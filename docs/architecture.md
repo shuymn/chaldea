@@ -1,0 +1,59 @@
+# Chaldea Architecture
+
+## 1. Purpose Layer (Acceptance Criteria)
+
+- **Native CLI fidelity**: When a user or orchestrator launches Claude Code or Codex CLI through Chaldea, the CLI runs inside an interactive PTY and retains all native interactive features (hooks, skills, resume, permissions).
+- **Multi-agent orchestration support**: An orchestrator session can spawn isolated child threads (with git worktrees), exchange messages via pull-based `mailbox`, inspect child outcomes, and keep worktree ownership metadata without losing uncommitted or unpublished work.
+- **Cross-platform hosts + Android remote**: macOS and native Windows machines act as independent hosts (local SQLite as source of truth); Android connects remotely via a single PWA (Phase 2: Cloudflare Workers + Durable Objects + Cloudflare Access) for reading, approvals, short prompts, and emergency VT keypad recovery.
+- **Japanese IME reliability**: Composing and confirming Japanese text on macOS, Windows, and Android never triggers accidental submission, and multi-byte UTF-8 prompts arrive intact at the target CLI over PTY Bracketed Paste.
+- **Self-healing boundaries**: Unparseable CLI transcripts/hooks are preserved as `raw_unknown` (never silently dropped); stalled startup/non-hook prompts surface a live `alacritty_terminal` VT snapshot and keypad; a dedicated Rescue Agent can inspect sessions cross-cuttingly and emit scoped A2UI recovery panels.
+
+## 2. Decision Classification
+
+### Irreversible Core (Fix Early)
+1. **Event & sync contract**: `stream_id`, monotonic `seq`, `schema_version`, `command_id` idempotency, 3-axis thread state (`process` / `turn` / `task`), worktree ownership (`base_commit`, owner, short base path support).
+2. **Auth & permission boundaries**: localhost Bearer token + `Host` check, regular vs Rescue scope tokens, browser CF Access vs host Service Token separation.
+3. **Crash-only & Windows-compatible foundation**: persisted `session_id` + `--resume`, `PtyRuntime` trait isolation, Job Object / pgid process-tree cleanup, Rust single-binary hook emitter (`chaldea hook-emit`).
+4. **PWA origin & Japanese IME foundation**: single-origin strategy (avoiding Private Network Access conflicts) and plain `<textarea>` IME-safe input.
+
+### Reversible Layers (Defer Intentionally)
+- Desktop native shell (PWA -> Tauri v2) and Android native wrapper/app (PWA -> Capacitor / Expo).
+- Specific UI features and layout details (diff view, desktop split-pane layout, visual styling — wireframes live in `docs/design/chaldea.pen`).
+- Phase 2 Cloudflare Workers + Durable Objects relay (added outside local-first MVP).
+- Splitting PTY ownership into a separate long-lived process behind `PtyRuntime`.
+- Expanding the A2UI component catalog beyond the initial minimal set (5–6 components).
+
+### Unavoidable Landmines (Self-Healing Seams)
+- **External CLI schema drift**: Persist `raw_unknown` + CLI version -> add to `fixtures/` contract corpus -> update adapter & verify.
+- **Unexpected TUI prompts (trust, login, update, sandbox network)**: `SessionStart` timeout / `unconfirmed` input triggers `NeedsAttention` + `vt_snapshot` -> emergency VT keypad or Rescue Agent A2UI.
+- **OS runtime quirks (ConPTY, worktree locks)**: Built-in `chaldea doctor` round-trip self-check.
+
+## 3. Technology Stack
+
+- **Host Core & Daemon (macOS / Windows)**: Rust workspace with Sans-IO separation (`crates/core`, `crates/pty-runtime`, `crates/daemon`) — `tokio`, `axum`, `rusqlite`, `portable-pty =0.8.1`, `alacritty_terminal`.
+- **Contracts**: Rust types as source of truth -> generated TypeScript types (`ts-rs`) + runtime boundary validation (`packages/contracts`).
+- **Client UI (Desktop / Android)**: React + TypeScript (strict) + Vite + Tailwind as a single PWA (`packages/web`).
+- **Remote Relay (Phase 2)**: Cloudflare Workers + SQLite-backed Durable Objects (Hibernatable WebSockets) + Cloudflare Access (`packages/relay`).
+
+## 4. The 5 Seams
+
+1. **Sync Seam**: `GET /api/events?stream_id=<id>&after_seq=<N>&limit=200` (snapshot fallback when cursor is invalid), WS live notifications, `command_id` idempotency, read-only lock with freshness indicator when host is offline.
+2. **Ingest & Event Store Seam**: SQLite append-only log (`user_message`, `assistant_message`, `tool_activity`, `status_changed`, `approval_requested`, `artifact_diff`, `surface_update`, `raw_unknown`). Explicit `session_id` / `transcript_path` only (no implicit directory guessing); generation + `(path, offset)` committed atomically with events; `transcript_path: null` allowed (Codex); size-bounded/referenced large tool outputs.
+3. **Agent Control & Adapter Seam**: `chaldea spawn / send / wait / stop / mailbox`; input state machine `queued -> sent -> acked / unconfirmed` (confirmed via `UserPromptSubmit` etc., never auto-resend `unconfirmed`); adapter capability declaration (hook approval support, ack support, resume flags); worktree short base path override (e.g., `C:\wt\...` for Windows MSVC `link.exe` 260-char limit).
+4. **Extension & Rescue Seam**: One-shot JSON hooks (`before_spawn`, `after_close`, `attention`) + authenticated `POST /events`; Rescue Agent token with cross-session read (`events`, `raw_unknown`, `vt_snapshot`, `doctor`) and scoped A2UI (`Host | Workspace | Thread`) + `surface_action` execution.
+5. **PTY Seam**: `PtyRuntime` trait (`spawn`, `write_text`, `write_key`, `snapshot`, `attach`, `kill`) sealing POSIX PTY / Windows ConPTY, `alacritty_terminal` headless VT query responder (DSR, DA1, OSC 10/11, kitty keyboard, wide-char), Job Object / pgid termination, and crash-only `--resume`.
+
+## 5. External Quirks (Observed Facts)
+
+- **Claude Code**: New folder trust prompt defaults to `No, exit` — never blindly send `Enter`. Launch-time `--settings <temp.json>` + `--session-id <uuid>` cleanly injects hooks without touching global settings.
+- **Codex CLI**: Startup can present up to 3 prompts before `SessionStart` (Update available -> Folder trust -> `Hooks need review`). Modifying `.codex/hooks.json` per session retriggers `Hooks need review`, so hook command strings must stay fixed while per-session URL/token/thread ID pass via environment variables. `transcript_path` can be `null`.
+- **`portable-pty`**: Pin `=0.8.1`; `0.9.0` enables `PSEUDOCONSOLE_INHERIT_CURSOR` on Windows ConPTY which stalls input until `ESC[6n]` is answered.
+- **Windows MSVC**: `link.exe` fails (`LNK1104`) on paths exceeding 260 characters; worktree base path must be configurable per workspace.
+
+## 6. Verification Strategy
+
+- **Real CLI contract tests (`fixtures/`)**: Versioned real transcripts and hook payloads (highest priority against upstream CLI drift).
+- **PBT (`proptest` / `fast-check`)**: 3-axis state machine, input ack transitions, client reducer.
+- **Targeted model checking (`stateright`)**: Scoped strictly to startup crash, offline event buffering, and retry after lost response on the Sync Seam.
+- **Fuzzing (`cargo-fuzz`)**: JSONL line parser, hook payload decoder, VT escape responder.
+- **Cross-OS CI + E2E**: macOS + Windows CI matrix (`core` + `FakePty`), `chaldea doctor`, Playwright E2E (desktop + mobile viewports, including IME composition guard tests).
