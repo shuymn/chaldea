@@ -487,7 +487,8 @@ type Cleanup = Box<dyn Fn() -> String + Send + Sync>;
 struct Wd {
     sink: Mutex<Option<Sink>>,
     owned: Mutex<Vec<Weak<Owned>>>,
-    cleanups: Mutex<Vec<(String, Cleanup)>>,
+    /// Run-dir removal, registered by `Ctx::new` unless `--keep-temp`.
+    run_dir_cleanup: Mutex<Option<Cleanup>>,
     interrupted: Arc<AtomicBool>,
     finished: AtomicBool,
     fired: AtomicBool,
@@ -501,7 +502,7 @@ fn wd() -> &'static Wd {
     WD.get_or_init(|| Wd {
         sink: Mutex::new(None),
         owned: Mutex::new(Vec::new()),
-        cleanups: Mutex::new(Vec::new()),
+        run_dir_cleanup: Mutex::new(None),
         interrupted: Arc::new(AtomicBool::new(false)),
         finished: AtomicBool::new(false),
         fired: AtomicBool::new(false),
@@ -515,21 +516,21 @@ pub fn watchdog_register(o: &Arc<Owned>) {
     v.push(Arc::downgrade(o));
 }
 
-/// Registers a cleanup that runs on every watchdog exit path (e.g. run-dir removal).
-pub fn watchdog_cleanup(name: &str, f: Cleanup) {
-    wd().cleanups
+/// Registers the run-dir removal that runs on every watchdog exit path.
+pub fn watchdog_run_dir_cleanup(f: Cleanup) {
+    *wd()
+        .run_dir_cleanup
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((name.to_string(), f));
+        .unwrap_or_else(|e| e.into_inner()) = Some(f);
 }
 
-/// Runs every registered cleanup (watchdog exit paths).
+/// Runs the registered cleanup (watchdog exit paths); the report lists it.
 fn run_cleanups() -> Vec<String> {
-    wd().cleanups
+    wd().run_dir_cleanup
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .map(|(n, f)| format!("{n}: {}", f()))
+        .map(|f| format!("run dir: {}", f()))
         .collect()
 }
 

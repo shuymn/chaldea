@@ -63,13 +63,10 @@ impl Ctx {
         session::watchdog_start(sink.clone(), cutoff, deadline);
         if !args.keep_temp {
             let (root, dir) = (args.root.clone(), run_dir.clone());
-            session::watchdog_cleanup(
-                "run dir",
-                Box::new(move || {
-                    remove_run_dir(&root, &dir);
-                    "removed".into()
-                }),
-            );
+            session::watchdog_run_dir_cleanup(Box::new(move || {
+                remove_run_dir(&root, &dir);
+                "removed".into()
+            }));
         }
         Ok(Ctx {
             args,
