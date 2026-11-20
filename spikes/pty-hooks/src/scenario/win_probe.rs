@@ -1220,12 +1220,10 @@ fn attach_client(args: &Args) -> i32 {
         Duration::from_secs(1),
         dl(),
     );
-    let marker = screen.as_ref().ok().and_then(|(_, b)| {
-        let s = String::from_utf8_lossy(b);
-        s.find("MARKER-")
-            .and_then(|i| s.get(i + 7..i + 13))
-            .and_then(|d| d.parse::<u64>().ok())
-    });
+    let marker = screen
+        .as_ref()
+        .ok()
+        .and_then(|(_, b)| marker_of(&String::from_utf8_lossy(b)));
     let nonce = util::token()[..16].to_string();
     let input = post("/probe/input", nonce.as_bytes());
     let mut keys = Vec::new();
