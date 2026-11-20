@@ -8,7 +8,6 @@
 //! its caller gave up.
 
 use std::io::{Read, Write};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -220,18 +219,23 @@ impl PtyIo {
     /// writer drops (its drop writes `\n` + VEOF to the PTY).
     pub fn start(
         master: Box<dyn MasterPty + Send>,
-        out_file: &Path,
+        mut out: std::fs::File,
         cols: u16,
         rows: u16,
         responder: bool,
         t0: Instant,
         kill_first: &dyn Fn(),
     ) -> Result<PtyIo, String> {
-        let mut out =
-            std::fs::File::create(out_file).map_err(|e| format!("{}: {e}", out_file.display()))?;
-        let mut reader = master
-            .try_clone_reader()
-            .map_err(|e| format!("reader: {e}"))?;
+        // Every setup error kills the tree before `master` (owned here) drops,
+        // so ConPTY is never closed under a live, undrained child.
+        let fail = |e: String| -> Result<PtyIo, String> {
+            kill_first();
+            Err(e)
+        };
+        let mut reader = match master.try_clone_reader() {
+            Ok(r) => r,
+            Err(e) => return fail(format!("reader: {e}")),
+        };
         let (tx, rx): (Sender<WriteMsg>, Receiver<WriteMsg>) = mpsc::channel();
         let written = Arc::new(AtomicU64::new(0));
         let gate = Arc::new(GateState::default());
@@ -278,12 +282,15 @@ impl PtyIo {
                 }
                 let _ = out.flush();
                 eof2.store(true, Ordering::SeqCst);
-            })
-            .map_err(|e| e.to_string())?;
+            });
+        let reader_join = match reader_join {
+            Ok(j) => j,
+            Err(e) => return fail(format!("reader thread: {e}")),
+        };
 
         let writer = match master.take_writer() {
             Ok(w) => w,
-            Err(e) => return Err(format!("writer: {e}")),
+            Err(e) => return fail(format!("writer: {e}")),
         };
         let log2 = log.clone();
         let (wtx_slot, wrx) = mpsc::channel::<Box<dyn Write + Send>>();

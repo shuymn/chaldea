@@ -275,6 +275,9 @@ pub struct Session {
 impl Session {
     pub fn spawn(opts: SpawnOpts) -> Result<Session, String> {
         let t0 = Instant::now();
+        // The output sink is prepared before anything is spawned.
+        let out = std::fs::File::create(&opts.out_file)
+            .map_err(|e| format!("{}: {e}", opts.out_file.display()))?;
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -331,7 +334,7 @@ impl Session {
         let o = s.owned.clone();
         s.io = Some(PtyIo::start(
             pair.master,
-            &opts.out_file,
+            out,
             opts.cols,
             opts.rows,
             opts.responder,
