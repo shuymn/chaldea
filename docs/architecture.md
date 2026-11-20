@@ -45,8 +45,19 @@
 
 ## 5. External Quirks (Observed Facts)
 
-- **Claude Code**: New folder trust prompt defaults to `No, exit` — never blindly send `Enter`. Launch-time `--settings <temp.json>` + `--session-id <uuid>` cleanly injects hooks without touching global settings.
-- **Codex CLI**: Startup can present up to 3 prompts before `SessionStart` (Update available -> Folder trust -> `Hooks need review`). Modifying `.codex/hooks.json` per session retriggers `Hooks need review`, so hook command strings must stay fixed while per-session URL/token/thread ID pass via environment variables. `transcript_path` can be `null`.
+Observed on macOS with Claude Code 2.1.322 and Codex CLI 0.170.0 (spike evidence: `docs/spikes/pty-hooks-spike.md`).
+
+- **Claude Code**:
+  - New folder trust prompt defaults to `No, exit` — never blindly send `Enter`.
+  - Launch-time `--settings <temp.json>` + `--session-id <uuid>` cleanly injects hooks without touching global settings, and `SessionStart` arrives at startup carrying the given session id.
+  - `UserPromptSubmit.prompt` is Claude's own rendering of the input, not the pasted bytes: TAB becomes 4 spaces, combining sequences are NFC-composed, and large pastes arrive wrapped in `<pasted_content id="…">`.
+  - MCP servers from `--mcp-config` run as descendants of the CLI process; they need `"type": "stdio"` and their env stated explicitly.
+- **Codex CLI**:
+  - Startup can present prompts before the first turn (Update available, Folder trust, `Hooks need review`).
+  - No hook fires at startup: `SessionStart`, `UserPromptSubmit` and `Stop` all fire when the first turn runs. Readiness therefore cannot be gated on `SessionStart`. The adapter passes the first prompt as the positional argument and never writes to the PTY before the session is bound. Inside the review dialog, digit keys pick options (`2` = "Trust all and continue"), so stray input there can approve hooks.
+  - Hooks passed via `-c hooks.<Event>=[…]` (source `<session-flags>`) are trusted once and persisted in `config.toml` under `/<session-flags>/config.toml:<event>:<group>:<index>`. The key does not depend on cwd, so the same trust covers every worktree. Changing the command string retriggers `Hooks need review`, so hook command strings must stay fixed while per-session URL/token/thread ID pass via environment variables, which reach the hook process. Trust may need renewal after a Codex upgrade.
+  - Without `--no-daemon`, the CLI attaches to a shared, long-lived `codex app-server` daemon, whose version can differ from the CLI's. Session MCP servers then run as children of that daemon, outside the PTY process tree, and survive `stop`. The adapter must launch Codex with `--no-daemon`.
+  - `transcript_path` can be `null`.
 - **`portable-pty`**: Pin `=0.8.1`; `0.9.0` enables `PSEUDOCONSOLE_INHERIT_CURSOR` on Windows ConPTY which stalls input until `ESC[6n]` is answered.
 - **Windows MSVC**: `link.exe` fails (`LNK1104`) on paths exceeding 260 characters; worktree base path must be configurable per workspace.
 
