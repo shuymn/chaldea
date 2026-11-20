@@ -15,7 +15,7 @@ use super::{Ctx, Launch, LaunchSpec, cli_version, hook_command, launch, write_sn
 use crate::cli::{self, Args};
 use crate::paste::{self, Newline, PasteOpts};
 use crate::report::result_str;
-use crate::session::{self, Session, SpawnOpts};
+use crate::session::{Session, SpawnOpts};
 use crate::{os, util};
 
 pub const SCENARIOS: &[&str] = &[
@@ -97,12 +97,6 @@ pub fn preflight(args: &Args) -> Result<(String, Bins), String> {
             "chs real {which}: refusing to launch real CLIs without --allow-api-usage \
              (they run under the owner's account and may use the API)"
         ));
-    }
-    if args.hook_source == "codex-home" && !args.i_approve_global_hooks {
-        return Err(
-            "--hook-source codex-home rewrites ~/.codex/hooks.json; add --i-approve-global-hooks"
-                .into(),
-        );
     }
     let mut bins = Bins {
         claude: None,
@@ -510,249 +504,6 @@ fn claude_global_hooks() -> (Value, bool) {
     (Value::Object(out), ok)
 }
 
-// ---------------- codex-home hooks.json backup / restore (§4.3) ----------------
-//
-// Install and restore run under `session::EDIT_LOCK`, which the watchdog also
-// takes before running cleanups; the restore cleanup is registered only after
-// our hooks.json is in place. Restore never overwrites: the current file is
-// moved aside, re-verified, and the original is linked back in only if the
-// target name is still free.
-
-fn meta_path(home: &Path) -> PathBuf {
-    home.join("hooks.json.chs-backup.json")
-}
-
-fn cleanup_name(home: &Path) -> String {
-    format!("codex-home hooks.json {}", home.display())
-}
-
-/// Test hook: called with a step name at the interleaving points the H2 tests probe.
-type StepHook = Box<dyn Fn(&str) + Send + Sync>;
-static STEP_HOOK: std::sync::Mutex<Option<StepHook>> = std::sync::Mutex::new(None);
-
-fn step(name: &str) {
-    if let Some(h) = STEP_HOOK.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        h(name);
-    }
-}
-
-fn lock_edits() -> std::sync::MutexGuard<'static, ()> {
-    session::EDIT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn create_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()
-}
-
-/// Backs up `<home>/hooks.json`, creates the metadata file exclusively, then writes ours.
-fn install_global_hooks(home: &Path, run_id: &str, content: &[u8]) -> Result<(), String> {
-    let _g = lock_edits();
-    let target = home.join("hooks.json");
-    let meta = meta_path(home);
-    if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(format!("{} is a symlink; refusing", target.display()));
-    }
-    let me = os::proc_info(std::process::id())
-        .map(|p| p.start_time)
-        .unwrap_or(0);
-    let backup = home.join(format!("hooks.json.chs-backup-{run_id}"));
-    let original = match std::fs::read(&target) {
-        Ok(b) => Some(b),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("{}: {e}", target.display())),
-    };
-    let m = json!({
-        "run_id": run_id, "harness_pid": std::process::id(), "harness_start": me,
-        "backup_path": original.is_some().then(|| backup.display().to_string()),
-        "mode": os::file_mode(&target),
-        "written": String::from_utf8_lossy(content),
-    });
-    create_new(&meta, m.to_string().as_bytes()).map_err(|e| match e.kind() {
-        std::io::ErrorKind::AlreadyExists => format!(
-            "{} exists; a previous run has not been restored",
-            meta.display()
-        ),
-        _ => format!("meta: {e}"),
-    })?;
-    // From here on we own `meta` (and `backup` once created); undo both on failure.
-    let undo = |msg: String, created_backup: bool| {
-        if created_backup {
-            let _ = std::fs::remove_file(&backup);
-        }
-        let _ = std::fs::remove_file(&meta);
-        Err(msg)
-    };
-    if let Some(b) = &original
-        && let Err(e) = create_new(&backup, b)
-    {
-        return undo(format!("backup: {e}"), false);
-    }
-    if std::fs::read(&target).ok() != original {
-        return undo(
-            format!("{} changed during install; refusing", target.display()),
-            original.is_some(),
-        );
-    }
-    if let Err(e) = util::write_atomic(&target, content) {
-        return undo(format!("write hooks.json: {e}"), original.is_some());
-    }
-    step("after_rename");
-    let h = home.to_path_buf();
-    session::watchdog_cleanup(
-        &cleanup_name(home),
-        Box::new(move || match restore_locked(&h, false, &os::liveness) {
-            Ok(s) | Err(s) => s,
-        }),
-    );
-    Ok(())
-}
-
-/// Swaps ours for `next` (A-4 mutation of the active source) under the lock;
-/// only if the file still holds exactly what the metadata says we wrote.
-fn replace_global_hooks(home: &Path, next: &[u8]) -> Result<(), String> {
-    let _g = lock_edits();
-    let meta = meta_path(home);
-    let target = home.join("hooks.json");
-    let mut m: Value = std::fs::read(&meta)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .ok_or("metadata missing or unreadable")?;
-    if m["harness_pid"].as_u64() != Some(std::process::id() as u64) {
-        return Err("metadata belongs to another harness".into());
-    }
-    let written = m["written"].as_str().unwrap_or("").as_bytes().to_vec();
-    if std::fs::read(&target).ok() != Some(written) {
-        return Err(format!("{} changed since we wrote it", target.display()));
-    }
-    m["written"] = json!(String::from_utf8_lossy(next));
-    util::write_atomic(&meta, m.to_string().as_bytes()).map_err(|e| format!("meta: {e}"))?;
-    util::write_atomic(&target, next).map_err(|e| format!("write hooks.json: {e}"))
-}
-
-/// Restores the backed-up hooks.json. `Ok` = restored or nothing to do;
-/// `Err` = refused or failed (the caller reports status error).
-pub fn restore_global_hooks(home: &Path, only_if_dead: bool) -> Result<String, String> {
-    let _g = lock_edits();
-    let r = restore_locked(home, only_if_dead, &os::liveness);
-    session::watchdog_remove_cleanup(&cleanup_name(home));
-    r
-}
-
-fn restore_locked(
-    home: &Path,
-    only_if_dead: bool,
-    liveness: &dyn Fn(u32, u64) -> Option<bool>,
-) -> Result<String, String> {
-    let meta = meta_path(home);
-    let raw = match std::fs::read(&meta) {
-        Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok("no metadata".into()),
-        Err(e) => return Err(format!("metadata unreadable: {e}; left in place")),
-    };
-    let m: Value = serde_json::from_slice(&raw)
-        .map_err(|_| "metadata malformed; left in place".to_string())?;
-    let pid = m["harness_pid"].as_u64().unwrap_or(0) as u32;
-    let start = m["harness_start"].as_u64().unwrap_or(0);
-    if only_if_dead {
-        match liveness(pid, start) {
-            Some(false) => {}
-            Some(true) => return Ok("owning harness still running".into()),
-            None => {
-                return Err(format!(
-                    "cannot confirm harness {pid} is dead; refusing to restore"
-                ));
-            }
-        }
-    }
-    let target = home.join("hooks.json");
-    let written = m["written"].as_str().unwrap_or("").as_bytes().to_vec();
-    match std::fs::read(&target) {
-        Ok(cur) if cur == written => {}
-        Ok(_) => {
-            return Err(format!(
-                "{} changed since we wrote it; refusing to restore",
-                target.display()
-            ));
-        }
-        Err(_) => return Err(format!("{} missing; refusing to restore", target.display())),
-    }
-    step("after_check");
-    let backup = m["backup_path"].as_str().map(PathBuf::from);
-    // Stage the original first, so the swap below is rename + link only.
-    let staged = home.join(format!("hooks.json.chs-staged-{}", std::process::id()));
-    if let Some(b) = &backup {
-        let bytes = std::fs::read(b).map_err(|e| format!("backup unreadable: {e}"))?;
-        let _ = std::fs::remove_file(&staged);
-        create_new(&staged, &bytes).map_err(|e| format!("stage: {e}"))?;
-        let _ = os::set_file_mode(&staged, m["mode"].as_u64().map(|v| v as u32));
-    }
-    let displaced = home.join(format!("hooks.json.chs-displaced-{}", util::now_ms()));
-    if let Err(e) = std::fs::rename(&target, &displaced) {
-        let _ = std::fs::remove_file(&staged);
-        return Err(format!("move aside: {e}"));
-    }
-    let concurrent_edit = std::fs::read(&displaced).ok() != Some(written);
-    if backup.is_some() {
-        let linked = std::fs::hard_link(&staged, &target);
-        let _ = std::fs::remove_file(&staged);
-        if let Err(e) = linked {
-            return Err(format!(
-                "{} reappeared during restore ({e}); ours/edited copy kept at {}",
-                target.display(),
-                displaced.display()
-            ));
-        }
-    }
-    if let Some(b) = &backup {
-        let _ = std::fs::remove_file(b);
-    }
-    let _ = std::fs::remove_file(&meta);
-    if concurrent_edit {
-        return Err(format!(
-            "restored the original; a concurrent edit was preserved at {}",
-            displaced.display()
-        ));
-    }
-    let _ = std::fs::remove_file(&displaced);
-    Ok("restored".into())
-}
-
-/// Called at every `chs` start (§4.3).
-pub fn recover_leftover() {
-    let home = codex_home();
-    if meta_path(&home).exists() {
-        let r = restore_global_hooks(&home, true);
-        eprintln!("chs: leftover codex-home hooks.json backup: {r:?}");
-    }
-}
-
-/// `project` source: `<cwd>/.codex/hooks.json`, created only if absent.
-fn install_project_hooks(cwd: &Path, content: &[u8]) -> Result<PathBuf, String> {
-    let dir = cwd.join(".codex");
-    let f = dir.join("hooks.json");
-    if f.exists() {
-        return Err(format!(
-            "{} already exists; refusing to overwrite",
-            f.display()
-        ));
-    }
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::write(&f, content).map_err(|e| e.to_string())?;
-    Ok(f)
-}
-
-fn remove_project_hooks(f: &Path, content: &[u8]) {
-    if std::fs::read(f).is_ok_and(|c| c == content) {
-        let _ = std::fs::remove_file(f);
-    }
-}
-
 // ---------------- scenarios ----------------
 //
 // Every scenario declares its required cases up front (`ctx.require`); a case
@@ -1072,35 +823,8 @@ fn codex_modes(ctx: &Ctx) -> Vec<&'static str> {
     }
 }
 
-/// Points the active file-based hook source (codex-home / project) at `next`.
-/// Session flags carry the command in argv, so nothing to do there.
-fn set_file_source(
-    ctx: &Ctx,
-    project_file: Option<&PathBuf>,
-    cur: &[u8],
-    next: &[u8],
-) -> Result<(), String> {
-    match ctx.args.hook_source.as_str() {
-        "codex-home" => replace_global_hooks(&codex_home(), next),
-        "project" => {
-            let f = project_file.ok_or("project hooks.json not installed")?;
-            if std::fs::read(f).ok().as_deref() != Some(cur) {
-                return Err(format!("{} changed since we wrote it", f.display()));
-            }
-            util::write_atomic(f, next).map_err(|e| e.to_string())
-        }
-        _ => Ok(()),
-    }
-}
-
 fn codex_hooks(ctx: &Ctx, a: &Agent) {
     let cwd = default_cwd(ctx, a);
-    let content =
-        serde_json::to_vec_pretty(&codex_hooks_json(&hook_command(&ctx.args.root, "codex")))
-            .unwrap_or_default();
-    let mutated =
-        serde_json::to_vec_pretty(&codex_hooks_json(&hook_command(&ctx.args.root, "codez")))
-            .unwrap_or_default();
     let mut plan: Vec<(&str, PathBuf, String, &str, String)> = Vec::new();
     for mode in codex_modes(ctx) {
         for i in 0..ctx.args.launches.max(1) {
@@ -1145,43 +869,13 @@ fn codex_hooks(ctx: &Ctx, a: &Agent) {
             ctx.require("A-5", case);
         }
     }
-    let all_cases: Vec<(&str, String)> = plan.iter().map(|p| (p.3, p.4.clone())).collect();
-    let mut project_file = None;
-    match ctx.args.hook_source.as_str() {
-        "codex-home" => {
-            if let Err(e) = install_global_hooks(&codex_home(), &ctx.run_id, &content) {
-                ctx.error(e.clone());
-                return not_run(ctx, &all_cases, &e);
-            }
-        }
-        "project" => match install_project_hooks(&cwd, &content) {
-            Ok(f) => project_file = Some(f),
-            Err(e) => {
-                ctx.error(e.clone());
-                return not_run(ctx, &all_cases, &e);
-            }
-        },
-        _ => {}
-    }
     let mut first_keys: std::collections::BTreeMap<&str, BTreeSet<String>> = Default::default();
     for (mode, dir, tag, id, case) in plan {
         if ctx.past_cutoff() {
             break;
         }
         let is_mutated = tag.ends_with("-mutated");
-        let is_restored = tag.ends_with("-restored");
-        if is_mutated
-            && let Err(e) = set_file_source(ctx, project_file.as_ref(), &content, &mutated)
-        {
-            not_run(ctx, &[(id, case)], &format!("mutation not applied: {e}"));
-            continue;
-        }
-        if is_restored
-            && let Err(e) = set_file_source(ctx, project_file.as_ref(), &mutated, &content)
-        {
-            not_run(ctx, &[(id, case)], &format!("restore not applied: {e}"));
-            continue;
-        }
+        // A-4 mutates one byte of the session-flag command string (the emitter argument).
         let hook_agent = if is_mutated { "codez" } else { "codex" };
         let before = codex_config();
         let label = format!("codex-hooks-{tag}");
@@ -1273,18 +967,6 @@ fn codex_hooks(ctx: &Ctx, a: &Agent) {
                     if config_ok { "pass" } else { "inconclusive" },
                     base,
                 );
-            }
-        }
-    }
-    if let Some(f) = project_file {
-        remove_project_hooks(&f, &content);
-    }
-    if ctx.args.hook_source == "codex-home" {
-        match restore_global_hooks(&codex_home(), false) {
-            Ok(r) => ctx.detail("codex_home_restore", json!(r)),
-            Err(e) => {
-                ctx.detail("codex_home_restore", json!(e));
-                ctx.error(format!("codex-home restore: {e}"));
             }
         }
     }
@@ -1598,160 +1280,6 @@ mod tests {
             k.into_iter().collect::<Vec<_>>(),
             vec!["\"<session-flags>/config.toml:session_start:0:0\"".to_string()]
         );
-    }
-
-    fn tmp_home() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("chs-codex-home-{}", util::run_id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    /// The H2 tests share the step hook, the edit lock, and the cleanup registry.
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn set_step(h: Option<StepHook>) {
-        *STEP_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = h;
-    }
-
-    #[test]
-    fn global_hooks_backup_restores_original() {
-        let _s = serial();
-        let h = tmp_home();
-        std::fs::write(h.join("hooks.json"), b"original").unwrap();
-        install_global_hooks(&h, "r1", b"ours").unwrap();
-        assert_eq!(std::fs::read(h.join("hooks.json")).unwrap(), b"ours");
-        assert!(
-            install_global_hooks(&h, "r2", b"ours").is_err(),
-            "second install must refuse (metadata is created exclusively)"
-        );
-        // Our own harness is alive: a start-time recovery must leave it alone.
-        assert_eq!(
-            restore_global_hooks(&h, true).unwrap(),
-            "owning harness still running"
-        );
-        assert_eq!(restore_global_hooks(&h, false).unwrap(), "restored");
-        assert_eq!(std::fs::read(h.join("hooks.json")).unwrap(), b"original");
-        assert!(!meta_path(&h).exists());
-        let _ = std::fs::remove_dir_all(&h);
-    }
-
-    #[test]
-    fn global_hooks_restore_refuses_concurrent_change() {
-        let _s = serial();
-        let h = tmp_home();
-        install_global_hooks(&h, "r1", b"ours").unwrap();
-        std::fs::write(h.join("hooks.json"), b"someone else").unwrap();
-        assert!(
-            restore_global_hooks(&h, false)
-                .unwrap_err()
-                .contains("refusing")
-        );
-        assert_eq!(
-            std::fs::read(h.join("hooks.json")).unwrap(),
-            b"someone else"
-        );
-        assert!(meta_path(&h).exists());
-        let _ = std::fs::remove_dir_all(&h);
-    }
-
-    #[test]
-    fn global_hooks_absent_original_is_removed() {
-        let _s = serial();
-        let h = tmp_home();
-        install_global_hooks(&h, "r1", b"ours").unwrap();
-        assert_eq!(restore_global_hooks(&h, false).unwrap(), "restored");
-        assert!(!h.join("hooks.json").exists());
-        let _ = std::fs::remove_dir_all(&h);
-    }
-
-    /// H2: an edit landing between the content check and the swap is moved
-    /// aside, never overwritten, and the restore reports an error.
-    #[test]
-    fn concurrent_edit_between_check_and_swap_is_preserved() {
-        let _s = serial();
-        let h = tmp_home();
-        std::fs::write(h.join("hooks.json"), b"original").unwrap();
-        install_global_hooks(&h, "r1", b"ours").unwrap();
-        let target = h.join("hooks.json");
-        set_step(Some(Box::new(move |s| {
-            if s == "after_check" {
-                std::fs::write(&target, b"owner edit").unwrap();
-            }
-        })));
-        let r = restore_global_hooks(&h, false);
-        set_step(None);
-        let e = r.unwrap_err();
-        assert!(e.contains("concurrent edit"), "{e}");
-        let displaced: Vec<_> = std::fs::read_dir(&h)
-            .unwrap()
-            .flatten()
-            .filter(|d| d.file_name().to_string_lossy().contains("chs-displaced-"))
-            .collect();
-        assert_eq!(displaced.len(), 1);
-        assert_eq!(std::fs::read(displaced[0].path()).unwrap(), b"owner edit");
-        assert_eq!(std::fs::read(h.join("hooks.json")).unwrap(), b"original");
-        let _ = std::fs::remove_dir_all(&h);
-    }
-
-    /// H2: the watchdog's cleanup sweep waits for an in-flight install and
-    /// then restores, instead of running before the cleanup is registered.
-    #[test]
-    fn watchdog_sweep_waits_for_install_and_restores() {
-        let _s = serial();
-        let h = tmp_home();
-        std::fs::write(h.join("hooks.json"), b"original").unwrap();
-        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
-        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-        let go_rx = std::sync::Mutex::new(go_rx);
-        set_step(Some(Box::new(move |s| {
-            if s == "after_rename" {
-                let _ = paused_tx.send(());
-                let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
-            }
-        })));
-        let h2 = h.clone();
-        let installer = std::thread::spawn(move || install_global_hooks(&h2, "r1", b"ours"));
-        paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let sweeper = std::thread::spawn(session::run_cleanups);
-        std::thread::sleep(Duration::from_millis(200));
-        go_tx.send(()).unwrap();
-        installer.join().unwrap().unwrap();
-        let swept = sweeper.join().unwrap();
-        set_step(None);
-        assert!(
-            swept.iter().any(|s| s.ends_with(": restored")),
-            "sweep ran before the install registered its cleanup: {swept:?}"
-        );
-        assert_eq!(std::fs::read(h.join("hooks.json")).unwrap(), b"original");
-        session::watchdog_remove_cleanup(&cleanup_name(&h));
-        let _ = std::fs::remove_dir_all(&h);
-    }
-
-    /// H2: start-time recovery needs positive death; a failed lookup refuses.
-    #[test]
-    fn recovery_refuses_without_positive_death() {
-        let _s = serial();
-        let h = tmp_home();
-        install_global_hooks(&h, "r1", b"ours").unwrap();
-        let unknown = |_: u32, _: u64| None;
-        let e = {
-            let _g = lock_edits();
-            restore_locked(&h, true, &unknown).unwrap_err()
-        };
-        assert!(e.contains("cannot confirm"), "{e}");
-        assert_eq!(std::fs::read(h.join("hooks.json")).unwrap(), b"ours");
-        let dead = |_: u32, _: u64| Some(false);
-        let r = {
-            let _g = lock_edits();
-            restore_locked(&h, true, &dead)
-        };
-        assert_eq!(r.unwrap(), "restored");
-        session::watchdog_remove_cleanup(&cleanup_name(&h));
-        let _ = std::fs::remove_dir_all(&h);
     }
 
     #[test]

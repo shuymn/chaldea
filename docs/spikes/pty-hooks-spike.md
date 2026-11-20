@@ -146,7 +146,7 @@ common: --root R (~/.chs | C:\chs)  --out DIR (R/out/<run-id>)  --deadline-secs 
         --session-start-timeout 20  --keep-temp  --cols 120 --rows 40
 real:   --prompt (claude-hooks: also submit one prompt)  --claude-bin PATH --codex-bin PATH (required on Windows; .cmd/.bat/.ps1 rejected) --cwd DIR
 paste:  --paste-newline <cr|lf|crlf> (default cr; real runs sweep all three) --enter-delay-ms 300 --chunk N
-codex:  --hook-source <session-flags|codex-home --i-approve-global-hooks|project> --launches N
+codex:  --hook-source session-flags --launches N
         --mutate-command --cwd2 DIR --codex-mode <no-daemon|default|both>
 ```
 
@@ -169,8 +169,7 @@ Claude: `R/runs/<id>/claude-settings.json` (no secrets; 0600 on Unix) registers 
 
 Codex (production must use the real `CODEX_HOME`, so that is what is measured; no disposable profile, which would need the auth credential copied):
 - `session-flags` (default): `-c 'hooks.SessionStart=[{hooks=[{type="command",command="<cmd>",timeout=10}]}]'`, same for `UserPromptSubmit` and `Stop`, fixed order. No file written; Codex itself adds `hooks.state` entries to the real `config.toml`. The harness records the file's hash before/after and the added keys.
-- `codex-home --i-approve-global-hooks`: separate opt-in scenario, run only if session-flags cannot persist trust. Backs up `~/.codex/hooks.json` with its mode, creates `hooks.json.chs-backup.json` (run id, harness pid + start time, backup path, mode, what we wrote) next to it exclusively, then writes ours. Install, restore, and the watchdog's cleanups are serialized by one lock, and the restore cleanup is registered only after ours is in place. Restore runs on every exit path including the watchdog, first verifying the file still has the content we wrote (if not, it refuses and reports); it then moves the current file aside to `hooks.json.chs-displaced-<ts>` and links the original back only if the name is still free, so an edit that lands mid-restore is preserved there and reported, never overwritten. A failed or refused restore makes the report status `error`. Every `chs` start checks for a leftover metadata file and restores only on positive evidence that run's harness (pid + start time) has ended; a process lookup that fails refuses. B-9's quiet no-env exit keeps the global hook inert in other sessions.
-- `project`: `<cwd>/.codex/hooks.json`, a control expected to re-review per path.
+- `session-flags` is the only source the spike builds. A global `~/.codex/hooks.json` (`codex-home`) source, which the owner approved only if session-flag hooks cannot persist trust, is a follow-up built after A-3 shows that; a per-path project `hooks.json` control is deferred with it. `--hook-source` with any other value exits 2 ("codex-home mode is not built; requires A-3 result showing session-flags cannot persist trust"). A-4 mutates one byte of the session-flag command string.
 
 Receiver: std `TcpListener` on `127.0.0.1:0`, one request per connection (`Connection: close`), thread per connection (max 16). Each connection gets an absolute 5 s deadline; every read sets `set_read_timeout(deadline - now)`. The head is read up to its `\r\n\r\n` boundary (at most 8 KiB; no body byte is consumed before the checks) and parsed with `httparse` (32-header array); then, before any body byte: method/path `POST /hook` or `POST /witness` (plus `/probe/*` only while C-4 or C-5 runs; `GET /probe/screen` is bodyless and needs no `Content-Length`) else 405/404; exactly one `Host`, equal to `127.0.0.1:<port>` or `localhost:<port>`, else 421; exactly one `Authorization`, Bearer compared with `subtle::ConstantTimeEq`, else 401; any `Transfer-Encoding` → 400; exactly one `Content-Length` ≤ 4 MiB on POST else 411/413. Accepted bodies are stored byte-for-byte as `fixtures/<agent>/<cli-version>/<launch-id>/<Event>-<seq>.json`, where `<launch-id>` is unique per launch, `<Event>` is a known event name from the parsed payload or `unknown`, and `<seq>` is a report-wide counter; `.meta.json` holds only allowlisted fields (receive time, run id, thread id, agent, emitter version, emitter ancestry). Rejections are counted, never stored, and never mark readiness.
 
@@ -274,12 +273,12 @@ Full survey with evidence: `docs/prior-art.md`. Rows that drive this design:
 
 ## 7. Open Questions and Risks
 
-Owner decisions: O1 trust clicks on both machines and snapshot legibility (A-7); O2 whether the `codex-home` scenario runs if session-flags fail (approved conditionally; the owner sees the result first); O3 running set C.
+Owner decisions: O1 trust clicks on both machines and snapshot legibility (A-7); O2 whether a `codex-home` source is built and run if A-3 shows session-flags cannot persist trust (approved conditionally; the owner sees the result first); O3 running set C.
 
 Orchestrator may choose: timeout and corpus defaults.
 
 Risks:
-- R1. Session-flag hooks may not persist trust; the fallback is the global `codex-home` scenario.
+- R1. Session-flag hooks may not persist trust; the fallback, a global `codex-home` source, is built only after A-3 shows that.
 - R2. Codex may filter env for hooks under some `shell_environment_policy`; per-session data would then need another path (lookup by `session_id`).
 - R3. Inbox conhost handling of `WIN32_INPUT_MODE` (0x4) is unknown; open-source OpenConsole ignores the flag. Behavior varies by Windows build and loaded ConPTY module.
 - R4. Hook shells differ on Windows (Claude: Git Bash; Codex: unknown); the fixed command must parse in each.

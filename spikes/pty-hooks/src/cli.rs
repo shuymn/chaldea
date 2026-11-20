@@ -29,7 +29,6 @@ pub struct Args {
     pub chunk: usize,
     // codex
     pub hook_source: String,
-    pub i_approve_global_hooks: bool,
     pub launches: u32,
     pub mutate_command: bool,
     pub cwd2: Option<PathBuf>,
@@ -59,8 +58,12 @@ usage:
 common: --root R  --out DIR  --deadline-secs 180  --session-start-timeout 20  --keep-temp  --cols 120 --rows 40
 real:   --prompt  --claude-bin PATH  --codex-bin PATH  --cwd DIR  --attended  --subset required
 paste:  --paste-newline <cr|lf|crlf>  --enter-delay-ms 300  --chunk N
-codex:  --hook-source <session-flags|codex-home|project> [--i-approve-global-hooks]  --launches N
+codex:  --hook-source session-flags  --launches N
         --mutate-command  --cwd2 DIR  --codex-mode <no-daemon|default|both>";
+
+/// The only hook source built in this spike (§4.3).
+pub const HOOK_SOURCE_NOT_BUILT: &str =
+    "codex-home mode is not built; requires A-3 result showing session-flags cannot persist trust";
 
 fn value(it: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<String, String> {
     it.next()
@@ -95,7 +98,6 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         enter_delay_ms: 300,
         chunk: 0,
         hook_source: "session-flags".into(),
-        i_approve_global_hooks: false,
         launches: 1,
         mutate_command: false,
         cwd2: None,
@@ -140,11 +142,10 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             "--chunk" => a.chunk = num(&value(&mut it, f)?, f)?,
             "--hook-source" => {
                 a.hook_source = value(&mut it, f)?;
-                if !["session-flags", "codex-home", "project"].contains(&a.hook_source.as_str()) {
-                    return Err(format!("{f}: expected session-flags|codex-home|project"));
+                if a.hook_source != "session-flags" {
+                    return Err(HOOK_SOURCE_NOT_BUILT.into());
                 }
             }
-            "--i-approve-global-hooks" => a.i_approve_global_hooks = true,
             "--launches" => a.launches = num(&value(&mut it, f)?, f)?,
             "--mutate-command" => a.mutate_command = true,
             "--cwd2" => a.cwd2 = Some(PathBuf::from(value(&mut it, f)?)),

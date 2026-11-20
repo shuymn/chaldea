@@ -509,7 +509,7 @@ pub fn watchdog_register(o: &Arc<Owned>) {
     v.push(Arc::downgrade(o));
 }
 
-/// Registers a cleanup that runs on every watchdog exit path (e.g. hooks.json restore).
+/// Registers a cleanup that runs on every watchdog exit path (e.g. run-dir removal).
 pub fn watchdog_cleanup(name: &str, f: Cleanup) {
     wd().cleanups
         .lock()
@@ -517,43 +517,14 @@ pub fn watchdog_cleanup(name: &str, f: Cleanup) {
         .push((name.to_string(), f));
 }
 
-/// Serializes edits of files outside the run (codex-home `hooks.json`) with
-/// the watchdog: an install holds it from metadata creation until its
-/// cleanup is registered, and the watchdog takes it before running cleanups.
-pub static EDIT_LOCK: Mutex<()> = Mutex::new(());
-
-/// Runs every registered cleanup while holding `EDIT_LOCK` (bounded wait:
-/// a stuck holder is reported, and cleanups still run).
-pub fn run_cleanups() -> Vec<String> {
-    let end = Instant::now() + Duration::from_secs(3);
-    let guard = loop {
-        match EDIT_LOCK.try_lock() {
-            Ok(g) => break Some(g),
-            Err(std::sync::TryLockError::Poisoned(p)) => break Some(p.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < end => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(std::sync::TryLockError::WouldBlock) => break None,
-        }
-    };
-    let mut out: Vec<String> = wd()
-        .cleanups
+/// Runs every registered cleanup (watchdog exit paths).
+fn run_cleanups() -> Vec<String> {
+    wd().cleanups
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .map(|(n, f)| format!("{n}: {}", f()))
-        .collect();
-    if guard.is_none() {
-        out.push("edit lock busy for 3 s; cleanups ran without it".into());
-    }
-    out
-}
-
-pub fn watchdog_remove_cleanup(name: &str) {
-    wd().cleanups
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|(n, _)| n != name);
+        .collect()
 }
 
 pub fn interrupted() -> bool {

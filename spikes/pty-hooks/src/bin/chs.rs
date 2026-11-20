@@ -12,8 +12,6 @@ fn main() {
             std::process::exit(2);
         }
     };
-    // Every start: restore a hooks.json left by a dead run of the codex-home scenario (§4.3).
-    real::recover_leftover();
     let cmd = args.positional.first().cloned().unwrap_or_default();
     let result = std::panic::catch_unwind(move || match cmd.as_str() {
         "install-emitter" => scenario::install_emitter(&args),
