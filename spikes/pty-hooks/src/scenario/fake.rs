@@ -1410,7 +1410,12 @@ fn run_case(args: Args) -> i32 {
             );
         }
         _ => {
-            let mut spec = fake_spec(&ctx, &case, "spawn-tree", &[]);
+            let mut spec = fake_spec(
+                &ctx,
+                &case,
+                "spawn-tree",
+                &["--max-life-secs", SLEEPER_MAX_LIFE],
+            );
             if case == "setup-fail" {
                 spec.inject = Some(Inject::SetupFail);
             }
@@ -1466,12 +1471,17 @@ fn run_case(args: Args) -> i32 {
                 "ctrl-c-during-stop" => {
                     // Teardown has started but not killed yet when Ctrl-C lands:
                     // the watchdog must still kill the tree.
+                    // The marker is written from inside teardown, so the
+                    // interrupt always lands after teardown has begun.
+                    let marker = ctx.out.join("stopping");
                     *l.session
                         .owned
-                        .pause_before_kill
+                        .before_kill
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(Duration::from_secs(5));
-                    let _ = std::fs::write(ctx.out.join("stopping"), b"1");
+                        .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
+                        let _ = std::fs::write(&marker, b"1");
+                        std::thread::sleep(Duration::from_secs(5));
+                    }));
                 }
                 _ => {}
             }

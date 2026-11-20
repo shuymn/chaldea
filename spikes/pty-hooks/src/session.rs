@@ -66,9 +66,11 @@ pub struct Owned {
     kill_lock: Mutex<()>,
     /// Set only after kill + fallback completed.
     done: AtomicBool,
-    /// B-10 test hook: a pause between teardown start and the kill.
-    pub pause_before_kill: Mutex<Option<Duration>>,
+    /// B-10 test hook: runs inside teardown, after it started and before the kill.
+    pub before_kill: Mutex<Option<BeforeKill>>,
 }
+
+pub type BeforeKill = Box<dyn Fn() + Send + Sync>;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct KillResult {
@@ -305,7 +307,7 @@ impl Session {
             recorded: Mutex::new(BTreeMap::new()),
             kill_lock: Mutex::new(()),
             done: AtomicBool::new(false),
-            pause_before_kill: Mutex::new(None),
+            before_kill: Mutex::new(None),
         });
         watchdog_register(&owned);
         SPAWNED
@@ -419,13 +421,14 @@ impl Session {
             st.store(true, Ordering::SeqCst);
             let _ = j.join();
         }
-        let pause = *self
+        let hook = self
             .owned
-            .pause_before_kill
+            .before_kill
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(p) = pause {
-            std::thread::sleep(p);
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(h) = hook {
+            h();
         }
         let k = self.owned.kill_and_fallback(KILL_GRACE);
         let end = Instant::now() + VERIFY;
