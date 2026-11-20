@@ -621,7 +621,7 @@ impl State {
         }
         match (route, probe) {
             ("hook", _) => self.store_hook(&head, body, deadline),
-            ("witness", _) => self.store_witness(&body),
+            ("witness", _) => self.store_witness(&body, deadline),
             ("screen", Some(p)) => Outcome::Reply(200, p.screen(deadline)),
             ("input", Some(p)) => Outcome::Reply(p.input(&body, deadline), Vec::new()),
             ("key", Some(p)) => Outcome::Reply(p.key(&body, deadline), Vec::new()),
@@ -798,7 +798,9 @@ impl State {
         Outcome::Reply(200, Vec::new())
     }
 
-    fn store_witness(&self, body: &[u8]) -> Outcome {
+    /// Like `store_hook`, nothing is published once the deadline passed,
+    /// checked again under the state lock.
+    fn store_witness(&self, body: &[u8], deadline: Instant) -> Outcome {
         let Ok(v) = serde_json::from_slice::<Value>(body) else {
             return Outcome::Reply(400, Vec::new());
         };
@@ -817,11 +819,12 @@ impl State {
             report: v.get("report").cloned().unwrap_or(Value::Null),
             received_ms: self.t0.elapsed().as_millis() as u64,
         };
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .witnesses
-            .push(rec);
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if remaining(deadline).is_none() {
+            return Outcome::Reply(408, Vec::new());
+        }
+        g.witnesses.push(rec);
+        drop(g);
         self.cv.notify_all();
         Outcome::Reply(200, Vec::new())
     }
