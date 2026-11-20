@@ -33,7 +33,15 @@ fn log(msg: &str) {
 
 pub fn main() -> ! {
     let deadline = Instant::now() + TOTAL;
+    // One budget for the whole run (stdin, ancestry lookup, logging, POST):
+    // the timer exits 0 whatever the main thread is blocked on.
+    std::thread::spawn(move || {
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        std::process::exit(0)
+    });
     let agent = std::env::args().nth(1).unwrap_or_else(|| "unknown".into());
+    // Distinguishes "never ran" from a quiet no-env exit (only with a log path).
+    log(&format!("ran agent={agent}"));
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     // Missing or non-exact URL / missing token: exit at once without reading stdin.
     let Some(url) = env("CHALDEA_HOOK_URL").and_then(|u| parse_local_url(&u, "/hook")) else {
