@@ -47,15 +47,39 @@ fn cstr_field(field: &[libc::c_char]) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Basename of the executable image (`proc_pidpath`). Unlike `pbi_name`,
+/// it follows exec, so a CLI that renames itself or a stale pre-exec name
+/// does not hide which binary runs.
+fn exe_name(pid: u32) -> Option<String> {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: the buffer is PROC_PIDPATHINFO_MAXSIZE bytes; proc_pidpath writes at most that.
+    let n = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len() as u32,
+        )
+    };
+    if n <= 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    let path = String::from_utf8_lossy(&buf).into_owned();
+    path.rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 fn to_info(info: &libc::proc_bsdinfo) -> ProcInfo {
-    let name = {
+    let name = exe_name(info.pbi_pid).unwrap_or_else(|| {
         let n = cstr_field(&info.pbi_name);
         if n.is_empty() {
             cstr_field(&info.pbi_comm)
         } else {
             n
         }
-    };
+    });
     // SAFETY: getsid has no memory-safety preconditions.
     let sid = unsafe { libc::getsid(info.pbi_pid as libc::pid_t) };
     ProcInfo {
@@ -120,6 +144,16 @@ pub fn send_interrupt(pid: u32) -> io::Result<()> {
 
 /// Makes `cmd` interruptible by `send_interrupt` (no-op on Unix).
 pub fn interruptible(_cmd: &mut Command) {}
+
+/// Creates a new file readable only by this user (0600), failing if it exists.
+pub fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
 
 /// Non-interactive harness launch: no console window (Windows only).
 pub fn no_window(_cmd: &mut Command) {}

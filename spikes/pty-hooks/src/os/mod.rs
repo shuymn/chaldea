@@ -87,3 +87,16 @@ pub fn non_utf8_os_string() -> std::ffi::OsString {
         std::ffi::OsString::from_wide(&[0x61, 0xD800, 0x62])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// A process is named after its executable image: the test binary's
+    /// full name (longer than the 16-byte `pbi_name`) comes back intact.
+    #[test]
+    fn process_name_is_the_executable() {
+        let exe = std::env::current_exe().unwrap();
+        let want = exe.file_name().unwrap().to_string_lossy().into_owned();
+        let got = super::proc_info(std::process::id()).unwrap().name;
+        assert_eq!(got, want);
+    }
+}

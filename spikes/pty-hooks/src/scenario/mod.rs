@@ -244,7 +244,12 @@ pub struct LaunchSpec {
     pub responder: bool,
     pub hold_assign: bool,
     pub inject: Option<Inject>,
+    /// Runs with the launch's env (URL, token, thread id) after the receiver
+    /// started and before the spawn, e.g. to write a per-launch config.
+    pub before_spawn: Option<BeforeSpawn>,
 }
+
+pub type BeforeSpawn = Box<dyn FnOnce(&[(String, String)]) -> Result<(), String>>;
 
 pub struct Launch {
     pub label: String,
@@ -348,6 +353,9 @@ pub fn launch(ctx: &Ctx, spec: LaunchSpec) -> Result<Launch, String> {
         ),
     ];
     env.extend(spec.extra_env.iter().cloned());
+    if let Some(f) = spec.before_spawn {
+        f(&env)?;
+    }
     let session = Session::spawn(SpawnOpts {
         argv: spec.argv,
         cwd: spec.cwd,

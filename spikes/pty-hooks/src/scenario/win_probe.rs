@@ -951,6 +951,7 @@ fn start_attachable(
             responder: true,
             hold_assign: false,
             inject: None,
+            before_spawn: None,
         },
     )?;
     if !l.wait_gate(ctx.until(Duration::from_secs(ctx.args.session_start_timeout))) {

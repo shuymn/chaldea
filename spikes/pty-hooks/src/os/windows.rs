@@ -268,6 +268,14 @@ impl Tree {
     }
 }
 
+/// Creates a new file, failing if it exists (the run dir is private).
+pub fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
 /// Non-interactive harness launch: no console window (C-5).
 pub fn no_window(cmd: &mut Command) {
     cmd.creation_flags(CREATE_NO_WINDOW);

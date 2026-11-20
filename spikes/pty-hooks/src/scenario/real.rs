@@ -393,6 +393,20 @@ fn start(
     hook_agent: &str,
     extra: &[String],
 ) -> Result<Launch, String> {
+    start_with(ctx, a, label, cwd, mode, hook_agent, extra, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_with(
+    ctx: &Ctx,
+    a: &Agent,
+    label: &str,
+    cwd: &Path,
+    mode: Option<&str>,
+    hook_agent: &str,
+    extra: &[String],
+    before_spawn: Option<super::BeforeSpawn>,
+) -> Result<Launch, String> {
     let p = plan(ctx, a, label, mode, hook_agent, extra)?;
     std::fs::create_dir_all(cwd).map_err(|e| format!("{}: {e}", cwd.display()))?;
     launch(
@@ -409,6 +423,7 @@ fn start(
             responder: true,
             hold_assign: false,
             inject: None,
+            before_spawn,
         },
     )
 }
@@ -1361,18 +1376,45 @@ fn codex_warm(ctx: &Ctx, a: &Agent) {
     ctx.detail("unrelated_stop", json!(s));
 }
 
+/// Claude's `--mcp-config` entry for the FakeCli sleeper: an explicit stdio
+/// server with the launch's hook env (Claude does not pass its own env on).
+fn claude_mcp_config(fake: &Path, env: &[(String, String)]) -> Value {
+    let pass: serde_json::Map<String, Value> = env
+        .iter()
+        .filter(|(k, _)| {
+            [
+                "CHALDEA_HOOK_URL",
+                "CHALDEA_HOOK_TOKEN",
+                "CHALDEA_THREAD_ID",
+            ]
+            .contains(&k.as_str())
+        })
+        .map(|(k, v)| (k.clone(), json!(v)))
+        .collect();
+    json!({"mcpServers": {"chs": {"type": "stdio", "command": fake,
+                                   "args": ["--mode", "sleeper", "--role", "mcp"], "env": pass}}})
+}
+
 /// A-8: stop after the MCP sleeper attested; nothing owned survives 5 s later.
 fn tree_kill(ctx: &Ctx, a: &Agent) {
     let case = format!("{}_mcp_witness_tree", a.name);
     ctx.require("A-8", &case);
     let fake = util::sibling_bin("chs-fake-cli");
     let cwd = default_cwd(ctx, a);
+    let cfg = ctx.run_dir.join("mcp.json");
+    let mut before_spawn: Option<super::BeforeSpawn> = None;
     let extra: Vec<String> = if a.name == "claude" {
-        let cfg = ctx.run_dir.join("mcp.json");
-        let v = json!({"mcpServers": {"chs": {"command": fake, "args": ["--mode", "sleeper", "--role", "mcp"]}}});
-        if let Err(e) = std::fs::write(&cfg, v.to_string()) {
-            return not_run(ctx, &[("A-8", case)], &e.to_string());
-        }
+        // Claude does not hand its env to MCP servers: the per-launch values
+        // go into the stdio entry itself, in a new 0600 file inside the run
+        // dir (removed with it).
+        let (path, fake) = (cfg.clone(), fake.clone());
+        before_spawn = Some(Box::new(move |env: &[(String, String)]| {
+            let v = claude_mcp_config(&fake, env);
+            let mut f =
+                os::create_private_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            std::io::Write::write_all(&mut f, v.to_string().as_bytes())
+                .map_err(|e| format!("{}: {e}", path.display()))
+        }));
         vec!["--mcp-config".into(), cfg.display().to_string()]
     } else {
         vec![
@@ -1384,7 +1426,7 @@ fn tree_kill(ctx: &Ctx, a: &Agent) {
             "mcp_servers.chs.env_vars=[\"CHALDEA_HOOK_URL\",\"CHALDEA_HOOK_TOKEN\",\"CHALDEA_THREAD_ID\"]".into(),
         ]
     };
-    let l = match start(
+    let l = match start_with(
         ctx,
         a,
         &format!("{}-tree-kill", a.name),
@@ -1392,6 +1434,7 @@ fn tree_kill(ctx: &Ctx, a: &Agent) {
         Some("no-daemon"),
         a.name,
         &extra,
+        before_spawn,
     ) {
         Ok(l) => l,
         Err(e) => return not_run(ctx, &[("A-8", case)], &e),
@@ -1414,6 +1457,17 @@ fn tree_kill(ctx: &Ctx, a: &Agent) {
         .collect();
     let owned_survivors = fin["stop"]["survivors"].clone();
     let owned_clear = owned_survivors.as_array().is_some_and(|a| a.is_empty());
+    // Real-grandchild containment (e.g. the owner's own MCP servers), kept as
+    // evidence even when the chs witness is absent.
+    let recorded = fin["stop"]["recorded"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let containment = json!({
+        "recorded_descendants": recorded.iter().map(|p| json!({"pid": p["pid"], "name": p["name"]})).collect::<Vec<_>>(),
+        "survivors": owned_survivors,
+        "recorded_count": recorded.len(),
+    });
     let o = if w.is_none() {
         Outcome::not_exercised("the MCP sleeper never attested")
     } else if lives.iter().any(|(_, l)| l.is_none()) {
@@ -1429,7 +1483,7 @@ fn tree_kill(ctx: &Ctx, a: &Agent) {
         &case,
         o,
         json!({"bound": bound, "snapshot": snap, "witness": w, "witness_liveness": lives,
-               "owned_survivors": owned_survivors}),
+               "owned_survivors": owned_survivors, "containment": containment}),
     );
 }
 
@@ -1576,6 +1630,25 @@ mod tests {
             a[1],
             "hooks.SessionStart=[{hooks=[{type=\"command\",command=\"/x/chs-hook-emit codex\",timeout=10}]}]"
         );
+    }
+
+    #[test]
+    fn claude_mcp_entry_is_stdio_with_launch_env() {
+        let env = [
+            (
+                "CHALDEA_HOOK_URL".to_string(),
+                "http://127.0.0.1:1/hook".to_string(),
+            ),
+            ("CHALDEA_HOOK_TOKEN".to_string(), "t".to_string()),
+            ("CHALDEA_THREAD_ID".to_string(), "th".to_string()),
+            ("CHALDEA_HOOK_LOG".to_string(), "/x".to_string()),
+        ];
+        let v = claude_mcp_config(Path::new("/b/chs-fake-cli"), &env);
+        let e = &v["mcpServers"]["chs"];
+        assert_eq!(e["type"], "stdio");
+        assert_eq!(e["env"]["CHALDEA_HOOK_TOKEN"], "t");
+        assert_eq!(e["env"]["CHALDEA_THREAD_ID"], "th");
+        assert!(e["env"].get("CHALDEA_HOOK_LOG").is_none());
     }
 
     /// r3 A-4: only an event bound to the mutated launch counts as delivery.

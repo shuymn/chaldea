@@ -110,6 +110,7 @@ fn fake_spec(ctx: &Ctx, label: &str, mode: &str, extra: &[&str]) -> LaunchSpec {
         responder: true,
         hold_assign: false,
         inject: None,
+        before_spawn: None,
     }
 }
 
