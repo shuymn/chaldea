@@ -36,38 +36,100 @@ const REAL_STOP_WAIT: Duration = Duration::from_secs(120);
 
 // ---------------- binaries ----------------
 
-/// Resolves a CLI binary: explicit path (required on Windows; .cmd/.bat/.ps1 rejected) or PATH.
+/// Example of the native Codex binary on macOS, for refusal messages and the runbook.
+const CODEX_NATIVE_HINT: &str =
+    "…/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex";
+
+/// Resolves a CLI binary: explicit path (required on Windows) or PATH.
 pub fn resolve_bin(name: &str, explicit: Option<&PathBuf>) -> Result<PathBuf, String> {
-    if let Some(p) = explicit {
-        let ext = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if ["cmd", "bat", "ps1"].contains(&ext.as_str()) {
-            return Err(format!(
-                "--{name}-bin {}: .{ext} wrappers cannot be launched directly; pass the native binary",
-                p.display()
-            ));
+    resolve_in(name, explicit, std::env::var_os("PATH"))
+}
+
+/// Identity is checked on the file the symlink chain ends at, followed hop by
+/// hop, never on a version-manager shim's link name: that file must be named
+/// `name` (minus `.exe`) and must not be a script (shebang, `.js`) or a
+/// `.cmd` / `.bat` / `.ps1` wrapper. Returns that exact file.
+fn resolve_in(
+    name: &str,
+    explicit: Option<&PathBuf>,
+    path_var: Option<OsString>,
+) -> Result<PathBuf, String> {
+    let ask = |what: &str| {
+        let hint = if name == "codex" {
+            format!(" (on macOS: {CODEX_NATIVE_HINT})")
+        } else {
+            String::new()
+        };
+        format!("{what}; pass --{name}-bin with the native {name} binary{hint}")
+    };
+    let found = match explicit {
+        Some(p) => p.clone(),
+        None if os::os_name() == "windows" => {
+            return Err(ask(&format!("--{name}-bin is required on Windows")));
         }
-        if !p.is_file() {
-            return Err(format!("--{name}-bin {}: not a file", p.display()));
+        None => {
+            let file = util::bin_name(name);
+            path_var
+                .iter()
+                .flat_map(std::env::split_paths)
+                .map(|d| d.join(&file))
+                .find(|p| p.is_file())
+                .ok_or_else(|| ask(&format!("{name} not found on PATH")))?
         }
-        return std::fs::canonicalize(p).map_err(|e| e.to_string());
+    };
+    let target = symlink_target(&found).map_err(|e| ask(&format!("{}: {e}", found.display())))?;
+    let refuse = |why: &str| {
+        ask(&format!(
+            "{} resolves to {}, {why}",
+            found.display(),
+            target.display()
+        ))
+    };
+    let file_name = target
+        .file_name()
+        .map(|f| f.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let ext = target
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if ["cmd", "bat", "ps1", "js", "mjs", "cjs"].contains(&ext.as_str()) {
+        return Err(refuse(&format!(
+            "a .{ext} wrapper that cannot be launched directly"
+        )));
     }
-    if os::os_name() == "windows" {
-        return Err(format!(
-            "--{name}-bin is required on Windows (native binary, not the npm wrapper)"
-        ));
+    if file_name.strip_suffix(".exe").unwrap_or(&file_name) != name {
+        return Err(refuse(&format!(
+            "which is not the {name} binary (a version-manager shim?)"
+        )));
     }
-    let file = util::bin_name(name);
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-        .map(|d| d.join(&file))
-        .find(|p| p.is_file())
-        .and_then(|p| std::fs::canonicalize(p).ok())
-        .ok_or_else(|| format!("{name} not found on PATH; pass --{name}-bin PATH"))
+    let mut head = [0u8; 2];
+    let n = std::fs::File::open(&target)
+        .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+        .map_err(|e| refuse(&e.to_string()))?;
+    if head[..n] == *b"#!" {
+        return Err(refuse("a script"));
+    }
+    Ok(target)
+}
+
+/// Follows `p`'s symlink chain one hop at a time (bounded) to a regular file.
+fn symlink_target(p: &Path) -> Result<PathBuf, String> {
+    let mut cur = p.to_path_buf();
+    for _ in 0..16 {
+        let m = std::fs::symlink_metadata(&cur).map_err(|e| e.to_string())?;
+        if m.file_type().is_symlink() {
+            let t = std::fs::read_link(&cur).map_err(|e| e.to_string())?;
+            let base = cur.parent().map(Path::to_path_buf).unwrap_or_default();
+            cur = base.join(t);
+        } else if m.is_file() {
+            // `cur` is no longer a link; this only normalizes its directories.
+            return std::fs::canonicalize(&cur).map_err(|e| e.to_string());
+        } else {
+            return Err("not a file".into());
+        }
+    }
+    Err("too many symlinks".into())
 }
 
 fn needed_agents(which: &str, args: &Args) -> Result<Vec<&'static str>, String> {
@@ -1284,7 +1346,50 @@ mod tests {
 
     #[test]
     fn wrappers_rejected() {
-        let e = resolve_bin("codex", Some(&PathBuf::from("C:/x/codex.cmd"))).unwrap_err();
-        assert!(e.contains(".cmd"));
+        let d = std::env::temp_dir().join(format!("chs-bin-test-{}", util::run_id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let cmd = d.join("codex.cmd");
+        std::fs::write(&cmd, b"@echo off").unwrap();
+        let e = resolve_bin("codex", Some(&cmd)).unwrap_err();
+        assert!(e.contains(".cmd"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The orchestrator's Mac: PATH has a mise shim `codex` that links to the
+    /// `mise` binary. Resolution must refuse it rather than launch mise, and
+    /// must return the exact native file behind a chain of `codex` links.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_chain_resolves_to_the_named_binary() {
+        use std::os::unix::fs::symlink;
+        let d = std::env::temp_dir().join(format!("chs-bin-test-{}", util::run_id()));
+        let mk = |p: &str, body: &[u8]| {
+            let f = d.join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, body).unwrap();
+            f
+        };
+        mk("nix/bin/mise", b"\x7fELF");
+        let native = mk("vendor/bin/codex", b"\xcf\xfa\xed\xfe");
+        mk("npm/codex.js", b"#!/usr/bin/env node\n");
+        mk("sh/codex", b"#!/bin/sh\n");
+        for dir in ["shims", "brew", "lib", "npmbin"] {
+            std::fs::create_dir_all(d.join(dir)).unwrap();
+        }
+        symlink("../nix/bin/mise", d.join("shims/codex")).unwrap();
+        symlink("../vendor/bin/codex", d.join("lib/codex")).unwrap();
+        symlink(d.join("lib/codex"), d.join("brew/codex")).unwrap();
+        symlink("../npm/codex.js", d.join("npmbin/codex")).unwrap();
+        let path =
+            |dirs: &[&str]| Some(std::env::join_paths(dirs.iter().map(|x| d.join(x))).unwrap());
+        let e = resolve_in("codex", None, path(&["shims", "brew"])).unwrap_err();
+        assert!(e.contains("mise") && e.contains("--codex-bin"), "{e}");
+        let got = resolve_in("codex", None, path(&["brew", "shims"])).unwrap();
+        assert_eq!(got, std::fs::canonicalize(&native).unwrap());
+        let e = resolve_in("codex", None, path(&["npmbin"])).unwrap_err();
+        assert!(e.contains(".js"), "{e}");
+        let e = resolve_in("codex", Some(&d.join("sh/codex")), None).unwrap_err();
+        assert!(e.contains("script"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
