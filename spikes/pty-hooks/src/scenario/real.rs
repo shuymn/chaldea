@@ -841,14 +841,26 @@ fn paste_sweep(ctx: &Ctx, a: &Agent) {
                 let (res, ev) = match &got {
                     Some(g) => {
                         let gotn = paste::normalize_lf(g.as_bytes());
-                        let d = util::first_diff(&want, &gotn);
-                        (
-                            Outcome::observed(
-                                d.is_none(),
-                                format!("prompt bytes differ at offset {d:?}"),
+                        let fixture = ups.as_ref().map(|e| &e.fixture);
+                        // A known CLI input transform is not PTY corruption.
+                        match paste::match_prompt(&want, &gotn) {
+                            paste::PromptMatch::Exact => {
+                                (Outcome::Pass, json!({"equal": true, "fixture": fixture}))
+                            }
+                            paste::PromptMatch::Transformed(t) => (
+                                Outcome::Pass,
+                                json!({"equal": false, "cli_transform": t,
+                                       "first_diff": util::first_diff(&want, &gotn), "fixture": fixture}),
                             ),
-                            json!({"equal": d.is_none(), "first_diff": d, "fixture": ups.as_ref().map(|e| &e.fixture)}),
-                        )
+                            paste::PromptMatch::Differs(d) => (
+                                Outcome::platform(format!(
+                                    "prompt bytes differ at offset {d}, not explained by {:?}",
+                                    paste::CLI_TRANSFORMS
+                                )),
+                                json!({"equal": false, "first_diff": d, "fixture": fixture,
+                                       "transforms_checked": paste::CLI_TRANSFORMS}),
+                            ),
+                        }
                     }
                     // No prompt bytes to compare: hook evidence is missing.
                     None => (Outcome::Missing, json!({"ups": "missing"})),

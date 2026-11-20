@@ -169,6 +169,85 @@ pub fn normalize_lf(s: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Input transformations a CLI is known to apply to a pasted prompt before
+/// `UserPromptSubmit` (observed on Claude Code 2.1.322). Each is checked
+/// explicitly; only a difference none of them explains is a platform failure.
+pub const CLI_TRANSFORMS: &[&str] = &["tab_expand", "nfc", "paste_wrapper"];
+
+/// How an observed prompt compares with the pasted text (both LF-normalized).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptMatch {
+    Exact,
+    /// Equal after these known CLI transforms (smallest set that explains it).
+    Transformed(Vec<&'static str>),
+    /// No known transform explains the difference (first differing byte offset).
+    Differs(usize),
+}
+
+/// Strips Claude's large-paste wrapper, exactly
+/// `\n\n<pasted_content id="ID">\n` + body + `\n</pasted_content id="ID">\n`.
+fn strip_paste_wrapper(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix("\n\n<pasted_content id=\"")?;
+    let q = rest.find('"')?;
+    let id = &rest[..q];
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    let body = rest[q..].strip_prefix("\">\n")?;
+    body.strip_suffix(&format!("\n</pasted_content id=\"{id}\">\n"))
+}
+
+/// Compares `got` (the prompt) with `want` (the pasted text), trying every
+/// combination of `CLI_TRANSFORMS`: TAB expanded to 4 spaces and NFC
+/// composition applied to `want`, the paste wrapper stripped from `got`.
+pub fn match_prompt(want: &[u8], got: &[u8]) -> PromptMatch {
+    use unicode_normalization::UnicodeNormalization;
+    if want == got {
+        return PromptMatch::Exact;
+    }
+    let diff = || crate::util::first_diff(want, got).unwrap_or(0);
+    let (Ok(w), Ok(g)) = (std::str::from_utf8(want), std::str::from_utf8(got)) else {
+        return PromptMatch::Differs(diff());
+    };
+    let mut best: Option<Vec<&'static str>> = None;
+    for mask in 1u8..8 {
+        let (tab, nfc, wrap) = (mask & 1 != 0, mask & 2 != 0, mask & 4 != 0);
+        let mut w2 = w.to_string();
+        if tab {
+            w2 = w2.replace('\t', "    ");
+        }
+        if nfc {
+            w2 = w2.nfc().collect();
+        }
+        let g2 = if wrap {
+            match strip_paste_wrapper(g) {
+                Some(b) => b,
+                None => continue,
+            }
+        } else {
+            g
+        };
+        if w2 == g2 {
+            let used: Vec<&'static str> =
+                [(tab, "tab_expand"), (nfc, "nfc"), (wrap, "paste_wrapper")]
+                    .into_iter()
+                    .filter_map(|(on, n)| on.then_some(n))
+                    .collect();
+            if best.as_ref().is_none_or(|b| used.len() < b.len()) {
+                best = Some(used);
+            }
+        }
+    }
+    match best {
+        Some(t) => PromptMatch::Transformed(t),
+        None => PromptMatch::Differs(diff()),
+    }
+}
+
 /// Bracketed paste wire bytes split into `chunk`-byte writes (0 = one write).
 pub fn encode(payload: &[u8], mode: Newline, chunk: usize) -> Vec<Vec<u8>> {
     let mut wire = PASTE_START.to_vec();
@@ -262,6 +341,73 @@ pub fn paste(tx: &WriterTx, payload: &[u8], opts: &PasteOpts, ready: impl Fn() -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn corpus_text(id: &str) -> Vec<u8> {
+        let e = corpus().into_iter().find(|e| e.id == id).unwrap();
+        normalize_lf(e.text.as_bytes())
+    }
+
+    /// A-6 on Claude Code 2.1.322: the three real observed prompts (saved
+    /// verbatim from `UserPromptSubmit.prompt`) are each explained by one
+    /// known CLI transform, and only by that one.
+    #[test]
+    fn real_claude_prompts_match_known_transforms() {
+        let cases: [(&str, &str, &str); 4] = [
+            (
+                "ascii",
+                include_str!("../testdata/claude-2.1.322/ups-ascii.prompt.txt"),
+                "tab_expand",
+            ),
+            (
+                "decomposed_kana",
+                include_str!("../testdata/claude-2.1.322/ups-decomposed_kana.prompt.txt"),
+                "nfc",
+            ),
+            (
+                "decomposed_latin",
+                include_str!("../testdata/claude-2.1.322/ups-decomposed_latin.prompt.txt"),
+                "nfc",
+            ),
+            (
+                "size_4k_plus_1",
+                include_str!("../testdata/claude-2.1.322/ups-size_4k_plus_1.prompt.txt"),
+                "paste_wrapper",
+            ),
+        ];
+        for (id, got, t) in cases {
+            assert_eq!(
+                match_prompt(&corpus_text(id), got.as_bytes()),
+                PromptMatch::Transformed(vec![t]),
+                "{id}"
+            );
+        }
+    }
+
+    /// Differences no listed transform explains stay platform evidence.
+    #[test]
+    fn unexplained_differences_still_differ() {
+        assert_eq!(match_prompt(b"abc", b"abc"), PromptMatch::Exact);
+        assert_eq!(match_prompt(b"abc", b"abd"), PromptMatch::Differs(2));
+        // A tab replaced by 2 spaces is not the known 4-space expansion.
+        assert_eq!(match_prompt(b"a\tb", b"a  b"), PromptMatch::Differs(1));
+        // NFD is not applied to the prompt side: composed input that
+        // arrives decomposed is a difference.
+        assert!(matches!(
+            match_prompt("\u{e9}".as_bytes(), "e\u{301}".as_bytes()),
+            PromptMatch::Differs(_)
+        ));
+        // A wrapper with mismatched ids, or a body that differs, is not stripped.
+        let bad = "\n\n<pasted_content id=\"a1\">\nabc\n</pasted_content id=\"b2\">\n";
+        assert!(matches!(
+            match_prompt(b"abc", bad.as_bytes()),
+            PromptMatch::Differs(_)
+        ));
+        let lost = "\n\n<pasted_content id=\"a1\">\nab\n</pasted_content id=\"a1\">\n";
+        assert!(matches!(
+            match_prompt(b"abc", lost.as_bytes()),
+            PromptMatch::Differs(_)
+        ));
+    }
 
     #[test]
     fn validator_rejects_esc_and_c0() {

@@ -350,7 +350,10 @@ fn probe_paste(ctx: &Ctx) {
         );
     }
     // Provider evidence: each child samples the ConPTY module after its first PTY launch.
-    let extra = json!({"fake": fake, "real": real_hosts, "console_cp": os::console_code_page()});
+    // Real cases carry A-6 outcomes, judged against the same known CLI
+    // transforms (`paste::match_prompt`) as on macOS.
+    let extra = json!({"fake": fake, "real": real_hosts, "console_cp": os::console_code_page(),
+                       "cli_transforms_checked": paste::CLI_TRANSFORMS});
     pc.finish(ctx, extra);
 }
 
