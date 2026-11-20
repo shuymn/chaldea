@@ -406,7 +406,6 @@ fn start_with(
             cli_version: a.version.clone(),
             session_id: p.session_id,
             cli_names: a.cli_names(),
-            extra_env: Vec::new(),
             responder: true,
             hold_assign: false,
             inject: None,

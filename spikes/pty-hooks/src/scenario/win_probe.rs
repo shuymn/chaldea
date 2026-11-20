@@ -947,7 +947,6 @@ fn start_attachable(
             cli_version: util::FAKE_CLI_VERSION.into(),
             session_id: None,
             cli_names: vec!["chs-fake-cli".into()],
-            extra_env: Vec::new(),
             responder: true,
             hold_assign: false,
             inject: None,

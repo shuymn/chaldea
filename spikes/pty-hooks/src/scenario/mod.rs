@@ -29,7 +29,6 @@ pub struct Ctx {
     pub sink: Sink,
     pub t0: Instant,
     pub cutoff: Instant,
-    pub deadline: Instant,
 }
 
 impl Ctx {
@@ -76,7 +75,6 @@ impl Ctx {
             sink,
             t0,
             cutoff,
-            deadline,
         })
     }
 
@@ -237,7 +235,6 @@ pub struct LaunchSpec {
     pub cli_version: String,
     pub session_id: Option<String>,
     pub cli_names: Vec<String>,
-    pub extra_env: Vec<(String, String)>,
     pub responder: bool,
     pub hold_assign: bool,
     pub inject: Option<Inject>,
@@ -382,7 +379,7 @@ pub fn launch(ctx: &Ctx, spec: LaunchSpec) -> Result<Launch, String> {
         cli_names: spec.cli_names.clone(),
     })
     .map_err(|e| format!("receiver: {e}"))?;
-    let mut env = vec![
+    let env = vec![
         ("CHALDEA_HOOK_URL".to_string(), receiver.url()),
         ("CHALDEA_HOOK_TOKEN".to_string(), token.clone()),
         ("CHALDEA_THREAD_ID".to_string(), thread_id.clone()),
@@ -391,7 +388,6 @@ pub fn launch(ctx: &Ctx, spec: LaunchSpec) -> Result<Launch, String> {
             ctx.out.join("hook.log").display().to_string(),
         ),
     ];
-    env.extend(spec.extra_env.iter().cloned());
     if let Some(f) = spec.before_spawn {
         f(&env)?;
     }

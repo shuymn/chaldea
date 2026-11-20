@@ -315,14 +315,6 @@ impl Receiver {
         .flatten()
     }
 
-    pub fn wait_event(
-        &self,
-        deadline: Instant,
-        pred: impl Fn(&EventRecord) -> bool,
-    ) -> Option<EventRecord> {
-        self.wait_until(deadline, |i| i.events.iter().find(|e| pred(e)).cloned())
-    }
-
     pub fn wait_witness(
         &self,
         deadline: Instant,
@@ -370,10 +362,6 @@ impl Receiver {
     /// Milliseconds since the receiver started (the clock of `received_ms`).
     pub fn now_ms(&self) -> u64 {
         self.state.t0.elapsed().as_millis() as u64
-    }
-
-    pub fn bound_at_ms(&self) -> Option<u64> {
-        self.lock().bound_at
     }
 
     pub fn ambiguous(&self) -> Vec<String> {

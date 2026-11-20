@@ -106,7 +106,6 @@ fn fake_spec(ctx: &Ctx, label: &str, mode: &str, extra: &[&str]) -> LaunchSpec {
         cli_version: util::FAKE_CLI_VERSION.into(),
         session_id: None,
         cli_names: vec!["chs-fake-cli".into()],
-        extra_env: Vec::new(),
         responder: true,
         hold_assign: false,
         inject: None,

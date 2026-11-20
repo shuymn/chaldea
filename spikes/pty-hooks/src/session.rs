@@ -268,7 +268,6 @@ pub struct Session {
     pub io: Option<PtyIo>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     recorder: Option<(JoinHandle<()>, Arc<AtomicBool>)>,
-    pub t0: Instant,
     stopped: bool,
 }
 
@@ -322,7 +321,6 @@ impl Session {
             io: None,
             child: Mutex::new(child),
             recorder: None,
-            t0,
             stopped: false,
         };
         if !opts.hold_assign {
