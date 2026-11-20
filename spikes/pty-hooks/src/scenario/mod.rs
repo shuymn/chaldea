@@ -272,6 +272,48 @@ impl Launch {
         self.receiver.bound().is_some()
     }
 
+    /// Waits for the `n`-th bound `event`, polling every `poll`; checked once
+    /// more at the deadline.
+    pub fn wait_nth_bound(
+        &self,
+        event: &str,
+        n: usize,
+        deadline: Instant,
+        poll: Duration,
+    ) -> Option<crate::receiver::EventRecord> {
+        loop {
+            if let Some(e) = self.receiver.nth_bound(event, n) {
+                return Some(e);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(poll);
+        }
+    }
+
+    /// Gated bracketed paste (readiness = bound SessionStart) with the
+    /// configured Enter delay and a ten-second, cutoff-capped write budget.
+    pub fn submit(
+        &self,
+        ctx: &Ctx,
+        text: &str,
+        mode: crate::paste::Newline,
+        chunk: usize,
+    ) -> crate::paste::Outcome {
+        crate::paste::paste(
+            &self.session.io().tx,
+            text.as_bytes(),
+            &crate::paste::PasteOpts {
+                mode,
+                chunk,
+                enter_delay: Duration::from_millis(ctx.args.enter_delay_ms),
+                write_deadline: ctx.until(Duration::from_secs(10)),
+            },
+            || self.ready(),
+        )
+    }
+
     pub fn gate_open(&self) -> bool {
         self.ready() && self.session.io().tx.gate.admit().is_some()
     }

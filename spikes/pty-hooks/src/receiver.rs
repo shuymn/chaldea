@@ -344,6 +344,17 @@ impl Receiver {
         self.lock().events.clone()
     }
 
+    /// The `n`-th (1-based) bound event named `event`, selected under the
+    /// lock so only that record is cloned.
+    pub fn nth_bound(&self, event: &str, n: usize) -> Option<EventRecord> {
+        let g = self.lock();
+        g.events
+            .iter()
+            .filter(|e| e.event == event && e.is_bound())
+            .nth(n.checked_sub(1)?)
+            .cloned()
+    }
+
     pub fn witnesses(&self) -> Vec<WitnessRecord> {
         self.lock().witnesses.clone()
     }

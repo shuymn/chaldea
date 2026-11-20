@@ -136,28 +136,16 @@ fn bound_ups_count(l: &Launch) -> usize {
 
 /// Waits for the `n`-th bound UserPromptSubmit and returns its prompt bytes + payload.
 fn wait_ups(l: &Launch, n: usize, end: Instant) -> Option<(Vec<u8>, Value)> {
-    loop {
-        let ups: Vec<_> = l
-            .receiver
-            .events()
-            .into_iter()
-            .filter(|e| e.event == "UserPromptSubmit" && e.is_bound())
-            .collect();
-        if ups.len() >= n {
-            let v = ups[n - 1].json()?;
-            let prompt = v
-                .get("prompt")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .as_bytes()
-                .to_vec();
-            return Some((prompt, v));
-        }
-        if Instant::now() >= end {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let v = l
+        .wait_nth_bound("UserPromptSubmit", n, end, Duration::from_millis(10))?
+        .json()?;
+    let prompt = v
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .as_bytes()
+        .to_vec();
+    Some((prompt, v))
 }
 
 // ---------------- B-3 / B-4 paste ----------------
@@ -240,17 +228,7 @@ fn paste_scenario(ctx: &Ctx) {
                 }
                 let case = b3_case(mode, &e.id, *chunk);
                 let n = bound_ups_count(&l) + 1;
-                let o = paste::paste(
-                    &l.session.io().tx,
-                    e.text.as_bytes(),
-                    &PasteOpts {
-                        mode: *mode,
-                        chunk: *chunk,
-                        enter_delay: Duration::from_millis(ctx.args.enter_delay_ms),
-                        write_deadline: ctx.until(Duration::from_secs(10)),
-                    },
-                    || l.ready(),
-                );
+                let o = l.submit(ctx, &e.text, *mode, *chunk);
                 let expected = expected_wire(&e.text, *mode);
                 let got = (o.state == "sent")
                     .then(|| wait_ups(&l, n, ctx.until(FAKE_UPS_WAIT)))

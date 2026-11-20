@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use super::{Ctx, Launch, LaunchSpec, cli_version, hook_command, launch, write_snapshot};
 use crate::cli::{self, Args};
-use crate::paste::{self, Newline, PasteOpts};
+use crate::paste::{self, Newline};
 use crate::session::{Session, SpawnOpts};
 use crate::verdict::Outcome;
 use crate::{os, util};
@@ -463,41 +463,13 @@ fn finish(ctx: &Ctx, l: Launch) -> Value {
     v
 }
 
-fn submit(ctx: &Ctx, l: &Launch, text: &str, mode: Newline, chunk: usize) -> paste::Outcome {
-    paste::paste(
-        &l.session.io().tx,
-        text.as_bytes(),
-        &PasteOpts {
-            mode,
-            chunk,
-            enter_delay: Duration::from_millis(ctx.args.enter_delay_ms),
-            write_deadline: ctx.until(Duration::from_secs(10)),
-        },
-        || l.ready(),
-    )
-}
-
 fn nth_bound(
     l: &Launch,
     event: &str,
     n: usize,
     deadline: Instant,
 ) -> Option<crate::receiver::EventRecord> {
-    loop {
-        let v: Vec<_> = l
-            .receiver
-            .events()
-            .into_iter()
-            .filter(|e| e.event == event && e.is_bound())
-            .collect();
-        if v.len() >= n {
-            return v.into_iter().nth(n - 1);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    l.wait_nth_bound(event, n, deadline, Duration::from_millis(50))
 }
 
 // ---------------- global config fingerprints (A-5, C1) ----------------
@@ -686,7 +658,7 @@ fn claude_hooks(ctx: &Ctx, a: &Agent) {
                 json!({}),
             )
         } else {
-            let o = submit(ctx, &l, "Reply with the single word OK.", Newline::Cr, 0);
+            let o = l.submit(ctx, "Reply with the single word OK.", Newline::Cr, 0);
             if o.state != "sent" {
                 (unsent(&o), json!({"paste": o}))
             } else {
@@ -828,7 +800,7 @@ fn paste_sweep(ctx: &Ctx, a: &Agent) {
                     ));
                     continue;
                 }
-                let o = submit(ctx, &l, &e.text, mode, chunk);
+                let o = l.submit(ctx, &e.text, mode, chunk);
                 if o.state != "sent" {
                     held.push((case.clone(), unsent(&o), json!({"paste": o})));
                     continue;
