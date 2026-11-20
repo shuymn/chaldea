@@ -32,6 +32,15 @@ pub const SCENARIOS: &[&str] = &[
 const CLAUDE_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"];
 const CODEX_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit", "Stop"];
 const REAL_UPS_WAIT: Duration = Duration::from_secs(30);
+/// Codex fires no hook at startup: SessionStart, UserPromptSubmit and Stop
+/// all fire with the first turn. Every Codex launch therefore passes this
+/// first prompt as positional argv, so the session starts without a single
+/// keystroke through the PTY (a key typed under a hook-review dialog can
+/// approve hooks).
+pub const CODEX_FIRST_PROMPT: &str = "Reply with the single word OK.";
+/// Trust key Codex 0.170.0 records for the session-flag SessionStart hook
+/// (cwd-independent; note the leading `/`).
+const CODEX_SESSION_START_KEY: &str = "/<session-flags>/config.toml:session_start:0:0";
 const REAL_STOP_WAIT: Duration = Duration::from_secs(120);
 
 // ---------------- binaries ----------------
@@ -210,6 +219,9 @@ pub fn run(mut args: Args) -> i32 {
         r.config["versions"] =
             json!({"claude": claude.as_ref().map(|a| &a.version), "codex": codex.as_ref().map(|a| &a.version)});
         r.config["hook_source"] = json!(ctx.args.hook_source);
+        r.config["session_start"] = json!({"claude": claude.as_ref().map(|a| a.session_start()),
+                                           "codex": codex.as_ref().map(|a| a.session_start())});
+        r.config["codex_first_prompt"] = json!(CODEX_FIRST_PROMPT);
         r.config["codex_mode"] = json!(ctx.args.codex_mode);
     });
     match which.as_str() {
@@ -249,6 +261,20 @@ impl Agent {
             bin: bin.to_path_buf(),
             version: cli_version(bin),
         }
+    }
+    /// Adapter capability: when the CLI fires SessionStart. `eager`: at
+    /// startup (Claude). `first_turn`: only with the first user turn
+    /// (Codex), so binding and readiness come from that turn.
+    pub fn session_start(&self) -> &'static str {
+        if self.name == "codex" {
+            "first_turn"
+        } else {
+            "eager"
+        }
+    }
+    /// User turns the launch itself submits (Codex's positional first prompt).
+    fn launch_turns(&self) -> usize {
+        usize::from(self.name == "codex")
     }
     fn cli_names(&self) -> Vec<String> {
         let stem = self
@@ -350,6 +376,8 @@ fn plan(
         );
     }
     argv.extend(extra.iter().map(OsString::from));
+    // The first turn is the positional prompt; nothing is typed before binding.
+    argv.push(CODEX_FIRST_PROMPT.into());
     Ok(Plan {
         argv,
         session_id: None,
@@ -780,7 +808,12 @@ fn paste_sweep(ctx: &Ctx, a: &Agent) {
                     ));
                 }
             }
-            let mut n = 0;
+            // Codex's positional first prompt is turn 1: wait for it to end
+            // before the first paste, and count pasted turns after it.
+            let mut n = a.launch_turns();
+            if n > 0 && bound.is_some() {
+                let _ = nth_bound(&l, "Stop", n, ctx.until(REAL_STOP_WAIT));
+            }
             for (e, (_, case)) in corpus.iter().zip(&cases).filter(|_| bound.is_some()) {
                 if ctx.past_cutoff() {
                     break;
@@ -963,17 +996,42 @@ fn codex_modes(ctx: &Ctx) -> Vec<&'static str> {
     }
 }
 
-/// The exact trust key(s) of the hook under test: the session-flag
-/// SessionStart hook this harness injects (other session-flag keys are
-/// ignored, so a concurrent change to them does not affect C3).
+/// The exact trust key of the hook under test: the session-flag
+/// SessionStart hook this harness injects, compared verbatim with its
+/// leading `/` (other keys are ignored, so a concurrent change to them does
+/// not affect C3).
 fn hook_keys(keys: &BTreeSet<String>) -> BTreeSet<String> {
     keys.iter()
-        .filter(|k| {
-            let k = k.trim_matches('"');
-            k.starts_with("<session-flags>/") && k.ends_with(":session_start:0:0")
-        })
+        .filter(|k| k.trim_matches('"') == CODEX_SESSION_START_KEY)
         .cloned()
         .collect()
+}
+
+/// C3 (second cwd or a fresh, empty cwd): the hook delivered (SessionStart
+/// bound, so no review dialog held the first turn), the key under test was
+/// already trusted from the first cwd, and the launch added no new key.
+fn c3_outcome(
+    config_ok: bool,
+    bound: Outcome,
+    first: &BTreeSet<String>,
+    before: &BTreeSet<String>,
+    after: &BTreeSet<String>,
+) -> Outcome {
+    if !config_ok {
+        return Outcome::harness("config.toml unreadable");
+    }
+    if first.is_empty() {
+        return Outcome::not_exercised("no session-flag trust key recorded in the first cwd");
+    }
+    match bound {
+        Outcome::Pass => Outcome::observed(
+            after.difference(before).count() == 0 && after == first,
+            "this cwd added or changed the session-flag trust key",
+        ),
+        // No SessionStart: a review dialog may be holding the first turn;
+        // the timeout snapshot is the evidence.
+        o => o,
+    }
 }
 
 /// A-4: events this launch's receiver bound to the launch. `raw_unknown`
@@ -1008,6 +1066,14 @@ fn codex_hooks(ctx: &Ctx, a: &Agent) {
                 format!("{mode}/second_cwd_same_key"),
             ));
         }
+        // A brand-new, empty (untrusted) folder: trust must still hold.
+        plan.push((
+            mode,
+            ctx.run_dir.join(format!("fresh-cwd-{mode}")),
+            format!("{mode}-fresh-cwd"),
+            "C3",
+            format!("{mode}/fresh_cwd_no_review"),
+        ));
         if ctx.args.mutate_command {
             plan.push((
                 mode,
@@ -1049,9 +1115,9 @@ fn codex_hooks(ctx: &Ctx, a: &Agent) {
             }
         };
         let (bound, ms, snap) = wait_start(ctx, &l);
+        // The positional first prompt is the turn that fires every hook.
         let mut ups_seen = None;
-        if ctx.args.prompt && bound.is_some() && l.wait_gate(ctx.until(Duration::from_secs(10))) {
-            let _ = submit(ctx, &l, "Reply with the single word OK.", Newline::Cr, 0);
+        if bound.is_some() {
             ups_seen =
                 Some(nth_bound(&l, "UserPromptSubmit", 1, ctx.until(REAL_UPS_WAIT)).is_some());
             let _ = nth_bound(&l, "Stop", 1, ctx.until(REAL_STOP_WAIT));
@@ -1101,27 +1167,14 @@ fn codex_hooks(ctx: &Ctx, a: &Agent) {
             "A-4" => ctx.check(id, &case, bound_outcome(&fin), base),
             "C3" => {
                 let first = first_keys.get(mode).cloned().unwrap_or_default();
-                let second = hook_keys(&after.keys);
-                let added = hook_keys(&after.keys)
-                    .difference(&hook_keys(&before.keys))
-                    .count();
-                let o = if !config_ok {
-                    Outcome::harness("config.toml unreadable")
-                } else if !matches!(bound_outcome(&fin), Outcome::Pass) {
-                    bound_outcome(&fin)
-                } else if first.is_empty() {
-                    Outcome::not_exercised("no session-flag trust key recorded in the first cwd")
-                } else {
-                    Outcome::observed(
-                        added == 0 && first == second,
-                        "the second cwd needed a different session-flag trust key",
-                    )
-                };
+                let (prior, now) = (hook_keys(&before.keys), hook_keys(&after.keys));
+                let o = c3_outcome(config_ok, bound_outcome(&fin), &first, &prior, &now);
                 ctx.check(
                     id,
                     &case,
                     o,
-                    json!({"base": base, "first_cwd_keys": first, "second_cwd_keys": second}),
+                    json!({"base": base, "first_cwd_keys": first, "keys_before": prior,
+                           "keys_after": now}),
                 );
             }
             _ => {
@@ -1164,7 +1217,8 @@ fn codex_warm(ctx: &Ctx, a: &Agent) {
     let cwd = default_cwd(ctx, a);
     // The unrelated Codex: our own PTY, no CHALDEA_* env, default mode.
     let unrelated = Session::spawn(SpawnOpts {
-        argv: vec![a.bin.clone().into()],
+        // Codex starts only with a first turn: the positional prompt.
+        argv: vec![a.bin.clone().into(), CODEX_FIRST_PROMPT.into()],
         cwd: cwd.clone(),
         env: Vec::new(),
         cols: ctx.args.cols,
@@ -1426,6 +1480,7 @@ pub fn print_launch(args: &Args) -> i32 {
             argv.push("--no-daemon".into());
         }
         argv.extend(codex_hook_args(&hook_command(&args.root, "codex")));
+        argv.push(CODEX_FIRST_PROMPT.into());
     }
     let work = args.root.join("work");
     let mut cwds = vec![work.join(name)];
@@ -1526,23 +1581,68 @@ mod tests {
     /// r3 C3: only the SessionStart session-flag key of the hook under test.
     #[test]
     fn c3_compares_the_hook_under_test() {
+        // The real 0.170.0 format has a leading `/`; the old form without it
+        // must not match.
         let k = trust_keys(
-            b"[hooks.state.\"<session-flags>/config.toml:session_start:0:0\"]\n\
-              [hooks.state.\"<session-flags>/config.toml:stop:0:0\"]\n\
+            b"[hooks.state.\"/<session-flags>/config.toml:session_start:0:0\"]\n\
+              [hooks.state.\"/<session-flags>/config.toml:stop:0:0\"]\n\
+              [hooks.state.\"<session-flags>/config.toml:session_start:0:0\"]\n\
               [hooks.state.\"/x/hooks.json:session_start:0:0\"]\n",
         );
         assert_eq!(
             hook_keys(&k).into_iter().collect::<Vec<_>>(),
-            vec!["\"<session-flags>/config.toml:session_start:0:0\"".to_string()]
+            vec!["\"/<session-flags>/config.toml:session_start:0:0\"".to_string()]
         );
+    }
+
+    /// C3 fresh cwd: delivered, no review, and no new key.
+    #[test]
+    fn c3_fresh_cwd_needs_delivery_and_no_new_key() {
+        let key: BTreeSet<String> = [format!("\"{CODEX_SESSION_START_KEY}\"")].into();
+        let none = BTreeSet::new();
+        assert_eq!(
+            c3_outcome(true, Outcome::Pass, &key, &key, &key),
+            Outcome::Pass
+        );
+        let extra: BTreeSet<String> = [key.iter().next().unwrap().clone(), "\"x\"".into()].into();
+        assert!(matches!(
+            c3_outcome(true, Outcome::Pass, &key, &key, &extra),
+            Outcome::PlatformFail { .. }
+        ));
+        assert_eq!(
+            c3_outcome(true, Outcome::Missing, &key, &key, &key),
+            Outcome::Missing
+        );
+        assert!(matches!(
+            c3_outcome(true, Outcome::Pass, &none, &none, &key),
+            Outcome::NotExercised { .. }
+        ));
+    }
+
+    /// Every Codex launch starts with the positional first prompt, last in argv.
+    #[test]
+    fn codex_capability_is_first_turn() {
+        let a = Agent {
+            name: "codex",
+            bin: PathBuf::from("/x/codex"),
+            version: "0.170.0".into(),
+        };
+        assert_eq!(a.session_start(), "first_turn");
+        assert_eq!(a.launch_turns(), 1);
+        let c = Agent {
+            name: "claude",
+            ..a
+        };
+        assert_eq!(c.session_start(), "eager");
+        assert_eq!(c.launch_turns(), 0);
     }
 
     #[test]
     fn trust_keys_parsed() {
-        let k = trust_keys(b"[x]\n[hooks.state.\"<session-flags>/config.toml:session_start:0:0\"]\ntrusted_hash = \"sha256:1\"\n");
+        let k = trust_keys(b"[x]\n[hooks.state.\"/<session-flags>/config.toml:session_start:0:0\"]\ntrusted_hash = \"sha256:1\"\n");
         assert_eq!(
             k.into_iter().collect::<Vec<_>>(),
-            vec!["\"<session-flags>/config.toml:session_start:0:0\"".to_string()]
+            vec!["\"/<session-flags>/config.toml:session_start:0:0\"".to_string()]
         );
     }
 
