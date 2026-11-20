@@ -34,7 +34,7 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows_sys::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentThreadId, GetExitCodeProcess,
     GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
@@ -205,7 +205,7 @@ fn new_kill_on_close_job() -> io::Result<Handle> {
     }
 }
 
-fn job_members(job: HANDLE) -> Vec<u32> {
+fn job_members(job: HANDLE) -> io::Result<Vec<u32>> {
     const N: usize = 1024;
     let off = std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList);
     let bytes = off + N * std::mem::size_of::<usize>();
@@ -220,12 +220,17 @@ fn job_members(job: HANDLE) -> Vec<u32> {
             std::ptr::null_mut(),
         ) == 0
         {
-            return Vec::new();
+            return Err(io::Error::last_os_error());
         }
         let list = &*(buf.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST);
-        let n = (list.NumberOfProcessIdsInList as usize).min(N);
+        if list.NumberOfAssignedProcesses as usize > N {
+            return Err(io::Error::other(
+                "job has more processes than the list holds",
+            ));
+        }
+        let n = list.NumberOfProcessIdsInList as usize;
         let ids = (buf.as_ptr() as *const u8).add(off) as *const usize;
-        (0..n).map(|i| *ids.add(i) as u32).collect()
+        Ok((0..n).map(|i| *ids.add(i) as u32).collect())
     }
 }
 
@@ -257,9 +262,15 @@ impl Tree {
         vec![format!("TerminateJobObject={r}")]
     }
 
+    /// Best-effort membership for the kill scan (the lineage scan backs it up).
     pub fn members(&self) -> Vec<u32> {
-        job_members(self.job.raw())
+        job_members(self.job.raw()).unwrap_or_default()
     }
+}
+
+/// Non-interactive harness launch: no console window (C-5).
+pub fn no_window(cmd: &mut Command) {
+    cmd.creation_flags(CREATE_NO_WINDOW);
 }
 
 pub fn spawn_escapee(cmd: &mut Command) -> io::Result<(Child, &'static str)> {
@@ -906,8 +917,9 @@ impl JobFirst {
         self.pid
     }
 
-    pub fn members(&self) -> Vec<u32> {
-        job_members(self.job.raw())
+    /// Job membership; an enumeration failure is an error, never an empty job.
+    pub fn members(&self) -> Result<Vec<u32>, String> {
+        job_members(self.job.raw()).map_err(|e| e.to_string())
     }
 
     pub fn start_time(&self) -> u64 {

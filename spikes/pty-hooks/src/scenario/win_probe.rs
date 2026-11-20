@@ -3,10 +3,10 @@
 //! (§1 C, §4.8). Compiles everywhere; refuses to run off Windows.
 //!
 //! Every probe declares its required cases and gets its verdict from
-//! `verdict::probe`: `go` only with every required case present and passed,
-//! `blocker` only when the documented blocker condition is demonstrated, and
-//! anything missing, setup-failed, readiness-failed, or timed out is
-//! `inconclusive`.
+//! `verdict::probe`: `inconclusive` when any required case is missing,
+//! harness-failed, or not exercised; `go` when all passed; otherwise
+//! `fail_observed`. The orchestrator, not the harness, decides whether an
+//! observed failure is a blocker.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ use crate::paste::{self, Newline, PasteOpts};
 use crate::pty::WriterTx;
 use crate::receiver::{ProbeHandler, WitnessView};
 use crate::report::{Check, Probe, Report, read_report};
-use crate::verdict::{self, Eval};
+use crate::verdict::{self, Outcome};
 use crate::vt::Vt;
 use crate::{os, util};
 
@@ -84,7 +84,6 @@ pub fn run(mut args: Args) -> i32 {
     }
     ctx.finish()
 }
-
 /// One probe's declared cases and observed results.
 struct Pc {
     id: &'static str,
@@ -106,25 +105,17 @@ impl Pc {
             self.required.push(k);
         }
     }
-    fn put(&mut self, case: &str, result: &str, evidence: Value) {
+    fn put(&mut self, case: &str, outcome: Outcome, evidence: Value) {
         self.checks.push(Check {
             id: self.id.into(),
             case: case.into(),
-            result: result.into(),
+            result: outcome.tag().into(),
+            cause: outcome.cause(),
             evidence,
         });
     }
-    fn k(&self, case: &str) -> String {
-        verdict::key(self.id, case)
-    }
-    fn finish(
-        self,
-        ctx: &Ctx,
-        blocker: impl Fn(&Eval) -> Option<String>,
-        tuning: impl Fn(&Eval) -> Option<String>,
-        extra: Value,
-    ) {
-        let (v, why, eval) = verdict::probe(&self.required, &self.checks, blocker, tuning);
+    fn finish(self, ctx: &Ctx, extra: Value) {
+        let (v, why, eval) = verdict::probe(&self.required, &self.checks);
         ctx.sink.with(|r| {
             r.probes.push(Probe {
                 id: self.id.into(),
@@ -136,11 +127,19 @@ impl Pc {
     }
 }
 
-fn status_result(r: &Option<Report>) -> &'static str {
-    match r.as_ref().map(|r| r.status.as_str()) {
-        Some("pass") => "pass",
-        Some("fail") => "fail",
-        _ => "inconclusive",
+/// A child run's status as one case: `fail` (a complete run with a platform
+/// failure) is the only platform outcome; no report is missing.
+fn child_outcome(r: &Option<Report>) -> Outcome {
+    match r.as_ref() {
+        None => Outcome::Missing,
+        Some(r) => match r.status.as_str() {
+            "pass" => Outcome::Pass,
+            "fail" => {
+                Outcome::platform("the child run observed a platform failure (see its report)")
+            }
+            "error" => Outcome::harness(format!("child errors: {:?}", r.errors)),
+            s => Outcome::not_exercised(format!("child status {s}")),
+        },
     }
 }
 
@@ -222,7 +221,7 @@ fn find_check<'a>(r: &'a Option<Report>, id: &str, case: &str) -> Option<&'a Che
 fn carry(pc: &mut Pc, case: &str, r: &Option<Report>, id: &str, child_case: &str) {
     pc.req(case);
     if let Some(c) = find_check(r, id, child_case) {
-        pc.put(case, &c.result, c.evidence.clone());
+        pc.put(case, Outcome::from_check(c), c.evidence.clone());
     }
 }
 
@@ -291,7 +290,7 @@ fn probe_paste(ctx: &Ctx) {
         if r.is_some() {
             pc.put(
                 &case,
-                status_result(&r),
+                child_outcome(&r),
                 json!({"status": r.as_ref().map(|r| r.status.clone())}),
             );
         }
@@ -331,55 +330,19 @@ fn probe_paste(ctx: &Ctx) {
             json!(r.as_ref().map(|r| (r.status.clone(), r.host.clone()))),
         );
     }
-    // Blocker: for some CLI, every newline mode and write strategy has a
-    // definitely corrupted or dropped required entry (readiness failures are
-    // inconclusive and never count).
-    let groups = |agent: &str| -> Vec<Vec<String>> {
-        let mut g = Vec::new();
-        for m in Newline::ALL {
-            for chunk in [0usize, 7] {
-                g.push(
-                    entries
-                        .iter()
-                        .map(|e| {
-                            pc.k(&format!(
-                                "real/{}",
-                                super::real::paste_case(agent, m, chunk, e)
-                            ))
-                        })
-                        .collect(),
-                );
-            }
-        }
-        g
-    };
-    let (gc, gx) = (groups("claude"), groups("codex"));
-    let blocker = |ev: &Eval| {
-        [("claude", &gc), ("codex", &gx)]
-            .iter()
-            .find(|(_, gs)| {
-                gs.iter().all(|g| {
-                    g.iter().all(|k| matches!(ev.result_of(k), "pass" | "fail"))
-                        && g.iter().any(|k| ev.result_of(k) == "fail")
-                })
-            })
-            .map(|(a, _)| format!("{a}: required subset corrupted or dropped in every newline mode and write strategy"))
-    };
-    let tuning = |ev: &Eval| {
-        (!ev.failed.is_empty())
-            .then(|| format!("some modes or write strategies differ: {:?}", ev.failed))
-    };
-    let extra = json!({"fake": fake, "real": real_hosts,
-        "conpty_module": os::conpty_module(), "console_cp": os::console_code_page()});
-    pc.finish(ctx, blocker, tuning, extra);
+    // Provider evidence: each child samples the ConPTY module after its first PTY launch.
+    let extra = json!({"fake": fake, "real": real_hosts, "console_cp": os::console_code_page()});
+    pc.finish(ctx, extra);
 }
 
 // ---------------- C-2 ----------------
 
-/// Unanswered queries in a child's launch details (query-log check).
-fn unanswered(r: &Option<Report>) -> Option<Vec<Value>> {
+/// Query case from a child's launch details: every logged query must have a
+/// reply the harness wrote (the harness is the expected responder). None
+/// when the child logged no launch.
+fn query_outcome(r: &Option<Report>) -> Option<(Outcome, Value)> {
     let d = r.as_ref()?.details.as_object()?;
-    let mut out = Vec::new();
+    let mut bad = Vec::new();
     let mut any = false;
     for (k, v) in d {
         if !k.starts_with("launch-") {
@@ -387,12 +350,23 @@ fn unanswered(r: &Option<Report>) -> Option<Vec<Value>> {
         }
         any = true;
         for q in v["query_log"].as_array().into_iter().flatten() {
-            if q["reply"].is_null() {
-                out.push(json!({"launch": k, "kind": q["kind"]}));
+            if q["reply"].is_null() || q["harness_wrote"] != json!(true) {
+                bad.push(json!({"launch": k, "kind": q["kind"], "reply": q["reply"],
+                                "harness_wrote": q["harness_wrote"]}));
             }
         }
     }
-    any.then_some(out)
+    if !any {
+        return None;
+    }
+    Some(if bad.is_empty() {
+        (Outcome::Pass, json!({"unanswered": []}))
+    } else {
+        (
+            Outcome::harness("the harness did not write a reply to every query"),
+            json!({"unanswered": bad}),
+        )
+    })
 }
 
 fn probe_startup(ctx: &Ctx) {
@@ -463,6 +437,8 @@ fn probe_startup(ctx: &Ctx) {
                 }
             }
             _ => {
+                // The child passes an attended case only when a relayed key
+                // was written and SessionStart followed it.
                 let agent = if name.starts_with("claude") {
                     "claude"
                 } else {
@@ -474,39 +450,15 @@ fn probe_startup(ctx: &Ctx) {
         }
         let qcase = format!("queries/{name}");
         pc.req(&qcase);
-        match unanswered(&r) {
-            Some(u) if u.is_empty() => pc.put(&qcase, "pass", json!({"unanswered": []})),
-            // An unanswered query is evidence for the orchestrator, not a verdict by itself.
-            Some(u) => pc.put(&qcase, "inconclusive", json!({"unanswered": u})),
-            None => {}
+        if let Some((o, e)) = query_outcome(&r) {
+            pc.put(&qcase, o, e);
         }
         ev.insert(
             name.into(),
             json!({"status": r.as_ref().map(|r| r.status.clone()), "errors": r.as_ref().map(|r| r.errors.clone())}),
         );
     }
-    // Blocker: a CLI never starts under ConPTY: every startup case for it
-    // (hook launches and the attended launch) is present and failed.
-    let mut claude_keys = vec![pc.k("claude/A-1"), pc.k("attended/claude")];
-    claude_keys.dedup();
-    let mut codex_keys: Vec<String> = Vec::new();
-    for mode in ["no-daemon", "default"] {
-        for i in 0..3 {
-            codex_keys.push(pc.k(&format!("codex/A-3 {mode}/{mode}-{i}")));
-        }
-    }
-    codex_keys.push(pc.k("attended/codex"));
-    let blocker = |e: &Eval| {
-        if e.all_present_and_failed(&claude_keys) {
-            Some("claude: no launch delivered SessionStart under ConPTY, attended included".into())
-        } else if e.all_present_and_failed(&codex_keys) {
-            Some("codex: no launch delivered SessionStart under ConPTY, attended included".into())
-        } else {
-            None
-        }
-    };
-    let tuning = |e: &Eval| (!e.failed.is_empty()).then(|| format!("failed: {:?}", e.failed));
-    pc.finish(ctx, blocker, tuning, Value::Object(ev));
+    pc.finish(ctx, Value::Object(ev));
 }
 
 // ---------------- C-3 ----------------
@@ -537,7 +489,7 @@ fn probe_kill(ctx: &Ctx) {
         if r.is_some() {
             pc.put(
                 &format!("{label}/status"),
-                status_result(r),
+                child_outcome(r),
                 json!({"status": r.as_ref().map(|r| r.status.clone())}),
             );
         }
@@ -563,76 +515,117 @@ fn probe_kill(ctx: &Ctx) {
         carry(&mut pc, &format!("real/{c}"), &r, "A-8", &c);
         real.insert(a.into(), json!(r.map(|r| r.status)));
     }
+    // Race escapees: fallback kills under held assignment (positive evidence
+    // from the child's B-7 checks).
     let race_escapees: Vec<Value> = checks_of(&held, "B-7")
         .iter()
         .filter(|c| c.evidence.pointer("/killed_by").and_then(Value::as_str) == Some("fallback"))
         .map(|c| json!(c.case))
         .collect();
-    let jf = job_first(ctx);
-    for (case, v) in [
-        ("job_first/launched", &jf["launched"]),
-        ("job_first/zero_escapees", &jf["zero_escapees"]),
-        ("job_first/no_survivors", &jf["no_survivors"]),
-    ] {
-        pc.req(case);
-        if let Some(r) = v.as_str() {
-            pc.put(case, r, Value::Null);
-        }
-    }
-    let survivor_keys: Vec<String> = [
-        "held/no_session_survivors",
-        "plain/no_session_survivors",
-        "real/claude_mcp_witness_tree",
-        "real/codex_mcp_witness_tree",
-        "job_first/no_survivors",
-    ]
-    .iter()
-    .map(|c| pc.k(c))
-    .collect();
-    // Race escapees (fallback kills under held assignment) keep C-3 from `go`.
     pc.req("held/race_free");
     if held.is_some() {
         pc.put(
             "held/race_free",
-            if race_escapees.is_empty() {
-                "pass"
-            } else {
-                "fail"
-            },
+            Outcome::observed(
+                race_escapees.is_empty(),
+                "assign-after race escapees killed by the fallback",
+            ),
             json!({"race_escapees": race_escapees}),
         );
     }
-    let (launched_k, zero_k, race_k) = (
-        pc.k("job_first/launched"),
-        pc.k("job_first/zero_escapees"),
-        pc.k("held/race_free"),
-    );
-    let blocker = |e: &Eval| {
-        if let Some(k) = survivor_keys.iter().find(|k| e.result_of(k) == "fail") {
-            Some(format!("owned processes survived job + fallback ({k})"))
-        } else if e.result_of(&race_k) == "fail"
-            && (e.result_of(&launched_k) == "fail" || e.result_of(&zero_k) == "fail")
-        {
-            Some("assign-after race escapees and job-first launch not feasible".into())
-        } else {
-            None
+    let jf = job_first(ctx);
+    for (case, o) in [
+        ("job_first/launched", jf.launched),
+        ("job_first/zero_escapees", jf.zero_escapees),
+        ("job_first/no_survivors", jf.no_survivors),
+    ] {
+        pc.req(case);
+        pc.put(case, o, Value::Null);
+    }
+    let extra = json!({"real": real, "job_first": jf.evidence, "harness_job": os::self_job_info()});
+    pc.finish(ctx, extra);
+}
+
+struct JobFirstResult {
+    launched: Outcome,
+    zero_escapees: Outcome,
+    no_survivors: Outcome,
+    evidence: Value,
+}
+
+/// C-3 escapees. One SUCCESSFUL job membership snapshot is taken first; then
+/// every session witness that is positively live and not in it is an
+/// escapee. An enumeration failure is a harness failure, never an empty job.
+fn escapee_outcome(
+    all_seen: bool,
+    witnesses: &[(u32, u64)],
+    enumerate: impl FnOnce() -> Result<Vec<u32>, String>,
+    live: impl Fn(u32, u64) -> Option<bool>,
+) -> (Outcome, Value) {
+    let members = match enumerate() {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                Outcome::harness(format!("job enumeration failed: {e}")),
+                json!({"enumeration_error": e}),
+            );
         }
     };
-    let tuning = |e: &Eval| {
-        (e.result_of(&race_k) == "fail"
-            && e.result_of(&launched_k) == "pass"
-            && e.result_of(&zero_k) == "pass")
-            .then(|| "assign-after race escapees, job-first feasible".to_string())
+    if !all_seen {
+        return (
+            Outcome::not_exercised("not every spawn-tree witness attested"),
+            json!({"members": members}),
+        );
+    }
+    let (mut escapees, mut unknown) = (Vec::new(), Vec::new());
+    for &(pid, st) in witnesses {
+        match live(pid, st) {
+            Some(true) if !members.contains(&pid) => escapees.push(pid),
+            Some(_) => {}
+            None => unknown.push(pid),
+        }
+    }
+    let ev = json!({"members": members, "escapees": escapees, "lookup_failed": unknown});
+    let o = if !unknown.is_empty() {
+        Outcome::harness("witness liveness lookup failed")
+    } else {
+        Outcome::observed(
+            escapees.is_empty(),
+            "live session witnesses outside the job",
+        )
     };
-    let extra = json!({"real": real, "job_first": jf, "harness_job": os::self_job_info()});
-    pc.finish(ctx, blocker, tuning, extra);
+    (o, ev)
+}
+
+/// Survivors among `procs`: platform failure only with positive liveness;
+/// a failed lookup is a harness failure.
+fn survivors_outcome(procs: &[(u32, u64)], what: &str) -> (Outcome, Value) {
+    let lives: Vec<(u32, Option<bool>)> = procs
+        .iter()
+        .map(|&(p, st)| (p, os::liveness(p, st)))
+        .collect();
+    let o = if lives.iter().any(|(_, l)| l.is_none()) {
+        Outcome::harness("process lookup failed")
+    } else {
+        Outcome::observed(
+            lives.iter().all(|(_, l)| *l == Some(false)),
+            format!("{what} survived"),
+        )
+    };
+    (o, json!(lives))
 }
 
 /// One job-first launch of FakeCli `spawn-tree` (§4.6). Kill authority comes
 /// only from the job, the retained process handle, and descendants recorded
 /// with verified lineage during the wait; witnesses are only checked for
 /// survival. Verification and fallback run before ConPTY is closed.
-fn job_first(ctx: &Ctx) -> Value {
+fn job_first(ctx: &Ctx) -> JobFirstResult {
+    let not_run = |why: &str, o: Outcome| JobFirstResult {
+        launched: o,
+        zero_escapees: Outcome::not_exercised(why),
+        no_survivors: Outcome::not_exercised(why),
+        evidence: json!({"error": why}),
+    };
     let rx = match crate::receiver::Receiver::start(crate::receiver::Config {
         token: util::token(),
         thread_id: uuid::Uuid::new_v4().to_string(),
@@ -645,7 +638,10 @@ fn job_first(ctx: &Ctx) -> Value {
         cli_names: vec!["chs-fake-cli".into()],
     }) {
         Ok(r) => r,
-        Err(e) => return json!({"launched": "inconclusive", "error": e.to_string()}),
+        Err(e) => {
+            let why = format!("receiver: {e}");
+            return not_run(&why, Outcome::harness(why.clone()));
+        }
     };
     let cfg = rx.config().clone();
     let env = vec![
@@ -668,7 +664,11 @@ fn job_first(ctx: &Ctx) -> Value {
         .collect();
     let (mut jf, branch) = match os::JobFirst::launch(&argv, &env, &remove, &ctx.run_dir) {
         Ok(v) => v,
-        Err(e) => return json!({"launched": "fail", "error": e}),
+        // The OS refused the job-first launch: positive evidence.
+        Err(e) => {
+            let why = format!("job-first launch failed: {e}");
+            return not_run(&why, Outcome::platform(why.clone()));
+        }
     };
     let mut want: Vec<&str> = os::spawn_tree_roles().to_vec();
     want.push("spawn-tree");
@@ -681,8 +681,10 @@ fn job_first(ctx: &Ctx) -> Value {
         let mut roots = vec![(jf.pid(), jf.start_time())];
         roots.extend(recorded.keys().copied());
         let mut found = crate::session::owned_by(jf.pid(), jf.start_time(), &roots, &procs);
-        for m in jf.members() {
-            found.extend(procs.iter().filter(|p| p.pid == m).cloned());
+        if let Ok(ms) = jf.members() {
+            for m in ms {
+                found.extend(procs.iter().filter(|p| p.pid == m).cloned());
+            }
         }
         for p in found {
             recorded.entry((p.pid, p.start_time)).or_insert(p);
@@ -700,54 +702,49 @@ fn job_first(ctx: &Ctx) -> Value {
         std::thread::sleep(Duration::from_millis(200));
     }
     record(&jf);
-    let members = jf.members();
     let ws = rx.witnesses();
-    let escapees: Vec<Value> = ws
+    let session_ws: Vec<(u32, u64)> = ws
         .iter()
-        .filter(|w| w.session && !members.contains(&w.pid) && os::is_alive(w.pid, w.start_time))
-        .map(|w| json!({"pid": w.pid, "role": w.role}))
+        .filter(|w| w.session)
+        .map(|w| (w.pid, w.start_time))
         .collect();
+    let (zero_escapees, esc_ev) = escapee_outcome(seen, &session_ws, || jf.members(), os::liveness);
     let steps = jf.terminate_job();
     std::thread::sleep(Duration::from_millis(300));
-    let alive_recorded = |r: &std::collections::BTreeMap<(u32, u64), os::ProcInfo>| -> Vec<u32> {
-        r.values()
-            .filter(|p| os::is_alive(p.pid, p.start_time))
-            .map(|p| p.pid)
-            .collect()
-    };
-    let escaped_job = alive_recorded(&recorded);
+    let rec: Vec<(u32, u64)> = recorded.keys().copied().collect();
+    let escaped_job: Vec<u32> = rec
+        .iter()
+        .filter(|(p, st)| os::is_alive(*p, *st))
+        .map(|(p, _)| *p)
+        .collect();
     let fallback: Vec<u32> = recorded
         .values()
         .filter(|p| os::force_kill(p.pid, p.start_time))
         .map(|p| p.pid)
         .collect();
-    let witness_alive = |ws: &[crate::receiver::WitnessRecord]| -> Vec<u32> {
-        ws.iter()
-            .filter(|w| w.session && os::is_alive(w.pid, w.start_time))
-            .map(|w| w.pid)
-            .collect()
-    };
+    let mut watched = rec.clone();
+    watched.extend(session_ws.iter().copied());
     let vend = Instant::now() + Duration::from_secs(5);
-    let mut pre_close: Vec<u32> = alive_recorded(&recorded);
-    pre_close.extend(witness_alive(&ws));
-    while !pre_close.is_empty() && Instant::now() < vend {
+    let mut pre = survivors_outcome(&watched, "owned processes or session witnesses");
+    while pre.0 != Outcome::Pass && Instant::now() < vend {
         std::thread::sleep(Duration::from_millis(100));
-        pre_close = alive_recorded(&recorded);
-        pre_close.extend(witness_alive(&ws));
+        pre = survivors_outcome(&watched, "owned processes or session witnesses");
     }
     jf.close_conpty();
-    let post_close = witness_alive(&ws);
+    let (_, post_close) = survivors_outcome(&session_ws, "session witnesses");
     let mut rx = rx;
     rx.stop();
-    json!({
-        "launched": "pass", "branch": branch, "pid": jf.pid(), "all_witnesses_seen": seen,
-        "zero_escapees": if !seen { "inconclusive" } else if escapees.is_empty() { "pass" } else { "fail" },
-        "no_survivors": if pre_close.is_empty() { "pass" } else { "fail" },
-        "job_members": members, "escapees": escapees, "kill_steps": steps,
-        "recorded": recorded.values().collect::<Vec<_>>(), "escaped_job": escaped_job,
-        "killed_by_fallback": fallback, "survivors_before_conpty_close": pre_close,
-        "survivors_after_conpty_close": post_close,
-    })
+    JobFirstResult {
+        launched: Outcome::Pass,
+        zero_escapees,
+        no_survivors: pre.0,
+        evidence: json!({
+            "branch": branch, "pid": jf.pid(), "all_witnesses_seen": seen, "escapees": esc_ev,
+            "kill_steps": steps, "recorded": recorded.values().collect::<Vec<_>>(),
+            "escaped_job": escaped_job, "killed_by_fallback": fallback,
+            "liveness_before_conpty_close": pre.1, "witness_liveness_after_conpty_close": post_close,
+        }),
+    }
 }
 
 // ---------------- C-4 / C-5 attach ----------------
@@ -946,9 +943,10 @@ fn start_attachable(
     Ok((l, base, p))
 }
 
-/// Result of the request(s) of `kind` matching `pred`: pass if one was
-/// attributed, fail if one was made and none attributed, None if never made.
-fn attributed(log: &[Value], kind: &str, pred: impl Fn(&Value) -> bool) -> Option<&'static str> {
+/// Outcome of the relayed request(s) of `kind` matching `pred`: pass if one
+/// was attributed; a request that was made but never attributed (relay, gate,
+/// writer, or witness timeout) is a harness failure; None if never made.
+fn relayed(log: &[Value], kind: &str, pred: impl Fn(&Value) -> bool) -> Option<Outcome> {
     let made: Vec<&Value> = log
         .iter()
         .filter(|v| v["kind"] == kind && pred(v))
@@ -956,9 +954,45 @@ fn attributed(log: &[Value], kind: &str, pred: impl Fn(&Value) -> bool) -> Optio
     if made.is_empty() {
         None
     } else if made.iter().any(|v| v["attributed"] == true) {
-        Some("pass")
+        Some(Outcome::Pass)
     } else {
-        Some("fail")
+        Some(Outcome::harness(format!(
+            "relayed {kind} never attributed: {:?}",
+            made.iter()
+                .map(|v| (v["state"].clone(), v["wrote"].clone()))
+                .collect::<Vec<_>>()
+        )))
+    }
+}
+
+/// `MARKER-nnnnnn` on a screen dump.
+fn marker_of(screen: &str) -> Option<u64> {
+    let i = screen.find("MARKER-")?;
+    screen.get(i + 7..i + 13)?.parse().ok()
+}
+
+/// Marker advancement across the viewerless interval: the marker another
+/// process reads must be one the fixture emitted, and later than the one on
+/// screen before the interval.
+fn marker_outcome(before: Option<u64>, client: &Value, emitted: &[u64]) -> Outcome {
+    let Some(m0) = before else {
+        return Outcome::harness("no marker on screen before the viewerless interval");
+    };
+    if client["screen_status"].as_u64() != Some(200) {
+        return Outcome::harness("screen relay failed");
+    }
+    let Some(m) = client["marker"].as_u64() else {
+        return Outcome::platform("the screen read by another process had no marker");
+    };
+    if !emitted.contains(&m) {
+        return Outcome::harness("marker not in the fixture's emitted list");
+    }
+    if m > m0 {
+        Outcome::Pass
+    } else if emitted.iter().any(|e| *e > m0) {
+        Outcome::platform("the screen did not advance across the viewerless interval")
+    } else {
+        Outcome::harness("the fixture emitted no marker during the interval")
     }
 }
 
@@ -977,10 +1011,14 @@ fn probe_attach(ctx: &Ctx) {
     let (l, base, p) = match start_attachable(ctx, util::token()) {
         Ok(v) => v,
         Err(e) => {
-            return pc.finish(ctx, |_| None, |_| None, json!({"setup_error": e}));
+            pc.put("viewerless_30s", Outcome::harness(e.clone()), Value::Null);
+            return pc.finish(ctx, json!({"setup_error": e}));
         }
     };
-    // Viewerless for the full 30 s; a cutoff that cuts it short is inconclusive.
+    let before = marker_of(&String::from_utf8_lossy(
+        &p.screen(Instant::now() + Duration::from_secs(1)),
+    ));
+    // Viewerless for the full 30 s; a cutoff that cuts it short is not exercised.
     let want = Duration::from_secs(30);
     let t = Instant::now();
     std::thread::sleep(want.min(ctx.cutoff.saturating_duration_since(Instant::now())));
@@ -988,9 +1026,9 @@ fn probe_attach(ctx: &Ctx) {
     pc.put(
         "viewerless_30s",
         if slept >= want {
-            "pass"
+            Outcome::Pass
         } else {
-            "inconclusive"
+            Outcome::not_exercised("cut short by the run cutoff")
         },
         json!({"slept_ms": slept.as_millis() as u64}),
     );
@@ -1006,45 +1044,26 @@ fn probe_attach(ctx: &Ctx) {
         .iter()
         .filter_map(Value::as_u64)
         .collect();
-    match (client["screen_status"].as_u64(), client["marker"].as_u64()) {
-        (Some(200), Some(m)) => pc.put(
+    if client.get("spawn_error").is_none() {
+        pc.put(
             "marker",
-            if emitted.contains(&m) { "pass" } else { "fail" },
-            json!({"marker": m}),
-        ),
-        (Some(200), None) => pc.put("marker", "fail", json!({"marker": null})),
-        _ => {}
+            marker_outcome(before, &client, &emitted),
+            json!({"before": before, "marker": client["marker"]}),
+        );
     }
     let nonce = client["nonce"].as_str().unwrap_or("").to_string();
-    if let Some(r) = attributed(&log, "input", |v| v["nonce"] == json!(nonce)) {
-        pc.put("nonce", r, json!({"nonce": nonce}));
+    if let Some(o) = relayed(&log, "input", |v| v["nonce"] == json!(nonce)) {
+        pc.put("nonce", o, json!({"nonce": nonce}));
     }
     for k in ["down", "enter", "esc"] {
-        if let Some(r) = attributed(&log, "key", |v| v["key"] == json!(k)) {
-            pc.put(&format!("key/{k}"), r, Value::Null);
+        if let Some(o) = relayed(&log, "key", |v| v["key"] == json!(k)) {
+            pc.put(&format!("key/{k}"), o, Value::Null);
         }
     }
     l.receiver.set_probe(None);
     let (stop, _) = l.finish();
-    let (mk, nk) = (pc.k("marker"), pc.k("nonce"));
-    let keys: Vec<String> = ["key/down", "key/enter", "key/esc"]
-        .iter()
-        .map(|c| pc.k(c))
-        .collect();
-    let blocker = |e: &Eval| {
-        if e.result_of(&mk) == "fail" {
-            Some("no viewerless progress visible to another process".into())
-        } else if e.result_of(&nk) == "fail" && e.all_present_and_failed(&keys) {
-            Some("input and keys from another process were not delivered".into())
-        } else {
-            None
-        }
-    };
-    let tuning = |e: &Eval| (!e.failed.is_empty()).then(|| format!("failed: {:?}", e.failed));
     pc.finish(
         ctx,
-        blocker,
-        tuning,
         json!({"client": client, "requests": log, "survivors": stop.survivors}),
     );
 }
@@ -1168,6 +1187,15 @@ struct PpidRecorder {
     stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attr {
+    Ours,
+    Other,
+    /// The owner could not be identified at callback time (no pid, or no
+    /// parent known for it).
+    Unattributed,
+}
+
 impl PpidRecorder {
     fn start() -> PpidRecorder {
         let map = Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -1186,23 +1214,37 @@ impl PpidRecorder {
         PpidRecorder { map, stop }
     }
 
-    /// True when the shown window's owner (via its event-time ppid, then the
+    /// Whether the shown window's owner (via its event-time ppid, then the
     /// sampled chain, conhost / OpenConsole included) reaches `root`.
-    fn attributed(&self, shown: &(u32, Option<u32>), root: u32) -> bool {
+    fn classify(&self, shown: &(u32, Option<u32>), root: u32) -> Attr {
         let m = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        if shown.0 == root {
-            return true;
-        }
-        let mut cur = shown.1.or_else(|| m.get(&shown.0).copied());
-        for _ in 0..16 {
-            match cur {
-                Some(c) if c == root => return true,
-                Some(c) => cur = m.get(&c).copied().filter(|pp| *pp != c),
-                None => break,
-            }
-        }
-        false
+        classify(&m, shown, root)
     }
+}
+
+fn classify(
+    m: &std::collections::HashMap<u32, u32>,
+    shown: &(u32, Option<u32>),
+    root: u32,
+) -> Attr {
+    if shown.0 == 0 {
+        return Attr::Unattributed;
+    }
+    if shown.0 == root {
+        return Attr::Ours;
+    }
+    let mut cur = shown.1.or_else(|| m.get(&shown.0).copied());
+    if cur.is_none() {
+        return Attr::Unattributed;
+    }
+    for _ in 0..16 {
+        match cur {
+            Some(c) if c == root => return Attr::Ours,
+            Some(c) => cur = m.get(&c).copied().filter(|pp| *pp != c),
+            None => break,
+        }
+    }
+    Attr::Other
 }
 
 impl Drop for PpidRecorder {
@@ -1211,174 +1253,248 @@ impl Drop for PpidRecorder {
     }
 }
 
+/// Window events seen while one launch ran under its own observer.
+#[derive(Default)]
+struct Flash {
+    observer_error: Option<String>,
+    ours: Vec<(u32, Option<u32>)>,
+    unattributed: Vec<(u32, Option<u32>)>,
+}
+
+impl Flash {
+    fn json(&self) -> Value {
+        json!({"observer_error": self.observer_error, "shown_from_our_tree": self.ours,
+               "unattributed": self.unattributed})
+    }
+}
+
+/// No-flash judgment for one launch. A window attributed to our tree is
+/// positive evidence; an observer failure is a harness failure; unattributed
+/// events block `pass` unless calibration showed attribution works.
+fn flash_outcome(f: &Flash, launched: bool, calibrated: bool) -> Outcome {
+    if let Some(e) = &f.observer_error {
+        return Outcome::harness(format!("window observer failed: {e}"));
+    }
+    if !f.ours.is_empty() {
+        return Outcome::platform("a window was shown from the harness tree");
+    }
+    if !launched {
+        return Outcome::not_exercised("the launch did not complete in scope");
+    }
+    if !f.unattributed.is_empty() && !calibrated {
+        return Outcome::not_exercised(
+            "unattributed window events and calibration did not show attribution works",
+        );
+    }
+    Outcome::Pass
+}
+
+/// Runs one launch child under its own window observer.
+fn observed_child(
+    ctx: &Ctx,
+    tree: &PpidRecorder,
+    name: &str,
+    argv: &[String],
+    budget: u64,
+    env: &[(&str, &str)],
+) -> (Option<Report>, Flash) {
+    let obs = match os::WindowObserver::start() {
+        Ok(o) => o,
+        Err(e) => {
+            return (
+                None,
+                Flash {
+                    observer_error: Some(e),
+                    ..Default::default()
+                },
+            );
+        }
+    };
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let (r, _) = child(ctx, name, &argv, budget, false, env);
+    let shown = obs.stop();
+    let me = std::process::id();
+    let mut f = Flash::default();
+    for s in shown {
+        match tree.classify(&s, me) {
+            Attr::Ours => f.ours.push(s),
+            Attr::Unattributed => f.unattributed.push(s),
+            Attr::Other => {}
+        }
+    }
+    (r, f)
+}
+
+/// The pre-trusted, unattended baseline matrix (no attended steps).
+fn console_matrix(ctx: &Ctx) -> Vec<(&'static str, Vec<String>, u64)> {
+    let cwd = ctx
+        .args
+        .cwd
+        .clone()
+        .unwrap_or_else(|| super::real::c2_cwd(&ctx.args.root))
+        .display()
+        .to_string();
+    let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    vec![
+        (
+            "claude-hooks",
+            v(&["real", "claude-hooks", "--cwd", &cwd]),
+            600,
+        ),
+        (
+            "codex-hooks-no-daemon",
+            v(&[
+                "real",
+                "codex-hooks",
+                "--codex-mode",
+                "no-daemon",
+                "--cwd",
+                &cwd,
+            ]),
+            900,
+        ),
+        (
+            "codex-hooks-default",
+            v(&[
+                "real",
+                "codex-hooks",
+                "--codex-mode",
+                "default",
+                "--cwd",
+                &cwd,
+            ]),
+            900,
+        ),
+        (
+            "fake-paste",
+            v(&["fake", "paste", "--paste-newline", "cr"]),
+            900,
+        ),
+    ]
+}
+
 fn probe_console(ctx: &Ctx) {
     if ctx.args.detached && std::env::var("CHS_DETACHED_CHILD").is_err() {
         return relaunch_detached(ctx);
     }
     let mut pc = Pc::new("C-5");
-    for c in [
-        "detached",
-        "calibration",
-        "startup_launch",
-        "paste_launch",
-        "no_flash",
-        "survival",
-    ] {
+    let matrix = console_matrix(ctx);
+    for c in ["detached", "calibration", "survival"] {
         pc.req(c);
+    }
+    for (name, _, _) in &matrix {
+        pc.req(&format!("launch/{name}"));
+        pc.req(&format!("no_flash/{name}"));
     }
     let detached = std::env::var("CHS_DETACHED_CHILD").is_ok();
     let console_window = os::console_window_present();
     pc.put(
         "detached",
-        if detached && console_window == Some(false) {
-            "pass"
-        } else {
-            "inconclusive"
+        match (detached, console_window) {
+            (false, _) => Outcome::not_exercised("run `chs win-probe console --detached`"),
+            (true, Some(false)) => Outcome::Pass,
+            (true, Some(true)) => Outcome::harness("the detached harness still has a console"),
+            (true, None) => Outcome::harness("console window lookup failed"),
         },
         json!({"detached": detached, "console_window_present": console_window}),
     );
     let tree = PpidRecorder::start();
-    let me = std::process::id();
-    let obs = match os::WindowObserver::start() {
-        Ok(o) => o,
-        Err(e) => return pc.finish(ctx, |_| None, |_| None, json!({"observer_error": e})),
-    };
-    // Calibration: a short-lived console exe (no CREATE_NO_WINDOW) must be seen and attributed.
-    let cal = Command::new("cmd.exe").args(["/c", "exit"]).spawn();
-    let cal_pid = cal.as_ref().map(|c| c.id()).ok();
-    if let Ok(mut c) = cal {
-        let _ = c.wait();
-    }
-    std::thread::sleep(Duration::from_millis(500));
-    let shown_cal = obs.stop();
-    let calibrated = cal_pid.is_some_and(|p| shown_cal.iter().any(|s| tree.attributed(s, p)));
-    pc.put(
-        "calibration",
-        if calibrated { "pass" } else { "inconclusive" },
-        json!({"pid": cal_pid, "events": shown_cal.len()}),
-    );
-    let obs = match os::WindowObserver::start() {
-        Ok(o) => o,
-        Err(e) => return pc.finish(ctx, |_| None, |_| None, json!({"observer_error": e})),
-    };
-    let (startup, _) = child(
-        ctx,
-        "console-startup",
-        &["win-probe", "startup"],
-        7200,
-        false,
-        &[],
-    );
-    let (fpaste, _) = child(
-        ctx,
-        "console-fake-paste",
-        &["fake", "paste", "--paste-newline", "cr"],
-        900,
-        false,
-        &[],
-    );
-    let shown = obs.stop();
-    // A flash judgment needs launches that actually ran in scope.
-    let in_scope = |r: &Option<Report>| {
-        if status_result(r) == "pass" {
-            "pass"
-        } else {
-            "inconclusive"
-        }
-    };
-    pc.put(
-        "startup_launch",
-        in_scope(&startup),
-        json!({"status": startup.as_ref().map(|r| r.status.clone())}),
-    );
-    pc.put(
-        "paste_launch",
-        in_scope(&fpaste),
-        json!({"status": fpaste.as_ref().map(|r| r.status.clone())}),
-    );
-    let ours: Vec<(u32, Option<u32>)> = shown
-        .iter()
-        .copied()
-        .filter(|s| tree.attributed(s, me))
-        .collect();
-    pc.put(
-        "no_flash",
-        if ours.is_empty() { "pass" } else { "fail" },
-        json!({"shown_from_our_tree": ours}),
-    );
-    if !ours.is_empty() {
-        // Mitigation re-run in the same session: GUI-subsystem emitter for
-        // FakeCli and for a real hook delivery.
-        for c in ["rerun_gui_no_flash", "rerun_gui_delivery"] {
-            pc.req(c);
-        }
-        let obs2 = os::WindowObserver::start().ok();
-        let gui = [("CHS_EMITTER_VARIANT", "gui")];
-        let (rp, _) = child(
-            ctx,
-            "console-rerun-gui-paste",
-            &["fake", "paste", "--paste-newline", "cr"],
-            900,
-            false,
-            &gui,
-        );
-        let (rh, _) = child(
-            ctx,
-            "console-rerun-gui-claude",
-            &["real", "claude-hooks"],
-            600,
-            false,
-            &gui,
-        );
-        let shown2 = obs2.map(|o| o.stop()).unwrap_or_default();
-        let ours2: Vec<(u32, Option<u32>)> = shown2
-            .iter()
-            .copied()
-            .filter(|s| tree.attributed(s, me))
-            .collect();
-        let delivered = find_check(&rh, "A-1", "session_start_bound").map(|c| c.result.clone());
-        if status_result(&rp) == "pass" && delivered.as_deref() == Some("pass") {
+    // Calibration: a short-lived console exe, deliberately visible (no
+    // CREATE_NO_WINDOW), must be seen and attributed.
+    let calibrated = match os::WindowObserver::start() {
+        Err(e) => {
             pc.put(
-                "rerun_gui_no_flash",
-                if ours2.is_empty() { "pass" } else { "fail" },
-                json!({"shown": ours2}),
+                "calibration",
+                Outcome::harness(format!("window observer failed: {e}")),
+                Value::Null,
             );
+            false
         }
-        if let Some(d) = delivered {
-            pc.put("rerun_gui_delivery", &d, Value::Null);
+        Ok(obs) => {
+            let cal = Command::new("cmd.exe").args(["/c", "exit"]).spawn();
+            let cal_pid = cal.as_ref().map(|c| c.id()).ok();
+            if let Ok(mut c) = cal {
+                let _ = c.wait();
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            let shown = obs.stop();
+            let ok =
+                cal_pid.is_some_and(|p| shown.iter().any(|s| tree.classify(s, p) == Attr::Ours));
+            pc.put(
+                "calibration",
+                match (cal_pid, ok) {
+                    (None, _) => Outcome::harness("calibration launch failed"),
+                    (_, true) => Outcome::Pass,
+                    (_, false) => Outcome::not_exercised("calibration window not attributed"),
+                },
+                json!({"pid": cal_pid, "events": shown.len()}),
+            );
+            ok
         }
+    };
+    let mut launches = serde_json::Map::new();
+    for (name, argv, budget) in &matrix {
+        let (r, f) = observed_child(ctx, &tree, &format!("console-{name}"), argv, *budget, &[]);
+        let launched = child_outcome(&r);
+        let ok = launched == Outcome::Pass;
+        pc.put(
+            &format!("launch/{name}"),
+            match launched {
+                Outcome::Pass | Outcome::Missing => launched,
+                o => Outcome::not_exercised(format!("launch out of scope: {}", o.tag())),
+            },
+            json!({"status": r.as_ref().map(|r| r.status.clone())}),
+        );
+        let nf = flash_outcome(&f, ok, calibrated);
+        let flashed = matches!(nf, Outcome::PlatformFail { .. });
+        pc.put(&format!("no_flash/{name}"), nf, f.json());
+        let mut entry = json!({"baseline": f.json()});
+        if flashed {
+            // Mitigation: rerun the SAME launch, cwd, and hook delivery with
+            // the GUI-subsystem emitter.
+            let (dk, fk) = (
+                format!("mitigated/{name}/delivery"),
+                format!("mitigated/{name}/no_flash"),
+            );
+            pc.req(&dk);
+            pc.req(&fk);
+            let gui = [("CHS_EMITTER_VARIANT", "gui")];
+            let (r2, f2) = observed_child(
+                ctx,
+                &tree,
+                &format!("console-{name}-gui"),
+                argv,
+                *budget,
+                &gui,
+            );
+            let delivered = child_outcome(&r2);
+            let ok2 = delivered == Outcome::Pass;
+            if r2.is_some() {
+                pc.put(
+                    &dk,
+                    delivered,
+                    json!({"status": r2.as_ref().map(|r| r.status.clone())}),
+                );
+            }
+            pc.put(&fk, flash_outcome(&f2, ok2, calibrated), f2.json());
+            entry["mitigated"] = f2.json();
+        }
+        launches.insert((*name).into(), entry);
     }
-    let survival = if detached {
-        terminal_close_survival(ctx)
+    if detached {
+        let (o, ev) = terminal_close_survival(ctx);
+        pc.put("survival", o, ev);
     } else {
-        json!({"result": null, "why": "run `chs win-probe console --detached`"})
-    };
-    if let Some(r) = survival["result"].as_str() {
-        pc.put("survival", r, survival.clone());
+        pc.put(
+            "survival",
+            Outcome::not_exercised("run `chs win-probe console --detached`"),
+            Value::Null,
+        );
     }
-    let (nf, rr, sv) = (
-        pc.k("no_flash"),
-        pc.k("rerun_gui_no_flash"),
-        pc.k("survival"),
-    );
-    let blocker = |e: &Eval| {
-        if e.result_of(&nf) == "fail" && e.result_of(&rr) == "fail" {
-            Some("repeatable window flash not removed by the GUI-subsystem emitter".into())
-        } else if e.result_of(&sv) == "fail" {
-            Some("the session died on terminal close".into())
-        } else {
-            None
-        }
-    };
-    let tuning = |e: &Eval| {
-        (e.result_of(&nf) == "fail" && e.result_of(&rr) == "pass")
-            .then(|| "flash removed by the GUI-subsystem emitter".to_string())
-    };
     pc.finish(
         ctx,
-        blocker,
-        tuning,
-        json!({"breakaway": std::env::var("CHS_BREAKAWAY").ok(), "harness_job": os::self_job_info()}),
+        json!({"launches": launches, "breakaway": std::env::var("CHS_BREAKAWAY").ok(),
+               "harness_job": os::self_job_info()}),
     );
 }
 
@@ -1420,23 +1536,24 @@ fn relaunch_detached(ctx: &Ctx) {
             println!("(its report: {})", ctx.args.root.join("out").display());
             pc.put(
                 "detached_launch",
-                "inconclusive",
+                Outcome::not_exercised("the detached child reports C-5"),
                 json!({"breakaway_permitted": breakaway, "breakaway_denied": !breakaway,
-                       "parent_job": os::self_job_info(), "note": "the detached child reports C-5"}),
+                       "parent_job": os::self_job_info()}),
             );
         }
         Err(e) => pc.put(
             "detached_launch",
-            "inconclusive",
+            Outcome::harness(format!("detached launch failed: {e}")),
             json!({"error": e, "parent_job": os::self_job_info()}),
         ),
     }
-    pc.finish(ctx, |_| None, |_| None, Value::Null);
+    pc.finish(ctx, Value::Null);
 }
 
 /// Detached child: FakeCli `attachable` waits for an owner-confirmed terminal
-/// close (`/probe/confirm`) and then a fresh nonce from the same child.
-fn terminal_close_survival(ctx: &Ctx) -> Value {
+/// close (`/probe/confirm`) and then a fresh nonce from the same child. A
+/// platform failure needs positive death evidence for that child.
+fn terminal_close_survival(ctx: &Ctx) -> (Outcome, Value) {
     let mut cred = String::new();
     let _ = std::io::stdin().lock().read_line(&mut cred);
     let credential = if cred.trim().is_empty() {
@@ -1446,11 +1563,17 @@ fn terminal_close_survival(ctx: &Ctx) -> Value {
     };
     let (l, base, p) = match start_attachable(ctx, credential) {
         Ok(v) => v,
-        Err(e) => return json!({"result": null, "error": e}),
+        Err(e) => return (Outcome::harness(e.clone()), json!({"error": e})),
     };
     if let Ok(f) = std::env::var("CHS_ATTACH_URL_FILE") {
         let _ = std::fs::write(Path::new(&f), &base);
     }
+    let start_time = p
+        .witnesses
+        .witnesses()
+        .iter()
+        .find(|w| w.role == "attachable" && w.pid == p.child_pid)
+        .map(|w| w.start_time);
     let end = ctx.until(Duration::from_secs(1800));
     let after_confirm = |log: &[Value], c: u64| {
         log.iter().any(|v| {
@@ -1459,29 +1582,125 @@ fn terminal_close_survival(ctx: &Ctx) -> Value {
                 && v["at_ms"].as_u64().is_some_and(|t| t >= c)
         })
     };
-    let mut res: Option<&str> = None;
+    let mut res: Option<Outcome> = None;
+    let mut last_lookup: Option<bool> = None;
+    let mut confirmed = None;
     while Instant::now() < end {
-        let confirmed = *p.confirmed_ms.lock().unwrap_or_else(|e| e.into_inner());
+        confirmed = *p.confirmed_ms.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = confirmed {
             if after_confirm(&p.log(), c) {
-                res = Some("pass");
+                res = Some(Outcome::Pass);
                 break;
             }
-            let child_alive = p
-                .witnesses
-                .witnesses()
-                .iter()
-                .find(|w| w.role == "attachable" && w.pid == p.child_pid)
-                .is_some_and(|w| os::is_alive(w.pid, w.start_time));
-            if !child_alive {
-                res = Some("fail");
+            last_lookup = start_time.and_then(|st| os::liveness(p.child_pid, st));
+            if last_lookup == Some(false) {
+                res = Some(Outcome::platform(
+                    "the attachable child died after the terminal closed",
+                ));
                 break;
             }
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+    let res = res.unwrap_or_else(|| match (confirmed, last_lookup) {
+        (None, _) => Outcome::not_exercised("the owner never confirmed the terminal close"),
+        (Some(_), None) => Outcome::harness("child liveness lookup failed"),
+        (Some(_), Some(_)) => Outcome::not_exercised("no fresh input after the confirmed close"),
+    });
     let log = p.log();
     l.receiver.set_probe(None);
     let (stop, _) = l.finish();
-    json!({"result": res, "requests": log, "child_pid": p.child_pid, "survivors": stop.survivors})
+    (
+        res,
+        json!({"requests": log, "child_pid": p.child_pid, "survivors": stop.survivors}),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// r2 C-3: an enumeration failure is a harness failure, never an empty
+    /// job that turns every live witness into an escapee.
+    #[test]
+    fn enumeration_failure_is_harness_fail() {
+        let ws = [(10, 1), (11, 1)];
+        let (o, _) = escapee_outcome(true, &ws, || Err("denied".into()), |_, _| Some(true));
+        assert!(matches!(o, Outcome::HarnessFail { .. }), "{o:?}");
+        // A successful snapshot that misses a live witness is an escapee.
+        let (o, _) = escapee_outcome(true, &ws, || Ok(vec![10]), |_, _| Some(true));
+        assert!(matches!(o, Outcome::PlatformFail { .. }), "{o:?}");
+        // A dead witness outside the job is not an escapee; a failed lookup is harness.
+        let (o, _) = escapee_outcome(true, &ws, || Ok(vec![10]), |p, _| Some(p == 10));
+        assert_eq!(o, Outcome::Pass);
+        let (o, _) = escapee_outcome(true, &ws, || Ok(vec![10]), |_, _| None);
+        assert!(matches!(o, Outcome::HarnessFail { .. }), "{o:?}");
+    }
+
+    #[test]
+    fn unattributed_events_block_no_flash_without_calibration() {
+        let mut f = Flash {
+            unattributed: vec![(0, None)],
+            ..Default::default()
+        };
+        assert!(matches!(
+            flash_outcome(&f, true, false),
+            Outcome::NotExercised { .. }
+        ));
+        assert_eq!(flash_outcome(&f, true, true), Outcome::Pass);
+        f.observer_error = Some("hook".into());
+        assert!(matches!(
+            flash_outcome(&f, true, true),
+            Outcome::HarnessFail { .. }
+        ));
+        let m = std::collections::HashMap::from([(5, 4), (4, 1)]);
+        assert_eq!(classify(&m, &(0, None), 1), Attr::Unattributed);
+        assert_eq!(classify(&m, &(9, None), 1), Attr::Unattributed);
+        assert_eq!(classify(&m, &(5, None), 1), Attr::Ours);
+        assert_eq!(classify(&m, &(5, None), 2), Attr::Other);
+    }
+
+    #[test]
+    fn relay_failures_are_harness_fail() {
+        let log = vec![json!({"kind": "key", "key": "esc", "wrote": false, "attributed": false})];
+        assert!(matches!(
+            relayed(&log, "key", |v| v["key"] == "esc"),
+            Some(Outcome::HarnessFail { .. })
+        ));
+        assert!(relayed(&log, "key", |v| v["key"] == "down").is_none());
+    }
+
+    #[test]
+    fn marker_must_advance_across_the_interval() {
+        let c = |m: u64| json!({"screen_status": 200, "marker": m});
+        assert_eq!(marker_outcome(Some(3), &c(9), &[1, 9]), Outcome::Pass);
+        assert!(matches!(
+            marker_outcome(Some(3), &c(3), &[3, 9]),
+            Outcome::PlatformFail { .. }
+        ));
+        assert!(matches!(
+            marker_outcome(Some(3), &c(3), &[3]),
+            Outcome::HarnessFail { .. }
+        ));
+        assert!(matches!(
+            marker_outcome(None, &c(9), &[9]),
+            Outcome::HarnessFail { .. }
+        ));
+    }
+
+    #[test]
+    fn queries_need_a_written_reply() {
+        let mut r = Report::new("x", "y");
+        r.detail(
+            "launch-a",
+            json!({"query_log": [{"kind": "da1", "reply": "x", "harness_wrote": false}]}),
+        );
+        let o = query_outcome(&Some(r.clone())).map(|x| x.0);
+        assert!(matches!(o, Some(Outcome::HarnessFail { .. })), "{o:?}");
+        r.detail(
+            "launch-a",
+            json!({"query_log": [{"kind": "da1", "reply": "x", "harness_wrote": true}]}),
+        );
+        assert_eq!(query_outcome(&Some(r)).map(|x| x.0), Some(Outcome::Pass));
+    }
 }

@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use super::{Ctx, Launch, LaunchSpec, cli_version, hook_command, launch, write_snapshot};
 use crate::cli::{self, Args};
 use crate::paste::{self, Newline, PasteOpts};
-use crate::report::result_str;
 use crate::session::{Session, SpawnOpts};
+use crate::verdict::Outcome;
 use crate::{os, util};
 
 pub const SCENARIOS: &[&str] = &[
@@ -568,22 +568,51 @@ fn claude_global_hooks() -> (Value, bool) {
 
 // ---------------- scenarios ----------------
 //
-// Every scenario declares its required cases up front (`ctx.require`); a case
-// a setup failure, timeout, or cutoff prevented is `inconclusive`, never pass.
+// Every scenario declares its required cases up front (`ctx.require`). A
+// case is a `PlatformFail` only with positive evidence of what the CLI or OS
+// did; an absent hook is `Missing`, and setup, gate, writer, or lookup
+// failures are `HarnessFail` or `NotExercised`. Launch verdicts are taken from
+// the receiver's final summary after it stopped and drained.
 
 fn not_run(ctx: &Ctx, cases: &[(&str, String)], why: &str) {
     for (id, case) in cases {
-        ctx.check(id, case, "inconclusive", json!({"not_run": why}));
+        ctx.check(id, case, Outcome::harness(why), json!({"not_run": why}));
     }
 }
 
-/// A paste that was not sent: validator rejection is a failure; readiness,
-/// gate, deadline, and writer outcomes are inconclusive (never retried).
-fn unsent_result(o: &paste::Outcome) -> &'static str {
-    if o.state == "rejected" {
-        "fail"
+/// A paste that was not sent: a readiness-gate failure was never exercised;
+/// any other gate, writer, or validator outcome is a harness failure.
+fn unsent(o: &paste::Outcome) -> Outcome {
+    match o.state.as_str() {
+        "readiness_gate_failed" => Outcome::not_exercised("readiness gate never opened"),
+        s => Outcome::harness(format!("paste not sent: {s}")),
+    }
+}
+
+/// The bound session id from the final receiver summary; ambiguity voids it.
+fn final_bound(fin: &Value) -> Option<String> {
+    let r = &fin["receiver"];
+    if r["ambiguous"].as_array().is_some_and(|a| !a.is_empty()) {
+        return None;
+    }
+    r["bound_session"].as_str().map(str::to_string)
+}
+
+fn final_ambiguous(fin: &Value) -> bool {
+    fin["receiver"]["ambiguous"]
+        .as_array()
+        .is_some_and(|a| !a.is_empty())
+}
+
+/// Readiness outcome from the final summary: bound → pass, ambiguous → not
+/// exercised, otherwise the hook is missing.
+fn bound_outcome(fin: &Value) -> Outcome {
+    if final_ambiguous(fin) {
+        Outcome::not_exercised("binding became ambiguous")
+    } else if final_bound(fin).is_some() {
+        Outcome::Pass
     } else {
-        "inconclusive"
+        Outcome::Missing
     }
 }
 
@@ -619,50 +648,66 @@ fn claude_hooks(ctx: &Ctx, a: &Agent) {
         Err(e) => return not_run(ctx, &[("A-1", "session_start_bound".into())], &e),
     };
     let (bound, ms, snap) = wait_start(ctx, &l);
-    ctx.check(
-        "A-1",
-        "session_start_bound",
-        result_str(bound.is_some()),
-        json!({"session_id": bound, "latency_ms": ms, "snapshot": snap, "ambiguous": l.receiver.ambiguous()}),
-    );
+    let mut a2 = None;
     if ctx.args.prompt && bound.is_some() {
-        let (res, ev) = if !l.wait_gate(ctx.until(Duration::from_secs(10))) {
-            ("inconclusive", json!({"readiness_gate_failed": true}))
+        a2 = Some(if !l.wait_gate(ctx.until(Duration::from_secs(10))) {
+            (
+                Outcome::not_exercised("readiness gate never opened"),
+                json!({}),
+            )
         } else {
             let o = submit(ctx, &l, "Reply with the single word OK.", Newline::Cr, 0);
             if o.state != "sent" {
-                (unsent_result(&o), json!({"paste": o}))
+                (unsent(&o), json!({"paste": o}))
             } else {
                 let ups = nth_bound(&l, "UserPromptSubmit", 1, ctx.until(REAL_UPS_WAIT));
-                let has_prompt = ups
+                let prompt = ups
                     .as_ref()
                     .and_then(|e| e.json())
-                    .is_some_and(|v| v.get("prompt").is_some_and(Value::is_string));
+                    .and_then(|v| v.get("prompt").and_then(Value::as_str).map(str::to_string));
                 (
-                    result_str(has_prompt),
+                    if prompt.is_some() {
+                        Outcome::Pass
+                    } else {
+                        Outcome::Missing
+                    },
                     json!({"paste": o, "fixture": ups.map(|e| e.fixture)}),
                 )
             }
-        };
-        ctx.check("A-2", "user_prompt_submit", res, ev);
+        });
     }
     let obs = observed(&l);
-    finish(ctx, l);
+    let fin = finish(ctx, l);
+    ctx.check(
+        "A-1",
+        "session_start_bound",
+        bound_outcome(&fin),
+        json!({"session_id": final_bound(&fin), "latency_ms": ms, "snapshot": snap,
+               "ambiguous": fin["receiver"]["ambiguous"]}),
+    );
+    if let Some((o, ev)) = a2 {
+        let o = if final_ambiguous(&fin) {
+            Outcome::not_exercised("binding became ambiguous")
+        } else {
+            o
+        };
+        ctx.check("A-2", "user_prompt_submit", o, ev);
+    }
     let (after, after_ok) = claude_global_hooks();
     ctx.check(
         "C1",
         "no_global_hook_edit",
         if before_ok && after_ok {
-            result_str(before == after)
+            Outcome::observed(before == after, "global Claude hook config changed")
         } else {
-            "inconclusive"
+            Outcome::harness("global Claude config unreadable or malformed")
         },
         json!({"before": before, "after": after}),
     );
     ctx.check(
         "A-5",
         "claude_registered_vs_observed",
-        "pass",
+        Outcome::Pass,
         json!({"registered": CLAUDE_EVENTS, "observed": obs}),
     );
 }
@@ -723,36 +768,34 @@ fn paste_sweep(ctx: &Ctx, a: &Agent) {
                 }
             };
             let (bound, ms, snap) = wait_start(ctx, &l);
+            // Results are held until the receiver drained: a late ambiguous
+            // candidate voids them.
+            let mut held: Vec<(String, Outcome, Value)> = Vec::new();
             if bound.is_none() {
-                for (id, case) in &cases {
-                    ctx.check(
-                        id,
-                        case,
-                        "inconclusive",
-                        json!({"session_start": "timeout", "latency_ms": ms, "snapshot": snap,
-                               "ambiguous": l.receiver.ambiguous()}),
-                    );
+                for (_, case) in &cases {
+                    held.push((
+                        case.clone(),
+                        Outcome::not_exercised("no bound SessionStart"),
+                        json!({"latency_ms": ms, "snapshot": snap}),
+                    ));
                 }
-                finish(ctx, l);
-                continue;
             }
             let mut n = 0;
-            for (e, (_, case)) in corpus.iter().zip(&cases) {
+            for (e, (_, case)) in corpus.iter().zip(&cases).filter(|_| bound.is_some()) {
                 if ctx.past_cutoff() {
                     break;
                 }
                 if !l.wait_gate(ctx.until(Duration::from_secs(15))) {
-                    ctx.check(
-                        "A-6",
-                        case,
-                        "inconclusive",
+                    held.push((
+                        case.clone(),
+                        Outcome::not_exercised("readiness gate never opened"),
                         json!({"readiness_gate_failed": true}),
-                    );
+                    ));
                     continue;
                 }
                 let o = submit(ctx, &l, &e.text, mode, chunk);
                 if o.state != "sent" {
-                    ctx.check("A-6", case, unsent_result(&o), json!({"paste": o}));
+                    held.push((case.clone(), unsent(&o), json!({"paste": o})));
                     continue;
                 }
                 n += 1;
@@ -767,17 +810,30 @@ fn paste_sweep(ctx: &Ctx, a: &Agent) {
                         let gotn = paste::normalize_lf(g.as_bytes());
                         let d = util::first_diff(&want, &gotn);
                         (
-                            result_str(d.is_none()),
+                            Outcome::observed(
+                                d.is_none(),
+                                format!("prompt bytes differ at offset {d:?}"),
+                            ),
                             json!({"equal": d.is_none(), "first_diff": d, "fixture": ups.as_ref().map(|e| &e.fixture)}),
                         )
                     }
-                    None => ("fail", json!({"ups": "missing", "dropped": true})),
+                    // No prompt bytes to compare: hook evidence is missing.
+                    None => (Outcome::Missing, json!({"ups": "missing"})),
                 };
-                ctx.check("A-6", case, res, ev);
+                held.push((case.clone(), res, ev));
                 // Let the turn finish before the next paste.
                 let _ = nth_bound(&l, "Stop", n, ctx.until(REAL_STOP_WAIT));
             }
-            finish(ctx, l);
+            let fin = finish(ctx, l);
+            let void = final_ambiguous(&fin);
+            for (case, o, ev) in held {
+                let o = if void {
+                    Outcome::not_exercised("binding became ambiguous")
+                } else {
+                    o
+                };
+                ctx.check("A-6", &case, o, ev);
+            }
         }
     }
 }
@@ -809,43 +865,50 @@ fn stall(ctx: &Ctx, a: &Agent) {
         Err(e) => return not_run(ctx, &[("A-7", a7), ("C-2", c2)], &e),
     };
     let (bound, ms, snap) = wait_start(ctx, &l);
+    let mut attended = None;
     if ctx.args.attended {
-        let (res, attended) = if bound.is_some() {
+        attended = Some(if bound.is_some() {
             (
-                "inconclusive",
+                None,
                 json!({"why": "SessionStart arrived without a prompt; nothing to clear"}),
             )
         } else {
-            let v = attend(ctx, &l);
-            let sent = v["keys"]
-                .as_array()
-                .is_some_and(|k| k.iter().any(|k| k["ok"] == true));
-            let res = match (sent, l.receiver.bound().is_some()) {
-                (_, true) => "pass",
-                (true, false) => "fail",
-                (false, false) => "inconclusive",
-            };
-            (res, v)
+            attend(ctx, &l)
+        });
+    }
+    let fin = finish(ctx, l);
+    if let Some((first_key, ev)) = attended {
+        // Pass only when a relayed key was written while unbound and the
+        // SessionStart followed it.
+        let bound_at = fin["receiver"]["bound_at_ms"].as_u64();
+        let o = match (first_key, bound_at, final_ambiguous(&fin)) {
+            (_, _, true) => Outcome::not_exercised("binding became ambiguous"),
+            (Some(k), Some(b), false) if b >= k => Outcome::Pass,
+            (Some(_), _, false) => {
+                Outcome::not_exercised("no SessionStart followed the relayed keys")
+            }
+            (None, _, false) => Outcome::not_exercised("no key was written through the relay"),
         };
         ctx.check(
             "C-2",
             &c2,
-            res,
-            json!({"attended": attended, "bound_after_keys": l.receiver.bound()}),
+            o,
+            json!({"attended": ev, "first_key_ms": first_key, "bound_at_ms": bound_at}),
         );
     }
     ctx.check(
         "A-7",
         &a7,
-        "inconclusive",
-        json!({"owner_judgment_required": true, "timed_out": bound.is_none(), "latency_ms": ms, "snapshot": snap}),
+        Outcome::not_exercised("owner judgment required"),
+        json!({"timed_out": bound.is_none(), "latency_ms": ms, "snapshot": snap}),
     );
-    finish(ctx, l);
 }
 
 /// Shows the snapshot and relays the owner's keys as ungated `write_key` (C-2).
-fn attend(ctx: &Ctx, l: &Launch) -> Value {
+/// Returns the receiver-relative time of the first key written while unbound.
+fn attend(ctx: &Ctx, l: &Launch) -> (Option<u64>, Value) {
     let mut used = Vec::new();
+    let mut first: Option<u64> = None;
     loop {
         for line in l.snapshot().lines.iter().filter(|s| !s.is_empty()) {
             println!("| {line}");
@@ -860,12 +923,18 @@ fn attend(ctx: &Ctx, l: &Launch) -> Value {
             break;
         }
         if let Some(b) = paste::key_bytes(&cmd) {
+            let unbound = l.receiver.bound().is_none();
+            let at = l.receiver.now_ms();
             let r = l
                 .session
                 .io()
                 .tx
                 .write_wait(vec![b], ctx.until(Duration::from_secs(5)));
-            used.push(json!({"key": cmd, "ok": r.is_ok(), "encoding": if cmd.starts_with("w-") { "win32" } else { "vt" }}));
+            if r.is_ok() && unbound {
+                first.get_or_insert(at);
+            }
+            used.push(json!({"key": cmd, "written": r.is_ok(), "at_ms": at,
+                             "encoding": if cmd.starts_with("w-") { "win32" } else { "vt" }}));
         }
         if l.receiver
             .wait_bound(ctx.until(Duration::from_secs(2)))
@@ -874,7 +943,10 @@ fn attend(ctx: &Ctx, l: &Launch) -> Value {
             break;
         }
     }
-    json!({"keys": used, "csi_9001h_seen": l.session.io().saw_win32_input_mode.load(std::sync::atomic::Ordering::SeqCst)})
+    (
+        first,
+        json!({"keys": used, "csi_9001h_seen": l.session.io().saw_win32_input_mode.load(std::sync::atomic::Ordering::SeqCst)}),
+    )
 }
 
 fn codex_modes(ctx: &Ctx) -> Vec<&'static str> {
@@ -883,6 +955,14 @@ fn codex_modes(ctx: &Ctx) -> Vec<&'static str> {
         "default" => vec!["default"],
         _ => vec!["no-daemon"],
     }
+}
+
+/// Trust keys Codex keeps for the effective session-flag hooks.
+fn session_flag_keys(keys: &BTreeSet<String>) -> BTreeSet<String> {
+    keys.iter()
+        .filter(|k| k.contains("<session-flags>"))
+        .cloned()
+        .collect()
 }
 
 fn codex_hooks(ctx: &Ctx, a: &Agent) {
@@ -956,9 +1036,8 @@ fn codex_hooks(ctx: &Ctx, a: &Agent) {
                 Some(nth_bound(&l, "UserPromptSubmit", 1, ctx.until(REAL_UPS_WAIT)).is_some());
             let _ = nth_bound(&l, "Stop", 1, ctx.until(REAL_STOP_WAIT));
         }
-        let any_event = !l.receiver.events().is_empty();
         let mut owner = Value::Null;
-        if is_mutated && !any_event {
+        if is_mutated && bound.is_none() {
             for line in l.snapshot().lines.iter().filter(|s| !s.is_empty()) {
                 println!("| {line}");
             }
@@ -969,64 +1048,81 @@ fn codex_hooks(ctx: &Ctx, a: &Agent) {
             owner = json!({"prompt": "review entry names the mutated command", "answer": ans});
         }
         let obs = observed(&l);
-        let ambiguous = l.receiver.ambiguous();
-        finish(ctx, l);
+        // Finalized after the receiver stopped and drained.
+        let fin = finish(ctx, l);
+        let any_event = fin["receiver"]["events"]
+            .as_array()
+            .is_some_and(|e| !e.is_empty());
         let after = codex_config();
         let delta = config_delta(&before, &after);
-        let base = json!({"mode": mode, "cwd": dir, "session_id": bound, "latency_ms": ms, "snapshot": snap,
-                          "registered": CODEX_EVENTS, "observed": obs, "ups_seen": ups_seen, "config": delta,
-                          "ambiguous": ambiguous,
-                          "observed_on": format!("codex {}, source {}, mode {mode}", a.version, ctx.args.hook_source)});
+        let base = json!({"mode": mode, "cwd": dir, "session_id": final_bound(&fin), "latency_ms": ms,
+                          "snapshot": snap, "registered": CODEX_EVENTS, "observed": obs, "ups_seen": ups_seen,
+                          "config": delta, "ambiguous": fin["receiver"]["ambiguous"],
+                          "observed_on": format!("codex {}, source session-flags, mode {mode}", a.version)});
         let config_ok = before.readable && after.readable;
         match id {
             "A-4" if is_mutated => {
-                let res = if any_event {
-                    "fail"
+                let o = if any_event {
+                    Outcome::platform("the mutated hook delivered without review")
                 } else {
                     match owner["answer"].as_str().map(|s| s.to_ascii_lowercase()) {
-                        Some(s) if s == "y" || s == "yes" => "pass",
-                        Some(s) if s == "n" || s == "no" => "fail",
-                        _ => "inconclusive",
+                        Some(s) if s == "y" || s == "yes" => Outcome::Pass,
+                        Some(s) if s == "n" || s == "no" => Outcome::platform(
+                            "owner: the review entry does not name the mutated command",
+                        ),
+                        _ => Outcome::not_exercised("no owner confirmation"),
                     }
                 };
                 ctx.check(
                     id,
                     &case,
-                    res,
+                    o,
                     json!({"base": base, "delivered_from_mutated": any_event, "owner": owner}),
                 );
             }
-            "A-4" => ctx.check(id, &case, result_str(bound.is_some()), base),
+            "A-4" => ctx.check(id, &case, bound_outcome(&fin), base),
             "C3" => {
                 let first = first_keys.get(mode).cloned().unwrap_or_default();
-                let wanted = |k: &String| {
-                    ctx.args.hook_source != "session-flags" || k.contains("<session-flags>")
-                };
-                let matching = !first.is_empty()
-                    && first.iter().all(wanted)
-                    && first.is_subset(&after.keys)
-                    && after.keys.difference(&before.keys).count() == 0;
-                let res = if !config_ok {
-                    "inconclusive"
+                let second = session_flag_keys(&after.keys);
+                let added = session_flag_keys(&after.keys)
+                    .difference(&session_flag_keys(&before.keys))
+                    .count();
+                let o = if !config_ok {
+                    Outcome::harness("config.toml unreadable")
+                } else if !matches!(bound_outcome(&fin), Outcome::Pass) {
+                    bound_outcome(&fin)
+                } else if first.is_empty() {
+                    Outcome::not_exercised("no session-flag trust key recorded in the first cwd")
                 } else {
-                    result_str(bound.is_some() && matching)
+                    Outcome::observed(
+                        added == 0 && first == second,
+                        "the second cwd needed a different session-flag trust key",
+                    )
                 };
                 ctx.check(
                     id,
                     &case,
-                    res,
-                    json!({"base": base, "first_cwd_keys": first, "second_cwd_keys": after.keys}),
+                    o,
+                    json!({"base": base, "first_cwd_keys": first, "second_cwd_keys": second}),
                 );
             }
             _ => {
-                if bound.is_some() && config_ok {
-                    first_keys.entry(mode).or_insert_with(|| after.keys.clone());
+                let o = bound_outcome(&fin);
+                if o == Outcome::Pass && config_ok {
+                    let k = session_flag_keys(&after.keys);
+                    if !k.is_empty() {
+                        first_keys.entry(mode).or_insert(k);
+                    }
                 }
-                ctx.check(id, &case, result_str(bound.is_some()), base.clone());
+                ctx.check(id, &case, o, base.clone());
                 ctx.check(
                     "A-5",
                     &case,
-                    if config_ok { "pass" } else { "inconclusive" },
+                    if config_ok {
+                        Outcome::Pass
+                    } else {
+                        Outcome::harness("config.toml unreadable")
+                    },
                     base,
                 );
             }
@@ -1034,12 +1130,8 @@ fn codex_hooks(ctx: &Ctx, a: &Agent) {
     }
 }
 
-fn codex_procs() -> Vec<os::ProcInfo> {
-    os::list_processes()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|p| util::normalize_proc_name(&p.name) == "codex" && !p.zombie)
-        .collect()
+fn is_codex(p: &os::ProcInfo) -> bool {
+    util::normalize_proc_name(&p.name) == "codex" && !p.zombie
 }
 
 /// A-9: our default-mode Codex next to an unrelated, already-running Codex.
@@ -1052,7 +1144,6 @@ fn codex_warm(ctx: &Ctx, a: &Agent) {
         ctx.require(id, c);
     }
     let cwd = default_cwd(ctx, a);
-    let pre: Vec<u32> = codex_procs().iter().map(|p| p.pid).collect();
     // The unrelated Codex: our own PTY, no CHALDEA_* env, default mode.
     let unrelated = Session::spawn(SpawnOpts {
         argv: vec![a.bin.clone().into()],
@@ -1072,19 +1163,43 @@ fn codex_warm(ctx: &Ctx, a: &Agent) {
     std::thread::sleep(
         Duration::from_secs(10).min(ctx.cutoff.saturating_duration_since(Instant::now())),
     );
-    // The warm server: a Codex process that appeared since `pre`, other than
-    // the unrelated CLI itself, identified by pid + start time + ancestry.
-    let warm: Vec<os::ProcInfo> = codex_procs()
+    // The warm server must be the warm fixture's own process: a Codex
+    // recorded in its tree by verified lineage, or whose ancestry reaches the
+    // fixture's CLI.
+    unrelated.owned.record_scan();
+    let fixture = unrelated.owned.child_pid;
+    let mut warm: Vec<os::ProcInfo> = unrelated
+        .owned
+        .recorded()
         .into_iter()
-        .filter(|p| !pre.contains(&p.pid) && p.pid != unrelated.owned.child_pid)
+        .filter(|p| p.pid != fixture && is_codex(p))
         .collect();
+    for p in os::list_processes().unwrap_or_default() {
+        if p.pid != fixture
+            && is_codex(&p)
+            && !warm.iter().any(|w| w.pid == p.pid)
+            && os::ancestry(p.pid, 16).iter().any(|(q, _)| *q == fixture)
+        {
+            warm.push(p);
+        }
+    }
     let warm_id: Vec<Value> = warm
         .iter()
         .map(|p| json!({"pid": p.pid, "start_time": p.start_time, "ancestry": os::ancestry(p.pid, 8)}))
         .collect();
-    ctx.detail("warm_server", json!(warm_id));
+    ctx.detail(
+        "warm_server",
+        json!({"fixture_pid": fixture, "servers": warm_id}),
+    );
     if warm.is_empty() {
-        not_run(ctx, &cases, "no warm server identified before launch");
+        for (id, c) in &cases {
+            ctx.check(
+                id,
+                c,
+                Outcome::not_exercised("no warm server from the fixture identified before launch"),
+                json!({}),
+            );
+        }
         let s = unrelated.stop();
         ctx.detail("unrelated_stop", json!(s));
         return;
@@ -1096,7 +1211,7 @@ fn codex_warm(ctx: &Ctx, a: &Agent) {
             return not_run(ctx, &cases, &e);
         }
     };
-    let (bound, ms, snap) = wait_start(ctx, &l);
+    let (_, ms, snap) = wait_start(ctx, &l);
     let ours = l.session.owned.child_pid;
     let warm_pids: Vec<u32> = warm.iter().map(|p| p.pid).collect();
     let from_warm: Vec<u64> = l
@@ -1106,32 +1221,37 @@ fn codex_warm(ctx: &Ctx, a: &Agent) {
         .filter(|e| e.ancestry.iter().any(|(p, _)| warm_pids.contains(p)))
         .map(|e| e.seq)
         .collect();
-    let ambiguous = l.receiver.ambiguous();
-    finish(ctx, l);
-    let warm_alive: Vec<u32> = warm
-        .iter()
-        .filter(|p| os::is_alive(p.pid, p.start_time))
-        .map(|p| p.pid)
-        .collect();
-    let unrelated_alive = os::is_alive(unrelated.owned.child_pid, unrelated.owned.child_start);
+    let fin = finish(ctx, l);
+    let bound = final_bound(&fin);
     ctx.check(
         "A-9",
         "hooks_in_our_tree",
-        if ambiguous.is_empty() {
-            result_str(bound.is_some())
-        } else {
-            "inconclusive"
-        },
+        bound_outcome(&fin),
         json!({"bound": bound, "our_cli_pid": ours, "latency_ms": ms, "snapshot": snap, "warm_server": warm_id,
-               "events_from_warm_tree": from_warm, "ambiguous": ambiguous,
+               "events_from_warm_tree": from_warm,
                "interpretation": if bound.is_none() && !from_warm.is_empty() { "adapter requires --no-daemon" }
                                  else if bound.is_none() { "delivery failure (no hook arrived)" } else { "ok" }}),
     );
+    // Survival needs positive evidence either way; a failed lookup is a harness failure.
+    let mut lives: Vec<(u32, Option<bool>)> =
+        vec![(fixture, os::liveness(fixture, unrelated.owned.child_start))];
+    lives.extend(
+        warm.iter()
+            .map(|p| (p.pid, os::liveness(p.pid, p.start_time))),
+    );
+    let o = if lives.iter().any(|(_, l)| l.is_none()) {
+        Outcome::harness("process lookup failed")
+    } else {
+        Outcome::observed(
+            lives.iter().all(|(_, l)| *l == Some(true)),
+            "stopping our session ended the unrelated Codex or its warm server",
+        )
+    };
     ctx.check(
         "A-9",
         "unrelated_survives_our_stop",
-        result_str(unrelated_alive && warm_alive.len() == warm.len()),
-        json!({"unrelated_cli_alive": unrelated_alive, "warm_alive": warm_alive, "warm_before": warm_pids}),
+        o,
+        json!({"liveness": lives, "warm_before": warm_pids}),
     );
     let s = unrelated.stop();
     ctx.detail("unrelated_stop", json!(s));
@@ -1183,23 +1303,28 @@ fn tree_kill(ctx: &Ctx, a: &Agent) {
     std::thread::sleep(
         Duration::from_secs(5).min(ctx.cutoff.saturating_duration_since(Instant::now())),
     );
-    let alive: Vec<_> = witnesses
+    let lives: Vec<(u32, Option<bool>)> = witnesses
         .iter()
-        .filter(|w| w.session && os::is_alive(w.pid, w.start_time))
-        .map(|w| w.pid)
+        .filter(|w| w.session)
+        .map(|w| (w.pid, os::liveness(w.pid, w.start_time)))
         .collect();
     let owned_survivors = fin["stop"]["survivors"].clone();
     let owned_clear = owned_survivors.as_array().is_some_and(|a| a.is_empty());
-    let res = if w.is_none() {
-        "inconclusive"
+    let o = if w.is_none() {
+        Outcome::not_exercised("the MCP sleeper never attested")
+    } else if lives.iter().any(|(_, l)| l.is_none()) {
+        Outcome::harness("process lookup failed")
     } else {
-        result_str(alive.is_empty() && owned_clear)
+        Outcome::observed(
+            owned_clear && lives.iter().all(|(_, l)| *l == Some(false)),
+            "owned processes or session witnesses survived the stop",
+        )
     };
     ctx.check(
         "A-8",
         &case,
-        res,
-        json!({"bound": bound, "snapshot": snap, "witness": w, "witness_survivors": alive,
+        o,
+        json!({"bound": bound, "snapshot": snap, "witness": w, "witness_liveness": lives,
                "owned_survivors": owned_survivors}),
     );
 }

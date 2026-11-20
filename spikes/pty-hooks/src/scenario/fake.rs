@@ -13,11 +13,17 @@ use super::{Ctx, Launch, LaunchSpec, emitter_path, launch, write_snapshot};
 use crate::cli::{self, Args};
 use crate::paste::{self, Newline, PasteOpts};
 use crate::receiver::{self, BindRule, Config, Receiver};
-use crate::report::{Report, read_report, result_str};
+use crate::report::{Report, read_report};
 use crate::session::{Inject, StopReport};
+use crate::verdict::Outcome;
 use crate::{fake_cli, os, util};
 
 const FAKE_UPS_WAIT: Duration = Duration::from_secs(5);
+
+/// B scenarios check the harness against FakeCli; a failed comparison is the observation.
+fn checked(b: bool) -> Outcome {
+    Outcome::observed(b, "check failed; see evidence")
+}
 
 pub const SCENARIOS: &[&str] = &[
     "paste",
@@ -191,7 +197,7 @@ fn paste_scenario(ctx: &Ctx) {
                 ctx.check(
                     "B-3",
                     &format!("{}/launch", mode.name()),
-                    "inconclusive",
+                    Outcome::harness("launch failed"),
                     json!({"launch_error": e}),
                 );
                 continue;
@@ -202,7 +208,7 @@ fn paste_scenario(ctx: &Ctx) {
             ctx.check(
                 "B-3",
                 &format!("{}/launch", mode.name()),
-                "inconclusive",
+                Outcome::not_exercised("readiness gate never opened"),
                 json!({"readiness_gate_failed": true, "bound": l.receiver.bound(),
                        "ambiguous": l.receiver.ambiguous()}),
             );
@@ -235,12 +241,18 @@ fn paste_scenario(ctx: &Ctx) {
                     Some((prompt, _)) => {
                         let diff = util::first_diff(&expected, prompt);
                         (
-                            result_str(diff.is_none()),
+                            checked(diff.is_none()),
                             json!({"byte_equal": diff.is_none(), "first_diff": diff, "len": expected.len(), "got_len": prompt.len()}),
                         )
                     }
-                    None if o.state == "sent" => ("fail", json!({"paste": o, "ups": "missing"})),
-                    None => ("inconclusive", json!({"paste": o})),
+                    None if o.state == "sent" => (
+                        Outcome::harness("UserPromptSubmit missing after a sent paste"),
+                        json!({"paste": o, "ups": "missing"}),
+                    ),
+                    None => (
+                        Outcome::not_exercised(format!("paste {}", o.state)),
+                        json!({"paste": o}),
+                    ),
                 };
                 ctx.check("B-3", &case, res, ev);
             }
@@ -267,7 +279,7 @@ fn paste_scenario(ctx: &Ctx) {
             ctx.check(
                 "B-4",
                 &format!("{}/{name}", mode.name()),
-                result_str(ok),
+                checked(ok),
                 json!(o),
             );
         }
@@ -296,7 +308,12 @@ fn queries(ctx: &Ctx) {
         let l = match launch(ctx, spec) {
             Ok(l) => l,
             Err(e) => {
-                ctx.check("B-5", label, "inconclusive", json!({"launch_error": e}));
+                ctx.check(
+                    "B-5",
+                    label,
+                    Outcome::harness("launch failed"),
+                    json!({"launch_error": e}),
+                );
                 return;
             }
         };
@@ -317,14 +334,17 @@ fn queries(ctx: &Ctx) {
     ctx.check(
         "B-5",
         "responder",
-        result_str(on_ok),
+        checked(on_ok),
         json!({"exit": on.1, "fake": on.2, "query_log": on.3}),
     );
     if let Some(off) = off {
         let failed = off.1 != Some(0);
         // Negative control: must fail on macOS; on Windows conhost may answer some queries itself.
         let required = os::os_name() != "windows";
-        let res = if failed || !required { "pass" } else { "fail" };
+        let res = Outcome::observed(
+            failed || !required,
+            "queries answered without the responder",
+        );
         ctx.check(
             "B-5",
             "negative_control_no_responder",
@@ -363,7 +383,12 @@ fn stall(ctx: &Ctx) {
         let l = match launch(ctx, fake_spec(ctx, label, mode, &extra)) {
             Ok(l) => l,
             Err(e) => {
-                ctx.check("B-6", label, "inconclusive", json!({"launch_error": e}));
+                ctx.check(
+                    "B-6",
+                    label,
+                    Outcome::harness("launch failed"),
+                    json!({"launch_error": e}),
+                );
                 continue;
             }
         };
@@ -421,7 +446,7 @@ fn stall(ctx: &Ctx) {
         ctx.check(
             "B-6",
             label,
-            result_str(ok && stop.survivors.is_empty()),
+            checked(ok && stop.survivors.is_empty()),
             json!({"check": ev, "stop": stop_evidence(&stop)}),
         );
     }
@@ -483,7 +508,7 @@ pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str, escape_probe: b
             ctx.check(
                 "B-7",
                 &format!("{label}/launch"),
-                "inconclusive",
+                Outcome::harness("launch failed"),
                 json!({"launch_error": e}),
             );
             return;
@@ -527,7 +552,10 @@ pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str, escape_probe: b
     for role in &roles {
         let w = witnesses.iter().find(|w| w.role == *role);
         let (res, mut ev) = match w {
-            None => ("inconclusive", json!({"witness": "never seen"})),
+            None => (
+                Outcome::not_exercised("witness never seen"),
+                json!({"witness": "never seen"}),
+            ),
             Some(w) => {
                 let dead = !os::is_alive(w.pid, w.start_time);
                 let by = if stop.killed_by_fallback.iter().any(|p| p.pid == w.pid) {
@@ -536,7 +564,7 @@ pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str, escape_probe: b
                     "primary"
                 };
                 (
-                    result_str(dead),
+                    checked(dead),
                     json!({"pid": w.pid, "dead": dead, "killed_by": dead.then_some(by)}),
                 )
             }
@@ -548,10 +576,13 @@ pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str, escape_probe: b
     }
     let un = witnesses.iter().find(|w| w.role == "unrelated");
     let (res, ev) = match un {
-        None => ("inconclusive", json!({"witness": "never seen"})),
+        None => (
+            Outcome::not_exercised("witness never seen"),
+            json!({"witness": "never seen"}),
+        ),
         Some(w) => {
             let a = os::is_alive(w.pid, w.start_time);
-            (result_str(a), json!({"pid": w.pid, "alive_after_stop": a}))
+            (checked(a), json!({"pid": w.pid, "alive_after_stop": a}))
         }
     };
     ctx.check(
@@ -564,9 +595,9 @@ pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str, escape_probe: b
         "B-7",
         &format!("{label}/no_session_survivors"),
         if !all_seen {
-            "inconclusive"
+            Outcome::not_exercised("not every witness attested")
         } else {
-            result_str(alive.is_empty() && stop.survivors.is_empty())
+            checked(alive.is_empty() && stop.survivors.is_empty())
         },
         json!({"alive_session_witnesses": alive, "assign": assign, "stop": stop_evidence(&stop)}),
     );
@@ -786,7 +817,7 @@ fn auth(ctx: &Ctx) {
         ctx.check(
             "B-8",
             name,
-            result_str(ok),
+            checked(ok),
             json!({"status": got, "want": want, "ms": ms}),
         );
     }
@@ -825,7 +856,7 @@ fn auth(ctx: &Ctx) {
             ctx.check(
                 "B-8",
                 name,
-                result_str(ok),
+                checked(ok),
                 json!({"status": code, "elapsed_ms": ms, "deadline_ms": 5000}),
             );
         }
@@ -833,7 +864,7 @@ fn auth(ctx: &Ctx) {
     ctx.check(
         "B-8",
         "no_fixture_no_readiness",
-        result_str(count_files(&fixtures) == 0 && r.bound().is_none() && r.events().is_empty()),
+        checked(count_files(&fixtures) == 0 && r.bound().is_none() && r.events().is_empty()),
         json!({"fixtures": count_files(&fixtures), "events": r.events().len(), "rejections": r.rejections()}),
     );
     // Positive control: the same receiver accepts a valid request (proves the checks can pass).
@@ -848,7 +879,7 @@ fn auth(ctx: &Ctx) {
     ctx.check(
         "B-8",
         "positive_control",
-        result_str(code == 200 && r.bound().is_some() && count_files(&fixtures) == 2),
+        checked(code == 200 && r.bound().is_some() && count_files(&fixtures) == 2),
         json!({"status": code, "fixtures": count_files(&fixtures)}),
     );
     r.stop();
@@ -1046,7 +1077,7 @@ fn emit(ctx: &Ctx) {
             ctx.check(
                 "B-9",
                 "slow_post",
-                "inconclusive",
+                Outcome::harness("slow listener setup failed"),
                 json!({"setup_error": e.to_string()}),
             );
             0
@@ -1078,7 +1109,7 @@ fn emit(ctx: &Ctx) {
         ctx.check(
             "B-9",
             &name,
-            result_str(ok),
+            checked(ok),
             json!({"exit": run.exit, "stdout_len": run.stdout.len(), "receiver_saw": !quiet, "ms": run.ms, "max_ms": max_ms}),
         );
     }
@@ -1090,7 +1121,7 @@ fn emit(ctx: &Ctx) {
     ctx.check(
         "B-9",
         "positive_control",
-        result_str(run.exit == Some(0) && run.stdout.is_empty() && delivered),
+        checked(run.exit == Some(0) && run.stdout.is_empty() && delivered),
         json!({"exit": run.exit, "stdout_len": run.stdout.len(), "delivered": delivered, "ms": run.ms}),
     );
     r.stop();
@@ -1111,7 +1142,12 @@ fn nested(ctx: &Ctx) {
     ) {
         Ok(l) => l,
         Err(e) => {
-            ctx.check("B-11", "nested", "fail", json!({"launch_error": e}));
+            ctx.check(
+                "B-11",
+                "nested",
+                Outcome::harness("launch failed"),
+                json!({"launch_error": e}),
+            );
             return;
         }
     };
@@ -1152,14 +1188,14 @@ fn nested(ctx: &Ctx) {
     ctx.check(
         "B-11",
         "nested_session_start_binds_real_one",
-        result_str(bound.as_deref() == Some(sid.as_str()) && real.iter().all(|e| e.is_bound()) && order_ok),
+        checked(bound.as_deref() == Some(sid.as_str()) && real.iter().all(|e| e.is_bound()) && order_ok),
         json!({"bound": bound, "expected": sid, "foreign_before_and_after": order_ok,
                "session_starts": starts.iter().map(|e| json!({"seq": e.seq, "class": e.class, "reason": e.reason, "nearest_cli": e.nearest_cli})).collect::<Vec<_>>()}),
     );
     ctx.check(
         "B-11",
         "nested_kept_as_foreign_session",
-        result_str(
+        checked(
             foreign.len() >= 2
                 && foreign.iter().all(|e| {
                     e.class == "raw_unknown" && e.reason.as_deref() == Some("foreign_session")
@@ -1174,7 +1210,7 @@ fn nested(ctx: &Ctx) {
     ctx.check(
         "B-11",
         "codex_shaped_transcript_path_null_stored",
-        result_str(transcript_null == Some(true)),
+        checked(transcript_null == Some(true)),
         json!({"transcript_path_null": transcript_null}),
     );
     let unknown = events.iter().find(|e| e.event == "unknown");
@@ -1184,7 +1220,7 @@ fn nested(ctx: &Ctx) {
     ctx.check(
         "B-11",
         "unknown_payload_verbatim",
-        result_str(verbatim == Some(true) && unknown.is_some_and(|e| e.class == "raw_unknown")),
+        checked(verbatim == Some(true) && unknown.is_some_and(|e| e.class == "raw_unknown")),
         json!({"stored_verbatim": verbatim, "class": unknown.map(|e| e.class.clone())}),
     );
     ctx.detail("nested_stop", stop_evidence(&stop));
@@ -1214,7 +1250,7 @@ fn teardown(ctx: &Ctx) {
             ctx.check(
                 "B-10",
                 case,
-                "inconclusive",
+                Outcome::not_exercised("scenario cutoff"),
                 json!({"skipped": "scenario cutoff"}),
             );
             continue;
@@ -1241,7 +1277,12 @@ fn teardown(ctx: &Ctx) {
             .stderr(Stdio::null())
             .spawn()
         else {
-            ctx.check("B-10", case, "inconclusive", json!({"spawn": "failed"}));
+            ctx.check(
+                "B-10",
+                case,
+                Outcome::harness("teardown case spawn failed"),
+                json!({"spawn": "failed"}),
+            );
             continue;
         };
         let hard = t + Duration::from_secs(deadline + 5);
@@ -1274,7 +1315,7 @@ fn teardown(ctx: &Ctx) {
         ctx.check(
             "B-10",
             case,
-            result_str(ok),
+            checked(ok),
             json!({"want_status": want, "status": status, "exit": code, "elapsed_ms": elapsed.as_millis() as u64,
                    "deadline_s": deadline, "owned_checked": owned, "survivors": survivors, "interrupt_sent": interrupted,
                    "errors": rep.as_ref().map(|r| r.errors.clone()), "case_details": rep.as_ref().map(|r| r.details.get("case").cloned())}),
@@ -1399,7 +1440,7 @@ fn run_case(args: Args) -> i32 {
             ctx.check(
                 "B-10",
                 &case,
-                result_str(ok && stop.survivors.is_empty()),
+                checked(ok && stop.survivors.is_empty()),
                 json!({"paste": o, "paste_ms": paste_ms, "bytes_written": o.bytes_after - o.bytes_before,
                        "ups_reply_after_paste": ups.as_ref().map(|(_, v)| v["chs_query_reply_after_paste"].clone()),
                        "stop": stop_evidence(&stop)}),
@@ -1491,12 +1532,17 @@ fn run_case(args: Args) -> i32 {
                 json!({"teardown_ms": stop.teardown_ms, "threads": stop.threads}),
             );
             match case.as_str() {
-                "fail" => ctx.check("B-10", "injected_failure", "fail", json!({})),
+                "fail" => ctx.check(
+                    "B-10",
+                    "injected_failure",
+                    Outcome::platform("injected failure (B-10)"),
+                    json!({}),
+                ),
                 "timeout" => {}
                 _ => ctx.check(
                     "B-10",
                     &case,
-                    result_str(stop.survivors.is_empty()),
+                    checked(stop.survivors.is_empty()),
                     stop_evidence(&stop),
                 ),
             }
@@ -1527,7 +1573,7 @@ fn run_all(mut args: Args) -> i32 {
     ctx.check(
         "B-1",
         "binaries_built",
-        result_str(bins.iter().all(|b| b.1)),
+        checked(bins.iter().all(|b| b.1)),
         json!({"bins": bins, "exe_dir": util::exe_dir(), "os": os::os_name(), "arch": std::env::consts::ARCH,
                "emitter_used": emitter_path(&ctx.args.root)}),
     );
@@ -1577,7 +1623,7 @@ fn run_all(mut args: Args) -> i32 {
     ctx.check(
         "B-2",
         "all_fake_scenarios_pass",
-        result_str(all_pass),
+        checked(all_pass),
         json!({"children": child_status}),
     );
     ctx.finish()

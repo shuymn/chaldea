@@ -7,11 +7,17 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::verdict::Outcome;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Check {
     pub id: String,
     pub case: String,
+    /// `pass` | `platform_fail` | `harness_fail` | `missing` | `not_exercised`.
     pub result: String,
+    /// Failure cause or not-exercised reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
     pub evidence: Value,
 }
 
@@ -42,10 +48,6 @@ pub struct Report {
     pub details: Value,
 }
 
-pub fn result_str(ok: bool) -> &'static str {
-    if ok { "pass" } else { "fail" }
-}
-
 impl Report {
     pub fn new(scenario: &str, run_id: &str) -> Report {
         Report {
@@ -60,29 +62,32 @@ impl Report {
         }
     }
 
-    pub fn check(&mut self, id: &str, case: &str, result: &str, evidence: Value) {
+    pub fn check(&mut self, id: &str, case: &str, outcome: Outcome, evidence: Value) {
         self.checks.push(Check {
             id: id.into(),
             case: case.into(),
-            result: result.into(),
+            result: outcome.tag().into(),
+            cause: outcome.cause(),
             evidence,
         });
     }
 
     /// Status from the required cases and checks (`verdict::status`); probes
-    /// count as checks with go → pass, blocker/tuning → fail, else inconclusive.
+    /// count as checks with go → pass, fail_observed → platform failure,
+    /// anything else → not exercised.
     pub fn derive_status(&self) -> String {
         let mut checks = self.checks.clone();
         for p in &self.probes {
-            let result = match p.verdict.as_str() {
-                "go" => "pass",
-                "blocker" | "tuning" => "fail",
-                _ => "inconclusive",
+            let o = match p.verdict.as_str() {
+                "go" => Outcome::Pass,
+                "fail_observed" => Outcome::platform(p.why.clone()),
+                _ => Outcome::not_exercised(p.why.clone()),
             };
             checks.push(Check {
                 id: p.id.clone(),
                 case: "verdict".into(),
-                result: result.into(),
+                result: o.tag().into(),
+                cause: o.cause(),
                 evidence: Value::Null,
             });
         }

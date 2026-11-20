@@ -121,6 +121,9 @@ pub fn send_interrupt(pid: u32) -> io::Result<()> {
 /// Makes `cmd` interruptible by `send_interrupt` (no-op on Unix).
 pub fn interruptible(_cmd: &mut Command) {}
 
+/// Non-interactive harness launch: no console window (Windows only).
+pub fn no_window(_cmd: &mut Command) {}
+
 /// Harness-established ownership of the launched tree: the process group
 /// portable-pty created with `setsid()` (pgid = sid = child pid).
 pub struct Tree {
@@ -364,8 +367,8 @@ impl JobFirst {
     pub fn pid(&self) -> u32 {
         0
     }
-    pub fn members(&self) -> Vec<u32> {
-        Vec::new()
+    pub fn members(&self) -> Result<Vec<u32>, String> {
+        Err("windows_only".into())
     }
     pub fn start_time(&self) -> u64 {
         0

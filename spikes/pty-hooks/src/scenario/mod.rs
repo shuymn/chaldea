@@ -18,6 +18,7 @@ use crate::receiver::{BindRule, Config, Receiver};
 use crate::report::{Report, Sink};
 use crate::session::{self, Inject, Session, SpawnOpts};
 use crate::util;
+use crate::verdict::Outcome;
 use crate::vt::Snapshot;
 
 pub struct Ctx {
@@ -45,10 +46,9 @@ impl Ctx {
         let run_dir = args.root.join("runs").join(&run_id);
         std::fs::create_dir_all(&run_dir).map_err(|e| format!("{}: {e}", run_dir.display()))?;
         let mut report = Report::new(scenario, &run_id);
-        // Every report (C-1's children included) records the console code page
-        // and the loaded ConPTY module (null off Windows).
+        // Every report records the console code page; the ConPTY module is
+        // sampled after the first PTY launch (`conpty_module_after_launch`).
         report.host["console_cp"] = json!(os::console_code_page());
-        report.host["conpty_module"] = json!(os::conpty_module());
         report.config = json!({
             "deadline_secs": args.deadline_secs,
             "session_start_timeout": args.session_start_timeout,
@@ -92,8 +92,8 @@ impl Ctx {
         Instant::now() >= self.cutoff
     }
 
-    pub fn check(&self, id: &str, case: &str, result: &str, evidence: Value) {
-        self.sink.with(|r| r.check(id, case, result, evidence));
+    pub fn check(&self, id: &str, case: &str, outcome: Outcome, evidence: Value) {
+        self.sink.with(|r| r.check(id, case, outcome, evidence));
     }
 
     /// Declares a case this run must produce; a missing one makes the run inconclusive.
@@ -360,6 +360,15 @@ pub fn launch(ctx: &Ctx, spec: LaunchSpec) -> Result<Launch, String> {
         inject: spec.inject,
     })?;
     receiver.set_cli_pid(session.owned.child_pid);
+    // Ambiguous binding revokes the writer gate (queued pastes are dropped).
+    let gate = session.io().tx.gate.clone();
+    receiver.on_ambiguous(Box::new(move || gate.revoke()));
+    // The ConPTY provider is only known once a PTY launch has loaded it.
+    ctx.sink.with(|r| {
+        if r.host.get("conpty_module_after_launch").is_none() {
+            r.host["conpty_module_after_launch"] = json!(os::conpty_module());
+        }
+    });
     Ok(Launch {
         label: spec.label,
         receiver,
@@ -378,7 +387,9 @@ pub fn write_snapshot(ctx: &Ctx, label: &str, snap: &Snapshot) -> PathBuf {
 }
 
 /// Runs `cmd` with a deadline; kills only the child we started on timeout.
+/// Non-interactive: no console window on Windows (C-5).
 pub fn run_bounded(cmd: &mut Command, timeout: Duration) -> Result<(i32, String), String> {
+    crate::os::no_window(cmd);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
