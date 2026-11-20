@@ -49,12 +49,19 @@ fn tree_kill_primary_fallback_and_negative_control() {
         let c = check(&r, "B-7", &format!("tree/{role}"));
         assert_eq!(c.result, "pass", "{c:#?}");
         let by = c.evidence["killed_by"].as_str().unwrap();
-        let want = if *role == "setsid" || *role == "breakaway" { "fallback" } else { "primary" };
+        let want = if *role == "setsid" || *role == "breakaway" {
+            "fallback"
+        } else {
+            "primary"
+        };
         if chs::os::os_name() != "windows" {
             assert_eq!(by, want, "{role}: {c:#?}");
         }
     }
-    assert_eq!(check(&r, "B-7", "tree/unrelated_negative_control").result, "pass");
+    assert_eq!(
+        check(&r, "B-7", "tree/unrelated_negative_control").result,
+        "pass"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -65,7 +72,14 @@ fn non_reading_child_does_not_hang_teardown() {
     let d = tmp("nonread");
     let (code, elapsed, r) = chs(
         &d,
-        &["fake", "teardown-case", "--case", "non-reading-child", "--deadline-secs", "30"],
+        &[
+            "fake",
+            "teardown-case",
+            "--case",
+            "non-reading-child",
+            "--deadline-secs",
+            "30",
+        ],
     );
     assert_eq!(r.status, "pass", "{:#?} {:?}", r.checks, r.errors);
     assert_eq!(code, Some(0));
@@ -83,7 +97,14 @@ fn watchdog_kills_tree_at_hard_deadline() {
     let d = tmp("hard");
     let (code, elapsed, r) = chs(
         &d,
-        &["fake", "teardown-case", "--case", "hard-deadline", "--deadline-secs", "12"],
+        &[
+            "fake",
+            "teardown-case",
+            "--case",
+            "hard-deadline",
+            "--deadline-secs",
+            "12",
+        ],
     );
     assert_eq!(r.status, "timeout", "{:?}", r.errors);
     assert_eq!(code, Some(124));
@@ -93,7 +114,10 @@ fn watchdog_kills_tree_at_hard_deadline() {
     for k in killed {
         assert!(!k["recorded"].as_array().unwrap().is_empty());
         for p in k["recorded"].as_array().unwrap() {
-            let (pid, st) = (p["pid"].as_u64().unwrap() as u32, p["start_time"].as_u64().unwrap());
+            let (pid, st) = (
+                p["pid"].as_u64().unwrap() as u32,
+                p["start_time"].as_u64().unwrap(),
+            );
             assert!(!chs::os::is_alive(pid, st), "survivor {p}");
         }
     }
