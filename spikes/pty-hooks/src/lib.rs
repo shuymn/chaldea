@@ -13,4 +13,5 @@ pub mod report;
 pub mod scenario;
 pub mod session;
 pub mod util;
+pub mod verdict;
 pub mod vt;

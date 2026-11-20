@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::pty::WriterTx;
+use crate::pty::{Guard, WriterTx};
 
 pub const PASTE_START: &[u8] = b"\x1b[200~";
 pub const PASTE_END: &[u8] = b"\x1b[201~";
@@ -216,8 +216,10 @@ pub struct PasteOpts {
 }
 
 /// Validate → gate → bracketed write → delay → CR as a separate write.
-/// `gate` returns true while input may be sent (bound SessionStart + DECSET 2004).
-pub fn paste(tx: &WriterTx, payload: &[u8], opts: &PasteOpts, gate: impl Fn() -> bool) -> Outcome {
+/// `ready` is the launch's readiness (bound, unambiguous SessionStart); the
+/// DECSET 2004 half of the gate is admitted here and re-checked by the writer
+/// immediately before the first byte of the paste and of the CR.
+pub fn paste(tx: &WriterTx, payload: &[u8], opts: &PasteOpts, ready: impl Fn() -> bool) -> Outcome {
     let before = tx.written.load(std::sync::atomic::Ordering::SeqCst);
     let out = |state: &str, rejected, detail: Option<String>| Outcome {
         state: state.into(),
@@ -229,24 +231,30 @@ pub fn paste(tx: &WriterTx, payload: &[u8], opts: &PasteOpts, gate: impl Fn() ->
     if let Err(r) = validate(payload) {
         return out("rejected", Some(r), None);
     }
-    if !gate() {
-        return out(
-            "readiness_gate_failed",
-            None,
-            Some("unconfirmed; not retried".into()),
-        );
-    }
-    if let Err(e) = tx.write_wait(encode(payload, opts.mode, opts.chunk), opts.write_deadline) {
-        let state = if e == "write_timeout" {
-            "write_timeout"
-        } else {
-            "write_error"
+    let generation = match (ready(), tx.gate.admit()) {
+        (true, Some(g)) => g,
+        _ => {
+            return out(
+                "readiness_gate_failed",
+                None,
+                Some("unconfirmed; not retried".into()),
+            );
+        }
+    };
+    let guard = || Guard {
+        gate: Some((tx.gate.clone(), generation)),
+        deadline: opts.write_deadline,
+    };
+    if let Err(e) = tx.write_guarded(encode(payload, opts.mode, opts.chunk), guard()) {
+        let state = match e.as_str() {
+            "write_timeout" | "expired_before_start" | "gate_closed_before_start" => e.clone(),
+            _ => "write_error".into(),
         };
-        return out(state, None, Some(e));
+        return out(&state, None, Some(e));
     }
     std::thread::sleep(opts.enter_delay);
-    if let Err(e) = tx.write_wait(vec![b"\r".to_vec()], opts.write_deadline) {
-        return out("write_error", None, Some(format!("enter: {e}")));
+    if let Err(e) = tx.write_guarded(vec![b"\r".to_vec()], guard()) {
+        return out("enter_not_sent", None, Some(e));
     }
     out("sent", None, None)
 }

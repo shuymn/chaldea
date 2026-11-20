@@ -34,6 +34,9 @@ pub struct Report {
     pub checks: Vec<Check>,
     pub probes: Vec<Probe>,
     pub errors: Vec<String>,
+    /// Cases this run must produce (`"<id> <case>"`); see `verdict`.
+    #[serde(default)]
+    pub required: Vec<String>,
     /// Scenario-specific raw facts (owned pids, teardown timing, ...).
     #[serde(default)]
     pub details: Value,
@@ -66,27 +69,30 @@ impl Report {
         });
     }
 
-    /// pass unless any check failed (fail) or was inconclusive; errors win.
+    /// Status from the required cases and checks (`verdict::status`); probes
+    /// count as checks with go → pass, blocker/tuning → fail, else inconclusive.
     pub fn derive_status(&self) -> String {
-        if !self.errors.is_empty() {
-            return "error".into();
-        }
-        let results: Vec<&str> = self
-            .checks
-            .iter()
-            .map(|c| c.result.as_str())
-            .chain(self.probes.iter().map(|p| match p.verdict.as_str() {
+        let mut checks = self.checks.clone();
+        for p in &self.probes {
+            let result = match p.verdict.as_str() {
                 "go" => "pass",
                 "blocker" | "tuning" => "fail",
                 _ => "inconclusive",
-            }))
-            .collect();
-        if results.contains(&"fail") {
-            "fail".into()
-        } else if results.is_empty() || results.contains(&"inconclusive") {
-            "inconclusive".into()
-        } else {
-            "pass".into()
+            };
+            checks.push(Check {
+                id: p.id.clone(),
+                case: "verdict".into(),
+                result: result.into(),
+                evidence: Value::Null,
+            });
+        }
+        crate::verdict::status(&self.required, &checks, &self.errors).into()
+    }
+
+    pub fn require(&mut self, id: &str, case: &str) {
+        let k = crate::verdict::key(id, case);
+        if !self.required.contains(&k) {
+            self.required.push(k);
         }
     }
 

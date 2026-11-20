@@ -44,8 +44,9 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EVENT_OBJECT_SHOW, GetMessageW, GetWindowThreadProcessId, IsWindowVisible,
-    MSG, OBJID_WINDOW, PostThreadMessageW, TranslateMessage, WINEVENT_OUTOFCONTEXT, WM_QUIT,
+    DispatchMessageW, EVENT_OBJECT_SHOW, GetMessageW, GetWindowThreadProcessId, MSG, OBJID_WINDOW,
+    PM_NOREMOVE, PeekMessageW, PostThreadMessageW, TranslateMessage, WINEVENT_OUTOFCONTEXT,
+    WM_QUIT,
 };
 
 use super::ProcInfo;
@@ -505,7 +506,9 @@ pub fn spawn_detached(cmd: &mut Command) -> Result<(Child, bool), String> {
     }
 }
 
-static SHOWN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// `(pid, ppid at event time)` per shown window, recorded inside the callback
+/// so a short-lived owner is still attributable after it exits.
+static SHOWN: Mutex<Vec<(u32, Option<u32>)>> = Mutex::new(Vec::new());
 
 unsafe extern "system" fn on_show(
     _hook: HWINEVENTHOOK,
@@ -519,16 +522,15 @@ unsafe extern "system" fn on_show(
     if id_object != OBJID_WINDOW || hwnd.is_null() {
         return;
     }
+    // No IsWindowVisible filter: a flash may already be hidden by now.
+    let mut pid = 0u32;
     // SAFETY: hwnd comes from the system for this callback.
     unsafe {
-        if IsWindowVisible(hwnd) == 0 {
-            return;
-        }
-        let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, &mut pid);
-        if let Ok(mut v) = SHOWN.lock() {
-            v.push(pid);
-        }
+    }
+    let ppid = proc_info(pid).map(|p| p.ppid);
+    if let Ok(mut v) = SHOWN.lock() {
+        v.push((pid, ppid));
     }
 }
 
@@ -547,6 +549,9 @@ impl WindowObserver {
         let join = std::thread::spawn(move || {
             // SAFETY: hook + message loop on this thread; unhooked before exit.
             unsafe {
+                // Create the thread's message queue before reporting the id.
+                let mut msg: MSG = std::mem::zeroed();
+                PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
                 let hook = SetWinEventHook(
                     EVENT_OBJECT_SHOW,
                     EVENT_OBJECT_SHOW,
@@ -560,7 +565,6 @@ impl WindowObserver {
                 if hook.is_null() {
                     return;
                 }
-                let mut msg: MSG = std::mem::zeroed();
                 while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
@@ -578,12 +582,19 @@ impl WindowObserver {
         }
     }
 
-    pub fn stop(self) -> Vec<u32> {
+    /// Stops the loop (bounded: a thread that does not quit is abandoned).
+    pub fn stop(self) -> Vec<(u32, Option<u32>)> {
         // SAFETY: posting WM_QUIT to the observer thread.
-        unsafe {
-            PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0);
+        let posted = unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) } != 0;
+        if posted {
+            let end = std::time::Instant::now() + Duration::from_secs(2);
+            while !self.join.is_finished() && std::time::Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if self.join.is_finished() {
+                let _ = self.join.join();
+            }
         }
-        let _ = self.join.join();
         SHOWN.lock().map(|v| v.clone()).unwrap_or_default()
     }
 }
@@ -698,8 +709,10 @@ pub struct JobFirst {
     job: Handle,
     process: Handle,
     pid: u32,
+    start: u64,
     _input: std::fs::File,
     drain: Option<std::thread::JoinHandle<()>>,
+    terminated: bool,
     closed: bool,
 }
 
@@ -776,6 +789,8 @@ impl JobFirst {
 
             let try_create =
                 |job_list: bool, cmdline: &mut Vec<u16>| -> Result<PROCESS_INFORMATION, String> {
+                    // Declared before the attribute list so it outlives the list.
+                    let jobs = [job.raw()];
                     let mut attrs =
                         AttrList::new(if job_list { 2 } else { 1 }).map_err(|e| e.to_string())?;
                     attrs
@@ -785,7 +800,6 @@ impl JobFirst {
                             std::mem::size_of::<HPCON>(),
                         )
                         .map_err(|e| format!("attr pseudoconsole: {e}"))?;
-                    let jobs = [job.raw()];
                     if job_list {
                         attrs
                             .set(
@@ -838,7 +852,20 @@ impl JobFirst {
                                 "job_list failed ({job_list_err}); suspended assign failed: {e}"
                             ));
                         }
-                        ResumeThread(pi.hThread);
+                        // The thread was created suspended once: anything but 1 means
+                        // it did not start (or started early), so this branch is void.
+                        let prev = ResumeThread(pi.hThread);
+                        if prev != 1 {
+                            let e = io::Error::last_os_error();
+                            TerminateJobObject(job.raw(), 1);
+                            TerminateProcess(pi.hProcess, 1);
+                            CloseHandle(pi.hThread);
+                            CloseHandle(pi.hProcess);
+                            ClosePseudoConsole(hpc);
+                            return Err(format!(
+                                "job_list failed ({job_list_err}); ResumeThread returned {prev} ({e})"
+                            ));
+                        }
                         (pi, format!("suspended (job_list failed: {job_list_err})"))
                     }
                     Err(e) => {
@@ -848,14 +875,26 @@ impl JobFirst {
                 },
             };
             CloseHandle(pi.hThread);
+            let process = Handle(pi.hProcess as usize);
+            let mut c: FILETIME = std::mem::zeroed();
+            let mut e: FILETIME = std::mem::zeroed();
+            let mut k: FILETIME = std::mem::zeroed();
+            let mut u: FILETIME = std::mem::zeroed();
+            let start = if GetProcessTimes(process.raw(), &mut c, &mut e, &mut k, &mut u) != 0 {
+                filetime_u64(&c)
+            } else {
+                0
+            };
             Ok((
                 JobFirst {
                     hpc,
                     job,
-                    process: Handle(pi.hProcess as usize),
+                    process,
                     pid: pi.dwProcessId,
+                    start,
                     _input: input,
                     drain: Some(drain),
+                    terminated: false,
                     closed: false,
                 },
                 branch,
@@ -871,15 +910,41 @@ impl JobFirst {
         job_members(self.job.raw())
     }
 
-    pub fn terminate(&mut self) {
+    pub fn start_time(&self) -> u64 {
+        self.start
+    }
+
+    /// Kills through the harness's own authority only: the job and the
+    /// retained process handle. ConPTY stays open (closing it can itself kill
+    /// console clients and hide survivors); call `close_conpty` after the
+    /// caller has verified and run its fallback.
+    pub fn terminate_job(&mut self) -> Vec<String> {
+        if self.terminated {
+            return vec!["already terminated".into()];
+        }
+        self.terminated = true;
+        // SAFETY: owned handles.
+        unsafe {
+            vec![
+                format!(
+                    "TerminateJobObject={}",
+                    TerminateJobObject(self.job.raw(), 1) != 0
+                ),
+                format!(
+                    "TerminateProcess(retained)={}",
+                    TerminateProcess(self.process.raw(), 1) != 0
+                ),
+            ]
+        }
+    }
+
+    pub fn close_conpty(&mut self) {
         if self.closed {
             return;
         }
         self.closed = true;
-        // SAFETY: owned handles; ConPTY closed after the job is terminated (§4.6 order).
+        // SAFETY: hpc is owned and closed once.
         unsafe {
-            TerminateJobObject(self.job.raw(), 1);
-            TerminateProcess(self.process.raw(), 1);
             ClosePseudoConsole(self.hpc);
         }
         if let Some(d) = self.drain.take() {
@@ -896,6 +961,7 @@ impl JobFirst {
 
 impl Drop for JobFirst {
     fn drop(&mut self) {
-        self.terminate();
+        self.terminate_job();
+        self.close_conpty();
     }
 }

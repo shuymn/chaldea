@@ -45,6 +45,10 @@ impl Ctx {
         let run_dir = args.root.join("runs").join(&run_id);
         std::fs::create_dir_all(&run_dir).map_err(|e| format!("{}: {e}", run_dir.display()))?;
         let mut report = Report::new(scenario, &run_id);
+        // Every report (C-1's children included) records the console code page
+        // and the loaded ConPTY module (null off Windows).
+        report.host["console_cp"] = json!(os::console_code_page());
+        report.host["conpty_module"] = json!(os::conpty_module());
         report.config = json!({
             "deadline_secs": args.deadline_secs,
             "session_start_timeout": args.session_start_timeout,
@@ -56,7 +60,7 @@ impl Ctx {
         let sink = Sink::new(&out, report);
         let deadline = t0 + Duration::from_secs(args.deadline_secs);
         let cutoff = deadline - Duration::from_secs(10);
-        session::watchdog_start(sink.clone(), deadline);
+        session::watchdog_start(sink.clone(), cutoff, deadline);
         if !args.keep_temp {
             let (root, dir) = (args.root.clone(), run_dir.clone());
             session::watchdog_cleanup(
@@ -90,6 +94,11 @@ impl Ctx {
 
     pub fn check(&self, id: &str, case: &str, result: &str, evidence: Value) {
         self.sink.with(|r| r.check(id, case, result, evidence));
+    }
+
+    /// Declares a case this run must produce; a missing one makes the run inconclusive.
+    pub fn require(&self, id: &str, case: &str) {
+        self.sink.with(|r| r.require(id, case));
     }
 
     pub fn detail(&self, key: &str, v: Value) {
@@ -150,23 +159,28 @@ fn remove_run_dir(root: &Path, dir: &Path) {
     }
 }
 
+/// Emitter binary name; `CHS_EMITTER_VARIANT=gui` selects the GUI-subsystem
+/// emitter for C-5's re-run (both the hook command and direct invocations).
+pub fn emitter_name() -> &'static str {
+    match std::env::var("CHS_EMITTER_VARIANT").as_deref() {
+        Ok("gui") => "chs-hook-emit-gui",
+        _ => "chs-hook-emit",
+    }
+}
+
 pub fn emitter_path(root: &Path) -> PathBuf {
-    let installed = root.join("bin").join(util::bin_name("chs-hook-emit"));
+    let name = emitter_name();
+    let installed = root.join("bin").join(util::bin_name(name));
     if installed.is_file() {
         installed
     } else {
-        util::sibling_bin("chs-hook-emit")
+        util::sibling_bin(name)
     }
 }
 
 /// Fixed hook command string: `<abs emitter> <agent>` (forward slashes, no spaces).
-/// `CHS_EMITTER_VARIANT=gui` selects the GUI-subsystem emitter for C-5's re-run.
 pub fn hook_command(root: &Path, agent: &str) -> String {
-    let name = match std::env::var("CHS_EMITTER_VARIANT").as_deref() {
-        Ok("gui") => "chs-hook-emit-gui",
-        _ => "chs-hook-emit",
-    };
-    let p = root.join("bin").join(util::bin_name(name));
+    let p = root.join("bin").join(util::bin_name(emitter_name()));
     format!("{} {agent}", p.display().to_string().replace('\\', "/"))
 }
 
@@ -250,15 +264,14 @@ impl Launch {
         ]
     }
 
-    pub fn gate_open(&self) -> bool {
+    /// Readiness: a bound, unambiguous SessionStart (`bound()` is None once
+    /// anything is ambiguous). The DECSET 2004 half lives in the writer gate.
+    pub fn ready(&self) -> bool {
         self.receiver.bound().is_some()
-            && self
-                .session
-                .io()
-                .vt
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .bracketed_paste()
+    }
+
+    pub fn gate_open(&self) -> bool {
+        self.ready() && self.session.io().tx.gate.admit().is_some()
     }
 
     /// Waits until input may be sent (bound SessionStart + DECSET 2004).
@@ -315,6 +328,11 @@ pub fn launch(ctx: &Ctx, spec: LaunchSpec) -> Result<Launch, String> {
             Some(s) => BindRule::SessionId(s.clone()),
             None => BindRule::Ancestor,
         },
+        launch_id: format!(
+            "{}-{}",
+            util::sanitize_component(&spec.label),
+            &thread_id[..8]
+        ),
         fixtures_dir: ctx.out.join("fixtures"),
         run_id: ctx.run_id.clone(),
         cli_names: spec.cli_names.clone(),
@@ -326,7 +344,7 @@ pub fn launch(ctx: &Ctx, spec: LaunchSpec) -> Result<Launch, String> {
         ("CHALDEA_THREAD_ID".to_string(), thread_id.clone()),
         (
             "CHALDEA_HOOK_LOG".to_string(),
-            ctx.run_dir.join("hook.log").display().to_string(),
+            ctx.out.join("hook.log").display().to_string(),
         ),
     ];
     env.extend(spec.extra_env.iter().cloned());
@@ -428,7 +446,9 @@ pub fn bundle(args: &Args) -> i32 {
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
             let allowed = name == "report.json"
                 || name == "corpus.json"
-                || rel.contains("/fixtures/")
+                || rel
+                    .split('/')
+                    .any(|c| c == "fixtures" || c.starts_with("fixtures-"))
                 || rel.contains("/snapshots/")
                 || (include_pty && name.starts_with("pty-output") && name.ends_with(".bin"));
             if allowed {

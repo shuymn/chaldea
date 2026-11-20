@@ -344,7 +344,8 @@ impl WindowObserver {
     pub fn start() -> Result<WindowObserver, String> {
         Err("windows_only".into())
     }
-    pub fn stop(self) -> Vec<u32> {
+    /// `(pid, ppid at event time)` of every shown window.
+    pub fn stop(self) -> Vec<(u32, Option<u32>)> {
         Vec::new()
     }
 }
@@ -366,5 +367,11 @@ impl JobFirst {
     pub fn members(&self) -> Vec<u32> {
         Vec::new()
     }
-    pub fn terminate(&mut self) {}
+    pub fn start_time(&self) -> u64 {
+        0
+    }
+    pub fn terminate_job(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    pub fn close_conpty(&mut self) {}
 }

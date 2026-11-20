@@ -36,7 +36,9 @@ pub struct Args {
     pub codex_mode: String,
     // fake / probes
     pub hold_assign: bool,
+    pub escape_probe: bool,
     pub detached: bool,
+    pub confirm_close: bool,
     pub url: Option<String>,
     pub case: Option<String>,
     pub include_pty_output: bool,
@@ -47,11 +49,12 @@ pub const USAGE: &str = "\
 usage:
   chs install-emitter [--root R]
   chs fake <paste|queries|stall|tree-kill|auth|emit|teardown|all> [--hold-assign-until-child]
+  chs fake tree-kill --escape-probe          (macOS containment limit; not part of `all`)
   chs real <claude-hooks|claude-paste|claude-stall|codex-hooks|codex-paste|codex-stall|codex-warm|tree-kill>
            --allow-api-usage [--agent claude|codex]
   chs print-launch <claude|codex>
   chs win-probe <paste|startup|kill|attach|console|all> [--detached]
-  chs win-probe attach-client --url U        (credential on stdin)
+  chs win-probe attach-client --url U [--confirm-close]   (credential on stdin)
   chs bundle [--include-pty-output]
 common: --root R  --out DIR  --deadline-secs 180  --session-start-timeout 20  --keep-temp  --cols 120 --rows 40
 real:   --prompt  --claude-bin PATH  --codex-bin PATH  --cwd DIR  --attended  --subset required
@@ -98,7 +101,9 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         cwd2: None,
         codex_mode: "no-daemon".into(),
         hold_assign: false,
+        escape_probe: false,
         detached: false,
+        confirm_close: false,
         url: None,
         case: None,
         include_pty_output: false,
@@ -150,7 +155,9 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
                 }
             }
             "--hold-assign-until-child" => a.hold_assign = true,
+            "--escape-probe" => a.escape_probe = true,
             "--detached" => a.detached = true,
+            "--confirm-close" => a.confirm_close = true,
             "--url" => a.url = Some(value(&mut it, f)?),
             "--case" => a.case = Some(value(&mut it, f)?),
             "--include-pty-output" => a.include_pty_output = true,

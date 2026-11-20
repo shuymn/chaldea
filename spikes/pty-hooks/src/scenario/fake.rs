@@ -138,6 +138,21 @@ fn wait_ups(l: &Launch, n: usize, end: Instant) -> Option<(Vec<u8>, Value)> {
 
 // ---------------- B-3 / B-4 paste ----------------
 
+/// B-3 oracle, independent of the writer's mapper: normalize CRLF to LF,
+/// split on LF, join with the mode's newline (a lone CR is kept).
+fn expected_wire(text: &str, mode: Newline) -> Vec<u8> {
+    let nl = match mode {
+        Newline::Cr => "\r",
+        Newline::Lf => "\n",
+        Newline::Crlf => "\r\n",
+    };
+    text.replace("\r\n", "\n")
+        .split('\n')
+        .collect::<Vec<_>>()
+        .join(nl)
+        .into_bytes()
+}
+
 fn paste_scenario(ctx: &Ctx) {
     let corpus = paste::corpus();
     let _ = std::fs::write(
@@ -154,6 +169,18 @@ fn paste_scenario(ctx: &Ctx) {
     } else {
         vec![0, 7]
     };
+    let b3_case = |m: &Newline, id: &str, chunk: usize| format!("{}/{id}/chunk{chunk}", m.name());
+    const B4: [&str; 4] = ["esc_injection", "etx", "nul", "bel"];
+    for mode in &modes {
+        for chunk in &chunks {
+            for e in &corpus {
+                ctx.require("B-3", &b3_case(mode, &e.id, *chunk));
+            }
+        }
+        for name in B4 {
+            ctx.require("B-4", &format!("{}/{name}", mode.name()));
+        }
+    }
     for mode in &modes {
         let l = match launch(
             ctx,
@@ -161,7 +188,12 @@ fn paste_scenario(ctx: &Ctx) {
         ) {
             Ok(l) => l,
             Err(e) => {
-                ctx.check("B-3", mode.name(), "fail", json!({"launch_error": e}));
+                ctx.check(
+                    "B-3",
+                    &format!("{}/launch", mode.name()),
+                    "inconclusive",
+                    json!({"launch_error": e}),
+                );
                 continue;
             }
         };
@@ -169,9 +201,10 @@ fn paste_scenario(ctx: &Ctx) {
         if !l.wait_gate(ss) {
             ctx.check(
                 "B-3",
-                mode.name(),
-                "fail",
-                json!({"readiness_gate_failed": true, "bound": l.receiver.bound()}),
+                &format!("{}/launch", mode.name()),
+                "inconclusive",
+                json!({"readiness_gate_failed": true, "bound": l.receiver.bound(),
+                       "ambiguous": l.receiver.ambiguous()}),
             );
             ctx.detail(&format!("launch-{}", l.label), json!(l.finish().1));
             continue;
@@ -181,7 +214,7 @@ fn paste_scenario(ctx: &Ctx) {
                 if ctx.past_cutoff() {
                     break;
                 }
-                let case = format!("{}/{}/chunk{}", mode.name(), e.id, chunk);
+                let case = b3_case(mode, &e.id, *chunk);
                 let n = bound_ups_count(&l) + 1;
                 let o = paste::paste(
                     &l.session.io().tx,
@@ -192,9 +225,9 @@ fn paste_scenario(ctx: &Ctx) {
                         enter_delay: Duration::from_millis(ctx.args.enter_delay_ms),
                         write_deadline: ctx.until(Duration::from_secs(10)),
                     },
-                    || l.gate_open(),
+                    || l.ready(),
                 );
-                let expected = paste::map_newlines(e.text.as_bytes(), *mode);
+                let expected = expected_wire(&e.text, *mode);
                 let got = (o.state == "sent")
                     .then(|| wait_ups(&l, n, ctx.until(FAKE_UPS_WAIT)))
                     .flatten();
@@ -206,7 +239,8 @@ fn paste_scenario(ctx: &Ctx) {
                             json!({"byte_equal": diff.is_none(), "first_diff": diff, "len": expected.len(), "got_len": prompt.len()}),
                         )
                     }
-                    None => ("fail", json!({"paste": o, "ups": "missing"})),
+                    None if o.state == "sent" => ("fail", json!({"paste": o, "ups": "missing"})),
+                    None => ("inconclusive", json!({"paste": o})),
                 };
                 ctx.check("B-3", &case, res, ev);
             }
@@ -227,7 +261,7 @@ fn paste_scenario(ctx: &Ctx) {
                     enter_delay: Duration::from_millis(0),
                     write_deadline: ctx.until(Duration::from_secs(2)),
                 },
-                || l.gate_open(),
+                || l.ready(),
             );
             let ok = o.state == "rejected" && o.bytes_after == o.bytes_before;
             ctx.check(
@@ -248,6 +282,8 @@ fn paste_scenario(ctx: &Ctx) {
 // ---------------- B-5 queries ----------------
 
 fn queries(ctx: &Ctx) {
+    ctx.require("B-5", "responder");
+    ctx.require("B-5", "negative_control_no_responder");
     let mut runs = Vec::new();
     for responder in [true, false] {
         let label = if responder {
@@ -260,7 +296,7 @@ fn queries(ctx: &Ctx) {
         let l = match launch(ctx, spec) {
             Ok(l) => l,
             Err(e) => {
-                ctx.check("B-5", label, "fail", json!({"launch_error": e}));
+                ctx.check("B-5", label, "inconclusive", json!({"launch_error": e}));
                 return;
             }
         };
@@ -316,6 +352,9 @@ fn expected_stall_lines(rows: usize) -> Vec<String> {
 
 fn stall(ctx: &Ctx) {
     let rows = ctx.args.rows as usize;
+    for label in ["stall", "stall-silent", "banner"] {
+        ctx.require("B-6", label);
+    }
     for (label, mode, extra) in [
         ("stall", "stall", vec![]),
         ("stall-silent", "stall", vec!["--silent"]),
@@ -324,7 +363,7 @@ fn stall(ctx: &Ctx) {
         let l = match launch(ctx, fake_spec(ctx, label, mode, &extra)) {
             Ok(l) => l,
             Err(e) => {
-                ctx.check("B-6", label, "fail", json!({"launch_error": e}));
+                ctx.check("B-6", label, "inconclusive", json!({"launch_error": e}));
                 continue;
             }
         };
@@ -390,9 +429,20 @@ fn stall(ctx: &Ctx) {
 
 // ---------------- B-7 tree kill ----------------
 
+/// Upper bound on every FakeCli sleeper's life, so a fixture that escapes
+/// containment still ends by itself.
+const SLEEPER_MAX_LIFE: &str = "300";
+
 fn spawn_unrelated(env: &[(String, String)]) -> std::io::Result<Child> {
     let mut cmd = Command::new(fake_bin());
-    cmd.args(["--mode", "sleeper", "--role", "unrelated"]);
+    cmd.args([
+        "--mode",
+        "sleeper",
+        "--role",
+        "unrelated",
+        "--max-life-secs",
+        SLEEPER_MAX_LIFE,
+    ]);
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -402,14 +452,40 @@ fn spawn_unrelated(env: &[(String, String)]) -> std::io::Result<Child> {
         .spawn()
 }
 
-/// Runs B-7 once; returns per-role results for the report.
-pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str) {
-    let mut spec = fake_spec(ctx, label, "spawn-tree", &[]);
+/// Role of the escape probe's orphaned `setsid` grandchild.
+pub const ORPHAN_ROLE: &str = "setsid-orphan";
+
+/// Runs B-7 once. With `escape_probe`, spawn-tree also starts a `setsid`
+/// grandchild whose parent exits at once (a containment limit on macOS: no
+/// subreaper, so neither pgid nor ppid reaches it); the case is reported with
+/// `containment_limit: true` and the orphan, a fixture this harness spawned,
+/// is cleaned up through its witness identity afterwards (`fixture_cleanup`).
+pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str, escape_probe: bool) {
+    let mut roles: Vec<&str> = os::spawn_tree_roles().to_vec();
+    roles.push("spawn-tree");
+    if escape_probe {
+        roles.push(ORPHAN_ROLE);
+    }
+    for role in &roles {
+        ctx.require("B-7", &format!("{label}/{role}"));
+    }
+    ctx.require("B-7", &format!("{label}/unrelated_negative_control"));
+    ctx.require("B-7", &format!("{label}/no_session_survivors"));
+    let mut extra = vec!["--max-life-secs", SLEEPER_MAX_LIFE];
+    if escape_probe {
+        extra.push("--escape-orphan");
+    }
+    let mut spec = fake_spec(ctx, label, "spawn-tree", &extra);
     spec.hold_assign = hold_assign;
     let l = match launch(ctx, spec) {
         Ok(l) => l,
         Err(e) => {
-            ctx.check("B-7", label, "fail", json!({"launch_error": e}));
+            ctx.check(
+                "B-7",
+                &format!("{label}/launch"),
+                "inconclusive",
+                json!({"launch_error": e}),
+            );
             return;
         }
     };
@@ -424,8 +500,7 @@ pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str) {
             .map(|w| w.report["first_child"].clone());
         assign = json!({"held_until_child": first, "tree": l.session.attach_tree()});
     }
-    let mut want: Vec<&str> = os::spawn_tree_roles().to_vec();
-    want.push("spawn-tree");
+    let mut want = roles.clone();
     want.push("unrelated");
     let all_seen = l
         .receiver
@@ -449,9 +524,9 @@ pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str) {
         std::thread::sleep(Duration::from_millis(50));
         alive = session_alive(&witnesses);
     }
-    for role in os::spawn_tree_roles().iter().chain(["spawn-tree"].iter()) {
+    for role in &roles {
         let w = witnesses.iter().find(|w| w.role == *role);
-        let (res, ev) = match w {
+        let (res, mut ev) = match w {
             None => ("inconclusive", json!({"witness": "never seen"})),
             Some(w) => {
                 let dead = !os::is_alive(w.pid, w.start_time);
@@ -462,10 +537,13 @@ pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str) {
                 };
                 (
                     result_str(dead),
-                    json!({"pid": w.pid, "dead": dead, "killed_by": by}),
+                    json!({"pid": w.pid, "dead": dead, "killed_by": dead.then_some(by)}),
                 )
             }
         };
+        if *role == ORPHAN_ROLE {
+            ev["containment_limit"] = json!(true);
+        }
         ctx.check("B-7", &format!("{label}/{role}"), res, ev);
     }
     let un = witnesses.iter().find(|w| w.role == "unrelated");
@@ -492,22 +570,44 @@ pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str) {
         },
         json!({"alive_session_witnesses": alive, "assign": assign, "stop": stop_evidence(&stop)}),
     );
+    if escape_probe {
+        ctx.detail("containment_limit", json!(true));
+        ctx.detail("fixture_cleanup", fixture_cleanup(&witnesses));
+    }
     if let Some(u) = unrelated.as_mut() {
         let _ = u.kill();
         let _ = u.wait();
     }
 }
 
+/// After the verdict: kills the escape probe's orphan, a fixture this harness
+/// spawned, only if its (pid, start_time) still matches the witness and the
+/// process is FakeCli. Not part of the kill set; witnesses never get kill
+/// authority over sessions.
+fn fixture_cleanup(witnesses: &[receiver::WitnessRecord]) -> Value {
+    let fake = util::normalize_proc_name("chs-fake-cli");
+    let out: Vec<Value> = witnesses
+        .iter()
+        .filter(|w| w.role == ORPHAN_ROLE)
+        .map(|w| {
+            let p = os::proc_info(w.pid);
+            let identity = p.as_ref().is_some_and(|p| {
+                p.start_time == w.start_time && util::normalize_proc_name(&p.name) == fake
+            });
+            let killed = identity && os::force_kill(w.pid, w.start_time);
+            json!({"pid": w.pid, "role": w.role, "alive": p.is_some(), "identity_ok": identity, "killed": killed})
+        })
+        .collect();
+    json!(out)
+}
+
 fn tree_kill(ctx: &Ctx) {
-    tree_kill_once(
-        ctx,
-        ctx.args.hold_assign,
-        if ctx.args.hold_assign {
-            "tree-hold-assign"
-        } else {
-            "tree"
-        },
-    );
+    let label = match (ctx.args.escape_probe, ctx.args.hold_assign) {
+        (true, _) => "tree-escape-probe",
+        (false, true) => "tree-hold-assign",
+        (false, false) => "tree",
+    };
+    tree_kill_once(ctx, ctx.args.hold_assign, label, ctx.args.escape_probe);
 }
 
 // ---------------- B-8 auth ----------------
@@ -554,6 +654,7 @@ fn auth(ctx: &Ctx) {
         thread_id: "thread".into(),
         agent: "fake".into(),
         cli_version: "auth".into(),
+        launch_id: "auth".into(),
         rule: BindRule::SessionId("sid".into()),
         fixtures_dir: fixtures.clone(),
         run_id: ctx.run_id.clone(),
@@ -567,7 +668,7 @@ fn auth(ctx: &Ctx) {
     };
     let p = r.port();
     let host = format!("127.0.0.1:{p}");
-    let auth = format!("Authorization: Bearer {token}\r\n");
+    let auth = format!("Authorization: Bearer {token}\r\nX-Chaldea-Thread-Id: thread\r\n");
     let body = r#"{"hook_event_name":"SessionStart","session_id":"sid"}"#;
     let mk = |head: String| -> Vec<u8> { head.into_bytes() };
     let post = |hdrs: &str, b: &str| {
@@ -667,6 +768,17 @@ fn auth(ctx: &Ctx) {
             413,
         ),
     ];
+    for (name, _, _) in &cases {
+        ctx.require("B-8", name);
+    }
+    for name in [
+        "deadline_slow_head",
+        "deadline_slow_body",
+        "no_fixture_no_readiness",
+        "positive_control",
+    ] {
+        ctx.require("B-8", name);
+    }
     let before_files = count_files(&fixtures);
     for (name, bytes, want) in cases {
         let (got, ms) = raw_request(p, &[(&bytes, Duration::ZERO)], Duration::from_secs(7));
@@ -821,6 +933,25 @@ fn run_emitter(
     EmitRun { exit, stdout, ms }
 }
 
+/// Accepts connections on 127.0.0.1 and holds them without answering for
+/// `hold`; the thread ends by itself. Returns the port.
+fn slow_listener(hold: Duration) -> std::io::Result<u16> {
+    let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+    l.set_nonblocking(true)?;
+    let port = l.local_addr()?.port();
+    std::thread::spawn(move || {
+        let end = Instant::now() + hold;
+        let mut held = Vec::new();
+        while Instant::now() < end {
+            if let Ok((s, _)) = l.accept() {
+                held.push(s);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    Ok(port)
+}
+
 /// (name, env, stdin, keep stdin open, max exit time in ms)
 type EmitCase<'a> = (String, Vec<(&'a str, String)>, Option<Vec<u8>>, bool, u128);
 
@@ -832,6 +963,7 @@ fn emit(ctx: &Ctx) {
         thread_id: "thread-emit".into(),
         agent: "fake".into(),
         cli_version: "emit".into(),
+        launch_id: "emit".into(),
         rule: BindRule::SessionId("sid-emit".into()),
         fixtures_dir: fixtures,
         run_id: ctx.run_id.clone(),
@@ -898,15 +1030,45 @@ fn emit(ctx: &Ctx) {
         valid.clone(),
         Some(vec![b'a'; crate::emitter::MAX_STDIN + 1]),
         false,
-        4000,
+        3500,
     ));
     cases.push((
         "stdin_open_past_3s".into(),
         valid.clone(),
         Some(b"{\"partial\":".to_vec()),
         true,
-        4000,
+        3500,
     ));
+    // A listener that accepts and never answers: the 3 s budget still holds.
+    let slow = match slow_listener(Duration::from_secs(8)) {
+        Ok(p) => p,
+        Err(e) => {
+            ctx.check(
+                "B-9",
+                "slow_post",
+                "inconclusive",
+                json!({"setup_error": e.to_string()}),
+            );
+            0
+        }
+    };
+    if slow != 0 {
+        cases.push((
+            "slow_post".into(),
+            vec![
+                ("CHALDEA_HOOK_URL", format!("http://127.0.0.1:{slow}/hook")),
+                ("CHALDEA_HOOK_TOKEN", token.clone()),
+                ("CHALDEA_THREAD_ID", "thread-emit".to_string()),
+            ],
+            Some(payload.clone()),
+            false,
+            3500,
+        ));
+    }
+    for c in &cases {
+        ctx.require("B-9", &c.0);
+    }
+    ctx.require("B-9", "positive_control");
     for (name, env, stdin, keep_open, max_ms) in cases {
         let before = seen(&r);
         let run = run_emitter(&em, &env, stdin, keep_open);
@@ -1035,6 +1197,7 @@ pub const TEARDOWN_CASES: &[(&str, &str, u64)] = &[
     ("fail", "fail", 40),
     ("panic", "error", 40),
     ("ctrl-c", "error", 40),
+    ("ctrl-c-during-stop", "error", 40),
     ("timeout", "timeout", 14),
     ("hard-deadline", "timeout", 14),
     ("setup-fail", "error", 40),
@@ -1043,6 +1206,9 @@ pub const TEARDOWN_CASES: &[(&str, &str, u64)] = &[
 ];
 
 fn teardown(ctx: &Ctx) {
+    for (case, _, _) in TEARDOWN_CASES {
+        ctx.require("B-10", case);
+    }
     for (case, want, deadline) in TEARDOWN_CASES {
         if ctx.past_cutoff() {
             ctx.check(
@@ -1075,13 +1241,18 @@ fn teardown(ctx: &Ctx) {
             .stderr(Stdio::null())
             .spawn()
         else {
-            ctx.check("B-10", case, "fail", json!({"spawn": "failed"}));
+            ctx.check("B-10", case, "inconclusive", json!({"spawn": "failed"}));
             continue;
         };
         let hard = t + Duration::from_secs(deadline + 5);
         let mut interrupted = false;
         let code = loop {
-            if *case == "ctrl-c" && !interrupted && out.join("ready").exists() {
+            let marker = if *case == "ctrl-c-during-stop" {
+                "stopping"
+            } else {
+                "ready"
+            };
+            if case.starts_with("ctrl-c") && !interrupted && out.join(marker).exists() {
                 interrupted = os::send_interrupt(child.id()).is_ok();
             }
             if let Ok(Some(st)) = child.try_wait() {
@@ -1207,7 +1378,7 @@ fn run_case(args: Args) -> i32 {
                     enter_delay: Duration::from_millis(ctx.args.enter_delay_ms),
                     write_deadline: ctx.until(Duration::from_secs(3)),
                 },
-                || l.gate_open(),
+                || l.ready(),
             );
             let paste_ms = t.elapsed().as_millis() as u64;
             let ups = if case == "query-mid-paste" {
@@ -1292,6 +1463,16 @@ fn run_case(args: Args) -> i32 {
                     // Ignores the cutoff on purpose; only the watchdog can end this.
                     std::thread::sleep(Duration::from_millis(100));
                 },
+                "ctrl-c-during-stop" => {
+                    // Teardown has started but not killed yet when Ctrl-C lands:
+                    // the watchdog must still kill the tree.
+                    *l.session
+                        .owned
+                        .pause_before_kill
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(Duration::from_secs(5));
+                    let _ = std::fs::write(ctx.out.join("stopping"), b"1");
+                }
                 _ => {}
             }
             let (stop, _) = l.finish();
@@ -1327,6 +1508,8 @@ fn run_all(mut args: Args) -> i32 {
             return 3;
         }
     };
+    ctx.require("B-1", "binaries_built");
+    ctx.require("B-2", "all_fake_scenarios_pass");
     let bins: Vec<(String, bool)> = ["chs", "chs-hook-emit", "chs-fake-cli"]
         .iter()
         .map(|b| (b.to_string(), util::sibling_bin(b).is_file()))
@@ -1388,4 +1571,32 @@ fn run_all(mut args: Args) -> i32 {
         json!({"children": child_status}),
     );
     ctx.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The B-3 oracle against hand-written wire bytes (not the writer's mapper).
+    #[test]
+    fn b3_oracle_hand_written() {
+        let t = "日\nb\r\nc\rd";
+        assert_eq!(expected_wire(t, Newline::Cr), b"\xe6\x97\xa5\rb\rc\rd");
+        assert_eq!(expected_wire(t, Newline::Lf), b"\xe6\x97\xa5\nb\nc\rd");
+        assert_eq!(
+            expected_wire(t, Newline::Crlf),
+            b"\xe6\x97\xa5\r\nb\r\nc\rd"
+        );
+        for e in paste::corpus() {
+            for m in Newline::ALL {
+                assert_eq!(
+                    expected_wire(&e.text, m),
+                    paste::map_newlines(e.text.as_bytes(), m),
+                    "{} {}",
+                    e.id,
+                    m.name()
+                );
+            }
+        }
+    }
 }

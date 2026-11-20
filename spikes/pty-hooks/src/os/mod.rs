@@ -57,3 +57,29 @@ pub fn spawn_tree_roles() -> &'static [&'static str] {
 pub fn os_name() -> &'static str {
     std::env::consts::OS
 }
+
+/// Positive liveness for recovery decisions: `Some(false)` only when a full
+/// process-table read shows `pid` absent, reused, or a zombie; `None` when
+/// the table or the start time cannot be read (callers must refuse).
+pub fn liveness(pid: u32, start_time: u64) -> Option<bool> {
+    let procs = list_processes().ok()?;
+    match procs.iter().find(|p| p.pid == pid) {
+        None => Some(false),
+        Some(p) if p.start_time == 0 => None,
+        Some(p) => Some(p.start_time == start_time && !p.zombie),
+    }
+}
+
+/// An `OsString` that is not valid UTF-8 on this platform (test fixture).
+pub fn non_utf8_os_string() -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![b'a', 0xff, b'b'])
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[0x61, 0xD800, 0x62])
+    }
+}

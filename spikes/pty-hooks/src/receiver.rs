@@ -1,12 +1,15 @@
 //! Hook receiver (§4.3): std `TcpListener` + `httparse`, one request per
-//! connection, 5 s absolute deadline, head/auth/framing checks before any
-//! body byte, fixtures stored byte-for-byte, launch binding, witnesses.
+//! connection, 5 s absolute deadline carried through read, dispatch, and
+//! write. The head is read byte by byte up to its boundary, so no body byte is
+//! consumed before method/path, Host, Bearer, and framing pass. Fixtures are
+//! stored byte-for-byte under a per-launch directory with a report-wide
+//! sequence; launch binding and witnesses live here too.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -22,6 +25,9 @@ pub const MAX_BODY: usize = 4 * 1024 * 1024;
 pub const MAX_HEADERS: usize = 32;
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 pub const MAX_CONNS: usize = 16;
+
+/// Report-wide fixture sequence (one report per process), shared by every receiver.
+static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Union of the event names observed in Claude Code 2.1.322 and Codex 0.170.0 (§3).
 pub const KNOWN_EVENTS: &[&str] = &[
@@ -42,7 +48,7 @@ pub const KNOWN_EVENTS: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub enum BindRule {
-    /// Claude: the predetermined `--session-id`.
+    /// Claude: the predetermined `--session-id` (plus the launch's thread header).
     SessionId(String),
     /// Codex / FakeCli: thread id header + nearest CLI ancestor is the launched pid.
     Ancestor,
@@ -54,6 +60,8 @@ pub struct Config {
     pub thread_id: String,
     pub agent: String,
     pub cli_version: String,
+    /// Unique per launch: fixtures go to `<fixtures_dir>/<agent>/<ver>/<launch_id>/`.
+    pub launch_id: String,
     pub rule: BindRule,
     pub fixtures_dir: PathBuf,
     pub run_id: String,
@@ -98,17 +106,18 @@ pub struct WitnessRecord {
     pub received_ms: u64,
 }
 
-/// C-4 / C-5 probe routes, present only while a probe runs.
+/// C-4 / C-5 probe routes, present only while a probe runs. Every handler
+/// gets the request's absolute deadline.
 pub trait ProbeHandler: Send + Sync {
     fn credential(&self) -> String;
-    fn screen(&self) -> Vec<u8>;
-    fn input(&self, body: &[u8]) -> u16;
-    fn key(&self, body: &[u8]) -> u16;
+    fn screen(&self, deadline: Instant) -> Vec<u8>;
+    fn input(&self, body: &[u8], deadline: Instant) -> u16;
+    fn key(&self, body: &[u8], deadline: Instant) -> u16;
+    fn confirm(&self, body: &[u8], deadline: Instant) -> u16;
 }
 
 #[derive(Default)]
 struct Inner {
-    seq: u64,
     events: Vec<EventRecord>,
     witnesses: Vec<WitnessRecord>,
     rejections: BTreeMap<u16, u32>,
@@ -127,12 +136,29 @@ struct State {
     cv: Condvar,
     active: AtomicUsize,
     probe: Mutex<Option<Arc<dyn ProbeHandler>>>,
+    /// Largest number of bytes read past the head boundary before a rejection.
+    overread: AtomicUsize,
 }
 
 pub struct Receiver {
     state: Arc<State>,
     stop: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
+}
+
+/// Read-only view on a receiver's witnesses (for probe handlers).
+#[derive(Clone)]
+pub struct WitnessView(Arc<State>);
+
+impl WitnessView {
+    pub fn witnesses(&self) -> Vec<WitnessRecord> {
+        self.0
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .witnesses
+            .clone()
+    }
 }
 
 impl Receiver {
@@ -150,6 +176,7 @@ impl Receiver {
             cv: Condvar::new(),
             active: AtomicUsize::new(0),
             probe: Mutex::new(None),
+            overread: AtomicUsize::new(0),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let (st, sp) = (state.clone(), stop.clone());
@@ -209,6 +236,10 @@ impl Receiver {
         &self.state.cfg
     }
 
+    pub fn witness_view(&self) -> WitnessView {
+        WitnessView(self.state.clone())
+    }
+
     pub fn set_cli_pid(&self, pid: u32) {
         *self.state.cli_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(pid);
         self.state.cli_cv.notify_all();
@@ -218,12 +249,16 @@ impl Receiver {
         *self.state.probe.lock().unwrap_or_else(|e| e.into_inner()) = p;
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.state.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn wait_until<T>(
         &self,
         deadline: Instant,
         mut f: impl FnMut(&Inner) -> Option<T>,
     ) -> Option<T> {
-        let mut g = self.state.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.lock();
         loop {
             if let Some(v) = f(&g) {
                 return Some(v);
@@ -241,9 +276,26 @@ impl Receiver {
         }
     }
 
-    /// Waits for the readiness event (a bound SessionStart); returns the bound session id.
+    /// Readiness: the bound session id, unless a conflicting eligible
+    /// SessionStart made the binding ambiguous (then never ready).
+    fn ready(i: &Inner) -> Option<String> {
+        if i.ambiguous.is_empty() {
+            i.bound_session.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Waits for the readiness event (a bound, unambiguous SessionStart).
     pub fn wait_bound(&self, deadline: Instant) -> Option<String> {
-        self.wait_until(deadline, |i| i.bound_session.clone())
+        self.wait_until(deadline, |i| {
+            if !i.ambiguous.is_empty() {
+                // Ambiguity is final for this launch: stop waiting.
+                return Some(None);
+            }
+            i.bound_session.clone().map(Some)
+        })
+        .flatten()
     }
 
     pub fn wait_event(
@@ -272,62 +324,39 @@ impl Receiver {
     }
 
     pub fn events(&self) -> Vec<EventRecord> {
-        self.state
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .events
-            .clone()
+        self.lock().events.clone()
     }
 
     pub fn witnesses(&self) -> Vec<WitnessRecord> {
-        self.state
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .witnesses
-            .clone()
+        self.lock().witnesses.clone()
     }
 
     pub fn rejections(&self) -> BTreeMap<u16, u32> {
-        self.state
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .rejections
-            .clone()
+        self.lock().rejections.clone()
     }
 
     pub fn bound(&self) -> Option<String> {
-        self.state
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .bound_session
-            .clone()
+        Self::ready(&self.lock())
     }
 
     pub fn bound_at_ms(&self) -> Option<u64> {
-        self.state
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .bound_at
+        self.lock().bound_at
     }
 
     pub fn ambiguous(&self) -> Vec<String> {
-        self.state
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .ambiguous
-            .clone()
+        self.lock().ambiguous.clone()
+    }
+
+    /// Bytes consumed past a head boundary before any rejection (must stay 0).
+    pub fn max_overread(&self) -> usize {
+        self.state.overread.load(Ordering::SeqCst)
     }
 
     pub fn summary(&self) -> Value {
-        let g = self.state.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let g = self.lock();
         json!({
             "port": self.state.port,
+            "launch_id": self.state.cfg.launch_id,
             "bound_session": g.bound_session,
             "bound_at_ms": g.bound_at,
             "ambiguous": g.ambiguous,
@@ -370,6 +399,7 @@ fn reason(code: u16) -> &'static str {
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "Status",
     }
 }
@@ -383,10 +413,6 @@ fn respond(s: &mut TcpStream, code: u16, body: &[u8]) -> io::Result<()> {
     s.write_all(head.as_bytes())?;
     s.write_all(body)?;
     s.flush()
-}
-
-fn find_head_end(b: &[u8]) -> Option<usize> {
-    b.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
 enum Outcome {
@@ -408,6 +434,11 @@ struct Head {
     ancestry: Option<String>,
 }
 
+fn remaining(deadline: Instant) -> Option<Duration> {
+    let now = Instant::now();
+    (now < deadline).then(|| deadline - now)
+}
+
 impl State {
     fn reject(&self, code: u16) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -421,22 +452,19 @@ impl State {
             if code != 200 {
                 self.reject(code);
             }
-            let left = deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_millis(100));
-            let _ = s.set_write_timeout(Some(left));
-            let _ = respond(&mut s, code, &body);
+            // The response is written only inside the same absolute deadline.
+            if let Some(left) = remaining(deadline)
+                && s.set_write_timeout(Some(left)).is_ok()
+            {
+                let _ = respond(&mut s, code, &body);
+            }
         }
         let _ = s.shutdown(Shutdown::Both);
     }
 
     fn read_some(s: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> Result<usize, u16> {
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(408);
-        }
-        s.set_read_timeout(Some(deadline - now))
-            .map_err(|_| 400u16)?;
+        let left = remaining(deadline).ok_or(408u16)?;
+        s.set_read_timeout(Some(left)).map_err(|_| 400u16)?;
         match s.read(buf) {
             Ok(n) => Ok(n),
             Err(e)
@@ -451,23 +479,35 @@ impl State {
         }
     }
 
+    /// Reads exactly through `\r\n\r\n` (one byte per read), never past it.
+    fn read_head(s: &mut TcpStream, deadline: Instant) -> Result<Option<Vec<u8>>, u16> {
+        let mut head = Vec::with_capacity(512);
+        let mut b = [0u8; 1];
+        loop {
+            if head.ends_with(b"\r\n\r\n") {
+                return Ok(Some(head));
+            }
+            if head.len() == MAX_HEAD {
+                return Err(431);
+            }
+            match Self::read_some(s, &mut b, deadline)? {
+                0 => return Ok(None),
+                _ => head.push(b[0]),
+            }
+        }
+    }
+
     fn process(&self, s: &mut TcpStream, deadline: Instant) -> Outcome {
-        let mut buf = vec![0u8; MAX_HEAD];
-        let mut len = 0;
-        let head_end = loop {
-            if let Some(e) = find_head_end(&buf[..len]) {
-                break e;
-            }
-            if len == MAX_HEAD {
-                return Outcome::Reply(431, Vec::new());
-            }
-            match Self::read_some(s, &mut buf[len..], deadline) {
-                Ok(0) => return Outcome::Closed,
-                Ok(n) => len += n,
-                Err(code) => return Outcome::Reply(code, Vec::new()),
-            }
+        let raw = match Self::read_head(s, deadline) {
+            Ok(Some(h)) => h,
+            Ok(None) => return Outcome::Closed,
+            Err(code) => return Outcome::Reply(code, Vec::new()),
         };
-        let head = match parse_head(&buf[..head_end]) {
+        // `raw` ends at the boundary by construction; nothing past it has been read.
+        let consumed_past_head = raw.len() - (find_head_end(&raw).unwrap_or(raw.len()));
+        self.overread
+            .fetch_max(consumed_past_head, Ordering::SeqCst);
+        let head = match parse_head(&raw) {
             Ok(h) => h,
             Err(code) => return Outcome::Reply(code, Vec::new()),
         };
@@ -480,7 +520,10 @@ impl State {
             ("/probe/screen", "GET") if probe.is_some() => "screen",
             ("/probe/input", "POST") if probe.is_some() => "input",
             ("/probe/key", "POST") if probe.is_some() => "key",
-            ("/probe/screen" | "/probe/input" | "/probe/key", _) if probe.is_some() => {
+            ("/probe/confirm", "POST") if probe.is_some() => "confirm",
+            ("/probe/screen" | "/probe/input" | "/probe/key" | "/probe/confirm", _)
+                if probe.is_some() =>
+            {
                 return Outcome::Reply(405, Vec::new());
             }
             _ => return Outcome::Reply(404, Vec::new()),
@@ -494,8 +537,9 @@ impl State {
             return Outcome::Reply(421, Vec::new());
         }
         // 3. Authorization (probe routes use the separate per-run credential)
-        let secret = match (&probe, route) {
-            (Some(p), "screen" | "input" | "key") => p.credential(),
+        let is_probe = matches!(route, "screen" | "input" | "key" | "confirm");
+        let secret = match (&probe, is_probe) {
+            (Some(p), true) => p.credential(),
             _ => self.cfg.token.clone(),
         };
         let authed = head.auths.len() == 1
@@ -528,10 +572,7 @@ impl State {
             n
         };
         // 5. body, bounded by Content-Length and the deadline
-        let mut body = buf[head_end..len].to_vec();
-        if body.len() > body_len {
-            return Outcome::Reply(400, Vec::new());
-        }
+        let mut body = Vec::with_capacity(body_len.min(64 * 1024));
         let mut chunk = vec![0u8; 64 * 1024];
         while body.len() < body_len {
             let want = (body_len - body.len()).min(chunk.len());
@@ -541,12 +582,13 @@ impl State {
                 Err(code) => return Outcome::Reply(code, Vec::new()),
             }
         }
-        match route {
-            "hook" => self.store_hook(&head, body),
-            "witness" => self.store_witness(&body),
-            "screen" => Outcome::Reply(200, probe.map(|p| p.screen()).unwrap_or_default()),
-            "input" => Outcome::Reply(probe.map(|p| p.input(&body)).unwrap_or(404), Vec::new()),
-            "key" => Outcome::Reply(probe.map(|p| p.key(&body)).unwrap_or(404), Vec::new()),
+        match (route, probe) {
+            ("hook", _) => self.store_hook(&head, body),
+            ("witness", _) => self.store_witness(&body),
+            ("screen", Some(p)) => Outcome::Reply(200, p.screen(deadline)),
+            ("input", Some(p)) => Outcome::Reply(p.input(&body, deadline), Vec::new()),
+            ("key", Some(p)) => Outcome::Reply(p.key(&body, deadline), Vec::new()),
+            ("confirm", Some(p)) => Outcome::Reply(p.confirm(&body, deadline), Vec::new()),
             _ => Outcome::Reply(404, Vec::new()),
         }
     }
@@ -590,22 +632,23 @@ impl State {
             .unwrap_or_default();
         let nearest = self.nearest_cli(&chain);
         let cli_pid = match self.cfg.rule {
-            BindRule::Ancestor if event == "SessionStart" => self.cli_pid(),
+            BindRule::Ancestor => self.cli_pid(),
             _ => None,
         };
+        let thread_ok = head.thread.as_deref() == Some(self.cfg.thread_id.as_str());
+        let ancestor_ok = nearest.is_some() && nearest == cli_pid;
 
         let dir = self
             .cfg
             .fixtures_dir
             .join(util::sanitize_component(&self.cfg.agent))
-            .join(util::sanitize_component(&self.cfg.cli_version));
+            .join(util::sanitize_component(&self.cfg.cli_version))
+            .join(util::sanitize_component(&self.cfg.launch_id));
         if std::fs::create_dir_all(&dir).is_err() {
             return Outcome::Reply(500, Vec::new());
         }
         let received_ms = self.t0.elapsed().as_millis() as u64;
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.seq += 1;
-        let seq = g.seq;
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst) + 1;
         let name = format!("{event}-{seq}");
         let path = dir.join(format!("{name}.json"));
         if std::fs::write(&path, &body).is_err() {
@@ -614,6 +657,7 @@ impl State {
         let meta = json!({
             "received_unix_ms": util::now_ms(),
             "run_id": self.cfg.run_id,
+            "launch_id": self.cfg.launch_id,
             "thread_id": head.thread,
             "agent": head.agent,
             "emitter_version": head.emitter_version,
@@ -624,24 +668,24 @@ impl State {
             serde_json::to_vec_pretty(&meta).unwrap_or_default(),
         );
 
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let foreign = ("raw_unknown", Some("foreign_session".to_string()));
         let (class, why) = if parsed.is_none() {
             ("raw_unknown", Some("unparseable".to_string()))
         } else {
             match (&self.cfg.rule, event.as_str()) {
                 (BindRule::SessionId(want), _) => {
-                    if session_id.as_deref() == Some(want.as_str()) {
+                    if session_id.as_deref() == Some(want.as_str()) && thread_ok {
                         if event == "SessionStart" && g.bound_session.is_none() {
                             g.bound_session = Some(want.clone());
                             g.bound_at = Some(received_ms);
                         }
                         ("bound", None)
                     } else {
-                        ("raw_unknown", Some("foreign_session".into()))
+                        foreign
                     }
                 }
                 (BindRule::Ancestor, "SessionStart") => {
-                    let thread_ok = head.thread.as_deref() == Some(self.cfg.thread_id.as_str());
-                    let ancestor_ok = nearest.is_some() && nearest == cli_pid;
                     match (thread_ok && ancestor_ok, &g.bound_session, &session_id) {
                         (true, None, Some(sid)) => {
                             g.bound_session = Some(sid.clone());
@@ -650,17 +694,23 @@ impl State {
                         }
                         (true, Some(b), Some(sid)) if b == sid => ("bound", None),
                         (true, Some(_), Some(sid)) => {
+                            // A second eligible candidate: readiness is invalidated.
                             g.ambiguous.push(sid.clone());
                             ("raw_unknown", Some("ambiguous_candidate".into()))
                         }
-                        _ => ("raw_unknown", Some("foreign_session".into())),
+                        _ => foreign,
                     }
                 }
                 (BindRule::Ancestor, _) => {
-                    if g.bound_session.is_some() && g.bound_session == session_id {
+                    // Evidence events re-check the launch identity, not just the id.
+                    if g.bound_session.is_some()
+                        && g.bound_session == session_id
+                        && thread_ok
+                        && ancestor_ok
+                    {
                         ("bound", None)
                     } else {
-                        ("raw_unknown", Some("foreign_session".into()))
+                        foreign
                     }
                 }
             }
@@ -717,6 +767,10 @@ impl State {
     }
 }
 
+fn find_head_end(b: &[u8]) -> Option<usize> {
+    b.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+}
+
 fn parse_head(raw: &[u8]) -> Result<Head, u16> {
     let mut hdrs = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut req = httparse::Request::new(&mut hdrs);
@@ -760,18 +814,22 @@ pub(crate) mod tests {
     use super::*;
     use std::net::SocketAddr;
 
-    pub fn test_receiver(dir: &Path) -> Receiver {
-        Receiver::start(Config {
+    fn cfg(dir: &Path, launch: &str, rule: BindRule) -> Config {
+        Config {
             token: "t0k".into(),
             thread_id: "thread-1".into(),
             agent: "fake".into(),
             cli_version: "v1".into(),
-            rule: BindRule::SessionId("sid-1".into()),
+            launch_id: launch.into(),
+            rule,
             fixtures_dir: dir.join("fixtures"),
             run_id: "r".into(),
             cli_names: vec!["chs-fake-cli".into()],
-        })
-        .unwrap()
+        }
+    }
+
+    pub fn test_receiver(dir: &Path) -> Receiver {
+        Receiver::start(cfg(dir, "l1", BindRule::SessionId("sid-1".into()))).unwrap()
     }
 
     pub fn raw(port: u16, req: &[u8]) -> u16 {
@@ -808,6 +866,7 @@ pub(crate) mod tests {
     }
 
     const BODY: &str = r#"{"hook_event_name":"SessionStart","session_id":"sid-1"}"#;
+    const THREAD: &str = "X-Chaldea-Thread-Id: thread-1\r\n";
 
     fn req(host: &str, auth: &str, extra: &str, body: &str) -> Vec<u8> {
         format!(
@@ -824,30 +883,23 @@ pub(crate) mod tests {
         let p = r.port();
         let host = format!("127.0.0.1:{p}");
         let good_auth = "Authorization: Bearer t0k\r\n";
-        let cases: Vec<(&str, Vec<u8>, u16)> = vec![
-            ("bad host", req("evil:1", good_auth, "", BODY), 421),
+        let cases: Vec<(&str, Vec<u8>, u16)> =
+            vec![
+            ("bad host", req("evil:1", good_auth, THREAD, BODY), 421),
             (
                 "dup host",
-                req(&host, good_auth, &format!("Host: {host}\r\n"), BODY),
+                req(&host, good_auth, &format!("Host: {host}\r\n{THREAD}"), BODY),
                 421,
             ),
-            ("no token", req(&host, "", "", BODY), 401),
+            ("no token", req(&host, "", THREAD, BODY), 401),
             (
                 "wrong token",
-                req(&host, "Authorization: Bearer t0x\r\n", "", BODY),
+                req(&host, "Authorization: Bearer t0x\r\n", THREAD, BODY),
                 401,
             ),
-            ("dup token", req(&host, good_auth, good_auth, BODY), 401),
-            (
-                "te",
-                req(&host, good_auth, "Transfer-Encoding: chunked\r\n", BODY),
-                400,
-            ),
-            (
-                "dup cl",
-                req(&host, good_auth, "Content-Length: 1\r\n", BODY),
-                411,
-            ),
+            ("dup token", req(&host, good_auth, &format!("{good_auth}{THREAD}"), BODY), 401),
+            ("te", req(&host, good_auth, "Transfer-Encoding: chunked\r\n", BODY), 400),
+            ("dup cl", req(&host, good_auth, "Content-Length: 1\r\n", BODY), 411),
             (
                 "no cl",
                 format!("POST /hook HTTP/1.1\r\nHost: {host}\r\n{good_auth}\r\n").into_bytes(),
@@ -887,10 +939,23 @@ pub(crate) mod tests {
         }
         assert_eq!(fixtures(&d), 0);
         assert!(r.bound().is_none());
-        assert_eq!(raw(p, &req(&host, good_auth, "", BODY)), 200);
+        assert_eq!(raw(p, &req(&host, good_auth, THREAD, BODY)), 200);
         assert_eq!(fixtures(&d), 2);
         assert_eq!(r.bound().as_deref(), Some("sid-1"));
         r.stop();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// M7: a rejected head coalesced with its body must not consume body bytes.
+    #[test]
+    fn rejection_reads_nothing_past_head() {
+        let d = tmp();
+        let r = test_receiver(&d);
+        let p = r.port();
+        let big = "x".repeat(4000);
+        let bytes = req("evil:1", "Authorization: Bearer t0k\r\n", THREAD, &big);
+        assert_eq!(raw(p, &bytes), 421);
+        assert_eq!(r.max_overread(), 0);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -912,6 +977,86 @@ pub(crate) mod tests {
         assert_eq!(ev[0].class, "raw_unknown");
         let stored = std::fs::read(d.join(&ev[0].fixture)).unwrap();
         assert_eq!(stored, body.as_bytes());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// H7: two launches with the same agent/version keep separate raw evidence.
+    #[test]
+    fn launches_do_not_overwrite_each_others_fixtures() {
+        let d = tmp();
+        let a = Receiver::start(cfg(&d, "launch-a", BindRule::SessionId("sid-1".into()))).unwrap();
+        let b = Receiver::start(cfg(&d, "launch-b", BindRule::SessionId("sid-1".into()))).unwrap();
+        let auth = "Authorization: Bearer t0k\r\n";
+        let body_a = r#"{"hook_event_name":"SessionStart","session_id":"sid-1","n":"a"}"#;
+        let body_b = r#"{"hook_event_name":"SessionStart","session_id":"sid-1","n":"b"}"#;
+        assert_eq!(
+            raw(
+                a.port(),
+                &req(&format!("127.0.0.1:{}", a.port()), auth, THREAD, body_a)
+            ),
+            200
+        );
+        assert_eq!(
+            raw(
+                b.port(),
+                &req(&format!("127.0.0.1:{}", b.port()), auth, THREAD, body_b)
+            ),
+            200
+        );
+        let (ea, eb) = (&a.events()[0], &b.events()[0]);
+        assert_ne!(ea.fixture, eb.fixture);
+        assert_ne!(ea.seq, eb.seq);
+        assert_eq!(
+            std::fs::read(d.join(&ea.fixture)).unwrap(),
+            body_a.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(d.join(&eb.fixture)).unwrap(),
+            body_b.as_bytes()
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// M3: a second eligible SessionStart invalidates readiness, and evidence
+    /// events re-check the thread header and nearest CLI ancestor.
+    #[test]
+    fn ambiguity_invalidates_readiness_and_followups_recheck_identity() {
+        let d = tmp();
+        let r = Receiver::start(cfg(&d, "l", BindRule::Ancestor)).unwrap();
+        r.set_cli_pid(4242);
+        let host = format!("127.0.0.1:{}", r.port());
+        let auth = "Authorization: Bearer t0k\r\n";
+        let ok_anc =
+            format!("{THREAD}X-Chaldea-Emitter-Ancestry: 1:chs-hook-emit/4242:chs-fake-cli\r\n");
+        let ss =
+            |sid: &str| format!(r#"{{"hook_event_name":"SessionStart","session_id":"{sid}"}}"#);
+        assert_eq!(raw(r.port(), &req(&host, auth, &ok_anc, &ss("s1"))), 200);
+        assert_eq!(r.bound().as_deref(), Some("s1"));
+        // Follow-up with the bound id but a foreign thread header is not evidence.
+        let ups = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"x"}"#;
+        let bad_thread =
+            "X-Chaldea-Thread-Id: other\r\nX-Chaldea-Emitter-Ancestry: 1:e/4242:chs-fake-cli\r\n";
+        assert_eq!(raw(r.port(), &req(&host, auth, bad_thread, ups)), 200);
+        // Same thread, but the nearest CLI is a nested one.
+        let nested = format!(
+            "{THREAD}X-Chaldea-Emitter-Ancestry: 1:e/77:chs-fake-cli/4242:chs-fake-cli\r\n"
+        );
+        assert_eq!(raw(r.port(), &req(&host, auth, &nested, ups)), 200);
+        assert!(
+            r.events()[1..].iter().all(|e| !e.is_bound()),
+            "{:?}",
+            r.events()
+        );
+        assert_eq!(raw(r.port(), &req(&host, auth, &ok_anc, ups)), 200);
+        assert!(r.events()[3].is_bound());
+        // A conflicting eligible SessionStart: never ready again.
+        assert_eq!(raw(r.port(), &req(&host, auth, &ok_anc, &ss("s2"))), 200);
+        assert!(r.bound().is_none());
+        assert_eq!(r.ambiguous(), vec!["s2".to_string()]);
+        assert!(
+            r.wait_bound(Instant::now() + Duration::from_millis(50))
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 }

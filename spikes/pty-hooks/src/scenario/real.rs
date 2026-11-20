@@ -117,7 +117,22 @@ pub fn preflight(args: &Args) -> Result<(String, Bins), String> {
     Ok((which, bins))
 }
 
-pub fn run(args: Args) -> i32 {
+/// Default `--deadline-secs` per real scenario (paste sweeps run longest).
+pub fn default_deadline(which: &str, args: &Args) -> u64 {
+    match which {
+        "claude-paste" | "codex-paste" => 5400,
+        "codex-hooks" => 2400,
+        "claude-stall" | "codex-stall" if args.attended => 1800,
+        "codex-warm" => 900,
+        _ => 600,
+    }
+}
+
+pub fn run(mut args: Args) -> i32 {
+    let which = args.positional.get(1).cloned().unwrap_or_default();
+    if !args.explicit_deadline {
+        args.deadline_secs = default_deadline(&which, &args);
+    }
     let (which, bins) = match preflight(&args) {
         Ok(v) => v,
         Err(e) => {
@@ -362,17 +377,17 @@ fn finish(ctx: &Ctx, l: Launch) -> Value {
     v
 }
 
-fn submit(ctx: &Ctx, l: &Launch, text: &str, mode: Newline) -> paste::Outcome {
+fn submit(ctx: &Ctx, l: &Launch, text: &str, mode: Newline, chunk: usize) -> paste::Outcome {
     paste::paste(
         &l.session.io().tx,
         text.as_bytes(),
         &PasteOpts {
             mode,
-            chunk: ctx.args.chunk,
+            chunk,
             enter_delay: Duration::from_millis(ctx.args.enter_delay_ms),
             write_deadline: ctx.until(Duration::from_secs(10)),
         },
-        || l.gate_open(),
+        || l.ready(),
     )
 }
 
@@ -427,15 +442,29 @@ fn trust_keys(config: &[u8]) -> BTreeSet<String> {
 
 #[derive(Clone)]
 struct ConfigState {
-    fp: Option<String>,
+    /// `absent`, `unreadable: <kind>`, or the content fingerprint.
+    fp: String,
+    readable: bool,
     keys: BTreeSet<String>,
 }
 
 fn codex_config() -> ConfigState {
-    let b = std::fs::read(codex_home().join("config.toml")).ok();
-    ConfigState {
-        fp: b.as_deref().map(fingerprint),
-        keys: b.as_deref().map(trust_keys).unwrap_or_default(),
+    match std::fs::read(codex_home().join("config.toml")) {
+        Ok(b) => ConfigState {
+            fp: fingerprint(&b),
+            readable: true,
+            keys: trust_keys(&b),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ConfigState {
+            fp: "absent".into(),
+            readable: true,
+            keys: BTreeSet::new(),
+        },
+        Err(e) => ConfigState {
+            fp: format!("unreadable: {}", e.kind()),
+            readable: false,
+            keys: BTreeSet::new(),
+        },
     }
 }
 
@@ -448,109 +477,250 @@ fn config_delta(before: &ConfigState, after: &ConfigState) -> Value {
     })
 }
 
-fn claude_global_hooks() -> Value {
+/// Hook fingerprints of Claude's global config files; the flag is false when
+/// any file is unreadable or malformed (C1 is then inconclusive).
+fn claude_global_hooks() -> (Value, bool) {
     let home = std::env::home_dir().unwrap_or_default();
     let mut out = serde_json::Map::new();
+    let mut ok = true;
     for f in [
         home.join(".claude").join("settings.json"),
         home.join(".claude.json"),
     ] {
-        let v = std::fs::read(&f)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-        let hooks = v
-            .as_ref()
-            .and_then(|v| v.get("hooks"))
-            .map(|h| fingerprint(h.to_string().as_bytes()));
-        out.insert(f.display().to_string(), json!(hooks));
+        let state = match std::fs::read(&f) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!("absent"),
+            Err(e) => {
+                ok = false;
+                json!(format!("unreadable: {}", e.kind()))
+            }
+            Ok(b) => match serde_json::from_slice::<Value>(&b) {
+                Ok(v) => json!(
+                    v.get("hooks")
+                        .map(|h| fingerprint(h.to_string().as_bytes()))
+                        .unwrap_or_else(|| "no hooks key".into())
+                ),
+                Err(_) => {
+                    ok = false;
+                    json!("malformed")
+                }
+            },
+        };
+        out.insert(f.display().to_string(), state);
     }
-    Value::Object(out)
+    (Value::Object(out), ok)
 }
 
 // ---------------- codex-home hooks.json backup / restore (§4.3) ----------------
+//
+// Install and restore run under `session::EDIT_LOCK`, which the watchdog also
+// takes before running cleanups; the restore cleanup is registered only after
+// our hooks.json is in place. Restore never overwrites: the current file is
+// moved aside, re-verified, and the original is linked back in only if the
+// target name is still free.
 
 fn meta_path(home: &Path) -> PathBuf {
     home.join("hooks.json.chs-backup.json")
 }
 
-/// Backs up `<home>/hooks.json`, records metadata next to it, then writes ours.
+fn cleanup_name(home: &Path) -> String {
+    format!("codex-home hooks.json {}", home.display())
+}
+
+/// Test hook: called with a step name at the interleaving points the H2 tests probe.
+type StepHook = Box<dyn Fn(&str) + Send + Sync>;
+static STEP_HOOK: std::sync::Mutex<Option<StepHook>> = std::sync::Mutex::new(None);
+
+fn step(name: &str) {
+    if let Some(h) = STEP_HOOK.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        h(name);
+    }
+}
+
+fn lock_edits() -> std::sync::MutexGuard<'static, ()> {
+    session::EDIT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn create_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+/// Backs up `<home>/hooks.json`, creates the metadata file exclusively, then writes ours.
 fn install_global_hooks(home: &Path, run_id: &str, content: &[u8]) -> Result<(), String> {
+    let _g = lock_edits();
     let target = home.join("hooks.json");
     let meta = meta_path(home);
-    if meta.exists() {
-        return Err(format!(
-            "{} exists; a previous run has not been restored",
-            meta.display()
-        ));
-    }
     if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(format!("{} is a symlink; refusing", target.display()));
-    }
-    let backup = home.join(format!("hooks.json.chs-backup-{run_id}"));
-    let had = target.exists();
-    let mode = os::file_mode(&target);
-    if had {
-        std::fs::copy(&target, &backup).map_err(|e| format!("backup: {e}"))?;
     }
     let me = os::proc_info(std::process::id())
         .map(|p| p.start_time)
         .unwrap_or(0);
+    let backup = home.join(format!("hooks.json.chs-backup-{run_id}"));
+    let original = match std::fs::read(&target) {
+        Ok(b) => Some(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{}: {e}", target.display())),
+    };
     let m = json!({
         "run_id": run_id, "harness_pid": std::process::id(), "harness_start": me,
-        "backup_path": had.then(|| backup.display().to_string()), "mode": mode,
+        "backup_path": original.is_some().then(|| backup.display().to_string()),
+        "mode": os::file_mode(&target),
         "written": String::from_utf8_lossy(content),
     });
-    util::write_atomic(&meta, m.to_string().as_bytes()).map_err(|e| format!("meta: {e}"))?;
+    create_new(&meta, m.to_string().as_bytes()).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => format!(
+            "{} exists; a previous run has not been restored",
+            meta.display()
+        ),
+        _ => format!("meta: {e}"),
+    })?;
+    // From here on we own `meta` (and `backup` once created); undo both on failure.
+    let undo = |msg: String, created_backup: bool| {
+        if created_backup {
+            let _ = std::fs::remove_file(&backup);
+        }
+        let _ = std::fs::remove_file(&meta);
+        Err(msg)
+    };
+    if let Some(b) = &original
+        && let Err(e) = create_new(&backup, b)
+    {
+        return undo(format!("backup: {e}"), false);
+    }
+    if std::fs::read(&target).ok() != original {
+        return undo(
+            format!("{} changed during install; refusing", target.display()),
+            original.is_some(),
+        );
+    }
+    if let Err(e) = util::write_atomic(&target, content) {
+        return undo(format!("write hooks.json: {e}"), original.is_some());
+    }
+    step("after_rename");
     let h = home.to_path_buf();
     session::watchdog_cleanup(
-        "codex-home hooks.json",
-        Box::new(move || restore_global_hooks(&h, false)),
+        &cleanup_name(home),
+        Box::new(move || match restore_locked(&h, false, &os::liveness) {
+            Ok(s) | Err(s) => s,
+        }),
     );
-    util::write_atomic(&target, content).map_err(|e| format!("write hooks.json: {e}"))?;
     Ok(())
 }
 
-/// Restores the backed-up hooks.json if it still holds exactly what we wrote.
-/// With `only_if_dead`, a metadata file from a still-running harness is left alone.
-pub fn restore_global_hooks(home: &Path, only_if_dead: bool) -> String {
+/// Swaps ours for `next` (A-4 mutation of the active source) under the lock;
+/// only if the file still holds exactly what the metadata says we wrote.
+fn replace_global_hooks(home: &Path, next: &[u8]) -> Result<(), String> {
+    let _g = lock_edits();
     let meta = meta_path(home);
-    let Ok(raw) = std::fs::read(&meta) else {
-        return "no metadata".into();
+    let target = home.join("hooks.json");
+    let mut m: Value = std::fs::read(&meta)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .ok_or("metadata missing or unreadable")?;
+    if m["harness_pid"].as_u64() != Some(std::process::id() as u64) {
+        return Err("metadata belongs to another harness".into());
+    }
+    let written = m["written"].as_str().unwrap_or("").as_bytes().to_vec();
+    if std::fs::read(&target).ok() != Some(written) {
+        return Err(format!("{} changed since we wrote it", target.display()));
+    }
+    m["written"] = json!(String::from_utf8_lossy(next));
+    util::write_atomic(&meta, m.to_string().as_bytes()).map_err(|e| format!("meta: {e}"))?;
+    util::write_atomic(&target, next).map_err(|e| format!("write hooks.json: {e}"))
+}
+
+/// Restores the backed-up hooks.json. `Ok` = restored or nothing to do;
+/// `Err` = refused or failed (the caller reports status error).
+pub fn restore_global_hooks(home: &Path, only_if_dead: bool) -> Result<String, String> {
+    let _g = lock_edits();
+    let r = restore_locked(home, only_if_dead, &os::liveness);
+    session::watchdog_remove_cleanup(&cleanup_name(home));
+    r
+}
+
+fn restore_locked(
+    home: &Path,
+    only_if_dead: bool,
+    liveness: &dyn Fn(u32, u64) -> Option<bool>,
+) -> Result<String, String> {
+    let meta = meta_path(home);
+    let raw = match std::fs::read(&meta) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok("no metadata".into()),
+        Err(e) => return Err(format!("metadata unreadable: {e}; left in place")),
     };
-    let Ok(m) = serde_json::from_slice::<Value>(&raw) else {
-        return "metadata unreadable; left in place".into();
-    };
+    let m: Value = serde_json::from_slice(&raw)
+        .map_err(|_| "metadata malformed; left in place".to_string())?;
     let pid = m["harness_pid"].as_u64().unwrap_or(0) as u32;
     let start = m["harness_start"].as_u64().unwrap_or(0);
-    if only_if_dead && os::is_alive(pid, start) {
-        return "owning harness still running".into();
+    if only_if_dead {
+        match liveness(pid, start) {
+            Some(false) => {}
+            Some(true) => return Ok("owning harness still running".into()),
+            None => {
+                return Err(format!(
+                    "cannot confirm harness {pid} is dead; refusing to restore"
+                ));
+            }
+        }
     }
     let target = home.join("hooks.json");
     let written = m["written"].as_str().unwrap_or("").as_bytes().to_vec();
     match std::fs::read(&target) {
         Ok(cur) if cur == written => {}
         Ok(_) => {
-            return format!(
+            return Err(format!(
                 "{} changed since we wrote it; refusing to restore",
                 target.display()
-            );
+            ));
         }
-        Err(_) => return format!("{} missing; refusing to restore", target.display()),
+        Err(_) => return Err(format!("{} missing; refusing to restore", target.display())),
     }
-    let res = match m["backup_path"].as_str() {
-        Some(b) => std::fs::copy(b, &target)
-            .map(|_| ())
-            .and_then(|_| os::set_file_mode(&target, m["mode"].as_u64().map(|v| v as u32)))
-            .and_then(|_| std::fs::remove_file(b)),
-        None => std::fs::remove_file(&target),
-    };
-    match res {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&meta);
-            "restored".into()
+    step("after_check");
+    let backup = m["backup_path"].as_str().map(PathBuf::from);
+    // Stage the original first, so the swap below is rename + link only.
+    let staged = home.join(format!("hooks.json.chs-staged-{}", std::process::id()));
+    if let Some(b) = &backup {
+        let bytes = std::fs::read(b).map_err(|e| format!("backup unreadable: {e}"))?;
+        let _ = std::fs::remove_file(&staged);
+        create_new(&staged, &bytes).map_err(|e| format!("stage: {e}"))?;
+        let _ = os::set_file_mode(&staged, m["mode"].as_u64().map(|v| v as u32));
+    }
+    let displaced = home.join(format!("hooks.json.chs-displaced-{}", util::now_ms()));
+    if let Err(e) = std::fs::rename(&target, &displaced) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!("move aside: {e}"));
+    }
+    let concurrent_edit = std::fs::read(&displaced).ok() != Some(written);
+    if backup.is_some() {
+        let linked = std::fs::hard_link(&staged, &target);
+        let _ = std::fs::remove_file(&staged);
+        if let Err(e) = linked {
+            return Err(format!(
+                "{} reappeared during restore ({e}); ours/edited copy kept at {}",
+                target.display(),
+                displaced.display()
+            ));
         }
-        Err(e) => format!("restore failed: {e}"),
     }
+    if let Some(b) = &backup {
+        let _ = std::fs::remove_file(b);
+    }
+    let _ = std::fs::remove_file(&meta);
+    if concurrent_edit {
+        return Err(format!(
+            "restored the original; a concurrent edit was preserved at {}",
+            displaced.display()
+        ));
+    }
+    let _ = std::fs::remove_file(&displaced);
+    Ok("restored".into())
 }
 
 /// Called at every `chs` start (§4.3).
@@ -558,7 +728,7 @@ pub fn recover_leftover() {
     let home = codex_home();
     if meta_path(&home).exists() {
         let r = restore_global_hooks(&home, true);
-        eprintln!("chs: leftover codex-home hooks.json backup: {r}");
+        eprintln!("chs: leftover codex-home hooks.json backup: {r:?}");
     }
 }
 
@@ -584,43 +754,96 @@ fn remove_project_hooks(f: &Path, content: &[u8]) {
 }
 
 // ---------------- scenarios ----------------
+//
+// Every scenario declares its required cases up front (`ctx.require`); a case
+// a setup failure, timeout, or cutoff prevented is `inconclusive`, never pass.
+
+fn not_run(ctx: &Ctx, cases: &[(&str, String)], why: &str) {
+    for (id, case) in cases {
+        ctx.check(id, case, "inconclusive", json!({"not_run": why}));
+    }
+}
+
+/// A paste that was not sent: validator rejection is a failure; readiness,
+/// gate, deadline, and writer outcomes are inconclusive (never retried).
+fn unsent_result(o: &paste::Outcome) -> &'static str {
+    if o.state == "rejected" {
+        "fail"
+    } else {
+        "inconclusive"
+    }
+}
+
+/// Reads one line from stdin with a deadline (owner prompts).
+fn ask_owner(question: &str, deadline: Instant) -> Option<String> {
+    println!("{question}");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        if std::io::stdin()
+            .lock()
+            .read_line(&mut s)
+            .is_ok_and(|n| n > 0)
+        {
+            let _ = tx.send(s.trim().to_string());
+        }
+    });
+    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
+}
 
 fn claude_hooks(ctx: &Ctx, a: &Agent) {
-    let before = claude_global_hooks();
+    ctx.require("A-1", "session_start_bound");
+    if ctx.args.prompt {
+        ctx.require("A-2", "user_prompt_submit");
+    }
+    ctx.require("C1", "no_global_hook_edit");
+    ctx.require("A-5", "claude_registered_vs_observed");
+    let (before, before_ok) = claude_global_hooks();
     let cwd = default_cwd(ctx, a);
     let l = match start(ctx, a, "claude-hooks", &cwd, None, "claude", &[]) {
         Ok(l) => l,
-        Err(e) => return ctx.error(e),
+        Err(e) => return not_run(ctx, &[("A-1", "session_start_bound".into())], &e),
     };
     let (bound, ms, snap) = wait_start(ctx, &l);
     ctx.check(
         "A-1",
         "session_start_bound",
         result_str(bound.is_some()),
-        json!({"session_id": bound, "latency_ms": ms, "snapshot": snap}),
+        json!({"session_id": bound, "latency_ms": ms, "snapshot": snap, "ambiguous": l.receiver.ambiguous()}),
     );
     if ctx.args.prompt && bound.is_some() {
-        let gate = l.wait_gate(ctx.until(Duration::from_secs(10)));
-        let o = submit(ctx, &l, "Reply with the single word OK.", Newline::Cr);
-        let ups = nth_bound(&l, "UserPromptSubmit", 1, ctx.until(REAL_UPS_WAIT));
-        let has_prompt = ups
-            .as_ref()
-            .and_then(|e| e.json())
-            .is_some_and(|v| v.get("prompt").is_some_and(Value::is_string));
-        ctx.check(
-            "A-2",
-            "user_prompt_submit",
-            if gate { result_str(has_prompt) } else { "fail" },
-            json!({"paste": o, "gate": gate, "fixture": ups.map(|e| e.fixture)}),
-        );
+        let (res, ev) = if !l.wait_gate(ctx.until(Duration::from_secs(10))) {
+            ("inconclusive", json!({"readiness_gate_failed": true}))
+        } else {
+            let o = submit(ctx, &l, "Reply with the single word OK.", Newline::Cr, 0);
+            if o.state != "sent" {
+                (unsent_result(&o), json!({"paste": o}))
+            } else {
+                let ups = nth_bound(&l, "UserPromptSubmit", 1, ctx.until(REAL_UPS_WAIT));
+                let has_prompt = ups
+                    .as_ref()
+                    .and_then(|e| e.json())
+                    .is_some_and(|v| v.get("prompt").is_some_and(Value::is_string));
+                (
+                    result_str(has_prompt),
+                    json!({"paste": o, "fixture": ups.map(|e| e.fixture)}),
+                )
+            }
+        };
+        ctx.check("A-2", "user_prompt_submit", res, ev);
     }
     let obs = observed(&l);
     finish(ctx, l);
-    let after = claude_global_hooks();
+    let (after, after_ok) = claude_global_hooks();
     ctx.check(
         "C1",
         "no_global_hook_edit",
-        result_str(before == after),
+        if before_ok && after_ok {
+            result_str(before == after)
+        } else {
+            "inconclusive"
+        },
         json!({"before": before, "after": after}),
     );
     ctx.check(
@@ -629,6 +852,20 @@ fn claude_hooks(ctx: &Ctx, a: &Agent) {
         "pass",
         json!({"registered": CLAUDE_EVENTS, "observed": obs}),
     );
+}
+
+/// Write strategies for the real paste sweep: C-1's required subset runs
+/// whole and 7-byte chunked writes; otherwise `--chunk`.
+fn paste_chunks(ctx: &Ctx) -> Vec<usize> {
+    if ctx.args.subset.as_deref() == Some("required") {
+        vec![0, 7]
+    } else {
+        vec![ctx.args.chunk]
+    }
+}
+
+pub fn paste_case(agent: &str, mode: Newline, chunk: usize, entry: &str) -> String {
+    format!("{agent}/{}/c{chunk}/{entry}", mode.name())
 }
 
 fn paste_sweep(ctx: &Ctx, a: &Agent) {
@@ -646,75 +883,100 @@ fn paste_sweep(ctx: &Ctx, a: &Agent) {
         .paste_newline
         .map(|m| vec![m])
         .unwrap_or(Newline::ALL.to_vec());
+    let chunks = paste_chunks(ctx);
+    for mode in &modes {
+        for chunk in &chunks {
+            for e in &corpus {
+                ctx.require("A-6", &paste_case(a.name, *mode, *chunk, &e.id));
+            }
+        }
+    }
     let cwd = default_cwd(ctx, a);
     for mode in modes {
-        let label = format!("{}-paste-{}", a.name, mode.name());
-        let l = match start(ctx, a, &label, &cwd, Some("no-daemon"), a.name, &[]) {
-            Ok(l) => l,
-            Err(e) => {
-                ctx.error(e);
-                continue;
-            }
-        };
-        let (bound, ms, snap) = wait_start(ctx, &l);
-        if bound.is_none() {
-            ctx.check(
-                "A-6",
-                &format!("{}/{}", a.name, mode.name()),
-                "fail",
-                json!({"session_start": "timeout", "latency_ms": ms, "snapshot": snap}),
-            );
-            finish(ctx, l);
-            continue;
-        }
-        let mut n = 0;
-        for e in &corpus {
+        for &chunk in &chunks {
             if ctx.past_cutoff() {
-                break;
+                return;
             }
-            let case = format!("{}/{}/{}", a.name, mode.name(), e.id);
-            if !l.wait_gate(ctx.until(Duration::from_secs(15))) {
-                ctx.check(
-                    "A-6",
-                    &case,
-                    "inconclusive",
-                    json!({"readiness_gate_failed": true}),
-                );
-                continue;
-            }
-            let o = submit(ctx, &l, &e.text, mode);
-            if o.state != "sent" {
-                ctx.check("A-6", &case, "fail", json!({"paste": o}));
-                continue;
-            }
-            n += 1;
-            let ups = nth_bound(&l, "UserPromptSubmit", n, ctx.until(REAL_UPS_WAIT));
-            let got = ups
-                .as_ref()
-                .and_then(|e| e.json())
-                .and_then(|v| v["prompt"].as_str().map(str::to_string));
-            let want = paste::normalize_lf(e.text.as_bytes());
-            let (res, ev) = match &got {
-                Some(g) => {
-                    let gotn = paste::normalize_lf(g.as_bytes());
-                    let d = util::first_diff(&want, &gotn);
-                    (
-                        result_str(d.is_none()),
-                        json!({"equal": d.is_none(), "first_diff": d, "fixture": ups.as_ref().map(|e| &e.fixture)}),
-                    )
+            let cases: Vec<(&str, String)> = corpus
+                .iter()
+                .map(|e| ("A-6", paste_case(a.name, mode, chunk, &e.id)))
+                .collect();
+            let label = format!("{}-paste-{}-c{chunk}", a.name, mode.name());
+            let l = match start(ctx, a, &label, &cwd, Some("no-daemon"), a.name, &[]) {
+                Ok(l) => l,
+                Err(e) => {
+                    not_run(ctx, &cases, &e);
+                    continue;
                 }
-                None => ("fail", json!({"ups": "missing"})),
             };
-            ctx.check("A-6", &case, res, ev);
-            // Let the turn finish before the next paste.
-            let _ = nth_bound(&l, "Stop", n, ctx.until(REAL_STOP_WAIT));
+            let (bound, ms, snap) = wait_start(ctx, &l);
+            if bound.is_none() {
+                for (id, case) in &cases {
+                    ctx.check(
+                        id,
+                        case,
+                        "inconclusive",
+                        json!({"session_start": "timeout", "latency_ms": ms, "snapshot": snap,
+                               "ambiguous": l.receiver.ambiguous()}),
+                    );
+                }
+                finish(ctx, l);
+                continue;
+            }
+            let mut n = 0;
+            for (e, (_, case)) in corpus.iter().zip(&cases) {
+                if ctx.past_cutoff() {
+                    break;
+                }
+                if !l.wait_gate(ctx.until(Duration::from_secs(15))) {
+                    ctx.check(
+                        "A-6",
+                        case,
+                        "inconclusive",
+                        json!({"readiness_gate_failed": true}),
+                    );
+                    continue;
+                }
+                let o = submit(ctx, &l, &e.text, mode, chunk);
+                if o.state != "sent" {
+                    ctx.check("A-6", case, unsent_result(&o), json!({"paste": o}));
+                    continue;
+                }
+                n += 1;
+                let ups = nth_bound(&l, "UserPromptSubmit", n, ctx.until(REAL_UPS_WAIT));
+                let got = ups
+                    .as_ref()
+                    .and_then(|e| e.json())
+                    .and_then(|v| v["prompt"].as_str().map(str::to_string));
+                let want = paste::normalize_lf(e.text.as_bytes());
+                let (res, ev) = match &got {
+                    Some(g) => {
+                        let gotn = paste::normalize_lf(g.as_bytes());
+                        let d = util::first_diff(&want, &gotn);
+                        (
+                            result_str(d.is_none()),
+                            json!({"equal": d.is_none(), "first_diff": d, "fixture": ups.as_ref().map(|e| &e.fixture)}),
+                        )
+                    }
+                    None => ("fail", json!({"ups": "missing", "dropped": true})),
+                };
+                ctx.check("A-6", case, res, ev);
+                // Let the turn finish before the next paste.
+                let _ = nth_bound(&l, "Stop", n, ctx.until(REAL_STOP_WAIT));
+            }
+            finish(ctx, l);
         }
-        finish(ctx, l);
     }
 }
 
 /// A-7 (and C-2's attended launch with `--attended`).
 fn stall(ctx: &Ctx, a: &Agent) {
+    let a7 = format!("{}_untrusted_folder_snapshot", a.name);
+    let c2 = format!("attended/{}", a.name);
+    ctx.require("A-7", &a7);
+    if ctx.args.attended {
+        ctx.require("C-2", &c2);
+    }
     let cwd = ctx.args.cwd.clone().unwrap_or_else(|| {
         ctx.args
             .root
@@ -731,19 +993,39 @@ fn stall(ctx: &Ctx, a: &Agent) {
         &[],
     ) {
         Ok(l) => l,
-        Err(e) => return ctx.error(e),
+        Err(e) => return not_run(ctx, &[("A-7", a7), ("C-2", c2)], &e),
     };
     let (bound, ms, snap) = wait_start(ctx, &l);
-    let mut attended = Value::Null;
-    if bound.is_none() && ctx.args.attended {
-        attended = attend(ctx, &l);
+    if ctx.args.attended {
+        let (res, attended) = if bound.is_some() {
+            (
+                "inconclusive",
+                json!({"why": "SessionStart arrived without a prompt; nothing to clear"}),
+            )
+        } else {
+            let v = attend(ctx, &l);
+            let sent = v["keys"]
+                .as_array()
+                .is_some_and(|k| k.iter().any(|k| k["ok"] == true));
+            let res = match (sent, l.receiver.bound().is_some()) {
+                (_, true) => "pass",
+                (true, false) => "fail",
+                (false, false) => "inconclusive",
+            };
+            (res, v)
+        };
+        ctx.check(
+            "C-2",
+            &c2,
+            res,
+            json!({"attended": attended, "bound_after_keys": l.receiver.bound()}),
+        );
     }
     ctx.check(
         "A-7",
-        &format!("{}_untrusted_folder_snapshot", a.name),
+        &a7,
         "inconclusive",
-        json!({"owner_judgment_required": true, "timed_out": bound.is_none(), "latency_ms": ms, "snapshot": snap,
-               "attended": attended, "bound_after_keys": l.receiver.bound()}),
+        json!({"owner_judgment_required": true, "timed_out": bound.is_none(), "latency_ms": ms, "snapshot": snap}),
     );
     finish(ctx, l);
 }
@@ -751,15 +1033,16 @@ fn stall(ctx: &Ctx, a: &Agent) {
 /// Shows the snapshot and relays the owner's keys as ungated `write_key` (C-2).
 fn attend(ctx: &Ctx, l: &Launch) -> Value {
     let mut used = Vec::new();
-    let stdin = std::io::stdin();
-    let mut lines = stdin.lock().lines();
     loop {
         for line in l.snapshot().lines.iter().filter(|s| !s.is_empty()) {
             println!("| {line}");
         }
-        println!("keys: down enter esc w-down w-enter w-esc | done");
-        let Some(Ok(cmd)) = lines.next() else { break };
-        let cmd = cmd.trim().to_string();
+        let Some(cmd) = ask_owner(
+            "keys: down enter esc w-down w-enter w-esc | done",
+            ctx.until(Duration::from_secs(300)),
+        ) else {
+            break;
+        };
         if cmd == "done" || ctx.past_cutoff() {
             break;
         }
@@ -769,7 +1052,7 @@ fn attend(ctx: &Ctx, l: &Launch) -> Value {
                 .io()
                 .tx
                 .write_wait(vec![b], ctx.until(Duration::from_secs(5)));
-            used.push(json!({"key": cmd, "ok": r.is_ok()}));
+            used.push(json!({"key": cmd, "ok": r.is_ok(), "encoding": if cmd.starts_with("w-") { "win32" } else { "vt" }}));
         }
         if l.receiver
             .wait_bound(ctx.until(Duration::from_secs(2)))
@@ -789,112 +1072,221 @@ fn codex_modes(ctx: &Ctx) -> Vec<&'static str> {
     }
 }
 
+/// Points the active file-based hook source (codex-home / project) at `next`.
+/// Session flags carry the command in argv, so nothing to do there.
+fn set_file_source(
+    ctx: &Ctx,
+    project_file: Option<&PathBuf>,
+    cur: &[u8],
+    next: &[u8],
+) -> Result<(), String> {
+    match ctx.args.hook_source.as_str() {
+        "codex-home" => replace_global_hooks(&codex_home(), next),
+        "project" => {
+            let f = project_file.ok_or("project hooks.json not installed")?;
+            if std::fs::read(f).ok().as_deref() != Some(cur) {
+                return Err(format!("{} changed since we wrote it", f.display()));
+            }
+            util::write_atomic(f, next).map_err(|e| e.to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn codex_hooks(ctx: &Ctx, a: &Agent) {
     let cwd = default_cwd(ctx, a);
-    let cmd = hook_command(&ctx.args.root, "codex");
-    let content = serde_json::to_vec_pretty(&codex_hooks_json(&cmd)).unwrap_or_default();
+    let content =
+        serde_json::to_vec_pretty(&codex_hooks_json(&hook_command(&ctx.args.root, "codex")))
+            .unwrap_or_default();
+    let mutated =
+        serde_json::to_vec_pretty(&codex_hooks_json(&hook_command(&ctx.args.root, "codez")))
+            .unwrap_or_default();
+    let mut plan: Vec<(&str, PathBuf, String, &str, String)> = Vec::new();
+    for mode in codex_modes(ctx) {
+        for i in 0..ctx.args.launches.max(1) {
+            let tag = format!("{mode}-{i}");
+            plan.push((
+                mode,
+                cwd.clone(),
+                tag.clone(),
+                "A-3",
+                format!("{mode}/{tag}"),
+            ));
+        }
+        if let Some(c2) = &ctx.args.cwd2 {
+            plan.push((
+                mode,
+                c2.clone(),
+                format!("{mode}-cwd2"),
+                "C3",
+                format!("{mode}/second_cwd_same_key"),
+            ));
+        }
+        if ctx.args.mutate_command {
+            plan.push((
+                mode,
+                cwd.clone(),
+                format!("{mode}-mutated"),
+                "A-4",
+                format!("{mode}/mutated_not_delivered"),
+            ));
+            plan.push((
+                mode,
+                cwd.clone(),
+                format!("{mode}-restored"),
+                "A-4",
+                format!("{mode}/restored_delivers"),
+            ));
+        }
+    }
+    for (_, _, _, id, case) in &plan {
+        ctx.require(id, case);
+        if *id == "A-3" {
+            ctx.require("A-5", case);
+        }
+    }
+    let all_cases: Vec<(&str, String)> = plan.iter().map(|p| (p.3, p.4.clone())).collect();
     let mut project_file = None;
     match ctx.args.hook_source.as_str() {
         "codex-home" => {
             if let Err(e) = install_global_hooks(&codex_home(), &ctx.run_id, &content) {
-                return ctx.error(e);
+                ctx.error(e.clone());
+                return not_run(ctx, &all_cases, &e);
             }
         }
         "project" => match install_project_hooks(&cwd, &content) {
             Ok(f) => project_file = Some(f),
-            Err(e) => return ctx.error(e),
+            Err(e) => {
+                ctx.error(e.clone());
+                return not_run(ctx, &all_cases, &e);
+            }
         },
         _ => {}
     }
-    let mut runs = Vec::new();
-    for mode in codex_modes(ctx) {
-        let mut launches: Vec<(PathBuf, String)> = (0..ctx.args.launches.max(1))
-            .map(|i| (cwd.clone(), format!("{mode}-{i}")))
-            .collect();
-        if let Some(c2) = &ctx.args.cwd2 {
-            launches.push((c2.clone(), format!("{mode}-cwd2")));
+    let mut first_keys: std::collections::BTreeMap<&str, BTreeSet<String>> = Default::default();
+    for (mode, dir, tag, id, case) in plan {
+        if ctx.past_cutoff() {
+            break;
         }
-        if ctx.args.mutate_command {
-            launches.push((cwd.clone(), format!("{mode}-mutated")));
-            launches.push((cwd.clone(), format!("{mode}-restored")));
+        let is_mutated = tag.ends_with("-mutated");
+        let is_restored = tag.ends_with("-restored");
+        if is_mutated
+            && let Err(e) = set_file_source(ctx, project_file.as_ref(), &content, &mutated)
+        {
+            not_run(ctx, &[(id, case)], &format!("mutation not applied: {e}"));
+            continue;
         }
-        for (dir, tag) in launches {
-            if ctx.past_cutoff() {
-                break;
+        if is_restored
+            && let Err(e) = set_file_source(ctx, project_file.as_ref(), &mutated, &content)
+        {
+            not_run(ctx, &[(id, case)], &format!("restore not applied: {e}"));
+            continue;
+        }
+        let hook_agent = if is_mutated { "codez" } else { "codex" };
+        let before = codex_config();
+        let label = format!("codex-hooks-{tag}");
+        let l = match start(ctx, a, &label, &dir, Some(mode), hook_agent, &[]) {
+            Ok(l) => l,
+            Err(e) => {
+                not_run(ctx, &[(id, case)], &e);
+                continue;
             }
-            let mutated = tag.ends_with("-mutated");
-            let hook_agent = if mutated { "codez" } else { "codex" };
-            let before = codex_config();
-            let label = format!("codex-hooks-{tag}");
-            let l = match start(ctx, a, &label, &dir, Some(mode), hook_agent, &[]) {
-                Ok(l) => l,
-                Err(e) => {
-                    ctx.error(e);
-                    continue;
+        };
+        let (bound, ms, snap) = wait_start(ctx, &l);
+        let mut ups_seen = None;
+        if ctx.args.prompt && bound.is_some() && l.wait_gate(ctx.until(Duration::from_secs(10))) {
+            let _ = submit(ctx, &l, "Reply with the single word OK.", Newline::Cr, 0);
+            ups_seen =
+                Some(nth_bound(&l, "UserPromptSubmit", 1, ctx.until(REAL_UPS_WAIT)).is_some());
+            let _ = nth_bound(&l, "Stop", 1, ctx.until(REAL_STOP_WAIT));
+        }
+        let any_event = !l.receiver.events().is_empty();
+        let mut owner = Value::Null;
+        if is_mutated && !any_event {
+            for line in l.snapshot().lines.iter().filter(|s| !s.is_empty()) {
+                println!("| {line}");
+            }
+            let ans = ask_owner(
+                "A-4: does the hooks review entry above name the mutated command (ending in `codez`)? [y/n]",
+                ctx.until(Duration::from_secs(300)),
+            );
+            owner = json!({"prompt": "review entry names the mutated command", "answer": ans});
+        }
+        let obs = observed(&l);
+        let ambiguous = l.receiver.ambiguous();
+        finish(ctx, l);
+        let after = codex_config();
+        let delta = config_delta(&before, &after);
+        let base = json!({"mode": mode, "cwd": dir, "session_id": bound, "latency_ms": ms, "snapshot": snap,
+                          "registered": CODEX_EVENTS, "observed": obs, "ups_seen": ups_seen, "config": delta,
+                          "ambiguous": ambiguous,
+                          "observed_on": format!("codex {}, source {}, mode {mode}", a.version, ctx.args.hook_source)});
+        let config_ok = before.readable && after.readable;
+        match id {
+            "A-4" if is_mutated => {
+                let res = if any_event {
+                    "fail"
+                } else {
+                    match owner["answer"].as_str().map(|s| s.to_ascii_lowercase()) {
+                        Some(s) if s == "y" || s == "yes" => "pass",
+                        Some(s) if s == "n" || s == "no" => "fail",
+                        _ => "inconclusive",
+                    }
+                };
+                ctx.check(
+                    id,
+                    &case,
+                    res,
+                    json!({"base": base, "delivered_from_mutated": any_event, "owner": owner}),
+                );
+            }
+            "A-4" => ctx.check(id, &case, result_str(bound.is_some()), base),
+            "C3" => {
+                let first = first_keys.get(mode).cloned().unwrap_or_default();
+                let wanted = |k: &String| {
+                    ctx.args.hook_source != "session-flags" || k.contains("<session-flags>")
+                };
+                let matching = !first.is_empty()
+                    && first.iter().all(wanted)
+                    && first.is_subset(&after.keys)
+                    && after.keys.difference(&before.keys).count() == 0;
+                let res = if !config_ok {
+                    "inconclusive"
+                } else {
+                    result_str(bound.is_some() && matching)
+                };
+                ctx.check(
+                    id,
+                    &case,
+                    res,
+                    json!({"base": base, "first_cwd_keys": first, "second_cwd_keys": after.keys}),
+                );
+            }
+            _ => {
+                if bound.is_some() && config_ok {
+                    first_keys.entry(mode).or_insert_with(|| after.keys.clone());
                 }
-            };
-            let (bound, ms, snap) = wait_start(ctx, &l);
-            let mut ups_seen = None;
-            if ctx.args.prompt && bound.is_some() && l.wait_gate(ctx.until(Duration::from_secs(10)))
-            {
-                let _ = submit(ctx, &l, "Reply with the single word OK.", Newline::Cr);
-                ups_seen =
-                    Some(nth_bound(&l, "UserPromptSubmit", 1, ctx.until(REAL_UPS_WAIT)).is_some());
-                let _ = nth_bound(&l, "Stop", 1, ctx.until(REAL_STOP_WAIT));
-            }
-            let mentions = snap
-                .as_ref()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .map(|s| s.contains("codez"));
-            let any_event = !l.receiver.events().is_empty();
-            let obs = observed(&l);
-            finish(ctx, l);
-            let after = codex_config();
-            let delta = config_delta(&before, &after);
-            let base = json!({"mode": mode, "cwd": dir, "session_id": bound, "latency_ms": ms, "snapshot": snap,
-                              "registered": CODEX_EVENTS, "observed": obs, "ups_seen": ups_seen, "config": delta,
-                              "observed_on": format!("codex {}, source {}, mode {mode}", a.version, ctx.args.hook_source)});
-            if mutated {
+                ctx.check(id, &case, result_str(bound.is_some()), base.clone());
                 ctx.check(
-                    "A-4",
-                    &format!("{mode}/mutated_not_delivered"),
-                    result_str(!any_event),
-                    json!({"base": base, "snapshot_mentions_mutated_command": mentions}),
-                );
-            } else if tag.ends_with("-restored") {
-                ctx.check(
-                    "A-4",
-                    &format!("{mode}/restored_delivers"),
-                    result_str(bound.is_some()),
+                    "A-5",
+                    &case,
+                    if config_ok { "pass" } else { "inconclusive" },
                     base,
                 );
-            } else if tag.ends_with("-cwd2") {
-                let added = after.keys.difference(&before.keys).count();
-                ctx.check(
-                    "C3",
-                    &format!("{mode}/second_cwd_same_key"),
-                    result_str(bound.is_some() && added == 0),
-                    base,
-                );
-            } else {
-                ctx.check(
-                    "A-3",
-                    &format!("{mode}/{tag}"),
-                    result_str(bound.is_some()),
-                    base.clone(),
-                );
-                ctx.check("A-5", &format!("{mode}/{tag}"), "pass", base);
             }
-            runs.push(tag);
         }
     }
     if let Some(f) = project_file {
         remove_project_hooks(&f, &content);
     }
     if ctx.args.hook_source == "codex-home" {
-        let r = restore_global_hooks(&codex_home(), false);
-        session::watchdog_remove_cleanup("codex-home hooks.json");
-        ctx.detail("codex_home_restore", json!(r));
+        match restore_global_hooks(&codex_home(), false) {
+            Ok(r) => ctx.detail("codex_home_restore", json!(r)),
+            Err(e) => {
+                ctx.detail("codex_home_restore", json!(e));
+                ctx.error(format!("codex-home restore: {e}"));
+            }
+        }
     }
 }
 
@@ -908,6 +1300,13 @@ fn codex_procs() -> Vec<os::ProcInfo> {
 
 /// A-9: our default-mode Codex next to an unrelated, already-running Codex.
 fn codex_warm(ctx: &Ctx, a: &Agent) {
+    let cases = [
+        ("A-9", "hooks_in_our_tree".to_string()),
+        ("A-9", "unrelated_survives_our_stop".to_string()),
+    ];
+    for (id, c) in &cases {
+        ctx.require(id, c);
+    }
     let cwd = default_cwd(ctx, a);
     let pre: Vec<u32> = codex_procs().iter().map(|p| p.pid).collect();
     // The unrelated Codex: our own PTY, no CHALDEA_* env, default mode.
@@ -924,20 +1323,33 @@ fn codex_warm(ctx: &Ctx, a: &Agent) {
     });
     let mut unrelated = match unrelated {
         Ok(s) => s,
-        Err(e) => return ctx.error(e),
+        Err(e) => return not_run(ctx, &cases, &e),
     };
     std::thread::sleep(
         Duration::from_secs(10).min(ctx.cutoff.saturating_duration_since(Instant::now())),
     );
+    // The warm server: a Codex process that appeared since `pre`, other than
+    // the unrelated CLI itself, identified by pid + start time + ancestry.
     let warm: Vec<os::ProcInfo> = codex_procs()
         .into_iter()
         .filter(|p| !pre.contains(&p.pid) && p.pid != unrelated.owned.child_pid)
         .collect();
+    let warm_id: Vec<Value> = warm
+        .iter()
+        .map(|p| json!({"pid": p.pid, "start_time": p.start_time, "ancestry": os::ancestry(p.pid, 8)}))
+        .collect();
+    ctx.detail("warm_server", json!(warm_id));
+    if warm.is_empty() {
+        not_run(ctx, &cases, "no warm server identified before launch");
+        let s = unrelated.stop();
+        ctx.detail("unrelated_stop", json!(s));
+        return;
+    }
     let l = match start(ctx, a, "codex-warm", &cwd, Some("default"), "codex", &[]) {
         Ok(l) => l,
         Err(e) => {
             unrelated.stop();
-            return ctx.error(e);
+            return not_run(ctx, &cases, &e);
         }
     };
     let (bound, ms, snap) = wait_start(ctx, &l);
@@ -950,6 +1362,7 @@ fn codex_warm(ctx: &Ctx, a: &Agent) {
         .filter(|e| e.ancestry.iter().any(|(p, _)| warm_pids.contains(p)))
         .map(|e| e.seq)
         .collect();
+    let ambiguous = l.receiver.ambiguous();
     finish(ctx, l);
     let warm_alive: Vec<u32> = warm
         .iter()
@@ -957,13 +1370,16 @@ fn codex_warm(ctx: &Ctx, a: &Agent) {
         .map(|p| p.pid)
         .collect();
     let unrelated_alive = os::is_alive(unrelated.owned.child_pid, unrelated.owned.child_start);
-    let verdict = result_str(bound.is_some());
     ctx.check(
         "A-9",
         "hooks_in_our_tree",
-        verdict,
-        json!({"bound": bound, "our_cli_pid": ours, "latency_ms": ms, "snapshot": snap, "warm_server_pids": warm_pids,
-               "events_from_warm_tree": from_warm,
+        if ambiguous.is_empty() {
+            result_str(bound.is_some())
+        } else {
+            "inconclusive"
+        },
+        json!({"bound": bound, "our_cli_pid": ours, "latency_ms": ms, "snapshot": snap, "warm_server": warm_id,
+               "events_from_warm_tree": from_warm, "ambiguous": ambiguous,
                "interpretation": if bound.is_none() && !from_warm.is_empty() { "adapter requires --no-daemon" }
                                  else if bound.is_none() { "delivery failure (no hook arrived)" } else { "ok" }}),
     );
@@ -979,13 +1395,15 @@ fn codex_warm(ctx: &Ctx, a: &Agent) {
 
 /// A-8: stop after the MCP sleeper attested; nothing owned survives 5 s later.
 fn tree_kill(ctx: &Ctx, a: &Agent) {
+    let case = format!("{}_mcp_witness_tree", a.name);
+    ctx.require("A-8", &case);
     let fake = util::sibling_bin("chs-fake-cli");
     let cwd = default_cwd(ctx, a);
     let extra: Vec<String> = if a.name == "claude" {
         let cfg = ctx.run_dir.join("mcp.json");
         let v = json!({"mcpServers": {"chs": {"command": fake, "args": ["--mode", "sleeper", "--role", "mcp"]}}});
         if let Err(e) = std::fs::write(&cfg, v.to_string()) {
-            return ctx.error(e.to_string());
+            return not_run(ctx, &[("A-8", case)], &e.to_string());
         }
         vec!["--mcp-config".into(), cfg.display().to_string()]
     } else {
@@ -1008,7 +1426,7 @@ fn tree_kill(ctx: &Ctx, a: &Agent) {
         &extra,
     ) {
         Ok(l) => l,
-        Err(e) => return ctx.error(e),
+        Err(e) => return not_run(ctx, &[("A-8", case)], &e),
     };
     let (bound, _, snap) = wait_start(ctx, &l);
     let w = l
@@ -1017,7 +1435,7 @@ fn tree_kill(ctx: &Ctx, a: &Agent) {
             w.role == "mcp-sleeper"
         });
     let witnesses = l.receiver.witnesses();
-    finish(ctx, l);
+    let fin = finish(ctx, l);
     std::thread::sleep(
         Duration::from_secs(5).min(ctx.cutoff.saturating_duration_since(Instant::now())),
     );
@@ -1026,16 +1444,19 @@ fn tree_kill(ctx: &Ctx, a: &Agent) {
         .filter(|w| w.session && os::is_alive(w.pid, w.start_time))
         .map(|w| w.pid)
         .collect();
+    let owned_survivors = fin["stop"]["survivors"].clone();
+    let owned_clear = owned_survivors.as_array().is_some_and(|a| a.is_empty());
     let res = if w.is_none() {
         "inconclusive"
     } else {
-        result_str(alive.is_empty())
+        result_str(alive.is_empty() && owned_clear)
     };
     ctx.check(
         "A-8",
-        &format!("{}_mcp_witness_tree", a.name),
+        &case,
         res,
-        json!({"bound": bound, "snapshot": snap, "witness": w, "survivors": alive}),
+        json!({"bound": bound, "snapshot": snap, "witness": w, "witness_survivors": alive,
+               "owned_survivors": owned_survivors}),
     );
 }
 
@@ -1099,7 +1520,18 @@ pub fn print_launch(args: &Args) -> i32 {
         }
         argv.extend(codex_hook_args(&hook_command(&args.root, "codex")));
     }
-    println!("cwd: {}", args.root.join("work").join(name).display());
+    let work = args.root.join("work");
+    let mut cwds = vec![work.join(name)];
+    if name == "codex" {
+        cwds.push(work.join("codex2"));
+    }
+    cwds.push(c2_cwd(&args.root));
+    println!(
+        "pre-trust: run the command below once in each of these folders and accept folder trust:"
+    );
+    for c in &cwds {
+        println!("  {}", c.display());
+    }
     println!("env (names only; values are per launch):");
     println!("  CHALDEA_HOOK_URL=http://127.0.0.1:<port>/hook");
     println!("  CHALDEA_HOOK_TOKEN=<64-hex, fresh per launch>");
@@ -1112,7 +1544,37 @@ pub fn print_launch(args: &Args) -> i32 {
             .collect::<Vec<_>>()
             .join(" ")
     );
+    println!("then (real CLIs run only with --allow-api-usage):");
+    let follow: &[&str] = if name == "claude" {
+        &[
+            "chs real claude-hooks --prompt --allow-api-usage",
+            "chs real tree-kill --agent claude --allow-api-usage",
+            "chs real claude-paste --allow-api-usage",
+            "chs real claude-stall --allow-api-usage",
+        ]
+    } else {
+        &[
+            "chs real codex-hooks --launches 3 --cwd2 <work>/codex2 --codex-mode both --allow-api-usage",
+            "chs real codex-hooks --mutate-command --allow-api-usage",
+            "chs real codex-warm --allow-api-usage",
+            "chs real tree-kill --agent codex --allow-api-usage",
+            "chs real codex-paste --allow-api-usage",
+            "chs real codex-stall --allow-api-usage",
+        ]
+    };
+    for f in follow {
+        println!("  {}", f.replace("<work>", &work.display().to_string()));
+    }
+    println!(
+        "Windows set C: chs win-probe all --claude-bin … --codex-bin … --allow-api-usage (C-2 uses {})",
+        c2_cwd(&args.root).display()
+    );
     0
+}
+
+/// C-2's spaced, non-ASCII cwd (`C:\chs\work\日本 dir` on Windows).
+pub fn c2_cwd(root: &Path) -> PathBuf {
+    root.join("work").join("日本 dir")
 }
 
 #[cfg(test)]
@@ -1144,22 +1606,34 @@ mod tests {
         d
     }
 
+    /// The H2 tests share the step hook, the edit lock, and the cleanup registry.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set_step(h: Option<StepHook>) {
+        *STEP_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = h;
+    }
+
     #[test]
     fn global_hooks_backup_restores_original() {
+        let _s = serial();
         let h = tmp_home();
         std::fs::write(h.join("hooks.json"), b"original").unwrap();
         install_global_hooks(&h, "r1", b"ours").unwrap();
         assert_eq!(std::fs::read(h.join("hooks.json")).unwrap(), b"ours");
         assert!(
             install_global_hooks(&h, "r2", b"ours").is_err(),
-            "second install must refuse"
+            "second install must refuse (metadata is created exclusively)"
         );
         // Our own harness is alive: a start-time recovery must leave it alone.
         assert_eq!(
-            restore_global_hooks(&h, true),
+            restore_global_hooks(&h, true).unwrap(),
             "owning harness still running"
         );
-        assert_eq!(restore_global_hooks(&h, false), "restored");
+        assert_eq!(restore_global_hooks(&h, false).unwrap(), "restored");
         assert_eq!(std::fs::read(h.join("hooks.json")).unwrap(), b"original");
         assert!(!meta_path(&h).exists());
         let _ = std::fs::remove_dir_all(&h);
@@ -1167,10 +1641,15 @@ mod tests {
 
     #[test]
     fn global_hooks_restore_refuses_concurrent_change() {
+        let _s = serial();
         let h = tmp_home();
         install_global_hooks(&h, "r1", b"ours").unwrap();
         std::fs::write(h.join("hooks.json"), b"someone else").unwrap();
-        assert!(restore_global_hooks(&h, false).contains("refusing"));
+        assert!(
+            restore_global_hooks(&h, false)
+                .unwrap_err()
+                .contains("refusing")
+        );
         assert_eq!(
             std::fs::read(h.join("hooks.json")).unwrap(),
             b"someone else"
@@ -1181,10 +1660,97 @@ mod tests {
 
     #[test]
     fn global_hooks_absent_original_is_removed() {
+        let _s = serial();
         let h = tmp_home();
         install_global_hooks(&h, "r1", b"ours").unwrap();
-        assert_eq!(restore_global_hooks(&h, false), "restored");
+        assert_eq!(restore_global_hooks(&h, false).unwrap(), "restored");
         assert!(!h.join("hooks.json").exists());
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    /// H2: an edit landing between the content check and the swap is moved
+    /// aside, never overwritten, and the restore reports an error.
+    #[test]
+    fn concurrent_edit_between_check_and_swap_is_preserved() {
+        let _s = serial();
+        let h = tmp_home();
+        std::fs::write(h.join("hooks.json"), b"original").unwrap();
+        install_global_hooks(&h, "r1", b"ours").unwrap();
+        let target = h.join("hooks.json");
+        set_step(Some(Box::new(move |s| {
+            if s == "after_check" {
+                std::fs::write(&target, b"owner edit").unwrap();
+            }
+        })));
+        let r = restore_global_hooks(&h, false);
+        set_step(None);
+        let e = r.unwrap_err();
+        assert!(e.contains("concurrent edit"), "{e}");
+        let displaced: Vec<_> = std::fs::read_dir(&h)
+            .unwrap()
+            .flatten()
+            .filter(|d| d.file_name().to_string_lossy().contains("chs-displaced-"))
+            .collect();
+        assert_eq!(displaced.len(), 1);
+        assert_eq!(std::fs::read(displaced[0].path()).unwrap(), b"owner edit");
+        assert_eq!(std::fs::read(h.join("hooks.json")).unwrap(), b"original");
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    /// H2: the watchdog's cleanup sweep waits for an in-flight install and
+    /// then restores, instead of running before the cleanup is registered.
+    #[test]
+    fn watchdog_sweep_waits_for_install_and_restores() {
+        let _s = serial();
+        let h = tmp_home();
+        std::fs::write(h.join("hooks.json"), b"original").unwrap();
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = std::sync::Mutex::new(go_rx);
+        set_step(Some(Box::new(move |s| {
+            if s == "after_rename" {
+                let _ = paused_tx.send(());
+                let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
+            }
+        })));
+        let h2 = h.clone();
+        let installer = std::thread::spawn(move || install_global_hooks(&h2, "r1", b"ours"));
+        paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let sweeper = std::thread::spawn(session::run_cleanups);
+        std::thread::sleep(Duration::from_millis(200));
+        go_tx.send(()).unwrap();
+        installer.join().unwrap().unwrap();
+        let swept = sweeper.join().unwrap();
+        set_step(None);
+        assert!(
+            swept.iter().any(|s| s.ends_with(": restored")),
+            "sweep ran before the install registered its cleanup: {swept:?}"
+        );
+        assert_eq!(std::fs::read(h.join("hooks.json")).unwrap(), b"original");
+        session::watchdog_remove_cleanup(&cleanup_name(&h));
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    /// H2: start-time recovery needs positive death; a failed lookup refuses.
+    #[test]
+    fn recovery_refuses_without_positive_death() {
+        let _s = serial();
+        let h = tmp_home();
+        install_global_hooks(&h, "r1", b"ours").unwrap();
+        let unknown = |_: u32, _: u64| None;
+        let e = {
+            let _g = lock_edits();
+            restore_locked(&h, true, &unknown).unwrap_err()
+        };
+        assert!(e.contains("cannot confirm"), "{e}");
+        assert_eq!(std::fs::read(h.join("hooks.json")).unwrap(), b"ours");
+        let dead = |_: u32, _: u64| Some(false);
+        let r = {
+            let _g = lock_edits();
+            restore_locked(&h, true, &dead)
+        };
+        assert_eq!(r.unwrap(), "restored");
+        session::watchdog_remove_cleanup(&cleanup_name(&h));
         let _ = std::fs::remove_dir_all(&h);
     }
 
