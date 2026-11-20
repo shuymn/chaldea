@@ -883,7 +883,7 @@ fn stall(ctx: &Ctx, a: &Agent) {
         let bound_at = fin["receiver"]["bound_at_ms"].as_u64();
         let o = match (first_key, bound_at, final_ambiguous(&fin)) {
             (_, _, true) => Outcome::not_exercised("binding became ambiguous"),
-            (Some(k), Some(b), false) if b >= k => Outcome::Pass,
+            (Some(k), Some(b), false) if b > k => Outcome::Pass,
             (Some(_), _, false) => {
                 Outcome::not_exercised("no SessionStart followed the relayed keys")
             }
@@ -905,7 +905,8 @@ fn stall(ctx: &Ctx, a: &Agent) {
 }
 
 /// Shows the snapshot and relays the owner's keys as ungated `write_key` (C-2).
-/// Returns the receiver-relative time of the first key written while unbound.
+/// Returns the receiver-relative time at which the writer finished the first
+/// key written while unbound.
 fn attend(ctx: &Ctx, l: &Launch) -> (Option<u64>, Value) {
     let mut used = Vec::new();
     let mut first: Option<u64> = None;
@@ -924,17 +925,22 @@ fn attend(ctx: &Ctx, l: &Launch) -> (Option<u64>, Value) {
         }
         if let Some(b) = paste::key_bytes(&cmd) {
             let unbound = l.receiver.bound().is_none();
-            let at = l.receiver.now_ms();
+            let requested = l.receiver.now_ms();
             let r = l
                 .session
                 .io()
                 .tx
                 .write_wait(vec![b], ctx.until(Duration::from_secs(5)));
-            if r.is_ok() && unbound {
-                first.get_or_insert(at);
+            // Taken once the writer reported the write done, so it is never
+            // earlier than the write itself.
+            let written = r.is_ok().then(|| l.receiver.now_ms());
+            if let (Some(w), true) = (written, unbound) {
+                first.get_or_insert(w);
             }
-            used.push(json!({"key": cmd, "written": r.is_ok(), "at_ms": at,
-                             "encoding": if cmd.starts_with("w-") { "win32" } else { "vt" }}));
+            used.push(
+                json!({"key": cmd, "requested_ms": requested, "written_ms": written,
+                             "encoding": if cmd.starts_with("w-") { "win32" } else { "vt" }}),
+            );
         }
         if l.receiver
             .wait_bound(ctx.until(Duration::from_secs(2)))
@@ -957,12 +963,26 @@ fn codex_modes(ctx: &Ctx) -> Vec<&'static str> {
     }
 }
 
-/// Trust keys Codex keeps for the effective session-flag hooks.
-fn session_flag_keys(keys: &BTreeSet<String>) -> BTreeSet<String> {
+/// The exact trust key(s) of the hook under test: the session-flag
+/// SessionStart hook this harness injects (other session-flag keys are
+/// ignored, so a concurrent change to them does not affect C3).
+fn hook_keys(keys: &BTreeSet<String>) -> BTreeSet<String> {
     keys.iter()
-        .filter(|k| k.contains("<session-flags>"))
+        .filter(|k| {
+            let k = k.trim_matches('"');
+            k.starts_with("<session-flags>/") && k.ends_with(":session_start:0:0")
+        })
         .cloned()
         .collect()
+}
+
+/// A-4: events this launch's receiver bound to the launch. `raw_unknown`
+/// and foreign-session events do not show that the mutated hook delivered.
+fn bound_events(fin: &Value) -> usize {
+    fin["receiver"]["events"]
+        .as_array()
+        .map(|a| a.iter().filter(|e| e["class"] == "bound").count())
+        .unwrap_or(0)
 }
 
 fn codex_hooks(ctx: &Ctx, a: &Agent) {
@@ -1050,9 +1070,7 @@ fn codex_hooks(ctx: &Ctx, a: &Agent) {
         let obs = observed(&l);
         // Finalized after the receiver stopped and drained.
         let fin = finish(ctx, l);
-        let any_event = fin["receiver"]["events"]
-            .as_array()
-            .is_some_and(|e| !e.is_empty());
+        let delivered = bound_events(&fin) > 0;
         let after = codex_config();
         let delta = config_delta(&before, &after);
         let base = json!({"mode": mode, "cwd": dir, "session_id": final_bound(&fin), "latency_ms": ms,
@@ -1062,7 +1080,7 @@ fn codex_hooks(ctx: &Ctx, a: &Agent) {
         let config_ok = before.readable && after.readable;
         match id {
             "A-4" if is_mutated => {
-                let o = if any_event {
+                let o = if delivered {
                     Outcome::platform("the mutated hook delivered without review")
                 } else {
                     match owner["answer"].as_str().map(|s| s.to_ascii_lowercase()) {
@@ -1077,15 +1095,15 @@ fn codex_hooks(ctx: &Ctx, a: &Agent) {
                     id,
                     &case,
                     o,
-                    json!({"base": base, "delivered_from_mutated": any_event, "owner": owner}),
+                    json!({"base": base, "delivered_from_mutated": delivered, "owner": owner}),
                 );
             }
             "A-4" => ctx.check(id, &case, bound_outcome(&fin), base),
             "C3" => {
                 let first = first_keys.get(mode).cloned().unwrap_or_default();
-                let second = session_flag_keys(&after.keys);
-                let added = session_flag_keys(&after.keys)
-                    .difference(&session_flag_keys(&before.keys))
+                let second = hook_keys(&after.keys);
+                let added = hook_keys(&after.keys)
+                    .difference(&hook_keys(&before.keys))
                     .count();
                 let o = if !config_ok {
                     Outcome::harness("config.toml unreadable")
@@ -1109,7 +1127,7 @@ fn codex_hooks(ctx: &Ctx, a: &Agent) {
             _ => {
                 let o = bound_outcome(&fin);
                 if o == Outcome::Pass && config_ok {
-                    let k = session_flag_keys(&after.keys);
+                    let k = hook_keys(&after.keys);
                     if !k.is_empty() {
                         first_keys.entry(mode).or_insert(k);
                     }
@@ -1183,6 +1201,26 @@ fn codex_warm(ctx: &Ctx, a: &Agent) {
             warm.push(p);
         }
     }
+    // Only servers positively alive (pid + start time) right before the
+    // measured launch count; a lookup failure is a harness failure.
+    let pre_launch: Vec<(u32, Option<bool>)> = warm
+        .iter()
+        .map(|p| (p.pid, os::liveness(p.pid, p.start_time)))
+        .collect();
+    if pre_launch.iter().any(|(_, l)| l.is_none()) {
+        for (id, c) in &cases {
+            ctx.check(
+                id,
+                c,
+                Outcome::harness("warm server liveness lookup failed"),
+                json!({"pre_launch": pre_launch}),
+            );
+        }
+        let s = unrelated.stop();
+        ctx.detail("unrelated_stop", json!(s));
+        return;
+    }
+    warm.retain(|p| pre_launch.contains(&(p.pid, Some(true))));
     let warm_id: Vec<Value> = warm
         .iter()
         .map(|p| json!({"pid": p.pid, "start_time": p.start_time, "ancestry": os::ancestry(p.pid, 8)}))
@@ -1431,11 +1469,24 @@ pub fn print_launch(args: &Args) -> i32 {
             "chs real codex-stall --allow-api-usage",
         ]
     };
+    // Every follow-up names the exact binary resolved above.
+    let bin_flag = format!("--{name}-bin {}", shell_quote(&bin.display().to_string()));
     for f in follow {
-        println!("  {}", f.replace("<work>", &work.display().to_string()));
+        println!(
+            "  {} {bin_flag}",
+            f.replace(
+                "<work>/codex2",
+                &shell_quote(&work.join("codex2").display().to_string())
+            )
+        );
     }
+    let other = if name == "claude" {
+        "--codex-bin …"
+    } else {
+        "--claude-bin …"
+    };
     println!(
-        "Windows set C: chs win-probe all --claude-bin … --codex-bin … --allow-api-usage (C-2 uses {})",
+        "Windows set C: chs win-probe all {bin_flag} {other} --allow-api-usage (C-2 uses {})",
         c2_cwd(&args.root).display()
     );
     0
@@ -1457,6 +1508,32 @@ mod tests {
         assert_eq!(
             a[1],
             "hooks.SessionStart=[{hooks=[{type=\"command\",command=\"/x/chs-hook-emit codex\",timeout=10}]}]"
+        );
+    }
+
+    /// r3 A-4: only an event bound to the mutated launch counts as delivery.
+    #[test]
+    fn a4_counts_only_bound_events() {
+        let fin = json!({"receiver": {"events": [
+            {"class": "raw_unknown", "reason": "foreign_session"},
+            {"class": "raw_unknown", "reason": "unparseable"}
+        ]}});
+        assert_eq!(bound_events(&fin), 0);
+        let fin = json!({"receiver": {"events": [{"class": "bound"}]}});
+        assert_eq!(bound_events(&fin), 1);
+    }
+
+    /// r3 C3: only the SessionStart session-flag key of the hook under test.
+    #[test]
+    fn c3_compares_the_hook_under_test() {
+        let k = trust_keys(
+            b"[hooks.state.\"<session-flags>/config.toml:session_start:0:0\"]\n\
+              [hooks.state.\"<session-flags>/config.toml:stop:0:0\"]\n\
+              [hooks.state.\"/x/hooks.json:session_start:0:0\"]\n",
+        );
+        assert_eq!(
+            hook_keys(&k).into_iter().collect::<Vec<_>>(),
+            vec!["\"<session-flags>/config.toml:session_start:0:0\"".to_string()]
         );
     }
 
