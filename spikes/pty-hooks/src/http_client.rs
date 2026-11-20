@@ -85,19 +85,25 @@ pub fn request(
         head.push_str(&format!("Content-Length: {}\r\n", b.len()));
     }
     head.push_str("\r\n");
-    write_bounded(&mut s, head.as_bytes(), deadline)?;
+    write_bounded(&mut s, head.as_bytes(), 64 * 1024, deadline)?;
     if let Some(b) = body {
-        write_bounded(&mut s, b, deadline)?;
+        write_bounded(&mut s, b, 64 * 1024, deadline)?;
     }
     s.flush()?;
     read_response(&mut s, deadline)
 }
 
-/// Writes in pieces, each with a write timeout set from the remaining budget.
-fn write_bounded(s: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+/// Writes in pieces of at most `chunk` bytes, each with a write timeout set
+/// from the remaining budget. The caller flushes.
+pub fn write_bounded(
+    s: &mut TcpStream,
+    mut bytes: &[u8],
+    chunk: usize,
+    deadline: Instant,
+) -> io::Result<()> {
     while !bytes.is_empty() {
         s.set_write_timeout(Some(remaining(deadline)?))?;
-        let n = s.write(&bytes[..bytes.len().min(64 * 1024)])?;
+        let n = s.write(&bytes[..bytes.len().min(chunk)])?;
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"));
         }

@@ -452,17 +452,7 @@ fn respond_by(s: &mut TcpStream, code: u16, body: &[u8], deadline: Instant) -> i
         body.len()
     );
     for part in [head.as_bytes(), body] {
-        let mut rest = part;
-        while !rest.is_empty() {
-            let left = remaining(deadline)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "deadline"))?;
-            s.set_write_timeout(Some(left))?;
-            let n = s.write(&rest[..rest.len().min(16 * 1024)])?;
-            if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"));
-            }
-            rest = &rest[n..];
-        }
+        crate::http_client::write_bounded(s, part, 16 * 1024, deadline)?;
     }
     s.flush()
 }
