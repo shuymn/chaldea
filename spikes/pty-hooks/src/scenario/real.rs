@@ -218,7 +218,7 @@ pub fn run(mut args: Args) -> i32 {
         r.config["bins"] = json!({"claude": claude.as_ref().map(|a| &a.bin), "codex": codex.as_ref().map(|a| &a.bin)});
         r.config["versions"] =
             json!({"claude": claude.as_ref().map(|a| &a.version), "codex": codex.as_ref().map(|a| &a.version)});
-        r.config["hook_source"] = json!(ctx.args.hook_source);
+        r.config["hook_source"] = json!(cli::HOOK_SOURCE);
         r.config["session_start"] = json!({"claude": claude.as_ref().map(|a| a.session_start()),
                                            "codex": codex.as_ref().map(|a| a.session_start())});
         r.config["codex_first_prompt"] = json!(CODEX_FIRST_PROMPT);
@@ -357,13 +357,11 @@ fn plan(
     if mode == Some("no-daemon") {
         argv.push("--no-daemon".into());
     }
-    if ctx.args.hook_source == "session-flags" {
-        argv.extend(
-            codex_hook_args(&hook_command(&ctx.args.root, hook_agent))
-                .into_iter()
-                .map(OsString::from),
-        );
-    }
+    argv.extend(
+        codex_hook_args(&hook_command(&ctx.args.root, hook_agent))
+            .into_iter()
+            .map(OsString::from),
+    );
     argv.extend(extra.iter().map(OsString::from));
     // The first turn is the positional prompt; nothing is typed before binding.
     argv.push(CODEX_FIRST_PROMPT.into());

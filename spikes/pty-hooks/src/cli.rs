@@ -30,7 +30,6 @@ pub struct Args {
     pub enter_delay_ms: u64,
     pub chunk: usize,
     // codex
-    pub hook_source: String,
     pub launches: u32,
     pub mutate_command: bool,
     pub cwd2: Option<PathBuf>,
@@ -64,6 +63,8 @@ codex:  --hook-source session-flags  --launches N
         --mutate-command  --cwd2 DIR  --codex-mode <no-daemon|default|both>";
 
 /// The only hook source built in this spike (§4.3).
+pub const HOOK_SOURCE: &str = "session-flags";
+
 pub const HOOK_SOURCE_NOT_BUILT: &str =
     "codex-home mode is not built; requires A-3 result showing session-flags cannot persist trust";
 
@@ -100,7 +101,6 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         paste_newline: None,
         enter_delay_ms: 300,
         chunk: 0,
-        hook_source: "session-flags".into(),
         launches: 1,
         mutate_command: false,
         cwd2: None,
@@ -151,8 +151,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             "--enter-delay-ms" => a.enter_delay_ms = num(&value(&mut it, f)?, f)?,
             "--chunk" => a.chunk = num(&value(&mut it, f)?, f)?,
             "--hook-source" => {
-                a.hook_source = value(&mut it, f)?;
-                if a.hook_source != "session-flags" {
+                if value(&mut it, f)? != HOOK_SOURCE {
                     return Err(HOOK_SOURCE_NOT_BUILT.into());
                 }
             }
