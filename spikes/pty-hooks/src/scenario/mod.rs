@@ -57,6 +57,16 @@ impl Ctx {
         let deadline = t0 + Duration::from_secs(args.deadline_secs);
         let cutoff = deadline - Duration::from_secs(10);
         session::watchdog_start(sink.clone(), deadline);
+        if !args.keep_temp {
+            let (root, dir) = (args.root.clone(), run_dir.clone());
+            session::watchdog_cleanup(
+                "run dir",
+                Box::new(move || {
+                    remove_run_dir(&root, &dir);
+                    "removed".into()
+                }),
+            );
+        }
         Ok(Ctx {
             args,
             run_id,
