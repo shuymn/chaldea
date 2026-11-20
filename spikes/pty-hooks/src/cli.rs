@@ -9,6 +9,8 @@ pub struct Args {
     pub positional: Vec<String>,
     pub root: PathBuf,
     pub out: Option<PathBuf>,
+    /// Run id a parent assigns to a child run (checked against its report).
+    pub run_id: Option<String>,
     pub deadline_secs: u64,
     pub session_start_timeout: u64,
     pub keep_temp: bool,
@@ -81,6 +83,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         positional: Vec::new(),
         root: crate::os::default_root(),
         out: None,
+        run_id: None,
         deadline_secs: 180,
         session_start_timeout: 20,
         keep_temp: false,
@@ -117,6 +120,13 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         match f {
             "--root" => a.root = PathBuf::from(value(&mut it, f)?),
             "--out" => a.out = Some(PathBuf::from(value(&mut it, f)?)),
+            "--run-id" => {
+                let v = value(&mut it, f)?;
+                if v.is_empty() || v.len() > 32 || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!("--run-id {v:?}: expected hex"));
+                }
+                a.run_id = Some(v);
+            }
             "--deadline-secs" => {
                 a.deadline_secs = num(&value(&mut it, f)?, f)?;
                 a.explicit_deadline = true;

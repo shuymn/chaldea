@@ -36,7 +36,7 @@ impl Ctx {
     /// Creates `R/out/<run-id>` (or `--out`) and `R/runs/<run-id>`, starts the watchdog.
     pub fn new(args: Args, scenario: &str) -> Result<Ctx, String> {
         let t0 = Instant::now();
-        let run_id = util::run_id();
+        let run_id = args.run_id.clone().unwrap_or_else(util::run_id);
         os::ensure_private_dir(&args.root).map_err(|e| format!("{}: {e}", args.root.display()))?;
         let out = args
             .out
@@ -386,6 +386,28 @@ pub fn write_snapshot(ctx: &Ctx, label: &str, snap: &Snapshot) -> PathBuf {
     p
 }
 
+/// A fresh output dir for one child run, created exclusively here (an
+/// existing dir is never reused), and the run id the child must report.
+pub fn child_out(parent: &Path, name: &str) -> Result<(PathBuf, String), String> {
+    let id = util::run_id();
+    let dir = parent.join(format!("{}-{id}", util::sanitize_component(name)));
+    std::fs::create_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    Ok((dir, id))
+}
+
+/// The child's report from its own fresh dir, accepted only when it carries
+/// the run id the parent passed in; anything else is `not_run`.
+pub fn child_report(out: &Path, run_id: &str) -> Result<Report, String> {
+    match crate::report::read_report(&out.join("report.json")) {
+        None => Err("not_run: the child wrote no report".into()),
+        Some(r) if r.run_id != run_id => Err(format!(
+            "not_run: report run_id {:?} is not the child's {run_id:?}",
+            r.run_id
+        )),
+        Some(r) => Ok(r),
+    }
+}
+
 /// Runs `cmd` with a deadline; kills only the child we started on timeout.
 /// Non-interactive: no console window on Windows (C-5).
 pub fn run_bounded(cmd: &mut Command, timeout: Duration) -> Result<(i32, String), String> {
@@ -505,5 +527,29 @@ pub fn bundle(args: &Args) -> i32 {
             eprintln!("chs bundle: tar failed: {other:?}");
             3
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// r3: a child never reads a report left by an earlier run. Its dir is
+    /// fresh and exclusive, and a report with another run id is `not_run`.
+    #[test]
+    fn stale_child_report_is_not_run() {
+        let parent = std::env::temp_dir().join(format!("chs-child-test-{}", util::run_id()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let (out, id) = child_out(&parent, "probe-kill").unwrap();
+        assert!(std::fs::read_dir(&out).unwrap().next().is_none());
+        assert!(child_report(&out, &id).is_err(), "no report is not_run");
+        let stale = Report::new("win-probe kill", "00000000");
+        std::fs::write(out.join("report.json"), serde_json::to_vec(&stale).unwrap()).unwrap();
+        let e = child_report(&out, &id).unwrap_err();
+        assert!(e.starts_with("not_run"), "{e}");
+        let own = Report::new("win-probe kill", &id);
+        std::fs::write(out.join("report.json"), serde_json::to_vec(&own).unwrap()).unwrap();
+        assert_eq!(child_report(&out, &id).unwrap().run_id, id);
+        let _ = std::fs::remove_dir_all(&parent);
     }
 }

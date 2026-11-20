@@ -347,9 +347,9 @@ impl WindowObserver {
     pub fn start() -> Result<WindowObserver, String> {
         Err("windows_only".into())
     }
-    /// `(pid, ppid at event time)` of every shown window.
-    pub fn stop(self) -> Vec<(u32, Option<u32>)> {
-        Vec::new()
+    /// `(pid, ppid at event time)` of every shown window, and observer health.
+    pub fn stop(self) -> super::ObserverStop {
+        (Vec::new(), Err("windows_only".into()))
     }
 }
 

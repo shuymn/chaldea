@@ -491,6 +491,8 @@ struct Wd {
     interrupted: Arc<AtomicBool>,
     finished: AtomicBool,
     fired: AtomicBool,
+    /// Set before the watchdog kills anything (cutoff or fire).
+    tearing_down: AtomicBool,
 }
 
 static WD: OnceLock<Wd> = OnceLock::new();
@@ -503,6 +505,7 @@ fn wd() -> &'static Wd {
         interrupted: Arc::new(AtomicBool::new(false)),
         finished: AtomicBool::new(false),
         fired: AtomicBool::new(false),
+        tearing_down: AtomicBool::new(false),
     })
 }
 
@@ -532,6 +535,15 @@ fn run_cleanups() -> Vec<String> {
 
 pub fn interrupted() -> bool {
     wd().interrupted.load(Ordering::SeqCst)
+}
+
+/// True once the harness itself started tearing trees down (cutoff,
+/// interrupt, or fire): a death seen after this is not platform evidence.
+pub fn teardown_in_progress() -> bool {
+    let w = wd();
+    w.tearing_down.load(Ordering::SeqCst)
+        || w.fired.load(Ordering::SeqCst)
+        || w.interrupted.load(Ordering::SeqCst)
 }
 
 fn live_owned() -> Vec<Arc<Owned>> {
@@ -564,6 +576,7 @@ pub fn watchdog_start(sink: Sink, cutoff: Instant, hard_deadline: Instant) {
                 }
                 if !cut && Instant::now() >= cutoff {
                     cut = true;
+                    wd().tearing_down.store(true, Ordering::SeqCst);
                     for o in live_owned() {
                         o.emergency_kill();
                     }
@@ -588,6 +601,7 @@ pub fn watchdog_finish() {
 /// Kills every registered tree, runs cleanups, writes the report, exits.
 pub fn watchdog_fire(status: &str, why: &str, code: i32) -> ! {
     let w = wd();
+    w.tearing_down.store(true, Ordering::SeqCst);
     if w.fired.swap(true, Ordering::SeqCst) {
         // Another path is already firing; let it finish.
         loop {

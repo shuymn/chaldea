@@ -9,11 +9,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::{Ctx, Launch, LaunchSpec, emitter_path, launch, write_snapshot};
+use super::{
+    Ctx, Launch, LaunchSpec, child_out, child_report, emitter_path, launch, write_snapshot,
+};
 use crate::cli::{self, Args};
 use crate::paste::{self, Newline, PasteOpts};
 use crate::receiver::{self, BindRule, Config, Receiver};
-use crate::report::{Report, read_report};
+use crate::report::Report;
 use crate::session::{Inject, StopReport};
 use crate::verdict::Outcome;
 use crate::{fake_cli, os, util};
@@ -23,6 +25,21 @@ const FAKE_UPS_WAIT: Duration = Duration::from_secs(5);
 /// B scenarios check the harness against FakeCli; a failed comparison is the observation.
 fn checked(b: bool) -> Outcome {
     Outcome::observed(b, "check failed; see evidence")
+}
+
+/// A session witness after the stop. It is platform evidence only when the
+/// assignment succeeded, the witness was positively alive before the stop,
+/// and both lookups succeeded; an unknown liveness is a harness failure.
+fn killed_outcome(assigned: bool, before: Option<bool>, after: Option<bool>) -> Outcome {
+    if !assigned {
+        return Outcome::harness("job assignment failed");
+    }
+    match (before, after) {
+        (None, _) | (_, None) => Outcome::harness("liveness lookup failed"),
+        (Some(false), _) => Outcome::not_exercised("witness exited before the stop"),
+        (Some(true), Some(false)) => Outcome::Pass,
+        (Some(true), Some(true)) => Outcome::platform("witness survived the stop"),
+    }
 }
 
 pub const SCENARIOS: &[&str] = &[
@@ -525,6 +542,10 @@ pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str, escape_probe: b
             .map(|w| w.report["first_child"].clone());
         assign = json!({"held_until_child": first, "tree": l.session.attach_tree()});
     }
+    // The exercised case needs the job assignment (or process group) to
+    // have succeeded; otherwise nothing below is platform evidence.
+    let tree = l.session.tree_desc();
+    let assign_error = tree.get("error").cloned();
     let mut want = roles.clone();
     want.push("unrelated");
     let all_seen = l
@@ -535,20 +556,32 @@ pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str, escape_probe: b
     // Give the recorder one more pass after every witness exists.
     l.session.owned.record_scan();
     let witnesses = l.receiver.witnesses();
+    // A witness counts only if it is positively alive before the stop.
+    let pre_stop: Vec<(u32, Option<bool>)> = witnesses
+        .iter()
+        .map(|w| (w.pid, os::liveness(w.pid, w.start_time)))
+        .collect();
     let (stop, _) = l.finish();
     // Verify within 5 s.
     let end = Instant::now() + Duration::from_secs(5);
-    let session_alive = |ws: &[receiver::WitnessRecord]| -> Vec<u32> {
+    let session_lives = |ws: &[receiver::WitnessRecord]| -> Vec<(u32, Option<bool>)> {
         ws.iter()
-            .filter(|w| w.session && os::is_alive(w.pid, w.start_time))
-            .map(|w| w.pid)
+            .filter(|w| w.session)
+            .map(|w| (w.pid, os::liveness(w.pid, w.start_time)))
+            .filter(|(_, l)| *l != Some(false))
             .collect()
     };
-    let mut alive = session_alive(&witnesses);
+    let mut alive = session_lives(&witnesses);
     while !alive.is_empty() && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(50));
-        alive = session_alive(&witnesses);
+        alive = session_lives(&witnesses);
     }
+    let pre = |pid: u32| {
+        pre_stop
+            .iter()
+            .find(|(p, _)| *p == pid)
+            .and_then(|(_, l)| *l)
+    };
     for role in &roles {
         let w = witnesses.iter().find(|w| w.role == *role);
         let (res, mut ev) = match w {
@@ -557,15 +590,17 @@ pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str, escape_probe: b
                 json!({"witness": "never seen"}),
             ),
             Some(w) => {
-                let dead = !os::is_alive(w.pid, w.start_time);
+                let after = os::liveness(w.pid, w.start_time);
                 let by = if stop.killed_by_fallback.iter().any(|p| p.pid == w.pid) {
                     "fallback"
                 } else {
                     "primary"
                 };
+                let dead = after == Some(false);
                 (
-                    checked(dead),
-                    json!({"pid": w.pid, "dead": dead, "killed_by": dead.then_some(by)}),
+                    killed_outcome(assign_error.is_none(), pre(w.pid), after),
+                    json!({"pid": w.pid, "alive_before_stop": pre(w.pid), "alive_after_stop": after,
+                           "dead": dead, "killed_by": dead.then_some(by)}),
                 )
             }
         };
@@ -581,8 +616,12 @@ pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str, escape_probe: b
             json!({"witness": "never seen"}),
         ),
         Some(w) => {
-            let a = os::is_alive(w.pid, w.start_time);
-            (checked(a), json!({"pid": w.pid, "alive_after_stop": a}))
+            let a = os::liveness(w.pid, w.start_time);
+            let o = match a {
+                None => Outcome::harness("liveness lookup failed"),
+                Some(a) => checked(a),
+            };
+            (o, json!({"pid": w.pid, "alive_after_stop": a}))
         }
     };
     ctx.check(
@@ -591,15 +630,21 @@ pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str, escape_probe: b
         res,
         ev,
     );
+    let unknown = alive.iter().any(|(_, l)| l.is_none());
     ctx.check(
         "B-7",
         &format!("{label}/no_session_survivors"),
-        if !all_seen {
+        if let Some(e) = &assign_error {
+            Outcome::harness(format!("job assignment failed: {e}"))
+        } else if !all_seen {
             Outcome::not_exercised("not every witness attested")
+        } else if unknown {
+            Outcome::harness("liveness lookup failed")
         } else {
             checked(alive.is_empty() && stop.survivors.is_empty())
         },
-        json!({"alive_session_witnesses": alive, "assign": assign, "stop": stop_evidence(&stop)}),
+        json!({"alive_session_witnesses": alive, "assign": assign, "tree": tree,
+               "stop": stop_evidence(&stop)}),
     );
     if escape_probe {
         ctx.detail("containment_limit", json!(true));
@@ -1255,8 +1300,18 @@ fn teardown(ctx: &Ctx) {
             );
             continue;
         }
-        let out = ctx.out.join(format!("teardown-{case}"));
-        let _ = std::fs::create_dir_all(&out);
+        let (out, run_id) = match child_out(&ctx.out, &format!("teardown-{case}")) {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.check(
+                    "B-10",
+                    case,
+                    Outcome::harness(format!("not_run: {e}")),
+                    json!({}),
+                );
+                continue;
+            }
+        };
         let mut cmd = Command::new(std::env::current_exe().unwrap_or_default());
         cmd.args([
             "fake",
@@ -1265,6 +1320,8 @@ fn teardown(ctx: &Ctx) {
             case,
             "--deadline-secs",
             &deadline.to_string(),
+            "--run-id",
+            &run_id,
             "--out",
         ])
         .arg(&out)
@@ -1307,7 +1364,19 @@ fn teardown(ctx: &Ctx) {
             std::thread::sleep(Duration::from_millis(20));
         };
         let elapsed = t.elapsed();
-        let rep = read_report(&out.join("report.json"));
+        let rep = match child_report(&out, &run_id) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.check(
+                    "B-10",
+                    case,
+                    Outcome::harness(e),
+                    json!({"exit": code, "elapsed_ms": elapsed.as_millis() as u64}),
+                );
+                continue;
+            }
+        };
+        let rep = Some(rep);
         let (survivors, owned) = rep.as_ref().map(case_survivors).unwrap_or_default();
         let status = rep.as_ref().map(|r| r.status.clone());
         let within = elapsed <= Duration::from_secs(*deadline) + Duration::from_millis(1500);
@@ -1579,10 +1648,18 @@ fn run_all(mut args: Args) -> i32 {
     );
     let mut child_status = Vec::new();
     for s in SCENARIOS {
-        let out = ctx.out.join(s);
+        let (out, run_id) = match child_out(&ctx.out, s) {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.error(format!("{s}: not_run: {e}"));
+                child_status.push(json!({"scenario": s, "status": "not_run"}));
+                continue;
+            }
+        };
         let mut cmd = Command::new(std::env::current_exe().unwrap_or_default());
         cmd.args(["fake", s, "--out"])
             .arg(&out)
+            .args(["--run-id", &run_id])
             .args(cli::forward_common(&ctx.args));
         if *s == "stall" {
             cmd.args(["--session-start-timeout", "5"]);
@@ -1595,14 +1672,14 @@ fn run_all(mut args: Args) -> i32 {
             &mut cmd,
             Duration::from_secs(ctx.args.deadline_secs.min(600)),
         );
-        let rep = read_report(&out.join("report.json"));
+        let rep = child_report(&out, &run_id);
         let status = rep
             .as_ref()
             .map(|r| r.status.clone())
-            .unwrap_or_else(|| "missing".into());
+            .unwrap_or_else(|_| "not_run".into());
         println!("  fake {s}: {status} ({} ms)", t.elapsed().as_millis());
         ctx.sink.with(|agg| {
-            if let Some(rep) = &rep {
+            if let Ok(rep) = &rep {
                 for c in &rep.checks {
                     agg.checks.push(crate::report::Check {
                         case: format!("{s}/{}", c.case),
@@ -1612,8 +1689,8 @@ fn run_all(mut args: Args) -> i32 {
                 for e in &rep.errors {
                     agg.errors.push(format!("{s}: {e}"));
                 }
-            } else {
-                agg.errors.push(format!("{s}: no report ({r:?})"));
+            } else if let Err(e) = &rep {
+                agg.errors.push(format!("{s}: {e} ({r:?})"));
             }
         });
         child_status
@@ -1632,6 +1709,31 @@ fn run_all(mut args: Args) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// r3 C-3/B-7: unknown liveness or a failed assignment is never platform
+    /// evidence, and a witness that exited before the stop does not count.
+    #[test]
+    fn b7_liveness_is_positive_evidence_only() {
+        assert_eq!(killed_outcome(true, Some(true), Some(false)), Outcome::Pass);
+        assert!(matches!(
+            killed_outcome(true, Some(true), Some(true)),
+            Outcome::PlatformFail { .. }
+        ));
+        for (a, b, c) in [
+            (true, Some(true), None),
+            (true, None, Some(false)),
+            (false, Some(true), Some(true)),
+        ] {
+            assert!(
+                matches!(killed_outcome(a, b, c), Outcome::HarnessFail { .. }),
+                "{a} {b:?} {c:?}"
+            );
+        }
+        assert!(matches!(
+            killed_outcome(true, Some(false), Some(false)),
+            Outcome::NotExercised { .. }
+        ));
+    }
 
     /// The B-3 oracle against hand-written wire bytes (not the writer's mapper).
     #[test]

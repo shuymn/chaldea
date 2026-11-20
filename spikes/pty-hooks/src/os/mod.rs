@@ -13,6 +13,10 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
+/// `WindowObserver::stop`: `(pid, ppid at event time)` per shown window, and
+/// the observer's health (an error means the events may be incomplete).
+pub type ObserverStop = (Vec<(u32, Option<u32>)>, Result<(), String>);
+
 /// One row of the process table. `pgid`/`sid` are Unix-only.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProcInfo {

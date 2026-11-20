@@ -17,13 +17,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::{Ctx, LaunchSpec, emitter_path, launch, run_bounded};
+use super::{Ctx, LaunchSpec, child_out, child_report, emitter_path, launch, run_bounded};
 use crate::cli::{self, Args};
 use crate::http_client::{self, parse_local_url};
 use crate::paste::{self, Newline, PasteOpts};
 use crate::pty::WriterTx;
 use crate::receiver::{ProbeHandler, WitnessView};
-use crate::report::{Check, Probe, Report, read_report};
+use crate::report::{Check, Probe, Report};
 use crate::verdict::{self, Outcome};
 use crate::vt::Vt;
 use crate::{os, util};
@@ -127,12 +127,17 @@ impl Pc {
     }
 }
 
+/// A child run's report, or why it is `not_run` (no fresh report carrying
+/// the run id the parent assigned).
+type ChildRep = Result<Report, String>;
+
 /// A child run's status as one case: `fail` (a complete run with a platform
-/// failure) is the only platform outcome; no report is missing.
-fn child_outcome(r: &Option<Report>) -> Outcome {
-    match r.as_ref() {
-        None => Outcome::Missing,
-        Some(r) => match r.status.as_str() {
+/// failure) is the only platform outcome; a child that did not run is a
+/// harness failure.
+fn child_outcome(r: &ChildRep) -> Outcome {
+    match r {
+        Err(e) => Outcome::harness(e.clone()),
+        Ok(r) => match r.status.as_str() {
             "pass" => Outcome::Pass,
             "fail" => {
                 Outcome::platform("the child run observed a platform failure (see its report)")
@@ -143,8 +148,16 @@ fn child_outcome(r: &Option<Report>) -> Outcome {
     }
 }
 
-/// Runs `chs <args...>` as a child with its own out dir and `--deadline-secs`
-/// capped to what is left of this run; returns its report (None if not run).
+fn status_of(r: &ChildRep) -> Value {
+    match r {
+        Ok(r) => json!(r.status),
+        Err(e) => json!(e),
+    }
+}
+
+/// Runs `chs <args...>` as a child in a fresh, exclusively created out dir
+/// with an assigned run id and `--deadline-secs` capped to what is left of
+/// this run. Its report counts only if it carries that run id.
 fn child(
     ctx: &Ctx,
     name: &str,
@@ -152,8 +165,7 @@ fn child(
     budget: u64,
     inherit_stdio: bool,
     env: &[(&str, &str)],
-) -> (Option<Report>, PathBuf) {
-    let out = ctx.out.join(util::sanitize_component(name));
+) -> (ChildRep, PathBuf) {
     let left = ctx
         .cutoff
         .saturating_duration_since(Instant::now())
@@ -161,16 +173,20 @@ fn child(
         .saturating_sub(CHILD_MARGIN);
     let deadline = budget.min(left);
     if deadline <= 20 {
-        ctx.detail(
-            &format!("child-{name}-not-run"),
-            json!("no budget left before the cutoff"),
+        return (
+            Err("not_run: no budget left before the cutoff".into()),
+            ctx.out.clone(),
         );
-        return (None, out);
     }
+    let (out, run_id) = match child_out(&ctx.out, name) {
+        Ok(v) => v,
+        Err(e) => return (Err(format!("not_run: {e}")), ctx.out.clone()),
+    };
     let mut cmd = Command::new(std::env::current_exe().unwrap_or_default());
     cmd.args(argv)
         .arg("--out")
         .arg(&out)
+        .args(["--run-id", &run_id])
         .args(["--deadline-secs", &deadline.to_string()])
         .args(cli::forward_common(&ctx.args));
     for (k, v) in env {
@@ -201,27 +217,33 @@ fn child(
     } else {
         run_bounded(&mut cmd, timeout)
     };
-    if let Err(e) = r {
+    if let Err(e) = &r {
         ctx.detail(&format!("child-{name}-error"), json!(e));
     }
-    (read_report(&out.join("report.json")), out)
+    (child_report(&out, &run_id), out)
 }
 
-fn checks_of<'a>(r: &'a Option<Report>, id: &str) -> Vec<&'a Check> {
+fn checks_of<'a>(r: &'a ChildRep, id: &str) -> Vec<&'a Check> {
     r.as_ref()
         .map(|r| r.checks.iter().filter(|c| c.id == id).collect())
         .unwrap_or_default()
 }
 
-fn find_check<'a>(r: &'a Option<Report>, id: &str, case: &str) -> Option<&'a Check> {
+fn find_check<'a>(r: &'a ChildRep, id: &str, case: &str) -> Option<&'a Check> {
     checks_of(r, id).into_iter().rev().find(|c| c.case == case)
 }
 
-/// Copies a child's check into the probe under `case` (absent = missing).
-fn carry(pc: &mut Pc, case: &str, r: &Option<Report>, id: &str, child_case: &str) {
+/// Copies a child's check into the probe under `case` (absent = missing; a
+/// child that did not run = harness failure).
+fn carry(pc: &mut Pc, case: &str, r: &ChildRep, id: &str, child_case: &str) {
     pc.req(case);
-    if let Some(c) = find_check(r, id, child_case) {
-        pc.put(case, Outcome::from_check(c), c.evidence.clone());
+    match r {
+        Err(e) => pc.put(case, Outcome::harness(e.clone()), Value::Null),
+        Ok(_) => {
+            if let Some(c) = find_check(r, id, child_case) {
+                pc.put(case, Outcome::from_check(c), c.evidence.clone());
+            }
+        }
     }
 }
 
@@ -245,13 +267,16 @@ fn all(ctx: &Ctx) {
         ctx.sink.with(|agg| {
             agg.detail(
                 &format!("probe-{p}"),
-                json!({"status": rep.as_ref().map(|r| r.status.clone()), "report": out.join("report.json")}),
+                json!({"status": status_of(&rep), "report": out.join("report.json")}),
             );
             if got.is_empty() {
                 agg.probes.push(Probe {
                     id: id.into(),
                     verdict: "inconclusive".into(),
-                    why: "not_run: the probe child wrote no verdict".into(),
+                    why: match &rep {
+                        Err(e) => e.clone(),
+                        Ok(_) => "not_run: the probe child wrote no verdict".into(),
+                    },
                     evidence: json!({"out": out}),
                 });
             } else {
@@ -287,14 +312,8 @@ fn probe_paste(ctx: &Ctx) {
             false,
             &[],
         );
-        if r.is_some() {
-            pc.put(
-                &case,
-                child_outcome(&r),
-                json!({"status": r.as_ref().map(|r| r.status.clone())}),
-            );
-        }
-        fake.push(json!({"mode": m.name(), "host": r.as_ref().map(|r| r.host.clone())}));
+        pc.put(&case, child_outcome(&r), json!({"status": status_of(&r)}));
+        fake.push(json!({"mode": m.name(), "host": r.as_ref().ok().map(|r| r.host.clone())}));
     }
     let entries: Vec<String> = paste::corpus()
         .into_iter()
@@ -327,7 +346,7 @@ fn probe_paste(ctx: &Ctx) {
         }
         real_hosts.insert(
             agent.into(),
-            json!(r.as_ref().map(|r| (r.status.clone(), r.host.clone()))),
+            json!({"status": status_of(&r), "host": r.as_ref().ok().map(|r| r.host.clone())}),
         );
     }
     // Provider evidence: each child samples the ConPTY module after its first PTY launch.
@@ -340,8 +359,8 @@ fn probe_paste(ctx: &Ctx) {
 /// Query case from a child's launch details: every logged query must have a
 /// reply the harness wrote (the harness is the expected responder). None
 /// when the child logged no launch.
-fn query_outcome(r: &Option<Report>) -> Option<(Outcome, Value)> {
-    let d = r.as_ref()?.details.as_object()?;
+fn query_outcome(r: &Report) -> Option<(Outcome, Value)> {
+    let d = r.details.as_object()?;
     let mut bad = Vec::new();
     let mut any = false;
     for (k, v) in d {
@@ -450,12 +469,17 @@ fn probe_startup(ctx: &Ctx) {
         }
         let qcase = format!("queries/{name}");
         pc.req(&qcase);
-        if let Some((o, e)) = query_outcome(&r) {
-            pc.put(&qcase, o, e);
+        match &r {
+            Err(e) => pc.put(&qcase, Outcome::harness(e.clone()), Value::Null),
+            Ok(rep) => {
+                if let Some((o, e)) = query_outcome(rep) {
+                    pc.put(&qcase, o, e);
+                }
+            }
         }
         ev.insert(
             name.into(),
-            json!({"status": r.as_ref().map(|r| r.status.clone()), "errors": r.as_ref().map(|r| r.errors.clone())}),
+            json!({"status": status_of(&r), "errors": r.as_ref().ok().map(|r| r.errors.clone())}),
         );
     }
     pc.finish(ctx, Value::Object(ev));
@@ -486,13 +510,11 @@ fn probe_kill(ctx: &Ctx) {
         ("plain", &plain, "tree"),
     ] {
         pc.req(&format!("{label}/status"));
-        if r.is_some() {
-            pc.put(
-                &format!("{label}/status"),
-                child_outcome(r),
-                json!({"status": r.as_ref().map(|r| r.status.clone())}),
-            );
-        }
+        pc.put(
+            &format!("{label}/status"),
+            child_outcome(r),
+            json!({"status": status_of(r)}),
+        );
         carry(
             &mut pc,
             &format!("{label}/no_session_survivors"),
@@ -513,7 +535,7 @@ fn probe_kill(ctx: &Ctx) {
         );
         let c = format!("{a}_mcp_witness_tree");
         carry(&mut pc, &format!("real/{c}"), &r, "A-8", &c);
-        real.insert(a.into(), json!(r.map(|r| r.status)));
+        real.insert(a.into(), status_of(&r));
     }
     // Race escapees: fallback kills under held assignment (positive evidence
     // from the child's B-7 checks).
@@ -523,15 +545,22 @@ fn probe_kill(ctx: &Ctx) {
         .map(|c| json!(c.case))
         .collect();
     pc.req("held/race_free");
-    if held.is_some() {
-        pc.put(
-            "held/race_free",
-            Outcome::observed(
+    let held_run = match &held {
+        Err(e) => Some(Outcome::harness(e.clone())),
+        Ok(_) => find_check(&held, "B-7", "tree-hold-assign/no_session_survivors")
+            .map(Outcome::from_check),
+    };
+    if let Some(run) = held_run {
+        // Fallback kills count as race escapees only when the held run
+        // itself was exercised (assignment succeeded, liveness known).
+        let o = match run {
+            Outcome::Pass | Outcome::PlatformFail { .. } => Outcome::observed(
                 race_escapees.is_empty(),
                 "assign-after race escapees killed by the fallback",
             ),
-            json!({"race_escapees": race_escapees}),
-        );
+            o => Outcome::harness(format!("held run not exercised: {}", o.tag())),
+        };
+        pc.put("held/race_free", o, json!({"race_escapees": race_escapees}));
     }
     let jf = job_first(ctx);
     for (case, o) in [
@@ -577,22 +606,28 @@ fn escapee_outcome(
             json!({"members": members}),
         );
     }
-    let (mut escapees, mut unknown) = (Vec::new(), Vec::new());
+    let (mut escapees, mut unknown, mut exited, mut counted) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for &(pid, st) in witnesses {
         match live(pid, st) {
-            Some(true) if !members.contains(&pid) => escapees.push(pid),
-            Some(_) => {}
+            Some(true) if members.contains(&pid) => counted.push(pid),
+            Some(true) => escapees.push(pid),
+            Some(false) => exited.push(pid),
             None => unknown.push(pid),
         }
     }
-    let ev = json!({"members": members, "escapees": escapees, "lookup_failed": unknown});
+    let ev = json!({"members": members, "counted": counted, "escapees": escapees,
+                    "exited_before_snapshot": exited, "lookup_failed": unknown});
+    // A required witness counts only if it is positively alive and in the
+    // job at this pre-stop snapshot.
     let o = if !unknown.is_empty() {
         Outcome::harness("witness liveness lookup failed")
+    } else if !escapees.is_empty() {
+        Outcome::platform("live session witnesses outside the job")
+    } else if !exited.is_empty() {
+        Outcome::not_exercised("a required witness exited before the membership snapshot")
     } else {
-        Outcome::observed(
-            escapees.is_empty(),
-            "live session witnesses outside the job",
-        )
+        Outcome::Pass
     };
     (o, ev)
 }
@@ -811,6 +846,7 @@ impl ProbeHandler for AttachProbe {
         s.lines.join("\n").into_bytes()
     }
     fn input(&self, body: &[u8], deadline: Instant) -> u16 {
+        let started_ms = self.now_ms();
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let nonce = String::from_utf8_lossy(body).into_owned();
         let before = self.len_of("nonces");
@@ -836,7 +872,7 @@ impl ProbeHandler for AttachProbe {
                 .is_some();
         self.record(
             json!({"id": id, "kind": "input", "nonce": nonce, "state": o.state,
-                           "attributed": attributed, "at_ms": self.now_ms()}),
+                           "attributed": attributed, "started_ms": started_ms, "at_ms": self.now_ms()}),
         );
         match (o.state.as_str(), attributed) {
             (_, true) => 200,
@@ -973,11 +1009,20 @@ fn marker_of(screen: &str) -> Option<u64> {
 
 /// Marker advancement across the viewerless interval: the marker another
 /// process reads must be one the fixture emitted, and later than the one on
-/// screen before the interval.
-fn marker_outcome(before: Option<u64>, client: &Value, emitted: &[u64]) -> Outcome {
+/// screen when the interval started. A stopped PTY reader is a harness
+/// failure (the screen it serves is stale).
+fn marker_outcome(
+    before: Option<u64>,
+    reader_ok: bool,
+    client: &Value,
+    emitted: &[u64],
+) -> Outcome {
     let Some(m0) = before else {
         return Outcome::harness("no marker on screen before the viewerless interval");
     };
+    if !reader_ok {
+        return Outcome::harness("the PTY reader stopped");
+    }
     if client["screen_status"].as_u64() != Some(200) {
         return Outcome::harness("screen relay failed");
     }
@@ -1015,9 +1060,18 @@ fn probe_attach(ctx: &Ctx) {
             return pc.finish(ctx, json!({"setup_error": e}));
         }
     };
-    let before = marker_of(&String::from_utf8_lossy(
-        &p.screen(Instant::now() + Duration::from_secs(1)),
-    ));
+    // The interval starts only once the first marker is on screen.
+    let first_by = ctx.until(Duration::from_secs(10));
+    let before = loop {
+        let m = marker_of(&String::from_utf8_lossy(
+            &p.screen(Instant::now() + Duration::from_secs(1)),
+        ));
+        if m.is_some() || Instant::now() >= first_by {
+            break m;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let reader_eof = l.session.io().reader_eof.clone();
     // Viewerless for the full 30 s; a cutoff that cuts it short is not exercised.
     let want = Duration::from_secs(30);
     let t = Instant::now();
@@ -1047,7 +1101,12 @@ fn probe_attach(ctx: &Ctx) {
     if client.get("spawn_error").is_none() {
         pc.put(
             "marker",
-            marker_outcome(before, &client, &emitted),
+            marker_outcome(
+                before,
+                !reader_eof.load(Ordering::SeqCst),
+                &client,
+                &emitted,
+            ),
             json!({"before": before, "marker": client["marker"]}),
         );
     }
@@ -1233,18 +1292,26 @@ fn classify(
     if shown.0 == root {
         return Attr::Ours;
     }
-    let mut cur = shown.1.or_else(|| m.get(&shown.0).copied());
-    if cur.is_none() {
-        return Attr::Unattributed;
-    }
-    for _ in 0..16 {
-        match cur {
-            Some(c) if c == root => return Attr::Ours,
-            Some(c) => cur = m.get(&c).copied().filter(|pp| *pp != c),
-            None => break,
+    let mut cur = match shown.1.or_else(|| m.get(&shown.0).copied()) {
+        Some(c) => c,
+        None => return Attr::Unattributed,
+    };
+    // Walk to the top of the chain; a parent missing from the samples breaks
+    // the chain, and a broken chain may have passed through `root`.
+    for _ in 0..32 {
+        if cur == root {
+            return Attr::Ours;
+        }
+        if cur == 0 {
+            return Attr::Other;
+        }
+        match m.get(&cur) {
+            None => return Attr::Unattributed,
+            Some(&pp) if pp == cur || pp == 0 => return Attr::Other,
+            Some(&pp) => cur = pp,
         }
     }
-    Attr::Other
+    Attr::Unattributed
 }
 
 impl Drop for PpidRecorder {
@@ -1269,9 +1336,10 @@ impl Flash {
 }
 
 /// No-flash judgment for one launch. A window attributed to our tree is
-/// positive evidence; an observer failure is a harness failure; unattributed
-/// events block `pass` unless calibration showed attribution works.
-fn flash_outcome(f: &Flash, launched: bool, calibrated: bool) -> Outcome {
+/// positive evidence; an observer failure (start, quit, join, or message
+/// loop) is a harness failure; any unattributed event (no owner pid, or a
+/// broken parent chain) leaves the case not exercised.
+fn flash_outcome(f: &Flash, launched: bool) -> Outcome {
     if let Some(e) = &f.observer_error {
         return Outcome::harness(format!("window observer failed: {e}"));
     }
@@ -1281,10 +1349,8 @@ fn flash_outcome(f: &Flash, launched: bool, calibrated: bool) -> Outcome {
     if !launched {
         return Outcome::not_exercised("the launch did not complete in scope");
     }
-    if !f.unattributed.is_empty() && !calibrated {
-        return Outcome::not_exercised(
-            "unattributed window events and calibration did not show attribution works",
-        );
+    if !f.unattributed.is_empty() {
+        return Outcome::not_exercised("unattributed window events");
     }
     Outcome::Pass
 }
@@ -1297,12 +1363,12 @@ fn observed_child(
     argv: &[String],
     budget: u64,
     env: &[(&str, &str)],
-) -> (Option<Report>, Flash) {
+) -> (ChildRep, Flash) {
     let obs = match os::WindowObserver::start() {
         Ok(o) => o,
         Err(e) => {
             return (
-                None,
+                Err(format!("not_run: window observer failed: {e}")),
                 Flash {
                     observer_error: Some(e),
                     ..Default::default()
@@ -1312,9 +1378,12 @@ fn observed_child(
     };
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     let (r, _) = child(ctx, name, &argv, budget, false, env);
-    let shown = obs.stop();
+    let (shown, health) = obs.stop();
     let me = std::process::id();
-    let mut f = Flash::default();
+    let mut f = Flash {
+        observer_error: health.err(),
+        ..Default::default()
+    };
     for s in shown {
         match tree.classify(&s, me) {
             Attr::Ours => f.ours.push(s),
@@ -1417,17 +1486,18 @@ fn probe_console(ctx: &Ctx) {
                 let _ = c.wait();
             }
             std::thread::sleep(Duration::from_millis(500));
-            let shown = obs.stop();
-            let ok =
-                cal_pid.is_some_and(|p| shown.iter().any(|s| tree.classify(s, p) == Attr::Ours));
+            let (shown, health) = obs.stop();
+            let ok = health.is_ok()
+                && cal_pid.is_some_and(|p| shown.iter().any(|s| tree.classify(s, p) == Attr::Ours));
             pc.put(
                 "calibration",
-                match (cal_pid, ok) {
-                    (None, _) => Outcome::harness("calibration launch failed"),
-                    (_, true) => Outcome::Pass,
-                    (_, false) => Outcome::not_exercised("calibration window not attributed"),
+                match (&health, cal_pid, ok) {
+                    (Err(e), _, _) => Outcome::harness(format!("window observer failed: {e}")),
+                    (_, None, _) => Outcome::harness("calibration launch failed"),
+                    (_, _, true) => Outcome::Pass,
+                    (_, _, false) => Outcome::not_exercised("calibration window not attributed"),
                 },
-                json!({"pid": cal_pid, "events": shown.len()}),
+                json!({"pid": cal_pid, "events": shown.len(), "observer_error": health.err()}),
             );
             ok
         }
@@ -1440,12 +1510,12 @@ fn probe_console(ctx: &Ctx) {
         pc.put(
             &format!("launch/{name}"),
             match launched {
-                Outcome::Pass | Outcome::Missing => launched,
+                Outcome::Pass | Outcome::HarnessFail { .. } => launched,
                 o => Outcome::not_exercised(format!("launch out of scope: {}", o.tag())),
             },
-            json!({"status": r.as_ref().map(|r| r.status.clone())}),
+            json!({"status": status_of(&r)}),
         );
-        let nf = flash_outcome(&f, ok, calibrated);
+        let nf = flash_outcome(&f, ok && calibrated);
         let flashed = matches!(nf, Outcome::PlatformFail { .. });
         pc.put(&format!("no_flash/{name}"), nf, f.json());
         let mut entry = json!({"baseline": f.json()});
@@ -1469,14 +1539,8 @@ fn probe_console(ctx: &Ctx) {
             );
             let delivered = child_outcome(&r2);
             let ok2 = delivered == Outcome::Pass;
-            if r2.is_some() {
-                pc.put(
-                    &dk,
-                    delivered,
-                    json!({"status": r2.as_ref().map(|r| r.status.clone())}),
-                );
-            }
-            pc.put(&fk, flash_outcome(&f2, ok2, calibrated), f2.json());
+            pc.put(&dk, delivered, json!({"status": status_of(&r2)}));
+            pc.put(&fk, flash_outcome(&f2, ok2 && calibrated), f2.json());
             entry["mitigated"] = f2.json();
         }
         launches.insert((*name).into(), entry);
@@ -1575,11 +1639,12 @@ fn terminal_close_survival(ctx: &Ctx) -> (Outcome, Value) {
         .find(|w| w.role == "attachable" && w.pid == p.child_pid)
         .map(|w| w.start_time);
     let end = ctx.until(Duration::from_secs(1800));
+    // The nonce must come from a request that started after the confirmation.
     let after_confirm = |log: &[Value], c: u64| {
         log.iter().any(|v| {
             v["kind"] == "input"
                 && v["attributed"] == true
-                && v["at_ms"].as_u64().is_some_and(|t| t >= c)
+                && v["started_ms"].as_u64().is_some_and(|t| t > c)
         })
     };
     let mut res: Option<Outcome> = None;
@@ -1594,9 +1659,12 @@ fn terminal_close_survival(ctx: &Ctx) -> (Outcome, Value) {
             }
             last_lookup = start_time.and_then(|st| os::liveness(p.child_pid, st));
             if last_lookup == Some(false) {
-                res = Some(Outcome::platform(
-                    "the attachable child died after the terminal closed",
-                ));
+                // A death during the harness's own teardown is not evidence.
+                res = Some(if crate::session::teardown_in_progress() {
+                    Outcome::harness("harness teardown in progress when the child died")
+                } else {
+                    Outcome::platform("the attachable child died after the terminal closed")
+                });
                 break;
             }
         }
@@ -1630,34 +1698,47 @@ mod tests {
         // A successful snapshot that misses a live witness is an escapee.
         let (o, _) = escapee_outcome(true, &ws, || Ok(vec![10]), |_, _| Some(true));
         assert!(matches!(o, Outcome::PlatformFail { .. }), "{o:?}");
-        // A dead witness outside the job is not an escapee; a failed lookup is harness.
-        let (o, _) = escapee_outcome(true, &ws, || Ok(vec![10]), |p, _| Some(p == 10));
-        assert_eq!(o, Outcome::Pass);
+        // A failed lookup is harness.
         let (o, _) = escapee_outcome(true, &ws, || Ok(vec![10]), |_, _| None);
         assert!(matches!(o, Outcome::HarnessFail { .. }), "{o:?}");
+        // Every witness live and in the job: pass.
+        let (o, _) = escapee_outcome(true, &ws, || Ok(vec![10, 11]), |_, _| Some(true));
+        assert_eq!(o, Outcome::Pass);
+    }
+
+    /// r3 C-3: a required witness that exited before the membership snapshot
+    /// does not count, so the case is not exercised rather than a false `go`.
+    #[test]
+    fn exited_witness_is_not_counted() {
+        let ws = [(10, 1), (11, 1)];
+        let (o, _) = escapee_outcome(true, &ws, || Ok(vec![10]), |p, _| Some(p == 10));
+        assert!(matches!(o, Outcome::NotExercised { .. }), "{o:?}");
     }
 
     #[test]
-    fn unattributed_events_block_no_flash_without_calibration() {
+    fn unattributed_events_block_no_flash() {
         let mut f = Flash {
             unattributed: vec![(0, None)],
             ..Default::default()
         };
         assert!(matches!(
-            flash_outcome(&f, true, false),
+            flash_outcome(&f, true),
             Outcome::NotExercised { .. }
         ));
-        assert_eq!(flash_outcome(&f, true, true), Outcome::Pass);
-        f.observer_error = Some("hook".into());
+        f.unattributed.clear();
+        assert_eq!(flash_outcome(&f, true), Outcome::Pass);
+        f.observer_error = Some("message loop ended on an error".into());
         assert!(matches!(
-            flash_outcome(&f, true, true),
+            flash_outcome(&f, true),
             Outcome::HarnessFail { .. }
         ));
-        let m = std::collections::HashMap::from([(5, 4), (4, 1)]);
+        let m = std::collections::HashMap::from([(5, 4), (4, 1), (1, 0)]);
         assert_eq!(classify(&m, &(0, None), 1), Attr::Unattributed);
         assert_eq!(classify(&m, &(9, None), 1), Attr::Unattributed);
         assert_eq!(classify(&m, &(5, None), 1), Attr::Ours);
         assert_eq!(classify(&m, &(5, None), 2), Attr::Other);
+        // r3: a parent missing from the samples breaks the chain.
+        assert_eq!(classify(&m, &(8, Some(7)), 2), Attr::Unattributed);
     }
 
     #[test]
@@ -1673,17 +1754,22 @@ mod tests {
     #[test]
     fn marker_must_advance_across_the_interval() {
         let c = |m: u64| json!({"screen_status": 200, "marker": m});
-        assert_eq!(marker_outcome(Some(3), &c(9), &[1, 9]), Outcome::Pass);
+        assert_eq!(marker_outcome(Some(3), true, &c(9), &[1, 9]), Outcome::Pass);
         assert!(matches!(
-            marker_outcome(Some(3), &c(3), &[3, 9]),
+            marker_outcome(Some(3), true, &c(3), &[3, 9]),
             Outcome::PlatformFail { .. }
         ));
+        // r3: a stopped reader serves a stale screen.
         assert!(matches!(
-            marker_outcome(Some(3), &c(3), &[3]),
+            marker_outcome(Some(3), false, &c(3), &[3, 9]),
             Outcome::HarnessFail { .. }
         ));
         assert!(matches!(
-            marker_outcome(None, &c(9), &[9]),
+            marker_outcome(Some(3), true, &c(3), &[3]),
+            Outcome::HarnessFail { .. }
+        ));
+        assert!(matches!(
+            marker_outcome(None, true, &c(9), &[9]),
             Outcome::HarnessFail { .. }
         ));
     }
@@ -1695,12 +1781,12 @@ mod tests {
             "launch-a",
             json!({"query_log": [{"kind": "da1", "reply": "x", "harness_wrote": false}]}),
         );
-        let o = query_outcome(&Some(r.clone())).map(|x| x.0);
+        let o = query_outcome(&r).map(|x| x.0);
         assert!(matches!(o, Some(Outcome::HarnessFail { .. })), "{o:?}");
         r.detail(
             "launch-a",
             json!({"query_log": [{"kind": "da1", "reply": "x", "harness_wrote": true}]}),
         );
-        assert_eq!(query_outcome(&Some(r)).map(|x| x.0), Some(Outcome::Pass));
+        assert_eq!(query_outcome(&r).map(|x| x.0), Some(Outcome::Pass));
     }
 }

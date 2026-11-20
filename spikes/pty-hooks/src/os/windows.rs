@@ -548,7 +548,8 @@ unsafe extern "system" fn on_show(
 /// Out-of-context `EVENT_OBJECT_SHOW` observer on its own message-loop thread.
 pub struct WindowObserver {
     thread_id: u32,
-    join: std::thread::JoinHandle<()>,
+    /// The loop thread returns whether its message loop ended cleanly (WM_QUIT).
+    join: std::thread::JoinHandle<bool>,
 }
 
 impl WindowObserver {
@@ -574,13 +575,20 @@ impl WindowObserver {
                 );
                 let _ = tx.send((GetCurrentThreadId(), !hook.is_null()));
                 if hook.is_null() {
-                    return;
+                    return false;
                 }
-                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
+                let clean = loop {
+                    match GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) {
+                        0 => break true,
+                        -1 => break false,
+                        _ => {
+                            TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                    }
+                };
                 UnhookWinEvent(hook);
+                clean
             }
         });
         match rx.recv_timeout(Duration::from_secs(5)) {
@@ -594,19 +602,37 @@ impl WindowObserver {
     }
 
     /// Stops the loop (bounded: a thread that does not quit is abandoned).
-    pub fn stop(self) -> Vec<(u32, Option<u32>)> {
+    /// Returns the events and the observer's health: a failed `WM_QUIT`
+    /// post, a thread that did not exit, or a message loop that ended on an
+    /// error means the events may be incomplete.
+    pub fn stop(self) -> super::ObserverStop {
         // SAFETY: posting WM_QUIT to the observer thread.
         let posted = unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) } != 0;
-        if posted {
+        let health = if !posted {
+            Err(format!(
+                "WM_QUIT post failed: {}",
+                io::Error::last_os_error()
+            ))
+        } else {
             let end = std::time::Instant::now() + Duration::from_secs(2);
             while !self.join.is_finished() && std::time::Instant::now() < end {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            if self.join.is_finished() {
-                let _ = self.join.join();
+            if !self.join.is_finished() {
+                Err("observer thread did not exit".into())
+            } else {
+                match self.join.join() {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err("observer message loop ended on an error".into()),
+                    Err(_) => Err("observer thread panicked".into()),
+                }
             }
-        }
-        SHOWN.lock().map(|v| v.clone()).unwrap_or_default()
+        };
+        let events = match SHOWN.lock() {
+            Ok(v) => v.clone(),
+            Err(_) => return (Vec::new(), Err("event list poisoned".into())),
+        };
+        (events, health)
     }
 }
 
