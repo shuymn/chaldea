@@ -300,17 +300,6 @@ pub fn set_private_file(path: &Path) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
-pub fn file_mode(path: &Path) -> Option<u32> {
-    std::fs::metadata(path).ok().map(|m| m.mode() & 0o7777)
-}
-
-pub fn set_file_mode(path: &Path, mode: Option<u32>) -> io::Result<()> {
-    match mode {
-        Some(m) => std::fs::set_permissions(path, std::fs::Permissions::from_mode(m)),
-        None => Ok(()),
-    }
-}
-
 pub fn make_executable(path: &Path) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }

@@ -317,17 +317,6 @@ pub fn codex_hook_args(cmd: &str) -> Vec<String> {
     v
 }
 
-pub fn codex_hooks_json(cmd: &str) -> Value {
-    let mut hooks = serde_json::Map::new();
-    for ev in CODEX_EVENTS {
-        hooks.insert(
-            ev.to_string(),
-            json!([{"hooks": [{"type": "command", "command": cmd, "timeout": 10}]}]),
-        );
-    }
-    json!({"hooks": hooks})
-}
-
 struct Plan {
     argv: Vec<OsString>,
     session_id: Option<String>,

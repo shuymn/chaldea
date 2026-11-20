@@ -423,14 +423,6 @@ pub fn set_private_file(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub fn file_mode(_path: &Path) -> Option<u32> {
-    None
-}
-
-pub fn set_file_mode(_path: &Path, _mode: Option<u32>) -> io::Result<()> {
-    Ok(())
-}
-
 pub fn make_executable(_path: &Path) -> io::Result<()> {
     Ok(())
 }
