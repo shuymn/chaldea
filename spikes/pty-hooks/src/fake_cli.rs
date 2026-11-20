@@ -495,6 +495,9 @@ pub enum InputEvent {
     Key(String),
 }
 
+/// Idle time after which a lone ESC is the Esc key (not a sequence start).
+pub const ESC_IDLE: Duration = Duration::from_millis(500);
+
 /// Byte-stream input parser for `attachable`: sequences may be split across
 /// reads (a lone ESC is held until more bytes arrive or the input goes idle).
 #[derive(Default)]
@@ -596,9 +599,10 @@ impl InputParser {
         ev
     }
 
-    /// Input went idle: a held lone ESC is the Esc key.
-    pub fn idle(&mut self) -> Vec<InputEvent> {
-        if self.paste.is_none() && self.buf == b"\x1b" {
+    /// Input has been quiet for `quiet`: a held lone ESC is the Esc key once
+    /// the input has been idle for `ESC_IDLE`.
+    pub fn idle(&mut self, quiet: Duration) -> Vec<InputEvent> {
+        if quiet >= ESC_IDLE && self.paste.is_none() && self.buf == b"\x1b" {
             self.buf.clear();
             self.after_paste = false;
             return vec![InputEvent::Key("esc:vt".into())];
@@ -632,10 +636,14 @@ fn run_attachable(o: &Opts) -> i32 {
     let mut nonces: Vec<String> = Vec::new();
     let mut keys: Vec<String> = Vec::new();
     let mut submits = 0u32;
+    let mut last_input = Instant::now();
     loop {
         let ev = match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(chunk) => parser.feed(&chunk),
-            Err(mpsc::RecvTimeoutError::Timeout) => parser.idle(),
+            Ok(chunk) => {
+                last_input = Instant::now();
+                parser.feed(&chunk)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => parser.idle(last_input.elapsed()),
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if ev.is_empty() {
@@ -857,7 +865,9 @@ mod tests {
         ] {
             ev.extend(p.feed(part));
         }
-        ev.extend(p.idle());
+        // A lone ESC stays held until the input has been idle for ESC_IDLE.
+        assert!(p.idle(ESC_IDLE - Duration::from_millis(1)).is_empty());
+        ev.extend(p.idle(ESC_IDLE));
         assert_eq!(
             ev,
             vec![
