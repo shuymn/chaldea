@@ -138,6 +138,8 @@ struct State {
     probe: Mutex<Option<Arc<dyn ProbeHandler>>>,
     /// Largest number of bytes read past the head boundary before a rejection.
     overread: AtomicUsize,
+    /// Called once when binding first becomes ambiguous (revokes the writer gate).
+    on_ambiguous: Mutex<Option<AmbiguityHook>>,
 }
 
 pub struct Receiver {
@@ -177,6 +179,7 @@ impl Receiver {
             active: AtomicUsize::new(0),
             probe: Mutex::new(None),
             overread: AtomicUsize::new(0),
+            on_ambiguous: Mutex::new(None),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let (st, sp) = (state.clone(), stop.clone());
@@ -243,6 +246,20 @@ impl Receiver {
     pub fn set_cli_pid(&self, pid: u32) {
         *self.state.cli_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(pid);
         self.state.cli_cv.notify_all();
+    }
+
+    /// Registers the hook run when binding becomes ambiguous; runs it at once
+    /// if that already happened.
+    pub fn on_ambiguous(&self, hook: AmbiguityHook) {
+        let already = !self.lock().ambiguous.is_empty();
+        if already {
+            hook();
+        }
+        *self
+            .state
+            .on_ambiguous
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hook);
     }
 
     pub fn set_probe(&self, p: Option<Arc<dyn ProbeHandler>>) {
@@ -339,6 +356,11 @@ impl Receiver {
         Self::ready(&self.lock())
     }
 
+    /// Milliseconds since the receiver started (the clock of `received_ms`).
+    pub fn now_ms(&self) -> u64 {
+        self.state.t0.elapsed().as_millis() as u64
+    }
+
     pub fn bound_at_ms(&self) -> Option<u64> {
         self.lock().bound_at
     }
@@ -404,14 +426,33 @@ fn reason(code: u16) -> &'static str {
     }
 }
 
+pub type AmbiguityHook = Box<dyn Fn() + Send + Sync>;
+
 fn respond(s: &mut TcpStream, code: u16, body: &[u8]) -> io::Result<()> {
+    respond_by(s, code, body, Instant::now() + Duration::from_millis(200))
+}
+
+/// Writes the response, recomputing the write timeout from `deadline` before
+/// every write.
+fn respond_by(s: &mut TcpStream, code: u16, body: &[u8], deadline: Instant) -> io::Result<()> {
     let head = format!(
         "HTTP/1.1 {code} {}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
         reason(code),
         body.len()
     );
-    s.write_all(head.as_bytes())?;
-    s.write_all(body)?;
+    for part in [head.as_bytes(), body] {
+        let mut rest = part;
+        while !rest.is_empty() {
+            let left = remaining(deadline)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "deadline"))?;
+            s.set_write_timeout(Some(left))?;
+            let n = s.write(&rest[..rest.len().min(16 * 1024)])?;
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"));
+            }
+            rest = &rest[n..];
+        }
+    }
     s.flush()
 }
 
@@ -453,11 +494,7 @@ impl State {
                 self.reject(code);
             }
             // The response is written only inside the same absolute deadline.
-            if let Some(left) = remaining(deadline)
-                && s.set_write_timeout(Some(left)).is_ok()
-            {
-                let _ = respond(&mut s, code, &body);
-            }
+            let _ = respond_by(&mut s, code, &body, deadline);
         }
         let _ = s.shutdown(Shutdown::Both);
     }
@@ -583,7 +620,7 @@ impl State {
             }
         }
         match (route, probe) {
-            ("hook", _) => self.store_hook(&head, body),
+            ("hook", _) => self.store_hook(&head, body, deadline),
             ("witness", _) => self.store_witness(&body),
             ("screen", Some(p)) => Outcome::Reply(200, p.screen(deadline)),
             ("input", Some(p)) => Outcome::Reply(p.input(&body, deadline), Vec::new()),
@@ -601,16 +638,18 @@ impl State {
             .map(|(p, _)| *p)
     }
 
-    fn cli_pid(&self) -> Option<u32> {
+    /// The launched CLI's pid, waiting at most 1 s and never past `deadline`.
+    fn cli_pid(&self, deadline: Instant) -> Option<u32> {
+        let wait = remaining(deadline)?.min(Duration::from_secs(1));
         let g = self.cli_pid.lock().unwrap_or_else(|e| e.into_inner());
         let (g, _) = self
             .cli_cv
-            .wait_timeout_while(g, Duration::from_secs(1), |p| p.is_none())
+            .wait_timeout_while(g, wait, |p| p.is_none())
             .unwrap_or_else(|e| e.into_inner());
         *g
     }
 
-    fn store_hook(&self, head: &Head, body: Vec<u8>) -> Outcome {
+    fn store_hook(&self, head: &Head, body: Vec<u8>, deadline: Instant) -> Outcome {
         let parsed: Option<Value> = serde_json::from_slice(&body).ok();
         let event_field = parsed
             .as_ref()
@@ -632,7 +671,7 @@ impl State {
             .unwrap_or_default();
         let nearest = self.nearest_cli(&chain);
         let cli_pid = match self.cfg.rule {
-            BindRule::Ancestor => self.cli_pid(),
+            BindRule::Ancestor => self.cli_pid(deadline),
             _ => None,
         };
         let thread_ok = head.thread.as_deref() == Some(self.cfg.thread_id.as_str());
@@ -644,6 +683,10 @@ impl State {
             .join(util::sanitize_component(&self.cfg.agent))
             .join(util::sanitize_component(&self.cfg.cli_version))
             .join(util::sanitize_component(&self.cfg.launch_id));
+        // Nothing is published (fixture or readiness) once the deadline passed.
+        if remaining(deadline).is_none() {
+            return Outcome::Reply(408, Vec::new());
+        }
         if std::fs::create_dir_all(&dir).is_err() {
             return Outcome::Reply(500, Vec::new());
         }
@@ -669,6 +712,13 @@ impl State {
         );
 
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if remaining(deadline).is_none() {
+            drop(g);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(dir.join(format!("{name}.meta.json")));
+            return Outcome::Reply(408, Vec::new());
+        }
+        let was_ambiguous = !g.ambiguous.is_empty();
         let foreign = ("raw_unknown", Some("foreign_session".to_string()));
         let (class, why) = if parsed.is_none() {
             ("raw_unknown", Some("unparseable".to_string()))
@@ -733,7 +783,17 @@ impl State {
             body_len: body.len(),
             body,
         });
+        let became_ambiguous = !was_ambiguous && !g.ambiguous.is_empty();
         drop(g);
+        if became_ambiguous
+            && let Some(h) = self
+                .on_ambiguous
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+        {
+            h();
+        }
         self.cv.notify_all();
         Outcome::Reply(200, Vec::new())
     }
@@ -1049,8 +1109,17 @@ pub(crate) mod tests {
         );
         assert_eq!(raw(r.port(), &req(&host, auth, &ok_anc, ups)), 200);
         assert!(r.events()[3].is_bound());
-        // A conflicting eligible SessionStart: never ready again.
+        // A conflicting eligible SessionStart: never ready again, and the
+        // writer gate is revoked (a queued paste admitted earlier is dropped).
+        let gate = Arc::new(crate::pty::GateState::default());
+        gate.set(true);
+        let admitted = gate.admit().unwrap();
+        let g2 = gate.clone();
+        r.on_ambiguous(Box::new(move || g2.revoke()));
+        assert!(gate.admit().is_some());
         assert_eq!(raw(r.port(), &req(&host, auth, &ok_anc, &ss("s2"))), 200);
+        assert!(gate.admit().is_none(), "ambiguity did not revoke the gate");
+        assert_ne!(gate.epoch.load(Ordering::SeqCst), admitted);
         assert!(r.bound().is_none());
         assert_eq!(r.ambiguous(), vec!["s2".to_string()]);
         assert!(

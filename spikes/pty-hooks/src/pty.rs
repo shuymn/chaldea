@@ -19,10 +19,12 @@ use portable_pty::MasterPty;
 use crate::vt::{QueryLog, Vt};
 
 /// DECSET 2004 as seen by the reader; `epoch` changes on every transition.
+/// `revoked` is sticky: once binding becomes ambiguous the gate never opens again.
 #[derive(Default)]
 pub struct GateState {
     pub open: AtomicBool,
     pub epoch: AtomicU64,
+    pub revoked: AtomicBool,
 }
 
 impl GateState {
@@ -31,11 +33,17 @@ impl GateState {
             self.epoch.fetch_add(1, Ordering::SeqCst);
         }
     }
+    /// Closes the gate for good and bumps the generation, so a paste admitted
+    /// earlier and still queued is dropped before its first byte.
+    pub fn revoke(&self) {
+        self.revoked.store(true, Ordering::SeqCst);
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
     /// The current generation if the gate is open.
     pub fn admit(&self) -> Option<u64> {
         let g = self.epoch.load(Ordering::SeqCst);
         // A transition racing this read bumps `epoch`, so the writer's re-check fails safe.
-        self.open.load(Ordering::SeqCst).then_some(g)
+        (self.open.load(Ordering::SeqCst) && !self.revoked.load(Ordering::SeqCst)).then_some(g)
     }
 }
 
