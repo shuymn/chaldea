@@ -552,6 +552,8 @@ pub enum WinKeysReject {
     NotUtf8,
     /// A lossy transform the caller did not accept (`--allow-lossy`).
     LossyInput(Vec<Lossy>),
+    /// The expected prompt would be empty (nothing for Codex to submit).
+    Empty,
 }
 
 /// The `win_keys` writes for `payload`: validate, refuse unaccepted lossy
@@ -574,6 +576,9 @@ pub fn encode_win_keys(
         .collect();
     if !refused.is_empty() {
         return Err(WinKeysReject::LossyInput(refused));
+    }
+    if expected_win_keys(text, allow).is_empty() {
+        return Err(WinKeysReject::Empty);
     }
     let mut changes = Vec::new();
     let composed = compose_marks(text);
@@ -654,6 +659,15 @@ pub fn type_keys(
         }
         Err(WinKeysReject::NotUtf8) => {
             return out("rejected", None, Some("not_utf8".into()), lossy, Vec::new());
+        }
+        Err(WinKeysReject::Empty) => {
+            return out(
+                "rejected",
+                None,
+                Some("empty_prompt".into()),
+                lossy,
+                Vec::new(),
+            );
         }
         Err(WinKeysReject::LossyInput(l)) => {
             let names: Vec<&str> = l.iter().map(|x| x.name()).collect();
@@ -767,6 +781,15 @@ pub fn corpus_f() -> Vec<FEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L2: an empty expected prompt is refused before anything is written,
+    /// including all-whitespace input accepted with `--allow-lossy trim`.
+    #[test]
+    fn empty_expected_prompt_is_rejected() {
+        assert!(encode_win_keys(b"", NewlineKey::CsiU, &[]).is_err());
+        assert!(encode_win_keys("　 \n".as_bytes(), NewlineKey::CsiU, &[Lossy::Trim]).is_err());
+        assert!(encode_win_keys(b"a", NewlineKey::CsiU, &[]).is_ok());
+    }
 
     fn corpus_text(id: &str) -> Vec<u8> {
         let e = corpus().into_iter().find(|e| e.id == id).unwrap();
