@@ -60,13 +60,17 @@ const F_PROBES: &[(&str, Budget)] = &[
 const F1_CASES: u64 = 18;
 const F1_RECORDED: u64 = 3;
 /// One `real codex-paste` F-1 child (one fresh session per case), sized so
-/// a run in which every case succeeds at its worst-case timing under the
-/// effective SessionStart timeout `sst` fits.
+/// a run in which every case first fails to start once (retried) and then
+/// succeeds at its worst-case timing under the effective SessionStart
+/// timeout `sst` fits.
+const fn f1_case(sst: u64) -> u64 {
+    super::real::keys_failed_start_secs(sst) + super::real::keys_case_worst_secs(sst)
+}
 const fn f1_child(sst: u64) -> u64 {
-    F1_CASES * super::real::keys_case_worst_secs(sst) + CHILD_MARGIN
+    F1_CASES * f1_case(sst) + CHILD_MARGIN
 }
 const fn f1_recorded_child(sst: u64) -> u64 {
-    F1_RECORDED * super::real::keys_case_worst_secs(sst) + CHILD_MARGIN
+    F1_RECORDED * f1_case(sst) + CHILD_MARGIN
 }
 fn codex_input_budget(sst: u64) -> u64 {
     2 * f1_child(sst) + f1_recorded_child(sst) + 3 * CHILD_MARGIN + 60
@@ -3570,11 +3574,13 @@ mod tests {
 
     /// M4: the F-1 budgets follow the effective SessionStart timeout and
     /// include the 10 s write bound (one case: SessionStart, bootstrap 120 s,
-    /// write 10 s, fixture 120 s, settle 5 s, launch and teardown 20 s).
+    /// write 10 s, fixture 120 s, settle 5 s, launch and teardown 20 s),
+    /// plus one failed start (SessionStart timeout, launch and teardown)
+    /// retried per case.
     #[test]
     fn f1_budget_follows_the_effective_timeout() {
         for sst in [20, 60, 120] {
-            let case = sst + 120 + 10 + 120 + 5 + 20;
+            let case = (sst + 20) + (sst + 120 + 10 + 120 + 5 + 20);
             let child = f1_child(sst);
             assert!(
                 child >= F1_CASES * case + CHILD_MARGIN,
@@ -3587,15 +3593,17 @@ mod tests {
         }
     }
 
-    /// M1: an F-1 child in which every case succeeds at its worst-case
-    /// timing fits the child's budget.
+    /// M1: an F-1 child in which every case fails to start once and then
+    /// succeeds at its worst-case timing fits the child's budget.
     #[test]
-    fn f1_child_budget_fits_a_successful_run() {
+    fn f1_child_budget_fits_a_retried_run() {
         let n = f1_entries().len() as u64;
         assert_eq!(n, F1_CASES);
         let recorded = paste::corpus_f().iter().filter(|e| e.recorded).count() as u64;
         assert_eq!(recorded, F1_RECORDED);
-        let worst = super::super::real::keys_case_worst_secs(20);
+        // Every case fails to start once, then succeeds at its worst case.
+        let worst = super::super::real::keys_failed_start_secs(20)
+            + super::super::real::keys_case_worst_secs(20);
         assert!(f1_recorded_child(20) >= recorded * worst + CHILD_MARGIN);
         assert!(f1_child(20) >= n * worst + CHILD_MARGIN);
     }

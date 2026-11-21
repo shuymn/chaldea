@@ -1066,6 +1066,12 @@ pub const fn keys_case_worst_secs(session_start_timeout: u64) -> u64 {
         + KEYS_OVERHEAD.as_secs()
 }
 
+/// Seconds of one failed `win_keys` start (no bound SessionStart, retried
+/// once): the SessionStart timeout plus launch and teardown.
+pub const fn keys_failed_start_secs(session_start_timeout: u64) -> u64 {
+    session_start_timeout + KEYS_OVERHEAD.as_secs()
+}
+
 /// The fixture's submit: the first bound event named `event` after the
 /// bootstrap fence.
 pub fn first_bound_after<'a>(
