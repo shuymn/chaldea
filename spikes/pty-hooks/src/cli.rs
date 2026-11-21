@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::paste::{InputEncoding, Lossy, Newline, NewlineKey};
+use crate::paste::{InputEncoding, Lossy, Newline, NewlineKey, UnicodeRecords};
 
 #[derive(Debug, Clone)]
 pub struct Args {
@@ -50,11 +50,23 @@ pub struct Args {
     /// Set by `--newline-key` (forwarded to children only then).
     pub explicit_newline_key: bool,
     pub allow_lossy: Vec<Lossy>,
+    /// `win_keys` Unicode records (`none` = today's UTF-8 path).
+    pub unicode_records: UnicodeRecords,
+    /// Codex `tui.disable_paste_burst` for `win_keys` input runs (spike
+    /// option, §4.4): `off` passes `=true`, `on` passes `=false`; always
+    /// explicit, so the owner's config cannot leak in.
+    pub codex_paste_burst: PasteBurst,
+    /// `win_keys` corpus F entries to run (`--f1-entries a,b`; empty = all
+    /// of the `--subset`).
+    pub f1_entries: Vec<String>,
     // pty (F-2)
     /// `portable` or `raw` (Windows only).
     pub pty_backend: String,
     pub conpty_flags: u32,
     pub raw_inject: Option<String>,
+    /// F-2c `reader-start`: measured launches after the warm-up (0 = the
+    /// single-case path).
+    pub repeat: u32,
     // C-5 / F-2 verdict
     pub configs: Vec<String>,
     pub join_run_id: Option<String>,
@@ -71,6 +83,35 @@ pub const RAW_INJECTS: &[&str] = &[
     "force-suspended",
     "resume-fail",
 ];
+
+/// Codex paste-burst detection for `win_keys` input runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PasteBurst {
+    #[default]
+    Off,
+    On,
+}
+
+impl PasteBurst {
+    pub fn parse(s: &str) -> Option<PasteBurst> {
+        match s {
+            "off" => Some(PasteBurst::Off),
+            "on" => Some(PasteBurst::On),
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            PasteBurst::Off => "off",
+            PasteBurst::On => "on",
+        }
+    }
+    /// The Codex `-c` pair, explicit both ways.
+    pub fn codex_args(self) -> [String; 2] {
+        let v = self == PasteBurst::Off;
+        ["-c".into(), format!("tui.disable_paste_burst={v}")]
+    }
+}
 
 /// F-2 configurations: `P` (portable-pty), `R0` / `R6` (raw, flags 0 / 0x6).
 pub const CONFIGS: &[&str] = &["P", "R0", "R6"];
@@ -119,9 +160,13 @@ paste:  --paste-newline <cr|lf|crlf>  --enter-delay-ms 300  --chunk N
 codex:  --hook-source session-flags  --launches N
         --mutate-command  --cwd2 DIR  --codex-mode <no-daemon|default|both>
 input:  --input-encoding <auto|bracketed|win-keys>  --newline-key <csi-u|w32>  --allow-lossy <trim|tab>
+        --unicode-records <none|marks>  --codex-paste-burst <off|on>  --f1-entries ID,ID
 pty:    --pty-backend <portable|raw>  --conpty-flags <0|6>  --raw-inject <before-spawn|after-spawn|reader-start|force-suspended|resume-fail>
+        --repeat N   (reader-start: N measured launches plus N no-injection launches)
 f-run:  chs win-probe <codex-input|backend|followup>  (backend: --f1-winner <csi-u|w32|none>)
         chs win-probe rerun   (phase 3b: F-1 w32, tree kills + codex_input per config, F-2c)
+        chs win-probe phase3c   (phase 3c: keys-probe, F-1 arms, tree_kill_codex, reader-start, R0)
+        chs win-probe keys-probe   (ReadConsoleInputW probe: raw UTF-8 vs records)
         chs win-probe console --detached --configs P,R0,R6 --join-run-id ID
         chs win-probe f2-verdict --from DIR --from DIR";
 
@@ -183,9 +228,13 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         newline_key: NewlineKey::CsiU,
         explicit_newline_key: false,
         allow_lossy: Vec::new(),
+        unicode_records: UnicodeRecords::None,
+        codex_paste_burst: PasteBurst::Off,
+        f1_entries: Vec::new(),
         pty_backend: "portable".into(),
         conpty_flags: 0,
         raw_inject: None,
+        repeat: 0,
         configs: Vec::new(),
         join_run_id: None,
         from: Vec::new(),
@@ -267,6 +316,24 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
                     a.allow_lossy.push(l);
                 }
             }
+            "--unicode-records" => {
+                let v = value(&mut it, f)?;
+                a.unicode_records =
+                    UnicodeRecords::parse(&v).ok_or_else(|| format!("{f}: expected none|marks"))?;
+            }
+            "--codex-paste-burst" => {
+                let v = value(&mut it, f)?;
+                a.codex_paste_burst =
+                    PasteBurst::parse(&v).ok_or_else(|| format!("{f}: expected off|on"))?;
+            }
+            "--f1-entries" => {
+                let v = value(&mut it, f)?;
+                a.f1_entries = v.split(',').map(str::to_string).collect();
+                if a.f1_entries.iter().any(|e| e.is_empty()) {
+                    return Err(format!("{f}: expected a comma list of corpus F ids"));
+                }
+            }
+            "--repeat" => a.repeat = num(&value(&mut it, f)?, f)?,
             "--pty-backend" => {
                 a.pty_backend = value(&mut it, f)?;
                 if !["portable", "raw"].contains(&a.pty_backend.as_str()) {
@@ -376,6 +443,15 @@ pub fn forward_input(a: &Args) -> Vec<String> {
     }
     for l in &a.allow_lossy {
         v.extend(["--allow-lossy".into(), l.name().into()]);
+    }
+    if a.unicode_records != UnicodeRecords::None {
+        v.extend(["--unicode-records".into(), a.unicode_records.name().into()]);
+    }
+    if a.codex_paste_burst != PasteBurst::Off {
+        v.extend([
+            "--codex-paste-burst".into(),
+            a.codex_paste_burst.name().into(),
+        ]);
     }
     v
 }

@@ -5,6 +5,7 @@ pub mod cli;
 pub mod emitter;
 pub mod fake_cli;
 pub mod http_client;
+pub mod marks;
 pub mod os;
 pub mod paste;
 pub mod pty;

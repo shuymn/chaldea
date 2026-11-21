@@ -57,7 +57,7 @@ const F_PROBES: &[(&str, Budget)] = &[
 
 /// Corpus F: verdict cases and recorded-only fixtures (a test checks both
 /// against `paste::corpus_f`).
-const F1_CASES: u64 = 18;
+const F1_CASES: u64 = 19;
 const F1_RECORDED: u64 = 3;
 /// One `real codex-paste` F-1 child (one fresh session per case), sized so
 /// a run in which every case first fails to start once (retried) and then

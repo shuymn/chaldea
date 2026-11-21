@@ -233,6 +233,21 @@ pub fn writer_loop(
     drop(writer);
 }
 
+/// A writer thread over `w` with a fresh gate (test rigs for code that
+/// drives a `WriterTx`); send `WriteMsg::Close` to end it.
+pub fn spawn_writer(w: Box<dyn Write + Send>) -> (WriterTx, JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel();
+    let written = Arc::new(AtomicU64::new(0));
+    let wtx = WriterTx {
+        tx,
+        written: written.clone(),
+        gate: Arc::new(GateState::default()),
+    };
+    let j =
+        std::thread::spawn(move || writer_loop(rx, w, written, Arc::new(Mutex::new(Vec::new()))));
+    (wtx, j)
+}
+
 pub struct PtyIo {
     pub vt: Arc<Mutex<Vt>>,
     pub tx: WriterTx,

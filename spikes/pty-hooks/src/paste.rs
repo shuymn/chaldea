@@ -556,15 +556,86 @@ pub enum WinKeysReject {
     Empty,
 }
 
-/// The `win_keys` writes for `payload`: validate, refuse unaccepted lossy
-/// input, compose marks, escape with one leading and one trailing space
-/// (Codex trims both on submit; this disarms `/`, `!`, `?` at the start and
-/// an `@` popup at the end), then one write per line and one write of the
-/// newline key per newline. The trailing CR is not included.
+/// Unicode records for `win_keys` (`--unicode-records`): `none` sends every
+/// character as UTF-8; `marks` sends each BMP scalar of General Category
+/// Mn, Me, or Cf (U+200D, U+309A, variation selectors, ...) left after
+/// composition as a win32-input-mode key-down + key-up record pair
+/// (`ESC[0;0;<unit>;1;0;1_ESC[0;0;<unit>;0;0;1_`, `Vk=Sc=Cs=0`) inside the
+/// write of its line. Astral scalars in those categories stay UTF-8 (a
+/// surrogate pair sent as records would reach Codex's parser as
+/// high-down, high-up, low-down, low-up and be lost) and are reported as
+/// `astral_mark_left_raw`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnicodeRecords {
+    #[default]
+    None,
+    Marks,
+}
+
+impl UnicodeRecords {
+    pub fn parse(s: &str) -> Option<UnicodeRecords> {
+        match s {
+            "none" => Some(UnicodeRecords::None),
+            "marks" => Some(UnicodeRecords::Marks),
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            UnicodeRecords::None => "none",
+            UnicodeRecords::Marks => "marks",
+        }
+    }
+}
+
+/// The win32-input-mode key-down and key-up records carrying one UTF-16
+/// unit with no virtual key, scan code, or modifiers.
+pub fn unit_records(unit: u16) -> Vec<u8> {
+    format!("\x1b[0;0;{unit};1;0;1_\x1b[0;0;{unit};0;0;1_").into_bytes()
+}
+
+/// One line's write under `records`, whether records were used, and
+/// whether an astral Mn/Me/Cf scalar was left as UTF-8.
+fn line_bytes(line: &str, records: UnicodeRecords) -> (Vec<u8>, bool, bool) {
+    let mut out = Vec::with_capacity(line.len());
+    let (mut used, mut astral) = (false, false);
+    for c in line.chars() {
+        if records == UnicodeRecords::Marks && crate::marks::is_mn_me_cf(c) {
+            if let Ok(unit) = u16::try_from(c as u32) {
+                out.extend(unit_records(unit));
+                used = true;
+                continue;
+            }
+            astral = true;
+        }
+        let mut b = [0u8; 4];
+        out.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+    }
+    (out, used, astral)
+}
+
+/// The `win_keys` writes for `payload` with every character as UTF-8
+/// (`--unicode-records none`); see [`encode_win_keys_with`].
 pub fn encode_win_keys(
     payload: &[u8],
     newline: NewlineKey,
     allow: &[Lossy],
+) -> Result<(Vec<Vec<u8>>, Vec<String>), WinKeysReject> {
+    encode_win_keys_with(payload, newline, allow, UnicodeRecords::None)
+}
+
+/// The `win_keys` writes for `payload`: validate, refuse unaccepted lossy
+/// input, compose marks, escape with one leading and one trailing space
+/// (Codex trims both on submit; this disarms `/`, `!`, `?` at the start and
+/// an `@` popup at the end), then one write per line (marks as records
+/// under `records`) and one write of the newline key per newline. The
+/// trailing CR is not included.
+pub fn encode_win_keys_with(
+    payload: &[u8],
+    newline: NewlineKey,
+    allow: &[Lossy],
+    records: UnicodeRecords,
 ) -> Result<(Vec<Vec<u8>>, Vec<String>), WinKeysReject> {
     validate(payload).map_err(WinKeysReject::Control)?;
     let text = std::str::from_utf8(payload).map_err(|_| WinKeysReject::NotUtf8)?;
@@ -590,6 +661,7 @@ pub fn encode_win_keys(
     let lines = split_lines(&composed);
     let last = lines.len() - 1;
     let mut writes = Vec::new();
+    let (mut used, mut astral) = (false, false);
     for (i, line) in lines.iter().enumerate() {
         let mut w = String::new();
         if i == 0 {
@@ -600,11 +672,20 @@ pub fn encode_win_keys(
             w.push(' ');
         }
         if !w.is_empty() {
-            writes.push(w.into_bytes());
+            let (b, u, a) = line_bytes(&w, records);
+            used |= u;
+            astral |= a;
+            writes.push(b);
         }
         if i != last {
             writes.push(newline.bytes().to_vec());
         }
+    }
+    if used {
+        changes.push("unicode_records:marks".to_string());
+    }
+    if astral {
+        changes.push("astral_mark_left_raw".to_string());
     }
     Ok((writes, changes))
 }
@@ -623,6 +704,7 @@ pub fn expected_win_keys(payload: &str, allow: &[Lossy]) -> String {
 
 pub struct KeysOpts {
     pub newline: NewlineKey,
+    pub records: UnicodeRecords,
     pub allow: Vec<Lossy>,
     pub enter_delay: Duration,
     pub write_deadline: Instant,
@@ -652,34 +734,35 @@ pub fn type_keys(
     let lossy = std::str::from_utf8(payload)
         .map(lossy_input)
         .unwrap_or_default();
-    let (writes, changes) = match encode_win_keys(payload, opts.newline, &opts.allow) {
-        Ok(v) => v,
-        Err(WinKeysReject::Control(r)) => {
-            return out("rejected", Some(r), None, lossy, Vec::new());
-        }
-        Err(WinKeysReject::NotUtf8) => {
-            return out("rejected", None, Some("not_utf8".into()), lossy, Vec::new());
-        }
-        Err(WinKeysReject::Empty) => {
-            return out(
-                "rejected",
-                None,
-                Some("empty_prompt".into()),
-                lossy,
-                Vec::new(),
-            );
-        }
-        Err(WinKeysReject::LossyInput(l)) => {
-            let names: Vec<&str> = l.iter().map(|x| x.name()).collect();
-            return out(
-                "rejected",
-                None,
-                Some(format!("lossy_input: {}", names.join(","))),
-                lossy,
-                Vec::new(),
-            );
-        }
-    };
+    let (writes, changes) =
+        match encode_win_keys_with(payload, opts.newline, &opts.allow, opts.records) {
+            Ok(v) => v,
+            Err(WinKeysReject::Control(r)) => {
+                return out("rejected", Some(r), None, lossy, Vec::new());
+            }
+            Err(WinKeysReject::NotUtf8) => {
+                return out("rejected", None, Some("not_utf8".into()), lossy, Vec::new());
+            }
+            Err(WinKeysReject::Empty) => {
+                return out(
+                    "rejected",
+                    None,
+                    Some("empty_prompt".into()),
+                    lossy,
+                    Vec::new(),
+                );
+            }
+            Err(WinKeysReject::LossyInput(l)) => {
+                let names: Vec<&str> = l.iter().map(|x| x.name()).collect();
+                return out(
+                    "rejected",
+                    None,
+                    Some(format!("lossy_input: {}", names.join(","))),
+                    lossy,
+                    Vec::new(),
+                );
+            }
+        };
     let generation = match (ready(), tx.gate.admit_keys()) {
         (true, Some(g)) => g,
         _ => {
@@ -753,6 +836,7 @@ pub fn corpus_f() -> Vec<FEntry> {
         e("astral", "𠮷野家"),
         e("emoji_zwj", "👨\u{200d}👩\u{200d}👧\u{200d}👦"),
         e("emoji_flag", "🇯🇵"),
+        e("emoji_vs16", "\u{2764}\u{FE0F}"),
         e("decomposed_kana", "か\u{3099}"),
         e("decomposed_latin", "e\u{301}"),
         e("cjk_compat", "\u{FA19}"),
@@ -1005,6 +1089,81 @@ mod tests {
         // A blank middle line is just two newline keys.
         let (w, _) = encode_win_keys(b"a\n\nb", NewlineKey::CsiU, &[]).unwrap();
         assert_eq!(w.len(), 4);
+    }
+
+    /// `--unicode-records marks`: each BMP Mn/Me/Cf scalar left after
+    /// composition becomes a key-down + key-up record pair inside its line's
+    /// write; everything else stays UTF-8; astral marks stay UTF-8 and are
+    /// reported. Literal wire bytes.
+    #[test]
+    fn marks_become_unit_records() {
+        let enc = |s: &str, r| encode_win_keys_with(s.as_bytes(), NewlineKey::W32, &[], r).unwrap();
+        let zwj: &[u8] = b"\x1b[0;0;8205;1;0;1_\x1b[0;0;8205;0;0;1_";
+        let (w, ch) = enc("👨\u{200d}👩\u{200d}👧\u{200d}👦", UnicodeRecords::Marks);
+        let want = [
+            " 👨".as_bytes(),
+            zwj,
+            "👩".as_bytes(),
+            zwj,
+            "👧".as_bytes(),
+            zwj,
+            "👦 ".as_bytes(),
+        ]
+        .concat();
+        assert_eq!(w, vec![want]);
+        assert_eq!(ch, ["escape_space", "unicode_records:marks"]);
+        // U+31F7 (Lo) stays UTF-8; U+309A (Mn) is a record.
+        let (w, _) = enc("\u{31F7}\u{309A}", UnicodeRecords::Marks);
+        let kana = [
+            " \u{31F7}".as_bytes(),
+            b"\x1b[0;0;12442;1;0;1_\x1b[0;0;12442;0;0;1_",
+            b" ",
+        ];
+        assert_eq!(w, vec![kana.concat()]);
+        // VS16 (U+FE0F) is a record.
+        let (w, _) = enc("\u{2764}\u{FE0F}", UnicodeRecords::Marks);
+        let vs16 = [
+            " \u{2764}".as_bytes(),
+            b"\x1b[0;0;65039;1;0;1_\x1b[0;0;65039;0;0;1_",
+            b" ",
+        ];
+        assert_eq!(w, vec![vs16.concat()]);
+        // A standalone U+3099 has nothing to compose with: a record.
+        let (w, _) = enc("\u{3099}", UnicodeRecords::Marks);
+        assert_eq!(
+            w,
+            vec![b" \x1b[0;0;12441;1;0;1_\x1b[0;0;12441;0;0;1_ ".to_vec()]
+        );
+        // Composition runs first: no mark left, no record.
+        let (w, ch) = enc("か\u{3099}", UnicodeRecords::Marks);
+        assert_eq!(
+            (w, ch),
+            (
+                vec![" が ".as_bytes().to_vec()],
+                vec!["compose_marks".into(), "escape_space".into()]
+            )
+        );
+        // CJK compatibility ideograph: not a mark.
+        let (w, _) = enc("\u{FA19}", UnicodeRecords::Marks);
+        assert_eq!(w, vec![" \u{FA19} ".as_bytes().to_vec()]);
+        // An astral Mn (U+E0100) stays UTF-8 and is reported; no surrogate
+        // unit is ever sent as a record.
+        let (w, ch) = enc("\u{845B}\u{E0100}", UnicodeRecords::Marks);
+        assert_eq!(w, vec![" \u{845B}\u{E0100} ".as_bytes().to_vec()]);
+        assert_eq!(ch, ["escape_space", "astral_mark_left_raw"]);
+        // Records stay inside the line's write; newline keys are separate.
+        let (w, _) = enc("a\u{200d}\nb", UnicodeRecords::Marks);
+        assert_eq!(w.len(), 3);
+        assert_eq!(w[1], NewlineKey::W32.bytes());
+        // `none`: today's UTF-8 bytes.
+        let (w, ch) = enc("👨\u{200d}👩", UnicodeRecords::None);
+        assert_eq!(w, vec![" 👨\u{200d}👩 ".as_bytes().to_vec()]);
+        assert_eq!(ch, ["escape_space"]);
+        // The oracle does not depend on the records mode.
+        assert_eq!(
+            expected_win_keys("\u{31F7}\u{309A}", &[]),
+            "\u{31F7}\u{309A}"
+        );
     }
 
     #[test]

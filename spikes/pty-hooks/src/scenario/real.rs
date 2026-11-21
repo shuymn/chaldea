@@ -1147,14 +1147,29 @@ pub fn win_keys_case(
     let Some(first) = ups.first() else {
         return (
             Outcome::Missing,
-            json!({"ups": 0, "why": "no UserPromptSubmit after the bootstrap turn"}),
+            json!({"ups": 0, "why": "no UserPromptSubmit after the bootstrap turn",
+                   "ack": "missing", "fidelity": "not_exercised", "completion": "not_exercised"}),
         );
     };
     let got = first.prompt.clone().unwrap_or_default();
     let latency = write_ms.map(|w| first.received_ms.saturating_sub(w));
+    let same_turn = |e: &&KeyEvent| e.turn_id.is_some() && e.turn_id == first.turn_id;
+    let completion = if after
+        .iter()
+        .any(|e| e.event == "Stop" && e.seq > first.seq && same_turn(e))
+    {
+        "ok"
+    } else {
+        "missing"
+    };
+    // The oracle split (§4.4): acknowledgment = the bound submit after the
+    // fence; fidelity = its prompt against the expected form; completion =
+    // the Stop of its turn. Each is recorded whatever the case outcome.
     let mut ev = json!({"ups": ups.len(), "prompts": prompts, "expected": expected,
                         "first_diff": util::first_diff(expected.as_bytes(), got.as_bytes()),
-                        "write_to_ups_ms": latency});
+                        "write_to_ups_ms": latency, "ack": "ok",
+                        "fidelity": if got == expected { "ok" } else { "differs" },
+                        "completion": completion});
     let markers = |s: &str| s.matches("[13;2u").count();
     let want_markers = markers(expected);
     if prompts.iter().flatten().any(|p| markers(p) > want_markers) {
@@ -1177,15 +1192,89 @@ pub fn win_keys_case(
         );
     }
     ev["turn_id"] = json!(first.turn_id);
-    let same_turn = |e: &&KeyEvent| e.turn_id.is_some() && e.turn_id == first.turn_id;
-    if !after
-        .iter()
-        .any(|e| e.event == "Stop" && e.seq > first.seq && same_turn(e))
-    {
+    if completion != "ok" {
+        // `ack_ok, completion_missing`: fidelity stands; the case is
+        // incomplete, not failed.
         ev["why"] = json!("matching prompt without a Stop of its turn");
         return (Outcome::Missing, ev);
     }
     (Outcome::Pass, ev)
+}
+
+/// One `win_keys` send and its wait: the input is written once (exactly
+/// one CR, never resent), then the first bound submit after the fence and
+/// the `Stop` of its turn are awaited until `end`; an acknowledged send is
+/// followed by the settle interval (cut short by `cutoff` = not settled).
+pub struct KeysSend {
+    pub sent: paste::Outcome,
+    /// `acked` (a bound submit after the fence), `unconfirmed` (sent, no
+    /// submit by the deadline; never resent), or the unsent state.
+    pub state: String,
+    pub write_ms: u64,
+    pub completed: bool,
+    pub settled: bool,
+}
+
+pub fn send_keys_case(
+    type_keys: impl FnOnce() -> paste::Outcome,
+    now_ms: impl Fn() -> u64,
+    events: impl Fn() -> Vec<KeyEvent>,
+    fence: u64,
+    end: Instant,
+    cutoff: Instant,
+    settle: Duration,
+) -> KeysSend {
+    let sent = type_keys();
+    let write_ms = now_ms();
+    let mut r = KeysSend {
+        state: sent.state.clone(),
+        sent,
+        write_ms,
+        completed: false,
+        settled: false,
+    };
+    if r.sent.state != "sent" {
+        return r;
+    }
+    wait_until(end, || {
+        first_bound_after(&events(), "UserPromptSubmit", fence).is_some()
+    });
+    let Some(turn) =
+        first_bound_after(&events(), "UserPromptSubmit", fence).map(|u| u.turn_id.clone())
+    else {
+        r.state = "unconfirmed".into();
+        return r;
+    };
+    r.state = "acked".into();
+    r.completed = turn.is_some()
+        && wait_until(end, || {
+            events()
+                .iter()
+                .any(|e| e.bound && e.event == "Stop" && e.seq > fence && e.turn_id == turn)
+        });
+    let left = cutoff.saturating_duration_since(Instant::now());
+    std::thread::sleep(settle.min(left));
+    r.settled = left >= settle;
+    r
+}
+
+/// F-1d `lossy_tab` under the paste-burst override (informational, never a
+/// pass/fail input): `literal_tab` (the expected prompt with its TAB),
+/// `submitted_early` (the first submit is the text before the TAB), or
+/// `other`.
+pub fn tab_outcome(events: &[KeyEvent], fence: u64, expected: &str) -> &'static str {
+    let Some(first) = first_bound_after(events, "UserPromptSubmit", fence) else {
+        return "other";
+    };
+    let got = first.prompt.as_deref().unwrap_or("");
+    let before_tab = expected.split('\t').next().unwrap_or("").trim();
+    if got == expected {
+        "literal_tab"
+    } else if !before_tab.is_empty() && got.trim() == before_tab {
+        "submitted_early"
+    } else {
+        "other"
+    }
 }
 
 /// F-1 (and C-1's Codex part on Windows): one fresh Codex session per case.
@@ -1216,6 +1305,7 @@ fn keys_sweep(ctx: &Ctx, a: &Agent, newline: NewlineKey) {
                 })
                 .collect()
         };
+    let entries = select_entries(entries, &ctx.args.f1_entries);
     let _ = std::fs::write(
         ctx.out.join("corpus.json"),
         serde_json::to_vec_pretty(&entries).unwrap_or_default(),
@@ -1223,6 +1313,10 @@ fn keys_sweep(ctx: &Ctx, a: &Agent, newline: NewlineKey) {
     ctx.sink.with(|r| {
         r.config["input_encoding"] = json!("win_keys");
         r.config["newline_key"] = json!(newline.name());
+        r.config["unicode_records"] = json!(ctx.args.unicode_records.name());
+        r.config["codex_paste_burst"] = json!(ctx.args.codex_paste_burst.name());
+        r.config["codex_paste_burst_args"] = json!(ctx.args.codex_paste_burst.codex_args());
+        r.config["f1_entries"] = json!(ctx.args.f1_entries);
     });
     for e in entries.iter().filter(|e| !e.recorded) {
         ctx.require("A-6", &keys_case(a.name, newline, &e.id));
@@ -1258,6 +1352,17 @@ fn keys_sweep(ctx: &Ctx, a: &Agent, newline: NewlineKey) {
     ctx.detail("f1_recorded", json!(recorded));
 }
 
+/// `--f1-entries`: only the named entries (all when empty), in corpus order.
+pub fn select_entries(entries: Vec<paste::FEntry>, only: &[String]) -> Vec<paste::FEntry> {
+    if only.is_empty() {
+        return entries;
+    }
+    entries
+        .into_iter()
+        .filter(|e| only.contains(&e.id))
+        .collect()
+}
+
 /// A case that ended because the CLI never started (no bound
 /// SessionStart) is retried once in a fresh session.
 pub fn startup_retry(o: &Outcome) -> bool {
@@ -1277,50 +1382,41 @@ fn keys_case_run(
     attempt: &str,
 ) -> (Outcome, Value) {
     let label = format!("{}-keys-{}-{}{attempt}", a.name, newline.name(), e.id);
-    let l = match start(ctx, a, &label, cwd, Some("no-daemon"), a.name, &[]) {
+    // The paste-burst override, explicit both ways (after the hook flags,
+    // which it never changes).
+    let burst = ctx.args.codex_paste_burst.codex_args();
+    let l = match start(ctx, a, &label, cwd, Some("no-daemon"), a.name, &burst) {
         Ok(l) => l,
         Err(err) => return (Outcome::harness(err.clone()), json!({"not_run": err})),
     };
     let (bound, ms, snap) = wait_start(ctx, &l);
-    let mut sent = None;
     let mut fence = None;
-    let mut write_ms = None;
-    let mut settled = false;
-    let mut completed = false;
+    let mut send = None;
     if bound.is_some() {
         // The bootstrap turn (positional first prompt) ends before any input.
         fence = nth_bound(&l, "Stop", 1, ctx.until(KEYS_BOOTSTRAP)).map(|s| s.seq);
     }
     if let Some(f) = fence {
-        let o = l.type_keys(ctx, &e.text, newline, allow, || {
-            l.ready() && l.receiver.nth_bound("Stop", 1).is_some_and(|s| s.seq == f)
-        });
-        write_ms = Some(l.receiver.now_ms());
-        if o.state == "sent" {
-            // One deadline for the submit and the Stop of its turn.
-            let end = ctx.until(KEYS_FIXTURE);
-            let keys =
-                || -> Vec<KeyEvent> { l.receiver.events().iter().map(KeyEvent::of).collect() };
-            wait_until(end, || {
-                first_bound_after(&keys(), "UserPromptSubmit", f).is_some()
-            });
-            let turn = first_bound_after(&keys(), "UserPromptSubmit", f).map(|u| u.turn_id.clone());
-            completed = turn.is_some_and(|t| {
-                t.is_some()
-                    && wait_until(end, || {
-                        l.receiver.events().iter().any(|e| {
-                            e.is_bound() && e.event == "Stop" && KeyEvent::of(e).turn_id == t
-                        })
-                    })
-            });
-            if completed {
-                let left = ctx.cutoff.saturating_duration_since(Instant::now());
-                std::thread::sleep(KEYS_SETTLE.min(left));
-                settled = left >= KEYS_SETTLE;
-            }
-        }
-        sent = Some(o);
+        // One deadline for the submit and the Stop of its turn.
+        send = Some(send_keys_case(
+            || {
+                l.type_keys(ctx, &e.text, newline, allow, || {
+                    l.ready() && l.receiver.nth_bound("Stop", 1).is_some_and(|s| s.seq == f)
+                })
+            },
+            || l.receiver.now_ms(),
+            || l.receiver.events().iter().map(KeyEvent::of).collect(),
+            f,
+            ctx.until(KEYS_FIXTURE),
+            ctx.cutoff,
+            KEYS_SETTLE,
+        ));
     }
+    let completed = send.as_ref().is_some_and(|s| s.completed);
+    let settled = send.as_ref().is_some_and(|s| s.settled);
+    let write_ms = send.as_ref().map(|s| s.write_ms);
+    let send_state = send.as_ref().map(|s| s.state.clone());
+    let sent = send.map(|s| s.sent);
     // The screen as it was when the case ended, for a case that did not
     // complete (taken before the session stops).
     let snap = match snap {
@@ -1336,6 +1432,10 @@ fn keys_case_run(
     );
     let base = json!({"latency_ms": ms, "snapshot": snap, "newline_key": newline.name(),
                       "allow_lossy": allow, "paste": sent, "bootstrap_stop_seq": fence,
+                      "send_state": send_state,
+                      "unicode_records": ctx.args.unicode_records.name(),
+                      "codex_paste_burst": ctx.args.codex_paste_burst.name(),
+                      "launch_branch": stop.launch.get("branch"),
                       "observed_on": format!("codex {}, source session-flags, mode no-daemon", a.version)});
     let (o, mut ev) = if final_ambiguous(&fin) {
         (
@@ -1354,7 +1454,10 @@ fn keys_case_run(
             Some(o) if o.state == "sent" => {
                 let evs: Vec<KeyEvent> = events.iter().map(KeyEvent::of).collect();
                 let expected = paste::expected_win_keys(&e.text, allow);
-                let (o, ev) = win_keys_case(&evs, fence.unwrap_or(0), &expected, write_ms);
+                let (o, mut ev) = win_keys_case(&evs, fence.unwrap_or(0), &expected, write_ms);
+                if allow.contains(&Lossy::Tab) && e.text.contains('\t') {
+                    ev["tab_outcome"] = json!(tab_outcome(&evs, fence.unwrap_or(0), &expected));
+                }
                 (keys_settled(o, settled), ev)
             }
             Some(o)
@@ -2528,6 +2631,157 @@ trusted_hash = "sha256:bb"
         assert_eq!(
             first_bound_after(&evs, "UserPromptSubmit", 2).map(|e| e.seq),
             Some(5)
+        );
+    }
+
+    /// A1: the paste-burst arms differ only in the explicit
+    /// `tui.disable_paste_burst` value, placed after the hook flags; every
+    /// hook-related argument (and its position) is identical across arms.
+    #[test]
+    fn paste_burst_arms_keep_the_hook_argv() {
+        use crate::cli::PasteBurst;
+        let cmd = "/x/chs-hook-emit codex";
+        let off = codex_launch_args(cmd, true, &PasteBurst::Off.codex_args());
+        let on = codex_launch_args(cmd, true, &PasteBurst::On.codex_args());
+        let hooks = |v: &[String]| -> Vec<(usize, String)> {
+            v.iter()
+                .enumerate()
+                .filter(|(_, a)| a.starts_with("hooks."))
+                .map(|(i, a)| (i, a.clone()))
+                .collect()
+        };
+        assert_eq!(hooks(&off).len(), 3);
+        assert_eq!(hooks(&off), hooks(&on));
+        let diff: Vec<(&String, &String)> = off.iter().zip(&on).filter(|(a, b)| a != b).collect();
+        assert_eq!(
+            diff,
+            [(
+                &"tui.disable_paste_burst=true".to_string(),
+                &"tui.disable_paste_burst=false".to_string()
+            )]
+        );
+        let at = off.iter().position(|a| a.starts_with("tui.")).unwrap();
+        assert!(at > hooks(&off).last().unwrap().0);
+        assert_eq!(off.last().map(String::as_str), Some(CODEX_FIRST_PROMPT));
+    }
+
+    /// A rig that records every write the writer thread makes.
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().push(b.to_vec());
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn keys_rig(events: Vec<KeyEvent>, wait: Duration) -> (KeysSend, Vec<Vec<u8>>) {
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, j) = crate::pty::spawn_writer(Box::new(Capture(writes.clone())));
+        let opts = paste::KeysOpts {
+            newline: NewlineKey::W32,
+            records: paste::UnicodeRecords::Marks,
+            allow: Vec::new(),
+            enter_delay: Duration::from_millis(1),
+            write_deadline: Instant::now() + Duration::from_secs(5),
+        };
+        let r = send_keys_case(
+            || paste::type_keys(&tx, "一\n二\u{200d}".as_bytes(), &opts, || true),
+            || 7,
+            || events.clone(),
+            2,
+            Instant::now() + wait,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_millis(1),
+        );
+        tx.send(crate::pty::WriteMsg::Close);
+        j.join().unwrap();
+        let w = writes.lock().unwrap().clone();
+        (r, w)
+    }
+
+    /// A7: a send without an acknowledgment by the deadline is
+    /// `unconfirmed`, and exactly one CR was written (never resent).
+    #[test]
+    fn unacked_send_is_unconfirmed_with_one_cr() {
+        let (r, w) = keys_rig(vec![ev(2, "Stop", None, 5)], Duration::from_millis(200));
+        assert_eq!(r.state, "unconfirmed");
+        assert!(!r.completed);
+        let crs: usize = w
+            .iter()
+            .map(|b| b.iter().filter(|c| **c == b'\r').count())
+            .sum();
+        assert_eq!(crs, 1);
+        assert_eq!(w.last().map(Vec::as_slice), Some(&b"\r"[..]));
+        // The text, its newline record pair, and the ZWJ record went out
+        // before the CR (no CR inside them).
+        assert!(w.len() >= 4);
+    }
+
+    /// A7: an acknowledgment without the turn's Stop is `acked`, not
+    /// completed; the oracle keeps fidelity apart from completion.
+    #[test]
+    fn ack_without_stop_keeps_fidelity() {
+        let evs = vec![
+            ev(2, "Stop", None, 5),
+            ev(3, "UserPromptSubmit", Some("一\n二\u{200d}"), 9),
+        ];
+        let (r, w) = keys_rig(evs.clone(), Duration::from_millis(200));
+        assert_eq!(r.state, "acked");
+        assert!(!r.completed && r.settled);
+        assert_eq!(w.iter().filter(|b| b.as_slice() == b"\r").count(), 1);
+        let (o, e) = win_keys_case(&evs, 2, "一\n二\u{200d}", Some(r.write_ms));
+        assert_eq!(o, Outcome::Missing);
+        assert_eq!(
+            (&e["ack"], &e["fidelity"], &e["completion"]),
+            (&json!("ok"), &json!("ok"), &json!("missing"))
+        );
+        // With the Stop of its turn the case passes and completion is ok.
+        let mut done = evs;
+        done.push(ev(4, "Stop", None, 12));
+        let (r, _) = keys_rig(done.clone(), Duration::from_millis(200));
+        assert!(r.completed && r.settled && r.state == "acked");
+        let (o, e) = win_keys_case(&done, 2, "一\n二\u{200d}", None);
+        assert_eq!((o, &e["completion"]), (Outcome::Pass, &json!("ok")));
+        // No submit at all: ack missing.
+        let (_, e) = win_keys_case(&done[..1], 2, "x", None);
+        assert_eq!(e["ack"], json!("missing"));
+        // A wrong prompt: fidelity differs.
+        let (_, e) = win_keys_case(&done, 2, "x", None);
+        assert_eq!(e["fidelity"], json!("differs"));
+    }
+
+    /// A1: `lossy_tab`'s disposition under the burst override.
+    #[test]
+    fn tab_outcome_is_classified() {
+        let with = |p: &str| {
+            vec![
+                ev(2, "Stop", None, 5),
+                ev(3, "UserPromptSubmit", Some(p), 9),
+            ]
+        };
+        let want = "列1\t列2";
+        assert_eq!(tab_outcome(&with(want), 2, want), "literal_tab");
+        assert_eq!(tab_outcome(&with("列1"), 2, want), "submitted_early");
+        assert_eq!(tab_outcome(&with("列1    列2"), 2, want), "other");
+        assert_eq!(tab_outcome(&with(want)[..1], 2, want), "other");
+    }
+
+    /// `--f1-entries` keeps corpus order and recorded entries.
+    #[test]
+    fn f1_entries_select_by_id() {
+        let ids = |v: Vec<paste::FEntry>| v.into_iter().map(|e| e.id).collect::<Vec<_>>();
+        let only = ["small_kana_mark".to_string(), "emoji_zwj".to_string()];
+        assert_eq!(
+            ids(select_entries(paste::corpus_f(), &only)),
+            ["emoji_zwj", "small_kana_mark"]
+        );
+        assert_eq!(
+            select_entries(paste::corpus_f(), &[]).len(),
+            paste::corpus_f().len()
         );
     }
 

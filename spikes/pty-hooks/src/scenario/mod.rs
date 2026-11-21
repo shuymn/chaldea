@@ -352,6 +352,7 @@ impl Launch {
             text.as_bytes(),
             &crate::paste::KeysOpts {
                 newline,
+                records: ctx.args.unicode_records,
                 allow: allow.to_vec(),
                 enter_delay: Duration::from_millis(ctx.args.enter_delay_ms),
                 write_deadline: ctx.until(real::KEYS_WRITE),
