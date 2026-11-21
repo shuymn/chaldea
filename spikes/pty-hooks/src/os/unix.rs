@@ -464,6 +464,21 @@ pub fn process_handle_count() -> Option<u32> {
     None
 }
 
+/// FakeCli `read-keys` reads Windows console input records only.
+pub fn read_console_keys(_ms: u64, _ready: &dyn Fn()) -> serde_json::Value {
+    serde_json::json!({"error": "windows_only"})
+}
+
+/// Image path and package identity of a process (Windows only).
+pub fn process_identity(_pid: u32, _start: u64) -> serde_json::Value {
+    serde_json::json!({"error": "windows_only"})
+}
+
+/// `major.minor.build` of the host (Windows only).
+pub fn os_build() -> Option<String> {
+    None
+}
+
 pub fn default_terminal_delegation() -> serde_json::Value {
     serde_json::Value::Null
 }

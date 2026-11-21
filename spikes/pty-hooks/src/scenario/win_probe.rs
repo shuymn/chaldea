@@ -49,6 +49,7 @@ const F_PROBES: &[(&str, Budget)] = &[
     ("backend", backend_budget),
     ("followup", followup_budget),
     ("rerun", rerun_budget),
+    ("keys-probe", |_| KEYS_PROBE_BUDGET),
     ("f2-verdict", |_| {
         // Step 5 waits for the detached step 4 run to end.
         console_budget(&F2_CONFIGS.map(String::from)) + 2 * CHILD_MARGIN + 120
@@ -84,6 +85,10 @@ fn backend_budget(sst: u64) -> u64 {
 fn followup_budget(sst: u64) -> u64 {
     1800 + codex_input_budget(sst) + backend_budget(sst) + 1800 + 4 * CHILD_MARGIN + 60
 }
+
+/// `keys-probe`: 12 FakeCli `read-keys` runs of about 2 s each, with room
+/// for slow launches.
+const KEYS_PROBE_BUDGET: u64 = 600;
 
 /// Margin a parent gives a child beyond the child's own deadline.
 const CHILD_MARGIN: u64 = 30;
@@ -140,6 +145,7 @@ pub fn run(mut args: Args) -> i32 {
         "codex-input" => probe_codex_input(&ctx, &NewlineKey::ALL),
         "backend" => probe_backend(&ctx, ctx.args.f1_winner, None),
         "rerun" => rerun(&ctx),
+        "keys-probe" => super::fake::keys_probe(&ctx),
         "followup" => followup(&ctx),
         "f2-verdict" => f2_verdict(&ctx),
         _ => unreachable!(),

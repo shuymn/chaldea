@@ -1038,6 +1038,143 @@ pub fn show_calibration_window(
 }
 
 /// `GetProcessHandleCount` of this process (F-2c).
+/// FakeCli `read-keys` (§4.5): sets the console input mode the way Codex's
+/// raw mode does (processed, line, and echo input cleared, then VT input
+/// cleared), reads it back, records the code pages, calls `ready` (the
+/// out-of-band readiness signal), then for `ms` waits on the input handle
+/// with a deadline before each `ReadConsoleInputW`, so an empty queue never
+/// blocks, and records every `KEY_EVENT` in order.
+pub fn read_console_keys(ms: u64, ready: &dyn Fn()) -> serde_json::Value {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleOutputCP, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW,
+    };
+    let mut errors: Vec<String> = Vec::new();
+    // SAFETY: console calls on the std input handle with sized buffers.
+    unsafe {
+        let hin = GetStdHandle(STD_INPUT_HANDLE);
+        let mut before = 0u32;
+        if GetConsoleMode(hin, &mut before) == 0 {
+            return serde_json::json!({"error": format!("GetConsoleMode: {}", io::Error::last_os_error())});
+        }
+        let set = before
+            & !(ENABLE_LINE_INPUT
+                | ENABLE_ECHO_INPUT
+                | ENABLE_PROCESSED_INPUT
+                | ENABLE_VIRTUAL_TERMINAL_INPUT);
+        if SetConsoleMode(hin, set) == 0 {
+            errors.push(format!("SetConsoleMode: {}", io::Error::last_os_error()));
+        }
+        let mut after = 0u32;
+        let after = (GetConsoleMode(hin, &mut after) != 0).then_some(after);
+        let (icp, ocp) = (GetConsoleCP(), GetConsoleOutputCP());
+        ready();
+        let t0 = Instant::now();
+        let end = t0 + Duration::from_millis(ms);
+        let mut events: Vec<super::KeyRecord> = Vec::new();
+        let mut other = 0u32;
+        loop {
+            let left = end.saturating_duration_since(Instant::now()).as_millis() as u32;
+            if left == 0 {
+                break;
+            }
+            if WaitForSingleObject(hin, left) != WAIT_OBJECT_0 {
+                continue;
+            }
+            let mut buf: [INPUT_RECORD; 64] = std::mem::zeroed();
+            let mut n = 0u32;
+            if ReadConsoleInputW(hin, buf.as_mut_ptr(), buf.len() as u32, &mut n) == 0 {
+                errors.push(format!("ReadConsoleInputW: {}", io::Error::last_os_error()));
+                break;
+            }
+            let at = t0.elapsed().as_millis() as u64;
+            for r in &buf[..n as usize] {
+                if r.EventType as u32 != KEY_EVENT {
+                    other += 1;
+                    continue;
+                }
+                let k = r.Event.KeyEvent;
+                events.push(super::KeyRecord {
+                    down: k.bKeyDown != 0,
+                    vk: k.wVirtualKeyCode,
+                    scan: k.wVirtualScanCode,
+                    uchar: k.uChar.UnicodeChar,
+                    control: k.dwControlKeyState,
+                    repeat: k.wRepeatCount,
+                    ms: at,
+                });
+            }
+        }
+        SetConsoleMode(hin, before);
+        serde_json::json!({
+            "mode_before": format!("{before:#x}"), "mode_set": format!("{set:#x}"),
+            "mode_after": after.map(|m| format!("{m:#x}")),
+            "vt_input_cleared": after.map(|m| m & ENABLE_VIRTUAL_TERMINAL_INPUT == 0),
+            "input_cp": icp, "output_cp": ocp, "read_ms": ms,
+            "events": events, "other_events": other, "errors": errors,
+        })
+    }
+}
+
+/// Image path and package identity of a live process (identity `pid` +
+/// `start`, A4 outside-job evidence): `QueryFullProcessImageNameW`, whether
+/// the image is under a `WindowsApps` directory, and `GetPackageFullName`
+/// (`none` when the process has no package identity, else the error).
+pub fn process_identity(pid: u32, start: u64) -> serde_json::Value {
+    use windows_sys::Win32::Foundation::{APPMODEL_ERROR_NO_PACKAGE, ERROR_INSUFFICIENT_BUFFER};
+    use windows_sys::Win32::Storage::Packaging::Appx::GetPackageFullName;
+    // SAFETY: a handle owned for the duration; buffer lengths passed.
+    unsafe {
+        let Some(h) = Handle::new(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)) else {
+            return serde_json::json!({"error": format!("OpenProcess: {}", io::Error::last_os_error())});
+        };
+        if creation_time(h.raw()) != start {
+            return serde_json::json!({"error": "the pid now names another process"});
+        }
+        let image = image_of(h.raw());
+        let under_windows_apps = image.as_deref().map(|p| {
+            p.to_ascii_lowercase()
+                .split(['\\', '/'])
+                .any(|c| c == "windowsapps")
+        });
+        let mut len = 0u32;
+        let r = GetPackageFullName(h.raw(), &mut len, std::ptr::null_mut());
+        let package = if r == APPMODEL_ERROR_NO_PACKAGE {
+            serde_json::json!("none")
+        } else if r == ERROR_INSUFFICIENT_BUFFER {
+            let mut buf = vec![0u16; len as usize];
+            match GetPackageFullName(h.raw(), &mut len, buf.as_mut_ptr()) {
+                0 => serde_json::json!(String::from_utf16_lossy(
+                    &buf[..(len as usize).saturating_sub(1)]
+                )),
+                e => serde_json::json!({"error": format!("GetPackageFullName: {e}")}),
+            }
+        } else {
+            serde_json::json!({"error": format!("GetPackageFullName: {r}")})
+        };
+        serde_json::json!({"image": image, "under_windows_apps": under_windows_apps,
+                           "package_full_name": package})
+    }
+}
+
+/// `major.minor.build` from `RtlGetVersion` (not subject to manifest
+/// version lies).
+pub fn os_build() -> Option<String> {
+    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+    // SAFETY: a zeroed struct with its size set, filled by the call.
+    unsafe {
+        let mut v: OSVERSIONINFOW = std::mem::zeroed();
+        v.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
+        (RtlGetVersion(&mut v) == 0).then(|| {
+            format!(
+                "{}.{}.{}",
+                v.dwMajorVersion, v.dwMinorVersion, v.dwBuildNumber
+            )
+        })
+    }
+}
+
 pub fn process_handle_count() -> Option<u32> {
     let mut n = 0u32;
     // SAFETY: plain call on the current-process pseudo handle.

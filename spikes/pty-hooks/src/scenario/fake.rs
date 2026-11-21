@@ -2483,6 +2483,192 @@ fn measure_inject(
     (r, tree, stop_report)
 }
 
+// ---------------- keys-probe (phase 3c) ----------------
+
+/// Code points of `text`, the probe's expected delivery.
+fn code_points(text: &str) -> Vec<u32> {
+    text.chars().map(|c| c as u32).collect()
+}
+
+fn hex_points(v: &[u32]) -> Vec<String> {
+    v.iter().map(|c| format!("U+{c:04X}")).collect()
+}
+
+/// The probe's explicit-records arm: every BMP scalar as a key-down +
+/// key-up record pair, astral scalars as UTF-8 (a surrogate pair is never
+/// split into records).
+pub fn all_bmp_records(text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for c in text.chars() {
+        match u16::try_from(c as u32) {
+            Ok(u) => out.extend(paste::unit_records(u)),
+            Err(_) => {
+                let mut b = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+            }
+        }
+    }
+    out
+}
+
+/// keys-probe items (A3): text written raw (UTF-8) and as records.
+pub const KEYS_PROBE_ITEMS: &[(&str, &str)] = &[
+    (
+        "emoji_zwj",
+        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
+    ),
+    ("small_kana_mark", "\u{31F7}\u{309A}"),
+    ("cjk_compat", "\u{FA19}"),
+    ("emoji_vs16", "\u{2764}\u{FE0F}"),
+    ("standalone_mark", "\u{3099}"),
+];
+
+/// How long FakeCli `read-keys` reads per run.
+const READ_KEYS_MS: u64 = 1500;
+
+/// One keys-probe run's outcome against `expected` code points: the run's
+/// report must exist and carry events; otherwise `not_exercised`.
+pub fn keys_run_outcome(report: Option<&Value>, expected: &[u32]) -> (Outcome, Value) {
+    let Some(r) = report else {
+        return (Outcome::not_exercised("no read-keys report"), Value::Null);
+    };
+    if let Some(e) = r.get("error") {
+        return (Outcome::harness(format!("read-keys: {e}")), Value::Null);
+    }
+    let events: Vec<os::KeyRecord> =
+        serde_json::from_value(r["events"].clone()).unwrap_or_default();
+    let got = os::delivered_code_points(&events);
+    let ev = json!({"delivered": hex_points(&got), "expected": hex_points(expected)});
+    if got == expected {
+        (Outcome::Pass, ev)
+    } else {
+        let lost: Vec<u32> = expected
+            .iter()
+            .copied()
+            .filter(|c| !got.contains(c))
+            .collect();
+        (
+            Outcome::platform(format!(
+                "delivered code points differ; lost {:?}",
+                hex_points(&lost)
+            )),
+            ev,
+        )
+    }
+}
+
+/// The Shift+Enter control: a key-down with `VK_RETURN` and Shift held.
+pub fn shift_enter_seen(report: Option<&Value>) -> bool {
+    let events: Vec<os::KeyRecord> = report
+        .map(|r| serde_json::from_value(r["events"].clone()).unwrap_or_default())
+        .unwrap_or_default();
+    events
+        .iter()
+        .any(|e| e.down && e.vk == 0x0D && e.control & 0x10 != 0)
+}
+
+/// A keys-probe case's outcome: a control that did not arrive is a
+/// harness failure (the probe is not interpretable); Shift+Enter is judged
+/// by its key-down record; an item after a failed control is a harness
+/// failure; an item's own result stands otherwise.
+pub fn probe_case_outcome(case: &str, o: Outcome, shift_seen: bool, controls_ok: bool) -> Outcome {
+    if matches!(
+        o,
+        Outcome::NotExercised { .. } | Outcome::HarnessFail { .. }
+    ) {
+        return o;
+    }
+    match case {
+        "controls/shift_enter" if shift_seen => Outcome::Pass,
+        "controls/shift_enter" => Outcome::harness("no Shift+Enter key-down record arrived"),
+        c if c.starts_with("controls/") && o != Outcome::Pass => {
+            Outcome::harness("the ASCII control did not arrive")
+        }
+        c if !c.starts_with("controls/") && !controls_ok => {
+            Outcome::harness("a positive control failed; this item is not interpretable")
+        }
+        _ => o,
+    }
+}
+
+/// One FakeCli `read-keys` run: launch, wait for readiness (the bound
+/// SessionStart, sent after the console mode is set), write `bytes` once,
+/// and take the records FakeCli reports. Returns the report (if any) and
+/// the run's evidence.
+fn keys_run(ctx: &Ctx, label: &str, bytes: &[u8]) -> (Option<Value>, Value) {
+    let ms = READ_KEYS_MS.to_string();
+    let l = match launch(ctx, fake_spec(ctx, label, "read-keys", &["--ms", &ms])) {
+        Ok(l) => l,
+        Err(e) => return (None, json!({"launch_error": e})),
+    };
+    let bound = l.receiver.wait_bound(ctx.until(Duration::from_secs(15)));
+    let mut write = Value::Null;
+    if bound.is_some() {
+        let r = l
+            .session
+            .io()
+            .tx
+            .write_wait(vec![bytes.to_vec()], ctx.until(Duration::from_secs(5)));
+        write = json!(r.map(|_| bytes.len()));
+    }
+    let w = l
+        .receiver
+        .wait_witness(ctx.until(Duration::from_millis(READ_KEYS_MS + 5000)), |w| {
+            w.role == "read-keys-result"
+        });
+    let (stop, _) = l.finish();
+    let report = w.map(|w| w.report);
+    let ev = json!({"bound": bound.is_some(), "wire": String::from_utf8_lossy(bytes),
+                    "write": write, "read_keys": report, "launch": stop.launch});
+    (report.filter(|_| bound.is_some()), ev)
+}
+
+/// `win-probe keys-probe` (phase 3c, A3): what reaches the console input
+/// buffer under the ConPTY, per item, as raw UTF-8 and as explicit records.
+/// Positive controls first: ASCII `abc` and one Win32 Shift+Enter record
+/// must arrive as expected, else every item is `harness_fail`.
+pub fn keys_probe(ctx: &Ctx) {
+    const ID: &str = "keys-probe";
+    let mut runs: Vec<(String, Vec<u8>, Vec<u32>)> = vec![
+        ("controls/ascii".into(), b"abc".to_vec(), code_points("abc")),
+        (
+            "controls/shift_enter".into(),
+            paste::NewlineKey::W32.bytes().to_vec(),
+            vec![13],
+        ),
+    ];
+    for (id, text) in KEYS_PROBE_ITEMS {
+        runs.push((
+            format!("{id}/raw"),
+            text.as_bytes().to_vec(),
+            code_points(text),
+        ));
+        runs.push((
+            format!("{id}/records"),
+            all_bmp_records(text),
+            code_points(text),
+        ));
+    }
+    for (case, _, _) in &runs {
+        ctx.require(ID, case);
+    }
+    let mut controls_ok = true;
+    for (case, bytes, expected) in runs {
+        if ctx.past_cutoff() {
+            break;
+        }
+        let label = format!("keys-probe-{}", case.replace('/', "-"));
+        let (report, mut ev) = keys_run(ctx, &label, &bytes);
+        let (o, e) = keys_run_outcome(report.as_ref(), &expected);
+        ev["result"] = e;
+        let o = probe_case_outcome(&case, o, shift_enter_seen(report.as_ref()), controls_ok);
+        if case.starts_with("controls/") {
+            controls_ok &= o == Outcome::Pass;
+        }
+        ctx.check(ID, &case, o, ev);
+    }
+}
+
 // ---------------- all ----------------
 
 fn run_all(mut args: Args) -> i32 {
@@ -3199,6 +3385,80 @@ mod tests {
         let mut r = r;
         r.teardown.as_mut().unwrap()["output_marker_seen"] = json!(true);
         assert_eq!(raw_inject_outcome(&r), Outcome::Pass);
+    }
+
+    /// Phase 3c keys-probe: the records arm sends every BMP unit as a
+    /// record pair and astral scalars as UTF-8; delivery compares exact code
+    /// points; controls gate every item.
+    #[test]
+    fn keys_probe_rules() {
+        assert_eq!(
+            all_bmp_records("\u{31F7}\u{309A}"),
+            b"\x1b[0;0;12791;1;0;1_\x1b[0;0;12791;0;0;1_\x1b[0;0;12442;1;0;1_\x1b[0;0;12442;0;0;1_"
+        );
+        let zwj = all_bmp_records("\u{1F468}\u{200D}\u{1F469}");
+        let want = [
+            "\u{1F468}".as_bytes(),
+            b"\x1b[0;0;8205;1;0;1_\x1b[0;0;8205;0;0;1_",
+            "\u{1F469}".as_bytes(),
+        ]
+        .concat();
+        assert_eq!(zwj, want);
+        let rec = |down, uchar, vk, control| os::KeyRecord {
+            down,
+            uchar,
+            vk,
+            control,
+            repeat: 1,
+            ..Default::default()
+        };
+        let report = |evs: Vec<os::KeyRecord>| Some(json!({"events": evs}));
+        let full = report(vec![rec(true, 0x31F7, 0, 0), rec(true, 0x309A, 0, 0)]);
+        assert_eq!(
+            keys_run_outcome(full.as_ref(), &[0x31F7, 0x309A]).0,
+            Outcome::Pass
+        );
+        // A mark that arrived only on a key-up is lost.
+        let lost = report(vec![rec(true, 0x31F7, 0, 0), rec(false, 0x309A, 0x12, 0)]);
+        let (o, e) = keys_run_outcome(lost.as_ref(), &[0x31F7, 0x309A]);
+        assert!(matches!(o, Outcome::PlatformFail { .. }));
+        assert_eq!(e["delivered"], json!(["U+31F7"]));
+        assert!(matches!(
+            keys_run_outcome(None, &[1]).0,
+            Outcome::NotExercised { .. }
+        ));
+        assert!(shift_enter_seen(
+            report(vec![rec(true, 13, 0x0D, 0x10)]).as_ref()
+        ));
+        assert!(!shift_enter_seen(
+            report(vec![rec(true, 13, 0x0D, 0)]).as_ref()
+        ));
+        // Controls gate the items.
+        let p = |c: &str, o, seen, ok| probe_case_outcome(c, o, seen, ok);
+        assert_eq!(
+            p("controls/shift_enter", Outcome::platform("x"), true, true),
+            Outcome::Pass
+        );
+        assert!(matches!(
+            p("controls/shift_enter", Outcome::Pass, false, true),
+            Outcome::HarnessFail { .. }
+        ));
+        assert!(matches!(
+            p("controls/ascii", Outcome::platform("x"), false, true),
+            Outcome::HarnessFail { .. }
+        ));
+        assert!(matches!(
+            p("emoji_zwj/raw", Outcome::Pass, false, false),
+            Outcome::HarnessFail { .. }
+        ));
+        assert!(matches!(
+            p("emoji_zwj/raw", Outcome::platform("lost"), false, true),
+            Outcome::PlatformFail { .. }
+        ));
+        assert!(matches!(
+            p("emoji_zwj/raw", Outcome::not_exercised("x"), false, false),
+            Outcome::NotExercised { .. }
+        ));
     }
 
     #[test]

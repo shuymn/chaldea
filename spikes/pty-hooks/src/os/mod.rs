@@ -122,6 +122,48 @@ impl Drop for SlotGuard<'_> {
     }
 }
 
+/// One console `KEY_EVENT` record as `ReadConsoleInputW` returned it
+/// (FakeCli `read-keys`, §4.5). `uchar` is one UTF-16 unit; `ms` is the
+/// time since the read loop started.
+#[derive(Debug, Clone, Copy, Default, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct KeyRecord {
+    pub down: bool,
+    pub vk: u16,
+    pub scan: u16,
+    pub uchar: u16,
+    pub control: u32,
+    pub repeat: u16,
+    pub ms: u64,
+}
+
+/// The code points key-down records delivered: each nonzero `uchar`
+/// (repeated `repeat` times, at least once) with surrogate units joined;
+/// a lone surrogate unit is kept as its own value so a loss is visible.
+pub fn delivered_code_points(events: &[KeyRecord]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut high: Option<u32> = None;
+    for e in events.iter().filter(|e| e.down && e.uchar != 0) {
+        for _ in 0..e.repeat.max(1) {
+            let u = e.uchar as u32;
+            match (high.take(), u) {
+                (Some(h), 0xDC00..=0xDFFF) => {
+                    out.push(0x10000 + ((h - 0xD800) << 10) + (u - 0xDC00));
+                }
+                (h, _) => {
+                    out.extend(h);
+                    if (0xD800..0xDC00).contains(&u) {
+                        high = Some(u);
+                    } else {
+                        out.push(u);
+                    }
+                }
+            }
+        }
+    }
+    out.extend(high);
+    out
+}
+
 /// F-2c fault injections for the raw backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawInject {
@@ -305,6 +347,36 @@ impl<T> Claim<T> {
 
 #[cfg(test)]
 mod tests {
+    /// `read-keys`: key-down units are joined into code points (surrogates
+    /// paired, a lone one kept), key-up records and zero units ignored.
+    #[test]
+    fn delivered_code_points_join_surrogates() {
+        let k = |down, uchar| super::KeyRecord {
+            down,
+            uchar,
+            repeat: 1,
+            ..Default::default()
+        };
+        let evs = [
+            k(true, 0xD83D),
+            k(false, 0xD83D),
+            k(true, 0xDC68),
+            k(true, 0x200D),
+            k(false, 0x200D),
+            k(true, 0),
+            k(true, 0x31F7),
+            k(true, 0xD83D),
+            k(true, 0x309A),
+        ];
+        assert_eq!(
+            super::delivered_code_points(&evs),
+            [0x1F468, 0x200D, 0x31F7, 0xD83D, 0x309A]
+        );
+        let mut twice = k(true, b'a' as u16);
+        twice.repeat = 2;
+        assert_eq!(super::delivered_code_points(&[twice]), [0x61, 0x61]);
+    }
+
     /// M3 (r3): the `after-spawn` injection reports the injected failure
     /// only once the fixture's `OUTPUT-` line was seen; otherwise the
     /// milestone was not reached (a distinct error the oracle rejects).

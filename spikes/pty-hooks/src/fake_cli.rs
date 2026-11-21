@@ -46,6 +46,8 @@ struct Opts {
     at_exit: bool,
     /// `spawn-tree`: keep writing output (F-2c `after-spawn` staging).
     emit_output: bool,
+    /// `read-keys`: how long to read console input records.
+    ms: Option<u64>,
 }
 
 fn parse() -> Opts {
@@ -84,6 +86,10 @@ fn parse() -> Opts {
             "--emit-output" => o.emit_output = true,
             "--report-file" => {
                 o.report_file = Some(PathBuf::from(next));
+                i += 1;
+            }
+            "--ms" => {
+                o.ms = next.parse().ok();
                 i += 1;
             }
             "--max-life-secs" => {
@@ -674,6 +680,24 @@ fn run_window_calibrate(o: &Opts) -> i32 {
     }
 }
 
+/// `read-keys` (keys-probe, §4.5): console input records as Codex's raw
+/// mode would read them. Sets the mode, then sends SessionStart as the
+/// readiness signal, reads every `KEY_EVENT` for `--ms`, and reports them
+/// through `/witness` (`read-keys-result`), which the harness puts in its
+/// report.
+fn run_read_keys(o: &Opts) -> i32 {
+    witness("read-keys", true, json!({}));
+    let sid = o
+        .session_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let r = os::read_console_keys(o.ms.unwrap_or(1500), &|| {
+        session_start(o, &sid);
+    });
+    witness("read-keys-result", false, r);
+    0
+}
+
 fn run_attachable(o: &Opts) -> i32 {
     let _raw = os::enable_raw_mode().ok();
     out(b"\x1b[?2004h\x1b[2J");
@@ -894,6 +918,7 @@ pub fn main() -> i32 {
         "spawn-tree" => run_spawn_tree(&o),
         "sleeper" => run_sleeper(&o),
         "window-calibrate" => run_window_calibrate(&o),
+        "read-keys" => run_read_keys(&o),
         m => {
             eprintln!("chs-fake-cli: unknown --mode {m:?}");
             2
