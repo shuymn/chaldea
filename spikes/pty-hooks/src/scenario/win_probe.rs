@@ -1139,7 +1139,8 @@ pub struct ResizeSeen {
 /// C-4 resize: the child must report the new size, the harness's screen
 /// must have the new geometry (a stale grid is the harness's own failure),
 /// and that screen must show the first marker the child printed after it
-/// observed the new size, or a later one.
+/// observed the new size, or a later one (also one printed after the
+/// child's last report).
 pub fn resize_outcome(r: &ResizeSeen, emitted: &[u64]) -> Outcome {
     match (&r.resized, r.child_reported) {
         (Err(e), _) => return Outcome::harness(format!("resize failed: {e}")),
@@ -1162,10 +1163,8 @@ pub fn resize_outcome(r: &ResizeSeen, emitted: &[u64]) -> Outcome {
     let Some(sm) = r.size_marker else {
         return Outcome::harness("the child recorded no marker after it saw the new size");
     };
+    // Markers are monotonic: one newer than the last report still counts.
     match r.marker_after {
-        Some(m) if !emitted.contains(&m) => {
-            Outcome::harness("marker not in the fixture's emitted list")
-        }
         Some(m) if m >= sm => Outcome::Pass,
         _ if emitted.iter().any(|e| *e >= sm) => Outcome::platform(
             "the resized screen shows no marker drawn after the child saw the new size",
@@ -4259,6 +4258,28 @@ mod tests {
         };
         let o = resize_outcome(&unknown, &emitted);
         assert!(matches!(o, Outcome::HarnessFail { .. }), "{o:?}");
+    }
+
+    /// L1 (r3): markers are monotonic, so the screen may show a marker
+    /// newer than the last report (which ends at the size marker N): N and
+    /// N+2 pass, N-1 does not.
+    #[test]
+    fn resize_accepts_markers_after_the_last_report() {
+        let seen = |after: u64| ResizeSeen {
+            resized: Ok(()),
+            child_reported: true,
+            report_present: true,
+            screen: (100, 30),
+            want: (100, 30),
+            marker_before: Some(4),
+            marker_after: Some(after),
+            size_marker: Some(6),
+        };
+        let emitted = [3, 4, 5, 6];
+        assert_eq!(resize_outcome(&seen(6), &emitted), Outcome::Pass);
+        assert_eq!(resize_outcome(&seen(8), &emitted), Outcome::Pass);
+        let o = resize_outcome(&seen(5), &emitted);
+        assert!(matches!(o, Outcome::PlatformFail { .. }), "{o:?}");
     }
 
     #[test]
