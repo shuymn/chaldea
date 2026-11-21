@@ -2182,7 +2182,8 @@ pub fn raw_inject_outcome(r: &InjectRun) -> Outcome {
             r.inject.as_str(),
             "after-spawn" | "resume-fail" | "reader-start"
         ) {
-            if t["child_pid"].as_u64().is_none() || t["child_start"].as_u64().is_none() {
+            let id = |k: &str| t[k].as_u64().unwrap_or(0);
+            if crate::os::verified_identity(id("child_pid") as u32, id("child_start")).is_err() {
                 return Outcome::harness("the child's identity was not recorded at acquisition");
             }
             match t["process_exit"].as_str() {
@@ -3040,6 +3041,36 @@ mod tests {
             let o = raw_inject_outcome(&run("reader-start", err, td));
             assert!(matches!(o, Outcome::HarnessFail { .. }), "{k}: {o:?}");
         }
+    }
+
+    /// M2a (r3): an identity with pid 0 or start time 0 (a failed lookup)
+    /// is no identity: the child's exit read against it proves nothing.
+    #[test]
+    fn reader_start_rejects_a_zero_identity() {
+        let td = |pid: u64, start: u64| {
+            json!({"path": "master_drop", "teardown_ms": 30, "drain_reached_eof": true,
+                   "drain_end": "eof", "close_hung": false, "child_pid": pid,
+                   "child_start": start, "process_exit": "exited"})
+        };
+        let err = "reader: injected reader-start failure";
+        let run = |t: Value| InjectRun {
+            inject: "reader-start".into(),
+            spawn_error: Some(err.into()),
+            teardown: Some(t),
+            handles_before: Some(100),
+            handles_after: Some(100),
+            ..Default::default()
+        };
+        for (pid, start) in [(7, 0), (0, 70)] {
+            let o = raw_inject_outcome(&run(td(pid, start)));
+            assert!(
+                matches!(o, Outcome::HarnessFail { .. }),
+                "{pid}/{start}: {o:?}"
+            );
+        }
+        assert!(crate::os::verified_identity(7, 0).is_err());
+        assert!(crate::os::verified_identity(0, 70).is_err());
+        assert_eq!(crate::os::verified_identity(7, 70), Ok((7, 70)));
     }
 
     /// M3: `after-spawn` counts only when the fixture's own `OUTPUT-` line

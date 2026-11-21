@@ -382,6 +382,11 @@ pub fn console_code_page() -> Option<u32> {
     None
 }
 
+/// The child's start time from the process table (0 when unreadable).
+pub fn child_start_time(_child: &dyn portable_pty::Child, pid: u32) -> u64 {
+    super::proc_info(pid).map_or(0, |p| p.start_time)
+}
+
 pub fn spawn_detached(_cmd: &mut Command) -> Result<(Child, bool), String> {
     Err("windows_only".into())
 }

@@ -570,8 +570,11 @@ impl Session {
                 (rs.master, rs.child, Some(rs.tree), launch)
             }
         };
-        let pid = child.process_id().unwrap_or(0);
-        let start = os::proc_info(pid).map(|p| p.start_time).unwrap_or(0);
+        let identity = os::child_identity(child.as_ref());
+        let (pid, start) = match &identity {
+            Ok(id) => *id,
+            Err(_) => (child.process_id().unwrap_or(0), 0),
+        };
         let owned = Arc::new(Owned {
             child_pid: pid,
             child_start: start,
@@ -584,10 +587,12 @@ impl Session {
             before_kill: Mutex::new(None),
         });
         watchdog_register(&owned);
-        SPAWNED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((pid, start));
+        if identity.is_ok() {
+            SPAWNED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((pid, start));
+        }
         let mut s = Session {
             owned,
             io: None,
@@ -599,6 +604,8 @@ impl Session {
         if !opts.hold_assign && opts.backend == os::Backend::Portable {
             s.attach_tree();
         }
+        // The guard exists: dropping the session kills the unidentified child.
+        identity?;
         if opts.inject == Some(Inject::SetupFail) {
             return Err("injected post-spawn setup failure".into());
         }

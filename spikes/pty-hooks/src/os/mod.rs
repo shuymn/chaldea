@@ -204,6 +204,24 @@ pub fn os_name() -> &'static str {
     std::env::consts::OS
 }
 
+/// A spawned child's identity: pid 0 or start time 0 (a failed lookup) is
+/// none.
+pub fn verified_identity(pid: u32, start_time: u64) -> Result<(u32, u64), String> {
+    if pid == 0 || start_time == 0 {
+        return Err(format!(
+            "child identity unknown (pid {pid}, start time {start_time})"
+        ));
+    }
+    Ok((pid, start_time))
+}
+
+/// The spawned child's verified identity, its start time read from the
+/// process handle the launch holds (Windows) or the process table (Unix).
+pub fn child_identity(child: &dyn portable_pty::Child) -> Result<(u32, u64), String> {
+    let pid = child.process_id().unwrap_or(0);
+    verified_identity(pid, child_start_time(child, pid))
+}
+
 /// Positive liveness for recovery decisions: `Some(false)` only when a full
 /// process-table read shows `pid` absent, reused, or a zombie; `None` when
 /// the table or the start time cannot be read (callers must refuse).

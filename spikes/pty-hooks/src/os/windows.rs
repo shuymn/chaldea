@@ -1365,6 +1365,14 @@ impl portable_pty::Child for RawChild {
     }
 }
 
+/// The child's creation time from the process handle the launch holds
+/// (0 when there is none or the query fails).
+pub fn child_start_time(child: &dyn portable_pty::Child, _pid: u32) -> u64 {
+    child
+        .as_raw_handle()
+        .map_or(0, |h| creation_time(h as HANDLE))
+}
+
 fn creation_time(h: HANDLE) -> u64 {
     // SAFETY: plain query on a valid handle.
     unsafe {
