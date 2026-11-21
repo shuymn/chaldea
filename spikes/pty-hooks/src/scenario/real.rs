@@ -1445,9 +1445,19 @@ fn keys_sweep(ctx: &Ctx, a: &Agent, newline: NewlineKey) {
     for e in entries.iter().filter(|e| !e.recorded) {
         ctx.require("A-6", &keys_case(a.name, newline, &e.id));
     }
-    let mut recorded = Vec::new();
+    // Every planned row starts as not exercised; each fixture's row replaces
+    // its own and the report is persisted, so a later hard stop keeps the
+    // completed rows.
+    let record = |e: &paste::FEntry, o: Outcome, ev: Value| {
+        let case = keys_case(a.name, newline, &e.id);
+        ctx.sink.with(|r| record_keys_row(r, &case, e, o, ev));
+        let _ = ctx.sink.write();
+    };
+    for e in &entries {
+        record(e, Outcome::not_exercised(KEYS_NOT_REACHED), json!({}));
+    }
     let min_start = Duration::from_secs(ctx.args.session_start_timeout) + KEYS_MIN_INPUT;
-    let results = sweep_slots(
+    sweep_slots(
         entries.len(),
         Instant::now,
         ctx.cutoff,
@@ -1471,20 +1481,39 @@ fn keys_sweep(ctx: &Ctx, a: &Agent, newline: NewlineKey) {
                 (o, ev) = keys_case_run(ctx, a, newline, e, &allow, "-retry", end);
                 ev["attempts"] = json!([first, {"result": o.tag(), "cause": o.cause()}]);
             }
-            (o, ev)
+            record(e, o, ev);
         },
-        |_, why| (Outcome::not_exercised(why), json!({})),
+        |i, why| record(&entries[i], Outcome::not_exercised(why), json!({})),
     );
-    for (e, (o, ev)) in entries.iter().zip(results) {
-        let case = keys_case(a.name, newline, &e.id);
-        if e.recorded {
-            recorded
-                .push(json!({"id": e.id, "result": o.tag(), "cause": o.cause(), "evidence": ev}));
-        } else {
-            ctx.check("A-6", &case, o, ev);
+}
+
+/// A planned keys row the run never reached.
+pub const KEYS_NOT_REACHED: &str = "not reached: the run stopped before this fixture";
+
+/// Sets one keys fixture's row (replacing an earlier one): a check for a
+/// verdict entry, an `f1_recorded` item for a recorded one.
+pub fn record_keys_row(
+    r: &mut crate::report::Report,
+    case: &str,
+    e: &paste::FEntry,
+    o: Outcome,
+    ev: Value,
+) {
+    if e.recorded {
+        let row = json!({"id": e.id, "result": o.tag(), "cause": o.cause(), "evidence": ev});
+        let mut rows = r.details["f1_recorded"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        match rows.iter_mut().find(|x| x["id"] == json!(e.id)) {
+            Some(x) => *x = row,
+            None => rows.push(row),
         }
+        r.detail("f1_recorded", json!(rows));
+    } else {
+        r.checks.retain(|c| !(c.id == "A-6" && c.case == case));
+        r.check("A-6", case, o, ev);
     }
-    ctx.detail("f1_recorded", json!(recorded));
 }
 
 /// The shortest input phase worth starting after SessionStart (bootstrap
@@ -1578,7 +1607,7 @@ fn keys_case_run(
         // One deadline for the submit and the Stop of its turn.
         send = Some(send_keys_case(
             || {
-                l.type_keys(ctx, &e.text, newline, allow, || {
+                l.type_keys(ctx, &e.text, newline, allow, end, || {
                     l.ready() && l.receiver.nth_bound("Stop", 1).is_some_and(|s| s.seq == f)
                 })
             },
@@ -3284,6 +3313,59 @@ trusted_hash = "sha256:bb"
             assert!(row.get("cause").is_none());
         }
         assert_eq!(outside_job_correlation(&Value::Null, &events), json!([]));
+    }
+
+    /// M2: the Enter delay never runs past the fixture's write deadline; a
+    /// CR due after it is never written.
+    #[test]
+    fn enter_delay_stops_at_the_deadline() {
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, j) = crate::pty::spawn_writer(Box::new(Capture(writes.clone())));
+        let opts = paste::KeysOpts {
+            newline: NewlineKey::W32,
+            records: paste::UnicodeRecords::None,
+            allow: Vec::new(),
+            enter_delay: Duration::from_secs(30),
+            write_deadline: Instant::now() + Duration::from_millis(200),
+        };
+        let t = Instant::now();
+        let o = paste::type_keys(&tx, b"x", &opts, || true);
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert_eq!(o.state, "enter_not_sent");
+        tx.send(crate::pty::WriteMsg::Close);
+        j.join().unwrap();
+        assert!(!writes.lock().unwrap().iter().any(|w| w == b"\r"));
+    }
+
+    /// M2: every planned row starts as not exercised and a fixture's row
+    /// replaces only its own, so a later hard stop keeps completed rows.
+    #[test]
+    fn keys_rows_are_replaced_in_place() {
+        let corpus = paste::corpus_f();
+        let pick = |id: &str| corpus.iter().find(|e| e.id == id).unwrap();
+        let (plain, rec) = (pick("long_multiline"), pick("small_kana_mark"));
+        assert!(!plain.recorded && rec.recorded);
+        let case = |e: &paste::FEntry| keys_case("codex", NewlineKey::W32, &e.id);
+        let mut r = crate::report::Report::new("x", "00000000");
+        for e in [plain, rec] {
+            record_keys_row(
+                &mut r,
+                &case(e),
+                e,
+                Outcome::not_exercised(KEYS_NOT_REACHED),
+                json!({}),
+            );
+        }
+        record_keys_row(&mut r, &case(plain), plain, Outcome::Pass, json!({"k": 1}));
+        assert_eq!(r.checks.len(), 1);
+        assert_eq!(r.checks[0].result, "pass");
+        let rows = r.details["f1_recorded"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["result"], "not_exercised");
+        assert_eq!(rows[0]["cause"], KEYS_NOT_REACHED);
+        record_keys_row(&mut r, &case(rec), rec, Outcome::Missing, json!({}));
+        assert_eq!(r.details["f1_recorded"].as_array().unwrap().len(), 1);
+        assert_eq!(r.details["f1_recorded"][0]["result"], "missing");
     }
 
     /// `--f1-entries` keeps corpus order and recorded entries.

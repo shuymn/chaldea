@@ -345,6 +345,7 @@ impl Launch {
         text: &str,
         newline: crate::paste::NewlineKey,
         allow: &[crate::paste::Lossy],
+        deadline: Instant,
         ready: impl Fn() -> bool,
     ) -> crate::paste::Outcome {
         crate::paste::type_keys(
@@ -355,7 +356,9 @@ impl Launch {
                 records: ctx.args.unicode_records,
                 allow: allow.to_vec(),
                 enter_delay: Duration::from_millis(ctx.args.enter_delay_ms),
-                write_deadline: ctx.until(real::KEYS_WRITE),
+                // The fixture's deadline bounds the writes and the Enter
+                // delay.
+                write_deadline: ctx.until(real::KEYS_WRITE).min(deadline),
             },
             ready,
         )

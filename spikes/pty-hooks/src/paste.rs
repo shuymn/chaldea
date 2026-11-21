@@ -788,7 +788,14 @@ pub fn type_keys(
         };
         return out(&state, None, Some(e), lossy, changes);
     }
-    std::thread::sleep(opts.enter_delay);
+    // The Enter delay never runs past the write deadline; a CR due after it
+    // is never written (`enter_not_sent`).
+    std::thread::sleep(
+        opts.enter_delay.min(
+            opts.write_deadline
+                .saturating_duration_since(Instant::now()),
+        ),
+    );
     if let Err(e) = tx.write_guarded(vec![b"\r".to_vec()], guard()) {
         // Never written (cancelled before start or the gate closed): the
         // Enter was not sent. Anything else (a write that started but did
