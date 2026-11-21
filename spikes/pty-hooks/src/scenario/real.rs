@@ -38,9 +38,6 @@ const REAL_UPS_WAIT: Duration = Duration::from_secs(30);
 /// keystroke through the PTY (a key typed under a hook-review dialog can
 /// approve hooks).
 pub const CODEX_FIRST_PROMPT: &str = "Reply with the single word OK.";
-/// Trust key Codex 0.170.0 records for the session-flag SessionStart hook
-/// (cwd-independent; note the leading `/`).
-const CODEX_SESSION_START_KEY: &str = "/<session-flags>/config.toml:session_start:0:0";
 const REAL_STOP_WAIT: Duration = Duration::from_secs(120);
 
 // ---------------- binaries ----------------
@@ -485,16 +482,129 @@ pub fn codex_home() -> PathBuf {
         .unwrap_or_else(|| std::env::home_dir().unwrap_or_default().join(".codex"))
 }
 
-fn trust_keys(config: &[u8]) -> BTreeSet<String> {
-    String::from_utf8_lossy(config)
-        .lines()
-        .filter_map(|l| {
-            l.trim()
-                .strip_prefix("[hooks.state.")
-                .and_then(|r| r.strip_suffix(']'))
-                .map(str::to_string)
-        })
-        .collect()
+/// Every `hooks.state` key of a parsed `config.toml`, however it is
+/// written (table or dotted form); hash values are never read.
+fn state_keys(t: &toml::Table) -> BTreeSet<String> {
+    t.get("hooks")
+        .and_then(toml::Value::as_table)
+        .and_then(|h| h.get("state"))
+        .and_then(toml::Value::as_table)
+        .map(|st| st.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// The session-flag SessionStart trust key (F-3b), found structurally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyResult {
+    /// `config.toml` is not valid UTF-8 TOML.
+    Unreadable(String),
+    /// No persisted entry (absent file, empty `hooks.state`, or no
+    /// session-flag SessionStart key).
+    None,
+    /// A `<session-flags>` key that does not split as
+    /// `<source>:<event>:<group>:<index>` or has non-numeric indices.
+    Unrecognized(Vec<String>),
+    /// More than one matching key.
+    Ambiguous(Vec<String>),
+    Found {
+        key: String,
+        raw: Vec<String>,
+    },
+}
+
+impl KeyResult {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            KeyResult::Unreadable(_) => "unreadable",
+            KeyResult::None => "none",
+            KeyResult::Unrecognized(_) => "unrecognized",
+            KeyResult::Ambiguous(_) => "ambiguous",
+            KeyResult::Found { .. } => "found",
+        }
+    }
+    pub fn key(&self) -> Option<&str> {
+        match self {
+            KeyResult::Found { key, .. } => Some(key),
+            _ => None,
+        }
+    }
+}
+
+/// Splits a trust key from the right into `(source, event, group, index)`;
+/// the source may itself hold a drive colon (`C:\…`).
+fn split_key(k: &str) -> Option<(&str, &str, &str, &str)> {
+    let mut it = k.rsplitn(4, ':');
+    let (i, g, e, s) = (it.next()?, it.next()?, it.next()?, it.next()?);
+    Some((s, e, g, i))
+}
+
+fn is_session_flags_source(src: &str) -> bool {
+    let comps: Vec<&str> = src.split(['/', '\\']).filter(|c| !c.is_empty()).collect();
+    comps.len() >= 2 && comps[comps.len() - 2..] == ["<session-flags>", "config.toml"]
+}
+
+fn is_index(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The trust key of the session-flag SessionStart hook under test: the one
+/// `hooks.state` key whose source path ends in `<session-flags>/config.toml`
+/// (either separator), whose event is `session_start`, and whose group and
+/// handler indices are non-negative integers. `raw` lists every key
+/// containing `session-flags` exactly as written (keys only).
+pub fn session_flag_key(config: &[u8]) -> KeyResult {
+    let text = match std::str::from_utf8(config) {
+        Ok(t) => t,
+        Err(e) => return KeyResult::Unreadable(format!("not UTF-8: {e}")),
+    };
+    let table: toml::Table = match toml::from_str(text) {
+        Ok(t) => t,
+        Err(e) => return KeyResult::Unreadable(e.message().to_string()),
+    };
+    let raw: Vec<String> = state_keys(&table)
+        .into_iter()
+        .filter(|k| k.contains("session-flags"))
+        .collect();
+    let mut found = Vec::new();
+    let mut unrecognized = Vec::new();
+    for k in &raw {
+        match split_key(k) {
+            Some((src, ev, g, i)) if is_session_flags_source(src) => {
+                if !is_index(g) || !is_index(i) {
+                    unrecognized.push(k.clone());
+                } else if ev == "session_start" {
+                    found.push(k.clone());
+                }
+            }
+            Some(_) => {}
+            None if k.contains("<session-flags>") => unrecognized.push(k.clone()),
+            None => {}
+        }
+    }
+    match (found.len(), unrecognized.is_empty()) {
+        (1, _) => KeyResult::Found {
+            key: found.remove(0),
+            raw,
+        },
+        (n, _) if n > 1 => KeyResult::Ambiguous(raw),
+        (_, false) => KeyResult::Unrecognized(raw),
+        _ => KeyResult::None,
+    }
+}
+
+impl KeyResult {
+    fn raw(&self) -> Vec<String> {
+        match self {
+            KeyResult::Unrecognized(r)
+            | KeyResult::Ambiguous(r)
+            | KeyResult::Found { raw: r, .. } => r.clone(),
+            _ => Vec::new(),
+        }
+    }
+    fn json(&self) -> Value {
+        json!({"result": self.tag(), "key": self.key(), "trust_keys_raw": self.raw(),
+               "error": match self { KeyResult::Unreadable(e) => Some(e), _ => None }})
+    }
 }
 
 #[derive(Clone)]
@@ -502,25 +612,40 @@ struct ConfigState {
     /// `absent`, `unreadable: <kind>`, or the content fingerprint.
     fp: String,
     readable: bool,
+    /// Every `hooks.state` key (A-5).
     keys: BTreeSet<String>,
+    /// The session-flag SessionStart key (F-3b, C3).
+    key: KeyResult,
 }
 
 fn codex_config() -> ConfigState {
     match std::fs::read(codex_home().join("config.toml")) {
-        Ok(b) => ConfigState {
-            fp: fingerprint(&b),
-            readable: true,
-            keys: trust_keys(&b),
-        },
+        Ok(b) => {
+            let key = session_flag_key(&b);
+            let keys = std::str::from_utf8(&b)
+                .ok()
+                .and_then(|t| toml::from_str::<toml::Table>(t).ok())
+                .map(|t| state_keys(&t))
+                .unwrap_or_default();
+            ConfigState {
+                fp: fingerprint(&b),
+                // Unreadable TOML is a harness failure like an unreadable file.
+                readable: !matches!(key, KeyResult::Unreadable(_)),
+                keys,
+                key,
+            }
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => ConfigState {
             fp: "absent".into(),
             readable: true,
             keys: BTreeSet::new(),
+            key: KeyResult::None,
         },
         Err(e) => ConfigState {
             fp: format!("unreadable: {}", e.kind()),
             readable: false,
             keys: BTreeSet::new(),
+            key: KeyResult::Unreadable(e.kind().to_string()),
         },
     }
 }
@@ -531,6 +656,9 @@ fn config_delta(before: &ConfigState, after: &ConfigState) -> Value {
         "config_toml_after": after.fp,
         "hooks_state_keys_added": after.keys.difference(&before.keys).collect::<Vec<_>>(),
         "hooks_state_keys_removed": before.keys.difference(&after.keys).collect::<Vec<_>>(),
+        "session_flag_key_before": before.key.json(),
+        "session_flag_key_after": after.key.json(),
+        "trust_keys_raw": after.key.raw(),
     })
 }
 
@@ -981,38 +1109,26 @@ fn codex_modes(ctx: &Ctx) -> Vec<&'static str> {
     }
 }
 
-/// The exact trust key of the hook under test: the session-flag
-/// SessionStart hook this harness injects, compared verbatim with its
-/// leading `/` (other keys are ignored, so a concurrent change to them does
-/// not affect C3).
-fn hook_keys(keys: &BTreeSet<String>) -> BTreeSet<String> {
-    keys.iter()
-        .filter(|k| k.trim_matches('"') == CODEX_SESSION_START_KEY)
-        .cloned()
-        .collect()
-}
-
 /// C3 (second cwd or a fresh, empty cwd): the hook delivered (SessionStart
-/// bound, so no review dialog held the first turn), the key under test was
-/// already trusted from the first cwd, and the launch added no new key.
-fn c3_outcome(
-    config_ok: bool,
-    bound: Outcome,
-    first: &BTreeSet<String>,
-    before: &BTreeSet<String>,
-    after: &BTreeSet<String>,
-) -> Outcome {
+/// bound, so no review dialog held the first turn), and the session-flag key
+/// found after the launch is the one trusted from the first cwd (a new or
+/// different key falsifies). A key that cannot be found uniquely leaves C3
+/// not exercised.
+fn c3_outcome(config_ok: bool, bound: Outcome, first: Option<&str>, after: &KeyResult) -> Outcome {
     if !config_ok {
         return Outcome::harness("config.toml unreadable");
     }
-    if first.is_empty() {
+    let Some(first) = first else {
         return Outcome::not_exercised("no session-flag trust key recorded in the first cwd");
-    }
+    };
     match bound {
-        Outcome::Pass => Outcome::observed(
-            after.difference(before).count() == 0 && after == first,
-            "this cwd added or changed the session-flag trust key",
-        ),
+        Outcome::Pass => match after.key() {
+            Some(k) => Outcome::observed(
+                k == first,
+                "this cwd added or changed the session-flag trust key",
+            ),
+            None => Outcome::not_exercised(format!("session-flag trust key {}", after.tag())),
+        },
         // No SessionStart: a review dialog may be holding the first turn;
         // the timeout snapshot is the evidence.
         o => o,
@@ -1082,7 +1198,7 @@ fn codex_hooks(ctx: &Ctx, a: &Agent) {
             ctx.require("A-5", case);
         }
     }
-    let mut first_keys: std::collections::BTreeMap<&str, BTreeSet<String>> = Default::default();
+    let mut first_keys: std::collections::BTreeMap<&str, String> = Default::default();
     for (mode, dir, tag, id, case) in plan {
         if ctx.past_cutoff() {
             break;
@@ -1151,24 +1267,23 @@ fn codex_hooks(ctx: &Ctx, a: &Agent) {
             }
             "A-4" => ctx.check(id, &case, bound_outcome(&fin), base),
             "C3" => {
-                let first = first_keys.get(mode).cloned().unwrap_or_default();
-                let (prior, now) = (hook_keys(&before.keys), hook_keys(&after.keys));
-                let o = c3_outcome(config_ok, bound_outcome(&fin), &first, &prior, &now);
+                let first = first_keys.get(mode).cloned();
+                let o = c3_outcome(config_ok, bound_outcome(&fin), first.as_deref(), &after.key);
                 ctx.check(
                     id,
                     &case,
                     o,
-                    json!({"base": base, "first_cwd_keys": first, "keys_before": prior,
-                           "keys_after": now}),
+                    json!({"base": base, "first_cwd_key": first, "key_before": before.key.json(),
+                           "key_after": after.key.json()}),
                 );
             }
             _ => {
                 let o = bound_outcome(&fin);
-                if o == Outcome::Pass && config_ok {
-                    let k = hook_keys(&after.keys);
-                    if !k.is_empty() {
-                        first_keys.entry(mode).or_insert(k);
-                    }
+                if o == Outcome::Pass
+                    && config_ok
+                    && let Some(k) = after.key.key()
+                {
+                    first_keys.entry(mode).or_insert_with(|| k.to_string());
                 }
                 ctx.check(id, &case, o, base.clone());
                 ctx.check(
@@ -1621,44 +1736,111 @@ mod tests {
         assert_eq!(bound_events(&fin), 1);
     }
 
-    /// r3 C3: only the SessionStart session-flag key of the hook under test.
-    #[test]
-    fn c3_compares_the_hook_under_test() {
-        // The real 0.170.0 format has a leading `/`; the old form without it
-        // must not match.
-        let k = trust_keys(
-            b"[hooks.state.\"/<session-flags>/config.toml:session_start:0:0\"]\n\
-              [hooks.state.\"/<session-flags>/config.toml:stop:0:0\"]\n\
-              [hooks.state.\"<session-flags>/config.toml:session_start:0:0\"]\n\
-              [hooks.state.\"/x/hooks.json:session_start:0:0\"]\n",
-        );
-        assert_eq!(
-            hook_keys(&k).into_iter().collect::<Vec<_>>(),
-            vec!["\"/<session-flags>/config.toml:session_start:0:0\"".to_string()]
-        );
+    fn found(k: &str) -> KeyResult {
+        KeyResult::Found {
+            key: k.into(),
+            raw: vec![k.into()],
+        }
     }
 
-    /// C3 fresh cwd: delivered, no review, and no new key.
+    /// F-3b: the session-flag key is found structurally on every OS.
     #[test]
-    fn c3_fresh_cwd_needs_delivery_and_no_new_key() {
-        let key: BTreeSet<String> = [format!("\"{CODEX_SESSION_START_KEY}\"")].into();
-        let none = BTreeSet::new();
+    fn session_flag_key_fixtures() {
+        let mac = "/<session-flags>/config.toml:session_start:0:0";
+        // Table form, with other keys and the hash beside it.
+        let cfg = format!(
+            "[x]\ny = 1\n[hooks.state.\"{mac}\"]\ntrusted_hash = \"sha256:1\"\n\
+             [hooks.state.\"/<session-flags>/config.toml:stop:0:0\"]\ntrusted_hash = \"sha256:2\"\n\
+             [hooks.state.\"/x/hooks.json:session_start:0:0\"]\ntrusted_hash = \"sha256:3\"\n"
+        );
+        let r = session_flag_key(cfg.as_bytes());
+        assert_eq!(r.key(), Some(mac));
+        assert!(
+            !format!("{r:?}").contains("sha256"),
+            "hashes never returned"
+        );
+        // Windows form: drive colon, TOML-escaped backslashes, dotted keys.
+        let win = r"C:\<session-flags>\config.toml:session_start:0:0";
+        let cfg = "hooks.state.\"C:\\\\<session-flags>\\\\config.toml:session_start:0:0\".trusted_hash = \"sha256:9\"\n";
+        assert_eq!(session_flag_key(cfg.as_bytes()).key(), Some(win));
+        // Near-matches are ignored.
+        let near = "[hooks.state.\"/<session-flags2>/config.toml:session_start:0:0\"]\n\
+                    [hooks.state.\"/<session-flags>/config.toml:session_start_x:0:0\"]\n\
+                    [hooks.state.\"/<session-flags>/other.toml:session_start:0:0\"]\n";
+        assert_eq!(session_flag_key(near.as_bytes()), KeyResult::None);
+        let with_real = format!("{near}[hooks.state.\"{mac}\"]\n");
+        assert_eq!(session_flag_key(with_real.as_bytes()).key(), Some(mac));
+        // Non-numeric indices: unrecognized.
+        let bad = "[hooks.state.\"/<session-flags>/config.toml:session_start:a:0\"]\n";
+        assert!(matches!(
+            session_flag_key(bad.as_bytes()),
+            KeyResult::Unrecognized(_)
+        ));
+        let bad = "[hooks.state.\"<session-flags>\"]\n";
+        assert!(matches!(
+            session_flag_key(bad.as_bytes()),
+            KeyResult::Unrecognized(_)
+        ));
+        // Empty hooks.state and no config: no persisted entry.
+        assert_eq!(session_flag_key(b"[hooks.state]\n"), KeyResult::None);
+        assert_eq!(session_flag_key(b""), KeyResult::None);
+        // Two matches: ambiguous.
+        let two = format!(
+            "[hooks.state.\"{mac}\"]\n[hooks.state.\"{win_esc}\"]\n",
+            win_esc = r"C:\\<session-flags>\\config.toml:session_start:0:0"
+        );
+        assert!(matches!(
+            session_flag_key(two.as_bytes()),
+            KeyResult::Ambiguous(_)
+        ));
+        // Invalid TOML: unreadable.
+        assert!(matches!(
+            session_flag_key(b"[hooks.state"),
+            KeyResult::Unreadable(_)
+        ));
+        // The old line scanner found nothing in the Windows form; this does.
+        assert_eq!(session_flag_key(cfg.as_bytes()).tag(), "found");
+    }
+
+    /// C3: delivered, no review, and the same key as the first cwd.
+    #[test]
+    fn c3_needs_delivery_and_the_same_key() {
+        let k = "/<session-flags>/config.toml:session_start:0:0";
         assert_eq!(
-            c3_outcome(true, Outcome::Pass, &key, &key, &key),
+            c3_outcome(true, Outcome::Pass, Some(k), &found(k)),
             Outcome::Pass
         );
-        let extra: BTreeSet<String> = [key.iter().next().unwrap().clone(), "\"x\"".into()].into();
+        // A changed key is detected.
         assert!(matches!(
-            c3_outcome(true, Outcome::Pass, &key, &key, &extra),
+            c3_outcome(
+                true,
+                Outcome::Pass,
+                Some(k),
+                &found("/<session-flags>/config.toml:session_start:0:1")
+            ),
             Outcome::PlatformFail { .. }
         ));
         assert_eq!(
-            c3_outcome(true, Outcome::Missing, &key, &key, &key),
+            c3_outcome(true, Outcome::Missing, Some(k), &found(k)),
             Outcome::Missing
         );
         assert!(matches!(
-            c3_outcome(true, Outcome::Pass, &none, &none, &key),
+            c3_outcome(true, Outcome::Pass, None, &found(k)),
             Outcome::NotExercised { .. }
+        ));
+        for r in [
+            KeyResult::None,
+            KeyResult::Unrecognized(vec![]),
+            KeyResult::Ambiguous(vec![]),
+        ] {
+            assert!(matches!(
+                c3_outcome(true, Outcome::Pass, Some(k), &r),
+                Outcome::NotExercised { .. }
+            ));
+        }
+        assert!(matches!(
+            c3_outcome(false, Outcome::Pass, Some(k), &found(k)),
+            Outcome::HarnessFail { .. }
         ));
     }
 
@@ -1678,15 +1860,6 @@ mod tests {
         };
         assert_eq!(c.session_start(), "eager");
         assert_eq!(c.launch_turns(), 0);
-    }
-
-    #[test]
-    fn trust_keys_parsed() {
-        let k = trust_keys(b"[x]\n[hooks.state.\"/<session-flags>/config.toml:session_start:0:0\"]\ntrusted_hash = \"sha256:1\"\n");
-        assert_eq!(
-            k.into_iter().collect::<Vec<_>>(),
-            vec!["\"/<session-flags>/config.toml:session_start:0:0\"".to_string()]
-        );
     }
 
     #[test]
