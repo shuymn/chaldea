@@ -2705,8 +2705,9 @@ trusted_hash = "sha256:bb"
         assert!(argv.windows(2).any(|w| w == CODEX_EFFORT_ARGS), "{argv:?}");
         let hooks: Vec<&String> = argv.iter().filter(|a| a.starts_with("hooks.")).collect();
         assert_eq!(hooks.len(), 3, "{argv:?}");
+        let emitter = hook_command_for(Path::new("/r"), "codex", "chs-hook-emit");
         assert!(
-            hooks.iter().all(|h| h.contains("chs-hook-emit codex")),
+            hooks.iter().all(|h| h.contains(emitter.as_str())),
             "{hooks:?}"
         );
         assert_eq!(
