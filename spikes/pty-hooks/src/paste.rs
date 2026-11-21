@@ -1,10 +1,11 @@
-//! Paste corpus, validator, newline mapping, bracketed-paste encoder (§4.4).
+//! Paste corpus, validator, newline mapping, bracketed-paste encoder, and
+//! the Windows Codex `win_keys` input encoding (§4.4).
 
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::pty::{Guard, WriterTx};
+use crate::pty::{GateMode, Guard, WriterTx};
 
 pub const PASTE_START: &[u8] = b"\x1b[200~";
 pub const PASTE_END: &[u8] = b"\x1b[201~";
@@ -248,7 +249,10 @@ pub fn match_prompt(want: &[u8], got: &[u8]) -> PromptMatch {
     }
 }
 
-/// Bracketed paste wire bytes split into `chunk`-byte writes (0 = one write).
+/// Bracketed paste wire bytes split into writes of about `chunk` bytes (0 =
+/// one write). A cut that would fall inside an escape sequence moves to the
+/// sequence's end (conhost drops a split `ESC[201~` prefix, §3); cuts inside
+/// multi-byte UTF-8 characters stay.
 pub fn encode(payload: &[u8], mode: Newline, chunk: usize) -> Vec<Vec<u8>> {
     let mut wire = PASTE_START.to_vec();
     wire.extend_from_slice(&map_newlines(payload, mode));
@@ -256,8 +260,47 @@ pub fn encode(payload: &[u8], mode: Newline, chunk: usize) -> Vec<Vec<u8>> {
     if chunk == 0 {
         vec![wire]
     } else {
-        wire.chunks(chunk).map(<[u8]>::to_vec).collect()
+        chunk_escape_safe(&wire, chunk)
     }
+}
+
+/// `(start, end)` of every escape sequence in `b`: ESC `[` … final byte
+/// (0x40..=0x7e), or ESC plus one byte; an unterminated one runs to the end.
+fn escape_spans(b: &[u8]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        let end = if b.get(i + 1) == Some(&b'[') {
+            b[i + 2..]
+                .iter()
+                .position(|c| (0x40..=0x7e).contains(c))
+                .map_or(b.len(), |p| i + 2 + p + 1)
+        } else {
+            (i + 2).min(b.len())
+        };
+        spans.push((i, end));
+        i = end;
+    }
+    spans
+}
+
+fn chunk_escape_safe(wire: &[u8], n: usize) -> Vec<Vec<u8>> {
+    let spans = escape_spans(wire);
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < wire.len() {
+        let mut cut = (start + n).min(wire.len());
+        if let Some(&(_, e)) = spans.iter().find(|(s, e)| *s < cut && cut < *e) {
+            cut = e;
+        }
+        out.push(wire[start..cut].to_vec());
+        start = cut;
+    }
+    out
 }
 
 /// Bytes for ungated `write_key` (owner keypad / probe client). `w-` names use
@@ -285,6 +328,13 @@ pub struct Outcome {
     pub bytes_before: u64,
     pub bytes_after: u64,
     pub detail: Option<String>,
+    /// `win_keys` only: lossy transforms found in the payload (F-1d).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lossy: Vec<Lossy>,
+    /// `win_keys` only: adapter-side changes (`compose_marks`, `escape_space`,
+    /// and each accepted lossy reason).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<String>,
 }
 
 pub struct PasteOpts {
@@ -306,6 +356,8 @@ pub fn paste(tx: &WriterTx, payload: &[u8], opts: &PasteOpts, ready: impl Fn() -
         bytes_before: before,
         bytes_after: tx.written.load(std::sync::atomic::Ordering::SeqCst),
         detail,
+        lossy: Vec::new(),
+        changes: Vec::new(),
     };
     if let Err(r) = validate(payload) {
         return out("rejected", Some(r), None);
@@ -322,6 +374,7 @@ pub fn paste(tx: &WriterTx, payload: &[u8], opts: &PasteOpts, ready: impl Fn() -
     };
     let guard = || Guard {
         gate: Some((tx.gate.clone(), generation)),
+        mode: GateMode::Paste,
         deadline: opts.write_deadline,
     };
     if let Err(e) = tx.write_guarded(encode(payload, opts.mode, opts.chunk), guard()) {
@@ -336,6 +389,379 @@ pub fn paste(tx: &WriterTx, payload: &[u8], opts: &PasteOpts, ready: impl Fn() -
         return out("enter_not_sent", None, Some(e));
     }
     out("sent", None, None)
+}
+
+// ---------------- win_keys (Codex on Windows, F-1) ----------------
+
+/// The newline key for `win_keys`: `csi-u` = `ESC[13;2u` (Codex reassembles
+/// it into Shift+Enter), `w32` = a win32-input-mode Shift+Enter key-down and
+/// key-up record. Each newline is one write of these bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum NewlineKey {
+    #[serde(rename = "csi-u")]
+    CsiU,
+    #[serde(rename = "w32")]
+    W32,
+}
+
+impl NewlineKey {
+    pub const ALL: [NewlineKey; 2] = [NewlineKey::CsiU, NewlineKey::W32];
+
+    pub fn parse(s: &str) -> Option<NewlineKey> {
+        match s {
+            "csi-u" => Some(NewlineKey::CsiU),
+            "w32" => Some(NewlineKey::W32),
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            NewlineKey::CsiU => "csi-u",
+            NewlineKey::W32 => "w32",
+        }
+    }
+    pub fn bytes(self) -> &'static [u8] {
+        match self {
+            NewlineKey::CsiU => b"\x1b[13;2u",
+            NewlineKey::W32 => b"\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_",
+        }
+    }
+}
+
+/// How a prompt reaches the CLI. Chosen by the adapter capability
+/// `input_encoding`, never by DECSET 2004.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputEncoding {
+    BracketedPaste,
+    WinKeys { newline: NewlineKey },
+}
+
+impl InputEncoding {
+    pub fn name(self) -> &'static str {
+        match self {
+            InputEncoding::BracketedPaste => "bracketed_paste",
+            InputEncoding::WinKeys { .. } => "win_keys",
+        }
+    }
+}
+
+/// Adapter capability (F-1f): `win_keys` for Codex on Windows (Codex 0.169.0
+/// reads Win32 key records there, so a bracketed paste never arrives as a
+/// paste, §3); bracketed paste for everything else. `os` is the runtime OS
+/// name (`std::env::consts::OS`).
+pub fn input_encoding(agent: &str, os: &str, newline: NewlineKey) -> InputEncoding {
+    if agent == "codex" && os == "windows" {
+        InputEncoding::WinKeys { newline }
+    } else {
+        InputEncoding::BracketedPaste
+    }
+}
+
+/// A transform Codex would apply to the payload that the encoder does not
+/// make silently (F-1d): leading/trailing whitespace (`trim_submission`) and
+/// TAB (the queue key unless inside a burst).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Lossy {
+    Trim,
+    Tab,
+}
+
+impl Lossy {
+    pub fn parse(s: &str) -> Option<Lossy> {
+        match s {
+            "trim" => Some(Lossy::Trim),
+            "tab" => Some(Lossy::Tab),
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Lossy::Trim => "trim",
+            Lossy::Tab => "tab",
+        }
+    }
+}
+
+/// Lossy transforms the payload would undergo (Unicode whitespace, so
+/// U+3000 and a trailing LF count as trimmed).
+pub fn lossy_input(payload: &str) -> Vec<Lossy> {
+    let mut v = Vec::new();
+    if payload.starts_with(char::is_whitespace) || payload.ends_with(char::is_whitespace) {
+        v.push(Lossy::Trim);
+    }
+    if payload.contains('\t') {
+        v.push(Lossy::Tab);
+    }
+    v
+}
+
+fn is_cjk_compat_ideograph(c: char) -> bool {
+    matches!(c as u32, 0xF900..=0xFAFF | 0x2F800..=0x2FA1F)
+}
+
+fn is_combining_or_extending(c: char) -> bool {
+    unicode_normalization::char::canonical_combining_class(c) > 0
+        || unicode_normalization::char::is_combining_mark(c)
+}
+
+/// NFC per extended grapheme cluster, only for clusters holding a combining
+/// or extending character (canonical combining class > 0, or a Mn/Mc/Me
+/// mark). CJK compatibility ideographs are kept as they are even inside such
+/// a cluster; only the characters around them are normalized. Every other
+/// cluster is unchanged, so whole-prompt NFC's U+FA19 → U+795E never happens.
+pub fn compose_marks(text: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut out = String::with_capacity(text.len());
+    for g in text.graphemes(true) {
+        if !g.chars().any(is_combining_or_extending) {
+            out.push_str(g);
+            continue;
+        }
+        let mut run = String::new();
+        for c in g.chars() {
+            if is_cjk_compat_ideograph(c) {
+                out.extend(run.nfc());
+                run.clear();
+                out.push(c);
+            } else {
+                run.push(c);
+            }
+        }
+        out.extend(run.nfc());
+    }
+    out
+}
+
+/// Lines of `text` with CRLF, CR, and LF each one newline.
+fn split_lines(text: &str) -> Vec<String> {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(str::to_string)
+        .collect()
+}
+
+/// Why `encode_win_keys` wrote nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WinKeysReject {
+    /// ESC or a C0 control other than TAB/CR/LF.
+    Control(Rejected),
+    NotUtf8,
+    /// A lossy transform the caller did not accept (`--allow-lossy`).
+    LossyInput(Vec<Lossy>),
+}
+
+/// The `win_keys` writes for `payload`: validate, refuse unaccepted lossy
+/// input, compose marks, escape with one leading and one trailing space
+/// (Codex trims both on submit; this disarms `/`, `!`, `?` at the start and
+/// an `@` popup at the end), then one write per line and one write of the
+/// newline key per newline. The trailing CR is not included.
+pub fn encode_win_keys(
+    payload: &[u8],
+    newline: NewlineKey,
+    allow: &[Lossy],
+) -> Result<(Vec<Vec<u8>>, Vec<String>), WinKeysReject> {
+    validate(payload).map_err(WinKeysReject::Control)?;
+    let text = std::str::from_utf8(payload).map_err(|_| WinKeysReject::NotUtf8)?;
+    let lossy = lossy_input(text);
+    let refused: Vec<Lossy> = lossy
+        .iter()
+        .copied()
+        .filter(|l| !allow.contains(l))
+        .collect();
+    if !refused.is_empty() {
+        return Err(WinKeysReject::LossyInput(refused));
+    }
+    let mut changes = Vec::new();
+    let composed = compose_marks(text);
+    if composed != text {
+        changes.push("compose_marks".to_string());
+    }
+    changes.push("escape_space".to_string());
+    changes.extend(lossy.iter().map(|l| format!("allow_lossy:{}", l.name())));
+    let lines = split_lines(&composed);
+    let last = lines.len() - 1;
+    let mut writes = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let mut w = String::new();
+        if i == 0 {
+            w.push(' ');
+        }
+        w.push_str(line);
+        if i == last {
+            w.push(' ');
+        }
+        if !w.is_empty() {
+            writes.push(w.into_bytes());
+        }
+        if i != last {
+            writes.push(newline.bytes().to_vec());
+        }
+    }
+    Ok((writes, changes))
+}
+
+/// The `win_keys` oracle: the prompt Codex should report for `payload`:
+/// marks composed as above, LF newlines, nothing else changed; with an
+/// accepted `trim`, the trimmed form (TAB, if accepted, stays literal).
+pub fn expected_win_keys(payload: &str, allow: &[Lossy]) -> String {
+    let s = split_lines(&compose_marks(payload)).join("\n");
+    if allow.contains(&Lossy::Trim) {
+        s.trim().to_string()
+    } else {
+        s
+    }
+}
+
+pub struct KeysOpts {
+    pub newline: NewlineKey,
+    pub allow: Vec<Lossy>,
+    pub enter_delay: Duration,
+    pub write_deadline: Instant,
+}
+
+/// `win_keys` counterpart of `paste()`: validate → lossy check → readiness
+/// → every line and newline key as one `WriteMsg::Data` → delay → CR as a
+/// separate write. Readiness is `ready()` (bound SessionStart plus the end of
+/// the bootstrap turn); the writer re-checks only the launch's revocation
+/// (`GateMode::Keys`), since Codex ignores bracketed paste here.
+pub fn type_keys(
+    tx: &WriterTx,
+    payload: &[u8],
+    opts: &KeysOpts,
+    ready: impl Fn() -> bool,
+) -> Outcome {
+    let before = tx.written.load(std::sync::atomic::Ordering::SeqCst);
+    let out = |state: &str, rejected, detail: Option<String>, lossy, changes| Outcome {
+        state: state.into(),
+        rejected,
+        bytes_before: before,
+        bytes_after: tx.written.load(std::sync::atomic::Ordering::SeqCst),
+        detail,
+        lossy,
+        changes,
+    };
+    let lossy = std::str::from_utf8(payload)
+        .map(lossy_input)
+        .unwrap_or_default();
+    let (writes, changes) = match encode_win_keys(payload, opts.newline, &opts.allow) {
+        Ok(v) => v,
+        Err(WinKeysReject::Control(r)) => {
+            return out("rejected", Some(r), None, lossy, Vec::new());
+        }
+        Err(WinKeysReject::NotUtf8) => {
+            return out("rejected", None, Some("not_utf8".into()), lossy, Vec::new());
+        }
+        Err(WinKeysReject::LossyInput(l)) => {
+            let names: Vec<&str> = l.iter().map(|x| x.name()).collect();
+            return out(
+                "rejected",
+                None,
+                Some(format!("lossy_input: {}", names.join(","))),
+                lossy,
+                Vec::new(),
+            );
+        }
+    };
+    let generation = match (ready(), tx.gate.admit_keys()) {
+        (true, Some(g)) => g,
+        _ => {
+            return out(
+                "readiness_gate_failed",
+                None,
+                Some("unconfirmed; not retried".into()),
+                lossy,
+                changes,
+            );
+        }
+    };
+    let guard = || Guard {
+        gate: Some((tx.gate.clone(), generation)),
+        mode: GateMode::Keys,
+        deadline: opts.write_deadline,
+    };
+    if let Err(e) = tx.write_guarded(writes, guard()) {
+        let state = match e.as_str() {
+            "write_timeout" | "expired_before_start" | "gate_closed_before_start" => e.clone(),
+            _ => "write_error".into(),
+        };
+        return out(&state, None, Some(e), lossy, changes);
+    }
+    std::thread::sleep(opts.enter_delay);
+    if let Err(e) = tx.write_guarded(vec![b"\r".to_vec()], guard()) {
+        return out("enter_not_sent", None, Some(e), lossy, changes);
+    }
+    out("sent", None, None, lossy, changes)
+}
+
+/// One corpus F entry (Codex on Windows, `--subset f1`). `recorded` entries
+/// go to `evidence.extra` and never enter the verdict (F-1d, F-1e); `allow`
+/// is the `--allow-lossy` set they run with.
+#[derive(Debug, Clone, Serialize)]
+pub struct FEntry {
+    pub id: String,
+    pub text: String,
+    pub recorded: bool,
+    pub allow: Vec<Lossy>,
+}
+
+/// A multiline Japanese entry of more than 1000 characters (about 3.5 KiB),
+/// so Codex's `[Pasted Content N chars]` path is reached if the input bursts.
+fn long_japanese() -> String {
+    (1..=60)
+        .map(|i| format!("{i:03}行目：日本語の長い入力テストです。"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn corpus_f() -> Vec<FEntry> {
+    let e = |id: &str, text: &str| FEntry {
+        id: id.into(),
+        text: text.into(),
+        recorded: false,
+        allow: Vec::new(),
+    };
+    let r = |id: &str, text: &str, allow: Vec<Lossy>| FEntry {
+        id: id.into(),
+        text: text.into(),
+        recorded: true,
+        allow,
+    };
+    vec![
+        e(
+            "ascii",
+            "Hello, world! 0123456789 ~#$%^&*()_+-=[]{}|;':\",./<>",
+        ),
+        e("japanese", "日本語の入力テスト、句読点。「括弧」"),
+        e("astral", "𠮷野家"),
+        e("emoji_zwj", "👨\u{200d}👩\u{200d}👧\u{200d}👦"),
+        e("emoji_flag", "🇯🇵"),
+        e("decomposed_kana", "か\u{3099}"),
+        e("decomposed_latin", "e\u{301}"),
+        e("cjk_compat", "\u{FA19}"),
+        e(
+            "multiline_lf",
+            "一行目の日本語\n二行目、句読点。\n三行目「括弧」",
+        ),
+        e(
+            "multiline_crlf",
+            "一行目の日本語\r\n二行目、句読点。\r\n三行目「括弧」",
+        ),
+        e("multiline_blank", "一行目の日本語\n\n三行目「括弧」"),
+        e("slash_first", "/review の件"),
+        e("bang_first", "!ls は実行しない"),
+        e("question_first", "?の意味"),
+        e("at_end", "参照してください @README.md"),
+        e("slash_second_line", "一行目\n/二行目"),
+        e("bang_second_line", "一行目\n!二行目"),
+        e("long_multiline", &long_japanese()),
+        r("small_kana_mark", "\u{31F7}\u{309A}", Vec::new()),
+        r("lossy_trim", "\u{3000}一行目\n二行目\n", vec![Lossy::Trim]),
+        r("lossy_tab", "列1\t列2", vec![Lossy::Tab]),
+    ]
 }
 
 #[cfg(test)]
@@ -458,5 +884,183 @@ mod tests {
             whole
         );
         assert!(whole.starts_with(PASTE_START) && whole.ends_with(PASTE_END));
+    }
+
+    /// F-3d: every chunk size over the whole corpus concatenates to the
+    /// unchunked wire and never cuts inside `ESC[200~` / `ESC[201~`.
+    #[test]
+    fn chunking_never_splits_an_escape() {
+        for e in corpus() {
+            for m in Newline::ALL {
+                let whole = encode(e.text.as_bytes(), m, 0).concat();
+                for n in 1..=16 {
+                    let parts = encode(e.text.as_bytes(), m, n);
+                    assert_eq!(parts.concat(), whole, "{} {n}", e.id);
+                    let spans = escape_spans(&whole);
+                    let mut at = 0;
+                    for p in &parts[..parts.len() - 1] {
+                        at += p.len();
+                        assert!(
+                            !spans.iter().any(|(s, e)| *s < at && at < *e),
+                            "{} chunk {n}: cut at {at} inside an escape",
+                            e.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// F-3d: at chunk 7, one cut falls inside the 4-byte `𠮷` and one inside
+    /// the 3-byte `日` (split UTF-8 is coverage we keep), while the cut that
+    /// would land inside `ESC[201~` moves to its end.
+    #[test]
+    fn chunking_keeps_utf8_splits() {
+        // Wire: ESC[200~ (0..6), "aaaaaa" (6..12), 𠮷 (12..16), "bbbb" (16..20),
+        // 日 (20..23), ESC[201~ (23..29). Cuts at 7, 14, 21, then 28 → 29.
+        let parts = encode("aaaaaa𠮷bbbb日".as_bytes(), Newline::Cr, 7);
+        let ends: Vec<usize> = parts
+            .iter()
+            .scan(0, |a, p| {
+                *a += p.len();
+                Some(*a)
+            })
+            .collect();
+        assert_eq!(ends, vec![7, 14, 21, 29]);
+        assert!(parts[1].ends_with(&"𠮷".as_bytes()[..2]));
+        assert!(parts[2].ends_with(&"日".as_bytes()[..1]));
+        assert_eq!(parts[3], [&"日".as_bytes()[1..], PASTE_END].concat());
+    }
+
+    #[test]
+    fn compose_marks_per_cluster() {
+        let cases: [(&str, &str); 7] = [
+            ("か\u{3099}", "が"),
+            ("e\u{301}", "é"),
+            // A class-0 spacing mark: needs grapheme clusters, not ccc alone.
+            ("\u{9C7}\u{9BE}", "\u{9CB}"),
+            // CJK compatibility ideographs stay (whole-prompt NFC → U+795E).
+            ("\u{FA19}", "\u{FA19}"),
+            ("\u{FA19}\u{301}", "\u{FA19}\u{301}"),
+            // No precomposed form: unchanged (F-1e records what arrives).
+            ("\u{31F7}\u{309A}", "\u{31F7}\u{309A}"),
+            ("日本語 abc", "日本語 abc"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(compose_marks(input), want, "{input:?}");
+        }
+        // Not whole-prompt NFC: a compatibility ideograph next to a composed
+        // cluster keeps its form.
+        assert_eq!(compose_marks("\u{FA19}か\u{3099}"), "\u{FA19}が");
+    }
+
+    #[test]
+    fn win_keys_writes_one_newline_key_per_newline() {
+        for key in NewlineKey::ALL {
+            let (w, changes) =
+                encode_win_keys("一行目\r\n二行目\n三か\u{3099}".as_bytes(), key, &[]).unwrap();
+            assert_eq!(
+                w,
+                vec![
+                    " 一行目".as_bytes().to_vec(),
+                    key.bytes().to_vec(),
+                    "二行目".as_bytes().to_vec(),
+                    key.bytes().to_vec(),
+                    "三が ".as_bytes().to_vec(),
+                ]
+            );
+            assert_eq!(changes, vec!["compose_marks", "escape_space"]);
+        }
+        assert_eq!(NewlineKey::CsiU.bytes().len(), 7);
+        assert_eq!(
+            NewlineKey::W32.bytes(),
+            b"\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_"
+        );
+        // Triggers at the start and an @ token at the end are escaped by spaces.
+        let (w, _) = encode_win_keys(b"/review", NewlineKey::CsiU, &[]).unwrap();
+        assert_eq!(w, vec![b" /review ".to_vec()]);
+        // A blank middle line is just two newline keys.
+        let (w, _) = encode_win_keys(b"a\n\nb", NewlineKey::CsiU, &[]).unwrap();
+        assert_eq!(w.len(), 4);
+    }
+
+    #[test]
+    fn win_keys_rejects_controls_and_lossy_input() {
+        assert!(matches!(
+            encode_win_keys(b"ab\x1bc", NewlineKey::CsiU, &[]),
+            Err(WinKeysReject::Control(_))
+        ));
+        assert!(matches!(
+            encode_win_keys(b"x\x00", NewlineKey::W32, &[]),
+            Err(WinKeysReject::Control(_))
+        ));
+        let trim = "\u{3000}一行目\n二行目\n";
+        assert_eq!(lossy_input(trim), vec![Lossy::Trim]);
+        assert_eq!(
+            encode_win_keys(trim.as_bytes(), NewlineKey::CsiU, &[]),
+            Err(WinKeysReject::LossyInput(vec![Lossy::Trim]))
+        );
+        let (w, ch) = encode_win_keys(trim.as_bytes(), NewlineKey::CsiU, &[Lossy::Trim]).unwrap();
+        assert_eq!(w[0], " \u{3000}一行目".as_bytes());
+        assert!(ch.contains(&"allow_lossy:trim".to_string()));
+        assert_eq!(expected_win_keys(trim, &[Lossy::Trim]), "一行目\n二行目");
+        let tab = "列1\t列2";
+        assert_eq!(
+            encode_win_keys(tab.as_bytes(), NewlineKey::CsiU, &[]),
+            Err(WinKeysReject::LossyInput(vec![Lossy::Tab]))
+        );
+        let (w, _) = encode_win_keys(tab.as_bytes(), NewlineKey::CsiU, &[Lossy::Tab]).unwrap();
+        // The accepted TAB stays literal inside the same write as its text.
+        assert_eq!(w, vec![" 列1\t列2 ".as_bytes().to_vec()]);
+        assert_eq!(expected_win_keys(tab, &[Lossy::Tab]), tab);
+    }
+
+    #[test]
+    fn expected_form_is_composition_and_lf_only() {
+        assert_eq!(expected_win_keys("a\r\nb\rc", &[]), "a\nb\nc");
+        assert_eq!(expected_win_keys("\u{FA19}\u{301}", &[]), "\u{FA19}\u{301}");
+        assert_eq!(expected_win_keys("e\u{301}", &[]), "é");
+    }
+
+    /// F-1f: the encoding is an adapter capability of (agent, OS), and the
+    /// macOS A-6 path still sends a bracketed paste.
+    #[test]
+    fn input_encoding_capability() {
+        let k = NewlineKey::CsiU;
+        assert_eq!(
+            input_encoding("codex", "windows", k),
+            InputEncoding::WinKeys { newline: k }
+        );
+        for (a, os) in [
+            ("codex", "macos"),
+            ("claude", "windows"),
+            ("claude", "macos"),
+        ] {
+            assert_eq!(
+                input_encoding(a, os, k),
+                InputEncoding::BracketedPaste,
+                "{a} {os}"
+            );
+        }
+        assert!(encode(b"x", Newline::Cr, 0)[0].starts_with(PASTE_START));
+    }
+
+    #[test]
+    fn corpus_f_shape() {
+        let c = corpus_f();
+        for e in c.iter().filter(|e| !e.recorded) {
+            assert!(lossy_input(&e.text).is_empty(), "{}", e.id);
+            assert!(encode_win_keys(e.text.as_bytes(), NewlineKey::CsiU, &[]).is_ok());
+        }
+        let long = c.iter().find(|e| e.id == "long_multiline").unwrap();
+        assert!(long.text.chars().count() > 1000 && long.text.len() < 8 * 1024);
+        assert!(
+            c.iter().filter(|e| e.recorded).all(|e| encode_win_keys(
+                e.text.as_bytes(),
+                NewlineKey::CsiU,
+                &e.allow
+            )
+            .is_ok())
+        );
     }
 }

@@ -20,11 +20,14 @@ use crate::vt::{QueryLog, Vt};
 
 /// DECSET 2004 as seen by the reader; `epoch` changes on every transition.
 /// `revoked` is sticky: once binding becomes ambiguous the gate never opens again.
+/// `revocations` changes only on revocation, so key input (`GateMode::Keys`)
+/// survives DECSET 2004 toggles.
 #[derive(Default)]
 pub struct GateState {
     pub open: AtomicBool,
     pub epoch: AtomicU64,
     pub revoked: AtomicBool,
+    pub revocations: AtomicU64,
 }
 
 impl GateState {
@@ -38,6 +41,7 @@ impl GateState {
     pub fn revoke(&self) {
         self.revoked.store(true, Ordering::SeqCst);
         self.epoch.fetch_add(1, Ordering::SeqCst);
+        self.revocations.fetch_add(1, Ordering::SeqCst);
     }
     /// The current generation if the gate is open.
     pub fn admit(&self) -> Option<u64> {
@@ -45,11 +49,33 @@ impl GateState {
         // A transition racing this read bumps `epoch`, so the writer's re-check fails safe.
         (self.open.load(Ordering::SeqCst) && !self.revoked.load(Ordering::SeqCst)).then_some(g)
     }
+    /// The current revocation epoch unless revoked (key input ignores DECSET 2004).
+    pub fn admit_keys(&self) -> Option<u64> {
+        let g = self.revocations.load(Ordering::SeqCst);
+        (!self.revoked.load(Ordering::SeqCst)).then_some(g)
+    }
+    fn admits(&self, mode: GateMode, epoch: u64) -> bool {
+        match mode {
+            GateMode::Paste => self.admit() == Some(epoch),
+            GateMode::Keys => self.admit_keys() == Some(epoch),
+        }
+    }
+}
+
+/// What the writer re-checks before the first byte: `Paste` needs the same
+/// DECSET 2004 generation it was admitted under; `Keys` (Codex `win_keys`,
+/// which ignores bracketed paste) needs only that the launch was not revoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GateMode {
+    #[default]
+    Paste,
+    Keys,
 }
 
 /// Conditions re-checked by the writer just before the first byte.
 pub struct Guard {
     pub gate: Option<(Arc<GateState>, u64)>,
+    pub mode: GateMode,
     pub deadline: Instant,
 }
 
@@ -92,6 +118,7 @@ impl WriterTx {
             chunks,
             Guard {
                 gate: None,
+                mode: GateMode::Paste,
                 deadline,
             },
         )
@@ -169,7 +196,7 @@ pub fn writer_loop(
                     } else if g
                         .gate
                         .as_ref()
-                        .is_some_and(|(s, epoch)| s.admit() != Some(*epoch))
+                        .is_some_and(|(s, epoch)| !s.admits(g.mode, *epoch))
                     {
                         Some("gate_closed_before_start")
                     } else {
@@ -435,6 +462,7 @@ mod tests {
             vec![b"PASTE".to_vec()],
             Guard {
                 gate: Some((tx.gate.clone(), epoch)),
+                mode: GateMode::Paste,
                 deadline: Instant::now() + Duration::from_millis(100),
             },
         );
@@ -456,6 +484,7 @@ mod tests {
             chunks: vec![b"PASTE".to_vec()],
             guard: Some(Guard {
                 gate: Some((tx.gate.clone(), epoch)),
+                mode: GateMode::Paste,
                 deadline: Instant::now() + Duration::from_secs(10),
             }),
             state: Arc::new(AtomicU8::new(PENDING)),
@@ -467,6 +496,50 @@ mod tests {
             drx.recv_timeout(Duration::from_secs(5)).unwrap(),
             Err("gate_closed_before_start".into())
         );
+        tx.send(WriteMsg::Close);
+        j.join().unwrap();
+        assert_eq!(&*out.lock().unwrap(), b"A");
+    }
+
+    /// F-1a: key input queued behind a write survives a DECSET 2004 toggle
+    /// (Codex ignores bracketed paste), but a revocation still drops it.
+    #[test]
+    fn keys_mode_ignores_2004_but_not_revocation() {
+        let send = |tx: &WriterTx, epoch: u64| {
+            let (dtx, drx) = mpsc::channel();
+            tx.send(WriteMsg::Data {
+                chunks: vec![b"KEYS".to_vec()],
+                guard: Some(Guard {
+                    gate: Some((tx.gate.clone(), epoch)),
+                    mode: GateMode::Keys,
+                    deadline: Instant::now() + Duration::from_secs(10),
+                }),
+                state: Arc::new(AtomicU8::new(PENDING)),
+                done: Some(dtx),
+            });
+            drx
+        };
+        let (tx, release, out, j) = rig();
+        blocker(&tx);
+        let drx = send(&tx, tx.gate.admit_keys().unwrap());
+        tx.gate.set(false);
+        tx.gate.set(true);
+        release.send(()).unwrap();
+        assert_eq!(drx.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+        assert_eq!(&*out.lock().unwrap(), b"AKEYS");
+        tx.send(WriteMsg::Close);
+        j.join().unwrap();
+
+        let (tx, release, out, j) = rig();
+        blocker(&tx);
+        let drx = send(&tx, tx.gate.admit_keys().unwrap());
+        tx.gate.revoke();
+        release.send(()).unwrap();
+        assert_eq!(
+            drx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err("gate_closed_before_start".into())
+        );
+        assert!(tx.gate.admit_keys().is_none());
         tx.send(WriteMsg::Close);
         j.join().unwrap();
         assert_eq!(&*out.lock().unwrap(), b"A");
