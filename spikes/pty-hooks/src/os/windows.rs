@@ -9,7 +9,7 @@ use std::os::windows::io::FromRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -58,7 +58,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, WINEVENT_OUTOFCONTEXT, WM_QUIT, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
-use super::ProcInfo;
+use super::{Drain, ProcInfo, close_bounded};
 
 pub const SPAWN_TREE_ROLES: &[&str] = &["plain", "breakaway"];
 
@@ -1073,6 +1073,9 @@ pub fn raw_last_teardown() -> Option<serde_json::Value> {
     RAW_TEARDOWNS.lock().ok().and_then(|t| t.last().cloned())
 }
 
+/// Bound on `ClosePseudoConsole` (run on a helper thread).
+const CLOSE_BOUND: Duration = Duration::from_secs(3);
+
 /// Owned pseudoconsole, closed on drop.
 struct Pcon(HPCON);
 
@@ -1080,98 +1083,6 @@ impl Drop for Pcon {
     fn drop(&mut self) {
         // SAFETY: hpc is owned and closed once.
         unsafe { ClosePseudoConsole(self.0) }
-    }
-}
-
-/// Bytes the drain holds while no consumer has attached yet.
-const DRAIN_HOLD: usize = 1 << 20;
-
-/// State shared by the output drain and the session's reader. The drain
-/// owns the host output read end and keeps reading on every path until
-/// `ClosePseudoConsole` has returned (EOF): output is forwarded to the
-/// consumer while there is one, held (bounded) before one attaches, and
-/// discarded once the consumer is gone (failed reader start, abort,
-/// teardown). The drain never depends on its consumer.
-#[derive(Default)]
-struct DrainState {
-    /// `(consumer, held output)`; the consumer is taken when it goes away.
-    consumer: Mutex<(Option<std::sync::mpsc::Sender<Vec<u8>>>, Vec<u8>, bool)>,
-    finished: AtomicBool,
-    bytes: AtomicU64,
-}
-
-struct Drain {
-    state: Arc<DrainState>,
-    join: std::thread::JoinHandle<()>,
-}
-
-impl Drain {
-    /// Starts the drain. If the thread cannot start, `output` is dropped with
-    /// the closure, so the host read end is closed before anything else.
-    fn start(mut output: std::fs::File) -> io::Result<Drain> {
-        let state = Arc::new(DrainState::default());
-        let st = state.clone();
-        let join = std::thread::Builder::new()
-            .name("conpty-drain".into())
-            .spawn(move || {
-                let mut buf = vec![0u8; 16 * 1024];
-                loop {
-                    let n = match output.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    st.bytes.fetch_add(n as u64, Ordering::SeqCst);
-                    let mut c = st.consumer.lock().unwrap_or_else(|e| e.into_inner());
-                    let (tx, held, gone) = &mut *c;
-                    match tx {
-                        Some(t) => {
-                            if t.send(buf[..n].to_vec()).is_err() {
-                                *tx = None;
-                                *gone = true;
-                            }
-                        }
-                        None if !*gone && held.len() + n <= DRAIN_HOLD => {
-                            held.extend_from_slice(&buf[..n]);
-                        }
-                        None => {}
-                    }
-                }
-                let mut c = st.consumer.lock().unwrap_or_else(|e| e.into_inner());
-                st.finished.store(true, Ordering::SeqCst);
-                // Dropping the sender ends the consumer's reads (EOF).
-                c.0 = None;
-            })?;
-        Ok(Drain { state, join })
-    }
-
-    /// Waits for the drain to reach EOF, bounded; true when it did.
-    fn wait(&self, bound: Duration) -> bool {
-        let end = Instant::now() + bound;
-        while !self.join.is_finished() && Instant::now() < end {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        self.join.is_finished()
-    }
-}
-
-/// The session reader: output forwarded by the drain; EOF when it ends.
-struct ChannelReader {
-    rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    pending: Vec<u8>,
-}
-
-impl Read for ChannelReader {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.pending.is_empty() {
-            match self.rx.recv() {
-                Ok(v) => self.pending = v,
-                Err(_) => return Ok(0),
-            }
-        }
-        let n = out.len().min(self.pending.len());
-        out[..n].copy_from_slice(&self.pending[..n]);
-        self.pending.drain(..n);
-        Ok(n)
     }
 }
 
@@ -1253,11 +1164,11 @@ impl Drop for Setup {
         self.thread.take();
         self.process.take();
         let read_end_closed = self.drain.is_none();
-        let close = self.pcon.take().map(|p| {
-            let c = Instant::now();
-            drop(p);
-            c.elapsed().as_millis() as u64
-        });
+        let had_pcon = self.pcon.is_some();
+        let close = self
+            .pcon
+            .take()
+            .and_then(|p| close_bounded(move || drop(p), CLOSE_BOUND));
         self.input.take();
         self.in_r.take();
         self.out_w.take();
@@ -1268,7 +1179,8 @@ impl Drop for Setup {
             "child_start": (self.start != 0).then_some(self.start), "steps": steps,
             "process_exit": process_exit, "output_pending_bytes": self.output_pending,
             "child_running_at_injection": self.running_at_injection,
-            "close_pseudoconsole_ms": close, "drain_reached_eof": drained,
+            "close_pseudoconsole_ms": close, "close_hung": had_pcon && close.is_none(),
+            "drain_reached_eof": drained,
             "host_read_end_closed": read_end_closed, "teardown_ms": t.elapsed().as_millis() as u64,
         }));
     }
@@ -1319,19 +1231,7 @@ impl portable_pty::MasterPty for RawMaster {
         let Some(d) = d.as_ref() else {
             anyhow::bail!("no output drain");
         };
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut c = d.state.consumer.lock().unwrap_or_else(|e| e.into_inner());
-        let held = std::mem::take(&mut c.1);
-        if !held.is_empty() {
-            let _ = tx.send(held);
-        }
-        if !d.state.finished.load(Ordering::SeqCst) {
-            c.0 = Some(tx);
-        }
-        Ok(Box::new(ChannelReader {
-            rx,
-            pending: Vec::new(),
-        }))
+        Ok(Box::new(d.attach().map_err(anyhow::Error::msg)?))
     }
 
     fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, anyhow::Error> {
@@ -1345,32 +1245,19 @@ impl portable_pty::MasterPty for RawMaster {
 impl Drop for RawMaster {
     fn drop(&mut self) {
         let t = Instant::now();
-        let close = self
-            .pcon
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .map(|p| {
-                drop(p);
-                t.elapsed().as_millis() as u64
-            });
+        let pcon = self.pcon.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let had_pcon = pcon.is_some();
+        let close = pcon.and_then(|p| close_bounded(move || drop(p), CLOSE_BOUND));
         self.input.lock().unwrap_or_else(|e| e.into_inner()).take();
         let drained = self
             .drain
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
-            .map(|d| {
-                // Detach the consumer so the drain discards from here on.
-                let mut c = d.state.consumer.lock().unwrap_or_else(|e| e.into_inner());
-                c.0 = None;
-                c.2 = true;
-                c.1.clear();
-                drop(c);
-                d.wait(Duration::from_secs(2))
-            });
+            .map(|d| d.finish(Duration::from_secs(2)));
         record_teardown(serde_json::json!({
             "path": "master_drop", "close_pseudoconsole_ms": close,
+            "close_hung": had_pcon && close.is_none(),
             "drain_reached_eof": drained, "teardown_ms": t.elapsed().as_millis() as u64,
         }));
     }
@@ -1654,10 +1541,7 @@ pub fn raw_spawn(
             // continuously), and record both.
             let end = Instant::now() + Duration::from_secs(5);
             loop {
-                let seen = st
-                    .drain
-                    .as_ref()
-                    .map_or(0, |d| d.state.bytes.load(Ordering::SeqCst));
+                let seen = st.drain.as_ref().map_or(0, |d| d.bytes());
                 let running = st.process.as_ref().is_some_and(|p| still_active(p.raw()));
                 if (seen > 0 && running) || Instant::now() >= end {
                     st.output_pending = Some(seen);

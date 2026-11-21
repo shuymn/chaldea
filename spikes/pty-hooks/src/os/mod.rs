@@ -3,6 +3,9 @@
 
 use serde::Serialize;
 
+mod drain;
+pub use drain::*;
+
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
