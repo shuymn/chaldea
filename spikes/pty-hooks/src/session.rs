@@ -87,6 +87,10 @@ pub struct KillResult {
 /// How long the live set may take to die after `TerminateJobObject`.
 pub const JOB_DEATH_WAIT: Duration = Duration::from_secs(2);
 
+/// A live identity before the stop and the handle retained on it, if one
+/// could be opened with its start time verified.
+type Retained = (u32, u64, Option<os::Retained>);
+
 impl Owned {
     pub fn recorded(&self) -> Vec<ProcInfo> {
         self.recorded
@@ -126,65 +130,82 @@ impl Owned {
     }
 
     /// Pre-stop half of the kill proof (job trees only): the historical
-    /// descendant list, each identity's liveness, and one membership snapshot.
-    fn proof_before(&self) -> Option<Value> {
+    /// descendant list, each identity's liveness, one membership snapshot,
+    /// and a retained handle on every live identity (positive death evidence
+    /// after the stop).
+    fn proof_before(&self) -> Option<(Value, Vec<Retained>)> {
         let tree = self.tree.lock().unwrap_or_else(|e| e.into_inner());
         let t = tree.as_ref().filter(|t| t.proves_membership())?;
         let membership = t.members_checked();
+        let mut retained = Vec::new();
         let pre: Vec<Value> = self
             .recorded()
             .iter()
             .map(|p| {
-                json!({"pid": p.pid, "start_time": p.start_time, "name": p.name,
-                            "live": os::liveness(p.pid, p.start_time)})
+                let live = os::liveness(p.pid, p.start_time);
+                if live == Some(true) {
+                    retained.push((p.pid, p.start_time, os::Retained::open(p.pid, p.start_time)));
+                }
+                json!({"pid": p.pid, "start_time": p.start_time, "name": p.name, "live": live})
             })
             .collect();
-        Some(json!({"pre_stop": pre, "membership": match &membership {
-            Ok(m) => json!(m), Err(e) => json!({"error": e}) }}))
+        let mut proof = json!({"pre_stop": pre, "membership": match &membership {
+            Ok(m) => json!(m), Err(e) => json!({"error": e}) }});
+        if t.describe()["assign"] == json!("after_spawn") {
+            proof["known_limit"] = json!(
+                "assign-after: a grandchild created by a child that exits before the job \
+                 assignment, between two recorder scans, is never recorded; this proof \
+                 cannot see it (job-first launches are not affected)"
+            );
+        }
+        Some((proof, retained))
     }
 
     /// After `TerminateJobObject`: waits (bounded) for every identity that
     /// was live before the stop to be positively dead, before the
-    /// retained-child kill, any pid fallback, or the ConPTY close.
-    fn proof_after(proof: &mut Value) {
-        let live: Vec<(u32, u64)> = proof["pre_stop"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|p| p["live"] == json!(true))
-            .filter_map(|p| Some((p["pid"].as_u64()? as u32, p["start_time"].as_u64()?)))
-            .collect();
+    /// retained-child kill, any pid fallback, or the ConPTY close. Death is
+    /// read from the handle retained before the stop where one was opened,
+    /// else from the process table; an unknown result stays unknown.
+    fn proof_after(proof: &mut Value, retained: &[Retained]) {
         let end = Instant::now() + JOB_DEATH_WAIT;
-        let mut after: Vec<(u32, Option<bool>)>;
-        loop {
-            after = live
-                .iter()
-                .map(|&(p, st)| (p, os::liveness(p, st)))
-                .collect();
-            if after.iter().all(|(_, l)| *l == Some(false)) || Instant::now() >= end {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        proof["after_job"] = json!(
-            after
-                .iter()
-                .map(|(p, l)| json!({"pid": p, "live": l}))
-                .collect::<Vec<_>>()
-        );
-        proof["live_set_dead_before_fallback"] =
-            json!(after.iter().all(|(_, l)| *l == Some(false)));
+        let after: Vec<Value> = retained
+            .iter()
+            .map(|(pid, st, h)| {
+                let (live, evidence) = match h {
+                    Some(h) => (h.wait_dead(end).map(|dead| !dead), "retained_handle"),
+                    None => {
+                        let live = loop {
+                            let l = os::liveness(*pid, *st);
+                            if l != Some(true) || Instant::now() >= end {
+                                break l;
+                            }
+                            std::thread::sleep(Duration::from_millis(50));
+                        };
+                        (live, "process_table")
+                    }
+                };
+                json!({"pid": pid, "live": live, "evidence": evidence})
+            })
+            .collect();
+        let dead = after.iter().all(|a| a["live"] == json!(false));
+        proof["after_job"] = json!(after);
+        proof["live_set_dead_before_fallback"] = json!(dead);
     }
 
-    fn kill_primary(&self, grace: Duration, proof: &mut Option<Value>) -> Vec<String> {
+    fn kill_primary(
+        &self,
+        grace: Duration,
+        proof: &mut Option<(Value, Vec<Retained>)>,
+    ) -> Vec<String> {
         let tree = self.tree.lock().unwrap_or_else(|e| e.into_inner());
-        let mut steps = match tree.as_ref() {
+        let (mut steps, ok) = match tree.as_ref() {
             Some(t) => t.kill(grace),
-            None => Vec::new(),
+            None => (Vec::new(), false),
         };
         drop(tree);
-        if let Some(p) = proof.as_mut() {
-            Self::proof_after(p);
+        if let Some((p, retained)) = proof.as_mut() {
+            p["terminate_job_ok"] = json!(ok);
+            Self::proof_after(p, retained);
         }
         // The retained child handle, always: covers a failed or delayed tree setup.
         let r = self.killer.lock().unwrap_or_else(|e| e.into_inner()).kill();
@@ -224,6 +245,7 @@ impl Owned {
         self.record_scan();
         let mut kill_proof = self.proof_before();
         let primary_steps = self.kill_primary(grace, &mut kill_proof);
+        let kill_proof = kill_proof.map(|(p, _)| p);
         // Give the primary a moment to land before judging escapees.
         let settle = Instant::now() + Duration::from_millis(300);
         while !self.alive_recorded().is_empty() && Instant::now() < settle {
@@ -297,8 +319,9 @@ pub fn owned_by(
 /// before the stop must be positively in the job (one outside it is an
 /// escapee); the MCP witness `(pid, start)` must be live and in the job;
 /// identities that already exited need no membership; an unknown liveness or
-/// a failed membership query is a harness failure; and every member of the
-/// live set must be positively dead after `TerminateJobObject` and before the
+/// a failed membership query is a harness failure; `TerminateJobObject`
+/// must itself have succeeded (else harness failure); and every member of
+/// the live set must be positively dead after it and before the
 /// retained-child kill, any pid fallback, or the ConPTY close.
 pub fn kill_proof_outcome(proof: &Value, witness: Option<(u32, u64)>) -> Outcome {
     let Some(members) = proof["membership"].as_array() else {
@@ -331,6 +354,9 @@ pub fn kill_proof_outcome(proof: &Value, witness: Option<(u32, u64)>) -> Outcome
         return Outcome::not_exercised(
             "the MCP witness was not live and in the job before the stop",
         );
+    }
+    if proof["terminate_job_ok"] != json!(true) {
+        return Outcome::harness("TerminateJobObject did not succeed");
     }
     let after: Vec<&Value> = proof["after_job"]
         .as_array()
@@ -888,7 +914,20 @@ mod tests {
 
     fn proof(pre: Value, members: Value, after: Value, dead: bool) -> Value {
         json!({"pre_stop": pre, "membership": members, "after_job": after,
-               "live_set_dead_before_fallback": dead})
+               "live_set_dead_before_fallback": dead, "terminate_job_ok": true})
+    }
+
+    /// M3: the kill proof credits job termination only when
+    /// `TerminateJobObject` itself succeeded.
+    #[test]
+    fn kill_proof_needs_terminate_success() {
+        let mut p = json!({"pre_stop": [{"pid": 10, "start_time": 1, "live": true}],
+            "membership": [10], "after_job": [{"pid": 10, "live": false}],
+            "live_set_dead_before_fallback": true, "terminate_job_ok": false});
+        let o = kill_proof_outcome(&p, Some((10, 1)));
+        assert!(matches!(o, Outcome::HarnessFail { .. }), "{o:?}");
+        p["terminate_job_ok"] = json!(true);
+        assert_eq!(kill_proof_outcome(&p, Some((10, 1))), Outcome::Pass);
     }
 
     /// §4.8 `backend` kill proof as a case outcome.

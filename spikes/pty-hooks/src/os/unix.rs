@@ -197,26 +197,29 @@ impl Tree {
         list_processes().is_ok_and(|ps| !ps.iter().any(|p| p.pgid == Some(self.pgid) && !p.zombie))
     }
 
-    /// SIGHUP, SIGTERM, `grace`, SIGKILL to the whole group.
-    pub fn kill(&self, grace: Duration) -> Vec<String> {
+    /// SIGHUP, SIGTERM, `grace`, SIGKILL to the whole group; also whether
+    /// the group was signalled.
+    pub fn kill(&self, grace: Duration) -> (Vec<String>, bool) {
         let mut steps = Vec::new();
+        let mut ok = false;
         for (sig, name) in [(libc::SIGHUP, "SIGHUP"), (libc::SIGTERM, "SIGTERM")] {
             // SAFETY: plain syscall on a group we established.
             let r = unsafe { libc::killpg(self.pgid as libc::pid_t, sig) };
+            ok |= r == 0;
             steps.push(format!("killpg({},{name})={r}", self.pgid));
         }
         let end = Instant::now() + grace;
         while Instant::now() < end {
             if self.group_empty() {
                 steps.push("group empty before SIGKILL".into());
-                return steps;
+                return (steps, ok);
             }
             std::thread::sleep(Duration::from_millis(25));
         }
         // SAFETY: plain syscall.
         let r = unsafe { libc::killpg(self.pgid as libc::pid_t, libc::SIGKILL) };
         steps.push(format!("killpg({},SIGKILL)={r}", self.pgid));
-        steps
+        (steps, ok || r == 0)
     }
 
     /// Unix has no job membership list; the scan in `session` covers pgid/sid.
@@ -381,6 +384,32 @@ pub fn console_code_page() -> Option<u32> {
 
 pub fn spawn_detached(_cmd: &mut Command) -> Result<(Child, bool), String> {
     Err("windows_only".into())
+}
+
+/// A handle retained on a live process for positive death evidence; on
+/// Unix there is none, so death is read from the process table.
+pub struct Retained {
+    pid: u32,
+    start: u64,
+}
+
+impl Retained {
+    pub fn open(pid: u32, start: u64) -> Option<Retained> {
+        Some(Retained { pid, start })
+    }
+
+    /// `Some(true)` once the process is positively dead, `Some(false)` if it
+    /// is still alive at `until`, `None` when liveness is unknown.
+    pub fn wait_dead(&self, until: Instant) -> Option<bool> {
+        loop {
+            match super::liveness(self.pid, self.start) {
+                Some(false) => return Some(true),
+                None => return None,
+                Some(true) if Instant::now() >= until => return Some(false),
+                Some(true) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    }
 }
 
 pub struct WindowObserver;

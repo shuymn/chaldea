@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, FILETIME, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM,
-    LRESULT, STILL_ACTIVE, WPARAM,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_NO_MORE_FILES, FILETIME, HANDLE, HWND,
+    INVALID_HANDLE_VALUE, LPARAM, LRESULT, STILL_ACTIVE, WPARAM,
 };
 use windows_sys::Win32::System::Console::{
     COORD, CTRL_BREAK_EVENT, ClosePseudoConsole, CreatePseudoConsole, ENABLE_ECHO_INPUT,
@@ -45,9 +45,10 @@ use windows_sys::Win32::System::Threading::{
     EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentThreadId, GetExitCodeProcess,
     GetProcessHandleCount, GetProcessTimes, INFINITE, InitializeProcThreadAttributeList,
     OpenProcess, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-    PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    QueryFullProcessImageNameW, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -99,8 +100,9 @@ fn filetime_u64(ft: &FILETIME) -> u64 {
     ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
 }
 
-/// (creation time, still running) for `pid`, if it can be opened.
-fn process_times(pid: u32) -> Option<(u64, bool)> {
+/// (creation time, still running) for `pid`, if it can be opened; the
+/// running flag is `None` when the exit code cannot be read.
+fn process_times(pid: u32) -> Option<(u64, Option<bool>)> {
     // SAFETY: plain Win32 calls on a handle we own for the duration.
     unsafe {
         let h = Handle::new(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid))?;
@@ -112,7 +114,8 @@ fn process_times(pid: u32) -> Option<(u64, bool)> {
             return None;
         }
         let mut code = 0u32;
-        let running = GetExitCodeProcess(h.raw(), &mut code) != 0 && code == STILL_ACTIVE as u32;
+        let running =
+            (GetExitCodeProcess(h.raw(), &mut code) != 0).then_some(code == STILL_ACTIVE as u32);
         Some((filetime_u64(&c), running))
     }
 }
@@ -135,7 +138,12 @@ pub fn list_processes() -> io::Result<Vec<ProcInfo>> {
                 .position(|c| *c == 0)
                 .unwrap_or(e.szExeFile.len());
             let name = String::from_utf16_lossy(&e.szExeFile[..len]);
-            let (start_time, running) = process_times(e.th32ProcessID).unwrap_or((0, true));
+            // An unreadable exit code leaves the identity unknown (start time
+            // 0, so `liveness` reports `None`), never dead.
+            let (start_time, running) = match process_times(e.th32ProcessID) {
+                Some((st, Some(r))) => (st, r),
+                _ => (0, true),
+            };
             out.push(ProcInfo {
                 pid: e.th32ProcessID,
                 ppid: e.th32ParentProcessID,
@@ -146,10 +154,45 @@ pub fn list_processes() -> io::Result<Vec<ProcInfo>> {
                 zombie: !running,
             });
             if Process32NextW(snap.raw(), &mut e) == 0 {
-                break;
+                // Only ERROR_NO_MORE_FILES ends the walk; anything else is a
+                // failed enumeration, never a short process table.
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                    break;
+                }
+                return Err(err);
             }
         }
         Ok(out)
+    }
+}
+
+/// A handle retained on a live process (identity verified by creation
+/// time) for positive death evidence after the stop.
+pub struct Retained(Handle);
+
+impl Retained {
+    pub fn open(pid: u32, start: u64) -> Option<Retained> {
+        // SAFETY: handle owned by the wrapper; identity checked before use.
+        let h = Handle::new(unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pid,
+            )
+        })?;
+        (creation_time(h.raw()) == start).then_some(Retained(h))
+    }
+
+    /// `Some(true)` once the process has exited (the handle is signalled),
+    /// `Some(false)` if it still runs at `until`, `None` if the wait failed.
+    pub fn wait_dead(&self, until: Instant) -> Option<bool> {
+        let ms = until.saturating_duration_since(Instant::now()).as_millis() as u32;
+        match wait_exit(self.0.raw(), ms) {
+            "exited" => Some(true),
+            "timeout" => Some(false),
+            _ => None,
+        }
     }
 }
 
@@ -271,10 +314,16 @@ impl Tree {
         serde_json::json!({"mechanism": "job_object", "kill_on_job_close": true, "assign": self.assign})
     }
 
-    pub fn kill(&self, _grace: Duration) -> Vec<String> {
+    /// `TerminateJobObject`; also whether it succeeded.
+    pub fn kill(&self, _grace: Duration) -> (Vec<String>, bool) {
         // SAFETY: valid job handle.
-        let r = unsafe { TerminateJobObject(self.job.raw(), 1) };
-        vec![format!("TerminateJobObject={r}")]
+        let ok = unsafe { TerminateJobObject(self.job.raw(), 1) } != 0;
+        let step = if ok {
+            "TerminateJobObject=ok".to_string()
+        } else {
+            format!("TerminateJobObject failed: {}", io::Error::last_os_error())
+        };
+        (vec![step], ok)
     }
 
     /// Best-effort membership for the kill scan (the lineage scan backs it up).
@@ -1723,7 +1772,7 @@ impl JobFirst {
         let Some(rs) = self.spawn.as_mut() else {
             return vec!["closed".into()];
         };
-        let mut steps = rs.tree.kill(Duration::ZERO);
+        let (mut steps, _) = rs.tree.kill(Duration::ZERO);
         steps.push(format!(
             "TerminateProcess(retained)={}",
             rs.child.kill().is_ok()
