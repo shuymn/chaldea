@@ -151,8 +151,10 @@ impl Owned {
         let mut census = Reconciled::default();
         // Handles opened on recorded members at the census, by identity.
         let mut member_handles: BTreeMap<(u32, u64), os::Retained> = BTreeMap::new();
-        // Members no process answered for at the census: whatever identity a
-        // recorded pid named, that process had exited.
+        // Members gone at the census (no process for the pid, or the pid now
+        // names a process outside the job). The recorded set was captured
+        // before the membership snapshot, so a recorded identity with that
+        // pid was the listed member and has exited.
         let mut census_exited: BTreeSet<u32> = BTreeSet::new();
         if let Ok(m) = &membership {
             let opened: Vec<(u32, MemberId, Option<os::Retained>)> = m
