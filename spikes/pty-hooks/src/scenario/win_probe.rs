@@ -2032,8 +2032,10 @@ fn image_name(e: &os::WindowEvent) -> Option<String> {
 /// `ours`: the owner was in the observation job at callback time, or its
 /// ancestry, matched by pid and start time, reaches the launch root.
 /// `ambiguous`: a console host / terminal owner that is not provably ours,
-/// or an unresolved owner (no pid, process gone, broken ancestry). An owner
-/// that started before the launch root cannot be its descendant (`other`).
+/// an unresolved owner (no pid, process gone, broken ancestry), or an hwnd
+/// whose owner at callback time is not the process (or thread) that raised
+/// the event (a reused handle). An owner that started before the launch
+/// root cannot be its descendant (`other`).
 pub fn classify(
     e: &os::WindowEvent,
     launch: &LaunchId,
@@ -2041,6 +2043,9 @@ pub fn classify(
 ) -> Option<Attr> {
     if !e.is_window() {
         return None;
+    }
+    if !e.owner_consistent() {
+        return Some(Attr::Ambiguous);
     }
     if e.in_job == Some(true) {
         return Some(Attr::Ours);
@@ -2130,7 +2135,11 @@ pub fn calibration_outcome(
         return (o.clone(), o);
     };
     let window = events.iter().any(|e| {
-        e.is_window() && e.hwnd == hwnd && e.owner_pid == pid && e.start_time == Some(start)
+        e.is_window()
+            && e.owner_consistent()
+            && e.hwnd == hwnd
+            && e.owner_pid == pid
+            && e.start_time == Some(start)
     });
     let caret = events
         .iter()
@@ -2859,7 +2868,33 @@ mod tests {
             ppid,
             start_time: start,
             in_job,
+            event_ms: 0,
+            event_thread: 7,
+            event_pid: Some(pid),
+            owner_thread: 7,
         }
+    }
+
+    /// M5: an hwnd that no longer belongs to the process (or thread) that
+    /// raised the event is not attributable, even when its current owner
+    /// is in the observation job; calibration needs a consistent owner too.
+    #[test]
+    fn reused_hwnd_owner_is_ambiguous() {
+        let l = LaunchId { root: (100, 1000) };
+        let samples = std::collections::HashMap::new();
+        let mut e = ev(100, "a.exe", Some(1), Some(1000), Some(true));
+        assert_eq!(classify(&e, &l, &samples), Some(Attr::Ours));
+        e.event_pid = Some(555);
+        assert_eq!(classify(&e, &l, &samples), Some(Attr::Ambiguous));
+        // Unresolved event process: the owning thread must be the event's.
+        e.event_pid = None;
+        assert_eq!(classify(&e, &l, &samples), Some(Attr::Ours));
+        e.owner_thread = 8;
+        assert_eq!(classify(&e, &l, &samples), Some(Attr::Ambiguous));
+        let mut w = ev(42, "chs-fake-cli.exe", Some(1), Some(7), Some(true));
+        w.event_pid = Some(43);
+        let (o, _) = calibration_outcome(&[w], Some((42, 7, 0x100)));
+        assert!(matches!(o, Outcome::NotExercised { .. }), "{o:?}");
     }
 
     /// F-3a: §4.8 classification of window events during a launch.

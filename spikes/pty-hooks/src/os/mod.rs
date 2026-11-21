@@ -36,6 +36,17 @@ pub struct WindowEvent {
     pub start_time: Option<u64>,
     /// The owner was in the observation job at callback time.
     pub in_job: Option<bool>,
+    /// The event's own `dwmsEventTime` and `idEventThread`.
+    #[serde(default)]
+    pub event_ms: u32,
+    #[serde(default)]
+    pub event_thread: u32,
+    /// The process of `idEventThread`, when it could be resolved.
+    #[serde(default)]
+    pub event_pid: Option<u32>,
+    /// The hwnd's owning thread at callback time.
+    #[serde(default)]
+    pub owner_thread: u32,
 }
 
 /// `OBJID_WINDOW` / `CHILDID_SELF`: the only events classified.
@@ -45,6 +56,49 @@ pub const CHILDID_SELF: i32 = 0;
 impl WindowEvent {
     pub fn is_window(&self) -> bool {
         self.id_object == OBJID_WINDOW && self.id_child == CHILDID_SELF
+    }
+
+    /// The hwnd resolved at callback time still belongs to the process
+    /// (or, when that cannot be resolved, the thread) that raised the event.
+    pub fn owner_consistent(&self) -> bool {
+        match self.event_pid {
+            Some(p) => p == self.owner_pid,
+            None => self.event_thread != 0 && self.owner_thread == self.event_thread,
+        }
+    }
+}
+
+/// One window observer at a time (C-5): an observer whose thread never
+/// exited (abandoned) keeps its slot, so a later launch cannot be observed
+/// with that thread still able to record events.
+pub struct ObserverSlot(std::sync::atomic::AtomicBool);
+
+impl Default for ObserverSlot {
+    fn default() -> ObserverSlot {
+        ObserverSlot::new()
+    }
+}
+
+/// Held by a running observer thread; frees the slot when dropped.
+pub struct SlotGuard<'a>(&'a ObserverSlot);
+
+impl ObserverSlot {
+    pub const fn new() -> ObserverSlot {
+        ObserverSlot(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// Claims the slot; refused while another observer thread holds it.
+    pub fn arm(&self) -> Result<SlotGuard<'_>, String> {
+        if self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err("a previous window observer is still active".into());
+        }
+        Ok(SlotGuard(self))
+    }
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        self.0.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -174,6 +228,17 @@ pub fn non_utf8_os_string() -> std::ffi::OsString {
 
 #[cfg(test)]
 mod tests {
+    /// M5: a second observer cannot arm while the first one's thread still
+    /// holds the slot; it can once that thread has exited.
+    #[test]
+    fn observer_slot_refuses_a_second_arm() {
+        let slot = super::ObserverSlot::new();
+        let g = slot.arm().unwrap();
+        assert!(slot.arm().is_err());
+        drop(g);
+        assert!(slot.arm().is_ok());
+    }
+
     /// A process is named after its executable image: the test binary's
     /// full name (longer than the 16-byte `pbi_name`) comes back intact.
     #[test]

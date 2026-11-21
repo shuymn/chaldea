@@ -9,7 +9,7 @@ use std::os::windows::io::FromRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -43,11 +43,12 @@ use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentThreadId, GetExitCodeProcess,
-    GetProcessHandleCount, GetProcessTimes, INFINITE, InitializeProcThreadAttributeList,
-    OpenProcess, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-    PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    GetProcessHandleCount, GetProcessIdOfThread, GetProcessTimes, INFINITE,
+    InitializeProcThreadAttributeList, OpenProcess, OpenThread, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    THREAD_QUERY_LIMITED_INFORMATION, TerminateProcess, UpdateProcThreadAttribute,
     WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
@@ -609,13 +610,24 @@ pub fn spawn_detached(cmd: &mut Command) -> Result<(Child, bool), String> {
     }
 }
 
-/// Every shown-window event of the running observer, recorded at callback
-/// time so a short-lived owner is still attributable after it exits.
-static SHOWN: Mutex<Vec<super::WindowEvent>> = Mutex::new(Vec::new());
-/// The running observer's start (event times are relative to it).
-static OBS_T0: Mutex<Option<Instant>> = Mutex::new(None);
-/// The observation job's handle (0 = none), for `IsProcessInJob` at callback time.
-static OBS_JOB: AtomicUsize = AtomicUsize::new(0);
+/// One observer's state, owned by that observer (never global): a thread
+/// abandoned by a stop that timed out can only write into its own state,
+/// never into a later launch's evidence.
+struct ObsState {
+    t0: Instant,
+    /// The observation job, owned for the observer's lifetime.
+    job: Option<Arc<Handle>>,
+    events: Mutex<Vec<super::WindowEvent>>,
+}
+
+thread_local! {
+    /// The state of the observer whose message loop runs on this thread
+    /// (out-of-context WinEvent callbacks run on the hooking thread).
+    static OBS: std::cell::RefCell<Option<Arc<ObsState>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// At most one observer thread alive at a time.
+static OBSERVER_SLOT: super::ObserverSlot = super::ObserverSlot::new();
 
 fn image_of(h: HANDLE) -> Option<String> {
     let mut buf = [0u16; 1024];
@@ -627,27 +639,37 @@ fn image_of(h: HANDLE) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..n as usize]))
 }
 
+/// The process owning thread `tid`, if it can still be opened.
+fn thread_pid(tid: u32) -> Option<u32> {
+    // SAFETY: handle owned for the duration of the query.
+    unsafe {
+        let h = Handle::new(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, tid))?;
+        let pid = GetProcessIdOfThread(h.raw());
+        (pid != 0).then_some(pid)
+    }
+}
+
 unsafe extern "system" fn on_show(
     _hook: HWINEVENTHOOK,
     _event: u32,
     hwnd: HWND,
     id_object: i32,
     id_child: i32,
-    _thread: u32,
-    _time: u32,
+    event_thread: u32,
+    event_ms: u32,
 ) {
-    let time_ms = OBS_T0
-        .lock()
-        .ok()
-        .and_then(|t| t.map(|t| t.elapsed().as_millis() as u64))
-        .unwrap_or(0);
+    let Some(state) = OBS.with(|o| o.borrow().clone()) else {
+        return;
+    };
+    let time_ms = state.t0.elapsed().as_millis() as u64;
     let mut owner = 0u32;
+    let mut owner_thread = 0u32;
     let mut class = String::new();
     if !hwnd.is_null() {
         let mut buf = [0u16; 256];
         // SAFETY: hwnd comes from the system for this callback; buffer length passed.
         unsafe {
-            GetWindowThreadProcessId(hwnd, &mut owner);
+            owner_thread = GetWindowThreadProcessId(hwnd, &mut owner);
             let n = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
             if n > 0 {
                 class = String::from_utf16_lossy(&buf[..n as usize]);
@@ -656,14 +678,13 @@ unsafe extern "system" fn on_show(
     }
     let (mut image, mut in_job) = (None, None);
     if owner != 0 {
-        // SAFETY: handle owned for the duration; the job handle stays open while the observer runs.
+        // SAFETY: handle owned for the duration; the job handle is owned by this observer.
         unsafe {
             if let Some(h) = Handle::new(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, owner)) {
                 image = image_of(h.raw());
-                let job = OBS_JOB.load(Ordering::SeqCst);
-                if job != 0 {
+                if let Some(job) = &state.job {
                     let mut r = 0;
-                    if IsProcessInJob(h.raw(), job as HANDLE, &mut r) != 0 {
+                    if IsProcessInJob(h.raw(), job.raw(), &mut r) != 0 {
                         in_job = Some(r != 0);
                     }
                 }
@@ -682,10 +703,16 @@ unsafe extern "system" fn on_show(
         ppid: info.as_ref().map(|p| p.ppid),
         start_time: info.as_ref().map(|p| p.start_time).filter(|t| *t != 0),
         in_job,
+        event_ms,
+        event_thread,
+        event_pid: thread_pid(event_thread),
+        owner_thread,
     };
-    if let Ok(mut v) = SHOWN.lock() {
-        v.push(ev);
-    }
+    state
+        .events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(ev);
 }
 
 /// After the observed process ended, the observer keeps pumping this long so
@@ -695,69 +722,85 @@ pub const OBSERVER_DRAIN: Duration = Duration::from_millis(500);
 /// Out-of-context `EVENT_OBJECT_SHOW` observer on its own message-loop thread.
 pub struct WindowObserver {
     thread_id: u32,
+    state: Arc<ObsState>,
     /// The loop thread returns whether its message loop ended cleanly (WM_QUIT).
     join: std::thread::JoinHandle<bool>,
 }
 
 impl WindowObserver {
     /// Arms the observer; `job` is the observation job whose membership each
-    /// event records. Call before the observed process is created.
+    /// event records. Call before the observed process is created. Refused
+    /// while an earlier observer's thread is still alive.
     pub fn start(job: Option<&ObservationJob>) -> Result<WindowObserver, String> {
-        if let Ok(mut v) = SHOWN.lock() {
-            v.clear();
-        }
-        if let Ok(mut t) = OBS_T0.lock() {
-            *t = Some(Instant::now());
-        }
-        OBS_JOB.store(job.map_or(0, |j| j.job.0), Ordering::SeqCst);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let join = std::thread::spawn(move || {
-            // SAFETY: hook + message loop on this thread; unhooked before exit.
-            unsafe {
-                // Create the thread's message queue before reporting the id.
-                let mut msg: MSG = std::mem::zeroed();
-                PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
-                let hook = SetWinEventHook(
-                    EVENT_OBJECT_SHOW,
-                    EVENT_OBJECT_SHOW,
-                    std::ptr::null_mut(),
-                    Some(on_show),
-                    0,
-                    0,
-                    WINEVENT_OUTOFCONTEXT,
-                );
-                let _ = tx.send((GetCurrentThreadId(), !hook.is_null()));
-                if hook.is_null() {
-                    return false;
-                }
-                let clean = loop {
-                    match GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) {
-                        0 => break true,
-                        -1 => break false,
-                        _ => {
-                            TranslateMessage(&msg);
-                            DispatchMessageW(&msg);
-                        }
-                    }
-                };
-                UnhookWinEvent(hook);
-                clean
-            }
+        let state = Arc::new(ObsState {
+            t0: Instant::now(),
+            job: job.map(|j| j.job.clone()),
+            events: Mutex::new(Vec::new()),
         });
+        let slot = OBSERVER_SLOT.arm()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let st = state.clone();
+        let join = std::thread::Builder::new()
+            .name("window-observer".into())
+            .spawn(move || {
+                // The slot stays claimed until this thread exits.
+                let _slot = slot;
+                OBS.with(|o| *o.borrow_mut() = Some(st));
+                // SAFETY: hook + message loop on this thread; unhooked before exit.
+                unsafe {
+                    // Create the thread's message queue before reporting the id.
+                    let mut msg: MSG = std::mem::zeroed();
+                    PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+                    let hook = SetWinEventHook(
+                        EVENT_OBJECT_SHOW,
+                        EVENT_OBJECT_SHOW,
+                        std::ptr::null_mut(),
+                        Some(on_show),
+                        0,
+                        0,
+                        WINEVENT_OUTOFCONTEXT,
+                    );
+                    let ready = tx.send((GetCurrentThreadId(), !hook.is_null())).is_ok();
+                    if hook.is_null() {
+                        return false;
+                    }
+                    if !ready {
+                        // The starter gave up waiting: never observe unclaimed.
+                        UnhookWinEvent(hook);
+                        return false;
+                    }
+                    let clean = loop {
+                        match GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) {
+                            0 => break true,
+                            -1 => break false,
+                            _ => {
+                                TranslateMessage(&msg);
+                                DispatchMessageW(&msg);
+                            }
+                        }
+                    };
+                    UnhookWinEvent(hook);
+                    clean
+                }
+            })
+            .map_err(|e| format!("observer thread: {e}"))?;
         match rx.recv_timeout(Duration::from_secs(5)) {
             Ok((tid, true)) => Ok(WindowObserver {
                 thread_id: tid,
+                state,
                 join,
             }),
             Ok((_, false)) => Err("SetWinEventHook failed".into()),
+            // Dropping `rx` makes the thread's readiness send fail: it unhooks.
             Err(_) => Err("observer thread did not start".into()),
         }
     }
 
     /// Stops the loop after the drain interval (bounded: a thread that does
-    /// not quit is abandoned). Returns the events and the observer's health:
-    /// a failed `WM_QUIT` post, a thread that did not exit, or a message
-    /// loop that ended on an error means the events may be incomplete.
+    /// not quit is abandoned and keeps the observer slot, so no later
+    /// observer arms). Returns this observer's events and its health: a
+    /// failed `WM_QUIT` post, a thread that did not exit, or a message loop
+    /// that ended on an error means the events may be incomplete.
     pub fn stop(self) -> super::ObserverStop {
         std::thread::sleep(OBSERVER_DRAIN);
         // SAFETY: posting WM_QUIT to the observer thread.
@@ -782,11 +825,12 @@ impl WindowObserver {
                 }
             }
         };
-        OBS_JOB.store(0, Ordering::SeqCst);
-        let events = match SHOWN.lock() {
-            Ok(v) => v.clone(),
-            Err(_) => return (Vec::new(), Err("event list poisoned".into())),
-        };
+        let events = self
+            .state
+            .events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         (events, health)
     }
 }
@@ -794,13 +838,13 @@ impl WindowObserver {
 /// A `KILL_ON_JOB_CLOSE` job each observed launch runs in (C-5): the child
 /// waits for `go` on stdin until it has been assigned.
 pub struct ObservationJob {
-    job: Handle,
+    job: Arc<Handle>,
 }
 
 impl ObservationJob {
     pub fn new() -> io::Result<ObservationJob> {
         Ok(ObservationJob {
-            job: new_kill_on_close_job()?,
+            job: Arc::new(new_kill_on_close_job()?),
         })
     }
     pub fn assign(&self, child: &Child) -> io::Result<()> {
