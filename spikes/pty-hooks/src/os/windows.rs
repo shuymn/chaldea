@@ -1151,6 +1151,7 @@ struct Setup {
     /// `after-spawn`: output bytes seen, and whether the child still ran,
     /// when the injection fired.
     output_pending: Option<u64>,
+    output_marker_seen: Option<bool>,
     running_at_injection: Option<bool>,
 }
 
@@ -1225,6 +1226,7 @@ impl Drop for Setup {
             "path": "setup_error", "failed_at": self.step, "child_pid": (self.pid != 0).then_some(self.pid),
             "child_start": (self.start != 0).then_some(self.start), "steps": steps,
             "process_exit": process_exit, "output_pending_bytes": self.output_pending,
+            "output_marker_seen": self.output_marker_seen,
             "child_running_at_injection": self.running_at_injection,
             "close_pseudoconsole_ms": close, "close_hung": had_pcon && close.is_none(),
             "drain_reached_eof": drain_end.as_deref() == Some("eof"), "drain_end": drain_end,
@@ -1584,15 +1586,20 @@ pub fn raw_spawn(
         };
         st.step = "after_spawn";
         if inject == Some(I::AfterSpawn) {
-            // Fail with the child's output pending: wait (bounded) until its
-            // output has been seen while it still runs (the fixture writes
-            // continuously), and record both.
+            // Fail with the child's output pending: wait (bounded) until the
+            // fixture's own output line (not ConPTY's startup bytes) has been
+            // seen while it still runs, and record both.
             let end = Instant::now() + Duration::from_secs(5);
             loop {
                 let seen = st.drain.as_ref().map_or(0, |d| d.bytes());
+                let marker = st
+                    .drain
+                    .as_ref()
+                    .is_some_and(|d| d.held_contains(super::EMIT_OUTPUT_MARKER.as_bytes()));
                 let running = st.process.as_ref().is_some_and(|p| still_active(p.raw()));
-                if (seen > 0 && running) || Instant::now() >= end {
+                if (marker && running) || Instant::now() >= end {
                     st.output_pending = Some(seen);
+                    st.output_marker_seen = Some(marker);
                     st.running_at_injection = Some(running);
                     break;
                 }

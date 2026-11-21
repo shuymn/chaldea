@@ -115,6 +115,17 @@ impl Drain {
         })
     }
 
+    /// Whether output held for a consumer that has not attached yet
+    /// contains `needle`.
+    pub fn held_contains(&self, needle: &[u8]) -> bool {
+        let c = self
+            .state
+            .consumer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        !needle.is_empty() && c.held.windows(needle.len()).any(|w| w == needle)
+    }
+
     /// How the drain ended (`eof` or `error: …`), once it has.
     pub fn end(&self) -> Option<String> {
         self.state
@@ -241,6 +252,31 @@ mod tests {
         drop(w);
         assert!(d.wait(Duration::from_secs(5)));
         assert_eq!(d.end().as_deref(), Some("eof"));
+    }
+
+    /// M3: held output is searched for the fixture's own marker, which
+    /// startup bytes alone do not satisfy, also when it arrives split
+    /// across reads.
+    #[test]
+    fn held_output_is_searched_for_a_marker() {
+        let (r, mut w) = io::pipe().unwrap();
+        let d = Drain::start(r).unwrap();
+        w.write_all(b"\x1b[?25l\x1b[2J\x1b[H").unwrap();
+        let wait_bytes = |n: u64| {
+            let end = Instant::now() + Duration::from_secs(5);
+            while d.bytes() < n && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait_bytes(13);
+        assert!(!d.held_contains(b"OUTPUT-"));
+        w.write_all(b"OUT").unwrap();
+        wait_bytes(16);
+        w.write_all(b"PUT-00000001").unwrap();
+        wait_bytes(28);
+        assert!(d.held_contains(b"OUTPUT-"));
+        drop(w);
+        assert!(d.wait(Duration::from_secs(5)));
     }
 
     /// M4: startup output beyond the hold buffer is never dropped silently:

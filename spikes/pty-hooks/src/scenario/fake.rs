@@ -2195,9 +2195,12 @@ pub fn raw_inject_outcome(r: &InjectRun) -> Outcome {
         }
         if r.inject == "after-spawn"
             && (t["output_pending_bytes"].as_u64().unwrap_or(0) == 0
+                || t["output_marker_seen"] != json!(true)
                 || t["child_running_at_injection"] != json!(true))
         {
-            return Outcome::harness("no output was pending when the injection fired");
+            return Outcome::harness(
+                "the fixture's output was not seen pending while it ran when the injection fired",
+            );
         }
     }
     if r.unknown_liveness > 0 {
@@ -2801,7 +2804,8 @@ mod tests {
                 inject_milestone(inject).unwrap_or(("", "master_drop", None));
             json!({"marker": marker, "path": path, "failed_at": failed_at,
                    "child_pid": 7, "child_start": 70, "process_exit": "exited",
-                   "output_pending_bytes": 64, "child_running_at_injection": true,
+                   "output_pending_bytes": 64, "output_marker_seen": true,
+                   "child_running_at_injection": true,
                    "teardown_ms": ms, "drain_reached_eof": eof})
         };
         let base = |inject: &str| {
@@ -2871,7 +2875,7 @@ mod tests {
             json!({"path": "setup_error", "failed_at": failed_at, "child_pid": 7,
                    "child_start": 70, "process_exit": "exited", "teardown_ms": 50,
                    "drain_reached_eof": true, "output_pending_bytes": 4096,
-                   "child_running_at_injection": true})
+                   "output_marker_seen": true, "child_running_at_injection": true})
         };
         let resume = run(
             "resume-fail",
@@ -3036,6 +3040,30 @@ mod tests {
             let o = raw_inject_outcome(&run("reader-start", err, td));
             assert!(matches!(o, Outcome::HarnessFail { .. }), "{k}: {o:?}");
         }
+    }
+
+    /// M3: `after-spawn` counts only when the fixture's own `OUTPUT-` line
+    /// was seen pending (ConPTY's startup bytes alone are not the staged
+    /// output).
+    #[test]
+    fn after_spawn_needs_the_fixture_output() {
+        let td = json!({"path": "setup_error", "failed_at": "after_spawn", "child_pid": 7,
+                        "child_start": 70, "process_exit": "exited", "teardown_ms": 50,
+                        "drain_reached_eof": true, "output_pending_bytes": 24,
+                        "child_running_at_injection": true});
+        let r = InjectRun {
+            inject: "after-spawn".into(),
+            spawn_error: Some("injected failure after spawn".into()),
+            teardown: Some(td),
+            handles_before: Some(100),
+            handles_after: Some(100),
+            ..Default::default()
+        };
+        let o = raw_inject_outcome(&r);
+        assert!(matches!(o, Outcome::HarnessFail { .. }), "{o:?}");
+        let mut r = r;
+        r.teardown.as_mut().unwrap()["output_marker_seen"] = json!(true);
+        assert_eq!(raw_inject_outcome(&r), Outcome::Pass);
     }
 
     #[test]

@@ -4,6 +4,10 @@
 use serde::Serialize;
 
 mod drain;
+/// The line prefix FakeCli `spawn-tree --emit-output` writes (F-2c
+/// `after-spawn` fires only once it is seen in the held output).
+pub const EMIT_OUTPUT_MARKER: &str = "OUTPUT-";
+
 pub use drain::*;
 
 #[cfg(unix)]

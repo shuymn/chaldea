@@ -788,7 +788,11 @@ fn run_spawn_tree(o: &Opts) -> i32 {
         let mut n = 0u64;
         loop {
             n += 1;
-            out(format!("OUTPUT-{n:08} 日本語 pending output for the F-2c abort\r\n").as_bytes());
+            out(format!(
+                "{}{n:08} 日本語 pending output for the F-2c abort\r\n",
+                os::EMIT_OUTPUT_MARKER
+            )
+            .as_bytes());
             std::thread::sleep(Duration::from_millis(10));
         }
     }
