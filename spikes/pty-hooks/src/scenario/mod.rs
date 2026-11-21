@@ -195,7 +195,13 @@ pub fn emitter_path(root: &Path) -> PathBuf {
 
 /// Fixed hook command string: `<abs emitter> <agent>` (forward slashes, no spaces).
 pub fn hook_command(root: &Path, agent: &str) -> String {
-    let p = root.join("bin").join(util::bin_name(emitter_name()));
+    hook_command_for(root, agent, emitter_name())
+}
+
+/// The hook command string for one emitter variant (`chs-hook-emit` or
+/// `chs-hook-emit-gui`).
+pub fn hook_command_for(root: &Path, agent: &str, emitter: &str) -> String {
+    let p = root.join("bin").join(util::bin_name(emitter));
     format!("{} {agent}", p.display().to_string().replace('\\', "/"))
 }
 

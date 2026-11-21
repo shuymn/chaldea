@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::{Ctx, Launch, LaunchSpec, cli_version, hook_command, launch, write_snapshot};
+use super::{
+    Ctx, Launch, LaunchSpec, cli_version, hook_command, hook_command_for, launch, write_snapshot,
+};
 use crate::cli::{self, Args};
 use crate::paste::{self, InputEncoding, Lossy, Newline, NewlineKey};
 use crate::session::{Session, SpawnOpts};
@@ -1962,13 +1964,12 @@ pub fn print_launch(args: &Args) -> i32 {
             "--session-id".into(),
             uuid::Uuid::new_v4().to_string(),
         ]);
-    } else {
-        if args.codex_mode == "no-daemon" {
-            argv.push("--no-daemon".into());
-        }
-        argv.extend(codex_hook_args(&hook_command(&args.root, "codex")));
-        argv.push(CODEX_FIRST_PROMPT.into());
     }
+    let variants = if name == "codex" {
+        codex_pretrust_argvs(&args.root, &argv[0], args.codex_mode == "no-daemon")
+    } else {
+        vec![("", argv)]
+    };
     let work = args.root.join("work");
     let mut cwds = vec![work.join(name)];
     if name == "codex" {
@@ -1976,7 +1977,7 @@ pub fn print_launch(args: &Args) -> i32 {
     }
     cwds.push(c2_cwd(&args.root));
     println!(
-        "pre-trust: run the command below once in each of these folders and accept folder trust:"
+        "pre-trust: run each command below once in each of these folders and accept folder trust:"
     );
     for c in &cwds {
         println!("  {}", c.display());
@@ -1985,14 +1986,16 @@ pub fn print_launch(args: &Args) -> i32 {
     println!("  CHALDEA_HOOK_URL=http://127.0.0.1:<port>/hook");
     println!("  CHALDEA_HOOK_TOKEN=<64-hex, fresh per launch>");
     println!("  CHALDEA_THREAD_ID=<uuid, fresh per launch>");
-    println!("command:");
-    println!(
-        "  {}",
-        argv.iter()
-            .map(|a| shell_quote(a))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
+    for (what, argv) in &variants {
+        println!("command{what}:");
+        println!(
+            "  {}",
+            argv.iter()
+                .map(|a| shell_quote(a))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
     println!("then (real CLIs run only with --allow-api-usage):");
     let follow: &[&str] = if name == "claude" {
         &[
@@ -2032,6 +2035,31 @@ pub fn print_launch(args: &Args) -> i32 {
         c2_cwd(&args.root).display()
     );
     0
+}
+
+/// The Codex pre-trust commands: one per hook command string Codex will
+/// see, the console emitter's and the GUI-subsystem emitter's (C-5's
+/// mitigation rerun), since trust is per command string.
+pub fn codex_pretrust_argvs(
+    root: &Path,
+    bin: &str,
+    no_daemon: bool,
+) -> Vec<(&'static str, Vec<String>)> {
+    [
+        ("", "chs-hook-emit"),
+        (" (GUI emitter, C-5 mitigation rerun)", "chs-hook-emit-gui"),
+    ]
+    .into_iter()
+    .map(|(what, emitter)| {
+        let mut argv = vec![bin.to_string()];
+        if no_daemon {
+            argv.push("--no-daemon".into());
+        }
+        argv.extend(codex_hook_args(&hook_command_for(root, "codex", emitter)));
+        argv.push(CODEX_FIRST_PROMPT.into());
+        (what, argv)
+    })
+    .collect()
 }
 
 /// C-2's spaced, non-ASCII cwd (`C:\chs\work\日本 dir` on Windows).
@@ -2166,6 +2194,22 @@ trusted_hash = "sha256:bb"
             KeyResult::Unrecognized(raw) => assert_eq!(raw.len(), 2, "{raw:?}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// L5: C-5's mitigation rerun uses the GUI-subsystem emitter, whose
+    /// hook command string differs, so `print-launch codex` pre-trusts both.
+    #[test]
+    fn pretrust_covers_both_emitter_variants() {
+        let v = codex_pretrust_argvs(Path::new("/r"), "codex", true);
+        let hooks: Vec<String> = v.iter().map(|(_, a)| a.join(" ")).collect();
+        assert!(
+            hooks.iter().any(|h| h.contains("chs-hook-emit codex")),
+            "{hooks:?}"
+        );
+        assert!(
+            hooks.iter().any(|h| h.contains("chs-hook-emit-gui codex")),
+            "{hooks:?}"
+        );
     }
 
     #[test]
