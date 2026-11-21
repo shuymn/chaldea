@@ -1,4 +1,5 @@
-//! Set B: `chs fake <paste|queries|stall|tree-kill|auth|emit|teardown|all>`.
+//! Set B: `chs fake <paste|queries|stall|tree-kill|auth|emit|teardown|all>`, plus
+//! `chs fake raw-inject` (F-2c, Windows raw backend only).
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -57,6 +58,17 @@ pub fn run(args: Args) -> i32 {
     match which.as_str() {
         "all" => run_all(args),
         "teardown-case" => run_case(args),
+        "raw-inject" => {
+            let ctx = match Ctx::new(args, "fake raw-inject") {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("chs: {e}");
+                    return 3;
+                }
+            };
+            raw_inject(&ctx);
+            ctx.finish()
+        }
         s if SCENARIOS.contains(&s) => {
             let ctx = match Ctx::new(args, &format!("fake {s}")) {
                 Ok(c) => c,
@@ -320,33 +332,26 @@ fn queries(ctx: &Ctx) {
             })
             .map(|w| w.report);
         let log = l.query_log();
-        let (stop, _) = l.finish();
-        runs.push((responder, code, fake_report, log, stop));
+        let _ = l.finish();
+        let output = std::fs::read(ctx.out.join(format!("pty-output-{label}.bin"))).ok();
+        runs.push((
+            responder,
+            B5Run {
+                exit: code,
+                fake: fake_report,
+                log: log.as_array().cloned().unwrap_or_default(),
+                output,
+            },
+        ));
     }
-    let on = &runs[0];
-    let off = runs.get(1);
-    let on_ok = on.1 == Some(0) && on.2.as_ref().and_then(|r| r["all_ok"].as_bool()) == Some(true);
-    ctx.check(
-        "B-5",
-        "responder",
-        checked(on_ok),
-        json!({"exit": on.1, "fake": on.2, "query_log": on.3}),
-    );
-    if let Some(off) = off {
-        let failed = off.1 != Some(0);
-        // Negative control: must fail on macOS; on Windows conhost may answer some queries itself.
-        let required = os::os_name() != "windows";
-        let res = Outcome::observed(
-            failed || !required,
-            "queries answered without the responder",
-        );
-        ctx.check(
-            "B-5",
-            "negative_control_no_responder",
-            res,
-            json!({"expected": "fake-cli fails", "exit": off.1, "fake": off.2, "query_log": off.3,
-                   "note": "replies seen without harness writes come from conhost"}),
-        );
+    for (responder, run) in &runs {
+        let case = if *responder {
+            "responder"
+        } else {
+            "negative_control_no_responder"
+        };
+        let (o, ev) = b5_expect(os::os_name(), *responder, run);
+        ctx.check("B-5", case, o, ev);
     }
 }
 
@@ -1456,15 +1461,15 @@ fn teardown(ctx: &Ctx) {
                 continue;
             }
         };
-        let rep = Some(rep);
-        let (survivors, owned) = rep.as_ref().map(case_survivors).unwrap_or_default();
-        let status = rep.as_ref().map(|r| r.status.clone());
+        let (survivors, owned) = case_survivors(&rep);
         let within = elapsed <= Duration::from_secs(*deadline) + Duration::from_millis(1500);
-        let ok = status.as_deref() == Some(*want) && survivors.is_empty() && within && owned > 0;
+        let o = teardown_outcome(case, want, &rep, within, survivors.is_empty(), owned);
+        let status = Some(rep.status.clone());
+        let rep = Some(rep);
         ctx.check(
             "B-10",
             case,
-            checked(ok),
+            o,
             json!({"want_status": want, "status": status, "exit": code, "elapsed_ms": elapsed.as_millis() as u64,
                    "deadline_s": deadline, "owned_checked": owned, "survivors": survivors, "interrupt_sent": interrupted,
                    "errors": rep.as_ref().map(|r| r.errors.clone()), "case_details": rep.as_ref().map(|r| r.details.get("case").cloned())}),
@@ -1571,29 +1576,47 @@ fn run_case(args: Args) -> i32 {
                 || l.ready(),
             );
             let paste_ms = t.elapsed().as_millis() as u64;
+            // Windows: conhost may accept the whole paste; keep writing
+            // ungated filler until the writer blocks or 16 MiB went in.
+            let filler =
+                (case == "non-reading-child" && os::os_name() == "windows" && o.state == "sent")
+                    .then(|| write_filler(&l.session.io().tx, &ctx));
             let ups = if case == "query-mid-paste" {
                 wait_ups(&l, 1, ctx.until(FAKE_UPS_WAIT))
             } else {
                 None
             };
+            let log = l.query_log();
             record(&ctx, &l);
             let (stop, _) = l.finish();
-            let ok = if case == "non-reading-child" {
-                gate && o.state == "write_timeout"
-            } else {
-                let expected = paste::map_newlines(payload.as_bytes(), Newline::Cr);
-                ups.as_ref().is_some_and(|(p, v)| {
-                    *p == expected && v["chs_query_reply_after_paste"] == json!(true)
-                })
+            let harness_dsr_written = log
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|e| e["kind"] == json!("dsr6") && e["harness_wrote"] == json!(true));
+            let run = B10Run {
+                gate,
+                paste_state: o.state.clone(),
+                filler,
+                survivors_empty: stop.survivors.is_empty(),
+                prompt: ups.as_ref().map(|(p, _)| p.clone()),
+                expected: paste::map_newlines(payload.as_bytes(), Newline::Cr),
+                reply_after_paste: ups
+                    .as_ref()
+                    .and_then(|(_, v)| v["chs_query_reply_after_paste"].as_bool()),
+                harness_dsr_written,
             };
-            ctx.check(
-                "B-10",
-                &case,
-                checked(ok && stop.survivors.is_empty()),
-                json!({"paste": o, "paste_ms": paste_ms, "bytes_written": o.bytes_after - o.bytes_before,
-                       "ups_reply_after_paste": ups.as_ref().map(|(_, v)| v["chs_query_reply_after_paste"].clone()),
-                       "stop": stop_evidence(&stop)}),
-            );
+            let (outcome, mut ev) = b10_expect(os::os_name(), &case, &run);
+            let output =
+                std::fs::read(ctx.out.join(format!("pty-output-{case}.bin"))).unwrap_or_default();
+            ev["query_log"] = log;
+            ev["dsr_excerpt"] =
+                json!(find_bytes(&output, b"\x1b[6n").map(|at| excerpt(&output, at, 4)));
+            ev["paste"] = json!(o);
+            ev["paste_ms"] = json!(paste_ms);
+            ev["bytes_written"] = json!(o.bytes_after - o.bytes_before);
+            ev["stop"] = stop_evidence(&stop);
+            ctx.check("B-10", &case, outcome, ev);
             ctx.detail(
                 "case",
                 json!({"teardown_ms": stop.teardown_ms, "threads": stop.threads}),
@@ -1700,6 +1723,531 @@ fn run_case(args: Args) -> i32 {
     ctx.finish()
 }
 
+// ---------------- conhost expectations (F-3e) ----------------
+
+/// The queries FakeCli `queries` sends, as they appear in the PTY output.
+const B5_QUERIES: &[(&str, &[u8])] = &[
+    ("dsr6", b"\x1b[6n"),
+    ("dsr5", b"\x1b[5n"),
+    ("da1", b"\x1b[c"),
+    ("da2", b"\x1b[>c"),
+    ("osc10", b"\x1b]10;?"),
+    ("osc11", b"\x1b]11;?"),
+    ("kitty_keyboard", b"\x1b[?u"),
+];
+
+/// Bytes of PTY output kept around each query in the report.
+const EXCERPT_MAX: usize = 256;
+
+fn find_bytes(h: &[u8], n: &[u8]) -> Option<usize> {
+    h.windows(n.len()).position(|w| w == n)
+}
+
+/// At most `EXCERPT_MAX` bytes of `out` around `[at, at + len)`, escaped.
+pub fn excerpt(out: &[u8], at: usize, len: usize) -> String {
+    let side = (EXCERPT_MAX.saturating_sub(len)) / 2;
+    let start = at.saturating_sub(side);
+    let end = (at + len + side).min(out.len()).min(start + EXCERPT_MAX);
+    String::from_utf8_lossy(&out[start..end])
+        .escape_debug()
+        .to_string()
+}
+
+/// Per query: its first offset in the PTY output and an excerpt (null when
+/// the query never reached the PTY output).
+fn query_excerpts(out: &[u8]) -> Value {
+    let m: serde_json::Map<String, Value> = B5_QUERIES
+        .iter()
+        .map(|(k, q)| {
+            let v = find_bytes(out, q)
+                .map(|at| json!({"offset": at, "excerpt": excerpt(out, at, q.len())}));
+            (k.to_string(), v.unwrap_or(Value::Null))
+        })
+        .collect();
+    Value::Object(m)
+}
+
+/// One FakeCli `queries` run as B-5 sees it.
+pub struct B5Run {
+    pub exit: Option<u32>,
+    /// The `queries-result` witness report.
+    pub fake: Option<Value>,
+    pub log: Vec<Value>,
+    /// The PTY output file, when it could be read.
+    pub output: Option<Vec<u8>>,
+}
+
+/// B-5 expectation per OS. macOS: today's checks. Windows (§3 conhost
+/// facts): DSR 5/6 and DA1/DA2 pass when answered validly within 500 ms
+/// with no harness write (`answered_by_conhost`); OSC 10/11 pass when no
+/// reply arrived, the query log has no OSC entry, and the PTY output has no
+/// OSC 10/11 query (`not_forwarded`); kitty must be harness-answered, and
+/// the negative control must fail on kitty. Missing evidence is a harness
+/// failure.
+pub fn b5_expect(os_name: &str, responder: bool, r: &B5Run) -> (Outcome, Value) {
+    let mut ev = json!({"exit": r.exit, "fake": r.fake, "query_log": r.log,
+                        "excerpts": r.output.as_deref().map(query_excerpts)});
+    let all_ok = r.fake.as_ref().and_then(|f| f["all_ok"].as_bool()) == Some(true);
+    if os_name != "windows" {
+        let o = if responder {
+            checked(r.exit == Some(0) && all_ok)
+        } else {
+            Outcome::observed(r.exit != Some(0), "queries answered without the responder")
+        };
+        return (o, ev);
+    }
+    let Some(fake) = &r.fake else {
+        return (Outcome::harness("no queries-result report"), ev);
+    };
+    let Some(out) = &r.output else {
+        return (Outcome::harness("no PTY output recorded"), ev);
+    };
+    let result = |k: &str| {
+        fake["results"]
+            .as_array()
+            .and_then(|a| a.iter().find(|x| x["kind"] == json!(k)))
+            .map(|x| x["ok"] == json!(true))
+    };
+    let wrote = |k: &str| {
+        r.log
+            .iter()
+            .any(|e| e["kind"] == json!(k) && e["harness_wrote"] == json!(true))
+    };
+    let osc_logged = r.log.iter().any(|e| {
+        e["kind"].as_str().is_some_and(|k| k.starts_with("osc"))
+            || e["reply"].as_str().is_some_and(|s| s.starts_with("\x1b]1"))
+    });
+    if !responder {
+        return match result("kitty_keyboard") {
+            None => (Outcome::harness("no kitty_keyboard result"), ev),
+            Some(true) => (
+                Outcome::platform("kitty query answered without the responder"),
+                ev,
+            ),
+            Some(false) => (Outcome::Pass, ev),
+        };
+    }
+    let (mut conhost, mut not_fwd, mut fails) = (Vec::new(), Vec::new(), Vec::new());
+    for (k, q) in B5_QUERIES {
+        let Some(ok) = result(k) else {
+            return (Outcome::harness(format!("no {k} result")), ev);
+        };
+        match *k {
+            "kitty_keyboard" => {
+                if !(ok && wrote(k)) {
+                    fails.push(*k);
+                }
+            }
+            "osc10" | "osc11" => {
+                if !ok {
+                    if !osc_logged && find_bytes(out, q).is_none() {
+                        not_fwd.push(*k);
+                    } else {
+                        fails.push(*k);
+                    }
+                }
+            }
+            _ => {
+                if !ok {
+                    fails.push(*k);
+                } else if !wrote(k) {
+                    conhost.push(*k);
+                }
+            }
+        }
+    }
+    ev["platform_fact"] = json!({"answered_by_conhost": conhost, "not_forwarded": not_fwd});
+    if fails.is_empty() {
+        (Outcome::Pass, ev)
+    } else {
+        (
+            Outcome::platform(format!("unexpected query handling: {fails:?}")),
+            ev,
+        )
+    }
+}
+
+/// Ungated filler after a 64 KiB paste to a non-reading child (Windows).
+pub const FILLER_MAX: u64 = 16 << 20;
+const FILLER_WRITE: usize = 64 * 1024;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Filler {
+    pub accepted: u64,
+    pub blocked: bool,
+    pub error: Option<String>,
+}
+
+fn write_filler(tx: &crate::pty::WriterTx, ctx: &Ctx) -> Filler {
+    let chunk = vec![b'x'; FILLER_WRITE];
+    let mut f = Filler {
+        accepted: 0,
+        blocked: false,
+        error: None,
+    };
+    while f.accepted < FILLER_MAX {
+        match tx.write_wait(vec![chunk.clone()], ctx.until(Duration::from_secs(3))) {
+            Ok(()) => f.accepted += FILLER_WRITE as u64,
+            Err(e) if e == "write_timeout" => {
+                f.blocked = true;
+                break;
+            }
+            Err(e) => {
+                f.error = Some(e);
+                break;
+            }
+        }
+    }
+    f
+}
+
+/// Exactly one CPR reply (`ESC[<r>;<c>R`) in `prompt`, whose removal
+/// leaves `expected`: its byte offset and text.
+pub fn single_cpr(prompt: &[u8], expected: &[u8]) -> Result<(usize, String), String> {
+    let mut found = Vec::new();
+    let mut i = 0;
+    while let Some(p) = find_bytes(&prompt[i..], b"\x1b[") {
+        let at = i + p;
+        let t = &prompt[at + 2..];
+        let d1 = t.iter().take_while(|b| b.is_ascii_digit()).count();
+        let rest = &t[d1..];
+        let ok = d1 > 0 && rest.first() == Some(&b';') && {
+            let d2 = rest[1..].iter().take_while(|b| b.is_ascii_digit()).count();
+            d2 > 0 && rest.get(1 + d2) == Some(&b'R')
+        };
+        if ok {
+            let d2 = rest[1..].iter().take_while(|b| b.is_ascii_digit()).count();
+            found.push((at, 2 + d1 + 1 + d2 + 1));
+        }
+        i = at + 2;
+    }
+    let [(at, len)] = found[..] else {
+        return Err(format!("{} CPR replies in the prompt", found.len()));
+    };
+    let mut rest = prompt[..at].to_vec();
+    rest.extend_from_slice(&prompt[at + len..]);
+    if rest != expected {
+        return Err("the prompt without the CPR reply differs from the payload".into());
+    }
+    Ok((
+        at,
+        String::from_utf8_lossy(&prompt[at..at + len]).into_owned(),
+    ))
+}
+
+/// One B-10 child case (`non-reading-child` or `query-mid-paste`).
+pub struct B10Run {
+    pub gate: bool,
+    pub paste_state: String,
+    pub filler: Option<Filler>,
+    pub survivors_empty: bool,
+    pub prompt: Option<Vec<u8>>,
+    pub expected: Vec<u8>,
+    pub reply_after_paste: Option<bool>,
+    pub harness_dsr_written: bool,
+}
+
+/// B-10 expectation per OS. macOS: today's checks. Windows (§3 conhost
+/// facts): a paste that conhost accepted is followed by filler up to
+/// 16 MiB; a blocked writer passes, all 16 MiB accepted is `not_exercised`
+/// with the accepted bytes; a CPR reply must appear in the prompt exactly
+/// once with no harness DSR write (`platform_fact` = its offset).
+pub fn b10_expect(os_name: &str, case: &str, r: &B10Run) -> (Outcome, Value) {
+    let mut ev = json!({"paste_state": r.paste_state, "filler": r.filler,
+                        "reply_after_paste": r.reply_after_paste});
+    if !r.survivors_empty {
+        return (Outcome::platform("processes survived the stop"), ev);
+    }
+    let win = os_name == "windows";
+    if case == "non-reading-child" {
+        if !win || r.paste_state != "sent" {
+            return (checked(r.gate && r.paste_state == "write_timeout"), ev);
+        }
+        let o = match &r.filler {
+            None => Outcome::harness("no filler run after the accepted paste"),
+            Some(f) if f.blocked => {
+                ev["platform_fact"] = json!({"paste_accepted_by_conhost": true,
+                                             "filler_accepted_bytes": f.accepted});
+                checked(r.gate)
+            }
+            Some(f) if f.accepted >= FILLER_MAX => Outcome::not_exercised(format!(
+                "conhost accepted the paste and all {} filler bytes; no blocked writer",
+                f.accepted
+            )),
+            Some(f) => Outcome::harness(format!(
+                "filler stopped: {}",
+                f.error.as_deref().unwrap_or("unknown")
+            )),
+        };
+        return (o, ev);
+    }
+    let today = r.prompt.as_deref() == Some(&r.expected[..]) && r.reply_after_paste == Some(true);
+    if !win || today {
+        return (checked(today), ev);
+    }
+    let Some(prompt) = &r.prompt else {
+        return (checked(false), ev);
+    };
+    if r.harness_dsr_written {
+        return (
+            Outcome::platform("the harness wrote a DSR reply during the paste"),
+            ev,
+        );
+    }
+    match single_cpr(prompt, &r.expected) {
+        Ok((at, reply)) => {
+            let chars = String::from_utf8_lossy(&prompt[..at]).chars().count();
+            ev["platform_fact"] = json!({"cpr_in_paste_body": reply, "offset_bytes": at,
+                "offset_chars": chars, "excerpt": excerpt(prompt, at, reply.len())});
+            (Outcome::Pass, ev)
+        }
+        Err(e) => (Outcome::platform(e), ev),
+    }
+}
+
+/// B-10 cases whose child decides a typed outcome the parent passes on.
+const TYPED_TEARDOWN: &[&str] = &["non-reading-child", "query-mid-paste"];
+
+/// The `fake teardown` parent's verdict for one child case. The parent
+/// still checks the child's elapsed time against its deadline, survivors,
+/// and that it recorded owned processes (the run id is checked when the
+/// report is read); a typed case then carries the child's own outcome
+/// unchanged, the others compare the child's status with the expected one.
+pub fn teardown_outcome(
+    case: &str,
+    want: &str,
+    rep: &Report,
+    within: bool,
+    survivors_empty: bool,
+    owned: usize,
+) -> Outcome {
+    let identity_ok = within && survivors_empty && owned > 0;
+    if !TYPED_TEARDOWN.contains(&case) {
+        return checked(rep.status == want && identity_ok);
+    }
+    if !identity_ok {
+        return checked(false);
+    }
+    if !rep.errors.is_empty() {
+        return Outcome::harness(format!("child errors: {:?}", rep.errors));
+    }
+    rep.checks
+        .iter()
+        .rev()
+        .find(|c| c.id == "B-10" && c.case == case)
+        .map(Outcome::from_check)
+        .unwrap_or(Outcome::Missing)
+}
+
+/// B-2 over the child scenarios' statuses, typed: all pass → pass; a `fail`
+/// → platform failure; an `error` or `not_run` → harness failure;
+/// otherwise (an `inconclusive` child) not exercised.
+pub fn b2_outcome(statuses: &[&str]) -> Outcome {
+    if statuses.iter().all(|s| *s == "pass") {
+        Outcome::Pass
+    } else if statuses.contains(&"fail") {
+        Outcome::platform("a fake scenario failed")
+    } else if statuses.iter().any(|s| *s == "error" || *s == "not_run") {
+        Outcome::harness("a fake scenario errored or did not run")
+    } else {
+        Outcome::not_exercised("a fake scenario was inconclusive")
+    }
+}
+
+// ---------------- F-2c raw backend injections ----------------
+
+/// Bound on a raw teardown (drain wait included).
+const RAW_TEARDOWN_BOUND_MS: u64 = 5000;
+
+/// One injected raw launch as F-2c sees it.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct InjectRun {
+    pub inject: String,
+    pub spawn_error: Option<String>,
+    pub branch: Option<String>,
+    pub survivors: Vec<Value>,
+    pub unknown_liveness: usize,
+    pub teardown: Option<Value>,
+    pub handles_before: Option<u32>,
+    pub handles_after: Option<u32>,
+}
+
+/// F-2c: `force-suspended` must launch on the suspended branch with zero
+/// escapees; every other injection must fail the launch and leave no
+/// process alive, a teardown within its bound with the output drained or
+/// the host read end closed, and the harness handle count back to its
+/// pre-launch value.
+pub fn raw_inject_outcome(r: &InjectRun) -> Outcome {
+    let (Some(before), Some(after)) = (r.handles_before, r.handles_after) else {
+        return Outcome::harness("handle count unavailable");
+    };
+    if r.inject == "force-suspended" {
+        if let Some(e) = &r.spawn_error {
+            return Outcome::platform(format!("suspended branch failed: {e}"));
+        }
+        if r.branch.as_deref() != Some("suspended") {
+            return Outcome::harness(format!("injection not effective: branch {:?}", r.branch));
+        }
+    } else if r.spawn_error.is_none() {
+        return Outcome::harness("the injection did not fail the launch");
+    }
+    if r.unknown_liveness > 0 {
+        return Outcome::harness("liveness lookup failed");
+    }
+    if !r.survivors.is_empty() {
+        return Outcome::platform("processes survived the teardown");
+    }
+    let Some(t) = &r.teardown else {
+        return Outcome::harness("no teardown record");
+    };
+    if t["teardown_ms"]
+        .as_u64()
+        .is_none_or(|ms| ms > RAW_TEARDOWN_BOUND_MS)
+    {
+        return Outcome::platform(format!("teardown past its bound: {}", t["teardown_ms"]));
+    }
+    if t["drain_reached_eof"] != json!(true) && t["host_read_end_closed"] != json!(true) {
+        return Outcome::platform("output neither drained to EOF nor its read end closed");
+    }
+    if after > before {
+        return Outcome::platform(format!("handle count {after} > {before} before launch"));
+    }
+    Outcome::Pass
+}
+
+/// Samples pid -> (ppid, start) until stopped, so short-lived descendants
+/// of a failed launch are still attributed.
+fn sample_procs(
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<std::collections::HashMap<u32, (u32, u64)>> {
+    std::thread::spawn(move || {
+        let mut m = std::collections::HashMap::new();
+        loop {
+            for p in os::list_processes().unwrap_or_default() {
+                m.entry(p.pid).or_insert((p.ppid, p.start_time));
+            }
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return m;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    })
+}
+
+/// Identities in `map` descending from one of `roots` (pid and start time).
+fn descendants(
+    map: &std::collections::HashMap<u32, (u32, u64)>,
+    roots: &[(u32, u64)],
+) -> Vec<(u32, u64)> {
+    let mut out: Vec<(u32, u64)> = roots.to_vec();
+    loop {
+        let before = out.len();
+        for (&pid, &(ppid, st)) in map {
+            let parent = out.iter().find(|(p, _)| *p == ppid).copied();
+            if parent.is_some_and(|(_, ps)| ps <= st) && !out.iter().any(|(p, _)| *p == pid) {
+                out.push((pid, st));
+            }
+        }
+        if out.len() == before {
+            return out;
+        }
+    }
+}
+
+/// `fake raw-inject --raw-inject <x>` (F-2c, Windows, raw backend only):
+/// one FakeCli `spawn-tree` launch with the injected failure.
+fn raw_inject(ctx: &Ctx) {
+    let inject = ctx.args.raw_inject.clone().unwrap_or_default();
+    ctx.require("F-2c", &inject);
+    if os::os_name() != "windows" || ctx.args.pty_backend != "raw" {
+        ctx.error("raw-inject needs Windows and --pty-backend raw");
+        return;
+    }
+    let mut r = InjectRun {
+        inject: inject.clone(),
+        handles_before: os::process_handle_count(),
+        ..Default::default()
+    };
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = sample_procs(stop.clone());
+    let opts = crate::session::SpawnOpts {
+        argv: vec![
+            fake_bin().into(),
+            "--mode".into(),
+            "spawn-tree".into(),
+            "--max-life-secs".into(),
+            SLEEPER_MAX_LIFE.into(),
+        ],
+        cwd: ctx.run_dir.clone(),
+        env: Vec::new(),
+        cols: ctx.args.cols,
+        rows: ctx.args.rows,
+        responder: true,
+        out_file: ctx.out.join("pty-output-raw-inject.bin"),
+        hold_assign: false,
+        inject: None,
+        backend: ctx.backend(),
+    };
+    let mut stop_report = None;
+    match crate::session::Session::spawn(opts) {
+        Ok(mut s) => {
+            r.branch = s.launch["branch"].as_str().map(String::from);
+            // Let the tree spawn before the stop.
+            std::thread::sleep(Duration::from_secs(2));
+            stop_report = Some(s.stop());
+        }
+        Err(e) => r.spawn_error = Some(e),
+    }
+    r.teardown = os::raw_last_teardown();
+    let mut roots = crate::session::spawned_children();
+    if let Some(t) = &r.teardown
+        && let (Some(p), Some(st)) = (t["child_pid"].as_u64(), t["child_start"].as_u64())
+    {
+        roots.push((p as u32, st));
+    }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let map = sampler.join().unwrap_or_default();
+    let tree = descendants(&map, &roots);
+    let end = Instant::now() + Duration::from_secs(3);
+    let alive = loop {
+        let l: Vec<((u32, u64), Option<bool>)> = tree
+            .iter()
+            .map(|&(p, st)| ((p, st), os::liveness(p, st)))
+            .filter(|(_, l)| *l != Some(false))
+            .collect();
+        if l.is_empty() || Instant::now() >= end {
+            break l;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    r.unknown_liveness = alive.iter().filter(|(_, l)| l.is_none()).count();
+    r.survivors = alive
+        .iter()
+        .filter(|(_, l)| *l == Some(true))
+        .map(|((p, st), _)| json!({"pid": p, "start_time": st}))
+        .collect();
+    // Handle count settles once released threads have exited.
+    let end = Instant::now() + Duration::from_secs(2);
+    loop {
+        r.handles_after = os::process_handle_count();
+        if r.handles_after <= r.handles_before || Instant::now() >= end {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if let Some(st) = &stop_report {
+        r.survivors.extend(st.survivors.iter().map(|p| json!(p)));
+    }
+    let o = raw_inject_outcome(&r);
+    ctx.check(
+        "F-2c",
+        &inject,
+        o,
+        json!({"run": r, "tree": tree.iter().map(|(p, s)| json!({"pid": p, "start_time": s})).collect::<Vec<_>>(),
+               "stop": stop_report.as_ref().map(stop_evidence)}),
+    );
+}
+
 // ---------------- all ----------------
 
 fn run_all(mut args: Args) -> i32 {
@@ -1776,11 +2324,14 @@ fn run_all(mut args: Args) -> i32 {
         child_status
             .push(json!({"scenario": s, "status": status, "report": out.join("report.json")}));
     }
-    let all_pass = child_status.iter().all(|c| c["status"] == "pass");
+    let statuses: Vec<&str> = child_status
+        .iter()
+        .map(|c| c["status"].as_str().unwrap_or("not_run"))
+        .collect();
     ctx.check(
         "B-2",
         "all_fake_scenarios_pass",
-        checked(all_pass),
+        b2_outcome(&statuses),
         json!({"children": child_status}),
     );
     ctx.finish()
@@ -1813,6 +2364,309 @@ mod tests {
             killed_outcome(true, Some(false), Some(false)),
             Outcome::NotExercised { .. }
         ));
+    }
+
+    fn results(ok: &[(&str, bool)]) -> Value {
+        let r: Vec<Value> = ok
+            .iter()
+            .map(|(k, o)| json!({"kind": k, "ok": o}))
+            .collect();
+        json!({"all_ok": ok.iter().all(|x| x.1), "results": r})
+    }
+
+    /// §3 Windows shape (`1b584fe6`): conhost answers DSR/DA itself, OSC
+    /// 10/11 never reach the harness, kitty is harness-answered.
+    fn windows_b5(responder: bool) -> B5Run {
+        let kitty = responder;
+        B5Run {
+            exit: Some(1),
+            fake: Some(results(&[
+                ("dsr6", true),
+                ("dsr5", true),
+                ("da1", true),
+                ("da2", true),
+                ("osc10", false),
+                ("osc11", false),
+                ("kitty_keyboard", kitty),
+            ])),
+            log: if responder {
+                vec![json!({"kind": "kitty_keyboard", "harness_wrote": true, "reply": "\x1b[?0u"})]
+            } else {
+                Vec::new()
+            },
+            output: Some(b"\x1b[?2004h\x1b[?u".to_vec()),
+        }
+    }
+
+    /// F-3e: B-5 expectations from the recorded Windows shapes, and macOS
+    /// keeps today's checks.
+    #[test]
+    fn b5_expect_windows_facts() {
+        let (o, ev) = b5_expect("windows", true, &windows_b5(true));
+        assert_eq!(o, Outcome::Pass, "{ev}");
+        assert_eq!(
+            ev["platform_fact"],
+            json!({"answered_by_conhost": ["dsr6", "dsr5", "da1", "da2"],
+                   "not_forwarded": ["osc10", "osc11"]})
+        );
+        assert_eq!(
+            b5_expect("windows", false, &windows_b5(false)).0,
+            Outcome::Pass
+        );
+        // Negative control: a kitty reply without the responder fails.
+        let mut neg = windows_b5(false);
+        neg.fake = windows_b5(true).fake;
+        assert!(matches!(
+            b5_expect("windows", false, &neg).0,
+            Outcome::PlatformFail { .. }
+        ));
+        // Missing facts are harness failures.
+        for f in [
+            |r: &mut B5Run| r.output = None,
+            |r: &mut B5Run| r.fake = None,
+            |r: &mut B5Run| r.fake = Some(results(&[("dsr6", true)])),
+        ] {
+            let mut r = windows_b5(true);
+            f(&mut r);
+            assert!(matches!(
+                b5_expect("windows", true, &r).0,
+                Outcome::HarnessFail { .. }
+            ));
+        }
+        // An OSC query that reached the PTY output is not `not_forwarded`.
+        let mut r = windows_b5(true);
+        r.output = Some(b"\x1b]10;?\x1b\\".to_vec());
+        assert!(matches!(
+            b5_expect("windows", true, &r).0,
+            PlatformFail { .. }
+        ));
+        // Kitty must be harness-answered.
+        let mut r = windows_b5(true);
+        r.log.clear();
+        assert!(matches!(
+            b5_expect("windows", true, &r).0,
+            PlatformFail { .. }
+        ));
+        // The same Windows shape on macOS fails today's check.
+        assert!(matches!(
+            b5_expect("macos", true, &windows_b5(true)).0,
+            PlatformFail { .. }
+        ));
+        let mac = B5Run {
+            exit: Some(0),
+            fake: Some(json!({"all_ok": true})),
+            log: Vec::new(),
+            output: None,
+        };
+        assert_eq!(b5_expect("macos", true, &mac).0, Outcome::Pass);
+        assert!(matches!(
+            b5_expect("macos", false, &mac).0,
+            PlatformFail { .. }
+        ));
+    }
+
+    use Outcome::PlatformFail;
+
+    fn b10(state: &str, filler: Option<Filler>) -> B10Run {
+        B10Run {
+            gate: true,
+            paste_state: state.into(),
+            filler,
+            survivors_empty: true,
+            prompt: None,
+            expected: b"abc\rdef".to_vec(),
+            reply_after_paste: None,
+            harness_dsr_written: false,
+        }
+    }
+
+    /// F-3e: B-10 `non-reading-child` and `query-mid-paste` per OS.
+    #[test]
+    fn b10_expect_windows_facts() {
+        let f = |accepted, blocked| {
+            Some(Filler {
+                accepted,
+                blocked,
+                error: None,
+            })
+        };
+        let nr = "non-reading-child";
+        assert_eq!(
+            b10_expect("windows", nr, &b10("sent", f(1 << 20, true))).0,
+            Outcome::Pass
+        );
+        assert!(matches!(
+            b10_expect("windows", nr, &b10("sent", f(FILLER_MAX, false))).0,
+            Outcome::NotExercised { .. }
+        ));
+        assert!(matches!(
+            b10_expect("windows", nr, &b10("sent", None)).0,
+            Outcome::HarnessFail { .. }
+        ));
+        assert_eq!(
+            b10_expect("macos", nr, &b10("write_timeout", None)).0,
+            Outcome::Pass
+        );
+        assert!(matches!(
+            b10_expect("macos", nr, &b10("sent", None)).0,
+            PlatformFail { .. }
+        ));
+        let mut s = b10("write_timeout", None);
+        s.survivors_empty = false;
+        assert!(matches!(
+            b10_expect("windows", nr, &s).0,
+            PlatformFail { .. }
+        ));
+        // query-mid-paste: exactly one CPR inside the body.
+        let q = "query-mid-paste";
+        let mut r = b10("sent", None);
+        r.prompt = Some(b"ab\x1b[1;1Rc\rdef".to_vec());
+        let (o, ev) = b10_expect("windows", q, &r);
+        assert_eq!(o, Outcome::Pass);
+        assert_eq!(ev["platform_fact"]["offset_bytes"], json!(2));
+        assert!(matches!(b10_expect("macos", q, &r).0, PlatformFail { .. }));
+        for bad in [
+            b"abc\rdef".to_vec(),
+            b"ab\x1b[1;1Rc\rd\x1b[2;2Ref".to_vec(),
+            b"ab\x1b[1;1Rxc\rdef".to_vec(),
+        ] {
+            r.prompt = Some(bad);
+            assert!(matches!(
+                b10_expect("windows", q, &r).0,
+                PlatformFail { .. }
+            ));
+        }
+        r.prompt = Some(b"ab\x1b[1;1Rc\rdef".to_vec());
+        r.harness_dsr_written = true;
+        assert!(matches!(
+            b10_expect("windows", q, &r).0,
+            PlatformFail { .. }
+        ));
+        // Today's shape still passes everywhere.
+        let mut t = b10("sent", None);
+        t.prompt = Some(t.expected.clone());
+        t.reply_after_paste = Some(true);
+        assert_eq!(b10_expect("windows", q, &t).0, Outcome::Pass);
+        assert_eq!(b10_expect("macos", q, &t).0, Outcome::Pass);
+    }
+
+    /// F-3e: the `fake teardown` parent passes a child's typed
+    /// `not_exercised` on unchanged, and still rejects a wrong run id, an
+    /// elapsed time past the deadline, or a survivor.
+    #[test]
+    fn teardown_parent_keeps_the_childs_outcome() {
+        let mut rep = Report::new("fake teardown-case non-reading-child", "run-1");
+        rep.status = "inconclusive".into();
+        rep.checks.push(crate::report::Check {
+            id: "B-10".into(),
+            case: "non-reading-child".into(),
+            result: "not_exercised".into(),
+            cause: Some("conhost accepted all 16 MiB".into()),
+            evidence: Value::Null,
+        });
+        let nr = "non-reading-child";
+        assert!(matches!(
+            teardown_outcome(nr, "pass", &rep, true, true, 2),
+            Outcome::NotExercised { .. }
+        ));
+        assert!(matches!(
+            teardown_outcome(nr, "pass", &rep, false, true, 2),
+            PlatformFail { .. }
+        ));
+        assert!(matches!(
+            teardown_outcome(nr, "pass", &rep, true, false, 2),
+            PlatformFail { .. }
+        ));
+        // Untyped cases still compare the status.
+        assert!(matches!(
+            teardown_outcome("pass", "pass", &rep, true, true, 2),
+            PlatformFail { .. }
+        ));
+        // A report with another run id is never read as the child's.
+        let dir = std::env::temp_dir().join(format!("chs-test-{}", util::run_id()));
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("report.json");
+        std::fs::write(&file, serde_json::to_vec(&rep).unwrap()).unwrap();
+        let (wrong, right) = (child_report(&dir, "run-2"), child_report(&dir, "run-1"));
+        std::fs::remove_file(&file).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(wrong.is_err());
+        assert!(right.is_ok());
+        // And `fake all` carries an inconclusive child as not exercised.
+        assert!(matches!(
+            b2_outcome(&["pass", "inconclusive"]),
+            Outcome::NotExercised { .. }
+        ));
+        assert_eq!(b2_outcome(&["pass", "pass"]), Outcome::Pass);
+        assert!(matches!(
+            b2_outcome(&["fail", "inconclusive"]),
+            PlatformFail { .. }
+        ));
+        assert!(matches!(
+            b2_outcome(&["pass", "not_run"]),
+            Outcome::HarnessFail { .. }
+        ));
+    }
+
+    /// F-2c outcome rules.
+    #[test]
+    fn raw_inject_rules() {
+        let td = json!({"teardown_ms": 120, "drain_reached_eof": true});
+        let base = |inject: &str| InjectRun {
+            inject: inject.into(),
+            spawn_error: Some("injected".into()),
+            teardown: Some(td.clone()),
+            handles_before: Some(100),
+            handles_after: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(raw_inject_outcome(&base("after-spawn")), Outcome::Pass);
+        let mut r = base("after-spawn");
+        r.spawn_error = None;
+        assert!(matches!(
+            raw_inject_outcome(&r),
+            Outcome::HarnessFail { .. }
+        ));
+        let mut r = base("reader-start");
+        r.survivors = vec![json!({"pid": 1})];
+        assert!(matches!(raw_inject_outcome(&r), PlatformFail { .. }));
+        let mut r = base("before-spawn");
+        r.handles_after = Some(101);
+        assert!(matches!(raw_inject_outcome(&r), PlatformFail { .. }));
+        let mut r = base("resume-fail");
+        r.teardown = Some(json!({"teardown_ms": 9000, "drain_reached_eof": true}));
+        assert!(matches!(raw_inject_outcome(&r), PlatformFail { .. }));
+        let mut r = base("resume-fail");
+        r.teardown = Some(json!({"teardown_ms": 10, "drain_reached_eof": false}));
+        assert!(matches!(raw_inject_outcome(&r), PlatformFail { .. }));
+        r.teardown = Some(json!({"teardown_ms": 10, "drain_reached_eof": false,
+                                 "host_read_end_closed": true}));
+        assert_eq!(raw_inject_outcome(&r), Outcome::Pass);
+        let mut r = base("before-spawn");
+        r.handles_after = None;
+        assert!(matches!(
+            raw_inject_outcome(&r),
+            Outcome::HarnessFail { .. }
+        ));
+        let mut r = base("force-suspended");
+        r.spawn_error = None;
+        r.branch = Some("suspended".into());
+        assert_eq!(raw_inject_outcome(&r), Outcome::Pass);
+        r.branch = Some("job_list".into());
+        assert!(matches!(
+            raw_inject_outcome(&r),
+            Outcome::HarnessFail { .. }
+        ));
+    }
+
+    #[test]
+    fn descendants_follow_pid_and_start_time() {
+        let m: std::collections::HashMap<u32, (u32, u64)> =
+            [(2, (1, 10)), (3, (2, 11)), (4, (2, 5)), (5, (9, 12))].into();
+        let mut d = descendants(&m, &[(1, 9)]);
+        d.sort();
+        // 4 started before its claimed parent: a reused pid, not ours.
+        assert_eq!(d, vec![(1, 9), (2, 10), (3, 11)]);
     }
 
     /// The B-3 oracle against hand-written wire bytes (not the writer's mapper).

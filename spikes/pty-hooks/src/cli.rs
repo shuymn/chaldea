@@ -105,6 +105,7 @@ usage:
   chs install-emitter [--root R]
   chs fake <paste|queries|stall|tree-kill|auth|emit|teardown|all> [--hold-assign-until-child]
   chs fake tree-kill --escape-probe          (macOS containment limit; not part of `all`)
+  chs fake raw-inject --pty-backend raw --raw-inject X   (Windows F-2c; not part of `all`)
   chs real <claude-hooks|claude-paste|claude-stall|codex-hooks|codex-paste|codex-stall|codex-warm|tree-kill>
            --allow-api-usage [--agent claude|codex]
   chs print-launch <claude|codex>
