@@ -15,7 +15,7 @@ Surveyed 2026-11-21 by reading source (shallow clones, default branch at that da
 | WezTerm `pty` crate (`wezterm/wezterm`) | `630ba68`, 2026-11-20 (unreleased successor of portable-pty 0.9.0) |
 | tmux, xterm.js, claude-squad (`smtg-ai/claude-squad`) | default branches 2026-11-21 |
 | Codex CLI (`openai/codex`) | `0a0b102`, 2026-11-20 (sparse: `codex-rs/hooks`); tag `rust-v0.169.0` (`d32063f`, sparse: `codex-rs/tui`) for the Windows input path, with its crossterm fork `openai-oss-forks/crossterm` rev `ed1cdab` (`src/event/sys/windows/parse.rs`) |
-| Spike Windows run | one native Windows host (phase 3c recorded build 10.0.26200), inbox ConPTY, console CP 932, Claude Code 2.1.326, Codex 0.169.0; report ids cited per row are in `docs/spikes/pty-hooks-spike.md` §3 |
+| Spike Windows run | one native Windows host (phase 3c recorded build 10.0.26200), inbox ConPTY, console CP 932, Claude Code 2.1.326, Codex 0.169.0 / 0.171.0; report ids cited per row are in `docs/spikes/pty-hooks-spike.md` §3 |
 | crates | `portable-pty 0.8.1`, `process-wrap 10.0.1`, `command-group 5.0.1`, `win32job 2.1.0`, `conpty 0.7.0`, `winpty-rs 1.0.8`, `vt100 0.18.1`, `alacritty_terminal 0.26.0`, `tiny_http 0.12.0`, `minreq 3.0.0`, `sha2 0.11.1` |
 
 ## Mechanism Comparison
@@ -69,7 +69,7 @@ One observation, not reopened: herdr runs portable-pty 0.9.0 with `INHERIT_CURSO
 - Whether conhost turns `ESC[13;2u` written by the host into seven key events, or parses and drops it as a CSI sequence: in the submitted prompts every such newline was missing with no escape residue (spike F-1, `d97ee701` csi-u `checks[].evidence.prompts`), but the key records were not traced.
 - Which process owned the windows the first C-5 calibration produced (`59bc61b8`, not attributed); the calibrated rerun used a different helper.
 - Which BMP characters inbox conhost delivers only on an Alt-key release when written as UTF-8: observed for U+200D, U+FE0F, U+2764, U+3099, U+309A (CP 932 host, phase 3c); that they are the ones outside the console code page is inferred, not traced in conhost.
-- Why B-8's `Content-Length: +5` case got 400 after 5 s instead of 411 on Windows, and whether the status-0 rejections come from a reset on close with unread data (inferred, not traced in Winsock).
+- Why the two remaining Windows B-8 cases failed after the F-3c receiver change (`d97ee701`, 20 of 22 passed): `deadline_slow_head` (receiver decided and wrote 408 after 5002 ms, drain stopped by `peer_closed` with 0 bytes drained; client read status 0 after 8006 ms) and `non_numeric_content_length` (`Content-Length: +5`, body withheld until response: receiver decided and wrote 408 at the 5 s deadline instead of rejecting with 411, while the client read 400 after 5010 ms).
 - VS Code-specific process-tree handling beyond node-pty.
 - Zellij and WezTerm mux-server attach on Windows; the `termwiz`/`wezterm-term` query responder.
 - Whether ureq reads proxy environment variables by default.
