@@ -45,7 +45,7 @@
 
 ## 5. External Quirks (Observed Facts)
 
-Observed on macOS with Claude Code 2.1.322 and Codex CLI 0.170.0, and on native Windows (inbox ConPTY, console code page 932) with Claude Code 2.1.326 and Codex CLI 0.169.0 where marked (spike evidence: `docs/spikes/pty-hooks-spike.md` §3).
+Observed on macOS with Claude Code 2.1.322 and Codex CLI 0.170.0, and on one native Windows host (inbox ConPTY, console code page 932; phase 3c recorded build 10.0.26200) with Claude Code 2.1.326 and Codex CLI 0.169.0 / 0.171.0 where marked (spike evidence: `docs/spikes/pty-hooks-spike.md` §3).
 
 - **Claude Code**:
   - New folder trust prompt defaults to `No, exit` — never blindly send `Enter`.
@@ -69,6 +69,13 @@ Observed on macOS with Claude Code 2.1.322 and Codex CLI 0.170.0, and on native 
   - Leading and trailing whitespace of the prompt itself is trimmed by Codex, and with paste-burst detection off a TAB submitted early (two submits for one prompt, phase 3c), so both are rejected unless explicitly allowed. Composer triggers apply to typed input: a leading `/`, `!`, or `?` and an `@` token at the cursor change how the input is handled, and Tab queues the message. Without `--no-daemon`, Codex on Windows ran `node.exe` / `node_repl.exe` inside the launched tree, and no separate warm server was found.
   - Outside-job PowerShell (phase 3c, `p3c-tree-kill-codex` `outside_job_identity`): a packaged PowerShell (`Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe`, image under `WindowsApps`) whose reported parent was `codex.exe`, started about 2.4 s after launch, was in another job and outside Chaldea's; no captured hook ancestry matched it, and it and its `conhost.exe` were dead before any pid fallback. How it came to be outside the job (e.g. packaged-app activation) is unverified.
 - **Windows MSVC**: `link.exe` fails (`LNK1104`) on paths exceeding 260 characters; worktree base path must be configurable per workspace.
+- **Open items for the MVP**:
+  - **Codex on Windows keyed input**: end-to-end verification of the planned encoding (see **Codex CLI on Windows** above).
+  - **Human pastes through `chaldea attach` to Codex on Windows**: with `tui.disable_paste_burst=true`, human pastes through the outer terminal also arrive as key records without burst capture, so plain Enter or Tab can submit or queue early; the attach path is planned to apply the same keyed-input encoding (including Shift+Enter records for newlines), which was not tested in the spike and needs end-to-end verification.
+  - **Codex hook trust renewal after upgrades**: hook trust hashes can flip to `Modified` after a Codex upgrade (`openai/codex#58011`), so the adapter should record the CLI version alongside hook trust state and treat a post-upgrade `Hooks need review` prompt as an expected startup stall.
+  - **Windows hook receiver**: in spike B-8 on Windows, the client read no response (status 0) for most rejections (inferred cause: Winsock resetting the connection on close with unread received data, not traced in Winsock) and `Content-Length: +5` returned 400 after 5 s instead of 411 (cause not established). Planned work (spike F-3c): write the rejection response within its write budget, half-close, drain unread bytes (bounded) before closing, and verify decided, written, and client-observed status codes match.
+  - **Daemon parent job check**: verify at startup that the daemon is not inside a `KILL_ON_JOB_CLOSE` job inherited from the launching terminal, which would take down the daemon and its sessions when that terminal closes (prior-art 8).
+  - **Windows build coverage**: all Windows runs were on one host (phase 3c recorded build `10.0.26200`; earlier runs did not record a build); verify ConPTY and hook behavior on additional Windows builds.
 
 ## 6. Verification Strategy
 
