@@ -3350,7 +3350,9 @@ trusted_hash = "sha256:bb"
             records: paste::UnicodeRecords::None,
             allow: Vec::new(),
             enter_delay: Duration::from_secs(30),
-            write_deadline: Instant::now() + Duration::from_millis(200),
+            // Long enough for the text write on a loaded runner; the CR is
+            // still due 28 s after the deadline.
+            write_deadline: Instant::now() + Duration::from_secs(2),
         };
         let t = Instant::now();
         let o = paste::type_keys(&tx, b"x", &opts, || true);
