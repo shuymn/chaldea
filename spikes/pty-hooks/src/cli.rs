@@ -121,6 +121,7 @@ codex:  --hook-source session-flags  --launches N
 input:  --input-encoding <auto|bracketed|win-keys>  --newline-key <csi-u|w32>  --allow-lossy <trim|tab>
 pty:    --pty-backend <portable|raw>  --conpty-flags <0|6>  --raw-inject <before-spawn|after-spawn|reader-start|force-suspended|resume-fail>
 f-run:  chs win-probe <codex-input|backend|followup>  (backend: --f1-winner <csi-u|w32|none>)
+        chs win-probe rerun   (phase 3b: F-1 w32, tree kills + codex_input per config, F-2c)
         chs win-probe console --detached --configs P,R0,R6 --join-run-id ID
         chs win-probe f2-verdict --from DIR --from DIR";
 

@@ -48,6 +48,7 @@ const F_PROBES: &[(&str, Budget)] = &[
     ("codex-input", codex_input_budget),
     ("backend", backend_budget),
     ("followup", followup_budget),
+    ("rerun", rerun_budget),
     ("f2-verdict", |_| {
         // Step 5 waits for the detached step 4 run to end.
         console_budget(&F2_CONFIGS.map(String::from)) + 2 * CHILD_MARGIN + 120
@@ -132,8 +133,9 @@ pub fn run(mut args: Args) -> i32 {
         "kill" => probe_kill(&ctx),
         "attach" => probe_attach(&ctx),
         "console" => probe_console(&ctx),
-        "codex-input" => probe_codex_input(&ctx),
-        "backend" => probe_backend(&ctx),
+        "codex-input" => probe_codex_input(&ctx, &NewlineKey::ALL),
+        "backend" => probe_backend(&ctx, ctx.args.f1_winner, None),
+        "rerun" => rerun(&ctx),
         "followup" => followup(&ctx),
         "f2-verdict" => f2_verdict(&ctx),
         _ => unreachable!(),
@@ -1475,15 +1477,16 @@ fn f1_entries() -> Vec<String> {
         .collect()
 }
 
-/// F-1 (`codex-input`): the corpus F sweep once per newline key, each case
-/// in its own fresh Codex session; recorded fixtures once with the winner
-/// (or `csi-u`), outside the verdict.
-fn probe_codex_input(ctx: &Ctx) {
+/// F-1 (`codex-input`): the corpus F sweep once per newline key in `keys`,
+/// each case in its own fresh Codex session; recorded fixtures once with
+/// the winner (or the first key), outside the verdict. A key not run
+/// counts as incomplete for the selection.
+fn probe_codex_input(ctx: &Ctx, keys: &[NewlineKey]) {
     let entries = f1_entries();
     let mut checks = Vec::new();
     let mut variants = serde_json::Map::new();
-    let mut sels = Vec::new();
-    for nk in NewlineKey::ALL {
+    let mut sels = [Sel::Incomplete; 2];
+    for &nk in keys {
         let (r, out) = child(
             ctx,
             &format!("codex-input-{}", nk.name()),
@@ -1506,7 +1509,7 @@ fn probe_codex_input(ctx: &Ctx) {
         }
         let e = verdict::evaluate(&pc.required, &pc.checks);
         let sel = sel_of(&e);
-        sels.push(sel);
+        sels[NewlineKey::ALL.iter().position(|k| *k == nk).unwrap_or(0)] = sel;
         variants.insert(
             nk.name().into(),
             json!({"sel": format!("{sel:?}"), "eval": e.json(), "status": status_of(&r),
@@ -1515,7 +1518,7 @@ fn probe_codex_input(ctx: &Ctx) {
         checks.extend(pc.checks);
     }
     let (v, winner) = f1_select(sels[0], sels[1]);
-    let rec_key = winner.unwrap_or(NewlineKey::CsiU);
+    let rec_key = winner.unwrap_or(keys[0]);
     let (r, out) = child(
         ctx,
         "codex-input-recorded",
@@ -1776,16 +1779,20 @@ const F2C_INJECTS: [&str; 5] = [
     "resume-fail",
 ];
 
-/// F-2 step 3 (`backend`): the comparison rows under every configuration
-/// as cases `<row>/<config>`; F-2c injections under `R0` as their own probe.
-fn probe_backend(ctx: &Ctx) {
+/// F-2 step 3 (`backend`): the comparison rows (all, or those named in
+/// `only`) under every configuration as cases `<row>/<config>`, the Codex
+/// input row with `f1_winner`; F-2c injections under `R0` as their own probe.
+fn probe_backend(ctx: &Ctx, f1_winner: Option<NewlineKey>, only: Option<&[&str]>) {
     let configs: Vec<String> = if ctx.args.configs.is_empty() {
         F2_CONFIGS.iter().map(|c| c.to_string()).collect()
     } else {
         ctx.args.configs.clone()
     };
-    let winner = ctx.args.f1_winner.map(|k| k.name());
-    let rows = backend_rows(ctx.args.f1_winner, ctx.args.session_start_timeout);
+    let winner = f1_winner.map(|k| k.name());
+    let mut rows = backend_rows(f1_winner, ctx.args.session_start_timeout);
+    if let Some(only) = only {
+        rows.retain(|r| only.contains(&r.name));
+    }
     let mut pc = Pc::new("F-2a");
     for cfg in &configs {
         for row in &rows {
@@ -1931,6 +1938,40 @@ fn followup(ctx: &Ctx) {
         }
         None => println!("step 3: the backend child wrote no report; no step 4 command"),
     }
+}
+
+/// Rows of the narrow rerun (§5 phase 3b).
+const RERUN_ROWS: [&str; 3] = ["tree_kill_claude", "tree_kill_codex", "codex_input"];
+
+/// Narrow rerun budget: F-1 `w32` (corpus and recorded), the rerun rows
+/// under every configuration, and the F-2c injections.
+fn rerun_budget(sst: u64) -> u64 {
+    f1_child(sst)
+        + f1_recorded_child(sst)
+        + 3 * (600 + 600 + f1_child(sst) + 3 * CHILD_MARGIN)
+        + 5 * (300 + CHILD_MARGIN)
+        + 2 * CHILD_MARGIN
+        + 60
+}
+
+/// `rerun` (§5 phase 3b): F-1 with the `w32` newline key only, F-2a's
+/// `tree_kill_claude`, `tree_kill_codex`, and `codex_input` (`w32`) under
+/// `P`, `R0`, `R6`, and F-2c. No detached console step and no F-2 verdict:
+/// the orchestrator reads the raw reports. Ends with the bundle command.
+fn rerun(ctx: &Ctx) {
+    println!("rerun: about 40 minutes; leave the PC idle until it prints the bundle command");
+    probe_codex_input(ctx, &[NewlineKey::W32]);
+    probe_backend(ctx, Some(NewlineKey::W32), Some(&RERUN_ROWS));
+    let exe = std::env::current_exe().unwrap_or_default();
+    println!(
+        "rerun done in {} min (estimated about 40 min). Report dir:\n  {}",
+        ctx.t0.elapsed().as_secs() / 60,
+        ctx.out.display()
+    );
+    println!(
+        "next: {}  (writes C:\\chs\\chs-out-windows.zip; review it, then send it back)",
+        ps_invocation(&exe, &["bundle".to_string()])
+    );
 }
 
 /// The step 4 command `followup` prints: `console --detached` over every
@@ -3557,6 +3598,23 @@ mod tests {
         let worst = super::super::real::keys_case_worst_secs(20);
         assert!(f1_recorded_child(20) >= recorded * worst + CHILD_MARGIN);
         assert!(f1_child(20) >= n * worst + CHILD_MARGIN);
+    }
+
+    /// The narrow rerun names existing rows, all runnable with `w32`, and
+    /// its budget covers each of its children.
+    #[test]
+    fn rerun_rows_exist() {
+        let rows = backend_rows(Some(NewlineKey::W32), 20);
+        for name in RERUN_ROWS {
+            let r = rows.iter().find(|r| r.name == name);
+            assert!(r.is_some_and(|r| r.argv.is_some()), "{name}");
+        }
+        let children: u64 = rows
+            .iter()
+            .filter(|r| RERUN_ROWS.contains(&r.name))
+            .map(|r| r.budget + CHILD_MARGIN)
+            .sum();
+        assert!(rerun_budget(20) >= f1_child(20) + f1_recorded_child(20) + 3 * children + 5 * 300);
     }
 
     /// F-1b selection.
