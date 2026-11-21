@@ -1216,7 +1216,10 @@ impl Drop for Setup {
         self.input.take();
         self.in_r.take();
         self.out_w.take();
-        let drained = self.drain.take().map(|d| d.wait(Duration::from_secs(2)));
+        let drain_end = self.drain.take().and_then(|d| {
+            d.wait(Duration::from_secs(2));
+            d.end()
+        });
         self.job.take();
         record_teardown(serde_json::json!({
             "path": "setup_error", "failed_at": self.step, "child_pid": (self.pid != 0).then_some(self.pid),
@@ -1224,7 +1227,7 @@ impl Drop for Setup {
             "process_exit": process_exit, "output_pending_bytes": self.output_pending,
             "child_running_at_injection": self.running_at_injection,
             "close_pseudoconsole_ms": close, "close_hung": had_pcon && close.is_none(),
-            "drain_reached_eof": drained,
+            "drain_reached_eof": drain_end.as_deref() == Some("eof"), "drain_end": drain_end,
             "host_read_end_closed": read_end_closed, "teardown_ms": t.elapsed().as_millis() as u64,
         }));
     }
@@ -1293,16 +1296,17 @@ impl Drop for RawMaster {
         let had_pcon = pcon.is_some();
         let close = pcon.and_then(|p| close_bounded(move || drop(p), CLOSE_BOUND));
         self.input.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let drained = self
+        let drain_end = self
             .drain
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
-            .map(|d| d.finish(Duration::from_secs(2)));
+            .and_then(|d| d.finish(Duration::from_secs(2)));
         record_teardown(serde_json::json!({
             "path": "master_drop", "close_pseudoconsole_ms": close,
             "close_hung": had_pcon && close.is_none(),
-            "drain_reached_eof": drained, "teardown_ms": t.elapsed().as_millis() as u64,
+            "drain_reached_eof": drain_end.as_deref() == Some("eof"), "drain_end": drain_end,
+            "teardown_ms": t.elapsed().as_millis() as u64,
         }));
     }
 }

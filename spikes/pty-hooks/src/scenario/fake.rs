@@ -2178,7 +2178,10 @@ pub fn raw_inject_outcome(r: &InjectRun) -> Outcome {
                 t["path"], t["failed_at"]
             ));
         }
-        if matches!(r.inject.as_str(), "after-spawn" | "resume-fail") {
+        if matches!(
+            r.inject.as_str(),
+            "after-spawn" | "resume-fail" | "reader-start"
+        ) {
             if t["child_pid"].as_u64().is_none() || t["child_start"].as_u64().is_none() {
                 return Outcome::harness("the child's identity was not recorded at acquisition");
             }
@@ -2212,6 +2215,12 @@ pub fn raw_inject_outcome(r: &InjectRun) -> Outcome {
     {
         return Outcome::platform(format!("teardown past its bound: {}", t["teardown_ms"]));
     }
+    if t["close_hung"] == json!(true) {
+        return Outcome::platform("ClosePseudoConsole did not return within its bound");
+    }
+    if let Some(e) = t["drain_end"].as_str().filter(|e| *e != "eof") {
+        return Outcome::harness(format!("the output drain ended on a read {e}"));
+    }
     if t["drain_reached_eof"] != json!(true) && t["host_read_end_closed"] != json!(true) {
         return Outcome::platform("output neither drained to EOF nor its read end closed");
     }
@@ -2219,6 +2228,27 @@ pub fn raw_inject_outcome(r: &InjectRun) -> Outcome {
         return Outcome::platform(format!("handle count {after} > {before} before launch"));
     }
     Outcome::Pass
+}
+
+/// `reader-start`: the session's one spawned child as the teardown's child
+/// identity, and its exit as `process_exit` (`exited` once positively gone
+/// within 3 s, `timeout` while alive, `unknown` when the lookup fails).
+fn reader_start_child(t: &mut Value, spawned: &[(u32, u64)]) {
+    let &[(pid, start)] = spawned else {
+        return;
+    };
+    t["child_pid"] = json!(pid);
+    t["child_start"] = json!(start);
+    let end = Instant::now() + Duration::from_secs(3);
+    let exit = loop {
+        match os::liveness(pid, start) {
+            Some(false) => break "exited",
+            None => break "unknown",
+            Some(true) if Instant::now() >= end => break "timeout",
+            Some(true) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    t["process_exit"] = json!(exit);
 }
 
 /// Samples pid -> (ppid, start) until stopped, so short-lived descendants
@@ -2315,6 +2345,14 @@ fn raw_inject(ctx: &Ctx) {
         Err(e) => r.spawn_error = Some(e),
     }
     r.teardown = os::raw_last_teardown();
+    if inject == "reader-start"
+        && let Some(t) = r.teardown.as_mut()
+    {
+        // The reader failed after the spawn: the master's teardown record
+        // has no child, so its identity is the session's spawned child and
+        // its exit is read (pid and start time) once the session is gone.
+        reader_start_child(t, &crate::session::spawned_children());
+    }
     let mut roots = crate::session::spawned_children();
     if let Some(t) = &r.teardown
         && let (Some(p), Some(st)) = (t["child_pid"].as_u64(), t["child_start"].as_u64())
@@ -2897,7 +2935,8 @@ mod tests {
         let reader = run(
             "reader-start",
             "reader: injected reader-start failure",
-            json!({"path": "master_drop", "teardown_ms": 30, "drain_reached_eof": true}),
+            json!({"path": "master_drop", "teardown_ms": 30, "drain_reached_eof": true,
+                   "child_pid": 7, "child_start": 70, "process_exit": "exited"}),
         );
         assert!(pass(&reader), "{:?}", raw_inject_outcome(&reader));
         r = run(
@@ -2942,6 +2981,61 @@ mod tests {
         assert!(matches!(raw_inject_outcome(&fs), PlatformFail { .. }));
         fs.kill_proof = None;
         assert!(!pass(&fs));
+    }
+
+    /// M2: F-2c's teardown counts only with the close returning in bound,
+    /// the drain ending at EOF (a read error is not EOF), and for
+    /// `reader-start` the child's identity and confirmed exit.
+    #[test]
+    fn raw_inject_needs_close_drain_and_reader_child() {
+        let run = |inject: &str, err: &str, td: Value| InjectRun {
+            inject: inject.into(),
+            spawn_error: Some(err.into()),
+            teardown: Some(td),
+            handles_before: Some(100),
+            handles_after: Some(100),
+            ..Default::default()
+        };
+        let after = || {
+            json!({"path": "setup_error", "failed_at": "after_spawn", "child_pid": 7,
+                   "child_start": 70, "process_exit": "exited", "teardown_ms": 50,
+                   "drain_reached_eof": true, "drain_end": "eof", "close_hung": false,
+                   "output_pending_bytes": 4096, "output_marker_seen": true,
+                   "child_running_at_injection": true})
+        };
+        let ok = run("after-spawn", "injected failure after spawn", after());
+        assert_eq!(raw_inject_outcome(&ok), Outcome::Pass);
+        let mut r = run("after-spawn", "injected failure after spawn", after());
+        r.teardown.as_mut().unwrap()["close_hung"] = json!(true);
+        assert!(
+            matches!(raw_inject_outcome(&r), PlatformFail { .. }),
+            "{:?}",
+            raw_inject_outcome(&r)
+        );
+        let mut r = run("after-spawn", "injected failure after spawn", after());
+        r.teardown.as_mut().unwrap()["drain_end"] = json!("error: broken pipe");
+        assert!(
+            matches!(raw_inject_outcome(&r), Outcome::HarnessFail { .. }),
+            "{:?}",
+            raw_inject_outcome(&r)
+        );
+        // reader-start: the master's teardown plus the child identity and its exit.
+        let reader = || {
+            json!({"path": "master_drop", "teardown_ms": 30, "drain_reached_eof": true,
+                   "drain_end": "eof", "close_hung": false, "child_pid": 7, "child_start": 70,
+                   "process_exit": "exited"})
+        };
+        let err = "reader: injected reader-start failure";
+        assert_eq!(
+            raw_inject_outcome(&run("reader-start", err, reader())),
+            Outcome::Pass
+        );
+        for k in ["child_pid", "child_start", "process_exit"] {
+            let mut td = reader();
+            td[k] = Value::Null;
+            let o = raw_inject_outcome(&run("reader-start", err, td));
+            assert!(matches!(o, Outcome::HarnessFail { .. }), "{k}: {o:?}");
+        }
     }
 
     #[test]

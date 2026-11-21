@@ -637,6 +637,16 @@ impl Session {
         }
     }
 
+    /// The launch record; a raw launch also carries its master's teardown
+    /// (close result and how the output drain ended).
+    fn launch_with_teardown(&self) -> Value {
+        let mut l = self.launch.clone();
+        if l["backend"] == json!("raw") {
+            l["teardown"] = os::raw_last_teardown().unwrap_or(Value::Null);
+        }
+        l
+    }
+
     pub fn tree_desc(&self) -> Value {
         match self
             .owned
@@ -719,7 +729,7 @@ impl Session {
             tree: self.tree_desc(),
             threads,
             teardown_ms: t.elapsed().as_millis() as u64,
-            launch: self.launch.clone(),
+            launch: self.launch_with_teardown(),
             kill_proof: k.kill_proof,
         }
     }

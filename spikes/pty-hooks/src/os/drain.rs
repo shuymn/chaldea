@@ -30,6 +30,8 @@ struct DrainState {
     consumer: Mutex<Consumer>,
     finished: AtomicBool,
     bytes: AtomicU64,
+    /// How the read loop ended: `eof`, or `error: …` (never taken for EOF).
+    end: Mutex<Option<String>>,
 }
 
 pub struct Drain {
@@ -47,9 +49,11 @@ impl Drain {
             .name("conpty-drain".into())
             .spawn(move || {
                 let mut buf = vec![0u8; 16 * 1024];
-                loop {
+                let end = loop {
                     let n = match output.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => break "eof".to_string(),
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => break format!("error: {e}"),
                         Ok(n) => n,
                     };
                     st.bytes.fetch_add(n as u64, Ordering::SeqCst);
@@ -67,7 +71,8 @@ impl Drain {
                         None if !c.gone => c.dropped += n as u64,
                         None => {}
                     }
-                }
+                };
+                *st.end.lock().unwrap_or_else(|e| e.into_inner()) = Some(end);
                 let mut c = st.consumer.lock().unwrap_or_else(|e| e.into_inner());
                 st.finished.store(true, Ordering::SeqCst);
                 // Dropping the sender ends the consumer's reads (EOF).
@@ -110,7 +115,17 @@ impl Drain {
         })
     }
 
-    /// Waits for the drain to reach EOF, bounded; true when it did.
+    /// How the drain ended (`eof` or `error: …`), once it has.
+    pub fn end(&self) -> Option<String> {
+        self.state
+            .end
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Waits for the drain's read loop to end, bounded; true when it did
+    /// (at EOF or on a read error: see `end`).
     pub fn wait(&self, bound: Duration) -> bool {
         let end = Instant::now() + bound;
         while !self.join.is_finished() && Instant::now() < end {
@@ -120,9 +135,11 @@ impl Drain {
     }
 
     /// Master teardown: waits (bounded) for EOF while an attached reader
-    /// keeps receiving the final output; with no reader it is discarded.
-    pub fn finish(self, bound: Duration) -> bool {
-        self.wait(bound)
+    /// keeps receiving the final output (with no reader it is discarded);
+    /// how the drain ended, or `None` if it did not within `bound`.
+    pub fn finish(self, bound: Duration) -> Option<String> {
+        self.wait(bound);
+        self.end()
     }
 }
 
@@ -194,12 +211,36 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             w.write_all("日本語".as_bytes()).unwrap();
         });
-        assert!(d.finish(Duration::from_secs(5)), "drain reached EOF");
+        assert_eq!(d.finish(Duration::from_secs(5)).as_deref(), Some("eof"));
         writer.join().unwrap();
         assert_eq!(
             String::from_utf8(reader.join().unwrap()).unwrap(),
             "before 日本語"
         );
+    }
+
+    /// M2: a read error ends the drain but is reported as such, never as
+    /// EOF.
+    #[test]
+    fn read_error_is_not_eof() {
+        struct Failing;
+        impl Read for Failing {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("broken pipe"))
+            }
+        }
+        let d = Drain::start(Failing).unwrap();
+        assert!(d.wait(Duration::from_secs(5)));
+        assert!(
+            d.end().is_some_and(|e| e.starts_with("error:")),
+            "{:?}",
+            d.end()
+        );
+        let (r, w) = io::pipe().unwrap();
+        let d = Drain::start(r).unwrap();
+        drop(w);
+        assert!(d.wait(Duration::from_secs(5)));
+        assert_eq!(d.end().as_deref(), Some("eof"));
     }
 
     /// M4: startup output beyond the hold buffer is never dropped silently:
