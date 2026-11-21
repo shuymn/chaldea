@@ -46,8 +46,8 @@ pub struct Responder {
     log: QueryLog,
     t0: Instant,
     chunk_at: Arc<Mutex<Instant>>,
-    cols: AtomicU16,
-    rows: AtomicU16,
+    cols: Arc<AtomicU16>,
+    rows: Arc<AtomicU16>,
 }
 
 fn kind_of(reply: &str) -> String {
@@ -155,6 +155,8 @@ pub struct Vt {
     term: Term<Responder>,
     parser: Processor,
     chunk_at: Arc<Mutex<Instant>>,
+    cols: Arc<AtomicU16>,
+    rows: Arc<AtomicU16>,
 }
 
 impl Vt {
@@ -167,14 +169,18 @@ impl Vt {
         t0: Instant,
     ) -> Vt {
         let chunk_at = Arc::new(Mutex::new(Instant::now()));
+        let (c, r) = (
+            Arc::new(AtomicU16::new(cols)),
+            Arc::new(AtomicU16::new(rows)),
+        );
         let responder = Responder {
             tx,
             enabled,
             log,
             t0,
             chunk_at: chunk_at.clone(),
-            cols: AtomicU16::new(cols),
-            rows: AtomicU16::new(rows),
+            cols: c.clone(),
+            rows: r.clone(),
         };
         let config = Config {
             kitty_keyboard: true,
@@ -192,6 +198,8 @@ impl Vt {
             term,
             parser: Processor::new(),
             chunk_at,
+            cols: c,
+            rows: r,
         }
     }
 
@@ -199,6 +207,24 @@ impl Vt {
     pub fn feed(&mut self, bytes: &[u8], at: Instant) {
         *self.chunk_at.lock().unwrap_or_else(|e| e.into_inner()) = at;
         self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// `(cols, rows)` the responder reports for a text-area size request.
+    pub fn size(&self) -> (u16, u16) {
+        (
+            self.cols.load(Ordering::Relaxed),
+            self.rows.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Resizes the grid and the size the responder reports (with the PTY).
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        self.term.resize(Size {
+            cols: cols as usize,
+            rows: rows as usize,
+        });
+        self.cols.store(cols, Ordering::Relaxed);
+        self.rows.store(rows, Ordering::Relaxed);
     }
 
     pub fn bracketed_paste(&self) -> bool {

@@ -1097,6 +1097,55 @@ fn marker_outcome(
     }
 }
 
+/// What the C-4 resize step observed.
+pub struct ResizeSeen {
+    pub resized: Result<(), String>,
+    /// The child reported the new console size.
+    pub child_reported: bool,
+    pub report_present: bool,
+    /// The harness screen's `(cols, rows)` after the resize.
+    pub screen: (usize, usize),
+    pub want: (u16, u16),
+    /// The marker on screen at the resize and after it.
+    pub marker_before: Option<u64>,
+    pub marker_after: Option<u64>,
+}
+
+/// C-4 resize: the child must report the new size, the harness's screen
+/// must have the new geometry (a stale grid is the harness's own failure),
+/// and that screen must show a marker the child emitted after the one on
+/// screen at the resize.
+pub fn resize_outcome(r: &ResizeSeen, emitted: &[u64]) -> Outcome {
+    match (&r.resized, r.child_reported) {
+        (Err(e), _) => return Outcome::harness(format!("resize failed: {e}")),
+        (Ok(()), true) => {}
+        (Ok(()), false) if !r.report_present => {
+            return Outcome::harness("the child sent no report after the resize");
+        }
+        (Ok(()), false) => return Outcome::platform("the child never reported the new size"),
+    }
+    let want = (r.want.0 as usize, r.want.1 as usize);
+    if r.screen != want {
+        return Outcome::harness(format!(
+            "the harness screen is {:?} after a resize to {want:?}",
+            r.screen
+        ));
+    }
+    let Some(m0) = r.marker_before else {
+        return Outcome::harness("no marker on screen at the resize");
+    };
+    match r.marker_after {
+        Some(m) if !emitted.contains(&m) => {
+            Outcome::harness("marker not in the fixture's emitted list")
+        }
+        Some(m) if m > m0 => Outcome::Pass,
+        _ if emitted.iter().any(|e| *e > m0) => {
+            Outcome::platform("the resized screen shows no marker drawn after the resize")
+        }
+        _ => Outcome::harness("the fixture emitted no marker after the resize"),
+    }
+}
+
 fn probe_attach(ctx: &Ctx) {
     let mut pc = Pc::new("C-4");
     for c in [
@@ -1176,25 +1225,47 @@ fn probe_attach(ctx: &Ctx) {
             pc.put(&format!("key/{k}"), o, Value::Null);
         }
     }
-    // One resize (F-2): 120x40 → 100x30, which the child must report.
+    // One resize (F-2): 120x40 → 100x30, which the child must report, and
+    // after which the harness's screen has the new geometry and shows a
+    // marker the child drew after the resize.
     let (cols, rows) = (100u16, 30u16);
+    let at_resize = marker_of(&String::from_utf8_lossy(
+        &p.screen(Instant::now() + Duration::from_secs(1)),
+    ));
     let resized = l.session.io().resize(cols, rows);
     let seen = resized.is_ok()
         && p.wait_report(ctx.until(Duration::from_secs(10)), |r| {
             r["console_size"] == json!({"cols": cols, "rows": rows})
         })
         .is_some();
+    // Two marker ticks after the size report, so the resized screen is drawn.
+    std::thread::sleep(
+        Duration::from_millis(1200).min(ctx.cutoff.saturating_duration_since(Instant::now())),
+    );
+    let snap = l.snapshot();
+    let after = marker_of(&snap.lines.join("\n"));
+    let emitted: Vec<u64> = p
+        .report()
+        .and_then(|r| r["markers_emitted"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Value::as_u64)
+        .collect();
+    let rs = ResizeSeen {
+        resized: resized.clone(),
+        child_reported: seen,
+        report_present: p.report().is_some(),
+        screen: (snap.cols, snap.rows),
+        want: (cols, rows),
+        marker_before: at_resize,
+        marker_after: after,
+    };
     pc.put(
         "resize",
-        match (&resized, seen) {
-            (Err(e), _) => Outcome::harness(format!("resize failed: {e}")),
-            (Ok(()), true) => Outcome::Pass,
-            (Ok(()), false) if p.report().is_none() => {
-                Outcome::harness("the child sent no report after the resize")
-            }
-            (Ok(()), false) => Outcome::platform("the child never reported the new size"),
-        },
-        json!({"want": {"cols": cols, "rows": rows}, "reported": p.report().map(|r| r["console_size"].clone())}),
+        resize_outcome(&rs, &emitted),
+        json!({"want": {"cols": cols, "rows": rows}, "reported": p.report().map(|r| r["console_size"].clone()),
+               "screen": {"cols": snap.cols, "rows": snap.rows}, "marker_at_resize": at_resize,
+               "marker_after": after}),
     );
     l.receiver.set_probe(None);
     let (stop, _) = l.finish();
@@ -3486,6 +3557,47 @@ mod tests {
             Some(Outcome::HarnessFail { .. })
         ));
         assert!(relayed(&log, "key", |v| v["key"] == "down").is_none());
+    }
+
+    /// M6: the resize passes only when the harness's own screen took the
+    /// new geometry and shows a marker the child drew after the resize.
+    #[test]
+    fn resize_needs_the_resized_screen() {
+        let ok = || ResizeSeen {
+            resized: Ok(()),
+            child_reported: true,
+            report_present: true,
+            screen: (100, 30),
+            want: (100, 30),
+            marker_before: Some(4),
+            marker_after: Some(6),
+        };
+        let emitted = [3, 4, 5, 6];
+        assert_eq!(resize_outcome(&ok(), &emitted), Outcome::Pass);
+        // The reviewer's shape: the child saw 100x30, the grid stayed 120x40.
+        let stale = ResizeSeen {
+            screen: (120, 40),
+            ..ok()
+        };
+        let o = resize_outcome(&stale, &emitted);
+        assert!(matches!(o, Outcome::HarnessFail { .. }), "{o:?}");
+        // No new content drawn on the resized screen.
+        let same = ResizeSeen {
+            marker_after: Some(4),
+            ..ok()
+        };
+        assert!(matches!(
+            resize_outcome(&same, &emitted),
+            Outcome::PlatformFail { .. }
+        ));
+        let none = ResizeSeen {
+            marker_after: None,
+            ..ok()
+        };
+        assert!(matches!(
+            resize_outcome(&none, &emitted),
+            Outcome::PlatformFail { .. }
+        ));
     }
 
     #[test]

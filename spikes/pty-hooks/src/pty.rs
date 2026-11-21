@@ -365,7 +365,8 @@ impl PtyIo {
         self.tx.send(WriteMsg::Close);
     }
 
-    /// Resizes the PTY (`ResizePseudoConsole` under the raw backend).
+    /// Resizes the PTY (`ResizePseudoConsole` under the raw backend), then
+    /// the VT grid and the size its responder reports.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
         let m = self.master.as_ref().ok_or("master closed")?;
         m.resize(portable_pty::PtySize {
@@ -374,7 +375,12 @@ impl PtyIo {
             pixel_width: 0,
             pixel_height: 0,
         })
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        self.vt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resize(cols, rows);
+        Ok(())
     }
 
     /// Closes the master (ConPTY on Windows) while the reader keeps draining.
@@ -465,6 +471,49 @@ mod tests {
 
     /// M4: a gated paste that expires while queued behind a blocked write is
     /// reported as expired and never reaches the PTY.
+    /// M6: a resize reaches the VT grid and the size the responder reports,
+    /// not only the PTY: the snapshot after the resize has the new geometry
+    /// and content drawn afterwards lands in it.
+    #[test]
+    fn resize_resizes_the_vt_grid() {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let out = std::env::temp_dir().join(format!("chs-resize-{}", crate::util::run_id()));
+        let mut io = PtyIo::start(
+            pair.master,
+            std::fs::File::create(&out).unwrap(),
+            120,
+            40,
+            true,
+            Instant::now(),
+            &|| {},
+        )
+        .unwrap();
+        io.resize(100, 30).unwrap();
+        let wide = "x".repeat(110);
+        {
+            let mut vt = io.vt.lock().unwrap();
+            vt.feed(format!("\x1b[H{wide}").as_bytes(), Instant::now());
+            let s = vt.snapshot();
+            assert_eq!((s.cols, s.rows), (100, 30));
+            // 110 columns of text wrap at the new width.
+            assert_eq!(s.lines[0], "x".repeat(100));
+            assert_eq!(s.lines[1], "x".repeat(10));
+            assert_eq!(vt.size(), (100, 30));
+        }
+        io.close_writer();
+        io.close_master();
+        drop(pair.slave);
+        io.join_bounded(Duration::from_secs(2));
+        let _ = std::fs::remove_file(&out);
+    }
+
     #[test]
     fn expired_queued_paste_is_never_written() {
         let (tx, release, out, j) = rig();
