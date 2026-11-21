@@ -790,7 +790,15 @@ pub fn type_keys(
     }
     std::thread::sleep(opts.enter_delay);
     if let Err(e) = tx.write_guarded(vec![b"\r".to_vec()], guard()) {
-        return out("enter_not_sent", None, Some(e), lossy, changes);
+        // Never written (cancelled before start or the gate closed): the
+        // Enter was not sent. Anything else (a write that started but did
+        // not report completion in time) may have reached the PTY: the
+        // send is `unconfirmed` and the hooks decide; it is never resent.
+        let state = match e.as_str() {
+            "expired_before_start" | "gate_closed_before_start" => "enter_not_sent",
+            _ => "unconfirmed",
+        };
+        return out(state, None, Some(e), lossy, changes);
     }
     out("sent", None, None, lossy, changes)
 }

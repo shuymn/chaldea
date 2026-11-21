@@ -440,6 +440,46 @@ fn start_with(
     )
 }
 
+/// The full argv of a Codex `win_keys` case launch for the arm in `args`:
+/// `--no-daemon`, the session flags, and the paste-burst override,
+/// explicit both ways and after the hook flags (which it never changes).
+pub fn keys_launch_argv(args: &Args, bin: &Path, hook_cmd: &str) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = vec![bin.into()];
+    argv.extend(
+        codex_launch_args(hook_cmd, true, &args.codex_paste_burst.codex_args())
+            .into_iter()
+            .map(OsString::from),
+    );
+    argv
+}
+
+/// Launches `argv` (built by the caller) for `a` in `cwd`.
+fn start_argv(
+    ctx: &Ctx,
+    a: &Agent,
+    label: &str,
+    cwd: &Path,
+    argv: Vec<OsString>,
+) -> Result<Launch, String> {
+    std::fs::create_dir_all(cwd).map_err(|e| format!("{}: {e}", cwd.display()))?;
+    launch(
+        ctx,
+        LaunchSpec {
+            label: label.into(),
+            argv,
+            cwd: cwd.to_path_buf(),
+            agent: a.name.into(),
+            cli_version: a.version.clone(),
+            session_id: None,
+            cli_names: a.cli_names(),
+            responder: true,
+            hold_assign: false,
+            inject: None,
+            before_spawn: None,
+        },
+    )
+}
+
 fn default_cwd(ctx: &Ctx, a: &Agent) -> PathBuf {
     ctx.args
         .cwd
@@ -449,10 +489,16 @@ fn default_cwd(ctx: &Ctx, a: &Agent) -> PathBuf {
 
 /// Waits for the bound SessionStart; on timeout writes the snapshot (decided_by hook_timeout).
 fn wait_start(ctx: &Ctx, l: &Launch) -> (Option<String>, u64, Option<PathBuf>) {
+    wait_start_by(ctx, l, ctx.cutoff)
+}
+
+/// `wait_start` ending no later than `end`.
+fn wait_start_by(ctx: &Ctx, l: &Launch, end: Instant) -> (Option<String>, u64, Option<PathBuf>) {
     let t = Instant::now();
-    let bound = l
-        .receiver
-        .wait_bound(ctx.until(Duration::from_secs(ctx.args.session_start_timeout)));
+    let bound = l.receiver.wait_bound(
+        ctx.until(Duration::from_secs(ctx.args.session_start_timeout))
+            .min(end),
+    );
     let ms = t.elapsed().as_millis() as u64;
     if bound.is_some() {
         return (bound, ms, None);
@@ -1207,8 +1253,9 @@ pub fn win_keys_case(
 /// followed by the settle interval (cut short by `cutoff` = not settled).
 pub struct KeysSend {
     pub sent: paste::Outcome,
-    /// `acked` (a bound submit after the fence), `unconfirmed` (sent, no
-    /// submit by the deadline; never resent), or the unsent state.
+    /// `acked` (a bound submit after the fence), `unconfirmed` (sent, or a
+    /// CR write whose completion was not reported in time, with no submit
+    /// by the deadline; never resent), or the unsent state.
     pub state: String,
     pub write_ms: u64,
     pub completed: bool,
@@ -1220,12 +1267,14 @@ pub fn send_keys_case(
     now_ms: impl Fn() -> u64,
     events: impl Fn() -> Vec<KeyEvent>,
     fence: u64,
-    end: Instant,
+    window: Duration,
     cutoff: Instant,
     settle: Duration,
 ) -> KeysSend {
     let sent = type_keys();
     let write_ms = now_ms();
+    // The fixture's wait starts once the write has returned.
+    let end = (Instant::now() + window).min(cutoff);
     let mut r = KeysSend {
         state: sent.state.clone(),
         sent,
@@ -1233,7 +1282,7 @@ pub fn send_keys_case(
         completed: false,
         settled: false,
     };
-    if r.sent.state != "sent" {
+    if !submit_may_have_reached(&r.sent) {
         return r;
     }
     wait_until(end, || {
@@ -1256,6 +1305,12 @@ pub fn send_keys_case(
     std::thread::sleep(settle.min(left));
     r.settled = left >= settle;
     r
+}
+
+/// The input and its CR were written, or the CR write may have reached
+/// the PTY (`unconfirmed`): the bound hooks decide either way.
+pub fn submit_may_have_reached(o: &paste::Outcome) -> bool {
+    o.state == "sent" || o.state == "unconfirmed"
 }
 
 /// F-1d `lossy_tab` under the paste-burst override (informational, never a
@@ -1323,27 +1378,38 @@ fn keys_sweep(ctx: &Ctx, a: &Agent, newline: NewlineKey) {
     for e in entries.iter().filter(|e| !e.recorded) {
         ctx.require("A-6", &keys_case(a.name, newline, &e.id));
     }
-    let cwd = default_cwd(ctx, a);
     let mut recorded = Vec::new();
-    for e in &entries {
-        if ctx.past_cutoff() {
-            break;
-        }
+    let min_start = Duration::from_secs(ctx.args.session_start_timeout) + KEYS_MIN_INPUT;
+    let results = sweep_slots(
+        entries.len(),
+        Instant::now,
+        ctx.cutoff,
+        min_start,
+        |i, end| {
+            let e = &entries[i];
+            // Recorded entries run with their own allow set; others with the CLI's.
+            let allow: Vec<Lossy> = if e.recorded {
+                e.allow.clone()
+            } else {
+                ctx.args.allow_lossy.clone()
+            };
+            let (mut o, mut ev) = keys_case_run(ctx, a, newline, e, &allow, "", end);
+            ev["slot_end_ms_left"] =
+                json!(end.saturating_duration_since(Instant::now()).as_millis() as u64);
+            if startup_retry(&o) && end.saturating_duration_since(Instant::now()) >= min_start {
+                // Codex failed to start (e.g. `account/read` timed out): once
+                // more in a fresh session within the same slot; both attempts
+                // are recorded.
+                let first = json!({"result": o.tag(), "cause": o.cause(), "evidence": ev});
+                (o, ev) = keys_case_run(ctx, a, newline, e, &allow, "-retry", end);
+                ev["attempts"] = json!([first, {"result": o.tag(), "cause": o.cause()}]);
+            }
+            (o, ev)
+        },
+        |_, why| (Outcome::not_exercised(why), json!({})),
+    );
+    for (e, (o, ev)) in entries.iter().zip(results) {
         let case = keys_case(a.name, newline, &e.id);
-        // Recorded entries run with their own allow set; others with the CLI's.
-        let allow: Vec<Lossy> = if e.recorded {
-            e.allow.clone()
-        } else {
-            ctx.args.allow_lossy.clone()
-        };
-        let (mut o, mut ev) = keys_case_run(ctx, a, &cwd, newline, e, &allow, "");
-        if startup_retry(&o) && !ctx.past_cutoff() {
-            // Codex failed to start (e.g. `account/read` timed out): once
-            // more in a fresh session; both attempts are recorded.
-            let first = json!({"result": o.tag(), "cause": o.cause(), "evidence": ev});
-            (o, ev) = keys_case_run(ctx, a, &cwd, newline, e, &allow, "-retry");
-            ev["attempts"] = json!([first, {"result": o.tag(), "cause": o.cause()}]);
-        }
         if e.recorded {
             recorded
                 .push(json!({"id": e.id, "result": o.tag(), "cause": o.cause(), "evidence": ev}));
@@ -1352,6 +1418,49 @@ fn keys_sweep(ctx: &Ctx, a: &Agent, newline: NewlineKey) {
         }
     }
     ctx.detail("f1_recorded", json!(recorded));
+}
+
+/// The shortest input phase worth starting after SessionStart (bootstrap
+/// turn, write, and some of the fixture wait).
+const KEYS_MIN_INPUT: Duration = Duration::from_secs(20);
+
+/// Per-fixture slots (M2): the time from the start to `cutoff` is split
+/// into `n` equal slots with fixed ends; fixture `i` runs from whenever the
+/// previous one ended until its own slot end, less the launch-and-teardown
+/// reserve, so time an early fixture leaves carries forward and a slow
+/// fixture never eats a later one's slot. A fixture with less than
+/// `min_start` before its wait end is not started and becomes an explicit
+/// `skip` row; every fixture yields exactly one result.
+pub fn sweep_slots<T>(
+    n: usize,
+    now: impl Fn() -> Instant,
+    cutoff: Instant,
+    min_start: Duration,
+    mut run: impl FnMut(usize, Instant) -> T,
+    mut skip: impl FnMut(usize, String) -> T,
+) -> Vec<T> {
+    let start = now();
+    let total = cutoff.saturating_duration_since(start);
+    let slot = total / n.max(1) as u32;
+    (0..n)
+        .map(|i| {
+            let slot_end = (start + slot * (i as u32 + 1)).min(cutoff);
+            let end = slot_end.checked_sub(KEYS_OVERHEAD).unwrap_or(start);
+            let left = end.saturating_duration_since(now());
+            if left < min_start {
+                skip(
+                    i,
+                    format!(
+                        "not started: {} s left in its slot, {} s needed",
+                        left.as_secs(),
+                        min_start.as_secs()
+                    ),
+                )
+            } else {
+                run(i, end)
+            }
+        })
+        .collect()
 }
 
 /// `--f1-entries`: only the named entries (all when empty), in corpus order.
@@ -1377,26 +1486,26 @@ const NO_BOUND_START: &str = "no bound SessionStart";
 fn keys_case_run(
     ctx: &Ctx,
     a: &Agent,
-    cwd: &Path,
     newline: NewlineKey,
     e: &paste::FEntry,
     allow: &[Lossy],
     attempt: &str,
+    end: Instant,
 ) -> (Outcome, Value) {
+    // Every wait of this case ends by its slot's end.
+    let until = |d: Duration| ctx.until(d).min(end);
     let label = format!("{}-keys-{}-{}{attempt}", a.name, newline.name(), e.id);
-    // The paste-burst override, explicit both ways (after the hook flags,
-    // which it never changes).
-    let burst = ctx.args.codex_paste_burst.codex_args();
-    let l = match start(ctx, a, &label, cwd, Some("no-daemon"), a.name, &burst) {
+    let argv = keys_launch_argv(&ctx.args, &a.bin, &hook_command(&ctx.args.root, a.name));
+    let l = match start_argv(ctx, a, &label, &default_cwd(ctx, a), argv) {
         Ok(l) => l,
         Err(err) => return (Outcome::harness(err.clone()), json!({"not_run": err})),
     };
-    let (bound, ms, snap) = wait_start(ctx, &l);
+    let (bound, ms, snap) = wait_start_by(ctx, &l, end);
     let mut fence = None;
     let mut send = None;
     if bound.is_some() {
         // The bootstrap turn (positional first prompt) ends before any input.
-        fence = nth_bound(&l, "Stop", 1, ctx.until(KEYS_BOOTSTRAP)).map(|s| s.seq);
+        fence = nth_bound(&l, "Stop", 1, until(KEYS_BOOTSTRAP)).map(|s| s.seq);
     }
     if let Some(f) = fence {
         // One deadline for the submit and the Stop of its turn.
@@ -1409,8 +1518,9 @@ fn keys_case_run(
             || l.receiver.now_ms(),
             || l.receiver.events().iter().map(KeyEvent::of).collect(),
             f,
-            ctx.until(KEYS_FIXTURE),
-            ctx.cutoff,
+            KEYS_FIXTURE,
+            // The settle may use part of the slot's teardown reserve.
+            ctx.cutoff.min(end + KEYS_SETTLE),
             KEYS_SETTLE,
         ));
     }
@@ -1453,7 +1563,7 @@ fn keys_case_run(
         )
     } else {
         match sent.as_ref() {
-            Some(o) if o.state == "sent" => {
+            Some(o) if submit_may_have_reached(o) => {
                 let evs: Vec<KeyEvent> = events.iter().map(KeyEvent::of).collect();
                 let expected = paste::expected_win_keys(&e.text, allow);
                 let (o, mut ev) = win_keys_case(&evs, fence.unwrap_or(0), &expected, write_ms);
@@ -2084,11 +2194,11 @@ fn tree_kill(ctx: &Ctx, a: &Agent) {
     }
 }
 
-/// A4 (evidence only): for each outside-job process, its identity, the
-/// hook invocations whose emitter ancestry names it (pid and image name),
-/// and the cause statement: resolved only when package identity is present
-/// (alias / MSIX activation); otherwise "identity recorded, cause
-/// unresolved". A creation path is never inferred from ancestry.
+/// A4 (evidence only): for each outside-job process, three independent
+/// fields: its image path, its package identity, and the hook invocations
+/// whose emitter ancestry names it (pid and image name). The report never
+/// states a cause: none of these shows how the process was created outside
+/// the job.
 pub fn outside_job_correlation(outside: &Value, events: &Value) -> Value {
     let empty = Vec::new();
     let evs = events.as_array().unwrap_or(&empty);
@@ -2115,15 +2225,11 @@ pub fn outside_job_correlation(outside: &Value, events: &Value) -> Value {
                     )
                 })
                 .collect();
-            let package = &o["identity"]["package_full_name"];
-            let cause = match package.as_str() {
-                Some(p) if p != "none" => {
-                    "resolved: package identity present (alias/MSIX activation)"
-                }
-                _ => "identity recorded, cause unresolved",
-            };
-            json!({"pid": o["pid"], "name": o["name"], "identity": o["identity"],
-                   "hooks": hooks, "cause": cause})
+            json!({"pid": o["pid"], "name": o["name"],
+                   "image": o["identity"]["image"],
+                   "package_full_name": o["identity"]["package_full_name"],
+                   "hook_ancestry_match": !hooks.is_empty(), "hooks": hooks,
+                   "identity": o["identity"]})
         })
         .collect();
     json!(rows)
@@ -2714,6 +2820,44 @@ trusted_hash = "sha256:bb"
         assert_eq!(off.last().map(String::as_str), Some(CODEX_FIRST_PROMPT));
     }
 
+    /// LOW: the argv a keys case actually launches carries the arm's
+    /// explicit burst value (built from parsed arguments, the same function
+    /// the launch calls).
+    #[test]
+    fn keys_launch_argv_carries_the_arm() {
+        let argv = |extra: &[&str]| -> Vec<String> {
+            let mut v = vec!["real", "codex-paste"];
+            v.extend(extra);
+            let a =
+                crate::cli::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
+            keys_launch_argv(&a, Path::new("/x/codex"), "/x/chs-hook-emit codex")
+                .into_iter()
+                .map(|s| s.into_string().unwrap())
+                .collect()
+        };
+        let on = argv(&["--codex-paste-burst", "on"]);
+        let off = argv(&[]);
+        assert!(
+            on.windows(2)
+                .any(|w| w == ["-c", "tui.disable_paste_burst=false"])
+        );
+        assert!(
+            off.windows(2)
+                .any(|w| w == ["-c", "tui.disable_paste_burst=true"])
+        );
+        assert_eq!(on[0], "/x/codex");
+        assert_eq!(on[1], "--no-daemon");
+        assert_eq!(on.last().map(String::as_str), Some(CODEX_FIRST_PROMPT));
+        let hooks = |v: &[String]| {
+            v.iter()
+                .filter(|a| a.starts_with("hooks."))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(hooks(&on), hooks(&off));
+        assert_eq!(hooks(&on).len(), 3);
+    }
+
     /// A rig that records every write the writer thread makes.
     struct Capture(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
 
@@ -2742,7 +2886,7 @@ trusted_hash = "sha256:bb"
             || 7,
             || events.clone(),
             2,
-            Instant::now() + wait,
+            wait,
             Instant::now() + Duration::from_secs(5),
             Duration::from_millis(1),
         );
@@ -2827,7 +2971,7 @@ trusted_hash = "sha256:bb"
             || 0,
             || evs.clone(),
             2,
-            now + Duration::from_millis(50),
+            Duration::from_millis(50),
             now,
             Duration::from_secs(5),
         );
@@ -2837,6 +2981,180 @@ trusted_hash = "sha256:bb"
             keys_settled(o, r.settled),
             Outcome::HarnessFail { .. }
         ));
+    }
+
+    /// A writer that sleeps before completing each write: `cr` for the CR,
+    /// `text` for everything else.
+    struct Late {
+        out: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        text: Duration,
+        cr: Duration,
+    }
+
+    impl std::io::Write for Late {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(if b == b"\r" { self.cr } else { self.text });
+            self.out.lock().unwrap().push(b.to_vec());
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn late_rig(
+        text: Duration,
+        cr: Duration,
+        deadline: Duration,
+        events: impl Fn() -> Vec<KeyEvent>,
+        window: Duration,
+    ) -> (KeysSend, Vec<Vec<u8>>) {
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, j) = crate::pty::spawn_writer(Box::new(Late {
+            out: out.clone(),
+            text,
+            cr,
+        }));
+        let opts = paste::KeysOpts {
+            newline: NewlineKey::W32,
+            records: paste::UnicodeRecords::None,
+            allow: Vec::new(),
+            enter_delay: Duration::from_millis(1),
+            write_deadline: Instant::now() + deadline,
+        };
+        let r = send_keys_case(
+            || paste::type_keys(&tx, b"x", &opts, || true),
+            || 0,
+            events,
+            2,
+            window,
+            Instant::now() + Duration::from_secs(10),
+            Duration::from_millis(1),
+        );
+        tx.send(crate::pty::WriteMsg::Close);
+        j.join().unwrap();
+        let w = out.lock().unwrap().clone();
+        (r, w)
+    }
+
+    /// M3: a CR write that completes after its deadline is `unconfirmed`
+    /// (not `enter_not_sent`), the hooks still decide, and it is written
+    /// once.
+    #[test]
+    fn late_cr_completion_is_unconfirmed_and_reconciled() {
+        let evs = vec![
+            ev(2, "Stop", None, 5),
+            ev(3, "UserPromptSubmit", Some("x"), 9),
+            ev(4, "Stop", None, 12),
+        ];
+        let (r, w) = late_rig(
+            Duration::ZERO,
+            Duration::from_millis(400),
+            Duration::from_millis(150),
+            || evs.clone(),
+            Duration::from_millis(500),
+        );
+        assert_eq!(r.sent.state, "unconfirmed");
+        assert!(submit_may_have_reached(&r.sent));
+        assert_eq!(r.state, "acked");
+        assert!(r.completed);
+        assert_eq!(w.iter().filter(|b| b.as_slice() == b"\r").count(), 1);
+        let (o, _) = win_keys_case(&evs, 2, "x", None);
+        assert_eq!(o, Outcome::Pass);
+        // With no hook at all it stays unconfirmed.
+        let (r, _) = late_rig(
+            Duration::ZERO,
+            Duration::from_millis(400),
+            Duration::from_millis(150),
+            || vec![ev(2, "Stop", None, 5)],
+            Duration::from_millis(100),
+        );
+        assert_eq!(r.state, "unconfirmed");
+    }
+
+    /// M3: the fixture's wait starts after the write returns, so a slow
+    /// write does not eat the observation window.
+    #[test]
+    fn fixture_window_starts_after_the_write() {
+        let t0 = Instant::now();
+        let late_ack = move || {
+            let mut v = vec![ev(2, "Stop", None, 5)];
+            if t0.elapsed() >= Duration::from_millis(400) {
+                v.push(ev(3, "UserPromptSubmit", Some("x"), 9));
+            }
+            v
+        };
+        let (r, _) = late_rig(
+            Duration::from_millis(300),
+            Duration::ZERO,
+            Duration::from_secs(5),
+            late_ack,
+            Duration::from_millis(300),
+        );
+        assert_eq!(r.sent.state, "sent");
+        assert_eq!(r.state, "acked");
+    }
+
+    /// M2: a slow first fixture ends at its own slot; the second still gets
+    /// its slot, and one that cannot start in time is an explicit row.
+    #[test]
+    fn slow_fixture_leaves_the_next_its_slot() {
+        use std::cell::Cell;
+        let base = Instant::now();
+        let t = Cell::new(Duration::ZERO);
+        let now = || base + t.get();
+        let cutoff = base + Duration::from_secs(220);
+        let min_start = Duration::from_secs(40);
+        // Each run takes every second it is given, then its teardown.
+        let mut ends = Vec::new();
+        let rows = sweep_slots(
+            2,
+            now,
+            cutoff,
+            min_start,
+            |i, end| {
+                ends.push(end - base);
+                t.set(end - base + KEYS_OVERHEAD);
+                format!("ran {i}")
+            },
+            |i, why| format!("skipped {i}: {why}"),
+        );
+        assert_eq!(rows, ["ran 0", "ran 1"]);
+        assert_eq!(ends, [Duration::from_secs(90), Duration::from_secs(200)]);
+        // A first fixture that overruns its slot (e.g. a hung teardown)
+        // leaves the second an explicit not-started row, never a dropped one.
+        let t = Cell::new(Duration::ZERO);
+        let now = || base + t.get();
+        let rows = sweep_slots(
+            2,
+            now,
+            cutoff,
+            min_start,
+            |i, _| {
+                t.set(Duration::from_secs(190));
+                format!("ran {i}")
+            },
+            |i, why| format!("skipped {i}: {why}"),
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], "ran 0");
+        assert!(rows[1].starts_with("skipped 1: not started"), "{}", rows[1]);
+        // An early finisher's leftover carries forward.
+        let t = Cell::new(Duration::ZERO);
+        let now = || base + t.get();
+        let mut ends = Vec::new();
+        sweep_slots(
+            2,
+            now,
+            cutoff,
+            min_start,
+            |_, end| {
+                ends.push((t.get(), end - base));
+                t.set(t.get() + Duration::from_secs(10));
+            },
+            |_, _| (),
+        );
+        assert_eq!(ends[1], (Duration::from_secs(10), Duration::from_secs(200)));
     }
 
     /// A1: `lossy_tab`'s disposition under the burst override.
@@ -2856,8 +3174,8 @@ trusted_hash = "sha256:bb"
     }
 
     /// A4: an outside-job shell is correlated with the hook whose emitter
-    /// ancestry names it (pid and name, case-insensitive); the cause is
-    /// resolved only with package identity.
+    /// ancestry names it (pid and name, case-insensitive); package identity,
+    /// the hook match, and the image are independent fields, never a cause.
     #[test]
     fn outside_job_is_correlated_with_its_hook() {
         let outside = json!([
@@ -2878,9 +3196,25 @@ trusted_hash = "sha256:bb"
             r[0]["hooks"],
             json!([{"seq": 1, "event": "SessionStart", "class": "bound", "ancestry_index": 1}])
         );
-        assert_eq!(r[0]["cause"], json!("identity recorded, cause unresolved"));
+        assert_eq!(r[0]["hook_ancestry_match"], json!(true));
+        assert_eq!(r[0]["package_full_name"], json!("none"));
+        assert_eq!(
+            r[0]["image"],
+            json!("C:\\Program Files\\PowerShell\\7\\pwsh.exe")
+        );
+        // A packaged process with no hook naming it: the package is
+        // reported, the match is false, and no cause is ever stated.
         assert_eq!(r[1]["hooks"], json!([]));
-        assert!(r[1]["cause"].as_str().unwrap().starts_with("resolved"));
+        assert_eq!(r[1]["hook_ancestry_match"], json!(false));
+        assert!(
+            r[1]["package_full_name"]
+                .as_str()
+                .unwrap()
+                .starts_with("Microsoft.")
+        );
+        for row in r.as_array().unwrap() {
+            assert!(row.get("cause").is_none());
+        }
         assert_eq!(outside_job_correlation(&Value::Null, &events), json!([]));
     }
 
