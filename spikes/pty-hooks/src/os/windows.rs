@@ -1603,8 +1603,8 @@ pub fn raw_spawn(
             // Fail with the child's output pending: wait (bounded) until the
             // fixture's own output line (not ConPTY's startup bytes) has been
             // seen while it still runs, and record both.
-            let end = Instant::now() + Duration::from_secs(5);
-            loop {
+            let end = Instant::now() + Duration::from_secs(super::AFTER_SPAWN_WAIT_SECS);
+            let marker = loop {
                 let seen = st.drain.as_ref().map_or(0, |d| d.bytes());
                 let marker = st
                     .drain
@@ -1615,11 +1615,11 @@ pub fn raw_spawn(
                     st.output_pending = Some(seen);
                     st.output_marker_seen = Some(marker);
                     st.running_at_injection = Some(running);
-                    break;
+                    break marker;
                 }
                 std::thread::sleep(Duration::from_millis(20));
-            }
-            return Err("injected failure after spawn".into());
+            };
+            return Err(super::after_spawn_error(marker));
         }
         st.thread.take();
         let process = Arc::new(st.process.take().ok_or("no process handle")?);

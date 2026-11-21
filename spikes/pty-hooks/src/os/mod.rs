@@ -10,6 +10,22 @@ pub use drain::*;
 /// `after-spawn` fires only once it is seen in the held output).
 pub const EMIT_OUTPUT_MARKER: &str = "OUTPUT-";
 
+/// How long the `after-spawn` injection waits for [`EMIT_OUTPUT_MARKER`].
+pub const AFTER_SPAWN_WAIT_SECS: u64 = 5;
+
+/// The `after-spawn` injection's error: the injected failure once the
+/// fixture's output line was seen, else the missed milestone.
+pub fn after_spawn_error(marker_seen: bool) -> String {
+    if marker_seen {
+        "injected failure after spawn".into()
+    } else {
+        format!(
+            "milestone not reached: {EMIT_OUTPUT_MARKER} marker not seen in \
+             {AFTER_SPAWN_WAIT_SECS} s"
+        )
+    }
+}
+
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -279,6 +295,21 @@ impl<T> Claim<T> {
 
 #[cfg(test)]
 mod tests {
+    /// M3 (r3): the `after-spawn` injection reports the injected failure
+    /// only once the fixture's `OUTPUT-` line was seen; otherwise the
+    /// milestone was not reached (a distinct error the oracle rejects).
+    #[test]
+    fn after_spawn_error_names_the_missed_milestone() {
+        assert_eq!(
+            super::after_spawn_error(true),
+            "injected failure after spawn"
+        );
+        assert_eq!(
+            super::after_spawn_error(false),
+            "milestone not reached: OUTPUT- marker not seen in 5 s"
+        );
+    }
+
     /// M5: a readiness report offered after the starter stopped waiting
     /// is never taken as claimed (the worker then unhooks and exits), even
     /// while the starter has not dropped its side yet; one offered in time
