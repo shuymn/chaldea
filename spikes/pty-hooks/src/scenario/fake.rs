@@ -2525,8 +2525,9 @@ pub fn repeat_outcome(
 
 /// A baseline launch's teardown, checked like an injected one: a teardown
 /// record within its bound, `ClosePseudoConsole` returned, the drain at EOF
-/// (or the host read end closed), the child's exit confirmed, no survivor.
-pub fn baseline_check(t: Option<&Value>, survivors: usize) -> Result<(), String> {
+/// (or the host read end closed), the child's exit confirmed, no survivor,
+/// and every process of its tree positively confirmed gone.
+pub fn baseline_check(t: Option<&Value>, survivors: usize, unknown: usize) -> Result<(), String> {
     let Some(t) = t else {
         return Err("no teardown record".into());
     };
@@ -2550,6 +2551,9 @@ pub fn baseline_check(t: Option<&Value>, survivors: usize) -> Result<(), String>
     }
     if survivors > 0 {
         return Err("processes survived the teardown".into());
+    }
+    if unknown > 0 {
+        return Err(format!("liveness unknown for {unknown} tree processes"));
     }
     Ok(())
 }
@@ -2576,23 +2580,42 @@ fn reader_start_repeat(ctx: &Ctx, warm: InjectRun, extra: &[&str], roles: &[Stri
         let before = os::process_handle_count();
         let from = crate::session::spawned_children().len();
         let spec = fake_spec(ctx, &format!("raw-baseline-{i}"), "spawn-tree", extra);
-        let (ok, ev) = match launch_with(ctx, spec, plain) {
+        // The same positive liveness as the injected launches: the tree is
+        // sampled during the launch and each process confirmed gone.
+        let sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sampler = sample_procs(sampling.clone());
+        let launched = launch_with(ctx, spec, plain);
+        let (ok, ev) = match launched {
             Ok(l) => {
                 let branch = l.session.launch["branch"].clone();
                 let (st, _) = l.finish();
                 let mut t = os::raw_last_teardown();
+                let mut roots = crate::session::spawned_children().split_off(from);
                 if let Some(t) = t.as_mut() {
-                    reader_start_child(t, &crate::session::spawned_children().split_off(from));
+                    reader_start_child(t, &roots);
+                    if let (Some(p), Some(s)) = (t["child_pid"].as_u64(), t["child_start"].as_u64())
+                    {
+                        roots.push((p as u32, s));
+                    }
                 }
+                sampling.store(true, std::sync::atomic::Ordering::SeqCst);
+                let map = sampler.join().unwrap_or_default();
+                let tree = descendants(&map, &roots);
+                let (alive, unknown) = tree_liveness(&tree, os::liveness, Duration::from_secs(3));
                 (
-                    baseline_check(t.as_ref(), st.survivors.len()),
-                    json!({"branch": branch, "stop": stop_evidence(&st), "teardown": t}),
+                    baseline_check(t.as_ref(), st.survivors.len() + alive.len(), unknown),
+                    json!({"branch": branch, "stop": stop_evidence(&st), "teardown": t,
+                           "tree_survivors": alive, "unknown_liveness": unknown}),
                 )
             }
-            Err(e) => (
-                Err(format!("launch failed: {e}")),
-                json!({"launch_error": e}),
-            ),
+            Err(e) => {
+                sampling.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = sampler.join();
+                (
+                    Err(format!("launch failed: {e}")),
+                    json!({"launch_error": e}),
+                )
+            }
         };
         let after = settled_handles(before, REPEAT_SETTLE);
         let valid = json!(ok.as_ref().err());
@@ -2709,11 +2732,28 @@ fn measure_inject(
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let map = sampler.join().unwrap_or_default();
     let tree = descendants(&map, &roots);
-    let end = Instant::now() + Duration::from_secs(3);
+    (r.survivors, r.unknown_liveness) = tree_liveness(&tree, os::liveness, Duration::from_secs(3));
+    // Handle count settles once released threads have exited.
+    r.handles_after = settled_handles(r.handles_before, settle);
+    if let Some(st) = &stop_report {
+        r.survivors.extend(st.survivors.iter().map(|p| json!(p)));
+    }
+    (r, tree, stop_report)
+}
+
+/// Positive liveness of a launch's sampled tree: waits up to `wait` for
+/// every process to be confirmed gone, then returns the survivors and how
+/// many could not be looked up (unknown liveness is never "gone").
+pub fn tree_liveness(
+    tree: &[(u32, u64)],
+    live: impl Fn(u32, u64) -> Option<bool>,
+    wait: Duration,
+) -> (Vec<Value>, usize) {
+    let end = Instant::now() + wait;
     let alive = loop {
         let l: Vec<((u32, u64), Option<bool>)> = tree
             .iter()
-            .map(|&(p, st)| ((p, st), os::liveness(p, st)))
+            .map(|&(p, st)| ((p, st), live(p, st)))
             .filter(|(_, l)| *l != Some(false))
             .collect();
         if l.is_empty() || Instant::now() >= end {
@@ -2721,18 +2761,13 @@ fn measure_inject(
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    r.unknown_liveness = alive.iter().filter(|(_, l)| l.is_none()).count();
-    r.survivors = alive
+    let unknown = alive.iter().filter(|(_, l)| l.is_none()).count();
+    let survivors = alive
         .iter()
         .filter(|(_, l)| *l == Some(true))
         .map(|((p, st), _)| json!({"pid": p, "start_time": st}))
         .collect();
-    // Handle count settles once released threads have exited.
-    r.handles_after = settled_handles(r.handles_before, settle);
-    if let Some(st) = &stop_report {
-        r.survivors.extend(st.survivors.iter().map(|p| json!(p)));
-    }
-    (r, tree, stop_report)
+    (survivors, unknown)
 }
 
 // ---------------- keys-probe (phase 3c) ----------------
@@ -3825,9 +3860,21 @@ mod tests {
     fn baseline_teardown_is_validated() {
         let good = json!({"teardown_ms": 100, "close_hung": false, "drain_end": "eof",
                           "drain_reached_eof": true, "process_exit": "exited"});
-        assert_eq!(baseline_check(Some(&good), 0), Ok(()));
-        assert!(baseline_check(None, 0).is_err());
-        assert!(baseline_check(Some(&good), 1).is_err());
+        assert_eq!(baseline_check(Some(&good), 0, 0), Ok(()));
+        assert!(baseline_check(None, 0, 0).is_err());
+        assert!(baseline_check(Some(&good), 1, 0).is_err());
+        // H2: a process whose liveness lookup failed is not "gone".
+        let tree = [(41, 7), (42, 8)];
+        let lookup_failed = |p, _| if p == 42 { None } else { Some(false) };
+        let (alive, unknown) = tree_liveness(&tree, lookup_failed, Duration::ZERO);
+        assert_eq!((alive.len(), unknown), (0, 1));
+        let r = baseline_check(Some(&good), alive.len(), unknown);
+        assert!(
+            r.as_ref().is_err_and(|e| e.contains("liveness unknown")),
+            "{r:?}"
+        );
+        let gone = |_, _| Some(false);
+        assert_eq!(tree_liveness(&tree, gone, Duration::ZERO), (Vec::new(), 0));
         for (k, v) in [
             ("close_hung", json!(true)),
             ("drain_end", json!("error: broken pipe")),
@@ -3837,7 +3884,7 @@ mod tests {
         ] {
             let mut t = good.clone();
             t[k] = v;
-            assert!(baseline_check(Some(&t), 0).is_err(), "{k}");
+            assert!(baseline_check(Some(&t), 0, 0).is_err(), "{k}");
         }
     }
 
