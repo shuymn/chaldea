@@ -1,4 +1,5 @@
-//! Set A (and the real-CLI parts of set C): `chs real ...`, `chs print-launch`.
+//! Set A (and the real-CLI parts of set C): `chs real ...`, `chs pretrust`,
+//! `chs print-launch`.
 //! Launches the owner's real Claude Code / Codex; never run without
 //! `--allow-api-usage`.
 
@@ -322,6 +323,20 @@ pub fn codex_hook_args(cmd: &str) -> Vec<String> {
     v
 }
 
+/// Codex launch arguments after the binary: the session-flag hooks for
+/// `hook_cmd`, `extra`, then the positional first prompt (the first turn,
+/// so nothing is typed before binding).
+pub fn codex_launch_args(hook_cmd: &str, no_daemon: bool, extra: &[String]) -> Vec<String> {
+    let mut v = Vec::new();
+    if no_daemon {
+        v.push("--no-daemon".into());
+    }
+    v.extend(codex_hook_args(hook_cmd));
+    v.extend(extra.iter().cloned());
+    v.push(CODEX_FIRST_PROMPT.into());
+    v
+}
+
 struct Plan {
     argv: Vec<OsString>,
     session_id: Option<String>,
@@ -359,17 +374,15 @@ fn plan(
             session_id: Some(sid),
         });
     }
-    if mode == Some("no-daemon") {
-        argv.push("--no-daemon".into());
-    }
     argv.extend(
-        codex_hook_args(&hook_command(&ctx.args.root, hook_agent))
-            .into_iter()
-            .map(OsString::from),
+        codex_launch_args(
+            &hook_command(&ctx.args.root, hook_agent),
+            mode == Some("no-daemon"),
+            extra,
+        )
+        .into_iter()
+        .map(OsString::from),
     );
-    argv.extend(extra.iter().map(OsString::from));
-    // The first turn is the positional prompt; nothing is typed before binding.
-    argv.push(CODEX_FIRST_PROMPT.into());
     Ok(Plan {
         argv,
         session_id: None,
@@ -1942,13 +1955,21 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
+/// How long one pre-trust launch may run before the harness ends it.
+const PRETRUST_LAUNCH: Duration = Duration::from_secs(1800);
+
+/// `chs pretrust <claude|codex>` launches the harness's launch argv in each
+/// folder the owner must trust, one at a time and without a shell, and
+/// says what to approve there; `chs print-launch` only prints that argv
+/// (diagnostics).
 pub fn print_launch(args: &Args) -> i32 {
+    let run = args.positional.first().map(String::as_str) == Some("pretrust");
     let which = args.positional.get(1).map(String::as_str).unwrap_or("");
     let (name, explicit) = match which {
         "claude" => ("claude", args.claude_bin.as_ref()),
         "codex" => ("codex", args.codex_bin.as_ref()),
         _ => {
-            eprintln!("usage: chs print-launch <claude|codex>");
+            eprintln!("usage: chs pretrust|print-launch <claude|codex>");
             return 2;
         }
     };
@@ -1959,52 +1980,59 @@ pub fn print_launch(args: &Args) -> i32 {
             return 2;
         }
     };
-    let mut argv = vec![bin.display().to_string()];
-    if name == "claude" {
-        let dir = args.root.join("print-launch");
-        if let Err(e) =
-            os::ensure_private_dir(&args.root).and_then(|_| std::fs::create_dir_all(&dir))
-        {
-            eprintln!("{e}");
-            return 3;
-        }
-        let f = dir.join("claude-settings.json");
-        if std::fs::write(
-            &f,
-            serde_json::to_vec_pretty(&claude_settings(&args.root, "claude")).unwrap_or_default(),
-        )
-        .is_err()
-        {
-            return 3;
-        }
-        argv.extend([
-            "--settings".into(),
-            f.display().to_string(),
-            "--session-id".into(),
-            uuid::Uuid::new_v4().to_string(),
-        ]);
-    }
-    if name == "codex" {
-        argv = codex_pretrust_argv(&args.root, &argv[0], args.codex_mode == "no-daemon");
-    }
     let work = args.root.join("work");
     let mut cwds = vec![work.join(name)];
     if name == "codex" {
         cwds.push(work.join("codex2"));
     }
     cwds.push(c2_cwd(&args.root));
-    println!(
-        "pre-trust: run each command below once in each of these folders and accept folder trust:"
-    );
-    for c in &cwds {
-        println!("  {}", c.display());
+    if run {
+        let approve = if name == "claude" {
+            "accept folder trust, then quit with /exit".to_string()
+        } else {
+            format!(
+                "accept folder trust; open \"Review hooks\" and trust only if every pending \
+                 entry runs `{}` (otherwise quit without trusting and report it); let the \
+                 first turn answer, then quit with /exit",
+                hook_command_for(&args.root, "codex", "chs-hook-emit")
+            )
+        };
+        for (i, cwd) in cwds.iter().enumerate() {
+            println!("pre-trust {}/{}: {name} in {}", i + 1, cwds.len(), cwd.display());
+            println!("  {approve}");
+            let res = std::fs::create_dir_all(cwd)
+                .map_err(|e| format!("{}: {e}", cwd.display()))
+                .and_then(|_| pretrust_argv(args, name, &bin))
+                .and_then(|argv| run_pretrust(&argv, cwd, PRETRUST_LAUNCH));
+            match res {
+                Ok(status) => println!("  {name} exited ({status})"),
+                Err(e) => {
+                    eprintln!("pre-trust stopped: {e}");
+                    return 3;
+                }
+            }
+        }
+    } else {
+        let argv = match pretrust_argv(args, name, &bin) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("{e}");
+                return 3;
+            }
+        };
+        println!("pre-trust (`chs pretrust {name}` runs this) in each of these folders:");
+        for c in &cwds {
+            println!("  {}", c.display());
+        }
+        println!("env (names only; values are per launch):");
+        println!("  CHALDEA_HOOK_URL=http://127.0.0.1:<port>/hook");
+        println!("  CHALDEA_HOOK_TOKEN=<64-hex, fresh per launch>");
+        println!("  CHALDEA_THREAD_ID=<uuid, fresh per launch>");
+        println!("argv (one JSON string per line):");
+        for a in &argv {
+            println!("  {}", serde_json::to_string(a).unwrap_or_default());
+        }
     }
-    println!("env (names only; values are per launch):");
-    println!("  CHALDEA_HOOK_URL=http://127.0.0.1:<port>/hook");
-    println!("  CHALDEA_HOOK_TOKEN=<64-hex, fresh per launch>");
-    println!("  CHALDEA_THREAD_ID=<uuid, fresh per launch>");
-    println!("command:");
-    println!("  {}", pretrust_command_line(os::os_name(), &argv));
     println!("then (real CLIs run only with --allow-api-usage):");
     let follow: &[&str] = if name == "claude" {
         &[
@@ -2046,6 +2074,36 @@ pub fn print_launch(args: &Args) -> i32 {
     0
 }
 
+/// One pre-trust launch's argv: Claude with the harness settings and a
+/// fresh session id; Codex as [`codex_pretrust_argv`].
+fn pretrust_argv(args: &Args, name: &str, bin: &Path) -> Result<Vec<String>, String> {
+    let bin = bin.display().to_string();
+    if name == "codex" {
+        return Ok(codex_pretrust_argv(
+            &args.root,
+            &bin,
+            args.codex_mode == "no-daemon",
+        ));
+    }
+    let dir = args.root.join("print-launch");
+    os::ensure_private_dir(&args.root)
+        .and_then(|_| std::fs::create_dir_all(&dir))
+        .map_err(|e| e.to_string())?;
+    let f = dir.join("claude-settings.json");
+    std::fs::write(
+        &f,
+        serde_json::to_vec_pretty(&claude_settings(&args.root, "claude")).unwrap_or_default(),
+    )
+    .map_err(|e| format!("{}: {e}", f.display()))?;
+    Ok(vec![
+        bin,
+        "--settings".into(),
+        f.display().to_string(),
+        "--session-id".into(),
+        uuid::Uuid::new_v4().to_string(),
+    ])
+}
+
 /// The Codex pre-trust command: the console emitter only. Codex keys hook
 /// trust by source, event, and position and keeps one trusted hash per key,
 /// so trusting another command string at the same position (the
@@ -2053,67 +2111,42 @@ pub fn print_launch(args: &Args) -> i32 {
 /// `Modified` (codex-rs `hooks/src/engine/discovery.rs`).
 pub fn codex_pretrust_argv(root: &Path, bin: &str, no_daemon: bool) -> Vec<String> {
     let mut argv = vec![bin.to_string()];
-    if no_daemon {
-        argv.push("--no-daemon".into());
-    }
-    argv.extend(codex_hook_args(&hook_command_for(
-        root,
-        "codex",
-        "chs-hook-emit",
-    )));
-    argv.push(CODEX_FIRST_PROMPT.into());
+    argv.extend(codex_launch_args(
+        &hook_command_for(root, "codex", "chs-hook-emit"),
+        no_daemon,
+        &[],
+    ));
     argv
 }
 
-/// The pre-trust command line for the owner's shell. Windows: a PowerShell
-/// call whose arguments follow the stop-parsing token `--%` in MSVC quoting,
-/// so the program receives exactly `argv` in both Windows PowerShell 5.1
-/// (which drops double quotes inside native arguments) and PowerShell 7.
-/// Elsewhere: POSIX shell quoting.
-pub fn pretrust_command_line(os: &str, argv: &[String]) -> String {
-    if os != "windows" {
-        return argv
-            .iter()
-            .map(|a| shell_quote(a))
-            .collect::<Vec<_>>()
-            .join(" ");
-    }
-    let Some((exe, args)) = argv.split_first() else {
-        return String::new();
-    };
-    let mut s = format!("& '{}' --%", exe.replace('\'', "''"));
-    for a in args {
-        s.push(' ');
-        s.push_str(&msvc_quote(a));
-    }
-    s
+/// The pre-trust process: `argv` spawned directly (no shell, so no quoting
+/// layer) in `cwd`, with the owner's console inherited.
+pub fn pretrust_command(argv: &[String], cwd: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new(&argv[0]);
+    c.args(&argv[1..]).current_dir(cwd);
+    c
 }
 
-/// One argument quoted for the MSVC C runtime's command-line parser.
-fn msvc_quote(a: &str) -> String {
-    if !a.is_empty() && !a.contains([' ', '\t', '"']) {
-        return a.to_string();
-    }
-    let mut s = String::from('"');
-    let mut backslashes = 0;
-    for c in a.chars() {
-        match c {
-            '\\' => backslashes += 1,
-            '"' => {
-                s.extend(std::iter::repeat_n('\\', 2 * backslashes + 1));
-                s.push('"');
-                backslashes = 0;
+/// Runs one pre-trust launch until it exits; ends it after `limit`.
+fn run_pretrust(argv: &[String], cwd: &Path, limit: Duration) -> Result<String, String> {
+    let mut child = pretrust_command(argv, cwd)
+        .spawn()
+        .map_err(|e| format!("{}: {e}", argv[0]))?;
+    let end = Instant::now() + limit;
+    loop {
+        let why = match child.try_wait() {
+            Ok(Some(s)) => return Ok(s.to_string()),
+            Ok(None) if Instant::now() < end => {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
             }
-            c => {
-                s.extend(std::iter::repeat_n('\\', backslashes));
-                s.push(c);
-                backslashes = 0;
-            }
-        }
+            Ok(None) => format!("still running after {} min; ended it", limit.as_secs() / 60),
+            Err(e) => e.to_string(),
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(why);
     }
-    s.extend(std::iter::repeat_n('\\', 2 * backslashes));
-    s.push('"');
-    s
 }
 
 /// C-2's spaced, non-ASCII cwd (`C:\chs\work\日本 dir` on Windows).
@@ -2124,6 +2157,7 @@ pub fn c2_cwd(root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     #[test]
     fn codex_flag_is_valid_inline_toml_shape() {
@@ -2271,73 +2305,28 @@ trusted_hash = "sha256:bb"
         );
     }
 
-    /// Splits a command line with the MSVC C runtime rules (what a Rust
-    /// program on Windows sees as its arguments).
-    fn msvc_args(s: &str) -> Vec<String> {
-        let (mut out, mut cur, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
-        let c: Vec<char> = s.chars().collect();
-        let mut i = 0;
-        while i < c.len() {
-            match c[i] {
-                '\\' => {
-                    let n = c[i..].iter().take_while(|x| **x == '\\').count();
-                    if c.get(i + n) == Some(&'"') {
-                        cur.extend(std::iter::repeat_n('\\', n / 2));
-                        if n % 2 == 1 {
-                            cur.push('"');
-                            i += n + 1;
-                            any = true;
-                            continue;
-                        }
-                        i += n;
-                    } else {
-                        cur.extend(std::iter::repeat_n('\\', n));
-                        i += n;
-                    }
-                    any = true;
-                }
-                '"' => {
-                    quoted = !quoted;
-                    any = true;
-                    i += 1;
-                }
-                ' ' | '\t' if !quoted => {
-                    if any {
-                        out.push(std::mem::take(&mut cur));
-                        any = false;
-                    }
-                    i += 1;
-                }
-                ch => {
-                    cur.push(ch);
-                    any = true;
-                    i += 1;
-                }
-            }
-        }
-        if any {
-            out.push(cur);
-        }
-        out
-    }
-
-    /// H1: on Windows the pre-trust command is a PowerShell invocation that
-    /// hands Codex exactly the harness's argv (the session-flag TOML holds
-    /// double quotes, which PowerShell 5.1 drops from native arguments, so
-    /// the arguments follow the stop-parsing token in MSVC quoting); other
-    /// hosts keep POSIX shell quoting.
+    /// H1: pre-trust spawns the harness's own Codex launch argv directly
+    /// (no shell), in the listed folder: a path with spaces and `-c`
+    /// values holding double quotes reach Codex unchanged.
     #[test]
-    fn pretrust_command_is_powershell_on_windows() {
+    fn pretrust_spawns_the_harness_argv_without_a_shell() {
+        let root = Path::new(r"C:\chs root");
         let exe = r"C:\chs\npm\codex 1\codex.exe";
-        let argv = codex_pretrust_argv(Path::new(r"C:\chs"), exe, true);
-        let line = pretrust_command_line("windows", &argv);
-        let rest = line
-            .strip_prefix(&format!("& '{exe}' --% "))
-            .unwrap_or_else(|| panic!("not a PowerShell call: {line}"));
-        assert_eq!(msvc_args(rest), argv[1..].to_vec(), "{line}");
-        assert!(!rest.contains('%'), "{line}");
-        let posix = pretrust_command_line("macos", &argv[..2]);
-        assert_eq!(posix, format!("'{exe}' --no-daemon"));
+        let cwd = c2_cwd(root);
+        let argv = codex_pretrust_argv(root, exe, true);
+        let mut harness = vec![exe.to_string()];
+        harness.extend(codex_launch_args(
+            &hook_command_for(root, "codex", "chs-hook-emit"),
+            true,
+            &[],
+        ));
+        assert_eq!(argv, harness);
+        assert!(argv.iter().any(|a| a.contains('"')), "{argv:?}");
+        let cmd = pretrust_command(&argv, &cwd);
+        assert_eq!(cmd.get_program(), exe);
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, argv[1..].iter().map(OsStr::new).collect::<Vec<_>>());
+        assert_eq!(cmd.get_current_dir(), Some(cwd.as_path()));
     }
 
     #[test]

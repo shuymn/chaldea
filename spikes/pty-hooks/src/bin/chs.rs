@@ -37,7 +37,7 @@ fn main() {
         "install-emitter" => scenario::install_emitter(&args),
         "fake" => fake::run(args),
         "real" => real::run(args),
-        "print-launch" => real::print_launch(&args),
+        "print-launch" | "pretrust" => real::print_launch(&args),
         "win-probe" => win_probe::run(args),
         "bundle" => scenario::bundle(&args),
         _ => {

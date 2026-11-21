@@ -108,7 +108,8 @@ usage:
   chs fake raw-inject --pty-backend raw --raw-inject X   (Windows F-2c; not part of `all`)
   chs real <claude-hooks|claude-paste|claude-stall|codex-hooks|codex-paste|codex-stall|codex-warm|tree-kill>
            --allow-api-usage [--agent claude|codex]
-  chs print-launch <claude|codex>
+  chs pretrust <claude|codex>               (launches the CLI in each folder to trust)
+  chs print-launch <claude|codex>           (prints the launch argv; diagnostics)
   chs win-probe <paste|startup|kill|attach|console|all> [--detached]
   chs win-probe attach-client --url U [--confirm-close]   (credential on stdin)
   chs bundle [--include-pty-output]
