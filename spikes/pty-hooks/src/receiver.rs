@@ -230,10 +230,16 @@ impl Receiver {
                             }
                             if st.active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
                                 st.active.fetch_sub(1, Ordering::SeqCst);
-                                st.reject(503);
-                                let mut s = stream;
-                                let _ = s.set_write_timeout(Some(Duration::from_millis(200)));
-                                let _ = respond(&mut s, 503, b"");
+                                // The same bounded rejection finalizer as any
+                                // other rejection (inline: accepting waits
+                                // while every slot is taken).
+                                st.finalize(
+                                    stream,
+                                    Instant::now(),
+                                    "overload",
+                                    None,
+                                    Some((503, Vec::new())),
+                                );
                                 continue;
                             }
                             let st2 = st.clone();
@@ -466,17 +472,8 @@ fn reason(code: u16) -> &'static str {
 
 pub type AmbiguityHook = Box<dyn Fn() + Send + Sync>;
 
-fn respond(s: &mut TcpStream, code: u16, body: &[u8]) -> io::Result<()> {
-    respond_by(s, code, body, Instant::now() + Duration::from_millis(200))
-}
-
 /// Writes the response, recomputing the write timeout from `deadline` before
-/// every write.
-fn respond_by(s: &mut TcpStream, code: u16, body: &[u8], deadline: Instant) -> io::Result<()> {
-    respond_counted(s, code, body, deadline).1
-}
-
-/// Like `respond_by`, also returning how many bytes reached the socket.
+/// every write; returns how many bytes reached the socket.
 fn respond_counted(
     s: &mut TcpStream,
     code: u16,
@@ -580,21 +577,38 @@ impl State {
 
     fn handle(&self, mut s: TcpStream) {
         let accepted = Instant::now();
-        let bound = accepted + CONNECTION_BOUND;
         let deadline = accepted + REQUEST_DEADLINE;
         let mut info = ConnInfo {
             route: "unrouted",
             declared: None,
         };
-        let outcome = self.process(&mut s, deadline, &mut info);
+        let reply = match self.process(&mut s, deadline, &mut info) {
+            Outcome::Reply(code, body) => Some((code, body)),
+            Outcome::Closed => None,
+        };
+        self.finalize(s, accepted, info.route, info.declared, reply);
+    }
+
+    /// Writes a decided response with its own budget and, for a rejection,
+    /// half-closes and drains the unread request bytes (bounded) before
+    /// closing; records the connection either way.
+    fn finalize(
+        &self,
+        mut s: TcpStream,
+        accepted: Instant,
+        route: &str,
+        declared: Option<usize>,
+        reply: Option<(u16, Vec<u8>)>,
+    ) {
+        let bound = accepted + CONNECTION_BOUND;
         let ms = || accepted.elapsed().as_millis() as u64;
         let mut rec = ConnRecord {
             seq: CONN_SEQ.fetch_add(1, Ordering::SeqCst) + 1,
-            route: info.route.into(),
+            route: route.into(),
             decided_ms: ms(),
             ..Default::default()
         };
-        if let Outcome::Reply(code, body) = outcome {
+        if let Some((code, body)) = reply {
             rec.decided = Some(code);
             if code != 200 {
                 self.reject(code);
@@ -614,7 +628,7 @@ impl State {
                 // Half-close, then discard what the client still sends, so
                 // closing never resets a connection the response is still on.
                 let _ = s.shutdown(Shutdown::Write);
-                let cap = info.declared.map_or(MAX_BODY, |n| n.min(MAX_BODY)) + DRAIN_SLACK;
+                let cap = declared.map_or(MAX_BODY, |n| n.min(MAX_BODY)) + DRAIN_SLACK;
                 let (d, why) = drain(&mut s, cap, (Instant::now() + DRAIN_TIME).min(bound));
                 rec.drained = d;
                 rec.drain_stop = Some(why);
@@ -1404,6 +1418,52 @@ pub(crate) mod tests {
                 .all(|c| c.decided == Some(401) && c.write_ok == Some(true))
         );
         assert_eq!(fixtures(&d), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// M8: the 17th concurrent connection gets its 503 through the same
+    /// rejection finalizer as every other rejection (write budget,
+    /// half-close, bounded drain) and leaves a per-request record, also
+    /// when its body was sent up front.
+    #[test]
+    fn overload_rejection_is_finalized_and_recorded() {
+        let d = tmp();
+        let r = test_receiver(&d);
+        let p = r.port();
+        // Sixteen connections that never send a head hold every slot.
+        let idle: Vec<TcpStream> = (0..MAX_CONNS).map(|_| connect(p)).collect();
+        let end = Instant::now() + Duration::from_secs(5);
+        while r.state.active.load(Ordering::SeqCst) < MAX_CONNS && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let body = vec![b'b'; 256 * 1024];
+        let mut s = connect(p);
+        s.write_all(
+            format!(
+                "POST /hook HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nAuthorization: Bearer t0k\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut w = s.try_clone().unwrap();
+        let writer = std::thread::spawn(move || w.write_all(&body).is_ok());
+        assert_eq!(read_status(&mut s), 503);
+        assert!(writer.join().unwrap(), "the drain took the body");
+        drop(s);
+        let end = Instant::now() + Duration::from_secs(5);
+        let rec = loop {
+            let c = r.connections().into_iter().find(|c| c.decided == Some(503));
+            if c.is_some() || Instant::now() >= end {
+                break c;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        drop(idle);
+        let rec = rec.expect("a record for the 503");
+        assert_eq!(rec.route, "overload");
+        assert_eq!(rec.write_ok, Some(true));
+        assert!(rec.drained > 0, "{rec:#?}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
