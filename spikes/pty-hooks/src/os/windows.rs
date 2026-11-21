@@ -1371,6 +1371,14 @@ pub fn raw_last_launch() -> Option<serde_json::Value> {
     RAW_LAUNCH.lock().ok().and_then(|l| l.clone())
 }
 
+/// Forgets the previous launch's record, so a launch that fails before its
+/// spawn (e.g. in receiver setup) never reports an earlier launch's branch.
+pub fn raw_clear_launch() {
+    if let Ok(mut l) = RAW_LAUNCH.lock() {
+        *l = None;
+    }
+}
+
 /// Records of raw-backend teardowns (F-2c evidence), newest last.
 static RAW_TEARDOWNS: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
 

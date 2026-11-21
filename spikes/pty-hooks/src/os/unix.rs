@@ -492,6 +492,8 @@ pub fn raw_last_launch() -> Option<serde_json::Value> {
     None
 }
 
+pub fn raw_clear_launch() {}
+
 #[allow(clippy::too_many_arguments)]
 pub fn raw_spawn(
     _argv: &[OsString],

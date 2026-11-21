@@ -429,6 +429,9 @@ pub fn launch(ctx: &Ctx, spec: LaunchSpec) -> Result<Launch, String> {
 /// `launch` under an explicit backend (F-2c's no-injection baseline
 /// launches run in an injection run's process).
 pub fn launch_with(ctx: &Ctx, spec: LaunchSpec, backend: os::Backend) -> Result<Launch, String> {
+    // Branch evidence belongs to this launch only (cleared before the
+    // receiver is set up).
+    os::raw_clear_launch();
     let thread_id = uuid::Uuid::new_v4().to_string();
     let token = util::token();
     let receiver = Receiver::start(Config {
