@@ -13,9 +13,85 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
-/// `WindowObserver::stop`: `(pid, ppid at event time)` per shown window, and
-/// the observer's health (an error means the events may be incomplete).
-pub type ObserverStop = (Vec<(u32, Option<u32>)>, Result<(), String>);
+/// `WindowObserver::stop`: every `EVENT_OBJECT_SHOW` recorded, and the
+/// observer's health (an error means the events may be incomplete).
+pub type ObserverStop = (Vec<WindowEvent>, Result<(), String>);
+
+/// One `EVENT_OBJECT_SHOW`, recorded at callback time (C-5, F-3a). No
+/// visibility filter: a flash already hidden still counts.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct WindowEvent {
+    /// Milliseconds since the observer started.
+    pub time_ms: u64,
+    pub hwnd: u64,
+    pub id_object: i32,
+    pub id_child: i32,
+    pub class: String,
+    pub owner_pid: u32,
+    pub image: Option<String>,
+    pub ppid: Option<u32>,
+    pub start_time: Option<u64>,
+    /// The owner was in the observation job at callback time.
+    pub in_job: Option<bool>,
+}
+
+/// `OBJID_WINDOW` / `CHILDID_SELF`: the only events classified.
+pub const OBJID_WINDOW: i32 = 0;
+pub const CHILDID_SELF: i32 = 0;
+
+impl WindowEvent {
+    pub fn is_window(&self) -> bool {
+        self.id_object == OBJID_WINDOW && self.id_child == CHILDID_SELF
+    }
+}
+
+/// F-2c fault injections for the raw backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawInject {
+    BeforeSpawn,
+    AfterSpawn,
+    ReaderStart,
+    ForceSuspended,
+    ResumeFail,
+}
+
+impl RawInject {
+    pub fn parse(s: &str) -> Option<RawInject> {
+        Some(match s {
+            "before-spawn" => RawInject::BeforeSpawn,
+            "after-spawn" => RawInject::AfterSpawn,
+            "reader-start" => RawInject::ReaderStart,
+            "force-suspended" => RawInject::ForceSuspended,
+            "resume-fail" => RawInject::ResumeFail,
+            _ => return None,
+        })
+    }
+}
+
+/// PTY backend of a launch. `Portable` is today's portable-pty path (and
+/// the only one off Windows); `Raw` is the spike's own ConPTY launch with
+/// `PROC_THREAD_ATTRIBUTE_JOB_LIST` (§4.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    #[default]
+    Portable,
+    Raw {
+        conpty_flags: u32,
+        inject: Option<RawInject>,
+    },
+}
+
+/// A raw ConPTY launch, plugged into `Session` through portable-pty's own
+/// traits. `branch` is `job_list` or `suspended`; `job_list_error` is the
+/// error `CreateProcessW` returned with the job list, when it did.
+pub struct RawSpawn {
+    pub master: Box<dyn portable_pty::MasterPty + Send>,
+    pub child: Box<dyn portable_pty::Child + Send + Sync>,
+    pub tree: Tree,
+    pub branch: String,
+    pub job_list_error: Option<String>,
+    pub conpty_module: Option<String>,
+}
 
 /// One row of the process table. `pgid`/`sid` are Unix-only.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

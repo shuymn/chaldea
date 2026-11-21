@@ -223,6 +223,16 @@ impl Tree {
     pub fn members(&self) -> Vec<u32> {
         Vec::new()
     }
+
+    /// Positive membership is a job property; the Unix kill path has no
+    /// membership proof (§4.8 `backend` kill proof is Windows only).
+    pub fn proves_membership(&self) -> bool {
+        false
+    }
+
+    pub fn members_checked(&self) -> Result<Vec<u32>, String> {
+        Err("not applicable".into())
+    }
 }
 
 /// Starts `cmd` so that it leaves the caller's session (`setsid`).
@@ -278,6 +288,15 @@ impl Drop for RawMode {
 }
 
 pub fn enable_vt_output() {}
+
+/// `(cols, rows)` of the terminal on stdout.
+pub fn console_size() -> Option<(u16, u16)> {
+    // SAFETY: winsize is plain data filled by the ioctl.
+    unsafe {
+        let mut w: libc::winsize = std::mem::zeroed();
+        (libc::ioctl(1, libc::TIOCGWINSZ, &mut w) == 0).then_some((w.ws_col, w.ws_row))
+    }
+}
 
 pub fn stdin_reader() -> Box<dyn Read + Send> {
     Box::new(io::stdin())
@@ -367,13 +386,59 @@ pub fn spawn_detached(_cmd: &mut Command) -> Result<(Child, bool), String> {
 pub struct WindowObserver;
 
 impl WindowObserver {
-    pub fn start() -> Result<WindowObserver, String> {
+    pub fn start(_job: Option<&ObservationJob>) -> Result<WindowObserver, String> {
         Err("windows_only".into())
     }
-    /// `(pid, ppid at event time)` of every shown window, and observer health.
     pub fn stop(self) -> super::ObserverStop {
         (Vec::new(), Err("windows_only".into()))
     }
+}
+
+/// C-5 observation job (no-op off Windows).
+pub struct ObservationJob;
+
+impl ObservationJob {
+    pub fn new() -> io::Result<ObservationJob> {
+        Ok(ObservationJob)
+    }
+    pub fn assign(&self, _child: &Child) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// C-5 calibration window: `(pid, start_time, hwnd)` of the shown window.
+pub fn show_calibration_window(
+    _at_exit: bool,
+    _report: &dyn Fn(u32, u64, u64),
+) -> Result<(u32, u64, u64), String> {
+    Err("windows_only".into())
+}
+
+pub fn process_handle_count() -> Option<u32> {
+    None
+}
+
+pub fn default_terminal_delegation() -> serde_json::Value {
+    serde_json::Value::Null
+}
+
+/// The last raw-backend teardown record (Windows only).
+pub fn raw_last_teardown() -> Option<serde_json::Value> {
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn raw_spawn(
+    _argv: &[OsString],
+    _env: &[(String, String)],
+    _remove: &[String],
+    _cwd: &Path,
+    _cols: u16,
+    _rows: u16,
+    _flags: u32,
+    _inject: Option<super::RawInject>,
+) -> Result<super::RawSpawn, String> {
+    Err("windows_only".into())
 }
 
 pub struct JobFirst;

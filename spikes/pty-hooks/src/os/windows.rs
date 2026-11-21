@@ -9,18 +9,20 @@ use std::os::windows::io::FromRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, FILETIME, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE,
+    CloseHandle, ERROR_ACCESS_DENIED, FILETIME, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM,
+    LRESULT, STILL_ACTIVE, WPARAM,
 };
 use windows_sys::Win32::System::Console::{
     COORD, CTRL_BREAK_EVENT, ClosePseudoConsole, CreatePseudoConsole, ENABLE_ECHO_INPUT,
     ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
     ENABLE_VIRTUAL_TERMINAL_PROCESSING, GenerateConsoleCtrlEvent, GetConsoleCP, GetConsoleMode,
-    GetConsoleWindow, GetStdHandle, HPCON, ReadConsoleW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-    SetConsoleMode,
+    GetConsoleWindow, GetStdHandle, HPCON, ReadConsoleW, ResizePseudoConsole, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE, SetConsoleMode,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -33,20 +35,26 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW,
+};
 use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentThreadId, GetExitCodeProcess,
-    GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
-    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    GetProcessHandleCount, GetProcessTimes, INFINITE, InitializeProcThreadAttributeList,
+    OpenProcess, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+    PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EVENT_OBJECT_SHOW, GetMessageW, GetWindowThreadProcessId, MSG, OBJID_WINDOW,
-    PM_NOREMOVE, PeekMessageW, PostThreadMessageW, TranslateMessage, WINEVENT_OUTOFCONTEXT,
-    WM_QUIT,
+    CreateCaret, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    EVENT_OBJECT_SHOW, GetClassNameW, GetMessageW, GetWindowThreadProcessId, MSG, PM_NOREMOVE,
+    PM_REMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW, SW_SHOW, ShowCaret, ShowWindow,
+    TranslateMessage, WINEVENT_OUTOFCONTEXT, WM_QUIT, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
 use super::ProcInfo;
@@ -62,6 +70,7 @@ fn wide(s: &OsStr) -> Vec<u16> {
 }
 
 /// Owned kernel handle, closed on drop. Stored as usize so it is Send + Sync.
+#[derive(Debug)]
 struct Handle(usize);
 
 impl Handle {
@@ -234,9 +243,12 @@ fn job_members(job: HANDLE) -> io::Result<Vec<u32>> {
     }
 }
 
-/// Harness-established ownership: a `KILL_ON_JOB_CLOSE` job assigned after spawn.
+/// Harness-established ownership: a `KILL_ON_JOB_CLOSE` job, assigned after
+/// spawn (portable-pty) or given at creation (raw backend).
 pub struct Tree {
     job: Handle,
+    /// `after_spawn`, `job_list`, or `suspended`.
+    assign: &'static str,
 }
 
 impl Tree {
@@ -249,11 +261,14 @@ impl Tree {
         if unsafe { AssignProcessToJobObject(job.raw(), h as HANDLE) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Tree { job })
+        Ok(Tree {
+            job,
+            assign: "after_spawn",
+        })
     }
 
     pub fn describe(&self) -> serde_json::Value {
-        serde_json::json!({"mechanism": "job_object", "kill_on_job_close": true, "assign": "after_spawn"})
+        serde_json::json!({"mechanism": "job_object", "kill_on_job_close": true, "assign": self.assign})
     }
 
     pub fn kill(&self, _grace: Duration) -> Vec<String> {
@@ -265,6 +280,16 @@ impl Tree {
     /// Best-effort membership for the kill scan (the lineage scan backs it up).
     pub fn members(&self) -> Vec<u32> {
         job_members(self.job.raw()).unwrap_or_default()
+    }
+
+    /// Positive job membership backs the §4.8 `backend` kill proof.
+    pub fn proves_membership(&self) -> bool {
+        true
+    }
+
+    /// Membership; an enumeration failure is an error, never an empty job.
+    pub fn members_checked(&self) -> Result<Vec<u32>, String> {
+        job_members(self.job.raw()).map_err(|e| e.to_string())
     }
 }
 
@@ -337,6 +362,24 @@ impl Drop for RawMode {
                 SetConsoleMode(h as HANDLE, m);
             }
         }
+    }
+}
+
+/// `(cols, rows)` of the console window on stdout.
+pub fn console_size() -> Option<(u16, u16)> {
+    // SAFETY: plain query into a zeroed struct.
+    unsafe {
+        let mut i: windows_sys::Win32::System::Console::CONSOLE_SCREEN_BUFFER_INFO =
+            std::mem::zeroed();
+        if windows_sys::Win32::System::Console::GetConsoleScreenBufferInfo(
+            GetStdHandle(STD_OUTPUT_HANDLE),
+            &mut i,
+        ) == 0
+        {
+            return None;
+        }
+        let w = i.srWindow;
+        Some(((w.Right - w.Left + 1) as u16, (w.Bottom - w.Top + 1) as u16))
     }
 }
 
@@ -517,33 +560,88 @@ pub fn spawn_detached(cmd: &mut Command) -> Result<(Child, bool), String> {
     }
 }
 
-/// `(pid, ppid at event time)` per shown window, recorded inside the callback
-/// so a short-lived owner is still attributable after it exits.
-static SHOWN: Mutex<Vec<(u32, Option<u32>)>> = Mutex::new(Vec::new());
+/// Every shown-window event of the running observer, recorded at callback
+/// time so a short-lived owner is still attributable after it exits.
+static SHOWN: Mutex<Vec<super::WindowEvent>> = Mutex::new(Vec::new());
+/// The running observer's start (event times are relative to it).
+static OBS_T0: Mutex<Option<Instant>> = Mutex::new(None);
+/// The observation job's handle (0 = none), for `IsProcessInJob` at callback time.
+static OBS_JOB: AtomicUsize = AtomicUsize::new(0);
+
+fn image_of(h: HANDLE) -> Option<String> {
+    let mut buf = [0u16; 1024];
+    let mut n = buf.len() as u32;
+    // SAFETY: buffer length passed in `n`.
+    if unsafe { QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut n) } == 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..n as usize]))
+}
 
 unsafe extern "system" fn on_show(
     _hook: HWINEVENTHOOK,
     _event: u32,
-    hwnd: windows_sys::Win32::Foundation::HWND,
+    hwnd: HWND,
     id_object: i32,
-    _id_child: i32,
+    id_child: i32,
     _thread: u32,
     _time: u32,
 ) {
-    if id_object != OBJID_WINDOW || hwnd.is_null() {
-        return;
+    let time_ms = OBS_T0
+        .lock()
+        .ok()
+        .and_then(|t| t.map(|t| t.elapsed().as_millis() as u64))
+        .unwrap_or(0);
+    let mut owner = 0u32;
+    let mut class = String::new();
+    if !hwnd.is_null() {
+        let mut buf = [0u16; 256];
+        // SAFETY: hwnd comes from the system for this callback; buffer length passed.
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut owner);
+            let n = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+            if n > 0 {
+                class = String::from_utf16_lossy(&buf[..n as usize]);
+            }
+        }
     }
-    // No IsWindowVisible filter: a flash may already be hidden by now.
-    let mut pid = 0u32;
-    // SAFETY: hwnd comes from the system for this callback.
-    unsafe {
-        GetWindowThreadProcessId(hwnd, &mut pid);
+    let (mut image, mut in_job) = (None, None);
+    if owner != 0 {
+        // SAFETY: handle owned for the duration; the job handle stays open while the observer runs.
+        unsafe {
+            if let Some(h) = Handle::new(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, owner)) {
+                image = image_of(h.raw());
+                let job = OBS_JOB.load(Ordering::SeqCst);
+                if job != 0 {
+                    let mut r = 0;
+                    if IsProcessInJob(h.raw(), job as HANDLE, &mut r) != 0 {
+                        in_job = Some(r != 0);
+                    }
+                }
+            }
+        }
     }
-    let ppid = proc_info(pid).map(|p| p.ppid);
+    let info = (owner != 0).then(|| proc_info(owner)).flatten();
+    let ev = super::WindowEvent {
+        time_ms,
+        hwnd: hwnd as usize as u64,
+        id_object,
+        id_child,
+        class,
+        owner_pid: owner,
+        image,
+        ppid: info.as_ref().map(|p| p.ppid),
+        start_time: info.as_ref().map(|p| p.start_time).filter(|t| *t != 0),
+        in_job,
+    };
     if let Ok(mut v) = SHOWN.lock() {
-        v.push((pid, ppid));
+        v.push(ev);
     }
 }
+
+/// After the observed process ended, the observer keeps pumping this long so
+/// callbacks already queued are delivered (a flash at the end of a launch).
+pub const OBSERVER_DRAIN: Duration = Duration::from_millis(500);
 
 /// Out-of-context `EVENT_OBJECT_SHOW` observer on its own message-loop thread.
 pub struct WindowObserver {
@@ -553,10 +651,16 @@ pub struct WindowObserver {
 }
 
 impl WindowObserver {
-    pub fn start() -> Result<WindowObserver, String> {
+    /// Arms the observer; `job` is the observation job whose membership each
+    /// event records. Call before the observed process is created.
+    pub fn start(job: Option<&ObservationJob>) -> Result<WindowObserver, String> {
         if let Ok(mut v) = SHOWN.lock() {
             v.clear();
         }
+        if let Ok(mut t) = OBS_T0.lock() {
+            *t = Some(Instant::now());
+        }
+        OBS_JOB.store(job.map_or(0, |j| j.job.0), Ordering::SeqCst);
         let (tx, rx) = std::sync::mpsc::channel();
         let join = std::thread::spawn(move || {
             // SAFETY: hook + message loop on this thread; unhooked before exit.
@@ -601,11 +705,12 @@ impl WindowObserver {
         }
     }
 
-    /// Stops the loop (bounded: a thread that does not quit is abandoned).
-    /// Returns the events and the observer's health: a failed `WM_QUIT`
-    /// post, a thread that did not exit, or a message loop that ended on an
-    /// error means the events may be incomplete.
+    /// Stops the loop after the drain interval (bounded: a thread that does
+    /// not quit is abandoned). Returns the events and the observer's health:
+    /// a failed `WM_QUIT` post, a thread that did not exit, or a message
+    /// loop that ended on an error means the events may be incomplete.
     pub fn stop(self) -> super::ObserverStop {
+        std::thread::sleep(OBSERVER_DRAIN);
         // SAFETY: posting WM_QUIT to the observer thread.
         let posted = unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) } != 0;
         let health = if !posted {
@@ -614,8 +719,8 @@ impl WindowObserver {
                 io::Error::last_os_error()
             ))
         } else {
-            let end = std::time::Instant::now() + Duration::from_secs(2);
-            while !self.join.is_finished() && std::time::Instant::now() < end {
+            let end = Instant::now() + Duration::from_secs(2);
+            while !self.join.is_finished() && Instant::now() < end {
                 std::thread::sleep(Duration::from_millis(10));
             }
             if !self.join.is_finished() {
@@ -628,12 +733,170 @@ impl WindowObserver {
                 }
             }
         };
+        OBS_JOB.store(0, Ordering::SeqCst);
         let events = match SHOWN.lock() {
             Ok(v) => v.clone(),
             Err(_) => return (Vec::new(), Err("event list poisoned".into())),
         };
         (events, health)
     }
+}
+
+/// A `KILL_ON_JOB_CLOSE` job each observed launch runs in (C-5): the child
+/// waits for `go` on stdin until it has been assigned.
+pub struct ObservationJob {
+    job: Handle,
+}
+
+impl ObservationJob {
+    pub fn new() -> io::Result<ObservationJob> {
+        Ok(ObservationJob {
+            job: new_kill_on_close_job()?,
+        })
+    }
+    pub fn assign(&self, child: &Child) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: both handles are valid for the call.
+        if unsafe { AssignProcessToJobObject(self.job.raw(), child.as_raw_handle() as HANDLE) } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+unsafe extern "system" fn calib_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    // SAFETY: default handling for our own window class.
+    unsafe { DefWindowProcW(hwnd, msg, w, l) }
+}
+
+/// Pumps this thread's messages for `d`.
+fn pump(d: Duration) {
+    let end = Instant::now() + d;
+    // SAFETY: plain message pump on the calling thread.
+    unsafe {
+        let mut msg: MSG = std::mem::zeroed();
+        while Instant::now() < end {
+            while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// C-5 calibration helper body (`chs-fake-cli --mode window-calibrate`): a
+/// caret first (a non-window control event), then one visible top-level
+/// window of its own (so the event's owner pid is this process), shown for
+/// 1 s, or only in the last 50 ms with `at_exit`. Returns `(pid, start
+/// time, hwnd)`; the caller reports them before the window shows.
+pub fn show_calibration_window(
+    at_exit: bool,
+    report: &dyn Fn(u32, u64, u64),
+) -> Result<(u32, u64, u64), String> {
+    let pid = std::process::id();
+    let start = proc_info(pid).map(|p| p.start_time).unwrap_or(0);
+    let class = wide(OsStr::new("ChsCalibrationWindow"));
+    let title = wide(OsStr::new("chs calibration"));
+    // SAFETY: class registration and window creation for our own process.
+    unsafe {
+        let hinst = GetModuleHandleW(std::ptr::null());
+        let mut wc: WNDCLASSW = std::mem::zeroed();
+        wc.lpfnWndProc = Some(calib_proc);
+        wc.hInstance = hinst;
+        wc.lpszClassName = class.as_ptr();
+        if RegisterClassW(&wc) == 0 {
+            return Err(format!("RegisterClassW: {}", io::Error::last_os_error()));
+        }
+        let hwnd = CreateWindowExW(
+            0,
+            class.as_ptr(),
+            title.as_ptr(),
+            WS_OVERLAPPEDWINDOW,
+            100,
+            100,
+            320,
+            120,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            hinst,
+            std::ptr::null(),
+        );
+        if hwnd.is_null() {
+            return Err(format!("CreateWindowExW: {}", io::Error::last_os_error()));
+        }
+        let h = hwnd as usize as u64;
+        report(pid, start, h);
+        // The caret control: a show event with OBJID_CARET from the same pid.
+        CreateCaret(hwnd, std::ptr::null_mut(), 2, 16);
+        ShowCaret(hwnd);
+        if at_exit {
+            pump(Duration::from_millis(300));
+        }
+        ShowWindow(hwnd, SW_SHOW);
+        pump(if at_exit {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(1)
+        });
+        DestroyWindow(hwnd);
+        Ok((pid, start, h))
+    }
+}
+
+/// `GetProcessHandleCount` of this process (F-2c).
+pub fn process_handle_count() -> Option<u32> {
+    let mut n = 0u32;
+    // SAFETY: plain call on the current-process pseudo handle.
+    (unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) } != 0).then_some(n)
+}
+
+fn reg_sz(root: HKEY, sub: &str, value: Option<&str>) -> Option<String> {
+    let sub = wide(OsStr::new(sub));
+    let val = value.map(|v| wide(OsStr::new(v)));
+    let mut buf = vec![0u16; 1024];
+    let mut len = (buf.len() * 2) as u32;
+    // SAFETY: buffer size passed in bytes.
+    let r = unsafe {
+        RegGetValueW(
+            root,
+            sub.as_ptr(),
+            val.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut c_void,
+            &mut len,
+        )
+    };
+    if r != 0 {
+        return None;
+    }
+    let n = (len as usize / 2).min(buf.len());
+    let s = String::from_utf16_lossy(&buf[..n]);
+    Some(s.trim_end_matches('\0').to_string())
+}
+
+/// The host's default-terminal setting (`HKCU\Console\%%Startup`) as raw
+/// CLSID values, each resolved to an executable only through a plain
+/// `HKCR\CLSID\{…}\LocalServer32` default value, else `unresolved`.
+pub fn default_terminal_delegation() -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for name in ["DelegationConsole", "DelegationTerminal"] {
+        let raw = reg_sz(HKEY_CURRENT_USER, r"Console\%%Startup", Some(name));
+        let exe = raw.as_ref().and_then(|c| {
+            reg_sz(
+                HKEY_CLASSES_ROOT,
+                &format!(r"CLSID\{c}\LocalServer32"),
+                None,
+            )
+        });
+        out.insert(
+            name.into(),
+            serde_json::json!({"clsid": raw, "exe": exe.unwrap_or_else(|| "unresolved".into())}),
+        );
+    }
+    serde_json::Value::Object(out)
 }
 
 fn quote_arg(arg: &OsStr, out: &mut Vec<u16>) {
@@ -738,19 +1001,595 @@ impl Drop for AttrList {
     }
 }
 
-/// C-3 job-first launch: raw ConPTY + `CreateProcessW` with
-/// `PROC_THREAD_ATTRIBUTE_JOB_LIST`; the `CREATE_SUSPENDED` + assign +
-/// `ResumeThread` branch runs only if JOB_LIST fails.
-pub struct JobFirst {
-    hpc: HPCON,
-    job: Handle,
-    process: Handle,
+/// Records of raw-backend teardowns (F-2c evidence), newest last.
+static RAW_TEARDOWNS: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
+
+fn record_teardown(v: serde_json::Value) {
+    if let Ok(mut t) = RAW_TEARDOWNS.lock() {
+        t.push(v);
+    }
+}
+
+/// The last raw-backend teardown record.
+pub fn raw_last_teardown() -> Option<serde_json::Value> {
+    RAW_TEARDOWNS.lock().ok().and_then(|t| t.last().cloned())
+}
+
+/// Owned pseudoconsole, closed on drop.
+struct Pcon(HPCON);
+
+impl Drop for Pcon {
+    fn drop(&mut self) {
+        // SAFETY: hpc is owned and closed once.
+        unsafe { ClosePseudoConsole(self.0) }
+    }
+}
+
+/// Bytes the drain holds while no consumer has attached yet.
+const DRAIN_HOLD: usize = 1 << 20;
+
+/// State shared by the output drain and the session's reader. The drain
+/// owns the host output read end and keeps reading on every path until
+/// `ClosePseudoConsole` has returned (EOF): output is forwarded to the
+/// consumer while there is one, held (bounded) before one attaches, and
+/// discarded once the consumer is gone (failed reader start, abort,
+/// teardown). The drain never depends on its consumer.
+#[derive(Default)]
+struct DrainState {
+    /// `(consumer, held output)`; the consumer is taken when it goes away.
+    consumer: Mutex<(Option<std::sync::mpsc::Sender<Vec<u8>>>, Vec<u8>, bool)>,
+    finished: AtomicBool,
+    bytes: AtomicU64,
+}
+
+struct Drain {
+    state: Arc<DrainState>,
+    join: std::thread::JoinHandle<()>,
+}
+
+impl Drain {
+    /// Starts the drain. If the thread cannot start, `output` is dropped with
+    /// the closure, so the host read end is closed before anything else.
+    fn start(mut output: std::fs::File) -> io::Result<Drain> {
+        let state = Arc::new(DrainState::default());
+        let st = state.clone();
+        let join = std::thread::Builder::new()
+            .name("conpty-drain".into())
+            .spawn(move || {
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    let n = match output.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    st.bytes.fetch_add(n as u64, Ordering::SeqCst);
+                    let mut c = st.consumer.lock().unwrap_or_else(|e| e.into_inner());
+                    let (tx, held, gone) = &mut *c;
+                    match tx {
+                        Some(t) => {
+                            if t.send(buf[..n].to_vec()).is_err() {
+                                *tx = None;
+                                *gone = true;
+                            }
+                        }
+                        None if !*gone && held.len() + n <= DRAIN_HOLD => {
+                            held.extend_from_slice(&buf[..n]);
+                        }
+                        None => {}
+                    }
+                }
+                let mut c = st.consumer.lock().unwrap_or_else(|e| e.into_inner());
+                st.finished.store(true, Ordering::SeqCst);
+                // Dropping the sender ends the consumer's reads (EOF).
+                c.0 = None;
+            })?;
+        Ok(Drain { state, join })
+    }
+
+    /// Waits for the drain to reach EOF, bounded; true when it did.
+    fn wait(&self, bound: Duration) -> bool {
+        let end = Instant::now() + bound;
+        while !self.join.is_finished() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.join.is_finished()
+    }
+}
+
+/// The session reader: output forwarded by the drain; EOF when it ends.
+struct ChannelReader {
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    pending: Vec<u8>,
+}
+
+impl Read for ChannelReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.pending.is_empty() {
+            match self.rx.recv() {
+                Ok(v) => self.pending = v,
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = out.len().min(self.pending.len());
+        out[..n].copy_from_slice(&self.pending[..n]);
+        self.pending.drain(..n);
+        Ok(n)
+    }
+}
+
+/// Everything a raw launch acquired, each held from the moment it is
+/// created. Dropping it (every early return) releases in a fixed order:
+/// terminate the job and process if one exists, close the pseudoconsole
+/// (the drain keeps reading, or the read end is already closed), then the
+/// pipe ends; the drain is waited for, bounded, and the teardown recorded.
+#[derive(Default)]
+struct Setup {
+    job: Option<Handle>,
+    process: Option<Handle>,
+    thread: Option<Handle>,
+    pcon: Option<Pcon>,
+    input: Option<std::fs::File>,
+    in_r: Option<Handle>,
+    out_w: Option<Handle>,
+    drain: Option<Drain>,
     pid: u32,
     start: u64,
-    _input: std::fs::File,
-    drain: Option<std::thread::JoinHandle<()>>,
+    step: &'static str,
+}
+
+impl Drop for Setup {
+    fn drop(&mut self) {
+        if self.pcon.is_none()
+            && self.process.is_none()
+            && self.job.is_none()
+            && self.drain.is_none()
+        {
+            return;
+        }
+        let t = Instant::now();
+        let mut steps = Vec::new();
+        // SAFETY: owned handles.
+        unsafe {
+            if let Some(j) = &self.job {
+                steps.push(format!(
+                    "TerminateJobObject={}",
+                    TerminateJobObject(j.raw(), 1) != 0
+                ));
+            }
+            if let Some(p) = &self.process {
+                steps.push(format!(
+                    "TerminateProcess={}",
+                    TerminateProcess(p.raw(), 1) != 0
+                ));
+            }
+        }
+        self.thread.take();
+        self.process.take();
+        let read_end_closed = self.drain.is_none();
+        let close = self.pcon.take().map(|p| {
+            let c = Instant::now();
+            drop(p);
+            c.elapsed().as_millis() as u64
+        });
+        self.input.take();
+        self.in_r.take();
+        self.out_w.take();
+        let drained = self.drain.take().map(|d| d.wait(Duration::from_secs(2)));
+        self.job.take();
+        record_teardown(serde_json::json!({
+            "path": "setup_error", "failed_at": self.step, "child_pid": (self.pid != 0).then_some(self.pid),
+            "child_start": (self.start != 0).then_some(self.start), "steps": steps,
+            "close_pseudoconsole_ms": close, "drain_reached_eof": drained,
+            "host_read_end_closed": read_end_closed, "teardown_ms": t.elapsed().as_millis() as u64,
+        }));
+    }
+}
+
+/// `MasterPty` over the raw pseudoconsole. Drop closes the pseudoconsole
+/// while the drain keeps reading, so `PtyIo::close_master` keeps its order.
+struct RawMaster {
+    pcon: Mutex<Option<Pcon>>,
+    input: Mutex<Option<std::fs::File>>,
+    drain: Mutex<Option<Drain>>,
+    size: Mutex<portable_pty::PtySize>,
+    fail_reader: AtomicBool,
+}
+
+impl portable_pty::MasterPty for RawMaster {
+    fn resize(&self, size: portable_pty::PtySize) -> Result<(), anyhow::Error> {
+        let p = self.pcon.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(p) = p.as_ref() else {
+            anyhow::bail!("pseudoconsole closed");
+        };
+        // SAFETY: owned pseudoconsole.
+        let hr = unsafe {
+            ResizePseudoConsole(
+                p.0,
+                COORD {
+                    X: size.cols as i16,
+                    Y: size.rows as i16,
+                },
+            )
+        };
+        if hr < 0 {
+            anyhow::bail!("ResizePseudoConsole hr={hr:#x}");
+        }
+        *self.size.lock().unwrap_or_else(|e| e.into_inner()) = size;
+        Ok(())
+    }
+
+    fn get_size(&self) -> Result<portable_pty::PtySize, anyhow::Error> {
+        Ok(*self.size.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>, anyhow::Error> {
+        if self.fail_reader.swap(false, Ordering::SeqCst) {
+            anyhow::bail!("injected reader-start failure");
+        }
+        let d = self.drain.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(d) = d.as_ref() else {
+            anyhow::bail!("no output drain");
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut c = d.state.consumer.lock().unwrap_or_else(|e| e.into_inner());
+        let held = std::mem::take(&mut c.1);
+        if !held.is_empty() {
+            let _ = tx.send(held);
+        }
+        if !d.state.finished.load(Ordering::SeqCst) {
+            c.0 = Some(tx);
+        }
+        Ok(Box::new(ChannelReader {
+            rx,
+            pending: Vec::new(),
+        }))
+    }
+
+    fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, anyhow::Error> {
+        match self.input.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            Some(f) => Ok(Box::new(f)),
+            None => anyhow::bail!("writer already taken"),
+        }
+    }
+}
+
+impl Drop for RawMaster {
+    fn drop(&mut self) {
+        let t = Instant::now();
+        let close = self
+            .pcon
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map(|p| {
+                drop(p);
+                t.elapsed().as_millis() as u64
+            });
+        self.input.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let drained = self
+            .drain
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map(|d| {
+                // Detach the consumer so the drain discards from here on.
+                let mut c = d.state.consumer.lock().unwrap_or_else(|e| e.into_inner());
+                c.0 = None;
+                c.2 = true;
+                c.1.clear();
+                drop(c);
+                d.wait(Duration::from_secs(2))
+            });
+        record_teardown(serde_json::json!({
+            "path": "master_drop", "close_pseudoconsole_ms": close,
+            "drain_reached_eof": drained, "teardown_ms": t.elapsed().as_millis() as u64,
+        }));
+    }
+}
+
+/// `Child` over the raw launch's retained process handle. Unlike
+/// portable-pty's Windows killer, `kill` returns `Ok` only when
+/// `TerminateProcess` succeeds.
+#[derive(Debug, Clone)]
+struct RawChild {
+    process: Arc<Handle>,
+    pid: u32,
+}
+
+impl portable_pty::ChildKiller for RawChild {
+    fn kill(&mut self) -> io::Result<()> {
+        // SAFETY: owned handle.
+        if unsafe { TerminateProcess(self.process.raw(), 1) } != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+impl portable_pty::Child for RawChild {
+    fn try_wait(&mut self) -> io::Result<Option<portable_pty::ExitStatus>> {
+        let mut code = 0u32;
+        // SAFETY: owned handle.
+        if unsafe { GetExitCodeProcess(self.process.raw(), &mut code) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((code != STILL_ACTIVE as u32).then(|| portable_pty::ExitStatus::with_exit_code(code)))
+    }
+    fn wait(&mut self) -> io::Result<portable_pty::ExitStatus> {
+        // SAFETY: owned handle.
+        unsafe { WaitForSingleObject(self.process.raw(), INFINITE) };
+        loop {
+            if let Some(s) = self.try_wait()? {
+                return Ok(s);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    fn process_id(&self) -> Option<u32> {
+        Some(self.pid)
+    }
+    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        Some(self.process.raw() as std::os::windows::io::RawHandle)
+    }
+}
+
+fn creation_time(h: HANDLE) -> u64 {
+    // SAFETY: plain query on a valid handle.
+    unsafe {
+        let mut c: FILETIME = std::mem::zeroed();
+        let mut e: FILETIME = std::mem::zeroed();
+        let mut k: FILETIME = std::mem::zeroed();
+        let mut u: FILETIME = std::mem::zeroed();
+        if GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0 {
+            filetime_u64(&c)
+        } else {
+            0
+        }
+    }
+}
+
+/// Raw ConPTY launch (§4.6): own `CreatePseudoConsole` (`flags`) and
+/// `CreateProcessW` with one attribute list holding
+/// `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` and `PROC_THREAD_ATTRIBUTE_JOB_LIST`,
+/// so the child is a job member from creation; the `CREATE_SUSPENDED` +
+/// assign + `ResumeThread == 1` branch runs only if JOB_LIST fails. The
+/// output drain starts right after `CreatePseudoConsole`. `inject` fails the
+/// launch at the named step (F-2c).
+#[allow(clippy::too_many_arguments)]
+pub fn raw_spawn(
+    argv: &[OsString],
+    env: &[(String, String)],
+    remove: &[String],
+    cwd: &Path,
+    cols: u16,
+    rows: u16,
+    flags: u32,
+    inject: Option<super::RawInject>,
+) -> Result<super::RawSpawn, String> {
+    use super::RawInject as I;
+    let mut st = Setup::default();
+    st.step = "pipes";
+    // SAFETY: Microsoft's "Creating a Pseudoconsole session"; every handle is
+    // owned by `st` from the moment it exists, and `st`'s drop releases them.
+    unsafe {
+        let (mut in_r, mut in_w, mut out_r, mut out_w): (HANDLE, HANDLE, HANDLE, HANDLE) = (
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        if CreatePipe(&mut in_r, &mut in_w, std::ptr::null(), 0) == 0 {
+            return Err(format!("CreatePipe: {}", io::Error::last_os_error()));
+        }
+        st.in_r = Handle::new(in_r);
+        st.input = Some(std::fs::File::from_raw_handle(in_w));
+        if CreatePipe(&mut out_r, &mut out_w, std::ptr::null(), 0) == 0 {
+            return Err(format!("CreatePipe: {}", io::Error::last_os_error()));
+        }
+        st.out_w = Handle::new(out_w);
+        let output = std::fs::File::from_raw_handle(out_r);
+        st.step = "pseudoconsole";
+        let mut hpc: HPCON = 0;
+        let hr = CreatePseudoConsole(
+            COORD {
+                X: cols as i16,
+                Y: rows as i16,
+            },
+            in_r,
+            out_w,
+            flags,
+            &mut hpc,
+        );
+        if hr < 0 {
+            drop(output);
+            return Err(format!("CreatePseudoConsole hr={hr:#x}"));
+        }
+        st.pcon = Some(Pcon(hpc));
+        // The pseudoconsole holds its own copies of its pipe ends.
+        st.in_r.take();
+        st.out_w.take();
+        st.step = "drain";
+        st.drain = Some(
+            Drain::start(output)
+                .map_err(|e| format!("drain thread: {e} (host read end closed)"))?,
+        );
+        st.step = "job";
+        let job = new_kill_on_close_job().map_err(|e| format!("job: {e}"))?;
+        let job_raw = job.raw();
+        st.job = Some(job);
+        st.step = "before_spawn";
+        if inject == Some(I::BeforeSpawn) {
+            return Err("injected failure before spawn".into());
+        }
+        let mut cmdline = Vec::new();
+        for (i, a) in argv.iter().enumerate() {
+            if i > 0 {
+                cmdline.push(b' ' as u16);
+            }
+            quote_arg(a, &mut cmdline);
+        }
+        cmdline.push(0);
+        let envb = env_block(env, remove);
+        let cwdw = wide(cwd.as_os_str());
+        let try_create =
+            |job_list: bool, cmdline: &mut Vec<u16>| -> Result<PROCESS_INFORMATION, String> {
+                // Declared before the attribute list so it outlives the list.
+                let jobs = [job_raw];
+                let mut attrs =
+                    AttrList::new(if job_list { 2 } else { 1 }).map_err(|e| e.to_string())?;
+                attrs
+                    .set(
+                        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                        hpc as *const c_void,
+                        std::mem::size_of::<HPCON>(),
+                    )
+                    .map_err(|e| format!("attr pseudoconsole: {e}"))?;
+                if job_list {
+                    attrs
+                        .set(
+                            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                            jobs.as_ptr() as *const c_void,
+                            std::mem::size_of::<HANDLE>(),
+                        )
+                        .map_err(|e| format!("attr job_list: {e}"))?;
+                }
+                let mut si: STARTUPINFOEXW = std::mem::zeroed();
+                si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+                si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+                si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+                si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+                si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
+                si.lpAttributeList = attrs.ptr();
+                let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+                let cflags = EXTENDED_STARTUPINFO_PRESENT
+                    | CREATE_UNICODE_ENVIRONMENT
+                    | if job_list { 0 } else { CREATE_SUSPENDED };
+                if CreateProcessW(
+                    std::ptr::null(),
+                    cmdline.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    cflags,
+                    envb.as_ptr() as *const c_void,
+                    cwdw.as_ptr(),
+                    &si.StartupInfo,
+                    &mut pi,
+                ) == 0
+                {
+                    return Err(format!("CreateProcessW: {}", io::Error::last_os_error()));
+                }
+                Ok(pi)
+            };
+        st.step = "create_process";
+        let force_suspended = matches!(inject, Some(I::ForceSuspended | I::ResumeFail));
+        let first = if force_suspended {
+            Err("injected JOB_LIST failure".to_string())
+        } else {
+            try_create(true, &mut cmdline.clone())
+        };
+        let (branch, job_list_error) = match first {
+            Ok(pi) => {
+                st.process = Handle::new(pi.hProcess);
+                st.thread = Handle::new(pi.hThread);
+                st.pid = pi.dwProcessId;
+                ("job_list".to_string(), None)
+            }
+            Err(job_list_err) => {
+                let pi = try_create(false, &mut cmdline)
+                    .map_err(|e| format!("job_list: {job_list_err}; suspended: {e}"))?;
+                st.process = Handle::new(pi.hProcess);
+                st.thread = Handle::new(pi.hThread);
+                st.pid = pi.dwProcessId;
+                st.step = "suspended_assign";
+                let (Some(p), Some(t)) = (st.process.as_ref(), st.thread.as_ref()) else {
+                    return Err("CreateProcessW returned no handles".into());
+                };
+                if AssignProcessToJobObject(job_raw, p.raw()) == 0 {
+                    return Err(format!(
+                        "job_list failed ({job_list_err}); suspended assign failed: {}",
+                        io::Error::last_os_error()
+                    ));
+                }
+                st.step = "resume";
+                // The thread was created suspended once: anything but 1 means
+                // it did not start (or started early), so this branch is void.
+                if inject == Some(I::ResumeFail) {
+                    return Err("injected ResumeThread failure".into());
+                }
+                let prev = ResumeThread(t.raw());
+                if prev != 1 {
+                    return Err(format!(
+                        "job_list failed ({job_list_err}); ResumeThread returned {prev} ({})",
+                        io::Error::last_os_error()
+                    ));
+                }
+                ("suspended".to_string(), Some(job_list_err))
+            }
+        };
+        st.start = st.process.as_ref().map_or(0, |p| creation_time(p.raw()));
+        st.step = "after_spawn";
+        if inject == Some(I::AfterSpawn) {
+            // Fail with the child's output pending in the pipe.
+            let end = Instant::now() + Duration::from_secs(3);
+            while st
+                .drain
+                .as_ref()
+                .is_some_and(|d| d.state.bytes.load(Ordering::SeqCst) == 0)
+                && Instant::now() < end
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            return Err("injected failure after spawn".into());
+        }
+        st.thread.take();
+        let process = Arc::new(st.process.take().ok_or("no process handle")?);
+        let child = RawChild {
+            process,
+            pid: st.pid,
+        };
+        let master = RawMaster {
+            pcon: Mutex::new(st.pcon.take()),
+            input: Mutex::new(st.input.take()),
+            drain: Mutex::new(st.drain.take()),
+            size: Mutex::new(portable_pty::PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            }),
+            fail_reader: AtomicBool::new(inject == Some(I::ReaderStart)),
+        };
+        let tree = Tree {
+            job: st.job.take().ok_or("no job")?,
+            assign: if branch == "job_list" {
+                "job_list"
+            } else {
+                "suspended"
+            },
+        };
+        Ok(super::RawSpawn {
+            master: Box::new(master),
+            child: Box::new(child),
+            tree,
+            branch,
+            job_list_error,
+            conpty_module: conpty_module(),
+        })
+    }
+}
+
+/// C-3 job-first launch: a thin wrapper over `raw_spawn` (flags 0) that
+/// keeps the pseudoconsole open until `close_conpty`.
+pub struct JobFirst {
+    spawn: Option<super::RawSpawn>,
+    pid: u32,
+    start: u64,
     terminated: bool,
-    closed: bool,
 }
 
 impl JobFirst {
@@ -760,183 +1599,25 @@ impl JobFirst {
         remove: &[String],
         cwd: &Path,
     ) -> Result<(JobFirst, String), String> {
-        // SAFETY: standard ConPTY setup per Microsoft's "Creating a Pseudoconsole session";
-        // every handle is owned by a Handle/File or closed on the error path.
-        unsafe {
-            let mut in_r: HANDLE = std::ptr::null_mut();
-            let mut in_w: HANDLE = std::ptr::null_mut();
-            let mut out_r: HANDLE = std::ptr::null_mut();
-            let mut out_w: HANDLE = std::ptr::null_mut();
-            if windows_sys::Win32::System::Pipes::CreatePipe(
-                &mut in_r,
-                &mut in_w,
-                std::ptr::null(),
-                0,
-            ) == 0
-            {
-                return Err(format!("CreatePipe: {}", io::Error::last_os_error()));
-            }
-            let in_r = Handle(in_r as usize);
-            let input = std::fs::File::from_raw_handle(in_w);
-            if windows_sys::Win32::System::Pipes::CreatePipe(
-                &mut out_r,
-                &mut out_w,
-                std::ptr::null(),
-                0,
-            ) == 0
-            {
-                return Err(format!("CreatePipe: {}", io::Error::last_os_error()));
-            }
-            let out_w = Handle(out_w as usize);
-            let mut output = std::fs::File::from_raw_handle(out_r);
-            let mut hpc: HPCON = 0;
-            let hr = CreatePseudoConsole(
-                COORD { X: 120, Y: 40 },
-                in_r.raw(),
-                out_w.raw(),
-                0,
-                &mut hpc,
-            );
-            if hr < 0 {
-                return Err(format!("CreatePseudoConsole hr={hr:#x}"));
-            }
-            drop(in_r);
-            drop(out_w);
-            let drain = std::thread::spawn(move || {
-                let mut buf = [0u8; 4096];
-                while matches!(output.read(&mut buf), Ok(n) if n > 0) {}
-            });
-            let job = match new_kill_on_close_job() {
-                Ok(j) => j,
-                Err(e) => {
-                    ClosePseudoConsole(hpc);
-                    return Err(format!("job: {e}"));
-                }
-            };
-            let mut cmdline = Vec::new();
-            for (i, a) in argv.iter().enumerate() {
-                if i > 0 {
-                    cmdline.push(b' ' as u16);
-                }
-                quote_arg(a, &mut cmdline);
-            }
-            cmdline.push(0);
-            let envb = env_block(env, remove);
-            let cwdw = wide(cwd.as_os_str());
-
-            let try_create =
-                |job_list: bool, cmdline: &mut Vec<u16>| -> Result<PROCESS_INFORMATION, String> {
-                    // Declared before the attribute list so it outlives the list.
-                    let jobs = [job.raw()];
-                    let mut attrs =
-                        AttrList::new(if job_list { 2 } else { 1 }).map_err(|e| e.to_string())?;
-                    attrs
-                        .set(
-                            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                            hpc as *const c_void,
-                            std::mem::size_of::<HPCON>(),
-                        )
-                        .map_err(|e| format!("attr pseudoconsole: {e}"))?;
-                    if job_list {
-                        attrs
-                            .set(
-                                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-                                jobs.as_ptr() as *const c_void,
-                                std::mem::size_of::<HANDLE>(),
-                            )
-                            .map_err(|e| format!("attr job_list: {e}"))?;
-                    }
-                    let mut si: STARTUPINFOEXW = std::mem::zeroed();
-                    si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-                    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-                    si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
-                    si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
-                    si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
-                    si.lpAttributeList = attrs.ptr();
-                    let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
-                    let flags = EXTENDED_STARTUPINFO_PRESENT
-                        | CREATE_UNICODE_ENVIRONMENT
-                        | if job_list { 0 } else { CREATE_SUSPENDED };
-                    if CreateProcessW(
-                        std::ptr::null(),
-                        cmdline.as_mut_ptr(),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        0,
-                        flags,
-                        envb.as_ptr() as *const c_void,
-                        cwdw.as_ptr(),
-                        &si.StartupInfo,
-                        &mut pi,
-                    ) == 0
-                    {
-                        return Err(format!("CreateProcessW: {}", io::Error::last_os_error()));
-                    }
-                    Ok(pi)
-                };
-
-            let (pi, branch) = match try_create(true, &mut cmdline.clone()) {
-                Ok(pi) => (pi, "job_list".to_string()),
-                Err(job_list_err) => match try_create(false, &mut cmdline) {
-                    Ok(pi) => {
-                        if AssignProcessToJobObject(job.raw(), pi.hProcess) == 0 {
-                            let e = io::Error::last_os_error();
-                            TerminateProcess(pi.hProcess, 1);
-                            CloseHandle(pi.hThread);
-                            CloseHandle(pi.hProcess);
-                            ClosePseudoConsole(hpc);
-                            return Err(format!(
-                                "job_list failed ({job_list_err}); suspended assign failed: {e}"
-                            ));
-                        }
-                        // The thread was created suspended once: anything but 1 means
-                        // it did not start (or started early), so this branch is void.
-                        let prev = ResumeThread(pi.hThread);
-                        if prev != 1 {
-                            let e = io::Error::last_os_error();
-                            TerminateJobObject(job.raw(), 1);
-                            TerminateProcess(pi.hProcess, 1);
-                            CloseHandle(pi.hThread);
-                            CloseHandle(pi.hProcess);
-                            ClosePseudoConsole(hpc);
-                            return Err(format!(
-                                "job_list failed ({job_list_err}); ResumeThread returned {prev} ({e})"
-                            ));
-                        }
-                        (pi, format!("suspended (job_list failed: {job_list_err})"))
-                    }
-                    Err(e) => {
-                        ClosePseudoConsole(hpc);
-                        return Err(format!("job_list: {job_list_err}; suspended: {e}"));
-                    }
-                },
-            };
-            CloseHandle(pi.hThread);
-            let process = Handle(pi.hProcess as usize);
-            let mut c: FILETIME = std::mem::zeroed();
-            let mut e: FILETIME = std::mem::zeroed();
-            let mut k: FILETIME = std::mem::zeroed();
-            let mut u: FILETIME = std::mem::zeroed();
-            let start = if GetProcessTimes(process.raw(), &mut c, &mut e, &mut k, &mut u) != 0 {
-                filetime_u64(&c)
-            } else {
-                0
-            };
-            Ok((
-                JobFirst {
-                    hpc,
-                    job,
-                    process,
-                    pid: pi.dwProcessId,
-                    start,
-                    _input: input,
-                    drain: Some(drain),
-                    terminated: false,
-                    closed: false,
-                },
-                branch,
-            ))
-        }
+        let rs = raw_spawn(argv, env, remove, cwd, 120, 40, 0, None)?;
+        let pid = rs.child.process_id().unwrap_or(0);
+        let start = rs
+            .child
+            .as_raw_handle()
+            .map_or(0, |h| creation_time(h as HANDLE));
+        let branch = match &rs.job_list_error {
+            None => rs.branch.clone(),
+            Some(e) => format!("{} (job_list failed: {e})", rs.branch),
+        };
+        Ok((
+            JobFirst {
+                spawn: Some(rs),
+                pid,
+                start,
+                terminated: false,
+            },
+            branch,
+        ))
     }
 
     pub fn pid(&self) -> u32 {
@@ -945,7 +1626,10 @@ impl JobFirst {
 
     /// Job membership; an enumeration failure is an error, never an empty job.
     pub fn members(&self) -> Result<Vec<u32>, String> {
-        job_members(self.job.raw()).map_err(|e| e.to_string())
+        match &self.spawn {
+            Some(rs) => rs.tree.members_checked(),
+            None => Err("closed".into()),
+        }
     }
 
     pub fn start_time(&self) -> u64 {
@@ -961,39 +1645,20 @@ impl JobFirst {
             return vec!["already terminated".into()];
         }
         self.terminated = true;
-        // SAFETY: owned handles.
-        unsafe {
-            vec![
-                format!(
-                    "TerminateJobObject={}",
-                    TerminateJobObject(self.job.raw(), 1) != 0
-                ),
-                format!(
-                    "TerminateProcess(retained)={}",
-                    TerminateProcess(self.process.raw(), 1) != 0
-                ),
-            ]
-        }
+        let Some(rs) = self.spawn.as_mut() else {
+            return vec!["closed".into()];
+        };
+        let mut steps = rs.tree.kill(Duration::ZERO);
+        steps.push(format!(
+            "TerminateProcess(retained)={}",
+            rs.child.kill().is_ok()
+        ));
+        steps
     }
 
     pub fn close_conpty(&mut self) {
-        if self.closed {
-            return;
-        }
-        self.closed = true;
-        // SAFETY: hpc is owned and closed once.
-        unsafe {
-            ClosePseudoConsole(self.hpc);
-        }
-        if let Some(d) = self.drain.take() {
-            let end = std::time::Instant::now() + Duration::from_secs(2);
-            while !d.is_finished() && std::time::Instant::now() < end {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            if d.is_finished() {
-                let _ = d.join();
-            }
-        }
+        // Dropping the master closes the pseudoconsole while the drain reads.
+        self.spawn.take();
     }
 }
 

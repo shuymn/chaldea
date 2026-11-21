@@ -42,6 +42,8 @@ struct Opts {
     silent: bool,
     max_life_secs: Option<String>,
     escape_orphan: bool,
+    report_file: Option<PathBuf>,
+    at_exit: bool,
 }
 
 fn parse() -> Opts {
@@ -76,6 +78,11 @@ fn parse() -> Opts {
             "--query-mid-paste" => o.query_mid_paste = true,
             "--silent" => o.silent = true,
             "--escape-orphan" => o.escape_orphan = true,
+            "--at-exit" => o.at_exit = true,
+            "--report-file" => {
+                o.report_file = Some(PathBuf::from(next));
+                i += 1;
+            }
             "--max-life-secs" => {
                 o.max_life_secs = Some(next);
                 i += 1;
@@ -611,6 +618,56 @@ impl InputParser {
     }
 }
 
+/// What `attachable` has received so far (shared by the input loop and the
+/// marker thread, so every report carries the full state).
+#[derive(Default)]
+struct Attach {
+    markers: Vec<u64>,
+    nonces: Vec<String>,
+    keys: Vec<String>,
+    submits: u32,
+}
+
+/// `attachable-report` witness: markers, nonces, keys, submits, and the
+/// console size seen now.
+fn report_attachable(st: &std::sync::Mutex<Attach>) {
+    let v = {
+        let a = st.lock().unwrap_or_else(|e| e.into_inner());
+        let size = os::console_size();
+        json!({"markers_emitted": a.markers, "nonces": a.nonces, "keys": a.keys,
+               "submits": a.submits, "console_size": size.map(|(c, r)| json!({"cols": c, "rows": r}))})
+    };
+    witness("attachable-report", false, v);
+}
+
+/// C-5 calibration helper: waits for `go` on stdin (sent after the parent
+/// assigned it to the observation job), then shows a caret and one visible
+/// top-level window of its own (only in its last 50 ms with `--at-exit`),
+/// writing its pid, start time, and hwnd to `--report-file` before showing.
+fn run_window_calibrate(o: &Opts) -> i32 {
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    if line.trim() != "go" {
+        return 3;
+    }
+    let file = o.report_file.clone();
+    let report = move |pid: u32, start: u64, hwnd: u64| {
+        if let Some(f) = &file {
+            let _ = std::fs::write(
+                f,
+                json!({"pid": pid, "start_time": start, "hwnd": hwnd}).to_string(),
+            );
+        }
+    };
+    match os::show_calibration_window(o.at_exit, &report) {
+        Ok(_) => 0,
+        Err(e) => {
+            eprintln!("window-calibrate: {e}");
+            1
+        }
+    }
+}
+
 fn run_attachable(o: &Opts) -> i32 {
     let _raw = os::enable_raw_mode().ok();
     out(b"\x1b[?2004h\x1b[2J");
@@ -620,22 +677,29 @@ fn run_attachable(o: &Opts) -> i32 {
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     session_start(o, &sid);
-    let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
-    let em2 = emitted.clone();
+    let st = std::sync::Arc::new(std::sync::Mutex::new(Attach::default()));
+    let st2 = st.clone();
     std::thread::spawn(move || {
         let mut n: u64 = 0;
+        let mut size = os::console_size();
         loop {
             n += 1;
-            em2.lock().unwrap_or_else(|e| e.into_inner()).push(n);
+            st2.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .markers
+                .push(n);
             out(format!("\x1b[1;1HMARKER-{n:06}\x1b[K").as_bytes());
+            // A resize is reported with the next marker (F-2 attach + resize).
+            let now = os::console_size();
+            if now != size {
+                size = now;
+                report_attachable(&st2);
+            }
             std::thread::sleep(Duration::from_millis(500));
         }
     });
     let rx = input_chunks();
     let mut parser = InputParser::default();
-    let mut nonces: Vec<String> = Vec::new();
-    let mut keys: Vec<String> = Vec::new();
-    let mut submits = 0u32;
     let mut last_input = Instant::now();
     loop {
         let ev = match rx.recv_timeout(Duration::from_millis(50)) {
@@ -649,19 +713,17 @@ fn run_attachable(o: &Opts) -> i32 {
         if ev.is_empty() {
             continue;
         }
-        for e in ev {
-            match e {
-                InputEvent::Paste(s) => nonces.push(s),
-                InputEvent::Submit => submits += 1,
-                InputEvent::Key(k) => keys.push(k),
+        {
+            let mut a = st.lock().unwrap_or_else(|e| e.into_inner());
+            for e in ev {
+                match e {
+                    InputEvent::Paste(s) => a.nonces.push(s),
+                    InputEvent::Submit => a.submits += 1,
+                    InputEvent::Key(k) => a.keys.push(k),
+                }
             }
         }
-        let markers = emitted.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        witness(
-            "attachable-report",
-            false,
-            json!({"markers_emitted": markers, "nonces": nonces, "keys": keys, "submits": submits}),
-        );
+        report_attachable(&st);
     }
     0
 }
@@ -805,6 +867,7 @@ pub fn main() -> i32 {
         "attachable" => run_attachable(&o),
         "spawn-tree" => run_spawn_tree(&o),
         "sleeper" => run_sleeper(&o),
+        "window-calibrate" => run_window_calibrate(&o),
         m => {
             eprintln!("chs-fake-cli: unknown --mode {m:?}");
             2

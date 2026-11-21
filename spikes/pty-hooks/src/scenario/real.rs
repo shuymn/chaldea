@@ -1565,6 +1565,8 @@ fn codex_warm(ctx: &Ctx, a: &Agent) {
         out_file: ctx.out.join("pty-output-codex-unrelated.bin"),
         hold_assign: false,
         inject: None,
+        // A fixture outside the measured session: today's path.
+        backend: crate::os::Backend::Portable,
     });
     let mut unrelated = match unrelated {
         Ok(s) => s,

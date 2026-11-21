@@ -25,8 +25,11 @@ unicode-segmentation = "=1.13.3"
 libc = "=0.2.191"
 
 [target.'cfg(windows)'.dependencies]
+# MasterPty returns anyhow::Error; the version portable-pty already locks.
+anyhow = "=1.0.104"
 windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
+  "Win32_Graphics_Gdi",
   "Win32_Security",
   "Win32_System_JobObjects",
   "Win32_System_Threading",

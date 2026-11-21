@@ -83,6 +83,22 @@ impl Ctx {
         (Instant::now() + d).min(self.cutoff)
     }
 
+    /// The PTY backend from `--pty-backend` / `--conpty-flags` / `--raw-inject`.
+    pub fn backend(&self) -> os::Backend {
+        if self.args.pty_backend == "raw" {
+            os::Backend::Raw {
+                conpty_flags: self.args.conpty_flags,
+                inject: self
+                    .args
+                    .raw_inject
+                    .as_deref()
+                    .and_then(os::RawInject::parse),
+            }
+        } else {
+            os::Backend::Portable
+        }
+    }
+
     pub fn past_cutoff(&self) -> bool {
         Instant::now() >= self.cutoff
     }
@@ -436,6 +452,7 @@ pub fn launch(ctx: &Ctx, spec: LaunchSpec) -> Result<Launch, String> {
         out_file: ctx.out.join(format!("pty-output-{}.bin", spec.label)),
         hold_assign: spec.hold_assign,
         inject: spec.inject,
+        backend: ctx.backend(),
     })?;
     receiver.set_cli_pid(session.owned.child_pid);
     // Ambiguous binding revokes the writer gate (queued pastes are dropped).

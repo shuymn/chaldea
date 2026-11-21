@@ -3,7 +3,27 @@
 use chs::scenario::{self, fake, real, win_probe};
 use chs::{cli, session};
 
+/// `CHS_WAIT_GO`: an observed launch (C-5) waits for `go` on stdin until its
+/// parent has assigned it to the observation job; anything else, or no line
+/// within 60 s, exits 3 without running.
+fn wait_go() {
+    if std::env::var_os("CHS_WAIT_GO").is_none() {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut l = String::new();
+        let _ = std::io::stdin().read_line(&mut l);
+        let _ = tx.send(l);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(l) if l.trim() == "go" => {}
+        _ => std::process::exit(3),
+    }
+}
+
 fn main() {
+    wait_go();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = match cli::parse(&argv) {
         Ok(a) => a,

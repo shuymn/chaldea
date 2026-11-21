@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use super::{Ctx, LaunchSpec, child_out, child_report, emitter_path, launch, run_bounded};
 use crate::cli::{self, Args};
 use crate::http_client::{self, parse_local_url};
-use crate::paste::{self, InputEncoding, Newline, NewlineKey, PasteOpts};
+use crate::paste::{self, InputEncoding, Newline, PasteOpts};
 use crate::pty::WriterTx;
 use crate::receiver::{ProbeHandler, WitnessView};
 use crate::report::{Check, Probe, Report};
@@ -1071,6 +1071,7 @@ fn probe_attach(ctx: &Ctx) {
         "key/down",
         "key/enter",
         "key/esc",
+        "resize",
     ] {
         pc.req(c);
     }
@@ -1140,11 +1141,32 @@ fn probe_attach(ctx: &Ctx) {
             pc.put(&format!("key/{k}"), o, Value::Null);
         }
     }
+    // One resize (F-2): 120x40 → 100x30, which the child must report.
+    let (cols, rows) = (100u16, 30u16);
+    let resized = l.session.io().resize(cols, rows);
+    let seen = resized.is_ok()
+        && p.wait_report(ctx.until(Duration::from_secs(10)), |r| {
+            r["console_size"] == json!({"cols": cols, "rows": rows})
+        })
+        .is_some();
+    pc.put(
+        "resize",
+        match (&resized, seen) {
+            (Err(e), _) => Outcome::harness(format!("resize failed: {e}")),
+            (Ok(()), true) => Outcome::Pass,
+            (Ok(()), false) if p.report().is_none() => {
+                Outcome::harness("the child sent no report after the resize")
+            }
+            (Ok(()), false) => Outcome::platform("the child never reported the new size"),
+        },
+        json!({"want": {"cols": cols, "rows": rows}, "reported": p.report().map(|r| r["console_size"].clone())}),
+    );
     l.receiver.set_probe(None);
     let (stop, _) = l.finish();
     pc.finish(
         ctx,
-        json!({"client": client, "requests": log, "survivors": stop.survivors}),
+        json!({"client": client, "requests": log, "survivors": stop.survivors,
+               "launch": stop.launch}),
     );
 }
 
@@ -1258,20 +1280,12 @@ fn attach_client(args: &Args) -> i32 {
 
 // ---------------- C-5 console ----------------
 
-/// Records pid -> ppid every 300 ms; window events also carry their own
-/// ppid captured at event time, which attributes short-lived owners.
+/// Records pid -> (ppid, start time) every 300 ms; window events also carry
+/// their owner's ppid and start time captured at event time, which
+/// attributes short-lived owners.
 struct PpidRecorder {
-    map: Arc<Mutex<std::collections::HashMap<u32, u32>>>,
+    map: Arc<Mutex<std::collections::HashMap<u32, (u32, u64)>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Attr {
-    Ours,
-    Other,
-    /// The owner could not be identified at callback time (no pid, or no
-    /// parent known for it).
-    Unattributed,
 }
 
 impl PpidRecorder {
@@ -1284,7 +1298,7 @@ impl PpidRecorder {
                 for p in os::list_processes().unwrap_or_default() {
                     m.lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(p.pid, p.ppid);
+                        .insert(p.pid, (p.ppid, p.start_time));
                 }
                 std::thread::sleep(Duration::from_millis(300));
             }
@@ -1292,45 +1306,9 @@ impl PpidRecorder {
         PpidRecorder { map, stop }
     }
 
-    /// Whether the shown window's owner (via its event-time ppid, then the
-    /// sampled chain, conhost / OpenConsole included) reaches `root`.
-    fn classify(&self, shown: &(u32, Option<u32>), root: u32) -> Attr {
-        let m = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        classify(&m, shown, root)
+    fn snapshot(&self) -> std::collections::HashMap<u32, (u32, u64)> {
+        self.map.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
-}
-
-fn classify(
-    m: &std::collections::HashMap<u32, u32>,
-    shown: &(u32, Option<u32>),
-    root: u32,
-) -> Attr {
-    if shown.0 == 0 {
-        return Attr::Unattributed;
-    }
-    if shown.0 == root {
-        return Attr::Ours;
-    }
-    let mut cur = match shown.1.or_else(|| m.get(&shown.0).copied()) {
-        Some(c) => c,
-        None => return Attr::Unattributed,
-    };
-    // Walk to the top of the chain; a parent missing from the samples breaks
-    // the chain, and a broken chain may have passed through `root`.
-    for _ in 0..32 {
-        if cur == root {
-            return Attr::Ours;
-        }
-        if cur == 0 {
-            return Attr::Other;
-        }
-        match m.get(&cur) {
-            None => return Attr::Unattributed,
-            Some(&pp) if pp == cur || pp == 0 => return Attr::Other,
-            Some(&pp) => cur = pp,
-        }
-    }
-    Attr::Unattributed
 }
 
 impl Drop for PpidRecorder {
@@ -1339,42 +1317,225 @@ impl Drop for PpidRecorder {
     }
 }
 
-/// Window events seen while one launch ran under its own observer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attr {
+    Ours,
+    Ambiguous,
+    Other,
+}
+
+/// The observed launch: its root `(pid, start time)` (the process the
+/// harness created inside the observation job).
+#[derive(Debug, Clone, Copy)]
+pub struct LaunchId {
+    pub root: (u32, u64),
+}
+
+const CONSOLE_HOSTS: &[&str] = &["conhost.exe", "openconsole.exe", "windowsterminal.exe"];
+
+fn image_name(e: &os::WindowEvent) -> Option<String> {
+    e.image.as_ref().map(|i| {
+        i.rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(i)
+            .to_ascii_lowercase()
+    })
+}
+
+/// C-5 classification of one window event during a launch (§4.8), for
+/// `OBJID_WINDOW` / `CHILDID_SELF` events only (others: `None`, ignored).
+/// `ours`: the owner was in the observation job at callback time, or its
+/// ancestry, matched by pid and start time, reaches the launch root.
+/// `ambiguous`: a console host / terminal owner that is not provably ours,
+/// or an unresolved owner (no pid, process gone, broken ancestry). An owner
+/// that started before the launch root cannot be its descendant (`other`).
+pub fn classify(
+    e: &os::WindowEvent,
+    launch: &LaunchId,
+    samples: &std::collections::HashMap<u32, (u32, u64)>,
+) -> Option<Attr> {
+    if !e.is_window() {
+        return None;
+    }
+    if e.in_job == Some(true) {
+        return Some(Attr::Ours);
+    }
+    let (Some(start), Some(ppid)) = (e.start_time, e.ppid) else {
+        return Some(Attr::Ambiguous);
+    };
+    if e.owner_pid == 0 {
+        return Some(Attr::Ambiguous);
+    }
+    let is_host = image_name(e).is_some_and(|n| CONSOLE_HOSTS.contains(&n.as_str()));
+    // Walk up by (pid, start time); a parent never starts after its child.
+    let (mut pid, mut st, mut parent) = (e.owner_pid, start, ppid);
+    let mut broken = false;
+    for _ in 0..64 {
+        if (pid, st) == launch.root {
+            return Some(Attr::Ours);
+        }
+        if parent == 0 || parent == pid || st < launch.root.1 {
+            break;
+        }
+        match samples.get(&parent) {
+            Some(&(pp, ps)) if ps <= st => {
+                (pid, st, parent) = (parent, ps, pp);
+            }
+            _ => {
+                broken = true;
+                break;
+            }
+        }
+    }
+    Some(if is_host || (broken && start >= launch.root.1) {
+        Attr::Ambiguous
+    } else {
+        Attr::Other
+    })
+}
+
+/// Window events of one observed launch, classified.
 #[derive(Default)]
 struct Flash {
     observer_error: Option<String>,
-    ours: Vec<(u32, Option<u32>)>,
-    unattributed: Vec<(u32, Option<u32>)>,
+    ours: Vec<os::WindowEvent>,
+    ambiguous: Vec<os::WindowEvent>,
+    all: usize,
 }
 
 impl Flash {
     fn json(&self) -> Value {
-        json!({"observer_error": self.observer_error, "shown_from_our_tree": self.ours,
-               "unattributed": self.unattributed})
+        json!({"observer_error": self.observer_error, "ours": self.ours,
+               "ambiguous": self.ambiguous, "events": self.all})
     }
 }
 
-/// No-flash judgment for one launch. A window attributed to our tree is
-/// positive evidence; an observer failure (start, quit, join, or message
-/// loop) is a harness failure; any unattributed event (no owner pid, or a
-/// broken parent chain) leaves the case not exercised.
-fn flash_outcome(f: &Flash, launched: bool) -> Outcome {
+/// `no_flash`: an `ours` event is a flash (`platform_fail`); an `ambiguous`
+/// one leaves the case not exercised; an observer failure (start, quit,
+/// join, message loop) is a harness failure; an uncalibrated observer or a
+/// launch out of scope proves nothing.
+fn flash_outcome(f: &Flash, launched: bool, calibrated: bool) -> Outcome {
     if let Some(e) = &f.observer_error {
         return Outcome::harness(format!("window observer failed: {e}"));
     }
     if !f.ours.is_empty() {
-        return Outcome::platform("a window was shown from the harness tree");
+        return Outcome::platform("a window was shown from the observed launch");
+    }
+    if !f.ambiguous.is_empty() {
+        return Outcome::not_exercised("ambiguous window events");
+    }
+    if !calibrated {
+        return Outcome::not_exercised("the observer is not calibrated");
     }
     if !launched {
         return Outcome::not_exercised("the launch did not complete in scope");
     }
-    if !f.unattributed.is_empty() {
-        return Outcome::not_exercised("unattributed window events");
-    }
     Outcome::Pass
 }
 
-/// Runs one launch child under its own window observer.
+/// Calibration passes only on an `OBJID_WINDOW` show event whose hwnd is the
+/// one the helper reported and whose owner pid and start time are the
+/// helper's; the caret control must be recorded and never counts.
+pub fn calibration_outcome(
+    events: &[os::WindowEvent],
+    helper: Option<(u32, u64, u64)>,
+) -> (Outcome, Outcome) {
+    let Some((pid, start, hwnd)) = helper else {
+        let o = Outcome::not_exercised("the helper reported no window");
+        return (o.clone(), o);
+    };
+    let window = events.iter().any(|e| {
+        e.is_window() && e.hwnd == hwnd && e.owner_pid == pid && e.start_time == Some(start)
+    });
+    let caret = events
+        .iter()
+        .any(|e| e.id_object == OBJID_CARET && e.owner_pid == pid);
+    (
+        if window {
+            Outcome::Pass
+        } else {
+            Outcome::not_exercised("no show event for the helper's window")
+        },
+        if caret {
+            Outcome::Pass
+        } else {
+            Outcome::not_exercised("the helper's caret event was not recorded")
+        },
+    )
+}
+
+const OBJID_CARET: i32 = -8;
+
+/// Runs `cmd` as an observed launch: the observer is armed first, the child
+/// starts with `CREATE_NO_WINDOW`, is assigned to its own observation job,
+/// and only then gets `go` on stdin. Returns the exit code and the root
+/// identity.
+fn run_observed(
+    cmd: &mut Command,
+    job: &os::ObservationJob,
+    timeout: Duration,
+) -> Result<(Option<i32>, LaunchId), String> {
+    os::no_window(cmd);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut c = cmd.spawn().map_err(|e| e.to_string())?;
+    let root = (
+        c.id(),
+        os::proc_info(c.id()).map(|p| p.start_time).unwrap_or(0),
+    );
+    if let Err(e) = job.assign(&c) {
+        let _ = c.kill();
+        let _ = c.wait();
+        return Err(format!("observation job assignment failed: {e}"));
+    }
+    if let Some(mut si) = c.stdin.take() {
+        let _ = writeln!(si, "go");
+    }
+    let end = Instant::now() + timeout;
+    let code = loop {
+        if let Ok(Some(st)) = c.try_wait() {
+            break st.code();
+        }
+        if Instant::now() >= end {
+            let _ = c.kill();
+            let _ = c.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    Ok((code, LaunchId { root }))
+}
+
+/// Classifies an observer's events for one launch.
+fn classify_all(
+    events: Vec<os::WindowEvent>,
+    health: Result<(), String>,
+    launch: Option<&LaunchId>,
+    tree: &PpidRecorder,
+) -> Flash {
+    let samples = tree.snapshot();
+    let mut f = Flash {
+        observer_error: health.err(),
+        all: events.len(),
+        ..Default::default()
+    };
+    for e in events {
+        let attr = match launch {
+            Some(l) => classify(&e, l, &samples),
+            None => e.is_window().then_some(Attr::Ambiguous),
+        };
+        match attr {
+            Some(Attr::Ours) => f.ours.push(e),
+            Some(Attr::Ambiguous) => f.ambiguous.push(e),
+            _ => {}
+        }
+    }
+    f
+}
+
+/// One `chs` child under its own observer and observation job; its report
+/// counts only with the run id assigned here.
 fn observed_child(
     ctx: &Ctx,
     tree: &PpidRecorder,
@@ -1383,38 +1544,159 @@ fn observed_child(
     budget: u64,
     env: &[(&str, &str)],
 ) -> (ChildRep, Flash) {
-    let obs = match os::WindowObserver::start() {
-        Ok(o) => o,
-        Err(e) => {
-            return (
-                Err(format!("not_run: window observer failed: {e}")),
-                Flash {
-                    observer_error: Some(e),
-                    ..Default::default()
-                },
-            );
-        }
+    let not_run = |e: String| {
+        (
+            Err(format!("not_run: {e}")),
+            Flash {
+                observer_error: Some(e),
+                ..Default::default()
+            },
+        )
     };
-    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let (r, _) = child(ctx, name, &argv, budget, false, env);
-    let (shown, health) = obs.stop();
-    let me = std::process::id();
-    let mut f = Flash {
-        observer_error: health.err(),
-        ..Default::default()
+    let job = match os::ObservationJob::new() {
+        Ok(j) => j,
+        Err(e) => return not_run(format!("observation job: {e}")),
     };
-    for s in shown {
-        match tree.classify(&s, me) {
-            Attr::Ours => f.ours.push(s),
-            Attr::Unattributed => f.unattributed.push(s),
-            Attr::Other => {}
-        }
+    let (out, run_id) = match child_out(&ctx.out, name) {
+        Ok(v) => v,
+        Err(e) => return not_run(e),
+    };
+    let left = ctx
+        .cutoff
+        .saturating_duration_since(Instant::now())
+        .as_secs()
+        .saturating_sub(CHILD_MARGIN);
+    let deadline = budget.min(left);
+    if deadline <= 20 {
+        return not_run("no budget left before the cutoff".into());
     }
-    (r, f)
+    let obs = match os::WindowObserver::start(Some(&job)) {
+        Ok(o) => o,
+        Err(e) => return not_run(format!("window observer failed: {e}")),
+    };
+    let mut cmd = Command::new(std::env::current_exe().unwrap_or_default());
+    cmd.args(argv)
+        .arg("--out")
+        .arg(&out)
+        .args(["--run-id", &run_id])
+        .args(["--deadline-secs", &deadline.to_string()])
+        .args(cli::forward_common(&ctx.args))
+        .env("CHS_WAIT_GO", "1");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let r = run_observed(&mut cmd, &job, Duration::from_secs(deadline + CHILD_MARGIN));
+    let (events, health) = obs.stop();
+    let launch = r.as_ref().ok().map(|(_, l)| *l);
+    if let Err(e) = &r {
+        ctx.detail(&format!("child-{name}-error"), json!(e));
+    }
+    let f = classify_all(events, health, launch.as_ref(), tree);
+    (child_report(&out, &run_id), f)
 }
 
-/// The pre-trusted, unattended baseline matrix (no attended steps).
-fn console_matrix(ctx: &Ctx) -> Vec<(&'static str, Vec<String>, u64)> {
+/// One calibration helper run; a launch failure (spawn, job assignment)
+/// lands in `health`.
+struct Calib {
+    events: Vec<os::WindowEvent>,
+    health: Result<(), String>,
+    /// `(pid, start time, hwnd)` the helper reported.
+    helper: Option<(u32, u64, u64)>,
+    launch: Option<LaunchId>,
+}
+
+/// Runs the calibration helper once (`at_exit`: window only in its last
+/// 50 ms) under a fresh observer and observation job.
+fn calibrate(ctx: &Ctx, at_exit: bool) -> Calib {
+    let failed = |e: String| Calib {
+        events: Vec::new(),
+        health: Err(e),
+        helper: None,
+        launch: None,
+    };
+    let job = match os::ObservationJob::new() {
+        Ok(j) => j,
+        Err(e) => return failed(format!("observation job: {e}")),
+    };
+    let report = ctx.out.join(format!(
+        "calibration{}.json",
+        if at_exit { "-at-exit" } else { "" }
+    ));
+    let obs = match os::WindowObserver::start(Some(&job)) {
+        Ok(o) => o,
+        Err(e) => return failed(e),
+    };
+    let mut cmd = Command::new(util::sibling_bin("chs-fake-cli"));
+    cmd.args(["--mode", "window-calibrate", "--report-file"])
+        .arg(&report);
+    if at_exit {
+        cmd.arg("--at-exit");
+    }
+    let r = run_observed(&mut cmd, &job, Duration::from_secs(15));
+    let (events, health) = obs.stop();
+    let helper = std::fs::read(&report)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| {
+            Some((
+                v["pid"].as_u64()? as u32,
+                v["start_time"].as_u64()?,
+                v["hwnd"].as_u64()?,
+            ))
+        });
+    let (health, launch) = match r {
+        Ok((_, l)) => (health, Some(l)),
+        Err(e) => (Err(e), None),
+    };
+    Calib {
+        events,
+        health,
+        helper,
+        launch,
+    }
+}
+
+/// A launch's own hook-delivery case decides `launch/<config>/<name>`:
+/// Claude A-1, Codex the first A-3 case, fake paste every chunk 0 B-3 case.
+fn delivery_outcome(name: &str, r: &ChildRep) -> Outcome {
+    let rep = match r {
+        Err(e) => return Outcome::harness(e.clone()),
+        Ok(rep) => rep,
+    };
+    let find = |id: &str, case: &str| {
+        rep.checks
+            .iter()
+            .rev()
+            .find(|c| c.id == id && c.case == case)
+            .map(Outcome::from_check)
+            .unwrap_or(Outcome::Missing)
+    };
+    match name {
+        "claude-hooks" => find("A-1", "session_start_bound"),
+        "codex-hooks-no-daemon" => find("A-3", "no-daemon/no-daemon-0"),
+        "codex-hooks-default" => find("A-3", "default/default-0"),
+        _ => {
+            let c0: Vec<Outcome> = rep
+                .checks
+                .iter()
+                .filter(|c| c.id == "B-3" && c.case.ends_with("/chunk0"))
+                .map(Outcome::from_check)
+                .collect();
+            if c0.is_empty() {
+                Outcome::Missing
+            } else {
+                c0.into_iter()
+                    .find(|o| *o != Outcome::Pass)
+                    .unwrap_or(Outcome::Pass)
+            }
+        }
+    }
+}
+
+/// The pre-trusted, unattended matrix for one configuration (no attended
+/// steps): Claude and Codex `--no-daemon` under every configuration; under
+/// `P` also Codex default mode and fake paste.
+fn console_matrix(ctx: &Ctx, config: &str) -> Vec<(&'static str, Vec<String>, u64)> {
     let cwd = ctx
         .args
         .cwd
@@ -1422,8 +1704,13 @@ fn console_matrix(ctx: &Ctx) -> Vec<(&'static str, Vec<String>, u64)> {
         .unwrap_or_else(|| super::real::c2_cwd(&ctx.args.root))
         .display()
         .to_string();
-    let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    vec![
+    let flags = cli::config_flags(config).unwrap_or_default();
+    let v = |a: &[&str]| {
+        let mut x: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+        x.extend(flags.iter().cloned());
+        x
+    };
+    let mut m = vec![
         (
             "claude-hooks",
             v(&["real", "claude-hooks", "--cwd", &cwd]),
@@ -1441,7 +1728,9 @@ fn console_matrix(ctx: &Ctx) -> Vec<(&'static str, Vec<String>, u64)> {
             ]),
             900,
         ),
-        (
+    ];
+    if config == "P" {
+        m.push((
             "codex-hooks-default",
             v(&[
                 "real",
@@ -1452,13 +1741,14 @@ fn console_matrix(ctx: &Ctx) -> Vec<(&'static str, Vec<String>, u64)> {
                 &cwd,
             ]),
             900,
-        ),
-        (
+        ));
+        m.push((
             "fake-paste",
             v(&["fake", "paste", "--paste-newline", "cr"]),
             900,
-        ),
-    ]
+        ));
+    }
+    m
 }
 
 fn probe_console(ctx: &Ctx) {
@@ -1466,13 +1756,25 @@ fn probe_console(ctx: &Ctx) {
         return relaunch_detached(ctx);
     }
     let mut pc = Pc::new("C-5");
-    let matrix = console_matrix(ctx);
-    for c in ["detached", "calibration", "survival"] {
+    let configs: Vec<String> = if ctx.args.configs.is_empty() {
+        vec!["P".into()]
+    } else {
+        ctx.args.configs.clone()
+    };
+    for c in [
+        "detached",
+        "calibration",
+        "calibration/caret_control",
+        "calibration/at_exit_control",
+        "survival",
+    ] {
         pc.req(c);
     }
-    for (name, _, _) in &matrix {
-        pc.req(&format!("launch/{name}"));
-        pc.req(&format!("no_flash/{name}"));
+    for cfg in &configs {
+        for (name, _, _) in console_matrix(ctx, cfg) {
+            pc.req(&format!("launch/{cfg}/{name}"));
+            pc.req(&format!("no_flash/{cfg}/{name}"));
+        }
     }
     let detached = std::env::var("CHS_DETACHED_CHILD").is_ok();
     let console_window = os::console_window_present();
@@ -1487,82 +1789,101 @@ fn probe_console(ctx: &Ctx) {
         json!({"detached": detached, "console_window_present": console_window}),
     );
     let tree = PpidRecorder::start();
-    // Calibration: a short-lived console exe, deliberately visible (no
-    // CREATE_NO_WINDOW), must be seen and attributed.
-    let calibrated = match os::WindowObserver::start() {
+    // Calibration: a helper of ours shows its own top-level window inside an
+    // observation job, with the observer armed first (deliberately visible).
+    let Calib {
+        events,
+        health,
+        helper,
+        ..
+    } = calibrate(ctx, false);
+    let calibrated = match &health {
         Err(e) => {
-            pc.put(
-                "calibration",
-                Outcome::harness(format!("window observer failed: {e}")),
-                Value::Null,
-            );
+            let o = Outcome::harness(format!("window observer failed: {e}"));
+            pc.put("calibration", o.clone(), Value::Null);
+            pc.put("calibration/caret_control", o, Value::Null);
             false
         }
-        Ok(obs) => {
-            let cal = Command::new("cmd.exe").args(["/c", "exit"]).spawn();
-            let cal_pid = cal.as_ref().map(|c| c.id()).ok();
-            if let Ok(mut c) = cal {
-                let _ = c.wait();
-            }
-            std::thread::sleep(Duration::from_millis(500));
-            let (shown, health) = obs.stop();
-            let ok = health.is_ok()
-                && cal_pid.is_some_and(|p| shown.iter().any(|s| tree.classify(s, p) == Attr::Ours));
-            pc.put(
-                "calibration",
-                match (&health, cal_pid, ok) {
-                    (Err(e), _, _) => Outcome::harness(format!("window observer failed: {e}")),
-                    (_, None, _) => Outcome::harness("calibration launch failed"),
-                    (_, _, true) => Outcome::Pass,
-                    (_, _, false) => Outcome::not_exercised("calibration window not attributed"),
-                },
-                json!({"pid": cal_pid, "events": shown.len(), "observer_error": health.err()}),
-            );
+        Ok(()) => {
+            let (win, caret) = calibration_outcome(&events, helper);
+            let ok = win == Outcome::Pass;
+            let ev = json!({"helper": helper, "events": events});
+            pc.put("calibration", win, ev.clone());
+            pc.put("calibration/caret_control", caret, ev);
             ok
         }
     };
+    // A flash at the very end of a launch must still come out `ours`.
+    let c = calibrate(ctx, true);
+    let (helper, launch) = (c.helper, c.launch);
+    let f = classify_all(c.events, c.health, launch.as_ref(), &tree);
+    let hit = helper.is_some_and(|(_, _, h)| f.ours.iter().any(|e| e.hwnd == h));
+    pc.put(
+        "calibration/at_exit_control",
+        match (&f.observer_error, hit) {
+            (Some(e), _) => Outcome::harness(format!("window observer failed: {e}")),
+            (None, true) => Outcome::Pass,
+            (None, false) => Outcome::not_exercised("the at-exit window was not classified ours"),
+        },
+        json!({"helper": helper, "flash": f.json()}),
+    );
     let mut launches = serde_json::Map::new();
-    for (name, argv, budget) in &matrix {
-        let (r, f) = observed_child(ctx, &tree, &format!("console-{name}"), argv, *budget, &[]);
-        let launched = child_outcome(&r);
-        let ok = launched == Outcome::Pass;
-        pc.put(
-            &format!("launch/{name}"),
-            match launched {
-                Outcome::Pass | Outcome::HarnessFail { .. } => launched,
-                o => Outcome::not_exercised(format!("launch out of scope: {}", o.tag())),
-            },
-            json!({"status": status_of(&r)}),
-        );
-        let nf = flash_outcome(&f, ok && calibrated);
-        let flashed = matches!(nf, Outcome::PlatformFail { .. });
-        pc.put(&format!("no_flash/{name}"), nf, f.json());
-        let mut entry = json!({"baseline": f.json()});
-        if flashed {
-            // Mitigation: rerun the SAME launch, cwd, and hook delivery with
-            // the GUI-subsystem emitter.
-            let (dk, fk) = (
-                format!("mitigated/{name}/delivery"),
-                format!("mitigated/{name}/no_flash"),
-            );
-            pc.req(&dk);
-            pc.req(&fk);
-            let gui = [("CHS_EMITTER_VARIANT", "gui")];
-            let (r2, f2) = observed_child(
+    for cfg in &configs {
+        for (name, argv, budget) in console_matrix(ctx, cfg) {
+            let (r, f) = observed_child(
                 ctx,
                 &tree,
-                &format!("console-{name}-gui"),
-                argv,
-                *budget,
-                &gui,
+                &format!("console-{cfg}-{name}"),
+                &argv,
+                budget,
+                &[],
             );
-            let delivered = child_outcome(&r2);
-            let ok2 = delivered == Outcome::Pass;
-            pc.put(&dk, delivered, json!({"status": status_of(&r2)}));
-            pc.put(&fk, flash_outcome(&f2, ok2 && calibrated), f2.json());
-            entry["mitigated"] = f2.json();
+            let delivered = delivery_outcome(name, &r);
+            let ok = delivered == Outcome::Pass;
+            let tag = json!({"config": cfg, "status": status_of(&r)});
+            pc.put(&format!("launch/{cfg}/{name}"), delivered, tag.clone());
+            let nf = flash_outcome(&f, ok, calibrated);
+            let flashed = matches!(nf, Outcome::PlatformFail { .. });
+            pc.put(
+                &format!("no_flash/{cfg}/{name}"),
+                nf,
+                json!({"config": cfg, "flash": f.json()}),
+            );
+            let mut entry = json!({"baseline": f.json()});
+            if flashed {
+                // Mitigation: rerun the SAME launch, cwd, and hook delivery with
+                // the GUI-subsystem emitter.
+                let (dk, fk) = (
+                    format!("mitigated/{cfg}/{name}/delivery"),
+                    format!("mitigated/{cfg}/{name}/no_flash"),
+                );
+                pc.req(&dk);
+                pc.req(&fk);
+                let gui = [("CHS_EMITTER_VARIANT", "gui")];
+                let (r2, f2) = observed_child(
+                    ctx,
+                    &tree,
+                    &format!("console-{cfg}-{name}-gui"),
+                    &argv,
+                    budget,
+                    &gui,
+                );
+                let delivered = delivery_outcome(name, &r2);
+                let ok2 = delivered == Outcome::Pass;
+                pc.put(
+                    &dk,
+                    delivered,
+                    json!({"config": cfg, "status": status_of(&r2)}),
+                );
+                pc.put(
+                    &fk,
+                    flash_outcome(&f2, ok2, calibrated),
+                    json!({"config": cfg, "flash": f2.json()}),
+                );
+                entry["mitigated"] = f2.json();
+            }
+            launches.insert(format!("{cfg}/{name}"), entry);
         }
-        launches.insert((*name).into(), entry);
     }
     if detached {
         let (o, ev) = terminal_close_survival(ctx);
@@ -1574,10 +1895,15 @@ fn probe_console(ctx: &Ctx) {
             Value::Null,
         );
     }
+    ctx.sink.with(|r| {
+        r.config["join_run_id"] = json!(ctx.args.join_run_id);
+        r.config["configs"] = json!(configs);
+    });
     pc.finish(
         ctx,
         json!({"launches": launches, "breakaway": std::env::var("CHS_BREAKAWAY").ok(),
-               "harness_job": os::self_job_info()}),
+               "harness_job": os::self_job_info(), "join_run_id": ctx.args.join_run_id,
+               "default_terminal": os::default_terminal_delegation()}),
     );
 }
 
@@ -1706,6 +2032,7 @@ fn terminal_close_survival(ctx: &Ctx) -> (Outcome, Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paste::NewlineKey;
 
     /// r2 C-3: an enumeration failure is a harness failure, never an empty
     /// job that turns every live witness into an escapee.
@@ -1734,30 +2061,175 @@ mod tests {
         assert!(matches!(o, Outcome::NotExercised { .. }), "{o:?}");
     }
 
+    fn ev(
+        pid: u32,
+        image: &str,
+        ppid: Option<u32>,
+        start: Option<u64>,
+        in_job: Option<bool>,
+    ) -> os::WindowEvent {
+        os::WindowEvent {
+            time_ms: 0,
+            hwnd: 0x100,
+            id_object: os::OBJID_WINDOW,
+            id_child: os::CHILDID_SELF,
+            class: "C".into(),
+            owner_pid: pid,
+            image: Some(format!("C:\\Windows\\{image}")),
+            ppid,
+            start_time: start,
+            in_job,
+        }
+    }
+
+    /// F-3a: §4.8 classification of window events during a launch.
     #[test]
-    fn unattributed_events_block_no_flash() {
-        let mut f = Flash {
-            unattributed: vec![(0, None)],
-            ..Default::default()
+    fn classify_rules() {
+        let l = LaunchId { root: (100, 1000) };
+        // root 100 (start 1000) -> 200 (1100) -> conhost 300 (1200)
+        let samples: std::collections::HashMap<u32, (u32, u64)> =
+            [(100, (1, 1000)), (200, (100, 1100)), (1, (0, 10))].into();
+        let c = |e: &os::WindowEvent| classify(e, &l, &samples);
+        // In the observation job at callback time.
+        assert_eq!(c(&ev(9, "x.exe", None, None, Some(true))), Some(Attr::Ours));
+        // Ancestry by pid and start time; a console host under our client.
+        assert_eq!(
+            c(&ev(300, "conhost.exe", Some(200), Some(1200), Some(false))),
+            Some(Attr::Ours)
+        );
+        assert_eq!(
+            c(&ev(100, "a.exe", Some(1), Some(1000), None)),
+            Some(Attr::Ours)
+        );
+        // Same pid as the root, different start time: not ours.
+        assert_ne!(
+            c(&ev(100, "a.exe", Some(1), Some(5000), None)),
+            Some(Attr::Ours)
+        );
+        // A parent pid reused by a later process breaks the ancestry.
+        let reused: std::collections::HashMap<u32, (u32, u64)> =
+            [(100, (1, 1000)), (200, (100, 9000))].into();
+        assert_eq!(
+            classify(
+                &ev(300, "x.exe", Some(200), Some(1200), Some(false)),
+                &l,
+                &reused
+            ),
+            Some(Attr::Ambiguous)
+        );
+        // Console hosts / terminals not provably ours.
+        for host in ["conhost.exe", "OpenConsole.exe", "WindowsTerminal.exe"] {
+            assert_eq!(
+                c(&ev(400, host, Some(1), Some(50), Some(false))),
+                Some(Attr::Ambiguous)
+            );
+        }
+        // Unresolved owner: no start time, no pid, broken ancestry.
+        assert_eq!(
+            c(&ev(500, "x.exe", Some(1), None, None)),
+            Some(Attr::Ambiguous)
+        );
+        assert_eq!(
+            c(&ev(0, "x.exe", Some(1), Some(1500), None)),
+            Some(Attr::Ambiguous)
+        );
+        assert_eq!(
+            c(&ev(501, "x.exe", Some(777), Some(1500), None)),
+            Some(Attr::Ambiguous)
+        );
+        // Unrelated owners.
+        assert_eq!(
+            c(&ev(600, "explorer.exe", Some(1), Some(20), Some(false))),
+            Some(Attr::Other)
+        );
+        assert_eq!(
+            c(&ev(601, "x.exe", Some(1), Some(1500), Some(false))),
+            Some(Attr::Other)
+        );
+        // Non-window events (the caret) are ignored.
+        let mut caret = ev(9, "x.exe", None, None, Some(true));
+        caret.id_object = OBJID_CARET;
+        assert_eq!(c(&caret), None);
+    }
+
+    /// F-3a: calibration needs the reported hwnd plus the helper's pid and
+    /// start time; the caret alone never satisfies it.
+    #[test]
+    fn calibration_needs_the_helpers_window() {
+        let helper = Some((42, 7, 0x100));
+        let win = ev(42, "chs-fake-cli.exe", Some(1), Some(7), Some(true));
+        let mut caret = win.clone();
+        caret.id_object = OBJID_CARET;
+        assert_eq!(
+            calibration_outcome(&[win.clone(), caret.clone()], helper),
+            (Outcome::Pass, Outcome::Pass)
+        );
+        let (w, c) = calibration_outcome(std::slice::from_ref(&caret), helper);
+        assert!(matches!(w, Outcome::NotExercised { .. }), "{w:?}");
+        assert_eq!(c, Outcome::Pass);
+        for bad in [
+            os::WindowEvent {
+                hwnd: 0x200,
+                ..win.clone()
+            },
+            os::WindowEvent {
+                owner_pid: 43,
+                ..win.clone()
+            },
+            os::WindowEvent {
+                start_time: Some(8),
+                ..win.clone()
+            },
+        ] {
+            let (w, _) = calibration_outcome(&[bad], helper);
+            assert!(matches!(w, Outcome::NotExercised { .. }), "{w:?}");
+        }
+        let (w, _) = calibration_outcome(&[win], None);
+        assert!(matches!(w, Outcome::NotExercised { .. }), "{w:?}");
+    }
+
+    /// F-3a: an event recorded during the shutdown drain is classified, and
+    /// the no-flash rules follow it.
+    #[test]
+    fn flash_rules() {
+        let l = LaunchId { root: (100, 1000) };
+        let tree = PpidRecorder {
+            map: Arc::new(Mutex::new([(100, (1, 1000))].into())),
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
+        let mut late = ev(100, "a.exe", Some(1), Some(1000), Some(false));
+        late.time_ms = 60_000;
+        let f = classify_all(vec![late], Ok(()), Some(&l), &tree);
+        assert_eq!(f.ours.len(), 1);
         assert!(matches!(
-            flash_outcome(&f, true),
+            flash_outcome(&f, true, true),
+            Outcome::PlatformFail { .. }
+        ));
+        let amb = classify_all(
+            vec![ev(400, "conhost.exe", Some(1), Some(50), Some(false))],
+            Ok(()),
+            Some(&l),
+            &tree,
+        );
+        assert!(matches!(
+            flash_outcome(&amb, true, true),
             Outcome::NotExercised { .. }
         ));
-        f.unattributed.clear();
-        assert_eq!(flash_outcome(&f, true), Outcome::Pass);
-        f.observer_error = Some("message loop ended on an error".into());
+        let none = classify_all(Vec::new(), Ok(()), Some(&l), &tree);
+        assert_eq!(flash_outcome(&none, true, true), Outcome::Pass);
         assert!(matches!(
-            flash_outcome(&f, true),
+            flash_outcome(&none, true, false),
+            Outcome::NotExercised { .. }
+        ));
+        assert!(matches!(
+            flash_outcome(&none, false, true),
+            Outcome::NotExercised { .. }
+        ));
+        let broken = classify_all(Vec::new(), Err("WM_QUIT".into()), Some(&l), &tree);
+        assert!(matches!(
+            flash_outcome(&broken, true, true),
             Outcome::HarnessFail { .. }
         ));
-        let m = std::collections::HashMap::from([(5, 4), (4, 1), (1, 0)]);
-        assert_eq!(classify(&m, &(0, None), 1), Attr::Unattributed);
-        assert_eq!(classify(&m, &(9, None), 1), Attr::Unattributed);
-        assert_eq!(classify(&m, &(5, None), 1), Attr::Ours);
-        assert_eq!(classify(&m, &(5, None), 2), Attr::Other);
-        // r3: a parent missing from the samples breaks the chain.
-        assert_eq!(classify(&m, &(8, Some(7)), 2), Attr::Unattributed);
     }
 
     #[test]

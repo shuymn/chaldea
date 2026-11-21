@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use crate::os::{self, ProcInfo};
 use crate::pty::PtyIo;
 use crate::report::Sink;
+use crate::verdict::Outcome;
 
 pub const KILL_GRACE: Duration = Duration::from_secs(2);
 pub const VERIFY: Duration = Duration::from_secs(5);
@@ -79,7 +80,12 @@ pub struct KillResult {
     pub killed_by_fallback: Vec<ProcInfo>,
     /// Another path (watchdog or guard drop) had already killed this tree.
     pub already_done: bool,
+    /// §4.8 `backend` kill proof (job trees only; see `kill_proof_outcome`).
+    pub kill_proof: Option<Value>,
 }
+
+/// How long the live set may take to die after `TerminateJobObject`.
+pub const JOB_DEATH_WAIT: Duration = Duration::from_secs(2);
 
 impl Owned {
     pub fn recorded(&self) -> Vec<ProcInfo> {
@@ -119,12 +125,67 @@ impl Owned {
         }
     }
 
-    fn kill_primary(&self, grace: Duration) -> Vec<String> {
+    /// Pre-stop half of the kill proof (job trees only): the historical
+    /// descendant list, each identity's liveness, and one membership snapshot.
+    fn proof_before(&self) -> Option<Value> {
+        let tree = self.tree.lock().unwrap_or_else(|e| e.into_inner());
+        let t = tree.as_ref().filter(|t| t.proves_membership())?;
+        let membership = t.members_checked();
+        let pre: Vec<Value> = self
+            .recorded()
+            .iter()
+            .map(|p| {
+                json!({"pid": p.pid, "start_time": p.start_time, "name": p.name,
+                            "live": os::liveness(p.pid, p.start_time)})
+            })
+            .collect();
+        Some(json!({"pre_stop": pre, "membership": match &membership {
+            Ok(m) => json!(m), Err(e) => json!({"error": e}) }}))
+    }
+
+    /// After `TerminateJobObject`: waits (bounded) for every identity that
+    /// was live before the stop to be positively dead, before the
+    /// retained-child kill, any pid fallback, or the ConPTY close.
+    fn proof_after(proof: &mut Value) {
+        let live: Vec<(u32, u64)> = proof["pre_stop"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| p["live"] == json!(true))
+            .filter_map(|p| Some((p["pid"].as_u64()? as u32, p["start_time"].as_u64()?)))
+            .collect();
+        let end = Instant::now() + JOB_DEATH_WAIT;
+        let mut after: Vec<(u32, Option<bool>)>;
+        loop {
+            after = live
+                .iter()
+                .map(|&(p, st)| (p, os::liveness(p, st)))
+                .collect();
+            if after.iter().all(|(_, l)| *l == Some(false)) || Instant::now() >= end {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        proof["after_job"] = json!(
+            after
+                .iter()
+                .map(|(p, l)| json!({"pid": p, "live": l}))
+                .collect::<Vec<_>>()
+        );
+        proof["live_set_dead_before_fallback"] =
+            json!(after.iter().all(|(_, l)| *l == Some(false)));
+    }
+
+    fn kill_primary(&self, grace: Duration, proof: &mut Option<Value>) -> Vec<String> {
         let tree = self.tree.lock().unwrap_or_else(|e| e.into_inner());
         let mut steps = match tree.as_ref() {
             Some(t) => t.kill(grace),
             None => Vec::new(),
         };
+        drop(tree);
+        if let Some(p) = proof.as_mut() {
+            Self::proof_after(p);
+        }
         // The retained child handle, always: covers a failed or delayed tree setup.
         let r = self.killer.lock().unwrap_or_else(|e| e.into_inner()).kill();
         steps.push(format!("child_killer.kill={}", r.is_ok()));
@@ -161,7 +222,8 @@ impl Owned {
             };
         }
         self.record_scan();
-        let primary_steps = self.kill_primary(grace);
+        let mut kill_proof = self.proof_before();
+        let primary_steps = self.kill_primary(grace, &mut kill_proof);
         // Give the primary a moment to land before judging escapees.
         let settle = Instant::now() + Duration::from_millis(300);
         while !self.alive_recorded().is_empty() && Instant::now() < settle {
@@ -175,6 +237,7 @@ impl Owned {
             escaped_primary,
             killed_by_fallback,
             already_done: false,
+            kill_proof,
         }
     }
 
@@ -230,6 +293,59 @@ pub fn owned_by(
     out
 }
 
+/// The §4.8 `backend` kill proof as a case outcome. Every descendant live
+/// before the stop must be positively in the job (one outside it is an
+/// escapee); the MCP witness `(pid, start)` must be live and in the job;
+/// identities that already exited need no membership; an unknown liveness or
+/// a failed membership query is a harness failure; and every member of the
+/// live set must be positively dead after `TerminateJobObject` and before the
+/// retained-child kill, any pid fallback, or the ConPTY close.
+pub fn kill_proof_outcome(proof: &Value, witness: Option<(u32, u64)>) -> Outcome {
+    let Some(members) = proof["membership"].as_array() else {
+        return Outcome::harness(format!("membership query failed: {}", proof["membership"]));
+    };
+    let members: Vec<u64> = members.iter().filter_map(Value::as_u64).collect();
+    let pre: Vec<&Value> = proof["pre_stop"].as_array().into_iter().flatten().collect();
+    if pre.iter().any(|p| p["live"].is_null()) {
+        return Outcome::harness("pre-stop liveness unknown");
+    }
+    let live = |p: &Value| p["live"] == json!(true);
+    let outside: Vec<u64> = pre
+        .iter()
+        .filter(|p| live(p))
+        .filter_map(|p| p["pid"].as_u64())
+        .filter(|pid| !members.contains(pid))
+        .collect();
+    if !outside.is_empty() {
+        return Outcome::platform(format!("live descendants outside the job: {outside:?}"));
+    }
+    let witness_ok = witness.is_some_and(|(wp, ws)| {
+        pre.iter().any(|p| {
+            live(p)
+                && p["pid"].as_u64() == Some(wp as u64)
+                && p["start_time"].as_u64() == Some(ws)
+                && members.contains(&(wp as u64))
+        })
+    });
+    if !witness_ok {
+        return Outcome::not_exercised(
+            "the MCP witness was not live and in the job before the stop",
+        );
+    }
+    let after: Vec<&Value> = proof["after_job"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .collect();
+    if after.iter().any(|p| p["live"].is_null()) {
+        return Outcome::harness("liveness after TerminateJobObject unknown");
+    }
+    if proof["live_set_dead_before_fallback"] != json!(true) {
+        return Outcome::platform("the live set survived TerminateJobObject");
+    }
+    Outcome::Pass
+}
+
 pub struct SpawnOpts {
     pub argv: Vec<OsString>,
     pub cwd: PathBuf,
@@ -241,6 +357,8 @@ pub struct SpawnOpts {
     /// Delay tree attachment until `attach_tree` is called (`--hold-assign-until-child`).
     pub hold_assign: bool,
     pub inject: Option<Inject>,
+    /// `Portable` (default, today's path) or the Windows raw backend.
+    pub backend: os::Backend,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -254,6 +372,9 @@ pub struct StopReport {
     pub tree: Value,
     pub threads: Value,
     pub teardown_ms: u64,
+    /// Backend, launch branch, and loaded ConPTY module of this launch.
+    pub launch: Value,
+    pub kill_proof: Option<Value>,
 }
 
 static SPAWNED: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
@@ -269,6 +390,8 @@ pub struct Session {
     child: Mutex<Box<dyn Child + Send + Sync>>,
     recorder: Option<(JoinHandle<()>, Arc<AtomicBool>)>,
     stopped: bool,
+    /// Backend, branch, and ConPTY module (raw: recorded before I/O starts).
+    pub launch: Value,
 }
 
 impl Session {
@@ -277,34 +400,70 @@ impl Session {
         // The output sink is prepared before anything is spawned.
         let out = std::fs::File::create(&opts.out_file)
             .map_err(|e| format!("{}: {e}", opts.out_file.display()))?;
-        let pty = native_pty_system();
-        let pair = pty
-            .openpty(PtySize {
-                rows: opts.rows,
-                cols: opts.cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| format!("openpty: {e}"))?;
-        let mut cmd = CommandBuilder::from_argv(opts.argv.clone());
-        apply_scrub(&mut cmd, std::env::vars_os().map(|(k, _)| k));
-        for (k, v) in &opts.env {
-            cmd.env(k, v);
-        }
-        cmd.cwd(&opts.cwd);
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| format!("spawn {:?}: {e}", opts.argv))?;
-        // --- guard exists from here on; every early return below kills the child ---
-        drop(pair.slave);
+        let (master, child, raw_tree, launch) = match opts.backend {
+            os::Backend::Portable => {
+                let pty = native_pty_system();
+                let pair = pty
+                    .openpty(PtySize {
+                        rows: opts.rows,
+                        cols: opts.cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .map_err(|e| format!("openpty: {e}"))?;
+                let mut cmd = CommandBuilder::from_argv(opts.argv.clone());
+                apply_scrub(&mut cmd, std::env::vars_os().map(|(k, _)| k));
+                for (k, v) in &opts.env {
+                    cmd.env(k, v);
+                }
+                cmd.cwd(&opts.cwd);
+                let child = pair
+                    .slave
+                    .spawn_command(cmd)
+                    .map_err(|e| format!("spawn {:?}: {e}", opts.argv))?;
+                // --- guard exists from here on; every early return below kills the child ---
+                drop(pair.slave);
+                let launch = json!({"backend": "portable", "branch": "assign_after",
+                                    "conpty_module": os::conpty_module()});
+                (pair.master, child, None, launch)
+            }
+            os::Backend::Raw {
+                conpty_flags,
+                inject,
+            } => {
+                if opts.hold_assign {
+                    return Err(
+                        "--hold-assign-until-child does not apply to the raw backend".into(),
+                    );
+                }
+                let remove: Vec<String> = std::env::vars_os()
+                    .map(|(k, _)| k.to_string_lossy().into_owned())
+                    .filter(|k| scrub_env_name(k))
+                    .collect();
+                let rs = os::raw_spawn(
+                    &opts.argv,
+                    &opts.env,
+                    &remove,
+                    &opts.cwd,
+                    opts.cols,
+                    opts.rows,
+                    conpty_flags,
+                    inject,
+                )?;
+                // --- guard exists from here on; the tree is the job from creation ---
+                let launch = json!({"backend": "raw", "conpty_flags": conpty_flags,
+                                    "branch": rs.branch, "job_list_error": rs.job_list_error,
+                                    "conpty_module": rs.conpty_module});
+                (rs.master, rs.child, Some(rs.tree), launch)
+            }
+        };
         let pid = child.process_id().unwrap_or(0);
         let start = os::proc_info(pid).map(|p| p.start_time).unwrap_or(0);
         let owned = Arc::new(Owned {
             child_pid: pid,
             child_start: start,
             killer: Mutex::new(child.clone_killer()),
-            tree: Mutex::new(None),
+            tree: Mutex::new(raw_tree),
             tree_error: Mutex::new(None),
             recorded: Mutex::new(BTreeMap::new()),
             kill_lock: Mutex::new(()),
@@ -322,8 +481,9 @@ impl Session {
             child: Mutex::new(child),
             recorder: None,
             stopped: false,
+            launch,
         };
-        if !opts.hold_assign {
+        if !opts.hold_assign && opts.backend == os::Backend::Portable {
             s.attach_tree();
         }
         if opts.inject == Some(Inject::SetupFail) {
@@ -331,7 +491,7 @@ impl Session {
         }
         let o = s.owned.clone();
         s.io = Some(PtyIo::start(
-            pair.master,
+            master,
             out,
             opts.cols,
             opts.rows,
@@ -458,6 +618,8 @@ impl Session {
             tree: self.tree_desc(),
             threads,
             teardown_ms: t.elapsed().as_millis() as u64,
+            launch: self.launch.clone(),
+            kill_proof: k.kill_proof,
         }
     }
 }
@@ -689,5 +851,66 @@ mod tests {
         let v = os::non_utf8_os_string();
         assert!(v.to_str().is_none());
         v
+    }
+
+    fn proof(pre: Value, members: Value, after: Value, dead: bool) -> Value {
+        json!({"pre_stop": pre, "membership": members, "after_job": after,
+               "live_set_dead_before_fallback": dead})
+    }
+
+    /// §4.8 `backend` kill proof as a case outcome.
+    #[test]
+    fn kill_proof_rules() {
+        let pre = json!([
+            {"pid": 10, "start_time": 1, "live": true},
+            {"pid": 11, "start_time": 1, "live": true},
+            {"pid": 12, "start_time": 1, "live": false}
+        ]);
+        let after = json!([{"pid": 10, "live": false}, {"pid": 11, "live": false}]);
+        let w = Some((11, 1));
+        let ok = proof(pre.clone(), json!([10, 11]), after.clone(), true);
+        assert_eq!(kill_proof_outcome(&ok, w), Outcome::Pass);
+        // An exited identity needs no membership; a live one outside the job is an escapee.
+        let esc = proof(pre.clone(), json!([10]), after.clone(), true);
+        assert!(matches!(
+            kill_proof_outcome(&esc, w),
+            Outcome::PlatformFail { .. }
+        ));
+        // The witness must be live and in the job (same start time).
+        assert!(matches!(
+            kill_proof_outcome(&ok, Some((11, 2))),
+            Outcome::NotExercised { .. }
+        ));
+        assert!(matches!(
+            kill_proof_outcome(&ok, None),
+            Outcome::NotExercised { .. }
+        ));
+        // A failed membership query or unknown liveness is a harness failure.
+        let bad = proof(pre.clone(), json!({"error": "denied"}), after.clone(), true);
+        assert!(matches!(
+            kill_proof_outcome(&bad, w),
+            Outcome::HarnessFail { .. }
+        ));
+        let unk = proof(
+            json!([{"pid": 10, "start_time": 1, "live": null}]),
+            json!([10]),
+            after.clone(),
+            true,
+        );
+        assert!(matches!(
+            kill_proof_outcome(&unk, w),
+            Outcome::HarnessFail { .. }
+        ));
+        // The live set must be dead before the later steps.
+        let late = proof(
+            pre,
+            json!([10, 11]),
+            json!([{"pid": 10, "live": true}]),
+            false,
+        );
+        assert!(matches!(
+            kill_proof_outcome(&late, w),
+            Outcome::PlatformFail { .. }
+        ));
     }
 }

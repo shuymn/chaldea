@@ -365,6 +365,18 @@ impl PtyIo {
         self.tx.send(WriteMsg::Close);
     }
 
+    /// Resizes the PTY (`ResizePseudoConsole` under the raw backend).
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        let m = self.master.as_ref().ok_or("master closed")?;
+        m.resize(portable_pty::PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| e.to_string())
+    }
+
     /// Closes the master (ConPTY on Windows) while the reader keeps draining.
     pub fn close_master(&mut self) {
         self.master.take();
