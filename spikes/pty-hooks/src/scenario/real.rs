@@ -1288,9 +1288,11 @@ fn keys_sweep(ctx: &Ctx, a: &Agent, newline: NewlineKey) {
     // (run once with F-1's winner).
     let entries: Vec<paste::FEntry> =
         if let Some(rec @ ("f1" | "f1-recorded")) = ctx.args.subset.as_deref() {
+            // With `--f1-entries`, entries are chosen by id from the whole
+            // corpus F (recorded ones stay recorded).
             paste::corpus_f()
                 .into_iter()
-                .filter(|e| e.recorded == (rec == "f1-recorded"))
+                .filter(|e| !ctx.args.f1_entries.is_empty() || e.recorded == (rec == "f1-recorded"))
                 .collect()
         } else {
             paste::corpus()
@@ -2799,6 +2801,42 @@ trusted_hash = "sha256:bb"
         // A wrong prompt: fidelity differs.
         let (_, e) = win_keys_case(&done, 2, "x", None);
         assert_eq!(e["fidelity"], json!("differs"));
+    }
+
+    /// A7: a settle interval the run cutoff cuts short is not settled, so
+    /// the case is never a pass.
+    #[test]
+    fn cutoff_cuts_the_settle() {
+        let evs = vec![
+            ev(2, "Stop", None, 5),
+            ev(3, "UserPromptSubmit", Some("x"), 9),
+            ev(4, "Stop", None, 12),
+        ];
+        let sent = || paste::Outcome {
+            state: "sent".into(),
+            rejected: None,
+            bytes_before: 0,
+            bytes_after: 1,
+            detail: None,
+            lossy: Vec::new(),
+            changes: Vec::new(),
+        };
+        let now = Instant::now();
+        let r = send_keys_case(
+            sent,
+            || 0,
+            || evs.clone(),
+            2,
+            now + Duration::from_millis(50),
+            now,
+            Duration::from_secs(5),
+        );
+        assert!(r.completed && !r.settled);
+        let (o, _) = win_keys_case(&evs, 2, "x", None);
+        assert!(matches!(
+            keys_settled(o, r.settled),
+            Outcome::HarnessFail { .. }
+        ));
     }
 
     /// A1: `lossy_tab`'s disposition under the burst override.

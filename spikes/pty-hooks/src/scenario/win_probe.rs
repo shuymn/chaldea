@@ -50,6 +50,7 @@ const F_PROBES: &[(&str, Budget)] = &[
     ("followup", followup_budget),
     ("rerun", rerun_budget),
     ("keys-probe", |_| KEYS_PROBE_BUDGET),
+    ("phase3c", |_| phase3c_budget()),
     ("f2-verdict", |_| {
         // Step 5 waits for the detached step 4 run to end.
         console_budget(&F2_CONFIGS.map(String::from)) + 2 * CHILD_MARGIN + 120
@@ -146,6 +147,7 @@ pub fn run(mut args: Args) -> i32 {
         "backend" => probe_backend(&ctx, ctx.args.f1_winner, None),
         "rerun" => rerun(&ctx),
         "keys-probe" => super::fake::keys_probe(&ctx),
+        "phase3c" => phase3c(&ctx),
         "followup" => followup(&ctx),
         "f2-verdict" => f2_verdict(&ctx),
         _ => unreachable!(),
@@ -1984,6 +1986,355 @@ fn rerun(ctx: &Ctx) {
     );
 }
 
+/// One phase 3c child: the question it answers, its name, argv (the R0
+/// flags included), its own hard cutoff in seconds, and whether its time
+/// is reserved against earlier steps.
+#[derive(Debug, Clone)]
+pub struct P3cStep {
+    pub question: &'static str,
+    pub name: String,
+    pub argv: Vec<String>,
+    pub budget: u64,
+    pub reserved: bool,
+}
+
+/// Practical per-case cutoff for a phase 3c Codex child (Phase 3b's first
+/// 21 sessions took about 11 minutes); a child cut short reports its
+/// unrun cases `not_exercised`.
+const P3C_CASE: u64 = 80;
+
+/// The corpus F entries the second sweep (`none`) is restricted to.
+const P3C_AFFECTED: [&str; 4] = ["emoji_zwj", "small_kana_mark", "cjk_compat", "emoji_vs16"];
+
+/// The phase 3c matrix in run order (A6): keys-probe, the ZWJ/kana pairs,
+/// the long_multiline/cjk_compat paired arms (burst on interleaved with
+/// equally configured burst off), the full w32 corpus (burst off, marks),
+/// the second sweep (burst off, none) on the affected fixtures,
+/// tree_kill_codex, and reader-start; all under `R0`.
+pub fn phase3c_steps() -> Vec<P3cStep> {
+    let r0 = cli::config_flags("R0").unwrap_or_default();
+    let step = |question, name: String, argv: &[&str], budget, reserved| {
+        let mut a: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        a.extend(r0.iter().cloned());
+        P3cStep {
+            question,
+            name,
+            argv: a,
+            budget,
+            reserved,
+        }
+    };
+    let keys = |name: String, subset: &str, burst: &str, records: &str, entries: &[&str]| {
+        let joined = entries.join(",");
+        let mut a = vec![
+            "real",
+            "codex-paste",
+            "--subset",
+            subset,
+            "--newline-key",
+            "w32",
+            "--codex-paste-burst",
+            burst,
+            "--unicode-records",
+            records,
+        ];
+        if !entries.is_empty() {
+            a.extend(["--f1-entries", joined.as_str()]);
+        }
+        let n = if entries.is_empty() {
+            if subset == "f1" {
+                F1_CASES
+            } else {
+                F1_RECORDED
+            }
+        } else {
+            entries.len() as u64
+        };
+        step("delivery", name, &a, n * P3C_CASE + 60, false)
+    };
+    let mut v = vec![step(
+        "delivery",
+        "p3c-keys-probe".into(),
+        &["win-probe", "keys-probe"],
+        300,
+        false,
+    )];
+    for rec in ["marks", "none"] {
+        v.push(keys(
+            format!("p3c-pair-{rec}"),
+            "f1",
+            "off",
+            rec,
+            &["emoji_zwj", "small_kana_mark"],
+        ));
+    }
+    for i in 1..=3 {
+        for burst in ["on", "off"] {
+            let mut s = keys(
+                format!("p3c-control-{burst}-{i}"),
+                "f1",
+                burst,
+                "marks",
+                &["long_multiline", "cjk_compat"],
+            );
+            s.question = "submit";
+            v.push(s);
+        }
+    }
+    v.push(keys("p3c-corpus".into(), "f1", "off", "marks", &[]));
+    v.push(keys(
+        "p3c-corpus-recorded".into(),
+        "f1-recorded",
+        "off",
+        "marks",
+        &[],
+    ));
+    v.push(keys("p3c-none".into(), "f1", "off", "none", &P3C_AFFECTED));
+    v.push(step(
+        "outside_job",
+        "p3c-tree-kill-codex".into(),
+        &["real", "tree-kill", "--agent", "codex"],
+        420,
+        true,
+    ));
+    v.push(step(
+        "reader_start",
+        "p3c-reader-start".into(),
+        &[
+            "fake",
+            "raw-inject",
+            "--raw-inject",
+            "reader-start",
+            "--repeat",
+            "10",
+        ],
+        420,
+        true,
+    ));
+    v
+}
+
+/// The overall phase 3c cutoff: every step's own cutoff and margin (about
+/// 90 minutes).
+fn phase3c_budget() -> u64 {
+    phase3c_steps()
+        .iter()
+        .map(|s| s.budget + CHILD_MARGIN)
+        .sum::<u64>()
+        + 60
+}
+
+/// A step's cutoff: its own, capped so the reserved later steps (other
+/// questions) keep their time.
+pub fn p3c_budget(steps: &[P3cStep], i: usize, left: u64) -> u64 {
+    let reserve: u64 = steps[i + 1..]
+        .iter()
+        .filter(|s| s.reserved)
+        .map(|s| s.budget + CHILD_MARGIN)
+        .sum();
+    steps[i].budget.min(left.saturating_sub(reserve))
+}
+
+/// Every `win_keys` row of a child: its A-6 checks and its recorded
+/// entries, keyed by corpus F id.
+fn keys_rows(r: &ChildRep) -> Vec<(String, Check)> {
+    let Ok(rep) = r else {
+        return Vec::new();
+    };
+    let mut v: Vec<(String, Check)> = rep
+        .checks
+        .iter()
+        .filter(|c| c.id == "A-6")
+        .filter_map(|c| Some((c.case.rsplit('/').next()?.to_string(), c.clone())))
+        .collect();
+    for e in rep.details["f1_recorded"].as_array().into_iter().flatten() {
+        v.push((
+            e["id"].as_str().unwrap_or("").to_string(),
+            Check {
+                id: "A-6".into(),
+                case: e["id"].as_str().unwrap_or("").to_string(),
+                result: e["result"].as_str().unwrap_or("missing").to_string(),
+                cause: e["cause"].as_str().map(String::from),
+                evidence: e["evidence"].clone(),
+            },
+        ));
+    }
+    v
+}
+
+/// The oracle split of one row, for the summary.
+fn row_summary(entry: &str, c: &Check) -> Value {
+    let e = &c.evidence;
+    json!({"entry": entry, "result": c.result, "cause": c.cause, "ack": e["ack"],
+           "fidelity": e["fidelity"], "completion": e["completion"],
+           "send_state": e["base"]["send_state"], "tab_outcome": e["tab_outcome"],
+           "launch_branch": e["base"]["launch_branch"],
+           "changes": e["base"]["paste"]["changes"]})
+}
+
+/// `phase3c` (§5 phase 3c): the narrow Windows test under `R0` only. Each
+/// question's children have their own hard cutoffs; the overall cutoff is
+/// about 90 minutes. Unrun items are `not_exercised`, never inferred.
+fn phase3c(ctx: &Ctx) {
+    let steps = phase3c_steps();
+    let typical = 30;
+    println!(
+        "phase3c: {} steps, about {typical}-60 minutes (hard cutoff {} min); leave the PC idle \
+         until it prints the bundle command",
+        steps.len(),
+        phase3c_budget() / 60
+    );
+    let mut ran: Vec<(P3cStep, ChildRep, PathBuf)> = Vec::new();
+    for i in 0..steps.len() {
+        let left = ctx
+            .cutoff
+            .saturating_duration_since(Instant::now())
+            .as_secs()
+            .saturating_sub(CHILD_MARGIN);
+        let b = p3c_budget(&steps, i, left);
+        let s = &steps[i];
+        println!("phase3c: {} ({} s cutoff)", s.name, b);
+        let a: Vec<&str> = s.argv.iter().map(String::as_str).collect();
+        let (r, out) = child(ctx, &s.name, &a, b, false, &[]);
+        ran.push((s.clone(), r, out));
+    }
+    let find = |name: &str| ran.iter().find(|(s, _, _)| s.name == name);
+    let mut steps_json = Vec::new();
+    for (s, r, out) in &ran {
+        steps_json.push(
+            json!({"name": s.name, "question": s.question, "argv": s.argv,
+                               "status": status_of(r), "report": out.join("report.json")}),
+        );
+    }
+    ctx.detail("phase3c_steps", json!(steps_json));
+
+    // Question 1: Enter submits with the burst override (control arm).
+    let mut submit = Pc::new("P3c-submit");
+    let mut control = Vec::new();
+    for (s, r, _) in ran.iter().filter(|(s, _, _)| s.question == "submit") {
+        let burst = if s.name.contains("-on-") { "on" } else { "off" };
+        let i = s.name.rsplit('-').next().unwrap_or("?");
+        for entry in ["long_multiline", "cjk_compat"] {
+            let case = format!("{entry}/{burst}/{i}");
+            let row = keys_rows(r).into_iter().find(|(e, _)| e == entry);
+            control.push(
+                json!({"case": case, "row": row.as_ref().map(|(e, c)| row_summary(e, c)),
+                                "status": status_of(r)}),
+            );
+            if burst == "off" {
+                submit.req(&case);
+                match (&row, r) {
+                    (_, Err(e)) => submit.put(&case, Outcome::harness(e.clone()), Value::Null),
+                    (Some((_, c)), _) => {
+                        submit.put(&case, Outcome::from_check(c), c.evidence.clone())
+                    }
+                    (None, _) => {}
+                }
+            }
+        }
+    }
+    submit.finish(
+        ctx,
+        json!({"control_arm": control,
+        "note": "burst-on runs are the control (current behavior), outside the verdict"}),
+    );
+
+    // Question 2: delivery (records), the corpus under the override.
+    let mut delivery = Pc::new("P3c-delivery");
+    let mut extra = serde_json::Map::new();
+    let put_rows = |pc: &mut Pc, prefix: &str, name: &str, entries: &[String]| {
+        let Some((_, r, _)) = find(name) else { return };
+        let rows = keys_rows(r);
+        for e in entries {
+            let case = format!("{prefix}/{e}");
+            pc.req(&case);
+            match (r, rows.iter().find(|(x, _)| x == e)) {
+                (Err(err), _) => pc.put(&case, Outcome::harness(err.clone()), Value::Null),
+                (Ok(_), Some((_, c))) => pc.put(&case, Outcome::from_check(c), c.evidence.clone()),
+                // Absent from a child that ran: missing.
+                (Ok(_), None) => {}
+            }
+        }
+    };
+    let pair: Vec<String> = ["emoji_zwj", "small_kana_mark"].map(String::from).to_vec();
+    put_rows(&mut delivery, "pair/marks", "p3c-pair-marks", &pair);
+    put_rows(&mut delivery, "corpus", "p3c-corpus", &f1_entries());
+    put_rows(
+        &mut delivery,
+        "corpus",
+        "p3c-corpus-recorded",
+        &["small_kana_mark".to_string()],
+    );
+    if let Some((_, r, _)) = find("p3c-corpus-recorded") {
+        let rows = keys_rows(r);
+        extra.insert(
+            "recorded".into(),
+            json!(
+                rows.iter()
+                    .map(|(e, c)| row_summary(e, c))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    for name in ["p3c-pair-none", "p3c-none"] {
+        if let Some((_, r, out)) = find(name) {
+            extra.insert(
+                name.into(),
+                json!({"status": status_of(r), "report": out.join("report.json"),
+                       "rows": keys_rows(r).iter().map(|(e, c)| row_summary(e, c)).collect::<Vec<_>>()}),
+            );
+        }
+    }
+    if let Some((_, r, out)) = find("p3c-keys-probe") {
+        extra.insert(
+            "keys_probe".into(),
+            json!({"status": status_of(r), "report": out.join("report.json"),
+                   "cases": checks_of(r, "keys-probe").iter().map(|c| json!({"case": c.case, "result": c.result,
+                       "cause": c.cause, "result_detail": c.evidence["result"]})).collect::<Vec<_>>()}),
+        );
+    }
+    extra.insert(
+        "note".into(),
+        json!("the none arms isolate the records' effect and stay outside the verdict"),
+    );
+    delivery.finish(ctx, Value::Object(extra));
+
+    // Question 3: outside-job identity.
+    let mut outside = Pc::new("P3c-outside-job");
+    if let Some((_, r, _)) = find("p3c-tree-kill-codex") {
+        carry(
+            &mut outside,
+            "codex_kill_proof",
+            r,
+            "A-8",
+            "codex_kill_proof",
+        );
+        let ident = find_check(r, "A-8", "codex_kill_proof")
+            .map(|c| c.evidence["outside_job_identity"].clone());
+        outside.finish(ctx, json!({"outside_job_identity": ident}));
+    } else {
+        outside.finish(ctx, Value::Null);
+    }
+
+    // Question 4: reader-start repetition.
+    let mut reader = Pc::new("P3c-reader-start");
+    if let Some((_, r, _)) = find("p3c-reader-start") {
+        carry(&mut reader, "reader-start", r, "F-2c", "reader-start");
+    }
+    reader.finish(ctx, Value::Null);
+
+    let exe = std::env::current_exe().unwrap_or_default();
+    println!(
+        "phase3c done in {} min. Report dir:\n  {}",
+        ctx.t0.elapsed().as_secs() / 60,
+        ctx.out.display()
+    );
+    println!(
+        "next: {}  (writes C:\\chs\\chs-out-windows.zip; review it, then send it back)",
+        ps_invocation(&exe, &["bundle".to_string()])
+    );
+}
+
 /// The step 4 command `followup` prints: `console --detached` over every
 /// configuration, joined to step 3's run id, with F-1's winning newline key.
 pub fn step4_command(exe: &Path, join: &str, winner: Option<NewlineKey>, a: &Args) -> String {
@@ -3612,6 +3963,96 @@ mod tests {
             + super::super::real::keys_case_worst_secs(20);
         assert!(f1_recorded_child(20) >= recorded * worst + CHILD_MARGIN);
         assert!(f1_child(20) >= n * worst + CHILD_MARGIN);
+    }
+
+    /// Phase 3c (A6): run order, R0 on every step, explicit burst and
+    /// records on every Codex step, the control arm interleaved with equally
+    /// configured burst-off runs, the second sweep restricted, and an
+    /// overall cutoff around 90 minutes with the later questions reserved.
+    #[test]
+    fn phase3c_matrix() {
+        let steps = phase3c_steps();
+        let names: Vec<&str> = steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "p3c-keys-probe",
+                "p3c-pair-marks",
+                "p3c-pair-none",
+                "p3c-control-on-1",
+                "p3c-control-off-1",
+                "p3c-control-on-2",
+                "p3c-control-off-2",
+                "p3c-control-on-3",
+                "p3c-control-off-3",
+                "p3c-corpus",
+                "p3c-corpus-recorded",
+                "p3c-none",
+                "p3c-tree-kill-codex",
+                "p3c-reader-start",
+            ]
+        );
+        let has = |s: &P3cStep, pair: [&str; 2]| s.argv.windows(2).any(|w| w == pair);
+        let r0 = cli::config_flags("R0").unwrap();
+        for s in &steps {
+            assert!(s.argv.ends_with(&r0), "{}", s.name);
+            assert!(!s.argv.iter().any(|a| a == "R6" || a == "6"), "{}", s.name);
+            if s.argv.iter().any(|a| a == "codex-paste") {
+                assert!(has(s, ["--newline-key", "w32"]), "{}", s.name);
+                assert!(
+                    s.argv.iter().any(|a| a == "--codex-paste-burst"),
+                    "{}",
+                    s.name
+                );
+                assert!(
+                    s.argv.iter().any(|a| a == "--unicode-records"),
+                    "{}",
+                    s.name
+                );
+            }
+        }
+        // The control arm: on/off alternate with the same records mode and
+        // entries; only the burst differs.
+        let control: Vec<&P3cStep> = steps.iter().filter(|s| s.question == "submit").collect();
+        assert_eq!(control.len(), 6);
+        for pair in control.chunks(2) {
+            assert!(has(pair[0], ["--codex-paste-burst", "on"]));
+            assert!(has(pair[1], ["--codex-paste-burst", "off"]));
+            let strip = |s: &P3cStep| {
+                s.argv
+                    .iter()
+                    .filter(|a| *a != "on" && *a != "off")
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(strip(pair[0]), strip(pair[1]));
+            assert!(has(pair[0], ["--f1-entries", "long_multiline,cjk_compat"]));
+        }
+        let none = steps.iter().find(|s| s.name == "p3c-none").unwrap();
+        assert!(has(none, ["--unicode-records", "none"]));
+        assert!(has(
+            none,
+            [
+                "--f1-entries",
+                "emoji_zwj,small_kana_mark,cjk_compat,emoji_vs16"
+            ]
+        ));
+        let reader = steps.iter().find(|s| s.name == "p3c-reader-start").unwrap();
+        assert!(has(reader, ["--repeat", "10"]));
+        // Every affected fixture exists in corpus F.
+        let ids: Vec<String> = paste::corpus_f().into_iter().map(|e| e.id).collect();
+        for e in P3C_AFFECTED {
+            assert!(ids.contains(&e.to_string()), "{e}");
+        }
+        let total = phase3c_budget();
+        assert!((80 * 60..=100 * 60).contains(&total), "{total}");
+        // Reservation: with little time left, the corpus step yields to the
+        // reserved tree-kill and reader-start steps; those keep their own.
+        let corpus = names.iter().position(|n| *n == "p3c-corpus").unwrap();
+        let reserved = 2 * (420 + CHILD_MARGIN);
+        assert_eq!(p3c_budget(&steps, corpus, reserved + 100), 100);
+        assert_eq!(p3c_budget(&steps, corpus, reserved), 0);
+        assert_eq!(p3c_budget(&steps, steps.len() - 1, 420), 420);
     }
 
     /// The narrow rerun names existing rows, all runnable with `w32`, and

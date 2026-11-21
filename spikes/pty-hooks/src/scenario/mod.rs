@@ -565,6 +565,19 @@ pub fn cli_version(bin: &Path) -> String {
     }
 }
 
+/// The bundle allowlist over a path relative to the root (`/`-separated):
+/// reports, corpora, fixtures, snapshots, and PTY output only on request.
+pub fn bundle_allowed(rel: &str, include_pty: bool) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or("");
+    name == "report.json"
+        || name == "corpus.json"
+        || rel
+            .split('/')
+            .any(|c| c == "fixtures" || c.starts_with("fixtures-"))
+        || rel.contains("/snapshots/")
+        || (include_pty && name.starts_with("pty-output") && name.ends_with(".bin"))
+}
+
 /// Evidence bundle (§5): allowlisted files under `R/out`, zipped by the OS `tar` (bsdtar).
 pub fn bundle(args: &Args) -> i32 {
     let out_root = args.root.join("out");
@@ -588,15 +601,7 @@ pub fn bundle(args: &Args) -> i32 {
                 .unwrap_or(&p)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let allowed = name == "report.json"
-                || name == "corpus.json"
-                || rel
-                    .split('/')
-                    .any(|c| c == "fixtures" || c.starts_with("fixtures-"))
-                || rel.contains("/snapshots/")
-                || (include_pty && name.starts_with("pty-output") && name.ends_with(".bin"));
-            if allowed {
+            if bundle_allowed(&rel, include_pty) {
                 files.push(rel);
             }
         }
@@ -645,6 +650,38 @@ pub fn bundle(args: &Args) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A8: a phase 3c report tree passes the bundle allowlist: the parent
+    /// and every child report (raw key events, outside-job identity, and
+    /// the reader-start series live in report.json), corpora, fixtures,
+    /// snapshots; nothing else.
+    #[test]
+    fn phase3c_tree_passes_the_bundle_allowlist() {
+        for rel in [
+            "out/1a2b3c4d/report.json",
+            "out/1a2b3c4d/p3c-keys-probe-0a0b0c0d/report.json",
+            "out/1a2b3c4d/p3c-control-on-1-0a0b0c0e/report.json",
+            "out/1a2b3c4d/p3c-control-on-1-0a0b0c0e/corpus.json",
+            "out/1a2b3c4d/p3c-corpus-0a0b0c0f/fixtures/codex/0.171.0/x/UserPromptSubmit-3.json",
+            "out/1a2b3c4d/p3c-corpus-0a0b0c0f/fixtures/codex/0.171.0/x/UserPromptSubmit-3.meta.json",
+            "out/1a2b3c4d/p3c-corpus-0a0b0c0f/snapshots/codex-keys-w32-cjk_compat-end.json",
+            "out/1a2b3c4d/p3c-tree-kill-codex-0a0b0c10/report.json",
+            "out/1a2b3c4d/p3c-reader-start-0a0b0c11/report.json",
+        ] {
+            assert!(bundle_allowed(rel, false), "{rel}");
+        }
+        for rel in [
+            "out/1a2b3c4d/p3c-corpus-0a0b0c0f/pty-output-codex-keys-w32-ascii.bin",
+            "out/1a2b3c4d/hook.log",
+            "out/1a2b3c4d/keys.json",
+        ] {
+            assert!(!bundle_allowed(rel, false), "{rel}");
+        }
+        assert!(bundle_allowed(
+            "out/1a2b3c4d/p3c-corpus-0a0b0c0f/pty-output-codex-keys-w32-ascii.bin",
+            true
+        ));
+    }
 
     /// r3: a child never reads a report left by an earlier run. Its dir is
     /// fresh and exclusive, and a report with another run id is `not_run`.

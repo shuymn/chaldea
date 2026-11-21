@@ -332,7 +332,8 @@ pub struct Outcome {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub lossy: Vec<Lossy>,
     /// `win_keys` only: adapter-side changes (`compose_marks`, `escape_space`,
-    /// and each accepted lossy reason).
+    /// `unicode_records:marks`, `astral_mark_left_raw`, and each accepted
+    /// lossy reason).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub changes: Vec<String>,
 }
