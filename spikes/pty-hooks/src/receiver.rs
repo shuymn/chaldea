@@ -1,9 +1,14 @@
 //! Hook receiver (§4.3): std `TcpListener` + `httparse`, one request per
-//! connection, 5 s absolute deadline carried through read, dispatch, and
-//! write. The head is read byte by byte up to its boundary, so no body byte is
-//! consumed before method/path, Host, Bearer, and framing pass. Fixtures are
-//! stored byte-for-byte under a per-launch directory with a report-wide
-//! sequence; launch binding and witnesses live here too.
+//! connection, 5 s absolute request deadline carried through read and
+//! dispatch. The head is read byte by byte up to its boundary, so no body
+//! byte is consumed before method/path, Host, Bearer, and framing pass. The
+//! response gets its own 500 ms write budget after the decision (a 408 sent
+//! because the deadline passed included); after a rejection the receiver
+//! half-closes and drains the unread request bytes (bounded) before closing,
+//! so the client can read the status (on Windows, closing with unread data
+//! resets the connection). Every step is clipped to a 7 s connection bound.
+//! Fixtures are stored byte-for-byte under a per-launch directory with a
+//! report-wide sequence; launch binding and witnesses live here too.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
@@ -24,10 +29,38 @@ pub const MAX_HEAD: usize = 8 * 1024;
 pub const MAX_BODY: usize = 4 * 1024 * 1024;
 pub const MAX_HEADERS: usize = 32;
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+/// Write budget for the response, from the decision.
+pub const RESPONSE_BUDGET: Duration = Duration::from_millis(500);
+/// Drain budget after a rejection response.
+pub const DRAIN_TIME: Duration = Duration::from_secs(1);
+/// Bytes drained beyond the declared length (or 4 MiB without one).
+pub const DRAIN_SLACK: usize = 64 * 1024;
+/// Absolute bound per connection, from accept: request + response + drain.
+pub const CONNECTION_BOUND: Duration = Duration::from_secs(7);
 pub const MAX_CONNS: usize = 16;
 
 /// Report-wide fixture sequence (one report per process), shared by every receiver.
 static SEQ: AtomicU64 = AtomicU64::new(0);
+/// Report-wide connection sequence (`connections` log).
+static CONN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One connection as the receiver handled it (F-3c): what it decided, what
+/// it wrote, and how the drain of unread request bytes ended.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ConnRecord {
+    pub seq: u64,
+    pub route: String,
+    /// The status decided for the request (None: the peer closed before a head).
+    pub decided: Option<u16>,
+    pub bytes_written: usize,
+    pub write_ok: Option<bool>,
+    pub write_error: Option<String>,
+    pub drained: usize,
+    /// `peer_closed`, `deadline`, `byte_cap`, or `error: <kind>`.
+    pub drain_stop: Option<String>,
+    pub decided_ms: u64,
+    pub total_ms: u64,
+}
 
 /// Union of the event names observed in Claude Code 2.1.322 and Codex 0.170.0 (§3).
 pub const KNOWN_EVENTS: &[&str] = &[
@@ -124,6 +157,7 @@ struct Inner {
     bound_session: Option<String>,
     bound_at: Option<u64>,
     ambiguous: Vec<String>,
+    connections: Vec<ConnRecord>,
 }
 
 struct State {
@@ -355,6 +389,10 @@ impl Receiver {
         self.lock().rejections.clone()
     }
 
+    pub fn connections(&self) -> Vec<ConnRecord> {
+        self.lock().connections.clone()
+    }
+
     pub fn bound(&self) -> Option<String> {
         Self::ready(&self.lock())
     }
@@ -384,6 +422,7 @@ impl Receiver {
             "events": g.events,
             "witnesses": g.witnesses,
             "rejections": g.rejections,
+            "connections": g.connections,
         })
     }
 
@@ -392,8 +431,8 @@ impl Receiver {
         if let Some(j) = self.accept.take() {
             let _ = j.join();
         }
-        // Connection threads end by their own 5 s deadline; wait for them, bounded.
-        let end = Instant::now() + REQUEST_DEADLINE + Duration::from_secs(1);
+        // Connection threads end by their own 7 s bound; wait for them, bounded.
+        let end = Instant::now() + CONNECTION_BOUND + Duration::from_secs(1);
         while self.state.active.load(Ordering::SeqCst) > 0 && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -434,21 +473,85 @@ fn respond(s: &mut TcpStream, code: u16, body: &[u8]) -> io::Result<()> {
 /// Writes the response, recomputing the write timeout from `deadline` before
 /// every write.
 fn respond_by(s: &mut TcpStream, code: u16, body: &[u8], deadline: Instant) -> io::Result<()> {
-    let head = format!(
+    respond_counted(s, code, body, deadline).1
+}
+
+/// Like `respond_by`, also returning how many bytes reached the socket.
+fn respond_counted(
+    s: &mut TcpStream,
+    code: u16,
+    body: &[u8],
+    deadline: Instant,
+) -> (usize, io::Result<()>) {
+    let mut msg = format!(
         "HTTP/1.1 {code} {}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
         reason(code),
         body.len()
-    );
-    for part in [head.as_bytes(), body] {
-        crate::http_client::write_bounded(s, part, 16 * 1024, deadline)?;
+    )
+    .into_bytes();
+    msg.extend_from_slice(body);
+    let mut n = 0;
+    while n < msg.len() {
+        let r = remaining(deadline)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "write budget spent"))
+            .and_then(|left| s.set_write_timeout(Some(left)))
+            .and_then(|_| s.write(&msg[n..(n + 16 * 1024).min(msg.len())]));
+        match r {
+            Ok(0) => return (n, Err(io::ErrorKind::WriteZero.into())),
+            Ok(k) => n += k,
+            Err(e) => return (n, Err(e)),
+        }
     }
-    s.flush()
+    (n, s.flush())
+}
+
+/// Reads and discards unread request bytes until the peer closes, `deadline`
+/// passes, or `cap` bytes were read. Nothing read here is parsed or stored.
+/// The read timeout is set once to a short tick (macOS may refuse a later
+/// `setsockopt` on a half-closed socket) and the deadline is checked per read.
+fn drain(s: &mut TcpStream, cap: usize, deadline: Instant) -> (usize, String) {
+    const TICK: Duration = Duration::from_millis(50);
+    let mut n = 0;
+    let mut buf = vec![0u8; 16 * 1024];
+    let Some(left) = remaining(deadline) else {
+        return (n, "deadline".into());
+    };
+    if let Err(e) = s.set_read_timeout(Some(left.min(TICK))) {
+        return (n, format!("error: {}", e.kind()));
+    }
+    loop {
+        if n >= cap {
+            return (n, "byte_cap".into());
+        }
+        if remaining(deadline).is_none() {
+            return (n, "deadline".into());
+        }
+        let want = buf.len().min(cap - n);
+        match s.read(&mut buf[..want]) {
+            Ok(0) => return (n, "peer_closed".into()),
+            Ok(k) => n += k,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return (n, format!("error: {}", e.kind())),
+        }
+    }
 }
 
 enum Outcome {
     Reply(u16, Vec<u8>),
     /// Peer closed before a full head; nothing to answer.
     Closed,
+}
+
+/// What `process` learned about the request, for the drain and the log.
+#[derive(Default)]
+struct ConnInfo {
+    route: &'static str,
+    /// A valid `Content-Length` (bounds the drain).
+    declared: Option<usize>,
 }
 
 struct Head {
@@ -476,16 +579,56 @@ impl State {
     }
 
     fn handle(&self, mut s: TcpStream) {
-        let deadline = Instant::now() + REQUEST_DEADLINE;
-        let outcome = self.process(&mut s, deadline);
+        let accepted = Instant::now();
+        let bound = accepted + CONNECTION_BOUND;
+        let deadline = accepted + REQUEST_DEADLINE;
+        let mut info = ConnInfo {
+            route: "unrouted",
+            declared: None,
+        };
+        let outcome = self.process(&mut s, deadline, &mut info);
+        let ms = || accepted.elapsed().as_millis() as u64;
+        let mut rec = ConnRecord {
+            seq: CONN_SEQ.fetch_add(1, Ordering::SeqCst) + 1,
+            route: info.route.into(),
+            decided_ms: ms(),
+            ..Default::default()
+        };
         if let Outcome::Reply(code, body) = outcome {
+            rec.decided = Some(code);
             if code != 200 {
                 self.reject(code);
             }
-            // The response is written only inside the same absolute deadline.
-            let _ = respond_by(&mut s, code, &body, deadline);
+            // Its own write budget from the decision, so a 408 decided at the
+            // request deadline still reaches the client.
+            let (n, r) = respond_counted(
+                &mut s,
+                code,
+                &body,
+                (Instant::now() + RESPONSE_BUDGET).min(bound),
+            );
+            rec.bytes_written = n;
+            rec.write_ok = Some(r.is_ok());
+            rec.write_error = r.err().map(|e| e.to_string());
+            if code != 200 {
+                // Half-close, then discard what the client still sends, so
+                // closing never resets a connection the response is still on.
+                let _ = s.shutdown(Shutdown::Write);
+                let cap = info.declared.map_or(MAX_BODY, |n| n.min(MAX_BODY)) + DRAIN_SLACK;
+                let (d, why) = drain(&mut s, cap, (Instant::now() + DRAIN_TIME).min(bound));
+                rec.drained = d;
+                rec.drain_stop = Some(why);
+            }
+        } else {
+            rec.route = "closed".into();
         }
         let _ = s.shutdown(Shutdown::Both);
+        rec.total_ms = ms();
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connections
+            .push(rec);
     }
 
     fn read_some(s: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> Result<usize, u16> {
@@ -523,7 +666,7 @@ impl State {
         }
     }
 
-    fn process(&self, s: &mut TcpStream, deadline: Instant) -> Outcome {
+    fn process(&self, s: &mut TcpStream, deadline: Instant, info: &mut ConnInfo) -> Outcome {
         let raw = match Self::read_head(s, deadline) {
             Ok(Some(h)) => h,
             Ok(None) => return Outcome::Closed,
@@ -536,6 +679,13 @@ impl State {
         let head = match parse_head(&raw) {
             Ok(h) => h,
             Err(code) => return Outcome::Reply(code, Vec::new()),
+        };
+        // The drain bound uses the declared length whatever check rejects.
+        info.declared = match head.cls.as_slice() {
+            [c] if !c.is_empty() && c.len() <= 12 && c.bytes().all(|b| b.is_ascii_digit()) => {
+                c.parse().ok()
+            }
+            _ => None,
         };
         let probe = self.probe.lock().unwrap_or_else(|e| e.into_inner()).clone();
         // 1. method / path
@@ -554,6 +704,7 @@ impl State {
             }
             _ => return Outcome::Reply(404, Vec::new()),
         };
+        info.route = route;
         // 2. Host
         let ok_hosts = [
             format!("127.0.0.1:{}", self.port),
@@ -1118,6 +1269,182 @@ pub(crate) mod tests {
             r.wait_bound(Instant::now() + Duration::from_millis(50))
                 .is_none()
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Connection records, waiting (bounded) until `n` exist.
+    fn wait_conns(r: &Receiver, n: usize) -> Vec<ConnRecord> {
+        let end = Instant::now() + Duration::from_secs(10);
+        while r.connections().len() < n && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        r.connections()
+    }
+
+    fn connect(port: u16) -> TcpStream {
+        TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port))).unwrap()
+    }
+
+    fn read_status(s: &mut TcpStream) -> u16 {
+        crate::http_client::read_response(s, Instant::now() + Duration::from_secs(9))
+            .map(|r| r.0)
+            .unwrap_or(0)
+    }
+
+    /// F-3c: both deadline cases and `Content-Length: +5` deliver their
+    /// status to the client, and the receiver's decided and written status
+    /// match what the client read.
+    #[test]
+    fn deadline_and_bad_length_statuses_reach_the_client() {
+        let d = tmp();
+        let r = test_receiver(&d);
+        let p = r.port();
+        let host = format!("127.0.0.1:{p}");
+        let slow_head = format!("POST /hook HTTP/1.1\r\nHost: {host}\r\n");
+        let slow_body = format!(
+            "POST /hook HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer t0k\r\n{THREAD}Content-Length: {}\r\n\r\n{}",
+            BODY.len(),
+            &BODY[..5]
+        );
+        let plus5 = format!(
+            "POST /hook HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer t0k\r\nContent-Length: +5\r\n\r\nabcde"
+        );
+        let hs: Vec<_> = [(slow_head, 408u16), (slow_body, 408), (plus5, 411)]
+            .into_iter()
+            .map(|(req, want)| {
+                std::thread::spawn(move || {
+                    let t = Instant::now();
+                    let mut s = connect(p);
+                    s.write_all(req.as_bytes()).unwrap();
+                    (want, read_status(&mut s), t.elapsed())
+                })
+            })
+            .collect();
+        for h in hs {
+            let (want, got, took) = h.join().unwrap();
+            assert_eq!(got, want, "client status after {took:?}");
+        }
+        let conns = wait_conns(&r, 3);
+        for want in [408u16, 408, 411] {
+            assert!(
+                conns.iter().any(|c| c.decided == Some(want)
+                    && c.write_ok == Some(true)
+                    && c.bytes_written > 0
+                    && c.total_ms <= CONNECTION_BOUND.as_millis() as u64),
+                "{want}: {conns:#?}"
+            );
+        }
+        assert_eq!(conns.iter().filter(|c| c.decided == Some(408)).count(), 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// F-3c ordering and drain: a rejected head gets its status before any
+    /// body byte is sent; a body sent up front (1 MiB) is drained and the
+    /// status still arrives; the drain stops at its byte and time bounds.
+    #[test]
+    fn rejection_ordering_and_drain_bounds() {
+        let d = tmp();
+        let r = test_receiver(&d);
+        let p = r.port();
+        let host = format!("127.0.0.1:{p}");
+        let head = |len: usize| {
+            format!(
+                "POST /hook HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer bad\r\nContent-Length: {len}\r\n\r\n"
+            )
+        };
+        let mib = vec![b'x'; 1 << 20];
+        // Body withheld until the status was read.
+        let mut s = connect(p);
+        s.write_all(head(mib.len()).as_bytes()).unwrap();
+        assert_eq!(read_status(&mut s), 401);
+        let _ = s.write_all(&mib[..1024]);
+        drop(s);
+        // reject_with_body_sent: the whole 1 MiB body up front.
+        let mut s = connect(p);
+        s.write_all(head(mib.len()).as_bytes()).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let body = mib.clone();
+        let writer = std::thread::spawn(move || w.write_all(&body).is_ok());
+        assert_eq!(read_status(&mut s), 401);
+        assert!(writer.join().unwrap(), "the drain accepted the whole body");
+        drop(s);
+        // Byte cap: 10 bytes declared, 200 KiB sent; the socket stays open.
+        let mut s = connect(p);
+        s.write_all(head(10).as_bytes()).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let writer = std::thread::spawn(move || {
+            let _ = w.write_all(&vec![b'y'; 200 * 1024]);
+        });
+        assert_eq!(read_status(&mut s), 401);
+        let conns = wait_conns(&r, 3);
+        drop(s);
+        let _ = writer.join();
+        // Time bound: nothing more is sent and the socket stays open.
+        let mut s = connect(p);
+        s.write_all(head(1000).as_bytes()).unwrap();
+        assert_eq!(read_status(&mut s), 401);
+        let conns4 = wait_conns(&r, 4);
+        drop(s);
+        let c = &conns4[3];
+        assert_eq!(c.drain_stop.as_deref(), Some("deadline"), "{c:#?}");
+        assert_eq!(c.drained, 0);
+        let up_front = &conns[1];
+        assert_eq!(up_front.drained, mib.len(), "{up_front:#?}");
+        assert_eq!(up_front.drain_stop.as_deref(), Some("peer_closed"));
+        let capped = &conns[2];
+        assert_eq!(
+            capped.drain_stop.as_deref(),
+            Some("byte_cap"),
+            "{capped:#?}"
+        );
+        assert_eq!(capped.drained, 10 + DRAIN_SLACK);
+        assert!(
+            conns4
+                .iter()
+                .all(|c| c.decided == Some(401) && c.write_ok == Some(true))
+        );
+        assert_eq!(fixtures(&d), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// F-3c: a client still sending its body when the 408 is decided reads
+    /// 408; the drain is stopped by its own deadline and the connection ends
+    /// inside the 7 s bound.
+    #[test]
+    fn drain_under_deadline_is_bounded() {
+        let d = tmp();
+        let r = test_receiver(&d);
+        let p = r.port();
+        let t = Instant::now();
+        let mut s = connect(p);
+        s.write_all(
+            format!(
+                "POST /hook HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nAuthorization: Bearer t0k\r\nContent-Length: {}\r\n\r\n",
+                1 << 20
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (mut w, st) = (s.try_clone().unwrap(), stop.clone());
+        let trickle = std::thread::spawn(move || {
+            while !st.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(9) {
+                if w.write_all(&[b'z'; 512]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        assert_eq!(read_status(&mut s), 408);
+        let conns = wait_conns(&r, 1);
+        stop.store(true, Ordering::SeqCst);
+        let _ = trickle.join();
+        let c = &conns[0];
+        assert_eq!(c.decided, Some(408));
+        assert_eq!(c.write_ok, Some(true));
+        assert!(c.drained > 0, "{c:#?}");
+        assert_eq!(c.drain_stop.as_deref(), Some("deadline"));
+        assert!(c.total_ms <= CONNECTION_BOUND.as_millis() as u64, "{c:#?}");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

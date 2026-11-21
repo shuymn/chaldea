@@ -684,6 +684,73 @@ fn raw_request(port: u16, parts: &[(&[u8], Duration)], read_deadline: Duration) 
     (code, t.elapsed().as_millis())
 }
 
+/// One B-8 request. With `withhold`, only the head is sent and the body
+/// follows after the response was read: a status read first shows the
+/// decision came before any body byte. With `body_up_front`, the body is
+/// written from another thread while the response is read (drain case).
+fn b8_request(
+    port: u16,
+    bytes: &[u8],
+    withhold: bool,
+    body_up_front: Option<Vec<u8>>,
+) -> (u16, u128) {
+    let t = Instant::now();
+    let Ok(mut s) = TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_secs(1),
+    ) else {
+        return (0, 0);
+    };
+    let split = bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .filter(|p| withhold && *p < bytes.len());
+    let (head, rest) = bytes.split_at(split.unwrap_or(bytes.len()));
+    let _ = s.write_all(head);
+    let writer = body_up_front.and_then(|b| {
+        let mut w = s.try_clone().ok()?;
+        Some(std::thread::spawn(move || {
+            let _ = w.write_all(&b);
+        }))
+    });
+    let code = crate::http_client::read_response(&mut s, Instant::now() + Duration::from_secs(8))
+        .map(|r| r.0)
+        .unwrap_or(0);
+    let ms = t.elapsed().as_millis();
+    if !rest.is_empty() {
+        let _ = s.write_all(rest);
+    }
+    drop(s);
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
+    (code, ms)
+}
+
+/// The receiver's records of connections after the first `before`, waiting
+/// (bounded) until `n` new ones exist.
+fn new_conns(r: &Receiver, before: usize, n: usize) -> Vec<receiver::ConnRecord> {
+    let end = Instant::now() + Duration::from_secs(9);
+    while r.connections().len() < before + n && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    r.connections().into_iter().skip(before).collect()
+}
+
+/// F-3c: decided, written, and client-observed status all equal `want`.
+fn statuses_agree(got: u16, want: u16, rec: Option<&receiver::ConnRecord>) -> bool {
+    got == want && rec.is_some_and(|c| c.decided == Some(want) && c.write_ok == Some(true))
+}
+
+fn conn_evidence(rec: Option<&receiver::ConnRecord>) -> Value {
+    rec.map_or(json!(null), |c| {
+        json!({"decided": c.decided, "bytes_written": c.bytes_written, "write_ok": c.write_ok,
+               "write_error": c.write_error, "drained": c.drained, "drain_stop": c.drain_stop,
+               "total_ms": c.total_ms})
+    })
+}
+
 fn count_files(dir: &Path) -> usize {
     std::fs::read_dir(dir)
         .map(|rd| {
@@ -826,6 +893,7 @@ fn auth(ctx: &Ctx) {
         ctx.require("B-8", name);
     }
     for name in [
+        "reject_with_body_sent",
         "deadline_slow_head",
         "deadline_slow_body",
         "no_fixture_no_readiness",
@@ -835,15 +903,40 @@ fn auth(ctx: &Ctx) {
     }
     let before_files = count_files(&fixtures);
     for (name, bytes, want) in cases {
-        let (got, ms) = raw_request(p, &[(&bytes, Duration::ZERO)], Duration::from_secs(7));
-        let ok = got == want && count_files(&fixtures) == before_files && r.bound().is_none();
+        let n0 = r.connections().len();
+        let (got, ms) = b8_request(p, &bytes, true, None);
+        let rec = new_conns(&r, n0, 1).pop();
+        let ok = statuses_agree(got, want, rec.as_ref())
+            && count_files(&fixtures) == before_files
+            && r.bound().is_none();
         ctx.check(
             "B-8",
             name,
             checked(ok),
-            json!({"status": got, "want": want, "ms": ms}),
+            json!({"status": got, "want": want, "ms": ms, "receiver": conn_evidence(rec.as_ref()),
+                   "body_withheld_until_response": true}),
         );
     }
+    // The body sent up front (1 MiB): the receiver drains it after the 401.
+    let n0 = r.connections().len();
+    let (got, ms) = b8_request(
+        p,
+        format!(
+            "POST /hook HTTP/1.1\r\n{h}Authorization: Bearer {}\r\nContent-Length: {}\r\n\r\n",
+            util::token(),
+            1 << 20
+        )
+        .as_bytes(),
+        false,
+        Some(vec![b'x'; 1 << 20]),
+    );
+    let rec = new_conns(&r, n0, 1).pop();
+    ctx.check(
+        "B-8",
+        "reject_with_body_sent",
+        checked(statuses_agree(got, 401, rec.as_ref()) && count_files(&fixtures) == before_files),
+        json!({"status": got, "want": 401, "ms": ms, "receiver": conn_evidence(rec.as_ref())}),
+    );
     // Deadline cases run concurrently: a stalled head and a stalled body.
     let head_part = format!("POST /hook HTTP/1.1\r\n{h}");
     let body_head = format!(
@@ -858,6 +951,7 @@ fn auth(ctx: &Ctx) {
             body.as_bytes()[..5].to_vec(),
         ),
     ];
+    let n0 = r.connections().len();
     let handles: Vec<_> = slow
         .into_iter()
         .map(|(name, a, b)| {
@@ -871,18 +965,26 @@ fn auth(ctx: &Ctx) {
             })
         })
         .collect();
-    for hnd in handles {
-        if let Ok((name, code, ms)) = hnd.join() {
-            let ok = (code == 408 || code == 0)
-                && (4500..=6500).contains(&ms)
-                && count_files(&fixtures) == before_files;
-            ctx.check(
-                "B-8",
-                name,
-                checked(ok),
-                json!({"status": code, "elapsed_ms": ms, "deadline_ms": 5000}),
-            );
-        }
+    let joined: Vec<_> = handles.into_iter().filter_map(|h| h.join().ok()).collect();
+    let recs = new_conns(&r, n0, 2);
+    for (name, code, ms) in joined {
+        // The stalled head is never routed; the stalled body reached `/hook`.
+        let route = if name == "deadline_slow_head" {
+            "unrouted"
+        } else {
+            "hook"
+        };
+        let rec = recs.iter().find(|c| c.route == route);
+        let ok = statuses_agree(code, 408, rec)
+            && (4500..=6500).contains(&ms)
+            && count_files(&fixtures) == before_files;
+        ctx.check(
+            "B-8",
+            name,
+            checked(ok),
+            json!({"status": code, "elapsed_ms": ms, "deadline_ms": 5000,
+                   "receiver": conn_evidence(rec)}),
+        );
     }
     ctx.check(
         "B-8",
