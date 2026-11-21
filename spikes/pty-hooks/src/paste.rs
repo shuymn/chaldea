@@ -303,7 +303,7 @@ fn chunk_escape_safe(wire: &[u8], n: usize) -> Vec<Vec<u8>> {
     out
 }
 
-/// Bytes for ungated `write_key` (owner keypad / probe client). `w-` names use
+/// Bytes for ungated `write_key` (keys from a person at the keyboard / probe client). `w-` names use
 /// win32-input-mode encoding (`CSI Vk;Sc;Uc;Kd;Cs;Rc _`, key-down then key-up).
 pub fn key_bytes(name: &str) -> Option<Vec<u8>> {
     let w = |vk: u32, sc: u32, uc: u32, cs: u32| {

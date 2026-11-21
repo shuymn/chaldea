@@ -1,6 +1,6 @@
 //! Set A (and the real-CLI parts of set C): `chs real ...`, `chs pretrust`,
 //! `chs print-launch`.
-//! Launches the owner's real Claude Code / Codex; never run without
+//! Launches the user's real Claude Code / Codex; never run without
 //! `--allow-api-usage`.
 
 use std::collections::BTreeSet;
@@ -166,7 +166,7 @@ pub fn preflight(args: &Args) -> Result<(String, Bins), String> {
     if !args.allow_api_usage {
         return Err(format!(
             "chs real {which}: refusing to launch real CLIs without --allow-api-usage \
-             (they run under the owner's account and may use the API)"
+             (they run under the user's account and may use the API)"
         ));
     }
     let mut bins = Bins {
@@ -323,7 +323,7 @@ pub fn codex_hook_args(cmd: &str) -> Vec<String> {
     v
 }
 
-/// Low reasoning effort for every harness Codex launch, so the owner's
+/// Low reasoning effort for every harness Codex launch, so the user's
 /// default (e.g. max) does not stretch the bootstrap turn past minutes
 /// (codex-rs 0.171.0 `config/src/config_toml.rs:414`). Hook trust is keyed
 /// by source path, event, and group/handler index
@@ -840,8 +840,8 @@ fn bound_outcome(fin: &Value) -> Outcome {
     }
 }
 
-/// Reads one line from stdin with a deadline (owner prompts).
-fn ask_owner(question: &str, deadline: Instant) -> Option<String> {
+/// Reads one line from stdin with a deadline (prompts to a person at the keyboard).
+fn ask_person(question: &str, deadline: Instant) -> Option<String> {
     println!("{question}");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1766,12 +1766,12 @@ fn stall(ctx: &Ctx, a: &Agent) {
     ctx.check(
         "A-7",
         &a7,
-        Outcome::not_exercised("owner judgment required"),
+        Outcome::not_exercised("manual judgment required"),
         json!({"timed_out": bound.is_none(), "latency_ms": ms, "snapshot": snap}),
     );
 }
 
-/// Shows the snapshot and relays the owner's keys as ungated `write_key` (C-2).
+/// Shows the snapshot and relays a person's keys as ungated `write_key` (C-2).
 /// Returns the receiver-relative time at which the writer finished the first
 /// key written while unbound.
 fn attend(ctx: &Ctx, l: &Launch) -> (Option<u64>, Value) {
@@ -1781,7 +1781,7 @@ fn attend(ctx: &Ctx, l: &Launch) -> (Option<u64>, Value) {
         for line in l.snapshot().lines.iter().filter(|s| !s.is_empty()) {
             println!("| {line}");
         }
-        let Some(cmd) = ask_owner(
+        let Some(cmd) = ask_person(
             "keys: down enter esc w-down w-enter w-esc | done",
             ctx.until(Duration::from_secs(300)),
         ) else {
@@ -1944,16 +1944,16 @@ fn codex_hooks(ctx: &Ctx, a: &Agent) {
                 Some(nth_bound(&l, "UserPromptSubmit", 1, ctx.until(REAL_UPS_WAIT)).is_some());
             let _ = nth_bound(&l, "Stop", 1, ctx.until(REAL_STOP_WAIT));
         }
-        let mut owner = Value::Null;
+        let mut manual = Value::Null;
         if is_mutated && bound.is_none() {
             for line in l.snapshot().lines.iter().filter(|s| !s.is_empty()) {
                 println!("| {line}");
             }
-            let ans = ask_owner(
+            let ans = ask_person(
                 "A-4: does the hooks review entry above name the mutated command (ending in `codez`)? [y/n]",
                 ctx.until(Duration::from_secs(300)),
             );
-            owner = json!({"prompt": "review entry names the mutated command", "answer": ans});
+            manual = json!({"prompt": "review entry names the mutated command", "answer": ans});
         }
         let obs = observed(&l);
         // Finalized after the receiver stopped and drained.
@@ -1971,19 +1971,19 @@ fn codex_hooks(ctx: &Ctx, a: &Agent) {
                 let o = if delivered {
                     Outcome::platform("the mutated hook delivered without review")
                 } else {
-                    match owner["answer"].as_str().map(|s| s.to_ascii_lowercase()) {
+                    match manual["answer"].as_str().map(|s| s.to_ascii_lowercase()) {
                         Some(s) if s == "y" || s == "yes" => Outcome::Pass,
                         Some(s) if s == "n" || s == "no" => Outcome::platform(
-                            "owner: the review entry does not name the mutated command",
+                            "manual check: the review entry does not name the mutated command",
                         ),
-                        _ => Outcome::not_exercised("no owner confirmation"),
+                        _ => Outcome::not_exercised("no manual confirmation"),
                     }
                 };
                 ctx.check(
                     id,
                     &case,
                     o,
-                    json!({"base": base, "delivered_from_mutated": delivered, "owner": owner}),
+                    json!({"base": base, "delivered_from_mutated": delivered, "manual": manual}),
                 );
             }
             "A-4" => ctx.check(id, &case, bound_outcome(&fin), base),
@@ -2262,7 +2262,7 @@ fn tree_kill(ctx: &Ctx, a: &Agent) {
         .collect();
     let owned_survivors = fin["stop"]["survivors"].clone();
     let owned_clear = owned_survivors.as_array().is_some_and(|a| a.is_empty());
-    // Real-grandchild containment (e.g. the owner's own MCP servers), kept as
+    // Real-grandchild containment (e.g. the user's own MCP servers), kept as
     // evidence even when the chs witness is absent.
     let recorded = fin["stop"]["recorded"]
         .as_array()
@@ -2366,7 +2366,7 @@ fn shell_quote(s: &str) -> String {
 const PRETRUST_LAUNCH: Duration = Duration::from_secs(1800);
 
 /// `chs pretrust <claude|codex>` launches the harness's launch argv in each
-/// folder the owner must trust, one at a time and without a shell, and
+/// folder the user must trust, one at a time and without a shell, and
 /// says what to approve there; `chs print-launch` only prints that argv
 /// (diagnostics).
 pub fn print_launch(args: &Args) -> i32 {
@@ -2532,7 +2532,7 @@ pub fn codex_pretrust_argv(root: &Path, bin: &str, no_daemon: bool) -> Vec<Strin
 }
 
 /// The pre-trust process: `argv` spawned directly (no shell, so no quoting
-/// layer) in `cwd`, with the owner's console inherited.
+/// layer) in `cwd`, with the launching console inherited.
 pub fn pretrust_command(argv: &[String], cwd: &Path) -> std::process::Command {
     let mut c = std::process::Command::new(&argv[0]);
     c.args(&argv[1..]).current_dir(cwd);
@@ -2825,7 +2825,7 @@ trusted_hash = "sha256:bb"
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The orchestrator's Mac: PATH has a mise shim `codex` that links to the
+    /// A Mac where PATH has a mise shim `codex` that links to the
     /// `mise` binary. Resolution must refuse it rather than launch mise, and
     /// must return the exact native file behind a chain of `codex` links.
     #[cfg(unix)]

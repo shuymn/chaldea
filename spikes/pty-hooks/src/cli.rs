@@ -54,7 +54,7 @@ pub struct Args {
     pub unicode_records: UnicodeRecords,
     /// Codex `tui.disable_paste_burst` for `win_keys` input runs (spike
     /// option, §4.4): `off` passes `=true`, `on` passes `=false`; always
-    /// explicit, so the owner's config cannot leak in.
+    /// explicit, so the user's real Codex config cannot leak in.
     pub codex_paste_burst: PasteBurst,
     /// `win_keys` corpus F entries to run (`--f1-entries a,b`; empty = all
     /// of the `--subset`).

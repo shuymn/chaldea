@@ -5,7 +5,7 @@
 //! `pass` / `go`, and anything else `fail` / `fail_observed`.
 //!
 //! The harness never classifies a platform failure as a blocker or tuning
-//! issue; the orchestrator reads `fail_observed` evidence against design §1 C.
+//! issue; `fail_observed` evidence is classified manually against design §1 C.
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -170,7 +170,7 @@ pub fn probe(required: &[String], checks: &[Check]) -> (&'static str, String, Va
         Some(false) => (
             "fail_observed",
             format!(
-                "platform failures observed (classified by the orchestrator): {:?}",
+                "platform failures observed (classified manually from the raw evidence): {:?}",
                 e.platform_fail
             ),
         ),

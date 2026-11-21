@@ -3559,7 +3559,7 @@ mod tests {
             spawned("resume"),
         );
         assert!(pass(&resume), "{:?}", raw_inject_outcome(&resume));
-        // The reviewer's shape: resume-fail that failed before the spawn.
+        // Regression shape: resume-fail that failed before the spawn.
         let mut r = run(
             "resume-fail",
             "injected ResumeThread failure",

@@ -112,7 +112,7 @@ impl WriterTx {
         self.tx.send(m).is_ok()
     }
 
-    /// Ungated write (VT replies, owner/probe keys); waits until written or `deadline`.
+    /// Ungated write (VT replies, keyboard/probe keys); waits until written or `deadline`.
     pub fn write_wait(&self, chunks: Vec<Vec<u8>>, deadline: Instant) -> Result<(), String> {
         self.write_guarded(
             chunks,

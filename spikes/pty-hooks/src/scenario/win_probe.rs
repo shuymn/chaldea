@@ -7,8 +7,8 @@
 //! Every probe declares its required cases and gets its verdict from
 //! `verdict::probe`: `inconclusive` when any required case is missing,
 //! harness-failed, or not exercised; `go` when all passed; otherwise
-//! `fail_observed`. The orchestrator, not the harness, decides whether an
-//! observed failure is a blocker.
+//! `fail_observed`. Whether an observed failure is a blocker is decided
+//! manually from the raw evidence, not by the harness.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -1969,7 +1969,7 @@ fn rerun_budget(sst: u64) -> u64 {
 /// `rerun` (§5 phase 3b): F-1 with the `w32` newline key only, F-2a's
 /// `tree_kill_claude`, `tree_kill_codex`, and `codex_input` (`w32`) under
 /// `P`, `R0`, `R6`, and F-2c. No detached console step and no F-2 verdict:
-/// the orchestrator reads the raw reports. Ends with the bundle command.
+/// the raw reports are classified manually. Ends with the bundle command.
 fn rerun(ctx: &Ctx) {
     println!("rerun: about 40 minutes; leave the PC idle until it prints the bundle command");
     probe_codex_input(ctx, &[NewlineKey::W32]);
@@ -3054,7 +3054,7 @@ fn console_launch_budget(name: &str) -> u64 {
     if name == "claude-hooks" { 600 } else { 900 }
 }
 
-/// How long the detached survival step waits for the owner's attach-client.
+/// How long the detached survival step waits for the user's attach-client.
 const SURVIVAL_WAIT: Duration = Duration::from_secs(1800);
 
 /// A console run's budget over `configs`, so a run in which every wait
@@ -3229,7 +3229,7 @@ fn probe_console(ctx: &Ctx) {
     );
     // Detached: the survival fixture starts before anything is observed, so
     // its attach URL (or why there is none) is published at once; the
-    // launching process tells the owner to close the terminal only after
+    // launching process tells the user to close the terminal only after
     // the matrix (`close_step_lines`).
     let mut hand = detached.then(|| Handoff {
         run_id: ctx.run_id.clone(),
@@ -3637,7 +3637,7 @@ pub fn wait_final_report(
 }
 
 /// Relaunches the harness detached into a report dir allocated here, and
-/// prints that dir and the owner's next steps.
+/// prints that dir and the user's next steps.
 fn relaunch_detached(ctx: &Ctx) {
     let mut pc = Pc::new("C-5-launch");
     pc.req("detached_launch");
@@ -3734,7 +3734,7 @@ fn relaunch_detached(ctx: &Ctx) {
     pc.finish(ctx, Value::Null);
 }
 
-/// Detached child: FakeCli `attachable` waits for an owner-confirmed terminal
+/// Detached child: FakeCli `attachable` waits for a user-confirmed terminal
 /// close (`/probe/confirm`) and then a fresh nonce from the same child. A
 /// platform failure needs positive death evidence for that child.
 fn terminal_close_survival(
@@ -3784,7 +3784,7 @@ fn terminal_close_survival(
         std::thread::sleep(Duration::from_millis(500));
     }
     let res = res.unwrap_or_else(|| match (confirmed, last_lookup) {
-        (None, _) => Outcome::not_exercised("the owner never confirmed the terminal close"),
+        (None, _) => Outcome::not_exercised("the user never confirmed the terminal close"),
         (Some(_), None) => Outcome::harness("child liveness lookup failed"),
         (Some(_), Some(_)) => Outcome::not_exercised("no fresh input after the confirmed close"),
     });
@@ -4862,7 +4862,7 @@ mod tests {
     }
 
     /// H2: the terminal-close instruction is printed only with a valid URL
-    /// and after the matrix; otherwise the owner is told how to proceed.
+    /// and after the matrix; otherwise the user is told how to proceed.
     #[test]
     fn close_step_needs_a_url_and_the_matrix() {
         let exe = Path::new(r"C:\chs\t\release\chs.exe");
@@ -5103,7 +5103,7 @@ mod tests {
         };
         let emitted = [3, 4, 5, 6];
         assert_eq!(resize_outcome(&ok(), &emitted), Outcome::Pass);
-        // The reviewer's shape: the child saw 100x30, the grid stayed 120x40.
+        // Regression shape: the child saw 100x30, the grid stayed 120x40.
         let stale = ResizeSeen {
             screen: (120, 40),
             ..ok()
