@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_NO_MORE_FILES, FILETIME, HANDLE, HWND,
-    INVALID_HANDLE_VALUE, LPARAM, LRESULT, STILL_ACTIVE, WPARAM,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, FILETIME,
+    HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, STILL_ACTIVE, WPARAM,
 };
 use windows_sys::Win32::System::Console::{
     COORD, CTRL_BREAK_EVENT, ClosePseudoConsole, CreatePseudoConsole, ENABLE_ECHO_INPUT,
@@ -341,6 +341,67 @@ impl Tree {
     pub fn members_checked(&self) -> Result<Vec<u32>, String> {
         job_members(self.job.raw()).map_err(|e| e.to_string())
     }
+
+    /// Opens a member by pid and reads its identity from that handle: a pid
+    /// that no longer names a process, or names one outside this job (the
+    /// member exited and the pid was reused), is `Exited`.
+    pub fn open_member(&self, pid: u32) -> super::MemberOpen {
+        use super::MemberOpen;
+        // SAFETY: the handle is owned by the wrapper.
+        let h = Handle::new(unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pid,
+            )
+        });
+        let Some(h) = h else {
+            let e = io::Error::last_os_error();
+            return if e.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                MemberOpen::Exited
+            } else {
+                MemberOpen::Failed(format!("OpenProcess: {e}"))
+            };
+        };
+        match in_job(h.raw(), self.job.raw()) {
+            Ok(false) => return MemberOpen::Exited,
+            Err(e) => return MemberOpen::Failed(format!("IsProcessInJob: {e}")),
+            Ok(true) => {}
+        }
+        match creation_time(h.raw()) {
+            0 => MemberOpen::Failed(format!("GetProcessTimes: {}", io::Error::last_os_error())),
+            st => MemberOpen::Opened(st, Retained(h)),
+        }
+    }
+
+    /// Job evidence for a live descendant (identity `pid` + `start`):
+    /// `IsProcessInJob` against this job and against any job.
+    pub fn job_evidence(&self, pid: u32, start: u64) -> serde_json::Value {
+        // SAFETY: the handle is owned by the wrapper.
+        let Some(h) =
+            Handle::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })
+        else {
+            return serde_json::json!({"error": format!("OpenProcess: {}", io::Error::last_os_error())});
+        };
+        if creation_time(h.raw()) != start {
+            return serde_json::json!({"error": "the pid now names another process"});
+        }
+        let r = |j: HANDLE| match in_job(h.raw(), j) {
+            Ok(b) => serde_json::json!(b),
+            Err(e) => serde_json::json!({"error": e.to_string()}),
+        };
+        serde_json::json!({"in_our_job": r(self.job.raw()), "in_any_job": r(std::ptr::null_mut())})
+    }
+}
+
+/// `IsProcessInJob(process, job)`; a null `job` asks for any job.
+fn in_job(process: HANDLE, job: HANDLE) -> io::Result<bool> {
+    let mut r = 0;
+    // SAFETY: plain query on handles valid for the call.
+    if unsafe { IsProcessInJob(process, job, &mut r) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(r != 0)
 }
 
 /// Creates a new file, failing if it exists (the run dir is private).

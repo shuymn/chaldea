@@ -133,17 +133,39 @@ impl Owned {
     /// Pre-stop half of the kill proof (job trees only): the historical
     /// descendant list, each identity's liveness, one membership snapshot,
     /// and a retained handle on every live identity (positive death evidence
-    /// after the stop). The census gaps are recorded: the final scan's error,
-    /// job members whose current identity (pid + start time) is not a
-    /// recorded one, and live identities whose
-    /// handle could not be retained.
+    /// after the stop). Each member is opened right after the membership
+    /// snapshot and reconciled by the identity read from that handle (see
+    /// [`reconcile`]); a new member's handle joins the live set. The census
+    /// gaps are recorded: the final scan's error, unreconciled members, and
+    /// live identities whose handle could not be retained. Live descendants
+    /// outside the job get their parent and job evidence (`outside_job`).
     fn proof_before(&self, scan: Result<(), String>) -> Option<(Value, Vec<Retained>)> {
         let tree = self.tree.lock().unwrap_or_else(|e| e.into_inner());
         let t = tree.as_ref().filter(|t| t.proves_membership())?;
         let membership = t.members_checked();
+        let recorded = self.recorded();
+        let ids: Vec<(u32, u64)> = recorded.iter().map(|p| (p.pid, p.start_time)).collect();
         let mut retained = Vec::new();
-        let pre: Vec<Value> = self
-            .recorded()
+        let mut census = Reconciled::default();
+        if let Ok(m) = &membership {
+            let opened: Vec<(u32, MemberId, Option<os::Retained>)> = m
+                .iter()
+                .map(|&pid| match t.open_member(pid) {
+                    os::MemberOpen::Exited => (pid, MemberId::Exited, None),
+                    os::MemberOpen::Opened(st, h) => (pid, MemberId::Start(st), Some(h)),
+                    os::MemberOpen::Failed(e) => (pid, MemberId::Unknown(e), None),
+                })
+                .collect();
+            let ids_now: Vec<(u32, MemberId)> =
+                opened.iter().map(|(p, id, _)| (*p, id.clone())).collect();
+            census = reconcile(&ids_now, &ids, self.child_start);
+            for (pid, id, h) in opened {
+                if let (MemberId::Start(st), true) = (&id, census.new_members.contains(&pid)) {
+                    retained.push((pid, *st, h));
+                }
+            }
+        }
+        let pre: Vec<Value> = recorded
             .iter()
             .map(|p| {
                 let live = os::liveness(p.pid, p.start_time);
@@ -153,15 +175,10 @@ impl Owned {
                 json!({"pid": p.pid, "start_time": p.start_time, "name": p.name, "live": live})
             })
             .collect();
-        let ids: Vec<(u32, u64)> = self
-            .recorded()
-            .iter()
-            .map(|p| (p.pid, p.start_time))
-            .collect();
-        // A fresh lookup of each member's identity; a failed read leaves
-        // every member unverified.
-        let procs = os::list_processes().unwrap_or_default();
-        let now = |pid: u32| procs.iter().find(|p| p.pid == pid).map(|p| p.start_time);
+        let outside = match &membership {
+            Ok(m) => self.outside_job(t, m, &recorded, &pre),
+            Err(_) => Vec::new(),
+        };
         let open_failed: Vec<u32> = retained
             .iter()
             .filter(|(_, _, h)| h.is_none())
@@ -170,7 +187,11 @@ impl Owned {
         let mut proof = json!({"pre_stop": pre, "membership": match &membership {
             Ok(m) => json!(m), Err(e) => json!({"error": e}) },
             "scan_error": scan.err(),
-            "unreconciled_members": membership.as_ref().map(|m| unreconciled(m, now, &ids)).unwrap_or_default(),
+            "unreconciled_members": census.unreconciled,
+            "member_open_errors": census.open_errors,
+            "exited_before_open": census.exited_before_open,
+            "new_members": census.new_members,
+            "outside_job": outside,
             "retained_open_failed": open_failed});
         if t.describe()["assign"] == json!("after_spawn") {
             proof["known_limit"] = json!(
@@ -180,6 +201,41 @@ impl Owned {
             );
         }
         Some((proof, retained))
+    }
+
+    /// Evidence only (the verdict rule is unchanged): for each live pre-stop
+    /// descendant not in `members`, its ppid, the parent's image, start time
+    /// and job membership, `IsProcessInJob` against our job and any job, and
+    /// its start relative to the launched child's (Windows FILETIME, so
+    /// 100 ns units; job trees are Windows only).
+    fn outside_job(
+        &self,
+        t: &os::Tree,
+        members: &[u32],
+        recorded: &[ProcInfo],
+        pre: &[Value],
+    ) -> Vec<Value> {
+        let procs = os::list_processes().unwrap_or_default();
+        recorded
+            .iter()
+            .zip(pre)
+            .filter(|(p, v)| v["live"] == json!(true) && !members.contains(&p.pid))
+            .map(|(p, _)| {
+                let parent = procs
+                    .iter()
+                    .chain(recorded)
+                    .find(|q| q.pid == p.ppid && q.start_time <= p.start_time)
+                    .map(|q| {
+                        json!({"pid": q.pid, "name": q.name, "start_time": q.start_time,
+                               "in_membership": members.contains(&q.pid),
+                               "job": t.job_evidence(q.pid, q.start_time)})
+                    });
+                let delta = p.start_time as i128 - self.child_start as i128;
+                json!({"pid": p.pid, "name": p.name, "ppid": p.ppid, "parent": parent,
+                       "job": t.job_evidence(p.pid, p.start_time),
+                       "start_after_child_ms": (delta / 10_000) as i64})
+            })
+            .collect()
     }
 
     /// After `TerminateJobObject`: waits (bounded) for every identity that
@@ -336,20 +392,55 @@ pub fn owned_by(
     out
 }
 
-/// Job members with no recorded identity before the stop: a member
-/// reconciles only when `now` (a fresh lookup of its pid's start time)
-/// yields a nonzero start time recorded with that pid, so a reused pid or
-/// one without a verified current identity stays unreconciled.
-pub fn unreconciled(
-    members: &[u32],
-    now: impl Fn(u32) -> Option<u64>,
+/// A job member's identity as read from a handle opened on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberId {
+    /// Gone before it could be opened (or its pid now names a non-member).
+    Exited,
+    /// Creation time read from the handle.
+    Start(u64),
+    /// Opened (or not) without a readable identity.
+    Unknown(String),
+}
+
+/// The job census against the recorded identities.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    /// Members that block the proof: no readable identity, or a creation
+    /// time before the launch start that is not a recorded identity (a
+    /// stale pid).
+    pub unreconciled: Vec<u32>,
+    /// Members gone before they could be opened: they cannot survive.
+    pub exited_before_open: Vec<u32>,
+    /// Unrecorded members created at or after the launch start.
+    pub new_members: Vec<u32>,
+    pub open_errors: Vec<(u32, String)>,
+}
+
+/// Reconciles each job member by the identity read from a handle opened on
+/// it: a recorded `(pid, start)` or a creation time at or after
+/// `launch_start` reconciles; one that exited before it could be opened is
+/// `exited_before_open`; anything else (no identity, or an earlier creation
+/// time that is not recorded) stays unreconciled.
+pub fn reconcile(
+    members: &[(u32, MemberId)],
     recorded: &[(u32, u64)],
-) -> Vec<u32> {
-    members
-        .iter()
-        .copied()
-        .filter(|&m| !now(m).is_some_and(|st| st != 0 && recorded.contains(&(m, st))))
-        .collect()
+    launch_start: u64,
+) -> Reconciled {
+    let mut r = Reconciled::default();
+    for (pid, id) in members {
+        match id {
+            MemberId::Exited => r.exited_before_open.push(*pid),
+            MemberId::Start(st) if *st != 0 && recorded.contains(&(*pid, *st)) => {}
+            MemberId::Start(st) if *st != 0 && *st >= launch_start => r.new_members.push(*pid),
+            MemberId::Start(_) => r.unreconciled.push(*pid),
+            MemberId::Unknown(e) => {
+                r.unreconciled.push(*pid);
+                r.open_errors.push((*pid, e.clone()));
+            }
+        }
+    }
+    r
 }
 
 /// The §4.8 `backend` kill proof as a case outcome. Every descendant live
@@ -1025,24 +1116,36 @@ mod tests {
         }
     }
 
-    /// M1 (r3): a job member reconciles only by identity: its pid's fresh
-    /// start time must match a recorded identity. A reused pid (recorded
-    /// with another start time), a pid with no current identity, and a
-    /// start time of 0 stay unreconciled.
+    /// A job member reconciles by the identity read from a handle on it
+    /// (launch start 100): a recorded identity, or a new member created
+    /// after the launch start. Claude's churn (members that exited before
+    /// they could be opened, e.g. R0 findstr/tasklist) does not block. A
+    /// reused pid (unrecorded, created before the launch: the r3 stale-pid
+    /// case), a start time of 0, and an unreadable identity block.
     #[test]
     fn job_census_reconciles_by_identity() {
-        let now = |pid: u32| match pid {
-            10 => Some(1),
-            11 => Some(9),
-            13 => Some(0),
-            _ => None,
-        };
-        let recorded = [(10, 1), (11, 5), (12, 3), (13, 0)];
-        assert_eq!(
-            unreconciled(&[10, 11, 12, 13], now, &recorded),
-            vec![11, 12, 13]
+        use MemberId::*;
+        let recorded = [(10, 100), (11, 150), (12, 120)];
+        let members = [
+            (10, Start(100)),
+            (11, Start(50)),
+            (12, Exited),
+            (13, Start(180)),
+            (14, Start(0)),
+            (15, Unknown("OpenProcess: access denied".into())),
+        ];
+        let r = reconcile(&members, &recorded, 100);
+        assert_eq!(r.unreconciled, vec![11, 14, 15]);
+        assert_eq!(r.exited_before_open, vec![12]);
+        assert_eq!(r.new_members, vec![13]);
+        assert_eq!(r.open_errors.len(), 1);
+        // The R0 shape: every live member is recorded or new, the rest churned.
+        let r0 = reconcile(
+            &[(32048, Start(150)), (104140, Exited), (106488, Exited)],
+            &[(32048, 150)],
+            100,
         );
-        assert!(unreconciled(&[10], now, &recorded).is_empty());
+        assert!(r0.unreconciled.is_empty(), "{r0:?}");
     }
 
     /// §4.8 `backend` kill proof as a case outcome.

@@ -236,6 +236,14 @@ impl Tree {
     pub fn members_checked(&self) -> Result<Vec<u32>, String> {
         Err("not applicable".into())
     }
+
+    pub fn open_member(&self, _pid: u32) -> super::MemberOpen {
+        super::MemberOpen::Failed("not applicable".into())
+    }
+
+    pub fn job_evidence(&self, _pid: u32, _start: u64) -> serde_json::Value {
+        serde_json::json!({"error": "not applicable"})
+    }
 }
 
 /// Starts `cmd` so that it leaves the caller's session (`setsid`).

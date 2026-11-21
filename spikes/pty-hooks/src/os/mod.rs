@@ -175,6 +175,16 @@ pub struct RawSpawn {
     pub conpty_module: Option<String>,
 }
 
+/// A job member opened by pid for the kill-proof census (`Tree::open_member`).
+pub enum MemberOpen {
+    /// The pid no longer names a process, or now names one outside the job
+    /// (the member exited and its pid was reused): it cannot survive the stop.
+    Exited,
+    /// Creation time read from a handle on the member, which is retained.
+    Opened(u64, Retained),
+    Failed(String),
+}
+
 /// One row of the process table. `pgid`/`sid` are Unix-only.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProcInfo {
