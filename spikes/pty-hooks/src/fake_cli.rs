@@ -629,6 +629,8 @@ struct Attach {
     nonces: Vec<String>,
     keys: Vec<String>,
     submits: u32,
+    /// The console size last observed and the first marker printed after it.
+    size_marker: Option<(u16, u16, u64)>,
 }
 
 /// `attachable-report` witness: markers, nonces, keys, submits, and the
@@ -638,7 +640,8 @@ fn report_attachable(st: &std::sync::Mutex<Attach>) {
         let a = st.lock().unwrap_or_else(|e| e.into_inner());
         let size = os::console_size();
         json!({"markers_emitted": a.markers, "nonces": a.nonces, "keys": a.keys,
-               "submits": a.submits, "console_size": size.map(|(c, r)| json!({"cols": c, "rows": r}))})
+               "submits": a.submits, "console_size": size.map(|(c, r)| json!({"cols": c, "rows": r})),
+               "size_marker": a.size_marker.map(|(c, r, m)| json!({"cols": c, "rows": r, "marker": m}))})
     };
     witness("attachable-report", false, v);
 }
@@ -687,15 +690,21 @@ fn run_attachable(o: &Opts) -> i32 {
         let mut size = os::console_size();
         loop {
             n += 1;
-            st2.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .markers
-                .push(n);
-            out(format!("\x1b[1;1HMARKER-{n:06}\x1b[K").as_bytes());
-            // A resize is reported with the next marker (F-2 attach + resize).
+            // A resize is observed before this marker is printed, so this
+            // marker is the first one drawn at the new size; both are
+            // reported (F-2 attach + resize).
             let now = os::console_size();
-            if now != size {
-                size = now;
+            let resized = now != size;
+            size = now;
+            {
+                let mut a = st2.lock().unwrap_or_else(|e| e.into_inner());
+                a.markers.push(n);
+                if resized && let Some((c, r)) = now {
+                    a.size_marker = Some((c, r, n));
+                }
+            }
+            out(format!("\x1b[1;1HMARKER-{n:06}\x1b[K").as_bytes());
+            if resized {
                 report_attachable(&st2);
             }
             std::thread::sleep(Duration::from_millis(500));

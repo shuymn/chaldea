@@ -1132,12 +1132,14 @@ pub struct ResizeSeen {
     /// The marker on screen at the resize and after it.
     pub marker_before: Option<u64>,
     pub marker_after: Option<u64>,
+    /// The first marker the child printed after it observed the new size.
+    pub size_marker: Option<u64>,
 }
 
 /// C-4 resize: the child must report the new size, the harness's screen
 /// must have the new geometry (a stale grid is the harness's own failure),
-/// and that screen must show a marker the child emitted after the one on
-/// screen at the resize.
+/// and that screen must show the first marker the child printed after it
+/// observed the new size, or a later one.
 pub fn resize_outcome(r: &ResizeSeen, emitted: &[u64]) -> Outcome {
     match (&r.resized, r.child_reported) {
         (Err(e), _) => return Outcome::harness(format!("resize failed: {e}")),
@@ -1154,17 +1156,20 @@ pub fn resize_outcome(r: &ResizeSeen, emitted: &[u64]) -> Outcome {
             r.screen
         ));
     }
-    let Some(m0) = r.marker_before else {
+    if r.marker_before.is_none() {
         return Outcome::harness("no marker on screen at the resize");
+    }
+    let Some(sm) = r.size_marker else {
+        return Outcome::harness("the child recorded no marker after it saw the new size");
     };
     match r.marker_after {
         Some(m) if !emitted.contains(&m) => {
             Outcome::harness("marker not in the fixture's emitted list")
         }
-        Some(m) if m > m0 => Outcome::Pass,
-        _ if emitted.iter().any(|e| *e > m0) => {
-            Outcome::platform("the resized screen shows no marker drawn after the resize")
-        }
+        Some(m) if m >= sm => Outcome::Pass,
+        _ if emitted.iter().any(|e| *e >= sm) => Outcome::platform(
+            "the resized screen shows no marker drawn after the child saw the new size",
+        ),
         _ => Outcome::harness("the fixture emitted no marker after the resize"),
     }
 }
@@ -1256,11 +1261,18 @@ fn probe_attach(ctx: &Ctx) {
         &p.screen(Instant::now() + Duration::from_secs(1)),
     ));
     let resized = l.session.io().resize(cols, rows);
+    let want = json!({"cols": cols, "rows": rows});
     let seen = resized.is_ok()
         && p.wait_report(ctx.until(Duration::from_secs(10)), |r| {
-            r["console_size"] == json!({"cols": cols, "rows": rows})
+            r["console_size"] == want
         })
         .is_some();
+    // The first marker printed after the child observed the new size.
+    let size_marker = p
+        .wait_report(ctx.until(Duration::from_secs(2)), |r| {
+            r["size_marker"]["cols"] == want["cols"] && r["size_marker"]["rows"] == want["rows"]
+        })
+        .and_then(|r| r["size_marker"]["marker"].as_u64());
     // Two marker ticks after the size report, so the resized screen is drawn.
     std::thread::sleep(
         Duration::from_millis(1200).min(ctx.cutoff.saturating_duration_since(Instant::now())),
@@ -1282,13 +1294,14 @@ fn probe_attach(ctx: &Ctx) {
         want: (cols, rows),
         marker_before: at_resize,
         marker_after: after,
+        size_marker,
     };
     pc.put(
         "resize",
         resize_outcome(&rs, &emitted),
         json!({"want": {"cols": cols, "rows": rows}, "reported": p.report().map(|r| r["console_size"].clone()),
                "screen": {"cols": snap.cols, "rows": snap.rows}, "marker_at_resize": at_resize,
-               "marker_after": after}),
+               "marker_after": after, "size_marker": size_marker}),
     );
     l.receiver.set_probe(None);
     let (stop, _) = l.finish();
@@ -4052,6 +4065,7 @@ mod tests {
             want: (100, 30),
             marker_before: Some(4),
             marker_after: Some(6),
+            size_marker: Some(6),
         };
         let emitted = [3, 4, 5, 6];
         assert_eq!(resize_outcome(&ok(), &emitted), Outcome::Pass);
@@ -4079,6 +4093,21 @@ mod tests {
             resize_outcome(&none, &emitted),
             Outcome::PlatformFail { .. }
         ));
+        // L1: a marker printed after the resize call but before the child
+        // observed the new size is not resized content.
+        let early = ResizeSeen {
+            marker_after: Some(5),
+            ..ok()
+        };
+        let o = resize_outcome(&early, &emitted);
+        assert!(matches!(o, Outcome::PlatformFail { .. }), "{o:?}");
+        // The child never recorded a marker after the new size.
+        let unknown = ResizeSeen {
+            size_marker: None,
+            ..ok()
+        };
+        let o = resize_outcome(&unknown, &emitted);
+        assert!(matches!(o, Outcome::HarnessFail { .. }), "{o:?}");
     }
 
     #[test]
