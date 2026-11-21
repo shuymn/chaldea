@@ -1,0 +1,20 @@
+# Each tool tracks its major version; mise.lock pins the exact versions and
+# checksums, and .github/workflows/mise-update.yml advances it.
+[tools]
+"github:babarot/gh-infra" = "0"
+lefthook = "2"
+# Linters the shared security and gha workflows also run; the git hooks use
+# these so local checks match CI.
+actionlint = "1"
+betterleaks = "1"
+ghalint = "1"
+
+# Rust is not listed: spikes/pty-hooks is a standalone project whose toolchain
+# is pinned by its own rust-toolchain.toml, which rustup reads directly.
+
+[settings]
+lockfile = true
+lockfile_platforms = ["macos-arm64", "linux-x64", "windows-x64"]
+locked = true
+# Matches the minimumReleaseAge of the shared Renovate preset.
+minimum_release_age = "3d"
