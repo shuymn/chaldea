@@ -86,6 +86,8 @@ pub struct KillResult {
 
 /// How long the live set may take to die after `TerminateJobObject`.
 pub const JOB_DEATH_WAIT: Duration = Duration::from_secs(2);
+/// How long the job's `ActiveProcesses` may take to reach 0 after it.
+pub const JOB_DRAIN_WAIT: Duration = Duration::from_secs(5);
 
 /// A live identity before the stop and the handle retained on it, if one
 /// could be opened with its start time verified.
@@ -192,6 +194,7 @@ impl Owned {
             "exited_before_open": census.exited_before_open,
             "new_members": census.new_members,
             "outside_job": outside,
+            "assign": t.describe()["assign"],
             "retained_open_failed": open_failed});
         if t.describe()["assign"] == json!("after_spawn") {
             proof["known_limit"] = json!(
@@ -279,9 +282,15 @@ impl Owned {
             Some(t) => t.kill(grace),
             None => (Vec::new(), false),
         };
+        // The whole job, late members included, must drain (bounded).
+        let drain = match (tree.as_ref(), proof.is_some()) {
+            (Some(t), true) => Some(t.wait_drained(Instant::now() + JOB_DRAIN_WAIT)),
+            _ => None,
+        };
         drop(tree);
         if let Some((p, retained)) = proof.as_mut() {
             p["terminate_job_ok"] = json!(ok);
+            p["job_drain"] = drain.unwrap_or(Value::Null);
             Self::proof_after(p, retained);
         }
         // The retained child handle, always: covers a failed or delayed tree setup.
@@ -514,7 +523,16 @@ pub fn kill_proof_outcome(proof: &Value, witness: Option<(u32, u64)>) -> Outcome
     if proof["live_set_dead_before_fallback"] != json!(true) {
         return Outcome::platform("the live set survived TerminateJobObject");
     }
-    Outcome::Pass
+    // Members that joined after the membership snapshot are covered only
+    // by the job itself draining to no active process.
+    match proof["job_drain"]["active_processes"].as_u64() {
+        Some(0) => Outcome::Pass,
+        Some(n) => Outcome::platform(format!(
+            "the job still had {n} active processes {} ms after TerminateJobObject",
+            proof["job_drain"]["wait_ms"]
+        )),
+        None => Outcome::harness(format!("job drain unknown: {}", proof["job_drain"])),
+    }
 }
 
 pub struct SpawnOpts {
@@ -1077,7 +1095,8 @@ mod tests {
 
     fn proof(pre: Value, members: Value, after: Value, dead: bool) -> Value {
         json!({"pre_stop": pre, "membership": members, "after_job": after,
-               "live_set_dead_before_fallback": dead, "terminate_job_ok": true})
+               "live_set_dead_before_fallback": dead, "terminate_job_ok": true,
+               "job_drain": {"active_processes": 0, "wait_ms": 0}})
     }
 
     /// M3: the kill proof credits job termination only when
@@ -1086,11 +1105,32 @@ mod tests {
     fn kill_proof_needs_terminate_success() {
         let mut p = json!({"pre_stop": [{"pid": 10, "start_time": 1, "live": true}],
             "membership": [10], "after_job": [{"pid": 10, "live": false}],
-            "live_set_dead_before_fallback": true, "terminate_job_ok": false});
+            "live_set_dead_before_fallback": true, "terminate_job_ok": false,
+            "job_drain": {"active_processes": 0, "wait_ms": 0}});
         let o = kill_proof_outcome(&p, Some((10, 1)));
         assert!(matches!(o, Outcome::HarnessFail { .. }), "{o:?}");
         p["terminate_job_ok"] = json!(true);
         assert_eq!(kill_proof_outcome(&p, Some((10, 1))), Outcome::Pass);
+    }
+
+    /// A member that joined after the membership snapshot is covered only
+    /// by the whole job draining: a nonzero `ActiveProcesses` at the drain
+    /// deadline is a platform failure, an unknown count a harness failure.
+    #[test]
+    fn kill_proof_needs_the_job_drained() {
+        let mut p = json!({"pre_stop": [{"pid": 10, "start_time": 1, "live": true}],
+            "membership": [10], "after_job": [{"pid": 10, "live": false}],
+            "live_set_dead_before_fallback": true, "terminate_job_ok": true,
+            "job_drain": {"active_processes": 0, "wait_ms": 3}});
+        assert_eq!(kill_proof_outcome(&p, Some((10, 1))), Outcome::Pass);
+        p["job_drain"] = json!({"active_processes": 1, "wait_ms": 5000});
+        let o = kill_proof_outcome(&p, Some((10, 1)));
+        assert!(matches!(o, Outcome::PlatformFail { .. }), "{o:?}");
+        for d in [json!({"error": "denied", "wait_ms": 0}), Value::Null] {
+            p["job_drain"] = d;
+            let o = kill_proof_outcome(&p, Some((10, 1)));
+            assert!(matches!(o, Outcome::HarnessFail { .. }), "{o:?}");
+        }
     }
 
     /// M1: a failed final scan, a job member missing from the recorded
@@ -1101,7 +1141,8 @@ mod tests {
         let base = || {
             json!({"pre_stop": [{"pid": 10, "start_time": 1, "live": true}],
                 "membership": [10], "after_job": [{"pid": 10, "live": false}],
-                "live_set_dead_before_fallback": true, "terminate_job_ok": true})
+                "live_set_dead_before_fallback": true, "terminate_job_ok": true,
+                "job_drain": {"active_processes": 0, "wait_ms": 0}})
         };
         assert_eq!(kill_proof_outcome(&base(), Some((10, 1))), Outcome::Pass);
         for (k, v) in [

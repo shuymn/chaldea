@@ -241,6 +241,10 @@ impl Tree {
         super::MemberOpen::Failed("not applicable".into())
     }
 
+    pub fn wait_drained(&self, _until: Instant) -> serde_json::Value {
+        serde_json::json!({"error": "not applicable"})
+    }
+
     pub fn job_evidence(&self, _pid: u32, _start: u64) -> serde_json::Value {
         serde_json::json!({"error": "not applicable"})
     }

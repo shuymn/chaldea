@@ -30,7 +30,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
-    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
     JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
 };
@@ -374,6 +375,22 @@ impl Tree {
         }
     }
 
+    /// After `TerminateJobObject`: polls the job's `ActiveProcesses` until
+    /// it is 0 or `until`; the last count and the wait, or the query error.
+    pub fn wait_drained(&self, until: Instant) -> serde_json::Value {
+        let t0 = Instant::now();
+        loop {
+            let ms = t0.elapsed().as_millis() as u64;
+            match active_processes(self.job.raw()) {
+                Err(e) => return serde_json::json!({"error": e.to_string(), "wait_ms": ms}),
+                Ok(n) if n == 0 || Instant::now() >= until => {
+                    return serde_json::json!({"active_processes": n, "wait_ms": ms});
+                }
+                Ok(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
     /// Job evidence for a live descendant (identity `pid` + `start`):
     /// `IsProcessInJob` against this job and against any job.
     pub fn job_evidence(&self, pid: u32, start: u64) -> serde_json::Value {
@@ -391,6 +408,25 @@ impl Tree {
             Err(e) => serde_json::json!({"error": e.to_string()}),
         };
         serde_json::json!({"in_our_job": r(self.job.raw()), "in_any_job": r(std::ptr::null_mut())})
+    }
+}
+
+/// `ActiveProcesses` of `job` (child jobs included).
+fn active_processes(job: HANDLE) -> io::Result<u32> {
+    // SAFETY: correctly sized struct for this information class.
+    unsafe {
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
+        if QueryInformationJobObject(
+            job,
+            JobObjectBasicAccountingInformation,
+            &mut info as *mut _ as *mut c_void,
+            std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info.ActiveProcesses)
     }
 }
 

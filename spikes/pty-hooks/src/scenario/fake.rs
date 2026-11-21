@@ -3037,7 +3037,7 @@ mod tests {
                    "membership": members, "terminate_job_ok": true,
                    "after_job": [{"pid": 10, "live": false}, {"pid": 11, "live": false},
                                  {"pid": 12, "live": false}],
-                   "live_set_dead_before_fallback": dead})
+                   "live_set_dead_before_fallback": dead, "job_drain": {"active_processes": 0, "wait_ms": 0}})
         };
         fs.kill_proof = Some(proof(json!([10, 11, 12]), true));
         assert!(pass(&fs), "{:?}", raw_inject_outcome(&fs));
