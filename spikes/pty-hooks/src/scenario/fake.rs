@@ -1779,12 +1779,14 @@ pub struct B5Run {
 }
 
 /// B-5 expectation per OS. macOS: today's checks. Windows (§3 conhost
-/// facts): DSR 5/6 and DA1/DA2 pass when answered validly within 500 ms
-/// with no harness write (`answered_by_conhost`); OSC 10/11 pass when no
-/// reply arrived, the query log has no OSC entry, and the PTY output has no
-/// OSC 10/11 query (`not_forwarded`); kitty must be harness-answered, and
-/// the negative control must fail on kitty. Missing evidence is a harness
-/// failure.
+/// facts): DSR 5/6 and DA1/DA2 pass only when answered validly within
+/// 500 ms with no harness write (`answered_by_conhost`); OSC 10/11 pass only
+/// when no reply arrived, the query log has no OSC entry, and the PTY
+/// output has no OSC 10/11 query (`not_forwarded`); kitty must be
+/// harness-answered, and the negative control must fail on kitty. Any other
+/// shape, a macOS-shaped one included (harness-written DSR/DA replies, OSC
+/// answered), is a different observation (`platform_fail` naming it), never
+/// a pass. Missing evidence is a harness failure.
 pub fn b5_expect(os_name: &str, responder: bool, r: &B5Run) -> (Outcome, Value) {
     let mut ev = json!({"exit": r.exit, "fake": r.fake, "query_log": r.log,
                         "excerpts": r.output.as_deref().map(query_excerpts)});
@@ -1840,24 +1842,25 @@ pub fn b5_expect(os_name: &str, responder: bool, r: &B5Run) -> (Outcome, Value) 
                 }
             }
             "osc10" | "osc11" => {
-                if !ok {
-                    if !osc_logged && find_bytes(out, q).is_none() {
-                        not_fwd.push(*k);
-                    } else {
-                        fails.push(*k);
-                    }
+                if !ok && !osc_logged && find_bytes(out, q).is_none() {
+                    not_fwd.push(*k);
+                } else {
+                    fails.push(*k);
                 }
             }
             _ => {
-                if !ok {
-                    fails.push(*k);
-                } else if !wrote(k) {
+                if ok && !wrote(k) {
                     conhost.push(*k);
+                } else {
+                    fails.push(*k);
                 }
             }
         }
     }
     ev["platform_fact"] = json!({"answered_by_conhost": conhost, "not_forwarded": not_fwd});
+    if !fails.is_empty() {
+        ev["observation"] = json!({"differs_from_recorded_conhost_facts": fails});
+    }
     if fails.is_empty() {
         (Outcome::Pass, ev)
     } else {
@@ -1952,7 +1955,9 @@ pub struct B10Run {
 /// facts): a paste that conhost accepted is followed by filler up to
 /// 16 MiB; a blocked writer passes, all 16 MiB accepted is `not_exercised`
 /// with the accepted bytes; a CPR reply must appear in the prompt exactly
-/// once with no harness DSR write (`platform_fact` = its offset).
+/// once with no harness DSR write (`platform_fact` = its offset). A
+/// macOS-shaped prompt (no CPR in the body) is a different observation,
+/// not a pass.
 pub fn b10_expect(os_name: &str, case: &str, r: &B10Run) -> (Outcome, Value) {
     let mut ev = json!({"paste_state": r.paste_state, "filler": r.filler,
                         "reply_after_paste": r.reply_after_paste});
@@ -1983,8 +1988,15 @@ pub fn b10_expect(os_name: &str, case: &str, r: &B10Run) -> (Outcome, Value) {
         return (o, ev);
     }
     let today = r.prompt.as_deref() == Some(&r.expected[..]) && r.reply_after_paste == Some(true);
-    if !win || today {
+    if !win {
         return (checked(today), ev);
+    }
+    if today {
+        ev["observation"] = json!("macos_shape");
+        return (
+            Outcome::platform("no CPR reply in the paste body (the macOS shape)"),
+            ev,
+        );
     }
     let Some(prompt) = &r.prompt else {
         return (checked(false), ev);
@@ -2569,6 +2581,36 @@ mod tests {
         ));
     }
 
+    /// M7: on Windows a macOS-shaped B-5 result (harness-written DSR/DA
+    /// replies, OSC 10/11 answered) is a different observation, never a
+    /// pass; a macOS-shaped B-10 prompt (no CPR in the body) neither.
+    #[test]
+    fn windows_checks_need_the_windows_observations() {
+        let mut r = windows_b5(true);
+        r.log
+            .push(json!({"kind": "dsr6", "harness_wrote": true, "reply": "\x1b[1;1R"}));
+        let (o, ev) = b5_expect("windows", true, &r);
+        assert!(matches!(o, PlatformFail { .. }), "{o:?} {ev}");
+        let mut r = windows_b5(true);
+        r.fake = Some(results(&[
+            ("dsr6", true),
+            ("dsr5", true),
+            ("da1", true),
+            ("da2", true),
+            ("osc10", true),
+            ("osc11", true),
+            ("kitty_keyboard", true),
+        ]));
+        let (o, ev) = b5_expect("windows", true, &r);
+        assert!(matches!(o, PlatformFail { .. }), "{o:?} {ev}");
+        let mut t = b10("sent", None);
+        t.prompt = Some(t.expected.clone());
+        t.reply_after_paste = Some(true);
+        let (o, ev) = b10_expect("windows", "query-mid-paste", &t);
+        assert!(matches!(o, PlatformFail { .. }), "{o:?} {ev}");
+        assert_eq!(ev["observation"], "macos_shape");
+    }
+
     use Outcome::PlatformFail;
 
     fn b10(state: &str, filler: Option<Filler>) -> B10Run {
@@ -2646,11 +2688,11 @@ mod tests {
             b10_expect("windows", q, &r).0,
             PlatformFail { .. }
         ));
-        // Today's shape still passes everywhere.
+        // Today's shape still passes on macOS (on Windows it is a
+        // different observation; see `windows_checks_need_the_windows_observations`).
         let mut t = b10("sent", None);
         t.prompt = Some(t.expected.clone());
         t.reply_after_paste = Some(true);
-        assert_eq!(b10_expect("windows", q, &t).0, Outcome::Pass);
         assert_eq!(b10_expect("macos", q, &t).0, Outcome::Pass);
     }
 
