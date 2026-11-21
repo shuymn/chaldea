@@ -149,6 +149,8 @@ impl Owned {
         let ids: Vec<(u32, u64)> = recorded.iter().map(|p| (p.pid, p.start_time)).collect();
         let mut retained = Vec::new();
         let mut census = Reconciled::default();
+        // Handles opened on recorded members at the census, by identity.
+        let mut member_handles: BTreeMap<(u32, u64), os::Retained> = BTreeMap::new();
         if let Ok(m) = &membership {
             let opened: Vec<(u32, MemberId, Option<os::Retained>)> = m
                 .iter()
@@ -162,19 +164,30 @@ impl Owned {
                 opened.iter().map(|(p, id, _)| (*p, id.clone())).collect();
             census = reconcile(&ids_now, &ids, self.child_start);
             for (pid, id, h) in opened {
-                if let (MemberId::Start(st), true) = (&id, census.new_members.contains(&pid)) {
-                    retained.push((pid, *st, h));
+                let (MemberId::Start(st), Some(h)) = (id, h) else {
+                    continue;
+                };
+                if census.new_members.contains(&pid) {
+                    retained.push((pid, st, Some(h)));
+                } else if ids.contains(&(pid, st)) {
+                    member_handles.insert((pid, st), h);
                 }
             }
         }
         let pre: Vec<Value> = recorded
             .iter()
             .map(|p| {
-                let live = os::liveness(p.pid, p.start_time);
+                let h = member_handles.remove(&(p.pid, p.start_time));
+                let (live, evidence) =
+                    pre_liveness(h.as_ref().map(|h| h.wait_dead(Instant::now())), || {
+                        os::liveness(p.pid, p.start_time)
+                    });
                 if live == Some(true) {
-                    retained.push((p.pid, p.start_time, os::Retained::open(p.pid, p.start_time)));
+                    let h = h.or_else(|| os::Retained::open(p.pid, p.start_time));
+                    retained.push((p.pid, p.start_time, h));
                 }
-                json!({"pid": p.pid, "start_time": p.start_time, "name": p.name, "live": live})
+                json!({"pid": p.pid, "start_time": p.start_time, "name": p.name, "live": live,
+                       "evidence": evidence})
             })
             .collect();
         let outside = match &membership {
@@ -224,14 +237,14 @@ impl Owned {
             .zip(pre)
             .filter(|(p, v)| v["live"] == json!(true) && !members.contains(&p.pid))
             .map(|(p, _)| {
-                let parent = procs
-                    .iter()
-                    .chain(recorded)
-                    .find(|q| q.pid == p.ppid && q.start_time <= p.start_time)
-                    .map(|q| {
+                // Provenance only from the current table with a start time
+                // that a handle on the parent confirms; else unknown.
+                let parent = parent_of(p, &procs)
+                    .map(|q| (q, t.job_evidence(q.pid, q.start_time)))
+                    .filter(|(_, job)| job.get("error").is_none())
+                    .map_or(json!("unknown"), |(q, job)| {
                         json!({"pid": q.pid, "name": q.name, "start_time": q.start_time,
-                               "in_membership": members.contains(&q.pid),
-                               "job": t.job_evidence(q.pid, q.start_time)})
+                               "in_membership": members.contains(&q.pid), "job": job})
                     });
                 let delta = p.start_time as i128 - self.child_start as i128;
                 json!({"pid": p.pid, "name": p.name, "ppid": p.ppid, "parent": parent,
@@ -399,6 +412,29 @@ pub fn owned_by(
         }
     }
     out
+}
+
+/// Pre-stop liveness of a recorded identity and its evidence: read from
+/// the handle opened on it at the job census when there is one (`dead`:
+/// that handle's signalled state; an exited member reads dead, never
+/// unknown), else from the process table.
+pub fn pre_liveness(
+    dead: Option<Option<bool>>,
+    table: impl FnOnce() -> Option<bool>,
+) -> (Option<bool>, &'static str) {
+    match dead {
+        Some(d) => (d.map(|d| !d), "member_handle"),
+        None => (table(), "process_table"),
+    }
+}
+
+/// `p`'s parent in the current table: the row for its ppid with a known
+/// start time no later than `p`'s (a pid reused after `p` started, or one
+/// with an unreadable start time, is no parent).
+pub fn parent_of<'a>(p: &ProcInfo, procs: &'a [ProcInfo]) -> Option<&'a ProcInfo> {
+    procs
+        .iter()
+        .find(|q| q.pid == p.ppid && q.start_time != 0 && q.start_time <= p.start_time)
 }
 
 /// A job member's identity as read from a handle opened on it.
@@ -1111,6 +1147,46 @@ mod tests {
         assert!(matches!(o, Outcome::HarnessFail { .. }), "{o:?}");
         p["terminate_job_ok"] = json!(true);
         assert_eq!(kill_proof_outcome(&p, Some((10, 1))), Outcome::Pass);
+    }
+
+    /// A recorded member's pre-stop liveness comes from the handle opened at
+    /// the census, never from a fresh table read: one that exited since
+    /// reads dead (not unknown). Without a handle the table decides.
+    #[test]
+    fn member_liveness_comes_from_its_handle() {
+        let table = || -> Option<bool> { panic!("table read for a member with a handle") };
+        assert_eq!(
+            pre_liveness(Some(Some(true)), table),
+            (Some(false), "member_handle")
+        );
+        assert_eq!(
+            pre_liveness(Some(Some(false)), table),
+            (Some(true), "member_handle")
+        );
+        assert_eq!(pre_liveness(None, || None), (None, "process_table"));
+    }
+
+    /// Parent provenance only from a current row with a known start time
+    /// no later than the child's.
+    #[test]
+    fn parent_needs_a_known_earlier_identity() {
+        let row = |pid, ppid, start_time| ProcInfo {
+            pid,
+            ppid,
+            pgid: None,
+            sid: None,
+            start_time,
+            name: String::new(),
+            zombie: false,
+        };
+        let child = row(20, 10, 100);
+        assert_eq!(
+            parent_of(&child, &[row(10, 1, 50)]).map(|q| q.pid),
+            Some(10)
+        );
+        assert!(parent_of(&child, &[row(10, 1, 0)]).is_none());
+        assert!(parent_of(&child, &[row(10, 1, 150)]).is_none());
+        assert!(parent_of(&child, &[]).is_none());
     }
 
     /// A member that joined after the membership snapshot is covered only
