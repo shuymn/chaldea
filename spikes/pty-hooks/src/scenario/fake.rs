@@ -2084,8 +2084,9 @@ pub struct InjectRun {
     /// Around the measured launch only (after the warm-up).
     pub handles_before: Option<u32>,
     pub handles_after: Option<u32>,
-    /// The discarded warm-up launch: its handle counts, spawn error, branch.
-    pub warmup: Option<Value>,
+    /// The warm-up launch, measured the same way; it must reach its
+    /// milestone and clean up, and its handle delta is not compared.
+    pub warmup: Option<Box<InjectRun>>,
     /// `force-suspended`: the spawn-tree roles that had to attest.
     pub roles: Vec<String>,
     /// `(role, pid, start time)` of every attested FakeCli process.
@@ -2133,6 +2134,28 @@ pub fn raw_inject_outcome(r: &InjectRun) -> Outcome {
     let (Some(before), Some(after)) = (r.handles_before, r.handles_after) else {
         return Outcome::harness("handle count unavailable");
     };
+    if let Some(w) = &r.warmup {
+        let o = launch_outcome(w);
+        if o != Outcome::Pass {
+            return Outcome::harness(format!(
+                "warm-up: {}",
+                o.cause().unwrap_or_else(|| o.tag().into())
+            ));
+        }
+    }
+    let o = launch_outcome(r);
+    if o != Outcome::Pass {
+        return o;
+    }
+    if after > before {
+        return Outcome::platform(format!("handle count {after} > {before} before launch"));
+    }
+    Outcome::Pass
+}
+
+/// Every F-2c rule except the handle count: milestone, kill proof,
+/// survivors, and teardown.
+fn launch_outcome(r: &InjectRun) -> Outcome {
     if r.inject == "force-suspended" {
         if let Some(e) = &r.spawn_error {
             return Outcome::platform(format!("suspended branch failed: {e}"));
@@ -2230,9 +2253,6 @@ pub fn raw_inject_outcome(r: &InjectRun) -> Outcome {
     }
     if t["drain_reached_eof"] != json!(true) && t["host_read_end_closed"] != json!(true) {
         return Outcome::platform("output neither drained to EOF nor its read end closed");
-    }
-    if after > before {
-        return Outcome::platform(format!("handle count {after} > {before} before launch"));
     }
     Outcome::Pass
 }
@@ -2360,30 +2380,45 @@ fn raw_inject(ctx: &Ctx) {
         extra.push("--emit-output");
     }
     // Warm-up: the same injected path once, so one-time initialization in
-    // this process (modules, thread pools) is not counted as a leak. Its
-    // handle delta is recorded and discarded.
-    let warm_from = crate::session::spawned_children().len();
-    let warm_before = os::process_handle_count();
-    let warm = inject_launch(ctx, "raw-inject-warmup", &extra, &roles);
-    let warm_children = crate::session::spawned_children().split_off(warm_from);
-    let end = Instant::now() + Duration::from_secs(3);
-    while warm_children
-        .iter()
-        .any(|&(p, st)| os::liveness(p, st) != Some(false))
-        && Instant::now() < end
-    {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let warmup = json!({"handles_before": warm_before, "handles_after": os::process_handle_count(),
-        "spawn_error": warm.spawn_error, "branch": warm.branch,
-        "survivors": warm.stop.as_ref().map(|s| json!(s.survivors))});
-    let measured_from = crate::session::spawned_children().len();
+    // this process (modules, thread pools) is not counted as a leak. It is
+    // measured like the case (milestone, teardown, survivors) and must have
+    // reached its milestone and cleaned up; its handle delta is discarded.
+    let (warm, warm_tree, warm_stop) =
+        measure_inject(ctx, &inject, "raw-inject-warmup", &extra, &roles);
+    let (mut r, tree, stop_report) = measure_inject(ctx, &inject, "raw-inject", &extra, &roles);
+    r.warmup = Some(Box::new(warm));
+    let o = raw_inject_outcome(&r);
+    let ids = |t: &[(u32, u64)]| {
+        t.iter()
+            .map(|(p, s)| json!({"pid": p, "start_time": s}))
+            .collect::<Vec<_>>()
+    };
+    ctx.check(
+        "F-2c",
+        &inject,
+        o,
+        json!({"run": r, "tree": ids(&tree), "stop": stop_report.as_ref().map(stop_evidence),
+               "warmup_tree": ids(&warm_tree),
+               "warmup_stop": warm_stop.as_ref().map(stop_evidence)}),
+    );
+}
+
+/// One measured F-2c launch: handle counts around it, its teardown record
+/// and roots (read before any later launch), its process tree and
+/// survivors, and its stop report.
+fn measure_inject(
+    ctx: &Ctx,
+    inject: &str,
+    label: &str,
+    extra: &[&str],
+    roles: &[String],
+) -> (InjectRun, Vec<(u32, u64)>, Option<StopReport>) {
+    let from = crate::session::spawned_children().len();
     let mut r = InjectRun {
-        inject: inject.clone(),
+        inject: inject.to_string(),
         handles_before: os::process_handle_count(),
-        warmup: Some(warmup),
         roles: if inject == "force-suspended" {
-            roles.clone()
+            roles.to_vec()
         } else {
             Vec::new()
         },
@@ -2391,12 +2426,12 @@ fn raw_inject(ctx: &Ctx) {
     };
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sampler = sample_procs(stop.clone());
-    let measured = inject_launch(ctx, "raw-inject", &extra, &roles);
-    r.spawn_error = measured.spawn_error;
-    r.branch = measured.branch;
-    r.witnesses = measured.witnesses;
-    r.kill_proof = measured.stop.as_ref().and_then(|s| s.kill_proof.clone());
-    let stop_report = measured.stop;
+    let launched = inject_launch(ctx, label, extra, roles);
+    r.spawn_error = launched.spawn_error;
+    r.branch = launched.branch;
+    r.witnesses = launched.witnesses;
+    r.kill_proof = launched.stop.as_ref().and_then(|s| s.kill_proof.clone());
+    let stop_report = launched.stop;
     r.teardown = os::raw_last_teardown();
     if inject == "reader-start"
         && let Some(t) = r.teardown.as_mut()
@@ -2404,12 +2439,9 @@ fn raw_inject(ctx: &Ctx) {
         // The reader failed after the spawn: the master's teardown record
         // has no child, so its identity is the session's spawned child and
         // its exit is read (pid and start time) once the session is gone.
-        reader_start_child(
-            t,
-            &crate::session::spawned_children().split_off(measured_from),
-        );
+        reader_start_child(t, &crate::session::spawned_children().split_off(from));
     }
-    let mut roots = crate::session::spawned_children().split_off(measured_from);
+    let mut roots = crate::session::spawned_children().split_off(from);
     if let Some(t) = &r.teardown
         && let (Some(p), Some(st)) = (t["child_pid"].as_u64(), t["child_start"].as_u64())
     {
@@ -2448,14 +2480,7 @@ fn raw_inject(ctx: &Ctx) {
     if let Some(st) = &stop_report {
         r.survivors.extend(st.survivors.iter().map(|p| json!(p)));
     }
-    let o = raw_inject_outcome(&r);
-    ctx.check(
-        "F-2c",
-        &inject,
-        o,
-        json!({"run": r, "tree": tree.iter().map(|(p, s)| json!({"pid": p, "start_time": s})).collect::<Vec<_>>(),
-               "stop": stop_report.as_ref().map(stop_evidence)}),
-    );
+    (r, tree, stop_report)
 }
 
 // ---------------- all ----------------
@@ -2888,11 +2913,30 @@ mod tests {
         // The Windows run's one-time 80 -> 91 lands in the discarded warm-up;
         // only the measured launch's counts decide.
         let mut r = base("before-spawn");
-        r.warmup = Some(json!({"handles_before": 80, "handles_after": 91}));
+        let mut warm = base("before-spawn");
+        (warm.handles_before, warm.handles_after) = (Some(80), Some(91));
+        r.warmup = Some(Box::new(warm));
         (r.handles_before, r.handles_after) = (Some(91), Some(91));
         assert_eq!(raw_inject_outcome(&r), Outcome::Pass);
         r.handles_after = Some(92);
         assert!(matches!(raw_inject_outcome(&r), PlatformFail { .. }));
+        // The warm-up must itself reach its milestone and clean up: a
+        // retained process that did not exit, a survivor, a hung close, or
+        // a missed milestone is a harness failure of the case.
+        for spoil in [
+            (|w: &mut InjectRun| w.teardown.as_mut().unwrap()["process_exit"] = json!("timeout"))
+                as fn(&mut InjectRun),
+            |w| w.survivors = vec![json!({"pid": 1})],
+            |w| w.teardown.as_mut().unwrap()["close_hung"] = json!(true),
+            |w| w.spawn_error = None,
+        ] {
+            let mut r = base("after-spawn");
+            let mut warm = base("after-spawn");
+            spoil(&mut warm);
+            r.warmup = Some(Box::new(warm));
+            let o = raw_inject_outcome(&r);
+            assert!(matches!(o, Outcome::HarnessFail { .. }), "{o:?}");
+        }
         let mut r = base("resume-fail");
         r.teardown = Some(at("resume-fail", 9000, true));
         assert!(matches!(raw_inject_outcome(&r), PlatformFail { .. }));
