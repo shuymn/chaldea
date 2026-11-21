@@ -1998,7 +1998,12 @@ pub fn print_launch(args: &Args) -> i32 {
             )
         };
         for (i, cwd) in cwds.iter().enumerate() {
-            println!("pre-trust {}/{}: {name} in {}", i + 1, cwds.len(), cwd.display());
+            println!(
+                "pre-trust {}/{}: {name} in {}",
+                i + 1,
+                cwds.len(),
+                cwd.display()
+            );
             println!("  {approve}");
             let res = std::fs::create_dir_all(cwd)
                 .map_err(|e| format!("{}: {e}", cwd.display()))
