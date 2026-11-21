@@ -55,7 +55,8 @@ impl Report {
             scenario: scenario.into(),
             run_id: run_id.into(),
             status: "running".into(),
-            host: json!({"os": crate::os::os_name(), "os_version": crate::os::os_version()}),
+            host: json!({"os": crate::os::os_name(), "os_version": crate::os::os_version(),
+                         "os_build": crate::os::os_build()}),
             config: json!({}),
             details: json!({}),
             ..Default::default()

@@ -230,7 +230,9 @@ impl Owned {
 
     /// Evidence only (the verdict rule is unchanged): for each live pre-stop
     /// descendant not in `members`, its ppid, the parent's image, start time
-    /// and job membership, `IsProcessInJob` against our job and any job, and
+    /// and job membership, `IsProcessInJob` against our job and any job, its
+    /// image path and package identity (`os::process_identity`; a foreign
+    /// job's limits are never queried), and
     /// its start relative to the launched child's (Windows FILETIME, so
     /// 100 ns units; job trees are Windows only).
     fn outside_job(
@@ -257,7 +259,9 @@ impl Owned {
                     });
                 let delta = p.start_time as i128 - self.child_start as i128;
                 json!({"pid": p.pid, "name": p.name, "ppid": p.ppid, "parent": parent,
+                       "start_time": p.start_time,
                        "job": t.job_evidence(p.pid, p.start_time),
+                       "identity": os::process_identity(p.pid, p.start_time),
                        "start_after_child_ms": (delta / 10_000) as i64})
             })
             .collect()

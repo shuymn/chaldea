@@ -2075,9 +2075,56 @@ fn tree_kill(ctx: &Ctx, a: &Agent) {
             "A-8",
             &proof_case,
             o,
-            json!({"kill_proof": proof, "witness": w, "launch": fin["stop"]["launch"]}),
+            json!({"kill_proof": proof, "witness": w, "launch": fin["stop"]["launch"],
+                   "outside_job_identity":
+                       outside_job_correlation(&proof["outside_job"], &fin["receiver"]["events"])}),
         );
     }
+}
+
+/// A4 (evidence only): for each outside-job process, its identity, the
+/// hook invocations whose emitter ancestry names it (pid and image name),
+/// and the cause statement: resolved only when package identity is present
+/// (alias / MSIX activation); otherwise "identity recorded, cause
+/// unresolved". A creation path is never inferred from ancestry.
+pub fn outside_job_correlation(outside: &Value, events: &Value) -> Value {
+    let empty = Vec::new();
+    let evs = events.as_array().unwrap_or(&empty);
+    let rows: Vec<Value> = outside
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|o| {
+            let pid = o["pid"].as_u64();
+            let name = o["name"].as_str().unwrap_or("").to_ascii_lowercase();
+            let hooks: Vec<Value> = evs
+                .iter()
+                .filter_map(|e| {
+                    let chain = e["ancestry"].as_array()?;
+                    let at = chain.iter().position(|a| {
+                        a[0].as_u64() == pid
+                            && a[1]
+                                .as_str()
+                                .is_some_and(|n| n.to_ascii_lowercase() == name)
+                    })?;
+                    Some(
+                        json!({"seq": e["seq"], "event": e["event"], "class": e["class"],
+                                "ancestry_index": at}),
+                    )
+                })
+                .collect();
+            let package = &o["identity"]["package_full_name"];
+            let cause = match package.as_str() {
+                Some(p) if p != "none" => {
+                    "resolved: package identity present (alias/MSIX activation)"
+                }
+                _ => "identity recorded, cause unresolved",
+            };
+            json!({"pid": o["pid"], "name": o["name"], "identity": o["identity"],
+                   "hooks": hooks, "cause": cause})
+        })
+        .collect();
+    json!(rows)
 }
 
 // ---------------- print-launch ----------------
@@ -2768,6 +2815,35 @@ trusted_hash = "sha256:bb"
         assert_eq!(tab_outcome(&with("列1"), 2, want), "submitted_early");
         assert_eq!(tab_outcome(&with("列1    列2"), 2, want), "other");
         assert_eq!(tab_outcome(&with(want)[..1], 2, want), "other");
+    }
+
+    /// A4: an outside-job shell is correlated with the hook whose emitter
+    /// ancestry names it (pid and name, case-insensitive); the cause is
+    /// resolved only with package identity.
+    #[test]
+    fn outside_job_is_correlated_with_its_hook() {
+        let outside = json!([
+            {"pid": 19224, "name": "pwsh.exe",
+             "identity": {"image": "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+                          "package_full_name": "none"}},
+            {"pid": 77, "name": "pwsh.exe",
+             "identity": {"package_full_name": "Microsoft.PowerShell_7.5.4.0_x64__8wekyb3d8bbwe"}},
+        ]);
+        let events = json!([
+            {"seq": 1, "event": "SessionStart", "class": "bound",
+             "ancestry": [[63820, "chs-hook-emit.exe"], [19224, "PWSH.EXE"], [89300, "codex.exe"]]},
+            {"seq": 2, "event": "Stop", "class": "bound",
+             "ancestry": [[1, "chs-hook-emit.exe"], [19224, "cmd.exe"]]},
+        ]);
+        let r = outside_job_correlation(&outside, &events);
+        assert_eq!(
+            r[0]["hooks"],
+            json!([{"seq": 1, "event": "SessionStart", "class": "bound", "ancestry_index": 1}])
+        );
+        assert_eq!(r[0]["cause"], json!("identity recorded, cause unresolved"));
+        assert_eq!(r[1]["hooks"], json!([]));
+        assert!(r[1]["cause"].as_str().unwrap().starts_with("resolved"));
+        assert_eq!(outside_job_correlation(&Value::Null, &events), json!([]));
     }
 
     /// `--f1-entries` keeps corpus order and recorded entries.
