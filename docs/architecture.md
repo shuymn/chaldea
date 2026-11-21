@@ -45,7 +45,7 @@
 
 ## 5. External Quirks (Observed Facts)
 
-Observed on macOS with Claude Code 2.1.322 and Codex CLI 0.170.0 (spike evidence: `docs/spikes/pty-hooks-spike.md`).
+Observed on macOS with Claude Code 2.1.322 and Codex CLI 0.170.0, and on native Windows (inbox ConPTY, console code page 932) with Claude Code 2.1.326 and Codex CLI 0.169.0 where marked (spike evidence: `docs/spikes/pty-hooks-spike.md` §3).
 
 - **Claude Code**:
   - New folder trust prompt defaults to `No, exit` — never blindly send `Enter`.
@@ -58,7 +58,11 @@ Observed on macOS with Claude Code 2.1.322 and Codex CLI 0.170.0 (spike evidence
   - Hooks passed via `-c hooks.<Event>=[…]` (source `<session-flags>`) are trusted once and persisted in `config.toml` under `/<session-flags>/config.toml:<event>:<group>:<index>`. The key does not depend on cwd, so the same trust covers every worktree. Changing the command string retriggers `Hooks need review`, so hook command strings must stay fixed while per-session URL/token/thread ID pass via environment variables, which reach the hook process. Trust may need renewal after a Codex upgrade.
   - Without `--no-daemon`, the CLI attaches to a shared, long-lived `codex app-server` daemon, whose version can differ from the CLI's. Session MCP servers then run as children of that daemon, outside the PTY process tree, and survive `stop`. The adapter must launch Codex with `--no-daemon`.
   - `transcript_path` can be `null`.
-- **`portable-pty`**: Pin `=0.8.1`; `0.9.0` enables `PSEUDOCONSOLE_INHERIT_CURSOR` on Windows ConPTY which stalls input until `ESC[6n]` is answered.
+- **`portable-pty`**: Pin `=0.8.1`; `0.9.0` enables `PSEUDOCONSOLE_INHERIT_CURSOR` on Windows ConPTY which stalls input until `ESC[6n]` is answered. On Windows, 0.8.1 fixes the ConPTY flags at `RESIZE_QUIRK | WIN32_INPUT_MODE`, loads a bare `conpty.dll` through the DLL search path, inverts the result of `kill` (returns `Err` on success), and offers no job list or suspended start, so its child can spawn descendants before a job is assigned (assign-after race escapees observed). Whether Windows keeps portable-pty (vendored and patched) or gets its own `windows-sys` backend is decided by the spike's F-2 run.
+- **Windows process tree**: `PROC_THREAD_ATTRIBUTE_JOB_LIST` together with `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` in one `CreateProcessW` puts the child in a kill-on-close job from creation (zero escapees, FakeCli only so far). Job kill left no survivors from real Claude Code and Codex trees (26 and 13 descendants, MCP servers included).
+- **Windows inbox conhost (ConPTY)**: answers DSR 5/6 and DA1/DA2 itself, swallows OSC 10/11 queries, and forwards the kitty keyboard query to the host. A reply conhost writes can land inside a bracketed paste body. It loses an escape sequence split across two host writes, so every sequence goes out in one write. It buffered a 64 KiB paste to a child that stopped reading without blocking the writer.
+- **Claude Code on Windows** (2.1.326): bracketed paste over ConPTY delivers Japanese, astral, combining, and multi-line prompts intact.
+- **Codex CLI on Windows** (0.169.0): it clears `ENABLE_VIRTUAL_TERMINAL_INPUT` and reads Win32 key records, so bracketed paste never arrives as a paste: CR newlines submit each line as its own turn, LF newlines are dropped, and combining marks are lost. Input to Codex on Windows needs a per-adapter encoding chosen by the adapter capability table, not by `?2004h` (candidate under test: NFC text, newline as `ESC[13;2u` in one write, which Codex reassembles into Shift+Enter, Enter after a delay). Composer triggers apply to typed input: a leading `/`, `!`, or `?` and an `@` token at the cursor change how the input is handled, and Tab queues the message. Without `--no-daemon`, Codex on Windows ran `node.exe` / `node_repl.exe` inside the launched tree, and no separate warm server was found.
 - **Windows MSVC**: `link.exe` fails (`LNK1104`) on paths exceeding 260 characters; worktree base path must be configurable per workspace.
 
 ## 6. Verification Strategy
