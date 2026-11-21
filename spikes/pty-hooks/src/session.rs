@@ -134,7 +134,8 @@ impl Owned {
     /// descendant list, each identity's liveness, one membership snapshot,
     /// and a retained handle on every live identity (positive death evidence
     /// after the stop). The census gaps are recorded: the final scan's error,
-    /// job members with no recorded identity, and live identities whose
+    /// job members whose current identity (pid + start time) is not a
+    /// recorded one, and live identities whose
     /// handle could not be retained.
     fn proof_before(&self, scan: Result<(), String>) -> Option<(Value, Vec<Retained>)> {
         let tree = self.tree.lock().unwrap_or_else(|e| e.into_inner());
@@ -157,6 +158,10 @@ impl Owned {
             .iter()
             .map(|p| (p.pid, p.start_time))
             .collect();
+        // A fresh lookup of each member's identity; a failed read leaves
+        // every member unverified.
+        let procs = os::list_processes().unwrap_or_default();
+        let now = |pid: u32| procs.iter().find(|p| p.pid == pid).map(|p| p.start_time);
         let open_failed: Vec<u32> = retained
             .iter()
             .filter(|(_, _, h)| h.is_none())
@@ -165,7 +170,7 @@ impl Owned {
         let mut proof = json!({"pre_stop": pre, "membership": match &membership {
             Ok(m) => json!(m), Err(e) => json!({"error": e}) },
             "scan_error": scan.err(),
-            "unreconciled_members": membership.as_ref().map(|m| unreconciled(m, &ids)).unwrap_or_default(),
+            "unreconciled_members": membership.as_ref().map(|m| unreconciled(m, now, &ids)).unwrap_or_default(),
             "retained_open_failed": open_failed});
         if t.describe()["assign"] == json!("after_spawn") {
             proof["known_limit"] = json!(
@@ -331,12 +336,19 @@ pub fn owned_by(
     out
 }
 
-/// Job members with no recorded identity (pid) before the stop.
-pub fn unreconciled(members: &[u32], recorded: &[(u32, u64)]) -> Vec<u32> {
+/// Job members with no recorded identity before the stop: a member
+/// reconciles only when `now` (a fresh lookup of its pid's start time)
+/// yields a nonzero start time recorded with that pid, so a reused pid or
+/// one without a verified current identity stays unreconciled.
+pub fn unreconciled(
+    members: &[u32],
+    now: impl Fn(u32) -> Option<u64>,
+    recorded: &[(u32, u64)],
+) -> Vec<u32> {
     members
         .iter()
         .copied()
-        .filter(|m| !recorded.iter().any(|(pid, _)| pid == m))
+        .filter(|&m| !now(m).is_some_and(|st| st != 0 && recorded.contains(&(m, st))))
         .collect()
 }
 
@@ -1003,7 +1015,26 @@ mod tests {
             let o = kill_proof_outcome(&p, Some((10, 1)));
             assert!(matches!(o, Outcome::HarnessFail { .. }), "{k}: {o:?}");
         }
-        assert_eq!(unreconciled(&[10, 11, 12], &[(10, 1), (12, 3)]), vec![11]);
+    }
+
+    /// M1 (r3): a job member reconciles only by identity: its pid's fresh
+    /// start time must match a recorded identity. A reused pid (recorded
+    /// with another start time), a pid with no current identity, and a
+    /// start time of 0 stay unreconciled.
+    #[test]
+    fn job_census_reconciles_by_identity() {
+        let now = |pid: u32| match pid {
+            10 => Some(1),
+            11 => Some(9),
+            13 => Some(0),
+            _ => None,
+        };
+        let recorded = [(10, 1), (11, 5), (12, 3), (13, 0)];
+        assert_eq!(
+            unreconciled(&[10, 11, 12, 13], now, &recorded),
+            vec![11, 12, 13]
+        );
+        assert!(unreconciled(&[10], now, &recorded).is_empty());
     }
 
     /// §4.8 `backend` kill proof as a case outcome.
