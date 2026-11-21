@@ -21,7 +21,7 @@ Canonical design reference: `docs/architecture.md`.
    - **PTY Seam**: Encapsulate all OS differences (macOS POSIX PTY / Windows ConPTY) inside `crates/pty-runtime` behind `PtyRuntime` trait, using `portable-pty =0.8.1` on macOS/Unix and an own `windows-sys` ConPTY backend on Windows (child joins the kill-on-close job at creation via `PROC_THREAD_ATTRIBUTE_JOB_LIST`), `alacritty_terminal` headless VT responder, process-tree cleanup (Job Object / `setsid`+pgid), and crash-only `--resume` recovery.
 4. **Japanese IME is Mandatory**:
    - Use plain `<textarea>` (never `contenteditable`) for prompt inputs; guard `isComposing`, `keyCode === 229`, and post-`compositionend` Enter.
-   - Preserve UTF-8 multi-byte Japanese text across Bracketed Paste on both macOS and Windows ConPTY, and handle wide-char widths in `alacritty_terminal` snapshots.
+   - Deliver prompts intact (the prompt the CLI records equals the prompt sent, Japanese and emoji included) through each adapter's input encoding: Bracketed Paste for CLIs that read VT input, keyed input for Codex on Windows (it reads Win32 key records); handle wide-char widths in `alacritty_terminal` snapshots.
 5. **Security**:
    - Localhost HTTP endpoints require Bearer token + `Host` header validation.
    - Separate regular session tokens from Rescue tokens, and browser CF Access auth from host Service Tokens.
