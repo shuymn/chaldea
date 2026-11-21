@@ -84,6 +84,12 @@ pub fn run(mut args: Args) -> i32 {
             }
         },
     };
+    let budget = match sub.as_str() {
+        "console" => console_budget(&console_configs(&args)),
+        // Step 5 waits for the detached step 4 run to end.
+        "f2-verdict" => console_budget(&F2_CONFIGS.map(String::from)) + 2 * CHILD_MARGIN + 120,
+        _ => budget,
+    };
     if !args.explicit_deadline {
         args.deadline_secs = budget;
     }
@@ -2011,7 +2017,24 @@ fn f2_verdict(ctx: &Ctx) {
         crate::report::read_report(&d.join("report.json"))
             .ok_or_else(|| format!("{}: no readable report.json", d.display()))
     };
-    let (v, why, sel, ev) = match (read(0), read(1)) {
+    // The detached step 4 run writes its report only when it ends.
+    let step4 = match ctx.args.from.get(1) {
+        None => Err("needs --from <step 3 dir> --from <step 4 dir>".to_string()),
+        Some(d) => wait_final_report(
+            d,
+            ctx.cutoff,
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+            |m| println!("{m}"),
+        ),
+    };
+    if let Err(e) = &step4 {
+        println!("f2-verdict: {e}");
+        ctx.detail("from", json!(ctx.args.from));
+        ctx.error(format!("step 4 report: {e}"));
+        return;
+    }
+    let (v, why, sel, ev) = match (read(0), step4) {
         (Ok(s3), Ok(s4)) => {
             let (v, sel, ev) = f2_evaluate(&s3, &s4);
             (v, format!("selected: {sel:?}"), sel, ev)
@@ -2483,6 +2506,27 @@ pub fn gui_mitigation(name: &str) -> bool {
 /// The pre-trusted, unattended matrix for one configuration (no attended
 /// steps): Claude and Codex `--no-daemon` under every configuration; under
 /// `P` also Codex default mode and fake paste.
+/// Budget of one console matrix launch.
+fn console_launch_budget(name: &str) -> u64 {
+    if name == "claude-hooks" { 600 } else { 900 }
+}
+
+/// How long the detached survival step waits for the owner's attach-client.
+const SURVIVAL_WAIT: Duration = Duration::from_secs(1800);
+
+/// A console run's budget over `configs`, so a run in which every wait
+/// ends at its bound fits: the survival fixture's start, both
+/// calibrations, every matrix launch (and its GUI-emitter rerun where one
+/// applies), and the survival wait.
+pub fn console_budget(configs: &[String]) -> u64 {
+    let matrix: u64 = configs
+        .iter()
+        .flat_map(|c| console_names(c))
+        .map(|n| (console_launch_budget(n) + CHILD_MARGIN) * (1 + gui_mitigation(n) as u64))
+        .sum();
+    120 + 2 * (15 + CHILD_MARGIN) + matrix + SURVIVAL_WAIT.as_secs() + 60
+}
+
 fn console_matrix(ctx: &Ctx, config: &str) -> Vec<(&'static str, Vec<String>, u64)> {
     let cwd = ctx
         .args
@@ -2501,7 +2545,7 @@ fn console_matrix(ctx: &Ctx, config: &str) -> Vec<(&'static str, Vec<String>, u6
         (
             "claude-hooks",
             v(&["real", "claude-hooks", "--cwd", &cwd]),
-            600,
+            console_launch_budget("claude-hooks"),
         ),
         (
             "codex-hooks-no-daemon",
@@ -2513,7 +2557,7 @@ fn console_matrix(ctx: &Ctx, config: &str) -> Vec<(&'static str, Vec<String>, u6
                 "--cwd",
                 &cwd,
             ]),
-            900,
+            console_launch_budget("codex-hooks-no-daemon"),
         ),
     ];
     if config == "P" {
@@ -2527,12 +2571,12 @@ fn console_matrix(ctx: &Ctx, config: &str) -> Vec<(&'static str, Vec<String>, u6
                 "--cwd",
                 &cwd,
             ]),
-            900,
+            console_launch_budget("codex-hooks-default"),
         ));
         m.push((
             "fake-paste",
             v(&["fake", "paste", "--paste-newline", "cr"]),
-            900,
+            console_launch_budget("fake-paste"),
         ));
     }
     m
@@ -2609,6 +2653,16 @@ pub fn detached_child_argv(a: &Args, out: &Path, run_id: &str) -> Vec<String> {
     v
 }
 
+/// Applies `f` to the detached run's handoff and rewrites it.
+fn publish(ctx: &Ctx, h: &mut Option<Handoff>, f: impl FnOnce(&mut Handoff)) {
+    if let Some(h) = h {
+        f(h);
+        if let Err(e) = write_handoff(h) {
+            ctx.error(format!("handoff not written: {e}"));
+        }
+    }
+}
+
 fn probe_console(ctx: &Ctx) {
     if ctx.args.detached && std::env::var("CHS_DETACHED_CHILD").is_err() {
         return relaunch_detached(ctx);
@@ -2630,6 +2684,41 @@ fn probe_console(ctx: &Ctx) {
         },
         json!({"detached": detached, "console_window_present": console_window}),
     );
+    // Detached: the survival fixture starts before anything is observed, so
+    // its attach URL (or why there is none) is published at once; the
+    // launching process tells the owner to close the terminal only after
+    // the matrix (`close_step_lines`).
+    let mut hand = detached.then(|| Handoff {
+        run_id: ctx.run_id.clone(),
+        report_dir: ctx.out.clone(),
+        phase: "starting the survival fixture".into(),
+        deadline_unix_ms: unix_ms()
+            + ctx
+                .cutoff
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64
+            + 10_000,
+        ..Default::default()
+    });
+    publish(ctx, &mut hand, |_| {});
+    let attach = detached.then(|| {
+        let mut cred = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut cred);
+        let credential = if cred.trim().is_empty() {
+            util::token()
+        } else {
+            cred.trim().to_string()
+        };
+        start_attachable(ctx, credential)
+    });
+    publish(ctx, &mut hand, |h| {
+        match &attach {
+            Some(Ok((_, base, _))) => h.url = Some(base.clone()),
+            Some(Err(e)) => h.error = Some(e.clone()),
+            None => {}
+        }
+        h.phase = "calibration".into();
+    });
     let tree = PpidRecorder::start();
     // Calibration: a helper of ours shows its own top-level window inside an
     // observation job, with the observer armed first (deliberately visible).
@@ -2670,8 +2759,14 @@ fn probe_console(ctx: &Ctx) {
         json!({"helper": helper, "flash": f.json()}),
     );
     let mut launches = serde_json::Map::new();
+    let total: usize = configs.iter().map(|c| console_names(c).len()).sum();
+    let mut i = 0;
     for cfg in &configs {
         for (name, argv, budget) in console_matrix(ctx, cfg) {
+            i += 1;
+            publish(ctx, &mut hand, |h| {
+                h.phase = format!("matrix {i}/{total}: {cfg}/{name}")
+            });
             let (r, f) = observed_child(
                 ctx,
                 &tree,
@@ -2727,9 +2822,14 @@ fn probe_console(ctx: &Ctx) {
             launches.insert(format!("{cfg}/{name}"), entry);
         }
     }
-    if detached {
-        let (o, ev) = terminal_close_survival(ctx);
+    publish(ctx, &mut hand, |h| {
+        h.matrix_done = true;
+        h.phase = "survival: waiting for attach-client".into();
+    });
+    if let Some(a) = attach {
+        let (o, ev) = terminal_close_survival(ctx, a);
         pc.put("survival", o, ev);
+        publish(ctx, &mut hand, |h| h.phase = "writing the report".into());
     } else {
         pc.put(
             "survival",
@@ -2748,6 +2848,200 @@ fn probe_console(ctx: &Ctx) {
                "harness_job": os::self_job_info(), "join_run_id": ctx.args.join_run_id,
                "default_terminal": os::default_terminal_delegation()}),
     );
+}
+
+/// The detached console child's handoff, `<report dir>/handoff.json`,
+/// rewritten atomically as it advances: published before the matrix with
+/// the attach URL (or why there is none), then the phase, and
+/// `matrix_done` once every observed launch has ended.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Handoff {
+    pub run_id: String,
+    pub report_dir: PathBuf,
+    pub url: Option<String>,
+    pub error: Option<String>,
+    pub phase: String,
+    pub matrix_done: bool,
+    /// The child's hard deadline (its report is written by then).
+    pub deadline_unix_ms: u64,
+}
+
+const HANDOFF: &str = "handoff.json";
+
+/// How long the launching process waits for the detached child's attach
+/// URL (published before the matrix, after the survival fixture started).
+const ATTACH_URL_WAIT: Duration = Duration::from_secs(120);
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// `Instant` for a wall-clock time in unix milliseconds.
+fn instant_at(unix: u64) -> Instant {
+    Instant::now() + Duration::from_millis(unix.saturating_sub(unix_ms()))
+}
+
+/// Writes the handoff (retried briefly: a reader holding the file open can
+/// make the rename fail on Windows).
+pub fn write_handoff(h: &Handoff) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(h).unwrap_or_default();
+    let mut last = String::new();
+    for _ in 0..20 {
+        match util::write_atomic(&h.report_dir.join(HANDOFF), &bytes) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e.to_string(),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(last)
+}
+
+pub fn read_handoff(dir: &Path) -> Option<Handoff> {
+    serde_json::from_slice(&std::fs::read(dir.join(HANDOFF)).ok()?).ok()
+}
+
+/// Polls `f` every `poll` until it yields or `end` passes; calls `progress`
+/// every `every` meanwhile.
+fn poll_until<T>(
+    end: Instant,
+    poll: Duration,
+    every: Duration,
+    mut f: impl FnMut() -> Option<T>,
+    mut progress: impl FnMut(),
+) -> Option<T> {
+    let mut next = Instant::now() + every;
+    loop {
+        if let Some(v) = f() {
+            return Some(v);
+        }
+        let now = Instant::now();
+        if now >= end {
+            return None;
+        }
+        if now >= next {
+            progress();
+            next = now + every;
+        }
+        std::thread::sleep(poll.min(end - now));
+    }
+}
+
+/// The attach URL the detached child published for this run (its run id
+/// and report dir), validated as a local probe URL; or why there is none.
+pub fn await_attach_url(dir: &Path, run_id: &str, end: Instant) -> Result<String, String> {
+    let h = poll_until(
+        end,
+        Duration::from_millis(200),
+        Duration::from_secs(3600),
+        || {
+            read_handoff(dir)
+                .filter(|h| h.run_id == run_id && (h.url.is_some() || h.error.is_some()))
+        },
+        || {},
+    )
+    .ok_or("the detached run published no attach URL in time")?;
+    if h.report_dir != dir {
+        return Err(format!(
+            "handoff names report dir {}",
+            h.report_dir.display()
+        ));
+    }
+    match (h.url, h.error) {
+        (Some(u), _) if parse_local_url(&u, "/probe").is_some() => Ok(u),
+        (Some(u), _) => Err(format!("invalid attach URL {u:?}")),
+        (None, e) => Err(e.unwrap_or_default()),
+    }
+}
+
+/// The terminal-close step the launching process prints: only with a
+/// valid attach URL and once the observation matrix has ended (a terminal
+/// opened during an observed launch would be an `ambiguous` window);
+/// otherwise why not and how to proceed.
+pub fn close_step_lines(
+    exe: &Path,
+    url: &Result<String, String>,
+    matrix_done: bool,
+    cred: &str,
+) -> Vec<String> {
+    match (url, matrix_done) {
+        (Err(e), _) => vec![
+            format!("no attach URL from the detached run: {e}"),
+            "do not close this terminal for the survival check (C-5 survival stays not_exercised);"
+                .into(),
+            "run step 5 below; it waits for the detached report.".into(),
+        ],
+        (Ok(_), false) => vec![
+            "the observation matrix did not finish by its deadline; do not close this terminal;"
+                .into(),
+            "run step 5 below; it waits for the detached report.".into(),
+        ],
+        (Ok(u), true) => {
+            let client: Vec<String> = ["win-probe", "attach-client", "--confirm-close", "--url"]
+                .iter()
+                .map(|s| s.to_string())
+                .chain([u.clone()])
+                .collect();
+            vec![
+                "now close this terminal, open a new one, and run:".into(),
+                format!("  {}", ps_invocation(exe, &client)),
+                format!("then paste this credential on its stdin: {cred}"),
+                "when it has reported, run step 5 below.".into(),
+            ]
+        }
+    }
+}
+
+/// Step 5's wait for the detached run's final report: `report.json`
+/// (written once, when the run ends) in the step 4 dir, polled until the
+/// deadline its handoff names (capped at `cap`), with progress. A dir with
+/// neither a report nor a handoff, or a report of another run, is refused.
+pub fn wait_final_report(
+    dir: &Path,
+    cap: Instant,
+    poll: Duration,
+    every: Duration,
+    mut progress: impl FnMut(&str),
+) -> Result<Report, String> {
+    let path = dir.join("report.json");
+    let first = read_handoff(dir);
+    if first.is_none() && !path.exists() {
+        return Err(format!(
+            "{}: neither a report nor a detached-run handoff",
+            dir.display()
+        ));
+    }
+    let end = first.as_ref().map_or(cap, |h| {
+        instant_at(h.deadline_unix_ms + CHILD_MARGIN * 1000).min(cap)
+    });
+    let r = poll_until(
+        end,
+        poll,
+        every,
+        || crate::report::read_report(&path),
+        || {
+            let phase = read_handoff(dir).map(|h| h.phase).unwrap_or_default();
+            let left = end.saturating_duration_since(Instant::now()).as_secs() / 60;
+            progress(&format!(
+                "waiting for the step 4 report ({phase}); at most {left} min left"
+            ));
+        },
+    )
+    .ok_or_else(|| {
+        format!(
+            "the step 4 report did not appear in {} by its deadline; nothing was evaluated; \
+             rerun f2-verdict once the detached run has written report.json",
+            dir.display()
+        )
+    })?;
+    match first {
+        Some(h) if h.run_id != r.run_id => Err(format!(
+            "report run id {} is not the detached run's {}",
+            r.run_id, h.run_id
+        )),
+        _ => Ok(r),
+    }
 }
 
 /// Relaunches the harness detached into a report dir allocated here, and
@@ -2774,19 +3068,12 @@ fn relaunch_detached(ctx: &Ctx) {
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let url_file = ctx.out.join("attach-url.txt");
-    cmd.env("CHS_ATTACH_URL_FILE", &url_file);
     ctx.detail("step4_report_dir", json!(child_dir));
     match os::spawn_detached(&mut cmd) {
         Ok((mut c, breakaway)) => {
             if let Some(mut si) = c.stdin.take() {
                 let _ = writeln!(si, "{cred}");
             }
-            let end = ctx.until(Duration::from_secs(900));
-            while !url_file.exists() && Instant::now() < end {
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            let url = std::fs::read_to_string(&url_file).unwrap_or_default();
             println!(
                 "detached harness pid {} (breakaway {})",
                 c.id(),
@@ -2794,15 +3081,6 @@ fn relaunch_detached(ctx: &Ctx) {
             );
             println!("step 4 report dir (f2-verdict --from), run id {child_id}:");
             println!("  {}", child_dir.display());
-            println!("now close this terminal, open a new one, and run:");
-            let client: Vec<String> = ["win-probe", "attach-client", "--confirm-close", "--url"]
-                .iter()
-                .map(|s| s.to_string())
-                .chain([url.trim().to_string()])
-                .collect();
-            println!("  {}", ps_invocation(&exe, &client));
-            println!("then paste this credential on its stdin: {cred}");
-            println!("when it has reported, step 5:");
             let verdict: Vec<String> = [
                 "win-probe".to_string(),
                 "f2-verdict".into(),
@@ -2812,13 +3090,42 @@ fn relaunch_detached(ctx: &Ctx) {
                 child_dir.display().to_string(),
             ]
             .into();
-            println!("  {}", ps_invocation(&exe, &verdict));
+            let step5 = format!("  {}", ps_invocation(&exe, &verdict));
+            // The child publishes its attach URL before the matrix.
+            let url = await_attach_url(&child_dir, &child_id, ctx.until(ATTACH_URL_WAIT));
+            let matrix_done = url.is_ok() && {
+                println!(
+                    "the detached run is observing launches; leave the machine idle and keep \
+                     this terminal open until told (progress every minute)"
+                );
+                let end = read_handoff(&child_dir).map_or(ctx.cutoff, |h| {
+                    instant_at(h.deadline_unix_ms).min(ctx.cutoff)
+                });
+                poll_until(
+                    end,
+                    Duration::from_secs(1),
+                    Duration::from_secs(60),
+                    || read_handoff(&child_dir).filter(|h| h.matrix_done),
+                    || {
+                        let phase = read_handoff(&child_dir)
+                            .map(|h| h.phase)
+                            .unwrap_or_default();
+                        println!("  step 4: {phase}");
+                    },
+                )
+                .is_some()
+            };
+            for line in close_step_lines(&exe, &url, matrix_done, &cred) {
+                println!("{line}");
+            }
+            println!("step 5 (waits for the detached report, then evaluates F-2):");
+            println!("{step5}");
             pc.put(
                 "detached_launch",
                 Outcome::not_exercised("the detached child reports C-5"),
                 json!({"breakaway_permitted": breakaway, "breakaway_denied": !breakaway,
                        "parent_job": os::self_job_info(), "child_report_dir": child_dir,
-                       "child_run_id": child_id}),
+                       "child_run_id": child_id, "attach_url": url, "matrix_done": matrix_done}),
             );
         }
         Err(e) => pc.put(
@@ -2833,28 +3140,21 @@ fn relaunch_detached(ctx: &Ctx) {
 /// Detached child: FakeCli `attachable` waits for an owner-confirmed terminal
 /// close (`/probe/confirm`) and then a fresh nonce from the same child. A
 /// platform failure needs positive death evidence for that child.
-fn terminal_close_survival(ctx: &Ctx) -> (Outcome, Value) {
-    let mut cred = String::new();
-    let _ = std::io::stdin().lock().read_line(&mut cred);
-    let credential = if cred.trim().is_empty() {
-        util::token()
-    } else {
-        cred.trim().to_string()
-    };
-    let (l, base, p) = match start_attachable(ctx, credential) {
+fn terminal_close_survival(
+    ctx: &Ctx,
+    started: Result<(super::Launch, String, Arc<AttachProbe>), String>,
+) -> (Outcome, Value) {
+    let (l, _, p) = match started {
         Ok(v) => v,
         Err(e) => return (Outcome::harness(e.clone()), json!({"error": e})),
     };
-    if let Ok(f) = std::env::var("CHS_ATTACH_URL_FILE") {
-        let _ = std::fs::write(Path::new(&f), &base);
-    }
     let start_time = p
         .witnesses
         .witnesses()
         .iter()
         .find(|w| w.role == "attachable" && w.pid == p.child_pid)
         .map(|w| w.start_time);
-    let end = ctx.until(Duration::from_secs(1800));
+    let end = ctx.until(SURVIVAL_WAIT);
     // The nonce must come from a request that started after the confirmation.
     let after_confirm = |log: &[Value], c: u64| {
         log.iter().any(|v| {
@@ -3450,6 +3750,129 @@ mod tests {
         ] {
             assert_eq!(gui_mitigation(n), !n.starts_with("codex"), "{n}");
         }
+    }
+
+    fn handoff_dir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("chs-handoff-test-{}", util::run_id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn handoff(dir: &Path, url: Option<&str>, deadline_ms: u64) -> Handoff {
+        Handoff {
+            run_id: "r4".into(),
+            report_dir: dir.to_path_buf(),
+            url: url.map(String::from),
+            phase: "matrix 1/7".into(),
+            deadline_unix_ms: unix_ms() + deadline_ms,
+            ..Default::default()
+        }
+    }
+
+    /// H2: the attach URL published after the parent started waiting is
+    /// still taken; none in time is an error, never an empty URL.
+    #[test]
+    fn late_attach_url_is_taken() {
+        let d = handoff_dir();
+        let h = handoff(&d, Some("http://127.0.0.1:4321/probe"), 60_000);
+        let w = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            write_handoff(&h).unwrap();
+        });
+        let end = Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            await_attach_url(&d, "r4", end),
+            Ok("http://127.0.0.1:4321/probe".into())
+        );
+        w.join().unwrap();
+        let other = handoff_dir();
+        let e = await_attach_url(&other, "r4", Instant::now() + Duration::from_millis(300));
+        assert!(e.is_err(), "{e:?}");
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// H2: the terminal-close instruction is printed only with a valid URL
+    /// and after the matrix; otherwise the owner is told how to proceed.
+    #[test]
+    fn close_step_needs_a_url_and_the_matrix() {
+        let exe = Path::new(r"C:\chs\t\release\chs.exe");
+        let url: Result<String, String> = Ok("http://127.0.0.1:4321/probe".into());
+        let has_close = |l: &[String]| l.iter().any(|l| l.contains("close this terminal,"));
+        let ok = close_step_lines(exe, &url, true, "c");
+        assert!(has_close(&ok), "{ok:?}");
+        assert!(
+            ok.iter()
+                .any(|l| l.contains("--url http://127.0.0.1:4321/probe"))
+        );
+        let none = close_step_lines(exe, &Err("no URL".into()), true, "c");
+        assert!(!has_close(&none), "{none:?}");
+        assert!(none.iter().any(|l| l.contains("step 5")), "{none:?}");
+        assert!(!none.iter().any(|l| l.contains("--url")), "{none:?}");
+        assert!(!has_close(&close_step_lines(exe, &url, false, "c")));
+    }
+
+    /// H2: step 5 waits for the detached run's final report (it is written
+    /// only when the run ends) and evaluates it once it appears.
+    #[test]
+    fn final_report_appearing_during_the_wait_is_read() {
+        let d = handoff_dir();
+        write_handoff(&handoff(&d, Some("http://127.0.0.1:1/probe"), 60_000)).unwrap();
+        let path = d.join("report.json");
+        let w = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            let r = Report::new("win-probe console", "r4");
+            util::write_atomic(&path, &serde_json::to_vec(&r).unwrap()).unwrap();
+        });
+        let mut ticks = 0;
+        let r = wait_final_report(
+            &d,
+            Instant::now() + Duration::from_secs(10),
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+            |_| ticks += 1,
+        );
+        w.join().unwrap();
+        assert_eq!(r.map(|r| r.run_id), Ok("r4".into()));
+        assert!(ticks > 0, "progress was printed");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// H2: a report still absent at the handoff's deadline is reported as
+    /// such, within that deadline (no verdict is persisted from it).
+    #[test]
+    fn absent_final_report_is_an_error_at_the_deadline() {
+        let d = handoff_dir();
+        let mut h = handoff(&d, None, 0);
+        h.deadline_unix_ms = unix_ms().saturating_sub(CHILD_MARGIN * 1000) + 300;
+        write_handoff(&h).unwrap();
+        let t = Instant::now();
+        let r = wait_final_report(
+            &d,
+            Instant::now() + Duration::from_secs(10),
+            Duration::from_millis(20),
+            Duration::from_secs(60),
+            |_| {},
+        );
+        assert!(
+            r.as_ref().is_err_and(|e| e.contains("did not appear")),
+            "{:?}",
+            r.map(|r| r.run_id)
+        );
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        let empty = handoff_dir();
+        assert!(
+            wait_final_report(
+                &empty,
+                Instant::now(),
+                Duration::ZERO,
+                Duration::ZERO,
+                |_| {}
+            )
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     /// H2: F-2 needs C-5's detached and observer-health cases (calibration
