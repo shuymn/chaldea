@@ -1260,27 +1260,48 @@ pub struct KeysSend {
     pub write_ms: u64,
     pub completed: bool,
     pub settled: bool,
+    /// The input and its CR were written and reported complete (`sent`).
+    pub write_completed: bool,
+    /// The planned observation window (from the write's return to
+    /// `window` or the slot's end, whichever came first) in milliseconds.
+    pub window_ms: u64,
+    /// The wait ran to the end of the planned window without the run's
+    /// hard cutoff cutting it short (set when the evidence did not end it
+    /// earlier).
+    pub window_elapsed: bool,
 }
 
+/// Sends one case and waits for its hooks. The planned observation window
+/// ends at `window` after the write returns or at `slot_end`, whichever is
+/// first; the run's `hard` cutoff can cut it short (then it did not
+/// elapse). The settle may run into the slot's teardown reserve.
+#[allow(clippy::too_many_arguments)]
 pub fn send_keys_case(
     type_keys: impl FnOnce() -> paste::Outcome,
     now_ms: impl Fn() -> u64,
     events: impl Fn() -> Vec<KeyEvent>,
     fence: u64,
     window: Duration,
-    cutoff: Instant,
+    slot_end: Instant,
+    hard: Instant,
     settle: Duration,
 ) -> KeysSend {
     let sent = type_keys();
     let write_ms = now_ms();
     // The fixture's wait starts once the write has returned.
-    let end = (Instant::now() + window).min(cutoff);
+    let t = Instant::now();
+    let planned = (t + window).min(slot_end);
+    let end = planned.min(hard);
+    let elapsed = || planned <= hard && Instant::now() >= planned;
     let mut r = KeysSend {
         state: sent.state.clone(),
+        write_completed: sent.state == "sent",
         sent,
         write_ms,
         completed: false,
         settled: false,
+        window_ms: planned.saturating_duration_since(t).as_millis() as u64,
+        window_elapsed: false,
     };
     if !submit_may_have_reached(&r.sent) {
         return r;
@@ -1292,6 +1313,7 @@ pub fn send_keys_case(
         first_bound_after(&events(), "UserPromptSubmit", fence).map(|u| u.turn_id.clone())
     else {
         r.state = "unconfirmed".into();
+        r.window_elapsed = elapsed();
         return r;
     };
     r.state = "acked".into();
@@ -1301,10 +1323,55 @@ pub fn send_keys_case(
                 .iter()
                 .any(|e| e.bound && e.event == "Stop" && e.seq > fence && e.turn_id == turn)
         });
-    let left = cutoff.saturating_duration_since(Instant::now());
+    if !r.completed {
+        r.window_elapsed = elapsed();
+    }
+    let settle_end = hard.min(slot_end + settle);
+    let left = settle_end.saturating_duration_since(Instant::now());
     std::thread::sleep(settle.min(left));
     r.settled = left >= settle;
     r
+}
+
+/// A case whose write completed and whose planned observation window fully
+/// elapsed with no `UserPromptSubmit` is an observed no-submit (the
+/// control outcome phase 3b recorded); skipped, cut-short, or
+/// uncertain-write cases are not.
+pub fn no_submit_observed(result: &str, ev: &Value) -> bool {
+    let b = &ev["base"];
+    result == "missing"
+        && ev["ack"] == json!("missing")
+        && b["write_completed"] == json!(true)
+        && b["window_elapsed"] == json!(true)
+}
+
+/// The send's state and observation flags for a case's `base` evidence.
+pub fn send_flags(s: Option<&KeysSend>) -> Value {
+    json!({"send_state": s.map(|s| s.state.clone()),
+           "write_completed": s.is_some_and(|s| s.write_completed),
+           "window_ms": s.map(|s| s.window_ms),
+           "window_elapsed": s.is_some_and(|s| s.window_elapsed)})
+}
+
+/// The oracle for a case whose input may have reached the CLI (`None`
+/// otherwise): ack, fidelity and completion from the drained events, a
+/// pass cut by the run cutoff's settle downgraded.
+pub fn keys_sent_outcome(
+    send: &KeysSend,
+    evs: &[KeyEvent],
+    fence: u64,
+    text: &str,
+    allow: &[Lossy],
+) -> Option<(Outcome, Value)> {
+    if !submit_may_have_reached(&send.sent) {
+        return None;
+    }
+    let expected = paste::expected_win_keys(text, allow);
+    let (o, mut ev) = win_keys_case(evs, fence, &expected, Some(send.write_ms));
+    if allow.contains(&Lossy::Tab) && text.contains('\t') {
+        ev["tab_outcome"] = json!(tab_outcome(evs, fence, &expected));
+    }
+    Some((keys_settled(o, send.settled), ev))
 }
 
 /// The input and its CR were written, or the CR write may have reached
@@ -1519,16 +1586,12 @@ fn keys_case_run(
             || l.receiver.events().iter().map(KeyEvent::of).collect(),
             f,
             KEYS_FIXTURE,
-            // The settle may use part of the slot's teardown reserve.
-            ctx.cutoff.min(end + KEYS_SETTLE),
+            end,
+            ctx.cutoff,
             KEYS_SETTLE,
         ));
     }
     let completed = send.as_ref().is_some_and(|s| s.completed);
-    let settled = send.as_ref().is_some_and(|s| s.settled);
-    let write_ms = send.as_ref().map(|s| s.write_ms);
-    let send_state = send.as_ref().map(|s| s.state.clone());
-    let sent = send.map(|s| s.sent);
     // The screen as it was when the case ended, for a case that did not
     // complete (taken before the session stops).
     let snap = match snap {
@@ -1542,13 +1605,16 @@ fn keys_case_run(
         &format!("launch-{label}"),
         json!({"stop": stop, "receiver": fin["receiver"], "query_log": q}),
     );
-    let base = json!({"latency_ms": ms, "snapshot": snap, "newline_key": newline.name(),
-                      "allow_lossy": allow, "paste": sent, "bootstrap_stop_seq": fence,
-                      "send_state": send_state,
+    let mut base = json!({"latency_ms": ms, "snapshot": snap, "newline_key": newline.name(),
+                      "allow_lossy": allow, "paste": send.as_ref().map(|s| &s.sent),
+                      "bootstrap_stop_seq": fence,
                       "unicode_records": ctx.args.unicode_records.name(),
                       "codex_paste_burst": ctx.args.codex_paste_burst.name(),
                       "launch_branch": stop.launch.get("branch"),
                       "observed_on": format!("codex {}, source session-flags, mode no-daemon", a.version)});
+    if let (Value::Object(b), Value::Object(f)) = (&mut base, send_flags(send.as_ref())) {
+        b.extend(f);
+    }
     let (o, mut ev) = if final_ambiguous(&fin) {
         (
             Outcome::not_exercised("binding became ambiguous"),
@@ -1562,29 +1628,28 @@ fn keys_case_run(
             json!({}),
         )
     } else {
-        match sent.as_ref() {
-            Some(o) if submit_may_have_reached(o) => {
-                let evs: Vec<KeyEvent> = events.iter().map(KeyEvent::of).collect();
-                let expected = paste::expected_win_keys(&e.text, allow);
-                let (o, mut ev) = win_keys_case(&evs, fence.unwrap_or(0), &expected, write_ms);
-                if allow.contains(&Lossy::Tab) && e.text.contains('\t') {
-                    ev["tab_outcome"] = json!(tab_outcome(&evs, fence.unwrap_or(0), &expected));
+        let evs: Vec<KeyEvent> = events.iter().map(KeyEvent::of).collect();
+        let sent = send.as_ref().map(|s| &s.sent);
+        match send
+            .as_ref()
+            .and_then(|s| keys_sent_outcome(s, &evs, fence.unwrap_or(0), &e.text, allow))
+        {
+            Some(r) => r,
+            None => match sent {
+                Some(o)
+                    if o.state == "rejected"
+                        && o.detail
+                            .as_deref()
+                            .is_some_and(|d| d.starts_with("lossy_input")) =>
+                {
+                    (
+                        Outcome::not_exercised("lossy_input rejected (F-1d)"),
+                        json!({}),
+                    )
                 }
-                (keys_settled(o, settled), ev)
-            }
-            Some(o)
-                if o.state == "rejected"
-                    && o.detail
-                        .as_deref()
-                        .is_some_and(|d| d.starts_with("lossy_input")) =>
-            {
-                (
-                    Outcome::not_exercised("lossy_input rejected (F-1d)"),
-                    json!({}),
-                )
-            }
-            Some(o) => (unsent(o), json!({})),
-            None => (Outcome::harness("nothing sent"), json!({})),
+                Some(o) => (unsent(o), json!({})),
+                None => (Outcome::harness("nothing sent"), json!({})),
+            },
         }
     };
     ev["base"] = base;
@@ -2887,6 +2952,7 @@ trusted_hash = "sha256:bb"
             || events.clone(),
             2,
             wait,
+            Instant::now() + Duration::from_secs(60),
             Instant::now() + Duration::from_secs(5),
             Duration::from_millis(1),
         );
@@ -2972,6 +3038,7 @@ trusted_hash = "sha256:bb"
             || evs.clone(),
             2,
             Duration::from_millis(50),
+            now + Duration::from_secs(60),
             now,
             Duration::from_secs(5),
         );
@@ -3028,6 +3095,7 @@ trusted_hash = "sha256:bb"
             events,
             2,
             window,
+            Instant::now() + Duration::from_secs(60),
             Instant::now() + Duration::from_secs(10),
             Duration::from_millis(1),
         );

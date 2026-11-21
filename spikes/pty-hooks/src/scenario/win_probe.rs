@@ -2174,19 +2174,27 @@ fn row_summary(entry: &str, c: &Check) -> Value {
            "changes": e["base"]["paste"]["changes"]})
 }
 
-/// A comparison arm's row (H1): an explicit result, passed or an observed
-/// platform failure, satisfies the arm (`pass`, the arm's own result in
-/// the evidence); a child that did not run, an absent row, or an
-/// incomplete row (harness failure, not exercised, missing) keeps the
+/// A comparison arm's row (H1): an explicit result satisfies the arm
+/// (`pass`, the arm's own result in the evidence): passed, an observed
+/// platform failure, or an observed no-submit (`missing` after a completed
+/// write and a fully elapsed observation window). A child that did not
+/// run, an absent row, or an incomplete row (harness failure, not
+/// exercised, a skipped, cut-short or uncertain-write `missing`) keeps the
 /// question inconclusive.
 fn arm_outcome(r: &ChildRep, c: Option<&Check>) -> (Option<Outcome>, Value) {
     match (r, c) {
         (Err(e), _) => (Some(Outcome::harness(e.clone())), Value::Null),
         (Ok(_), None) => (None, Value::Null),
-        (Ok(_), Some(c)) if c.result == "pass" || c.result == "platform_fail" => (
-            Some(Outcome::Pass),
-            json!({"arm_result": c.result, "arm_cause": c.cause, "evidence": c.evidence}),
-        ),
+        (Ok(_), Some(c))
+            if c.result == "pass"
+                || c.result == "platform_fail"
+                || super::real::no_submit_observed(&c.result, &c.evidence) =>
+        {
+            (
+                Some(Outcome::Pass),
+                json!({"arm_result": c.result, "arm_cause": c.cause, "evidence": c.evidence}),
+            )
+        }
         (Ok(_), Some(c)) => (Some(Outcome::from_check(c)), c.evidence.clone()),
     }
 }
@@ -4202,6 +4210,93 @@ mod tests {
             }
         }
         assert_eq!(p3c_verdict(&ran, "P3c-submit").0, "fail_observed");
+    }
+
+    /// H1: a burst-on control whose write completed and whose window
+    /// elapsed with no submit, as the real child oracle reports it, is an
+    /// observed arm result; the same case cut short by the hard cutoff, or
+    /// with an uncertain CR write, is not.
+    #[test]
+    fn observed_no_submit_is_an_arm_result() {
+        use super::super::real::{self as r, KeyEvent};
+        let boot = |seq, event: &str| KeyEvent {
+            seq,
+            event: event.into(),
+            bound: true,
+            prompt: None,
+            received_ms: seq,
+            turn_id: Some("boot".into()),
+        };
+        let evs = vec![
+            boot(1, "SessionStart"),
+            boot(2, "UserPromptSubmit"),
+            boot(3, "Stop"),
+        ];
+        let text = paste::corpus_f()
+            .into_iter()
+            .find(|e| e.id == "long_multiline")
+            .unwrap()
+            .text;
+        // The child's case: the send, then the oracle on the drained events.
+        let child_case = |state: &str, hard: Duration| {
+            let sent = paste::Outcome {
+                state: state.into(),
+                rejected: None,
+                bytes_before: 0,
+                bytes_after: 1,
+                detail: None,
+                lossy: Vec::new(),
+                changes: Vec::new(),
+            };
+            let now = Instant::now();
+            let send = r::send_keys_case(
+                || sent,
+                || 10,
+                || evs.clone(),
+                3,
+                Duration::from_millis(50),
+                now + Duration::from_secs(60),
+                now + hard,
+                Duration::ZERO,
+            );
+            let (o, mut ev) = r::keys_sent_outcome(&send, &evs, 3, &text, &[]).unwrap();
+            ev["base"] = r::send_flags(Some(&send));
+            let mut rep = Report::new("x", "00000000");
+            rep.check(
+                "A-6",
+                &r::keys_case("codex", NewlineKey::W32, "long_multiline"),
+                o,
+                ev,
+            );
+            rep.checks.pop().unwrap()
+        };
+        let with_on1 = |c: Check| {
+            let mut ran = p3c_complete();
+            for (s, rep, _) in ran.iter_mut() {
+                if s.name == "p3c-control-on-1"
+                    && let Ok(rep) = rep
+                {
+                    rep.checks.retain(|k| k.case != c.case);
+                    rep.checks.push(c.clone());
+                }
+            }
+            p3c_verdict(&ran, "P3c-submit")
+        };
+        let observed = child_case("sent", Duration::from_secs(60));
+        assert_eq!(observed.result, "missing");
+        assert_eq!(observed.evidence["base"]["write_completed"], true);
+        assert_eq!(observed.evidence["base"]["window_elapsed"], true);
+        let (v, why) = with_on1(observed);
+        assert_eq!(v, "go", "{why}");
+        // Cut short by the hard cutoff: inconclusive.
+        let cut = child_case("sent", Duration::from_millis(10));
+        assert_eq!(cut.result, "missing");
+        assert_eq!(cut.evidence["base"]["window_elapsed"], false);
+        assert_eq!(with_on1(cut).0, "inconclusive");
+        // An uncertain CR write: inconclusive.
+        let unsure = child_case("unconfirmed", Duration::from_secs(60));
+        assert_eq!(unsure.evidence["base"]["write_completed"], false);
+        assert_eq!(with_on1(unsure).0, "inconclusive");
     }
 
     /// Phase 3c (A6): run order, R0 on every step, explicit burst and
