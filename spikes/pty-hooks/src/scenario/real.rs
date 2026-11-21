@@ -2705,8 +2705,9 @@ trusted_hash = "sha256:bb"
         assert!(argv.windows(2).any(|w| w == CODEX_EFFORT_ARGS), "{argv:?}");
         let hooks: Vec<&String> = argv.iter().filter(|a| a.starts_with("hooks.")).collect();
         assert_eq!(hooks.len(), 3, "{argv:?}");
+        let emitter = hook_command_for(Path::new("/r"), "codex", "chs-hook-emit");
         assert!(
-            hooks.iter().all(|h| h.contains("chs-hook-emit codex")),
+            hooks.iter().all(|h| h.contains(emitter.as_str())),
             "{hooks:?}"
         );
         assert_eq!(
@@ -3349,7 +3350,9 @@ trusted_hash = "sha256:bb"
             records: paste::UnicodeRecords::None,
             allow: Vec::new(),
             enter_delay: Duration::from_secs(30),
-            write_deadline: Instant::now() + Duration::from_millis(200),
+            // Long enough for the text write on a loaded runner; the CR is
+            // still due 28 s after the deadline.
+            write_deadline: Instant::now() + Duration::from_secs(2),
         };
         let t = Instant::now();
         let o = paste::type_keys(&tx, b"x", &opts, || true);

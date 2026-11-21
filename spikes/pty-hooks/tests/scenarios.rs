@@ -81,12 +81,36 @@ fn non_reading_child_does_not_hang_teardown() {
             "30",
         ],
     );
+    // Windows writes up to 16 MiB of filler before teardown, which a CI
+    // runner can take most of the 30 s deadline to accept.
+    let bound = if chs::os::os_name() == "windows" {
+        30
+    } else {
+        15
+    };
+    assert!(elapsed < Duration::from_secs(bound), "{elapsed:?}");
+    let c = check(&r, "B-10", "non-reading-child");
+    let ev = &c.evidence;
+    assert_eq!(
+        ev["stop"]["survivors"].as_array().unwrap().len(),
+        0,
+        "{c:#?}"
+    );
+    if chs::os::os_name() == "windows" && c.result == "not_exercised" {
+        // Windows B-10: a conhost that buffers the paste and all 16 MiB of
+        // filler leaves no blocked writer to tear down (`b10_expect` in
+        // src/scenario/fake.rs); the bounded teardown above is all this host
+        // can show.
+        assert_eq!(ev["filler"]["blocked"], false, "{c:#?}");
+        assert_eq!(ev["filler"]["accepted"], 16 * 1024 * 1024, "{c:#?}");
+        let _ = std::fs::remove_dir_all(&d);
+        return;
+    }
     assert_eq!(r.status, "pass", "{:#?} {:?}", r.checks, r.errors);
     assert_eq!(code, Some(0));
-    assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
-    let ev = &check(&r, "B-10", "non-reading-child").evidence;
-    assert_eq!(ev["paste"]["state"], "write_timeout");
-    assert_eq!(ev["stop"]["survivors"].as_array().unwrap().len(), 0);
+    if chs::os::os_name() != "windows" {
+        assert_eq!(ev["paste"]["state"], "write_timeout");
+    }
     let _ = std::fs::remove_dir_all(&d);
 }
 

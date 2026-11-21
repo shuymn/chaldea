@@ -1,0 +1,19 @@
+name: Lint GitHub Actions workflow
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/**
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/**
+
+jobs:
+  lint:
+    permissions:
+      contents: read
+    uses: shuymn/github-actions/.github/workflows/gha.yml@6a2c5e22ebc4808a9409bd93490320af3f400d1a # main
