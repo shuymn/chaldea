@@ -2836,17 +2836,43 @@ pub fn keys_run_outcome(
     }
 }
 
+/// The fields of each win32-input-mode record `ESC[Vk;Sc;Uc;Kd;Cs;Rc_` in
+/// `bytes`, in order (`None` for anything else).
+pub fn w32_records(bytes: &[u8]) -> Option<Vec<[u32; 6]>> {
+    let s = std::str::from_utf8(bytes).ok()?;
+    s.split_terminator('_')
+        .map(|r| {
+            let v: Vec<u32> = r
+                .strip_prefix("\x1b[")?
+                .split(';')
+                .map(|f| f.parse().ok())
+                .collect::<Option<_>>()?;
+            v.try_into().ok()
+        })
+        .collect()
+}
+
 /// The Shift+Enter control: the key events are exactly the Shift+Return
-/// record pair we wrote (a key-down then a key-up, `VK_RETURN`, `uChar`
-/// CR, Shift held).
+/// record pair we wrote, every field (virtual key, scan code, `uChar`,
+/// key-down/up, control state, repeat count) as written.
 pub fn shift_enter_exact(report: Option<&Value>) -> bool {
     let events: Vec<os::KeyRecord> = report
         .and_then(|r| serde_json::from_value(r["events"].clone()).ok())
         .unwrap_or_default();
-    let ret = |e: &os::KeyRecord, down| {
-        e.down == down && e.vk == 0x0D && e.uchar == 13 && e.control & 0x10 != 0
-    };
-    matches!(events.as_slice(), [d, u] if ret(d, true) && ret(u, false))
+    let got: Vec<[u32; 6]> = events
+        .iter()
+        .map(|e| {
+            [
+                e.vk.into(),
+                e.scan.into(),
+                e.uchar.into(),
+                e.down.into(),
+                e.control,
+                e.repeat.into(),
+            ]
+        })
+        .collect();
+    w32_records(paste::NewlineKey::W32.bytes()).is_some_and(|want| got == want)
 }
 
 /// A keys-probe case's outcome: a control that did not arrive is a
@@ -3881,17 +3907,32 @@ mod tests {
             let (o, _) = keys_run_outcome(r.as_ref(), true, &[0x31F7, 0x309A]);
             assert!(matches!(o, Outcome::HarnessFail { .. }), "{r:?}");
         }
-        // The Shift+Enter control needs exactly the record pair.
-        let sd = rec(true, 13, 0x0D, 0x10);
-        let su = rec(false, 13, 0x0D, 0x10);
+        // The Shift+Enter control needs exactly the record pair, every
+        // field as written (`ESC[13;28;13;Kd;16;1_`).
+        let ret = |down| os::KeyRecord {
+            scan: 28,
+            ..rec(down, 13, 0x0D, 0x10)
+        };
+        let (sd, su) = (ret(true), ret(false));
         assert!(shift_enter_exact(healthy(vec![sd, su]).as_ref()));
         assert!(!shift_enter_exact(healthy(vec![sd]).as_ref()));
+        assert!(!shift_enter_exact(healthy(vec![su, sd]).as_ref()));
         assert!(!shift_enter_exact(
             healthy(vec![sd, su, rec(true, 0x61, 0x41, 0)]).as_ref()
         ));
-        assert!(!shift_enter_exact(
-            healthy(vec![rec(true, 13, 0x0D, 0), rec(false, 13, 0x0D, 0)]).as_ref()
-        ));
+        let changed = [
+            |e: &mut os::KeyRecord| e.vk = 0x0C,
+            |e: &mut os::KeyRecord| e.scan = 0,
+            |e: &mut os::KeyRecord| e.uchar = 10,
+            |e: &mut os::KeyRecord| e.control = 0x10 | 0x08,
+            |e: &mut os::KeyRecord| e.control = 0,
+            |e: &mut os::KeyRecord| e.repeat = 2,
+        ];
+        for f in changed {
+            let mut d = sd;
+            f(&mut d);
+            assert!(!shift_enter_exact(healthy(vec![d, su]).as_ref()), "{d:?}");
+        }
         // M4: the Codex arm's bytes: the base as UTF-8, the mark as records,
         // the escape spaces included.
         let (wire, carried) = codex_marks_wire("\u{31F7}\u{309A}");

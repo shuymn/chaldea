@@ -1063,7 +1063,7 @@ pub fn show_calibration_window(
 /// with a deadline before each `ReadConsoleInputW`, so an empty queue never
 /// blocks, and records every `KEY_EVENT` in order.
 pub fn read_console_keys(ms: u64, ready: &dyn Fn()) -> serde_json::Value {
-    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Console::{
         GetConsoleOutputCP, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW,
     };
@@ -1096,8 +1096,17 @@ pub fn read_console_keys(ms: u64, ready: &dyn Fn()) -> serde_json::Value {
             if left == 0 {
                 break;
             }
-            if WaitForSingleObject(hin, left) != WAIT_OBJECT_0 {
-                continue;
+            match WaitForSingleObject(hin, left) {
+                WAIT_OBJECT_0 => {}
+                // A failed wait is a capture error, never an empty queue.
+                WAIT_FAILED => {
+                    errors.push(format!(
+                        "WaitForSingleObject: {}",
+                        io::Error::last_os_error()
+                    ));
+                    break;
+                }
+                _ => continue,
             }
             let mut buf: [INPUT_RECORD; 64] = std::mem::zeroed();
             let mut n = 0u32;
