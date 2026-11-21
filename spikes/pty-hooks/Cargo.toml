@@ -3,6 +3,7 @@ name = "chs"
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "MIT OR Apache-2.0"
 description = "PTY / hooks spike harness (docs/spikes/pty-hooks-spike.md)"
 
 # Standalone project outside any future workspace.
