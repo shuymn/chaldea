@@ -1,0 +1,126 @@
+name: Check mise tools
+
+# Install every tool from mise.lock and run the ones a pull request changes on
+# each platform in lockfile_platforms. No other check reads mise.lock, so
+# without this the daily mise-update PR would merge tools that were never
+# installed or run. The jobs are required checks, so they run on every pull
+# request and pass at once when no mise file changed.
+
+on:
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  mise-lock:
+    name: mise-lock (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - ubuntu-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Select changed tools
+        id: changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -eu
+          git rev-parse --verify --quiet "${BASE_SHA:?}^{commit}" >/dev/null
+          if git diff --quiet "$BASE_SHA" HEAD -- mise.toml mise.lock .github/workflows/mise-lock.yml; then
+            echo "No mise file changed"
+            echo "run=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Run every tool when the config or this check changes; otherwise only
+          # the tools whose [[tools.<name>]] entries differ from the base.
+          if ! git diff --quiet "$BASE_SHA" HEAD -- mise.toml .github/workflows/mise-lock.yml ||
+            ! git show "$BASE_SHA:mise.lock" >"$RUNNER_TEMP/base.lock" 2>/dev/null; then
+            : >"$RUNNER_TEMP/base.lock"
+          fi
+          # Windows runners provide python, not python3.
+          python=python3
+          if [ "$RUNNER_OS" = Windows ]; then
+            python=python
+          fi
+          "$python" - "$RUNNER_TEMP/base.lock" mise.lock "$RUNNER_TEMP/changed" <<'EOF'
+          import sys, tomllib
+          base, head = (tomllib.load(open(p, "rb")).get("tools", {}) for p in sys.argv[1:3])
+          with open(sys.argv[3], "w", newline="\n") as out:
+              out.writelines(f"{name}\n" for name in sorted(head) if head[name] != base.get(name))
+          EOF
+          echo "Changed tools:"
+          cat "$RUNNER_TEMP/changed"
+          echo "run=true" >>"$GITHUB_OUTPUT"
+
+      - uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
+        if: steps.changed.outputs.run == 'true'
+        with:
+          install: false
+          cache: false
+
+      - name: Install and run tools
+        if: steps.changed.outputs.run == 'true'
+        env:
+          MISE_GITHUB_TOKEN: ${{ github.token }}
+          MISE_YES: 1
+        run: |
+          set -eu
+          mise trust mise.toml >/dev/null
+          mise install --locked
+          # mise prints Windows paths; compare them in one form.
+          normalize() {
+            if [ "$RUNNER_OS" = Windows ]; then
+              cygpath -u "$1"
+            else
+              printf '%s\n' "$1"
+            fi
+          }
+          failed=0
+          while IFS= read -r tool; do
+            [ -n "$tool" ] || continue
+            # Commands that start the tool and exit 0; the default is
+            # "<last name segment> --version", which every current tool accepts.
+            case $tool in
+              *) set -- "${tool##*[:/]}" --version ;;
+            esac
+            echo "::group::$tool: $*"
+            # Fail rather than run a same-named command the runner provides.
+            bin=$(mise which "$1" --tool "$tool") || bin=
+            dir=$(mise where "$tool") || dir=
+            if [ -n "$bin" ] && [ -n "$dir" ]; then
+              case $(normalize "$bin") in
+                "$(normalize "$dir")"/*) ;;
+                *) bin= ;;
+              esac
+            else
+              bin=
+            fi
+            if [ -z "$bin" ] || ! mise exec "$tool" -- "$bin" "${@:2}" </dev/null; then
+              echo "::error::$tool: $* failed"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done <"$RUNNER_TEMP/changed"
+          exit "$failed"
