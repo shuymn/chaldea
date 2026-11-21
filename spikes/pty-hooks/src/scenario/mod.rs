@@ -354,7 +354,7 @@ impl Launch {
                 newline,
                 allow: allow.to_vec(),
                 enter_delay: Duration::from_millis(ctx.args.enter_delay_ms),
-                write_deadline: ctx.until(Duration::from_secs(10)),
+                write_deadline: ctx.until(real::KEYS_WRITE),
             },
             ready,
         )

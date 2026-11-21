@@ -39,32 +39,46 @@ const PROBES: &[(&str, u64)] = &[
     ("console", 7200),
 ];
 
-/// Follow-up run (§5 phase 3) probes, outside `all`, with their budgets.
-const F_PROBES: &[(&str, u64)] = &[
-    ("codex-input", CODEX_INPUT_BUDGET),
-    ("backend", BACKEND_BUDGET),
-    ("followup", FOLLOWUP_BUDGET),
-    ("f2-verdict", 120),
+/// Follow-up run (§5 phase 3) probes, outside `all`, with their budgets
+/// from the effective SessionStart timeout.
+/// A probe budget from the effective SessionStart timeout.
+type Budget = fn(u64) -> u64;
+
+const F_PROBES: &[(&str, Budget)] = &[
+    ("codex-input", codex_input_budget),
+    ("backend", backend_budget),
+    ("followup", followup_budget),
+    ("f2-verdict", |_| {
+        // Step 5 waits for the detached step 4 run to end.
+        console_budget(&F2_CONFIGS.map(String::from)) + 2 * CHILD_MARGIN + 120
+    }),
 ];
 
 /// Corpus F: verdict cases and recorded-only fixtures (a test checks both
 /// against `paste::corpus_f`).
 const F1_CASES: u64 = 18;
 const F1_RECORDED: u64 = 3;
-/// One `win_keys` case at its worst-case timing with the default
-/// SessionStart timeout.
-const F1_CASE: u64 = super::real::keys_case_worst_secs(cli::SESSION_START_DEFAULT);
 /// One `real codex-paste` F-1 child (one fresh session per case), sized so
-/// a run in which every case succeeds at its worst-case timing fits.
-const F1_CHILD: u64 = F1_CASES * F1_CASE + CHILD_MARGIN;
-const F1_RECORDED_CHILD: u64 = F1_RECORDED * F1_CASE + CHILD_MARGIN;
-const CODEX_INPUT_BUDGET: u64 = 2 * F1_CHILD + F1_RECORDED_CHILD + 3 * CHILD_MARGIN + 60;
+/// a run in which every case succeeds at its worst-case timing under the
+/// effective SessionStart timeout `sst` fits.
+const fn f1_child(sst: u64) -> u64 {
+    F1_CASES * super::real::keys_case_worst_secs(sst) + CHILD_MARGIN
+}
+const fn f1_recorded_child(sst: u64) -> u64 {
+    F1_RECORDED * super::real::keys_case_worst_secs(sst) + CHILD_MARGIN
+}
+fn codex_input_budget(sst: u64) -> u64 {
+    2 * f1_child(sst) + f1_recorded_child(sst) + 3 * CHILD_MARGIN + 60
+}
 /// Per configuration: the comparison rows; plus the F-2c injections.
-const BACKEND_BUDGET: u64 = 3 * (600 + 900 + 2400 + F1_CHILD + 2 * 600 + 600 + 7 * CHILD_MARGIN)
-    + 5 * (300 + CHILD_MARGIN)
-    + 60;
-const FOLLOWUP_BUDGET: u64 =
-    1800 + CODEX_INPUT_BUDGET + BACKEND_BUDGET + 1800 + 4 * CHILD_MARGIN + 60;
+fn backend_budget(sst: u64) -> u64 {
+    3 * (600 + 900 + 2400 + f1_child(sst) + 2 * 600 + 600 + 7 * CHILD_MARGIN)
+        + 5 * (300 + CHILD_MARGIN)
+        + 60
+}
+fn followup_budget(sst: u64) -> u64 {
+    1800 + codex_input_budget(sst) + backend_budget(sst) + 1800 + 4 * CHILD_MARGIN + 60
+}
 
 /// Margin a parent gives a child beyond the child's own deadline.
 const CHILD_MARGIN: u64 = 30;
@@ -76,8 +90,13 @@ pub fn run(mut args: Args) -> i32 {
     }
     let budget = match sub.as_str() {
         "all" => PROBES.iter().map(|p| p.1 + CHILD_MARGIN).sum::<u64>() + 60,
-        s => match PROBES.iter().chain(F_PROBES).find(|p| p.0 == s) {
-            Some(p) => p.1,
+        s => match PROBES.iter().find(|p| p.0 == s).map(|p| p.1).or_else(|| {
+            F_PROBES
+                .iter()
+                .find(|p| p.0 == s)
+                .map(|p| (p.1)(args.session_start_timeout))
+        }) {
+            Some(b) => b,
             None => {
                 eprintln!("chs win-probe: unknown probe {sub:?}\n{}", cli::USAGE);
                 return 2;
@@ -86,8 +105,6 @@ pub fn run(mut args: Args) -> i32 {
     };
     let budget = match sub.as_str() {
         "console" => console_budget(&console_configs(&args)),
-        // Step 5 waits for the detached step 4 run to end.
-        "f2-verdict" => console_budget(&F2_CONFIGS.map(String::from)) + 2 * CHILD_MARGIN + 120,
         _ => budget,
     };
     if !args.explicit_deadline {
@@ -1466,7 +1483,7 @@ fn probe_codex_input(ctx: &Ctx) {
                 "--newline-key",
                 nk.name(),
             ],
-            F1_CHILD,
+            f1_child(ctx.args.session_start_timeout),
             false,
             &[],
         );
@@ -1498,7 +1515,7 @@ fn probe_codex_input(ctx: &Ctx) {
             "--newline-key",
             rec_key.name(),
         ],
-        F1_RECORDED_CHILD,
+        f1_recorded_child(ctx.args.session_start_timeout),
         false,
         &[],
     );
@@ -1528,7 +1545,7 @@ struct Row {
     ids: &'static [&'static str],
 }
 
-fn backend_rows(winner: Option<NewlineKey>) -> Vec<Row> {
+fn backend_rows(winner: Option<NewlineKey>, sst: u64) -> Vec<Row> {
     let v = |a: &[&str]| Some(a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
     let row = |name, argv, budget, ids| Row {
         name,
@@ -1581,7 +1598,7 @@ fn backend_rows(winner: Option<NewlineKey>) -> Vec<Row> {
                     k.name(),
                 ])
             }),
-            F1_CHILD,
+            f1_child(sst),
             &["A-6"],
         ),
         row(
@@ -1740,7 +1757,7 @@ fn probe_backend(ctx: &Ctx) {
         ctx.args.configs.clone()
     };
     let winner = ctx.args.f1_winner.map(|k| k.name());
-    let rows = backend_rows(ctx.args.f1_winner);
+    let rows = backend_rows(ctx.args.f1_winner, ctx.args.session_start_timeout);
     let mut pc = Pc::new("F-2a");
     for cfg in &configs {
         for row in &rows {
@@ -1830,7 +1847,7 @@ fn followup(ctx: &Ctx) {
         ctx,
         "codex-input",
         &["win-probe", "codex-input"],
-        CODEX_INPUT_BUDGET,
+        codex_input_budget(ctx.args.session_start_timeout),
         false,
         &[],
     );
@@ -1845,7 +1862,7 @@ fn followup(ctx: &Ctx) {
         ctx,
         "backend",
         &["win-probe", "backend", "--f1-winner", w],
-        BACKEND_BUDGET,
+        backend_budget(ctx.args.session_start_timeout),
         false,
         &[],
     );
@@ -1943,7 +1960,7 @@ pub fn ps_invocation(exe: &Path, args: &[String]) -> String {
 /// step 4 the detached run's observer health (detached, calibration, both
 /// controls) and the C-5 observation of Claude and Codex (`--no-daemon`).
 fn f2_required(config: &str) -> Vec<String> {
-    let mut v: Vec<String> = backend_rows(None)
+    let mut v: Vec<String> = backend_rows(None, cli::SESSION_START_DEFAULT)
         .iter()
         .map(|r| verdict::key("F-2a", &format!("{}/{config}", r.name)))
         .collect();
@@ -3428,6 +3445,25 @@ mod tests {
         ));
     }
 
+    /// M4: the F-1 budgets follow the effective SessionStart timeout and
+    /// include the 10 s write bound (one case: SessionStart, bootstrap 120 s,
+    /// write 10 s, fixture 120 s, settle 5 s, launch and teardown 20 s).
+    #[test]
+    fn f1_budget_follows_the_effective_timeout() {
+        for sst in [20, 60, 120] {
+            let case = sst + 120 + 10 + 120 + 5 + 20;
+            let child = f1_child(sst);
+            assert!(
+                child >= F1_CASES * case + CHILD_MARGIN,
+                "sst {sst}: {child}"
+            );
+            assert!(f1_recorded_child(sst) >= F1_RECORDED * case + CHILD_MARGIN);
+            assert!(codex_input_budget(sst) >= 2 * child + f1_recorded_child(sst));
+            assert!(backend_budget(sst) >= 3 * child);
+            assert!(followup_budget(sst) >= codex_input_budget(sst) + backend_budget(sst));
+        }
+    }
+
     /// M1: an F-1 child in which every case succeeds at its worst-case
     /// timing fits the child's budget.
     #[test]
@@ -3436,12 +3472,9 @@ mod tests {
         assert_eq!(n, F1_CASES);
         let recorded = paste::corpus_f().iter().filter(|e| e.recorded).count() as u64;
         assert_eq!(recorded, F1_RECORDED);
-        assert!(F1_RECORDED_CHILD >= recorded * F1_CASE + CHILD_MARGIN);
         let worst = super::super::real::keys_case_worst_secs(20);
-        assert!(
-            F1_CHILD >= n * worst + CHILD_MARGIN,
-            "{n} cases x {worst} s + {CHILD_MARGIN} s > {F1_CHILD} s"
-        );
+        assert!(f1_recorded_child(20) >= recorded * worst + CHILD_MARGIN);
+        assert!(f1_child(20) >= n * worst + CHILD_MARGIN);
     }
 
     /// F-1b selection.

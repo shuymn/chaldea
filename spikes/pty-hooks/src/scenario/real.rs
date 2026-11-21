@@ -1030,16 +1030,31 @@ const KEYS_OVERHEAD: Duration = Duration::from_secs(20);
 const KEYS_BOOTSTRAP: Duration = REAL_STOP_WAIT;
 /// One deadline for the fixture's `UserPromptSubmit` and its turn's `Stop`.
 const KEYS_FIXTURE: Duration = Duration::from_secs(120);
+/// Bound on writing one case's input (the writer's deadline).
+pub const KEYS_WRITE: Duration = Duration::from_secs(10);
 
 /// Worst-case seconds of one `win_keys` case in which every wait succeeds
-/// at its bound: SessionStart, the bootstrap turn, the fixture, the full
-/// settle interval, and launch plus teardown.
+/// at its bound: SessionStart, the bootstrap turn, the input write, the
+/// fixture, the full settle interval, and launch plus teardown.
 pub const fn keys_case_worst_secs(session_start_timeout: u64) -> u64 {
     session_start_timeout
         + KEYS_BOOTSTRAP.as_secs()
+        + KEYS_WRITE.as_secs()
         + KEYS_FIXTURE.as_secs()
         + KEYS_SETTLE.as_secs()
         + KEYS_OVERHEAD.as_secs()
+}
+
+/// The fixture's submit: the first bound event named `event` after the
+/// bootstrap fence.
+pub fn first_bound_after<'a>(
+    events: &'a [KeyEvent],
+    event: &str,
+    fence: u64,
+) -> Option<&'a KeyEvent> {
+    events
+        .iter()
+        .find(|e| e.bound && e.event == event && e.seq > fence)
 }
 
 /// A case decided after a settle interval the cutoff cut short is never a
@@ -1240,8 +1255,12 @@ fn keys_case_run(
         if o.state == "sent" {
             // One deadline for the submit and the Stop of its turn.
             let end = ctx.until(KEYS_FIXTURE);
-            let ups = nth_bound(&l, "UserPromptSubmit", 2, end);
-            let turn = ups.as_ref().map(|u| KeyEvent::of(u).turn_id);
+            let keys =
+                || -> Vec<KeyEvent> { l.receiver.events().iter().map(KeyEvent::of).collect() };
+            wait_until(end, || {
+                first_bound_after(&keys(), "UserPromptSubmit", f).is_some()
+            });
+            let turn = first_bound_after(&keys(), "UserPromptSubmit", f).map(|u| u.turn_id.clone());
             completed = turn.is_some_and(|t| {
                 t.is_some()
                     && wait_until(end, || {
@@ -2438,6 +2457,35 @@ trusted_hash = "sha256:bb"
             received_ms: ms,
             turn_id: Some("turn-1".into()),
         }
+    }
+
+    /// M4: the fixture's submit is the first bound one after the bootstrap
+    /// fence, whatever the bootstrap turn itself delivered.
+    #[test]
+    fn fixture_submit_is_the_first_after_the_fence() {
+        // The bootstrap turn's own submit never arrived bound.
+        let evs = vec![
+            ev(1, "SessionStart", None, 0),
+            ev(2, "Stop", None, 5),
+            ev(3, "UserPromptSubmit", Some("x"), 9),
+        ];
+        assert_eq!(
+            first_bound_after(&evs, "UserPromptSubmit", 2).map(|e| e.seq),
+            Some(3)
+        );
+        // An unbound (foreign) submit after the fence does not count.
+        let mut foreign = ev(4, "UserPromptSubmit", Some("y"), 10);
+        foreign.bound = false;
+        let evs = vec![
+            ev(1, "UserPromptSubmit", Some("boot"), 0),
+            ev(2, "Stop", None, 5),
+            foreign,
+            ev(5, "UserPromptSubmit", Some("x"), 11),
+        ];
+        assert_eq!(
+            first_bound_after(&evs, "UserPromptSubmit", 2).map(|e| e.seq),
+            Some(5)
+        );
     }
 
     /// M2: the fixture's Stop must belong to its UserPromptSubmit's turn.
