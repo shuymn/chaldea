@@ -1269,17 +1269,22 @@ pub struct KeysSend {
     /// hard cutoff cutting it short (set when the evidence did not end it
     /// earlier).
     pub window_elapsed: bool,
+    /// The CLI was still running when the observation window ended (only
+    /// checked for a case that ended without its submit or its `Stop`).
+    pub cli_running_at_end: bool,
 }
 
 /// Sends one case and waits for its hooks. The planned observation window
 /// ends at `window` after the write returns or at `slot_end`, whichever is
 /// first; the run's `hard` cutoff can cut it short (then it did not
-/// elapse). The settle may run into the slot's teardown reserve.
+/// elapse). `running` reports whether the CLI is still running. The
+/// settle may run into the slot's teardown reserve.
 #[allow(clippy::too_many_arguments)]
 pub fn send_keys_case(
     type_keys: impl FnOnce() -> paste::Outcome,
     now_ms: impl Fn() -> u64,
     events: impl Fn() -> Vec<KeyEvent>,
+    running: impl Fn() -> bool,
     fence: u64,
     window: Duration,
     slot_end: Instant,
@@ -1302,6 +1307,7 @@ pub fn send_keys_case(
         settled: false,
         window_ms: planned.saturating_duration_since(t).as_millis() as u64,
         window_elapsed: false,
+        cli_running_at_end: false,
     };
     if !submit_may_have_reached(&r.sent) {
         return r;
@@ -1314,6 +1320,7 @@ pub fn send_keys_case(
     else {
         r.state = "unconfirmed".into();
         r.window_elapsed = elapsed();
+        r.cli_running_at_end = running();
         return r;
     };
     r.state = "acked".into();
@@ -1325,6 +1332,7 @@ pub fn send_keys_case(
         });
     if !r.completed {
         r.window_elapsed = elapsed();
+        r.cli_running_at_end = running();
     }
     let settle_end = hard.min(slot_end + settle);
     let left = settle_end.saturating_duration_since(Instant::now());
@@ -1333,16 +1341,26 @@ pub fn send_keys_case(
     r
 }
 
-/// A case whose write completed and whose planned observation window fully
-/// elapsed with no `UserPromptSubmit` is an observed no-submit (the
-/// control outcome phase 3b recorded); skipped, cut-short, or
-/// uncertain-write cases are not.
+/// The shortest live observation window in which "no submit arrived" is
+/// an observed result (phase 3b's slowest Windows `w32` submit took about
+/// 5.8 s after the write).
+pub const NO_SUBMIT_MIN_WINDOW: Duration = Duration::from_secs(10);
+
+/// A case whose write completed, whose planned observation window of at
+/// least `NO_SUBMIT_MIN_WINDOW` fully elapsed with no `UserPromptSubmit`,
+/// and whose CLI was still running at the window's end is an observed
+/// no-submit (the control outcome phase 3b recorded); skipped, cut-short,
+/// short-window, early-exit, or uncertain-write cases are not.
 pub fn no_submit_observed(result: &str, ev: &Value) -> bool {
     let b = &ev["base"];
     result == "missing"
         && ev["ack"] == json!("missing")
         && b["write_completed"] == json!(true)
         && b["window_elapsed"] == json!(true)
+        && b["cli_running_at_end"] == json!(true)
+        && b["window_ms"]
+            .as_u64()
+            .is_some_and(|ms| ms >= NO_SUBMIT_MIN_WINDOW.as_millis() as u64)
 }
 
 /// The send's state and observation flags for a case's `base` evidence.
@@ -1350,7 +1368,8 @@ pub fn send_flags(s: Option<&KeysSend>) -> Value {
     json!({"send_state": s.map(|s| s.state.clone()),
            "write_completed": s.is_some_and(|s| s.write_completed),
            "window_ms": s.map(|s| s.window_ms),
-           "window_elapsed": s.is_some_and(|s| s.window_elapsed)})
+           "window_elapsed": s.is_some_and(|s| s.window_elapsed),
+           "cli_running_at_end": s.is_some_and(|s| s.cli_running_at_end)})
 }
 
 /// The oracle for a case whose input may have reached the CLI (`None`
@@ -1613,6 +1632,7 @@ fn keys_case_run(
             },
             || l.receiver.now_ms(),
             || l.receiver.events().iter().map(KeyEvent::of).collect(),
+            || l.session.child_running(),
             f,
             KEYS_FIXTURE,
             end,
@@ -2979,6 +2999,7 @@ trusted_hash = "sha256:bb"
             || paste::type_keys(&tx, "一\n二\u{200d}".as_bytes(), &opts, || true),
             || 7,
             || events.clone(),
+            || true,
             2,
             wait,
             Instant::now() + Duration::from_secs(60),
@@ -3065,6 +3086,7 @@ trusted_hash = "sha256:bb"
             sent,
             || 0,
             || evs.clone(),
+            || true,
             2,
             Duration::from_millis(50),
             now + Duration::from_secs(60),
@@ -3122,6 +3144,7 @@ trusted_hash = "sha256:bb"
             || paste::type_keys(&tx, b"x", &opts, || true),
             || 0,
             events,
+            || true,
             2,
             window,
             Instant::now() + Duration::from_secs(60),

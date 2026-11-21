@@ -846,6 +846,13 @@ impl Session {
         self.io.as_ref().expect("io started")
     }
 
+    /// The child is positively still running (a failed status query is
+    /// not "running").
+    pub fn child_running(&self) -> bool {
+        let mut c = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(c.try_wait(), Ok(None))
+    }
+
     pub fn child_exited(&self) -> Option<u32> {
         let mut c = self.child.lock().unwrap_or_else(|e| e.into_inner());
         c.try_wait().ok().flatten().map(|s| s.exit_code())

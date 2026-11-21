@@ -2176,8 +2176,9 @@ fn row_summary(entry: &str, c: &Check) -> Value {
 
 /// A comparison arm's row (H1): an explicit result satisfies the arm
 /// (`pass`, the arm's own result in the evidence): passed, an observed
-/// platform failure, or an observed no-submit (`missing` after a completed
-/// write and a fully elapsed observation window). A child that did not
+/// platform failure, or an observed no-submit (`real::no_submit_observed`:
+/// a completed write, a fully elapsed live window of at least 10 s, the CLI
+/// still running at its end). A child that did not
 /// run, an absent row, or an incomplete row (harness failure, not
 /// exercised, a skipped, cut-short or uncertain-write `missing`) keeps the
 /// question inconclusive.
@@ -2196,6 +2197,21 @@ fn arm_outcome(r: &ChildRep, c: Option<&Check>) -> (Option<Outcome>, Value) {
             )
         }
         (Ok(_), Some(c)) => (Some(Outcome::from_check(c)), c.evidence.clone()),
+    }
+}
+
+/// A burst-off submit row: an observed no-submit (the same floor as the
+/// burst-on arm: completed write, a live window of at least
+/// `NO_SUBMIT_MIN_WINDOW`, the CLI still running) is an observed failure;
+/// any other row counts by its own outcome, so a shorter or cut-short
+/// `missing` stays inconclusive.
+fn submit_off_outcome(r: &ChildRep, c: Option<&Check>) -> (Option<Outcome>, Value) {
+    match (r, c) {
+        (Ok(_), Some(c)) if super::real::no_submit_observed(&c.result, &c.evidence) => (
+            Some(Outcome::platform("observed no-submit with burst off")),
+            c.evidence.clone(),
+        ),
+        _ => verdict_outcome(r, c),
     }
 }
 
@@ -2252,7 +2268,7 @@ fn p3c_probes(ran: &[(P3cStep, ChildRep, PathBuf)]) -> Vec<(Pc, Value)> {
                                 "status": status_of(r)}),
             );
             let o = if burst == "off" {
-                verdict_outcome(r, c.as_ref())
+                submit_off_outcome(r, c.as_ref())
             } else {
                 arm_outcome(r, c.as_ref())
             };
@@ -4212,10 +4228,11 @@ mod tests {
         assert_eq!(p3c_verdict(&ran, "P3c-submit").0, "fail_observed");
     }
 
-    /// H1: a burst-on control whose write completed and whose window
-    /// elapsed with no submit, as the real child oracle reports it, is an
-    /// observed arm result; the same case cut short by the hard cutoff, or
-    /// with an uncertain CR write, is not.
+    /// H1: a burst-on control whose write completed and whose live window of
+    /// at least 10 s elapsed with no submit, as the real child oracle
+    /// reports it, is an observed arm result, and the same row with burst
+    /// off is an observed failure. A 50 ms window, an early CLI exit, a
+    /// window cut short by the hard cutoff, or an uncertain CR write is not.
     #[test]
     fn observed_no_submit_is_an_arm_result() {
         use super::super::real::{self as r, KeyEvent};
@@ -4238,7 +4255,7 @@ mod tests {
             .unwrap()
             .text;
         // The child's case: the send, then the oracle on the drained events.
-        let child_case = |state: &str, hard: Duration| {
+        let child_case = |state: &str, window: Duration, hard: Duration, running: bool| {
             let sent = paste::Outcome {
                 state: state.into(),
                 rejected: None,
@@ -4253,8 +4270,9 @@ mod tests {
                 || sent,
                 || 10,
                 || evs.clone(),
+                || running,
                 3,
-                Duration::from_millis(50),
+                window,
                 now + Duration::from_secs(60),
                 now + hard,
                 Duration::ZERO,
@@ -4270,10 +4288,10 @@ mod tests {
             );
             rep.checks.pop().unwrap()
         };
-        let with_on1 = |c: Check| {
+        let with_row = |step: &str, c: &Check| {
             let mut ran = p3c_complete();
             for (s, rep, _) in ran.iter_mut() {
-                if s.name == "p3c-control-on-1"
+                if s.name == step
                     && let Ok(rep) = rep
                 {
                     rep.checks.retain(|k| k.case != c.case);
@@ -4282,21 +4300,39 @@ mod tests {
             }
             p3c_verdict(&ran, "P3c-submit")
         };
-        let observed = child_case("sent", Duration::from_secs(60));
+        let (min, long) = (r::NO_SUBMIT_MIN_WINDOW, Duration::from_secs(60));
+        // The two 10 s windows run side by side.
+        let (observed, exited) = std::thread::scope(|sc| {
+            let a = sc.spawn(|| child_case("sent", min, long, true));
+            let b = sc.spawn(|| child_case("sent", min, long, false));
+            (a.join().unwrap(), b.join().unwrap())
+        });
         assert_eq!(observed.result, "missing");
         assert_eq!(observed.evidence["base"]["write_completed"], true);
         assert_eq!(observed.evidence["base"]["window_elapsed"], true);
-        let (v, why) = with_on1(observed);
+        assert_eq!(observed.evidence["base"]["cli_running_at_end"], true);
+        let (v, why) = with_row("p3c-control-on-1", &observed);
         assert_eq!(v, "go", "{why}");
+        // The same floor on the paired burst-off arm: an observed failure.
+        assert_eq!(with_row("p3c-control-off-1", &observed).0, "fail_observed");
+        // The CLI exited before the window's end: inconclusive.
+        assert_eq!(exited.evidence["base"]["cli_running_at_end"], false);
+        assert_eq!(with_row("p3c-control-on-1", &exited).0, "inconclusive");
+        assert_eq!(with_row("p3c-control-off-1", &exited).0, "inconclusive");
+        // A 50 ms window that fully elapsed: below the floor, inconclusive.
+        let short = child_case("sent", Duration::from_millis(50), long, true);
+        assert_eq!(short.evidence["base"]["window_elapsed"], true);
+        assert_eq!(with_row("p3c-control-on-1", &short).0, "inconclusive");
+        assert_eq!(with_row("p3c-control-off-1", &short).0, "inconclusive");
         // Cut short by the hard cutoff: inconclusive.
-        let cut = child_case("sent", Duration::from_millis(10));
+        let cut = child_case("sent", min, Duration::from_millis(10), true);
         assert_eq!(cut.result, "missing");
         assert_eq!(cut.evidence["base"]["window_elapsed"], false);
-        assert_eq!(with_on1(cut).0, "inconclusive");
+        assert_eq!(with_row("p3c-control-on-1", &cut).0, "inconclusive");
         // An uncertain CR write: inconclusive.
-        let unsure = child_case("unconfirmed", Duration::from_secs(60));
+        let unsure = child_case("unconfirmed", Duration::from_millis(50), long, true);
         assert_eq!(unsure.evidence["base"]["write_completed"], false);
-        assert_eq!(with_on1(unsure).0, "inconclusive");
+        assert_eq!(with_row("p3c-control-on-1", &unsure).0, "inconclusive");
     }
 
     /// Phase 3c (A6): run order, R0 on every step, explicit burst and
