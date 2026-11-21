@@ -2600,7 +2600,10 @@ fn reader_start_repeat(ctx: &Ctx, warm: InjectRun, extra: &[&str], roles: &[Stri
                 }
                 sampling.store(true, std::sync::atomic::Ordering::SeqCst);
                 let map = sampler.join().unwrap_or_default();
-                let tree = descendants(&map, &roots);
+                // The sampled tree and the session's recorded identities.
+                let recorded: Vec<(u32, u64)> =
+                    st.recorded.iter().map(|p| (p.pid, p.start_time)).collect();
+                let tree = identity_union(&descendants(&map, &roots), &recorded);
                 let (alive, unknown) = tree_liveness(&tree, os::liveness, Duration::from_secs(3));
                 (
                     baseline_check(t.as_ref(), st.survivors.len() + alive.len(), unknown),
@@ -2739,6 +2742,22 @@ fn measure_inject(
         r.survivors.extend(st.survivors.iter().map(|p| json!(p)));
     }
     (r, tree, stop_report)
+}
+
+/// The union of two identity lists by pid, keeping the identity with a
+/// nonzero creation time when they disagree (a sampler that first saw a
+/// process with creation time 0 drops it from the ancestry walk, while the
+/// session may have recorded it properly).
+pub fn identity_union(a: &[(u32, u64)], b: &[(u32, u64)]) -> Vec<(u32, u64)> {
+    let mut out: Vec<(u32, u64)> = Vec::new();
+    for &(p, st) in a.iter().chain(b) {
+        match out.iter_mut().find(|(q, _)| *q == p) {
+            Some(x) if x.1 == 0 => x.1 = st,
+            Some(_) => {}
+            None => out.push((p, st)),
+        }
+    }
+    out
 }
 
 /// Positive liveness of a launch's sampled tree: waits up to `wait` for
@@ -3873,6 +3892,26 @@ mod tests {
             r.as_ref().is_err_and(|e| e.contains("liveness unknown")),
             "{r:?}"
         );
+        // H2: the sampler saw a descendant with creation time 0 (so the
+        // ancestry walk dropped it) and the session recorded it properly;
+        // the union keeps the valid identity and a failed lookup on it
+        // leaves the baseline invalid.
+        let m: std::collections::HashMap<u32, (u32, u64)> = [(42, (41, 0))].into();
+        let sampled = descendants(&m, &[(41, 7)]);
+        assert_eq!(sampled, [(41, 7)]);
+        let union = identity_union(&sampled, &[(41, 7), (42, 9)]);
+        assert_eq!(union, [(41, 7), (42, 9)]);
+        assert_eq!(identity_union(&[(42, 0)], &[(42, 9)]), [(42, 9)]);
+        assert_eq!(identity_union(&[(42, 9)], &[(42, 0)]), [(42, 9)]);
+        let fails_on_42 = |p, st| {
+            if p == 42 && st == 9 {
+                None
+            } else {
+                Some(false)
+            }
+        };
+        let (alive, unknown) = tree_liveness(&union, fails_on_42, Duration::ZERO);
+        assert!(baseline_check(Some(&good), alive.len(), unknown).is_err());
         let gone = |_, _| Some(false);
         assert_eq!(tree_liveness(&tree, gone, Duration::ZERO), (Vec::new(), 0));
         for (k, v) in [
