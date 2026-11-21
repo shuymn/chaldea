@@ -323,14 +323,22 @@ pub fn codex_hook_args(cmd: &str) -> Vec<String> {
     v
 }
 
-/// Codex launch arguments after the binary: the session-flag hooks for
-/// `hook_cmd`, `extra`, then the positional first prompt (the first turn,
-/// so nothing is typed before binding).
+/// Low reasoning effort for every harness Codex launch, so the owner's
+/// default (e.g. max) does not stretch the bootstrap turn past minutes
+/// (codex-rs 0.171.0 `config/src/config_toml.rs:414`). Hook trust is keyed
+/// by source path, event, and group/handler index
+/// (`hooks/src/engine/discovery.rs:473,821`); a non-hook `-c` changes none.
+pub const CODEX_EFFORT_ARGS: [&str; 2] = ["-c", "model_reasoning_effort=\"low\""];
+
+/// Codex launch arguments after the binary: the reasoning effort, the
+/// session-flag hooks for `hook_cmd`, `extra`, then the positional first
+/// prompt (the first turn, so nothing is typed before binding).
 pub fn codex_launch_args(hook_cmd: &str, no_daemon: bool, extra: &[String]) -> Vec<String> {
     let mut v = Vec::new();
     if no_daemon {
         v.push("--no-daemon".into());
     }
+    v.extend(CODEX_EFFORT_ARGS.map(String::from));
     v.extend(codex_hook_args(hook_cmd));
     v.extend(extra.iter().cloned());
     v.push(CODEX_FIRST_PROMPT.into());
@@ -1679,7 +1687,11 @@ fn codex_warm(ctx: &Ctx, a: &Agent) {
     // The unrelated Codex: our own PTY, no CHALDEA_* env, default mode.
     let unrelated = Session::spawn(SpawnOpts {
         // Codex starts only with a first turn: the positional prompt.
-        argv: vec![a.bin.clone().into(), CODEX_FIRST_PROMPT.into()],
+        argv: [a.bin.clone().into_os_string()]
+            .into_iter()
+            .chain(CODEX_EFFORT_ARGS.map(OsString::from))
+            .chain([CODEX_FIRST_PROMPT.into()])
+            .collect(),
         cwd: cwd.clone(),
         env: Vec::new(),
         cols: ctx.args.cols,
@@ -2295,6 +2307,7 @@ trusted_hash = "sha256:bb"
     #[test]
     fn pretrust_is_one_console_command() {
         let argv = codex_pretrust_argv(Path::new("/r"), "codex", true);
+        assert!(argv.windows(2).any(|w| w == CODEX_EFFORT_ARGS), "{argv:?}");
         let hooks: Vec<&String> = argv.iter().filter(|a| a.starts_with("hooks.")).collect();
         assert_eq!(hooks.len(), 3, "{argv:?}");
         assert!(
