@@ -465,6 +465,20 @@ fn finish(ctx: &Ctx, l: Launch) -> Value {
     v
 }
 
+/// Polls `cond` every 50 ms until it holds or `end` passes (checked once
+/// more at the end).
+fn wait_until(end: Instant, cond: impl Fn() -> bool) -> bool {
+    loop {
+        if cond() {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn nth_bound(
     l: &Launch,
     event: &str,
@@ -1001,6 +1015,34 @@ fn paste_sweep(ctx: &Ctx, a: &Agent) {
 /// Settle interval after a `win_keys` case's `Stop`: the receiver and Codex
 /// stay up so a late second submit still fails the case.
 const KEYS_SETTLE: Duration = Duration::from_secs(5);
+/// Launch plus teardown of one `win_keys` case session (spawn, kill grace,
+/// job death wait, verification, thread joins, receiver stop).
+const KEYS_OVERHEAD: Duration = Duration::from_secs(20);
+/// The bootstrap turn's budget: its `Stop` after the bound SessionStart.
+const KEYS_BOOTSTRAP: Duration = REAL_STOP_WAIT;
+/// One deadline for the fixture's `UserPromptSubmit` and its turn's `Stop`.
+const KEYS_FIXTURE: Duration = Duration::from_secs(120);
+
+/// Worst-case seconds of one `win_keys` case in which every wait succeeds
+/// at its bound: SessionStart, the bootstrap turn, the fixture, the full
+/// settle interval, and launch plus teardown.
+pub const fn keys_case_worst_secs(session_start_timeout: u64) -> u64 {
+    session_start_timeout
+        + KEYS_BOOTSTRAP.as_secs()
+        + KEYS_FIXTURE.as_secs()
+        + KEYS_SETTLE.as_secs()
+        + KEYS_OVERHEAD.as_secs()
+}
+
+/// A case decided after a settle interval the cutoff cut short is never a
+/// pass: a late second submit could have been missed.
+pub fn keys_settled(o: Outcome, settled: bool) -> Outcome {
+    if o == Outcome::Pass && !settled {
+        Outcome::harness("the settle interval was cut short by the run cutoff")
+    } else {
+        o
+    }
+}
 
 /// One drained hook event, reduced for the `win_keys` oracle.
 #[derive(Debug, Clone)]
@@ -1010,6 +1052,8 @@ pub struct KeyEvent {
     pub bound: bool,
     pub prompt: Option<String>,
     pub received_ms: u64,
+    /// The payload's `turn_id` (Codex sends it on submit and Stop).
+    pub turn_id: Option<String>,
 }
 
 impl KeyEvent {
@@ -1022,6 +1066,9 @@ impl KeyEvent {
                 .json()
                 .and_then(|v| v["prompt"].as_str().map(str::to_string)),
             received_ms: e.received_ms,
+            turn_id: e
+                .json()
+                .and_then(|v| v["turn_id"].as_str().map(str::to_string)),
         }
     }
 }
@@ -1029,9 +1076,12 @@ impl KeyEvent {
 /// The `win_keys` oracle over one case's drained events (§4.4): bound
 /// events after the bootstrap fence (`seq > fence`) only; exactly one
 /// `UserPromptSubmit` equal to `expected` byte for byte, followed by a
-/// `Stop`, passes. A literal `[13;2u`, a second submit (also after the
-/// `Stop`), or a different prompt is a platform failure; a matching submit
-/// without `Stop`, or no submit at all, is missing.
+/// `Stop` of the same `turn_id`, passes. A second submit (also after the
+/// `Stop`) or a different prompt is a platform failure, classified
+/// `csi_u_not_reassembled` when the prompt holds more literal `[13;2u` than
+/// the expected form (a marker the payload itself holds is text); a
+/// matching submit without its turn's `Stop`, or no submit at all, is
+/// missing.
 pub fn win_keys_case(
     events: &[KeyEvent],
     fence: u64,
@@ -1055,7 +1105,9 @@ pub fn win_keys_case(
     let mut ev = json!({"ups": ups.len(), "prompts": prompts, "expected": expected,
                         "first_diff": util::first_diff(expected.as_bytes(), got.as_bytes()),
                         "write_to_ups_ms": latency});
-    if prompts.iter().flatten().any(|p| p.contains("[13;2u")) {
+    let markers = |s: &str| s.matches("[13;2u").count();
+    let want_markers = markers(expected);
+    if prompts.iter().flatten().any(|p| markers(p) > want_markers) {
         ev["classification"] = json!("csi_u_not_reassembled");
         return (
             Outcome::platform("a literal [13;2u reached the prompt (csi_u_not_reassembled)"),
@@ -1074,8 +1126,13 @@ pub fn win_keys_case(
             ev,
         );
     }
-    if !after.iter().any(|e| e.event == "Stop" && e.seq > first.seq) {
-        ev["why"] = json!("matching prompt without Stop");
+    ev["turn_id"] = json!(first.turn_id);
+    let same_turn = |e: &&KeyEvent| e.turn_id.is_some() && e.turn_id == first.turn_id;
+    if !after
+        .iter()
+        .any(|e| e.event == "Stop" && e.seq > first.seq && same_turn(e))
+    {
+        ev["why"] = json!("matching prompt without a Stop of its turn");
         return (Outcome::Missing, ev);
     }
     (Outcome::Pass, ev)
@@ -1161,9 +1218,11 @@ fn keys_case_run(
     let mut sent = None;
     let mut fence = None;
     let mut write_ms = None;
+    let mut settled = false;
+    let mut completed = false;
     if bound.is_some() {
         // The bootstrap turn (positional first prompt) ends before any input.
-        fence = nth_bound(&l, "Stop", 1, ctx.until(REAL_STOP_WAIT)).map(|s| s.seq);
+        fence = nth_bound(&l, "Stop", 1, ctx.until(KEYS_BOOTSTRAP)).map(|s| s.seq);
     }
     if let Some(f) = fence {
         let o = l.type_keys(ctx, &e.text, newline, allow, || {
@@ -1171,15 +1230,32 @@ fn keys_case_run(
         });
         write_ms = Some(l.receiver.now_ms());
         if o.state == "sent" {
-            let _ = nth_bound(&l, "UserPromptSubmit", 2, ctx.until(REAL_UPS_WAIT));
-            if nth_bound(&l, "Stop", 2, ctx.until(REAL_STOP_WAIT)).is_some() {
-                std::thread::sleep(
-                    KEYS_SETTLE.min(ctx.cutoff.saturating_duration_since(Instant::now())),
-                );
+            // One deadline for the submit and the Stop of its turn.
+            let end = ctx.until(KEYS_FIXTURE);
+            let ups = nth_bound(&l, "UserPromptSubmit", 2, end);
+            let turn = ups.as_ref().map(|u| KeyEvent::of(u).turn_id);
+            completed = turn.is_some_and(|t| {
+                t.is_some()
+                    && wait_until(end, || {
+                        l.receiver.events().iter().any(|e| {
+                            e.is_bound() && e.event == "Stop" && KeyEvent::of(e).turn_id == t
+                        })
+                    })
+            });
+            if completed {
+                let left = ctx.cutoff.saturating_duration_since(Instant::now());
+                std::thread::sleep(KEYS_SETTLE.min(left));
+                settled = left >= KEYS_SETTLE;
             }
         }
         sent = Some(o);
     }
+    // The screen as it was when the case ended, for a case that did not
+    // complete (taken before the session stops).
+    let snap = match snap {
+        None if !completed => Some(write_snapshot(ctx, &format!("{label}-end"), &l.snapshot())),
+        s => s,
+    };
     let q = l.query_log();
     let (stop, summary, events) = l.finish_events();
     let fin = json!({"receiver": summary});
@@ -1207,7 +1283,8 @@ fn keys_case_run(
             Some(o) if o.state == "sent" => {
                 let evs: Vec<KeyEvent> = events.iter().map(KeyEvent::of).collect();
                 let expected = paste::expected_win_keys(&e.text, allow);
-                win_keys_case(&evs, fence.unwrap_or(0), &expected, write_ms)
+                let (o, ev) = win_keys_case(&evs, fence.unwrap_or(0), &expected, write_ms);
+                (keys_settled(o, settled), ev)
             }
             Some(o)
                 if o.state == "rejected"
@@ -2183,7 +2260,59 @@ mod tests {
             bound: true,
             prompt: prompt.map(str::to_string),
             received_ms: ms,
+            turn_id: Some("turn-1".into()),
         }
+    }
+
+    /// M2: the fixture's Stop must belong to its UserPromptSubmit's turn.
+    #[test]
+    fn win_keys_stop_matches_the_turn() {
+        let turn = |mut e: KeyEvent, t: Option<&str>| {
+            e.turn_id = t.map(String::from);
+            e
+        };
+        let ups = |t| turn(ev(4, "UserPromptSubmit", Some("x"), 9), t);
+        let stop = |t| turn(ev(5, "Stop", None, 9), t);
+        let o = win_keys_case(&[ups(Some("A")), stop(Some("B"))], 3, "x", None).0;
+        assert_eq!(o, Outcome::Missing);
+        let o = win_keys_case(&[ups(None), stop(None)], 3, "x", None).0;
+        assert_eq!(o, Outcome::Missing);
+        let o = win_keys_case(&[ups(Some("A")), stop(Some("A"))], 3, "x", None).0;
+        assert_eq!(o, Outcome::Pass);
+    }
+
+    /// L3: a literal `[13;2u` the payload itself holds is not a reassembly
+    /// failure; one that adds a marker (at an encoded newline) still is.
+    #[test]
+    fn literal_marker_is_diagnostic_only_on_a_mismatch() {
+        let case = |want: &str, got: &str| {
+            win_keys_case(
+                &[
+                    ev(4, "UserPromptSubmit", Some(got), 9),
+                    ev(5, "Stop", None, 9),
+                ],
+                3,
+                want,
+                None,
+            )
+        };
+        assert_eq!(case("a[13;2u", "a[13;2u").0, Outcome::Pass);
+        let (o, e) = case("a[13;2u\nb", "a[13;2u[13;2ub");
+        assert!(matches!(o, Outcome::PlatformFail { .. }));
+        assert_eq!(e["classification"], "csi_u_not_reassembled");
+    }
+
+    /// M1: a case decided after a settle interval the cutoff cut short is
+    /// never a pass; other outcomes keep their evidence.
+    #[test]
+    fn cut_settle_is_not_a_pass() {
+        assert!(matches!(
+            keys_settled(Outcome::Pass, false),
+            Outcome::HarnessFail { .. }
+        ));
+        assert_eq!(keys_settled(Outcome::Pass, true), Outcome::Pass);
+        let p = Outcome::platform("x");
+        assert_eq!(keys_settled(p.clone(), false), p);
     }
 
     /// F-1a oracle over synthetic drained events (fence = bootstrap Stop seq 3).

@@ -47,9 +47,18 @@ const F_PROBES: &[(&str, u64)] = &[
     ("f2-verdict", 120),
 ];
 
-/// One `real codex-paste` F-1 child (one fresh session per case).
-const F1_CHILD: u64 = 3600;
-const CODEX_INPUT_BUDGET: u64 = 2 * F1_CHILD + 1800 + 3 * CHILD_MARGIN + 60;
+/// Corpus F: verdict cases and recorded-only fixtures (a test checks both
+/// against `paste::corpus_f`).
+const F1_CASES: u64 = 18;
+const F1_RECORDED: u64 = 3;
+/// One `win_keys` case at its worst-case timing with the default
+/// SessionStart timeout.
+const F1_CASE: u64 = super::real::keys_case_worst_secs(cli::SESSION_START_DEFAULT);
+/// One `real codex-paste` F-1 child (one fresh session per case), sized so
+/// a run in which every case succeeds at its worst-case timing fits.
+const F1_CHILD: u64 = F1_CASES * F1_CASE + CHILD_MARGIN;
+const F1_RECORDED_CHILD: u64 = F1_RECORDED * F1_CASE + CHILD_MARGIN;
+const CODEX_INPUT_BUDGET: u64 = 2 * F1_CHILD + F1_RECORDED_CHILD + 3 * CHILD_MARGIN + 60;
 /// Per configuration: the comparison rows; plus the F-2c injections.
 const BACKEND_BUDGET: u64 = 3 * (600 + 900 + 2400 + F1_CHILD + 2 * 600 + 600 + 7 * CHILD_MARGIN)
     + 5 * (300 + CHILD_MARGIN)
@@ -1412,7 +1421,7 @@ fn probe_codex_input(ctx: &Ctx) {
             "--newline-key",
             rec_key.name(),
         ],
-        1800,
+        F1_RECORDED_CHILD,
         false,
         &[],
     );
@@ -3001,6 +3010,22 @@ mod tests {
             flash_outcome(&broken, true, true),
             Outcome::HarnessFail { .. }
         ));
+    }
+
+    /// M1: an F-1 child in which every case succeeds at its worst-case
+    /// timing fits the child's budget.
+    #[test]
+    fn f1_child_budget_fits_a_successful_run() {
+        let n = f1_entries().len() as u64;
+        assert_eq!(n, F1_CASES);
+        let recorded = paste::corpus_f().iter().filter(|e| e.recorded).count() as u64;
+        assert_eq!(recorded, F1_RECORDED);
+        assert!(F1_RECORDED_CHILD >= recorded * F1_CASE + CHILD_MARGIN);
+        let worst = super::super::real::keys_case_worst_secs(20);
+        assert!(
+            F1_CHILD >= n * worst + CHILD_MARGIN,
+            "{n} cases x {worst} s + {CHILD_MARGIN} s > {F1_CHILD} s"
+        );
     }
 
     /// F-1b selection.

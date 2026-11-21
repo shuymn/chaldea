@@ -123,6 +123,9 @@ f-run:  chs win-probe <codex-input|backend|followup>  (backend: --f1-winner <csi
         chs win-probe console --detached --configs P,R0,R6 --join-run-id ID
         chs win-probe f2-verdict --from DIR --from DIR";
 
+/// Default `--session-start-timeout` in seconds.
+pub const SESSION_START_DEFAULT: u64 = 20;
+
 /// The only hook source built in this spike (§4.3).
 pub const HOOK_SOURCE: &str = "session-flags";
 
@@ -147,7 +150,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         out: None,
         run_id: None,
         deadline_secs: 180,
-        session_start_timeout: 20,
+        session_start_timeout: SESSION_START_DEFAULT,
         keep_temp: false,
         cols: 120,
         rows: 40,
