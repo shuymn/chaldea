@@ -134,6 +134,7 @@ fn stop_evidence(stop: &StopReport) -> Value {
         "threads": stop.threads,
         "tree": stop.tree,
         "primary_steps": stop.primary_steps,
+        "launch": stop.launch,
     })
 }
 

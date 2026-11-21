@@ -82,14 +82,19 @@ pub enum Backend {
 }
 
 /// A raw ConPTY launch, plugged into `Session` through portable-pty's own
-/// traits. `branch` is `job_list` or `suspended`; `job_list_error` is the
-/// error `CreateProcessW` returned with the job list, when it did.
+/// traits. `branch` is `job_list` or `suspended`; `job_list_error` is why
+/// the JOB_LIST attempt failed, when it did.
 pub struct RawSpawn {
     pub master: Box<dyn portable_pty::MasterPty + Send>,
     pub child: Box<dyn portable_pty::Child + Send + Sync>,
     pub tree: Tree,
     pub branch: String,
     pub job_list_error: Option<String>,
+    /// `CreateProcessW` with the job list itself failed (not an attribute
+    /// setup step or an injection).
+    pub job_list_rejected: bool,
+    /// Each creation attempt: branch, stage, and Win32 result.
+    pub attempts: Vec<serde_json::Value>,
     pub conpty_module: Option<String>,
 }
 

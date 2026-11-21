@@ -1001,6 +1001,15 @@ impl Drop for AttrList {
     }
 }
 
+/// The last raw launch's attempts (each with its stage and Win32 result),
+/// kept so a launch whose branches all failed still leaves a record.
+static RAW_LAUNCH: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+
+/// The last raw launch's attempts and whether JOB_LIST was rejected.
+pub fn raw_last_launch() -> Option<serde_json::Value> {
+    RAW_LAUNCH.lock().ok().and_then(|l| l.clone())
+}
+
 /// Records of raw-backend teardowns (F-2c evidence), newest last.
 static RAW_TEARDOWNS: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
 
@@ -1371,6 +1380,9 @@ pub fn raw_spawn(
     inject: Option<super::RawInject>,
 ) -> Result<super::RawSpawn, String> {
     use super::RawInject as I;
+    if let Ok(mut l) = RAW_LAUNCH.lock() {
+        *l = None;
+    }
     let mut st = Setup::default();
     st.step = "pipes";
     // SAFETY: Microsoft's "Creating a Pseudoconsole session"; every handle is
@@ -1435,63 +1447,79 @@ pub fn raw_spawn(
         cmdline.push(0);
         let envb = env_block(env, remove);
         let cwdw = wide(cwd.as_os_str());
-        let try_create =
-            |job_list: bool, cmdline: &mut Vec<u16>| -> Result<PROCESS_INFORMATION, String> {
-                // Declared before the attribute list so it outlives the list.
-                let jobs = [job_raw];
-                let mut attrs =
-                    AttrList::new(if job_list { 2 } else { 1 }).map_err(|e| e.to_string())?;
+        // Each attempt records its stage and Win32 result; only a failed
+        // `CreateProcessW` with the job list is a JOB_LIST rejection.
+        let try_create = |job_list: bool,
+                          cmdline: &mut Vec<u16>|
+         -> Result<PROCESS_INFORMATION, (&'static str, String)> {
+            // Declared before the attribute list so it outlives the list.
+            let jobs = [job_raw];
+            let mut attrs = AttrList::new(if job_list { 2 } else { 1 })
+                .map_err(|e| ("attr_list", e.to_string()))?;
+            attrs
+                .set(
+                    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                    hpc as *const c_void,
+                    std::mem::size_of::<HPCON>(),
+                )
+                .map_err(|e| ("attr_pseudoconsole", e.to_string()))?;
+            if job_list {
                 attrs
                     .set(
-                        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                        hpc as *const c_void,
-                        std::mem::size_of::<HPCON>(),
+                        PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                        jobs.as_ptr() as *const c_void,
+                        std::mem::size_of::<HANDLE>(),
                     )
-                    .map_err(|e| format!("attr pseudoconsole: {e}"))?;
-                if job_list {
-                    attrs
-                        .set(
-                            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-                            jobs.as_ptr() as *const c_void,
-                            std::mem::size_of::<HANDLE>(),
-                        )
-                        .map_err(|e| format!("attr job_list: {e}"))?;
-                }
-                let mut si: STARTUPINFOEXW = std::mem::zeroed();
-                si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-                si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-                si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
-                si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
-                si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
-                si.lpAttributeList = attrs.ptr();
-                let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
-                let cflags = EXTENDED_STARTUPINFO_PRESENT
-                    | CREATE_UNICODE_ENVIRONMENT
-                    | if job_list { 0 } else { CREATE_SUSPENDED };
-                if CreateProcessW(
-                    std::ptr::null(),
-                    cmdline.as_mut_ptr(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    0,
-                    cflags,
-                    envb.as_ptr() as *const c_void,
-                    cwdw.as_ptr(),
-                    &si.StartupInfo,
-                    &mut pi,
-                ) == 0
-                {
-                    return Err(format!("CreateProcessW: {}", io::Error::last_os_error()));
-                }
-                Ok(pi)
-            };
+                    .map_err(|e| ("attr_job_list", e.to_string()))?;
+            }
+            let mut si: STARTUPINFOEXW = std::mem::zeroed();
+            si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+            si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+            si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+            si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
+            si.lpAttributeList = attrs.ptr();
+            let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+            let cflags = EXTENDED_STARTUPINFO_PRESENT
+                | CREATE_UNICODE_ENVIRONMENT
+                | if job_list { 0 } else { CREATE_SUSPENDED };
+            if CreateProcessW(
+                std::ptr::null(),
+                cmdline.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                cflags,
+                envb.as_ptr() as *const c_void,
+                cwdw.as_ptr(),
+                &si.StartupInfo,
+                &mut pi,
+            ) == 0
+            {
+                return Err(("create_process", io::Error::last_os_error().to_string()));
+            }
+            Ok(pi)
+        };
+        let attempt = |branch: &str, r: &Result<PROCESS_INFORMATION, (&str, String)>| match r {
+            Ok(_) => serde_json::json!({"branch": branch, "stage": "created"}),
+            Err((stage, e)) => serde_json::json!({"branch": branch, "stage": stage, "error": e}),
+        };
         st.step = "create_process";
         let force_suspended = matches!(inject, Some(I::ForceSuspended | I::ResumeFail));
         let first = if force_suspended {
-            Err("injected JOB_LIST failure".to_string())
+            Err(("injected", "injected JOB_LIST failure".to_string()))
         } else {
             try_create(true, &mut cmdline.clone())
         };
+        let mut attempts = vec![attempt("job_list", &first)];
+        let job_list_rejected = matches!(&first, Err(("create_process", _)));
+        let record = |attempts: &[serde_json::Value]| {
+            if let Ok(mut l) = RAW_LAUNCH.lock() {
+                *l = Some(serde_json::json!({"attempts": attempts,
+                                             "job_list_rejected": job_list_rejected}));
+            }
+        };
+        record(&attempts);
         let (branch, job_list_error) = match first {
             Ok(pi) => {
                 st.process = Handle::new(pi.hProcess);
@@ -1499,9 +1527,14 @@ pub fn raw_spawn(
                 st.pid = pi.dwProcessId;
                 ("job_list".to_string(), None)
             }
-            Err(job_list_err) => {
-                let pi = try_create(false, &mut cmdline)
-                    .map_err(|e| format!("job_list: {job_list_err}; suspended: {e}"))?;
+            Err((stage, e)) => {
+                let job_list_err = format!("{stage}: {e}");
+                let second = try_create(false, &mut cmdline);
+                attempts.push(attempt("suspended", &second));
+                record(&attempts);
+                let pi = second.map_err(|(stage, e)| {
+                    format!("job_list: {job_list_err}; suspended: {stage}: {e}")
+                })?;
                 st.process = Handle::new(pi.hProcess);
                 st.thread = Handle::new(pi.hThread);
                 st.pid = pi.dwProcessId;
@@ -1578,6 +1611,8 @@ pub fn raw_spawn(
             tree,
             branch,
             job_list_error,
+            job_list_rejected,
+            attempts,
             conpty_module: conpty_module(),
         })
     }

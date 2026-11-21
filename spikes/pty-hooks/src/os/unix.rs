@@ -427,6 +427,10 @@ pub fn raw_last_teardown() -> Option<serde_json::Value> {
     None
 }
 
+pub fn raw_last_launch() -> Option<serde_json::Value> {
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn raw_spawn(
     _argv: &[OsString],

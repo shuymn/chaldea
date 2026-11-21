@@ -379,6 +379,26 @@ pub struct StopReport {
 
 static SPAWNED: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
 
+/// Launch records of raw launches that never produced a session.
+static FAILED_LAUNCHES: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+
+fn record_failed_launch(launch: Value) {
+    FAILED_LAUNCHES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(launch);
+}
+
+/// Every failed raw launch's record (`{"launch": …}` each), for the report.
+pub fn failed_launches() -> Vec<Value> {
+    FAILED_LAUNCHES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|l| json!({"launch": l}))
+        .collect()
+}
+
 /// `(pid, start_time)` of every child this process spawned in a PTY.
 pub fn spawned_children() -> Vec<(u32, u64)> {
     SPAWNED.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -440,7 +460,7 @@ impl Session {
                     .map(|(k, _)| k.to_string_lossy().into_owned())
                     .filter(|k| scrub_env_name(k))
                     .collect();
-                let rs = os::raw_spawn(
+                let rs = match os::raw_spawn(
                     &opts.argv,
                     &opts.env,
                     &remove,
@@ -449,10 +469,23 @@ impl Session {
                     opts.rows,
                     conpty_flags,
                     inject,
-                )?;
+                ) {
+                    Ok(rs) => rs,
+                    Err(e) => {
+                        // Every attempt failed: keep the launch record anyway.
+                        let a = os::raw_last_launch().unwrap_or(Value::Null);
+                        record_failed_launch(json!({"backend": "raw",
+                            "conpty_flags": conpty_flags, "branch": "none", "error": e,
+                            "attempts": a["attempts"],
+                            "job_list_rejected": a["job_list_rejected"] == json!(true)}));
+                        return Err(e);
+                    }
+                };
                 // --- guard exists from here on; the tree is the job from creation ---
                 let launch = json!({"backend": "raw", "conpty_flags": conpty_flags,
                                     "branch": rs.branch, "job_list_error": rs.job_list_error,
+                                    "job_list_rejected": rs.job_list_rejected,
+                                    "attempts": rs.attempts,
                                     "conpty_module": rs.conpty_module});
                 (rs.master, rs.child, Some(rs.tree), launch)
             }

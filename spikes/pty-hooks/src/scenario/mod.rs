@@ -128,6 +128,10 @@ impl Ctx {
                 r.status = r.derive_status();
             }
             r.detail("elapsed_ms", json!(self.t0.elapsed().as_millis() as u64));
+            let failed = session::failed_launches();
+            if !failed.is_empty() {
+                r.detail("failed_launches", json!(failed));
+            }
             r.status.clone()
         });
         if !self.args.keep_temp {

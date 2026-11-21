@@ -1576,25 +1576,62 @@ fn launch_records(v: &Value, out: &mut Vec<Value>) {
     }
 }
 
-/// F-2b branch rule for a candidate's row: it counts only on the JOB_LIST
-/// branch. A positively observed JOB_LIST rejection (a launch on the
-/// suspended branch) is a branch failure; no launch record (a failed branch
-/// lookup) is a harness failure. `P` rows pass through.
+/// Every launch record in a child's report (details and probe evidence).
+fn child_launches(r: &ChildRep) -> Vec<Value> {
+    let mut launches = Vec::new();
+    if let Ok(rep) = r {
+        launch_records(&rep.details, &mut launches);
+        for p in &rep.probes {
+            launch_records(&p.evidence, &mut launches);
+        }
+    }
+    launches
+}
+
+/// The backend and ConPTY flags a configuration's launches must carry.
+fn config_launch(config: &str) -> Option<(&'static str, Option<u64>)> {
+    match config {
+        "P" => Some(("portable", None)),
+        "R0" => Some(("raw", Some(0))),
+        "R6" => Some(("raw", Some(6))),
+        _ => None,
+    }
+}
+
+/// F-2b launch rule for a row of `config`: every launch the child made
+/// must carry that configuration's backend and flags, and a candidate counts
+/// only on the JOB_LIST branch. A positively observed JOB_LIST rejection (the
+/// `CreateProcessW` call with the job list failed) is a branch failure, also
+/// when the fallback failed too; any other launch off the JOB_LIST branch
+/// (e.g. an attribute-setup failure), a mismatched launch, or no launch
+/// record (a failed lookup) is a harness failure.
 pub fn branch_gate(config: &str, o: Outcome, launches: &[Value]) -> Outcome {
-    if config == "P" || matches!(o, Outcome::Missing | Outcome::HarnessFail { .. }) {
+    let Some((backend, flags)) = config_launch(config) else {
+        return Outcome::harness(format!("unknown configuration {config}"));
+    };
+    if backend == "raw"
+        && launches
+            .iter()
+            .any(|l| l["job_list_rejected"] == json!(true))
+    {
+        return Outcome::platform("JOB_LIST rejected: CreateProcessW with the job list failed");
+    }
+    if matches!(o, Outcome::Missing | Outcome::HarnessFail { .. }) {
         return o;
     }
     if launches.is_empty() {
         return Outcome::harness("branch lookup failed: no launch record");
     }
-    if let Some(l) = launches.iter().find(|l| l["branch"] != json!("job_list")) {
-        if l["branch"] == json!("suspended") {
-            return Outcome::platform(format!(
-                "JOB_LIST rejected ({}); the launch ran on the suspended branch",
-                l["job_list_error"]
+    for l in launches {
+        if l["backend"] != json!(backend) || flags.is_some_and(|f| l["conpty_flags"] != json!(f)) {
+            return Outcome::harness(format!("launch {l} does not match configuration {config}"));
+        }
+        if backend == "raw" && l["branch"] != json!("job_list") {
+            return Outcome::harness(format!(
+                "launch on branch {} without an observed JOB_LIST rejection",
+                l["branch"]
             ));
         }
-        return Outcome::harness(format!("unexpected launch record {l}"));
     }
     o
 }
@@ -1647,13 +1684,7 @@ fn probe_backend(ctx: &Ctx) {
                 &[],
             );
             let (o, ev) = child_cases_outcome(&r, row.ids);
-            let mut launches = Vec::new();
-            if let Ok(rep) = &r {
-                launch_records(&rep.details, &mut launches);
-                for p in &rep.probes {
-                    launch_records(&p.evidence, &mut launches);
-                }
-            }
+            let launches = child_launches(&r);
             let o = branch_gate(cfg, o, &launches);
             pc.put(
                 &case,
@@ -1822,13 +1853,17 @@ pub fn ps_invocation(exe: &Path, args: &[String]) -> String {
     s
 }
 
-/// The cases F-2b needs for one configuration: step 3's rows and step 4's
-/// C-5 observation of Claude and Codex (`--no-daemon`).
+/// The cases F-2b needs for one configuration: step 3's rows, and from
+/// step 4 the detached run's observer health (detached, calibration, both
+/// controls) and the C-5 observation of Claude and Codex (`--no-daemon`).
 fn f2_required(config: &str) -> Vec<String> {
     let mut v: Vec<String> = backend_rows(None)
         .iter()
         .map(|r| verdict::key("F-2a", &format!("{}/{config}", r.name)))
         .collect();
+    for c in CONSOLE_BASE.iter().filter(|c| **c != "survival") {
+        v.push(verdict::key("C-5", c));
+    }
     for name in ["claude-hooks", "codex-hooks-no-daemon"] {
         v.push(verdict::key("C-5", &format!("launch/{config}/{name}")));
         v.push(verdict::key("C-5", &format!("no_flash/{config}/{name}")));
@@ -2336,6 +2371,16 @@ fn delivery_outcome(name: &str, r: &ChildRep) -> Outcome {
     }
 }
 
+/// `launch/<config>/<name>`: the launch's own delivery case, with the
+/// launch records it ran on.
+pub fn console_launch(config: &str, name: &str, r: &ChildRep) -> (Outcome, Vec<Value>) {
+    let launches = child_launches(r);
+    (
+        branch_gate(config, delivery_outcome(name, r), &launches),
+        launches,
+    )
+}
+
 /// The pre-trusted, unattended matrix for one configuration (no attended
 /// steps): Claude and Codex `--no-daemon` under every configuration; under
 /// `P` also Codex default mode and fake paste.
@@ -2536,9 +2581,9 @@ fn probe_console(ctx: &Ctx) {
                 budget,
                 &[],
             );
-            let delivered = delivery_outcome(name, &r);
+            let (delivered, ev) = console_launch(cfg, name, &r);
             let ok = delivered == Outcome::Pass;
-            let tag = json!({"config": cfg, "status": status_of(&r)});
+            let tag = json!({"config": cfg, "status": status_of(&r), "launches": ev});
             pc.put(&format!("launch/{cfg}/{name}"), delivered, tag.clone());
             let nf = flash_outcome(&f, ok, calibrated);
             let flashed = matches!(nf, Outcome::PlatformFail { .. });
@@ -2566,12 +2611,12 @@ fn probe_console(ctx: &Ctx) {
                     budget,
                     &gui,
                 );
-                let delivered = delivery_outcome(name, &r2);
+                let (delivered, ev2) = console_launch(cfg, name, &r2);
                 let ok2 = delivered == Outcome::Pass;
                 pc.put(
                     &dk,
                     delivered,
-                    json!({"config": cfg, "status": status_of(&r2)}),
+                    json!({"config": cfg, "status": status_of(&r2), "launches": ev2}),
                 );
                 pc.put(
                     &fk,
@@ -3084,7 +3129,8 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            10
+            // 6 other rows + 4 launch cases + 4 observer-health cases.
+            14
         );
         // Mismatched run ids: not joined.
         let (a, mut b) = f2_reports(&[], &[]);
@@ -3205,8 +3251,9 @@ mod tests {
     /// failed lookup is a harness failure (so the candidate is incomplete).
     #[test]
     fn branch_gate_rules() {
-        let jl = json!({"backend": "raw", "branch": "job_list"});
-        let sus = json!({"backend": "raw", "branch": "suspended", "job_list_error": "denied"});
+        let jl = raw_launch(0, "job_list");
+        let sus = json!({"backend": "raw", "conpty_flags": 0, "branch": "suspended",
+                         "job_list_rejected": true, "job_list_error": "denied"});
         assert_eq!(
             branch_gate("R0", Outcome::Pass, std::slice::from_ref(&jl)),
             Outcome::Pass
@@ -3247,6 +3294,103 @@ mod tests {
             &[],
         );
         assert_eq!(f2_evaluate(&a, &b).0, "inconclusive");
+    }
+
+    /// H2: F-2 needs C-5's detached and observer-health cases (calibration
+    /// and both controls); a broken control leaves every candidate
+    /// incomplete even when each launch passed.
+    #[test]
+    fn f2_needs_detached_observer_health() {
+        for case in [
+            "detached",
+            "calibration",
+            "calibration/caret_control",
+            "calibration/at_exit_control",
+        ] {
+            let (a, mut b) = f2_reports(&[], &[]);
+            let mut cases: Vec<Check> =
+                serde_json::from_value(b.probes[0].evidence["cases"].clone()).unwrap();
+            cases.retain(|c| c.case != case);
+            cases.push(chk("C-5", case, Outcome::harness("observer failed")));
+            b.probes[0].evidence["cases"] = json!(cases);
+            b.probes[0].verdict = "inconclusive".into();
+            assert_eq!(f2_evaluate(&a, &b).0, "inconclusive", "{case}");
+        }
+    }
+
+    fn raw_launch(flags: u64, branch: &str) -> Value {
+        json!({"backend": "raw", "conpty_flags": flags, "branch": branch,
+               "job_list_rejected": false})
+    }
+
+    /// H2 / M9: a row counts only on a launch with its configuration's own
+    /// backend and flags; only a failed JOB_LIST creation call is a branch
+    /// failure, and it stays one when both branches failed.
+    #[test]
+    fn branch_gate_validates_config_and_provenance() {
+        let harness = |o: Outcome| matches!(o, Outcome::HarnessFail { .. });
+        let portable = json!({"backend": "portable", "branch": "assign_after"});
+        assert!(harness(branch_gate(
+            "R0",
+            Outcome::Pass,
+            &[raw_launch(6, "job_list")]
+        )));
+        assert!(harness(branch_gate(
+            "R6",
+            Outcome::Pass,
+            std::slice::from_ref(&portable)
+        )));
+        assert!(harness(branch_gate(
+            "P",
+            Outcome::Pass,
+            &[raw_launch(0, "job_list")]
+        )));
+        assert!(harness(branch_gate("P", Outcome::Pass, &[])));
+        // Suspended after an attribute-setup failure: no JOB_LIST rejection.
+        let attr = json!({"backend": "raw", "conpty_flags": 0, "branch": "suspended",
+            "job_list_rejected": false, "job_list_error": "attr job_list: denied",
+            "attempts": [{"branch": "job_list", "stage": "attr_job_list", "error": "denied"},
+                         {"branch": "suspended", "stage": "created"}]});
+        assert!(harness(branch_gate("R0", Outcome::Pass, &[attr])));
+        // Both branches failed after a JOB_LIST creation rejection.
+        let both = json!({"backend": "raw", "conpty_flags": 0, "branch": "none",
+            "job_list_rejected": true,
+            "attempts": [{"branch": "job_list", "stage": "create_process", "error": "87"},
+                         {"branch": "suspended", "stage": "create_process", "error": "5"}]});
+        assert!(matches!(
+            branch_gate("R0", Outcome::harness("launch failed"), &[both]),
+            Outcome::PlatformFail { .. }
+        ));
+        assert_eq!(
+            branch_gate("R6", Outcome::Pass, &[raw_launch(6, "job_list")]),
+            Outcome::Pass
+        );
+        assert_eq!(branch_gate("P", Outcome::Pass, &[portable]), Outcome::Pass);
+    }
+
+    /// H2: a console launch counts only on its configuration's own JOB_LIST
+    /// launch (a raw launch that fell back to `suspended` under the
+    /// observer's job never supplies passing C-5 evidence).
+    #[test]
+    fn console_launch_validates_the_launch() {
+        let mut rep = Report::new("real claude-hooks", "r");
+        rep.check("A-1", "session_start_bound", Outcome::Pass, Value::Null);
+        rep.detail(
+            "launch-x",
+            json!({"stop": {"launch": raw_launch(0, "suspended")}}),
+        );
+        let o = console_launch("R0", "claude-hooks", &Ok(rep.clone())).0;
+        assert!(!matches!(o, Outcome::Pass), "{o:?}");
+        rep.detail(
+            "launch-x",
+            json!({"stop": {"launch": raw_launch(0, "job_list")}}),
+        );
+        assert_eq!(
+            console_launch("R0", "claude-hooks", &Ok(rep.clone())).0,
+            Outcome::Pass
+        );
+        let o = console_launch("R6", "claude-hooks", &Ok(rep)).0;
+        assert!(!matches!(o, Outcome::Pass), "{o:?}");
     }
 
     /// Row outcomes read the child's own required cases.
