@@ -2470,6 +2470,16 @@ pub fn console_launch(config: &str, name: &str, r: &ChildRep) -> (Outcome, Vec<V
     )
 }
 
+/// Whether a flashed console launch is re-run with the GUI-subsystem
+/// emitter. Never for Codex: its hook trust is keyed by source and position
+/// with one trusted hash per key, so the GUI emitter's command at the same
+/// position cannot be trusted next to the console emitter's (pre-trusting
+/// it marks the console command `Modified`). Claude (`--settings` hooks) and
+/// FakeCli have no hook trust.
+pub fn gui_mitigation(name: &str) -> bool {
+    !name.starts_with("codex")
+}
+
 /// The pre-trusted, unattended matrix for one configuration (no attended
 /// steps): Claude and Codex `--no-daemon` under every configuration; under
 /// `P` also Codex default mode and fake paste.
@@ -2682,7 +2692,7 @@ fn probe_console(ctx: &Ctx) {
                 json!({"config": cfg, "flash": f.json()}),
             );
             let mut entry = json!({"baseline": f.json()});
-            if flashed {
+            if flashed && gui_mitigation(name) {
                 // Mitigation: rerun the SAME launch, cwd, and hook delivery with
                 // the GUI-subsystem emitter.
                 let (dk, fk) = (
@@ -3425,6 +3435,21 @@ mod tests {
             &[],
         );
         assert_eq!(f2_evaluate(&a, &b).0, "inconclusive");
+    }
+
+    /// H1: a flashed Codex launch is not re-run with the GUI emitter (its
+    /// trust would collide with the console emitter's); Claude and FakeCli
+    /// launches still are.
+    #[test]
+    fn gui_mitigation_skips_codex() {
+        for n in [
+            "claude-hooks",
+            "codex-hooks-no-daemon",
+            "codex-hooks-default",
+            "fake-paste",
+        ] {
+            assert_eq!(gui_mitigation(n), !n.starts_with("codex"), "{n}");
+        }
     }
 
     /// H2: F-2 needs C-5's detached and observer-health cases (calibration

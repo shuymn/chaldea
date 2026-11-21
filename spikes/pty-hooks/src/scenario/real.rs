@@ -1965,11 +1965,9 @@ pub fn print_launch(args: &Args) -> i32 {
             uuid::Uuid::new_v4().to_string(),
         ]);
     }
-    let variants = if name == "codex" {
-        codex_pretrust_argvs(&args.root, &argv[0], args.codex_mode == "no-daemon")
-    } else {
-        vec![("", argv)]
-    };
+    if name == "codex" {
+        argv = codex_pretrust_argv(&args.root, &argv[0], args.codex_mode == "no-daemon");
+    }
     let work = args.root.join("work");
     let mut cwds = vec![work.join(name)];
     if name == "codex" {
@@ -1986,16 +1984,8 @@ pub fn print_launch(args: &Args) -> i32 {
     println!("  CHALDEA_HOOK_URL=http://127.0.0.1:<port>/hook");
     println!("  CHALDEA_HOOK_TOKEN=<64-hex, fresh per launch>");
     println!("  CHALDEA_THREAD_ID=<uuid, fresh per launch>");
-    for (what, argv) in &variants {
-        println!("command{what}:");
-        println!(
-            "  {}",
-            argv.iter()
-                .map(|a| shell_quote(a))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-    }
+    println!("command:");
+    println!("  {}", pretrust_command_line(os::os_name(), &argv));
     println!("then (real CLIs run only with --allow-api-usage):");
     let follow: &[&str] = if name == "claude" {
         &[
@@ -2037,29 +2027,74 @@ pub fn print_launch(args: &Args) -> i32 {
     0
 }
 
-/// The Codex pre-trust commands: one per hook command string Codex will
-/// see, the console emitter's and the GUI-subsystem emitter's (C-5's
-/// mitigation rerun), since trust is per command string.
-pub fn codex_pretrust_argvs(
-    root: &Path,
-    bin: &str,
-    no_daemon: bool,
-) -> Vec<(&'static str, Vec<String>)> {
-    [
-        ("", "chs-hook-emit"),
-        (" (GUI emitter, C-5 mitigation rerun)", "chs-hook-emit-gui"),
-    ]
-    .into_iter()
-    .map(|(what, emitter)| {
-        let mut argv = vec![bin.to_string()];
-        if no_daemon {
-            argv.push("--no-daemon".into());
+/// The Codex pre-trust command: the console emitter only. Codex keys hook
+/// trust by source, event, and position and keeps one trusted hash per key,
+/// so trusting another command string at the same position (the
+/// GUI-subsystem emitter) would turn the console command's trust into
+/// `Modified` (codex-rs `hooks/src/engine/discovery.rs`).
+pub fn codex_pretrust_argv(root: &Path, bin: &str, no_daemon: bool) -> Vec<String> {
+    let mut argv = vec![bin.to_string()];
+    if no_daemon {
+        argv.push("--no-daemon".into());
+    }
+    argv.extend(codex_hook_args(&hook_command_for(
+        root,
+        "codex",
+        "chs-hook-emit",
+    )));
+    argv.push(CODEX_FIRST_PROMPT.into());
+    argv
+}
+
+/// The pre-trust command line for the owner's shell. Windows: a PowerShell
+/// call whose arguments follow the stop-parsing token `--%` in MSVC quoting,
+/// so the program receives exactly `argv` in both Windows PowerShell 5.1
+/// (which drops double quotes inside native arguments) and PowerShell 7.
+/// Elsewhere: POSIX shell quoting.
+pub fn pretrust_command_line(os: &str, argv: &[String]) -> String {
+    if os != "windows" {
+        return argv
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    let Some((exe, args)) = argv.split_first() else {
+        return String::new();
+    };
+    let mut s = format!("& '{}' --%", exe.replace('\'', "''"));
+    for a in args {
+        s.push(' ');
+        s.push_str(&msvc_quote(a));
+    }
+    s
+}
+
+/// One argument quoted for the MSVC C runtime's command-line parser.
+fn msvc_quote(a: &str) -> String {
+    if !a.is_empty() && !a.contains([' ', '\t', '"']) {
+        return a.to_string();
+    }
+    let mut s = String::from('"');
+    let mut backslashes = 0;
+    for c in a.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                s.extend(std::iter::repeat_n('\\', 2 * backslashes + 1));
+                s.push('"');
+                backslashes = 0;
+            }
+            c => {
+                s.extend(std::iter::repeat_n('\\', backslashes));
+                s.push(c);
+                backslashes = 0;
+            }
         }
-        argv.extend(codex_hook_args(&hook_command_for(root, "codex", emitter)));
-        argv.push(CODEX_FIRST_PROMPT.into());
-        (what, argv)
-    })
-    .collect()
+    }
+    s.extend(std::iter::repeat_n('\\', 2 * backslashes));
+    s.push('"');
+    s
 }
 
 /// C-2's spaced, non-ASCII cwd (`C:\chs\work\日本 dir` on Windows).
@@ -2196,20 +2231,94 @@ trusted_hash = "sha256:bb"
         }
     }
 
-    /// L5: C-5's mitigation rerun uses the GUI-subsystem emitter, whose
-    /// hook command string differs, so `print-launch codex` pre-trusts both.
+    /// H1: Codex keys hook trust by source and position, not by command, so
+    /// pre-trusting a second emitter variant at the same position would mark
+    /// the console command `Modified`. Pre-trust is the console emitter only.
     #[test]
-    fn pretrust_covers_both_emitter_variants() {
-        let v = codex_pretrust_argvs(Path::new("/r"), "codex", true);
-        let hooks: Vec<String> = v.iter().map(|(_, a)| a.join(" ")).collect();
+    fn pretrust_is_one_console_command() {
+        let argv = codex_pretrust_argv(Path::new("/r"), "codex", true);
+        let hooks: Vec<&String> = argv.iter().filter(|a| a.starts_with("hooks.")).collect();
+        assert_eq!(hooks.len(), 3, "{argv:?}");
         assert!(
-            hooks.iter().any(|h| h.contains("chs-hook-emit codex")),
+            hooks.iter().all(|h| h.contains("chs-hook-emit codex")),
             "{hooks:?}"
         );
-        assert!(
-            hooks.iter().any(|h| h.contains("chs-hook-emit-gui codex")),
-            "{hooks:?}"
+        assert_eq!(
+            argv.iter()
+                .filter(|a| a.as_str() == CODEX_FIRST_PROMPT)
+                .count(),
+            1,
+            "{argv:?}"
         );
+    }
+
+    /// Splits a command line with the MSVC C runtime rules (what a Rust
+    /// program on Windows sees as its arguments).
+    fn msvc_args(s: &str) -> Vec<String> {
+        let (mut out, mut cur, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
+        let c: Vec<char> = s.chars().collect();
+        let mut i = 0;
+        while i < c.len() {
+            match c[i] {
+                '\\' => {
+                    let n = c[i..].iter().take_while(|x| **x == '\\').count();
+                    if c.get(i + n) == Some(&'"') {
+                        cur.extend(std::iter::repeat_n('\\', n / 2));
+                        if n % 2 == 1 {
+                            cur.push('"');
+                            i += n + 1;
+                            any = true;
+                            continue;
+                        }
+                        i += n;
+                    } else {
+                        cur.extend(std::iter::repeat_n('\\', n));
+                        i += n;
+                    }
+                    any = true;
+                }
+                '"' => {
+                    quoted = !quoted;
+                    any = true;
+                    i += 1;
+                }
+                ' ' | '\t' if !quoted => {
+                    if any {
+                        out.push(std::mem::take(&mut cur));
+                        any = false;
+                    }
+                    i += 1;
+                }
+                ch => {
+                    cur.push(ch);
+                    any = true;
+                    i += 1;
+                }
+            }
+        }
+        if any {
+            out.push(cur);
+        }
+        out
+    }
+
+    /// H1: on Windows the pre-trust command is a PowerShell invocation that
+    /// hands Codex exactly the harness's argv (the session-flag TOML holds
+    /// double quotes, which PowerShell 5.1 drops from native arguments, so
+    /// the arguments follow the stop-parsing token in MSVC quoting); other
+    /// hosts keep POSIX shell quoting.
+    #[test]
+    fn pretrust_command_is_powershell_on_windows() {
+        let exe = r"C:\chs\npm\codex 1\codex.exe";
+        let argv = codex_pretrust_argv(Path::new(r"C:\chs"), exe, true);
+        let line = pretrust_command_line("windows", &argv);
+        let rest = line
+            .strip_prefix(&format!("& '{exe}' --% "))
+            .unwrap_or_else(|| panic!("not a PowerShell call: {line}"));
+        assert_eq!(msvc_args(rest), argv[1..].to_vec(), "{line}");
+        assert!(!rest.contains('%'), "{line}");
+        let posix = pretrust_command_line("macos", &argv[..2]);
+        assert_eq!(posix, format!("'{exe}' --no-daemon"));
     }
 
     #[test]
