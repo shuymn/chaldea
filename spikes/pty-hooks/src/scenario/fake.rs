@@ -538,7 +538,7 @@ pub fn tree_kill_once(ctx: &Ctx, hold_assign: bool, label: &str, escape_probe: b
             want.iter().all(|r| ws.iter().any(|w| w.role == *r))
         });
     // Give the recorder one more pass after every witness exists.
-    l.session.owned.record_scan();
+    let _ = l.session.owned.record_scan();
     let witnesses = l.receiver.witnesses();
     // A witness counts only if it is positively alive before the stop.
     let pre_stop: Vec<(u32, Option<bool>)> = witnesses
@@ -1528,7 +1528,7 @@ fn run_case(args: Args) -> i32 {
         let _ = std::fs::write(ctx.out.join("ready"), b"1");
     };
     let record = |ctx: &Ctx, l: &Launch| {
-        l.session.owned.record_scan();
+        let _ = l.session.owned.record_scan();
         let owned: Vec<Value> = l
             .session
             .owned
@@ -2300,7 +2300,7 @@ fn raw_inject(ctx: &Ctx) {
                 .wait_witnesses(ctx.until(Duration::from_secs(10)), |ws| {
                     roles.iter().all(|role| ws.iter().any(|w| &w.role == role))
                 });
-            l.session.owned.record_scan();
+            let _ = l.session.owned.record_scan();
             r.witnesses = l
                 .receiver
                 .witnesses()

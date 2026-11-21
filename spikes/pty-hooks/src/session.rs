@@ -102,11 +102,11 @@ impl Owned {
     }
 
     /// Records the child's descendants with verified lineage (ppid walk from
-    /// identities already recorded) and, on Unix, its pgid/sid members.
-    pub fn record_scan(&self) {
-        let Ok(procs) = os::list_processes() else {
-            return;
-        };
+    /// identities already recorded) and, on Unix, its pgid/sid members. A
+    /// failed process enumeration is returned (the kill path's final scan
+    /// records it in the kill proof).
+    pub fn record_scan(&self) -> Result<(), String> {
+        let procs = os::list_processes().map_err(|e| format!("process enumeration: {e}"))?;
         let mut roots: Vec<(u32, u64)> = vec![(self.child_pid, self.child_start)];
         roots.extend(
             self.recorded
@@ -127,13 +127,16 @@ impl Owned {
         for p in found {
             rec.entry((p.pid, p.start_time)).or_insert(p);
         }
+        Ok(())
     }
 
     /// Pre-stop half of the kill proof (job trees only): the historical
     /// descendant list, each identity's liveness, one membership snapshot,
     /// and a retained handle on every live identity (positive death evidence
-    /// after the stop).
-    fn proof_before(&self) -> Option<(Value, Vec<Retained>)> {
+    /// after the stop). The census gaps are recorded: the final scan's error,
+    /// job members with no recorded identity, and live identities whose
+    /// handle could not be retained.
+    fn proof_before(&self, scan: Result<(), String>) -> Option<(Value, Vec<Retained>)> {
         let tree = self.tree.lock().unwrap_or_else(|e| e.into_inner());
         let t = tree.as_ref().filter(|t| t.proves_membership())?;
         let membership = t.members_checked();
@@ -149,8 +152,21 @@ impl Owned {
                 json!({"pid": p.pid, "start_time": p.start_time, "name": p.name, "live": live})
             })
             .collect();
+        let ids: Vec<(u32, u64)> = self
+            .recorded()
+            .iter()
+            .map(|p| (p.pid, p.start_time))
+            .collect();
+        let open_failed: Vec<u32> = retained
+            .iter()
+            .filter(|(_, _, h)| h.is_none())
+            .map(|(pid, _, _)| *pid)
+            .collect();
         let mut proof = json!({"pre_stop": pre, "membership": match &membership {
-            Ok(m) => json!(m), Err(e) => json!({"error": e}) }});
+            Ok(m) => json!(m), Err(e) => json!({"error": e}) },
+            "scan_error": scan.err(),
+            "unreconciled_members": membership.as_ref().map(|m| unreconciled(m, &ids)).unwrap_or_default(),
+            "retained_open_failed": open_failed});
         if t.describe()["assign"] == json!("after_spawn") {
             proof["known_limit"] = json!(
                 "assign-after: a grandchild created by a child that exits before the job \
@@ -242,8 +258,8 @@ impl Owned {
                 ..Default::default()
             };
         }
-        self.record_scan();
-        let mut kill_proof = self.proof_before();
+        let scan = self.record_scan();
+        let mut kill_proof = self.proof_before(scan);
         let primary_steps = self.kill_primary(grace, &mut kill_proof);
         let kill_proof = kill_proof.map(|(p, _)| p);
         // Give the primary a moment to land before judging escapees.
@@ -315,6 +331,15 @@ pub fn owned_by(
     out
 }
 
+/// Job members with no recorded identity (pid) before the stop.
+pub fn unreconciled(members: &[u32], recorded: &[(u32, u64)]) -> Vec<u32> {
+    members
+        .iter()
+        .copied()
+        .filter(|m| !recorded.iter().any(|(pid, _)| pid == m))
+        .collect()
+}
+
 /// The §4.8 `backend` kill proof as a case outcome. Every descendant live
 /// before the stop must be positively in the job (one outside it is an
 /// escapee); the MCP witness `(pid, start)` must be live and in the job;
@@ -328,6 +353,23 @@ pub fn kill_proof_outcome(proof: &Value, witness: Option<(u32, u64)>) -> Outcome
         return Outcome::harness(format!("membership query failed: {}", proof["membership"]));
     };
     let members: Vec<u64> = members.iter().filter_map(Value::as_u64).collect();
+    // An incomplete census proves nothing either way.
+    if let Some(e) = proof["scan_error"].as_str() {
+        return Outcome::harness(format!("final process scan failed: {e}"));
+    }
+    let listed = |k: &str| proof[k].as_array().is_some_and(|a| !a.is_empty());
+    if listed("unreconciled_members") {
+        return Outcome::harness(format!(
+            "job members with no recorded identity: {}",
+            proof["unreconciled_members"]
+        ));
+    }
+    if listed("retained_open_failed") {
+        return Outcome::harness(format!(
+            "no handle retained on live identities: {}",
+            proof["retained_open_failed"]
+        ));
+    }
     let pre: Vec<&Value> = proof["pre_stop"].as_array().into_iter().flatten().collect();
     if pre.iter().any(|p| p["live"].is_null()) {
         return Outcome::harness("pre-stop liveness unknown");
@@ -564,7 +606,7 @@ impl Session {
             .name("recorder".into())
             .spawn(move || {
                 while !st.load(Ordering::SeqCst) {
-                    o.record_scan();
+                    let _ = o.record_scan();
                     std::thread::sleep(Duration::from_millis(200));
                 }
             })
@@ -928,6 +970,30 @@ mod tests {
         assert!(matches!(o, Outcome::HarnessFail { .. }), "{o:?}");
         p["terminate_job_ok"] = json!(true);
         assert_eq!(kill_proof_outcome(&p, Some((10, 1))), Outcome::Pass);
+    }
+
+    /// M1: a failed final scan, a job member missing from the recorded
+    /// identities, or a live identity whose handle could not be retained
+    /// leaves the proof incomplete: harness failure, never a pass.
+    #[test]
+    fn kill_proof_needs_complete_census() {
+        let base = || {
+            json!({"pre_stop": [{"pid": 10, "start_time": 1, "live": true}],
+                "membership": [10], "after_job": [{"pid": 10, "live": false}],
+                "live_set_dead_before_fallback": true, "terminate_job_ok": true})
+        };
+        assert_eq!(kill_proof_outcome(&base(), Some((10, 1))), Outcome::Pass);
+        for (k, v) in [
+            ("scan_error", json!("Process32NextW: access denied")),
+            ("unreconciled_members", json!([11])),
+            ("retained_open_failed", json!([10])),
+        ] {
+            let mut p = base();
+            p[k] = v;
+            let o = kill_proof_outcome(&p, Some((10, 1)));
+            assert!(matches!(o, Outcome::HarnessFail { .. }), "{k}: {o:?}");
+        }
+        assert_eq!(unreconciled(&[10, 11, 12], &[(10, 1), (12, 3)]), vec![11]);
     }
 
     /// §4.8 `backend` kill proof as a case outcome.

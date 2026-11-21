@@ -1669,7 +1669,7 @@ fn codex_warm(ctx: &Ctx, a: &Agent) {
     // The warm server must be the warm fixture's own process: a Codex
     // recorded in its tree by verified lineage, or whose ancestry reaches the
     // fixture's CLI.
-    unrelated.owned.record_scan();
+    let _ = unrelated.owned.record_scan();
     let fixture = unrelated.owned.child_pid;
     let mut warm: Vec<os::ProcInfo> = unrelated
         .owned
