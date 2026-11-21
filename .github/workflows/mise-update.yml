@@ -101,9 +101,10 @@ jobs:
               # this one opens it.
               head=$(gh api "repos/$repo/git/ref/heads/$BRANCH" --jq .object.sha)
               # commits/{sha}/pulls omits closed unmerged PRs, so list the
-              # branch's PRs in every state instead.
+              # branch's PRs in every state instead. An open PR for this head
+              # wins over a closed one.
               pr=$(gh api "repos/$repo/pulls?state=all&head=${repo%%/*}:$BRANCH&base=$BASE_BRANCH&per_page=100" \
-                --jq "map(select(.head.sha == \"$head\"))[0] // empty")
+                --jq "map(select(.head.sha == \"$head\")) | (map(select(.state == \"open\"))[0] // .[0]) // empty")
               if [ -n "$pr" ] && [ "$(printf '%s' "$pr" | jq -r .state)" = closed ]; then
                 echo "$BRANCH proposes this lockfile; its PR was closed"
                 exit 0
