@@ -4,11 +4,11 @@
 use serde::Serialize;
 
 mod drain;
+pub use drain::*;
+
 /// The line prefix FakeCli `spawn-tree --emit-output` writes (F-2c
 /// `after-spawn` fires only once it is seen in the held output).
 pub const EMIT_OUTPUT_MARKER: &str = "OUTPUT-";
-
-pub use drain::*;
 
 #[cfg(unix)]
 mod unix;
@@ -230,8 +230,59 @@ pub fn non_utf8_os_string() -> std::ffi::OsString {
     }
 }
 
+/// A one-shot handoff from a worker thread to the thread that started it
+/// (the window observer's readiness report). A zero-capacity channel: the
+/// offer completes only when the starter receives it, and fails once the
+/// starter has given up and dropped its side, so both agree on whether
+/// the handoff happened.
+pub fn rendezvous<T>() -> (Offer<T>, Claim<T>) {
+    let (tx, rx) = std::sync::mpsc::sync_channel(0);
+    (Offer(tx), Claim(rx))
+}
+
+/// The worker's side: `offer` is true only when the starter took the value.
+pub struct Offer<T>(std::sync::mpsc::SyncSender<T>);
+
+impl<T> Offer<T> {
+    pub fn offer(self, v: T) -> bool {
+        self.0.send(v).is_ok()
+    }
+}
+
+/// The starter's side.
+pub struct Claim<T>(std::sync::mpsc::Receiver<T>);
+
+impl<T> Claim<T> {
+    /// The offered value, if it came within `timeout`.
+    pub fn claim(&self, timeout: std::time::Duration) -> Option<T> {
+        self.0.recv_timeout(timeout).ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// M5: a readiness report offered after the starter stopped waiting
+    /// is never taken as claimed (the worker then unhooks and exits), even
+    /// while the starter has not dropped its side yet; one offered in time
+    /// is claimed on both sides.
+    #[test]
+    fn late_ready_is_not_claimed() {
+        use std::time::Duration;
+        let (offer, claim) = super::rendezvous::<u32>();
+        assert_eq!(claim.claim(Duration::from_millis(20)), None);
+        let worker = std::thread::spawn(move || offer.offer(7));
+        std::thread::sleep(Duration::from_millis(100));
+        drop(claim);
+        assert!(
+            !worker.join().unwrap(),
+            "a late offer must not count as claimed"
+        );
+        let (offer, claim) = super::rendezvous::<u32>();
+        let worker = std::thread::spawn(move || offer.offer(7));
+        assert_eq!(claim.claim(Duration::from_secs(5)), Some(7));
+        assert!(worker.join().unwrap());
+    }
+
     /// M5: a second observer cannot arm while the first one's thread still
     /// holds the slot; it can once that thread has exited.
     #[test]

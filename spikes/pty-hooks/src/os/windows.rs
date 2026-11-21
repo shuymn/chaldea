@@ -738,7 +738,7 @@ impl WindowObserver {
             events: Mutex::new(Vec::new()),
         });
         let slot = OBSERVER_SLOT.arm()?;
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = super::rendezvous();
         let st = state.clone();
         let join = std::thread::Builder::new()
             .name("window-observer".into())
@@ -760,7 +760,8 @@ impl WindowObserver {
                         0,
                         WINEVENT_OUTOFCONTEXT,
                     );
-                    let ready = tx.send((GetCurrentThreadId(), !hook.is_null())).is_ok();
+                    // Blocks until the starter takes the report or gives up.
+                    let ready = tx.offer((GetCurrentThreadId(), !hook.is_null()));
                     if hook.is_null() {
                         return false;
                     }
@@ -784,15 +785,16 @@ impl WindowObserver {
                 }
             })
             .map_err(|e| format!("observer thread: {e}"))?;
-        match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok((tid, true)) => Ok(WindowObserver {
+        match rx.claim(Duration::from_secs(5)) {
+            Some((tid, true)) => Ok(WindowObserver {
                 thread_id: tid,
                 state,
                 join,
             }),
-            Ok((_, false)) => Err("SetWinEventHook failed".into()),
-            // Dropping `rx` makes the thread's readiness send fail: it unhooks.
-            Err(_) => Err("observer thread did not start".into()),
+            Some((_, false)) => Err("SetWinEventHook failed".into()),
+            // Dropping `rx` fails the thread's pending or later offer: it
+            // unhooks and exits, releasing the slot.
+            None => Err("observer thread did not start".into()),
         }
     }
 
