@@ -1725,6 +1725,13 @@ pub fn branch_gate(config: &str, o: Outcome, launches: &[Value]) -> Outcome {
     let Some((backend, flags)) = config_launch(config) else {
         return Outcome::harness(format!("unknown configuration {config}"));
     };
+    // Every launch must carry this configuration's backend and flags before
+    // any of them can say something about it (a JOB_LIST rejection included).
+    for l in launches {
+        if l["backend"] != json!(backend) || flags.is_some_and(|f| l["conpty_flags"] != json!(f)) {
+            return Outcome::harness(format!("launch {l} does not match configuration {config}"));
+        }
+    }
     if backend == "raw"
         && launches
             .iter()
@@ -1739,9 +1746,6 @@ pub fn branch_gate(config: &str, o: Outcome, launches: &[Value]) -> Outcome {
         return Outcome::harness("branch lookup failed: no launch record");
     }
     for l in launches {
-        if l["backend"] != json!(backend) || flags.is_some_and(|f| l["conpty_flags"] != json!(f)) {
-            return Outcome::harness(format!("launch {l} does not match configuration {config}"));
-        }
         if backend == "raw" && l["branch"] != json!("job_list") {
             return Outcome::harness(format!(
                 "launch on branch {} without an observed JOB_LIST rejection",
@@ -3991,6 +3995,16 @@ mod tests {
             Outcome::Pass
         );
         assert_eq!(branch_gate("P", Outcome::Pass, &[portable]), Outcome::Pass);
+        // L2: a JOB_LIST rejection on a launch of another configuration's
+        // flags is a mismatched launch (harness), not R0's branch failure.
+        let other = json!({"backend": "raw", "conpty_flags": 6, "branch": "none",
+            "job_list_rejected": true});
+        assert!(harness(branch_gate(
+            "R0",
+            Outcome::harness("launch failed"),
+            std::slice::from_ref(&other)
+        )));
+        assert!(harness(branch_gate("P", Outcome::Pass, &[other])));
     }
 
     /// H2: a console launch counts only on its configuration's own JOB_LIST
