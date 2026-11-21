@@ -570,8 +570,10 @@ fn is_index(s: &str) -> bool {
 /// The trust key of the session-flag SessionStart hook under test: the one
 /// `hooks.state` key whose source path ends in `<session-flags>/config.toml`
 /// (either separator), whose event is `session_start`, and whose group and
-/// handler indices are non-negative integers. `raw` lists every key
-/// containing `session-flags` exactly as written (keys only).
+/// handler indices are non-negative integers; any unrecognized
+/// `<session-flags>` candidate takes precedence (`Unrecognized`). `raw`
+/// lists every key containing `session-flags` exactly as written (keys
+/// only).
 pub fn session_flag_key(config: &[u8]) -> KeyResult {
     let text = match std::str::from_utf8(config) {
         Ok(t) => t,
@@ -601,14 +603,18 @@ pub fn session_flag_key(config: &[u8]) -> KeyResult {
             None => {}
         }
     }
-    match (found.len(), unrecognized.is_empty()) {
-        (1, _) => KeyResult::Found {
+    // An unrecognized candidate means the key under test is not established,
+    // whatever else matched.
+    if !unrecognized.is_empty() {
+        return KeyResult::Unrecognized(raw);
+    }
+    match found.len() {
+        0 => KeyResult::None,
+        1 => KeyResult::Found {
             key: found.remove(0),
             raw,
         },
-        (n, _) if n > 1 => KeyResult::Ambiguous(raw),
-        (_, false) => KeyResult::Unrecognized(raw),
-        _ => KeyResult::None,
+        _ => KeyResult::Ambiguous(raw),
     }
 }
 
@@ -2145,6 +2151,23 @@ mod tests {
     }
 
     /// C3: delivered, no review, and the same key as the first cwd.
+    /// L1: an unrecognized `<session-flags>` candidate takes precedence over
+    /// a valid key (the key under test is not established), and its raw
+    /// key is kept.
+    #[test]
+    fn unrecognized_candidate_takes_precedence() {
+        let cfg = br#"
+[hooks.state."/<session-flags>/config.toml:session_start:0:0"]
+trusted_hash = "sha256:aa"
+[hooks.state."/<session-flags>/config.toml:session_start:x:0"]
+trusted_hash = "sha256:bb"
+"#;
+        match session_flag_key(cfg) {
+            KeyResult::Unrecognized(raw) => assert_eq!(raw.len(), 2, "{raw:?}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn c3_needs_delivery_and_the_same_key() {
         let k = "/<session-flags>/config.toml:session_start:0:0";
