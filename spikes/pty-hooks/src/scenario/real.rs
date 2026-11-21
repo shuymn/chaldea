@@ -1234,7 +1234,14 @@ fn keys_sweep(ctx: &Ctx, a: &Agent, newline: NewlineKey) {
         } else {
             ctx.args.allow_lossy.clone()
         };
-        let (o, ev) = keys_case_run(ctx, a, &cwd, newline, e, &allow);
+        let (mut o, mut ev) = keys_case_run(ctx, a, &cwd, newline, e, &allow, "");
+        if startup_retry(&o) && !ctx.past_cutoff() {
+            // Codex failed to start (e.g. `account/read` timed out): once
+            // more in a fresh session; both attempts are recorded.
+            let first = json!({"result": o.tag(), "cause": o.cause(), "evidence": ev});
+            (o, ev) = keys_case_run(ctx, a, &cwd, newline, e, &allow, "-retry");
+            ev["attempts"] = json!([first, {"result": o.tag(), "cause": o.cause()}]);
+        }
         if e.recorded {
             recorded
                 .push(json!({"id": e.id, "result": o.tag(), "cause": o.cause(), "evidence": ev}));
@@ -1245,6 +1252,15 @@ fn keys_sweep(ctx: &Ctx, a: &Agent, newline: NewlineKey) {
     ctx.detail("f1_recorded", json!(recorded));
 }
 
+/// A case that ended because the CLI never started (no bound
+/// SessionStart) is retried once in a fresh session.
+pub fn startup_retry(o: &Outcome) -> bool {
+    matches!(o, Outcome::NotExercised { reason } if reason == NO_BOUND_START)
+}
+
+const NO_BOUND_START: &str = "no bound SessionStart";
+
+/// One case in its own session; `attempt` suffixes the launch label.
 fn keys_case_run(
     ctx: &Ctx,
     a: &Agent,
@@ -1252,8 +1268,9 @@ fn keys_case_run(
     newline: NewlineKey,
     e: &paste::FEntry,
     allow: &[Lossy],
+    attempt: &str,
 ) -> (Outcome, Value) {
-    let label = format!("{}-keys-{}-{}", a.name, newline.name(), e.id);
+    let label = format!("{}-keys-{}-{}{attempt}", a.name, newline.name(), e.id);
     let l = match start(ctx, a, &label, cwd, Some("no-daemon"), a.name, &[]) {
         Ok(l) => l,
         Err(err) => return (Outcome::harness(err.clone()), json!({"not_run": err})),
@@ -1320,7 +1337,7 @@ fn keys_case_run(
             json!({}),
         )
     } else if bound.is_none() {
-        (Outcome::not_exercised("no bound SessionStart"), json!({}))
+        (Outcome::not_exercised(NO_BOUND_START), json!({}))
     } else if fence.is_none() {
         (
             Outcome::not_exercised("the bootstrap turn never ended"),
@@ -2386,6 +2403,19 @@ trusted_hash = "sha256:bb"
             c3_outcome(false, Outcome::Pass, Some(k), &found(k)),
             Outcome::HarnessFail { .. }
         ));
+    }
+
+    /// Only a case whose CLI never bound a SessionStart is retried.
+    #[test]
+    fn only_a_failed_start_is_retried() {
+        assert!(startup_retry(&Outcome::not_exercised(
+            "no bound SessionStart"
+        )));
+        assert!(!startup_retry(&Outcome::not_exercised(
+            "the bootstrap turn never ended"
+        )));
+        assert!(!startup_retry(&Outcome::platform("no bound SessionStart")));
+        assert!(!startup_retry(&Outcome::Pass));
     }
 
     /// Every Codex launch starts with the positional first prompt, last in argv.
