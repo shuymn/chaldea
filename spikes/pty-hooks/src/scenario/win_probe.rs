@@ -2029,6 +2029,8 @@ pub fn phase3c_steps() -> Vec<P3cStep> {
         let mut a = vec![
             "real",
             "codex-paste",
+            "--input-encoding",
+            "win-keys",
             "--subset",
             subset,
             "--newline-key",
@@ -2172,6 +2174,189 @@ fn row_summary(entry: &str, c: &Check) -> Value {
            "changes": e["base"]["paste"]["changes"]})
 }
 
+/// A comparison arm's row (H1): an explicit result, passed or an observed
+/// platform failure, satisfies the arm (`pass`, the arm's own result in
+/// the evidence); a child that did not run, an absent row, or an
+/// incomplete row (harness failure, not exercised, missing) keeps the
+/// question inconclusive.
+fn arm_outcome(r: &ChildRep, c: Option<&Check>) -> (Option<Outcome>, Value) {
+    match (r, c) {
+        (Err(e), _) => (Some(Outcome::harness(e.clone())), Value::Null),
+        (Ok(_), None) => (None, Value::Null),
+        (Ok(_), Some(c)) if c.result == "pass" || c.result == "platform_fail" => (
+            Some(Outcome::Pass),
+            json!({"arm_result": c.result, "arm_cause": c.cause, "evidence": c.evidence}),
+        ),
+        (Ok(_), Some(c)) => (Some(Outcome::from_check(c)), c.evidence.clone()),
+    }
+}
+
+/// A verdict row: the case's own outcome (absent = missing).
+fn verdict_outcome(r: &ChildRep, c: Option<&Check>) -> (Option<Outcome>, Value) {
+    match (r, c) {
+        (Err(e), _) => (Some(Outcome::harness(e.clone())), Value::Null),
+        (Ok(_), None) => (None, Value::Null),
+        (Ok(_), Some(c)) => (Some(Outcome::from_check(c)), c.evidence.clone()),
+    }
+}
+
+/// Phase 3c's per-question probes from the children's reports. Every
+/// planned arm is required: the verdict rows (burst off, records `marks`,
+/// the full corpus) by their own outcome, and the comparison arms (the
+/// burst-on control, the records-`none` arms, every keys-probe item) by
+/// having an explicit result; the keys-probe controls must pass. A failed
+/// control or an absent or unrun arm leaves that question inconclusive.
+fn p3c_probes(ran: &[(P3cStep, ChildRep, PathBuf)]) -> Vec<(Pc, Value)> {
+    let not_run: ChildRep = Err("not_run: the step is not in this run".into());
+    let child = |name: &str| -> &ChildRep {
+        ran.iter()
+            .find(|(s, _, _)| s.name == name)
+            .map(|(_, r, _)| r)
+            .unwrap_or(&not_run)
+    };
+    let row = |r: &ChildRep, entry: &str| -> Option<Check> {
+        keys_rows(r)
+            .into_iter()
+            .find(|(e, _)| e == entry)
+            .map(|(_, c)| c)
+    };
+    let put = |pc: &mut Pc, case: &str, o: (Option<Outcome>, Value)| {
+        pc.req(case);
+        if let (Some(o), ev) = o {
+            pc.put(case, o, ev);
+        }
+    };
+    let mut out = Vec::new();
+
+    // Question 1: Enter submits with the burst override; the burst-on runs
+    // are the control and need an explicit result.
+    let mut submit = Pc::new("P3c-submit");
+    let mut control = Vec::new();
+    for s in phase3c_steps().iter().filter(|s| s.question == "submit") {
+        let r = child(&s.name);
+        let burst = if s.name.contains("-on-") { "on" } else { "off" };
+        let i = s.name.rsplit('-').next().unwrap_or("?");
+        for entry in ["long_multiline", "cjk_compat"] {
+            let case = format!("{entry}/{burst}/{i}");
+            let c = row(r, entry);
+            control.push(
+                json!({"case": case, "row": c.as_ref().map(|c| row_summary(entry, c)),
+                                "status": status_of(r)}),
+            );
+            let o = if burst == "off" {
+                verdict_outcome(r, c.as_ref())
+            } else {
+                arm_outcome(r, c.as_ref())
+            };
+            put(&mut submit, &case, o);
+        }
+    }
+    out.push((
+        submit,
+        json!({"control_arm": control,
+               "note": "burst-on rows count by having an explicit result (their own result is \
+                        in arm_result); burst-off rows by their outcome"}),
+    ));
+
+    // Question 2: delivery.
+    let mut delivery = Pc::new("P3c-delivery");
+    let mut extra = serde_json::Map::new();
+    let pair = ["emoji_zwj", "small_kana_mark"];
+    for e in pair {
+        let r = child("p3c-pair-marks");
+        put(
+            &mut delivery,
+            &format!("pair/marks/{e}"),
+            verdict_outcome(r, row(r, e).as_ref()),
+        );
+        let r = child("p3c-pair-none");
+        put(
+            &mut delivery,
+            &format!("pair/none/{e}"),
+            arm_outcome(r, row(r, e).as_ref()),
+        );
+    }
+    let r = child("p3c-corpus");
+    for e in f1_entries() {
+        put(
+            &mut delivery,
+            &format!("corpus/{e}"),
+            verdict_outcome(r, row(r, &e).as_ref()),
+        );
+    }
+    let r = child("p3c-corpus-recorded");
+    put(
+        &mut delivery,
+        "corpus/small_kana_mark",
+        verdict_outcome(r, row(r, "small_kana_mark").as_ref()),
+    );
+    extra.insert(
+        "recorded".into(),
+        json!(
+            keys_rows(r)
+                .iter()
+                .map(|(e, c)| row_summary(e, c))
+                .collect::<Vec<_>>()
+        ),
+    );
+    let r = child("p3c-none");
+    for e in P3C_AFFECTED {
+        put(
+            &mut delivery,
+            &format!("none/{e}"),
+            arm_outcome(r, row(r, e).as_ref()),
+        );
+    }
+    let r = child("p3c-keys-probe");
+    let probe_check = |case: &str| find_check(r, "keys-probe", case).cloned();
+    for c in ["controls/ascii", "controls/shift_enter"] {
+        put(
+            &mut delivery,
+            &format!("keys-probe/{c}"),
+            verdict_outcome(r, probe_check(c).as_ref()),
+        );
+    }
+    for (id, _) in super::fake::KEYS_PROBE_ITEMS {
+        for arm in ["raw", "records", "codex_marks"] {
+            let c = format!("{id}/{arm}");
+            put(
+                &mut delivery,
+                &format!("keys-probe/{c}"),
+                arm_outcome(r, probe_check(&c).as_ref()),
+            );
+        }
+    }
+    extra.insert(
+        "note".into(),
+        json!(
+            "records-none arms and keys-probe items count by having an explicit result \
+               (an observed loss is a result; see arm_result); a keys-probe item after a \
+               failed control is a harness failure"
+        ),
+    );
+    out.push((delivery, Value::Object(extra)));
+
+    // Question 3: outside-job identity.
+    let mut outside = Pc::new("P3c-outside-job");
+    let r = child("p3c-tree-kill-codex");
+    let c = find_check(r, "A-8", "codex_kill_proof").cloned();
+    put(
+        &mut outside,
+        "codex_kill_proof",
+        verdict_outcome(r, c.as_ref()),
+    );
+    let ident = c.map(|c| c.evidence["outside_job_identity"].clone());
+    out.push((outside, json!({"outside_job_identity": ident})));
+
+    // Question 4: reader-start repetition.
+    let mut reader = Pc::new("P3c-reader-start");
+    let r = child("p3c-reader-start");
+    let c = find_check(r, "F-2c", "reader-start").cloned();
+    put(&mut reader, "reader-start", verdict_outcome(r, c.as_ref()));
+    out.push((reader, Value::Null));
+    out
+}
+
 /// `phase3c` (§5 phase 3c): the narrow Windows test under `R0` only. Each
 /// question's children have their own hard cutoffs; the overall cutoff is
 /// about 90 minutes. Unrun items are `not_exercised`, never inferred.
@@ -2198,7 +2383,6 @@ fn phase3c(ctx: &Ctx) {
         let (r, out) = child(ctx, &s.name, &a, b, false, &[]);
         ran.push((s.clone(), r, out));
     }
-    let find = |name: &str| ran.iter().find(|(s, _, _)| s.name == name);
     let mut steps_json = Vec::new();
     for (s, r, out) in &ran {
         steps_json.push(
@@ -2207,121 +2391,9 @@ fn phase3c(ctx: &Ctx) {
         );
     }
     ctx.detail("phase3c_steps", json!(steps_json));
-
-    // Question 1: Enter submits with the burst override (control arm).
-    let mut submit = Pc::new("P3c-submit");
-    let mut control = Vec::new();
-    for (s, r, _) in ran.iter().filter(|(s, _, _)| s.question == "submit") {
-        let burst = if s.name.contains("-on-") { "on" } else { "off" };
-        let i = s.name.rsplit('-').next().unwrap_or("?");
-        for entry in ["long_multiline", "cjk_compat"] {
-            let case = format!("{entry}/{burst}/{i}");
-            let row = keys_rows(r).into_iter().find(|(e, _)| e == entry);
-            control.push(
-                json!({"case": case, "row": row.as_ref().map(|(e, c)| row_summary(e, c)),
-                                "status": status_of(r)}),
-            );
-            if burst == "off" {
-                submit.req(&case);
-                match (&row, r) {
-                    (_, Err(e)) => submit.put(&case, Outcome::harness(e.clone()), Value::Null),
-                    (Some((_, c)), _) => {
-                        submit.put(&case, Outcome::from_check(c), c.evidence.clone())
-                    }
-                    (None, _) => {}
-                }
-            }
-        }
+    for (pc, extra) in p3c_probes(&ran) {
+        pc.finish(ctx, extra);
     }
-    submit.finish(
-        ctx,
-        json!({"control_arm": control,
-        "note": "burst-on runs are the control (current behavior), outside the verdict"}),
-    );
-
-    // Question 2: delivery (records), the corpus under the override.
-    let mut delivery = Pc::new("P3c-delivery");
-    let mut extra = serde_json::Map::new();
-    let put_rows = |pc: &mut Pc, prefix: &str, name: &str, entries: &[String]| {
-        let Some((_, r, _)) = find(name) else { return };
-        let rows = keys_rows(r);
-        for e in entries {
-            let case = format!("{prefix}/{e}");
-            pc.req(&case);
-            match (r, rows.iter().find(|(x, _)| x == e)) {
-                (Err(err), _) => pc.put(&case, Outcome::harness(err.clone()), Value::Null),
-                (Ok(_), Some((_, c))) => pc.put(&case, Outcome::from_check(c), c.evidence.clone()),
-                // Absent from a child that ran: missing.
-                (Ok(_), None) => {}
-            }
-        }
-    };
-    let pair: Vec<String> = ["emoji_zwj", "small_kana_mark"].map(String::from).to_vec();
-    put_rows(&mut delivery, "pair/marks", "p3c-pair-marks", &pair);
-    put_rows(&mut delivery, "corpus", "p3c-corpus", &f1_entries());
-    put_rows(
-        &mut delivery,
-        "corpus",
-        "p3c-corpus-recorded",
-        &["small_kana_mark".to_string()],
-    );
-    if let Some((_, r, _)) = find("p3c-corpus-recorded") {
-        let rows = keys_rows(r);
-        extra.insert(
-            "recorded".into(),
-            json!(
-                rows.iter()
-                    .map(|(e, c)| row_summary(e, c))
-                    .collect::<Vec<_>>()
-            ),
-        );
-    }
-    for name in ["p3c-pair-none", "p3c-none"] {
-        if let Some((_, r, out)) = find(name) {
-            extra.insert(
-                name.into(),
-                json!({"status": status_of(r), "report": out.join("report.json"),
-                       "rows": keys_rows(r).iter().map(|(e, c)| row_summary(e, c)).collect::<Vec<_>>()}),
-            );
-        }
-    }
-    if let Some((_, r, out)) = find("p3c-keys-probe") {
-        extra.insert(
-            "keys_probe".into(),
-            json!({"status": status_of(r), "report": out.join("report.json"),
-                   "cases": checks_of(r, "keys-probe").iter().map(|c| json!({"case": c.case, "result": c.result,
-                       "cause": c.cause, "result_detail": c.evidence["result"]})).collect::<Vec<_>>()}),
-        );
-    }
-    extra.insert(
-        "note".into(),
-        json!("the none arms isolate the records' effect and stay outside the verdict"),
-    );
-    delivery.finish(ctx, Value::Object(extra));
-
-    // Question 3: outside-job identity.
-    let mut outside = Pc::new("P3c-outside-job");
-    if let Some((_, r, _)) = find("p3c-tree-kill-codex") {
-        carry(
-            &mut outside,
-            "codex_kill_proof",
-            r,
-            "A-8",
-            "codex_kill_proof",
-        );
-        let ident = find_check(r, "A-8", "codex_kill_proof")
-            .map(|c| c.evidence["outside_job_identity"].clone());
-        outside.finish(ctx, json!({"outside_job_identity": ident}));
-    } else {
-        outside.finish(ctx, Value::Null);
-    }
-
-    // Question 4: reader-start repetition.
-    let mut reader = Pc::new("P3c-reader-start");
-    if let Some((_, r, _)) = find("p3c-reader-start") {
-        carry(&mut reader, "reader-start", r, "F-2c", "reader-start");
-    }
-    reader.finish(ctx, Value::Null);
 
     let exe = std::env::current_exe().unwrap_or_default();
     println!(
@@ -3965,6 +4037,173 @@ mod tests {
         assert!(f1_child(20) >= n * worst + CHILD_MARGIN);
     }
 
+    /// H1: a phase 3c child report holding `rows` (entry, result) as A-6
+    /// keys cases, recorded entries in `f1_recorded`, and `probe` checks.
+    fn p3c_child(rows: &[(&str, &str)], probe: &[(&str, &str)]) -> ChildRep {
+        let mut r = Report::new("x", "00000000");
+        let corpus = paste::corpus_f();
+        let mut recorded = Vec::new();
+        for (e, res) in rows {
+            let rec = corpus.iter().any(|c| c.id == *e && c.recorded);
+            if rec {
+                recorded.push(json!({"id": e, "result": res, "cause": null, "evidence": {}}));
+            } else {
+                r.checks.push(Check {
+                    id: "A-6".into(),
+                    case: super::super::real::keys_case("codex", NewlineKey::W32, e),
+                    result: res.to_string(),
+                    cause: None,
+                    evidence: json!({}),
+                });
+            }
+        }
+        r.detail("f1_recorded", json!(recorded));
+        for (c, res) in probe {
+            r.checks.push(Check {
+                id: "keys-probe".into(),
+                case: c.to_string(),
+                result: res.to_string(),
+                cause: None,
+                evidence: json!({}),
+            });
+        }
+        Ok(r)
+    }
+
+    /// Every phase 3c child with a complete, plausible result: burst-on
+    /// controls and records-none arms observed failing, raw probe items
+    /// lost, everything under test passing.
+    fn p3c_complete() -> Vec<(P3cStep, ChildRep, PathBuf)> {
+        let lc = [("long_multiline", "pass"), ("cjk_compat", "pass")];
+        let lc_fail = [("long_multiline", "platform_fail"), ("cjk_compat", "pass")];
+        let mut probe = vec![("controls/ascii", "pass"), ("controls/shift_enter", "pass")];
+        let items: Vec<(String, &str)> = super::super::fake::KEYS_PROBE_ITEMS
+            .iter()
+            .flat_map(|(id, _)| {
+                [
+                    (format!("{id}/raw"), "platform_fail"),
+                    (format!("{id}/records"), "pass"),
+                    (format!("{id}/codex_marks"), "pass"),
+                ]
+            })
+            .collect();
+        probe.extend(items.iter().map(|(c, r)| (c.as_str(), *r)));
+        let corpus: Vec<(String, &str)> = f1_entries().into_iter().map(|e| (e, "pass")).collect();
+        let corpus: Vec<(&str, &str)> = corpus.iter().map(|(e, r)| (e.as_str(), *r)).collect();
+        phase3c_steps()
+            .into_iter()
+            .map(|s| {
+                let r = match s.name.as_str() {
+                    "p3c-keys-probe" => p3c_child(&[], &probe),
+                    "p3c-pair-marks" => {
+                        p3c_child(&[("emoji_zwj", "pass"), ("small_kana_mark", "pass")], &[])
+                    }
+                    "p3c-pair-none" => p3c_child(
+                        &[
+                            ("emoji_zwj", "platform_fail"),
+                            ("small_kana_mark", "platform_fail"),
+                        ],
+                        &[],
+                    ),
+                    n if n.starts_with("p3c-control-on") => p3c_child(&lc_fail, &[]),
+                    n if n.starts_with("p3c-control-off") => p3c_child(&lc, &[]),
+                    "p3c-corpus" => p3c_child(&corpus, &[]),
+                    "p3c-corpus-recorded" => p3c_child(
+                        &[("small_kana_mark", "pass"), ("lossy_tab", "missing")],
+                        &[],
+                    ),
+                    "p3c-none" => p3c_child(&P3C_AFFECTED.map(|e| (e, "platform_fail")), &[]),
+                    _ => p3c_child(&[], &[]),
+                };
+                (s, r, PathBuf::new())
+            })
+            .collect()
+    }
+
+    fn p3c_verdict(ran: &[(P3cStep, ChildRep, PathBuf)], id: &str) -> (&'static str, String) {
+        let probes = p3c_probes(ran);
+        let (pc, _) = probes.iter().find(|(pc, _)| pc.id == id).unwrap();
+        let (v, why, _) = verdict::probe(&pc.required, &pc.checks);
+        (v, why)
+    }
+
+    /// H1: submit and delivery are `go` only with every planned arm's
+    /// explicit result; an observed loss in a comparison arm is a result.
+    #[test]
+    fn p3c_verdicts_need_every_arm() {
+        let full = p3c_complete();
+        assert_eq!(p3c_verdict(&full, "P3c-submit").0, "go");
+        assert_eq!(p3c_verdict(&full, "P3c-delivery").0, "go");
+        // A failed Shift+Enter control: delivery inconclusive.
+        let mut ran = p3c_complete();
+        for (s, r, _) in ran.iter_mut() {
+            if s.name == "p3c-keys-probe"
+                && let Ok(rep) = r
+            {
+                for c in rep.checks.iter_mut() {
+                    // The Shift+Enter control failed, so every item is a
+                    // harness failure; the ASCII control passed.
+                    if c.case != "controls/ascii" {
+                        c.result = "harness_fail".into();
+                    }
+                }
+            }
+        }
+        let (v, why) = p3c_verdict(&ran, "P3c-delivery");
+        assert_eq!(v, "inconclusive", "{why}");
+        assert!(why.contains("controls/shift_enter"), "{why}");
+        // An unrun records-none sweep: delivery inconclusive.
+        let mut ran = p3c_complete();
+        for (s, r, _) in ran.iter_mut() {
+            if s.name == "p3c-none" {
+                *r = Err("not_run: no budget left before the cutoff".into());
+            }
+        }
+        let (v, why) = p3c_verdict(&ran, "P3c-delivery");
+        assert_eq!(v, "inconclusive");
+        assert!(why.contains("none/emoji_zwj"), "{why}");
+        // A records-none row absent from a child that ran: missing.
+        let mut ran = p3c_complete();
+        for (s, r, _) in ran.iter_mut() {
+            if s.name == "p3c-pair-none" {
+                *r = p3c_child(&[("emoji_zwj", "platform_fail")], &[]);
+            }
+        }
+        assert_eq!(p3c_verdict(&ran, "P3c-delivery").0, "inconclusive");
+        // Burst-on control rows absent: submit inconclusive.
+        let mut ran = p3c_complete();
+        for (s, r, _) in ran.iter_mut() {
+            if s.name == "p3c-control-on-2" {
+                *r = p3c_child(&[], &[]);
+            }
+        }
+        let (v, why) = p3c_verdict(&ran, "P3c-submit");
+        assert_eq!(v, "inconclusive");
+        assert!(why.contains("long_multiline/on/2"), "{why}");
+        // A not-exercised control row is not a result either.
+        let mut ran = p3c_complete();
+        for (s, r, _) in ran.iter_mut() {
+            if s.name == "p3c-control-on-1" {
+                *r = p3c_child(
+                    &[("long_multiline", "not_exercised"), ("cjk_compat", "pass")],
+                    &[],
+                );
+            }
+        }
+        assert_eq!(p3c_verdict(&ran, "P3c-submit").0, "inconclusive");
+        // A burst-off failure is an observed failure of the question.
+        let mut ran = p3c_complete();
+        for (s, r, _) in ran.iter_mut() {
+            if s.name == "p3c-control-off-3" {
+                *r = p3c_child(
+                    &[("long_multiline", "platform_fail"), ("cjk_compat", "pass")],
+                    &[],
+                );
+            }
+        }
+        assert_eq!(p3c_verdict(&ran, "P3c-submit").0, "fail_observed");
+    }
+
     /// Phase 3c (A6): run order, R0 on every step, explicit burst and
     /// records on every Codex step, the control arm interleaved with equally
     /// configured burst-off runs, the second sweep restricted, and an
@@ -3999,6 +4238,7 @@ mod tests {
             assert!(!s.argv.iter().any(|a| a == "R6" || a == "6"), "{}", s.name);
             if s.argv.iter().any(|a| a == "codex-paste") {
                 assert!(has(s, ["--newline-key", "w32"]), "{}", s.name);
+                assert!(has(s, ["--input-encoding", "win-keys"]), "{}", s.name);
                 assert!(
                     s.argv.iter().any(|a| a == "--codex-paste-burst"),
                     "{}",
