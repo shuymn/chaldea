@@ -311,6 +311,29 @@ impl Launch {
         )
     }
 
+    /// `win_keys` input (Codex on Windows, F-1): readiness is `ready`, the
+    /// writer re-checks only the launch's revocation.
+    pub fn type_keys(
+        &self,
+        ctx: &Ctx,
+        text: &str,
+        newline: crate::paste::NewlineKey,
+        allow: &[crate::paste::Lossy],
+        ready: impl Fn() -> bool,
+    ) -> crate::paste::Outcome {
+        crate::paste::type_keys(
+            &self.session.io().tx,
+            text.as_bytes(),
+            &crate::paste::KeysOpts {
+                newline,
+                allow: allow.to_vec(),
+                enter_delay: Duration::from_millis(ctx.args.enter_delay_ms),
+                write_deadline: ctx.until(Duration::from_secs(10)),
+            },
+            ready,
+        )
+    }
+
     pub fn gate_open(&self) -> bool {
         self.ready() && self.session.io().tx.gate.admit().is_some()
     }
@@ -349,11 +372,23 @@ impl Launch {
     }
 
     /// Stops the tree, then the receiver (§4.7 order). Returns evidence.
-    pub fn finish(mut self) -> (session::StopReport, Value) {
+    pub fn finish(self) -> (session::StopReport, Value) {
+        let (stop, summary, _) = self.finish_events();
+        (stop, summary)
+    }
+
+    /// Like `finish`, also returning the drained events with their bodies.
+    pub fn finish_events(
+        mut self,
+    ) -> (
+        session::StopReport,
+        Value,
+        Vec<crate::receiver::EventRecord>,
+    ) {
         let stop = self.session.stop();
         self.receiver.stop();
         let summary = self.receiver.summary();
-        (stop, summary)
+        (stop, summary, self.receiver.events())
     }
 }
 

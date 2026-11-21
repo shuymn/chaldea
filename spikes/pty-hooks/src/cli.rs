@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::paste::Newline;
+use crate::paste::{InputEncoding, Lossy, Newline, NewlineKey};
 
 #[derive(Debug, Clone)]
 pub struct Args {
@@ -43,6 +43,59 @@ pub struct Args {
     pub case: Option<String>,
     pub include_pty_output: bool,
     pub explicit_deadline: bool,
+    // input (F-1)
+    /// `auto` (adapter capability), `bracketed`, or `win-keys`.
+    pub input_encoding: String,
+    pub newline_key: NewlineKey,
+    /// Set by `--newline-key` (forwarded to children only then).
+    pub explicit_newline_key: bool,
+    pub allow_lossy: Vec<Lossy>,
+    // pty (F-2)
+    /// `portable` or `raw` (Windows only).
+    pub pty_backend: String,
+    pub conpty_flags: u32,
+    pub raw_inject: Option<String>,
+    // C-5 / F-2 verdict
+    pub configs: Vec<String>,
+    pub join_run_id: Option<String>,
+    pub from: Vec<PathBuf>,
+}
+
+/// F-2c fault injections for the raw backend.
+pub const RAW_INJECTS: &[&str] = &[
+    "before-spawn",
+    "after-spawn",
+    "reader-start",
+    "force-suspended",
+    "resume-fail",
+];
+
+/// F-2 configurations: `P` (portable-pty), `R0` / `R6` (raw, flags 0 / 0x6).
+pub const CONFIGS: &[&str] = &["P", "R0", "R6"];
+
+/// Backend flags of one F-2 configuration.
+pub fn config_flags(config: &str) -> Option<Vec<String>> {
+    let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect();
+    match config {
+        "P" => Some(v(&["--pty-backend", "portable"])),
+        "R0" => Some(v(&["--pty-backend", "raw", "--conpty-flags", "0"])),
+        "R6" => Some(v(&["--pty-backend", "raw", "--conpty-flags", "6"])),
+        _ => None,
+    }
+}
+
+impl Args {
+    /// The input encoding for `agent`: the adapter capability unless
+    /// `--input-encoding` overrides it for an experiment.
+    pub fn encoding_for(&self, agent: &str) -> InputEncoding {
+        match self.input_encoding.as_str() {
+            "bracketed" => InputEncoding::BracketedPaste,
+            "win-keys" => InputEncoding::WinKeys {
+                newline: self.newline_key,
+            },
+            _ => crate::paste::input_encoding(agent, crate::os::os_name(), self.newline_key),
+        }
+    }
 }
 
 pub const USAGE: &str = "\
@@ -60,7 +113,12 @@ common: --root R  --out DIR  --deadline-secs 180  --session-start-timeout 20  --
 real:   --prompt  --claude-bin PATH  --codex-bin PATH  --cwd DIR  --attended  --subset required
 paste:  --paste-newline <cr|lf|crlf>  --enter-delay-ms 300  --chunk N
 codex:  --hook-source session-flags  --launches N
-        --mutate-command  --cwd2 DIR  --codex-mode <no-daemon|default|both>";
+        --mutate-command  --cwd2 DIR  --codex-mode <no-daemon|default|both>
+input:  --input-encoding <auto|bracketed|win-keys>  --newline-key <csi-u|w32>  --allow-lossy <trim|tab>
+pty:    --pty-backend <portable|raw>  --conpty-flags <0|6>  --raw-inject <before-spawn|after-spawn|reader-start|force-suspended|resume-fail>
+f-run:  chs win-probe <codex-input|backend|followup>
+        chs win-probe console --detached --configs P,R0,R6 --join-run-id ID
+        chs win-probe f2-verdict --from DIR --from DIR";
 
 /// The only hook source built in this spike (§4.3).
 pub const HOOK_SOURCE: &str = "session-flags";
@@ -113,6 +171,16 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         case: None,
         include_pty_output: false,
         explicit_deadline: false,
+        input_encoding: "auto".into(),
+        newline_key: NewlineKey::CsiU,
+        explicit_newline_key: false,
+        allow_lossy: Vec::new(),
+        pty_backend: "portable".into(),
+        conpty_flags: 0,
+        raw_inject: None,
+        configs: Vec::new(),
+        join_run_id: None,
+        from: Vec::new(),
     };
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
@@ -171,10 +239,75 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             "--url" => a.url = Some(value(&mut it, f)?),
             "--case" => a.case = Some(value(&mut it, f)?),
             "--include-pty-output" => a.include_pty_output = true,
+            "--input-encoding" => {
+                a.input_encoding = value(&mut it, f)?;
+                if !["auto", "bracketed", "win-keys"].contains(&a.input_encoding.as_str()) {
+                    return Err(format!("{f}: expected auto|bracketed|win-keys"));
+                }
+            }
+            "--newline-key" => {
+                let v = value(&mut it, f)?;
+                a.newline_key =
+                    NewlineKey::parse(&v).ok_or_else(|| format!("{f}: expected csi-u|w32"))?;
+                a.explicit_newline_key = true;
+            }
+            "--allow-lossy" => {
+                let v = value(&mut it, f)?;
+                let l = Lossy::parse(&v).ok_or_else(|| format!("{f}: expected trim|tab"))?;
+                if !a.allow_lossy.contains(&l) {
+                    a.allow_lossy.push(l);
+                }
+            }
+            "--pty-backend" => {
+                a.pty_backend = value(&mut it, f)?;
+                if !["portable", "raw"].contains(&a.pty_backend.as_str()) {
+                    return Err(format!("{f}: expected portable|raw"));
+                }
+            }
+            "--conpty-flags" => {
+                a.conpty_flags = match value(&mut it, f)?.as_str() {
+                    "0" => 0,
+                    "6" => 6,
+                    _ => return Err(format!("{f}: expected 0|6")),
+                };
+            }
+            "--raw-inject" => {
+                let v = value(&mut it, f)?;
+                if !RAW_INJECTS.contains(&v.as_str()) {
+                    return Err(format!("{f}: expected one of {RAW_INJECTS:?}"));
+                }
+                a.raw_inject = Some(v);
+            }
+            "--configs" => {
+                let v = value(&mut it, f)?;
+                a.configs = v.split(',').map(str::to_string).collect();
+                if a.configs.is_empty() || a.configs.iter().any(|c| !CONFIGS.contains(&c.as_str()))
+                {
+                    return Err(format!("{f}: expected a comma list of {CONFIGS:?}"));
+                }
+            }
+            "--join-run-id" => {
+                let v = value(&mut it, f)?;
+                if v.is_empty() || v.len() > 32 || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!("{f} {v:?}: expected hex"));
+                }
+                a.join_run_id = Some(v);
+            }
+            "--from" => a.from.push(PathBuf::from(value(&mut it, f)?)),
             "-h" | "--help" => return Err(USAGE.into()),
             _ if f.starts_with('-') => return Err(format!("unknown flag {f}\n{USAGE}")),
             _ => a.positional.push(arg.clone()),
         }
+    }
+    // The raw backend is Windows-only, and its tree is the job from creation.
+    if a.pty_backend == "raw" && crate::os::os_name() != "windows" {
+        return Err("--pty-backend raw is Windows only".into());
+    }
+    if a.pty_backend != "raw" && (a.raw_inject.is_some() || a.conpty_flags != 0) {
+        return Err("--conpty-flags and --raw-inject need --pty-backend raw".into());
+    }
+    if a.pty_backend == "raw" && a.hold_assign {
+        return Err("--hold-assign-until-child does not apply to --pty-backend raw".into());
     }
     if a.deadline_secs <= 10 {
         return Err("--deadline-secs must exceed 10 (scenario budget = deadline - 10 s)".into());
@@ -208,5 +341,89 @@ pub fn forward_common(a: &Args) -> Vec<String> {
     if let Some(p) = &a.codex_bin {
         v.extend(["--codex-bin".into(), p.display().to_string()]);
     }
+    v.extend(forward_input(a));
+    v.extend(forward_backend(a));
     v
+}
+
+/// The input options (forwarded like the common ones).
+pub fn forward_input(a: &Args) -> Vec<String> {
+    let mut v = Vec::new();
+    if a.input_encoding != "auto" {
+        v.extend(["--input-encoding".into(), a.input_encoding.clone()]);
+    }
+    if a.explicit_newline_key {
+        v.extend(["--newline-key".into(), a.newline_key.name().into()]);
+    }
+    for l in &a.allow_lossy {
+        v.extend(["--allow-lossy".into(), l.name().into()]);
+    }
+    v
+}
+
+/// The backend options (forwarded like the common ones).
+pub fn forward_backend(a: &Args) -> Vec<String> {
+    let mut v = Vec::new();
+    if a.pty_backend != "portable" {
+        v.extend(["--pty-backend".into(), a.pty_backend.clone()]);
+        v.extend(["--conpty-flags".into(), a.conpty_flags.to_string()]);
+    }
+    if let Some(i) = &a.raw_inject {
+        v.extend(["--raw-inject".into(), i.clone()]);
+    }
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(args: &[&str]) -> Result<Args, String> {
+        parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    /// Unix paths stay as before: every new option defaults to today's path,
+    /// and the raw backend is refused off Windows.
+    #[test]
+    fn new_options_default_to_todays_path() {
+        let a = p(&["fake", "paste"]).unwrap();
+        assert_eq!(a.pty_backend, "portable");
+        assert_eq!(a.encoding_for("claude"), InputEncoding::BracketedPaste);
+        assert!(forward_input(&a).is_empty() && forward_backend(&a).is_empty());
+        if crate::os::os_name() != "windows" {
+            assert!(p(&["fake", "paste", "--pty-backend", "raw"]).is_err());
+            assert_eq!(a.encoding_for("codex"), InputEncoding::BracketedPaste);
+        }
+        assert!(p(&["fake", "paste", "--raw-inject", "before-spawn"]).is_err());
+        let a = p(&[
+            "real",
+            "codex-paste",
+            "--input-encoding",
+            "win-keys",
+            "--newline-key",
+            "w32",
+            "--allow-lossy",
+            "tab",
+        ])
+        .unwrap();
+        assert_eq!(
+            a.encoding_for("codex"),
+            InputEncoding::WinKeys {
+                newline: NewlineKey::W32
+            }
+        );
+        assert_eq!(
+            forward_input(&a),
+            [
+                "--input-encoding",
+                "win-keys",
+                "--newline-key",
+                "w32",
+                "--allow-lossy",
+                "tab"
+            ]
+        );
+        assert!(p(&["x", "--configs", "P,R7"]).is_err());
+        assert_eq!(p(&["x", "--configs", "P,R0,R6"]).unwrap().configs, CONFIGS);
+    }
 }

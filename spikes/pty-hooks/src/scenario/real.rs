@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use super::{Ctx, Launch, LaunchSpec, cli_version, hook_command, launch, write_snapshot};
 use crate::cli::{self, Args};
-use crate::paste::{self, Newline};
+use crate::paste::{self, InputEncoding, Lossy, Newline, NewlineKey};
 use crate::session::{Session, SpawnOpts};
 use crate::verdict::Outcome;
 use crate::{os, util};
@@ -220,6 +220,12 @@ pub fn run(mut args: Args) -> i32 {
                                            "codex": codex.as_ref().map(|a| a.session_start())});
         r.config["codex_first_prompt"] = json!(CODEX_FIRST_PROMPT);
         r.config["codex_mode"] = json!(ctx.args.codex_mode);
+        r.config["pty_backend"] = json!(ctx.args.pty_backend);
+        r.config["conpty_flags"] = json!(ctx.args.conpty_flags);
+        r.config["input_encoding"] = json!({
+            "claude": ctx.args.encoding_for("claude").name(),
+            "codex": ctx.args.encoding_for("codex").name()});
+        r.config["newline_key"] = json!(ctx.args.newline_key.name());
     });
     match which.as_str() {
         "claude-hooks" => claude_hooks(&ctx, claude.as_ref().expect("resolved")),
@@ -855,7 +861,15 @@ pub fn paste_case(agent: &str, mode: Newline, chunk: usize, entry: &str) -> Stri
     format!("{agent}/{}/c{chunk}/{entry}", mode.name())
 }
 
+/// Case id of a `win_keys` input case (§4.8).
+pub fn keys_case(agent: &str, key: NewlineKey, entry: &str) -> String {
+    format!("{agent}/keys/{}/{entry}", key.name())
+}
+
 fn paste_sweep(ctx: &Ctx, a: &Agent) {
+    if let InputEncoding::WinKeys { newline } = ctx.args.encoding_for(a.name) {
+        return keys_sweep(ctx, a, newline);
+    }
     let corpus: Vec<_> = paste::corpus()
         .into_iter()
         .filter(|e| !e.fake_only && e.text.len() <= 8 * 1024)
@@ -982,6 +996,230 @@ fn paste_sweep(ctx: &Ctx, a: &Agent) {
             }
         }
     }
+}
+
+/// Settle interval after a `win_keys` case's `Stop`: the receiver and Codex
+/// stay up so a late second submit still fails the case.
+const KEYS_SETTLE: Duration = Duration::from_secs(5);
+
+/// One drained hook event, reduced for the `win_keys` oracle.
+#[derive(Debug, Clone)]
+pub struct KeyEvent {
+    pub seq: u64,
+    pub event: String,
+    pub bound: bool,
+    pub prompt: Option<String>,
+    pub received_ms: u64,
+}
+
+impl KeyEvent {
+    fn of(e: &crate::receiver::EventRecord) -> KeyEvent {
+        KeyEvent {
+            seq: e.seq,
+            event: e.event.clone(),
+            bound: e.is_bound(),
+            prompt: e
+                .json()
+                .and_then(|v| v["prompt"].as_str().map(str::to_string)),
+            received_ms: e.received_ms,
+        }
+    }
+}
+
+/// The `win_keys` oracle over one case's drained events (§4.4): bound
+/// events after the bootstrap fence (`seq > fence`) only; exactly one
+/// `UserPromptSubmit` equal to `expected` byte for byte, followed by a
+/// `Stop`, passes. A literal `[13;2u`, a second submit (also after the
+/// `Stop`), or a different prompt is a platform failure; a matching submit
+/// without `Stop`, or no submit at all, is missing.
+pub fn win_keys_case(
+    events: &[KeyEvent],
+    fence: u64,
+    expected: &str,
+    write_ms: Option<u64>,
+) -> (Outcome, Value) {
+    let after: Vec<&KeyEvent> = events.iter().filter(|e| e.bound && e.seq > fence).collect();
+    let ups: Vec<&&KeyEvent> = after
+        .iter()
+        .filter(|e| e.event == "UserPromptSubmit")
+        .collect();
+    let prompts: Vec<Option<&str>> = ups.iter().map(|e| e.prompt.as_deref()).collect();
+    let Some(first) = ups.first() else {
+        return (
+            Outcome::Missing,
+            json!({"ups": 0, "why": "no UserPromptSubmit after the bootstrap turn"}),
+        );
+    };
+    let got = first.prompt.clone().unwrap_or_default();
+    let latency = write_ms.map(|w| first.received_ms.saturating_sub(w));
+    let mut ev = json!({"ups": ups.len(), "prompts": prompts, "expected": expected,
+                        "first_diff": util::first_diff(expected.as_bytes(), got.as_bytes()),
+                        "write_to_ups_ms": latency});
+    if prompts.iter().flatten().any(|p| p.contains("[13;2u")) {
+        ev["classification"] = json!("csi_u_not_reassembled");
+        return (
+            Outcome::platform("a literal [13;2u reached the prompt (csi_u_not_reassembled)"),
+            ev,
+        );
+    }
+    if ups.len() > 1 {
+        return (
+            Outcome::platform("more than one UserPromptSubmit for one input"),
+            ev,
+        );
+    }
+    if got != expected {
+        return (
+            Outcome::platform("the prompt differs from the expected form"),
+            ev,
+        );
+    }
+    if !after.iter().any(|e| e.event == "Stop" && e.seq > first.seq) {
+        ev["why"] = json!("matching prompt without Stop");
+        return (Outcome::Missing, ev);
+    }
+    (Outcome::Pass, ev)
+}
+
+/// F-1 (and C-1's Codex part on Windows): one fresh Codex session per case.
+/// Launch with the positional first prompt, wait for that bootstrap turn's
+/// `Stop` (the fence), type the one case, wait for its submit and `Stop`
+/// (or the timeout), keep everything up for the settle interval, stop, and
+/// decide from the drained receiver. Recorded entries go to
+/// `details.f1_recorded`, never into the verdict.
+fn keys_sweep(ctx: &Ctx, a: &Agent, newline: NewlineKey) {
+    let entries: Vec<paste::FEntry> = if ctx.args.subset.as_deref() == Some("f1") {
+        paste::corpus_f()
+    } else {
+        paste::corpus()
+            .into_iter()
+            .filter(|e| !e.fake_only && e.text.len() <= 8 * 1024)
+            .filter(|e| ctx.args.subset.as_deref() != Some("required") || e.required)
+            .map(|e| paste::FEntry {
+                id: e.id,
+                text: e.text,
+                recorded: false,
+                allow: Vec::new(),
+            })
+            .collect()
+    };
+    let _ = std::fs::write(
+        ctx.out.join("corpus.json"),
+        serde_json::to_vec_pretty(&entries).unwrap_or_default(),
+    );
+    ctx.sink.with(|r| {
+        r.config["input_encoding"] = json!("win_keys");
+        r.config["newline_key"] = json!(newline.name());
+    });
+    for e in entries.iter().filter(|e| !e.recorded) {
+        ctx.require("A-6", &keys_case(a.name, newline, &e.id));
+    }
+    let cwd = default_cwd(ctx, a);
+    let mut recorded = Vec::new();
+    for e in &entries {
+        if ctx.past_cutoff() {
+            break;
+        }
+        let case = keys_case(a.name, newline, &e.id);
+        // Recorded entries run with their own allow set; others with the CLI's.
+        let allow: Vec<Lossy> = if e.recorded {
+            e.allow.clone()
+        } else {
+            ctx.args.allow_lossy.clone()
+        };
+        let (o, ev) = keys_case_run(ctx, a, &cwd, newline, e, &allow);
+        if e.recorded {
+            recorded
+                .push(json!({"id": e.id, "result": o.tag(), "cause": o.cause(), "evidence": ev}));
+        } else {
+            ctx.check("A-6", &case, o, ev);
+        }
+    }
+    ctx.detail("f1_recorded", json!(recorded));
+}
+
+fn keys_case_run(
+    ctx: &Ctx,
+    a: &Agent,
+    cwd: &Path,
+    newline: NewlineKey,
+    e: &paste::FEntry,
+    allow: &[Lossy],
+) -> (Outcome, Value) {
+    let label = format!("{}-keys-{}-{}", a.name, newline.name(), e.id);
+    let l = match start(ctx, a, &label, cwd, Some("no-daemon"), a.name, &[]) {
+        Ok(l) => l,
+        Err(err) => return (Outcome::harness(err.clone()), json!({"not_run": err})),
+    };
+    let (bound, ms, snap) = wait_start(ctx, &l);
+    let mut sent = None;
+    let mut fence = None;
+    let mut write_ms = None;
+    if bound.is_some() {
+        // The bootstrap turn (positional first prompt) ends before any input.
+        fence = nth_bound(&l, "Stop", 1, ctx.until(REAL_STOP_WAIT)).map(|s| s.seq);
+    }
+    if let Some(f) = fence {
+        let o = l.type_keys(ctx, &e.text, newline, allow, || {
+            l.ready() && l.receiver.nth_bound("Stop", 1).is_some_and(|s| s.seq == f)
+        });
+        write_ms = Some(l.receiver.now_ms());
+        if o.state == "sent" {
+            let _ = nth_bound(&l, "UserPromptSubmit", 2, ctx.until(REAL_UPS_WAIT));
+            if nth_bound(&l, "Stop", 2, ctx.until(REAL_STOP_WAIT)).is_some() {
+                std::thread::sleep(
+                    KEYS_SETTLE.min(ctx.cutoff.saturating_duration_since(Instant::now())),
+                );
+            }
+        }
+        sent = Some(o);
+    }
+    let q = l.query_log();
+    let (stop, summary, events) = l.finish_events();
+    let fin = json!({"receiver": summary});
+    ctx.detail(
+        &format!("launch-{label}"),
+        json!({"stop": stop, "receiver": fin["receiver"], "query_log": q}),
+    );
+    let base = json!({"latency_ms": ms, "snapshot": snap, "newline_key": newline.name(),
+                      "allow_lossy": allow, "paste": sent, "bootstrap_stop_seq": fence,
+                      "observed_on": format!("codex {}, source session-flags, mode no-daemon", a.version)});
+    let (o, mut ev) = if final_ambiguous(&fin) {
+        (
+            Outcome::not_exercised("binding became ambiguous"),
+            json!({}),
+        )
+    } else if bound.is_none() {
+        (Outcome::not_exercised("no bound SessionStart"), json!({}))
+    } else if fence.is_none() {
+        (
+            Outcome::not_exercised("the bootstrap turn never ended"),
+            json!({}),
+        )
+    } else {
+        match sent.as_ref() {
+            Some(o) if o.state == "sent" => {
+                let evs: Vec<KeyEvent> = events.iter().map(KeyEvent::of).collect();
+                let expected = paste::expected_win_keys(&e.text, allow);
+                win_keys_case(&evs, fence.unwrap_or(0), &expected, write_ms)
+            }
+            Some(o)
+                if o.state == "rejected"
+                    && o.detail
+                        .as_deref()
+                        .is_some_and(|d| d.starts_with("lossy_input")) =>
+            {
+                (
+                    Outcome::not_exercised("lossy_input rejected (F-1d)"),
+                    json!({}),
+                )
+            }
+            Some(o) => (unsent(o), json!({})),
+            None => (Outcome::harness("nothing sent"), json!({})),
+        }
+    };
+    ev["base"] = base;
+    (o, ev)
 }
 
 /// A-7 (and C-2's attended launch with `--attended`).
@@ -1909,5 +2147,128 @@ mod tests {
         let e = resolve_in("codex", Some(&d.join("sh/codex")), None).unwrap_err();
         assert!(e.contains("script"), "{e}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn ev(seq: u64, event: &str, prompt: Option<&str>, ms: u64) -> KeyEvent {
+        KeyEvent {
+            seq,
+            event: event.into(),
+            bound: true,
+            prompt: prompt.map(str::to_string),
+            received_ms: ms,
+        }
+    }
+
+    /// F-1a oracle over synthetic drained events (fence = bootstrap Stop seq 3).
+    #[test]
+    fn win_keys_case_oracle() {
+        let want = "一行目\n二行目";
+        let boot = vec![
+            ev(1, "SessionStart", None, 0),
+            ev(
+                2,
+                "UserPromptSubmit",
+                Some("Reply with the single word OK."),
+                1,
+            ),
+            ev(3, "Stop", None, 2),
+        ];
+        let with = |more: Vec<KeyEvent>| [boot.clone(), more].concat();
+        // One matching prompt + Stop: pass, with its latency.
+        let (o, e) = win_keys_case(
+            &with(vec![
+                ev(4, "UserPromptSubmit", Some(want), 900),
+                ev(5, "Stop", None, 950),
+            ]),
+            3,
+            want,
+            Some(400),
+        );
+        assert_eq!(o, Outcome::Pass);
+        assert_eq!(e["write_to_ups_ms"], 500);
+        // Failed reassembly: a literal [13;2u (Esc replayed).
+        let (o, e) = win_keys_case(
+            &with(vec![
+                ev(4, "UserPromptSubmit", Some("一行目[13;2u二行目"), 9),
+                ev(5, "Stop", None, 9),
+            ]),
+            3,
+            want,
+            None,
+        );
+        assert!(matches!(o, Outcome::PlatformFail { .. }));
+        assert_eq!(e["classification"], "csi_u_not_reassembled");
+        // Two submits (split prompt).
+        let (o, _) = win_keys_case(
+            &with(vec![
+                ev(4, "UserPromptSubmit", Some("一行目"), 9),
+                ev(5, "UserPromptSubmit", Some("二行目"), 9),
+                ev(6, "Stop", None, 9),
+            ]),
+            3,
+            want,
+            None,
+        );
+        assert!(matches!(o, Outcome::PlatformFail { .. }));
+        // A second submit after the fixture's Stop, within the settle interval.
+        let (o, _) = win_keys_case(
+            &with(vec![
+                ev(4, "UserPromptSubmit", Some(want), 9),
+                ev(5, "Stop", None, 9),
+                ev(6, "UserPromptSubmit", Some("x"), 9),
+            ]),
+            3,
+            want,
+            None,
+        );
+        assert!(matches!(o, Outcome::PlatformFail { .. }));
+        // A different prompt.
+        let (o, _) = win_keys_case(
+            &with(vec![
+                ev(4, "UserPromptSubmit", Some("一行目二行目"), 9),
+                ev(5, "Stop", None, 9),
+            ]),
+            3,
+            want,
+            None,
+        );
+        assert!(matches!(o, Outcome::PlatformFail { .. }));
+        // A matching prompt without Stop: missing.
+        let (o, _) = win_keys_case(
+            &with(vec![ev(4, "UserPromptSubmit", Some(want), 9)]),
+            3,
+            want,
+            None,
+        );
+        assert_eq!(o, Outcome::Missing);
+        // Nothing after the fence (the bootstrap submit is ignored): missing.
+        let (o, _) = win_keys_case(&boot, 3, "Reply with the single word OK.", None);
+        assert_eq!(o, Outcome::Missing);
+        // A delayed delivery still before the timeout passes with its latency.
+        let (o, e) = win_keys_case(
+            &with(vec![
+                ev(4, "UserPromptSubmit", Some(want), 20_400),
+                ev(5, "Stop", None, 25_000),
+            ]),
+            3,
+            want,
+            Some(400),
+        );
+        assert_eq!(o, Outcome::Pass);
+        assert_eq!(e["write_to_ups_ms"], 20_000);
+        // Foreign (unbound) events never count.
+        let mut foreign = ev(4, "UserPromptSubmit", Some("x"), 9);
+        foreign.bound = false;
+        let (o, _) = win_keys_case(
+            &with(vec![
+                foreign,
+                ev(5, "UserPromptSubmit", Some(want), 9),
+                ev(6, "Stop", None, 9),
+            ]),
+            3,
+            want,
+            None,
+        );
+        assert_eq!(o, Outcome::Pass);
     }
 }

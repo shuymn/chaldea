@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use super::{Ctx, LaunchSpec, child_out, child_report, emitter_path, launch, run_bounded};
 use crate::cli::{self, Args};
 use crate::http_client::{self, parse_local_url};
-use crate::paste::{self, Newline, PasteOpts};
+use crate::paste::{self, InputEncoding, Newline, NewlineKey, PasteOpts};
 use crate::pty::WriterTx;
 use crate::receiver::{ProbeHandler, WitnessView};
 use crate::report::{Check, Probe, Report};
@@ -330,23 +330,12 @@ fn probe_paste(ctx: &Ctx) {
             false,
             &[],
         );
-        for m in Newline::ALL {
-            for chunk in [0usize, 7] {
-                for e in &entries {
-                    let child_case = super::real::paste_case(agent, m, chunk, e);
-                    carry(
-                        &mut pc,
-                        &format!("real/{child_case}"),
-                        &r,
-                        "A-6",
-                        &child_case,
-                    );
-                }
-            }
-        }
+        let enc = ctx.args.encoding_for(agent);
+        carry_c1(&mut pc, agent, enc, &entries, &r);
         real_hosts.insert(
             agent.into(),
-            json!({"status": status_of(&r), "host": r.as_ref().ok().map(|r| r.host.clone())}),
+            json!({"status": status_of(&r), "encoding": enc.name(),
+                   "host": r.as_ref().ok().map(|r| r.host.clone())}),
         );
     }
     // Provider evidence: each child samples the ConPTY module after its first PTY launch.
@@ -355,6 +344,35 @@ fn probe_paste(ctx: &Ctx) {
     let extra = json!({"fake": fake, "real": real_hosts, "console_cp": os::console_code_page(),
                        "cli_transforms_checked": paste::CLI_TRANSFORMS});
     pc.finish(ctx, extra);
+}
+
+/// The A-6 cases a C-1 child must report for `agent` under the encoding it
+/// actually uses: `<agent>/<mode>/c<chunk>/<entry>` for bracketed paste (all
+/// newline modes, chunk 0 and 7), `<agent>/keys/<newline-key>/<entry>` for
+/// `win_keys` (one newline key, no chunk sweep).
+pub fn c1_child_cases(agent: &str, enc: InputEncoding, entries: &[String]) -> Vec<String> {
+    match enc {
+        InputEncoding::BracketedPaste => Newline::ALL
+            .iter()
+            .flat_map(|m| {
+                [0usize, 7].into_iter().flat_map(move |c| {
+                    entries
+                        .iter()
+                        .map(move |e| super::real::paste_case(agent, *m, c, e))
+                })
+            })
+            .collect(),
+        InputEncoding::WinKeys { newline } => entries
+            .iter()
+            .map(|e| super::real::keys_case(agent, newline, e))
+            .collect(),
+    }
+}
+
+fn carry_c1(pc: &mut Pc, agent: &str, enc: InputEncoding, entries: &[String], r: &ChildRep) {
+    for c in c1_child_cases(agent, enc, entries) {
+        carry(pc, &format!("real/{c}"), r, "A-6", &c);
+    }
 }
 
 // ---------------- C-2 ----------------
@@ -1789,5 +1807,55 @@ mod tests {
             json!({"query_log": [{"kind": "da1", "reply": "x", "harness_wrote": true}]}),
         );
         assert_eq!(query_outcome(&r).map(|x| x.0), Some(Outcome::Pass));
+    }
+
+    /// C-1: the required child cases follow the encoding in use; a child
+    /// report of either shape aggregates with no missing case, and removing
+    /// one row yields exactly that case as missing.
+    #[test]
+    fn c1_aggregates_both_report_shapes() {
+        let entries: Vec<String> = vec!["japanese".into(), "astral".into()];
+        let bracketed = c1_child_cases("claude", InputEncoding::BracketedPaste, &entries);
+        assert_eq!(bracketed.len(), 3 * 2 * 2);
+        assert!(bracketed.contains(&"claude/crlf/c7/astral".to_string()));
+        let keys = c1_child_cases(
+            "codex",
+            InputEncoding::WinKeys {
+                newline: NewlineKey::W32,
+            },
+            &entries,
+        );
+        assert_eq!(
+            keys,
+            vec!["codex/keys/w32/japanese", "codex/keys/w32/astral"]
+        );
+        for (agent, enc, cases) in [
+            ("claude", InputEncoding::BracketedPaste, bracketed),
+            (
+                "codex",
+                InputEncoding::WinKeys {
+                    newline: NewlineKey::W32,
+                },
+                keys,
+            ),
+        ] {
+            let mut rep = Report::new("real x-paste", "r");
+            for c in &cases {
+                rep.check("A-6", c, Outcome::Pass, Value::Null);
+            }
+            let mut pc = Pc::new("C-1");
+            carry_c1(&mut pc, agent, enc, &entries, &Ok(rep.clone()));
+            let e = verdict::evaluate(&pc.required, &pc.checks);
+            assert!(e.complete() && e.missing.is_empty(), "{agent}: {e:?}");
+            let gone = cases[1].clone();
+            rep.checks.retain(|c| c.case != gone);
+            let mut pc = Pc::new("C-1");
+            carry_c1(&mut pc, agent, enc, &entries, &Ok(rep));
+            let e = verdict::evaluate(&pc.required, &pc.checks);
+            assert_eq!(
+                e.missing,
+                vec![verdict::key("C-1", &format!("real/{gone}"))]
+            );
+        }
     }
 }
