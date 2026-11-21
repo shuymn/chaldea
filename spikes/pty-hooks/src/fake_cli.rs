@@ -44,6 +44,8 @@ struct Opts {
     escape_orphan: bool,
     report_file: Option<PathBuf>,
     at_exit: bool,
+    /// `spawn-tree`: keep writing output (F-2c `after-spawn` staging).
+    emit_output: bool,
 }
 
 fn parse() -> Opts {
@@ -79,6 +81,7 @@ fn parse() -> Opts {
             "--silent" => o.silent = true,
             "--escape-orphan" => o.escape_orphan = true,
             "--at-exit" => o.at_exit = true,
+            "--emit-output" => o.emit_output = true,
             "--report-file" => {
                 o.report_file = Some(PathBuf::from(next));
                 i += 1;
@@ -779,6 +782,16 @@ fn run_spawn_tree(o: &Opts) -> i32 {
         true,
         json!({"first_child": first_child, "children": children}),
     );
+    if o.emit_output {
+        // Output stays pending for the parent: one line every 10 ms until the
+        // process is killed (or `--max-life-secs` ends it).
+        let mut n = 0u64;
+        loop {
+            n += 1;
+            out(format!("OUTPUT-{n:08} 日本語 pending output for the F-2c abort\r\n").as_bytes());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     sleep_forever()
 }
 

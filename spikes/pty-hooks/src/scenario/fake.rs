@@ -2071,13 +2071,49 @@ pub struct InjectRun {
     pub teardown: Option<Value>,
     pub handles_before: Option<u32>,
     pub handles_after: Option<u32>,
+    /// `force-suspended`: the spawn-tree roles that had to attest.
+    pub roles: Vec<String>,
+    /// `(role, pid, start time)` of every attested FakeCli process.
+    pub witnesses: Vec<(String, u32, u64)>,
+    /// The session stop's §4.8 kill proof (job membership before the stop).
+    pub kill_proof: Option<Value>,
 }
 
-/// F-2c: `force-suspended` must launch on the suspended branch with zero
-/// escapees; every other injection must fail the launch and leave no
-/// process alive, a teardown within its bound with the output drained or
-/// the host read end closed, and the harness handle count back to its
-/// pre-launch value.
+/// The milestone each failure injection must fail at: the spawn error it
+/// raises, and the teardown record's `(path, failed_at)`.
+fn inject_milestone(inject: &str) -> Option<(&'static str, &'static str, Option<&'static str>)> {
+    Some(match inject {
+        "before-spawn" => (
+            "injected failure before spawn",
+            "setup_error",
+            Some("before_spawn"),
+        ),
+        "after-spawn" => (
+            "injected failure after spawn",
+            "setup_error",
+            Some("after_spawn"),
+        ),
+        "resume-fail" => (
+            "injected ResumeThread failure",
+            "setup_error",
+            Some("resume"),
+        ),
+        "reader-start" => ("injected reader-start failure", "master_drop", None),
+        _ => return None,
+    })
+}
+
+/// F-2c. `force-suspended` must launch on the suspended branch, every
+/// spawn-tree role must attest, and each attested process must be live and
+/// positively in the job before the stop and dead after `TerminateJobObject`
+/// (§4.8 kill proof; an escapee later killed by the pid fallback fails).
+/// Every other injection must fail the launch at its own milestone (spawn
+/// error and teardown record); one that spawned a child must have recorded
+/// the child's identity at acquisition and seen the retained process exit,
+/// and `after-spawn` must have had output pending (seen and the child still
+/// running) when it fired. All: no process alive, a teardown within its
+/// bound with the output drained or the host read end closed, and the
+/// harness handle count back to its pre-launch value.
 pub fn raw_inject_outcome(r: &InjectRun) -> Outcome {
     let (Some(before), Some(after)) = (r.handles_before, r.handles_after) else {
         return Outcome::harness("handle count unavailable");
@@ -2089,8 +2125,65 @@ pub fn raw_inject_outcome(r: &InjectRun) -> Outcome {
         if r.branch.as_deref() != Some("suspended") {
             return Outcome::harness(format!("injection not effective: branch {:?}", r.branch));
         }
-    } else if r.spawn_error.is_none() {
-        return Outcome::harness("the injection did not fail the launch");
+        let missing: Vec<&String> = r
+            .roles
+            .iter()
+            .filter(|role| !r.witnesses.iter().any(|w| &w.0 == *role))
+            .collect();
+        if r.roles.is_empty() || !missing.is_empty() {
+            return Outcome::not_exercised(format!("roles never attested: {missing:?}"));
+        }
+        let Some(proof) = &r.kill_proof else {
+            return Outcome::harness("no kill proof (job membership) for the stop");
+        };
+        for (role, pid, start) in &r.witnesses {
+            let o = crate::session::kill_proof_outcome(proof, Some((*pid, *start)));
+            if o != Outcome::Pass {
+                return match o {
+                    Outcome::PlatformFail { cause } => {
+                        Outcome::platform(format!("{role}: {cause}"))
+                    }
+                    o => o,
+                };
+            }
+        }
+    } else {
+        let Some(err) = &r.spawn_error else {
+            return Outcome::harness("the injection did not fail the launch");
+        };
+        let Some((marker, path, failed_at)) = inject_milestone(&r.inject) else {
+            return Outcome::harness(format!("unknown injection {}", r.inject));
+        };
+        let Some(t) = &r.teardown else {
+            return Outcome::harness("no teardown record");
+        };
+        if !err.contains(marker)
+            || t["path"] != json!(path)
+            || failed_at.is_some_and(|f| t["failed_at"] != json!(f))
+        {
+            return Outcome::harness(format!(
+                "the launch failed at {}/{} ({err}), not at the injected milestone",
+                t["path"], t["failed_at"]
+            ));
+        }
+        if matches!(r.inject.as_str(), "after-spawn" | "resume-fail") {
+            if t["child_pid"].as_u64().is_none() || t["child_start"].as_u64().is_none() {
+                return Outcome::harness("the child's identity was not recorded at acquisition");
+            }
+            match t["process_exit"].as_str() {
+                Some("exited") => {}
+                Some("timeout") => {
+                    return Outcome::platform("the retained process did not exit after teardown");
+                }
+                other => return Outcome::harness(format!("process exit unknown: {other:?}")),
+            }
+        }
+        if r.inject == "after-spawn"
+            && (t["output_pending_bytes"].as_u64().unwrap_or(0) == 0
+                || t["child_running_at_injection"] != json!(true))
+        {
+            return Outcome::harness("no output was pending when the injection fired");
+        }
     }
     if r.unknown_liveness > 0 {
         return Outcome::harness("liveness lookup failed");
@@ -2164,38 +2257,48 @@ fn raw_inject(ctx: &Ctx) {
         ctx.error("raw-inject needs Windows and --pty-backend raw");
         return;
     }
+    let mut roles: Vec<String> = os::spawn_tree_roles()
+        .iter()
+        .map(|r| r.to_string())
+        .collect();
+    roles.push("spawn-tree".into());
     let mut r = InjectRun {
         inject: inject.clone(),
         handles_before: os::process_handle_count(),
+        roles: if inject == "force-suspended" {
+            roles.clone()
+        } else {
+            Vec::new()
+        },
         ..Default::default()
     };
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sampler = sample_procs(stop.clone());
-    let opts = crate::session::SpawnOpts {
-        argv: vec![
-            fake_bin().into(),
-            "--mode".into(),
-            "spawn-tree".into(),
-            "--max-life-secs".into(),
-            SLEEPER_MAX_LIFE.into(),
-        ],
-        cwd: ctx.run_dir.clone(),
-        env: Vec::new(),
-        cols: ctx.args.cols,
-        rows: ctx.args.rows,
-        responder: true,
-        out_file: ctx.out.join("pty-output-raw-inject.bin"),
-        hold_assign: false,
-        inject: None,
-        backend: ctx.backend(),
-    };
+    let mut extra = vec!["--max-life-secs", SLEEPER_MAX_LIFE];
+    if inject == "after-spawn" {
+        // Staged pending output: the child keeps writing until it is killed.
+        extra.push("--emit-output");
+    }
     let mut stop_report = None;
-    match crate::session::Session::spawn(opts) {
-        Ok(mut s) => {
-            r.branch = s.launch["branch"].as_str().map(String::from);
-            // Let the tree spawn before the stop.
-            std::thread::sleep(Duration::from_secs(2));
-            stop_report = Some(s.stop());
+    match launch(ctx, fake_spec(ctx, "raw-inject", "spawn-tree", &extra)) {
+        Ok(l) => {
+            r.branch = l.session.launch["branch"].as_str().map(String::from);
+            // Every spawn-tree process attests before the stop (bounded).
+            l.receiver
+                .wait_witnesses(ctx.until(Duration::from_secs(10)), |ws| {
+                    roles.iter().all(|role| ws.iter().any(|w| &w.role == role))
+                });
+            l.session.owned.record_scan();
+            r.witnesses = l
+                .receiver
+                .witnesses()
+                .iter()
+                .filter(|w| roles.contains(&w.role))
+                .map(|w| (w.role.clone(), w.pid, w.start_time))
+                .collect();
+            let (st, _) = l.finish();
+            r.kill_proof = st.kill_proof.clone();
+            stop_report = Some(st);
         }
         Err(e) => r.spawn_error = Some(e),
     }
@@ -2612,14 +2715,25 @@ mod tests {
     /// F-2c outcome rules.
     #[test]
     fn raw_inject_rules() {
-        let td = json!({"teardown_ms": 120, "drain_reached_eof": true});
-        let base = |inject: &str| InjectRun {
-            inject: inject.into(),
-            spawn_error: Some("injected".into()),
-            teardown: Some(td.clone()),
-            handles_before: Some(100),
-            handles_after: Some(100),
-            ..Default::default()
+        // A launch that failed at its own milestone with full evidence.
+        let at = |inject: &str, ms: u64, eof: bool| {
+            let (marker, path, failed_at) =
+                inject_milestone(inject).unwrap_or(("", "master_drop", None));
+            json!({"marker": marker, "path": path, "failed_at": failed_at,
+                   "child_pid": 7, "child_start": 70, "process_exit": "exited",
+                   "output_pending_bytes": 64, "child_running_at_injection": true,
+                   "teardown_ms": ms, "drain_reached_eof": eof})
+        };
+        let base = |inject: &str| {
+            let td = at(inject, 120, true);
+            InjectRun {
+                inject: inject.into(),
+                spawn_error: td["marker"].as_str().map(String::from),
+                teardown: Some(td),
+                handles_before: Some(100),
+                handles_after: Some(100),
+                ..Default::default()
+            }
         };
         assert_eq!(raw_inject_outcome(&base("after-spawn")), Outcome::Pass);
         let mut r = base("after-spawn");
@@ -2635,13 +2749,12 @@ mod tests {
         r.handles_after = Some(101);
         assert!(matches!(raw_inject_outcome(&r), PlatformFail { .. }));
         let mut r = base("resume-fail");
-        r.teardown = Some(json!({"teardown_ms": 9000, "drain_reached_eof": true}));
+        r.teardown = Some(at("resume-fail", 9000, true));
         assert!(matches!(raw_inject_outcome(&r), PlatformFail { .. }));
         let mut r = base("resume-fail");
-        r.teardown = Some(json!({"teardown_ms": 10, "drain_reached_eof": false}));
+        r.teardown = Some(at("resume-fail", 10, false));
         assert!(matches!(raw_inject_outcome(&r), PlatformFail { .. }));
-        r.teardown = Some(json!({"teardown_ms": 10, "drain_reached_eof": false,
-                                 "host_read_end_closed": true}));
+        r.teardown.as_mut().unwrap()["host_read_end_closed"] = json!(true);
         assert_eq!(raw_inject_outcome(&r), Outcome::Pass);
         let mut r = base("before-spawn");
         r.handles_after = None;
@@ -2651,13 +2764,142 @@ mod tests {
         ));
         let mut r = base("force-suspended");
         r.spawn_error = None;
-        r.branch = Some("suspended".into());
-        assert_eq!(raw_inject_outcome(&r), Outcome::Pass);
         r.branch = Some("job_list".into());
         assert!(matches!(
             raw_inject_outcome(&r),
             Outcome::HarnessFail { .. }
         ));
+    }
+
+    /// H3: F-2c passes only with the exercised milestone and its evidence:
+    /// the exact injection point, the child identity recorded at
+    /// acquisition, verified pending output, the retained process's exit,
+    /// and for `force-suspended` live, attested children positively in the
+    /// job before the stop.
+    #[test]
+    fn raw_inject_needs_the_exercised_milestone() {
+        let pass = |r: &InjectRun| raw_inject_outcome(r) == Outcome::Pass;
+        let run = |inject: &str, err: &str, td: Value| InjectRun {
+            inject: inject.into(),
+            spawn_error: Some(err.into()),
+            teardown: Some(td),
+            handles_before: Some(100),
+            handles_after: Some(100),
+            ..Default::default()
+        };
+        let spawned = |failed_at: &str| {
+            json!({"path": "setup_error", "failed_at": failed_at, "child_pid": 7,
+                   "child_start": 70, "process_exit": "exited", "teardown_ms": 50,
+                   "drain_reached_eof": true, "output_pending_bytes": 4096,
+                   "child_running_at_injection": true})
+        };
+        let resume = run(
+            "resume-fail",
+            "injected ResumeThread failure",
+            spawned("resume"),
+        );
+        assert!(pass(&resume), "{:?}", raw_inject_outcome(&resume));
+        // The reviewer's shape: resume-fail that failed before the spawn.
+        let mut r = run(
+            "resume-fail",
+            "injected ResumeThread failure",
+            spawned("before_spawn"),
+        );
+        assert!(!pass(&r));
+        // No child identity recorded at acquisition.
+        r = run(
+            "resume-fail",
+            "injected ResumeThread failure",
+            spawned("resume"),
+        );
+        r.teardown.as_mut().unwrap()["child_start"] = Value::Null;
+        assert!(!pass(&r));
+        // The retained process never confirmed its exit.
+        r = run(
+            "resume-fail",
+            "injected ResumeThread failure",
+            spawned("resume"),
+        );
+        r.teardown.as_mut().unwrap()["process_exit"] = json!("timeout");
+        assert!(matches!(raw_inject_outcome(&r), PlatformFail { .. }));
+        // after-spawn without verified pending output.
+        let after = run(
+            "after-spawn",
+            "injected failure after spawn",
+            spawned("after_spawn"),
+        );
+        assert!(pass(&after), "{:?}", raw_inject_outcome(&after));
+        r = run(
+            "after-spawn",
+            "injected failure after spawn",
+            spawned("after_spawn"),
+        );
+        r.teardown.as_mut().unwrap()["output_pending_bytes"] = json!(0);
+        assert!(!pass(&r));
+        r = run(
+            "after-spawn",
+            "injected failure after spawn",
+            spawned("after_spawn"),
+        );
+        r.teardown.as_mut().unwrap()["child_running_at_injection"] = json!(false);
+        assert!(!pass(&r));
+        // before-spawn must fail at that step and spawn nothing.
+        let before = run(
+            "before-spawn",
+            "injected failure before spawn",
+            json!({"path": "setup_error", "failed_at": "before_spawn", "teardown_ms": 5,
+                   "drain_reached_eof": true}),
+        );
+        assert!(pass(&before), "{:?}", raw_inject_outcome(&before));
+        // reader-start must fail in the session's reader start.
+        let reader = run(
+            "reader-start",
+            "reader: injected reader-start failure",
+            json!({"path": "master_drop", "teardown_ms": 30, "drain_reached_eof": true}),
+        );
+        assert!(pass(&reader), "{:?}", raw_inject_outcome(&reader));
+        r = run(
+            "reader-start",
+            "spawn failed",
+            json!({"path": "master_drop", "teardown_ms": 30, "drain_reached_eof": true}),
+        );
+        assert!(!pass(&r));
+        // force-suspended: zero recorded descendants is not a pass.
+        let roles: Vec<String> = ["spawn-tree", "plain", "breakaway"]
+            .map(String::from)
+            .into();
+        let mut fs = InjectRun {
+            inject: "force-suspended".into(),
+            branch: Some("suspended".into()),
+            teardown: Some(json!({"path": "master_drop", "teardown_ms": 40,
+                                  "drain_reached_eof": true})),
+            handles_before: Some(100),
+            handles_after: Some(100),
+            roles: roles.clone(),
+            ..Default::default()
+        };
+        assert!(!pass(&fs));
+        fs.witnesses = vec![
+            ("spawn-tree".into(), 10, 1),
+            ("plain".into(), 11, 1),
+            ("breakaway".into(), 12, 1),
+        ];
+        let proof = |members: Value, dead: bool| {
+            json!({"pre_stop": [{"pid": 10, "start_time": 1, "live": true},
+                                {"pid": 11, "start_time": 1, "live": true},
+                                {"pid": 12, "start_time": 1, "live": true}],
+                   "membership": members, "terminate_job_ok": true,
+                   "after_job": [{"pid": 10, "live": false}, {"pid": 11, "live": false},
+                                 {"pid": 12, "live": false}],
+                   "live_set_dead_before_fallback": dead})
+        };
+        fs.kill_proof = Some(proof(json!([10, 11, 12]), true));
+        assert!(pass(&fs), "{:?}", raw_inject_outcome(&fs));
+        // An escapee outside the job, later killed by the pid fallback.
+        fs.kill_proof = Some(proof(json!([10, 11]), true));
+        assert!(matches!(raw_inject_outcome(&fs), PlatformFail { .. }));
+        fs.kill_proof = None;
+        assert!(!pass(&fs));
     }
 
     #[test]

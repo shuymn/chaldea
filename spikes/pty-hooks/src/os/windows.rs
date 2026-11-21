@@ -1144,6 +1144,30 @@ struct Setup {
     pid: u32,
     start: u64,
     step: &'static str,
+    /// `after-spawn`: output bytes seen, and whether the child still ran,
+    /// when the injection fired.
+    output_pending: Option<u64>,
+    running_at_injection: Option<bool>,
+}
+
+/// Bound on waiting for a terminated process to exit (retained handle).
+const PROCESS_EXIT_WAIT_MS: u32 = 2000;
+
+/// Positive exit evidence through a retained process handle: `exited`,
+/// `timeout`, or `wait_failed`.
+fn wait_exit(h: HANDLE, ms: u32) -> &'static str {
+    // SAFETY: plain wait on a handle the caller owns.
+    match unsafe { WaitForSingleObject(h, ms) } {
+        0 => "exited",
+        0x102 => "timeout",
+        _ => "wait_failed",
+    }
+}
+
+fn still_active(h: HANDLE) -> bool {
+    let mut code = 0u32;
+    // SAFETY: plain query on a handle the caller owns.
+    unsafe { GetExitCodeProcess(h, &mut code) != 0 && code == STILL_ACTIVE as u32 }
 }
 
 impl Drop for Setup {
@@ -1172,6 +1196,11 @@ impl Drop for Setup {
                 ));
             }
         }
+        // The process handle is released only after its exit is confirmed.
+        let process_exit = self
+            .process
+            .as_ref()
+            .map(|p| wait_exit(p.raw(), PROCESS_EXIT_WAIT_MS));
         self.thread.take();
         self.process.take();
         let read_end_closed = self.drain.is_none();
@@ -1188,6 +1217,8 @@ impl Drop for Setup {
         record_teardown(serde_json::json!({
             "path": "setup_error", "failed_at": self.step, "child_pid": (self.pid != 0).then_some(self.pid),
             "child_start": (self.start != 0).then_some(self.start), "steps": steps,
+            "process_exit": process_exit, "output_pending_bytes": self.output_pending,
+            "child_running_at_injection": self.running_at_injection,
             "close_pseudoconsole_ms": close, "drain_reached_eof": drained,
             "host_read_end_closed": read_end_closed, "teardown_ms": t.elapsed().as_millis() as u64,
         }));
@@ -1525,6 +1556,7 @@ pub fn raw_spawn(
                 st.process = Handle::new(pi.hProcess);
                 st.thread = Handle::new(pi.hThread);
                 st.pid = pi.dwProcessId;
+                st.start = st.process.as_ref().map_or(0, |p| creation_time(p.raw()));
                 ("job_list".to_string(), None)
             }
             Err((stage, e)) => {
@@ -1538,6 +1570,8 @@ pub fn raw_spawn(
                 st.process = Handle::new(pi.hProcess);
                 st.thread = Handle::new(pi.hThread);
                 st.pid = pi.dwProcessId;
+                // Identity recorded at acquisition, before any later step can fail.
+                st.start = st.process.as_ref().map_or(0, |p| creation_time(p.raw()));
                 st.step = "suspended_assign";
                 let (Some(p), Some(t)) = (st.process.as_ref(), st.thread.as_ref()) else {
                     return Err("CreateProcessW returned no handles".into());
@@ -1564,17 +1598,23 @@ pub fn raw_spawn(
                 ("suspended".to_string(), Some(job_list_err))
             }
         };
-        st.start = st.process.as_ref().map_or(0, |p| creation_time(p.raw()));
         st.step = "after_spawn";
         if inject == Some(I::AfterSpawn) {
-            // Fail with the child's output pending in the pipe.
-            let end = Instant::now() + Duration::from_secs(3);
-            while st
-                .drain
-                .as_ref()
-                .is_some_and(|d| d.state.bytes.load(Ordering::SeqCst) == 0)
-                && Instant::now() < end
-            {
+            // Fail with the child's output pending: wait (bounded) until its
+            // output has been seen while it still runs (the fixture writes
+            // continuously), and record both.
+            let end = Instant::now() + Duration::from_secs(5);
+            loop {
+                let seen = st
+                    .drain
+                    .as_ref()
+                    .map_or(0, |d| d.state.bytes.load(Ordering::SeqCst));
+                let running = st.process.as_ref().is_some_and(|p| still_active(p.raw()));
+                if (seen > 0 && running) || Instant::now() >= end {
+                    st.output_pending = Some(seen);
+                    st.running_at_injection = Some(running);
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(20));
             }
             return Err("injected failure after spawn".into());
