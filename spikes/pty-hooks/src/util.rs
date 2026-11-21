@@ -146,11 +146,17 @@ pub fn sanitize_component(s: &str) -> String {
     }
 }
 
-/// Writes `bytes` to `path` via a sibling temp file and rename.
+/// Writes `bytes` to `path` via a sibling temp file unique to this write
+/// (pid and a counter) and rename.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let tmp = path.with_extension(format!("tmp-{}-{n}", std::process::id()));
+    let r = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
 }
 
 #[cfg(test)]
