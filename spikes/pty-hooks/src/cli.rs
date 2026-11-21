@@ -59,6 +59,8 @@ pub struct Args {
     pub configs: Vec<String>,
     pub join_run_id: Option<String>,
     pub from: Vec<PathBuf>,
+    /// F-1's winning newline key for `win-probe backend` (`none`: no winner).
+    pub f1_winner: Option<NewlineKey>,
 }
 
 /// F-2c fault injections for the raw backend.
@@ -110,13 +112,13 @@ usage:
   chs win-probe attach-client --url U [--confirm-close]   (credential on stdin)
   chs bundle [--include-pty-output]
 common: --root R  --out DIR  --deadline-secs 180  --session-start-timeout 20  --keep-temp  --cols 120 --rows 40
-real:   --prompt  --claude-bin PATH  --codex-bin PATH  --cwd DIR  --attended  --subset required
+real:   --prompt  --claude-bin PATH  --codex-bin PATH  --cwd DIR  --attended  --subset <required|f1|f1-recorded>
 paste:  --paste-newline <cr|lf|crlf>  --enter-delay-ms 300  --chunk N
 codex:  --hook-source session-flags  --launches N
         --mutate-command  --cwd2 DIR  --codex-mode <no-daemon|default|both>
 input:  --input-encoding <auto|bracketed|win-keys>  --newline-key <csi-u|w32>  --allow-lossy <trim|tab>
 pty:    --pty-backend <portable|raw>  --conpty-flags <0|6>  --raw-inject <before-spawn|after-spawn|reader-start|force-suspended|resume-fail>
-f-run:  chs win-probe <codex-input|backend|followup>
+f-run:  chs win-probe <codex-input|backend|followup>  (backend: --f1-winner <csi-u|w32|none>)
         chs win-probe console --detached --configs P,R0,R6 --join-run-id ID
         chs win-probe f2-verdict --from DIR --from DIR";
 
@@ -181,6 +183,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         configs: Vec::new(),
         join_run_id: None,
         from: Vec::new(),
+        f1_winner: None,
     };
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
@@ -294,6 +297,16 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
                 a.join_run_id = Some(v);
             }
             "--from" => a.from.push(PathBuf::from(value(&mut it, f)?)),
+            "--f1-winner" => {
+                let v = value(&mut it, f)?;
+                a.f1_winner = match v.as_str() {
+                    "none" => None,
+                    k => Some(
+                        NewlineKey::parse(k)
+                            .ok_or_else(|| format!("{f}: expected csi-u|w32|none"))?,
+                    ),
+                };
+            }
             "-h" | "--help" => return Err(USAGE.into()),
             _ if f.starts_with('-') => return Err(format!("unknown flag {f}\n{USAGE}")),
             _ => a.positional.push(arg.clone()),

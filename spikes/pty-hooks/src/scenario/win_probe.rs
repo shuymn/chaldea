@@ -1,6 +1,8 @@
 //! Set C: `chs win-probe <paste|startup|kill|attach|console|all>` and
 //! `attach-client`. Go/no-go screens for Windows architectural blockers
-//! (§1 C, §4.8). Compiles everywhere; refuses to run off Windows.
+//! (§1 C, §4.8). The follow-up run (§1 D, §5 phase 3) adds `codex-input`
+//! (F-1), `backend` (F-2 step 3), `followup`, and `f2-verdict`. Compiles
+//! everywhere; refuses to run off Windows.
 //!
 //! Every probe declares its required cases and gets its verdict from
 //! `verdict::probe`: `inconclusive` when any required case is missing,
@@ -20,7 +22,7 @@ use serde_json::{Value, json};
 use super::{Ctx, LaunchSpec, child_out, child_report, emitter_path, launch, run_bounded};
 use crate::cli::{self, Args};
 use crate::http_client::{self, parse_local_url};
-use crate::paste::{self, InputEncoding, Newline, PasteOpts};
+use crate::paste::{self, InputEncoding, Newline, NewlineKey, PasteOpts};
 use crate::pty::WriterTx;
 use crate::receiver::{ProbeHandler, WitnessView};
 use crate::report::{Check, Probe, Report};
@@ -37,6 +39,24 @@ const PROBES: &[(&str, u64)] = &[
     ("console", 7200),
 ];
 
+/// Follow-up run (§5 phase 3) probes, outside `all`, with their budgets.
+const F_PROBES: &[(&str, u64)] = &[
+    ("codex-input", CODEX_INPUT_BUDGET),
+    ("backend", BACKEND_BUDGET),
+    ("followup", FOLLOWUP_BUDGET),
+    ("f2-verdict", 120),
+];
+
+/// One `real codex-paste` F-1 child (one fresh session per case).
+const F1_CHILD: u64 = 3600;
+const CODEX_INPUT_BUDGET: u64 = 2 * F1_CHILD + 1800 + 3 * CHILD_MARGIN + 60;
+/// Per configuration: the comparison rows; plus the F-2c injections.
+const BACKEND_BUDGET: u64 = 3 * (600 + 900 + 2400 + F1_CHILD + 2 * 600 + 600 + 7 * CHILD_MARGIN)
+    + 5 * (300 + CHILD_MARGIN)
+    + 60;
+const FOLLOWUP_BUDGET: u64 =
+    1800 + CODEX_INPUT_BUDGET + BACKEND_BUDGET + 1800 + 4 * CHILD_MARGIN + 60;
+
 /// Margin a parent gives a child beyond the child's own deadline.
 const CHILD_MARGIN: u64 = 30;
 
@@ -47,7 +67,7 @@ pub fn run(mut args: Args) -> i32 {
     }
     let budget = match sub.as_str() {
         "all" => PROBES.iter().map(|p| p.1 + CHILD_MARGIN).sum::<u64>() + 60,
-        s => match PROBES.iter().find(|p| p.0 == s) {
+        s => match PROBES.iter().chain(F_PROBES).find(|p| p.0 == s) {
             Some(p) => p.1,
             None => {
                 eprintln!("chs win-probe: unknown probe {sub:?}\n{}", cli::USAGE);
@@ -80,6 +100,10 @@ pub fn run(mut args: Args) -> i32 {
         "kill" => probe_kill(&ctx),
         "attach" => probe_attach(&ctx),
         "console" => probe_console(&ctx),
+        "codex-input" => probe_codex_input(&ctx),
+        "backend" => probe_backend(&ctx),
+        "followup" => followup(&ctx),
+        "f2-verdict" => f2_verdict(&ctx),
         _ => unreachable!(),
     }
     ctx.finish()
@@ -183,12 +207,14 @@ fn child(
         Err(e) => return (Err(format!("not_run: {e}")), ctx.out.clone()),
     };
     let mut cmd = Command::new(std::env::current_exe().unwrap_or_default());
-    cmd.args(argv)
+    // Forwarded options first: a child's own flags (e.g. a configuration's
+    // backend flags) come later and win.
+    cmd.args(cli::forward_common(&ctx.args))
+        .args(argv)
         .arg("--out")
         .arg(&out)
         .args(["--run-id", &run_id])
-        .args(["--deadline-secs", &deadline.to_string()])
-        .args(cli::forward_common(&ctx.args));
+        .args(["--deadline-secs", &deadline.to_string()]);
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -1278,6 +1304,584 @@ fn attach_client(args: &Args) -> i32 {
     if marker.is_some() { 0 } else { 1 }
 }
 
+// ---------------- F-1 / F-2 follow-up (§4.8, §5 phase 3) ----------------
+
+/// Completeness of one case set: every case passed; complete with a
+/// platform failure; or incomplete (missing, harness failure, not exercised).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sel {
+    Pass,
+    Fail,
+    Incomplete,
+}
+
+pub fn sel_of(e: &verdict::Eval) -> Sel {
+    if !e.complete() || (e.passed.is_empty() && e.platform_fail.is_empty()) {
+        Sel::Incomplete
+    } else if e.platform_fail.is_empty() {
+        Sel::Pass
+    } else {
+        Sel::Fail
+    }
+}
+
+/// F-1b: `csi-u` wins whenever it passes; else `w32` if it passes. Both
+/// complete with failures → `fail_observed`; anything else `inconclusive`.
+pub fn f1_select(csi_u: Sel, w32: Sel) -> (&'static str, Option<NewlineKey>) {
+    match (csi_u, w32) {
+        (Sel::Pass, _) => ("go", Some(NewlineKey::CsiU)),
+        (_, Sel::Pass) => ("go", Some(NewlineKey::W32)),
+        (Sel::Fail, Sel::Fail) => ("fail_observed", None),
+        _ => ("inconclusive", None),
+    }
+}
+
+/// F-2b: candidates are judged only against a complete, passing `P`; the
+/// first selectable of `R0`, `R6` wins, and one candidate's result never
+/// affects the other's eligibility; both complete with failures →
+/// `fail_observed`; anything else `inconclusive`.
+pub fn f2_select(p: Sel, r0: Sel, r6: Sel) -> (&'static str, Option<&'static str>) {
+    if p != Sel::Pass {
+        return ("inconclusive", None);
+    }
+    match (r0, r6) {
+        (Sel::Pass, _) => ("go", Some("R0")),
+        (_, Sel::Pass) => ("go", Some("R6")),
+        (Sel::Fail, Sel::Fail) => ("fail_observed", None),
+        _ => ("inconclusive", None),
+    }
+}
+
+fn f1_entries() -> Vec<String> {
+    paste::corpus_f()
+        .into_iter()
+        .filter(|e| !e.recorded)
+        .map(|e| e.id)
+        .collect()
+}
+
+/// F-1 (`codex-input`): the corpus F sweep once per newline key, each case
+/// in its own fresh Codex session; recorded fixtures once with the winner
+/// (or `csi-u`), outside the verdict.
+fn probe_codex_input(ctx: &Ctx) {
+    let entries = f1_entries();
+    let mut checks = Vec::new();
+    let mut variants = serde_json::Map::new();
+    let mut sels = Vec::new();
+    for nk in NewlineKey::ALL {
+        let (r, out) = child(
+            ctx,
+            &format!("codex-input-{}", nk.name()),
+            &[
+                "real",
+                "codex-paste",
+                "--subset",
+                "f1",
+                "--newline-key",
+                nk.name(),
+            ],
+            F1_CHILD,
+            false,
+            &[],
+        );
+        let mut pc = Pc::new("F-1");
+        for e in &entries {
+            let c = super::real::keys_case("codex", nk, e);
+            carry(&mut pc, &c, &r, "A-6", &c);
+        }
+        let e = verdict::evaluate(&pc.required, &pc.checks);
+        let sel = sel_of(&e);
+        sels.push(sel);
+        variants.insert(
+            nk.name().into(),
+            json!({"sel": format!("{sel:?}"), "eval": e.json(), "status": status_of(&r),
+                   "report": out.join("report.json")}),
+        );
+        checks.extend(pc.checks);
+    }
+    let (v, winner) = f1_select(sels[0], sels[1]);
+    let rec_key = winner.unwrap_or(NewlineKey::CsiU);
+    let (r, out) = child(
+        ctx,
+        "codex-input-recorded",
+        &[
+            "real",
+            "codex-paste",
+            "--subset",
+            "f1-recorded",
+            "--newline-key",
+            rec_key.name(),
+        ],
+        1800,
+        false,
+        &[],
+    );
+    let recorded = json!({"newline_key": rec_key.name(), "status": status_of(&r),
+        "report": out.join("report.json"),
+        "entries": r.as_ref().ok().map(|r| r.details["f1_recorded"].clone())});
+    let w = winner.map(|k| k.name());
+    ctx.detail("f1_winner", json!(w));
+    ctx.sink.with(|rep| {
+        rep.probes.push(Probe {
+            id: "F-1".into(),
+            verdict: v.into(),
+            why: format!("csi-u {:?}, w32 {:?}; winner {w:?}", sels[0], sels[1]),
+            evidence: json!({"variants": variants, "cases": checks, "winner": w,
+                             "extra": {"recorded": recorded}}),
+        });
+    });
+}
+
+/// One F-2a comparison row: its name, child argv (before the
+/// configuration's flags; `None` = not runnable), budget, and the child
+/// check ids that decide it (empty: the child's C-4 probe verdict).
+struct Row {
+    name: &'static str,
+    argv: Option<Vec<String>>,
+    budget: u64,
+    ids: &'static [&'static str],
+}
+
+fn backend_rows(winner: Option<NewlineKey>) -> Vec<Row> {
+    let v = |a: &[&str]| Some(a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    let row = |name, argv, budget, ids| Row {
+        name,
+        argv,
+        budget,
+        ids,
+    };
+    vec![
+        row(
+            "claude_hooks",
+            v(&["real", "claude-hooks", "--prompt"]),
+            600,
+            &["A-1", "A-2"],
+        ),
+        row(
+            "codex_hooks",
+            v(&[
+                "real",
+                "codex-hooks",
+                "--launches",
+                "1",
+                "--codex-mode",
+                "no-daemon",
+            ]),
+            900,
+            &["A-3"],
+        ),
+        row(
+            "claude_paste",
+            v(&[
+                "real",
+                "claude-paste",
+                "--subset",
+                "required",
+                "--paste-newline",
+                "cr",
+            ]),
+            2400,
+            &["A-6"],
+        ),
+        row(
+            "codex_input",
+            winner.and_then(|k| {
+                v(&[
+                    "real",
+                    "codex-paste",
+                    "--subset",
+                    "f1",
+                    "--newline-key",
+                    k.name(),
+                ])
+            }),
+            F1_CHILD,
+            &["A-6"],
+        ),
+        row(
+            "tree_kill_claude",
+            v(&["real", "tree-kill", "--agent", "claude"]),
+            600,
+            &["A-8"],
+        ),
+        row(
+            "tree_kill_codex",
+            v(&["real", "tree-kill", "--agent", "codex"]),
+            600,
+            &["A-8"],
+        ),
+        row("attach", v(&["win-probe", "attach"]), 600, &[]),
+    ]
+}
+
+/// A child's outcome over its own required cases with the given check ids
+/// (empty ids: the child's C-4 probe verdict).
+fn child_cases_outcome(r: &ChildRep, ids: &[&str]) -> (Outcome, Value) {
+    let rep = match r {
+        Err(e) => return (Outcome::harness(e.clone()), Value::Null),
+        Ok(rep) => rep,
+    };
+    let st = json!({"status": rep.status, "errors": rep.errors});
+    if ids.is_empty() {
+        let p = rep.probes.iter().find(|p| p.id == "C-4");
+        let o = match p.map(|p| (p.verdict.as_str(), p.why.clone())) {
+            Some(("go", _)) => Outcome::Pass,
+            Some(("fail_observed", why)) => Outcome::platform(why),
+            Some((_, why)) => Outcome::not_exercised(why),
+            None => Outcome::Missing,
+        };
+        return (o, st);
+    }
+    let in_ids = |k: &str| ids.iter().any(|i| k.starts_with(&format!("{i} ")));
+    let req: Vec<String> = rep.required.iter().filter(|k| in_ids(k)).cloned().collect();
+    let checks: Vec<Check> = rep
+        .checks
+        .iter()
+        .filter(|c| ids.contains(&c.id.as_str()))
+        .cloned()
+        .collect();
+    let e = verdict::evaluate(&req, &checks);
+    let o = if !rep.errors.is_empty() {
+        Outcome::harness(format!("child errors: {:?}", rep.errors))
+    } else if req.is_empty() {
+        Outcome::harness("the child declared no cases for this row")
+    } else if let Some((k, c)) = e.harness_fail.first() {
+        Outcome::harness(format!("{k}: {c}"))
+    } else if !e.missing.is_empty() {
+        Outcome::Missing
+    } else if let Some((k, c)) = e.not_exercised.first() {
+        Outcome::not_exercised(format!("{k}: {c}"))
+    } else if let Some((k, c)) = e.platform_fail.first() {
+        Outcome::platform(format!("{k}: {c}"))
+    } else {
+        Outcome::Pass
+    };
+    (o, json!({"status": st, "eval": e.json()}))
+}
+
+/// Every `launch` record (backend, branch, ConPTY module) in a report.
+fn launch_records(v: &Value, out: &mut Vec<Value>) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m {
+                if k == "launch" && x.get("backend").is_some() {
+                    out.push(x.clone());
+                } else {
+                    launch_records(x, out);
+                }
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| launch_records(x, out)),
+        _ => {}
+    }
+}
+
+/// F-2b branch rule for a candidate's row: it counts only on the JOB_LIST
+/// branch. A positively observed JOB_LIST rejection (a launch on the
+/// suspended branch) is a branch failure; no launch record (a failed branch
+/// lookup) is a harness failure. `P` rows pass through.
+pub fn branch_gate(config: &str, o: Outcome, launches: &[Value]) -> Outcome {
+    if config == "P" || matches!(o, Outcome::Missing | Outcome::HarnessFail { .. }) {
+        return o;
+    }
+    if launches.is_empty() {
+        return Outcome::harness("branch lookup failed: no launch record");
+    }
+    if let Some(l) = launches.iter().find(|l| l["branch"] != json!("job_list")) {
+        if l["branch"] == json!("suspended") {
+            return Outcome::platform(format!(
+                "JOB_LIST rejected ({}); the launch ran on the suspended branch",
+                l["job_list_error"]
+            ));
+        }
+        return Outcome::harness(format!("unexpected launch record {l}"));
+    }
+    o
+}
+
+const F2_CONFIGS: [&str; 3] = ["P", "R0", "R6"];
+const F2C_INJECTS: [&str; 5] = [
+    "force-suspended",
+    "before-spawn",
+    "after-spawn",
+    "reader-start",
+    "resume-fail",
+];
+
+/// F-2 step 3 (`backend`): the comparison rows under every configuration
+/// as cases `<row>/<config>`; F-2c injections under `R0` as their own probe.
+fn probe_backend(ctx: &Ctx) {
+    let configs: Vec<String> = if ctx.args.configs.is_empty() {
+        F2_CONFIGS.iter().map(|c| c.to_string()).collect()
+    } else {
+        ctx.args.configs.clone()
+    };
+    let winner = ctx.args.f1_winner.map(|k| k.name());
+    let rows = backend_rows(ctx.args.f1_winner);
+    let mut pc = Pc::new("F-2a");
+    for cfg in &configs {
+        for row in &rows {
+            pc.req(&format!("{}/{cfg}", row.name));
+        }
+    }
+    for cfg in &configs {
+        let flags = cli::config_flags(cfg).unwrap_or_default();
+        for row in &rows {
+            let case = format!("{}/{cfg}", row.name);
+            let Some(argv) = &row.argv else {
+                pc.put(
+                    &case,
+                    Outcome::not_exercised("no F-1 winner"),
+                    json!({"config": cfg}),
+                );
+                continue;
+            };
+            let mut a: Vec<&str> = argv.iter().map(String::as_str).collect();
+            a.extend(flags.iter().map(String::as_str));
+            let (r, out) = child(
+                ctx,
+                &format!("backend-{cfg}-{}", row.name),
+                &a,
+                row.budget,
+                false,
+                &[],
+            );
+            let (o, ev) = child_cases_outcome(&r, row.ids);
+            let mut launches = Vec::new();
+            if let Ok(rep) = &r {
+                launch_records(&rep.details, &mut launches);
+                for p in &rep.probes {
+                    launch_records(&p.evidence, &mut launches);
+                }
+            }
+            let o = branch_gate(cfg, o, &launches);
+            pc.put(
+                &case,
+                o,
+                json!({"config": cfg, "child": ev, "launches": launches,
+                       "report": out.join("report.json")}),
+            );
+        }
+    }
+    ctx.sink.with(|r| {
+        r.config["configs"] = json!(configs);
+        r.config["f1_winner"] = json!(winner);
+    });
+    pc.finish(ctx, json!({"f1_winner": winner}));
+    // F-2c: FakeCli `spawn-tree` under R0 with injected failures.
+    let mut fc = Pc::new("F-2c");
+    let r0 = cli::config_flags("R0").unwrap_or_default();
+    for inj in F2C_INJECTS {
+        fc.req(inj);
+        let mut a = vec!["fake", "raw-inject", "--raw-inject", inj];
+        a.extend(r0.iter().map(String::as_str));
+        let (r, out) = child(ctx, &format!("f2c-{inj}"), &a, 300, false, &[]);
+        let (o, ev) = child_cases_outcome(&r, &["F-2c"]);
+        fc.put(
+            inj,
+            o,
+            json!({"child": ev, "report": out.join("report.json")}),
+        );
+    }
+    fc.finish(ctx, Value::Null);
+}
+
+/// Step 3 (`followup`): `fake all`, `codex-input`, `backend` with F-1's
+/// winner, and C-2's Codex part, each a child with its own budget; then
+/// prints the step 4 command.
+fn followup(ctx: &Ctx) {
+    let mut steps = serde_json::Map::new();
+    let mut take = |name: &str, r: &ChildRep, out: &Path, probe: Option<&str>| {
+        steps.insert(
+            name.into(),
+            json!({"status": status_of(r), "report": out.join("report.json")}),
+        );
+        ctx.sink.with(|agg| match (r, probe) {
+            (Ok(rep), _) => agg.probes.extend(rep.probes.iter().cloned()),
+            (Err(e), Some(id)) => agg.probes.push(Probe {
+                id: id.into(),
+                verdict: "inconclusive".into(),
+                why: e.clone(),
+                evidence: json!({"out": out}),
+            }),
+            (Err(_), None) => {}
+        });
+    };
+    let (r, out) = child(ctx, "fake-all", &["fake", "all"], 1800, false, &[]);
+    take("fake_all", &r, &out, None);
+    let (r, out) = child(
+        ctx,
+        "codex-input",
+        &["win-probe", "codex-input"],
+        CODEX_INPUT_BUDGET,
+        false,
+        &[],
+    );
+    let winner = r
+        .as_ref()
+        .ok()
+        .and_then(|rep| rep.details["f1_winner"].as_str())
+        .and_then(NewlineKey::parse);
+    take("codex_input", &r, &out, Some("F-1"));
+    let w = winner.map_or("none", |k| k.name());
+    let (r, backend_out) = child(
+        ctx,
+        "backend",
+        &["win-probe", "backend", "--f1-winner", w],
+        BACKEND_BUDGET,
+        false,
+        &[],
+    );
+    let join = r.as_ref().ok().map(|rep| rep.run_id.clone());
+    take("backend", &r, &backend_out, Some("F-2a"));
+    let cwd = super::real::c2_cwd(&ctx.args.root).display().to_string();
+    let (r, out) = child(
+        ctx,
+        "codex-hooks-c2",
+        &[
+            "real",
+            "codex-hooks",
+            "--launches",
+            "3",
+            "--codex-mode",
+            "both",
+            "--cwd",
+            &cwd,
+        ],
+        1800,
+        false,
+        &[],
+    );
+    take("codex_hooks_c2", &r, &out, None);
+    let exe = std::env::current_exe().unwrap_or_default();
+    let bins: Vec<String> = [
+        ("--claude-bin", &ctx.args.claude_bin),
+        ("--codex-bin", &ctx.args.codex_bin),
+    ]
+    .iter()
+    .filter_map(|(f, b)| b.as_ref().map(|b| format!("{f} \"{}\"", b.display())))
+    .collect();
+    let next = join.as_ref().map(|j| {
+        let nk = winner
+            .map(|k| format!(" --newline-key {}", k.name()))
+            .unwrap_or_default();
+        format!(
+            "\"{}\" win-probe console --detached --configs P,R0,R6 --join-run-id {j}{nk} {} --allow-api-usage",
+            exe.display(),
+            bins.join(" ")
+        )
+    });
+    ctx.detail("steps", json!(steps));
+    ctx.detail("f1_winner", json!(winner.map(|k| k.name())));
+    ctx.detail("step3_report_dir", json!(backend_out));
+    ctx.detail("step4_command", json!(next));
+    match next {
+        Some(c) => {
+            println!("step 3 done. F-1 winner: {w}. Step 3 report dir (f2-verdict --from):");
+            println!("  {}", backend_out.display());
+            println!("step 4, from this terminal:\n  {c}");
+        }
+        None => println!("step 3: the backend child wrote no report; no step 4 command"),
+    }
+}
+
+/// The cases F-2b needs for one configuration: step 3's rows and step 4's
+/// C-5 observation of Claude and Codex (`--no-daemon`).
+fn f2_required(config: &str) -> Vec<String> {
+    let mut v: Vec<String> = backend_rows(None)
+        .iter()
+        .map(|r| verdict::key("F-2a", &format!("{}/{config}", r.name)))
+        .collect();
+    for name in ["claude-hooks", "codex-hooks-no-daemon"] {
+        v.push(verdict::key("C-5", &format!("launch/{config}/{name}")));
+        v.push(verdict::key("C-5", &format!("no_flash/{config}/{name}")));
+    }
+    v
+}
+
+fn probe_cases(r: &Report, id: &str) -> Vec<Check> {
+    r.probes
+        .iter()
+        .filter(|p| p.id == id)
+        .flat_map(|p| {
+            serde_json::from_value::<Vec<Check>>(p.evidence["cases"].clone()).unwrap_or_default()
+        })
+        .collect()
+}
+
+/// F-2b over the joined step 3 (`backend`) and step 4 (`console`) reports.
+/// They join only when step 4's `join_run_id` is step 3's run id; a case
+/// missing from either leaves its configuration incomplete.
+pub fn f2_evaluate(step3: &Report, step4: &Report) -> (&'static str, Option<&'static str>, Value) {
+    let joined = step4.config["join_run_id"].as_str() == Some(step3.run_id.as_str());
+    let all: Vec<Check> = if joined {
+        probe_cases(step3, "F-2a")
+            .into_iter()
+            .chain(probe_cases(step4, "C-5"))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut per = serde_json::Map::new();
+    let mut sels = Vec::new();
+    for cfg in F2_CONFIGS {
+        let req = f2_required(cfg);
+        let checks: Vec<Check> = all
+            .iter()
+            .filter(|c| req.contains(&verdict::key(&c.id, &c.case)))
+            .cloned()
+            .collect();
+        let e = verdict::evaluate(&req, &checks);
+        let sel = sel_of(&e);
+        sels.push(sel);
+        per.insert(
+            cfg.into(),
+            json!({"sel": format!("{sel:?}"), "eval": e.json()}),
+        );
+    }
+    let (v, selected) = f2_select(sels[0], sels[1], sels[2]);
+    (
+        v,
+        selected,
+        json!({"joined": joined, "step3_run_id": step3.run_id,
+               "step4_join_run_id": step4.config["join_run_id"], "configs": per}),
+    )
+}
+
+/// Step 5 (`f2-verdict --from <step 3 dir> --from <step 4 dir>`).
+fn f2_verdict(ctx: &Ctx) {
+    let read = |i: usize| -> Result<Report, String> {
+        let d = ctx
+            .args
+            .from
+            .get(i)
+            .ok_or("needs --from <step 3 dir> --from <step 4 dir>")?;
+        crate::report::read_report(&d.join("report.json"))
+            .ok_or_else(|| format!("{}: no readable report.json", d.display()))
+    };
+    let (v, why, sel, ev) = match (read(0), read(1)) {
+        (Ok(s3), Ok(s4)) => {
+            let (v, sel, ev) = f2_evaluate(&s3, &s4);
+            (v, format!("selected: {sel:?}"), sel, ev)
+        }
+        (a, b) => (
+            "inconclusive",
+            format!("not joined: {:?} {:?}", a.err(), b.err()),
+            None,
+            Value::Null,
+        ),
+    };
+    ctx.detail("from", json!(ctx.args.from));
+    ctx.sink.with(|r| {
+        r.probes.push(Probe {
+            id: "F-2".into(),
+            verdict: v.into(),
+            why,
+            evidence: json!({"selected": sel, "evaluation": ev}),
+        });
+    });
+}
+
 // ---------------- C-5 console ----------------
 
 /// Records pid -> (ppid, start time) every 300 ms; window events also carry
@@ -1575,12 +2179,14 @@ fn observed_child(
         Err(e) => return not_run(format!("window observer failed: {e}")),
     };
     let mut cmd = Command::new(std::env::current_exe().unwrap_or_default());
-    cmd.args(argv)
+    // Forwarded options first: a child's own flags (e.g. a configuration's
+    // backend flags) come later and win.
+    cmd.args(cli::forward_common(&ctx.args))
+        .args(argv)
         .arg("--out")
         .arg(&out)
         .args(["--run-id", &run_id])
         .args(["--deadline-secs", &deadline.to_string()])
-        .args(cli::forward_common(&ctx.args))
         .env("CHS_WAIT_GO", "1");
     for (k, v) in env {
         cmd.env(k, v);
@@ -2032,7 +2638,6 @@ fn terminal_close_survival(ctx: &Ctx) -> (Outcome, Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paste::NewlineKey;
 
     /// r2 C-3: an enumeration failure is a harness failure, never an empty
     /// job that turns every live witness into an escapee.
@@ -2228,6 +2833,214 @@ mod tests {
         let broken = classify_all(Vec::new(), Err("WM_QUIT".into()), Some(&l), &tree);
         assert!(matches!(
             flash_outcome(&broken, true, true),
+            Outcome::HarnessFail { .. }
+        ));
+    }
+
+    /// F-1b selection.
+    #[test]
+    fn f1_select_rules() {
+        use Sel::*;
+        assert_eq!(f1_select(Pass, Pass), ("go", Some(NewlineKey::CsiU)));
+        assert_eq!(f1_select(Pass, Fail), ("go", Some(NewlineKey::CsiU)));
+        assert_eq!(f1_select(Pass, Incomplete), ("go", Some(NewlineKey::CsiU)));
+        assert_eq!(f1_select(Fail, Pass), ("go", Some(NewlineKey::W32)));
+        assert_eq!(f1_select(Incomplete, Pass), ("go", Some(NewlineKey::W32)));
+        assert_eq!(f1_select(Fail, Fail), ("fail_observed", None));
+        assert_eq!(f1_select(Incomplete, Fail), ("inconclusive", None));
+        assert_eq!(f1_select(Fail, Incomplete), ("inconclusive", None));
+        assert_eq!(f1_select(Incomplete, Incomplete), ("inconclusive", None));
+    }
+
+    fn chk(id: &str, case: &str, o: Outcome) -> Check {
+        Check {
+            id: id.into(),
+            case: case.into(),
+            result: o.tag().into(),
+            cause: o.cause(),
+            evidence: Value::Null,
+        }
+    }
+
+    /// Step 3 and step 4 reports where every F-2 case of every config passes
+    /// except those `over` replaces.
+    fn f2_reports(over: &[(&str, &str, Outcome)], drop: &[&str]) -> (Report, Report) {
+        let mut s3 = Report::new("win-probe backend", "run-3");
+        let mut s4 = Report::new("win-probe console", "run-4");
+        s4.config = json!({"join_run_id": "run-3"});
+        let (mut c3, mut c4) = (Vec::new(), Vec::new());
+        for cfg in F2_CONFIGS {
+            for k in f2_required(cfg) {
+                let (id, case) = k.split_once(' ').unwrap();
+                if drop.contains(&case) {
+                    continue;
+                }
+                let o = over
+                    .iter()
+                    .find(|(i, c, _)| *i == id && *c == case)
+                    .map(|x| x.2.clone())
+                    .unwrap_or(Outcome::Pass);
+                let c = chk(id, case, o);
+                if id == "F-2a" { c3.push(c) } else { c4.push(c) }
+            }
+        }
+        let probe = |id: &str, cases: Vec<Check>| Probe {
+            id: id.into(),
+            verdict: "go".into(),
+            why: String::new(),
+            evidence: json!({"cases": cases}),
+        };
+        s3.probes.push(probe("F-2a", c3));
+        s4.probes.push(probe("C-5", c4));
+        (s3, s4)
+    }
+
+    /// F-2b selection over joined step 3 and step 4 reports.
+    #[test]
+    fn f2_select_over_joined_reports() {
+        let fail = || Outcome::platform("x");
+        let (a, b) = f2_reports(&[], &[]);
+        assert_eq!(f2_evaluate(&a, &b).0, "go");
+        assert_eq!(f2_evaluate(&a, &b).1, Some("R0"));
+        // R6 selectable when R0 fails, and vice versa.
+        let (a, b) = f2_reports(&[("F-2a", "claude_hooks/R0", fail())], &[]);
+        assert_eq!(f2_evaluate(&a, &b).1, Some("R6"));
+        let (a, b) = f2_reports(&[("C-5", "no_flash/R6/claude-hooks", fail())], &[]);
+        assert_eq!(f2_evaluate(&a, &b).1, Some("R0"));
+        // Both candidates complete with a failure each.
+        let (a, b) = f2_reports(
+            &[
+                ("F-2a", "attach/R0", fail()),
+                ("F-2a", "codex_hooks/R6", fail()),
+            ],
+            &[],
+        );
+        assert_eq!(f2_evaluate(&a, &b).0, "fail_observed");
+        // P evidence missing, or a config missing from step 4.
+        let (a, b) = f2_reports(&[], &["tree_kill_codex/P"]);
+        assert_eq!(
+            f2_evaluate(&a, &b),
+            ("inconclusive", None, f2_evaluate(&a, &b).2)
+        );
+        let (a, b) = f2_reports(
+            &[("F-2a", "claude_hooks/R0", fail())],
+            &["launch/R6/claude-hooks", "no_flash/R6/claude-hooks"],
+        );
+        assert_eq!(f2_evaluate(&a, &b).0, "inconclusive");
+        // Mixed: R0 failed, R6 incomplete (an ambiguous window observation).
+        let (a, b) = f2_reports(
+            &[
+                ("F-2a", "claude_paste/R0", fail()),
+                (
+                    "C-5",
+                    "no_flash/R6/codex-hooks-no-daemon",
+                    Outcome::not_exercised("ambiguous window events"),
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(f2_evaluate(&a, &b).0, "inconclusive");
+        // No F-1 winner: the Codex input row is not exercised everywhere.
+        let none: Vec<(&str, String, Outcome)> = F2_CONFIGS
+            .iter()
+            .map(|c| {
+                (
+                    "F-2a",
+                    format!("codex_input/{c}"),
+                    Outcome::not_exercised("no F-1 winner"),
+                )
+            })
+            .collect();
+        let none: Vec<(&str, &str, Outcome)> = none
+            .iter()
+            .map(|(i, c, o)| (*i, c.as_str(), o.clone()))
+            .collect();
+        let (a, b) = f2_reports(&none, &[]);
+        let (v, sel, ev) = f2_evaluate(&a, &b);
+        assert_eq!((v, sel), ("inconclusive", None));
+        assert_eq!(
+            ev["configs"]["R0"]["eval"]["passed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            10
+        );
+        // Mismatched run ids: not joined.
+        let (a, mut b) = f2_reports(&[], &[]);
+        b.config["join_run_id"] = json!("other");
+        let (v, _, ev) = f2_evaluate(&a, &b);
+        assert_eq!((v, ev["joined"].clone()), ("inconclusive", json!(false)));
+    }
+
+    /// F-2b branch rule: suspended-branch passes are branch failures; a
+    /// failed lookup is a harness failure (so the candidate is incomplete).
+    #[test]
+    fn branch_gate_rules() {
+        let jl = json!({"backend": "raw", "branch": "job_list"});
+        let sus = json!({"backend": "raw", "branch": "suspended", "job_list_error": "denied"});
+        assert_eq!(
+            branch_gate("R0", Outcome::Pass, std::slice::from_ref(&jl)),
+            Outcome::Pass
+        );
+        assert!(matches!(
+            branch_gate("R0", Outcome::Pass, &[jl.clone(), sus.clone()]),
+            Outcome::PlatformFail { .. }
+        ));
+        assert!(matches!(
+            branch_gate("R6", Outcome::Pass, &[]),
+            Outcome::HarnessFail { .. }
+        ));
+        let p = json!({"backend": "portable", "branch": "assign_after"});
+        assert_eq!(branch_gate("P", Outcome::Pass, &[p]), Outcome::Pass);
+        // The gated outcome makes the candidate not selectable.
+        let (a, b) = f2_reports(
+            &[(
+                "F-2a",
+                "claude_hooks/R0",
+                branch_gate("R0", Outcome::Pass, &[sus]),
+            )],
+            &[],
+        );
+        assert_eq!(f2_evaluate(&a, &b).1, Some("R6"));
+        let (a, b) = f2_reports(
+            &[
+                (
+                    "F-2a",
+                    "claude_hooks/R0",
+                    branch_gate("R0", Outcome::Pass, &[]),
+                ),
+                (
+                    "F-2a",
+                    "claude_hooks/R6",
+                    branch_gate("R6", Outcome::Pass, &[]),
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(f2_evaluate(&a, &b).0, "inconclusive");
+    }
+
+    /// Row outcomes read the child's own required cases.
+    #[test]
+    fn child_rows_follow_required_cases() {
+        let mut r = Report::new("real tree-kill", "x");
+        r.required = vec![
+            verdict::key("A-8", "codex_mcp_witness_tree"),
+            verdict::key("A-8", "codex_kill_proof"),
+        ];
+        r.checks = vec![chk("A-8", "codex_mcp_witness_tree", Outcome::Pass)];
+        let rep: ChildRep = Ok(r.clone());
+        assert_eq!(child_cases_outcome(&rep, &["A-8"]).0, Outcome::Missing);
+        r.checks
+            .push(chk("A-8", "codex_kill_proof", Outcome::platform("escapee")));
+        assert!(matches!(
+            child_cases_outcome(&Ok(r.clone()), &["A-8"]).0,
+            Outcome::PlatformFail { .. }
+        ));
+        r.checks.push(chk("A-8", "codex_kill_proof", Outcome::Pass));
+        assert_eq!(child_cases_outcome(&Ok(r), &["A-8"]).0, Outcome::Pass);
+        assert!(matches!(
+            child_cases_outcome(&Err("not_run".into()), &["A-8"]).0,
             Outcome::HarnessFail { .. }
         ));
     }
