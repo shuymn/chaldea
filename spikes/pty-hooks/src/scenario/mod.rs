@@ -420,6 +420,12 @@ impl Launch {
 }
 
 pub fn launch(ctx: &Ctx, spec: LaunchSpec) -> Result<Launch, String> {
+    launch_with(ctx, spec, ctx.backend())
+}
+
+/// `launch` under an explicit backend (F-2c's no-injection baseline
+/// launches run in an injection run's process).
+pub fn launch_with(ctx: &Ctx, spec: LaunchSpec, backend: os::Backend) -> Result<Launch, String> {
     let thread_id = uuid::Uuid::new_v4().to_string();
     let token = util::token();
     let receiver = Receiver::start(Config {
@@ -463,7 +469,7 @@ pub fn launch(ctx: &Ctx, spec: LaunchSpec) -> Result<Launch, String> {
         out_file: ctx.out.join(format!("pty-output-{}.bin", spec.label)),
         hold_assign: spec.hold_assign,
         inject: spec.inject,
-        backend: ctx.backend(),
+        backend,
     })?;
     receiver.set_cli_pid(session.owned.child_pid);
     // Ambiguous binding revokes the writer gate (queued pastes are dropped).

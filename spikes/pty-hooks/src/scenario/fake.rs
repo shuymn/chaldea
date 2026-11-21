@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::{
-    Ctx, Launch, LaunchSpec, child_out, child_report, emitter_path, launch, write_snapshot,
+    Ctx, Launch, LaunchSpec, child_out, child_report, emitter_path, launch, launch_with,
+    write_snapshot,
 };
 use crate::cli::{self, Args};
 use crate::paste::{self, Newline, PasteOpts};
@@ -2383,9 +2384,19 @@ fn raw_inject(ctx: &Ctx) {
     // this process (modules, thread pools) is not counted as a leak. It is
     // measured like the case (milestone, teardown, survivors) and must have
     // reached its milestone and cleaned up; its handle delta is discarded.
-    let (warm, warm_tree, warm_stop) =
-        measure_inject(ctx, &inject, "raw-inject-warmup", &extra, &roles);
-    let (mut r, tree, stop_report) = measure_inject(ctx, &inject, "raw-inject", &extra, &roles);
+    let (warm, warm_tree, warm_stop) = measure_inject(
+        ctx,
+        &inject,
+        "raw-inject-warmup",
+        &extra,
+        &roles,
+        Duration::ZERO,
+    );
+    if inject == "reader-start" && ctx.args.repeat > 0 {
+        return reader_start_repeat(ctx, warm, &extra, &roles);
+    }
+    let (mut r, tree, stop_report) =
+        measure_inject(ctx, &inject, "raw-inject", &extra, &roles, Duration::ZERO);
     r.warmup = Some(Box::new(warm));
     let o = raw_inject_outcome(&r);
     let ids = |t: &[(u32, u64)]| {
@@ -2403,15 +2414,180 @@ fn raw_inject(ctx: &Ctx) {
     );
 }
 
+/// Fixed settle before a repeat iteration's handle count is sampled.
+const REPEAT_SETTLE: Duration = Duration::from_millis(500);
+
+/// The harness handle count after a launch: `settle`, then sampled until
+/// it is at or below `before` or 2 s passed (the last sample is kept).
+fn settled_handles(before: Option<u32>, settle: Duration) -> Option<u32> {
+    std::thread::sleep(settle);
+    let end = Instant::now() + Duration::from_secs(2);
+    loop {
+        let now = os::process_handle_count();
+        if now <= before || Instant::now() >= end {
+            return now;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// F-2c `reader-start --repeat N` (A5): every injected iteration must
+/// reach its milestone and clean up (else that iteration's cause; a
+/// platform failure stays one); every sample must exist; then the injected
+/// series' settled count after its last iteration must not exceed the
+/// no-injection series' last, and must not have grown across iterations
+/// (last above first). Noise that returns to its level passes.
+pub fn repeat_outcome(inj: &[(Outcome, Option<u32>)], base: &[(bool, Option<u32>)]) -> Outcome {
+    if inj.is_empty() || base.is_empty() {
+        return Outcome::not_exercised("a series did not run");
+    }
+    for (i, (o, _)) in inj.iter().enumerate() {
+        match o {
+            Outcome::Pass => {}
+            Outcome::PlatformFail { cause } => {
+                return Outcome::platform(format!("iteration {}: {cause}", i + 1));
+            }
+            o => {
+                return Outcome::harness(format!(
+                    "iteration {}: {}",
+                    i + 1,
+                    o.cause().unwrap_or_else(|| o.tag().into())
+                ));
+            }
+        }
+    }
+    if let Some(i) = base.iter().position(|(ok, _)| !ok) {
+        return Outcome::harness(format!("no-injection launch {} failed", i + 1));
+    }
+    let samples = |v: Vec<Option<u32>>| v.into_iter().collect::<Option<Vec<u32>>>();
+    let (Some(i), Some(b)) = (
+        samples(inj.iter().map(|x| x.1).collect()),
+        samples(base.iter().map(|x| x.1).collect()),
+    ) else {
+        return Outcome::harness("a handle count sample is missing");
+    };
+    let (first, last, base_last) = (i[0], i[i.len() - 1], b[b.len() - 1]);
+    if last > base_last {
+        return Outcome::platform(format!(
+            "settled handle count {last} after the last injected launch > {base_last} \
+             after the no-injection series"
+        ));
+    }
+    if last > first {
+        return Outcome::platform(format!(
+            "handle count grew across injected iterations: {first} -> {last}"
+        ));
+    }
+    Outcome::Pass
+}
+
+/// A5: after the warm-up, `--repeat` no-injection launches (a normal raw
+/// FakeCli launch to the same milestone, the reader started, then stopped)
+/// and then as many injected launches, all in this process, each sampled
+/// after `REPEAT_SETTLE`. The raw series are reported either way.
+fn reader_start_repeat(ctx: &Ctx, warm: InjectRun, extra: &[&str], roles: &[String]) {
+    let n = ctx.args.repeat as usize;
+    let warm_o = launch_outcome(&warm);
+    let plain = match ctx.backend() {
+        os::Backend::Raw { conpty_flags, .. } => os::Backend::Raw {
+            conpty_flags,
+            inject: None,
+        },
+        b => b,
+    };
+    let mut base = Vec::new();
+    for i in 0..n {
+        if ctx.past_cutoff() {
+            break;
+        }
+        let before = os::process_handle_count();
+        let spec = fake_spec(ctx, &format!("raw-baseline-{i}"), "spawn-tree", extra);
+        let (ok, ev) = match launch_with(ctx, spec, plain) {
+            Ok(l) => {
+                let branch = l.session.launch["branch"].clone();
+                let (st, _) = l.finish();
+                (
+                    st.survivors.is_empty(),
+                    json!({"branch": branch, "stop": stop_evidence(&st)}),
+                )
+            }
+            Err(e) => (false, json!({"launch_error": e})),
+        };
+        let after = settled_handles(before, REPEAT_SETTLE);
+        base.push((
+            ok,
+            after,
+            json!({"before": before, "settled": after, "ok": ok, "launch": ev}),
+        ));
+    }
+    let mut inj = Vec::new();
+    for i in 0..n {
+        if ctx.past_cutoff() {
+            break;
+        }
+        let (r, tree, _) = measure_inject(
+            ctx,
+            "reader-start",
+            &format!("raw-inject-{i}"),
+            extra,
+            roles,
+            REPEAT_SETTLE,
+        );
+        let o = launch_outcome(&r);
+        let ids: Vec<Value> = tree
+            .iter()
+            .map(|(p, s)| json!({"pid": p, "start_time": s}))
+            .collect();
+        inj.push((o, r, ids));
+    }
+    let series_inj: Vec<(Outcome, Option<u32>)> = inj
+        .iter()
+        .map(|(o, r, _)| (o.clone(), r.handles_after))
+        .collect();
+    let series_base: Vec<(bool, Option<u32>)> = base.iter().map(|(ok, a, _)| (*ok, *a)).collect();
+    let o = if warm_o != Outcome::Pass {
+        Outcome::harness(format!(
+            "warm-up: {}",
+            warm_o.cause().unwrap_or_else(|| warm_o.tag().into())
+        ))
+    } else if series_inj.len() < n || series_base.len() < n {
+        Outcome::not_exercised(format!(
+            "cut short: {} of {n} injected, {} of {n} baseline launches",
+            series_inj.len(),
+            series_base.len()
+        ))
+    } else {
+        repeat_outcome(&series_inj, &series_base)
+    };
+    let iterations: Vec<Value> = inj
+        .iter()
+        .map(|(o, r, tree)| json!({"result": o.tag(), "cause": o.cause(), "run": r, "tree": tree}))
+        .collect();
+    ctx.check(
+        "F-2c",
+        "reader-start",
+        o,
+        json!({"repeat": n, "settle_ms": REPEAT_SETTLE.as_millis() as u64,
+               "series": {"injected": series_inj.iter().map(|x| x.1).collect::<Vec<_>>(),
+                          "baseline": series_base.iter().map(|x| x.1).collect::<Vec<_>>()},
+               "measured": "GetProcessHandleCount of the harness process only; other host-process \
+                            resources (threads, memory) are not measured",
+               "warmup": warm, "iterations": iterations,
+               "baseline": base.into_iter().map(|x| x.2).collect::<Vec<_>>()}),
+    );
+}
+
 /// One measured F-2c launch: handle counts around it, its teardown record
 /// and roots (read before any later launch), its process tree and
-/// survivors, and its stop report.
+/// survivors, and its stop report. `settle` is waited before the handle
+/// count is sampled.
 fn measure_inject(
     ctx: &Ctx,
     inject: &str,
     label: &str,
     extra: &[&str],
     roles: &[String],
+    settle: Duration,
 ) -> (InjectRun, Vec<(u32, u64)>, Option<StopReport>) {
     let from = crate::session::spawned_children().len();
     let mut r = InjectRun {
@@ -2469,14 +2645,7 @@ fn measure_inject(
         .map(|((p, st), _)| json!({"pid": p, "start_time": st}))
         .collect();
     // Handle count settles once released threads have exited.
-    let end = Instant::now() + Duration::from_secs(2);
-    loop {
-        r.handles_after = os::process_handle_count();
-        if r.handles_after <= r.handles_before || Instant::now() >= end {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    r.handles_after = settled_handles(r.handles_before, settle);
     if let Some(st) = &stop_report {
         r.survivors.extend(st.survivors.iter().map(|p| json!(p)));
     }
@@ -3385,6 +3554,79 @@ mod tests {
         let mut r = r;
         r.teardown.as_mut().unwrap()["output_marker_seen"] = json!(true);
         assert_eq!(raw_inject_outcome(&r), Outcome::Pass);
+    }
+
+    /// A5: the repeat verdict over synthetic series.
+    #[test]
+    fn reader_start_repeat_rules() {
+        let inj = |v: &[u32]| {
+            v.iter()
+                .map(|c| (Outcome::Pass, Some(*c)))
+                .collect::<Vec<_>>()
+        };
+        let base = |v: &[u32]| v.iter().map(|c| (true, Some(*c))).collect::<Vec<_>>();
+        // Flat.
+        assert_eq!(
+            repeat_outcome(&inj(&[88; 10]), &base(&[88; 10])),
+            Outcome::Pass
+        );
+        // Persistent +1 against the baseline.
+        assert!(matches!(
+            repeat_outcome(&inj(&[89; 10]), &base(&[88; 10])),
+            Outcome::PlatformFail { .. }
+        ));
+        // Per-iteration growth, even when the baseline ended higher.
+        let grow: Vec<u32> = (80..90).collect();
+        assert!(matches!(
+            repeat_outcome(&inj(&grow), &base(&[95; 10])),
+            Outcome::PlatformFail { .. }
+        ));
+        // Noise that returns to its level passes.
+        assert_eq!(
+            repeat_outcome(
+                &inj(&[88, 89, 88, 88, 90, 88, 88, 88, 88, 88]),
+                &base(&[88; 10])
+            ),
+            Outcome::Pass
+        );
+        // A missing sample is a harness failure.
+        let mut gap = inj(&[88; 10]);
+        gap[4].1 = None;
+        assert!(matches!(
+            repeat_outcome(&gap, &base(&[88; 10])),
+            Outcome::HarnessFail { .. }
+        ));
+        let mut gap = base(&[88; 10]);
+        gap[9].1 = None;
+        assert!(matches!(
+            repeat_outcome(&inj(&[88; 10]), &gap),
+            Outcome::HarnessFail { .. }
+        ));
+        // A missed injection names its iteration.
+        let mut miss = inj(&[88; 10]);
+        miss[2].0 = Outcome::harness("the injection did not fail the launch");
+        match repeat_outcome(&miss, &base(&[88; 10])) {
+            Outcome::HarnessFail { cause } => assert!(cause.starts_with("iteration 3:"), "{cause}"),
+            o => panic!("{o:?}"),
+        }
+        // A survivor in an iteration stays a platform failure.
+        let mut surv = inj(&[88; 10]);
+        surv[0].0 = Outcome::platform("processes survived the teardown");
+        assert!(matches!(
+            repeat_outcome(&surv, &base(&[88; 10])),
+            Outcome::PlatformFail { .. }
+        ));
+        // A failed baseline launch, or an empty series.
+        let mut bad = base(&[88; 10]);
+        bad[0].0 = false;
+        assert!(matches!(
+            repeat_outcome(&inj(&[88; 10]), &bad),
+            Outcome::HarnessFail { .. }
+        ));
+        assert!(matches!(
+            repeat_outcome(&[], &base(&[88])),
+            Outcome::NotExercised { .. }
+        ));
     }
 
     /// Phase 3c keys-probe: the records arm sends every BMP unit as a
