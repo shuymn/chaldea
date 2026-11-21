@@ -727,13 +727,31 @@ thread_local! {
 static OBSERVER_SLOT: super::ObserverSlot = super::ObserverSlot::new();
 
 fn image_of(h: HANDLE) -> Option<String> {
-    let mut buf = [0u16; 1024];
-    let mut n = buf.len() as u32;
-    // SAFETY: buffer length passed in `n`.
-    if unsafe { QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut n) } == 0 {
-        return None;
+    image_path(h).ok()
+}
+
+/// `QueryFullProcessImageNameW`, growing the buffer on
+/// `ERROR_INSUFFICIENT_BUFFER` (up to 32 Ki units); any other failure keeps
+/// its Win32 error.
+fn image_path(h: HANDLE) -> Result<String, String> {
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, GetLastError};
+    let mut cap = 1024usize;
+    loop {
+        let mut buf = vec![0u16; cap];
+        let mut n = cap as u32;
+        // SAFETY: buffer length passed in `n`.
+        if unsafe { QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut n) }
+            != 0
+        {
+            return Ok(String::from_utf16_lossy(&buf[..n as usize]));
+        }
+        // SAFETY: plain call right after the failed one.
+        let e = unsafe { GetLastError() };
+        if e != ERROR_INSUFFICIENT_BUFFER || cap >= 32 * 1024 {
+            return Err(format!("QueryFullProcessImageNameW: Win32 error {e}"));
+        }
+        cap *= 2;
     }
-    Some(String::from_utf16_lossy(&buf[..n as usize]))
 }
 
 /// The process owning thread `tid`, if it can still be opened.
@@ -1131,8 +1149,8 @@ pub fn process_identity(pid: u32, start: u64) -> serde_json::Value {
         if creation_time(h.raw()) != start {
             return serde_json::json!({"error": "the pid now names another process"});
         }
-        let image = image_of(h.raw());
-        let under_windows_apps = image.as_deref().map(|p| {
+        let image = image_path(h.raw());
+        let under_windows_apps = image.as_deref().ok().map(|p| {
             p.to_ascii_lowercase()
                 .split(['\\', '/'])
                 .any(|c| c == "windowsapps")
@@ -1152,7 +1170,12 @@ pub fn process_identity(pid: u32, start: u64) -> serde_json::Value {
         } else {
             serde_json::json!({"error": format!("GetPackageFullName: {r}")})
         };
-        serde_json::json!({"image": image, "under_windows_apps": under_windows_apps,
+        let (image, image_error) = match image {
+            Ok(p) => (Some(p), None),
+            Err(e) => (None, Some(e)),
+        };
+        serde_json::json!({"image": image, "image_error": image_error,
+                           "under_windows_apps": under_windows_apps,
                            "package_full_name": package})
     }
 }

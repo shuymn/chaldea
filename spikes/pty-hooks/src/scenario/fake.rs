@@ -2318,6 +2318,17 @@ fn descendants(
     }
 }
 
+/// The branch of the creation attempt that succeeded (`stage: created`) in
+/// a raw launch record, if any.
+pub fn created_branch(launch: &Value) -> Option<String> {
+    launch["attempts"]
+        .as_array()?
+        .iter()
+        .find(|a| a["stage"] == json!("created"))
+        .and_then(|a| a["branch"].as_str())
+        .map(String::from)
+}
+
 /// One injected F-2c launch.
 struct InjectLaunch {
     spawn_error: Option<String>,
@@ -2354,7 +2365,9 @@ fn inject_launch(ctx: &Ctx, label: &str, extra: &[&str], roles: &[String]) -> In
         }
         Err(e) => InjectLaunch {
             spawn_error: Some(e),
-            branch: None,
+            // A9: a launch that failed after process creation (reader-start)
+            // still records the branch that created the process.
+            branch: os::raw_last_launch().as_ref().and_then(created_branch),
             witnesses: Vec::new(),
             stop: None,
         },
@@ -2431,13 +2444,32 @@ fn settled_handles(before: Option<u32>, settle: Duration) -> Option<u32> {
     }
 }
 
-/// F-2c `reader-start --repeat N` (A5): every injected iteration must
-/// reach its milestone and clean up (else that iteration's cause; a
-/// platform failure stays one); every sample must exist; then the injected
-/// series' settled count after its last iteration must not exceed the
-/// no-injection series' last, and must not have grown across iterations
-/// (last above first). Noise that returns to its level passes.
-pub fn repeat_outcome(inj: &[(Outcome, Option<u32>)], base: &[(bool, Option<u32>)]) -> Outcome {
+/// The longest run of consecutive increases in a series.
+fn longest_rise(v: &[u32]) -> usize {
+    let (mut run, mut best) = (0, 0);
+    for w in v.windows(2) {
+        run = if w[1] > w[0] { run + 1 } else { 0 };
+        best = best.max(run);
+    }
+    best
+}
+
+/// Consecutive increases that count as growth.
+const GROWTH_RUN: usize = 3;
+
+/// F-2c `reader-start --repeat N` (A5), over settled samples per iteration:
+/// every injected iteration must reach its milestone and clean up (else
+/// that iteration's cause; a platform failure stays one) and every
+/// baseline launch must have torn down cleanly (else `harness_fail`); a
+/// missing sample, or a baseline that itself grows (a run of
+/// `GROWTH_RUN` consecutive increases), leaves the case `not_exercised`.
+/// Then the injected series fails on any run of `GROWTH_RUN` consecutive
+/// increases or an end count above the baseline's end. Noise that does not
+/// keep rising passes.
+pub fn repeat_outcome(
+    inj: &[(Outcome, Option<u32>)],
+    base: &[(Result<(), String>, Option<u32>)],
+) -> Outcome {
     if inj.is_empty() || base.is_empty() {
         return Outcome::not_exercised("a series did not run");
     }
@@ -2456,29 +2488,70 @@ pub fn repeat_outcome(inj: &[(Outcome, Option<u32>)], base: &[(bool, Option<u32>
             }
         }
     }
-    if let Some(i) = base.iter().position(|(ok, _)| !ok) {
-        return Outcome::harness(format!("no-injection launch {} failed", i + 1));
+    if let Some((i, e)) = base
+        .iter()
+        .enumerate()
+        .find_map(|(i, (r, _))| r.as_ref().err().map(|e| (i, e)))
+    {
+        return Outcome::harness(format!("no-injection launch {}: {e}", i + 1));
     }
     let samples = |v: Vec<Option<u32>>| v.into_iter().collect::<Option<Vec<u32>>>();
     let (Some(i), Some(b)) = (
         samples(inj.iter().map(|x| x.1).collect()),
         samples(base.iter().map(|x| x.1).collect()),
     ) else {
-        return Outcome::harness("a handle count sample is missing");
+        return Outcome::not_exercised("a handle count sample is missing");
     };
-    let (first, last, base_last) = (i[0], i[i.len() - 1], b[b.len() - 1]);
+    if longest_rise(&b) >= GROWTH_RUN {
+        return Outcome::not_exercised(format!(
+            "the no-injection baseline itself grows ({b:?}); growth cannot be attributed"
+        ));
+    }
+    let (last, base_last) = (i[i.len() - 1], b[b.len() - 1]);
+    if longest_rise(&i) >= GROWTH_RUN {
+        return Outcome::platform(format!(
+            "handle count rose on {} consecutive injected iterations: {i:?}",
+            longest_rise(&i)
+        ));
+    }
     if last > base_last {
         return Outcome::platform(format!(
             "settled handle count {last} after the last injected launch > {base_last} \
              after the no-injection series"
         ));
     }
-    if last > first {
-        return Outcome::platform(format!(
-            "handle count grew across injected iterations: {first} -> {last}"
-        ));
-    }
     Outcome::Pass
+}
+
+/// A baseline launch's teardown, checked like an injected one: a teardown
+/// record within its bound, `ClosePseudoConsole` returned, the drain at EOF
+/// (or the host read end closed), the child's exit confirmed, no survivor.
+pub fn baseline_check(t: Option<&Value>, survivors: usize) -> Result<(), String> {
+    let Some(t) = t else {
+        return Err("no teardown record".into());
+    };
+    if t["teardown_ms"]
+        .as_u64()
+        .is_none_or(|ms| ms > RAW_TEARDOWN_BOUND_MS)
+    {
+        return Err(format!("teardown past its bound: {}", t["teardown_ms"]));
+    }
+    if t["close_hung"] == json!(true) {
+        return Err("ClosePseudoConsole did not return within its bound".into());
+    }
+    if let Some(e) = t["drain_end"].as_str().filter(|e| *e != "eof") {
+        return Err(format!("the output drain ended on a read {e}"));
+    }
+    if t["drain_reached_eof"] != json!(true) && t["host_read_end_closed"] != json!(true) {
+        return Err("output neither drained to EOF nor its read end closed".into());
+    }
+    if t["process_exit"] != json!("exited") {
+        return Err(format!("child exit not confirmed: {}", t["process_exit"]));
+    }
+    if survivors > 0 {
+        return Err("processes survived the teardown".into());
+    }
+    Ok(())
 }
 
 /// A5: after the warm-up, `--repeat` no-injection launches (a normal raw
@@ -2501,23 +2574,32 @@ fn reader_start_repeat(ctx: &Ctx, warm: InjectRun, extra: &[&str], roles: &[Stri
             break;
         }
         let before = os::process_handle_count();
+        let from = crate::session::spawned_children().len();
         let spec = fake_spec(ctx, &format!("raw-baseline-{i}"), "spawn-tree", extra);
         let (ok, ev) = match launch_with(ctx, spec, plain) {
             Ok(l) => {
                 let branch = l.session.launch["branch"].clone();
                 let (st, _) = l.finish();
+                let mut t = os::raw_last_teardown();
+                if let Some(t) = t.as_mut() {
+                    reader_start_child(t, &crate::session::spawned_children().split_off(from));
+                }
                 (
-                    st.survivors.is_empty(),
-                    json!({"branch": branch, "stop": stop_evidence(&st)}),
+                    baseline_check(t.as_ref(), st.survivors.len()),
+                    json!({"branch": branch, "stop": stop_evidence(&st), "teardown": t}),
                 )
             }
-            Err(e) => (false, json!({"launch_error": e})),
+            Err(e) => (
+                Err(format!("launch failed: {e}")),
+                json!({"launch_error": e}),
+            ),
         };
         let after = settled_handles(before, REPEAT_SETTLE);
+        let valid = json!(ok.as_ref().err());
         base.push((
             ok,
             after,
-            json!({"before": before, "settled": after, "ok": ok, "launch": ev}),
+            json!({"before": before, "settled": after, "invalid": valid, "launch": ev}),
         ));
     }
     let mut inj = Vec::new();
@@ -2544,7 +2626,8 @@ fn reader_start_repeat(ctx: &Ctx, warm: InjectRun, extra: &[&str], roles: &[Stri
         .iter()
         .map(|(o, r, _)| (o.clone(), r.handles_after))
         .collect();
-    let series_base: Vec<(bool, Option<u32>)> = base.iter().map(|(ok, a, _)| (*ok, *a)).collect();
+    let series_base: Vec<(Result<(), String>, Option<u32>)> =
+        base.iter().map(|(ok, a, _)| (ok.clone(), *a)).collect();
     let o = if warm_o != Outcome::Pass {
         Outcome::harness(format!(
             "warm-up: {}",
@@ -2695,19 +2778,46 @@ pub const KEYS_PROBE_ITEMS: &[(&str, &str)] = &[
 /// How long FakeCli `read-keys` reads per run.
 const READ_KEYS_MS: u64 = 1500;
 
-/// One keys-probe run's outcome against `expected` code points: the run's
-/// report must exist and carry events; otherwise `not_exercised`.
-pub fn keys_run_outcome(report: Option<&Value>, expected: &[u32]) -> (Outcome, Value) {
+/// One keys-probe run's outcome against `expected` code points. The
+/// delivery is interpreted only when the harness's write succeeded, the
+/// console mode read back equals the mode requested, and the capture
+/// reported no `errors`; otherwise `harness_fail`, with whatever events
+/// arrived kept in the evidence. No report at all is `not_exercised`.
+pub fn keys_run_outcome(
+    report: Option<&Value>,
+    write_ok: bool,
+    expected: &[u32],
+) -> (Outcome, Value) {
     let Some(r) = report else {
         return (Outcome::not_exercised("no read-keys report"), Value::Null);
     };
     if let Some(e) = r.get("error") {
         return (Outcome::harness(format!("read-keys: {e}")), Value::Null);
     }
-    let events: Vec<os::KeyRecord> =
-        serde_json::from_value(r["events"].clone()).unwrap_or_default();
-    let got = os::delivered_code_points(&events);
+    let events: Result<Vec<os::KeyRecord>, _> = serde_json::from_value(r["events"].clone());
+    let got = events
+        .as_ref()
+        .map(|e| os::delivered_code_points(e))
+        .unwrap_or_default();
     let ev = json!({"delivered": hex_points(&got), "expected": hex_points(expected)});
+    let errors = r["errors"].as_array().map_or(0, Vec::len);
+    let broken = if !write_ok {
+        Some("the harness write did not complete".to_string())
+    } else if r["mode_after"].is_null() || r["mode_after"] != r["mode_set"] {
+        Some(format!(
+            "console mode read back {} is not the requested {}",
+            r["mode_after"], r["mode_set"]
+        ))
+    } else if errors > 0 || !r["errors"].is_array() {
+        Some(format!("the capture reported errors: {}", r["errors"]))
+    } else if let Err(e) = &events {
+        Some(format!("unreadable events: {e}"))
+    } else {
+        None
+    };
+    if let Some(why) = broken {
+        return (Outcome::harness(why), ev);
+    }
     if got == expected {
         (Outcome::Pass, ev)
     } else {
@@ -2726,19 +2836,22 @@ pub fn keys_run_outcome(report: Option<&Value>, expected: &[u32]) -> (Outcome, V
     }
 }
 
-/// The Shift+Enter control: a key-down with `VK_RETURN` and Shift held.
-pub fn shift_enter_seen(report: Option<&Value>) -> bool {
+/// The Shift+Enter control: the key events are exactly the Shift+Return
+/// record pair we wrote (a key-down then a key-up, `VK_RETURN`, `uChar`
+/// CR, Shift held).
+pub fn shift_enter_exact(report: Option<&Value>) -> bool {
     let events: Vec<os::KeyRecord> = report
-        .map(|r| serde_json::from_value(r["events"].clone()).unwrap_or_default())
+        .and_then(|r| serde_json::from_value(r["events"].clone()).ok())
         .unwrap_or_default();
-    events
-        .iter()
-        .any(|e| e.down && e.vk == 0x0D && e.control & 0x10 != 0)
+    let ret = |e: &os::KeyRecord, down| {
+        e.down == down && e.vk == 0x0D && e.uchar == 13 && e.control & 0x10 != 0
+    };
+    matches!(events.as_slice(), [d, u] if ret(d, true) && ret(u, false))
 }
 
 /// A keys-probe case's outcome: a control that did not arrive is a
 /// harness failure (the probe is not interpretable); Shift+Enter is judged
-/// by its key-down record; an item after a failed control is a harness
+/// by its exact record pair; an item after a failed control is a harness
 /// failure; an item's own result stands otherwise.
 pub fn probe_case_outcome(case: &str, o: Outcome, shift_seen: bool, controls_ok: bool) -> Outcome {
     if matches!(
@@ -2749,7 +2862,9 @@ pub fn probe_case_outcome(case: &str, o: Outcome, shift_seen: bool, controls_ok:
     }
     match case {
         "controls/shift_enter" if shift_seen => Outcome::Pass,
-        "controls/shift_enter" => Outcome::harness("no Shift+Enter key-down record arrived"),
+        "controls/shift_enter" => {
+            Outcome::harness("the events are not exactly the Shift+Return record pair")
+        }
         c if c.starts_with("controls/") && o != Outcome::Pass => {
             Outcome::harness("the ASCII control did not arrive")
         }
@@ -2764,20 +2879,22 @@ pub fn probe_case_outcome(case: &str, o: Outcome, shift_seen: bool, controls_ok:
 /// SessionStart, sent after the console mode is set), write `bytes` once,
 /// and take the records FakeCli reports. Returns the report (if any) and
 /// the run's evidence.
-fn keys_run(ctx: &Ctx, label: &str, bytes: &[u8]) -> (Option<Value>, Value) {
+fn keys_run(ctx: &Ctx, label: &str, bytes: &[u8]) -> (Option<Value>, bool, Value) {
     let ms = READ_KEYS_MS.to_string();
     let l = match launch(ctx, fake_spec(ctx, label, "read-keys", &["--ms", &ms])) {
         Ok(l) => l,
-        Err(e) => return (None, json!({"launch_error": e})),
+        Err(e) => return (None, false, json!({"launch_error": e})),
     };
     let bound = l.receiver.wait_bound(ctx.until(Duration::from_secs(15)));
     let mut write = Value::Null;
+    let mut write_ok = false;
     if bound.is_some() {
         let r = l
             .session
             .io()
             .tx
             .write_wait(vec![bytes.to_vec()], ctx.until(Duration::from_secs(5)));
+        write_ok = r.is_ok();
         write = json!(r.map(|_| bytes.len()));
     }
     let w = l
@@ -2789,11 +2906,27 @@ fn keys_run(ctx: &Ctx, label: &str, bytes: &[u8]) -> (Option<Value>, Value) {
     let report = w.map(|w| w.report);
     let ev = json!({"bound": bound.is_some(), "wire": String::from_utf8_lossy(bytes),
                     "write": write, "read_keys": report, "launch": stop.launch});
-    (report.filter(|_| bound.is_some()), ev)
+    (report.filter(|_| bound.is_some()), write_ok, ev)
+}
+
+/// The Codex arm's exact wire for `text` (`win_keys`, `w32`, records
+/// `marks`, the escape spaces; no CR) and the code points it carries.
+pub fn codex_marks_wire(text: &str) -> (Vec<u8>, Vec<u32>) {
+    let writes = paste::encode_win_keys_with(
+        text.as_bytes(),
+        paste::NewlineKey::W32,
+        &[],
+        paste::UnicodeRecords::Marks,
+    )
+    .map(|(w, _)| w.concat())
+    .unwrap_or_default();
+    let carried = format!(" {} ", paste::expected_win_keys(text, &[]));
+    (writes, code_points(&carried))
 }
 
 /// `win-probe keys-probe` (phase 3c, A3): what reaches the console input
-/// buffer under the ConPTY, per item, as raw UTF-8 and as explicit records.
+/// buffer under the ConPTY, per item, as raw UTF-8, as explicit records
+/// (every BMP scalar), and as the Codex arm's exact bytes (records `marks`).
 /// Positive controls first: ASCII `abc` and one Win32 Shift+Enter record
 /// must arrive as expected, else every item is `harness_fail`.
 pub fn keys_probe(ctx: &Ctx) {
@@ -2817,6 +2950,9 @@ pub fn keys_probe(ctx: &Ctx) {
             all_bmp_records(text),
             code_points(text),
         ));
+        // The exact bytes the Codex arm (records `marks`) writes.
+        let (wire, carried) = codex_marks_wire(text);
+        runs.push((format!("{id}/codex_marks"), wire, carried));
     }
     for (case, _, _) in &runs {
         ctx.require(ID, case);
@@ -2827,10 +2963,10 @@ pub fn keys_probe(ctx: &Ctx) {
             break;
         }
         let label = format!("keys-probe-{}", case.replace('/', "-"));
-        let (report, mut ev) = keys_run(ctx, &label, &bytes);
-        let (o, e) = keys_run_outcome(report.as_ref(), &expected);
+        let (report, write_ok, mut ev) = keys_run(ctx, &label, &bytes);
+        let (o, e) = keys_run_outcome(report.as_ref(), write_ok, &expected);
         ev["result"] = e;
-        let o = probe_case_outcome(&case, o, shift_enter_seen(report.as_ref()), controls_ok);
+        let o = probe_case_outcome(&case, o, shift_enter_exact(report.as_ref()), controls_ok);
         if case.starts_with("controls/") {
             controls_ok &= o == Outcome::Pass;
         }
@@ -3556,7 +3692,20 @@ mod tests {
         assert_eq!(raw_inject_outcome(&r), Outcome::Pass);
     }
 
-    /// A5: the repeat verdict over synthetic series.
+    /// A9: the effective branch of a failed launch is the attempt that
+    /// created the process.
+    #[test]
+    fn failed_launch_keeps_its_created_branch() {
+        let l = json!({"attempts": [
+            {"branch": "job_list", "stage": "create_process", "error": "x"},
+            {"branch": "suspended", "stage": "created"}]});
+        assert_eq!(created_branch(&l).as_deref(), Some("suspended"));
+        let none = json!({"attempts": [{"branch": "job_list", "stage": "injected"}]});
+        assert_eq!(created_branch(&none), None);
+        assert_eq!(created_branch(&Value::Null), None);
+    }
+
+    /// A5: the repeat verdict over synthetic series of settled samples.
     #[test]
     fn reader_start_repeat_rules() {
         let inj = |v: &[u32]| {
@@ -3564,7 +3713,7 @@ mod tests {
                 .map(|c| (Outcome::Pass, Some(*c)))
                 .collect::<Vec<_>>()
         };
-        let base = |v: &[u32]| v.iter().map(|c| (true, Some(*c))).collect::<Vec<_>>();
+        let base = |v: &[u32]| v.iter().map(|c| (Ok(()), Some(*c))).collect::<Vec<_>>();
         // Flat.
         assert_eq!(
             repeat_outcome(&inj(&[88; 10]), &base(&[88; 10])),
@@ -3581,26 +3730,42 @@ mod tests {
             repeat_outcome(&inj(&grow), &base(&[95; 10])),
             Outcome::PlatformFail { .. }
         ));
-        // Noise that returns to its level passes.
+        // The growing tail after a drop: endpoints pass, the run fails.
+        assert!(matches!(
+            repeat_outcome(
+                &inj(&[90, 80, 81, 82, 83, 84, 85, 86, 87, 88]),
+                &base(&[90; 10])
+            ),
+            Outcome::PlatformFail { .. }
+        ));
+        // Two rises then a drop: noise, not growth.
         assert_eq!(
             repeat_outcome(
-                &inj(&[88, 89, 88, 88, 90, 88, 88, 88, 88, 88]),
+                &inj(&[88, 89, 90, 88, 89, 88, 88, 88, 88, 88]),
                 &base(&[88; 10])
             ),
             Outcome::Pass
         );
-        // A missing sample is a harness failure.
+        // A missing sample leaves the case inconclusive.
         let mut gap = inj(&[88; 10]);
         gap[4].1 = None;
         assert!(matches!(
             repeat_outcome(&gap, &base(&[88; 10])),
-            Outcome::HarnessFail { .. }
+            Outcome::NotExercised { .. }
         ));
         let mut gap = base(&[88; 10]);
         gap[9].1 = None;
         assert!(matches!(
             repeat_outcome(&inj(&[88; 10]), &gap),
-            Outcome::HarnessFail { .. }
+            Outcome::NotExercised { .. }
+        ));
+        // A baseline that itself grows cannot carry the comparison.
+        assert!(matches!(
+            repeat_outcome(
+                &inj(&[88; 10]),
+                &base(&[88, 89, 90, 91, 91, 91, 91, 91, 91, 91])
+            ),
+            Outcome::NotExercised { .. }
         ));
         // A missed injection names its iteration.
         let mut miss = inj(&[88; 10]);
@@ -3616,9 +3781,9 @@ mod tests {
             repeat_outcome(&surv, &base(&[88; 10])),
             Outcome::PlatformFail { .. }
         ));
-        // A failed baseline launch, or an empty series.
+        // An invalid baseline launch (e.g. a hung close), or an empty series.
         let mut bad = base(&[88; 10]);
-        bad[0].0 = false;
+        bad[0].0 = Err("ClosePseudoConsole did not return within its bound".into());
         assert!(matches!(
             repeat_outcome(&inj(&[88; 10]), &bad),
             Outcome::HarnessFail { .. }
@@ -3629,9 +3794,27 @@ mod tests {
         ));
     }
 
-    /// Phase 3c keys-probe: the records arm sends every BMP unit as a
-    /// record pair and astral scalars as UTF-8; delivery compares exact code
-    /// points; controls gate every item.
+    /// A5: a baseline launch is validated like an injected teardown.
+    #[test]
+    fn baseline_teardown_is_validated() {
+        let good = json!({"teardown_ms": 100, "close_hung": false, "drain_end": "eof",
+                          "drain_reached_eof": true, "process_exit": "exited"});
+        assert_eq!(baseline_check(Some(&good), 0), Ok(()));
+        assert!(baseline_check(None, 0).is_err());
+        assert!(baseline_check(Some(&good), 1).is_err());
+        for (k, v) in [
+            ("close_hung", json!(true)),
+            ("drain_end", json!("error: broken pipe")),
+            ("drain_reached_eof", json!(false)),
+            ("process_exit", json!("timeout")),
+            ("teardown_ms", json!(RAW_TEARDOWN_BOUND_MS + 1)),
+        ] {
+            let mut t = good.clone();
+            t[k] = v;
+            assert!(baseline_check(Some(&t), 0).is_err(), "{k}");
+        }
+    }
+
     #[test]
     fn keys_probe_rules() {
         assert_eq!(
@@ -3654,27 +3837,74 @@ mod tests {
             repeat: 1,
             ..Default::default()
         };
-        let report = |evs: Vec<os::KeyRecord>| Some(json!({"events": evs}));
-        let full = report(vec![rec(true, 0x31F7, 0, 0), rec(true, 0x309A, 0, 0)]);
+        let healthy = |evs: Vec<os::KeyRecord>| {
+            Some(json!({"events": evs, "mode_set": "0x0", "mode_after": "0x0", "errors": []}))
+        };
+        let full = healthy(vec![rec(true, 0x31F7, 0, 0), rec(true, 0x309A, 0, 0)]);
         assert_eq!(
-            keys_run_outcome(full.as_ref(), &[0x31F7, 0x309A]).0,
+            keys_run_outcome(full.as_ref(), true, &[0x31F7, 0x309A]).0,
             Outcome::Pass
         );
         // A mark that arrived only on a key-up is lost.
-        let lost = report(vec![rec(true, 0x31F7, 0, 0), rec(false, 0x309A, 0x12, 0)]);
-        let (o, e) = keys_run_outcome(lost.as_ref(), &[0x31F7, 0x309A]);
+        let lost = healthy(vec![rec(true, 0x31F7, 0, 0), rec(false, 0x309A, 0x12, 0)]);
+        let (o, e) = keys_run_outcome(lost.as_ref(), true, &[0x31F7, 0x309A]);
         assert!(matches!(o, Outcome::PlatformFail { .. }));
         assert_eq!(e["delivered"], json!(["U+31F7"]));
         assert!(matches!(
-            keys_run_outcome(None, &[1]).0,
+            keys_run_outcome(None, true, &[1]).0,
             Outcome::NotExercised { .. }
         ));
-        assert!(shift_enter_seen(
-            report(vec![rec(true, 13, 0x0D, 0x10)]).as_ref()
+        // M1: a failed write, a mode that did not take, a capture error, or
+        // unreadable events is never read as character loss; the partial
+        // events stay in the evidence.
+        let partial = vec![rec(true, 0x31F7, 0, 0)];
+        let (o, e) = keys_run_outcome(healthy(partial.clone()).as_ref(), false, &[0x31F7, 0x309A]);
+        assert!(matches!(o, Outcome::HarnessFail { .. }));
+        assert_eq!(e["delivered"], json!(["U+31F7"]));
+        let bad_mode = Some(
+            json!({"events": partial, "mode_set": "0x0", "mode_after": "0x200",
+                                   "errors": []}),
+        );
+        let no_mode = Some(
+            json!({"events": partial, "mode_set": "0x0", "mode_after": null,
+                                  "errors": []}),
+        );
+        let read_err = Some(
+            json!({"events": partial, "mode_set": "0x0", "mode_after": "0x0",
+                                   "errors": ["ReadConsoleInputW: 6"]}),
+        );
+        let garbled = Some(
+            json!({"events": "x", "mode_set": "0x0", "mode_after": "0x0",
+                                  "errors": []}),
+        );
+        for r in [bad_mode, no_mode, read_err, garbled] {
+            let (o, _) = keys_run_outcome(r.as_ref(), true, &[0x31F7, 0x309A]);
+            assert!(matches!(o, Outcome::HarnessFail { .. }), "{r:?}");
+        }
+        // The Shift+Enter control needs exactly the record pair.
+        let sd = rec(true, 13, 0x0D, 0x10);
+        let su = rec(false, 13, 0x0D, 0x10);
+        assert!(shift_enter_exact(healthy(vec![sd, su]).as_ref()));
+        assert!(!shift_enter_exact(healthy(vec![sd]).as_ref()));
+        assert!(!shift_enter_exact(
+            healthy(vec![sd, su, rec(true, 0x61, 0x41, 0)]).as_ref()
         ));
-        assert!(!shift_enter_seen(
-            report(vec![rec(true, 13, 0x0D, 0)]).as_ref()
+        assert!(!shift_enter_exact(
+            healthy(vec![rec(true, 13, 0x0D, 0), rec(false, 13, 0x0D, 0)]).as_ref()
         ));
+        // M4: the Codex arm's bytes: the base as UTF-8, the mark as records,
+        // the escape spaces included.
+        let (wire, carried) = codex_marks_wire("\u{31F7}\u{309A}");
+        assert_eq!(
+            wire,
+            [
+                " \u{31F7}".as_bytes(),
+                b"\x1b[0;0;12442;1;0;1_\x1b[0;0;12442;0;0;1_",
+                b" "
+            ]
+            .concat()
+        );
+        assert_eq!(carried, [0x20, 0x31F7, 0x309A, 0x20]);
         // Controls gate the items.
         let p = |c: &str, o, seen, ok| probe_case_outcome(c, o, seen, ok);
         assert_eq!(
