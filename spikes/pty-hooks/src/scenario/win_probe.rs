@@ -2962,20 +2962,38 @@ fn poll_until<T>(
     }
 }
 
+/// Why the launcher stopped waiting: the detached run exited with
+/// `status` before it got that far.
+fn exited_early(dir: &Path, status: &str) -> String {
+    format!(
+        "the detached run exited early ({status}); its report, if it wrote one: {}",
+        dir.join("report.json").display()
+    )
+}
+
 /// The attach URL the detached child published for this run (its run id
-/// and report dir), validated as a local probe URL; or why there is none.
-pub fn await_attach_url(dir: &Path, run_id: &str, end: Instant) -> Result<String, String> {
+/// and report dir), validated as a local probe URL; or why there is none
+/// (also as soon as `exited` reports the child's exit status).
+pub fn await_attach_url(
+    dir: &Path,
+    run_id: &str,
+    end: Instant,
+    mut exited: impl FnMut() -> Option<String>,
+) -> Result<String, String> {
+    let published = || {
+        read_handoff(dir).filter(|h| h.run_id == run_id && (h.url.is_some() || h.error.is_some()))
+    };
     let h = poll_until(
         end,
         Duration::from_millis(200),
         Duration::from_secs(3600),
-        || {
-            read_handoff(dir)
-                .filter(|h| h.run_id == run_id && (h.url.is_some() || h.error.is_some()))
+        || match published() {
+            Some(h) => Some(Ok(h)),
+            None => exited().map(|s| published().ok_or_else(|| exited_early(dir, &s))),
         },
         || {},
     )
-    .ok_or("the detached run published no attach URL in time")?;
+    .ok_or("the detached run published no attach URL in time")??;
     if h.report_dir != dir {
         return Err(format!(
             "handoff names report dir {}",
@@ -2989,6 +3007,38 @@ pub fn await_attach_url(dir: &Path, run_id: &str, end: Instant) -> Result<String
     }
 }
 
+/// Waits until the detached run's handoff says `matrix_done`; stops at
+/// `end` or as soon as `exited` reports the child's exit status (a handoff
+/// with `matrix_done` still counts after the exit). Progress every minute.
+pub fn await_matrix(
+    dir: &Path,
+    end: Instant,
+    poll: Duration,
+    mut exited: impl FnMut() -> Option<String>,
+    mut progress: impl FnMut(),
+) -> Result<(), String> {
+    let done = || read_handoff(dir).is_some_and(|h| h.matrix_done);
+    poll_until(
+        end,
+        poll,
+        Duration::from_secs(60),
+        || {
+            if done() {
+                return Some(Ok(()));
+            }
+            exited().map(|s| {
+                if done() {
+                    Ok(())
+                } else {
+                    Err(exited_early(dir, &s))
+                }
+            })
+        },
+        &mut progress,
+    )
+    .unwrap_or_else(|| Err("the observation matrix did not finish by its deadline".into()))
+}
+
 /// The terminal-close step the launching process prints: only with a
 /// valid attach URL and once the observation matrix has ended (a terminal
 /// opened during an observed launch would be an `ambiguous` window);
@@ -2996,22 +3046,21 @@ pub fn await_attach_url(dir: &Path, run_id: &str, end: Instant) -> Result<String
 pub fn close_step_lines(
     exe: &Path,
     url: &Result<String, String>,
-    matrix_done: bool,
+    matrix: &Result<(), String>,
     cred: &str,
 ) -> Vec<String> {
-    match (url, matrix_done) {
+    match (url, matrix) {
         (Err(e), _) => vec![
             format!("no attach URL from the detached run: {e}"),
             "do not close this terminal for the survival check (C-5 survival stays not_exercised);"
                 .into(),
             "run step 5 below; it waits for the detached report.".into(),
         ],
-        (Ok(_), false) => vec![
-            "the observation matrix did not finish by its deadline; do not close this terminal;"
-                .into(),
+        (Ok(_), Err(e)) => vec![
+            format!("{e}; do not close this terminal;"),
             "run step 5 below; it waits for the detached report.".into(),
         ],
-        (Ok(u), true) => {
+        (Ok(u), Ok(())) => {
             let client: Vec<String> = ["win-probe", "attach-client", "--confirm-close", "--url"]
                 .iter()
                 .map(|s| s.to_string())
@@ -3125,31 +3174,36 @@ fn relaunch_detached(ctx: &Ctx) {
             ]
             .into();
             let step5 = format!("  {}", ps_invocation(&exe, &verdict));
+            println!("step 5 (waits for the detached report, then evaluates F-2):");
+            println!("{step5}");
+            let mut exited = || c.try_wait().ok().flatten().map(|s| s.to_string());
             // The child publishes its attach URL before the matrix.
-            let url = await_attach_url(&child_dir, &child_id, ctx.until(ATTACH_URL_WAIT));
-            let matrix_done = url.is_ok() && {
-                println!(
-                    "the detached run is observing launches; leave the machine idle and keep \
-                     this terminal open until told (progress every minute)"
-                );
-                let end = read_handoff(&child_dir).map_or(ctx.cutoff, |h| {
-                    instant_at(h.deadline_unix_ms).min(ctx.cutoff)
-                });
-                poll_until(
-                    end,
-                    Duration::from_secs(1),
-                    Duration::from_secs(60),
-                    || read_handoff(&child_dir).filter(|h| h.matrix_done),
-                    || {
+            let url = await_attach_url(
+                &child_dir,
+                &child_id,
+                ctx.until(ATTACH_URL_WAIT),
+                &mut exited,
+            );
+            let matrix = match &url {
+                Err(e) => Err(e.clone()),
+                Ok(_) => {
+                    println!(
+                        "the detached run is observing launches; leave the machine idle and keep \
+                         this terminal open until told (progress every minute)"
+                    );
+                    let end = read_handoff(&child_dir).map_or(ctx.cutoff, |h| {
+                        instant_at(h.deadline_unix_ms).min(ctx.cutoff)
+                    });
+                    await_matrix(&child_dir, end, Duration::from_secs(1), &mut exited, || {
                         let phase = read_handoff(&child_dir)
                             .map(|h| h.phase)
                             .unwrap_or_default();
                         println!("  step 4: {phase}");
-                    },
-                )
-                .is_some()
+                    })
+                }
             };
-            for line in close_step_lines(&exe, &url, matrix_done, &cred) {
+            let matrix_done = matrix.is_ok();
+            for line in close_step_lines(&exe, &url, &matrix, &cred) {
                 println!("{line}");
             }
             println!("step 5 (waits for the detached report, then evaluates F-2):");
@@ -3831,15 +3885,62 @@ mod tests {
         });
         let end = Instant::now() + Duration::from_secs(5);
         assert_eq!(
-            await_attach_url(&d, "r4", end),
+            await_attach_url(&d, "r4", end, || None),
             Ok("http://127.0.0.1:4321/probe".into())
         );
         w.join().unwrap();
         let other = handoff_dir();
-        let e = await_attach_url(&other, "r4", Instant::now() + Duration::from_millis(300));
+        let e = await_attach_url(
+            &other,
+            "r4",
+            Instant::now() + Duration::from_millis(300),
+            || None,
+        );
         assert!(e.is_err(), "{e:?}");
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// H2 (r3): a detached run that exits early ends the launcher's waits
+    /// at once, with its exit status and report path, instead of waiting
+    /// out the run's budget; a finished matrix still counts after exit.
+    #[test]
+    fn early_detached_exit_ends_the_wait() {
+        let short_lived = || {
+            #[cfg(windows)]
+            let c = Command::new("cmd").args(["/c", "exit 3"]).spawn();
+            #[cfg(not(windows))]
+            let c = Command::new("sh").args(["-c", "exit 3"]).spawn();
+            c.unwrap()
+        };
+        let d = handoff_dir();
+        let end = Instant::now() + Duration::from_secs(60);
+        let t0 = Instant::now();
+        let mut c = short_lived();
+        let mut exited = || c.try_wait().ok().flatten().map(|s| s.to_string());
+        let e = await_attach_url(&d, "r4", end, &mut exited).unwrap_err();
+        assert!(e.contains("exited early") && e.contains("3"), "{e}");
+        assert!(
+            e.contains(&d.join("report.json").display().to_string()),
+            "{e}"
+        );
+        let m = await_matrix(&d, end, Duration::from_millis(50), &mut exited, || {});
+        assert_eq!(m, Err(e.clone()));
+        assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+        let lines = close_step_lines(Path::new("chs.exe"), &Ok("u".into()), &m, "c");
+        assert!(lines.iter().any(|l| l.contains(&e)), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("close this terminal,")));
+        let mut h = handoff(&d, Some("http://127.0.0.1:1/probe"), 60_000);
+        h.matrix_done = true;
+        write_handoff(&h).unwrap();
+        let mut c = short_lived();
+        let _ = c.wait();
+        let mut exited = || c.try_wait().ok().flatten().map(|s| s.to_string());
+        assert_eq!(
+            await_matrix(&d, end, Duration::from_millis(50), &mut exited, || {}),
+            Ok(())
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// H2: the terminal-close instruction is printed only with a valid URL
@@ -3849,17 +3950,18 @@ mod tests {
         let exe = Path::new(r"C:\chs\t\release\chs.exe");
         let url: Result<String, String> = Ok("http://127.0.0.1:4321/probe".into());
         let has_close = |l: &[String]| l.iter().any(|l| l.contains("close this terminal,"));
-        let ok = close_step_lines(exe, &url, true, "c");
+        let ok = close_step_lines(exe, &url, &Ok(()), "c");
         assert!(has_close(&ok), "{ok:?}");
         assert!(
             ok.iter()
                 .any(|l| l.contains("--url http://127.0.0.1:4321/probe"))
         );
-        let none = close_step_lines(exe, &Err("no URL".into()), true, "c");
+        let none = close_step_lines(exe, &Err("no URL".into()), &Ok(()), "c");
         assert!(!has_close(&none), "{none:?}");
         assert!(none.iter().any(|l| l.contains("step 5")), "{none:?}");
         assert!(!none.iter().any(|l| l.contains("--url")), "{none:?}");
-        assert!(!has_close(&close_step_lines(exe, &url, false, "c")));
+        let late = Err("not finished".into());
+        assert!(!has_close(&close_step_lines(exe, &url, &late, "c")));
     }
 
     /// H2: step 5 waits for the detached run's final report (it is written
