@@ -1088,21 +1088,27 @@ pub fn win_keys_case(
 /// decide from the drained receiver. Recorded entries go to
 /// `details.f1_recorded`, never into the verdict.
 fn keys_sweep(ctx: &Ctx, a: &Agent, newline: NewlineKey) {
-    let entries: Vec<paste::FEntry> = if ctx.args.subset.as_deref() == Some("f1") {
-        paste::corpus_f()
-    } else {
-        paste::corpus()
-            .into_iter()
-            .filter(|e| !e.fake_only && e.text.len() <= 8 * 1024)
-            .filter(|e| ctx.args.subset.as_deref() != Some("required") || e.required)
-            .map(|e| paste::FEntry {
-                id: e.id,
-                text: e.text,
-                recorded: false,
-                allow: Vec::new(),
-            })
-            .collect()
-    };
+    // `f1`: the verdict corpus; `f1-recorded`: the recorded fixtures only
+    // (run once with F-1's winner).
+    let entries: Vec<paste::FEntry> =
+        if let Some(rec @ ("f1" | "f1-recorded")) = ctx.args.subset.as_deref() {
+            paste::corpus_f()
+                .into_iter()
+                .filter(|e| e.recorded == (rec == "f1-recorded"))
+                .collect()
+        } else {
+            paste::corpus()
+                .into_iter()
+                .filter(|e| !e.fake_only && e.text.len() <= 8 * 1024)
+                .filter(|e| ctx.args.subset.as_deref() != Some("required") || e.required)
+                .map(|e| paste::FEntry {
+                    id: e.id,
+                    text: e.text,
+                    recorded: false,
+                    allow: Vec::new(),
+                })
+                .collect()
+        };
     let _ = std::fs::write(
         ctx.out.join("corpus.json"),
         serde_json::to_vec_pretty(&entries).unwrap_or_default(),
@@ -1712,6 +1718,11 @@ fn claude_mcp_config(fake: &Path, env: &[(String, String)]) -> Value {
 fn tree_kill(ctx: &Ctx, a: &Agent) {
     let case = format!("{}_mcp_witness_tree", a.name);
     ctx.require("A-8", &case);
+    // §4.8 `backend` kill proof: job trees only (Windows).
+    let proof_case = format!("{}_kill_proof", a.name);
+    if os::os_name() == "windows" {
+        ctx.require("A-8", &proof_case);
+    }
     let fake = util::sibling_bin("chs-fake-cli");
     let cwd = default_cwd(ctx, a);
     let cfg = ctx.run_dir.join("mcp.json");
@@ -1798,6 +1809,20 @@ fn tree_kill(ctx: &Ctx, a: &Agent) {
         json!({"bound": bound, "snapshot": snap, "witness": w, "witness_liveness": lives,
                "owned_survivors": owned_survivors, "containment": containment}),
     );
+    if os::os_name() == "windows" {
+        let proof = &fin["stop"]["kill_proof"];
+        let o = if proof.is_null() {
+            Outcome::harness("the stop recorded no kill proof (no job tree)")
+        } else {
+            crate::session::kill_proof_outcome(proof, w.as_ref().map(|w| (w.pid, w.start_time)))
+        };
+        ctx.check(
+            "A-8",
+            &proof_case,
+            o,
+            json!({"kill_proof": proof, "witness": w, "launch": fin["stop"]["launch"]}),
+        );
+    }
 }
 
 // ---------------- print-launch ----------------
