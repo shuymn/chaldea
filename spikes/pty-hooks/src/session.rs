@@ -557,7 +557,8 @@ impl Session {
                         record_failed_launch(json!({"backend": "raw",
                             "conpty_flags": conpty_flags, "branch": "none", "error": e,
                             "attempts": a["attempts"],
-                            "job_list_rejected": a["job_list_rejected"] == json!(true)}));
+                            "job_list_rejected": a["job_list_rejected"] == json!(true),
+                            "teardown": os::raw_last_teardown()}));
                         return Err(e);
                     }
                 };

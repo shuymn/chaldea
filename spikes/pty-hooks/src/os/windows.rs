@@ -1114,7 +1114,7 @@ fn record_teardown(v: serde_json::Value) {
     }
 }
 
-/// The last raw-backend teardown record.
+/// The current raw launch's last teardown record (cleared at each launch).
 pub fn raw_last_teardown() -> Option<serde_json::Value> {
     RAW_TEARDOWNS.lock().ok().and_then(|t| t.last().cloned())
 }
@@ -1409,6 +1409,10 @@ pub fn raw_spawn(
     use super::RawInject as I;
     if let Ok(mut l) = RAW_LAUNCH.lock() {
         *l = None;
+    }
+    // The last teardown is this launch's own (none if it never held any).
+    if let Ok(mut t) = RAW_TEARDOWNS.lock() {
+        t.clear();
     }
     let mut st = Setup::default();
     st.step = "pipes";

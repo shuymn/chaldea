@@ -1720,7 +1720,9 @@ fn config_launch(config: &str) -> Option<(&'static str, Option<u64>)> {
 /// `CreateProcessW` call with the job list failed) is a branch failure, also
 /// when the fallback failed too; any other launch off the JOB_LIST branch
 /// (e.g. an attribute-setup failure), a mismatched launch, or no launch
-/// record (a failed lookup) is a harness failure.
+/// record (a failed lookup) is a harness failure. A raw launch's teardown
+/// record (ordinary or failed launch) with a hung close is a branch
+/// failure; one whose drain ended on a read error is a harness failure.
 pub fn branch_gate(config: &str, o: Outcome, launches: &[Value]) -> Outcome {
     let Some((backend, flags)) = config_launch(config) else {
         return Outcome::harness(format!("unknown configuration {config}"));
@@ -1751,6 +1753,16 @@ pub fn branch_gate(config: &str, o: Outcome, launches: &[Value]) -> Outcome {
                 "launch on branch {} without an observed JOB_LIST rejection",
                 l["branch"]
             ));
+        }
+    }
+    // A raw launch's teardown: the close must return in bound and the
+    // drain must not end on a read error.
+    for t in launches.iter().map(|l| &l["teardown"]) {
+        if t["close_hung"] == json!(true) {
+            return Outcome::platform("ClosePseudoConsole did not return within its bound");
+        }
+        if let Some(e) = t["drain_end"].as_str().filter(|e| *e != "eof") {
+            return Outcome::harness(format!("the output drain ended on a read {e}"));
         }
     }
     o
@@ -3790,6 +3802,29 @@ mod tests {
         let toks = ps_tokens(&cmd);
         assert_eq!(toks[1], exe.to_str().unwrap(), "{cmd}");
         assert!(toks.contains(&r"C:\Program Files\Claude\claude.exe".to_string()));
+    }
+
+    /// M2b (r3): a raw launch's teardown counts: a hung close or a drain
+    /// that ended on a read error prevents a pass (also on a failed
+    /// launch's record); a clean teardown passes.
+    #[test]
+    fn branch_gate_needs_a_clean_raw_teardown() {
+        let with = |td: Value| {
+            let mut l = raw_launch(0, "job_list");
+            l["teardown"] = td;
+            l
+        };
+        let clean = json!({"close_hung": false, "drain_end": "eof"});
+        assert_eq!(
+            branch_gate("R0", Outcome::Pass, &[with(clean.clone())]),
+            Outcome::Pass
+        );
+        let hung = json!({"close_hung": true, "drain_end": "eof"});
+        let o = branch_gate("R0", Outcome::Pass, &[with(hung)]);
+        assert!(matches!(o, Outcome::PlatformFail { .. }), "{o:?}");
+        let err = json!({"close_hung": false, "drain_end": "error: broken pipe"});
+        let o = branch_gate("R0", Outcome::Pass, &[with(clean), with(err)]);
+        assert!(matches!(o, Outcome::HarnessFail { .. }), "{o:?}");
     }
 
     /// F-2b branch rule: suspended-branch passes are branch failures; a
