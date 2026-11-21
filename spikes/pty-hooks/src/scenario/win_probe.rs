@@ -1754,23 +1754,9 @@ fn followup(ctx: &Ctx) {
     );
     take("codex_hooks_c2", &r, &out, None);
     let exe = std::env::current_exe().unwrap_or_default();
-    let bins: Vec<String> = [
-        ("--claude-bin", &ctx.args.claude_bin),
-        ("--codex-bin", &ctx.args.codex_bin),
-    ]
-    .iter()
-    .filter_map(|(f, b)| b.as_ref().map(|b| format!("{f} \"{}\"", b.display())))
-    .collect();
-    let next = join.as_ref().map(|j| {
-        let nk = winner
-            .map(|k| format!(" --newline-key {}", k.name()))
-            .unwrap_or_default();
-        format!(
-            "\"{}\" win-probe console --detached --configs P,R0,R6 --join-run-id {j}{nk} {} --allow-api-usage",
-            exe.display(),
-            bins.join(" ")
-        )
-    });
+    let next = join
+        .as_ref()
+        .map(|j| step4_command(&exe, j, winner, &ctx.args));
     ctx.detail("steps", json!(steps));
     ctx.detail("f1_winner", json!(winner.map(|k| k.name())));
     ctx.detail("step3_report_dir", json!(backend_out));
@@ -1783,6 +1769,57 @@ fn followup(ctx: &Ctx) {
         }
         None => println!("step 3: the backend child wrote no report; no step 4 command"),
     }
+}
+
+/// The step 4 command `followup` prints: `console --detached` over every
+/// configuration, joined to step 3's run id, with F-1's winning newline key.
+pub fn step4_command(exe: &Path, join: &str, winner: Option<NewlineKey>, a: &Args) -> String {
+    let mut v: Vec<String> = [
+        "win-probe",
+        "console",
+        "--detached",
+        "--configs",
+        "P,R0,R6",
+        "--join-run-id",
+        join,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if let Some(k) = winner {
+        v.extend(["--newline-key".into(), k.name().into()]);
+    }
+    for (f, b) in [
+        ("--claude-bin", &a.claude_bin),
+        ("--codex-bin", &a.codex_bin),
+    ] {
+        if let Some(b) = b {
+            v.extend([f.into(), b.display().to_string()]);
+        }
+    }
+    v.push("--allow-api-usage".into());
+    ps_invocation(exe, &v)
+}
+
+/// A PowerShell-valid invocation of `exe`: the call operator and every
+/// argument that needs it single-quoted (literal in PowerShell).
+pub fn ps_invocation(exe: &Path, args: &[String]) -> String {
+    let q = |s: &str| {
+        if !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.,:/\\=".contains(c))
+        {
+            s.to_string()
+        } else {
+            format!("'{}'", s.replace('\'', "''"))
+        }
+    };
+    let mut s = format!("& '{}'", exe.display().to_string().replace('\'', "''"));
+    for a in args {
+        s.push(' ');
+        s.push_str(&q(a));
+    }
+    s
 }
 
 /// The cases F-2b needs for one configuration: step 3's rows and step 4's
@@ -2357,30 +2394,85 @@ fn console_matrix(ctx: &Ctx, config: &str) -> Vec<(&'static str, Vec<String>, u6
     m
 }
 
+/// The matrix launches of one configuration (names only).
+fn console_names(config: &str) -> Vec<&'static str> {
+    let mut v = vec!["claude-hooks", "codex-hooks-no-daemon"];
+    if config == "P" {
+        v.extend(["codex-hooks-default", "fake-paste"]);
+    }
+    v
+}
+
+/// C-5 cases every observed run needs before any launch counts.
+const CONSOLE_BASE: [&str; 5] = [
+    "detached",
+    "calibration",
+    "calibration/caret_control",
+    "calibration/at_exit_control",
+    "survival",
+];
+
+/// Every required C-5 case of a console run over `configs`.
+pub fn console_cases(configs: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = CONSOLE_BASE.iter().map(|c| c.to_string()).collect();
+    for cfg in configs {
+        for name in console_names(cfg) {
+            v.push(format!("launch/{cfg}/{name}"));
+            v.push(format!("no_flash/{cfg}/{name}"));
+        }
+    }
+    v
+}
+
+/// The configurations a console run observes (`P` unless `--configs`).
+pub fn console_configs(a: &Args) -> Vec<String> {
+    if a.configs.is_empty() {
+        vec!["P".into()]
+    } else {
+        a.configs.clone()
+    }
+}
+
+/// The report config a console run writes; `f2-verdict` joins on it.
+pub fn console_config(a: &Args) -> Value {
+    json!({"join_run_id": a.join_run_id, "configs": console_configs(a)})
+}
+
+/// The detached console child's arguments: the common options plus, named
+/// explicitly, the configurations, the step 3 run id it joins, its cwd, and
+/// the report dir and run id the parent allocated and printed.
+pub fn detached_child_argv(a: &Args, out: &Path, run_id: &str) -> Vec<String> {
+    let mut v: Vec<String> = ["win-probe", "console", "--detached"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    v.extend(cli::forward_common(a));
+    if !a.configs.is_empty() {
+        v.extend(["--configs".into(), a.configs.join(",")]);
+    }
+    if let Some(j) = &a.join_run_id {
+        v.extend(["--join-run-id".into(), j.clone()]);
+    }
+    if let Some(c) = &a.cwd {
+        v.extend(["--cwd".into(), c.display().to_string()]);
+    }
+    v.extend([
+        "--out".into(),
+        out.display().to_string(),
+        "--run-id".into(),
+        run_id.into(),
+    ]);
+    v
+}
+
 fn probe_console(ctx: &Ctx) {
     if ctx.args.detached && std::env::var("CHS_DETACHED_CHILD").is_err() {
         return relaunch_detached(ctx);
     }
     let mut pc = Pc::new("C-5");
-    let configs: Vec<String> = if ctx.args.configs.is_empty() {
-        vec!["P".into()]
-    } else {
-        ctx.args.configs.clone()
-    };
-    for c in [
-        "detached",
-        "calibration",
-        "calibration/caret_control",
-        "calibration/at_exit_control",
-        "survival",
-    ] {
-        pc.req(c);
-    }
-    for cfg in &configs {
-        for (name, _, _) in console_matrix(ctx, cfg) {
-            pc.req(&format!("launch/{cfg}/{name}"));
-            pc.req(&format!("no_flash/{cfg}/{name}"));
-        }
+    let configs = console_configs(&ctx.args);
+    for c in console_cases(&configs) {
+        pc.req(&c);
     }
     let detached = std::env::var("CHS_DETACHED_CHILD").is_ok();
     let console_window = os::console_window_present();
@@ -2502,8 +2594,9 @@ fn probe_console(ctx: &Ctx) {
         );
     }
     ctx.sink.with(|r| {
-        r.config["join_run_id"] = json!(ctx.args.join_run_id);
-        r.config["configs"] = json!(configs);
+        if let (Value::Object(c), Value::Object(add)) = (&mut r.config, console_config(&ctx.args)) {
+            c.extend(add);
+        }
     });
     pc.finish(
         ctx,
@@ -2513,11 +2606,25 @@ fn probe_console(ctx: &Ctx) {
     );
 }
 
-/// Relaunches the harness detached and prints the owner's next steps.
+/// Relaunches the harness detached into a report dir allocated here, and
+/// prints that dir and the owner's next steps.
 fn relaunch_detached(ctx: &Ctx) {
-    let mut cmd = Command::new(std::env::current_exe().unwrap_or_default());
-    cmd.args(["win-probe", "console", "--detached"])
-        .args(cli::forward_common(&ctx.args));
+    let mut pc = Pc::new("C-5-launch");
+    pc.req("detached_launch");
+    let (child_dir, child_id) = match child_out(&ctx.out, "console-detached") {
+        Ok(v) => v,
+        Err(e) => {
+            pc.put(
+                "detached_launch",
+                Outcome::harness(format!("child report dir: {e}")),
+                Value::Null,
+            );
+            return pc.finish(ctx, Value::Null);
+        }
+    };
+    let exe = std::env::current_exe().unwrap_or_default();
+    let mut cmd = Command::new(&exe);
+    cmd.args(detached_child_argv(&ctx.args, &child_dir, &child_id));
     cmd.env("CHS_DETACHED_CHILD", "1");
     let cred = util::token();
     cmd.stdin(Stdio::piped())
@@ -2525,8 +2632,7 @@ fn relaunch_detached(ctx: &Ctx) {
         .stderr(Stdio::null());
     let url_file = ctx.out.join("attach-url.txt");
     cmd.env("CHS_ATTACH_URL_FILE", &url_file);
-    let mut pc = Pc::new("C-5-launch");
-    pc.req("detached_launch");
+    ctx.detail("step4_report_dir", json!(child_dir));
     match os::spawn_detached(&mut cmd) {
         Ok((mut c, breakaway)) => {
             if let Some(mut si) = c.stdin.take() {
@@ -2542,18 +2648,33 @@ fn relaunch_detached(ctx: &Ctx) {
                 c.id(),
                 if breakaway { "permitted" } else { "denied" }
             );
+            println!("step 4 report dir (f2-verdict --from), run id {child_id}:");
+            println!("  {}", child_dir.display());
             println!("now close this terminal, open a new one, and run:");
-            println!(
-                "  chs win-probe attach-client --confirm-close --url {}",
-                url.trim()
-            );
+            let client: Vec<String> = ["win-probe", "attach-client", "--confirm-close", "--url"]
+                .iter()
+                .map(|s| s.to_string())
+                .chain([url.trim().to_string()])
+                .collect();
+            println!("  {}", ps_invocation(&exe, &client));
             println!("then paste this credential on its stdin: {cred}");
-            println!("(its report: {})", ctx.args.root.join("out").display());
+            println!("when it has reported, step 5:");
+            let verdict: Vec<String> = [
+                "win-probe".to_string(),
+                "f2-verdict".into(),
+                "--from".into(),
+                "<step 3 report dir>".into(),
+                "--from".into(),
+                child_dir.display().to_string(),
+            ]
+            .into();
+            println!("  {}", ps_invocation(&exe, &verdict));
             pc.put(
                 "detached_launch",
                 Outcome::not_exercised("the detached child reports C-5"),
                 json!({"breakaway_permitted": breakaway, "breakaway_denied": !breakaway,
-                       "parent_job": os::self_job_info()}),
+                       "parent_job": os::self_job_info(), "child_report_dir": child_dir,
+                       "child_run_id": child_id}),
             );
         }
         Err(e) => pc.put(
@@ -2970,6 +3091,114 @@ mod tests {
         b.config["join_run_id"] = json!("other");
         let (v, _, ev) = f2_evaluate(&a, &b);
         assert_eq!((v, ev["joined"].clone()), ("inconclusive", json!(false)));
+    }
+
+    fn strs(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Splits a printed PowerShell command line into its arguments (single
+    /// and double quotes; `''` inside single quotes is one quote).
+    fn ps_tokens(s: &str) -> Vec<String> {
+        let cs: Vec<char> = s.chars().collect();
+        let (mut out, mut cur, mut q, mut quoted) = (Vec::new(), String::new(), None, false);
+        let mut i = 0;
+        while i < cs.len() {
+            let c = cs[i];
+            match q {
+                Some('\'') if c == '\'' && cs.get(i + 1) == Some(&'\'') => {
+                    cur.push('\'');
+                    i += 1;
+                }
+                Some(qc) if c == qc => q = None,
+                Some(_) => cur.push(c),
+                None if c == '\'' || c == '"' => {
+                    q = Some(c);
+                    quoted = true;
+                }
+                None if c == ' ' => {
+                    if quoted || !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                        quoted = false;
+                    }
+                }
+                None => cur.push(c),
+            }
+            i += 1;
+        }
+        if quoted || !cur.is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+
+    fn followup_parent() -> Args {
+        cli::parse(&strs(&[
+            "win-probe",
+            "followup",
+            "--claude-bin",
+            r"C:\Program Files\Claude\claude.exe",
+            "--codex-bin",
+            r"C:\chs\npm\codex.exe",
+            "--allow-api-usage",
+        ]))
+        .unwrap()
+    }
+
+    /// H1: the step 4 command `followup` prints, the detached relaunch it
+    /// starts, and the report config the detached child writes carry the
+    /// join id and every configuration, so `f2-verdict` joins step 3 with
+    /// step 4 and selects a candidate.
+    #[test]
+    fn relaunch_reaches_the_f2_join() {
+        let (mut step3, _) = f2_reports(&[], &[]);
+        step3.run_id = "a1b2c3d4".into();
+        let exe = Path::new(r"C:\chs\t\release\chs.exe");
+        let cmd = step4_command(
+            exe,
+            &step3.run_id,
+            Some(NewlineKey::W32),
+            &followup_parent(),
+        );
+        let toks = ps_tokens(&cmd);
+        let at = toks
+            .iter()
+            .position(|t| t == exe.to_str().unwrap())
+            .unwrap();
+        let step4 = cli::parse(&toks[at + 1..]).unwrap();
+        assert!(step4.detached, "{cmd}");
+        let out = PathBuf::from(r"C:\chs\out\5e6f7a8b\console-detached-0a0b0c0d");
+        let child = cli::parse(&detached_child_argv(&step4, &out, "0a0b0c0d")).unwrap();
+        let mut step4_rep = Report::new("win-probe console", "0a0b0c0d");
+        step4_rep.config = console_config(&child);
+        let cases: Vec<Check> = console_cases(&console_configs(&child))
+            .iter()
+            .map(|c| chk("C-5", c, Outcome::Pass))
+            .collect();
+        step4_rep.probes.push(Probe {
+            id: "C-5".into(),
+            verdict: "go".into(),
+            why: String::new(),
+            evidence: json!({"cases": cases}),
+        });
+        let (v, sel, ev) = f2_evaluate(&step3, &step4_rep);
+        assert_eq!((v, sel), ("go", Some("R0")), "{ev}");
+        // The child writes its report where the parent printed it would.
+        assert_eq!(child.out.as_deref(), Some(out.as_path()));
+        assert_eq!(child.run_id.as_deref(), Some("0a0b0c0d"));
+        assert_eq!(child.newline_key, NewlineKey::W32);
+    }
+
+    /// L4: the printed step 4 command is a PowerShell invocation (call
+    /// operator, quoted executable path).
+    #[test]
+    fn step4_command_is_powershell_valid() {
+        let exe = Path::new(r"C:\chs dir\t\release\chs.exe");
+        let cmd = step4_command(exe, "a1b2c3d4", None, &followup_parent());
+        assert!(cmd.starts_with("& "), "{cmd}");
+        let toks = ps_tokens(&cmd);
+        assert_eq!(toks[1], exe.to_str().unwrap(), "{cmd}");
+        assert!(toks.contains(&r"C:\Program Files\Claude\claude.exe".to_string()));
     }
 
     /// F-2b branch rule: suspended-branch passes are branch failures; a
