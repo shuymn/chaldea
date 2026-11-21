@@ -1,6 +1,6 @@
 # Spike: PTY Launch, Hook Injection, Paste, VT Snapshot, Tree Kill
 
-Status: sets A and B implemented and passed on macOS; sets B and C ran once on native Windows (facts in §3). The Windows follow-up run (§1 D, §4.10, §5 phase 3) and its narrow reruns ran on the owner's host; the phase 3c test (§4.8 `phase3c`, §5 phase 3c) is implemented and type-checked for Windows, not yet run there. Implementation lives in `spikes/pty-hooks/`, a standalone Cargo project outside the future `crates/` workspace. Canonical constraints: `AGENTS.md`, `docs/architecture.md` §4 (PTY Seam), §5 (External Quirks), §6 (Verification). Prior-art survey: `docs/prior-art.md`.
+Status: sets A and B implemented and passed on macOS; sets B and C ran once on native Windows (facts in §3). The Windows follow-up run (§1 D, §4.10, §5 phase 3) and its narrow reruns ran on the owner's host; the phase 3c test (§4.8 `phase3c`, §5 phase 3c) ran once there (`adbefa2d`: P3c-submit and P3c-reader-start `go`, P3c-delivery and P3c-outside-job `fail_observed`; results in architecture §5). Implementation lives in `spikes/pty-hooks/`, a standalone Cargo project outside the future `crates/` workspace. Canonical constraints: `AGENTS.md`, `docs/architecture.md` §4 (PTY Seam), §5 (External Quirks), §6 (Verification). Prior-art survey: `docs/prior-art.md`.
 
 The spike answers five questions with evidence. It does not build the daemon; nothing here is a public contract except where it pre-validates the irreversible core (architecture §2: hook emitter, Bearer + Host auth, Job Object / pgid cleanup).
 
