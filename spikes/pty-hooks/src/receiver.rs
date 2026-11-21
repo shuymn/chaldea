@@ -38,6 +38,9 @@ pub const DRAIN_SLACK: usize = 64 * 1024;
 /// Absolute bound per connection, from accept: request + response + drain.
 pub const CONNECTION_BOUND: Duration = Duration::from_secs(7);
 pub const MAX_CONNS: usize = 16;
+/// Threads draining connections rejected past `MAX_CONNS` (503) at a time;
+/// beyond that a rejected connection is closed right after its response.
+pub const OVERLOAD_DRAINERS: usize = 4;
 
 /// Report-wide fixture sequence (one report per process), shared by every receiver.
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -172,6 +175,8 @@ struct State {
     probe: Mutex<Option<Arc<dyn ProbeHandler>>>,
     /// Largest number of bytes read past the head boundary before a rejection.
     overread: AtomicUsize,
+    /// Overload (503) drains running off the accept thread.
+    drainers: AtomicUsize,
     /// Called once when binding first becomes ambiguous (revokes the writer gate).
     on_ambiguous: Mutex<Option<AmbiguityHook>>,
 }
@@ -213,6 +218,7 @@ impl Receiver {
             active: AtomicUsize::new(0),
             probe: Mutex::new(None),
             overread: AtomicUsize::new(0),
+            drainers: AtomicUsize::new(0),
             on_ambiguous: Mutex::new(None),
         });
         let stop = Arc::new(AtomicBool::new(false));
@@ -230,16 +236,7 @@ impl Receiver {
                             }
                             if st.active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
                                 st.active.fetch_sub(1, Ordering::SeqCst);
-                                // The same bounded rejection finalizer as any
-                                // other rejection (inline: accepting waits
-                                // while every slot is taken).
-                                st.finalize(
-                                    stream,
-                                    Instant::now(),
-                                    "overload",
-                                    None,
-                                    Some((503, Vec::new())),
-                                );
+                                st.overload(stream);
                                 continue;
                             }
                             let st2 = st.clone();
@@ -437,9 +434,13 @@ impl Receiver {
         if let Some(j) = self.accept.take() {
             let _ = j.join();
         }
-        // Connection threads end by their own 7 s bound; wait for them, bounded.
+        // Connection and overload-drain threads end by their own 7 s bound;
+        // wait for them (and their records), bounded.
         let end = Instant::now() + CONNECTION_BOUND + Duration::from_secs(1);
-        while self.state.active.load(Ordering::SeqCst) > 0 && Instant::now() < end {
+        while (self.state.active.load(Ordering::SeqCst) > 0
+            || self.state.drainers.load(Ordering::SeqCst) > 0)
+            && Instant::now() < end
+        {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -589,19 +590,66 @@ impl State {
         self.finalize(s, accepted, info.route, info.declared, reply);
     }
 
+    /// A connection past `MAX_CONNS`, on the accept thread: the 503 is
+    /// written (bounded) and the write side half-closed here, then the drain
+    /// runs on its own thread so a peer that keeps sending cannot hold up
+    /// accepting; past `OVERLOAD_DRAINERS` concurrent drains the connection
+    /// is closed at once (`drain_limit`). Recorded like any rejection.
+    fn overload(self: &Arc<Self>, stream: TcpStream) {
+        let accepted = Instant::now();
+        let (s, mut rec, plan) =
+            self.respond(stream, accepted, "overload", None, Some((503, Vec::new())));
+        if self.drainers.fetch_add(1, Ordering::SeqCst) >= OVERLOAD_DRAINERS {
+            self.drainers.fetch_sub(1, Ordering::SeqCst);
+            rec.drain_stop = Some("drain_limit".into());
+            return self.complete(s, rec, None, accepted);
+        }
+        let (st, copy) = (self.clone(), rec.clone());
+        let spawned = std::thread::Builder::new()
+            .name("receiver-drain".into())
+            .spawn(move || {
+                st.complete(s, rec, plan, accepted);
+                st.drainers.fetch_sub(1, Ordering::SeqCst);
+            });
+        if let Err(e) = spawned {
+            // The stream went with the closure: it is closed undrained.
+            self.drainers.fetch_sub(1, Ordering::SeqCst);
+            let mut rec = copy;
+            rec.drain_stop = Some(format!("drain_thread: {e}"));
+            rec.total_ms = accepted.elapsed().as_millis() as u64;
+            self.push_conn(rec);
+        }
+    }
+
     /// Writes a decided response with its own budget and, for a rejection,
     /// half-closes and drains the unread request bytes (bounded) before
     /// closing; records the connection either way.
     fn finalize(
+        &self,
+        s: TcpStream,
+        accepted: Instant,
+        route: &str,
+        declared: Option<usize>,
+        reply: Option<(u16, Vec<u8>)>,
+    ) {
+        let (s, rec, plan) = self.respond(s, accepted, route, declared, reply);
+        self.complete(s, rec, plan, accepted);
+    }
+
+    /// The response half of `finalize`: writes the decided response and,
+    /// for a rejection, half-closes; returns the drain to run (byte cap and
+    /// deadline).
+    fn respond(
         &self,
         mut s: TcpStream,
         accepted: Instant,
         route: &str,
         declared: Option<usize>,
         reply: Option<(u16, Vec<u8>)>,
-    ) {
+    ) -> (TcpStream, ConnRecord, Option<(usize, Instant)>) {
         let bound = accepted + CONNECTION_BOUND;
         let ms = || accepted.elapsed().as_millis() as u64;
+        let mut plan = None;
         let mut rec = ConnRecord {
             seq: CONN_SEQ.fetch_add(1, Ordering::SeqCst) + 1,
             route: route.into(),
@@ -629,15 +677,34 @@ impl State {
                 // closing never resets a connection the response is still on.
                 let _ = s.shutdown(Shutdown::Write);
                 let cap = declared.map_or(MAX_BODY, |n| n.min(MAX_BODY)) + DRAIN_SLACK;
-                let (d, why) = drain(&mut s, cap, (Instant::now() + DRAIN_TIME).min(bound));
-                rec.drained = d;
-                rec.drain_stop = Some(why);
+                plan = Some((cap, (Instant::now() + DRAIN_TIME).min(bound)));
             }
         } else {
             rec.route = "closed".into();
         }
+        (s, rec, plan)
+    }
+
+    /// The drain half of `finalize`: runs the drain if one is planned, then
+    /// closes and records the connection.
+    fn complete(
+        &self,
+        mut s: TcpStream,
+        mut rec: ConnRecord,
+        plan: Option<(usize, Instant)>,
+        accepted: Instant,
+    ) {
+        if let Some((cap, end)) = plan {
+            let (d, why) = drain(&mut s, cap, end);
+            rec.drained = d;
+            rec.drain_stop = Some(why);
+        }
         let _ = s.shutdown(Shutdown::Both);
-        rec.total_ms = ms();
+        rec.total_ms = accepted.elapsed().as_millis() as u64;
+        self.push_conn(rec);
+    }
+
+    fn push_conn(&self, rec: ConnRecord) {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1464,6 +1531,72 @@ pub(crate) mod tests {
         assert_eq!(rec.route, "overload");
         assert_eq!(rec.write_ok, Some(true));
         assert!(rec.drained > 0, "{rec:#?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// M6: overflow peers that keep their write side open do not block the
+    /// accept loop: each gets its 503 at once (drained off the accept
+    /// thread, at most `OVERLOAD_DRAINERS` at a time; beyond that closed
+    /// at once and recorded), and once a slot frees a normal hook is
+    /// admitted within the emitter's 3 s budget.
+    #[test]
+    fn overload_drain_does_not_block_accept() {
+        let d = tmp();
+        let r = test_receiver(&d);
+        let p = r.port();
+        let host = format!("127.0.0.1:{p}");
+        let mut idle: Vec<TcpStream> = (0..MAX_CONNS).map(|_| connect(p)).collect();
+        let end = Instant::now() + Duration::from_secs(5);
+        while r.state.active.load(Ordering::SeqCst) < MAX_CONNS && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let head = format!(
+            "POST /hook HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer t0k\r\nContent-Length: {}\r\n\r\n",
+            1 << 20
+        );
+        let t = Instant::now();
+        let mut over: Vec<TcpStream> = (0..5)
+            .map(|_| {
+                let mut s = connect(p);
+                s.write_all(head.as_bytes()).unwrap();
+                s
+            })
+            .collect();
+        for s in over.iter_mut() {
+            assert_eq!(read_status(s), 503);
+        }
+        assert!(
+            t.elapsed() < Duration::from_millis(900),
+            "{:?}",
+            t.elapsed()
+        );
+        drop(idle.pop());
+        let end = Instant::now() + Duration::from_secs(5);
+        while r.state.active.load(Ordering::SeqCst) >= MAX_CONNS && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let t = Instant::now();
+        assert_eq!(
+            raw(
+                p,
+                &req(&host, "Authorization: Bearer t0k\r\n", THREAD, BODY)
+            ),
+            200
+        );
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        let conns = wait_conns(&r, 7);
+        let over_recs: Vec<&ConnRecord> = conns.iter().filter(|c| c.route == "overload").collect();
+        assert_eq!(over_recs.len(), 5, "{conns:#?}");
+        assert_eq!(
+            over_recs
+                .iter()
+                .filter(|c| c.drain_stop.as_deref() == Some("drain_limit"))
+                .count(),
+            1,
+            "{over_recs:#?}"
+        );
+        drop(over);
+        drop(idle);
         let _ = std::fs::remove_dir_all(&d);
     }
 
