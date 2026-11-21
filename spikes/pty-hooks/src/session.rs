@@ -8,7 +8,7 @@
 //! deadline, on Ctrl-C, or on panic it also runs cleanups, writes
 //! `report.json`, and exits.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -151,6 +151,9 @@ impl Owned {
         let mut census = Reconciled::default();
         // Handles opened on recorded members at the census, by identity.
         let mut member_handles: BTreeMap<(u32, u64), os::Retained> = BTreeMap::new();
+        // Members no process answered for at the census: whatever identity a
+        // recorded pid named, that process had exited.
+        let mut census_exited: BTreeSet<u32> = BTreeSet::new();
         if let Ok(m) = &membership {
             let opened: Vec<(u32, MemberId, Option<os::Retained>)> = m
                 .iter()
@@ -164,6 +167,9 @@ impl Owned {
                 opened.iter().map(|(p, id, _)| (*p, id.clone())).collect();
             census = reconcile(&ids_now, &ids, self.child_start);
             for (pid, id, h) in opened {
+                if id == MemberId::Exited {
+                    census_exited.insert(pid);
+                }
                 let (MemberId::Start(st), Some(h)) = (id, h) else {
                     continue;
                 };
@@ -178,10 +184,11 @@ impl Owned {
             .iter()
             .map(|p| {
                 let h = member_handles.remove(&(p.pid, p.start_time));
-                let (live, evidence) =
-                    pre_liveness(h.as_ref().map(|h| h.wait_dead(Instant::now())), || {
-                        os::liveness(p.pid, p.start_time)
-                    });
+                let (live, evidence) = pre_liveness(
+                    h.as_ref().map(|h| h.wait_dead(Instant::now())),
+                    census_exited.contains(&p.pid),
+                    || os::liveness(p.pid, p.start_time),
+                );
                 if live == Some(true) {
                     let h = h.or_else(|| os::Retained::open(p.pid, p.start_time));
                     retained.push((p.pid, p.start_time, h));
@@ -420,10 +427,12 @@ pub fn owned_by(
 /// unknown), else from the process table.
 pub fn pre_liveness(
     dead: Option<Option<bool>>,
+    census_exited: bool,
     table: impl FnOnce() -> Option<bool>,
 ) -> (Option<bool>, &'static str) {
     match dead {
         Some(d) => (d.map(|d| !d), "member_handle"),
+        None if census_exited => (Some(false), "census_exited"),
         None => (table(), "process_table"),
     }
 }
@@ -1156,14 +1165,18 @@ mod tests {
     fn member_liveness_comes_from_its_handle() {
         let table = || -> Option<bool> { panic!("table read for a member with a handle") };
         assert_eq!(
-            pre_liveness(Some(Some(true)), table),
+            pre_liveness(Some(Some(true)), false, table),
             (Some(false), "member_handle")
         );
         assert_eq!(
-            pre_liveness(Some(Some(false)), table),
+            pre_liveness(Some(Some(false)), false, table),
             (Some(true), "member_handle")
         );
-        assert_eq!(pre_liveness(None, || None), (None, "process_table"));
+        assert_eq!(
+            pre_liveness(None, true, table),
+            (Some(false), "census_exited")
+        );
+        assert_eq!(pre_liveness(None, false, || None), (None, "process_table"));
     }
 
     /// Parent provenance only from a current row with a known start time
