@@ -1,0 +1,32 @@
+{
+  "command_id": "01930000-0000-7000-8000-000000000040",
+  "event_id": "01930000-0000-7000-8000-00000001000f",
+  "idempotency_key": "command:01930000-0000-7000-8000-000000000040:15",
+  "kind": "approval_requested",
+  "launch_id": "01930000-0000-7000-8000-000000000010",
+  "occurred_at": "2026-11-22T09:45:00.123Z",
+  "payload": {
+    "approval_id": "01930000-0000-7000-8000-000000000030",
+    "correlation": {
+      "tool_use_id": "toolu_01"
+    },
+    "launch_id": "01930000-0000-7000-8000-000000000010",
+    "tool_input": {
+      "encoding": "utf8",
+      "inline": "{\"command\":\"cargo test\"}"
+    },
+    "tool_name": "Bash",
+    "turn_ref": "turn-3"
+  },
+  "recorded_at": "2026-11-22T09:45:00.125Z",
+  "schema_version": 1,
+  "seq": 15,
+  "source": {
+    "agent": "claude",
+    "cli_version": "2.1.326",
+    "kind": "command",
+    "transcript": null
+  },
+  "stream_id": "thread:0193abcd-ef01-7000-8000-000000000001",
+  "thread_id": "0193abcd-ef01-7000-8000-000000000001"
+}

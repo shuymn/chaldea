@@ -1,0 +1,32 @@
+{
+  "$defs": {
+    "StreamId": {
+      "pattern": "^(host|thread:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Client to server on `GET /api/ws`.",
+  "oneOf": [
+    {
+      "properties": {
+        "stream_ids": {
+          "items": {
+            "$ref": "#/$defs/StreamId"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "subscribe",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "stream_ids"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "WsClientMessage"
+}

@@ -1,0 +1,1419 @@
+{
+  "$defs": {
+    "Actor": {
+      "pattern": "^(human|daemon|thread:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+      "type": "string"
+    },
+    "Agent": {
+      "description": "The CLI a thread runs.",
+      "enum": [
+        "claude",
+        "codex"
+      ],
+      "type": "string"
+    },
+    "ApprovalCorrelation": {
+      "properties": {
+        "tool_use_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool_use_id"
+      ],
+      "type": "object"
+    },
+    "ApprovalId": {
+      "description": "One approval card (§2.10).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "ApprovalRequested": {
+      "properties": {
+        "approval_id": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "correlation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApprovalCorrelation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Present only when exactly one `PreToolUse` of the same turn matches (§2.10)."
+        },
+        "launch_id": {
+          "$ref": "#/$defs/LaunchId"
+        },
+        "tool_input": {
+          "$ref": "#/$defs/Content"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "turn_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "approval_id",
+        "launch_id",
+        "tool_name",
+        "tool_input"
+      ],
+      "type": "object"
+    },
+    "AttentionCause": {
+      "description": "One reason a thread needs a human, each with its own clearing event (§2.2 \"Attention\").",
+      "oneOf": [
+        {
+          "description": "No `SessionStart` 20 s after `launch_started` of a non-manual launch.",
+          "properties": {
+            "kind": {
+              "const": "session_start_timeout",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An expected Codex `Hooks need review` after a CLI upgrade.",
+          "properties": {
+            "kind": {
+              "const": "startup_stall",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "That input entered `unconfirmed`.",
+          "properties": {
+            "input_id": {
+              "$ref": "#/$defs/InputId"
+            },
+            "kind": {
+              "const": "input_unconfirmed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "input_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "That input stayed `queued` for 60 s.",
+          "properties": {
+            "input_id": {
+              "$ref": "#/$defs/InputId"
+            },
+            "kind": {
+              "const": "input_gate_timeout",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "input_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A resume was refused because the old launch's death is not confirmed.",
+          "properties": {
+            "kind": {
+              "const": "resume_blocked",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BlobRef": {
+      "properties": {
+        "media_type": {
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Lowercase hex SHA-256 of the full content.",
+          "type": "string"
+        },
+        "size": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sha256",
+        "size",
+        "media_type"
+      ],
+      "type": "object"
+    },
+    "CommandId": {
+      "description": "A client-generated id that makes a mutating request idempotent (§2.4).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "Component": {
+      "description": "The minimal A2UI catalog.",
+      "oneOf": [
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "markdown": {
+              "type": "string"
+            },
+            "type": {
+              "const": "markdown",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "markdown"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "grid": {
+              "$ref": "#/$defs/Content"
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "vt_snapshot",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "grid",
+            "cols",
+            "rows"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/SurfaceAction"
+            },
+            "label": {
+              "type": "string"
+            },
+            "type": {
+              "const": "button",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "label",
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "text_input",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "label"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "items": {
+              "items": {
+                "$ref": "#/$defs/Component"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "list",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "items"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Content": {
+      "anyOf": [
+        {
+          "properties": {
+            "encoding": {
+              "$ref": "#/$defs/Encoding"
+            },
+            "inline": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "inline",
+            "encoding"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "blob": {
+              "$ref": "#/$defs/BlobRef"
+            },
+            "preview": {
+              "description": "The first `PREVIEW_LIMIT_BYTES` bytes decoded as UTF-8, invalid sequences\nreplaced by U+FFFD.",
+              "type": "string"
+            },
+            "preview_lossy": {
+              "description": "True when any sequence was replaced.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "blob",
+            "preview",
+            "preview_lossy"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "Every payload field that can be large: inline text or bytes, or a blob reference."
+    },
+    "Encoding": {
+      "description": "`utf8` carries text; `base64` carries bytes that are not valid UTF-8.",
+      "enum": [
+        "utf8",
+        "base64"
+      ],
+      "type": "string"
+    },
+    "Epoch": {
+      "description": "Random id stored at database creation; a change tells a client to resync (§2.4).",
+      "type": "string"
+    },
+    "EventEnvelope": {
+      "description": "One stored event. `kind` is an open set and `payload` stays raw until it is decoded\nby kind.",
+      "properties": {
+        "command_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "event_id": {
+          "$ref": "#/$defs/EventId"
+        },
+        "idempotency_key": {
+          "$ref": "#/$defs/IdempotencyKey"
+        },
+        "kind": {
+          "$ref": "#/$defs/EventKindTag"
+        },
+        "launch_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "occurred_at": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "Source time, or `recorded_at` when the source states none."
+        },
+        "payload": true,
+        "recorded_at": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "Append time."
+        },
+        "schema_version": {
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seq": {
+          "description": "Per stream, gapless, from 1.",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source": {
+          "$ref": "#/$defs/Source"
+        },
+        "stream_id": {
+          "$ref": "#/$defs/StreamId"
+        },
+        "thread_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "stream_id",
+        "seq",
+        "event_id",
+        "schema_version",
+        "idempotency_key",
+        "kind",
+        "source",
+        "occurred_at",
+        "recorded_at",
+        "payload"
+      ],
+      "type": "object"
+    },
+    "EventId": {
+      "description": "Unique per event; generated by the daemon.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "EventKindTag": {
+      "description": "Event kind on the wire. An open set: readers keep unknown kinds as `GenericEvent`.",
+      "type": "string"
+    },
+    "ExitReason": {
+      "oneOf": [
+        {
+          "enum": [
+            "exit",
+            "stopped",
+            "daemon_restart",
+            "unknown_after_crash"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "spawn_failed",
+          "description": "The child never started; reduced as an ordinary exit (`StateInput::Exited`).",
+          "type": "string"
+        }
+      ]
+    },
+    "GateEvidence": {
+      "description": "The gate evidence of the current launch, as thread-stream positions.",
+      "properties": {
+        "last_human_write_seq": {
+          "default": null,
+          "description": "The last human write that closes the gate (`attach` or `key`).",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "last_turn_start_seq": {
+          "default": null,
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "last_write_seq": {
+          "default": null,
+          "description": "The last write of any origin.",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "readiness_evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReadinessEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "readiness_seq": {
+          "default": null,
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "HostSnapshot": {
+      "description": "The thread list, worktrees, and host- and workspace-scoped surfaces.",
+      "properties": {
+        "surfaces": {
+          "items": {
+            "$ref": "#/$defs/SurfaceUpdate"
+          },
+          "type": "array"
+        },
+        "threads": {
+          "items": {
+            "$ref": "#/$defs/ThreadInfo"
+          },
+          "type": "array"
+        },
+        "worktrees": {
+          "items": {
+            "$ref": "#/$defs/WorktreeChanged"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "threads",
+        "worktrees",
+        "surfaces"
+      ],
+      "type": "object"
+    },
+    "IdempotencyKey": {
+      "description": "Dedupe key, unique per stream (§2.1 \"Idempotency keys\").",
+      "type": "string"
+    },
+    "InputEncoding": {
+      "description": "How the input's text reaches the CLI (§2.7 \"Text encoding\", \"First prompt\").",
+      "oneOf": [
+        {
+          "enum": [
+            "bracketed_paste",
+            "win_keys"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "positional",
+          "description": "The launch's positional argument.",
+          "type": "string"
+        }
+      ]
+    },
+    "InputId": {
+      "description": "One prompt sent through `chaldea send`, the PWA, or `surface_action` (§2.3).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "InputInfo": {
+      "properties": {
+        "created_by": {
+          "$ref": "#/$defs/Actor"
+        },
+        "encoding": {
+          "$ref": "#/$defs/InputEncoding"
+        },
+        "input_id": {
+          "$ref": "#/$defs/InputId"
+        },
+        "launch_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sent_after_seq": {
+          "default": null,
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/InputState"
+        },
+        "text": {
+          "$ref": "#/$defs/Content"
+        }
+      },
+      "required": [
+        "input_id",
+        "state",
+        "text",
+        "encoding",
+        "created_by"
+      ],
+      "type": "object"
+    },
+    "InputState": {
+      "oneOf": [
+        {
+          "enum": [
+            "queued",
+            "sending",
+            "sent",
+            "acked",
+            "rejected",
+            "cancelled",
+            "dismissed"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "unconfirmed",
+          "description": "May have reached the CLI; never resent.",
+          "type": "string"
+        }
+      ]
+    },
+    "LaunchId": {
+      "description": "A launch: one process lifetime of a thread.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "LaunchInfo": {
+      "properties": {
+        "death_confirmed": {
+          "type": "boolean"
+        },
+        "exit_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExitReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "launch_id": {
+          "$ref": "#/$defs/LaunchId"
+        },
+        "manual": {
+          "type": "boolean"
+        },
+        "pid": {
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "launch_id",
+        "manual",
+        "death_confirmed"
+      ],
+      "type": "object"
+    },
+    "OpenAgent": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Agent"
+        },
+        {
+          "type": "string"
+        }
+      ],
+      "description": "A known value, or a string this reader does not know."
+    },
+    "OpenSourceKind": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SourceKind"
+        },
+        {
+          "type": "string"
+        }
+      ],
+      "description": "A known value, or a string this reader does not know."
+    },
+    "ProcessState": {
+      "enum": [
+        "starting",
+        "running",
+        "stopping",
+        "exited"
+      ],
+      "type": "string"
+    },
+    "ReadinessEvidence": {
+      "oneOf": [
+        {
+          "enum": [
+            "session_start",
+            "stop_settled",
+            "post_decision"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "owner_asserted",
+          "description": "`chaldea ready` by the owner, for the current bound launch only.",
+          "type": "string"
+        }
+      ]
+    },
+    "SessionInfo": {
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "transcript_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "SnapshotReason": {
+      "oneOf": [
+        {
+          "enum": [
+            "epoch_changed",
+            "too_many_events",
+            "too_many_bytes"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "cursor_ahead",
+          "description": "`after_seq` is above the stream head.",
+          "type": "string"
+        }
+      ]
+    },
+    "Source": {
+      "properties": {
+        "agent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpenAgent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cli_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/OpenSourceKind"
+        },
+        "transcript": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TranscriptPos"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only for `kind: transcript`."
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "SourceKind": {
+      "description": "Where an event came from (`source.kind` of the envelope).",
+      "enum": [
+        "hook",
+        "transcript",
+        "process",
+        "command",
+        "daemon",
+        "extension"
+      ],
+      "type": "string"
+    },
+    "StreamId": {
+      "pattern": "^(host|thread:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+      "type": "string"
+    },
+    "StreamSnapshot": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/HostSnapshot",
+          "properties": {
+            "stream": {
+              "const": "host",
+              "type": "string"
+            }
+          },
+          "required": [
+            "stream"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ThreadSnapshot",
+          "properties": {
+            "stream": {
+              "const": "thread",
+              "type": "string"
+            }
+          },
+          "required": [
+            "stream"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SurfaceAction": {
+      "description": "Run only when a human with an owner token clicks its button.",
+      "properties": {
+        "action_id": {
+          "type": "string"
+        },
+        "args": {
+          "description": "Action arguments, validated by the command the action runs."
+        },
+        "kind": {
+          "$ref": "#/$defs/SurfaceActionKind"
+        }
+      },
+      "required": [
+        "action_id",
+        "kind",
+        "args"
+      ],
+      "type": "object"
+    },
+    "SurfaceActionKind": {
+      "enum": [
+        "send_input",
+        "send_key",
+        "stop",
+        "ready",
+        "open_attach"
+      ],
+      "type": "string"
+    },
+    "SurfaceId": {
+      "description": "A surface chosen by its emitter (§2.8).",
+      "type": "string"
+    },
+    "SurfaceScope": {
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "host",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "workspace",
+              "type": "string"
+            },
+            "workspace_id": {
+              "$ref": "#/$defs/WorkspaceId"
+            }
+          },
+          "required": [
+            "kind",
+            "workspace_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "thread",
+              "type": "string"
+            },
+            "thread_id": {
+              "$ref": "#/$defs/ThreadId"
+            }
+          },
+          "required": [
+            "kind",
+            "thread_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SurfaceUpdate": {
+      "properties": {
+        "components": {
+          "description": "An empty list removes the surface.",
+          "items": {
+            "$ref": "#/$defs/Component"
+          },
+          "type": "array"
+        },
+        "scope": {
+          "$ref": "#/$defs/SurfaceScope"
+        },
+        "surface_id": {
+          "$ref": "#/$defs/SurfaceId"
+        }
+      },
+      "required": [
+        "surface_id",
+        "scope",
+        "components"
+      ],
+      "type": "object"
+    },
+    "TaskState": {
+      "enum": [
+        "none",
+        "active",
+        "blocked",
+        "completed",
+        "failed",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "ThreadId": {
+      "description": "A thread: one agent conversation across all its launches.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "ThreadInfo": {
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/OpenAgent"
+        },
+        "attention": {
+          "description": "Sorted.",
+          "items": {
+            "$ref": "#/$defs/AttentionCause"
+          },
+          "type": "array"
+        },
+        "closed": {
+          "type": "boolean"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "parent_thread_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "process_state": {
+          "$ref": "#/$defs/ProcessState"
+        },
+        "role": {
+          "$ref": "#/$defs/ThreadRole"
+        },
+        "task_state": {
+          "$ref": "#/$defs/TaskState"
+        },
+        "thread_id": {
+          "$ref": "#/$defs/ThreadId"
+        },
+        "turn_state": {
+          "$ref": "#/$defs/TurnState"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "thread_id",
+        "agent",
+        "cwd",
+        "workspace_id",
+        "role",
+        "closed",
+        "process_state",
+        "turn_state",
+        "task_state",
+        "attention"
+      ],
+      "type": "object"
+    },
+    "ThreadRole": {
+      "oneOf": [
+        {
+          "enum": [
+            "standard"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "rescue",
+          "description": "Spawned by the owner with `--role rescue`; holds a Rescue token (§2.5).",
+          "type": "string"
+        }
+      ]
+    },
+    "ThreadSnapshot": {
+      "description": "A thread's projection plus its latest events (§2.4).",
+      "properties": {
+        "gate": {
+          "$ref": "#/$defs/GateEvidence"
+        },
+        "inputs": {
+          "description": "Inputs not yet terminal.",
+          "items": {
+            "$ref": "#/$defs/InputInfo"
+          },
+          "type": "array"
+        },
+        "launch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "open_approvals": {
+          "items": {
+            "$ref": "#/$defs/ApprovalRequested"
+          },
+          "type": "array"
+        },
+        "recent_events": {
+          "description": "The last `SNAPSHOT_RECENT_EVENTS` events of the stream.",
+          "items": {
+            "$ref": "#/$defs/EventEnvelope"
+          },
+          "type": "array"
+        },
+        "session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "surfaces": {
+          "items": {
+            "$ref": "#/$defs/SurfaceUpdate"
+          },
+          "type": "array"
+        },
+        "thread": {
+          "$ref": "#/$defs/ThreadInfo"
+        },
+        "vt_snapshot": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VtSnapshotTaken"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The latest `vt_snapshot_taken`, while an attention cause is active or a card is open."
+        },
+        "worktree": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorktreeChanged"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "thread",
+        "gate",
+        "inputs",
+        "open_approvals",
+        "surfaces",
+        "recent_events"
+      ],
+      "type": "object"
+    },
+    "Timestamp": {
+      "description": "RFC 3339 UTC with millisecond precision, e.g. `2026-11-22T09:45:00.123Z`.",
+      "type": "string"
+    },
+    "TranscriptPos": {
+      "description": "Where in a transcript an event's line ended.",
+      "properties": {
+        "file_id": {
+          "type": "string"
+        },
+        "generation": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset_end": {
+          "description": "Byte offset just after the line.",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "generation",
+        "path",
+        "file_id",
+        "offset_end"
+      ],
+      "type": "object"
+    },
+    "TurnState": {
+      "enum": [
+        "unknown",
+        "idle",
+        "running",
+        "awaiting_approval"
+      ],
+      "type": "string"
+    },
+    "VtCursor": {
+      "properties": {
+        "col": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "row": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "visible": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "row",
+        "col",
+        "visible"
+      ],
+      "type": "object"
+    },
+    "VtModes": {
+      "properties": {
+        "alternate_screen": {
+          "type": "boolean"
+        },
+        "bracketed_paste": {
+          "description": "DECSET 2004.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "bracketed_paste",
+        "alternate_screen"
+      ],
+      "type": "object"
+    },
+    "VtSnapshotTaken": {
+      "properties": {
+        "cols": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cursor": {
+          "$ref": "#/$defs/VtCursor"
+        },
+        "grid": {
+          "$ref": "#/$defs/Content"
+        },
+        "modes": {
+          "$ref": "#/$defs/VtModes"
+        },
+        "rows": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "grid",
+        "cols",
+        "rows",
+        "cursor",
+        "modes"
+      ],
+      "type": "object"
+    },
+    "WorkspaceId": {
+      "description": "Derived from the canonical path of the repository's common git directory,\nor of the cwd outside git (§2.1).",
+      "type": "string"
+    },
+    "WorktreeChanged": {
+      "description": "The full worktree record, carried on every change.",
+      "properties": {
+        "base_commit": {
+          "description": "The resolved SHA of `base_ref`.",
+          "type": "string"
+        },
+        "base_ref": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "created_by": {
+          "$ref": "#/$defs/Actor"
+        },
+        "owner_thread_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`null` when the human owner holds it."
+        },
+        "path": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/WorktreeState"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId"
+        },
+        "worktree_id": {
+          "$ref": "#/$defs/WorktreeId"
+        }
+      },
+      "required": [
+        "worktree_id",
+        "repo",
+        "workspace_id",
+        "path",
+        "branch",
+        "base_ref",
+        "base_commit",
+        "created_by",
+        "state"
+      ],
+      "type": "object"
+    },
+    "WorktreeId": {
+      "description": "8 hex characters, also the worktree's directory name (§2.6).",
+      "type": "string"
+    },
+    "WorktreeState": {
+      "enum": [
+        "creating",
+        "active",
+        "released",
+        "removing",
+        "uncertain",
+        "removed",
+        "failed"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The body of `GET /api/events`.",
+  "oneOf": [
+    {
+      "properties": {
+        "epoch": {
+          "$ref": "#/$defs/Epoch"
+        },
+        "events": {
+          "items": {
+            "$ref": "#/$defs/EventEnvelope"
+          },
+          "type": "array"
+        },
+        "has_more": {
+          "type": "boolean"
+        },
+        "has_more_before": {
+          "type": "boolean"
+        },
+        "head_seq": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mode": {
+          "const": "replay",
+          "type": "string"
+        },
+        "stream_id": {
+          "$ref": "#/$defs/StreamId"
+        }
+      },
+      "required": [
+        "mode",
+        "stream_id",
+        "epoch",
+        "events",
+        "head_seq",
+        "has_more",
+        "has_more_before"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "as_of_seq": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "epoch": {
+          "$ref": "#/$defs/Epoch"
+        },
+        "mode": {
+          "const": "snapshot",
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/SnapshotReason"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/StreamSnapshot"
+        },
+        "stream_id": {
+          "$ref": "#/$defs/StreamId"
+        }
+      },
+      "required": [
+        "mode",
+        "stream_id",
+        "epoch",
+        "snapshot",
+        "as_of_seq",
+        "reason"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "EventsResponse"
+}

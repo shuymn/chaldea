@@ -1,0 +1,30 @@
+{
+  "command_id": "01930000-0000-7000-8000-000000000040",
+  "event_id": "01930000-0000-7000-8000-000000010012",
+  "idempotency_key": "command:01930000-0000-7000-8000-000000000040:18",
+  "kind": "input_state_changed",
+  "launch_id": "01930000-0000-7000-8000-000000000010",
+  "occurred_at": "2026-11-22T09:45:00.123Z",
+  "payload": {
+    "by": null,
+    "from": "queued",
+    "input_id": "01930000-0000-7000-8000-000000000020",
+    "reason": {
+      "kind": "rejected",
+      "reject": "control_character"
+    },
+    "sent_after_seq": null,
+    "to": "rejected"
+  },
+  "recorded_at": "2026-11-22T09:45:00.125Z",
+  "schema_version": 1,
+  "seq": 18,
+  "source": {
+    "agent": "claude",
+    "cli_version": "2.1.326",
+    "kind": "command",
+    "transcript": null
+  },
+  "stream_id": "thread:0193abcd-ef01-7000-8000-000000000001",
+  "thread_id": "0193abcd-ef01-7000-8000-000000000001"
+}

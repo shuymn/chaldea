@@ -1,0 +1,2099 @@
+{
+  "$defs": {
+    "Actor": {
+      "pattern": "^(human|daemon|thread:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+      "type": "string"
+    },
+    "Agent": {
+      "description": "The CLI a thread runs.",
+      "enum": [
+        "claude",
+        "codex"
+      ],
+      "type": "string"
+    },
+    "ApprovalCorrelation": {
+      "properties": {
+        "tool_use_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool_use_id"
+      ],
+      "type": "object"
+    },
+    "ApprovalId": {
+      "description": "One approval card (§2.10).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "ApprovalOutcome": {
+      "oneOf": [
+        {
+          "const": "ran",
+          "description": "A `PostToolUse` with the card's `tool_use_id`.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "The launch exited with the card open.",
+          "type": "string"
+        },
+        {
+          "const": "superseded",
+          "description": "A `Stop` or interrupt closed the card.",
+          "type": "string"
+        }
+      ]
+    },
+    "ApprovalRequested": {
+      "properties": {
+        "approval_id": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "correlation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApprovalCorrelation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Present only when exactly one `PreToolUse` of the same turn matches (§2.10)."
+        },
+        "launch_id": {
+          "$ref": "#/$defs/LaunchId"
+        },
+        "tool_input": {
+          "$ref": "#/$defs/Content"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "turn_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "approval_id",
+        "launch_id",
+        "tool_name",
+        "tool_input"
+      ],
+      "type": "object"
+    },
+    "ApprovalResolved": {
+      "properties": {
+        "approval_id": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "outcome": {
+          "$ref": "#/$defs/ApprovalOutcome"
+        }
+      },
+      "required": [
+        "approval_id",
+        "outcome"
+      ],
+      "type": "object"
+    },
+    "AssistantMessage": {
+      "properties": {
+        "text": {
+          "$ref": "#/$defs/Content"
+        },
+        "turn_ref": {
+          "description": "The CLI's own turn id when its payload has one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "AttentionCause": {
+      "description": "One reason a thread needs a human, each with its own clearing event (§2.2 \"Attention\").",
+      "oneOf": [
+        {
+          "description": "No `SessionStart` 20 s after `launch_started` of a non-manual launch.",
+          "properties": {
+            "kind": {
+              "const": "session_start_timeout",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An expected Codex `Hooks need review` after a CLI upgrade.",
+          "properties": {
+            "kind": {
+              "const": "startup_stall",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "That input entered `unconfirmed`.",
+          "properties": {
+            "input_id": {
+              "$ref": "#/$defs/InputId"
+            },
+            "kind": {
+              "const": "input_unconfirmed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "input_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "That input stayed `queued` for 60 s.",
+          "properties": {
+            "input_id": {
+              "$ref": "#/$defs/InputId"
+            },
+            "kind": {
+              "const": "input_gate_timeout",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "input_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A resume was refused because the old launch's death is not confirmed.",
+          "properties": {
+            "kind": {
+              "const": "resume_blocked",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BlobRef": {
+      "properties": {
+        "media_type": {
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Lowercase hex SHA-256 of the full content.",
+          "type": "string"
+        },
+        "size": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sha256",
+        "size",
+        "media_type"
+      ],
+      "type": "object"
+    },
+    "Component": {
+      "description": "The minimal A2UI catalog.",
+      "oneOf": [
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "markdown": {
+              "type": "string"
+            },
+            "type": {
+              "const": "markdown",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "markdown"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "grid": {
+              "$ref": "#/$defs/Content"
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "vt_snapshot",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "grid",
+            "cols",
+            "rows"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/SurfaceAction"
+            },
+            "label": {
+              "type": "string"
+            },
+            "type": {
+              "const": "button",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "label",
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "text_input",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "label"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "items": {
+              "items": {
+                "$ref": "#/$defs/Component"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "list",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "items"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Content": {
+      "anyOf": [
+        {
+          "properties": {
+            "encoding": {
+              "$ref": "#/$defs/Encoding"
+            },
+            "inline": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "inline",
+            "encoding"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "blob": {
+              "$ref": "#/$defs/BlobRef"
+            },
+            "preview": {
+              "description": "The first `PREVIEW_LIMIT_BYTES` bytes decoded as UTF-8, invalid sequences\nreplaced by U+FFFD.",
+              "type": "string"
+            },
+            "preview_lossy": {
+              "description": "True when any sequence was replaced.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "blob",
+            "preview",
+            "preview_lossy"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "Every payload field that can be large: inline text or bytes, or a blob reference."
+    },
+    "Encoding": {
+      "description": "`utf8` carries text; `base64` carries bytes that are not valid UTF-8.",
+      "enum": [
+        "utf8",
+        "base64"
+      ],
+      "type": "string"
+    },
+    "ExitReason": {
+      "oneOf": [
+        {
+          "enum": [
+            "exit",
+            "stopped",
+            "daemon_restart",
+            "unknown_after_crash"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "spawn_failed",
+          "description": "The child never started; reduced as an ordinary exit (`StateInput::Exited`).",
+          "type": "string"
+        }
+      ]
+    },
+    "HumanWrite": {
+      "properties": {
+        "approval_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApprovalId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set for `card_key`."
+        },
+        "launch_id": {
+          "$ref": "#/$defs/LaunchId"
+        },
+        "origin": {
+          "$ref": "#/$defs/HumanWriteOrigin"
+        }
+      },
+      "required": [
+        "launch_id",
+        "origin"
+      ],
+      "type": "object"
+    },
+    "HumanWriteOrigin": {
+      "oneOf": [
+        {
+          "enum": [
+            "attach",
+            "key"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "card_key",
+          "description": "A key sent from an open approval card; it does not close the input gate.",
+          "type": "string"
+        }
+      ]
+    },
+    "InputCreated": {
+      "properties": {
+        "created_by": {
+          "$ref": "#/$defs/Actor"
+        },
+        "encoding": {
+          "$ref": "#/$defs/InputEncoding"
+        },
+        "initial_state": {
+          "$ref": "#/$defs/InputInitialState"
+        },
+        "input_id": {
+          "$ref": "#/$defs/InputId"
+        },
+        "launch_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin": {
+          "$ref": "#/$defs/InputOrigin"
+        },
+        "text": {
+          "$ref": "#/$defs/Content"
+        }
+      },
+      "required": [
+        "input_id",
+        "initial_state",
+        "text",
+        "encoding",
+        "origin",
+        "created_by"
+      ],
+      "type": "object"
+    },
+    "InputEncoding": {
+      "description": "How the input's text reaches the CLI (§2.7 \"Text encoding\", \"First prompt\").",
+      "oneOf": [
+        {
+          "enum": [
+            "bracketed_paste",
+            "win_keys"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "positional",
+          "description": "The launch's positional argument.",
+          "type": "string"
+        }
+      ]
+    },
+    "InputId": {
+      "description": "One prompt sent through `chaldea send`, the PWA, or `surface_action` (§2.3).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "InputInitialState": {
+      "oneOf": [
+        {
+          "enum": [
+            "queued"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "sending",
+          "description": "A Codex positional first prompt, whose bytes travel in argv (§2.3).",
+          "type": "string"
+        }
+      ]
+    },
+    "InputOrigin": {
+      "enum": [
+        "cli",
+        "pwa",
+        "surface_action"
+      ],
+      "type": "string"
+    },
+    "InputReason": {
+      "description": "The `reason` of `input_state_changed`: the state-machine input that caused it.",
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "gate_opened",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "write_completed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "write_outcome_unknown",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "rejected",
+              "type": "string"
+            },
+            "reject": {
+              "$ref": "#/$defs/RejectReason"
+            }
+          },
+          "required": [
+            "kind",
+            "reject"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "cancelled",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "recheck_failed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "launch_exited",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "daemon_restarted",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "ack_attributed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "ack_not_attributable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "ack_window_expired",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "resolved",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "InputState": {
+      "oneOf": [
+        {
+          "enum": [
+            "queued",
+            "sending",
+            "sent",
+            "acked",
+            "rejected",
+            "cancelled",
+            "dismissed"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "unconfirmed",
+          "description": "May have reached the CLI; never resent.",
+          "type": "string"
+        }
+      ]
+    },
+    "InputStateChanged": {
+      "properties": {
+        "by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Actor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set when a person or thread caused the change (cancel, resolve)."
+        },
+        "from": {
+          "$ref": "#/$defs/InputState"
+        },
+        "input_id": {
+          "$ref": "#/$defs/InputId"
+        },
+        "reason": {
+          "$ref": "#/$defs/InputReason"
+        },
+        "sent_after_seq": {
+          "default": null,
+          "description": "The thread stream's head when `sending` was recorded.",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "to": {
+          "$ref": "#/$defs/InputState"
+        }
+      },
+      "required": [
+        "input_id",
+        "from",
+        "to",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "LaunchDeathConfirmed": {
+      "properties": {
+        "launch_id": {
+          "$ref": "#/$defs/LaunchId"
+        },
+        "method": {
+          "description": "How death was proven, e.g. a session scan or a job query.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "launch_id",
+        "method"
+      ],
+      "type": "object"
+    },
+    "LaunchExited": {
+      "properties": {
+        "code": {
+          "format": "int32",
+          "maximum": 2147483647,
+          "minimum": -2147483648,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "death_confirmed": {
+          "description": "False until the whole process tree is proven dead (§2.9 \"Daemon restart\").",
+          "type": "boolean"
+        },
+        "launch_id": {
+          "$ref": "#/$defs/LaunchId"
+        },
+        "reason": {
+          "$ref": "#/$defs/ExitReason"
+        },
+        "signal": {
+          "format": "int32",
+          "maximum": 2147483647,
+          "minimum": -2147483648,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "launch_id",
+        "reason",
+        "death_confirmed"
+      ],
+      "type": "object"
+    },
+    "LaunchId": {
+      "description": "A launch: one process lifetime of a thread.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "LaunchReserved": {
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/Agent"
+        },
+        "argv_digest": {
+          "description": "Lowercase hex SHA-256 of the argv, so the prompt in argv is not stored here.",
+          "type": "string"
+        },
+        "expected_previous": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The launch the command expected to be current (§2.9)."
+        },
+        "launch_id": {
+          "$ref": "#/$defs/LaunchId"
+        },
+        "manual": {
+          "description": "A launch with no first prompt that Chaldea controls (§8 D5).",
+          "type": "boolean"
+        },
+        "worktree_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorktreeId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "launch_id",
+        "agent",
+        "argv_digest",
+        "manual"
+      ],
+      "type": "object"
+    },
+    "LaunchStarted": {
+      "properties": {
+        "cli_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "launch_id": {
+          "$ref": "#/$defs/LaunchId"
+        },
+        "pgid_or_job": {
+          "description": "The process group (Unix) or job object name (Windows), opaque.",
+          "type": "string"
+        },
+        "pid": {
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_time": {
+          "description": "The OS's process start time, opaque; with `pid` it identifies the process.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "launch_id",
+        "pid",
+        "start_time",
+        "pgid_or_job"
+      ],
+      "type": "object"
+    },
+    "MailboxMessage": {
+      "properties": {
+        "body": {
+          "$ref": "#/$defs/Content"
+        },
+        "from_thread_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`null` when a human sent it."
+        },
+        "in_reply_to": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message_id": {
+          "$ref": "#/$defs/MessageId"
+        },
+        "to_thread_id": {
+          "$ref": "#/$defs/ThreadId"
+        }
+      },
+      "required": [
+        "message_id",
+        "to_thread_id",
+        "body"
+      ],
+      "type": "object"
+    },
+    "MessageId": {
+      "description": "One mailbox message.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "ProcessState": {
+      "enum": [
+        "starting",
+        "running",
+        "stopping",
+        "exited"
+      ],
+      "type": "string"
+    },
+    "RawUnknown": {
+      "description": "Input kept verbatim because it could not be parsed or bound; nothing is dropped.",
+      "properties": {
+        "agent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Agent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cli_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "raw": {
+          "$ref": "#/$defs/Content"
+        },
+        "reason": {
+          "$ref": "#/$defs/RawUnknownReason"
+        },
+        "source": {
+          "$ref": "#/$defs/SourceKind"
+        }
+      },
+      "required": [
+        "source",
+        "reason",
+        "content_type",
+        "raw"
+      ],
+      "type": "object"
+    },
+    "RawUnknownReason": {
+      "enum": [
+        "unparseable",
+        "unknown_event",
+        "foreign_session",
+        "unbound",
+        "schema_mismatch",
+        "partial_line"
+      ],
+      "type": "string"
+    },
+    "ReadinessEvidence": {
+      "oneOf": [
+        {
+          "enum": [
+            "session_start",
+            "stop_settled",
+            "post_decision"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "owner_asserted",
+          "description": "`chaldea ready` by the owner, for the current bound launch only.",
+          "type": "string"
+        }
+      ]
+    },
+    "ReadinessObserved": {
+      "properties": {
+        "by": {
+          "$ref": "#/$defs/Actor"
+        },
+        "evidence": {
+          "$ref": "#/$defs/ReadinessEvidence"
+        },
+        "launch_id": {
+          "$ref": "#/$defs/LaunchId"
+        }
+      },
+      "required": [
+        "launch_id",
+        "evidence",
+        "by"
+      ],
+      "type": "object"
+    },
+    "RejectReason": {
+      "description": "Why an input was rejected with zero bytes written.",
+      "oneOf": [
+        {
+          "enum": [
+            "empty_prompt"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "control_character",
+          "description": "ESC or a C0 control other than TAB, CR, LF.",
+          "type": "string"
+        },
+        {
+          "const": "lossy_text",
+          "description": "Text the adapter's encoding cannot carry without loss.",
+          "type": "string"
+        },
+        {
+          "const": "leading_trailing_whitespace",
+          "description": "Codex on Windows trims it (§8 D6).",
+          "type": "string"
+        },
+        {
+          "const": "tab",
+          "description": "Codex on Windows takes TAB as its queue key (§8 D6).",
+          "type": "string"
+        },
+        {
+          "const": "spawn_failed",
+          "description": "The spawn of a positional first prompt was confirmed not to have started.",
+          "type": "string"
+        }
+      ]
+    },
+    "SessionBound": {
+      "properties": {
+        "launch_id": {
+          "$ref": "#/$defs/LaunchId"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "transcript_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "launch_id",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "SourceKind": {
+      "description": "Where an event came from (`source.kind` of the envelope).",
+      "enum": [
+        "hook",
+        "transcript",
+        "process",
+        "command",
+        "daemon",
+        "extension"
+      ],
+      "type": "string"
+    },
+    "StatusCause": {
+      "description": "The reducer input that caused a `status_changed` event.",
+      "enum": [
+        "reserved",
+        "spawned",
+        "session_bound",
+        "stop_requested",
+        "exited",
+        "death_confirmed",
+        "readiness_observed",
+        "prompt_submitted",
+        "interrupted",
+        "turn_stopped",
+        "approval_opened",
+        "approvals_all_resolved",
+        "attention_raised",
+        "attention_cleared",
+        "task_set"
+      ],
+      "type": "string"
+    },
+    "StatusChanged": {
+      "description": "Payload of `status_changed`: one axis or the attention set changed.\nThe attention set is carried whole and sorted, `from` before and `to` after.",
+      "oneOf": [
+        {
+          "properties": {
+            "cause": {
+              "$ref": "#/$defs/StatusCause"
+            },
+            "field": {
+              "const": "process_state",
+              "type": "string"
+            },
+            "from": {
+              "$ref": "#/$defs/ProcessState"
+            },
+            "to": {
+              "$ref": "#/$defs/ProcessState"
+            }
+          },
+          "required": [
+            "field",
+            "from",
+            "to",
+            "cause"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "cause": {
+              "$ref": "#/$defs/StatusCause"
+            },
+            "field": {
+              "const": "turn_state",
+              "type": "string"
+            },
+            "from": {
+              "$ref": "#/$defs/TurnState"
+            },
+            "to": {
+              "$ref": "#/$defs/TurnState"
+            }
+          },
+          "required": [
+            "field",
+            "from",
+            "to",
+            "cause"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "cause": {
+              "$ref": "#/$defs/StatusCause"
+            },
+            "field": {
+              "const": "task_state",
+              "type": "string"
+            },
+            "from": {
+              "$ref": "#/$defs/TaskState"
+            },
+            "to": {
+              "$ref": "#/$defs/TaskState"
+            }
+          },
+          "required": [
+            "field",
+            "from",
+            "to",
+            "cause"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "cause": {
+              "$ref": "#/$defs/StatusCause"
+            },
+            "field": {
+              "const": "attention",
+              "type": "string"
+            },
+            "from": {
+              "items": {
+                "$ref": "#/$defs/AttentionCause"
+              },
+              "type": "array"
+            },
+            "to": {
+              "items": {
+                "$ref": "#/$defs/AttentionCause"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "field",
+            "from",
+            "to",
+            "cause"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SurfaceAction": {
+      "description": "Run only when a human with an owner token clicks its button.",
+      "properties": {
+        "action_id": {
+          "type": "string"
+        },
+        "args": {
+          "description": "Action arguments, validated by the command the action runs."
+        },
+        "kind": {
+          "$ref": "#/$defs/SurfaceActionKind"
+        }
+      },
+      "required": [
+        "action_id",
+        "kind",
+        "args"
+      ],
+      "type": "object"
+    },
+    "SurfaceActionKind": {
+      "enum": [
+        "send_input",
+        "send_key",
+        "stop",
+        "ready",
+        "open_attach"
+      ],
+      "type": "string"
+    },
+    "SurfaceId": {
+      "description": "A surface chosen by its emitter (§2.8).",
+      "type": "string"
+    },
+    "SurfaceScope": {
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "host",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "workspace",
+              "type": "string"
+            },
+            "workspace_id": {
+              "$ref": "#/$defs/WorkspaceId"
+            }
+          },
+          "required": [
+            "kind",
+            "workspace_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "thread",
+              "type": "string"
+            },
+            "thread_id": {
+              "$ref": "#/$defs/ThreadId"
+            }
+          },
+          "required": [
+            "kind",
+            "thread_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SurfaceUpdate": {
+      "properties": {
+        "components": {
+          "description": "An empty list removes the surface.",
+          "items": {
+            "$ref": "#/$defs/Component"
+          },
+          "type": "array"
+        },
+        "scope": {
+          "$ref": "#/$defs/SurfaceScope"
+        },
+        "surface_id": {
+          "$ref": "#/$defs/SurfaceId"
+        }
+      },
+      "required": [
+        "surface_id",
+        "scope",
+        "components"
+      ],
+      "type": "object"
+    },
+    "TaskSet": {
+      "properties": {
+        "by": {
+          "$ref": "#/$defs/Actor"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "to": {
+          "$ref": "#/$defs/TaskState"
+        }
+      },
+      "required": [
+        "to",
+        "by"
+      ],
+      "type": "object"
+    },
+    "TaskState": {
+      "enum": [
+        "none",
+        "active",
+        "blocked",
+        "completed",
+        "failed",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "ThreadClosed": {
+      "properties": {
+        "by": {
+          "$ref": "#/$defs/Actor"
+        },
+        "thread_id": {
+          "$ref": "#/$defs/ThreadId"
+        }
+      },
+      "required": [
+        "thread_id",
+        "by"
+      ],
+      "type": "object"
+    },
+    "ThreadId": {
+      "description": "A thread: one agent conversation across all its launches.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "ThreadRegistered": {
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/Agent"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "parent_thread_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "role": {
+          "$ref": "#/$defs/ThreadRole"
+        },
+        "task": {
+          "description": "The task given at spawn; `task_state` starts `active` when present, else `none`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thread_id": {
+          "$ref": "#/$defs/ThreadId"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "thread_id",
+        "agent",
+        "cwd",
+        "workspace_id",
+        "role"
+      ],
+      "type": "object"
+    },
+    "ThreadRole": {
+      "oneOf": [
+        {
+          "enum": [
+            "standard"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "rescue",
+          "description": "Spawned by the owner with `--role rescue`; holds a Rescue token (§2.5).",
+          "type": "string"
+        }
+      ]
+    },
+    "ToolActivity": {
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/Content"
+        },
+        "output": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Content"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "phase": {
+          "$ref": "#/$defs/ToolPhase"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "tool_use_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turn_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "phase",
+        "tool_name",
+        "input"
+      ],
+      "type": "object"
+    },
+    "ToolPhase": {
+      "enum": [
+        "started",
+        "completed"
+      ],
+      "type": "string"
+    },
+    "TranscriptGeneration": {
+      "properties": {
+        "file_id": {
+          "description": "Device + inode on Unix, volume serial + file index on Windows, opaque.",
+          "type": "string"
+        },
+        "generation": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "generation",
+        "path",
+        "file_id"
+      ],
+      "type": "object"
+    },
+    "TurnState": {
+      "enum": [
+        "unknown",
+        "idle",
+        "running",
+        "awaiting_approval"
+      ],
+      "type": "string"
+    },
+    "UserMessage": {
+      "properties": {
+        "input_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InputId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The input this prompt acknowledged, when attributed (§2.3 \"Ack\")."
+        },
+        "prompt": {
+          "$ref": "#/$defs/Content"
+        }
+      },
+      "required": [
+        "prompt"
+      ],
+      "type": "object"
+    },
+    "VtCursor": {
+      "properties": {
+        "col": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "row": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "visible": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "row",
+        "col",
+        "visible"
+      ],
+      "type": "object"
+    },
+    "VtModes": {
+      "properties": {
+        "alternate_screen": {
+          "type": "boolean"
+        },
+        "bracketed_paste": {
+          "description": "DECSET 2004.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "bracketed_paste",
+        "alternate_screen"
+      ],
+      "type": "object"
+    },
+    "VtSnapshotTaken": {
+      "properties": {
+        "cols": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cursor": {
+          "$ref": "#/$defs/VtCursor"
+        },
+        "grid": {
+          "$ref": "#/$defs/Content"
+        },
+        "modes": {
+          "$ref": "#/$defs/VtModes"
+        },
+        "rows": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "grid",
+        "cols",
+        "rows",
+        "cursor",
+        "modes"
+      ],
+      "type": "object"
+    },
+    "WorkspaceId": {
+      "description": "Derived from the canonical path of the repository's common git directory,\nor of the cwd outside git (§2.1).",
+      "type": "string"
+    },
+    "WorktreeChanged": {
+      "description": "The full worktree record, carried on every change.",
+      "properties": {
+        "base_commit": {
+          "description": "The resolved SHA of `base_ref`.",
+          "type": "string"
+        },
+        "base_ref": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "created_by": {
+          "$ref": "#/$defs/Actor"
+        },
+        "owner_thread_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`null` when the human owner holds it."
+        },
+        "path": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/WorktreeState"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId"
+        },
+        "worktree_id": {
+          "$ref": "#/$defs/WorktreeId"
+        }
+      },
+      "required": [
+        "worktree_id",
+        "repo",
+        "workspace_id",
+        "path",
+        "branch",
+        "base_ref",
+        "base_commit",
+        "created_by",
+        "state"
+      ],
+      "type": "object"
+    },
+    "WorktreeId": {
+      "description": "8 hex characters, also the worktree's directory name (§2.6).",
+      "type": "string"
+    },
+    "WorktreeState": {
+      "enum": [
+        "creating",
+        "active",
+        "released",
+        "removing",
+        "uncertain",
+        "removed",
+        "failed"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The known event kinds with their payloads. On the wire this is the\nenvelope's `kind` and `payload` pair.",
+  "oneOf": [
+    {
+      "properties": {
+        "kind": {
+          "const": "thread_registered",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/ThreadRegistered"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "thread_closed",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/ThreadClosed"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "launch_reserved",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/LaunchReserved"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "launch_started",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/LaunchStarted"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "launch_exited",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/LaunchExited"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "launch_death_confirmed",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/LaunchDeathConfirmed"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "session_bound",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/SessionBound"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "transcript_generation",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/TranscriptGeneration"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "readiness_observed",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/ReadinessObserved"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "human_write",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/HumanWrite"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "user_message",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/UserMessage"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "assistant_message",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/AssistantMessage"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "tool_activity",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/ToolActivity"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "status_changed",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/StatusChanged"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "approval_requested",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/ApprovalRequested"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "approval_resolved",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/ApprovalResolved"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "input_created",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/InputCreated"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "input_state_changed",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/InputStateChanged"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "mailbox_message",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/MailboxMessage"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "task_set",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/TaskSet"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "surface_update",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/SurfaceUpdate"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "vt_snapshot_taken",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/VtSnapshotTaken"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "worktree_changed",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/WorktreeChanged"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "raw_unknown",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/RawUnknown"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "TypedEvent"
+}

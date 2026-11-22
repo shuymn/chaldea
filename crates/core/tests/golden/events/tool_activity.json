@@ -1,0 +1,38 @@
+{
+  "command_id": "01930000-0000-7000-8000-000000000040",
+  "event_id": "01930000-0000-7000-8000-00000001000d",
+  "idempotency_key": "command:01930000-0000-7000-8000-000000000040:13",
+  "kind": "tool_activity",
+  "launch_id": "01930000-0000-7000-8000-000000000010",
+  "occurred_at": "2026-11-22T09:45:00.123Z",
+  "payload": {
+    "input": {
+      "encoding": "utf8",
+      "inline": "{\"command\":\"cargo test\"}"
+    },
+    "output": {
+      "blob": {
+        "media_type": "text/plain; charset=utf-8",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size": 200000
+      },
+      "preview": "running 42 tests�",
+      "preview_lossy": true
+    },
+    "phase": "completed",
+    "tool_name": "Bash",
+    "tool_use_id": "toolu_01",
+    "turn_ref": "turn-3"
+  },
+  "recorded_at": "2026-11-22T09:45:00.125Z",
+  "schema_version": 1,
+  "seq": 13,
+  "source": {
+    "agent": "claude",
+    "cli_version": "2.1.326",
+    "kind": "command",
+    "transcript": null
+  },
+  "stream_id": "thread:0193abcd-ef01-7000-8000-000000000001",
+  "thread_id": "0193abcd-ef01-7000-8000-000000000001"
+}

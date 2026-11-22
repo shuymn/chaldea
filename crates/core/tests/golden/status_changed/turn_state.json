@@ -1,0 +1,6 @@
+{
+  "cause": "approval_opened",
+  "field": "turn_state",
+  "from": "running",
+  "to": "awaiting_approval"
+}

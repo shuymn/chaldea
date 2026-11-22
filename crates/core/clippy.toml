@@ -1,0 +1,51 @@
+# core is Sans-IO (docs/mvp-design.md §3): no filesystem, network, process, thread,
+# environment, or clock access. The daemon does the I/O and passes ids, times, and
+# bytes in.
+# Integration tests that must touch files (contract export, goldens) allow these lints
+# at their top with a reason.
+
+disallowed-types = [
+  { path = "std::fs::File", reason = "core is Sans-IO" },
+  { path = "std::fs::OpenOptions", reason = "core is Sans-IO" },
+  { path = "std::fs::DirBuilder", reason = "core is Sans-IO" },
+  { path = "std::net::TcpStream", reason = "core is Sans-IO" },
+  { path = "std::net::TcpListener", reason = "core is Sans-IO" },
+  { path = "std::net::UdpSocket", reason = "core is Sans-IO" },
+  { path = "std::process::Command", reason = "core is Sans-IO" },
+  { path = "std::process::Child", reason = "core is Sans-IO" },
+  { path = "std::thread::Builder", reason = "core is Sans-IO" },
+]
+
+disallowed-methods = [
+  { path = "std::fs::canonicalize", reason = "core is Sans-IO" },
+  { path = "std::fs::copy", reason = "core is Sans-IO" },
+  { path = "std::fs::create_dir", reason = "core is Sans-IO" },
+  { path = "std::fs::create_dir_all", reason = "core is Sans-IO" },
+  { path = "std::fs::exists", reason = "core is Sans-IO" },
+  { path = "std::fs::hard_link", reason = "core is Sans-IO" },
+  { path = "std::fs::metadata", reason = "core is Sans-IO" },
+  { path = "std::fs::read", reason = "core is Sans-IO" },
+  { path = "std::fs::read_dir", reason = "core is Sans-IO" },
+  { path = "std::fs::read_link", reason = "core is Sans-IO" },
+  { path = "std::fs::read_to_string", reason = "core is Sans-IO" },
+  { path = "std::fs::remove_dir", reason = "core is Sans-IO" },
+  { path = "std::fs::remove_dir_all", reason = "core is Sans-IO" },
+  { path = "std::fs::remove_file", reason = "core is Sans-IO" },
+  { path = "std::fs::rename", reason = "core is Sans-IO" },
+  { path = "std::fs::set_permissions", reason = "core is Sans-IO" },
+  { path = "std::fs::symlink_metadata", reason = "core is Sans-IO" },
+  { path = "std::fs::write", reason = "core is Sans-IO" },
+  { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "core is Sans-IO" },
+  { path = "std::process::exit", reason = "core is Sans-IO" },
+  { path = "std::process::id", reason = "core is Sans-IO" },
+  { path = "std::env::var", reason = "core reads no environment; configuration is an input" },
+  { path = "std::env::var_os", reason = "core reads no environment; configuration is an input" },
+  { path = "std::env::vars", reason = "core reads no environment; configuration is an input" },
+  { path = "std::env::vars_os", reason = "core reads no environment; configuration is an input" },
+  { path = "std::time::Instant::now", reason = "core has no clock; time is an input" },
+  { path = "std::time::Instant::elapsed", reason = "core has no clock; time is an input" },
+  { path = "std::time::SystemTime::now", reason = "core has no clock; time is an input" },
+  { path = "std::time::SystemTime::elapsed", reason = "core has no clock; time is an input" },
+  { path = "std::thread::spawn", reason = "core is Sans-IO" },
+  { path = "std::thread::sleep", reason = "core has no clock; time is an input" },
+]

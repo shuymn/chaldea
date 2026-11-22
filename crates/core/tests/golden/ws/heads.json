@@ -1,0 +1,13 @@
+{
+  "heads": [
+    {
+      "head_seq": 7,
+      "stream_id": "host"
+    },
+    {
+      "head_seq": 43,
+      "stream_id": "thread:0193abcd-ef01-7000-8000-000000000001"
+    }
+  ],
+  "type": "heads"
+}

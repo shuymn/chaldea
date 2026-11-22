@@ -1,0 +1,31 @@
+{
+  "command_id": "01930000-0000-7000-8000-000000000040",
+  "event_id": "01930000-0000-7000-8000-000000010017",
+  "idempotency_key": "command:01930000-0000-7000-8000-000000000040:23",
+  "kind": "worktree_changed",
+  "launch_id": "01930000-0000-7000-8000-000000000010",
+  "occurred_at": "2026-11-22T09:45:00.123Z",
+  "payload": {
+    "base_commit": "cee7556d0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+    "base_ref": "main",
+    "branch": "chaldea/a1b2c3d4",
+    "created_by": "thread:0193abcd-ef01-7000-8000-000000000001",
+    "owner_thread_id": "01930000-0000-7000-8000-000000000002",
+    "path": "/work/state/chaldea/wt/a1b2c3d4",
+    "repo": "/work/chaldea",
+    "state": "active",
+    "workspace_id": "ws-5f2c",
+    "worktree_id": "a1b2c3d4"
+  },
+  "recorded_at": "2026-11-22T09:45:00.125Z",
+  "schema_version": 1,
+  "seq": 23,
+  "source": {
+    "agent": "claude",
+    "cli_version": "2.1.326",
+    "kind": "command",
+    "transcript": null
+  },
+  "stream_id": "host",
+  "thread_id": "0193abcd-ef01-7000-8000-000000000001"
+}

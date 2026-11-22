@@ -1,0 +1,6 @@
+{
+  "cause": "spawned",
+  "field": "process_state",
+  "from": "starting",
+  "to": "running"
+}
