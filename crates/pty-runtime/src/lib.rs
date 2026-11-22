@@ -44,13 +44,15 @@ mod vt;
 #[cfg(windows)]
 mod windows;
 /// The platform-independent parts of the Windows backend (the kill engine over a synthetic
-/// `JobOs`, and the command-line, environment-block, and cwd rules), unit-tested on every OS.
+/// `JobOs`, the chunked exit wait, and the command-line, environment-block, and cwd rules),
+/// unit-tested on every OS.
 #[cfg(all(test, not(windows)))]
 #[path = "windows"]
 mod windows {
     #![allow(dead_code, reason = "only their unit tests run off Windows")]
     mod cmdline;
     mod kill;
+    mod wait;
 }
 mod writer;
 

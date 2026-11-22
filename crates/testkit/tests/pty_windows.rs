@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 use chaldea_pty_runtime::fake::{
     FaultReport, Watch, WindowsFault, gate, identify, kill_verified, process_handle_count,
     windows_close_threads_exited, windows_fault_report, windows_in_job, windows_inject_next,
-    windows_on_teardown_kill, windows_watch,
+    windows_job_active, windows_on_teardown_kill, windows_output_parked,
+    windows_output_parked_at_close, windows_track_close_threads, windows_watch,
 };
 use chaldea_pty_runtime::{
     Cleanup, CloseBounds, Guard, OutputEnd, ProcessIdentity, PtySize, Session, SessionConfig,
@@ -28,8 +29,6 @@ use chaldea_testkit::report::{Cleanup as FixtureCleanup, Fixture, ReportListener
 const BIN: &str = env!("CARGO_BIN_EXE_chaldea-fake-cli");
 const WAIT: Duration = Duration::from_secs(10);
 const KILL: Duration = Duration::from_secs(5);
-/// Slack for a killed process's handle to signal after the kill returned.
-const SLACK: Duration = Duration::from_millis(500);
 const HELPER_ENV: &str = "CHALDEA_PTY_WINDOWS_HELPER";
 
 static LOCK: Mutex<()> = Mutex::new(());
@@ -336,8 +335,10 @@ fn helper_case() -> Option<String> {
     std::env::var(HELPER_ENV).ok()
 }
 
-/// One warm-up cycle gives the baseline; five measured cycles must each equal it.
+/// One warm-up cycle gives the baseline; five measured cycles must each equal it. Close
+/// workers' handles are tracked so their threads' exit can be awaited before each sample.
 fn handle_cycles(label: &str, mut cycle: impl FnMut()) {
+    windows_track_close_threads(true);
     let mut sample = || {
         cycle();
         assert!(
@@ -457,20 +458,11 @@ fn after_process_faults_leave_no_handle() {
                     "Assign" => windows_inject_next(WindowsFault::Assign),
                     "ResumeFails" => windows_inject_next(WindowsFault::ResumeFails),
                     "AfterSpawn" => {
-                        s.argv = os(&[
-                            BIN,
-                            "--mode",
-                            "spawn-tree",
-                            "--roles",
-                            "none",
-                            "--emit-output",
-                            "--max-life-secs",
-                            "60",
-                        ]);
+                        s.argv = os(&[BIN, "--mode", "attachable", "--max-life-secs", "60"]);
                         let (g, ctl) = gate();
                         windows_inject_next(WindowsFault::AfterSpawn {
                             gate: g,
-                            marker: b"OUTPUT-1",
+                            marker: b"MARKER-0",
                         });
                         opener = Some(std::thread::spawn(move || {
                             assert!(ctl.wait_reached(WAIT), "AfterSpawn milestone");
@@ -543,7 +535,13 @@ fn child_is_in_the_job_from_creation() {
     ctl.open();
     let (session, rep) = spawner.join().unwrap();
     let session = session.unwrap();
-    assert!(!rep.unwrap().gate_abandoned);
+    let rep = rep.unwrap();
+    assert!(!rep.gate_abandoned);
+    assert_eq!(
+        rep.member_at_create,
+        vec![Some(true)],
+        "in the job at its create"
+    );
     let leader = session.identity().pid;
     assert_eq!(leader, root.hello.pid);
     assert!(windows_in_job(leader, leader).unwrap());
@@ -579,6 +577,11 @@ fn forced_fallback_runs_nothing_before_resume() {
     let session = session.unwrap();
     let rep = rep.unwrap();
     assert!(!rep.gate_abandoned);
+    assert_eq!(
+        rep.member_at_create,
+        vec![Some(false)],
+        "assigned only later"
+    );
     assert_eq!(wait_exit(&rx), 0);
     let ev = evidence(&session);
     assert_eq!(ev["job_branch"], "suspended");
@@ -619,8 +622,11 @@ fn forced_fallback_runs_nothing_before_resume() {
 
 const ROLES: &[&str] = &["plain", "double-forked", "breakaway"];
 
-/// Every role answers and is in the session's job; a watch per role.
-fn check_roles(r: &mut Rig) -> (BTreeMap<String, Fixture>, Vec<(String, Watch)>) {
+/// Every role answers and is in the session's job; a watch per role, and one on the leader.
+/// A watch and what it watches.
+type Watched = (String, Watch);
+
+fn check_roles(r: &mut Rig) -> (BTreeMap<String, Fixture>, Vec<Watched>, Watched) {
     let mut got = r.roles(ROLES);
     let leader = r.session.identity().pid;
     let mut watches = Vec::new();
@@ -632,8 +638,27 @@ fn check_roles(r: &mut Rig) -> (BTreeMap<String, Fixture>, Vec<(String, Watch)>)
         );
         watches.push((role.clone(), watch(f)));
     }
-    watches.push(("spawn-tree".into(), watch(&r.root)));
-    (got, watches)
+    (got, watches, ("spawn-tree".into(), watch(&r.root)))
+}
+
+/// The proof at a kill's return: the leader's (and each held extra's) handle is already
+/// signalled, polled with a zero wait, and the job's count reads 0; members then signal,
+/// observed through held watches with a watchdog only.
+fn assert_tree_dead_at_return(leader: u32, held: &[Watched], members: &[Watched]) {
+    for (role, w) in held {
+        assert!(
+            w.signalled(Duration::ZERO).unwrap(),
+            "{role} alive at the kill's return"
+        );
+    }
+    assert_eq!(
+        windows_job_active(leader).unwrap(),
+        0,
+        "a job member at the kill's return"
+    );
+    for (role, w) in members {
+        assert!(w.signalled(WAIT).unwrap(), "watchdog: {role} survived");
+    }
 }
 
 #[test]
@@ -648,12 +673,10 @@ fn forced_fallback_takes_the_suspended_branch() {
     ]);
     let mut other = outside(&mut r.cleanup, "unrelated");
     assert_eq!(evidence(&r.session)["job_branch"], "suspended");
-    let (_got, watches) = check_roles(&mut r);
+    let (_got, watches, root) = check_roles(&mut r);
     let k = r.session.kill(&[], Instant::now() + KILL);
     assert!(k.tree_dead, "{k:?}");
-    for (role, w) in &watches {
-        assert!(w.signalled(SLACK).unwrap(), "{role} survived");
-    }
+    assert_tree_dead_at_return(r.session.identity().pid, &[root], &watches);
     assert!(
         other.ping(soon()).is_some(),
         "the unrelated process was killed"
@@ -662,6 +685,15 @@ fn forced_fallback_takes_the_suspended_branch() {
 
 // ---- CL-7 ----
 
+/// What the teardown's kill hook saw: the leader's watch polled, and the job's count.
+#[derive(Default)]
+struct AtKill {
+    leader: Option<(u32, Watch)>,
+    seen: Option<(bool, Option<u32>)>,
+}
+
+/// PR4-CL-7: a failure after the process exists, with a write completed while the drain's
+/// reader is parked (output pending), kills the tree before the pseudoconsole closes.
 #[test]
 fn after_spawn_fault_with_output_pending_kills_the_tree() {
     let _l = lock();
@@ -676,23 +708,21 @@ fn after_spawn_fault_with_output_pending_kills_the_tree() {
             "plain,double-forked,breakaway",
         ],
     );
-    // The coordinator: watches in, zero-wait results out.
-    type Shared = Arc<Mutex<(Vec<(String, Watch)>, Vec<(String, bool)>)>>;
-    let shared: Shared = Arc::default();
+    let shared: Arc<Mutex<AtKill>> = Arc::default();
     let (g, ctl) = gate();
     let sh = shared.clone();
     let spawner = std::thread::spawn(move || {
         windows_on_teardown_kill(Box::new(move || {
             let mut st = sh.lock().unwrap();
-            let seen: Vec<(String, bool)> =
-                st.0.iter()
-                    .map(|(r, w)| (r.clone(), w.signalled(SLACK).unwrap_or(false)))
-                    .collect();
-            st.1 = seen;
+            if let Some((pid, w)) = &st.leader {
+                let dead = w.signalled(Duration::ZERO).unwrap_or(false);
+                let active = windows_job_active(*pid).ok();
+                st.seen = Some((dead, active));
+            }
         }));
         windows_inject_next(WindowsFault::AfterSpawn {
             gate: g,
-            marker: b"OUTPUT-1",
+            marker: b"OUTPUT-0",
         });
         let r = Session::spawn(&*native(), &s, SessionConfig::new(|_| {}));
         let r = match r {
@@ -706,26 +736,24 @@ fn after_spawn_fault_with_output_pending_kills_the_tree() {
     let mut root = listener.accept(soon()).unwrap();
     cleanup.track(root.hello.pid);
     let mut got = listener.expect_roles(ROLES, soon()).unwrap();
-    let mut watches = vec![("spawn-tree".to_owned(), watch(&root))];
+    let mut members = Vec::new();
     for (role, f) in &mut got {
         cleanup.track(f.hello.pid);
         assert!(f.ping(soon()).is_some(), "{role} pong");
-        watches.push((role.clone(), watch(f)));
+        members.push((role.clone(), watch(f)));
     }
     let mut other = outside(&mut cleanup, "unrelated");
+    root.send("emit").unwrap();
+    assert_eq!(next_kind(&mut root, "output")["n"], 0);
+    assert!(ctl.wait_reached(WAIT), "milestone: OUTPUT-0 seen");
     assert!(
-        ctl.wait_reached(WAIT),
-        "milestone: OUTPUT-1 seen with the drain held"
+        windows_output_parked(soon()),
+        "the reader parked after OUTPUT-0"
     );
-    // Catch up with the acknowledged writes, then wait for one more: a write completed
-    // while the drain is held, so output is pending at the teardown.
-    while matches!(
-        root.next_event(Instant::now() + Duration::from_millis(30)),
-        Ok(Some(_))
-    ) {}
-    let pending = next_kind(&mut root, "output");
-    assert!(pending["n"].as_u64().unwrap() >= 1, "{pending}");
-    shared.lock().unwrap().0 = watches;
+    // Written and flushed while the reader is parked: output is pending at the teardown.
+    root.send("emit").unwrap();
+    assert_eq!(next_kind(&mut root, "output")["n"], 1);
+    shared.lock().unwrap().leader = Some((root.hello.pid, watch(&root)));
     ctl.open();
     let (r, rep) = spawner.join().unwrap();
     let (stage, cleanup_result) = r.unwrap();
@@ -734,6 +762,11 @@ fn after_spawn_fault_with_output_pending_kills_the_tree() {
     let rep = rep.unwrap();
     assert!(!rep.gate_abandoned);
     assert_eq!(rep.marker_seen_running, Some(true));
+    assert_eq!(
+        rep.held_at_teardown_kill,
+        Some(true),
+        "the reader stayed parked through the kill"
+    );
     let n = rep.names();
     let hook = n
         .iter()
@@ -742,10 +775,14 @@ fn after_spawn_fault_with_output_pending_kills_the_tree() {
     let close = n.iter().rposition(|x| *x == "close").expect("close");
     let released = n.iter().position(|x| *x == "teardown_close").unwrap();
     assert!(hook < released && released < close, "{n:?}");
-    let seen = shared.lock().unwrap().1.clone();
-    assert_eq!(seen.len(), ROLES.len() + 1);
-    for (role, dead) in seen {
-        assert!(dead, "{role} alive right after the teardown's kill");
+    let seen = shared.lock().unwrap().seen;
+    assert_eq!(
+        seen,
+        Some((true, Some(0))),
+        "at the kill: the leader signalled and the job empty"
+    );
+    for (role, w) in &members {
+        assert!(w.signalled(WAIT).unwrap(), "watchdog: {role} survived");
     }
     assert!(
         other.ping(soon()).is_some(),
@@ -976,14 +1013,12 @@ fn spawn_tree_dies_and_unrelated_survives() {
         breakaway["result"], "denied",
         "a member's breakaway was refused"
     );
-    let (_got, watches) = check_roles(&mut r);
+    let (_got, watches, root) = check_roles(&mut r);
     let k = r.session.kill(&[], Instant::now() + KILL);
     assert!(k.tree_dead, "{k:?}");
     assert_eq!(k.method, "windows_job");
     assert!(k.survivors.is_empty());
-    for (role, w) in &watches {
-        assert!(w.signalled(SLACK).unwrap(), "{role} survived the kill");
-    }
+    assert_tree_dead_at_return(r.session.identity().pid, &[root], &watches);
     assert!(
         other.ping(soon()).is_some(),
         "the unrelated process was killed"
@@ -1008,9 +1043,10 @@ fn extra_outside_the_job_dies_and_stale_extra_is_spared() {
     stale.start_time = (stale.start_time.parse::<u64>().unwrap() + 1).to_string();
     let k2 = r.session.kill(&[sleeper_id, stale], Instant::now() + KILL);
     assert!(k2.tree_dead, "{k2:?}");
-    assert!(
-        sleeper_watch.signalled(SLACK).unwrap(),
-        "the named extra survived"
+    assert_tree_dead_at_return(
+        r.session.identity().pid,
+        &[("the named extra".into(), sleeper_watch)],
+        &[],
     );
     assert!(
         other.ping(soon()).is_some(),
@@ -1020,20 +1056,87 @@ fn extra_outside_the_job_dies_and_stale_extra_is_spared() {
 
 // ---- CL-20 ----
 
+/// PR4-CL-20: `close` with output pending (a write completed while the drain's reader is
+/// parked) returns within its budgets, its close operation on time, output ending in EOF.
 #[test]
 fn close_with_output_flowing_is_bounded() {
     let _l = lock();
+    windows_inject_next(WindowsFault::HoldOutput {
+        marker: b"OUTPUT-0",
+    });
     let mut r = rig(&["--mode", "spawn-tree", "--roles", "none", "--emit-output"]);
-    for _ in 0..3 {
-        next_kind(&mut r.root, "output");
-    }
+    r.root.send("emit").unwrap();
+    assert_eq!(next_kind(&mut r.root, "output")["n"], 0);
+    assert!(
+        windows_output_parked(soon()),
+        "the reader parked after OUTPUT-0"
+    );
+    r.root.send("emit").unwrap();
+    assert_eq!(next_kind(&mut r.root, "output")["n"], 1);
     let bounds = CloseBounds::default();
     let t = Instant::now();
     let out = r.session.close(&[], bounds);
     let budget = bounds.kill + bounds.input + bounds.close + bounds.drain + bounds.join;
     assert!(t.elapsed() < budget, "{:?}", t.elapsed());
+    assert_eq!(
+        windows_output_parked_at_close(),
+        Some(true),
+        "output was pending as the close began"
+    );
     assert!(out.close.elapsed.is_some(), "{out:?}");
     assert!(out.released.control, "{out:?}");
     assert_eq!(out.output, Some(OutputEnd::Eof), "{out:?}");
     assert!(out.abandoned.is_empty(), "{out:?}");
+}
+
+// ---- CL-10: unpaired surrogates ----
+
+/// A directory removed on drop.
+struct DirGuard(PathBuf);
+
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A verbatim cwd whose last unit is an unpaired surrogate names that directory, never its
+/// lossy twin (`U+FFFD`): the relative output lands there.
+#[test]
+fn verbatim_cwd_keeps_unpaired_surrogates() {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let _l = lock();
+    let base = std::env::temp_dir().join(format!("chaldea-ptywin-cwd-{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let guard = DirGuard(base.clone());
+    let base = std::fs::canonicalize(&base).unwrap();
+    assert!(base.to_str().unwrap().starts_with(r"\\?\"));
+    let named = |last: u16| {
+        let mut w: Vec<u16> = base.as_os_str().encode_wide().collect();
+        w.extend(r"\a".encode_utf16());
+        w.push(last);
+        PathBuf::from(OsString::from_wide(&w))
+    };
+    let (lone, twin) = (named(0xD800), named(0xFFFD));
+    std::fs::create_dir(&lone).unwrap();
+    std::fs::create_dir(&twin).unwrap();
+    let mut s = spec(
+        os(&[BIN, "--mode", "report-process", "--out", "marker.json"]),
+        Vec::new(),
+        PtySize::new(80, 24).unwrap(),
+    );
+    s.cwd = lone.clone();
+    let (config, rx) = events();
+    let session = Session::spawn(&*native(), &s, config).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(wait_exit(&rx), 0);
+    let _ = session.close(&[], CloseBounds::default());
+    assert!(
+        lone.join("marker.json").exists(),
+        "the marker is in the named directory"
+    );
+    assert!(
+        !twin.join("marker.json").exists(),
+        "the lossy twin was used"
+    );
+    drop(guard);
 }

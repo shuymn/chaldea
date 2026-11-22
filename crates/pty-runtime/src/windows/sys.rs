@@ -101,6 +101,8 @@ pub(crate) fn create_pseudo_console(
     output: &std::io::PipeWriter,
 ) -> io::Result<Pcon> {
     let mut hpc: HPCON = 0;
+    #[cfg(any(test, feature = "fake"))]
+    super::hooks::native_boundary("create_pseudo_console");
     // SAFETY: both handles are borrowed and valid for the call; `hpc` is a local the call
     // writes on success.
     let hr = unsafe { CreatePseudoConsole(coord(size), raw(input), raw(output), 0, &raw mut hpc) };
@@ -391,6 +393,8 @@ pub(crate) fn create_process(
     si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
     si.lpAttributeList = attrs.ptr();
     let mut pi = PROCESS_INFORMATION::default();
+    #[cfg(any(test, feature = "fake"))]
+    super::hooks::native_boundary("create_process");
     // SAFETY: every string is NUL-terminated and borrowed for the call; `cmdline` is a
     // mutable buffer of this attempt; `si` is zeroed with `cb` set and points to an
     // initialised attribute list; `bInheritHandles` is FALSE; `pi` is a local.
@@ -599,62 +603,4 @@ pub(crate) fn pipe_has_writer(r: &std::io::PipeReader) -> io::Result<bool> {
         return Err(e);
     }
     Ok(true)
-}
-
-/// Sets every UI restriction on a job (CL-27: such a job refuses nesting).
-#[cfg(test)]
-pub(crate) fn set_ui_restrictions(job: &OwnedHandle) -> io::Result<()> {
-    use windows_sys::Win32::System::JobObjects::{
-        JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS,
-        JOB_OBJECT_UILIMIT_EXITWINDOWS, JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES,
-        JOB_OBJECT_UILIMIT_READCLIPBOARD, JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS,
-        JOB_OBJECT_UILIMIT_WRITECLIPBOARD, JOBOBJECT_BASIC_UI_RESTRICTIONS,
-        JobObjectBasicUIRestrictions,
-    };
-    let info = JOBOBJECT_BASIC_UI_RESTRICTIONS {
-        UIRestrictionsClass: JOB_OBJECT_UILIMIT_DESKTOP
-            | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
-            | JOB_OBJECT_UILIMIT_EXITWINDOWS
-            | JOB_OBJECT_UILIMIT_GLOBALATOMS
-            | JOB_OBJECT_UILIMIT_HANDLES
-            | JOB_OBJECT_UILIMIT_READCLIPBOARD
-            | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
-            | JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
-    };
-    // SAFETY: the job handle is borrowed and valid; `info` is one integer, its size passed.
-    let ok = unsafe {
-        SetInformationJobObject(
-            raw(job),
-            JobObjectBasicUIRestrictions,
-            (&raw const info).cast(),
-            len_u32(size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>()),
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// The UI restrictions of a job (CL-27 setup check).
-#[cfg(test)]
-pub(crate) fn ui_restrictions(job: &OwnedHandle) -> io::Result<u32> {
-    use windows_sys::Win32::System::JobObjects::{
-        JOBOBJECT_BASIC_UI_RESTRICTIONS, JobObjectBasicUIRestrictions,
-    };
-    let mut info = JOBOBJECT_BASIC_UI_RESTRICTIONS::default();
-    // SAFETY: the job handle is borrowed and valid; `info` is one integer, its size passed.
-    let ok = unsafe {
-        QueryInformationJobObject(
-            raw(job),
-            JobObjectBasicUIRestrictions,
-            (&raw mut info).cast(),
-            len_u32(size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>()),
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(info.UIRestrictionsClass)
 }

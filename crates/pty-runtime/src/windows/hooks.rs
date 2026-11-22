@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::os::windows::io::{AsHandle, OwnedHandle};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::thread::JoinHandle;
@@ -66,6 +67,14 @@ pub enum WindowsFault {
     },
     /// The teardown's kill runs with an expired deadline.
     KillExpired,
+    /// Implies `RejectJobList(None)`; the real `ResumeThread` runs, and its previous suspend
+    /// count is classified as this value instead.
+    ResumeCount(u32),
+    /// No failure: once the marker is seen, the drain's next read waits until the control's
+    /// close begins (or `HOOK_WAIT`).
+    HoldOutput {
+        marker: &'static [u8],
+    },
 }
 
 impl WindowsFault {
@@ -78,6 +87,7 @@ impl WindowsFault {
                 | WindowsFault::AssignTerminateDenied
                 | WindowsFault::ResumeFails
                 | WindowsFault::ResumeTerminateDenied
+                | WindowsFault::ResumeCount(_)
         )
     }
 }
@@ -161,6 +171,15 @@ pub struct FaultReport {
     pub child_exited: Option<bool>,
     /// Whether the marker was seen while the child was running (`AfterSpawn`).
     pub marker_seen_running: Option<bool>,
+    /// Per created process, read right after its native create returned and before any
+    /// assignment: whether it was already in the session's job (`None`: the read failed).
+    pub member_at_create: Vec<Option<bool>>,
+    /// Each native `CreatePseudoConsole` / `CreateProcessW` call, with whether the calling
+    /// thread held the spawn lock as the call was made.
+    pub native_lock: Vec<(&'static str, bool)>,
+    /// Whether the drain's reader was parked by an `AfterSpawn` hold when the teardown's
+    /// kill returned.
+    pub held_at_teardown_kill: Option<bool>,
 }
 
 impl FaultReport {
@@ -212,6 +231,12 @@ pub(crate) fn with_report(f: impl FnOnce(&mut FaultReport)) {
     });
 }
 
+/// Records, at a native create's call boundary, whether this thread holds the spawn lock.
+pub(crate) fn native_boundary(name: &'static str) {
+    let held = crate::spawn::spawn_lock_held_here();
+    with_report(|r| r.native_lock.push((name, held)));
+}
+
 /// Records one call on this thread's report, if a spawn started one.
 pub(crate) fn trace(name: &'static str, native: bool, flags: u32, result: Result<u64, i32>) {
     let lock_held = crate::spawn::spawn_lock_held_here();
@@ -233,6 +258,9 @@ pub(crate) fn on_teardown_kill(f: TeardownHook) {
 /// The teardown point right after the kill.
 pub(crate) fn after_teardown_kill() {
     trace("teardown_kill", true, 0, Ok(0));
+    if let Some(parked) = HOLD.with(|h| h.borrow().as_ref().map(|m| m.parked())) {
+        with_report(|r| r.held_at_teardown_kill = Some(parked));
+    }
     if let Some(f) = TEARDOWN.with(|t| t.borrow_mut().take()) {
         f();
         trace("teardown_hook_ran", true, 0, Ok(0));
@@ -261,37 +289,58 @@ struct MarkerState {
     hold: bool,
     held_since: Option<Instant>,
     released: bool,
+    /// The reader is blocked in the hold right now.
+    parked: bool,
+    /// Whether the reader was parked when the close began (`HoldOutput`).
+    parked_at_close: Option<bool>,
+    /// Every byte read, in order (tests: CL-13).
+    #[cfg(test)]
+    bytes: Vec<u8>,
+    /// Set by the test right before the control's close (tests: CL-13).
+    #[cfg(test)]
+    closing: bool,
+    /// A read returned 0 before `closing` was set (tests: CL-13).
+    #[cfg(test)]
+    eof_before_closing: bool,
 }
 
-/// What the output-marker reader has seen; shared with the spawn and the teardown.
+/// What the output-marker reader has seen; shared with the spawn, the control, and the
+/// teardown.
 pub(crate) struct Marker {
     marker: &'static [u8],
     st: Mutex<MarkerState>,
     cv: Condvar,
 }
 
+/// The last holding marker made (test access through `fake`).
+static LAST_HELD: Mutex<Option<Weak<Marker>>> = Mutex::new(None);
+
 impl Marker {
     /// `hold`: once the marker is seen, the next read blocks until released (or
     /// `HOOK_WAIT`).
     pub(crate) fn new(marker: &'static [u8], hold: bool) -> Arc<Marker> {
-        Arc::new(Marker {
+        let m = Arc::new(Marker {
             marker,
             st: Mutex::new(MarkerState {
                 hold,
                 ..MarkerState::default()
             }),
             cv: Condvar::new(),
-        })
+        });
+        if hold {
+            *LAST_HELD.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::downgrade(&m));
+        }
+        m
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MarkerState> {
         self.st.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Waits until the marker was seen; false at `deadline`.
-    pub(crate) fn wait_seen(&self, deadline: Instant) -> bool {
+    /// Waits until `done` holds for the state; false at `deadline`.
+    fn wait_for(&self, deadline: Instant, done: impl Fn(&MarkerState) -> bool) -> bool {
         let mut st = self.lock();
-        while !st.seen {
+        while !done(&st) {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return false;
@@ -305,14 +354,55 @@ impl Marker {
         true
     }
 
-    #[cfg(test)]
-    pub(crate) fn seen(&self) -> bool {
-        self.lock().seen
+    /// Waits until the marker was seen; false at `deadline`.
+    pub(crate) fn wait_seen(&self, deadline: Instant) -> bool {
+        self.wait_for(deadline, |st| st.seen)
     }
 
+    /// Waits until the reader is parked in the hold; false at `deadline`.
+    pub(crate) fn wait_parked(&self, deadline: Instant) -> bool {
+        self.wait_for(deadline, |st| st.parked)
+    }
+
+    pub(crate) fn parked(&self) -> bool {
+        self.lock().parked
+    }
+
+    /// Every byte read so far.
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> Vec<u8> {
+        self.lock().bytes.clone()
+    }
+
+    /// Marks the start of the control's close: a later EOF is expected.
+    #[cfg(test)]
+    pub(crate) fn closing(&self) {
+        self.lock().closing = true;
+    }
+
+    /// Whether a read returned 0 before `closing`.
+    #[cfg(test)]
+    pub(crate) fn eof_before_closing(&self) -> bool {
+        self.lock().eof_before_closing
+    }
+
+    /// Releases the hold (one-shot).
     pub(crate) fn release(&self) {
         self.lock().released = true;
         self.cv.notify_all();
+    }
+
+    /// Records whether the reader is parked, then releases it (the control's close).
+    pub(crate) fn release_at_close(&self) {
+        let mut st = self.lock();
+        st.parked_at_close = Some(st.parked);
+        st.released = true;
+        drop(st);
+        self.cv.notify_all();
+    }
+
+    pub(crate) fn parked_at_close(&self) -> Option<bool> {
+        self.lock().parked_at_close
     }
 
     /// Blocks while held: from the read after the marker until released or `HOOK_WAIT`.
@@ -320,12 +410,16 @@ impl Marker {
         let mut st = self.lock();
         loop {
             if !(st.hold && st.seen) || st.released {
-                return;
+                break;
             }
             let since = *st.held_since.get_or_insert_with(Instant::now);
             let left = (since + HOOK_WAIT).saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return;
+                break;
+            }
+            if !st.parked {
+                st.parked = true;
+                self.cv.notify_all();
             }
             st = self
                 .cv
@@ -333,10 +427,18 @@ impl Marker {
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
+        st.parked = false;
     }
 
     fn scan(&self, bytes: &[u8]) {
         let mut st = self.lock();
+        #[cfg(test)]
+        {
+            if bytes.is_empty() && !st.closing {
+                st.eof_before_closing = true;
+            }
+            st.bytes.extend_from_slice(bytes);
+        }
         if st.seen || self.marker.is_empty() {
             return;
         }
@@ -351,6 +453,25 @@ impl Marker {
         let keep = self.marker.len() - 1;
         st.carry = window[window.len().saturating_sub(keep)..].to_vec();
     }
+}
+
+/// The last holding marker, while its spawn's reader lives.
+fn last_held() -> Option<Arc<Marker>> {
+    LAST_HELD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .and_then(Weak::upgrade)
+}
+
+/// The last holding marker: whether its reader parked by `deadline`.
+pub(crate) fn output_parked(deadline: Instant) -> bool {
+    last_held().is_some_and(|m| m.wait_parked(deadline))
+}
+
+/// The last holding marker: whether its reader was parked when the control's close began.
+pub(crate) fn output_parked_at_close() -> Option<bool> {
+    last_held().and_then(|m| m.parked_at_close())
 }
 
 /// The drain's reader in test and `fake` builds: the output read end, watched for a marker.
@@ -381,13 +502,37 @@ impl<R: Read> Read for MarkerReader<R> {
 // ---- Registries ----
 
 static CLOSE_THREADS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+/// Whether close workers' handles are kept for `close_threads_exited` (a handle-count probe).
+static TRACK_CLOSE_THREADS: AtomicBool = AtomicBool::new(false);
 
-/// A close worker whose close returned.
+/// Starts or stops keeping close workers' handles; stopping drops those kept.
+pub(crate) fn track_close_threads(on: bool) {
+    TRACK_CLOSE_THREADS.store(on, Ordering::Release);
+    if !on {
+        CLOSE_THREADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+}
+
+/// A close worker whose close returned: kept only while a probe tracks them, else dropped.
 pub(crate) fn register_close_thread(j: JoinHandle<()>) {
+    if TRACK_CLOSE_THREADS.load(Ordering::Acquire) {
+        CLOSE_THREADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(j);
+    }
+}
+
+/// How many close workers' handles are kept.
+#[cfg(test)]
+pub(crate) fn kept_close_threads() -> usize {
     CLOSE_THREADS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .push(j);
+        .len()
 }
 
 /// Waits (bounded) on the registered close threads' handles, joins those signalled, and
@@ -425,17 +570,25 @@ pub(crate) fn unregister_job(leader: u32) {
     }
 }
 
-/// `IsProcessInJob(pid, the job of the session led by `leader`)`.
-pub(crate) fn in_job(leader: u32, pid: u32) -> io::Result<bool> {
-    let job = JOBS
-        .lock()
+fn job_of(leader: u32) -> io::Result<Arc<OwnedHandle>> {
+    JOBS.lock()
         .unwrap_or_else(PoisonError::into_inner)
         .as_ref()
         .and_then(|m| m.get(&leader))
         .and_then(Weak::upgrade)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no live session job"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no live session job"))
+}
+
+/// `IsProcessInJob(pid, the job of the session led by `leader`)`.
+pub(crate) fn in_job(leader: u32, pid: u32) -> io::Result<bool> {
+    let job = job_of(leader)?;
     let p = sys::open_process(pid, super::QUERY_SYNC)?;
     sys::in_job(&p, &job)
+}
+
+/// `ActiveProcesses` of the job of the session led by `leader`.
+pub(crate) fn job_active(leader: u32) -> io::Result<u32> {
+    sys::active_processes(&*job_of(leader)?)
 }
 
 // ---- Process helpers ----

@@ -1,12 +1,14 @@
 //! `spawn-tree`: starts one sleeper per role, each sending its own hello, then idles and
 //! reaps the children that exit. On Windows the `breakaway` role is started with
 //! `CREATE_BREAKAWAY_FROM_JOB`, again without it when that is denied, and the result is
-//! reported on spawn-tree's own stream. `--emit-output` then writes `OUTPUT-<n>` lines every
-//! 50 ms, acknowledging each with an `output` event once its write and flush returned.
+//! reported on spawn-tree's own stream. With `--emit-output`, each `emit` line from the test
+//! writes the next `OUTPUT-<n>` line to stdout and acknowledges it with an `output` event
+//! only after its write and flush succeeded, else an `output_failed` event.
 
 use std::io::Write;
 use std::process::Child;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -28,7 +30,6 @@ const DEFAULT_ROLES: &[&str] = &[
 const DEFAULT_ROLES: &[&str] = &["plain", "double-forked"];
 
 const REAP_EVERY: Duration = Duration::from_millis(100);
-const EMIT_EVERY: Duration = Duration::from_millis(50);
 
 /// `CREATE_BREAKAWAY_FROM_JOB`.
 #[cfg(windows)]
@@ -36,8 +37,31 @@ const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 #[cfg(windows)]
 const ERROR_ACCESS_DENIED: i32 = 5;
 
+/// `emit`: writes the next numbered line and reports whether the write and flush succeeded.
+fn emit(line: &str) {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    if line != "emit" {
+        return;
+    }
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut out = std::io::stdout().lock();
+    let ok = write!(out, "OUTPUT-{n}\r\n")
+        .and_then(|()| out.flush())
+        .is_ok();
+    drop(out);
+    let event = if ok { "output" } else { "output_failed" };
+    crate::report::Reporter.send(&json!({"event": event, "n": n}));
+}
+
 pub(crate) fn run(o: &Opts) -> i32 {
+    if o.emit_output {
+        crate::report::on_command(emit);
+    }
     let raw = super::enter_raw(o, false);
+    #[cfg_attr(
+        not(windows),
+        allow(unused_variables, reason = "only the breakaway role reports here")
+    )]
     let rep = super::hello(o, raw);
     let roles: Vec<String> = o
         .roles
@@ -99,24 +123,8 @@ pub(crate) fn run(o: &Opts) -> i32 {
             Err(_) => return 1,
         }
     }
-    let mut out = std::io::stdout();
-    let mut n = 0u64;
-    let mut reap = Instant::now();
     loop {
-        if o.emit_output {
-            let _ = write!(out, "OUTPUT-{n}\r\n");
-            let _ = out.flush();
-            rep.send(&json!({"event": "output", "n": n}));
-            n += 1;
-        }
-        if Instant::now() >= reap {
-            children.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
-            reap = Instant::now() + REAP_EVERY;
-        }
-        std::thread::sleep(if o.emit_output {
-            EMIT_EVERY
-        } else {
-            REAP_EVERY
-        });
+        children.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+        std::thread::sleep(REAP_EVERY);
     }
 }

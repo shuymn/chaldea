@@ -14,8 +14,9 @@ mod kill;
 mod sys;
 #[cfg(test)]
 mod tests;
+mod wait;
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, ErrorKind, Write};
 use std::os::windows::io::{AsHandle, OwnedHandle};
 use std::path::Path;
@@ -205,18 +206,37 @@ impl Inject {
         }
     }
 
-    /// The gate after a successful create: `AfterCreate` on either branch, and the gate of
-    /// `RejectJobList(Some(_))` on the suspended branch.
+    /// The point right after a native create returned a process, before anything else can
+    /// assign it: records whether the process is already in `job`, then passes the gate of
+    /// `AfterCreate` (either branch) or of `RejectJobList(Some(_))` (the suspended branch).
     #[allow(clippy::unused_self, reason = "no gates outside test and fake builds")]
-    fn after_create(&self, suspended: bool) {
+    fn after_create(&self, suspended: bool, process: &OwnedHandle, job: &OwnedHandle) {
         #[cfg(any(test, feature = "fake"))]
-        match &self.fault {
-            Some(hooks::WindowsFault::AfterCreate(g)) => g.pass(),
-            Some(hooks::WindowsFault::RejectJobList(Some(g))) if suspended => g.pass(),
-            _ => {}
+        {
+            let member = sys::in_job(process, job).ok();
+            hooks::with_report(|r| r.member_at_create.push(member));
+            match &self.fault {
+                Some(hooks::WindowsFault::AfterCreate(g)) => g.pass(),
+                Some(hooks::WindowsFault::RejectJobList(Some(g))) if suspended => g.pass(),
+                _ => {}
+            }
         }
         #[cfg(not(any(test, feature = "fake")))]
-        let _ = suspended;
+        let _ = (suspended, process, job);
+    }
+
+    /// The previous suspend count to classify: the real one, or the scripted
+    /// `ResumeCount` (the real resume ran either way).
+    #[allow(
+        clippy::unused_self,
+        reason = "no scripts outside test and fake builds"
+    )]
+    fn resume_count(&self, real: io::Result<u32>) -> io::Result<u32> {
+        #[cfg(any(test, feature = "fake"))]
+        if let (Some(hooks::WindowsFault::ResumeCount(n)), Ok(_)) = (&self.fault, &real) {
+            return Ok(*n);
+        }
+        real
     }
 
     #[cfg(any(test, feature = "fake"))]
@@ -355,15 +375,21 @@ impl PtyRuntime for WindowsPty {
 
         // 2.2 The pseudoconsole, under the spawn lock.
         let pcon = {
+            #[cfg(test)]
+            self.hooks.on(&tests::Stage::BeforeLock { stage: 2 });
             let guard = spawn_lock();
             #[cfg(test)]
             self.hooks.on(&tests::Stage::LockAcquired { stage: 2 });
-            inject.run(
+            let r = inject.run(
                 Point::PseudoConsole,
                 "create_pseudo_console",
                 || injected("pseudoconsole"),
                 || sys::create_pseudo_console(&guard, spec.size, &in_r, &out_w),
-            )
+            );
+            #[cfg(test)]
+            self.hooks.on(&tests::Stage::BeforeUnlock { stage: 2 });
+            drop(guard);
+            r
         };
         let pcon = match pcon {
             Ok(p) => p,
@@ -377,7 +403,8 @@ impl PtyRuntime for WindowsPty {
                 return Err(setup_with(e, released(close, true)));
             }
         };
-        let control = WindowsControl::new(pcon, worker);
+        #[cfg_attr(not(any(test, feature = "fake")), allow(unused_mut))]
+        let mut control = WindowsControl::new(pcon, worker);
         // conhost holds its own ends: it is now the output pipe's last writer.
         drop((in_r, out_w));
         let conpty_module = sys::module_path("kernel32.dll")
@@ -390,6 +417,11 @@ impl PtyRuntime for WindowsPty {
             Some(hooks::WindowsFault::AfterSpawn { marker, .. }) => {
                 let m = hooks::Marker::new(marker, true);
                 hooks::hold_until_teardown(m.clone());
+                Some(m)
+            }
+            Some(hooks::WindowsFault::HoldOutput { marker }) => {
+                let m = hooks::Marker::new(marker, true);
+                control.hold_until_close(m.clone());
                 Some(m)
             }
             _ => None,
@@ -434,7 +466,10 @@ impl PtyRuntime for WindowsPty {
         // 4. The job.
         let job = match create_job(&inject) {
             Ok(j) => j,
-            Err(e) => return Err(setup_with(e, early.cleanup())),
+            Err((e, job)) => {
+                early.job = job;
+                return Err(setup_with(e, early.cleanup()));
+            }
         };
 
         // 5. Create.
@@ -580,6 +615,11 @@ fn invalid(msg: &str) -> SpawnError {
     setup(io::Error::new(ErrorKind::InvalidInput, msg.to_owned()))
 }
 
+fn nul_terminated(mut units: Vec<u16>) -> Vec<u16> {
+    units.push(0);
+    units
+}
+
 fn has_nul(s: &OsStr) -> bool {
     cmdline::wide(s).contains(&0)
 }
@@ -640,9 +680,15 @@ fn validate(spec: &SpawnSpec) -> Result<Buffers, SpawnError> {
         }
         Err(e) => return Err(setup(e)),
     }
-    let cwd = match cmdline::verbatim_cwd(spec.cwd.as_os_str(), |p| std::path::absolute(p)) {
-        Cwd::AsGiven => cmdline::wide_nul(spec.cwd.as_os_str()),
-        Cwd::Stripped(s) => cmdline::wide_nul(&s),
+    let given = cmdline::wide(spec.cwd.as_os_str());
+    let absolute = |u: &[u16]| -> io::Result<Vec<u16>> {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let a = std::path::absolute(std::path::PathBuf::from(OsString::from_wide(u)))?;
+        Ok(a.as_os_str().encode_wide().collect())
+    };
+    let cwd = match cmdline::verbatim_cwd(&given, absolute) {
+        Cwd::AsGiven => nul_terminated(given),
+        Cwd::Stripped(s) => nul_terminated(s),
         Cwd::Refused => {
             return Err(invalid(
                 "verbatim cwd names another directory without its prefix",
@@ -669,26 +715,27 @@ fn validate(spec: &SpawnSpec) -> Result<Buffers, SpawnError> {
     })
 }
 
-/// Stage 4: `CreateJobObjectW`, then the kill-on-close limit and nothing else.
-fn create_job(inject: &Inject) -> io::Result<OwnedHandle> {
-    let job = inject.run(
-        Point::JobCreate,
-        "job_create",
-        || injected("job create"),
-        sys::create_job,
-    )?;
+/// Stage 4: `CreateJobObjectW`, then the kill-on-close limit and nothing else. On a limit
+/// failure the job comes back with the error, for `release_early` to drop last.
+fn create_job(inject: &Inject) -> Result<OwnedHandle, (io::Error, Option<OwnedHandle>)> {
+    let job = inject
+        .run(
+            Point::JobCreate,
+            "job_create",
+            || injected("job create"),
+            sys::create_job,
+        )
+        .map_err(|e| (e, None))?;
     let limit = inject.run(
         Point::JobLimits,
         "job_limits",
         || injected("job limits"),
         || sys::set_job_limit(&job, sys::KILL_ON_JOB_CLOSE),
     );
-    if let Err(e) = limit {
-        drop(job);
-        tr("job_drop", true, 0, Ok(0));
-        return Err(e);
+    match limit {
+        Ok(()) => Ok(job),
+        Err(e) => Err((e, Some(job))),
     }
-    Ok(job)
 }
 
 /// The `NeverStarted` kind of a create error (§2.2 stage 5.3).
@@ -718,17 +765,21 @@ fn no_process(e: &io::Error, program: &Path, msg: String) -> NotLaunched {
 
 impl WindowsPty {
     /// One `CreateProcessW` attempt with a fresh copy of the command line, under the spawn
-    /// lock; `synthesized` replaces the call with that error.
+    /// lock; `synthesized` replaces the call with that error. A created process reaches
+    /// `after_create` right after the lock is released, before any assignment.
     fn attempt(
         &self,
         bufs: &Buffers,
         attrs: &mut sys::AttrList<'_>,
         suspended: bool,
         synthesized: Option<i32>,
+        (job, inject): (&OwnedHandle, &Inject),
     ) -> io::Result<sys::Created> {
         let mut line = bufs.cmdline.clone();
         #[cfg(test)]
         self.hooks.command_line(suspended, &mut line);
+        #[cfg(test)]
+        self.hooks.on(&tests::Stage::BeforeLock { stage: 5 });
         let guard = spawn_lock();
         #[cfg(test)]
         self.hooks.on(&tests::Stage::LockAcquired { stage: 5 });
@@ -744,7 +795,12 @@ impl WindowsPty {
             sys::creation_flags(suspended),
             result_of(&r, |c| u64::from(c.pid)),
         );
+        #[cfg(test)]
+        self.hooks.on(&tests::Stage::BeforeUnlock { stage: 5 });
         drop(guard);
+        if let Ok(c) = &r {
+            inject.after_create(suspended, &c.process, job);
+        }
         r
     }
 
@@ -794,7 +850,7 @@ impl WindowsPty {
             let synthesized = (inject.fails(Point::RejectJobList)
                 || inject.fails(Point::CreateProcess))
             .then_some(ERROR_NOT_SUPPORTED);
-            self.attempt(bufs, &mut attrs, false, synthesized)
+            self.attempt(bufs, &mut attrs, false, synthesized, (job, inject))
                 .map_err(|e| ("create_process", e, false))
         })();
         let (created, branch, job_list_error) = match first {
@@ -814,7 +870,7 @@ impl WindowsPty {
                     let synthesized = inject
                         .fails(Point::CreateProcess)
                         .then_some(ERROR_NOT_ENOUGH_MEMORY);
-                    self.attempt(bufs, &mut attrs, true, synthesized)
+                    self.attempt(bufs, &mut attrs, true, synthesized, (job, inject))
                         .map_err(|e| ("create_process", e))
                 })();
                 match second {
@@ -840,7 +896,6 @@ impl WindowsPty {
             || sys::creation_time(process.as_handle()),
         );
         let suspended = branch == "suspended";
-        inject.after_create(suspended);
         if !suspended {
             drop(thread);
             return Ok(Launched {
@@ -899,7 +954,7 @@ impl WindowsPty {
         let resumed = if inject.fails(Point::ResumeFails) {
             Err(io::Error::from_raw_os_error(ERROR_NOT_SUPPORTED))
         } else {
-            sys::resume(&thread)
+            inject.resume_count(sys::resume(&thread))
         };
         tr(
             "resume",

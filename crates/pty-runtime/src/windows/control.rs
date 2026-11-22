@@ -20,8 +20,18 @@ enum Msg {
 /// no path holds that resource without a thread able to close it.
 pub(crate) struct CloseWorker {
     tx: Sender<Msg>,
-    done: Receiver<()>,
+    /// When the close operation returned.
+    done: Receiver<Instant>,
     join: JoinHandle<()>,
+}
+
+#[cfg(test)]
+type AfterSend = Box<dyn FnOnce(&JoinHandle<()>)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs in `close` between handing over the close and receiving its result (tests).
+    static AFTER_SEND: std::cell::RefCell<Option<AfterSend>> = const { std::cell::RefCell::new(None) };
 }
 
 impl CloseWorker {
@@ -43,7 +53,7 @@ impl CloseWorker {
                                 f();
                             }
                             if msg.is_ok() {
-                                let _ = done_tx.send(());
+                                let _ = done_tx.send(Instant::now());
                             }
                             return;
                         }
@@ -66,23 +76,28 @@ impl CloseWorker {
     }
 
     /// Runs the close and waits for it until `deadline`: `Some` when the close operation
-    /// returned by then; `None` abandons the thread with the close recorded as hung. The
-    /// thread itself is not joined (`docs/design/pty-windows.md` §2.3).
+    /// returned by then (its completion time compared with the deadline, so a completion
+    /// queued late is not on time); `None` abandons the thread with the close recorded as
+    /// hung. The thread itself is not joined (`docs/design/pty-windows.md` §2.3).
     pub(crate) fn close(self, deadline: Instant) -> Option<Duration> {
         let t = Instant::now();
         let CloseWorker { tx, done, join } = self;
         if tx.send(Msg::Close).is_err() {
             return None;
         }
+        #[cfg(test)]
+        if let Some(f) = AFTER_SEND.with(|h| h.borrow_mut().take()) {
+            f(&join);
+        }
         match done.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(()) => {
+            Ok(at) if at <= deadline => {
                 #[cfg(any(test, feature = "fake"))]
                 super::hooks::register_close_thread(join);
                 #[cfg(not(any(test, feature = "fake")))]
                 drop(join);
-                Some(t.elapsed())
+                Some(at.saturating_duration_since(t))
             }
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => None,
+            Ok(_) | Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => None,
         }
     }
 }
@@ -109,6 +124,9 @@ impl Pseudo for Pcon {
 pub(crate) struct WindowsControl<P: Pseudo = Pcon> {
     pcon: Option<Arc<P>>,
     worker: Option<CloseWorker>,
+    /// A drain hold released when the close begins (`HoldOutput`).
+    #[cfg(any(test, feature = "fake"))]
+    hold: Option<Arc<super::hooks::Marker>>,
 }
 
 impl<P: Pseudo> WindowsControl<P> {
@@ -124,7 +142,15 @@ impl<P: Pseudo> WindowsControl<P> {
         WindowsControl {
             pcon: Some(pcon),
             worker: Some(worker),
+            #[cfg(any(test, feature = "fake"))]
+            hold: None,
         }
+    }
+
+    /// Keeps the drain's reader parked until this control's close begins.
+    #[cfg(any(test, feature = "fake"))]
+    pub(crate) fn hold_until_close(&mut self, m: Arc<super::hooks::Marker>) {
+        self.hold = Some(m);
     }
 
     /// The pseudoconsole, while the control is open (stage 5's attribute lists borrow it).
@@ -133,6 +159,10 @@ impl<P: Pseudo> WindowsControl<P> {
     }
 
     fn release(&mut self, deadline: Instant) -> CloseReport {
+        #[cfg(any(test, feature = "fake"))]
+        if let Some(m) = self.hold.take() {
+            m.release_at_close();
+        }
         drop(self.pcon.take());
         let elapsed = self.worker.take().and_then(|w| w.close(deadline));
         CloseReport { elapsed }
@@ -182,7 +212,8 @@ mod tests {
         }
     }
 
-    /// PR4-CL-20: a close that does not return by the deadline is `None`, on time.
+    /// PR4-CL-20: a close that does not return by the deadline is `None`, also when its
+    /// late completion is already queued as the caller reads it.
     #[test]
     fn hung_close_worker_is_bounded() {
         let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -192,8 +223,30 @@ mod tests {
         }));
         let t = Instant::now();
         assert_eq!(w.close(Instant::now() + Duration::from_millis(100)), None);
-        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert!(t.elapsed() < WAIT, "watchdog: {:?}", t.elapsed());
         release_tx.send(()).unwrap();
+        // The caller parks between handing over the close and reading its result; the close
+        // returns only after the deadline, and its completion is queued before the read.
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let mut w = CloseWorker::start("conpty-close-test").unwrap();
+        w.arm(Box::new(move || {
+            let _ = go_rx.recv_timeout(WAIT);
+        }));
+        let deadline = Instant::now() + Duration::from_millis(1);
+        AFTER_SEND.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |join: &JoinHandle<()>| {
+                while Instant::now() <= deadline {
+                    std::thread::yield_now();
+                }
+                go_tx.send(()).unwrap();
+                let end = Instant::now() + WAIT;
+                while !join.is_finished() {
+                    assert!(Instant::now() < end, "watchdog: the worker did not finish");
+                    std::thread::yield_now();
+                }
+            }));
+        });
+        assert_eq!(w.close(deadline), None, "a late completion is not on time");
         // A close that returns is `Some`.
         let mut w = CloseWorker::start("conpty-close-test").unwrap();
         w.arm(Box::new(|| {}));

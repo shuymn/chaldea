@@ -5,7 +5,6 @@
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::{Path, PathBuf};
 
 /// The longest command line, its NUL included (Microsoft, "CreateProcessW function").
 pub(crate) const MAX_COMMAND_LINE: usize = 32_767;
@@ -114,30 +113,35 @@ pub(crate) fn env_block(env: &[(OsString, OsString)], cmp: Compare) -> Vec<u16> 
 pub(crate) enum Cwd {
     /// No verbatim prefix: passed as given.
     AsGiven,
-    /// The prefix removed; the result names the same directory.
-    Stripped(OsString),
+    /// The prefix removed (UTF-16 units, no terminator); the result names the same
+    /// directory.
+    Stripped(Vec<u16>),
     /// A verbatim path whose stripped form Win32 normalization would change.
     Refused,
 }
 
-/// The verbatim-cwd rule: `\\?\X` becomes `X` and `\\?\UNC\X` becomes `\\X`, accepted only
-/// when `absolute(stripped)` returns exactly the stripped spelling (`OsStr` equality), so
-/// Win32 normalization (trailing dots and spaces, `.` and `..`, `/`) leaves it unchanged.
-pub(crate) fn verbatim_cwd(cwd: &OsStr, absolute: impl Fn(&Path) -> io::Result<PathBuf>) -> Cwd {
-    let s = cwd.to_string_lossy();
-    if s.len() != cwd.len() {
-        // Not valid Unicode: no prefix to recognise, passed as given.
-        return Cwd::AsGiven;
-    }
-    let stripped = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-        rest.to_owned()
+fn units(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+/// The verbatim-cwd rule over UTF-16 units, so no lossy conversion can change which
+/// directory is named: `\\?\X` becomes `X` and `\\?\UNC\X` becomes `\\X`, accepted only
+/// when `absolute(stripped)` returns exactly the stripped units, so Win32 normalization
+/// (trailing dots and spaces, `.` and `..`, `/`) leaves it unchanged.
+pub(crate) fn verbatim_cwd(cwd: &[u16], absolute: impl Fn(&[u16]) -> io::Result<Vec<u16>>) -> Cwd {
+    let unc = units(r"\\?\UNC\");
+    let verbatim = units(r"\\?\");
+    let stripped = if let Some(rest) = cwd.strip_prefix(unc.as_slice()) {
+        let mut s = units(r"\\");
+        s.extend_from_slice(rest);
+        s
+    } else if let Some(rest) = cwd.strip_prefix(verbatim.as_slice()) {
+        rest.to_vec()
     } else {
         return Cwd::AsGiven;
     };
-    match absolute(Path::new(&stripped)) {
-        Ok(a) if a.as_os_str() == OsStr::new(&stripped) => Cwd::Stripped(stripped.into()),
+    match absolute(&stripped) {
+        Ok(a) if a == stripped => Cwd::Stripped(stripped),
         _ => Cwd::Refused,
     }
 }
@@ -233,66 +237,88 @@ mod tests {
         assert!(!has_duplicate_key(&env, cmp()));
     }
 
-    /// A model of Win32 path normalization for the corpus on non-Windows hosts: `/` becomes
-    /// `\`, trailing dots and spaces of a component are dropped, `.` and `..` resolve.
+    /// A model of Win32 path normalization for the corpus on non-Windows hosts, over UTF-16
+    /// units (other units pass through unchanged): `/` becomes `\`, trailing dots and
+    /// spaces of a component are dropped, `.` and `..` resolve.
     #[cfg_attr(windows, allow(dead_code, reason = "Windows uses std::path::absolute"))]
-    fn model_absolute(p: &Path) -> io::Result<PathBuf> {
-        let s = p.to_string_lossy().replace('/', "\\");
-        let (root, rest) = if let Some(r) = s.strip_prefix(r"\\") {
-            let mut it = r.splitn(3, '\\');
+    fn model_absolute(p: &[u16]) -> io::Result<Vec<u16>> {
+        let bs = u16::from(b'\\');
+        let s: Vec<u16> = p
+            .iter()
+            .map(|&c| if c == u16::from(b'/') { bs } else { c })
+            .collect();
+        let (root, rest): (Vec<u16>, &[u16]) = if s.starts_with(&[bs, bs]) {
+            let r = &s[2..];
+            let mut it = r.splitn(3, |&c| c == bs);
             let server = it.next().unwrap_or_default();
             let share = it.next().unwrap_or_default();
-            (
-                format!(r"\\{server}\{share}"),
-                it.next().unwrap_or_default().to_owned(),
-            )
-        } else if s.get(1..3) == Some(r":\") {
-            (format!(r"{}\", &s[..2]), s[3..].to_owned())
+            let mut root = vec![bs, bs];
+            root.extend_from_slice(server);
+            root.push(bs);
+            root.extend_from_slice(share);
+            (root, it.next().unwrap_or_default())
+        } else if s.len() >= 3 && s[1] == u16::from(b':') && s[2] == bs {
+            (s[..3].to_vec(), &s[3..])
         } else {
             return Err(io::ErrorKind::InvalidInput.into());
         };
-        let mut parts: Vec<&str> = Vec::new();
-        for c in rest.split('\\') {
-            match c.trim_end_matches(['.', ' ']) {
-                "" => {}
-                ".." => {
+        let mut parts: Vec<&[u16]> = Vec::new();
+        for c in rest.split(|&c| c == bs) {
+            let mut c = c;
+            while let [head @ .., last] = c
+                && (*last == u16::from(b'.') || *last == u16::from(b' '))
+            {
+                c = head;
+            }
+            match c {
+                [] => {}
+                [a, b] if *a == u16::from(b'.') && *b == u16::from(b'.') => {
                     parts.pop();
                 }
                 c => parts.push(c),
             }
         }
-        let sep = if root.ends_with('\\') || parts.is_empty() {
-            ""
-        } else {
-            "\\"
-        };
-        Ok(PathBuf::from(format!("{root}{sep}{}", parts.join("\\"))))
+        let mut out = root;
+        for (i, c) in parts.iter().enumerate() {
+            if i > 0 || out.last() != Some(&bs) {
+                out.push(bs);
+            }
+            out.extend_from_slice(c);
+        }
+        Ok(out)
     }
 
-    fn absolute(p: &Path) -> io::Result<PathBuf> {
-        #[cfg(windows)]
-        return std::path::absolute(p);
-        #[cfg(not(windows))]
+    #[cfg(windows)]
+    fn absolute(p: &[u16]) -> io::Result<Vec<u16>> {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let a = std::path::absolute(std::path::PathBuf::from(OsString::from_wide(p)))?;
+        Ok(a.as_os_str().encode_wide().collect())
+    }
+
+    #[cfg(not(windows))]
+    fn absolute(p: &[u16]) -> io::Result<Vec<u16>> {
         model_absolute(p)
     }
 
     /// PR4-CL-10: the verbatim prefix is removed only when the result names the same
-    /// directory.
+    /// directory, compared unit for unit (an unpaired surrogate is kept, never replaced).
     #[test]
     fn cwd_normalization_rule() {
-        let v = |s: &str| verbatim_cwd(OsStr::new(s), absolute);
-        assert_eq!(v(r"\\?\C:\a"), Cwd::Stripped(r"C:\a".into()));
-        assert_eq!(v(r"\\?\UNC\s\x"), Cwd::Stripped(r"\\s\x".into()));
+        let v = |s: &str| verbatim_cwd(&units(s), absolute);
+        assert_eq!(v(r"\\?\C:\a"), Cwd::Stripped(units(r"C:\a")));
+        assert_eq!(v(r"\\?\UNC\s\x"), Cwd::Stripped(units(r"\\s\x")));
         assert_eq!(v(r"\\?\C:\a."), Cwd::Refused);
         assert_eq!(v(r"\\?\C:\a\..\b"), Cwd::Refused);
         assert_eq!(v(r"\\?\C:\a/b"), Cwd::Refused);
         assert_eq!(v(r"C:\a"), Cwd::AsGiven);
         assert_eq!(
-            verbatim_cwd(
-                OsStr::new(r"\\?\C:\a"),
-                |_| Err(io::ErrorKind::Other.into())
-            ),
+            verbatim_cwd(&units(r"\\?\C:\a"), |_| Err(io::ErrorKind::Other.into())),
             Cwd::Refused
         );
+        let mut lone = units(r"\\?\C:\a");
+        lone.push(0xD800);
+        let mut want = units(r"C:\a");
+        want.push(0xD800);
+        assert_eq!(verbatim_cwd(&lone, absolute), Cwd::Stripped(want));
     }
 }

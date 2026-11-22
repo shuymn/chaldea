@@ -7,7 +7,8 @@
 //! (Windows resets a socket still open at process exit, and the reset discards what the
 //! test has not read yet). The test may send `ping` lines; the fixture answers each with
 //! `{"event":"pong","inq":n}`, `inq` being the bytes waiting on its stdin when that is a
-//! terminal. EOF is death (or an exit already under way), `pong` is life.
+//! terminal. EOF is death (or an exit already under way), `pong` is life. Other lines go to
+//! the mode's command handler, if it registered one (`spawn-tree --emit-output`: `emit`).
 //!
 //! The test side also has [`Cleanup`], which kills fixtures by verified identity.
 
@@ -23,6 +24,14 @@ use serde_json::{Value, json};
 /// The process's report stream, once connected, and whether it has ended. It lives as
 /// long as the process; [`end`] ends it.
 static STREAM: OnceLock<Mutex<(TcpStream, bool)>> = OnceLock::new();
+
+/// The mode's handler of the test's lines other than `ping`.
+static COMMAND: OnceLock<fn(&str)> = OnceLock::new();
+
+/// Routes the test's lines other than `ping` to `f`, on the stream's reader thread.
+pub(crate) fn on_command(f: fn(&str)) {
+    let _ = COMMAND.set(f);
+}
 
 /// The fixture side of the report stream.
 pub(crate) struct Reporter;
@@ -43,6 +52,8 @@ impl Reporter {
                         if writeln!(write, "{pong}").is_err() {
                             return;
                         }
+                    } else if let Some(f) = COMMAND.get() {
+                        f(line.trim());
                     }
                 }
             });
@@ -320,6 +331,18 @@ impl Fixture {
                 Err(_) => return false,
             }
         }
+    }
+
+    /// Sends one command line to the fixture (`emit` for `spawn-tree --emit-output`).
+    ///
+    /// # Errors
+    ///
+    /// The stream is closed or the write failed.
+    pub fn send(&mut self, line: &str) -> io::Result<()> {
+        if self.closed {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        writeln!(self.writer, "{line}")
     }
 
     /// Sends `ping` and waits for the `pong`; `None` when the stream closed or the deadline

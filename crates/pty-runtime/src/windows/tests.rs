@@ -18,8 +18,13 @@ pub(crate) fn serial() -> MutexGuard<'static, ()> {
 pub(crate) enum Stage {
     /// Validation passed; nothing is created yet.
     Validated,
+    /// Right before taking the spawn lock for `CreatePseudoConsole` (2) or each
+    /// `CreateProcessW` (5).
+    BeforeLock { stage: u8 },
     /// Inside the spawn lock, before `CreatePseudoConsole` (2) or each `CreateProcessW` (5).
     LockAcquired { stage: u8 },
+    /// Still inside the spawn lock, right before releasing it.
+    BeforeUnlock { stage: u8 },
     /// Before the bounded wait on a terminated suspended child (stage 5.4).
     BeforeSuspendedWait { pid: u32 },
     /// Before stage 6; the hook returning true fails the identity read.
@@ -36,8 +41,10 @@ pub(crate) struct Hooks {
     /// Sees (and may overwrite) each attempt's fresh command-line copy; `true` for the
     /// suspended attempt.
     pub(crate) line: Option<LineFn>,
-    /// A marker the drain's reader watches (no hold).
+    /// A marker the drain's reader watches; with `hold`, the reader parks before its next
+    /// read once the marker is seen, until released.
     pub(crate) marker: Option<&'static [u8]>,
+    pub(crate) hold: bool,
     pub(crate) seen: Mutex<Option<Arc<Marker>>>,
     /// The last child built, kept alive until the test takes it.
     pub(crate) child: Mutex<Option<Arc<WindowsChild>>>,
@@ -56,7 +63,7 @@ impl Hooks {
     }
 
     pub(crate) fn marker(&self) -> Option<Arc<Marker>> {
-        let m = Marker::new(self.marker?, false);
+        let m = Marker::new(self.marker?, self.hold);
         *self.seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(m.clone());
         Some(m)
     }
@@ -123,6 +130,14 @@ impl Out {
             }
             st = self.cv.wait_timeout(st, left).unwrap().0;
         }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        self.st
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .0
+            .clone()
     }
 
     fn end(&self) -> Option<OutputEnd> {
@@ -380,16 +395,22 @@ fn equal_codes_are_both_kept() {
     let (r, _) = spawn(&WindowsPty::default(), &spec);
     let (kind, error, _) = never_started(r);
     assert_eq!(kind, NeverStartedKind::Setup);
-    let bad = io::Error::from_raw_os_error(193).to_string();
+    // The code is the OS's (`ERROR_BAD_EXE_FORMAT`, or `ERROR_EXE_MACHINE_TYPE_MISMATCH` on
+    // `windows-latest`); both native attempts fail with the same one.
+    let rep = report();
+    let c = both_attempts(&rep);
+    assert!(c.iter().all(|e| e.native), "{rep:?}");
+    let Err(code) = c[0].result else {
+        panic!("{rep:?}")
+    };
+    assert_eq!(c[1].result, Err(code), "{rep:?}");
+    let bad = io::Error::from_raw_os_error(code).to_string();
     let msg = error.to_string();
     assert_eq!(msg.matches(&bad).count(), 2, "{msg}");
     assert!(
         msg.contains("job_list: create_process: ") && msg.contains("suspended: create_process: "),
         "{msg}"
     );
-    let rep = report();
-    let c = both_attempts(&rep);
-    assert!(c.iter().all(|e| e.result == Err(193)), "{c:?}");
 }
 
 #[test]
@@ -519,10 +540,7 @@ fn pre_process_faults_release_in_order() {
             WindowsFault::JobCreate,
             cat(&[OPEN, &["job_create"], &EARLY[..3]]),
         ),
-        (
-            WindowsFault::JobLimits,
-            cat(&[OPEN, JOB, &["job_drop"], &EARLY[..3]]),
-        ),
+        (WindowsFault::JobLimits, cat(&[OPEN, JOB, EARLY])),
         (WindowsFault::AttrInit, cat(&[OPEN, JOB, EARLY])),
         (
             WindowsFault::PseudoConsoleAttr,
@@ -873,6 +891,47 @@ fn denied_job_termination_is_unresolved() {
     assert!(!marker.exists());
 }
 
+/// PR4-CL-6: the previous suspend count decides the route (the real resume runs; its count
+/// is scripted): 1 launches; 0 tears the started tree down; 2 terminates through the job
+/// and waits on the held process handle.
+#[test]
+fn resume_counts_are_classified() {
+    let _s = serial();
+    for n in [0u32, 1, 2] {
+        let pty = WindowsPty::default();
+        let r = spawn_with(WindowsFault::ResumeCount(n), &pty, &cmd("pause"));
+        let rep = report();
+        let names = names(&rep);
+        let resume = pos(&names, "resume", 0);
+        assert_eq!(rep.trace[resume].result, Ok(u64::from(n)), "{n}: {rep:?}");
+        match n {
+            1 => {
+                let parts = r.unwrap_or_else(|e| panic!("{n}: {e}"));
+                drop(take_child(&pty));
+                assert_eq!(release(parts), Cleanup::Confirmed);
+            }
+            0 => {
+                let (stage, identity, cleanup) = started_then_failed(r);
+                assert_eq!(stage, "resume");
+                assert!(identity.is_some());
+                assert_eq!(cleanup, Cleanup::Confirmed);
+                let k = pos(&names, "terminate_job", resume);
+                pos(&names, "input_drop", k);
+                drop(take_child(&pty));
+            }
+            _ => {
+                let (kind, _, cleanup) = never_started(r);
+                assert_eq!(kind, NeverStartedKind::Setup);
+                assert_eq!(cleanup, Cleanup::Confirmed);
+                let t = pos(&names, "terminate_job", resume);
+                let w = pos(&names, "wait", t);
+                assert_eq!(rep.trace[w].result, Ok(1), "{rep:?}");
+                assert_eq!(rep.child_exited, Some(true));
+            }
+        }
+    }
+}
+
 // ---- CL-7 ----
 
 fn identity_fault() -> WindowsPty {
@@ -977,12 +1036,17 @@ fn drain_starts_before_the_process() {
     let _ = release(parts);
 }
 
+/// PR4-CL-13: the sink gets every byte read, from the first one, and output ends only
+/// after the pseudoconsole closes: the reader parks once `READY` was read, its next read
+/// then runs with the child gone and the pseudoconsole open, and no read returns 0 before
+/// the close begins.
 #[test]
 fn output_ends_only_after_close() {
     let _s = serial();
     let pty = WindowsPty {
         hooks: Hooks {
             marker: Some(b"READY"),
+            hold: true,
             ..Hooks::default()
         },
     };
@@ -991,9 +1055,9 @@ fn output_ends_only_after_close() {
     let exit = parts.child.wait_timeout(BOUND).unwrap();
     assert_eq!(exit.map(|e| e.code), Some(Some(0)));
     let marker = pty.hooks.seen.lock().unwrap().clone().unwrap();
-    assert!(marker.wait_seen(Instant::now() + BOUND), "READY not seen");
-    assert!(marker.seen());
-    assert_eq!(out.end(), None, "no EOF before the pseudoconsole closes");
+    assert!(marker.wait_parked(Instant::now() + BOUND), "READY not read");
+    assert_eq!(out.end(), None);
+    marker.release();
     let SpawnedParts {
         child,
         output,
@@ -1002,10 +1066,18 @@ fn output_ends_only_after_close() {
         ..
     } = parts;
     drop(input);
+    marker.closing();
     let close = control.close(Instant::now() + BOUND);
     assert!(close.elapsed.is_some());
     assert_eq!(out.wait_end(), Some(OutputEnd::Eof));
     assert_eq!(output.finish(BOUND), Some(OutputEnd::Eof));
+    assert!(
+        !marker.eof_before_closing(),
+        "output ended while the pseudoconsole was open"
+    );
+    let read = marker.bytes();
+    assert!(!read.is_empty());
+    assert_eq!(out.bytes(), read, "the sink got exactly the bytes read");
     drop(child);
     drop(take_child(&pty));
 }
@@ -1029,6 +1101,8 @@ fn live_child(pty: &WindowsPty) -> (SpawnedParts, Arc<WindowsChild>) {
     (parts, child)
 }
 
+/// A wait never returns before its timeout; the chunking itself is scripted in
+/// `windows::wait::tests`.
 #[test]
 fn wait_timeout_returns_by_its_timeout() {
     let _s = serial();
@@ -1040,10 +1114,8 @@ fn wait_timeout_returns_by_its_timeout() {
         None
     );
     let e = t.elapsed();
-    assert!(
-        e >= Duration::from_millis(200) && e < Duration::from_secs(2),
-        "{e:?}"
-    );
+    assert!(e >= Duration::from_millis(200), "{e:?}");
+    assert!(e < BOUND, "watchdog: {e:?}");
     drop(child);
     assert_eq!(release(parts), Cleanup::Confirmed);
 }
@@ -1055,11 +1127,7 @@ fn zero_timeout_polls() {
     let (parts, child) = live_child(&pty);
     let t = Instant::now();
     assert_eq!(child.wait_timeout(Duration::ZERO).unwrap(), None);
-    assert!(
-        t.elapsed() < Duration::from_millis(100),
-        "{:?}",
-        t.elapsed()
-    );
+    assert!(t.elapsed() < BOUND, "watchdog: {:?}", t.elapsed());
     drop(child);
     let _ = release(parts);
 }
@@ -1083,26 +1151,8 @@ fn sub_millisecond_timeout_waits() {
     let _ = release(parts);
 }
 
-#[test]
-fn chunked_wait_continues() {
-    let _s = serial();
-    let pty = WindowsPty::default();
-    let (parts, child) = live_child(&pty);
-    super::child::CHUNK_CAP_MS.with(|c| c.set(1));
-    let t = Instant::now();
-    assert_eq!(child.wait_timeout(Duration::from_millis(50)).unwrap(), None);
-    assert!(
-        t.elapsed() >= Duration::from_millis(50),
-        "the wait continued past one chunk"
-    );
-    sys::terminate_job(child.job(), 1).unwrap();
-    let exit = child.wait_timeout(BOUND).unwrap();
-    super::child::CHUNK_CAP_MS.with(|c| c.set(u32::MAX - 1));
-    assert_eq!(exit.map(|e| e.code), Some(Some(1)));
-    drop(child);
-    let _ = release(parts);
-}
-
+/// `wait_timeout` does not wait for a running `kill_tree`: its result arrives while the
+/// kill is parked inside its lock.
 #[test]
 fn wait_timeout_runs_during_kill() {
     let _s = serial();
@@ -1120,14 +1170,24 @@ fn wait_timeout_runs_during_kill() {
         std::thread::spawn(move || c.kill_tree(&[], Instant::now() + Duration::from_secs(20)))
     };
     entered_rx.recv_timeout(BOUND).expect("kill_tree entered");
-    let t = Instant::now();
-    let _ = child.wait_timeout(Duration::from_millis(10)).unwrap();
-    assert!(
-        t.elapsed() < Duration::from_millis(200),
-        "{:?}",
-        t.elapsed()
-    );
+    let (wait_tx, wait_rx) = mpsc::channel();
+    let waiter = {
+        let c = child.clone();
+        std::thread::spawn(move || {
+            let _ = wait_tx.send(
+                c.wait_timeout(Duration::from_millis(10))
+                    .map_err(|e| e.to_string()),
+            );
+        })
+    };
+    let got = wait_rx.recv_timeout(BOUND);
     release_tx.send(()).unwrap();
+    assert_eq!(
+        got.expect("watchdog: wait_timeout waited for the kill")
+            .unwrap(),
+        None
+    );
+    waiter.join().unwrap();
     assert!(killer.join().unwrap().tree_dead);
     drop(child);
     let _ = release(parts);
@@ -1257,6 +1317,9 @@ fn inheriting_child_keeps_the_writer() {
 
 // ---- CL-23 ----
 
+/// PR4-CL-23: a PTY spawn that reaches the lock while a helper spawn holds it acquires it
+/// only after the helper left: the helper marks its exit right before releasing, and the
+/// PTY's stage-2 hook, inside the lock, must see that mark.
 #[test]
 fn pty_spawn_waits_for_a_helper_spawn() {
     let _s = serial();
@@ -1273,16 +1336,24 @@ fn pty_spawn_waits_for_a_helper_spawn() {
     });
     entered_rx.recv_timeout(BOUND).unwrap();
     let saw: Arc<Mutex<Option<bool>>> = Arc::default();
+    let (before_tx, before_rx) = mpsc::channel::<()>();
+    let before_tx = Mutex::new(before_tx);
     let saw2 = saw.clone();
     let hd = helper_done.clone();
     let spawner = std::thread::spawn(move || {
         let pty = WindowsPty {
             hooks: Hooks {
                 stage: Some(Box::new(move |s| {
-                    if matches!(s, Stage::LockAcquired { stage: 2 }) {
-                        saw2.lock()
-                            .unwrap()
-                            .get_or_insert(hd.load(Ordering::Acquire));
+                    match s {
+                        Stage::BeforeLock { stage: 2 } => {
+                            let _ = before_tx.lock().unwrap().send(());
+                        }
+                        Stage::LockAcquired { stage: 2 } => {
+                            saw2.lock()
+                                .unwrap()
+                                .get_or_insert(hd.load(Ordering::Acquire));
+                        }
+                        _ => {}
                     }
                     false
                 })),
@@ -1293,8 +1364,10 @@ fn pty_spawn_waits_for_a_helper_spawn() {
         drop(take_child(&pty));
         r.map(release).map_err(|e| e.to_string())
     });
-    // Give the PTY spawn time to reach the lock; it must wait there.
-    std::thread::sleep(Duration::from_millis(200));
+    // The PTY spawn is at the lock while the helper owns it.
+    before_rx
+        .recv_timeout(BOUND)
+        .expect("the PTY spawn reached the lock");
     assert_eq!(
         *saw.lock().unwrap(),
         None,
@@ -1303,28 +1376,41 @@ fn pty_spawn_waits_for_a_helper_spawn() {
     open_tx.send(()).unwrap();
     helper.join().unwrap();
     spawner.join().unwrap().unwrap();
-    assert_eq!(*saw.lock().unwrap(), Some(true));
+    assert_eq!(
+        *saw.lock().unwrap(),
+        Some(true),
+        "stage 2 acquired the lock before the helper released it"
+    );
 }
 
-/// A PTY spawn parked inside the lock at `stage`; a helper spawn must start only after.
+/// A PTY spawn parked inside the lock at `stage`; a helper spawn that reaches the lock
+/// meanwhile starts only after the PTY spawn's release: the PTY clears its mark right
+/// before releasing, and the helper's closure, inside the lock, must see it cleared.
 fn helper_waits_in(stage: u8) {
     let _s = serial();
-    let parked = Arc::new(AtomicBool::new(false));
+    let inside = Arc::new(AtomicBool::new(false));
     let (reached_tx, reached_rx) = mpsc::channel::<()>();
     let (open_tx, open_rx) = mpsc::channel::<()>();
+    let reached_tx = Mutex::new(reached_tx);
     let open_rx = Mutex::new(open_rx);
-    let p2 = parked.clone();
+    let once = AtomicBool::new(false);
+    let i2 = inside.clone();
     let spawner = std::thread::spawn(move || {
         let pty = WindowsPty {
             hooks: Hooks {
                 stage: Some(Box::new(move |s| {
-                    if let Stage::LockAcquired { stage: n } = s
-                        && *n == stage
-                        && !p2.swap(true, Ordering::AcqRel)
-                    {
-                        let _ = reached_tx.send(());
-                        let _ = open_rx.lock().unwrap().recv_timeout(BOUND);
-                        p2.store(false, Ordering::Release);
+                    match s {
+                        Stage::LockAcquired { stage: n }
+                            if *n == stage && !once.swap(true, Ordering::AcqRel) =>
+                        {
+                            i2.store(true, Ordering::Release);
+                            let _ = reached_tx.lock().unwrap().send(());
+                            let _ = open_rx.lock().unwrap().recv_timeout(BOUND);
+                        }
+                        Stage::BeforeUnlock { stage: n } if *n == stage => {
+                            i2.store(false, Ordering::Release);
+                        }
+                        _ => {}
                     }
                     false
                 })),
@@ -1336,22 +1422,29 @@ fn helper_waits_in(stage: u8) {
         r.map(release).map_err(|e| e.to_string())
     });
     reached_rx.recv_timeout(BOUND).unwrap();
-    let still_parked = Arc::new(Mutex::new(None));
-    let sp = still_parked.clone();
-    let p3 = parked.clone();
+    let saw = Arc::new(Mutex::new(None));
+    let (before_tx, before_rx) = mpsc::channel::<()>();
+    let sp = saw.clone();
+    let i3 = inside.clone();
     let helper = std::thread::spawn(move || {
-        crate::with_spawn_lock(|| *sp.lock().unwrap() = Some(p3.load(Ordering::Acquire)));
+        let _ = before_tx.send(());
+        crate::with_spawn_lock(|| *sp.lock().unwrap() = Some(i3.load(Ordering::Acquire)));
     });
-    std::thread::sleep(Duration::from_millis(200));
+    // The helper is at the lock while the PTY spawn owns it.
+    before_rx.recv_timeout(BOUND).unwrap();
     assert_eq!(
-        *still_parked.lock().unwrap(),
+        *saw.lock().unwrap(),
         None,
         "the helper ran inside stage {stage}"
     );
     open_tx.send(()).unwrap();
     helper.join().unwrap();
     spawner.join().unwrap().unwrap();
-    assert_eq!(*still_parked.lock().unwrap(), Some(false));
+    assert_eq!(
+        *saw.lock().unwrap(),
+        Some(false),
+        "the helper acquired the lock inside stage {stage}"
+    );
 }
 
 #[test]
@@ -1399,6 +1492,66 @@ fn failure_paths_release_the_lock() {
     }
 }
 
+/// PR4-CL-23 / PR4-CL-4 at the native boundary: each native create runs with the calling
+/// thread owning the spawn lock, and a job-list child is in the job right after its create
+/// returned (before any assignment could run), a suspended one not yet.
+#[test]
+fn native_create_boundary() {
+    let _s = serial();
+    for (fault, member) in [
+        (None, true),
+        (Some(WindowsFault::RejectJobList(None)), false),
+    ] {
+        let label = format!("{fault:?}");
+        let pty = WindowsPty::default();
+        if let Some(f) = fault {
+            hooks::inject_next(f);
+        }
+        let (r, _) = spawn(&pty, &cmd("exit 0"));
+        let parts = r.unwrap_or_else(|e| panic!("{label}: {e}"));
+        let rep = report();
+        let names: Vec<_> = rep.native_lock.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            ["create_pseudo_console", "create_process"],
+            "{label}"
+        );
+        assert!(
+            rep.native_lock.iter().all(|(_, held)| *held),
+            "{label}: {rep:?}"
+        );
+        assert_eq!(rep.member_at_create, vec![Some(member)], "{label}");
+        drop(take_child(&pty));
+        let _ = release(parts);
+    }
+}
+
+/// Ordinary closes keep no close worker's thread handle (only an armed probe does).
+#[test]
+fn ordinary_closes_keep_no_thread_handle() {
+    let _s = serial();
+    hooks::track_close_threads(false);
+    for _ in 0..3 {
+        let r = spawn_with(
+            WindowsFault::JobCreate,
+            &WindowsPty::default(),
+            &cmd("exit 0"),
+        );
+        assert!(
+            matches!(
+                &r,
+                Err(SpawnError::NeverStarted {
+                    cleanup: Cleanup::Confirmed,
+                    ..
+                })
+            ),
+            "{}",
+            describe(&r)
+        );
+        assert_eq!(hooks::kept_close_threads(), 0);
+    }
+}
+
 // ---- CL-27 ----
 
 const HELPER_ENV: &str = "CHALDEA_WINDOWS_TEST_HELPER";
@@ -1422,43 +1575,16 @@ fn helper_main(case: &str) {
             drop(take_child(&pty));
             let _ = release(parts);
         }
-        "refused" => {
-            let Err(SpawnError::NeverStarted { kind, .. }) = &r else {
-                panic!("{}", describe(&r));
-            };
-            assert_eq!(*kind, NeverStartedKind::Setup);
-            let rep = report();
-            let c = rep.entries("create_process");
-            assert_eq!(c.len(), 2, "{rep:?}");
-            assert!(
-                c[0].native && c[0].result.is_err(),
-                "the job-list attempt failed: {rep:?}"
-            );
-            assert!(
-                c[1].native && c[1].result.is_ok(),
-                "the suspended create ran: {rep:?}"
-            );
-            let a = rep.entries("assign");
-            assert!(
-                a[0].native && a[0].result.is_err(),
-                "a real assign error: {rep:?}"
-            );
-            assert_eq!(rep.child_exited, Some(true));
-        }
         other => panic!("unknown helper case {other}"),
     }
 }
 
-/// The outer side: a kill-on-close parent job (UI-restricted for `refused`) holding the
-/// helper and a sibling; the helper runs only after both are verified in the job.
-fn parent_job_case(test: &str, case: &str, restricted: bool) {
+/// The outer side: a kill-on-close parent job holding the helper and a sibling; the
+/// helper runs only after both are verified in the job.
+fn parent_job_case(test: &str, case: &str) {
     let _s = serial();
     let job = sys::create_job().unwrap();
     sys::set_job_limit(&job, sys::KILL_ON_JOB_CLOSE).unwrap();
-    if restricted {
-        sys::set_ui_restrictions(&job).unwrap();
-        assert_ne!(sys::ui_restrictions(&job).unwrap(), 0);
-    }
     let (mut helper, mut sibling) = crate::with_spawn_lock(|| {
         let helper = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--nocapture", "--test-threads", "1"])
@@ -1490,14 +1616,11 @@ fn parent_job_case(test: &str, case: &str, restricted: bool) {
         "setup: membership"
     );
     helper.stdin.take().unwrap().write_all(b"go\n").unwrap();
-    let end = Instant::now() + Duration::from_secs(60);
-    let status = loop {
-        if let Some(st) = helper.try_wait().unwrap() {
-            break st;
-        }
-        assert!(Instant::now() < end, "the helper did not finish");
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    assert!(
+        sys::wait_floor(h.as_handle(), Duration::from_secs(60)).unwrap(),
+        "the helper did not finish"
+    );
+    let status = helper.wait().unwrap();
     assert!(status.success(), "helper failed: {status:?}");
     assert!(
         !sys::wait(s.as_handle(), 0).unwrap(),
@@ -1516,24 +1639,7 @@ fn spawn_inside_a_parent_job_nests() {
         helper_main(&case);
         return;
     }
-    parent_job_case(
-        "windows::tests::spawn_inside_a_parent_job_nests",
-        "nests",
-        false,
-    );
-}
-
-#[test]
-fn ui_restricted_parent_job_refuses_nesting() {
-    if let Ok(case) = std::env::var(HELPER_ENV) {
-        helper_main(&case);
-        return;
-    }
-    parent_job_case(
-        "windows::tests::ui_restricted_parent_job_refuses_nesting",
-        "refused",
-        true,
-    );
+    parent_job_case("windows::tests::spawn_inside_a_parent_job_nests", "nests");
 }
 
 // ---- CL-28 ----

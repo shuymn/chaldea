@@ -8,25 +8,11 @@ use std::time::{Duration, Instant};
 
 use super::kill::{self, Access, JobOs, KillState, Leader, PidList};
 use super::sys;
+use super::wait::{self, MAX_CHUNK_MS};
 use crate::backend::{ChildExit, KillReport, ProcessIdentity, PtyChild};
 
-/// The longest single wait of `wait_timeout` (below `INFINITE`).
-const MAX_CHUNK_MS: u32 = u32::MAX - 1;
 /// The exit code of a killed process.
 pub(crate) const KILL_CODE: u32 = 1;
-
-#[cfg(test)]
-thread_local! {
-    /// Caps each `wait_timeout` chunk (tests: CL-15 `chunked_wait_continues`).
-    pub(crate) static CHUNK_CAP_MS: std::cell::Cell<u32> = const { std::cell::Cell::new(MAX_CHUNK_MS) };
-}
-
-fn chunk_cap() -> u32 {
-    #[cfg(test)]
-    return CHUNK_CAP_MS.with(std::cell::Cell::get);
-    #[cfg(not(test))]
-    MAX_CHUNK_MS
-}
 
 pub(crate) struct WindowsChild {
     process: OwnedHandle,
@@ -73,11 +59,6 @@ impl WindowsChild {
             in_kill: Mutex::new(None),
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn job(&self) -> &OwnedHandle {
-        &self.job
-    }
 }
 
 impl PtyChild for WindowsChild {
@@ -89,36 +70,18 @@ impl PtyChild for WindowsChild {
         if let Some(e) = self.exit.get() {
             return Ok(Some(*e));
         }
-        let end = Instant::now() + timeout;
-        let mut first = true;
-        loop {
-            let left = end.saturating_duration_since(Instant::now());
-            if left.is_zero() && !first {
-                return Ok(None);
-            }
-            // A zero timeout is one poll; otherwise a sub-millisecond remainder rounds up to
-            // 1 ms, never to `INFINITE`.
-            let ms = if timeout.is_zero() {
-                0
-            } else {
-                let ceil = left.as_nanos().div_ceil(1_000_000);
-                u32::try_from(ceil)
-                    .unwrap_or(u32::MAX)
-                    .clamp(1, chunk_cap())
-            };
-            first = false;
-            if sys::wait(self.process.as_handle(), ms)? {
-                let code = sys::exit_code(&self.process)?;
-                let e = ChildExit {
-                    code: Some(code.cast_signed()),
-                    signal: None,
-                };
-                return Ok(Some(*self.exit.get_or_init(|| e)));
-            }
-            if timeout.is_zero() {
-                return Ok(None);
-            }
+        let signalled = wait::chunked(timeout, Instant::now(), Instant::now, MAX_CHUNK_MS, |ms| {
+            sys::wait(self.process.as_handle(), ms)
+        })?;
+        if !signalled {
+            return Ok(None);
         }
+        let code = sys::exit_code(&self.process)?;
+        let e = ChildExit {
+            code: Some(code.cast_signed()),
+            signal: None,
+        };
+        Ok(Some(*self.exit.get_or_init(|| e)))
     }
 
     fn kill_tree(&self, extra: &[ProcessIdentity], deadline: Instant) -> KillReport {
@@ -213,14 +176,6 @@ impl JobOs for RealJobOs<'_> {
     }
 
     fn terminate(&self, h: &OwnedHandle) -> io::Result<()> {
-        match sys::terminate_process(h, KILL_CODE) {
-            Err(e)
-                if e.raw_os_error() == Some(super::ERROR_ACCESS_DENIED)
-                    && sys::wait(h.as_handle(), 0).unwrap_or(false) =>
-            {
-                Ok(())
-            }
-            r => r,
-        }
+        sys::terminate_process(h, KILL_CODE)
     }
 }

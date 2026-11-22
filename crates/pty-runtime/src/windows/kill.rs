@@ -56,7 +56,8 @@ pub(crate) trait JobOs {
     fn in_job(&self, h: &Self::Held) -> io::Result<bool>;
     /// A zero wait polls; the engine passes whole milliseconds.
     fn signalled(&self, h: &Self::Held, wait: Duration) -> io::Result<bool>;
-    /// `ACCESS_DENIED` after exit is not an error.
+    /// One termination call; its result is never proof (the proof rounds observe the
+    /// handle's signal).
     fn terminate(&self, h: &Self::Held) -> io::Result<()>;
 }
 
@@ -115,11 +116,18 @@ fn pace(os: &impl JobOs, deadline: Instant) {
     }
 }
 
-/// A handle wait of at most `cap` within the deadline, floored to whole milliseconds; a
-/// budget under 1 ms polls.
-fn budget(os: &impl JobOs, deadline: Instant, cap: Duration) -> Duration {
-    let left = deadline.saturating_duration_since(os.now()).min(cap);
-    Duration::from_millis(u64::try_from(left.as_millis()).unwrap_or(u64::MAX))
+/// A handle wait of at most `cap` within the deadline, from one clock read, floored to
+/// whole milliseconds: `None` when the deadline has passed (no call), a zero wait (a poll)
+/// when less than 1 ms remains.
+fn budget(os: &impl JobOs, deadline: Instant, cap: Duration) -> Option<Duration> {
+    let now = os.now();
+    if now >= deadline {
+        return None;
+    }
+    let left = (deadline - now).min(cap);
+    Some(Duration::from_millis(
+        u64::try_from(left.as_millis()).unwrap_or(u64::MAX),
+    ))
 }
 
 /// Opens `pid` and checks its creation time on that same handle, checking the clock before
@@ -382,13 +390,9 @@ pub(crate) fn kill_tree<O: JobOs>(
         for w in &wanted {
             if !call.resolved.contains(w) && call.open(&mut st, *w) {
                 progress = true;
-                if let Some(h) = st.held.get(w)
-                    && !call.expired()
-                {
-                    let _ = os.terminate(h);
-                }
             }
         }
+        // One termination per held handle, newly opened ones included.
         call.terminate_held(&st);
         // 5.2 Job.
         if call.expired() {
@@ -510,10 +514,9 @@ impl<O: JobOs> Call<'_, O> {
     fn wait_handles(&mut self, st: &mut KillState<O::Held>) -> bool {
         let mut any = false;
         if !self.leader_dead {
-            if self.expired() {
+            let Some(wait) = budget(self.os, self.deadline, PROOF_WAIT) else {
                 return any;
-            }
-            let wait = budget(self.os, self.deadline, PROOF_WAIT);
+            };
             if self.os.signalled(self.leader.handle, wait).unwrap_or(false) {
                 self.leader_dead = true;
                 any = true;
@@ -521,10 +524,9 @@ impl<O: JobOs> Call<'_, O> {
         }
         let keys: Vec<(u32, u64)> = st.held.keys().copied().collect();
         for k in keys {
-            if self.expired() {
+            let Some(wait) = budget(self.os, self.deadline, PROOF_WAIT) else {
                 break;
-            }
-            let wait = budget(self.os, self.deadline, PROOF_WAIT);
+            };
             if st
                 .held
                 .get(&k)
@@ -1210,6 +1212,82 @@ mod tests {
         );
         assert!(waits.contains(&Duration::ZERO), "{:?}", os.calls());
         assert!(os.now() <= deadline);
+    }
+
+    /// The wait budget comes from one clock read: an expired deadline makes no call, any
+    /// positive remainder under 1 ms polls, a larger one is floored and capped.
+    #[test]
+    fn budget_separates_expiry_from_a_sub_millisecond_remainder() {
+        let os = Os::new();
+        let cap = PROOF_WAIT;
+        let at = |d: Duration| os.base + d;
+        assert_eq!(budget(&os, at(Duration::ZERO), cap), None);
+        assert_eq!(
+            budget(&os, at(Duration::from_nanos(1)), cap),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            budget(&os, at(Duration::from_micros(1_500)), cap),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(budget(&os, at(Duration::from_secs(1)), cap), Some(cap));
+    }
+
+    /// A deadline reached right before the proof waits makes no wait call at all; one
+    /// nanosecond before it, the leader is polled.
+    #[test]
+    fn proof_waits_at_both_deadline_boundaries() {
+        for (left, polls) in [(Duration::ZERO, false), (Duration::from_nanos(1), true)] {
+            let os = Os::new();
+            os.add(300, proc(7, true));
+            let deadline = os.at(1_000);
+            // The proof round's count read (the second; the opening check made the first)
+            // reads 0, and the clock jumps to `deadline - left` on it.
+            let reads = Cell::new(0);
+            *os.hook.borrow_mut() = Some(Box::new(move |c, os| {
+                if *c == C::Active {
+                    reads.set(reads.get() + 1);
+                    if reads.get() == 2 {
+                        os.now.set(Duration::from_secs(1) - left);
+                    }
+                }
+            }));
+            let r = os.kill(&[], deadline, &state());
+            let calls = os.calls();
+            let after = calls
+                .iter()
+                .skip_while(|c| **c != C::Active)
+                .skip(1)
+                .skip_while(|c| **c != C::Active)
+                .skip(1);
+            let waits: Vec<&C> = after.filter(|c| matches!(c, C::Signalled(..))).collect();
+            if polls {
+                assert_eq!(
+                    waits.first(),
+                    Some(&&C::Signalled(L, Duration::ZERO)),
+                    "{calls:?}"
+                );
+            } else {
+                assert!(waits.is_empty(), "a wait after the deadline: {calls:?}");
+                assert!(!r.tree_dead);
+            }
+        }
+    }
+
+    /// An extra first resolved in a proof round is terminated once in that round.
+    #[test]
+    fn new_extra_is_terminated_once() {
+        let os = Os::new();
+        os.add(200, proc(5, false));
+        os.set(200, |p| p.open_error = Some(31));
+        *os.hook.borrow_mut() = Some(Box::new(|c, os| {
+            if *c == C::TerminateJob {
+                os.set(200, |p| p.open_error = None);
+            }
+        }));
+        let r = os.kill(&[id(200, 5)], os.at(1_000), &state());
+        assert!(r.tree_dead, "{r:?}");
+        assert_eq!(os.count(|c| *c == C::Terminate(200)), 1, "{:?}", os.calls());
     }
 
     #[test]

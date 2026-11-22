@@ -277,6 +277,8 @@ fn report_process_writes_the_file() {
     assert!(!std::path::Path::new(&format!("{path}.tmp")).exists());
 }
 
+/// Each `emit` writes one numbered line; its `output` event acknowledges a completed write
+/// (the line is already in the pipe).
 #[test]
 fn emit_output_reports_lines() {
     let l = ReportListener::bind().unwrap();
@@ -300,15 +302,47 @@ fn emit_output_reports_lines() {
     let mut f = l.accept(soon()).unwrap();
     let mut lines = std::io::BufRead::lines(std::io::BufReader::new(stdout));
     for n in 0..3u64 {
+        f.send("emit").unwrap();
         let ev = f.next_event(soon()).unwrap().unwrap();
         assert_eq!(
             (&ev["event"], &ev["n"]),
             (&"output".into(), &n.into()),
             "{ev}"
         );
-        // The event acknowledges a completed write: the line is already in the pipe.
         assert_eq!(lines.next().unwrap().unwrap(), format!("OUTPUT-{n}"));
     }
+}
+
+/// PR4-CL-24: a write that fails (the stdout reader is gone) is never acknowledged as
+/// `output`.
+#[test]
+fn failed_emit_is_not_acknowledged() {
+    let l = ReportListener::bind().unwrap();
+    let mut cl = cleanup();
+    let report = l.arg();
+    let mut c = fake(&[
+        "--mode",
+        "spawn-tree",
+        "--roles",
+        "none",
+        "--emit-output",
+        "--report",
+        &report,
+        "--max-life-secs",
+        "60",
+    ]);
+    c.stdout(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    drop(child.stdout.take());
+    cl.own(child);
+    let mut f = l.accept(soon()).unwrap();
+    f.send("emit").unwrap();
+    let ev = f.next_event(soon()).unwrap().unwrap();
+    assert_eq!(
+        (&ev["event"], &ev["n"]),
+        (&"output_failed".into(), &0.into()),
+        "{ev}"
+    );
 }
 
 #[test]

@@ -774,12 +774,45 @@ pub fn process_handle_count() -> Option<u32> {
     crate::windows::sys_handle_count()
 }
 
-/// Waits (bounded by `timeout`) for the threads of close workers whose close returned;
-/// true when all have exited.
+/// Starts (`true`) or stops keeping the handles of close workers whose close returned, for
+/// [`windows_close_threads_exited`]; ordinary closes drop them.
+#[cfg(windows)]
+pub fn windows_track_close_threads(on: bool) {
+    crate::windows::hooks::track_close_threads(on);
+}
+
+/// Waits (bounded by `timeout`) for the tracked threads of close workers whose close
+/// returned; true when all have exited.
 #[cfg(windows)]
 #[must_use]
 pub fn windows_close_threads_exited(timeout: Duration) -> bool {
     crate::windows::hooks::close_threads_exited(timeout)
+}
+
+/// Whether the drain's reader of the last `AfterSpawn` / `HoldOutput` spawn is parked in
+/// its hold by `deadline`.
+#[cfg(windows)]
+#[must_use]
+pub fn windows_output_parked(deadline: Instant) -> bool {
+    crate::windows::hooks::output_parked(deadline)
+}
+
+/// Whether the drain's reader of the last `HoldOutput` spawn was parked when the control's
+/// close began; `None` before that close.
+#[cfg(windows)]
+#[must_use]
+pub fn windows_output_parked_at_close() -> Option<bool> {
+    crate::windows::hooks::output_parked_at_close()
+}
+
+/// `ActiveProcesses` of the job of the live session led by `leader_pid`.
+///
+/// # Errors
+///
+/// No live session has that leader, or the query failed.
+#[cfg(windows)]
+pub fn windows_job_active(leader_pid: u32) -> io::Result<u32> {
+    crate::windows::hooks::job_active(leader_pid)
 }
 
 /// Whether `pid` is in the job of the live session led by `leader_pid`.
