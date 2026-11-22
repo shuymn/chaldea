@@ -84,7 +84,8 @@ struct Pass {
     covered: HashSet<u32>,
     /// Live processes this pass read that are not covered (yet), by parent pid.
     pending: HashMap<u32, Vec<Proc>>,
-    /// The parent pid each pending process waits under.
+    /// The parent pid each pending process waits under; a pending process the pass read
+    /// resolved is no longer here.
     waiting: HashMap<u32, u32>,
 }
 
@@ -249,26 +250,35 @@ impl<O: Os> Call<'_, O> {
         r
     }
 
-    /// Retains `p` and, within `pass`, every pending descendant of it.
+    /// Retains `p` and, within `pass`, every pending descendant of it. A pending process
+    /// the pass has since read resolved is not retained, but the ancestry it was read with
+    /// still leads to its own pending children.
     fn cover(&mut self, st: &mut KillState, p: Proc, pass: Option<&mut Pass>) {
-        let mut work = vec![p];
+        let mut work = vec![(p, true)];
         let mut pass = pass;
-        while let Some(p) = work.pop() {
-            st.targets.insert((p.pid, p.start), p.pgid);
-            self.unknown.remove(&p.pid);
+        while let Some((p, retain)) = work.pop() {
+            if retain {
+                st.targets.insert((p.pid, p.start), p.pgid);
+                self.unknown.remove(&p.pid);
+            }
             if let Some(ps) = pass.as_deref_mut() {
-                ps.alive = true;
-                ps.waiting.remove(&p.pid);
+                if retain {
+                    ps.alive = true;
+                    ps.waiting.remove(&p.pid);
+                }
                 if ps.covered.insert(p.pid) {
-                    work.extend(ps.pending.remove(&p.pid).unwrap_or_default());
+                    for c in ps.pending.remove(&p.pid).unwrap_or_default() {
+                        let waiting = ps.waiting.remove(&c.pid).is_some();
+                        work.push((c, waiting));
+                    }
                 }
             }
         }
     }
 
     /// Removes the identities at `pid` that a read disproved: all of them, or all but the
-    /// generation `keep` that the read showed live. A process gone from the pass's pending
-    /// records is dropped there too, so covering its parent cannot bring it back.
+    /// generation `keep` that the read showed live. A pending process the read shows gone
+    /// stops waiting, so covering its parent cannot retain it (see [`Call::cover`]).
     fn resolve(
         &mut self,
         st: &mut KillState,
@@ -288,11 +298,8 @@ impl<O: Os> Call<'_, O> {
         if keep.is_none() {
             self.unknown.remove(&pid);
             self.last_live.remove(&pid);
-            if let Some(ps) = pass
-                && let Some(ppid) = ps.waiting.remove(&pid)
-                && let Some(list) = ps.pending.get_mut(&ppid)
-            {
-                list.retain(|c| c.pid != pid);
+            if let Some(ps) = pass {
+                ps.waiting.remove(&pid);
             }
         }
     }
@@ -1945,9 +1952,10 @@ mod tests {
     #[test]
     fn member_read_before_the_ownership_check_is_retained() {
         // The deadline passes right after M's `getsid`, before any later ownership check.
-        // M is reparented and leads its own group: only its session covers it.
+        // M is reparented and in another group of the session: only its session covers
+        // it.
         let sim = Sim::new();
-        sim.world.borrow_mut().add(200, 1, 200, L, 2_000).dies = [false; 3];
+        sim.world.borrow_mut().add(200, 1, 150, L, 2_000).dies = [false; 3];
         jump_at(&sim, Ev::Getsid(200));
         let st = state();
         assert!(!sim.kill(&[], 1_000, &st).tree_dead);
@@ -2230,5 +2238,29 @@ mod tests {
         assert!(!sim.log().iter().any(|e| matches!(e, Ev::Lookup(_))));
         assert!(r.survivors.iter().all(|s| s.pid != L), "{r:?}");
         assert!(st.lock().unwrap().targets.is_empty());
+    }
+
+    #[test]
+    fn resolved_pending_parent_still_leads_to_its_child() {
+        // The list reaches D (pid 260), then its parent C (pid 280), then C's parent P (pid
+        // 300), a recorded escapee. C exits before its `getsid`. Reading P retains D through
+        // the ancestry already read, but not C. The deadline passes right after P is read.
+        let sim = Sim::new();
+        sim.world.borrow_mut().procs.get_mut(&L).unwrap().st = St::Zombie;
+        sim.world.borrow_mut().add(300, 1, 300, 300, 3_000).dies = [false; 3];
+        sim.world.borrow_mut().add(280, 300, 280, 280, 2_800);
+        sim.world.borrow_mut().add(260, 280, 260, 260, 2_600).dies = [false; 3];
+        sim.on(|w, ev| {
+            if ev == Ev::Getsid(280) {
+                w.exit(280);
+            }
+        });
+        jump_at(&sim, Ev::Lookup(300));
+        let st = state();
+        let r = sim.kill(&[sim.identity(300)], 1_000, &st);
+        assert!(!r.tree_dead, "{r:?}");
+        let targets = st.lock().unwrap().targets.clone();
+        assert!(!targets.contains_key(&(280, 2_800)), "{targets:?}");
+        assert!(targets.contains_key(&(260, 2_600)), "{targets:?}");
     }
 }
