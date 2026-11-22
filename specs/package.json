@@ -1,0 +1,16 @@
+{
+  "name": "chaldea-specs",
+  "private": true,
+  "description": "Quint specs of Chaldea's design contracts (docs/design/formal-specs.md)",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "quint typecheck thread_input.qnt && quint typecheck thread_input_traces.qnt",
+    "simulate": "node scripts/simulate.mjs",
+    "traces:check": "node scripts/traces.mjs",
+    "traces:write": "node scripts/traces.mjs --write"
+  },
+  "devDependencies": {
+    "@informalsystems/quint": "0.33.1"
+  }
+}

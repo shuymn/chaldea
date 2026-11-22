@@ -101,6 +101,55 @@ jobs:
           bad="$(awk '/^chaldea-/ && !/^chaldea-(testkit|core) /' <<<"$deps")"
           [ -z "$bad" ] || { echo "testkit depends on: $bad"; exit 1; }
 
+  # The Quint specs (docs/design/formal-specs.md): typecheck, seeded simulation of every
+  # invariant, and the check that specs/traces/ equals what the spec exports. The traces
+  # are replayed against the reducers by the workspace job's tests, which need no Node.
+  specs:
+    name: specs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
+        with:
+          version: 2026.10.17
+          install: false
+          cache: false
+
+      # Only Node and pnpm: Quint comes from specs/pnpm-lock.yaml.
+      - name: Install Node and pnpm
+        env:
+          MISE_YES: 1
+        run: |
+          mise trust mise.toml >/dev/null
+          mise install --locked node pnpm
+
+      # specs/pnpm-workspace.yaml denies every dependency build script.
+      - name: Install Quint
+        working-directory: specs
+        run: mise exec -- pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        working-directory: specs
+        run: mise exec -- pnpm run typecheck
+
+      - name: Simulate
+        working-directory: specs
+        run: mise exec -- pnpm run simulate
+
+      - name: Check traces
+        working-directory: specs
+        run: mise exec -- pnpm run traces:check
+
   pty-hooks:
     name: pty-hooks (${{ matrix.os }})
     strategy:
