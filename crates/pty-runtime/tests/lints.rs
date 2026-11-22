@@ -78,11 +78,8 @@ fn code_only(text: &str) -> String {
                     i += 1;
                 }
             }
-        } else if c == 'r'
-            && (next == Some('"') || next == Some('#'))
-            && !ident(b.get(i.wrapping_sub(1)))
-        {
-            let mut j = i + 1;
+        } else if let Some(r) = raw_start(&b, i) {
+            let mut j = r + 1;
             let mut hashes = 0;
             while b.get(j) == Some(&'#') {
                 hashes += 1;
@@ -140,6 +137,20 @@ fn code_only(text: &str) -> String {
         }
     }
     out
+}
+
+/// The index of the `r` when a raw string literal (`r`, `br`, or `cr` prefix) may start
+/// at `i`.
+fn raw_start(b: &[char], i: usize) -> Option<usize> {
+    if ident(i.checked_sub(1).and_then(|k| b.get(k))) {
+        return None;
+    }
+    let r = match b[i] {
+        'r' => i,
+        'b' | 'c' if b.get(i + 1) == Some(&'r') => i + 1,
+        _ => return None,
+    };
+    matches!(b.get(r + 1), Some('"' | '#')).then_some(r)
 }
 
 fn ident(c: Option<&char>) -> bool {
@@ -267,6 +278,20 @@ fn the_scan_sees_through_comments_and_strings() {
     assert!(!uses_unsafe(&code_only(
         "let s = \"unsafe {\"; // unsafe fn\nfn unsafe_x() {}"
     )));
+    // Raw byte and C strings: a quote inside one does not end it, and a backslash in a
+    // raw one does not escape.
+    let src = r##"const _: &[u8] = br#"""#;
+#[allow(/* scope */ unsafe_code)] const _: () = ();
+const _: &core::ffi::CStr = cr"\";
+#[allow(unsafe_code)] fn f() {}
+const _: &core::ffi::CStr = c"x";
+#[allow(unsafe_code)] fn g() {}
+"##;
+    let found: Vec<_> = attributes(&code_only(src))
+        .into_iter()
+        .filter(|a| a.1 == "[allow(unsafe_code)]")
+        .collect();
+    assert_eq!(found.len(), 3, "{found:?}");
 }
 
 /// The workspace's clippy keys, each with its value.
