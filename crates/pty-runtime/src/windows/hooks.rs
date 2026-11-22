@@ -7,7 +7,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::os::windows::io::{AsHandle, OwnedHandle};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::thread::JoinHandle;
@@ -59,22 +58,20 @@ pub enum WindowsFault {
     Identity,
     /// After a successful `CreateProcessW` (lock released): signal `reached`, wait `open`.
     AfterCreate(Gate),
-    /// After stage 6: wait for the marker, hold the drain, signal `reached`, wait for
-    /// `open`, then fail.
+    /// After stage 6: wait for the probe's marker, hold the drain, signal `reached`, wait
+    /// for `open`, then fail.
     AfterSpawn {
         gate: Gate,
-        marker: &'static [u8],
+        probe: OutputProbe,
     },
     /// The teardown's kill runs with an expired deadline.
     KillExpired,
     /// Implies `RejectJobList(None)`; the real `ResumeThread` runs, and its previous suspend
     /// count is classified as this value instead.
     ResumeCount(u32),
-    /// No failure: once the marker is seen, the drain's next read waits until the control's
-    /// close begins (or `HOOK_WAIT`).
-    HoldOutput {
-        marker: &'static [u8],
-    },
+    /// No failure: once the probe's marker is seen, the drain's next read waits until the
+    /// control's close begins (or `HOOK_WAIT`).
+    HoldOutput(OutputProbe),
 }
 
 impl WindowsFault {
@@ -312,25 +309,18 @@ pub(crate) struct Marker {
     cv: Condvar,
 }
 
-/// The last holding marker made (test access through `fake`).
-static LAST_HELD: Mutex<Option<Weak<Marker>>> = Mutex::new(None);
-
 impl Marker {
     /// `hold`: once the marker is seen, the next read blocks until released (or
     /// `HOOK_WAIT`).
     pub(crate) fn new(marker: &'static [u8], hold: bool) -> Arc<Marker> {
-        let m = Arc::new(Marker {
+        Arc::new(Marker {
             marker,
             st: Mutex::new(MarkerState {
                 hold,
                 ..MarkerState::default()
             }),
             cv: Condvar::new(),
-        });
-        if hold {
-            *LAST_HELD.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::downgrade(&m));
-        }
-        m
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MarkerState> {
@@ -455,23 +445,44 @@ impl Marker {
     }
 }
 
-/// The last holding marker, while its spawn's reader lives.
-fn last_held() -> Option<Arc<Marker>> {
-    LAST_HELD
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .as_ref()
-        .and_then(Weak::upgrade)
+/// The test's end of one spawn's holding output-marker reader (`AfterSpawn`,
+/// `HoldOutput`). The test keeps it through its assertions, so what the reader recorded
+/// outlives the spawn's own references, and no other spawn can replace it. One probe serves
+/// one spawn.
+#[derive(Clone)]
+pub struct OutputProbe(Arc<Marker>);
+
+impl OutputProbe {
+    /// A probe whose reader holds once it has seen `marker`.
+    #[must_use]
+    pub fn new(marker: &'static [u8]) -> OutputProbe {
+        OutputProbe(Marker::new(marker, true))
+    }
+
+    /// Whether the reader is parked in its hold by `deadline` (no read outstanding).
+    #[must_use]
+    pub fn parked(&self, deadline: Instant) -> bool {
+        self.0.wait_parked(deadline)
+    }
+
+    /// Whether the reader was parked when the control's close began; `None` before that
+    /// close (`HoldOutput`).
+    #[must_use]
+    pub fn parked_at_close(&self) -> Option<bool> {
+        self.0.parked_at_close()
+    }
+
+    pub(crate) fn marker(&self) -> Arc<Marker> {
+        self.0.clone()
+    }
 }
 
-/// The last holding marker: whether its reader parked by `deadline`.
-pub(crate) fn output_parked(deadline: Instant) -> bool {
-    last_held().is_some_and(|m| m.wait_parked(deadline))
-}
-
-/// The last holding marker: whether its reader was parked when the control's close began.
-pub(crate) fn output_parked_at_close() -> Option<bool> {
-    last_held().and_then(|m| m.parked_at_close())
+impl std::fmt::Debug for OutputProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("OutputProbe")
+            .field(&String::from_utf8_lossy(self.0.marker))
+            .finish()
+    }
 }
 
 /// The drain's reader in test and `fake` builds: the output read end, watched for a marker.
@@ -501,57 +512,94 @@ impl<R: Read> Read for MarkerReader<R> {
 
 // ---- Registries ----
 
-static CLOSE_THREADS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
-/// Whether close workers' handles are kept for `close_threads_exited` (a handle-count probe).
-static TRACK_CLOSE_THREADS: AtomicBool = AtomicBool::new(false);
+/// Close workers' handles kept for `close_threads_exited` (a handle-count probe), and
+/// whether they are kept: one lock, so a registration and a disarm are ordered.
+struct CloseThreads {
+    track: bool,
+    kept: Vec<JoinHandle<()>>,
+}
+
+static CLOSE_THREADS: Mutex<CloseThreads> = Mutex::new(CloseThreads {
+    track: false,
+    kept: Vec::new(),
+});
+
+fn close_threads() -> std::sync::MutexGuard<'static, CloseThreads> {
+    CLOSE_THREADS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+type AfterTake = Box<dyn FnOnce()>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs in `close_threads_exited` after it took the batch, before its waits (tests).
+    static AFTER_TAKE: RefCell<Option<AfterTake>> = const { RefCell::new(None) };
+}
+
+/// Runs `f` in the next `close_threads_exited` on this thread, after it took the batch.
+#[cfg(test)]
+pub(crate) fn after_take(f: AfterTake) {
+    AFTER_TAKE.with(|h| *h.borrow_mut() = Some(f));
+}
+
+/// Whether the registry's lock is free right now (tests).
+#[cfg(test)]
+pub(crate) fn close_threads_unlocked() -> bool {
+    CLOSE_THREADS.try_lock().is_ok()
+}
 
 /// Starts or stops keeping close workers' handles; stopping drops those kept.
 pub(crate) fn track_close_threads(on: bool) {
-    TRACK_CLOSE_THREADS.store(on, Ordering::Release);
-    if !on {
-        CLOSE_THREADS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-    }
+    let mut c = close_threads();
+    c.track = on;
+    let dropped = if on {
+        Vec::new()
+    } else {
+        std::mem::take(&mut c.kept)
+    };
+    drop(c);
+    drop(dropped);
 }
 
 /// A close worker whose close returned: kept only while a probe tracks them, else dropped.
 pub(crate) fn register_close_thread(j: JoinHandle<()>) {
-    if TRACK_CLOSE_THREADS.load(Ordering::Acquire) {
-        CLOSE_THREADS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(j);
+    let mut c = close_threads();
+    if c.track {
+        c.kept.push(j);
     }
 }
 
 /// How many close workers' handles are kept.
 #[cfg(test)]
 pub(crate) fn kept_close_threads() -> usize {
-    CLOSE_THREADS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .len()
+    close_threads().kept.len()
 }
 
-/// Waits (bounded) on the registered close threads' handles, joins those signalled, and
-/// returns whether all were.
+/// Takes the kept close threads out of the registry, waits (bounded, without the
+/// registry's lock) on their handles, joins those signalled, and returns whether all were;
+/// the others go back while tracking is on.
 pub(crate) fn close_threads_exited(timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
-    let mut threads = CLOSE_THREADS.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut all = true;
+    let batch = std::mem::take(&mut close_threads().kept);
+    #[cfg(test)]
+    if let Some(f) = AFTER_TAKE.with(|h| h.borrow_mut().take()) {
+        f();
+    }
     let mut left = Vec::new();
-    for j in threads.drain(..) {
+    for j in batch {
         let budget = deadline.saturating_duration_since(Instant::now());
         if sys::wait_floor(j.as_handle(), budget).unwrap_or(false) {
             let _ = j.join();
         } else {
-            all = false;
             left.push(j);
         }
     }
-    *threads = left;
+    let all = left.is_empty();
+    let mut c = close_threads();
+    if c.track {
+        c.kept.extend(left);
+    }
     all
 }
 

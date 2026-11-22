@@ -44,8 +44,8 @@ pub(crate) fn spawn_lock() -> SpawnGuard {
     }
 }
 
-/// Whether some thread holds the lock (tests only).
-#[cfg(all(test, target_os = "macos"))]
+/// Whether some thread holds the lock (tests only): `try_lock` returned `WouldBlock`.
+#[cfg(all(test, any(target_os = "macos", windows)))]
 pub(crate) fn spawn_lock_held() -> bool {
     matches!(
         SPAWN_LOCK.try_lock(),

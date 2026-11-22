@@ -14,10 +14,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use chaldea_pty_runtime::fake::{
-    FaultReport, Watch, WindowsFault, gate, identify, kill_verified, process_handle_count,
-    windows_close_threads_exited, windows_fault_report, windows_in_job, windows_inject_next,
-    windows_job_active, windows_on_teardown_kill, windows_output_parked,
-    windows_output_parked_at_close, windows_track_close_threads, windows_watch,
+    FaultReport, OutputProbe, Watch, WindowsFault, gate, identify, kill_verified,
+    process_handle_count, windows_close_threads_exited, windows_fault_report, windows_in_job,
+    windows_inject_next, windows_job_active, windows_on_teardown_kill, windows_track_close_threads,
+    windows_watch,
 };
 use chaldea_pty_runtime::{
     Cleanup, CloseBounds, Guard, OutputEnd, ProcessIdentity, PtySize, Session, SessionConfig,
@@ -462,7 +462,7 @@ fn after_process_faults_leave_no_handle() {
                         let (g, ctl) = gate();
                         windows_inject_next(WindowsFault::AfterSpawn {
                             gate: g,
-                            marker: b"MARKER-0",
+                            probe: OutputProbe::new(b"MARKER-0"),
                         });
                         opener = Some(std::thread::spawn(move || {
                             assert!(ctl.wait_reached(WAIT), "AfterSpawn milestone");
@@ -710,6 +710,8 @@ fn after_spawn_fault_with_output_pending_kills_the_tree() {
     );
     let shared: Arc<Mutex<AtKill>> = Arc::default();
     let (g, ctl) = gate();
+    let probe = OutputProbe::new(b"OUTPUT-0");
+    let p2 = probe.clone();
     let sh = shared.clone();
     let spawner = std::thread::spawn(move || {
         windows_on_teardown_kill(Box::new(move || {
@@ -720,10 +722,7 @@ fn after_spawn_fault_with_output_pending_kills_the_tree() {
                 st.seen = Some((dead, active));
             }
         }));
-        windows_inject_next(WindowsFault::AfterSpawn {
-            gate: g,
-            marker: b"OUTPUT-0",
-        });
+        windows_inject_next(WindowsFault::AfterSpawn { gate: g, probe: p2 });
         let r = Session::spawn(&*native(), &s, SessionConfig::new(|_| {}));
         let r = match r {
             Err(SpawnError::StartedThenFailed { stage, cleanup, .. }) => Ok((stage, cleanup)),
@@ -746,10 +745,7 @@ fn after_spawn_fault_with_output_pending_kills_the_tree() {
     root.send("emit").unwrap();
     assert_eq!(next_kind(&mut root, "output")["n"], 0);
     assert!(ctl.wait_reached(WAIT), "milestone: OUTPUT-0 seen");
-    assert!(
-        windows_output_parked(soon()),
-        "the reader parked after OUTPUT-0"
-    );
+    assert!(probe.parked(soon()), "the reader parked after OUTPUT-0");
     // Written and flushed while the reader is parked: output is pending at the teardown.
     root.send("emit").unwrap();
     assert_eq!(next_kind(&mut root, "output")["n"], 1);
@@ -1061,16 +1057,12 @@ fn extra_outside_the_job_dies_and_stale_extra_is_spared() {
 #[test]
 fn close_with_output_flowing_is_bounded() {
     let _l = lock();
-    windows_inject_next(WindowsFault::HoldOutput {
-        marker: b"OUTPUT-0",
-    });
+    let probe = OutputProbe::new(b"OUTPUT-0");
+    windows_inject_next(WindowsFault::HoldOutput(probe.clone()));
     let mut r = rig(&["--mode", "spawn-tree", "--roles", "none", "--emit-output"]);
     r.root.send("emit").unwrap();
     assert_eq!(next_kind(&mut r.root, "output")["n"], 0);
-    assert!(
-        windows_output_parked(soon()),
-        "the reader parked after OUTPUT-0"
-    );
+    assert!(probe.parked(soon()), "the reader parked after OUTPUT-0");
     r.root.send("emit").unwrap();
     assert_eq!(next_kind(&mut r.root, "output")["n"], 1);
     let bounds = CloseBounds::default();
@@ -1079,7 +1071,7 @@ fn close_with_output_flowing_is_bounded() {
     let budget = bounds.kill + bounds.input + bounds.close + bounds.drain + bounds.join;
     assert!(t.elapsed() < budget, "{:?}", t.elapsed());
     assert_eq!(
-        windows_output_parked_at_close(),
+        probe.parked_at_close(),
         Some(true),
         "output was pending as the close began"
     );

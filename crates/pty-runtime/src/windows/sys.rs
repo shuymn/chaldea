@@ -373,7 +373,13 @@ pub(crate) const SUSPENDED: u32 = CREATE_SUSPENDED;
 /// `CreateProcessW(app, cmdline, NULL, NULL, FALSE, flags, env, cwd, &si, &pi)` with the
 /// pseudoconsole's standard handles. `cmdline` is this attempt's fresh mutable copy
 /// (`CreateProcessW` may write to it); `app`, `env`, and `cwd` are NUL-terminated (the
-/// environment block double-NUL), as `cmdline::Buffers` guarantees.
+/// environment block double-NUL), as `cmdline::Buffers` guarantees. `created` sees the
+/// new process's handle at the success boundary, before this returns (test and `fake`
+/// builds record its job membership there).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one argument per CreateProcessW input"
+)]
 pub(crate) fn create_process(
     _held: &SpawnGuard,
     app: &[u16],
@@ -382,6 +388,7 @@ pub(crate) fn create_process(
     cwd: &[u16],
     attrs: &mut AttrList<'_>,
     suspended: bool,
+    created: &dyn Fn(&OwnedHandle),
 ) -> io::Result<Created> {
     debug_assert!(app.ends_with(&[0]) && cmdline.ends_with(&[0]) && cwd.ends_with(&[0]));
     debug_assert!(env.ends_with(&[0, 0]));
@@ -416,6 +423,7 @@ pub(crate) fn create_process(
         return Err(io::Error::last_os_error());
     }
     let process = owned(pi.hProcess)?;
+    created(&process);
     let thread = owned(pi.hThread)?;
     Ok(Created {
         process,

@@ -206,23 +206,32 @@ impl Inject {
         }
     }
 
-    /// The point right after a native create returned a process, before anything else can
-    /// assign it: records whether the process is already in `job`, then passes the gate of
-    /// `AfterCreate` (either branch) or of `RejectJobList(Some(_))` (the suspended branch).
-    #[allow(clippy::unused_self, reason = "no gates outside test and fake builds")]
-    fn after_create(&self, suspended: bool, process: &OwnedHandle, job: &OwnedHandle) {
+    /// Called by `sys::create_process` at its success boundary, before it returns the
+    /// process: records whether the process is already in `job`.
+    #[allow(clippy::unused_self, reason = "no report outside test and fake builds")]
+    fn member_at_create(&self, process: &OwnedHandle, job: &OwnedHandle) {
         #[cfg(any(test, feature = "fake"))]
         {
             let member = sys::in_job(process, job).ok();
             hooks::with_report(|r| r.member_at_create.push(member));
-            match &self.fault {
-                Some(hooks::WindowsFault::AfterCreate(g)) => g.pass(),
-                Some(hooks::WindowsFault::RejectJobList(Some(g))) if suspended => g.pass(),
-                _ => {}
-            }
         }
         #[cfg(not(any(test, feature = "fake")))]
-        let _ = (suspended, process, job);
+        let _ = (process, job);
+    }
+
+    /// The point right after a native create returned a process (lock released), before
+    /// anything else can assign it: passes the gate of `AfterCreate` (either branch) or of
+    /// `RejectJobList(Some(_))` (the suspended branch).
+    #[allow(clippy::unused_self, reason = "no gates outside test and fake builds")]
+    fn after_create(&self, suspended: bool) {
+        #[cfg(any(test, feature = "fake"))]
+        match &self.fault {
+            Some(hooks::WindowsFault::AfterCreate(g)) => g.pass(),
+            Some(hooks::WindowsFault::RejectJobList(Some(g))) if suspended => g.pass(),
+            _ => {}
+        }
+        #[cfg(not(any(test, feature = "fake")))]
+        let _ = suspended;
     }
 
     /// The previous suspend count to classify: the real one, or the scripted
@@ -414,13 +423,13 @@ impl PtyRuntime for WindowsPty {
         // 3. The drain, before any process exists.
         #[cfg(any(test, feature = "fake"))]
         let held = match &inject.fault {
-            Some(hooks::WindowsFault::AfterSpawn { marker, .. }) => {
-                let m = hooks::Marker::new(marker, true);
+            Some(hooks::WindowsFault::AfterSpawn { probe, .. }) => {
+                let m = probe.marker();
                 hooks::hold_until_teardown(m.clone());
                 Some(m)
             }
-            Some(hooks::WindowsFault::HoldOutput { marker }) => {
-                let m = hooks::Marker::new(marker, true);
+            Some(hooks::WindowsFault::HoldOutput(probe)) => {
+                let m = probe.marker();
                 control.hold_until_close(m.clone());
                 Some(m)
             }
@@ -431,6 +440,8 @@ impl PtyRuntime for WindowsPty {
             let marker = held.clone();
             #[cfg(test)]
             let marker = marker.or_else(|| self.hooks.marker());
+            #[cfg(test)]
+            self.hooks.keep_peek(&out_r);
             hooks::MarkerReader::new(out_r, marker)
         };
         #[cfg(not(any(test, feature = "fake")))]
@@ -786,7 +797,14 @@ impl WindowsPty {
         let r = match synthesized {
             Some(code) => Err(io::Error::from_raw_os_error(code)),
             None => sys::create_process(
-                &guard, &bufs.app, &mut line, &bufs.env, &bufs.cwd, attrs, suspended,
+                &guard,
+                &bufs.app,
+                &mut line,
+                &bufs.env,
+                &bufs.cwd,
+                attrs,
+                suspended,
+                &|p| inject.member_at_create(p, job),
             ),
         };
         tr(
@@ -798,8 +816,8 @@ impl WindowsPty {
         #[cfg(test)]
         self.hooks.on(&tests::Stage::BeforeUnlock { stage: 5 });
         drop(guard);
-        if let Ok(c) = &r {
-            inject.after_create(suspended, &c.process, job);
+        if r.is_ok() {
+            inject.after_create(suspended);
         }
         r
     }

@@ -46,6 +46,9 @@ pub(crate) struct Hooks {
     pub(crate) marker: Option<&'static [u8]>,
     pub(crate) hold: bool,
     pub(crate) seen: Mutex<Option<Arc<Marker>>>,
+    /// A second handle on the output pipe's read end, for `pipe_has_writer`; peek only
+    /// while the drain's reader is parked, since a synchronous pipe serializes the two.
+    pub(crate) peek: Mutex<Option<std::io::PipeReader>>,
     /// The last child built, kept alive until the test takes it.
     pub(crate) child: Mutex<Option<Arc<WindowsChild>>>,
 }
@@ -66,6 +69,10 @@ impl Hooks {
         let m = Marker::new(self.marker?, self.hold);
         *self.seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(m.clone());
         Some(m)
+    }
+
+    pub(crate) fn keep_peek(&self, out: &std::io::PipeReader) {
+        *self.peek.lock().unwrap_or_else(PoisonError::into_inner) = out.try_clone().ok();
     }
 
     pub(crate) fn keep(&self, child: Arc<WindowsChild>) {
@@ -1037,9 +1044,9 @@ fn drain_starts_before_the_process() {
 }
 
 /// PR4-CL-13: the sink gets every byte read, from the first one, and output ends only
-/// after the pseudoconsole closes: the reader parks once `READY` was read, its next read
-/// then runs with the child gone and the pseudoconsole open, and no read returns 0 before
-/// the close begins.
+/// after the pseudoconsole closes: the reader parks once `READY` was read; with the child
+/// gone, the pseudoconsole open, and no read outstanding, the output pipe still has a writer
+/// (conhost), and no read returned 0 before the close began.
 #[test]
 fn output_ends_only_after_close() {
     let _s = serial();
@@ -1057,7 +1064,12 @@ fn output_ends_only_after_close() {
     let marker = pty.hooks.seen.lock().unwrap().clone().unwrap();
     assert!(marker.wait_parked(Instant::now() + BOUND), "READY not read");
     assert_eq!(out.end(), None);
-    marker.release();
+    let peek = pty.hooks.peek.lock().unwrap().take().unwrap();
+    assert!(
+        sys::pipe_has_writer(&peek).unwrap(),
+        "the output pipe lost its writer with the pseudoconsole open"
+    );
+    drop(peek);
     let SpawnedParts {
         child,
         output,
@@ -1067,6 +1079,7 @@ fn output_ends_only_after_close() {
     } = parts;
     drop(input);
     marker.closing();
+    marker.release();
     let close = control.close(Instant::now() + BOUND);
     assert!(close.elapsed.is_some());
     assert_eq!(out.wait_end(), Some(OutputEnd::Eof));
@@ -1336,7 +1349,7 @@ fn pty_spawn_waits_for_a_helper_spawn() {
     });
     entered_rx.recv_timeout(BOUND).unwrap();
     let saw: Arc<Mutex<Option<bool>>> = Arc::default();
-    let (before_tx, before_rx) = mpsc::channel::<()>();
+    let (before_tx, before_rx) = mpsc::channel::<bool>();
     let before_tx = Mutex::new(before_tx);
     let saw2 = saw.clone();
     let hd = helper_done.clone();
@@ -1346,7 +1359,10 @@ fn pty_spawn_waits_for_a_helper_spawn() {
                 stage: Some(Box::new(move |s| {
                     match s {
                         Stage::BeforeLock { stage: 2 } => {
-                            let _ = before_tx.lock().unwrap().send(());
+                            let _ = before_tx
+                                .lock()
+                                .unwrap()
+                                .send(crate::spawn::spawn_lock_held());
                         }
                         Stage::LockAcquired { stage: 2 } => {
                             saw2.lock()
@@ -1364,10 +1380,13 @@ fn pty_spawn_waits_for_a_helper_spawn() {
         drop(take_child(&pty));
         r.map(release).map_err(|e| e.to_string())
     });
-    // The PTY spawn is at the lock while the helper owns it.
-    before_rx
-        .recv_timeout(BOUND)
-        .expect("the PTY spawn reached the lock");
+    // The PTY spawn is at the lock and finds it taken (`WouldBlock`) by the helper.
+    assert!(
+        before_rx
+            .recv_timeout(BOUND)
+            .expect("the PTY spawn reached the lock"),
+        "the helper's closure ran without the lock"
+    );
     assert_eq!(
         *saw.lock().unwrap(),
         None,
@@ -1423,15 +1442,18 @@ fn helper_waits_in(stage: u8) {
     });
     reached_rx.recv_timeout(BOUND).unwrap();
     let saw = Arc::new(Mutex::new(None));
-    let (before_tx, before_rx) = mpsc::channel::<()>();
+    let (before_tx, before_rx) = mpsc::channel::<bool>();
     let sp = saw.clone();
     let i3 = inside.clone();
     let helper = std::thread::spawn(move || {
-        let _ = before_tx.send(());
+        let _ = before_tx.send(crate::spawn::spawn_lock_held());
         crate::with_spawn_lock(|| *sp.lock().unwrap() = Some(i3.load(Ordering::Acquire)));
     });
-    // The helper is at the lock while the PTY spawn owns it.
-    before_rx.recv_timeout(BOUND).unwrap();
+    // The helper is at the lock and finds it taken (`WouldBlock`) by the PTY spawn.
+    assert!(
+        before_rx.recv_timeout(BOUND).unwrap(),
+        "stage {stage} ran without the lock"
+    );
     assert_eq!(
         *saw.lock().unwrap(),
         None,
@@ -1550,6 +1572,39 @@ fn ordinary_closes_keep_no_thread_handle() {
         );
         assert_eq!(hooks::kept_close_threads(), 0);
     }
+}
+
+/// The close-thread probe waits without the registry's lock: a close registered during
+/// the wait is kept, not blocked; disarming drops what is kept and keeps nothing more.
+#[test]
+fn close_thread_probe_waits_outside_the_registry_lock() {
+    let _s = serial();
+    hooks::track_close_threads(true);
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    hooks::register_close_thread(std::thread::spawn(move || {
+        let _ = go_rx.recv_timeout(BOUND);
+    }));
+    let unlocked = Arc::new(AtomicBool::new(false));
+    let u = unlocked.clone();
+    hooks::after_take(Box::new(move || {
+        u.store(hooks::close_threads_unlocked(), Ordering::Release);
+        hooks::register_close_thread(std::thread::spawn(|| {}));
+        go_tx.send(()).unwrap();
+    }));
+    assert!(hooks::close_threads_exited(BOUND));
+    assert!(
+        unlocked.load(Ordering::Acquire),
+        "the registry stayed locked"
+    );
+    assert_eq!(
+        hooks::kept_close_threads(),
+        1,
+        "the close registered meanwhile"
+    );
+    hooks::track_close_threads(false);
+    assert_eq!(hooks::kept_close_threads(), 0);
+    hooks::register_close_thread(std::thread::spawn(|| {}));
+    assert_eq!(hooks::kept_close_threads(), 0, "kept after disarm");
 }
 
 // ---- CL-27 ----

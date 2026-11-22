@@ -51,8 +51,9 @@ fn exit_code(child: &mut Child) -> Option<i32> {
         if let Some(s) = child.try_wait().unwrap() {
             return s.code();
         }
-        assert!(Instant::now() < end, "fake-cli did not exit");
-        std::thread::sleep(Duration::from_millis(10));
+        let left = end.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "fake-cli did not exit");
+        std::thread::sleep(left.min(Duration::from_millis(10)));
     }
 }
 

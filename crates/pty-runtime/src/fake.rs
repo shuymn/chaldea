@@ -715,7 +715,7 @@ pub fn unix_writer_polls() -> u64 {
 
 #[cfg(windows)]
 pub use crate::windows::hooks::{
-    FaultReport, Gate, GateControl, TraceEntry, Watch, WindowsFault, gate,
+    FaultReport, Gate, GateControl, OutputProbe, TraceEntry, Watch, WindowsFault, gate,
 };
 
 /// Injects `f` into the next native spawn on the calling thread.
@@ -787,22 +787,6 @@ pub fn windows_track_close_threads(on: bool) {
 #[must_use]
 pub fn windows_close_threads_exited(timeout: Duration) -> bool {
     crate::windows::hooks::close_threads_exited(timeout)
-}
-
-/// Whether the drain's reader of the last `AfterSpawn` / `HoldOutput` spawn is parked in
-/// its hold by `deadline`.
-#[cfg(windows)]
-#[must_use]
-pub fn windows_output_parked(deadline: Instant) -> bool {
-    crate::windows::hooks::output_parked(deadline)
-}
-
-/// Whether the drain's reader of the last `HoldOutput` spawn was parked when the control's
-/// close began; `None` before that close.
-#[cfg(windows)]
-#[must_use]
-pub fn windows_output_parked_at_close() -> Option<bool> {
-    crate::windows::hooks::output_parked_at_close()
 }
 
 /// `ActiveProcesses` of the job of the live session led by `leader_pid`.

@@ -191,9 +191,15 @@ impl<P: Pseudo> Drop for WindowsControl<P> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::windows::io::AsHandle;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    /// Waits (bounded) for the thread behind `join` to exit, on its handle.
+    fn exited(join: &JoinHandle<()>) -> bool {
+        super::super::sys::wait_floor(join.as_handle(), WAIT).unwrap_or(false)
+    }
 
     const WAIT: Duration = Duration::from_secs(10);
 
@@ -239,11 +245,8 @@ mod tests {
                     std::thread::yield_now();
                 }
                 go_tx.send(()).unwrap();
-                let end = Instant::now() + WAIT;
-                while !join.is_finished() {
-                    assert!(Instant::now() < end, "watchdog: the worker did not finish");
-                    std::thread::yield_now();
-                }
+                // The worker sends its completion before it exits.
+                assert!(exited(join), "watchdog: the worker did not finish");
             }));
         });
         assert_eq!(w.close(deadline), None, "a late completion is not on time");
@@ -262,11 +265,7 @@ mod tests {
         let join = CloseWorker::start("conpty-close-test")
             .unwrap()
             .disconnect();
-        let end = Instant::now() + WAIT;
-        while !join.is_finished() {
-            assert!(Instant::now() < end, "the unarmed worker did not exit");
-            std::thread::yield_now();
-        }
+        assert!(exited(&join), "the unarmed worker did not exit");
         join.join().unwrap();
     }
 
