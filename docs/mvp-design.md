@@ -51,7 +51,7 @@ All public types are Rust types in `crates/core` with `serde` and `ts-rs` derive
 | `idempotency_key` | string | dedupe key, unique per stream |
 | `kind` | string | event kind; an open set on the wire |
 | `thread_id`, `launch_id`, `command_id` | UUID or null | the thread, the launch (one process lifetime of a thread), and the causing command |
-| `source` | object | `{ kind: "hook" \| "transcript" \| "process" \| "command" \| "daemon" \| "extension", agent, cli_version, transcript: { generation, path, file_id, offset_end } \| null }` |
+| `source` | object | `{ kind, agent, cli_version, transcript: { generation, path, file_id, offset_end } \| null }`; the known `kind` values are `hook`, `transcript`, `process`, `command`, `daemon`, `extension`, and readers keep an unknown `kind` or `agent` string as received (`Open<T>`) |
 | `occurred_at`, `recorded_at` | RFC 3339 UTC, ms | source time (or `recorded_at` when the source states none); append time |
 | `payload` | object | kind-specific |
 
@@ -112,7 +112,7 @@ All public types are Rust types in `crates/core` with `serde` and `ts-rs` derive
 | axes, attention set | `status_changed` (plus `task_set`) |
 | current and reserved launch, pid, start time, manual, exit reason, death confirmed | `launch_reserved`, `launch_started`, `launch_exited`, `launch_death_confirmed` |
 | `session_id`, `transcript_path` | `session_bound` |
-| gate evidence (last readiness and its kind, last human write that closes the gate, last turn start) | `readiness_observed`, `human_write`, `user_message` (from `UserPromptSubmit`), `session_bound` |
+| gate evidence (last readiness and its kind, last write of any origin, last human write that closes the gate, last turn start) | `readiness_observed`; `input_state_changed` to `sending` and every `human_write` for the last write of any origin (a `card_key` advances only this one); `human_write` with origin `attach` or `key` for the last gate-closing human write; `user_message` (from `UserPromptSubmit`) and `session_bound` for the last turn start |
 | input text, encoding, launch, `created_by`, state, `sent_after_seq`, attribution | `input_created`, `input_state_changed`, `user_message.input_id` |
 | approval card, correlation, outcome | `approval_requested`, `approval_resolved` |
 | current surfaces | `surface_update` |
@@ -483,7 +483,7 @@ impl TypedEvent { pub fn decode(e: &EventEnvelope) -> Result<TypedEvent, Generic
 pub enum Content { Inline { inline: String, encoding: Encoding }, Blob { blob: BlobRef, preview: String, preview_lossy: bool } }
 
 pub enum StateInput {                                                     // no variant carries PTY output
-    Registered { task: bool }, Reserved { relaunch: bool }, Spawned, SessionBound, StopRequested,
+    Reserved { relaunch: bool }, Spawned, SessionBound, StopRequested,
     Exited { reason: ExitReason }, DeathConfirmed, ReadinessObserved, PromptSubmitted,
     Interrupted,                    // only from an explicit interrupt event (Codex `Interrupt` hook)
     TurnStopped,                    // turn -> unknown; ReadinessObserved then sets idle per `readiness_evidence`
@@ -491,6 +491,7 @@ pub enum StateInput {                                                     // no 
     AttentionRaised(AttentionCause), AttentionCleared(AttentionCause), TaskSet { to: TaskState, by: Actor },
 }
 pub struct ThreadState { pub process: ProcessState, pub turn: TurnState, pub task: TaskState, pub attention: BTreeSet<AttentionCause> }
+impl ThreadState { pub fn registered(task: bool) -> ThreadState; }      // the state `thread_registered` creates; task `active` when given, else `none`
 pub fn reduce(s: &ThreadState, input: &StateInput) -> Result<(ThreadState, Vec<StatusChanged>), InvalidTransition>;
 
 pub enum InputState { Queued, Sending, Sent, Acked, Unconfirmed, Rejected, Cancelled, Dismissed }
@@ -506,7 +507,7 @@ pub fn check_receipt(existing: Option<&CommandReceipt>, token: TokenId, request_
 
 **Tests** (macOS and Windows):
 
-- `reduce` proptests: never panics; after `Registered`, `task` changes only on `TaskSet`; after `Exited`, `turn` is `unknown`; each attention cause is cleared only by its own clearing input; `ApprovalsAllResolved` sets `running` only from `awaiting_approval`, and `TurnStopped` / `Interrupted` / `Exited` win over open cards; `TurnStopped` alone never sets `idle`; `DeathConfirmed` clears `resume_blocked`; every change appears in exactly one `StatusChanged`.
+- `reduce` proptests: never panics; after `ThreadState::registered(task)`, `task` changes only on `TaskSet`; after `Exited`, `turn` is `unknown`; each attention cause is cleared only by its own clearing input; `ApprovalsAllResolved` sets `running` only from `awaiting_approval`, and `TurnStopped` / `Interrupted` / `Exited` win over open cards; `TurnStopped` alone never sets `idle`; `DeathConfirmed` clears `resume_blocked`; every change appears in exactly one `StatusChanged`.
 - `step` proptests: `Sending` is entered at most once; nothing leads from `Sending`, `Sent`, or `Unconfirmed` back to `Queued` or `Sending`; `Rejected` from `Queued`, `Cancelled` from `Queued` or from `Sending` on `RecheckFailed`; `Rejected` also from `Sending` on a confirmed spawn failure of a positional prompt; `DaemonRestarted` and `LaunchExited` map `Sending`/`Sent` to `Unconfirmed` and `Queued` to `Cancelled`; `AckAttributed` moves `Unconfirmed` to `Acked`; `Dismissed` and `Resolved { delivered: true }` only from `Unconfirmed`.
 - `gate` table: open only with evidence newer than the last write and every other condition; each condition missing alone closes it.
 - `decide_replay` table: each fallback reason, `after_seq = head`, empty stream, absent epoch, `after_seq` with `before_seq`, `limit` bounds.
