@@ -3,4 +3,13 @@ import type { Content } from "./Content";
 import type { VtCursor } from "./VtCursor";
 import type { VtModes } from "./VtModes";
 
-export type VtSnapshotTaken = { grid: Content, cols: number, rows: number, cursor: VtCursor, modes: VtModes, };
+export type VtSnapshotTaken = { 
+/**
+ * A JSON array of exactly `rows` rows, top to bottom, each an array of at most
+ * `cols` cell strings, left to right. `""` is the second cell of a wide character and
+ * directly follows it; every other cell is non-empty (a blank cell is `" "`). Trailing
+ * blank cells are omitted; a reader fills them back to `cols`. A grid of any other
+ * shape is an unreadable snapshot. Above 64 KiB the grid is a blob, fetched before
+ * decoding (`docs/design/pty-runtime.md` §2.6).
+ */
+grid: Content, cols: number, rows: number, cursor: VtCursor, modes: VtModes, };

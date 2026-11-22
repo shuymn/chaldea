@@ -20,6 +20,13 @@ pre-commit:
         - "Cargo.{toml,lock}"
         - "rust-toolchain.toml"
       run: cargo clippy --workspace --all-targets --locked -- -D warnings
+    # pty-runtime is synchronous: no async runtime in its dependency tree. Without
+    # pipefail the pipeline's status is grep's, so an early grep exit cannot pass it.
+    pty-runtime-deps:
+      glob:
+        - "crates/**/Cargo.toml"
+        - "Cargo.{toml,lock}"
+      run: deps="$(cargo tree -p chaldea-pty-runtime -e normal --prefix none)" && ! printf '%s\n' "$deps" | grep -Eq '^tokio '
     pty-hooks-fmt:
       root: spikes/pty-hooks/
       glob: "*.rs"

@@ -12,6 +12,11 @@ use crate::ids::LaunchId;
 use crate::payload::ReadinessEvidence;
 use crate::state::{ProcessState, TurnState};
 
+/// The largest prompt text, in UTF-8 bytes, that `send` and recognised attach pastes
+/// admit (§2.3 "Prompt limit"). Longer text is refused before admission, with zero bytes
+/// written and no input created. The PTY writer's internal limits derive from it.
+pub const MAX_PROMPT_BYTES: usize = 256 * 1024;
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS, JsonSchema,
 )]

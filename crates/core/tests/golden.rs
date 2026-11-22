@@ -129,6 +129,21 @@ fn text(s: &str) -> Content {
     Content::text(s)
 }
 
+/// A VT grid in the `vt_snapshot_taken` encoding (`docs/design/pty-runtime.md` §2.6):
+/// `rows` JSON arrays of cell strings, `""` for the second cell of a wide character,
+/// trailing blank cells omitted. `top` gives the first rows; the rest are empty.
+fn grid(top: &[&[&str]], rows: usize) -> Content {
+    let mut v: Vec<Vec<&str>> = top.iter().map(|r| r.to_vec()).collect();
+    v.resize(rows, Vec::new());
+    Content::text(serde_json::to_string(&v).unwrap())
+}
+
+/// One cell per character: ASCII only.
+fn ascii_cells(s: &str) -> Vec<&str> {
+    assert!(s.is_ascii());
+    (0..s.len()).map(|i| &s[i..=i]).collect()
+}
+
 fn worktree() -> WorktreeChanged {
     WorktreeChanged {
         worktree_id: WorktreeId::from("a1b2c3d4"),
@@ -162,7 +177,7 @@ fn surface() -> SurfaceUpdate {
                 label: "Note".to_owned(),
             },
             Component::VtSnapshot {
-                grid: text("Do you trust this folder?"),
+                grid: grid(&[&ascii_cells("Do you trust this folder?")], 24),
                 cols: 80,
                 rows: 24,
             },
@@ -180,12 +195,19 @@ fn surface() -> SurfaceUpdate {
 
 fn vt_snapshot() -> VtSnapshotTaken {
     VtSnapshotTaken {
-        grid: text("> 日本語のプロンプト\n"),
+        // "> 日本語のプロンプト": each wide character is a cell and an empty tail.
+        grid: grid(
+            &[&[
+                ">", " ", "日", "", "本", "", "語", "", "の", "", "プ", "", "ロ", "", "ン", "",
+                "プ", "", "ト", "",
+            ]],
+            40,
+        ),
         cols: 120,
         rows: 40,
         cursor: VtCursor {
             row: 0,
-            col: 22,
+            col: 20,
             visible: true,
         },
         modes: VtModes {

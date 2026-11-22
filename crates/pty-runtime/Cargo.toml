@@ -1,0 +1,30 @@
+[package]
+name = "chaldea-pty-runtime"
+description = "PTY session runtime of Chaldea: backend seam, single writer with origin log, drain, VT responder, snapshot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+chaldea-core = { path = "../core" }
+alacritty_terminal.workspace = true
+# The snapshot grid encoding (docs/design/pty-runtime.md §2.6).
+serde_json.workspace = true
+# Decoding checks that a wide character has its tail, with alacritty's width table.
+unicode-width.workspace = true
+
+[dev-dependencies]
+# Integration tests use FakePty.
+chaldea-pty-runtime = { path = ".", features = ["fake"] }
+proptest.workspace = true
+
+[features]
+# FakePty and the test probes; no default-feature build contains them (design D6).
+fake = []
+
+# PR 3 replaces this with the crate's own table (design D7).
+[lints]
+workspace = true

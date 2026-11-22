@@ -62,6 +62,12 @@ jobs:
           deps="$(cargo tree -p chaldea-core -e normal --prefix none)"
           ! grep -Eq '^(tokio|rusqlite|axum) ' <<<"$deps"
 
+      # pty-runtime is synchronous: std threads and blocking I/O, no async runtime.
+      - name: Check pty-runtime dependencies
+        run: |
+          deps="$(cargo tree -p chaldea-pty-runtime -e normal --prefix none)"
+          ! grep -Eq '^tokio ' <<<"$deps"
+
   pty-hooks:
     name: pty-hooks (${{ matrix.os }})
     strategy:
