@@ -94,34 +94,46 @@ impl Ownership {
     /// The fresh check of §2.4: `lost` short-circuits with no call; a passed deadline is
     /// not owned for this call; `ECHILD`, or another start at the pid, sets `lost`.
     pub(crate) fn owned(&self, os: &impl ChildOs, deadline: Option<Instant>) -> bool {
+        self.check(os, deadline).0
+    }
+
+    /// [`Ownership::owned`], with the leader's record when the check read one, so the
+    /// kill engine applies that read like any other (§2.5).
+    pub(crate) fn check(
+        &self,
+        os: &impl ChildOs,
+        deadline: Option<Instant>,
+    ) -> (bool, Option<Lookup>) {
         if self.lost() {
-            return false;
+            return (false, None);
         }
         if deadline.is_some_and(|d| os.now() >= d) {
-            return false;
+            return (false, None);
         }
         match os.waitid(self.pid) {
             Ok(_) => {}
             Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
                 self.mark_lost();
-                return false;
+                return (false, None);
             }
-            Err(_) => return false,
+            Err(_) => return (false, None),
         }
         let Some(start) = self.start else {
-            return true;
+            return (true, None);
         };
         if deadline.is_some_and(|d| os.now() >= d) {
-            return false;
+            return (false, None);
         }
-        match os.lookup(self.pid) {
+        let r = os.lookup(self.pid);
+        let owned = match r {
             Lookup::Live(p) if p.start == start => true,
             Lookup::Zombie(s) if s == start => true,
             _ => {
                 self.mark_lost();
                 false
             }
-        }
+        };
+        (owned, Some(r))
     }
 }
 
@@ -243,8 +255,8 @@ fn signal_of(sig: Sig) -> Signal {
 }
 
 impl Os for RealOs<'_> {
-    fn owned(&self, deadline: Instant) -> bool {
-        self.own.owned(&RealChildOs, Some(deadline))
+    fn owned(&self, deadline: Instant) -> (bool, Option<Lookup>) {
+        self.own.check(&RealChildOs, Some(deadline))
     }
 
     fn lost(&self) -> bool {
