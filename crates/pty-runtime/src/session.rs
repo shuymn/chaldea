@@ -118,6 +118,16 @@ pub enum SubscribeError {
     TooManySubscribers,
 }
 
+/// What a successful `resize` changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Resized {
+    /// The PTY, the grid, and the size the responder reports.
+    PtyAndVt,
+    /// Only the PTY: the VT has failed, so there is no grid and no responder.
+    PtyOnly,
+}
+
 /// The VT lock was not free by the deadline, or the VT failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VtUnavailable;
@@ -755,22 +765,26 @@ impl Session {
     }
 
     /// Resizes the PTY first, without the VT lock, then the grid and the size the
-    /// responder reports. On failure neither side changes. Not bounded.
-    pub fn resize(&self, size: PtySize) -> io::Result<()> {
+    /// responder reports. On failure neither side changes. After `VtFailed` only the PTY
+    /// is resized, and the result says so. Not bounded.
+    pub fn resize(&self, size: PtySize) -> io::Result<Resized> {
         let ctl = lock(&self.sh.control);
         let Some(control) = ctl.as_ref() else {
             return Err(io::Error::other("pty closed"));
         };
         control.resize(size)?;
         let mut st = lock(&self.sh.vt);
+        let mut resized = Resized::PtyOnly;
         if !self.sh.vt_failed.load(Ordering::Acquire) {
             let vt = &mut st.vt;
-            if catch_unwind(AssertUnwindSafe(|| vt.resize(size))).is_err() {
+            if catch_unwind(AssertUnwindSafe(|| vt.resize(size))).is_ok() {
+                resized = Resized::PtyAndVt;
+            } else {
                 self.sh.vt_failed.store(true, Ordering::Release);
             }
         }
         self.sh.size.store(pack_size(size), Ordering::Release);
-        Ok(())
+        Ok(resized)
     }
 
     #[must_use]

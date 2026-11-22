@@ -161,7 +161,7 @@ fn alt_screen_shrink_leaves_no_orphan() {
     let r = rig_sized(6, 2);
     emit_parsed(&r, "\x1b[?1049habcd日".as_bytes());
     assert_eq!(snap(&r).lines[0].cells[4..], [lead("日"), tail()]);
-    r.session.resize(PtySize::new(5, 2).unwrap()).unwrap();
+    let _ = r.session.resize(PtySize::new(5, 2).unwrap()).unwrap();
     let s = snap(&r);
     assert!(s.modes.alt_screen);
     assert_eq!(s.cols, 5);

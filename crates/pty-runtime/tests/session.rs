@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use chaldea_pty_runtime::fake::{FakeEvent, FakePty, FakeScript, KillBehavior, ProbePoint};
 use chaldea_pty_runtime::{
     ChildExit, Cleanup, CloseBounds, Flow, Limits, OutputEnd, OutputEvent, OutputSink,
-    ProcessIdentity, PtySize, Received, Refusal, Session, SessionConfig, SessionEvent, SpawnError,
-    StartFault, SubscribeError, VtUnavailable, WriteOutcome, channel_sink,
+    ProcessIdentity, PtySize, Received, Refusal, Resized, Session, SessionConfig, SessionEvent,
+    SpawnError, StartFault, SubscribeError, VtUnavailable, WriteOutcome, channel_sink,
 };
 use common::*;
 
@@ -38,7 +38,7 @@ fn resize_moves_pty_grid_and_responder() {
     let r = rig();
     assert_eq!(r.session.size(), PtySize::new(80, 24).unwrap());
     let to = PtySize::new(100, 30).unwrap();
-    r.session.resize(to).unwrap();
+    assert_eq!(r.session.resize(to).unwrap(), Resized::PtyAndVt);
     assert!(r.child.log().contains(&FakeEvent::Resize(to)));
     assert_eq!(r.session.size(), to);
     let s = r.session.snapshot(soon()).unwrap();
@@ -1075,4 +1075,18 @@ fn final_snapshot_skipped_after_the_join_budget() {
     );
     assert!(out.abandoned.contains(&"pty-writer"));
     drop(hold);
+}
+
+/// PR2-CL-14: after `VtFailed`, a resize reaches the PTY and says that the VT did not
+/// follow.
+#[test]
+fn resize_after_vt_failure_is_pty_only() {
+    let r = rig();
+    r.session.fail_vt_on_next_piece();
+    r.child.emit(b"x");
+    assert!(r.events.wait(|e| *e == SessionEvent::VtFailed));
+    let to = PtySize::new(100, 30).unwrap();
+    assert_eq!(r.session.resize(to).unwrap(), Resized::PtyOnly);
+    assert!(r.child.log().contains(&FakeEvent::Resize(to)));
+    assert_eq!(r.session.size(), to);
 }

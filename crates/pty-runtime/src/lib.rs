@@ -63,7 +63,7 @@ pub use origin::{ClassSet, OriginClass, ReplyKind, WriteOrigin};
 pub use session::StartFault;
 pub use session::{
     CloseOutcome, Flow, OutputEnd, OutputEvent, OutputReceiver, OutputSink, Received, Released,
-    ResponderStatus, Session, SessionConfig, SessionEvent, SessionStatus, SubscribeError,
+    Resized, ResponderStatus, Session, SessionConfig, SessionEvent, SessionStatus, SubscribeError,
     SubscriptionId, VtUnavailable, channel_sink,
 };
 pub use snapshot::{Cell, CellWidth, Cursor, GridError, Line, Snapshot, TermModes, decode_grid};
