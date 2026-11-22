@@ -22,7 +22,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[V1];
 /// in the order of `MIGRATIONS`. `schema_tests::shipped_fingerprints_match_the_migrations`
 /// recomputes them, so a DDL edit without a migration fails a test.
 pub(crate) const FINGERPRINTS: &[&str] =
-    &["5edc542e0d4bec60b31ea9bb397bde06bae509e4366ac30c27fffdb9a812f536"];
+    &["497e99858728fa92c32e3f3468a3a0e2f478cc662b76c48e96ce913daf9f405a"];
 
 const V1: &str = r#"
 CREATE TABLE meta (
@@ -145,6 +145,7 @@ BEGIN
      OR NEW.tr_path IS NOT (SELECT json_extract(payload, '$.transcript_path') FROM events
                             WHERE stream_id = NEW.stream_id AND kind = 'session_bound' AND launch_id IS NEW.launch_id
                             ORDER BY seq DESC LIMIT 1)
+     OR NEW.tr_offset_end IS NULL OR NEW.tr_offset_end <= 0
      OR EXISTS (SELECT 1 FROM events
                 WHERE stream_id = NEW.stream_id AND src_kind = 'transcript' AND kind <> 'transcript_generation'
                   AND tr_generation = NEW.tr_generation AND tr_offset_end >= NEW.tr_offset_end);

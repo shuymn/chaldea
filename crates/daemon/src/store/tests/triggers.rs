@@ -627,6 +627,16 @@ fn offsets_must_increase() {
     raw_line("k", 1, A, "f1", 11, &l1()).insert(&c).unwrap();
 }
 
+/// The first line of a generation ends past offset 0 (the generation marker's offset).
+#[test]
+fn first_line_of_a_generation_ends_past_zero() {
+    let s = fixture();
+    let c = raw(&s.path());
+    raw_generation("g2", 2, A, "f2", &l1()).insert(&c).unwrap();
+    assert_line_refused(&c, "zero offset", &raw_line("zero", 2, A, "f2", 0, &l1()));
+    raw_line("one", 2, A, "f2", 1, &l1()).insert(&c).unwrap();
+}
+
 /// A generation must be the next number.
 #[test]
 fn generation_must_be_next() {
