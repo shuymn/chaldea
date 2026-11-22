@@ -175,13 +175,21 @@ pub(crate) fn on_writer_thread() -> bool {
     ON_WRITER.with(Cell::get)
 }
 
-/// Publishes `WriterExit::gone()` if the writer thread ends without a report (a panic
-/// outside a job), so every `shutdown` caller sees the end.
-struct ExitGuard(Arc<Shared>);
+/// The writer thread's last statement: publishes its report (or `WriterExit::gone()` after
+/// a panic outside a job) once everything else of the thread is dropped (the connection,
+/// the queue receiver, the notification sender), so a published report means the thread
+/// has finished its work and every subscriber already sees `Closed`.
+struct ExitGuard {
+    shared: Arc<Shared>,
+    faults: Arc<Faults>,
+    exit: Option<WriterExit>,
+}
 
 impl Drop for ExitGuard {
     fn drop(&mut self) {
-        self.0.publish_exit(WriterExit::gone());
+        self.faults.mark("writer_exiting");
+        self.shared
+            .publish_exit(self.exit.take().unwrap_or_else(WriterExit::gone));
     }
 }
 
@@ -190,8 +198,13 @@ pub(crate) fn spawn(ctx: WriterCtx) -> std::io::Result<JoinHandle<()>> {
         .name("store-writer".into())
         .spawn(move || {
             ON_WRITER.with(|w| w.set(true));
-            let _guard = ExitGuard(ctx.shared.clone());
-            ctx.run();
+            let mut guard = ExitGuard {
+                shared: ctx.shared.clone(),
+                faults: ctx.faults.clone(),
+                exit: None,
+            };
+            // `run` consumes the context, so it is dropped before the guard publishes.
+            guard.exit = Some(ctx.run());
         })
 }
 
@@ -244,7 +257,7 @@ enum Next {
 }
 
 impl WriterCtx {
-    fn run(mut self) {
+    fn run(mut self) -> WriterExit {
         loop {
             if self.faults.panic_outside_job.swap(false, Ordering::SeqCst) {
                 panic!("injected writer panic outside a job");
@@ -257,8 +270,9 @@ impl WriterCtx {
                 Next::Fail => return self.fail(),
             }
         }
-        // The queue closed (shutdown): wait until the readers are closed, then checkpoint.
-        self.shared.wait_readers_closed();
+        // The queue closed (shutdown): wait until the owning shutdown has finished with the
+        // readers (closed, or abandoned at its deadline), then checkpoint.
+        self.shared.wait_readers_released();
         self.faults.mark("checkpoint_begin");
         let checkpoint = match self.conn.as_ref() {
             None => Checkpoint::NotRun,
@@ -272,13 +286,11 @@ impl WriterCtx {
             },
         };
         self.faults.mark("checkpoint_end");
-        drop(self.conn.take());
-        self.shared.publish_exit(WriterExit {
+        WriterExit {
             checkpoint,
             jobs_run: self.jobs_run,
             jobs_expired: self.jobs_expired,
-        });
-        self.faults.mark("exit_published");
+        }
     }
 
     /// Publishes the failed state before any reply that ends the writer: from then on no
@@ -298,7 +310,7 @@ impl WriterCtx {
 
     /// The failed state: the connection is retired, no clone can submit, and every queued
     /// job gets `Failed`; the thread then ends.
-    fn fail(mut self) {
+    fn fail(mut self) -> WriterExit {
         self.faults.mark("fail_begin");
         self.retire();
         drop(self.conn.take());
@@ -308,11 +320,11 @@ impl WriterCtx {
                 message: "the store writer is in the failed state".into(),
             })));
         }
-        self.shared.publish_exit(WriterExit {
+        WriterExit {
             checkpoint: Checkpoint::NotRun,
             jobs_run: self.jobs_run,
             jobs_expired: self.jobs_expired,
-        });
+        }
     }
 
     fn run_job(&mut self, mut job: JobBox) -> Next {

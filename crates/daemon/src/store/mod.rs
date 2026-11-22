@@ -268,16 +268,22 @@ pub(crate) struct Shared {
     sender: Mutex<Option<SyncSender<JobBox>>>,
     failed: AtomicBool,
     shutting_down: AtomicBool,
-    /// Shutdown's progress, which every `shutdown` caller and the writer observe.
+    /// Shutdown's progress, which the owning `shutdown` call drives and every other caller
+    /// and the writer observe.
     stop: Mutex<Stop>,
     stop_cv: Condvar,
 }
 
 #[derive(Default)]
 struct Stop {
-    /// Every reader connection was closed (or the first caller's deadline passed).
-    readers_closed: bool,
-    /// The writer's final report; published after it closed its connection.
+    /// The first `shutdown` call owns the shutdown; later calls only wait for it.
+    owned: bool,
+    /// The owner has finished with the readers (closed, or abandoned at its deadline); the
+    /// writer may checkpoint.
+    readers_released: bool,
+    /// The owner's report, once it returned.
+    report: Option<ShutdownReport>,
+    /// The writer thread's report, published as its last statement.
     exit: Option<WriterExit>,
 }
 
@@ -292,46 +298,51 @@ impl Shared {
         }
     }
 
-    /// Lets the writer checkpoint.
-    fn close_readers(&self) {
-        lock(&self.stop).readers_closed = true;
+    fn update(&self, f: impl FnOnce(&mut Stop)) {
+        f(&mut lock(&self.stop));
         self.stop_cv.notify_all();
     }
 
-    pub(crate) fn wait_readers_closed(&self) {
+    /// Waits until `done` holds or `deadline` passes (`None`: no deadline); returns the
+    /// state as observed then.
+    fn wait_until<T>(
+        &self,
+        deadline: Option<Instant>,
+        f: impl Fn(&Stop) -> Option<T>,
+    ) -> Option<T> {
         let mut s = lock(&self.stop);
-        while !s.readers_closed {
-            s = self.stop_cv.wait(s).unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if let Some(v) = f(&s) {
+                return Some(v);
+            }
+            match deadline {
+                None => s = self.stop_cv.wait(s).unwrap_or_else(PoisonError::into_inner),
+                Some(d) => {
+                    let now = Instant::now();
+                    if now >= d {
+                        return None;
+                    }
+                    s = self
+                        .stop_cv
+                        .wait_timeout(s, d - now)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                }
+            }
         }
+    }
+
+    pub(crate) fn wait_readers_released(&self) {
+        self.wait_until(None, |s| s.readers_released.then_some(()));
     }
 
     /// Records the writer's report (the first one wins).
     pub(crate) fn publish_exit(&self, exit: WriterExit) {
-        let mut s = lock(&self.stop);
-        if s.exit.is_none() {
-            s.exit = Some(exit);
-        }
-        drop(s);
-        self.stop_cv.notify_all();
-    }
-
-    /// The writer's report, waiting for it until `deadline`.
-    fn wait_exit(&self, deadline: Instant) -> Option<WriterExit> {
-        let mut s = lock(&self.stop);
-        loop {
-            if let Some(e) = &s.exit {
-                return Some(e.clone());
+        self.update(|s| {
+            if s.exit.is_none() {
+                s.exit = Some(exit);
             }
-            let now = Instant::now();
-            if now >= deadline {
-                return None;
-            }
-            s = self
-                .stop_cv
-                .wait_timeout(s, deadline - now)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
-        }
+        });
     }
 }
 
@@ -452,33 +463,48 @@ impl Store {
         broadcast::channel(1).1
     }
 
-    /// Stops intake for every clone, drains the queue, waits for lent readers, lets the
-    /// writer checkpoint and exit, and reports what it observed by `deadline` (§5). Any
-    /// clone may call it, concurrently too: each caller waits only until its own deadline.
+    /// Shuts the store down and reports what this call observed by `deadline` (§5).
+    ///
+    /// The first call owns the shutdown: it stops intake for every clone, waits until its
+    /// deadline for lent readers, closes the readers (abandoning those still lent), lets the
+    /// writer checkpoint and exit, and waits for the writer until its deadline. Every later
+    /// call does no work: it waits until its own deadline for the owner's report.
     pub fn shutdown(&self, deadline: Instant) -> ShutdownReport {
         let inner = &self.inner;
-        // (1) One intake transition: once `submit` refuses, `read` refuses too.
-        {
+        // (1) One intake transition, by the owner: once `submit` refuses, `read` does too.
+        let owner = {
             let mut sender = lock(&inner.shared.sender);
-            inner.shared.shutting_down.store(true, Ordering::SeqCst);
-            drop(sender.take());
-            inner.pool.close();
+            let mut stop = lock(&inner.shared.stop);
+            if stop.owned {
+                false
+            } else {
+                stop.owned = true;
+                drop(stop);
+                inner.shared.shutting_down.store(true, Ordering::SeqCst);
+                drop(sender.take());
+                inner.pool.close();
+                true
+            }
+        };
+        if !owner {
+            return self.observe(deadline);
         }
         drop(lock(&inner.notifier).take());
         inner.faults.mark("intake_closed");
         // (2) The writer runs the queued jobs meanwhile. (3) Close every reader connection:
-        // idle ones now, lent ones as they come back; wait until all are closed.
+        // idle ones now, lent ones as they come back, until the deadline; then let the writer
+        // checkpoint.
         inner.pool.drain();
         let readers_returned = inner.pool.wait_closed(deadline);
         let readers_abandoned = inner.pool.open();
         if readers_returned {
             inner.faults.mark("readers_closed");
         }
-        inner.shared.close_readers();
-        // (4) The writer checkpoints and exits. (5) Wait for its report until the deadline.
-        let exit = inner.shared.wait_exit(deadline);
-        let writer_exited = exit.is_some();
-        if writer_exited {
+        inner.shared.update(|s| s.readers_released = true);
+        // (4) The writer checkpoints and its thread ends. (5) Wait for that until the deadline.
+        let exit = inner.shared.wait_until(Some(deadline), |s| s.exit.clone());
+        if exit.is_some() {
+            // The report is the thread's last statement; join it once it has returned.
             let mut w = lock(&inner.writer);
             if w.as_ref().is_some_and(JoinHandle::is_finished)
                 && let Some(h) = w.take()
@@ -486,15 +512,43 @@ impl Store {
                 let _ = h.join();
             }
         }
-        let exit = exit.unwrap_or_else(WriterExit::not_reached);
-        ShutdownReport {
-            readers_returned,
-            readers_abandoned,
-            writer_exited,
-            jobs_run: exit.jobs_run,
-            jobs_expired: exit.jobs_expired,
-            checkpoint: exit.checkpoint,
+        let report = report(readers_returned, readers_abandoned, exit);
+        inner.shared.update(|s| s.report = Some(report.clone()));
+        report
+    }
+
+    /// A later `shutdown` call: waits until `deadline` for the shutdown to complete (the
+    /// owner's report and the writer thread's exit), then reports what it observed: the
+    /// owner's reader outcome once the owner returned, and the writer's exit if it ended.
+    fn observe(&self, deadline: Instant) -> ShutdownReport {
+        let shared = &self.inner.shared;
+        let done = |s: &Stop| (s.report.is_some() && s.exit.is_some()).then_some(());
+        shared.wait_until(Some(deadline), done);
+        let (owner, exit) = {
+            let s = lock(&shared.stop);
+            (s.report.clone(), s.exit.clone())
+        };
+        match owner {
+            Some(r) => report(r.readers_returned, r.readers_abandoned, exit),
+            None => report(false, self.inner.pool.open(), exit),
         }
+    }
+}
+
+fn report(
+    readers_returned: bool,
+    readers_abandoned: usize,
+    exit: Option<WriterExit>,
+) -> ShutdownReport {
+    let writer_exited = exit.is_some();
+    let exit = exit.unwrap_or_else(WriterExit::not_reached);
+    ShutdownReport {
+        readers_returned,
+        readers_abandoned,
+        writer_exited,
+        jobs_run: exit.jobs_run,
+        jobs_expired: exit.jobs_expired,
+        checkpoint: exit.checkpoint,
     }
 }
 
@@ -508,6 +562,6 @@ impl Drop for Inner {
             self.pool.close();
         }
         self.pool.drain();
-        self.shared.close_readers();
+        self.shared.update(|s| s.readers_released = true);
     }
 }

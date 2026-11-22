@@ -1,11 +1,12 @@
-//! Concurrent and gated shutdowns: one intake transition, readers closed before completion,
-//! each caller bounded by its own deadline, no join of a running writer (PR6-CL-22, CL-24).
+//! Gated shutdowns: one intake transition by the owning call, the checkpoint only after the
+//! owner finished with the readers, later calls bounded by their own deadlines, and a
+//! reported writer exit with closed notifications (PR6-CL-22, CL-24).
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::helpers::{Gates, store_with};
-use super::support::{registered, soon, thread};
+use super::support::soon;
 use crate::store::{ReadError, ShutdownReport, Store, SubmitError};
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -17,25 +18,6 @@ fn in_thread(s: &Store, deadline: Duration) -> mpsc::Receiver<ShutdownReport> {
         let _ = tx.send(s.shutdown(Instant::now() + deadline));
     });
     rx
-}
-
-/// Shutdown A holds the idle readers it took and has not closed them yet; shutdown B must
-/// not report the readers returned (their handles are still open).
-#[test]
-fn concurrent_shutdown_waits_for_readers_another_caller_holds() {
-    let gates = Gates::default();
-    let (_dir, s, _) = store_with(gates.faults());
-    let (reached, release) = gates.arm("drain_taken");
-    let a = in_thread(&s, Duration::from_secs(30));
-    reached.recv_timeout(WAIT).expect("A took the idle readers");
-    let b = in_thread(&s, Duration::from_secs(1))
-        .recv_timeout(WAIT)
-        .expect("B returns by its deadline");
-    drop(release);
-    let a = a.recv_timeout(Duration::from_secs(40)).expect("A returns");
-    assert!(!b.readers_returned, "{b:?}");
-    assert!(b.readers_abandoned > 0, "{b:?}");
-    assert!(a.readers_returned && a.writer_exited, "{a:?}");
 }
 
 /// When `submit` reports `Closed`, `read` does too: intake closes in one transition.
@@ -88,22 +70,65 @@ fn shorter_shutdown_returns_by_its_deadline() {
     assert!(a.writer_exited, "{a:?}");
 }
 
-/// The writer published its exit but its thread has not returned: shutdown reports the
-/// exit without joining the thread, so it returns by its deadline.
+/// While the owning shutdown still holds the readers it took, a later caller with an
+/// expired deadline cannot start the writer's checkpoint.
 #[test]
-fn shutdown_does_not_join_a_running_writer() {
+fn checkpoint_waits_for_the_owner_to_finish_with_the_readers() {
     let gates = Gates::default();
     let (_dir, s, _) = store_with(gates.faults());
-    s.submit(soon(), |tx| {
-        Ok(tx.append(vec![registered(thread(1), false)])?)
-    })
-    .unwrap()
-    .blocking_wait()
-    .unwrap();
-    let (_reached, release) = gates.arm("exit_published");
-    let r = in_thread(&s, Duration::from_secs(2))
-        .recv_timeout(Duration::from_secs(8))
-        .expect("shutdown returns by its deadline");
+    let (taken, release_readers) = gates.arm("drain_taken");
+    let (checkpoint, release_checkpoint) = gates.arm("checkpoint_begin");
+    let a = in_thread(&s, Duration::from_secs(30));
+    taken
+        .recv_timeout(WAIT)
+        .expect("the owner took the idle readers");
+    let b = in_thread(&s, Duration::ZERO)
+        .recv_timeout(WAIT)
+        .expect("a later caller returns by its deadline");
+    assert!(!b.readers_returned && !b.writer_exited, "{b:?}");
+    // A bounded negative check: the checkpoint must not begin while the owner holds the
+    // readers.
+    assert!(
+        checkpoint.recv_timeout(Duration::from_secs(1)).is_err(),
+        "the checkpoint began while the owner held the readers"
+    );
+    drop(release_readers);
+    checkpoint
+        .recv_timeout(WAIT)
+        .expect("the checkpoint begins after the owner closed the readers");
+    drop(release_checkpoint);
+    let a = a
+        .recv_timeout(Duration::from_secs(40))
+        .expect("the owner returns");
+    assert!(a.readers_returned && a.writer_exited, "{a:?}");
+}
+
+/// A report with `writer_exited` means the writer thread finished, its notification sender
+/// included: a subscriber sees `Closed`. Held at the thread's last step, the owner returns
+/// by its deadline without the exit; once the thread ends, a later call reports it.
+#[test]
+fn reported_writer_exit_has_closed_notifications() {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let gates = Gates::default();
+    let (_dir, s, _) = store_with(gates.faults());
+    let mut notifications = s.subscribe();
+    let (reached, release) = gates.arm("writer_exiting");
+    let result = in_thread(&s, Duration::from_secs(2));
+    reached.recv_timeout(WAIT).unwrap();
+
+    let report = result.recv_timeout(WAIT).unwrap();
+    let notification = notifications.try_recv();
     drop(release);
-    assert!(r.writer_exited, "{r:?}");
+
+    assert!(
+        !report.writer_exited || matches!(notification, Err(TryRecvError::Closed)),
+        "{report:?}, notification {notification:?}"
+    );
+    let later = s.shutdown(Instant::now() + WAIT);
+    assert!(later.writer_exited, "{later:?}");
+    assert!(matches!(
+        notifications.try_recv(),
+        Err(TryRecvError::Closed)
+    ));
 }
