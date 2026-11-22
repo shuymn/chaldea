@@ -39,7 +39,7 @@ Two layers in one module:
 - Under `none`, Claude's `SessionStart` is no evidence either (mvp §2.3:173 "only `chaldea ready`"), although mvp §2.7:303 lists it before the after-turn mode. PR 10 decides.
 - A bound `UserPromptSubmit` supersedes the open cards, as the `PromptSubmitted` comment in `state.rs` says; mvp §2.10:335 lists only `Stop` and an interrupt, and PR 13–14 adds it.
 
-**Not modelled.** The PTY writer lock and the concrete `Basis` (PR 10 replaces list positions with `last_started` per class and makes `counted` an adapter policy), timer durations, the restart sid scan and descendant kills, worktree and close races, the prompt size limit (it refuses before any input exists), and the `vt_snapshot_taken` of a gate timeout (an output with no state). When PR 10 fixes the recheck view, the ack window and settle timers, or the promotion order of buffered hooks, the model grows those actions and the traces are re-exported.
+**Not modelled.** The PTY writer lock and the concrete `Basis` (PR 10 replaces list positions with `last_started` per class and makes `counted` an adapter policy), timer durations, the restart sid scan and descendant kills, worktree and close races, the prompt size limit (it refuses before any input exists), and the `vt_snapshot_taken` of a gate timeout (an output with no state). Ack expiry, settle completion, and buffered promotion are already modelled abstractly (`windowExpired`, `ready(StopSettled, stop)`, `bind`); when PR 10 fixes their concrete rules or the recheck view, the model follows and the traces are re-exported.
 
 **State** (`st`, one record, and `last`, the step's record):
 
@@ -83,7 +83,8 @@ Two layers in one module:
 | `cardOpen(c)`, `cardResolve(c)`, `lateResolve(c)` | a card of the current turn; resolving the last open card of the turn feeds `ApprovalsAllResolved`; a resolution of a closed card feeds nothing; each invalidates the evidence candidate | mvp §2.10 |
 | `sessionTimer`, `stall` | `session_start_timeout` for a non-manual live launch with no `SessionStart`; `startup_stall` for an upgraded Codex launch before binding | mvp §2.2:142-143, §2.7 |
 | `setTask`, `decset` | `task_set`; DECSET 2004 | mvp §2.2, §2.3 |
-| `raw(i)`, `rawStep(id, ii)`, `rawReadyUnbound(ev)` | reducer inputs with no supervisor guard; `stepUnguarded` adds them | §3 |
+| `raw(i)`, `rawReadyUnbound(ev)` | reducer inputs with no supervisor guard; `stepUnguarded` adds them | §3 |
+| `rawStep(id, ii)` | an input step with no guard, for deterministic replay coverage of a rejected step in a named trace | §4 |
 
 ## 2. Invariants
 
@@ -104,7 +105,7 @@ All are checked by `pnpm run simulate` (§5). Each reads facts recorded where th
 | `noStartupCauseAfterBindOrExit` | no startup cause once bound or exited | mvp §2.2:142-143 |
 | `stallOnlyForUpgradedCodex` | `startup_stall` only for an upgraded Codex launch | mvp §2.2:143, §2.7 |
 | `openCardsAwaitApproval` | while a card of the current launch is open the turn is `awaiting_approval` | mvp §2.10:333-336 |
-| `lateResolutionChangesNothing` | a resolution after `Stop`, interrupt, prompt, or exit changes nothing | mvp §2.10:335 |
+| `lateResolutionChangesNothing` | a resolution after `Stop`, interrupt, prompt, or exit leaves `ThreadState` unchanged (it can still invalidate pending readiness) | mvp §2.10:335 |
 | `restartRecovers` | a restart turns `sending`/`sent` into `unconfirmed` and `queued` into `cancelled` | mvp §2.4:214; CL-6 |
 | `exitedLaunchHasNoPendingInput` | after exit no input is `queued`, `sending`, or `sent` | mvp §2.3:183, :185 |
 | `ackOnlyWhenAttributable` | every `AckAttributed` fed has a record of the hook's intake facts, and every record shows all five (same launch, after the attempt, unique match, dispatched, no other counted write after it), checked directly rather than through the guard's `attributable` | mvp §2.3:182; CL-7 |
@@ -125,7 +126,7 @@ All are checked by `pnpm run simulate` (§5). Each reads facts recorded where th
 
 ## 3. Gaps the Traces Show
 
-`raw`, `rawStep`, and `rawReadyUnbound` feed the reducers what the supervisor's guards forbid. `quint run thread_input.qnt --step stepUnguarded --invariant <name> --seed 1 --max-samples 1000 --max-steps 40 --backend typescript` finds a, c, d, and the card finding (`reservedOnlyAfterDeath`, `noStartupCauseAfterBindOrExit` and `stallOnlyForUpgradedCodex`, `gateEvidenceIsBound`, `openCardsAwaitApproval`), and an `input_unconfirmed` raised for an input that is not `unconfirmed` (`unconfirmedAttentionIff`). The named traces fix one example each and end with an `expect` stating the gap; the replay shows the real reducers accept every step.
+`raw` and `rawReadyUnbound` feed the reducers what the supervisor's guards forbid, and `stepUnguarded` adds them to `step`. A manual reproducer, from `specs/`: `pnpm exec quint run thread_input.qnt --step stepUnguarded --invariant <name> --seed 1 --max-samples 1000 --max-steps 40 --backend typescript` finds a, c, d, and the card finding (`reservedOnlyAfterDeath`, `noStartupCauseAfterBindOrExit` and `stallOnlyForUpgradedCodex`, `gateEvidenceIsBound`, `openCardsAwaitApproval`), and an `input_unconfirmed` raised for an input that is not `unconfirmed` (`unconfirmedAttentionIff`; a search case with no named trace). The named traces fix one example of each of a, c, d, and the card finding and end with an `expect` stating the gap; the replay shows the real reducers accept every step.
 
 **Reducer preconditions the supervisor enforces.** The Rust reducers do not receive the facts these guards need; each lives in the supervisor layer, and the PR named in mvp §4 owns it.
 
@@ -176,7 +177,7 @@ pnpm run traces:check   # spec and specs/traces/ agree
 pnpm run traces:write   # regenerate specs/traces/ after a spec change
 ```
 
-The `specs` job of `ci.yml` (`ubuntu-latest`, mise pinned in `mise-action`) installs Node and pnpm through mise and runs those checks. `lefthook.yml` runs typecheck and the trace check on commit and the simulation on push for changes under `specs/`, each after `pnpm install --frozen-lockfile` (about 50 ms when `node_modules` is up to date), and runs the workspace tests on push when a trace changes. `verifyDepsBeforeRun: error` in `pnpm-workspace.yaml` also makes every `pnpm run` fail while `node_modules` does not match `package.json` and the lockfile. The simulation size reaches every witness: at 250 samples × 30 steps an attributed ack through the gate was reached in under 1 % of traces. The four seeds run in about 15 s on a development machine.
+The `specs` job of `ci.yml` (`ubuntu-latest`, mise pinned in `mise-action`) installs Node and pnpm through mise and runs those checks. `lefthook.yml` runs typecheck and the trace check on commit and the simulation on push for changes under `specs/`, each after `pnpm install --frozen-lockfile` (about 50 ms when `node_modules` is up to date), and runs the workspace tests on push when a trace changes. `verifyDepsBeforeRun: error` in `pnpm-workspace.yaml` also makes every `pnpm run` fail while `node_modules` does not match `package.json` and the lockfile. The simulation size reaches every witness. The four seeds run in about 15 s on a development machine.
 
 **Apalache** (`quint verify`) is not in CI and is unverified: it needs a Java runtime and downloads Apalache, and whether it accepts the spec's list folds and maps of records is untested. To try it: `pnpm exec quint verify thread_input.qnt --invariant allInvariants --max-steps 10`.
 
