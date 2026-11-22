@@ -2048,8 +2048,9 @@ mod tests {
 
     #[test]
     fn membership_needs_ownership_for_the_call() {
-        // Ownership cannot be established (and was never lost): a live process in the
-        // leader's group and session is not covered, and death is not proven.
+        // Ownership cannot be established: a live process in group and session `L` (which
+        // may then name another process's group) is not covered, never signalled, and
+        // death is not proven.
         let sim = Sim::new();
         sim.owned.set(false);
         sim.world.borrow_mut().procs.get_mut(&L).unwrap().st = St::Zombie;
@@ -2059,5 +2060,11 @@ mod tests {
         assert!(!r.tree_dead, "{r:?}");
         let targets = st.lock().unwrap().targets.clone();
         assert!(!targets.contains_key(&(200, 2_000)), "{targets:?}");
+        assert!(sim.alive(200));
+        assert!(
+            !sim.log().iter().any(|e| matches!(e, Ev::Kill(200, _))),
+            "{:?}",
+            sim.log()
+        );
     }
 }
