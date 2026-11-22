@@ -141,18 +141,17 @@ pub(crate) fn open_verified<O: JobOs>(
     if expired(os, deadline) {
         return Opened::Cut;
     }
-    let h = match os.open_process(pid, Access::Kill) {
-        Ok(h) => h,
+    let opened = match os.open_process(pid, Access::Kill) {
         Err(e) if code(&e) == Some(ERROR_ACCESS_DENIED) => {
             if expired(os, deadline) {
                 return Opened::Cut;
             }
-            match os.open_process(pid, Access::Wait) {
-                Ok(h) => h,
-                Err(e) if code(&e) == Some(ERROR_INVALID_PARAMETER) => return Opened::Gone,
-                Err(_) => return Opened::Unverifiable,
-            }
+            os.open_process(pid, Access::Wait)
         }
+        r => r,
+    };
+    let h = match opened {
+        Ok(h) => h,
         Err(e) if code(&e) == Some(ERROR_INVALID_PARAMETER) => return Opened::Gone,
         Err(_) => return Opened::Unverifiable,
     };
@@ -224,13 +223,13 @@ struct Supplied {
 }
 
 fn split(extra: &[ProcessIdentity], me: u32) -> Supplied {
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<&ProcessIdentity> = HashSet::new();
     let mut s = Supplied {
         wanted: Vec::new(),
         malformed: Vec::new(),
     };
     for id in extra {
-        if !seen.insert(id.clone()) {
+        if !seen.insert(id) {
             continue;
         }
         let start = id.start_time.parse::<u64>().ok();
