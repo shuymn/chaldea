@@ -426,3 +426,33 @@ fn shutdown_releases_every_file() {
         close(&store);
     }
 }
+
+/// A database whose text encoding is not UTF-8 is refused before any change; it would
+/// count payload bytes in another encoding.
+#[test]
+fn refuses_a_non_utf8_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("chaldea.db");
+    {
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("PRAGMA encoding='UTF-16le'; CREATE TABLE old(x); DROP TABLE old;")
+            .unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    match open(&path) {
+        Err(e) => {
+            assert!(matches!(e, OpenError::Encoding(_)), "{e}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        Ok(store) => {
+            let result = store
+                .submit(soon(), |tx| {
+                    Ok(tx.append(vec![registered(thread(1), false)])?)
+                })
+                .unwrap()
+                .blocking_wait();
+            close(&store);
+            assert!(result.is_ok(), "{result:?}");
+        }
+    }
+}

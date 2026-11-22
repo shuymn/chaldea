@@ -114,6 +114,11 @@ enum Found {
 fn classify(conn: &Connection) -> Result<Found, OpenError> {
     conn.execute_batch("BEGIN DEFERRED")?;
     let result = (|| {
+        // Fixed at creation; an empty file reports the encoding it will be created with.
+        let encoding: String = conn.pragma_query_value(None, "encoding", |r| r.get(0))?;
+        if encoding != "UTF-8" {
+            return Err(OpenError::Encoding(encoding));
+        }
         let app: i32 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
         let objects: i64 =
             conn.query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))?;

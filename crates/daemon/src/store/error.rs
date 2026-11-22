@@ -239,6 +239,9 @@ pub enum OpenError {
         version: u32,
         names: Vec<String>,
     },
+    /// The database's text encoding is not UTF-8 (SQLite fixes it at creation); the store
+    /// binds UTF-8 byte counts that `octet_length` must agree with.
+    Encoding(String),
     /// `journal_mode=WAL` returned another mode.
     NoWal(String),
     /// A connection setting did not take effect.
@@ -287,6 +290,7 @@ impl fmt::Display for OpenError {
                 "the schema differs from version {version}'s: {}",
                 names.join(", ")
             ),
+            OpenError::Encoding(e) => write!(f, "the database encoding is {e}, not UTF-8"),
             OpenError::NoWal(mode) => write!(f, "journal_mode=WAL returned {mode}"),
             OpenError::Setup(m) => write!(f, "connection setup: {m}"),
             OpenError::Store(e) => e.fmt(f),
