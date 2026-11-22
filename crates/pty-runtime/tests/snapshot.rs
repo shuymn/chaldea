@@ -393,6 +393,11 @@ fn malformed_grids_are_rejected() {
         let e = decode_grid(g, 3, 2).unwrap_err();
         assert!(ok(&e), "{g}: {e:?}");
     }
+    // A tail after a narrow character: the emulator lays `a` out in one cell.
+    assert_eq!(
+        decode_grid(r#"[["a",""],[]]"#, 3, 2).unwrap_err(),
+        GridError::EmptyWithoutLead { row: 0, col: 1 }
+    );
     // A wide pair ending exactly at the last column is well formed.
     assert!(decode_grid(r#"[["a","日",""],[]]"#, 3, 2).is_ok());
 }

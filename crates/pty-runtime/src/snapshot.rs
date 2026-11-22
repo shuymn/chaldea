@@ -240,9 +240,16 @@ impl fmt::Display for GridError {
 
 impl std::error::Error for GridError {}
 
+/// Whether the emulator lays out a cell whose text is `text` on two cells: the width of
+/// its base character (`unicode-width`, as alacritty).
+fn is_wide(text: &str) -> bool {
+    text.chars().next().and_then(UnicodeWidthChar::width) == Some(2)
+}
+
 /// The reader-side validation of the §2.6 grid encoding: the lines, filled back to `cols`.
-/// A cell is a `WideLead` when an `""` follows it; a wide character without that tail, an
-/// `""` without a lead, and every other shape outside §2.6 are rejected.
+/// A wide character followed by `""` is a `WideLead` and its `WideTail`; a wide character
+/// without that tail, an `""` after anything but a wide character, and every other shape
+/// outside §2.6 are rejected.
 pub fn decode_grid(grid: &str, cols: u16, rows: u16) -> Result<Vec<Line>, GridError> {
     let v: Value = serde_json::from_str(grid).map_err(|e| GridError::NotJson(e.to_string()))?;
     let Value::Array(rs) = v else {
@@ -276,7 +283,7 @@ pub fn decode_grid(grid: &str, cols: u16, rows: u16) -> Result<Vec<Line>, GridEr
         for (c, s) in texts.iter().enumerate() {
             if s.is_empty() {
                 let lead =
-                    c > 0 && !texts[c - 1].is_empty() && cells[c - 1].width == CellWidth::Single;
+                    c > 0 && is_wide(texts[c - 1]) && cells[c - 1].width == CellWidth::Single;
                 if !lead {
                     return Err(GridError::EmptyWithoutLead { row: r, col: c });
                 }
@@ -293,7 +300,7 @@ pub fn decode_grid(grid: &str, cols: u16, rows: u16) -> Result<Vec<Line>, GridEr
         // tail is never omitted). Width is the emulator's (`unicode-width`, as alacritty).
         if let Some(c) = cells.iter().enumerate().position(|(i, cell)| {
             cell.width == CellWidth::Single
-                && cell.text.chars().next().and_then(UnicodeWidthChar::width) == Some(2)
+                && is_wide(&cell.text)
                 && cells
                     .get(i + 1)
                     .is_none_or(|n| n.width != CellWidth::WideTail)
