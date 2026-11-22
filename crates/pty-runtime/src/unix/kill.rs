@@ -2,7 +2,7 @@
 //! census rule, HUP → TERM → KILL with budget-capped waits, and the proof of death. It runs
 //! over an [`Os`] so the unit tests drive it with a synthetic process table and clock.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
@@ -18,8 +18,6 @@ pub(crate) const METHOD_BUSY: &str = "unix_busy";
 const STEP: Duration = Duration::from_millis(25);
 /// The poll step while another call holds the kill lock.
 const LOCK_STEP: Duration = Duration::from_millis(10);
-/// Entries of CPU work between clock reads.
-const CPU_CHECK: usize = 256;
 /// Retries of a saturated process list, each with double the capacity.
 const LIST_RETRIES: usize = 3;
 /// Extra entries over the count call's estimate.
@@ -61,42 +59,42 @@ pub(crate) struct Leader {
     pub(crate) me: u32,
 }
 
-/// Targets kept across calls: `(pid, start)` → the process group last seen (0 unknown).
-/// A target is pruned only after a direct lookup of it resolved it (§2.5, the retention
-/// invariant).
+/// Targets kept across calls: `(pid, start)` → the process group last read (0 unknown).
+/// Only [`Call::read`] and [`Call::read_sid`] change it, at the moment of each direct read
+/// (§2.5, the retention invariant).
 #[derive(Debug, Default)]
 pub(crate) struct KillState {
     targets: BTreeMap<(u32, u64), u32>,
 }
 
-/// One pass over the process table.
+/// One census pass.
 #[derive(Debug)]
 struct Pass {
-    /// Live processes with their session id (`None`: `getsid` failed other than `ESRCH`).
-    live: HashMap<u32, (Proc, Option<u32>)>,
-    unreadable: HashMap<u32, Option<u32>>,
-    zombie: HashMap<u32, u64>,
-    gone: HashSet<u32>,
-    /// Pids looked up in this pass.
-    seen: HashSet<u32>,
     /// The whole list was obtained and every pid in it looked up.
     complete: bool,
     clean: bool,
     /// Every defect is churn (a process exited during the pass).
     churn_only: bool,
+    /// A covered process was read live or unreadable in this pass.
+    alive: bool,
+    /// The ownership check after the pass held.
+    owned: bool,
+    /// Pids whose covered generation this pass read live: their children are covered.
+    covered: HashSet<u32>,
+    /// Live processes this pass read that are not covered (yet), by parent pid.
+    pending: HashMap<u32, Vec<Proc>>,
 }
 
 impl Pass {
     fn new() -> Pass {
         Pass {
-            live: HashMap::new(),
-            unreadable: HashMap::new(),
-            zombie: HashMap::new(),
-            gone: HashSet::new(),
-            seen: HashSet::new(),
             complete: false,
             clean: true,
             churn_only: true,
+            alive: false,
+            owned: false,
+            covered: HashSet::new(),
+            pending: HashMap::new(),
         }
     }
 
@@ -108,39 +106,17 @@ impl Pass {
         self.clean = false;
         self.churn_only = false;
     }
-
-    fn status(&self, pid: u32, start: u64) -> Status {
-        if let Some((p, _)) = self.live.get(&pid) {
-            return if p.start == start {
-                Status::Live
-            } else {
-                Status::Resolved
-            };
-        }
-        if self.zombie.contains_key(&pid) || self.gone.contains(&pid) {
-            return Status::Resolved;
-        }
-        if self.unreadable.contains_key(&pid) {
-            return Status::Unresolved;
-        }
-        if self.complete && !self.seen.contains(&pid) {
-            // Not in a complete list: not live for this pass, but never proof that it is
-            // gone (the list can omit a live process; the recheck looks it up).
-            return Status::Absent;
-        }
-        Status::Unresolved
-    }
 }
 
+/// What a proof step established.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Status {
-    Live,
-    /// Unreadable, or the pass could not tell.
-    Unresolved,
-    /// Absent from a complete list; resolved only by a lookup of its own.
-    Absent,
-    /// A lookup of that pid showed it gone, a zombie, or another process.
-    Resolved,
+enum Proof {
+    /// Every covered identity was read resolved.
+    Dead,
+    /// A covered process was read live or unreadable.
+    Alive,
+    /// Nothing may be proven yet (an unclean pass, no ownership, or the deadline).
+    Unknown,
 }
 
 /// A process not proven dead.
@@ -171,23 +147,19 @@ struct Call<'a, O: Os> {
     deadline: Instant,
     /// Zombies seen in this call.
     zombies: BTreeSet<(u32, u64)>,
-    ticks: usize,
-    /// Identities a direct lookup in this call resolved: the only ones that may be pruned.
-    dead: BTreeSet<(u32, u64)>,
+    /// Ownership was established at the call's start: only then does session membership
+    /// cover a process, and only while ownership has not been lost since.
+    owned0: bool,
+    /// Covered processes without a readable start (unreadable session members, and the
+    /// leader while its start is unknown): pid → its group when known.
+    unknown: BTreeMap<u32, Option<u32>>,
+    /// The start each pid was last read live with: the report prefers that generation.
+    last_live: HashMap<u32, u64>,
 }
 
 impl<O: Os> Call<'_, O> {
     fn expired(&self) -> bool {
         self.os.now() >= self.deadline
-    }
-
-    /// Counts one entry of CPU work; true when the deadline has passed. The clock is read
-    /// at the first entry of each loop (`ticks` is reset per loop) and every `CPU_CHECK`
-    /// entries after it.
-    fn tick(&mut self) -> bool {
-        let check = self.ticks.is_multiple_of(CPU_CHECK);
-        self.ticks += 1;
-        check && self.expired()
     }
 
     fn sleep(&self, step: Duration) {
@@ -198,7 +170,116 @@ impl<O: Os> Call<'_, O> {
         }
     }
 
-    fn pass(&mut self) -> Pass {
+    fn member_ok(&self) -> bool {
+        self.owned0 && !self.os.lost()
+    }
+
+    /// The one place a `lookup` lands (§2.5, the retention invariant). Before anything
+    /// else runs, the retained targets take the read: every other generation at that pid
+    /// is removed when the read shows it gone, a zombie, or another start, and a covered
+    /// live record (a retained identity, a session member, or a child of a generation this
+    /// pass read covered) is retained under its full identity. `pass` is the census pass
+    /// the read belongs to, if any.
+    fn read(&mut self, st: &mut KillState, pid: u32, pass: Option<&mut Pass>) -> Lookup {
+        let r = self.os.lookup(pid);
+        match r {
+            Lookup::Gone | Lookup::Zombie(_) => self.resolve(st, pid, None),
+            Lookup::Live(p) => {
+                self.resolve(st, pid, Some(p.start));
+                self.last_live.insert(pid, p.start);
+                let covered = st.targets.contains_key(&(pid, p.start))
+                    || (self.member_ok() && (p.pgid == self.leader.pid || pid == self.leader.pid))
+                    || pass.as_ref().is_some_and(|ps| ps.covered.contains(&p.ppid));
+                if covered {
+                    self.cover(st, p, pass);
+                } else if let Some(ps) = pass {
+                    ps.pending.entry(p.ppid).or_default().push(p);
+                }
+            }
+            Lookup::Unreadable => {
+                let held = self.unknown.contains_key(&pid)
+                    || st
+                        .targets
+                        .range((pid, 0)..=(pid, u64::MAX))
+                        .next()
+                        .is_some();
+                if let Some(ps) = pass
+                    && held
+                {
+                    ps.alive = true;
+                }
+            }
+        }
+        r
+    }
+
+    /// The `getsid` that follows a census lookup of `pid` (`looked` its result), through
+    /// the same rule: `ESRCH` resolves the pid; the leader's session covers the process.
+    fn read_sid(
+        &mut self,
+        st: &mut KillState,
+        pid: u32,
+        looked: Lookup,
+        pass: &mut Pass,
+    ) -> Result<u32, i32> {
+        let r = self.os.getsid(pid);
+        match r {
+            Err(libc::ESRCH) => self.resolve(st, pid, None),
+            Ok(sid) if sid == self.leader.pid && self.member_ok() => match looked {
+                Lookup::Live(p) => self.cover(st, p, Some(pass)),
+                Lookup::Unreadable => {
+                    self.unknown.entry(pid).or_insert(None);
+                    pass.alive = true;
+                }
+                Lookup::Gone | Lookup::Zombie(_) => {}
+            },
+            _ => {}
+        }
+        r
+    }
+
+    /// Retains `p` and, within `pass`, every pending descendant of it.
+    fn cover(&mut self, st: &mut KillState, p: Proc, pass: Option<&mut Pass>) {
+        let mut work = vec![p];
+        let mut pass = pass;
+        while let Some(p) = work.pop() {
+            st.targets.insert((p.pid, p.start), p.pgid);
+            self.unknown.remove(&p.pid);
+            if let Some(ps) = pass.as_deref_mut() {
+                ps.alive = true;
+                if ps.covered.insert(p.pid) {
+                    work.extend(ps.pending.remove(&p.pid).unwrap_or_default());
+                }
+            }
+        }
+    }
+
+    /// Removes the identities at `pid` that a read disproved: all of them, or all but the
+    /// generation `keep` that the read showed live.
+    fn resolve(&mut self, st: &mut KillState, pid: u32, keep: Option<u64>) {
+        let gone: Vec<(u32, u64)> = st
+            .targets
+            .range((pid, 0)..=(pid, u64::MAX))
+            .map(|(k, _)| *k)
+            .filter(|(_, s)| Some(*s) != keep)
+            .collect();
+        for k in gone {
+            st.targets.remove(&k);
+        }
+        if keep.is_none() {
+            self.unknown.remove(&pid);
+            self.last_live.remove(&pid);
+        }
+    }
+
+    /// A census pass, then a fresh ownership check.
+    fn round(&mut self, st: &mut KillState) -> Pass {
+        let mut pass = self.pass(st);
+        pass.owned = !self.expired() && self.os.owned(self.deadline);
+        pass
+    }
+
+    fn pass(&mut self, st: &mut KillState) -> Pass {
         let mut p = Pass::new();
         if self.expired() {
             p.incomplete();
@@ -217,54 +298,24 @@ impl<O: Os> Call<'_, O> {
                 p.incomplete();
                 return p;
             }
-            p.seen.insert(pid);
-            match self.os.lookup(pid) {
-                Lookup::Gone => {
-                    p.gone.insert(pid);
-                    p.churn();
-                }
+            let looked = self.read(st, pid, Some(&mut p));
+            match looked {
+                Lookup::Gone => p.churn(),
                 Lookup::Zombie(start) => {
-                    p.zombie.insert(pid, start);
                     if self.zombies.insert((pid, start)) {
                         p.churn();
                     }
                 }
-                Lookup::Live(proc) => {
+                Lookup::Live(_) | Lookup::Unreadable => {
                     if self.expired() {
                         p.incomplete();
                         return p;
                     }
-                    match self.os.getsid(pid) {
-                        Ok(sid) => {
-                            p.live.insert(pid, (proc, Some(sid)));
-                        }
-                        Err(libc::ESRCH) => {
-                            p.gone.insert(pid);
-                            p.churn();
-                        }
-                        Err(_) => {
-                            p.live.insert(pid, (proc, None));
-                            p.incomplete();
-                        }
-                    }
-                }
-                Lookup::Unreadable => {
-                    if self.expired() {
-                        p.incomplete();
-                        return p;
-                    }
-                    match self.os.getsid(pid) {
-                        Ok(sid) => {
-                            p.unreadable.insert(pid, Some(sid));
-                        }
-                        Err(libc::ESRCH) => {
-                            p.gone.insert(pid);
-                            p.churn();
-                        }
-                        Err(_) => {
-                            p.unreadable.insert(pid, None);
-                            p.incomplete();
-                        }
+                    match self.read_sid(st, pid, looked, &mut p) {
+                        Ok(_) => {}
+                        Err(libc::ESRCH) => p.churn(),
+                        // A sid that could have made the pid a member.
+                        Err(_) => p.incomplete(),
                     }
                 }
             }
@@ -294,175 +345,48 @@ impl<O: Os> Call<'_, O> {
         None
     }
 
-    /// A pass, a fresh ownership check, and the targets extended with the members and
-    /// their descendants. A pass whose extension the deadline cut short is not clean.
-    fn round(&mut self, st: &mut KillState) -> (Pass, bool) {
-        let mut pass = self.pass();
-        let owned = !self.expired() && self.os.owned(self.deadline);
-        if !self.extend(&pass, owned, st) {
-            pass.incomplete();
-        }
-        (pass, owned)
-    }
-
-    /// False when the deadline cut it short.
-    fn extend(&mut self, pass: &Pass, owned: bool, st: &mut KillState) -> bool {
-        let l = self.leader.pid;
-        self.ticks = 0;
-        if owned {
-            for (proc, sid) in pass.live.values() {
-                if self.tick() {
-                    return false;
-                }
-                if proc.pgid == l || *sid == Some(l) {
-                    st.targets.insert((proc.pid, proc.start), proc.pgid);
-                }
-            }
-        }
-        let mut children: HashMap<u32, Vec<Proc>> = HashMap::new();
-        for (proc, _) in pass.live.values() {
-            if self.tick() {
-                return false;
-            }
-            children.entry(proc.ppid).or_default().push(*proc);
-        }
-        let mut queue: VecDeque<u32> = VecDeque::new();
-        for (pid, start) in st.targets.keys() {
-            if self.tick() {
-                return false;
-            }
-            if pass.status(*pid, *start) == Status::Live {
-                queue.push_back(*pid);
-            }
-        }
-        let mut visited: HashSet<u32> = queue.iter().copied().collect();
-        while let Some(pid) = queue.pop_front() {
-            if self.tick() {
-                return false;
-            }
-            for c in children.get(&pid).into_iter().flatten() {
-                if visited.insert(c.pid) {
-                    st.targets.insert((c.pid, c.start), c.pgid);
-                    queue.push_back(c.pid);
-                }
-            }
-        }
-        // Refresh the group of every live target.
-        for ((pid, start), pgid) in &mut st.targets {
-            if self.tick() {
-                return false;
-            }
-            if let Some((p, _)) = pass.live.get(pid)
-                && p.start == *start
-            {
-                *pgid = p.pgid;
-            }
-        }
-        true
-    }
-
-    /// Every target live or unresolved in the pass, plus (while owned) every live or
-    /// unreadable session member the pass saw, recorded as a target or not. Once the deadline has passed, the pass is unclean and every
-    /// remaining target is kept without a status check.
-    fn live_set(&mut self, pass: &mut Pass, owned: bool, st: &KillState) -> Vec<Survivor> {
-        let mut out: BTreeMap<u32, Survivor> = BTreeMap::new();
-        let mut cut = false;
-        self.ticks = 0;
-        for ((pid, start), pgid) in &st.targets {
-            cut = cut || self.tick();
-            let status = if cut {
-                Status::Unresolved
-            } else {
-                pass.status(*pid, *start)
-            };
-            if status == Status::Resolved {
-                self.dead.insert((*pid, *start));
-            }
-            if matches!(status, Status::Live | Status::Unresolved) {
-                out.insert(
-                    *pid,
-                    Survivor {
-                        pid: *pid,
-                        start: Some(*start),
-                        pgid: Some(*pgid),
-                    },
-                );
-            }
-        }
-        if owned {
-            let l = self.leader.pid;
-            for (proc, sid) in pass.live.values() {
-                cut = cut || self.tick();
-                if proc.pgid == l || *sid == Some(l) {
-                    out.entry(proc.pid).or_insert(Survivor {
-                        pid: proc.pid,
-                        start: Some(proc.start),
-                        pgid: Some(proc.pgid),
-                    });
-                }
-            }
-            for (pid, sid) in &pass.unreadable {
-                cut = cut || self.tick();
-                if *sid == Some(l) {
-                    out.entry(*pid).or_insert(Survivor {
-                        pid: *pid,
-                        start: None,
-                        pgid: None,
-                    });
-                }
-            }
-        }
-        if cut {
-            pass.incomplete();
-        }
-        out.into_values().collect()
-    }
-
-    /// Before a pass may prove death: every recorded identity looked up by itself, so one
-    /// the list omitted is still seen. The identities found live or unreadable, kept also
-    /// when the deadline cuts the recheck short, and whether it finished.
-    fn recheck(&mut self, st: &KillState) -> (Vec<Survivor>, bool) {
-        let mut out = Vec::new();
-        if self.leader.start.is_none() {
+    /// Every retained identity and every covered pid without a start, each read by
+    /// itself, so one the list omitted is still seen. `Dead` only when every read resolved
+    /// it; a cut by the deadline is `Unknown` unless something was already read alive.
+    fn recheck(&mut self, st: &mut KillState) -> Proof {
+        let ids: Vec<(u32, u64)> = st.targets.keys().copied().collect();
+        let unknown: Vec<u32> = self.unknown.keys().copied().collect();
+        let mut alive = false;
+        for (pid, start) in ids {
             if self.expired() {
-                return (out, false);
+                return if alive { Proof::Alive } else { Proof::Unknown };
+            }
+            match self.read(st, pid, None) {
+                Lookup::Live(p) if p.start == start => alive = true,
+                Lookup::Unreadable => alive = true,
+                _ => {}
+            }
+        }
+        for pid in unknown {
+            if self.expired() {
+                return if alive { Proof::Alive } else { Proof::Unknown };
             }
             if matches!(
-                self.os.lookup(self.leader.pid),
+                self.read(st, pid, None),
                 Lookup::Live(_) | Lookup::Unreadable
             ) {
-                out.push(Survivor {
-                    pid: self.leader.pid,
-                    start: None,
-                    pgid: Some(self.leader.pid),
-                });
+                alive = true;
             }
         }
-        for ((pid, start), pgid) in &st.targets {
-            if self.expired() {
-                return (out, false);
-            }
-            let unresolved = match self.os.lookup(*pid) {
-                Lookup::Live(p) => p.start == *start,
-                Lookup::Unreadable => true,
-                Lookup::Zombie(_) | Lookup::Gone => false,
-            };
-            if !unresolved {
-                self.dead.insert((*pid, *start));
-            } else {
-                out.push(Survivor {
-                    pid: *pid,
-                    start: Some(*start),
-                    pgid: Some(*pgid),
-                });
-            }
+        if alive { Proof::Alive } else { Proof::Dead }
+    }
+
+    /// The proof step of a pass that read nothing covered alive.
+    fn prove(&mut self, pass: &Pass, st: &mut KillState) -> Proof {
+        if !(pass.clean && pass.owned && self.owned0) {
+            return Proof::Unknown;
         }
-        (out, true)
+        self.recheck(st)
     }
 
     /// The group (after a fresh ownership check) and every target outside it, each by a
     /// verified per-pid signal.
-    fn signal(&mut self, sig: Sig, st: &KillState) {
+    fn signal(&mut self, sig: Sig, st: &mut KillState) {
         if self.expired() {
             return;
         }
@@ -473,27 +397,28 @@ impl<O: Os> Call<'_, O> {
             }
             self.os.killpg(self.leader.pid, sig);
         }
-        self.ticks = 0;
-        for ((pid, start), pgid) in &st.targets {
-            if self.tick() {
-                return;
-            }
-            if owned && *pgid == self.leader.pid {
+        let ids: Vec<((u32, u64), u32)> = st.targets.iter().map(|(k, g)| (*k, *g)).collect();
+        for ((pid, start), pgid) in ids {
+            if owned && pgid == self.leader.pid {
                 continue;
             }
-            self.signal_verified(*pid, *start, sig);
+            if self.expired() {
+                return;
+            }
+            self.signal_verified(st, pid, start, sig);
         }
     }
 
-    /// `lookup`, the clock check, `kill`: only when the lookup shows the recorded start.
-    fn signal_verified(&self, pid: u32, start: u64, sig: Sig) {
+    /// `lookup` (through [`Call::read`]), the clock check, `kill`: only when the lookup
+    /// shows the recorded start.
+    fn signal_verified(&mut self, st: &mut KillState, pid: u32, start: u64, sig: Sig) {
         if pid == 0 || pid == 1 || pid == self.leader.me {
             return;
         }
         if self.expired() {
             return;
         }
-        if let Lookup::Live(p) = self.os.lookup(pid)
+        if let Lookup::Live(p) = self.read(st, pid, None)
             && p.start == start
         {
             if self.expired() {
@@ -505,19 +430,20 @@ impl<O: Os> Call<'_, O> {
 
     /// Waits until `until` (capped by the deadline), polling the targets every `STEP`,
     /// and returns early once none is live.
-    fn grace(&self, until: Instant, st: &KillState) {
+    fn grace(&mut self, until: Instant, st: &mut KillState) {
         let until = until.min(self.deadline);
         loop {
             if self.os.now() >= until {
                 return;
             }
+            let ids: Vec<(u32, u64)> = st.targets.keys().copied().collect();
             let mut any = false;
-            for (pid, start) in st.targets.keys() {
+            for (pid, start) in ids {
                 if self.expired() {
                     return;
                 }
-                match self.os.lookup(*pid) {
-                    Lookup::Live(p) if p.start == *start => any = true,
+                match self.read(st, pid, None) {
+                    Lookup::Live(p) if p.start == start => any = true,
                     Lookup::Unreadable => any = true,
                     _ => {}
                 }
@@ -537,32 +463,36 @@ impl<O: Os> Call<'_, O> {
         }
     }
 
-    /// The proof step of a pass with no live member or target: `None` when it proves
-    /// death, else the identities a recheck found live (empty when nothing may be proven
-    /// yet).
-    fn prove(&mut self, pass: &Pass, owned: bool, st: &KillState) -> Option<Vec<Survivor>> {
-        if !(pass.clean && owned) {
-            return Some(Vec::new());
+    /// The survivors, derived from the retained targets (one entry per pid, the
+    /// generation last read live preferred) and the covered pids without a start.
+    fn survivors(&self, st: &KillState) -> Vec<Survivor> {
+        let mut by_pid: BTreeMap<u32, Survivor> = BTreeMap::new();
+        for (&(pid, start), &pgid) in &st.targets {
+            let s = Survivor {
+                pid,
+                start: Some(start),
+                pgid: Some(pgid),
+            };
+            let live = self.last_live.get(&pid) == Some(&start);
+            match by_pid.entry(pid) {
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(s);
+                }
+                std::collections::btree_map::Entry::Occupied(mut e) => {
+                    if live {
+                        e.insert(s);
+                    }
+                }
+            }
         }
-        match self.recheck(st) {
-            (found, true) if found.is_empty() => None,
-            (found, _) => Some(found),
+        for (&pid, &pgid) in &self.unknown {
+            by_pid.entry(pid).or_insert(Survivor {
+                pid,
+                start: None,
+                pgid,
+            });
         }
-    }
-
-    /// Replaces `live` with this pass's live set; after a pass that could not complete,
-    /// the survivors an earlier pass saw stay too (such a pass cannot show they died).
-    fn observe(&mut self, pass: &mut Pass, owned: bool, st: &KillState, live: &mut Vec<Survivor>) {
-        let now = self.live_set(pass, owned, st);
-        if pass.complete {
-            *live = now;
-            return;
-        }
-        let mut merged: BTreeMap<u32, Survivor> = now.into_iter().map(|s| (s.pid, s)).collect();
-        for s in live.drain(..) {
-            merged.entry(s.pid).or_insert(s);
-        }
-        *live = merged.into_values().collect();
+        by_pid.into_values().collect()
     }
 }
 
@@ -624,7 +554,7 @@ fn lock_until<'m, O: Os>(
     }
 }
 
-/// The steps of §2.5. Every result comes from this call's own passes.
+/// The steps of §2.5. Every result comes from this call's own reads.
 pub(crate) fn kill_tree<O: Os>(
     os: &O,
     leader: Leader,
@@ -638,7 +568,7 @@ pub(crate) fn kill_tree<O: Os>(
         .collect();
     let t0 = os.now();
     if t0 >= deadline {
-        // No pass and no blocking lock. When the state is free at once, the new `extra`
+        // No read and no blocking lock. When the state is free at once, the new `extra`
         // entries are kept for the next call and the kept targets are listed.
         let mut report = unresolved(leader, &accepted, method(os));
         let kept = match state.try_lock() {
@@ -650,13 +580,14 @@ pub(crate) fn kill_tree<O: Os>(
             for key in &accepted {
                 g.targets.entry(*key).or_insert(0);
             }
-            for ((pid, start), pgid) in &g.targets {
-                if !report.survivors.iter().any(|s| s.pid == *pid) {
+            let mut listed: HashSet<u32> = report.survivors.iter().map(|s| s.pid).collect();
+            for (&(pid, start), &pgid) in &g.targets {
+                if listed.insert(pid) {
                     report.survivors.push(
                         Survivor {
-                            pid: *pid,
-                            start: Some(*start),
-                            pgid: Some(*pgid),
+                            pid,
+                            start: Some(start),
+                            pgid: Some(pgid),
                         }
                         .identity(),
                     );
@@ -665,9 +596,10 @@ pub(crate) fn kill_tree<O: Os>(
         }
         return report;
     }
-    let Some(mut st) = lock_until(os, state, deadline) else {
+    let Some(mut guard) = lock_until(os, state, deadline) else {
         return unresolved(leader, &accepted, METHOD_BUSY);
     };
+    let st = &mut *guard;
     for key in &accepted {
         st.targets.entry(*key).or_insert(0);
     }
@@ -679,63 +611,65 @@ pub(crate) fn kill_tree<O: Os>(
         leader,
         deadline,
         zombies: BTreeSet::new(),
-        ticks: 0,
-        dead: BTreeSet::new(),
+        owned0: false,
+        unknown: BTreeMap::new(),
+        last_live: HashMap::new(),
     };
+    if leader.start.is_none() {
+        call.unknown.insert(leader.pid, Some(leader.pid));
+    }
+    // Ownership for the whole call, under the same deadline rules as every other check.
+    call.owned0 = !call.expired() && os.owned(deadline);
     let budget = deadline - t0;
 
-    // Opening pass: an already dead tree returns before any signal. `live` holds the
-    // survivors observed so far; every census updates it (`observe`).
-    let (mut pass, mut owned) = call.round(&mut st);
-    let mut live = Vec::new();
+    // Opening pass: an already dead tree returns before any signal.
+    let mut pass = call.round(st);
+    let mut alive = false;
     loop {
-        call.observe(&mut pass, owned, &st, &mut live);
-        if !live.is_empty() {
+        if pass.alive {
+            alive = true;
             break;
         }
-        match call.prove(&pass, owned, &st) {
-            None => return finish(&mut call, &mut st, true, Vec::new()),
-            Some(r) if !r.is_empty() => {
-                live = r;
+        match call.prove(&pass, st) {
+            Proof::Dead => return finish(&call, st, true),
+            Proof::Alive => {
+                alive = true;
                 break;
             }
-            Some(_) => {}
+            Proof::Unknown => {}
         }
         if os.lost() || call.expired() {
-            return finish(&mut call, &mut st, false, live);
+            return finish(&call, st, false);
         }
         if !pass.churn_only {
             break;
         }
-        (pass, owned) = call.round(&mut st);
+        pass = call.round(st);
     }
 
-    if !live.is_empty() {
+    if alive {
         if budget > Duration::from_millis(100) {
-            call.signal(Sig::Hup, &st);
-            call.grace(t0 + (budget / 4).min(Duration::from_millis(500)), &st);
-            // Extends the targets with what appeared since the HUP.
-            (pass, owned) = call.round(&mut st);
-            call.observe(&mut pass, owned, &st, &mut live);
-            call.signal(Sig::Term, &st);
-            call.grace(t0 + (budget / 2).min(Duration::from_secs(2)), &st);
+            call.signal(Sig::Hup, st);
+            call.grace(t0 + (budget / 4).min(Duration::from_millis(500)), st);
+            // Reads what appeared since the HUP.
+            let _ = call.round(st);
+            call.signal(Sig::Term, st);
+            call.grace(t0 + (budget / 2).min(Duration::from_secs(2)), st);
         }
-        (pass, owned) = call.round(&mut st);
-        call.observe(&mut pass, owned, &st, &mut live);
-        call.signal(Sig::Kill, &st);
+        let _ = call.round(st);
+        call.signal(Sig::Kill, st);
     }
 
     // Prove.
     while !call.expired() {
-        (pass, owned) = call.round(&mut st);
-        call.observe(&mut pass, owned, &st, &mut live);
-        if live.is_empty() {
-            match call.prove(&pass, owned, &st) {
-                None => return finish(&mut call, &mut st, true, Vec::new()),
-                Some(r) if !r.is_empty() => live = r,
-                Some(_) => {
+        pass = call.round(st);
+        if !pass.alive {
+            match call.prove(&pass, st) {
+                Proof::Dead => return finish(&call, st, true),
+                Proof::Alive => {}
+                Proof::Unknown => {
                     if os.lost() {
-                        return finish(&mut call, &mut st, false, live);
+                        return finish(&call, st, false);
                     }
                     if !pass.churn_only {
                         call.sleep(STEP);
@@ -744,44 +678,15 @@ pub(crate) fn kill_tree<O: Os>(
                 }
             }
         }
-        call.signal(Sig::Kill, &st);
+        call.signal(Sig::Kill, st);
         call.sleep(STEP);
     }
-    finish(&mut call, &mut st, false, live)
+    finish(&call, st, false)
 }
 
-/// Applies the retention invariant and builds the report from held state. Every reported
-/// survivor with a start becomes a target, on every exit path (with the members and
-/// descendants the extension recorded, every identity the call observed live is then a
-/// target: a member the extension could not record is in the live set, hence a survivor);
-/// then only identities a direct lookup resolved are pruned, never a survivor. Retention
-/// always completes (no syscall, bounded by the survivors); pruning stops at the deadline,
-/// which only keeps more.
-fn finish<O: Os>(
-    call: &mut Call<'_, O>,
-    st: &mut KillState,
-    tree_dead: bool,
-    live: Vec<Survivor>,
-) -> KillReport {
-    let mut kept = BTreeSet::new();
-    for s in &live {
-        if let Some(start) = s.start {
-            kept.insert((s.pid, start));
-            st.targets
-                .entry((s.pid, start))
-                .or_insert(s.pgid.unwrap_or(0));
-        }
-    }
-    call.ticks = 0;
-    let dead = std::mem::take(&mut call.dead);
-    for id in &dead {
-        if call.tick() {
-            break;
-        }
-        if !kept.contains(id) {
-            st.targets.remove(id);
-        }
-    }
+/// The report, derived from the retained targets: nothing is pruned or added here, since
+/// every read already updated them.
+fn finish<O: Os>(call: &Call<'_, O>, st: &KillState, tree_dead: bool) -> KillReport {
     let tree_dead = tree_dead && !call.os.lost();
     KillReport {
         method: method(call.os).to_owned(),
@@ -789,7 +694,10 @@ fn finish<O: Os>(
         survivors: if tree_dead {
             Vec::new()
         } else {
-            live.into_iter().map(Survivor::identity).collect()
+            call.survivors(st)
+                .into_iter()
+                .map(Survivor::identity)
+                .collect()
         },
     }
 }
@@ -1313,15 +1221,17 @@ mod tests {
             leader: sim.leader(),
             deadline: sim.at(5_000),
             zombies: BTreeSet::new(),
-            ticks: 0,
-            dead: BTreeSet::new(),
+            owned0: true,
+            unknown: BTreeMap::new(),
+            last_live: HashMap::new(),
         };
-        let first = call.pass();
+        let mut st = KillState::default();
+        let first = call.pass(&mut st);
         assert!(
             !first.clean && first.churn_only,
             "the leader's zombie is new"
         );
-        let second = call.pass();
+        let second = call.pass(&mut st);
         assert!(second.clean, "{second:?}");
     }
 
@@ -1730,63 +1640,13 @@ mod tests {
         assert!(!sim.alive(L));
     }
 
-    /// A clock that jumps 10 s at the `n`th clock read after the first ownership check.
-    fn jump_at_nth_now_after_owned(sim: &Sim, n: usize) {
-        let mut owned_seen = false;
-        let mut nows = 0;
-        *sim.clock.borrow_mut() = Some(Box::new(move |ev| match ev {
-            Ev::Owned if !owned_seen => {
-                owned_seen = true;
-                Duration::ZERO
-            }
-            Ev::Now if owned_seen => {
-                nows += 1;
-                if nows == n {
-                    Duration::from_secs(10)
-                } else {
-                    Duration::ZERO
-                }
-            }
-            _ => Duration::ZERO,
-        }));
-    }
-
-    #[test]
-    fn extension_cut_at_the_256th_entry_makes_the_pass_unclean() {
-        // Ownership holds and the census is clean; the clock passes the deadline at the
-        // check of the 256th entry of the extension (its second clock read).
-        let sim = Sim::new();
-        {
-            let mut w = sim.world.borrow_mut();
-            for pid in 1_000..1_300 {
-                w.add(pid, 1, pid, pid, u64::from(pid));
-            }
-        }
-        jump_at_nth_now_after_owned(&sim, 2);
-        let mut call = Call {
-            os: &sim,
-            leader: sim.leader(),
-            deadline: sim.at(1_000),
-            zombies: BTreeSet::new(),
-            ticks: 0,
-            dead: BTreeSet::new(),
-        };
-        let mut st = KillState::default();
-        let (pass, owned) = call.round(&mut st);
-        assert!(owned);
-        assert!(pass.complete);
-        assert!(!pass.clean);
-        assert!(call.expired());
-        assert_eq!(call.ticks, 257);
-    }
-
     #[test]
     fn member_cut_from_the_extension_is_tracked_by_the_next_call() {
-        // M, a live child of the leader in its group, is seen by the census; the clock
-        // passes the deadline at the extension's first check, before M is recorded.
+        // M, a live child of the leader in its group, is read by the census; the clock
+        // passes the deadline right after the ownership check that follows the pass.
         let sim = Sim::new();
         sim.world.borrow_mut().add(200, L, L, L, 2_000).dies = [false; 3];
-        jump_at_nth_now_after_owned(&sim, 1);
+        jump_after_owned_following(&sim, 200);
         let st = state();
         let r = sim.kill(&[], 1_000, &st);
         assert!(!r.tree_dead, "{r:?}");
@@ -1970,5 +1830,200 @@ mod tests {
         );
         assert!(sim.alive(X));
         assert_eq!(sim.world.borrow().procs[&X].start, 21);
+    }
+
+    // ---- Retention at the moment of each read ----
+
+    /// A clock that jumps 10 s at the first clock read after an ownership check that
+    /// follows `getsid(after)`: the census has read `after` by then.
+    fn jump_after_owned_following(sim: &Sim, after: u32) {
+        let mut stage = 0;
+        *sim.clock.borrow_mut() = Some(Box::new(move |ev| {
+            match (stage, ev) {
+                (0, Ev::Getsid(p)) if p == after => stage = 1,
+                (1, Ev::Owned) => stage = 2,
+                (2, Ev::Now) => {
+                    stage = 3;
+                    return Duration::from_secs(10);
+                }
+                _ => {}
+            }
+            Duration::ZERO
+        }));
+    }
+
+    /// A clock that jumps 10 s right after the first event `at`.
+    fn jump_at(sim: &Sim, at: Ev) {
+        let mut done = false;
+        *sim.clock.borrow_mut() = Some(Box::new(move |ev| {
+            if !done && ev == at {
+                done = true;
+                Duration::from_secs(10)
+            } else {
+                Duration::ZERO
+            }
+        }));
+    }
+
+    /// Between two calls `pid` leaves the session (`setsid`, reparented to launchd) and
+    /// its parent exits; the clock is a plain one again.
+    fn leave_and_orphan(sim: &Sim, pid: u32, parent_gone: impl FnOnce(&mut World)) {
+        let mut w = sim.world.borrow_mut();
+        let m = w.procs.get_mut(&pid).unwrap();
+        (m.ppid, m.pgid, m.sid) = (1, pid, pid);
+        parent_gone(&mut w);
+        drop(w);
+        *sim.clock.borrow_mut() = None;
+    }
+
+    /// The second call, with a complete list, still tracks `pid`.
+    fn retry_tracks(sim: &Sim, st: &Mutex<KillState>, pid: u32) {
+        let r = sim.kill(&[], 1_000, st);
+        assert!(!r.tree_dead, "{r:?}");
+        assert!(sim.alive(pid));
+        assert!(r.survivors.iter().any(|s| s.pid == pid), "{r:?}");
+    }
+
+    #[test]
+    fn member_read_before_getsid_is_retained() {
+        // The deadline passes right after the census read M, before its `getsid`.
+        let sim = Sim::new();
+        sim.world.borrow_mut().add(200, L, L, L, 2_000).dies = [false; 3];
+        jump_at(&sim, Ev::Lookup(200));
+        let st = state();
+        assert!(!sim.kill(&[], 1_000, &st).tree_dead);
+        leave_and_orphan(&sim, 200, |w| w.procs.get_mut(&L).unwrap().st = St::Zombie);
+        retry_tracks(&sim, &st, 200);
+    }
+
+    #[test]
+    fn member_read_before_the_ownership_check_is_retained() {
+        // The deadline passes right after M's `getsid`, before any later ownership check.
+        let sim = Sim::new();
+        sim.world.borrow_mut().add(200, L, L, L, 2_000).dies = [false; 3];
+        jump_at(&sim, Ev::Getsid(200));
+        let st = state();
+        assert!(!sim.kill(&[], 1_000, &st).tree_dead);
+        leave_and_orphan(&sim, 200, |w| w.procs.get_mut(&L).unwrap().st = St::Zombie);
+        retry_tracks(&sim, &st, 200);
+    }
+
+    #[test]
+    fn descendant_of_a_tracked_parent_is_retained_when_read() {
+        // P, a recorded escapee, is alive; M, its child, has already left P's session.
+        // The census reads both; the deadline passes right after (before any later walk).
+        let sim = Sim::new();
+        sim.world.borrow_mut().procs.get_mut(&L).unwrap().st = St::Zombie;
+        sim.world.borrow_mut().add(300, 1, 300, 300, 3_000).dies = [false; 3];
+        sim.world.borrow_mut().add(310, 300, 310, 310, 3_100).dies = [false; 3];
+        jump_after_owned_following(&sim, 310);
+        let st = state();
+        let r = sim.kill(&[sim.identity(300)], 1_000, &st);
+        assert!(!r.tree_dead, "{r:?}");
+        leave_and_orphan(&sim, 310, |w| {
+            w.procs.remove(&300);
+        });
+        retry_tracks(&sim, &st, 310);
+    }
+
+    #[test]
+    fn stale_extra_at_a_reused_pid_does_not_hide_a_live_member() {
+        // `extra` names an older process at pid 200; M now has that pid and is a member.
+        let sim = Sim::new();
+        sim.world.borrow_mut().add(200, L, L, L, 2_000).dies = [false; 3];
+        jump_after_owned_following(&sim, 200);
+        let stale = ProcessIdentity {
+            pid: 200,
+            start_time: "999".into(),
+            group: "200".into(),
+        };
+        let st = state();
+        assert!(!sim.kill(&[stale], 1_000, &st).tree_dead);
+        leave_and_orphan(&sim, 200, |w| w.procs.get_mut(&L).unwrap().st = St::Zombie);
+        retry_tracks(&sim, &st, 200);
+    }
+
+    #[test]
+    fn deadline_exits_do_not_keep_confirmed_zombies() {
+        // U, another user's helper in the session, keeps every call from a proof; each
+        // call names a new `extra` that is a zombie during the call and reaped after it.
+        let sim = Sim::new();
+        {
+            let mut w = sim.world.borrow_mut();
+            let u = w.add(200, L, 200, L, 30);
+            u.st = St::Unreadable;
+            u.dies = [false; 3];
+            w.procs.get_mut(&L).unwrap().st = St::Zombie;
+        }
+        sim.cost(|e| e == Ev::PidCount, Duration::from_millis(1));
+        let st = state();
+        for i in 0..5 {
+            let pid = 600 + i;
+            sim.world
+                .borrow_mut()
+                .add(pid, 1, pid, pid, 6_000 + u64::from(i));
+            let id = sim.identity(pid);
+            sim.world.borrow_mut().procs.get_mut(&pid).unwrap().st = St::Zombie;
+            let r = sim.kill(&[id], 300, &st);
+            assert!(!r.tree_dead, "{r:?}");
+            sim.world.borrow_mut().procs.remove(&pid);
+            let targets = st.lock().unwrap().targets.clone();
+            assert!(
+                targets.keys().all(|(p, _)| *p < 600),
+                "call {i}: {targets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage_5_leader_found_by_the_recheck_keeps_its_start() {
+        // The leader's start was never recorded; every list omits it, so only the recheck
+        // reads it, live.
+        let sim = Sim::new();
+        immortal(&sim, L);
+        *sim.list.borrow_mut() = Some(Box::new(|_| Ok((vec![1, ME, X], false))));
+        let leader = Leader {
+            start: None,
+            ..sim.leader()
+        };
+        let r = kill_tree(&sim, leader, &[], sim.at(300), &state());
+        assert!(!r.tree_dead, "{r:?}");
+        assert!(
+            r.survivors
+                .iter()
+                .any(|s| s.pid == L && s.start_time == START.to_string()),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn retained_escapee_omitted_from_a_later_list_stays_reported() {
+        // E, a recorded escapee, is listed by the opening census only; the deadline passes
+        // at the KILL, before any proof could look E up again.
+        const E: u32 = 300;
+        let sim = Sim::new();
+        immortal(&sim, L);
+        sim.world.borrow_mut().add(E, 1, E, E, 3_000).dies = [false; 3];
+        let phase = std::rc::Rc::new(Cell::new(false));
+        let p2 = phase.clone();
+        sim.on(move |_, ev| {
+            if matches!(ev, Ev::Killpg(_, Sig::Hup)) {
+                p2.set(true);
+            }
+        });
+        *sim.list.borrow_mut() = Some(Box::new(move |_| {
+            Ok((
+                if phase.get() {
+                    vec![1, ME, L, X]
+                } else {
+                    vec![1, ME, L, E, X]
+                },
+                false,
+            ))
+        }));
+        jump_at(&sim, Ev::Killpg(L, Sig::Kill));
+        let r = sim.kill(&[sim.identity(E)], 5_000, &state());
+        assert!(!r.tree_dead, "{r:?}");
+        assert!(r.survivors.iter().any(|s| s.pid == E), "{r:?}");
     }
 }
