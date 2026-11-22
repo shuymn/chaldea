@@ -12,6 +12,8 @@
     reason = "test support returns the store's WriteError"
 )]
 
+pub mod http;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

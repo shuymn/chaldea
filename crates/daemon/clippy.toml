@@ -1,0 +1,13 @@
+# The router is built in one place, from the route table (docs/design/http-surface.md §2.2):
+# `routes::build_router` carries the one `allow`. Any other route, nest, merge, or fallback
+# would serve a path the guard and the route inventory do not know.
+
+disallowed-methods = [
+  { path = "axum::routing::Router::route", reason = "routes come only from http::ROUTES through build_router" },
+  { path = "axum::routing::Router::route_service", reason = "routes come only from http::ROUTES through build_router" },
+  { path = "axum::routing::Router::nest", reason = "routes come only from http::ROUTES through build_router" },
+  { path = "axum::routing::Router::nest_service", reason = "routes come only from http::ROUTES through build_router" },
+  { path = "axum::routing::Router::merge", reason = "routes come only from http::ROUTES through build_router" },
+  { path = "axum::routing::Router::fallback", reason = "the fallback is build_router's" },
+  { path = "axum::routing::Router::fallback_service", reason = "the fallback is build_router's" },
+]

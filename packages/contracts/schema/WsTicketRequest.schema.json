@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The body of `POST /api/ws-ticket`: `events` or `attach:<thread_id>`.",
+  "properties": {
+    "purpose": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "purpose"
+  ],
+  "title": "WsTicketRequest",
+  "type": "object"
+}

@@ -1,5 +1,5 @@
 //! Chaldea's Sans-IO core: the public wire types and the pure rules every other crate
-//! applies (`docs/mvp-design.md` §2.1–§2.4, §5).
+//! applies (`docs/mvp-design.md` §2.1–§2.5, §5).
 //!
 //! No async runtime, filesystem, network, process, or clock access: `crates/core/clippy.toml`
 //! disallows them, and CI checks the dependency tree. Ids and times come in from the caller.
@@ -9,8 +9,10 @@
 
 use std::fmt;
 
+pub mod auth;
 pub mod command;
 pub mod event;
+pub mod http;
 pub mod ids;
 pub mod input;
 pub mod payload;

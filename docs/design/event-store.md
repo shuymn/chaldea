@@ -321,7 +321,7 @@ pub struct BufferedDelivery { pub emit_id: Uuid, pub receipt_ordinal: u64, pub r
 
 `hook_delivery_record`: if `(launch_id, emit_id)` exists, returns `Replay` with the stored first reply and the current routing, and changes nothing. Otherwise it appends the routing's events (if any), takes the launch's next commit ordinal (computed in the `INSERT`, checked gapless by trigger), and inserts the row with the reply, both ordinals, the routing, and for a terminal routing the `(stream_id, seq)` of its first event. Two orders are kept because they can differ: the **receipt ordinal** is the order in which the daemon received the requests, assigned by PR 9 at intake (per launch, increasing, unique by `UNIQUE (launch_id, receipt_ordinal)`; gaps are allowed for requests that never recorded a delivery), and is the order mvp §2.9 requires for buffered hooks; the **commit ordinal** is the order the record jobs committed, kept for audit. A launch never outlives a daemon run (restart ends every open launch, mvp §2.9), so PR 9's per-launch counter can live in memory. `hook_delivery_promote` takes the final events from the caller: PR 9 reads `buffered_deliveries(launch)` (in receipt order) in the binding job, after `session_bound`, decides each delivery's events against the current projections in that order, and calls `hook_delivery_promote` for each, in that order, in the same job. Promotion appends the events, sets the routing to `appended` or `raw_unknown` with `(stream_id, seq)`, and clears `pending_body` and `pending_meta`. The trigger allows only `buffered → appended | raw_unknown`, with `stream_id` and `seq` set and the pending columns cleared, and never changes the first reply, either ordinal, key, or `received_at`; terminal rows reference `events (stream_id, seq)` by foreign key. The caller replies only after the ticket resolves `Ok`, so the first reply is durable before the response (§2.9).
 
-**Tokens.** `token_insert` stores `{ token_id, kind, sha256, thread_id, launch_id, created_at }`; `token_revoke` sets `revoked_at` for one token, a launch's tokens, or a thread's tokens, returning the count. A trigger allows only `revoked_at` from `NULL` to a value. Issuance, hashing of secrets, and comparison are PR 7's; the reservation of mvp §2.9 inserts the launch's hook and agent token hashes in the job that appends `launch_reserved`. PR 20 may add a scope column for extension tokens in a later migration.
+**Tokens.** `token_insert` stores `{ token_id, kind, sha256, thread_id, launch_id, created_at }`, where `kind` is `chaldea_core::auth::TokenKind`, which the store re-exports as `rows::TokenKind`; `token_revoke` sets `revoked_at` for one token, a launch's tokens, or a thread's tokens, returning the count. A trigger allows only `revoked_at` from `NULL` to a value. Issuance, hashing of secrets, and comparison are PR 7's; the reservation of mvp §2.9 inserts the launch's hook and agent token hashes in the job that appends `launch_reserved`. PR 20 may add a scope column for extension tokens in a later migration.
 
 **Rebuild and verify** (§2.6).
 
@@ -507,7 +507,7 @@ pub const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 - **Refs.** The store writes `(stream_id, sha256, media_type)` for each typed blob reference, with the type its `Content` declares, using `INSERT … ON CONFLICT DO NOTHING`: a repeat in the same event or a later event of the stream is skipped, and the foreign key still refuses a missing blob (S11). `events_blob_refs` refuses an event whose typed reference has no ref, and only typed paths count, so a `{"blob": …}` object in `SurfaceAction.args` neither aborts an event nor grants a stream read access to a blob.
 - **Media type.** The body is shared by SHA-256; the media type belongs to each reference. Every event keeps the type its `Content` declared (in its payload and in its `blob_refs` row), and no event is ever refused because the same bytes were stored under another type: a 70 KiB JSON document can be a `text/plain; charset=utf-8` prompt in one thread and an `application/json` tool input in another, and both events and the full bytes are kept. The download type for `(stream_id, sha256)` is the type of that stream's refs when they all agree, else `application/octet-stream`; it does not depend on insertion order, and PR 7 then applies mvp §2.5's serving rule (only `text/plain; charset=utf-8` and `application/json` are served as stored).
 - **Deletion.** None in the MVP: events are immutable, so every reference is permanent, and no unreferenced blob can be stored.
-- **Reads.** `ReadTx::blob(stream_id, sha256)` returns the bytes and the download type above only when the stream has a ref to `sha256`. The whole blob is read into memory (at most 64 MiB); a streaming reader (`rusqlite`'s `blob` feature) can be added by PR 7 without a schema change.
+- **Reads.** `ReadTx::blob(stream_id, sha256)` returns the bytes and the download type above only when the stream has a ref to `sha256`. `ReadTx::blob_ref_exists(stream_id, sha256)` answers the same ref check without loading the bytes; PR 7 calls it before admitting a blob download. The whole blob is read into memory (at most 64 MiB); a streaming reader (`rusqlite`'s `blob` feature) can be added by PR 7 without a schema change.
 
 ### 2.6 Projections, Annex, and Rebuild
 
@@ -608,6 +608,7 @@ impl ReadTx<'_> {
     pub fn worktrees(&self) -> Result<Vec<WorktreeRow>, StoreError>;
     pub fn transcript_cursor(&self, t: ThreadId) -> Result<Option<TranscriptCursor>, StoreError>;
     pub fn blob(&self, s: StreamId, sha256: &str) -> Result<Option<BlobBody>, StoreError>;
+    pub fn blob_ref_exists(&self, s: StreamId, sha256: &str) -> Result<bool, StoreError>;
     pub fn receipt(&self, c: CommandId) -> Result<Option<CommandReceipt>, StoreError>;   // core::command::CommandReceipt
     pub fn token_by_hash(&self, sha256: &[u8; 32]) -> Result<Option<TokenRow>, StoreError>;
     pub fn hook_delivery(&self, l: LaunchId, emit: Uuid) -> Result<Option<HookDelivery>, StoreError>;
@@ -708,7 +709,7 @@ Every later PR that reads or writes the store, and what it uses. None needs a st
 | PR | Needs | Operation |
 |---|---|---|
 | 7 HTTP | replay, backward pages, head and byte bound, snapshots, 404 for unknown streams | `read`: `stream_exists`, `head` → `decide_replay`, `events_after` / `events_before` (`Page`), `thread_snapshot` / `host_snapshot` |
-| 7 | blobs with the object check | `read`: `blob(stream_id, sha256)` |
+| 7 | blobs with the object check | `read`: `blob_ref_exists(stream_id, sha256)`, `blob(stream_id, sha256)` |
 | 7 | receipts and deadline outcome | `submit`: `receipt_begin` first in the intent job, `receipt_complete`; `read`: `receipt`; the `WriteError` variants of §2.2 say whether the intent committed |
 | 7 | tokens, pairing | `submit`: `token_insert`, `token_revoke`; `read`: `token_by_hash` |
 | 7 | WS heads and `stream_advanced` | `subscribe` (`Committed`), `read`: `heads` |

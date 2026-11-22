@@ -1,0 +1,140 @@
+{
+  "$defs": {
+    "ErrorCode": {
+      "description": "The code of an [`ErrorBody`] (snake_case on the wire). Command PRs add their own refusal\ncodes here.",
+      "oneOf": [
+        {
+          "const": "misdirected_request",
+          "description": "421: the `Host` header or the absolute-form authority is not the daemon's.",
+          "type": "string"
+        },
+        {
+          "const": "origin_rejected",
+          "description": "403: the `Origin` header breaks the route's rule.",
+          "type": "string"
+        },
+        {
+          "const": "unauthorized",
+          "description": "401.",
+          "type": "string"
+        },
+        {
+          "const": "forbidden",
+          "description": "403: the token's kind or grant does not allow the action or object.",
+          "type": "string"
+        },
+        {
+          "const": "not_found",
+          "description": "404: no such route, command, or object, or one the token cannot read.",
+          "type": "string"
+        },
+        {
+          "const": "method_not_allowed",
+          "description": "405, with `Allow`.",
+          "type": "string"
+        },
+        {
+          "const": "request_timeout",
+          "description": "408.",
+          "type": "string"
+        },
+        {
+          "const": "length_required",
+          "description": "411.",
+          "type": "string"
+        },
+        {
+          "const": "payload_too_large",
+          "description": "413.",
+          "type": "string"
+        },
+        {
+          "const": "bad_request",
+          "description": "400: framing, a handshake, or a body that is not the route's.",
+          "type": "string"
+        },
+        {
+          "const": "bad_query",
+          "description": "400: the query string.",
+          "type": "string"
+        },
+        {
+          "const": "bad_args",
+          "description": "400: the command arguments.",
+          "type": "string"
+        },
+        {
+          "const": "in_progress",
+          "description": "409: the command's receipt is still `in_progress`.",
+          "type": "string"
+        },
+        {
+          "const": "conflict",
+          "description": "409: the `command_id` belongs to another token or another request.",
+          "type": "string"
+        },
+        {
+          "const": "unknown_after_crash",
+          "description": "409: the command's receipt was `in_progress` when the daemon restarted.",
+          "type": "string"
+        },
+        {
+          "const": "not_implemented",
+          "description": "501: the route's or command's handler has not been implemented yet.",
+          "type": "string"
+        },
+        {
+          "const": "busy",
+          "description": "503: a bounded resource is taken; retry after `retry_after`.",
+          "type": "string"
+        },
+        {
+          "const": "disk_full",
+          "description": "503.",
+          "type": "string"
+        },
+        {
+          "const": "shutting_down",
+          "description": "503: the daemon is stopping.",
+          "type": "string"
+        },
+        {
+          "const": "store_failed",
+          "description": "503: the store refused writes after a fatal error.",
+          "type": "string"
+        },
+        {
+          "const": "outcome_unknown",
+          "description": "503: the write's outcome is not known; retry with the same `command_id`.",
+          "type": "string"
+        },
+        {
+          "const": "internal",
+          "description": "500.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The body of every rejection the daemon decides. `retry_after` is whole seconds and\nabsent (never `null`) when not given.",
+  "properties": {
+    "code": {
+      "$ref": "#/$defs/ErrorCode"
+    },
+    "retry_after": {
+      "format": "uint32",
+      "maximum": 4294967295,
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "code"
+  ],
+  "title": "ErrorBody",
+  "type": "object"
+}

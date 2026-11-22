@@ -1,0 +1,112 @@
+{
+  "$defs": {
+    "Actor": {
+      "pattern": "^(human|daemon|thread:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+      "type": "string"
+    },
+    "Epoch": {
+      "description": "Random id stored at database creation; a change tells a client to resync (§2.4).",
+      "type": "string"
+    },
+    "ThreadId": {
+      "description": "A thread: one agent conversation across all its launches.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "WorkspaceId": {
+      "description": "Derived from the canonical path of the repository's common git directory,\nor of the cwd outside git (§2.1).",
+      "type": "string"
+    },
+    "WorktreeChanged": {
+      "description": "The full worktree record, carried on every change.",
+      "properties": {
+        "base_commit": {
+          "description": "The resolved SHA of `base_ref`.",
+          "type": "string"
+        },
+        "base_ref": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "created_by": {
+          "$ref": "#/$defs/Actor"
+        },
+        "owner_thread_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`null` when the human owner holds it."
+        },
+        "path": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/WorktreeState"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId"
+        },
+        "worktree_id": {
+          "$ref": "#/$defs/WorktreeId"
+        }
+      },
+      "required": [
+        "worktree_id",
+        "repo",
+        "workspace_id",
+        "path",
+        "branch",
+        "base_ref",
+        "base_commit",
+        "created_by",
+        "state"
+      ],
+      "type": "object"
+    },
+    "WorktreeId": {
+      "description": "8 hex characters, also the worktree's directory name (§2.6).",
+      "type": "string"
+    },
+    "WorktreeState": {
+      "enum": [
+        "creating",
+        "active",
+        "released",
+        "removing",
+        "uncertain",
+        "removed",
+        "failed"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The body of `GET /api/worktrees`: the worktrees the token can read.",
+  "properties": {
+    "epoch": {
+      "$ref": "#/$defs/Epoch"
+    },
+    "worktrees": {
+      "items": {
+        "$ref": "#/$defs/WorktreeChanged"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "epoch",
+    "worktrees"
+  ],
+  "title": "WorktreesResponse",
+  "type": "object"
+}

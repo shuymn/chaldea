@@ -19,7 +19,21 @@ mod write_tx;
 mod writer;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
+
+/// The writer's fault points, for unit tests of the crate's other modules.
+#[cfg(test)]
+pub(crate) mod test_faults {
+    use std::sync::Arc;
+
+    pub(crate) use super::writer::{CommitFault, Faults};
+    use super::{OpenError, Store, StoreConfig};
+
+    /// Opens a store with the given fault points.
+    pub(crate) fn open_with(cfg: StoreConfig, faults: Faults) -> Result<Store, OpenError> {
+        super::open::open(cfg, Arc::new(faults))
+    }
+}
 
 use std::fmt;
 use std::future::Future;
