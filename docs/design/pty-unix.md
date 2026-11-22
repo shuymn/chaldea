@@ -117,17 +117,18 @@ Names may change in review; shapes and rules may not.
 ### 2.1 Public Additions
 
 ```rust
-/// The native backend of this OS (macOS: this document; PR 4 adds the Windows arm).
-#[cfg(target_os = "macos")]
+/// The native backend of this OS (macOS: this document; Windows: `docs/design/pty-windows.md`).
+#[cfg(any(target_os = "macos", windows))]
 pub fn native() -> Arc<dyn PtyRuntime>;
 
 /// Runs `f` while holding the process-wide spawn lock. Every child the daemon creates is
 /// created inside such a closure or by the native backend (all OSes; the lock matters on
-/// macOS). Not reentrant: `f` must not call it again or spawn a PTY session.
+/// macOS for the exec-error pipe and on Windows for the inheritable handles
+/// `CreatePseudoConsole` holds during the call). Not reentrant: `f` must not call it again or spawn a PTY session.
 pub fn with_spawn_lock<R>(f: impl FnOnce() -> R) -> R;
 ```
 
-**The spawn rule.** One `static SPAWN_LOCK: Mutex<()>` in `pty-runtime` is held across every child creation in the process: the native backend's whole `Command::spawn` (§2.2 stage 4) and every closure passed to `with_spawn_lock`, so a `std::process::Command::spawn`, a `tokio::process::Command::spawn`, or a process-wrap spawn inside the closure runs from before std creates its exec-error pipe until it returns. The closure form serves spawn APIs that take no `&mut std::process::Command` (prior-art row 1c). A poisoned lock is taken over. std on macOS creates that pipe and marks it close-on-exec in two steps (`sys/pipe/unix.rs:34-40`); a fork by another thread in between gives that child the write end across its exec, and the first spawn then waits until that child exits (F19). Under the lock no fork happens in that window, and the parent has closed its write end before it releases the lock. The backend's own non-atomic fd, the wake pipe (§2.3), is created under the lock too. **Constraint:** a child created outside the lock (a library that forks on its own) can still inherit a handshake pipe and stall a spawn until it exits; that spawn then has no deadline. The daemon therefore creates every child inside `with_spawn_lock` and uses no library that creates children outside its call (a PR 8 / PR 10 obligation, with exclusive reaping, §2.4).
+**The spawn rule.** One `static SPAWN_LOCK: Mutex<()>` in `pty-runtime` is held across every child creation in the process: the native backend's whole `Command::spawn` (§2.2 stage 4) and every closure passed to `with_spawn_lock`, so a `std::process::Command::spawn`, a `tokio::process::Command::spawn`, or a process-wrap spawn inside the closure runs from before std creates its exec-error pipe until it returns. The closure form serves spawn APIs that take no `&mut std::process::Command` (prior-art row 1c). A poisoned lock is taken over. std on macOS creates that pipe and marks it close-on-exec in two steps (`sys/pipe/unix.rs:34-40`); a fork by another thread in between gives that child the write end across its exec, and the first spawn then waits until that child exits (F19). Under the lock no fork happens in that window, and the parent has closed its write end before it releases the lock. The backend's own non-atomic fd, the wake pipe (§2.3), is created under the lock too: `wake_pipe` takes `&SpawnGuard`, a guard only `SPAWN_LOCK` produces, so it cannot be called without the lock. **Constraint:** a child created outside the lock (a library that forks on its own) can still inherit a handshake pipe and stall a spawn until it exits; that spawn then has no deadline. The daemon therefore creates every child inside `with_spawn_lock` and uses no library that creates children outside its call (a PR 8 / PR 10 obligation, with exclusive reaping, §2.4).
 
 Process identity lookup stays internal in PR 3. Tests reach it through `chaldea_pty_runtime::fake::identify(pid) -> io::Result<Option<ProcessIdentity>>` (`fake` feature, macOS), which no default build contains (PR2 D6); `fake::unix_writer_polls() -> u64` counts the writer's entries into its full-queue `poll` (§2.3) for tests that must gate on that state. The public lookup the daemon needs to build `extra` (PR 9 / PR 10) is added by the PR that first consumes it. A launch passes only stdio to the child; there is no fd-passing API.
 
@@ -294,7 +295,7 @@ The proof covers the original session (while owned), every descendant of a cover
 
 **Steps**, with `t0` the entry time and `B = deadline − t0`. Every call computes its result from its own reads; nothing proven earlier is reused.
 
-1. **Expired or busy.** If `now ≥ deadline`: no blocking lock, no syscall; return `tree_dead: false`, survivors the leader's identity and the accepted `extra` entries, one entry per pid; when one `try_lock` gets the state at once, the accepted `extra` entries are also stored as targets for the next call and the targets kept by earlier calls are listed. Else take the `kill` mutex with `try_lock` polled every 10 ms until `deadline`; never acquired: the same report with `method: "unix_busy"`. A call that could not store its `extra` (busy, or expired with the state held elsewhere) leaves them to the caller, which passes them again. A poisoned lock is taken over. Add the accepted `extra` entries to the targets, then check ownership for the call.
+1. **Expired or busy.** If `now ≥ deadline`: no blocking lock, no syscall; return `tree_dead: false`, survivors the leader's identity and the accepted `extra` entries, one entry per pid; when one `try_lock` gets the state at once, the accepted `extra` entries are also stored as targets and the targets kept by earlier calls are listed. Else take the `kill` mutex with `try_lock` polled every 10 ms until `deadline`; never acquired: the same report with `method: "unix_busy"`. The caller passes its full list of recorded descendants on every call, retries included, and never resubmits a report's survivors (PR2 §2.1); the stored targets are the backend's internal margin, so a call that could not store its `extra` (busy, or expired with the state held elsewhere) loses nothing. A poisoned lock is taken over. Add the accepted `extra` entries to the targets, then check ownership for the call.
 2. **Opening pass**, then a fresh `owned()`. If the pass is not `alive`: clean and owned → the recheck (step 5), and `tree_dead: true` with no signal when it resolves everything; unclean with `churn_only` → another opening pass at once; after loss → `tree_dead: false` with no signal.
 3. If `B > 100 ms`: **HUP** the group and every retained target outside it; wait until `t0 + min(500 ms, B/4)`; pass; **TERM** the same way; wait until `t0 + min(2 s, B/2)`. Each wait polls the targets by lookup every 25 ms (each sleep capped to `deadline − now`) and ends early once none is live.
 4. Pass, **KILL** the group and every retained target outside it.
@@ -341,12 +342,13 @@ Exactly one module is allowed `unsafe`: `#[allow(unsafe_code)] mod sys;` in `src
 **Command line** (PR 3 subset of spike §4.5; an unknown mode or flag exits 2):
 
 ```
-chaldea-fake-cli --mode <echo|queries|attachable|spawn-tree|sleeper> [--report <127.0.0.1:port>]
+chaldea-fake-cli --mode <echo|queries|attachable|spawn-tree|sleeper|report-process> [--report <127.0.0.1:port>]
                  [--role <role>] [--roles <list>] [--max-life-secs <n>] [--reply-timeout-ms <n>]
                  [--raw] [--setsid] [--escape-orphan] [--orphan-keeps-tty]
+                 [--out <path>] [--emit-output] [--validate-input <n>] [--] [ignored…]
 ```
 
-**Terminal.** A mode that reads stdin enters raw mode (`rustix::termios` `make_raw`) only when stdin `isatty`; `--raw` makes a non-reading fixture do the same. The hello says which (`raw`). A pipe-backed run is the explicit non-PTY mode the smoke tests use.
+**Terminal.** A mode that reads stdin enters raw mode (`rustix::termios` `make_raw`) only when stdin `isatty`; `--raw` makes a non-reading fixture do the same. The hello says which (`raw`). A pipe-backed run is the explicit non-PTY mode the smoke tests use. On Windows the same functions go through `winapi-util` (testkit keeps `forbid(unsafe_code)`): raw mode clears line input, echo, and processed input and sets virtual-terminal input on stdin and processing on stdout; `size()` reads the console window, with no pixel size; `inq()` is `None`.
 
 **Report channel.** With `--report`, each FakeCli process connects its own TCP stream to the address, writes a hello line, then mode events, one JSON object per line. It ends the stream only as it exits: a killed process by the kernel, and a normal exit (the mode returned, or `--max-life-secs` passed) by `shutdown(Write)` after its last line, right before the process ends. Without that, the socket would still be open at process exit, which Windows resets, and a reset discards the lines the test has not read yet. A reader thread answers each `ping` line from the test with `{"event":"pong","inq":n}`, `inq` being `FIONREAD` on stdin when it is a terminal (`rustix::io::ioctl_fionread`). The test reads EOF on the stream as the process's death (or its normal exit under way) and a `pong` as proof it is alive, an oracle independent of the backend's process table. std sockets are close-on-exec, so a fixture's children never hold its stream. The hello: `{"mode","role","pid","ppid","pgid","sid","raw","ttys","ctty","fg","fds"}`: `pgid`/`sid` from `getpgrp`/`getsid`; `ttys` the `ttyname` of fds 0–2; `ctty` whether `/dev/tty` opens; `fg` whether `tcgetpgrp(0) == getpgrp()`; `fds` the open fds other than the `/dev/fd` listing's own handle, listed before connecting. Unix-only fields are null on Windows.
 
@@ -354,14 +356,15 @@ chaldea-fake-cli --mode <echo|queries|attachable|spawn-tree|sleeper> [--report <
 
 | Mode | Behaviour in PR 3 | Lifted later |
 |---|---|---|
-| `echo` | `ESC[?2004h`, then every stdin chunk as `{"event":"input","hex":…}` | paste parsing, hooks via `--emitter`, `--nested`, `--query-mid-paste`, `--ignore-input` (PR 9 / PR 10) |
+| `echo` | `ESC[?2004h`, then every stdin chunk as `{"event":"input","hex":…}`; with `--validate-input <n>` (raw), reads exactly `n` bytes, checks that byte `i` is `b'a' + (i % 26)`, and sends one `{"event":"validated","bytes","ok"}` instead | paste parsing, hooks via `--emitter`, `--nested`, `--query-mid-paste`, `--ignore-input` (PR 9 / PR 10) |
 | `queries` | the spike's seven queries (`fake_cli.rs:383-481`), each with a reply bound of `--reply-timeout-ms` (default 500), one `{"event":"query","kind","ok","received"}` per query, then `{"event":"queries","all_ok"}`; stdin EOF ends the remaining waits at once | — |
-| `attachable` | `MARKER-n` every 500 ms. On a terminal: `{"event":"size","cols","rows","xpixel","ypixel"}` at start, and `{"event":"winch",…same fields}` each time its `SIGWINCH` flag (`signal_hook::flag::register`) is set, so the event acknowledges the signal, not a polled size. On a pipe: one `size` event with null fields, no `winch` | input parser and key reports (PR 11), Windows console size (PR 4) |
-| `spawn-tree` | starts one sleeper per role in `--roles` (default: all of the table below except the orphan), passing its own `--report`, so each sleeper sends its own hello; then idles. `--escape-orphan` adds the orphan | Windows `breakaway` role (PR 4), `--emit-output` (PR 4's F-2c cases) |
-| `sleeper` | the roles below; never reads stdin; idles until killed or `--max-life-secs` | `mcp` role (PR 13 / PR 14) |
+| `attachable` | `MARKER-n` every 500 ms. On a terminal: `{"event":"size","cols","rows","xpixel","ypixel"}` at start, and `{"event":"winch",…same fields}` each time its `SIGWINCH` flag (`signal_hook::flag::register`) is set, so the event acknowledges the signal, not a polled size. On a pipe: one `size` event with null fields, no `winch`. On Windows: `size` from the console window at start, then a poll every 20 ms that sends `winch` on an observed change (no `SIGWINCH`) | input parser and key reports (PR 11) |
+| `spawn-tree` | starts one sleeper per role in `--roles` (default: all of the table below except the orphan), passing its own `--report`, so each sleeper sends its own hello; then idles. `--escape-orphan` adds the orphan. With `--emit-output`, after its hello and roles it writes `OUTPUT-<n>\r\n` every 50 ms and sends `{"event":"output","n"}` after each completed write, keeping output busy through a teardown (F-2c). On Windows, `--roles breakaway` starts that role with `CREATE_BREAKAWAY_FROM_JOB`, again without the flag on `ERROR_ACCESS_DENIED`, and sends `{"event":"breakaway","result":"accepted"\|"denied"}` before its hello | — |
+| `sleeper` | the roles below; never reads stdin (except the Windows `double-forked`); idles until killed or `--max-life-secs` | `mcp` role (PR 13 / PR 14) |
+| `report-process` | with `--out <path>`, writes one JSON object (`argv`, `env` in block order, `cwd`, and whether each of stdin, stdout, stderr is a console or terminal) to `<path>.tmp`, renames it to `<path>`, and exits 0; opens no report stream, so it runs with an empty environment | — |
 | `stall`, `banner` | not lifted | the PR that first asserts on them (PR 10: gate timeout snapshot, fake banner) |
 
-**Sleeper roles** (Unix; each isolates one mechanism and sends its hello only once that mechanism is in place; Windows gets `plain` and `double-forked`):
+**Sleeper roles** (Unix; each isolates one mechanism and sends its hello only once that mechanism is in place; Windows gets `plain` and `double-forked` by default and `breakaway` on request. The Windows `double-forked` has no reparenting to wait for: `double-fork-parent` keeps its piped stdin open until it exits at once, and the child sends its hello after that stdin reaches EOF, waiting at most 10 s):
 
 | Role | How it is made; hello after | What reaches it |
 |---|---|---|
@@ -391,11 +394,15 @@ impl Fixture {
     pub fn ping(&mut self, deadline: Instant) -> Option<Pong>;                                 // alive: a pong came back
 }
 pub type Identify = fn(u32) -> Option<String>;                                    // pid → start stamp of a live process
-pub struct Cleanup { /* fixture identities, owned std::process::Child values */ }  // Drop: SIGKILL each still-live identity
-impl Cleanup { pub fn new(identify: Option<Identify>) -> Cleanup; pub fn track(&mut self, pid: u32); pub fn own(&mut self, child: Child); }
+pub type KillVerified = fn(u32, &str) -> bool;                                    // (pid, start stamp) → killed that process
+pub struct Cleanup { /* fixture identities, owned std::process::Child values */ }  // Drop: kill each still-live identity
+impl Cleanup {
+    pub fn new(identify: Option<Identify>) -> Cleanup; pub fn track(&mut self, pid: u32); pub fn own(&mut self, child: Child);
+    pub fn kill_with(self, kill: KillVerified) -> Cleanup;                        // Windows: fake::kill_verified
+}
 ```
 
-`Cleanup` is independent of the `Session`: each test registers every fixture in it, so a fixture that survives a consumed `Session` (`close`) or a failing assertion is killed by verified identity (pid and start through the `Identify` the test passes, `fake::identify` on macOS, since testkit's normal dependencies cannot include `pty-runtime`; with the residual window of §2.5).
+`Cleanup` is independent of the `Session`: each test registers every fixture in it, so a fixture that survives a consumed `Session` (`close`) or a failing assertion is killed by verified identity (pid and start through the `Identify` the test passes, `fake::identify` on macOS, since testkit's normal dependencies cannot include `pty-runtime`; with the residual window of §2.5). On macOS it sends `SIGKILL`; Windows tests pass `fake::kill_verified` through `kill_with`, which checks the creation stamp and terminates through the same handle.
 
 **Locating the binary.** `CARGO_BIN_EXE_<name>` exists only for integration tests of the package that defines the binary, so the real-PTY tests that need FakeCli are integration tests of testkit (`tests/pty_unix.rs`), with `chaldea-pty-runtime` as a dev-dependency, using `env!("CARGO_BIN_EXE_chaldea-fake-cli")`. `chaldea-pty-runtime`'s own tests use system binaries (`/bin/sh`, `/bin/sleep`, `/usr/bin/env`, `/bin/pwd`, `/bin/stty`, `/bin/echo`, `/bin/cat`, `/usr/bin/true`, `/usr/bin/pgrep`). A later crate whose tests need FakeCli declares a thin `[[bin]]` over `fake_cli::main` or puts the test in testkit; guessing `target/<profile>/` is a legacy fallback that depends on Cargo's `build-dir` (assert_cmd `src/cargo.rs:275-296`).
 
@@ -460,7 +467,7 @@ Every MVP place that kills processes, reads pids, or spawns children:
 | Worktree removal in-use check | 16 | Stays out: it reads launch state, never processes. |
 | Rescue | 20 | Stays out: it acts through `surface_action stop`, the stop path above. |
 | Doctor: FakeCli tree kill | 21 | `native()` + `Session` + FakeCli; how the shipped binary gets FakeCli is PR 21's choice. |
-| Windows tree kill (job + recorded descendants) | 4 | Shares the `extra` rule, `KillReport`, and testkit; nothing OS-specific. PR 4 adds the `breakaway` role and Windows console modes to FakeCli. |
+| Windows tree kill (job + recorded descendants) | 4 | Shares the `extra` rule, the caller's full-list obligation, `KillReport`, and testkit (`docs/design/pty-windows.md`). PR 4 adds the `breakaway` role, the Windows `double-forked`, `report-process`, `--emit-output`, `--validate-input`, the Windows terminal functions, and `Cleanup::kill_with`. |
 | FakeCli's own children | 3 | testkit only; every sleeper takes `--max-life-secs`; tests hold a `Cleanup`. |
 | Spike watchdog and emergency kill | — | Not lifted; the supervisor (PR 10) decides. |
 
