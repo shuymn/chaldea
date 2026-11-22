@@ -50,9 +50,10 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # Includes the contract drift check (crates/core/tests/contracts_export.rs).
+      # Includes the contract drift check (crates/core/tests/contracts_export.rs). With
+      # --no-fail-fast, one failing test binary does not keep the others from running.
       - name: Run tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
       # The Windows tests are compiled only on Windows: a cfg mistake that compiles a whole
       # test binary or suite out must fail here instead of passing silently. Each binary
