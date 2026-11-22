@@ -1016,6 +1016,33 @@ mod tests {
     }
 
     #[test]
+    fn opening_check_needs_an_empty_job() {
+        // The leader is already dead, but a job member still runs: no opening proof.
+        let os = Os::new();
+        os.set(L, |p| p.alive = false);
+        os.add(300, proc(7, true));
+        let r = os.kill(&[], os.at(1_000), &state());
+        assert!(r.tree_dead);
+        assert!(
+            os.count(|c| *c == C::TerminateJob) >= 1,
+            "the live member was terminated before the proof: {:?}",
+            os.calls()
+        );
+        assert!(!os.live(300, 7));
+    }
+
+    #[test]
+    fn malformed_entry_blocks_the_opening_proof() {
+        // An already dead tree with an empty job is still not proven with a malformed entry.
+        let os = Os::new();
+        os.set(L, |p| p.alive = false);
+        let bad = id(0, 5);
+        let r = os.kill(std::slice::from_ref(&bad), os.at(500), &state());
+        assert!(!r.tree_dead);
+        assert_eq!(r.survivors, vec![bad]);
+    }
+
+    #[test]
     fn dead_tree_returns_without_terminate() {
         let os = Os::new();
         os.set(L, |p| p.alive = false);
