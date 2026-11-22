@@ -59,7 +59,7 @@ All public types are Rust types in `crates/core` with `serde` and `ts-rs` derive
 
 **`Content`** (public) is the type of every payload field that can be large (`text`, `prompt`, `input`, `output`, `body`, `raw`, VT grids): `{ "inline": string, "encoding": "utf8" | "base64" } | { "blob": { "sha256", "size", "media_type" }, "preview": string, "preview_lossy": bool }`. `utf8` carries text, `base64` bytes that are not valid UTF-8. Above 64 KiB the content moves to a blob; `preview` is its first 1 KiB decoded as UTF-8 with invalid sequences replaced by U+FFFD (`preview_lossy: true` when any were). The rest of the payload stays inline (arch §4.2 size-bounded outputs).
 
-**`schema_version`** is one integer for the whole schema set, starting at 1. Additive changes (an optional field, a new kind) do not bump it; a change of meaning or type of an existing field does. Per-kind versions were rejected: no client can use the extra precision.
+**`schema_version`** is one integer for the whole schema set, starting at 1. Additive changes (an optional field, a new kind) do not bump it; a change of meaning or type of an existing field does, except before any producer has persisted events: such a change (D9's `vt_snapshot_taken.grid`, `docs/design/pty-runtime.md`) keeps version 1. Per-kind versions were rejected: no client can use the extra precision.
 
 **Idempotency keys** are deterministic so that replaying a source yields the same key; the store rejects duplicates (`UNIQUE (stream_id, idempotency_key)`):
 

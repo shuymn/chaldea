@@ -18,7 +18,8 @@ pub mod state;
 pub mod sync;
 
 /// The version of the whole event schema set. Additive changes (an optional field, a new
-/// kind) keep it; a change of meaning or type of an existing field bumps it (§2.1).
+/// kind) keep it; a change of meaning or type of an existing field bumps it, except before
+/// any producer has persisted events, as for the `vt_snapshot_taken` grid encoding (§2.1).
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// The largest integer every wire reader keeps exactly: 2^53 - 1, JavaScript's
