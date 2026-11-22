@@ -230,6 +230,40 @@ pub(crate) fn bsd_info(pid: u32) -> Result<BsdInfo, i32> {
     })
 }
 
+/// `proc_pidinfo(pid, PROC_PIDT_SHORTBSDINFO, 1)`: whether the process is a zombie. Unlike
+/// `PROC_PIDTBSDINFO`, this flavor is allowed for another user's process; the errno on
+/// failure.
+pub(crate) fn short_zombie(pid: u32) -> Result<bool, i32> {
+    let Ok(raw_pid) = c_int::try_from(pid) else {
+        return Err(libc::ESRCH);
+    };
+    if raw_pid == 0 {
+        return Err(libc::EPERM);
+    }
+    let Ok(len) = c_int::try_from(size_of::<libc::proc_bsdshortinfo>()) else {
+        return Err(libc::EINVAL);
+    };
+    let mut info = MaybeUninit::<libc::proc_bsdshortinfo>::zeroed();
+    // SAFETY: the buffer is one `proc_bsdshortinfo`, `len` bytes long.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            raw_pid,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            1,
+            info.as_mut_ptr().cast(),
+            len,
+        )
+    };
+    if n != len {
+        let code = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        return Err(if n <= 0 && code != 0 { code } else { libc::EIO });
+    }
+    // SAFETY: `proc_bsdshortinfo` holds only integers and `c_char` arrays, so the zeroed
+    // value is valid, and the kernel filled all `len` bytes.
+    let info = unsafe { info.assume_init() };
+    Ok(info.pbsi_status == SZOMB)
+}
+
 /// The pids of this process's children (tests only).
 #[cfg(test)]
 pub(crate) fn child_pids() -> Vec<u32> {
