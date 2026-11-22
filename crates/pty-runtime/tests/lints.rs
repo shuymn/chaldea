@@ -44,8 +44,168 @@ fn table(manifest: &Path, section: &str) -> BTreeMap<String, String> {
     out
 }
 
-fn strip_comment(line: &str) -> &str {
-    line.find("//").map_or(line, |i| &line[..i])
+/// `text` with comments and the contents of string and char literals blanked, so only
+/// code remains; lengths and line breaks are kept.
+fn code_only(text: &str) -> String {
+    let b: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        let next = b.get(i + 1).copied();
+        if c == '/' && next == Some('/') {
+            while i < b.len() && b[i] != '\n' {
+                out.push(' ');
+                i += 1;
+            }
+        } else if c == '/' && next == Some('*') {
+            let mut depth = 0;
+            while i < b.len() {
+                if b[i] == '/' && b.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                } else if b[i] == '*' && b.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    out.push(blank(b[i]));
+                    i += 1;
+                }
+            }
+        } else if c == 'r'
+            && (next == Some('"') || next == Some('#'))
+            && !ident(b.get(i.wrapping_sub(1)))
+        {
+            let mut j = i + 1;
+            let mut hashes = 0;
+            while b.get(j) == Some(&'#') {
+                hashes += 1;
+                j += 1;
+            }
+            if b.get(j) != Some(&'"') {
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            out.push('"');
+            j += 1;
+            while j < b.len() {
+                if b[j] == '"' && (0..hashes).all(|k| b.get(j + 1 + k) == Some(&'#')) {
+                    j += 1 + hashes;
+                    break;
+                }
+                out.push(blank(b[j]));
+                j += 1;
+            }
+            out.push('"');
+            i = j;
+        } else if c == '"' {
+            out.push('"');
+            i += 1;
+            while i < b.len() && b[i] != '"' {
+                if b[i] == '\\' {
+                    out.push(' ');
+                    i += 1;
+                }
+                if i < b.len() {
+                    out.push(blank(b[i]));
+                    i += 1;
+                }
+            }
+            out.push('"');
+            i += 1;
+        } else if c == '\'' && (next == Some('\\') || b.get(i + 2) == Some(&'\'')) {
+            // A char literal (a lifetime has no closing quote two places on).
+            out.push('\'');
+            i += 1;
+            while i < b.len() && b[i] != '\'' {
+                if b[i] == '\\' {
+                    out.push(' ');
+                    i += 1;
+                }
+                out.push(' ');
+                i += 1;
+            }
+            out.push('\'');
+            i += 1;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn ident(c: Option<&char>) -> bool {
+    c.is_some_and(|c| c.is_alphanumeric() || *c == '_')
+}
+
+/// Every attribute in `code` as `(inner, body without whitespace, the code after it)`.
+fn attributes(code: &str) -> Vec<(bool, String, String)> {
+    let b: Vec<char> = code.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '#' {
+            let mut j = i + 1;
+            let inner = b.get(j) == Some(&'!');
+            if inner {
+                j += 1;
+            }
+            while b.get(j).is_some_and(|c| c.is_whitespace()) {
+                j += 1;
+            }
+            if b.get(j) == Some(&'[') {
+                let mut depth = 0;
+                let mut body = String::new();
+                while j < b.len() {
+                    match b[j] {
+                        '[' => depth += 1,
+                        ']' => depth -= 1,
+                        _ => {}
+                    }
+                    if !b[j].is_whitespace() {
+                        body.push(b[j]);
+                    }
+                    j += 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                let after: String = b[j..]
+                    .iter()
+                    .collect::<String>()
+                    .trim_start()
+                    .chars()
+                    .take(40)
+                    .collect();
+                out.push((inner, body, after));
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Whether `code` uses `unsafe` as a block, fn, impl, trait, or extern block.
+fn uses_unsafe(code: &str) -> bool {
+    code.match_indices("unsafe").any(|(i, _)| {
+        let before = code[..i].chars().next_back();
+        let rest = code[i + "unsafe".len()..].trim_start();
+        !ident(before.as_ref())
+            && (rest.starts_with('{')
+                || ["fn", "impl", "trait", "extern"].iter().any(|k| {
+                    rest.starts_with(k) && !ident(rest[k.len()..].chars().next().as_ref())
+                }))
+    })
 }
 
 #[test]
@@ -54,34 +214,59 @@ fn unsafe_is_allowed_only_in_sys() {
     sources(&crate_dir().join("src"), &mut files);
     let mut allows = Vec::new();
     for f in &files {
-        let text = std::fs::read_to_string(f).unwrap();
         let rel = f
             .strip_prefix(crate_dir())
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
-        let lines: Vec<&str> = text.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            let code = strip_comment(line);
-            assert!(!code.contains("#![allow(unsafe_code)]"), "{rel}:{}", i + 1);
-            assert!(!code.contains("expect(unsafe_code"), "{rel}:{}", i + 1);
-            if code.contains("allow(unsafe_code") {
-                allows.push((rel.clone(), lines.get(i + 1).map(|l| l.trim().to_owned())));
+        let code = code_only(&std::fs::read_to_string(f).unwrap());
+        for (inner, body, after) in attributes(&code) {
+            if !body.contains("unsafe_code") {
+                continue;
             }
-            let uses_unsafe = ["unsafe {", "unsafe fn", "unsafe impl", "unsafe extern"]
-                .iter()
-                .any(|k| code.contains(k));
+            assert!(!inner, "inner unsafe_code attribute in {rel}: {body}");
             assert!(
-                !uses_unsafe || rel == "src/unix/sys.rs",
-                "unsafe outside unix::sys: {rel}:{}",
-                i + 1
+                !body.contains("expect("),
+                "expect(unsafe_code) in {rel}: {body}"
             );
+            if body.contains("allow(") {
+                allows.push((
+                    rel.clone(),
+                    body,
+                    after.lines().next().unwrap_or("").to_owned(),
+                ));
+            }
         }
+        assert!(
+            !uses_unsafe(&code) || rel == "src/unix/sys.rs",
+            "unsafe outside unix::sys: {rel}"
+        );
     }
     assert_eq!(
         allows,
-        vec![("src/unix/mod.rs".to_owned(), Some("mod sys;".to_owned()))]
+        vec![(
+            "src/unix/mod.rs".to_owned(),
+            "[allow(unsafe_code)]".to_owned(),
+            "mod sys;".to_owned()
+        )]
     );
+}
+
+#[test]
+fn the_scan_sees_through_comments_and_strings() {
+    let src = "#[allow(/* scope */ unsafe_code)]\nmod a;\n#![ allow ( unsafe_code ) ]\nlet s = \"unsafe { }\"; // unsafe {\nunsafe  {}\n";
+    let code = code_only(src);
+    let found: Vec<_> = attributes(&code)
+        .into_iter()
+        .filter(|a| a.1.contains("unsafe_code"))
+        .collect();
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(found[0].1, "[allow(unsafe_code)]");
+    assert!(found[1].0);
+    assert!(uses_unsafe(&code));
+    assert!(!uses_unsafe(&code_only(
+        "let s = \"unsafe {\"; // unsafe fn\nfn unsafe_x() {}"
+    )));
 }
 
 /// The workspace's clippy keys, each with its value.

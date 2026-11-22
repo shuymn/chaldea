@@ -33,7 +33,7 @@ pub(crate) fn serial() -> MutexGuard<'static, ()> {
 pub(crate) enum Stage {
     /// Validation passed; nothing is created yet.
     Validated,
-    /// Stage 2: inside the spawn lock, before the wake pipe.
+    /// Stage 2: the wake pipe was just created, still inside the spawn lock.
     WakeUnderLock,
     /// Stage 4: the lock is held, before `Command::spawn`.
     LockAcquired,
@@ -681,6 +681,51 @@ fn identity_without_a_record_has_an_empty_start() {
     assert_eq!(id.group, id.pid.to_string());
     assert_eq!(id.start_time, "");
     assert!(wait_dead(id.pid));
+}
+
+/// A `UnixPty` whose hook records every stage it reaches.
+fn recording() -> (UnixPty, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s2 = seen.clone();
+    let pty = UnixPty {
+        hooks: Hooks {
+            stage: Some(Box::new(move |s| {
+                s2.lock().unwrap().push(format!("{s:?}"));
+                false
+            })),
+            ..Hooks::default()
+        },
+    };
+    (pty, seen)
+}
+
+#[test]
+fn invalid_spec_creates_nothing() {
+    let _s = serial();
+    let dir = TempDir::new("invalid");
+    let (pty, seen) = recording();
+    let mut bad_env = spec(&["/bin/echo"], &dir.0);
+    bad_env.env.push(("A=B".into(), "1".into()));
+    for sp in [
+        spec(&["/bin/echo", "a\0b"], &dir.0),
+        spec(&["bin/echo"], &dir.0),
+        bad_env,
+    ] {
+        let (r, _) = spawn(&pty, &sp);
+        assert!(
+            matches!(
+                r,
+                Err(SpawnError::NeverStarted {
+                    kind: NeverStartedKind::Setup,
+                    ..
+                })
+            ),
+            "{:?}",
+            r.map(|_| ())
+        );
+        // Validation failed before the PTY, the wake, or the drain existed.
+        assert_eq!(*seen.lock().unwrap(), Vec::<String>::new());
+    }
 }
 
 #[test]

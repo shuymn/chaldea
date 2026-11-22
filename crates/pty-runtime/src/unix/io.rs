@@ -518,7 +518,8 @@ mod tests {
         let mut buf = [0u8; 16];
         assert_eq!(rustix::io::read(&p.slave, &mut buf).unwrap(), 1);
         assert_eq!(rustix::io::read(&p.slave, &mut buf).unwrap(), 0);
-        // The drop writes nothing.
+        // The drop writes nothing: on a raw slave any single byte would be readable.
+        raw(&p.slave);
         drop(input);
         assert!(!slave_readable(200));
     }
@@ -636,7 +637,8 @@ mod tests {
         let (res, mut input) = rx.recv_timeout(BOUND).unwrap();
         let n = res.unwrap();
         assert!(n > 0 && n < 1 << 20, "{n}");
-        let e = input.write(b"more").unwrap_err();
+        // The stored error comes on the next call, even an empty one.
+        let e = input.write(b"").unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::EPIPE));
         // Nothing is pending after the error was returned.
         assert_eq!(input.write(b"").unwrap(), 0);

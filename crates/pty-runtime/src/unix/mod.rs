@@ -204,9 +204,10 @@ impl UnixPty {
         drop(master);
         let (wake_r, wake_w) = {
             let _g = spawn_lock();
+            let pair = std::io::pipe()?;
             #[cfg(test)]
             self.hooks.on(&tests::Stage::WakeUnderLock);
-            std::io::pipe()?
+            pair
         };
         let fl = rustix::fs::fcntl_getfl(&wake_w)?;
         rustix::fs::fcntl_setfl(&wake_w, fl | OFlags::NONBLOCK)?;
