@@ -45,13 +45,15 @@ fn arm(slot: &Mutex<Option<Gate>>) -> (oneshot::Receiver<()>, oneshot::Sender<()
     (reached_rx, release_tx)
 }
 
-/// Passes a gate: if armed, tells the test and waits for the release.
-async fn pass(slot: &Mutex<Option<Gate>>) {
+/// Passes a gate: if armed, tells the test and waits for the release; true if it was.
+async fn pass(slot: &Mutex<Option<Gate>>) -> bool {
     let gate = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
-    if let Some((reached, release)) = gate {
-        let _ = reached.send(());
-        let _ = release.await;
-    }
+    let Some((reached, release)) = gate else {
+        return false;
+    };
+    let _ = reached.send(());
+    let _ = release.await;
+    true
 }
 
 /// The armed hook if its skip count is used up; otherwise counts one skip.
@@ -144,15 +146,9 @@ impl Points {
     }
 
     pub(crate) async fn before_cutoff_wait(&self, ready: impl Fn() -> bool) {
-        let armed = self
-            .cutoff_gate
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some();
-        if !armed {
+        if !pass(&self.cutoff_gate).await {
             return;
         }
-        pass(&self.cutoff_gate).await;
         let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !ready() {
             assert!(

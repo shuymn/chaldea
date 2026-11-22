@@ -14,7 +14,6 @@ use axum::body::Body;
 use axum::extract::FromRequestParts;
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, Request, Response, header};
-use axum::response::IntoResponse;
 use chaldea_core::auth::TokenKind;
 use chaldea_core::ids::{ThreadId, TokenId};
 use tokio::sync::{oneshot, watch};
@@ -83,14 +82,14 @@ pub(crate) async fn admit(
     deadline: Instant,
     req: Request<Body>,
     handler: Arc<dyn UpgradeHandler>,
-) -> Response<Body> {
+) -> Result<Response<Body>, ApiError> {
     let (mut parts, _body) = req.into_parts();
     // 3. The handshake (axum's checks), and no `close` token.
     let Ok(ws) = WebSocketUpgrade::from_request_parts(&mut parts, &()).await else {
-        return ApiError::bad_request().into_response();
+        return Err(ApiError::bad_request());
     };
     if asks_close(&parts.headers) {
-        return ApiError::bad_request().into_response();
+        return Err(ApiError::bad_request());
     }
     // The socket task, registered before the ticket is spent. It waits on `admitted` while
     // admission runs: a refusal below drops the sender and ends the task at once. The
@@ -106,11 +105,13 @@ pub(crate) async fn admit(
     };
     let shutdown = shared.shutdown_signal();
     let hand_over = shared.cfg.short_deadline;
+    #[cfg(test)]
     let s = shared.clone();
     let task = async move {
         if admitted.await.is_err() {
             return;
         }
+        #[cfg(test)]
         s.faults.step("hand-over bound started");
         let Ok(Ok(socket)) = tokio::time::timeout(hand_over, rx).await else {
             return;
@@ -123,14 +124,14 @@ pub(crate) async fn admit(
             })
             .await;
     };
-    let task = shared.faults.socket_task(task);
+    #[cfg(test)]
+    let task = shared.faults.signal_first_park(task);
     if shared.registry.spawn(TaskKind::Socket, task).is_err() {
-        return ApiError::shutting_down().into_response();
+        return Err(ApiError::shutting_down());
     }
     // 4. The final admission read: this snapshot decides the token's validity.
-    if let Err(e) = verify_until(&shared, deadline, principal.token_sha256).await {
-        return e.into_response();
-    }
+    verify_until(&shared, deadline, principal.token_sha256).await?;
+    #[cfg(test)]
     shared.faults.before_ticket_removal().await;
     // 5. The conditional removal decides single use.
     if shared
@@ -138,12 +139,13 @@ pub(crate) async fn admit(
         .remove_if_valid(&ticket_sha, shared.cfg.clock.now())
         .is_none()
     {
-        return ApiError::unauthorized().into_response();
+        return Err(ApiError::unauthorized());
     }
+    #[cfg(test)]
     shared.faults.step("ticket removed");
     // 6. `101`; axum's upgrade task hands the socket to the registered task.
     let _ = admitted_tx.send(());
-    ws.on_upgrade(move |socket| async move {
+    Ok(ws.on_upgrade(move |socket| async move {
         let _ = tx.send(socket);
-    })
+    }))
 }

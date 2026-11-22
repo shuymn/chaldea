@@ -13,7 +13,7 @@ use http_body_util::{BodyExt, LengthLimitError, Limited};
 use tokio::sync::oneshot;
 use tokio::time::timeout_at;
 
-use super::auth::{Authorized, Principal, verify_in_job, verify_in_read};
+use super::auth::{Authorized, Principal, verify_in_read, verify_opt_in_job};
 use super::error::{ApiError, WriteFailure, read_error, write_failure};
 use super::registry::{Closing, TaskKind};
 use super::{Shared, StoreFatal};
@@ -48,11 +48,14 @@ pub(crate) async fn read_until<R: Send + 'static>(
     let cutoff = shared.timer(deadline);
     let s = shared.clone();
     let handle = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
         s.faults.before_read();
         let r = s.store.read(s.real(deadline), f);
+        #[cfg(test)]
         s.faults.after_read();
         r
     });
+    #[cfg(test)]
     shared
         .faults
         .before_cutoff_wait(|| handle.is_finished())
@@ -76,8 +79,22 @@ pub(crate) async fn verify_until(
     read_until(shared, deadline, move |tx| verify_in_read(tx, &sha256)).await?
 }
 
-/// Collects `body` until `deadline` (408), at most `max` bytes (413). A body completed at or
-/// after the deadline (by the server's clock) is 408 too, even when it was ready at once.
+/// Awaits the future `start` makes until `deadline`: not done by then, or done at or after
+/// it (by the server's clock, even when ready at once), is 408. The timer is set before
+/// `start` runs.
+pub(crate) async fn until_deadline<F: Future>(
+    shared: &Shared,
+    deadline: Instant,
+    start: impl FnOnce() -> F,
+) -> Result<F::Output, ApiError> {
+    let cutoff = shared.timer(deadline);
+    match timeout_at(cutoff, start()).await {
+        Ok(v) if !shared.passed(deadline) => Ok(v),
+        _ => Err(ApiError::request_timeout()),
+    }
+}
+
+/// Collects `body` until `deadline` (408, [`until_deadline`]), at most `max` bytes (413).
 pub(crate) async fn body_within(
     shared: &Shared,
     body: Body,
@@ -85,11 +102,9 @@ pub(crate) async fn body_within(
     max: u64,
 ) -> Result<Bytes, ApiError> {
     let max = usize::try_from(max).unwrap_or(usize::MAX);
-    match timeout_at(shared.timer(deadline), Limited::new(body, max).collect()).await {
-        Err(_) => Err(ApiError::request_timeout()),
-        Ok(_) if shared.passed(deadline) => Err(ApiError::request_timeout()),
-        Ok(Ok(collected)) => Ok(collected.to_bytes()),
-        Ok(Err(e)) => {
+    match until_deadline(shared, deadline, || Limited::new(body, max).collect()).await? {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(e) => {
             let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e.as_ref());
             while let Some(err) = cur {
                 if err.is::<LengthLimitError>() {
@@ -112,6 +127,7 @@ pub(crate) async fn run_write<R: Send + 'static>(
     job: Job<R>,
     after_ok: Option<AfterOk>,
 ) -> Result<R, WriteFailure> {
+    #[cfg(test)]
     shared.faults.write_submitted();
     let ticket = match shared.store.submit(shared.real(not_after), job) {
         Ok(t) => t,
@@ -180,6 +196,7 @@ pub(crate) async fn await_write<R: Send + 'static>(
     let cutoff = shared.timer(reply_by);
     let rx =
         observe_write(shared, deadline, job, after_ok).map_err(|_| ApiError::shutting_down())?;
+    #[cfg(test)]
     shared.faults.before_cutoff_wait(|| !rx.is_empty()).await;
     match timeout_at(cutoff, rx).await {
         Err(_) | Ok(Err(_)) => Err(ApiError::outcome_unknown()),
@@ -313,7 +330,7 @@ impl WriteCtx {
             &self.shared,
             self.deadline,
             Box::new(move |tx| {
-                let auth = sha.map(|sha| verify_in_job(&tx.read(), &sha)).transpose()?;
+                let auth = verify_opt_in_job(tx, sha)?;
                 job(tx, auth.as_ref())
             }),
             None,

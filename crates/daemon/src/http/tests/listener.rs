@@ -12,7 +12,7 @@ async fn accept_error_continues() {
     let s = shared(&srv);
     // The loop is already waiting in `accept`: the injected errors are taken from the next
     // iteration on, after the first connection.
-    s.faults.inner.arm_accept_errors(&[
+    s.faults.arm_accept_errors(&[
         ErrorKind::ConnectionReset,
         ErrorKind::ConnectionAborted,
         ErrorKind::Other,
@@ -22,7 +22,7 @@ async fn accept_error_continues() {
         assert_eq!(r.status, 404);
     }
     assert!(
-        s.faults.inner.accept_errors.lock().unwrap().is_empty(),
+        s.faults.accept_errors.lock().unwrap().is_empty(),
         "the injected errors were not all taken"
     );
     // The accept task is still registered once the connections have ended.

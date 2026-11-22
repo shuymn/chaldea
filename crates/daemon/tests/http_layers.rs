@@ -611,24 +611,6 @@ fn plain_write_mount(deadline_tx: tokio::sync::mpsc::UnboundedSender<Instant>) -
     ))
 }
 
-/// Occupies the store writer until the returned sender is used or dropped.
-async fn hold_writer(srv: &TestServer) -> std::sync::mpsc::Sender<()> {
-    let (release, wait) = std::sync::mpsc::channel::<()>();
-    let (entered_tx, entered) = tokio::sync::oneshot::channel();
-    let ticket = srv
-        .store
-        .store()
-        .submit(support::soon(), move |_tx| {
-            let _ = entered_tx.send(());
-            let _ = wait.recv_timeout(Duration::from_secs(20));
-            Ok(())
-        })
-        .unwrap();
-    tokio::spawn(ticket);
-    entered.await.unwrap();
-    release
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plain_write_expired_is_408() {
     let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
@@ -637,7 +619,7 @@ async fn plain_write_expired_is_408() {
     })
     .await;
     let hook = srv.token(TokenKind::Hook, None, None).await;
-    let release = hold_writer(&srv).await;
+    let release = srv.hold_writer().await;
     let port = srv.port;
     let req = srv.req("POST", "/hook").bearer(&hook).body(b"{}");
     let reply = tokio::spawn(async move { support::http::send(port, &req.bytes()).await });
@@ -660,14 +642,13 @@ async fn plain_write_unreplied_is_outcome_unknown() {
     let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
     let srv = TestServer::start(plain_write_mount(dtx)).await;
     let hook = srv.token(TokenKind::Hook, None, None).await;
-    let release = hold_writer(&srv).await;
+    let release = srv.hold_writer().await;
     let r = srv
         .send(&srv.req("POST", "/hook").bearer(&hook).body(b"{}"))
         .await;
     let deadline = drx.recv().await.unwrap();
     assert!(Instant::now() >= deadline + Duration::from_millis(100));
     assert_eq!(r.outcome(), (503, code("outcome_unknown")));
-    assert_eq!(r.code().as_deref(), Some("outcome_unknown"));
     assert!(r.body.windows(14).any(|w| w == b"\"retry_after\":"));
     release.send(()).unwrap();
     srv.stop().await;
@@ -725,13 +706,7 @@ async fn http10_gets_the_same_rules() {
     let (mounts, calls) = counting_root();
     let srv = TestServer::start(mounts).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
-    let http10 = |r: &Req| {
-        let mut b = r.bytes();
-        let line_end = b.windows(2).position(|w| w == b"\r\n").unwrap();
-        b.splice(line_end - 8..line_end, b"HTTP/1.0".iter().copied());
-        b
-    };
-    let r = support::http::send(srv.port, &http10(&srv.req("GET", "/"))).await;
+    let r = support::http::send(srv.port, &srv.req("GET", "/").http10_bytes()).await;
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(r.header("connection"), Some("close"));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -752,7 +727,7 @@ async fn http10_gets_the_same_rules() {
             (501, code("not_implemented")),
         ),
     ] {
-        let r = support::http::send(srv.port, &http10(&req)).await;
+        let r = support::http::send(srv.port, &req.http10_bytes()).await;
         assert_eq!(r.outcome(), want, "{name}: {r:?}");
         assert_eq!(r.header("connection"), Some("close"), "{name}");
     }

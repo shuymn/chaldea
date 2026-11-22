@@ -23,7 +23,7 @@ use uuid::Uuid;
 use super::Shared;
 use super::ctx::await_write;
 use super::error::{ApiError, refused};
-use crate::store::{JobError, NewToken, ReadTx, StoreError, TokenSelector};
+use crate::store::{JobError, NewToken, ReadTx, StoreError, TokenSelector, WriteTx};
 
 pub(crate) const TOKEN_PREFIX: &str = "chd_";
 pub(crate) const TICKET_PREFIX: &str = "chdt_";
@@ -202,13 +202,21 @@ pub(crate) fn verify_in_read(
     }
 }
 
-/// [`verify_hash_in`] inside a write job: an invalid token refuses the job with 401, a
-/// failed lookup is the job's store error.
-pub(crate) fn verify_in_job(tx: &ReadTx<'_>, sha256: &[u8; 32]) -> Result<Authorized, JobError> {
-    verify_hash_in(tx, sha256).map_err(|e| match e {
-        AuthFailure::Invalid => refused(ApiError::unauthorized()),
-        AuthFailure::Store(e) => e.into(),
-    })
+/// [`verify_hash_in`] inside a write job, in its transaction, when there is a hash: an
+/// invalid token refuses the job with 401, a failed lookup is the job's store error.
+pub(crate) fn verify_opt_in_job(
+    tx: &WriteTx<'_>,
+    sha256: Option<[u8; 32]>,
+) -> Result<Option<Authorized>, JobError> {
+    let Some(sha256) = sha256 else {
+        return Ok(None);
+    };
+    verify_hash_in(&tx.read(), &sha256)
+        .map(Some)
+        .map_err(|e| match e {
+            AuthFailure::Invalid => refused(ApiError::unauthorized()),
+            AuthFailure::Store(e) => e.into(),
+        })
 }
 
 /// Token issuance, verification, and revocation.
@@ -275,9 +283,7 @@ impl TokenService {
             &self.shared,
             deadline,
             Box::new(move |tx| {
-                if let Some(issuer) = issuer {
-                    verify_in_job(&tx.read(), &issuer)?;
-                }
+                verify_opt_in_job(tx, issuer)?;
                 tx.token_insert(row)?;
                 Ok(())
             }),

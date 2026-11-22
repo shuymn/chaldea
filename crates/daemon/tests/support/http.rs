@@ -63,7 +63,8 @@ impl MonotonicClock for SkewClock {
         Instant::now() + self.offset()
     }
 
-    /// `at` less the current offset (an instant before the platform's earliest is long past).
+    /// `at` less the current offset; when that is before the platform's earliest instant it
+    /// is long past, and the fixture reads `Instant::now()` instead.
     fn real(&self, at: Instant) -> Instant {
         at.checked_sub(self.offset()).unwrap_or_else(Instant::now)
     }
@@ -201,6 +202,24 @@ impl TestServer {
         assert_eq!(n, 1);
     }
 
+    /// Occupies the store writer until the returned sender is used or dropped.
+    pub async fn hold_writer(&self) -> std::sync::mpsc::Sender<()> {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let ticket = self
+            .store
+            .store()
+            .submit(soon(), move |_tx| {
+                let _ = entered_tx.send(());
+                let _ = wait.recv_timeout(Duration::from_secs(20));
+                Ok(())
+            })
+            .unwrap();
+        tokio::spawn(ticket);
+        entered.await.unwrap();
+        release
+    }
+
     /// A request builder for this server.
     #[must_use]
     pub fn req(&self, method: &str, path: &str) -> Req {
@@ -291,9 +310,13 @@ impl Req {
         b
     }
 
+    /// [`Req::bytes`] with the request line's version `HTTP/1.0`.
     #[must_use]
-    pub fn body_bytes(&self) -> &[u8] {
-        &self.body
+    pub fn http10_bytes(&self) -> Vec<u8> {
+        let mut b = self.bytes();
+        let line_end = b.windows(2).position(|w| w == b"\r\n").unwrap();
+        b.splice(line_end - 8..line_end, b"HTTP/1.0".iter().copied());
+        b
     }
 }
 

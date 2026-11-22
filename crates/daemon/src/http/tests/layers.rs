@@ -107,7 +107,7 @@ async fn run(withhold_body: bool) {
     let srv = TestServer::start(reading_hook()).await;
     let s = shared(&srv);
     for (step, req, want) in cases(&srv).await {
-        let before = s.faults.inner.polls();
+        let before = s.faults.polls();
         let mut c = connect(srv.port).await;
         let bytes = if withhold_body {
             req.head()
@@ -119,19 +119,19 @@ async fn run(withhold_body: bool) {
         let r = parse(&out, end);
         assert_eq!(r.outcome(), want, "{step}: {r:?}");
         assert_eq!(
-            s.faults.inner.polls(),
+            s.faults.polls(),
             before,
             "{step}: the application polled the body"
         );
     }
     // Positive control: a handler that reads the body polls it.
     let hook = srv.token(TokenKind::Hook, None, None).await;
-    let before = s.faults.inner.polls();
+    let before = s.faults.polls();
     let r = srv
         .send(&srv.req("POST", "/hook").bearer(&hook).body(b"{}"))
         .await;
     assert_eq!(r.status, 200);
-    assert!(s.faults.inner.polls() > before, "the counter saw no poll");
+    assert!(s.faults.polls() > before, "the counter saw no poll");
     srv.stop().await;
 }
 
@@ -153,7 +153,7 @@ async fn slow_head_then_slow_lookup() {
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let s = shared(&srv);
     let (release_tx, release_rx) = mpsc::channel::<()>();
-    s.faults.inner.arm_before_read(0, move || {
+    s.faults.arm_before_read(0, move || {
         let _ = release_rx.recv_timeout(Duration::from_secs(20));
     });
     let head = srv.req("GET", "/api/threads").bearer(&owner).head();

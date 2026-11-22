@@ -1,7 +1,6 @@
 //! The write mapping and fatal reporting of `run_write` (design §2.8, §2.9; the plain-write
 //! cases of PR7-CL-20).
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
@@ -71,10 +70,8 @@ fn write_outcomes_map_to_statuses() {
     assert_eq!(ApiError::outcome_unknown().retry_after(), Some(1));
 }
 
-/// A commit whose outcome is unknown reaches the lifecycle sink, whether or not anyone
-/// waits; the writer then refuses submissions, which is reported as `Failed`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fatal_outcomes_reach_the_sink() {
+/// A server over a store whose next commit fails after committing (outcome unknown).
+async fn commit_unknown_server() -> TestServer {
     let faults = Faults::default();
     *faults.commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
     let dir = tempfile::tempdir().unwrap();
@@ -85,7 +82,14 @@ async fn fatal_outcomes_reach_the_sink() {
         clock,
         dir,
     };
-    let srv = TestServer::start_on(ts, Mounts::mvp(), |_| {}).await;
+    TestServer::start_on(ts, Mounts::mvp(), |_| {}).await
+}
+
+/// A commit whose outcome is unknown reaches the lifecycle sink, whether or not anyone
+/// waits; the writer then refuses submissions, which is reported as `Failed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fatal_outcomes_reach_the_sink() {
+    let srv = commit_unknown_server().await;
     let s = shared(&srv);
     let deadline = Instant::now() + Duration::from_secs(5);
     let r = await_write(&s, deadline, Box::new(|_tx| Ok(())), None).await;
@@ -97,24 +101,7 @@ async fn fatal_outcomes_reach_the_sink() {
         [StoreFatal::CommitUnknown, StoreFatal::Failed]
     );
     // A commit nobody waits for is still reported: the observer owns the ticket.
-    let srv2 = {
-        let faults = Faults::default();
-        *faults.commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
-        let dir = tempfile::tempdir().unwrap();
-        let clock = FixedClock::new(T0);
-        let store =
-            open_with(config(dir.path().join("chaldea.db"), clock.clone()), faults).unwrap();
-        TestServer::start_on(
-            TestStore {
-                store: Some(store),
-                clock,
-                dir,
-            },
-            Mounts::mvp(),
-            |_| {},
-        )
-        .await
-    };
+    let srv2 = commit_unknown_server().await;
     let s2 = shared(&srv2);
     let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
     let rx = crate::http::ctx::observe_write(
@@ -135,7 +122,6 @@ async fn fatal_outcomes_reach_the_sink() {
     })
     .await;
     assert_eq!(*srv2.sink.0.lock().unwrap(), [StoreFatal::CommitUnknown]);
-    let _ = Arc::clone(&s2);
     srv.stop().await;
     srv2.stop().await;
 }

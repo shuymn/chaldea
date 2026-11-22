@@ -12,6 +12,7 @@ use std::time::Instant;
 use chaldea_core::auth::TokenKind;
 use chaldea_core::ids::{ThreadId, TokenId};
 
+#[cfg(test)]
 use super::auth::{Secret, TICKET_PREFIX};
 
 /// What a ticket may open.
@@ -43,11 +44,9 @@ impl TicketStore {
         self.map.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Stores a new ticket for `entry` and returns its secret.
-    #[allow(
-        dead_code,
-        reason = "the minting route arrives with PR 7b; tests mint directly"
-    )]
+    /// Stores a new ticket for `entry` and returns its secret (the minting route arrives
+    /// with PR 7b; until then only tests mint).
+    #[cfg(test)]
     pub(crate) fn mint(&self, entry: TicketEntry) -> Secret {
         let secret = Secret::generate(TICKET_PREFIX);
         self.lock().insert(secret.sha256(), entry);

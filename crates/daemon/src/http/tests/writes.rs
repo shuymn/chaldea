@@ -9,9 +9,9 @@ use axum::body::Body;
 use axum::http::{Method, Request, Response};
 use chaldea_core::auth::TokenKind;
 
+use super::eventually;
 use super::shared;
 use super::support::http::{SkewClock, TestServer};
-use super::{eventually, support};
 use crate::http::ctx::await_write;
 use crate::http::{ApiError, MonotonicClock, Mount, Mounts, WriteCtx, spec};
 
@@ -41,32 +41,14 @@ async fn body_after_the_cutoff_submits_nothing() {
     let srv = start(mounts, &clock).await;
     let hook = srv.token(TokenKind::Hook, None, None).await;
     let s = shared(&srv);
-    let before = s.faults.inner.submits();
+    let before = s.faults.submits();
     let r = srv
         .send(&srv.req("POST", "/hook").bearer(&hook).body(b"{}"))
         .await;
     clock.skew(Duration::ZERO);
     assert_eq!(r.outcome(), (408, Some("request_timeout".to_owned())));
-    assert_eq!(s.faults.inner.submits(), before, "a write was submitted");
+    assert_eq!(s.faults.submits(), before, "a write was submitted");
     srv.stop().await;
-}
-
-/// Occupies the store writer until the returned sender is used or dropped.
-async fn hold_writer(srv: &TestServer) -> std::sync::mpsc::Sender<()> {
-    let (release, wait) = std::sync::mpsc::channel::<()>();
-    let (entered_tx, entered) = tokio::sync::oneshot::channel();
-    let ticket = srv
-        .store
-        .store()
-        .submit(support::soon(), move |_tx| {
-            let _ = entered_tx.send(());
-            let _ = wait.recv_timeout(Duration::from_secs(20));
-            Ok(())
-        })
-        .unwrap();
-    tokio::spawn(ticket);
-    entered.await.unwrap();
-    release
 }
 
 /// The waiter is held at its gate while its job waits behind a held writer past
@@ -81,9 +63,9 @@ async fn reply_after_the_grace_is_outcome_unknown() {
     })
     .await;
     let s = shared(&srv);
-    let writer = hold_writer(&srv).await;
-    let (reached, release) = s.faults.inner.arm_cutoff_gate();
-    let before = s.faults.inner.submits();
+    let writer = srv.hold_writer().await;
+    let (reached, release) = s.faults.arm_cutoff_gate();
+    let before = s.faults.submits();
     let deadline = srv.clock.now() + Duration::from_millis(300);
     let w = s.clone();
     let waiter =
@@ -93,7 +75,7 @@ async fn reply_after_the_grace_is_outcome_unknown() {
         .expect("the waiter reached its gate")
         .unwrap();
     eventually(Duration::from_secs(10), "the job was submitted", || {
-        s.faults.inner.submits() == before + 1
+        s.faults.submits() == before + 1
     })
     .await;
     // Lower bounds: the reply cutoff and the job's `not_after` have passed in real time.

@@ -57,7 +57,7 @@ async fn read_outcomes_map() {
 
     // A read held running past the cutoff: 408.
     let (release_tx, release_rx) = mpsc::channel::<()>();
-    s.faults.inner.arm_before_read(0, move || {
+    s.faults.arm_before_read(0, move || {
         let _ = release_rx.recv_timeout(Duration::from_secs(20));
     });
     let r = read_until(&s, Instant::now() + Duration::from_millis(300), |_| Ok(1)).await;
@@ -91,7 +91,6 @@ async fn late_read_success_is_408() {
     let s = shared(&srv);
     let clock = srv.clock.clone();
     s.faults
-        .inner
         .arm_after_read(0, move || clock.skew(Duration::from_secs(3600)));
     let r = read_until(&s, Instant::now() + Duration::from_secs(5), |_| Ok(1)).await;
     assert_eq!(r, Err(ApiError::request_timeout()));
@@ -107,7 +106,7 @@ async fn late_read_success_is_408() {
 async fn late_read_error_is_408() {
     let srv = TestServer::start(Mounts::mvp()).await;
     let s = shared(&srv);
-    let (reached, release) = s.faults.inner.arm_cutoff_gate();
+    let (reached, release) = s.faults.arm_cutoff_gate();
     let w = s.clone();
     let deadline = srv.clock.now() + Duration::from_millis(200);
     let waiter = tokio::spawn(async move {
@@ -177,7 +176,6 @@ async fn late_admission_read_keeps_the_ticket() {
     let clock = srv.clock.clone();
     // Read 1 is the credential read, read 2 the final admission read.
     s.faults
-        .inner
         .arm_after_read(1, move || clock.skew(Duration::from_secs(3600)));
     let r = srv.send(&handshake(&srv, &ticket, "Upgrade")).await;
     assert_eq!(r.outcome(), (408, Some("request_timeout".to_owned())));

@@ -227,7 +227,7 @@ impl TaskRegistry {
     pub(crate) async fn wait_empty_until(&self, deadline: Instant) -> bool {
         let deadline = tokio::time::Instant::from_std(deadline);
         loop {
-            if self.lock().tasks.is_empty() {
+            if self.is_empty() {
                 return true;
             }
             #[cfg(test)]
@@ -236,7 +236,7 @@ impl TaskRegistry {
             // returns at once.
             tokio::select! {
                 () = self.inner.empty.notified() => {}
-                () = tokio::time::sleep_until(deadline) => return self.lock().tasks.is_empty(),
+                () = tokio::time::sleep_until(deadline) => return self.is_empty(),
             }
         }
     }

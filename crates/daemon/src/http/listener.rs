@@ -52,7 +52,13 @@ pub(crate) async fn accept_loop(shared: Arc<Shared>, listener: TcpListener, rout
         let accepted = tokio::select! {
             biased;
             () = shutdown.wait() => break,
-            r = accept(&shared, &listener) => r,
+            r = async {
+                #[cfg(test)]
+                if let Some(e) = shared.faults.accept_error() {
+                    return Err(e);
+                }
+                listener.accept().await.map(|(s, _)| s)
+            } => r,
         };
         let stream = match accepted {
             Ok(s) => s,
@@ -75,13 +81,6 @@ pub(crate) async fn accept_loop(shared: Arc<Shared>, listener: TcpListener, rout
             break;
         }
     }
-}
-
-async fn accept(shared: &Shared, listener: &TcpListener) -> io::Result<TcpStream> {
-    if let Some(e) = shared.faults.accept_error() {
-        return Err(e);
-    }
-    listener.accept().await.map(|(s, _)| s)
 }
 
 /// One connection: served until its response is sent (hyper closes it after a response

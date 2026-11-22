@@ -128,9 +128,7 @@ async fn http10_upgrade_is_400() {
     let srv = TestServer::start(ws_mounts()).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
-    let mut bytes = handshake(&srv, &ticket, "Upgrade").bytes();
-    let line_end = bytes.windows(2).position(|w| w == b"\r\n").unwrap();
-    bytes.splice(line_end - 8..line_end, b"HTTP/1.0".iter().copied());
+    let bytes = handshake(&srv, &ticket, "Upgrade").http10_bytes();
     let r = super::support::http::send(srv.port, &bytes).await;
     assert_eq!(r.outcome(), (400, Some("bad_request".to_owned())), "{r:?}");
     assert_eq!(r.header("connection"), Some("close"));
@@ -148,8 +146,8 @@ async fn hand_over_bound_starts_after_the_ticket_is_removed() {
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
     let s = super::shared(&srv);
-    let (reached, release) = s.faults.inner.arm_removal_gate();
-    let parked = s.faults.inner.arm_first_park();
+    let (reached, release) = s.faults.arm_removal_gate();
+    let parked = s.faults.arm_first_park();
     let url = format!("ws://127.0.0.1:{}/api/ws?ticket={ticket}", srv.port);
     let client = tokio::spawn(tokio_tungstenite::connect_async(url));
     for (what, signal) in [
@@ -161,7 +159,7 @@ async fn hand_over_bound_starts_after_the_ticket_is_removed() {
             .expect(what)
             .unwrap();
     }
-    assert_eq!(s.faults.inner.steps(), Vec::<&str>::new());
+    assert_eq!(s.faults.steps(), Vec::<&str>::new());
     drop(release);
     let (mut ws, resp) = tokio::time::timeout(Duration::from_secs(10), client)
         .await
@@ -176,7 +174,7 @@ async fn hand_over_bound_starts_after_the_ticket_is_removed() {
         .unwrap();
     assert!(hello.to_text().unwrap().contains("\"hello\""), "{hello:?}");
     assert_eq!(
-        s.faults.inner.steps(),
+        s.faults.steps(),
         ["ticket removed", "hand-over bound started"]
     );
     ws.close(None).await.unwrap();

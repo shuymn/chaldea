@@ -153,7 +153,9 @@ pub(crate) struct Shared {
     pub(crate) revocations: watch::Sender<u64>,
     /// Set once by shutdown; every registered task watches it.
     pub(crate) shutdown: watch::Sender<bool>,
-    pub(crate) faults: Faults,
+    /// Test-only fault points (design §7); absent from other builds.
+    #[cfg(test)]
+    pub(crate) faults: tests::faults::Points,
 }
 
 impl Shared {
@@ -210,7 +212,8 @@ impl HttpServer {
             tickets: tickets::TicketStore::default(),
             revocations: watch::channel(0).0,
             shutdown: watch::channel(false).0,
-            faults: Faults::default(),
+            #[cfg(test)]
+            faults: tests::faults::Points::default(),
         });
         let router = routes::build_router(mounts, &shared);
         HttpServer {
@@ -283,76 +286,5 @@ impl ServeHandle {
             exited: snapshot.minus(&abort_requested),
             abort_requested,
         }
-    }
-}
-
-/// Test-only fault points (design §7); inert in other builds.
-#[derive(Default)]
-pub(crate) struct Faults {
-    #[cfg(test)]
-    pub(crate) inner: tests::faults::Points,
-}
-
-impl Faults {
-    /// Counts one poll of a request body by the application.
-    pub(crate) fn body_polled(&self) {
-        #[cfg(test)]
-        self.inner.body_polled();
-    }
-
-    /// Runs on the blocking thread before every store read of a request or socket.
-    pub(crate) fn before_read(&self) {
-        #[cfg(test)]
-        self.inner.before_read();
-    }
-
-    /// Runs on the blocking thread after every store read of a request or socket.
-    pub(crate) fn after_read(&self) {
-        #[cfg(test)]
-        self.inner.after_read();
-    }
-
-    /// Counts one write job submitted to the store.
-    pub(crate) fn write_submitted(&self) {
-        #[cfg(test)]
-        self.inner.write_submitted();
-    }
-
-    /// Runs in an upgrade admission between the final read and the ticket removal.
-    pub(crate) async fn before_ticket_removal(&self) {
-        #[cfg(test)]
-        self.inner.before_ticket_removal().await;
-    }
-
-    /// Records a step of an upgrade, for tests that check the steps' order.
-    pub(crate) fn step(&self, _step: &'static str) {
-        #[cfg(test)]
-        self.inner.step(_step);
-    }
-
-    /// A socket task as registered: in tests, it signals the first time it parks.
-    pub(crate) fn socket_task<F>(&self, fut: F) -> impl Future<Output = ()> + Send + 'static
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        #[cfg(test)]
-        return self.inner.signal_first_park(fut);
-        #[cfg(not(test))]
-        fut
-    }
-
-    /// Runs after the work a cutoff bounds has started and before its waiter first polls
-    /// the result against the cutoff; `ready` tells whether the result is in.
-    pub(crate) async fn before_cutoff_wait(&self, _ready: impl Fn() -> bool) {
-        #[cfg(test)]
-        self.inner.before_cutoff_wait(_ready).await;
-    }
-
-    /// An injected accept error, taken before each real accept.
-    pub(crate) fn accept_error(&self) -> Option<std::io::Error> {
-        #[cfg(test)]
-        return self.inner.accept_error();
-        #[cfg(not(test))]
-        None
     }
 }

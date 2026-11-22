@@ -7,56 +7,57 @@
 //! or uses a body byte before the guard accepts the request.
 
 use std::convert::Infallible;
-use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use axum::response::IntoResponse;
 use chaldea_core::auth::{command, grant};
 use futures_util::future::BoxFuture;
 use http_body_util::Limited;
-use hyper::body::{Frame, Incoming, SizeHint};
+use hyper::body::Incoming;
 use tower::{Layer, Service, ServiceExt};
 use tower_http::sensitive_headers::{SetSensitiveRequestHeaders, SetSensitiveRequestHeadersLayer};
 use tracing::{Instrument, Span};
 
 use super::Shared;
 use super::auth::{Principal, TICKET_PREFIX, has_secret_form, parse_bearer, sha256};
-use super::ctx::{Deadline, ReadCtx, RequestStart, WriteCtx, verify_until};
+use super::ctx::{Deadline, ReadCtx, RequestStart, WriteCtx, until_deadline, verify_until};
 use super::error::ApiError;
 use super::routes::{ActionRule, Credential, Endpoint, OriginRule, RouteSpec, TicketPurposeKind};
 use super::tickets::{TicketEntry, TicketPurpose};
 use super::trace::{UNMATCHED, request_span};
 use super::upgrade;
 
-/// A request body as the application sees it: hyper's body, counting polls in tests.
+/// In tests, a request body that counts the application's polls.
+#[cfg(test)]
 struct AppBody {
     inner: Incoming,
     shared: Arc<Shared>,
 }
 
+#[cfg(test)]
 impl hyper::body::Body for AppBody {
-    type Data = Bytes;
+    type Data = axum::body::Bytes;
     type Error = hyper::Error;
 
     fn poll_frame(
-        mut self: Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, hyper::Error>>> {
         self.shared.faults.body_polled();
-        Pin::new(&mut self.inner).poll_frame(cx)
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
     }
 
     fn is_end_stream(&self) -> bool {
         self.inner.is_end_stream()
     }
 
-    fn size_hint(&self) -> SizeHint {
+    fn size_hint(&self) -> hyper::body::SizeHint {
         self.inner.size_hint()
     }
 }
@@ -112,10 +113,12 @@ impl Service<Request<Incoming>> for OuterService {
             let started = Instant::now();
             let (mut parts, body) = req.into_parts();
             parts.extensions.insert(start);
-            let body = Body::new(AppBody {
+            #[cfg(test)]
+            let body = AppBody {
                 inner: body,
                 shared: shared.clone(),
-            });
+            };
+            let body = Body::new(body);
             let resp = match check_host(&parts.headers, &parts.uri, shared.cfg.port) {
                 Err(e) => {
                     // Rejected before routing: no route template applies.
@@ -233,10 +236,10 @@ impl Service<Request<Body>> for GuardService {
         let this = self.clone();
         Box::pin(async move {
             Span::current().record("route", tracing::field::display(this.spec.path));
-            let mut resp = match this.handle(req).await {
-                Ok(r) => r,
-                Err(e) => e.into_response(),
-            };
+            let mut resp = this
+                .handle(req)
+                .await
+                .unwrap_or_else(IntoResponse::into_response);
             // Only the PWA's routes keep their own caching (mvp §2.5).
             if !this.spec.is_pwa() {
                 resp.headers_mut()
@@ -279,31 +282,24 @@ impl GuardService {
         }
         // 6. Framing, 7. size.
         check_framing(&parts.method, &parts.headers, shared.cfg.max_body_bytes)?;
-        // 8. Unimplemented.
-        if matches!(self.endpoint, Endpoint::Unimplemented) {
-            return Err(ApiError::not_implemented());
-        }
-        // 9. Deadline, then the handler: none is invoked once the deadline has passed.
-        if shared.passed(deadline) {
-            return Err(ApiError::request_timeout());
-        }
-        parts.extensions.insert(Deadline(deadline));
-        let max = usize::try_from(shared.cfg.max_body_bytes).unwrap_or(usize::MAX);
-        let req = Request::from_parts(parts, Body::new(Limited::new(body, max)));
+        // The handler's request: the deadline in its extensions, the body bounded.
+        let request = move || {
+            parts.extensions.insert(Deadline(deadline));
+            let max = usize::try_from(shared.cfg.max_body_bytes).unwrap_or(usize::MAX);
+            Request::from_parts(parts, Body::new(Limited::new(body, max)))
+        };
         match &self.endpoint {
+            // 8. Unimplemented.
             Endpoint::Unimplemented => Err(ApiError::not_implemented()),
+            // 9. Deadline: no handler is invoked once it has passed.
+            _ if shared.passed(deadline) => Err(ApiError::request_timeout()),
             Endpoint::Read(h) => {
                 let ctx = ReadCtx::new(admitted.principal, deadline, shared.clone());
-                match tokio::time::timeout_at(shared.timer(deadline), h.call(ctx, req)).await {
-                    // A result taken at or after the deadline is discarded.
-                    Ok(_) if shared.passed(deadline) => Err(ApiError::request_timeout()),
-                    Ok(r) => r,
-                    Err(_) => Err(ApiError::request_timeout()),
-                }
+                until_deadline(shared, deadline, || h.call(ctx, request())).await?
             }
             Endpoint::Write(h) => {
                 let ctx = WriteCtx::new(admitted.principal, deadline, shared.clone());
-                h.call(ctx, req).await
+                h.call(ctx, request()).await
             }
             Endpoint::Upgrade(h) => {
                 let (Some(principal), Some((ticket_sha, entry))) =
@@ -311,16 +307,16 @@ impl GuardService {
                 else {
                     return Err(ApiError::internal());
                 };
-                Ok(upgrade::admit(
+                upgrade::admit(
                     shared.clone(),
                     principal,
                     ticket_sha,
                     entry.purpose,
                     deadline,
-                    req,
+                    request(),
                     h.clone(),
                 )
-                .await)
+                .await
             }
         }
     }
