@@ -41,7 +41,7 @@ fn start_of(pid: u32) -> Option<String> {
 /// A session running FakeCli with `args`, its report listener, its root fixture, and a
 /// cleanup that tracks every fixture.
 struct Rig {
-    session: Option<Session>,
+    session: Session,
     listener: ReportListener,
     root: Fixture,
     cleanup: Cleanup,
@@ -67,7 +67,7 @@ fn rig_sized(args: &[&str], size: PtySize) -> Rig {
     let root = listener.accept(soon()).unwrap();
     cleanup.track(root.hello.pid);
     Rig {
-        session: Some(session),
+        session,
         listener,
         root,
         cleanup,
@@ -79,10 +79,6 @@ fn rig(args: &[&str]) -> Rig {
 }
 
 impl Rig {
-    fn session(&self) -> &Session {
-        self.session.as_ref().unwrap()
-    }
-
     fn roles(&mut self, roles: &[&str]) -> BTreeMap<String, Fixture> {
         let got = self.listener.expect_roles(roles, soon()).unwrap();
         for f in got.values() {
@@ -142,7 +138,7 @@ fn size_reaches_the_cli() {
         (&100.into(), &30.into(), &800.into(), &480.into()),
         "{size}"
     );
-    let _resized = r.session().resize(PtySize::new(120, 40).unwrap()).unwrap();
+    let _resized = r.session.resize(PtySize::new(120, 40).unwrap()).unwrap();
     let winch = next_kind(&mut r.root, "winch");
     assert_eq!(
         (
@@ -192,9 +188,9 @@ fn no_kill() -> CloseBounds {
 #[test]
 fn close_with_a_surviving_tty_holder_is_bounded() {
     let _l = lock();
-    let mut r = rig(&["--mode", "sleeper"]);
+    let r = rig(&["--mode", "sleeper"]);
     let t = Instant::now();
-    let out = r.session.take().unwrap().close(&[], no_kill());
+    let out = r.session.close(&[], no_kill());
     assert!(!out.kill.tree_dead, "{out:?}");
     assert!(matches!(out.output, Some(OutputEnd::Error(_))), "{out:?}");
     assert!(out.abandoned.is_empty(), "{out:?}");
@@ -223,7 +219,7 @@ fn leader_exit_revokes_the_tty_for_every_holder() {
         Some(0),
         "stdin is the terminal"
     );
-    let out = r.session.take().unwrap().close(&[], CloseBounds::default());
+    let out = r.session.close(&[], CloseBounds::default());
     assert!(out.kill.tree_dead, "{out:?}");
     assert_eq!(out.output, Some(OutputEnd::Eof), "{out:?}");
     // Alive, but its stdin is no longer a terminal.
@@ -240,7 +236,7 @@ fn large_write_reaches_the_cli_whole() {
     let payload = "漢😀a".repeat(32 * 1024).into_bytes();
     assert_eq!(payload.len(), 262_144);
     let (done, rx) = completion_channel();
-    r.session()
+    r.session
         .submit(
             WriteUnit::bytes(WriteOrigin::Key, payload.clone()),
             Guard::until(soon()),
@@ -268,11 +264,11 @@ fn large_write_reaches_the_cli_whole() {
 fn close_releases_a_blocked_writer() {
     let _l = lock();
     // The leader keeps the raw slave open and never reads.
-    let mut r = rig(&["--mode", "sleeper", "--raw"]);
+    let r = rig(&["--mode", "sleeper", "--raw"]);
     assert!(r.root.hello.raw);
     let before = unix_writer_polls();
     let (done, rx) = completion_channel();
-    r.session()
+    r.session
         .submit(
             WriteUnit::bytes(WriteOrigin::Key, vec![b'x'; 64 * 1024]),
             Guard::until(soon()),
@@ -284,7 +280,7 @@ fn close_releases_a_blocked_writer() {
         assert!(Instant::now() < end, "the writer never blocked");
         std::thread::yield_now();
     }
-    let out = r.session.take().unwrap().close(&[], no_kill());
+    let out = r.session.close(&[], no_kill());
     assert!(out.released.input, "{out:?}");
     assert!(out.abandoned.is_empty(), "{out:?}");
     let rec = rx.recv_deadline(soon()).unwrap();
@@ -325,7 +321,7 @@ fn spawn_tree_dies_and_unrelated_survives() {
     assert_ne!(h(&got, "own-group").pgid, Some(tree.pid));
     assert_eq!(h(&got, "setsid").sid, Some(h(&got, "setsid").pid));
     assert_eq!(h(&got, "setsid-child").ppid, Some(h(&got, "setsid").pid));
-    let k = r.session().kill(&[], Instant::now() + KILL);
+    let k = r.session.kill(&[], Instant::now() + KILL);
     assert!(k.tree_dead, "{k:?}");
     assert_eq!(k.method, "unix_killpg_session_scan");
     assert!(r.root.closed_by(soon()));
@@ -346,7 +342,7 @@ fn extra_reaches_an_orphan_and_spares_a_stale_identity() {
     let mut r = rig(&["--mode", "spawn-tree", "--roles", "none", "--escape-orphan"]);
     let mut other = unrelated(&mut r.cleanup);
     let mut got = r.roles(&["setsid-orphan", "orphan-child"]);
-    let k1 = r.session().kill(&[], Instant::now() + KILL);
+    let k1 = r.session.kill(&[], Instant::now() + KILL);
     assert!(k1.tree_dead, "{k1:?}");
     assert!(r.root.closed_by(soon()));
     // Outside the tree without `extra`: the containment limit.
@@ -355,7 +351,7 @@ fn extra_reaches_an_orphan_and_spares_a_stale_identity() {
     let orphan_id = identify(orphan.hello.pid).unwrap().unwrap();
     let mut stale: ProcessIdentity = identify(other.hello.pid).unwrap().unwrap();
     stale.start_time = (stale.start_time.parse::<u64>().unwrap() + 1).to_string();
-    let k2 = r.session().kill(&[orphan_id, stale], Instant::now() + KILL);
+    let k2 = r.session.kill(&[orphan_id, stale], Instant::now() + KILL);
     assert!(k2.tree_dead, "{k2:?}");
     for (role, f) in &mut got {
         assert!(f.closed_by(soon()), "{role} survived");

@@ -267,7 +267,6 @@ impl Fixture {
                         e.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) => {}
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
                     self.closed = true;
                     return Ok(None);
@@ -364,14 +363,6 @@ impl Cleanup {
     /// Takes a child the test started.
     pub fn own(&mut self, child: Child) {
         self.children.push(child);
-    }
-
-    /// Whether `pid` is still alive with its recorded start.
-    #[must_use]
-    pub fn alive(&self, pid: u32) -> bool {
-        self.ids
-            .iter()
-            .any(|(p, s)| *p == pid && self.identify.and_then(|f| f(pid)).as_ref() == Some(s))
     }
 }
 

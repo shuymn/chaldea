@@ -15,7 +15,6 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Error, ErrorKind};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, MutexGuard};
@@ -223,8 +222,8 @@ fn validate(spec: &SpawnSpec) -> Result<(), SpawnError> {
             cleanup: Cleanup::Confirmed,
         }
     })?;
-    let exec_ok = rustix::fs::access(program, Access::EXEC_OK).is_ok();
-    if !meta.file_type().is_file() || meta.file_type().is_fifo() || !exec_ok {
+    // `is_file` rejects FIFOs, directories, and devices; only a regular file reaches `access`.
+    if !meta.is_file() || rustix::fs::access(program, Access::EXEC_OK).is_err() {
         return Err(SpawnError::NeverStarted {
             kind: NeverStartedKind::PermissionDenied,
             error: Error::new(
