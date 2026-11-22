@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/pty-runtime", "crates/testkit"]
+members = ["crates/core", "crates/daemon", "crates/pty-runtime", "crates/testkit"]
 resolver = "3"
 
 [workspace.package]
@@ -45,6 +45,17 @@ windows-sys = { version = "=0.61.2", features = [
 ] }
 # testkit's FakeCli on Windows: console mode and size without `unsafe` (already in the lock).
 winapi-util = "=0.1.11"
+# The store (docs/design/event-store.md): SQLite compiled from the bundled source, so macOS and
+# Windows run the same SQLite; no default features (prepared-statement cache, wasm FFI).
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled"] }
+# Blob content addresses (mvp-design §2.1 `Content`).
+sha2 = "=0.11.1"
+# The store writer's reply channel and commit notifications only.
+tokio = { version = "=1.54.1", default-features = false, features = ["sync"] }
+# Inline `Content` with `encoding: base64` (already in the lock through alacritty_terminal).
+base64 = "=0.22.1"
+# Test databases in the OS temp directory (already in the lock through proptest).
+tempfile = "=3.27.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
