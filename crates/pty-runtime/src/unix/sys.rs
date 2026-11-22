@@ -508,10 +508,18 @@ mod tests {
 
     // ---- CL-19 ----
 
+    /// Both record flavours (F10, F26): pid 1 (root) refuses the full record and allows
+    /// the short one, so a lookup falls back to `Unreadable`; an exited, unreaped child is
+    /// a zombie in both, and gone from both after the reap.
     #[test]
-    fn bsd_info_sees_zombies_and_reports_eperm() {
+    fn libproc_records_read_zombies_and_another_users_process() {
         let _s = serial();
         assert_eq!(bsd_info(1), Err(libc::EPERM));
+        assert_eq!(short_zombie(1), Ok(false));
+        assert_eq!(
+            crate::unix::table::lookup(1),
+            crate::unix::table::Lookup::Unreadable
+        );
         let mut child = with_spawn_lock(|| Command::new("/usr/bin/true").spawn()).unwrap();
         let pid = child.id();
         let end = Instant::now() + BOUND;
@@ -522,8 +530,10 @@ mod tests {
         let info = bsd_info(pid).unwrap();
         assert!(info.zombie);
         assert_eq!(info.pid, pid);
+        assert_eq!(short_zombie(pid), Ok(true));
         child.wait().unwrap();
         assert_eq!(bsd_info(pid), Err(libc::ESRCH));
+        assert_eq!(short_zombie(pid), Err(libc::ESRCH));
     }
 
     // ---- CL-24 ----

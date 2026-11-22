@@ -218,13 +218,7 @@ fn bad_env_is_setup() {
 fn missing_interpreter_is_never_started() {
     let _l = lock();
     let d = TempDir::new("interp");
-    let prog = d.0.join("agent");
-    std::fs::write(&prog, "#!/nonexistent/interp\n").unwrap();
-    std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let e = never_started(
-        spawn(&spec(&[prog.to_str().unwrap()], &d.0)),
-        NeverStartedKind::Setup,
-    );
+    let e = never_started(spawn(&forked_failure(&d)), NeverStartedKind::Setup);
     // `ENOENT` from `execvp`: the interpreter, not the program, is missing.
     assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
 }

@@ -62,24 +62,4 @@ mod tests {
         assert_eq!(classify(eperm(), || Err(libc::ESRCH)), Lookup::Unreadable);
         assert_eq!(classify(Err(libc::ESRCH), || Ok(true)), Lookup::Gone);
     }
-
-    #[test]
-    fn short_record_reads_another_users_process_and_a_zombie() {
-        let _s = crate::unix::tests::serial();
-        // pid 1 belongs to root: the full record is refused, the short one is not.
-        assert_eq!(sys::bsd_info(1).map(|i| i.pid), Err(libc::EPERM));
-        assert_eq!(sys::short_zombie(1), Ok(false));
-        assert_eq!(lookup(1), Lookup::Unreadable);
-        let mut child =
-            crate::with_spawn_lock(|| std::process::Command::new("/usr/bin/true").spawn()).unwrap();
-        let pid = child.id();
-        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while super::super::child::waitid_nowait(pid).unwrap().is_none() {
-            assert!(std::time::Instant::now() < end);
-            std::thread::yield_now();
-        }
-        assert_eq!(sys::short_zombie(pid), Ok(true));
-        child.wait().unwrap();
-        assert_eq!(sys::short_zombie(pid), Err(libc::ESRCH));
-    }
 }
