@@ -71,8 +71,6 @@ pub(crate) struct KillState {
 /// One census pass.
 #[derive(Debug)]
 struct Pass {
-    /// The whole list was obtained and every pid in it looked up.
-    complete: bool,
     clean: bool,
     /// Every defect is churn (a process exited during the pass).
     churn_only: bool,
@@ -84,22 +82,21 @@ struct Pass {
     covered: HashSet<u32>,
     /// Live processes this pass read that are not covered (yet), by parent pid.
     pending: HashMap<u32, Vec<Proc>>,
-    /// The parent pid each pending process waits under; a pending process the pass read
-    /// resolved is no longer here.
-    waiting: HashMap<u32, u32>,
+    /// Pending processes still waiting for their parent; one the pass read resolved, or
+    /// already retained, is no longer here.
+    waiting: HashSet<u32>,
 }
 
 impl Pass {
     fn new() -> Pass {
         Pass {
-            complete: false,
             clean: true,
             churn_only: true,
             alive: false,
             owned: false,
             covered: HashSet::new(),
             pending: HashMap::new(),
-            waiting: HashMap::new(),
+            waiting: HashSet::new(),
         }
     }
 
@@ -158,8 +155,6 @@ struct Call<'a, O: Os> {
     /// Covered processes without a readable start (unreadable session members, and the
     /// leader while its start is unknown): pid → its group when known.
     unknown: BTreeMap<u32, Option<u32>>,
-    /// The start each pid was last read live with: the report prefers that generation.
-    last_live: HashMap<u32, u64>,
 }
 
 impl<O: Os> Call<'_, O> {
@@ -198,7 +193,6 @@ impl<O: Os> Call<'_, O> {
             Lookup::Gone | Lookup::Zombie(_) => self.resolve(st, pid, None, pass),
             Lookup::Live(p) => {
                 self.resolve(st, pid, Some(p.start), pass.as_deref_mut());
-                self.last_live.insert(pid, p.start);
                 let covered = st.targets.contains_key(&(pid, p.start))
                     || (self.member_ok() && (p.pgid == self.leader.pid || pid == self.leader.pid))
                     || pass.as_ref().is_some_and(|ps| ps.covered.contains(&p.ppid));
@@ -206,7 +200,7 @@ impl<O: Os> Call<'_, O> {
                     self.cover(st, p, pass);
                 } else if let Some(ps) = pass {
                     ps.pending.entry(p.ppid).or_default().push(p);
-                    ps.waiting.insert(p.pid, p.ppid);
+                    ps.waiting.insert(p.pid);
                 }
             }
             Lookup::Unreadable => {
@@ -268,7 +262,7 @@ impl<O: Os> Call<'_, O> {
                 }
                 if ps.covered.insert(p.pid) {
                     for c in ps.pending.remove(&p.pid).unwrap_or_default() {
-                        let waiting = ps.waiting.remove(&c.pid).is_some();
+                        let waiting = ps.waiting.remove(&c.pid);
                         work.push((c, waiting));
                     }
                 }
@@ -297,7 +291,6 @@ impl<O: Os> Call<'_, O> {
         }
         if keep.is_none() {
             self.unknown.remove(&pid);
-            self.last_live.remove(&pid);
             if let Some(ps) = pass {
                 ps.waiting.remove(&pid);
             }
@@ -361,7 +354,6 @@ impl<O: Os> Call<'_, O> {
                 }
             }
         }
-        p.complete = true;
         p
     }
 
@@ -493,27 +485,18 @@ impl<O: Os> Call<'_, O> {
         }
     }
 
-    /// The survivors, derived from the retained targets (one entry per pid, the
-    /// generation last read live preferred) and the covered pids without a start.
+    /// The survivors, derived from the retained targets and the covered pids without a
+    /// start: one entry per pid. A live read leaves one generation at its pid, so several
+    /// remain only among identities not read since they were recorded; the earliest start
+    /// is listed.
     fn survivors(&self, st: &KillState) -> Vec<Survivor> {
         let mut by_pid: BTreeMap<u32, Survivor> = BTreeMap::new();
         for (&(pid, start), &pgid) in &st.targets {
-            let s = Survivor {
+            by_pid.entry(pid).or_insert(Survivor {
                 pid,
                 start: Some(start),
                 pgid: Some(pgid),
-            };
-            let live = self.last_live.get(&pid) == Some(&start);
-            match by_pid.entry(pid) {
-                std::collections::btree_map::Entry::Vacant(e) => {
-                    e.insert(s);
-                }
-                std::collections::btree_map::Entry::Occupied(mut e) => {
-                    if live {
-                        e.insert(s);
-                    }
-                }
-            }
+            });
         }
         for (&pid, &pgid) in &self.unknown {
             by_pid.entry(pid).or_insert(Survivor {
@@ -649,7 +632,6 @@ pub(crate) fn kill_tree<O: Os>(
         zombies: BTreeSet::new(),
         owned0: false,
         unknown: BTreeMap::new(),
-        last_live: HashMap::new(),
     };
     if leader.start.is_none() {
         call.unknown.insert(leader.pid, Some(leader.pid));
@@ -1279,7 +1261,6 @@ mod tests {
             zombies: BTreeSet::new(),
             owned0: true,
             unknown: BTreeMap::new(),
-            last_live: HashMap::new(),
         };
         let mut st = KillState::default();
         let first = call.pass(&mut st);

@@ -243,7 +243,7 @@ pub(crate) struct Proc { pid: u32, ppid: u32, pgid: u32, start: u64 }
 pub(crate) enum Lookup { Live(Proc), Zombie(u64), Gone, Unreadable }   // PROC_PIDTBSDINFO arg 1: SZOMB (with start), ESRCH;
                                                                        // refused: PROC_PIDT_SHORTBSDINFO SZOMB → Zombie(0), else Unreadable
 pub(crate) trait Os {
-    fn owned(&self, deadline: Instant) -> bool;
+    fn owned(&self, deadline: Instant) -> (bool, Option<Lookup>);   // with the leader record it read
     fn pid_list(&self, capacity: usize) -> io::Result<(Vec<u32>, bool)>;   // (pids, saturated)
     fn lookup(&self, pid: u32) -> Lookup;
     fn getsid(&self, pid: u32) -> Result<u32, Errno>;
@@ -253,8 +253,8 @@ pub(crate) trait Os {
     fn sleep(&self, d: Duration);
 }
 pub(crate) struct KillState { targets: BTreeMap<(u32, u64), u32> }   // retained identities → last group read
-struct Pass { complete: bool, clean: bool, churn_only: bool, alive: bool, owned: bool,
-              covered: HashSet<u32>, pending: HashMap<u32, Vec<Proc>> }   // per census pass
+struct Pass { clean: bool, churn_only: bool, alive: bool, owned: bool, covered: HashSet<u32>,
+              pending: HashMap<u32, Vec<Proc>>, waiting: HashSet<u32> }   // per census pass
 ```
 
 Known zombies are a set local to one call.
@@ -267,7 +267,7 @@ Known zombies are a set local to one call.
 - a `Live` record that is covered is inserted at once under its identity: a retained identity, the leader's pid or group `L`, a member of session `L` (at its `getsid`), or a child of a generation this pass already read covered. A live record whose parent the pass has not read covered yet waits under its ppid, and is covered the moment that parent is, together with its own waiting children; a waiting process that a later read shows gone is not retained when its parent is covered, but the ancestry it was read with still leads to its own waiting children;
 - an unreadable session member and a leader whose start is unknown (a stage 5 failure) are kept by pid until a read shows them gone; with ownership for the call, the first readable read of such a leader keeps its start.
 
-Nothing else inserts or removes a target. So absence from a list, an expired deadline, an interrupted recheck, or an incomplete pass never removes one, and an identity the call read live and covered is retained however the call ends, whatever the process does before the next call (`setsid`, its parent's exit). The survivor report is derived from the retained targets and the pids kept without a start (one entry per pid, preferring the generation last read live), so it cannot disagree with them. A confirmed removal takes effect at its read, so a call that ends at its deadline keeps no identity it saw resolved.
+Nothing else inserts or removes a target. So absence from a list, an expired deadline, an interrupted recheck, or an incomplete pass never removes one, and an identity the call read live and covered is retained however the call ends, whatever the process does before the next call (`setsid`, its parent's exit). The survivor report is derived from the retained targets and the pids kept without a start (one entry per pid: a live read leaves one generation at its pid, so several remain only among identities not read since they were recorded, and the earliest start is listed), so it cannot disagree with them. A confirmed removal takes effect at its read, so a call that ends at its deadline keeps no identity it saw resolved.
 
 **The proof rule.** Death is proven exactly when a clean, owned pass (with ownership for the call) reads nothing covered alive and the recheck that follows leaves nothing retained: no target and no pid kept without a start. Whatever a recheck read keeps (a live target, an unreadable one, or a new live generation it found at a recorded pid) leaves the set non-empty, so the result is not `tree_dead: true`.
 
