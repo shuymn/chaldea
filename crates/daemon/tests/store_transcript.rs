@@ -453,3 +453,54 @@ fn read_continuity_survives_reopen() {
     assert_eq!((c.read_offset, c.read_continuity.0.as_str()), (33, "r33"));
     assert_eq!((c.event_offset, c.event_continuity.0.as_str()), (20, "c20"));
 }
+
+/// A source spelled as an unknown string equal to `transcript` is the transcript source:
+/// `append` refuses it, nothing commits, and the store still rebuilds.
+#[test]
+fn transcript_source_alias_cannot_bypass_batch() {
+    let s = TestStore::new();
+    let (t, l) = (thread(1), launch(1));
+    bound_thread(&s, t, l, Some(A));
+    start_generation(&s, t, l, A, "f1");
+
+    let mut e = event(StreamId::Thread(t), "transcript:1:0", assistant("one"));
+    e.launch_id = Some(l);
+    e.source.kind = Open::Unknown("transcript".into());
+    e.source.transcript = Some(TranscriptPos {
+        generation: 1,
+        path: A.into(),
+        file_id: "f1".into(),
+        offset_end: 10,
+    });
+    let before = head(&s, t);
+    let result = s.append(vec![e]);
+    let after = head(&s, t);
+    let offset = cursor(&s, t).unwrap().event_offset;
+    let rebuild = s.run(|tx| Ok(tx.rebuild_projections()?));
+
+    assert!(
+        matches!(
+            &result,
+            Err(WriteError::RolledBack(StoreError::TranscriptViaAppend))
+        ) && after == before
+            && offset == 0
+            && rebuild.is_ok(),
+        "{result:?}, head {before} -> {after}, offset {offset}, rebuild {rebuild:?}"
+    );
+}
+
+/// A retry of an event whose source is an unknown string equal to a known spelling is
+/// `Existing`.
+#[test]
+fn identical_hook_source_alias_is_existing() {
+    use chaldea_daemon::store::Appended;
+
+    let s = TestStore::new();
+    let mut e = event(StreamId::Thread(thread(1)), "hook:one", assistant("hi"));
+    e.source.kind = Open::Unknown("hook".into());
+    s.append(vec![e.clone()]).unwrap();
+    assert!(matches!(
+        s.append(vec![e]).unwrap().as_slice(),
+        [Appended::Existing(_)]
+    ));
+}

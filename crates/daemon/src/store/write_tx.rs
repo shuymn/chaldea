@@ -220,7 +220,7 @@ impl From<NewEvent> for Row {
             thread_id: e.thread_id,
             launch_id: e.launch_id,
             command_id: e.command_id,
-            source: e.source,
+            source: canonical_source(e.source),
             occurred_at: e.occurred_at,
             annex: e.annex,
             blobs: e.blobs,
@@ -239,6 +239,28 @@ pub struct WriteTx<'c> {
     heads: BTreeMap<StreamId, u64>,
     transcripts: HashMap<ThreadId, TranscriptJob>,
     task_causes: Vec<TaskCause>,
+}
+
+/// The source as a reader of the stored row sees it: an unknown string that spells a known
+/// value is that value. On the wire both are the same string, so the store treats them as
+/// one value for dispatch, the duplicate check, and the projection.
+fn canonical_source(s: Source) -> Source {
+    Source {
+        kind: canonical(s.kind),
+        agent: s.agent.map(canonical),
+        ..s
+    }
+}
+
+fn canonical<T: serde::de::DeserializeOwned>(o: Open<T>) -> Open<T> {
+    use serde::Deserialize;
+    match o {
+        Open::Unknown(v) => {
+            let de = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&v);
+            Open::deserialize(de).unwrap_or(Open::Unknown(v))
+        }
+        known @ Open::Known(_) => known,
+    }
 }
 
 fn is_transcript(s: &Source) -> bool {
@@ -329,10 +351,13 @@ impl<'c> WriteTx<'c> {
     fn append_inner(&mut self, events: Vec<NewEvent>) -> Result<Vec<Appended>, StoreError> {
         let mut out = Vec::with_capacity(events.len());
         for e in events {
-            if is_transcript(&e.source) || matches!(e.event, TypedEvent::TranscriptGeneration(_)) {
+            let row = Row::from(e);
+            if is_transcript(&row.source)
+                || matches!(row.typed, TypedEvent::TranscriptGeneration(_))
+            {
                 return Err(StoreError::TranscriptViaAppend);
             }
-            out.push(self.append_row(e.into())?);
+            out.push(self.append_row(row)?);
         }
         Ok(out)
     }
