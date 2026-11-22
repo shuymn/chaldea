@@ -71,7 +71,7 @@ jobs:
       # testkit may depend on no workspace crate other than core (mvp-design §3).
       - name: Check testkit dependencies
         run: |
-          deps="$(cargo tree -p chaldea-testkit -e normal --prefix none)"
+          deps="$(cargo tree -p chaldea-testkit -e normal --target all --prefix none)"
           bad="$(grep -E '^chaldea-' <<<"$deps" | grep -Ev '^chaldea-(testkit|core) ' || true)"
           [ -z "$bad" ] || { echo "testkit depends on: $bad"; exit 1; }
 
