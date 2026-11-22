@@ -1,0 +1,137 @@
+//! Upgrade admission (design §2.4 "Redemption" steps 3–6, §2.6 "Socket ownership").
+//!
+//! Every fallible check runs before the ticket is removed: the handshake, the socket task's
+//! registration, and the final admission read. The socket task is registered before the
+//! `101`, so every socket is in the registry from before `101` to its exit; axum's own
+//! upgrade task only hands the socket over.
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use axum::body::Body;
+use axum::extract::FromRequestParts;
+use axum::extract::ws::{WebSocket, WebSocketUpgrade};
+use axum::http::{HeaderMap, Request, Response, header};
+use axum::response::IntoResponse;
+use chaldea_core::auth::TokenKind;
+use chaldea_core::ids::{ThreadId, TokenId};
+use tokio::sync::{oneshot, watch};
+
+use super::Shared;
+use super::auth::Principal;
+use super::ctx::verify_until;
+use super::error::ApiError;
+use super::registry::TaskKind;
+use super::routes::UpgradeHandler;
+use super::tickets::TicketPurpose;
+
+/// The daemon's shutdown signal as a registered task sees it.
+#[derive(Clone)]
+pub struct ShutdownSignal(watch::Receiver<bool>);
+
+impl ShutdownSignal {
+    pub(crate) fn new(rx: watch::Receiver<bool>) -> Self {
+        ShutdownSignal(rx)
+    }
+
+    /// Resolves once shutdown has begun (at once if it already has).
+    pub async fn wait(&mut self) {
+        let _ = self.0.wait_for(|s| *s).await;
+    }
+
+    #[must_use]
+    pub fn is_set(&self) -> bool {
+        *self.0.borrow()
+    }
+}
+
+/// Who an admitted upgrade belongs to: the ticket's token (id and hash, no plaintext).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeGrant {
+    pub token_id: TokenId,
+    pub token_sha256: [u8; 32],
+    pub kind: TokenKind,
+    pub thread: Option<ThreadId>,
+    pub purpose: TicketPurpose,
+}
+
+/// What an upgrade handler runs with, inside its registered socket task.
+pub struct UpgradedSocket {
+    pub socket: WebSocket,
+    pub grant: UpgradeGrant,
+    pub shutdown: ShutdownSignal,
+}
+
+/// Whether any `Connection` token is `close`: an upgrade asking to close cannot keep the
+/// connection for the socket.
+fn asks_close(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|t| t.trim().eq_ignore_ascii_case("close"))
+}
+
+/// Steps 3–6 of the redemption; every refusal keeps the ticket and releases the task.
+pub(crate) async fn admit(
+    shared: Arc<Shared>,
+    principal: Principal,
+    ticket_sha: [u8; 32],
+    purpose: TicketPurpose,
+    deadline: Instant,
+    req: Request<Body>,
+    handler: Arc<dyn UpgradeHandler>,
+) -> Response<Body> {
+    let (mut parts, _body) = req.into_parts();
+    // 3. The handshake (axum's checks), and no `close` token.
+    let Ok(ws) = WebSocketUpgrade::from_request_parts(&mut parts, &()).await else {
+        return ApiError::bad_request().into_response();
+    };
+    if asks_close(&parts.headers) {
+        return ApiError::bad_request().into_response();
+    }
+    // The socket task, registered before the ticket is spent. Dropping `tx` on any refusal
+    // below ends it at once.
+    let (tx, rx) = oneshot::channel::<WebSocket>();
+    let grant = UpgradeGrant {
+        token_id: principal.token_id,
+        token_sha256: principal.token_sha256,
+        kind: principal.kind,
+        thread: principal.thread,
+        purpose,
+    };
+    let shutdown = shared.shutdown_signal();
+    let hand_over = shared.cfg.short_deadline;
+    let task = async move {
+        let Ok(Ok(socket)) = tokio::time::timeout(hand_over, rx).await else {
+            return;
+        };
+        handler
+            .run(UpgradedSocket {
+                socket,
+                grant,
+                shutdown,
+            })
+            .await;
+    };
+    if shared.registry.spawn(TaskKind::Socket, task).is_err() {
+        return ApiError::shutting_down().into_response();
+    }
+    // 4. The final admission read: this snapshot decides the token's validity.
+    if let Err(e) = verify_until(&shared, deadline, principal.token_sha256).await {
+        return e.into_response();
+    }
+    // 5. The conditional removal decides single use.
+    if shared
+        .tickets
+        .remove_if_valid(&ticket_sha, shared.cfg.clock.now())
+        .is_none()
+    {
+        return ApiError::unauthorized().into_response();
+    }
+    // 6. `101`; axum's upgrade task hands the socket to the registered task.
+    ws.on_upgrade(move |socket| async move {
+        let _ = tx.send(socket);
+    })
+}

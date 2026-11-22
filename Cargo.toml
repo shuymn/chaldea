@@ -56,6 +56,30 @@ tokio = { version = "=1.54.1", default-features = false, features = ["sync"] }
 base64 = "=0.22.1"
 # Test databases in the OS temp directory (already in the lock through proptest).
 tempfile = "=3.27.0"
+# HTTP routing and extractors (mvp §2.5, arch §3); no defaults: no form, no json, no axum tracing, no http2.
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "ws", "query", "matched-path"] }
+# The HTTP/1 connection builder with a timer, header limits, and upgrades; request parsing is hyper's.
+hyper = { version = "=1.12.0", default-features = false, features = ["server", "http1"] }
+# TokioIo, TokioTimer, and the tower-to-hyper service adapter for the own accept loop.
+hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio", "server", "http1", "service"] }
+# Layer and Service for the guard.
+tower = { version = "=0.5.3", default-features = false, features = ["util"] }
+# Sensitive-header marking; no TimeoutLayer, no TraceLayer, no body-limit layer.
+tower-http = { version = "=0.7.1", default-features = false, features = ["sensitive-headers"] }
+# Final equality of credential hashes (mvp §2.5, prior-art row 5d); same version as the spike.
+subtle = "=2.6.1"
+# 256-bit secrets for tokens, tickets, and pair codes from the OS CSPRNG (already in the lock through uuid).
+getrandom = "=0.4.3"
+# Request spans; PR 8 installs the subscriber.
+tracing = "=0.1.44"
+# Collecting a bounded request body under a deadline.
+http-body-util = "=0.1.5"
+# AbortHandle for the task registry and the split WebSocket halves (already in the lock through axum).
+futures-util = { version = "=0.3.34", default-features = false, features = ["sink", "std"] }
+# Dev only: the WebSocket test client (the version axum's `ws` feature locks).
+tokio-tungstenite = "=0.29.0"
+# Dev only: the capturing log subscriber of the secret-redaction tests.
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
