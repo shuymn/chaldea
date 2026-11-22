@@ -47,6 +47,63 @@ fn wait_for_exit(s: &Store) {
     }
 }
 
+/// Has a job install a thread-local on the writer thread whose destructor signals entry
+/// and then blocks (bounded) until released; returns the entry receiver and the release
+/// sender.
+fn hold_writer_teardown(s: &Store) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+    use std::cell::RefCell;
+
+    struct Held {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv_timeout(Duration::from_secs(30));
+        }
+    }
+    thread_local! {
+        static HELD: RefCell<Option<Held>> = const { RefCell::new(None) };
+    }
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    s.submit(soon(), move |_| {
+        HELD.with(|h| {
+            *h.borrow_mut() = Some(Held {
+                entered: entered_tx,
+                release: release_rx,
+            });
+        });
+        Ok(())
+    })
+    .unwrap()
+    .blocking_wait()
+    .unwrap();
+    (entered_rx, release_tx)
+}
+
+/// Waits (bounded) until the writer thread's main function has returned, while the store
+/// still holds its handle.
+fn wait_for_finished_writer(s: &Store) {
+    let deadline = Instant::now() + WAIT;
+    while !s
+        .inner
+        .writer
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(std::thread::JoinHandle::is_finished)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the writer's main never returned"
+        );
+        std::thread::yield_now();
+    }
+}
+
 /// When `submit` reports `Closed`, `read` does too: intake closes in one transition.
 #[test]
 fn intake_closes_for_submit_and_read_together() {
@@ -298,38 +355,9 @@ fn closing_notifications_leaves_the_intake_locks_free() {
 /// main function has returned: it does not wait in `join` for thread-local destructors.
 #[test]
 fn timed_out_owner_detaches_a_finished_writer() {
-    use std::cell::RefCell;
-
-    struct Held {
-        entered: mpsc::Sender<()>,
-        release: mpsc::Receiver<()>,
-    }
-    impl Drop for Held {
-        fn drop(&mut self) {
-            let _ = self.entered.send(());
-            let _ = self.release.recv_timeout(Duration::from_secs(30));
-        }
-    }
-    thread_local! {
-        static HELD: RefCell<Option<Held>> = const { RefCell::new(None) };
-    }
-
     let gates = Gates::default();
     let (_dir, s) = store_with(gates.faults());
-    let (entered_tx, entered_rx) = mpsc::channel();
-    let (release_dtor, release_rx) = mpsc::channel();
-    s.submit(soon(), move |_| {
-        HELD.with(|h| {
-            *h.borrow_mut() = Some(Held {
-                entered: entered_tx,
-                release: release_rx,
-            });
-        });
-        Ok(())
-    })
-    .unwrap()
-    .blocking_wait()
-    .unwrap();
+    let (entered_rx, release_dtor) = hold_writer_teardown(&s);
     let (exiting, release_writer) = gates.arm("writer_exiting");
     let (waited, release_owner) = gates.arm("owner_waited");
     let a = in_thread(&s, Duration::from_millis(300));
@@ -343,21 +371,7 @@ fn timed_out_owner_detaches_a_finished_writer() {
     entered_rx
         .recv_timeout(WAIT)
         .expect("the writer runs its thread-local destructor");
-    let deadline = Instant::now() + WAIT;
-    while !s
-        .inner
-        .writer
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(std::thread::JoinHandle::is_finished)
-    {
-        assert!(
-            Instant::now() < deadline,
-            "the writer's main never returned"
-        );
-        std::thread::yield_now();
-    }
+    wait_for_finished_writer(&s);
     drop(release_owner);
     let a = a.recv_timeout(Duration::from_secs(5));
     drop(release_dtor);
@@ -474,4 +488,31 @@ fn later_call_leaves_out_an_owner_report_after_its_deadline() {
     let b = b.recv_timeout(WAIT).expect("the later call returns");
     assert!(a.readers_returned, "{a:?}");
     assert!(!b.readers_returned, "{b:?}");
+}
+
+/// An owner whose writer reported in time returns by its deadline with the exit, without
+/// waiting for the thread's teardown: a thread-local destructor the job installed is still
+/// running when the owner returns.
+#[test]
+fn owner_detaches_a_reported_writer_still_tearing_down() {
+    let gates = Gates::default();
+    let (_dir, s) = store_with(gates.faults());
+    let (entered, release_dtor) = hold_writer_teardown(&s);
+    let (waited, release_owner) = gates.arm("owner_waited");
+    let a_deadline = Instant::now() + WAIT;
+    let a = in_thread(&s, WAIT);
+    waited
+        .recv_timeout(WAIT)
+        .expect("the owner's exit wait ended");
+    entered
+        .recv_timeout(WAIT)
+        .expect("the writer runs its thread-local destructor");
+    wait_for_finished_writer(&s);
+    drop(release_owner);
+    let a = a.recv_timeout(a_deadline.saturating_duration_since(Instant::now()));
+    let kept = s.inner.writer.lock().unwrap().is_some();
+    drop(release_dtor);
+    let a = a.expect("the owner returns by its deadline");
+    assert!(a.writer_exited, "{a:?}");
+    assert!(!kept, "the owner left the writer's handle in the store");
 }

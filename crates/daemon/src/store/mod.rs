@@ -382,7 +382,7 @@ struct Inner {
     paths: StorePaths,
     /// Taken by shutdown, so subscribers see `Closed` once the writer's clone drops too.
     notifier: Mutex<Option<broadcast::Sender<Committed>>>,
-    /// Joined only once the thread has finished.
+    /// Detached by the owning shutdown.
     writer: Mutex<Option<JoinHandle<()>>>,
     faults: Arc<Faults>,
 }
@@ -533,17 +533,10 @@ impl Store {
         // (4) The writer checkpoints and its thread ends. (5) Wait for that until the deadline.
         let exit = inner.shared.wait_until(Some(deadline), |s| s.exit.clone());
         inner.faults.mark("owner_waited");
-        // The owner always gives up the thread's handle. It joins a thread that published its
-        // report and has returned; otherwise it detaches the thread, whose report still
-        // reaches `Shared`. After a timed-out wait it always detaches: `join` also waits for
-        // thread-local destructors, which `is_finished` does not cover.
-        let handle = lock(&inner.writer).take();
-        if let Some(h) = handle
-            && exit.is_some()
-            && h.is_finished()
-        {
-            let _ = h.join();
-        }
+        // The owner always detaches the thread: `join` would also wait for thread-local
+        // destructors, which no deadline bounds. A report published later still reaches
+        // `Shared`.
+        drop(lock(&inner.writer).take());
         let report = report(readers_returned, readers_abandoned, exit);
         inner.shared.update(|s| {
             s.report = Some(report.clone());
