@@ -35,7 +35,7 @@ Two layers in one module:
 - Inputs are created only while the launch is `starting` or `running`; `launch_exited` has reason `stopped` exactly when a stop was accepted; the session timer also runs while `stopping`.
 - Only hooks of the launch's selected session enter the model. Selecting it is PR 9's check: hooks of another session become `raw_unknown` (`foreign_session`, mvp §2.9:325).
 - Hooks follow the adapter: `Interrupt` only for Codex (mvp §2.2:135, §2.7:301); a manual Codex launch fires none until a human starts the first turn through attach (`manualFirstTurn`; mvp §2.7:303).
-- A post-decision signal is its own entry for the current turn and may arrive at any point after the turn started, before or after the daemon takes in the turn's `Stop`. The CLI emits it only after every `Stop` hook decided (mvp §2.3:173), so this over-approximates.
+- A post-decision signal is its own entry for the current turn and may arrive at any point after the turn started, before or after the daemon takes in the turn's `Stop`. The CLI emits it only after every `Stop` hook decided (mvp §2.3:173), so this over-approximates; PR 12 checks that such a signal exists and its order, and PR 13–14 attribute it on the adapter side if one is adopted.
 - Under `none`, Claude's `SessionStart` is no evidence either (mvp §2.3:173 "only `chaldea ready`"), although mvp §2.7:303 lists it before the after-turn mode. PR 10 decides.
 - A bound `UserPromptSubmit` supersedes the open cards, as the `PromptSubmitted` comment in `state.rs` says; mvp §2.10:335 lists only `Stop` and an interrupt, and PR 13–14 adds it.
 
