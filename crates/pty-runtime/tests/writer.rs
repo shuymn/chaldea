@@ -1030,3 +1030,98 @@ fn writer_panic_settles_everything() {
         .log()
         .contains(&FakeEvent::InputDropped)));
 }
+
+/// PR2-CL-3 / CL-20: an exit that is visible before a unit's first write permission
+/// refuses the unit; a unit permitted first may write.
+#[test]
+fn exit_visible_before_dispatch_refuses() {
+    let r = rig();
+    let probe = r.session.probe();
+    let park = probe.park(ProbePoint::Dispatching);
+    let p = submit(&r.session, key(b"X"), open());
+    assert!(probe.wait(ProbePoint::Dispatching, 1, soon()));
+    r.child.exit(chaldea_pty_runtime::ChildExit {
+        code: Some(0),
+        signal: None,
+    });
+    let visible = wait_for(ms(500), || r.session.status().exit.is_some());
+    park.release();
+    let rec = p.wait();
+    assert!(
+        !(visible && rec.outcome == WriteOutcome::Written),
+        "exit was visible before the permission, yet {rec:?}"
+    );
+    assert!(r.events.wait(|e| matches!(e, SessionEvent::Exited(_))));
+}
+
+/// PR2-CL-3 / CL-5: DECRST 2004 visible in `modes()` before a guarded paste's first write
+/// permission refuses it with zero bytes.
+#[test]
+fn decrst_visible_before_dispatch_refuses() {
+    let r = rig();
+    emit_parsed(&r, b"\x1b[?2004h");
+    let epoch = r.session.modes().bracketed_paste_epoch;
+    let probe = r.session.probe();
+    let park = probe.park(ProbePoint::Dispatching);
+    let g = Guard {
+        bracketed_paste: Some(epoch),
+        recheck: Some(Box::new(|_| Ok(()))),
+        ..open()
+    };
+    let p = submit(
+        &r.session,
+        unit(input_origin(1), vec![b("\x1b[200~text\x1b[201~")]),
+        g,
+    );
+    assert!(probe.wait(ProbePoint::Dispatching, 1, soon()));
+    r.child.emit(b"\x1b[?2004l");
+    let visible = wait_for(ms(500), || !r.session.modes().modes.bracketed_paste);
+    park.release();
+    let rec = p.wait();
+    assert!(
+        !(visible && rec.outcome == WriteOutcome::Written),
+        "2004 was off before the permission, yet {rec:?}"
+    );
+    wait_parsed(&r.session, 16);
+    assert!(!r.session.modes().modes.bracketed_paste);
+}
+
+/// PR2-CL-28: a recheck capture is dropped after the queue lock is released, so its
+/// destructor may call the session: cancelling the queued unit does not deadlock.
+#[test]
+fn cancelled_recheck_capture_is_dropped_unlocked() {
+    let Rig { session, child, .. } = rig();
+    let session = Arc::new(session);
+    let hold = child.hold_writes();
+    let a = submit(&session, key(b"a"), open());
+    assert!(hold.wait_entered(soon()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let w = Arc::downgrade(&session);
+    let capture = OnDrop(move || {
+        let seen = w.upgrade().map(|s| s.last_started(ClassSet::ALL));
+        let _ = tx.send(seen);
+    });
+    let g = Guard {
+        recheck: Some(Box::new(move |_| {
+            let _keep = &capture;
+            Ok(())
+        })),
+        ..open()
+    };
+    let b2 = submit(&session, key(b"b"), g);
+    let s2 = session.clone();
+    let ticket = b2.ticket;
+    std::thread::spawn(move || {
+        let _ = ticket.cancel();
+        drop(s2);
+    });
+    let Ok(seen) = rx.recv_timeout(Duration::from_secs(5)) else {
+        // Deadlocked under the queue lock: nothing can be torn down.
+        std::mem::forget(session);
+        std::mem::forget(hold);
+        panic!("the recheck capture was dropped under the queue lock");
+    };
+    assert_eq!(seen, Some(1));
+    hold.release();
+    a.wait();
+}

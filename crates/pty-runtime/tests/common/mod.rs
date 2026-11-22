@@ -95,6 +95,20 @@ pub fn wait_until(mut f: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// Polls `f` for at most `d`; for checking that something does not become visible.
+pub fn wait_for(d: Duration, mut f: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + d;
+    loop {
+        if f() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// Waits until the VT parsed at least `n` output bytes.
 pub fn wait_parsed(s: &Session, n: u64) {
     assert!(
@@ -183,4 +197,13 @@ pub fn short_bounds() -> CloseBounds {
 
 pub fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
+}
+
+/// Runs `f` when dropped: a capture whose destructor calls back into the session.
+pub struct OnDrop<F: FnMut()>(pub F);
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
 }

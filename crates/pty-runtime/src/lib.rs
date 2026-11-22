@@ -16,8 +16,9 @@
 //! No callback (`Completion`, `OutputSink`, `on_event`) runs under an internal lock. A
 //! callback may call the non-blocking `Session` methods (`submit`, `cancel`,
 //! `last_started`, `writes_after`, `modes`, `snapshot`, `subscribe`, `unsubscribe`,
-//! `status`; `snapshot` and `subscribe` only with a deadline of now) but not `resize`,
-//! `kill`, or `close`: a sink runs on the drain thread, and a resize can wait for it.
+//! `status`; `snapshot` and `subscribe` only with a short deadline, which bounds both the
+//! lock attempt and the grid copy) but not `resize`, `kill`, or `close`: a sink runs on
+//! the drain thread, and a resize can wait for it.
 //!
 //! # Features
 //!

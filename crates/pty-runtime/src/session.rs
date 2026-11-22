@@ -219,7 +219,6 @@ pub(crate) struct Shared {
     /// Control lock.
     control: Mutex<Option<Box<dyn PtyControl>>>,
     pub(crate) modes: ModeWord,
-    pub(crate) exited: AtomicBool,
     exit: OnceLock<ChildExit>,
     wait_failed: OnceLock<String>,
     output_end: OnceLock<OutputEnd>,
@@ -278,7 +277,6 @@ impl Shared {
                 }),
                 control: Mutex::new(None),
                 modes,
-                exited: AtomicBool::new(false),
                 exit: OnceLock::new(),
                 wait_failed: OnceLock::new(),
                 output_end: OnceLock::new(),
@@ -319,10 +317,7 @@ impl Shared {
     fn enqueue_reply(&self, kind: ReplyKind, bytes: Vec<u8>) {
         {
             let mut q = lock(&self.q);
-            if q.closed
-                || self.exited.load(Ordering::Acquire)
-                || self.input_broken.load(Ordering::Acquire)
-            {
+            if q.closed || self.exited() || self.input_broken.load(Ordering::Acquire) {
                 self.responder
                     .dropped_after_end
                     .fetch_add(1, Ordering::Relaxed);
@@ -353,11 +348,18 @@ impl Shared {
         }
     }
 
+    /// Whether the exit is published. Read under the queue lock wherever a write
+    /// permission depends on it.
+    pub(crate) fn exited(&self) -> bool {
+        self.exit.get().is_some()
+    }
+
+    /// Publishes the exit under the queue lock, so it is ordered with every write
+    /// permission: a permission granted after it sees it.
     fn publish_exit(&self, e: ChildExit) {
-        let _ = self.exit.set(e);
-        self.exited.store(true, Ordering::Release);
         {
             let mut q = lock(&self.q);
+            let _ = self.exit.set(e);
             let n = q.discard_replies();
             self.responder
                 .dropped_after_end
@@ -391,7 +393,13 @@ impl Shared {
                     vt.feed(piece);
                 }));
                 match r {
-                    Ok(()) => self.modes.publish(st.vt.modes()),
+                    // Under the queue lock (VT lock → queue lock), so the word is ordered
+                    // with every write permission.
+                    Ok(()) => {
+                        let modes = st.vt.modes();
+                        let _q = lock(&self.q);
+                        self.modes.publish(modes);
+                    }
                     Err(_) => {
                         self.vt_failed.store(true, Ordering::Release);
                         vt_failed_now = true;
@@ -424,12 +432,16 @@ impl Shared {
         });
         let mut st = lock(&self.vt);
         let removed = std::mem::take(&mut st.pending_remove);
-        dispatch.retain(|s| !removed.contains(&s.id));
-        let added = std::mem::take(&mut st.pending_add);
-        dispatch.extend(added);
-        st.subs = dispatch;
+        let (gone, kept): (Vec<Sub>, Vec<Sub>) =
+            dispatch.into_iter().partition(|s| removed.contains(&s.id));
+        let mut subs = kept;
+        subs.append(&mut st.pending_add);
+        st.subs = subs;
         st.dispatching = false;
         st.in_dispatch = 0;
+        drop(st);
+        // Dropped after unlocking: a sink's captures may call the session.
+        drop(gone);
     }
 
     fn end(&self, end: &OutputEnd) {
@@ -447,6 +459,12 @@ impl Shared {
         }
         self.emit(SessionEvent::OutputEnded(end.clone()));
     }
+}
+
+/// Takes the subscriber `id` out of `subs`.
+fn take_sub(subs: &mut Vec<Sub>, id: SubscriptionId) -> Option<Sub> {
+    let i = subs.iter().position(|s| s.id == id)?;
+    Some(subs.remove(i))
 }
 
 /// The session's drain sink.
@@ -681,7 +699,9 @@ impl Session {
         if self.sh.vt_failed.load(Ordering::Acquire) {
             return Err(VtUnavailable);
         }
-        Ok(st.vt.snapshot(st.output_offset))
+        st.vt
+            .snapshot(st.output_offset, deadline)
+            .ok_or(VtUnavailable)
     }
 
     /// A diagnostic snapshot plus every output byte after its offset, then one `End`.
@@ -697,7 +717,9 @@ impl Session {
         if st.sub_count() >= self.sh.limits.subscribers {
             return Err(SubscribeError::TooManySubscribers);
         }
-        let snap = st.vt.snapshot(st.output_offset);
+        let Some(snap) = st.vt.snapshot(st.output_offset, deadline) else {
+            return Err(SubscribeError::VtUnavailable);
+        };
         let id = SubscriptionId(st.next_sub);
         st.next_sub += 1;
         if let Some(end) = st.output_end.clone() {
@@ -720,11 +742,16 @@ impl Session {
 
     pub fn unsubscribe(&self, id: SubscriptionId) {
         let mut st = lock(&self.sh.vt);
-        st.subs.retain(|s| s.id != id);
-        st.pending_add.retain(|s| s.id != id);
+        // Taken out and dropped after unlocking: a sink's captures may call the session.
+        let mut removed = take_sub(&mut st.subs, id);
+        if removed.is_none() {
+            removed = take_sub(&mut st.pending_add, id);
+        }
         if st.dispatching {
             st.pending_remove.push(id);
         }
+        drop(st);
+        drop(removed);
     }
 
     /// Resizes the PTY first, without the VT lock, then the grid and the size the
@@ -850,11 +877,13 @@ impl Session {
         let (final_snapshot, final_after_end) = if sh.vt_failed.load(Ordering::Acquire) {
             (None, false)
         } else {
+            // One attempt, and the copy stops at the join deadline.
             match sh.vt.try_lock() {
-                Ok(st) => (
-                    Some(st.vt.snapshot(st.output_offset)),
-                    st.output_end.is_some(),
-                ),
+                Ok(st) => {
+                    let snap = st.vt.snapshot(st.output_offset, deadline);
+                    let after_end = snap.is_some() && st.output_end.is_some();
+                    (snap, after_end)
+                }
                 Err(_) => (None, false),
             }
         };

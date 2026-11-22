@@ -242,10 +242,14 @@ impl fmt::Debug for WriteTicket {
 pub(crate) struct Fired {
     completions: Vec<(Completion, WriteRecord)>,
     pub(crate) events: Vec<SessionEvent>,
+    /// Guards of settled units: a recheck capture may call the session when dropped, so
+    /// it is dropped here, after unlocking.
+    guards: Vec<Guard>,
 }
 
 impl Fired {
     pub(crate) fn fire(self, sh: &Shared) {
+        drop(self.guards);
         for (done, rec) in self.completions {
             let _ = catch_unwind(AssertUnwindSafe(move || done(&rec)));
         }
@@ -393,6 +397,7 @@ impl Queue {
         };
         self.log(rec.clone());
         fired.completions.push((item.done, rec));
+        fired.guards.push(item.guard);
     }
 
     fn cancel(&mut self, id: u64, fired: &mut Fired) -> bool {
@@ -549,7 +554,7 @@ struct Facts {
 
 fn facts(sh: &Shared) -> Facts {
     Facts {
-        exited: sh.exited.load(Ordering::Acquire),
+        exited: sh.exited(),
         broken: sh.input_broken.load(Ordering::Acquire),
         word: sh.modes.raw(),
     }
@@ -789,6 +794,7 @@ fn write_next_unit(sh: &Shared, input: &mut dyn Write) {
         }
     }
     // Dispatch boundary: the first write call's permission.
+    crate::probe!(sh, Dispatching);
     let pos = q.input_pos;
     if let Some(s) = q.slot.as_mut() {
         s.dispatched = true;
@@ -812,7 +818,7 @@ fn write_parts(sh: &Shared, input: &mut dyn Write, seq: u64, parts: &[Part]) {
                 crate::probe!(sh, PauseEntered);
                 let end = Instant::now() + *d;
                 let mut q = lock(&sh.q);
-                while !q.closed && !sh.exited.load(Ordering::Acquire) && q.slot_is(seq) {
+                while !q.closed && !sh.exited() && q.slot_is(seq) {
                     let left = end.saturating_duration_since(Instant::now());
                     if left.is_zero() {
                         break;
@@ -834,7 +840,7 @@ fn write_parts(sh: &Shared, input: &mut dyn Write, seq: u64, parts: &[Part]) {
                         }
                         let stop = if q.closed {
                             Some("closed")
-                        } else if sh.exited.load(Ordering::Acquire) {
+                        } else if sh.exited() {
                             Some("child_exited")
                         } else {
                             None

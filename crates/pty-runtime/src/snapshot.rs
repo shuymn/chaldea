@@ -1,6 +1,7 @@
 //! Screen snapshots and the grid encoding (`docs/design/pty-runtime.md` §2.6, D9).
 
 use std::fmt;
+use std::time::Instant;
 
 use alacritty_terminal::Term;
 use alacritty_terminal::event::EventListener;
@@ -113,13 +114,21 @@ fn cell_text(cell: &GridCell) -> String {
 }
 
 /// The walker: a wide character is a `WideLead` and its spacer a `WideTail`; orphan
-/// halves and leading wide-char spacers are blank `Single` cells.
-pub(crate) fn walk<T: EventListener>(term: &Term<T>, output_offset: u64) -> Snapshot {
+/// halves and leading wide-char spacers are blank `Single` cells. `None` once `deadline`
+/// passes, checked before each row.
+pub(crate) fn walk<T: EventListener>(
+    term: &Term<T>,
+    output_offset: u64,
+    deadline: Instant,
+) -> Option<Snapshot> {
     let grid = term.grid();
     let rows = grid.screen_lines();
     let cols = grid.columns();
     let mut lines = Vec::with_capacity(rows);
     for l in 0..rows {
+        if Instant::now() >= deadline {
+            return None;
+        }
         let row = &grid[GridLine(i32::try_from(l).unwrap_or(i32::MAX))];
         let mut cells = Vec::with_capacity(cols);
         let mut c = 0;
@@ -154,7 +163,7 @@ pub(crate) fn walk<T: EventListener>(term: &Term<T>, output_offset: u64) -> Snap
     }
     let p = grid.cursor.point;
     let modes = crate::vt::term_modes(term);
-    Snapshot {
+    Some(Snapshot {
         cols: u16::try_from(cols).unwrap_or(u16::MAX),
         rows: u16::try_from(rows).unwrap_or(u16::MAX),
         lines,
@@ -165,7 +174,7 @@ pub(crate) fn walk<T: EventListener>(term: &Term<T>, output_offset: u64) -> Snap
         },
         modes,
         output_offset,
-    }
+    })
 }
 
 impl Snapshot {

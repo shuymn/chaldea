@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -178,8 +178,9 @@ impl Vt {
         term_modes(&self.term)
     }
 
-    pub(crate) fn snapshot(&self, output_offset: u64) -> Snapshot {
-        walk(&self.term, output_offset)
+    /// The screen, or `None` once `deadline` passes during the copy.
+    pub(crate) fn snapshot(&self, output_offset: u64, deadline: Instant) -> Option<Snapshot> {
+        walk(&self.term, output_offset, deadline)
     }
 }
 

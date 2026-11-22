@@ -570,6 +570,9 @@ pub enum ProbePoint {
     Permitted,
     /// The drain is about to parse a piece, with the VT lock held.
     PieceParsing,
+    /// The writer is about to grant a unit's first write permission, with the queue lock
+    /// held: every check has passed.
+    Dispatching,
 }
 
 impl ProbePoint {
@@ -580,14 +583,15 @@ impl ProbePoint {
             ProbePoint::RecheckEntered => 2,
             ProbePoint::Permitted => 3,
             ProbePoint::PieceParsing => 4,
+            ProbePoint::Dispatching => 5,
         }
     }
 }
 
 #[derive(Default)]
 struct ProbeState {
-    counts: [u64; 5],
-    armed: [Option<u64>; 5],
+    counts: [u64; 6],
+    armed: [Option<u64>; 6],
     released: Vec<u64>,
     next: u64,
 }

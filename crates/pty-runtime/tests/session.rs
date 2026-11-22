@@ -147,7 +147,7 @@ fn subscribe_is_gapless() {
                 && let Some(s) = weak.upgrade()
             {
                 let (sink, got) = recorder();
-                let (snap, _) = s.subscribe(sink, Instant::now()).unwrap();
+                let (snap, _) = s.subscribe(sink, soon()).unwrap();
                 *slot = Some((snap.output_offset, got));
             }
         }
@@ -886,7 +886,7 @@ fn callbacks_may_reenter() {
         if e == SessionEvent::ReplyDropped
             && let Some(s) = m.get().and_then(Weak::upgrade)
         {
-            let text = s.snapshot(Instant::now()).map(|x| x.lines[0].text());
+            let text = s.snapshot(soon()).map(|x| x.lines[0].text());
             *st.lock().unwrap() = Some(text.unwrap_or_else(|_| "unavailable".into()));
         }
     });
@@ -939,7 +939,7 @@ fn callbacks_may_reenter() {
                     && let Some(s) = w.upgrade()
                 {
                     let (sink, got) = recorder();
-                    s.subscribe(sink, Instant::now()).unwrap();
+                    s.subscribe(sink, soon()).unwrap();
                     *slot = Some(got);
                 }
                 Flow::Continue
@@ -973,7 +973,7 @@ fn subscriber_limit_holds_during_a_dispatch() {
                     && let Some(s) = w.upgrade()
                 {
                     for _ in 0..2 {
-                        res.push(s.subscribe(recorder().0, Instant::now()).is_ok());
+                        res.push(s.subscribe(recorder().0, soon()).is_ok());
                     }
                 }
                 Flow::Continue
@@ -988,4 +988,91 @@ fn subscriber_limit_holds_during_a_dispatch() {
         session.subscribe(recorder().0, soon()),
         Err(SubscribeError::TooManySubscribers)
     ));
+}
+
+/// A sink whose destructor takes a snapshot, and the result it got.
+fn dropping_sink(w: Weak<Session>) -> (OutputSink, Arc<Mutex<Option<bool>>>) {
+    let got: Arc<Mutex<Option<bool>>> = Arc::default();
+    let g = got.clone();
+    let capture = OnDrop(move || {
+        let ok = w
+            .upgrade()
+            .map(|s| s.snapshot(Instant::now() + Duration::from_secs(2)).is_ok());
+        *g.lock().unwrap() = ok;
+    });
+    let sink: OutputSink = Box::new(move |_| {
+        let _keep = &capture;
+        Flow::Continue
+    });
+    (sink, got)
+}
+
+/// PR2-CL-28: a removed subscriber is dropped after the VT lock is released, both on
+/// `unsubscribe` and when it unsubscribes itself during a dispatch.
+#[test]
+fn removed_sink_is_dropped_unlocked() {
+    let Rig { session, child, .. } = rig();
+    let session = Arc::new(session);
+    let (sink, got) = dropping_sink(Arc::downgrade(&session));
+    let (_, id) = session.subscribe(sink, soon()).unwrap();
+    session.unsubscribe(id);
+    assert_eq!(*got.lock().unwrap(), Some(true), "unsubscribe");
+
+    // A sink that unsubscribes itself from inside its callback.
+    let (inner, got) = dropping_sink(Arc::downgrade(&session));
+    let me: Arc<OnceLock<chaldea_pty_runtime::SubscriptionId>> = Arc::default();
+    let (m, w) = (me.clone(), Arc::downgrade(&session));
+    let mut inner = Some(inner);
+    let sink: OutputSink = Box::new(move |ev| {
+        if let (Some(s), Some(id)) = (w.upgrade(), m.get()) {
+            s.unsubscribe(*id);
+        }
+        inner.as_mut().map_or(Flow::Continue, |f| f(ev))
+    });
+    let (_, id) = session.subscribe(sink, soon()).unwrap();
+    me.set(id).unwrap();
+    child.emit(b"x");
+    assert!(wait_until(|| got.lock().unwrap().is_some()));
+    assert_eq!(*got.lock().unwrap(), Some(true), "self-unsubscribe");
+}
+
+/// PR2-CL-24: the snapshot copy is bounded by its deadline: a past deadline, or one that
+/// passes during the copy of a large grid, gives `VtUnavailable`.
+#[test]
+fn snapshot_copy_ends_by_its_deadline() {
+    let r = rig_with(FakeScript::default(), Limits::default(), 1000, 1000);
+    let past = Instant::now();
+    std::thread::sleep(ms(1));
+    assert!(r.session.snapshot(past).is_err(), "past deadline");
+    let t = Instant::now();
+    assert!(
+        r.session.snapshot(Instant::now() + ms(1)).is_err(),
+        "deadline during the copy"
+    );
+    assert!(t.elapsed() < ms(500), "{:?}", t.elapsed());
+    assert!(r.session.snapshot(soon()).is_ok());
+}
+
+/// PR2-CL-17 / CL-18 / CL-24: once the join budget has run out, close skips the final
+/// snapshot instead of copying past its bound.
+#[test]
+fn final_snapshot_skipped_after_the_join_budget() {
+    let r = rig_with(FakeScript::default(), Limits::default(), 1000, 1000);
+    let hold = r.child.hold_writes();
+    let _p = submit(&r.session, key(b"x"), open());
+    assert!(hold.wait_entered(soon()));
+    let bounds = CloseBounds {
+        kill: ms(20),
+        input: ms(20),
+        close: ms(20),
+        drain: ms(20),
+        join: ms(20),
+    };
+    let out = r.session.close(&[], bounds);
+    assert!(
+        out.final_snapshot.is_none(),
+        "the writer used the whole join budget"
+    );
+    assert!(out.abandoned.contains(&"pty-writer"));
+    drop(hold);
 }
