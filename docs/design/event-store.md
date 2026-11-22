@@ -125,9 +125,9 @@ Names may change in review; shapes may not.
 ```rust
 pub struct StoreConfig {
     pub path: PathBuf,                     // <state_dir>/chaldea.db; the directory exists (PR 8 creates it)
-    pub readers: usize,                    // 4
-    pub writer_queue: usize,               // 256 jobs
-    pub busy_timeout: Duration,            // 5 s
+    pub readers: usize,                    // 4; 1..=MAX_READERS (64)
+    pub writer_queue: usize,               // 256 jobs; 1..=MAX_WRITER_QUEUE (65 536), allocated up front
+    pub busy_timeout: Duration,            // 5 s; at most i32::MAX ms (SQLite's range)
     pub clock: Arc<dyn Clock>,             // recorded_at; tests pass a fixed clock
     pub ids: Arc<dyn IdSource>,            // event ids, the epoch; tests pass a counter
 }
@@ -627,6 +627,7 @@ impl ReadTx<'_> {
 
 **Open sequence.**
 
+0. **Configuration.** Each `StoreConfig` range above is checked before the path is touched; a value outside it is `OpenError::Config`, never a panic.
 1. **Create if missing.** If the path does not exist, create it with `create_new` (mode `0o600` on Unix; S13 gives `-wal` and `-shm` the same mode); if another opener created it first, continue with that file. `open` never creates directories.
 2. **Writer connection** with the setup above (no `SQLITE_OPEN_CREATE`).
 3. **Read-only checks** in a read transaction: a file that is not a database is `NotADatabase`; a text encoding other than UTF-8 is `Encoding` (SQLite fixes it at creation, and the `payload_bytes = octet_length(payload)` check needs the UTF-8 byte count the store binds; an empty file reports UTF-8, the encoding it is created with); `application_id` = `0x4348_4C44` ("CHLD") is ours, `0` with no schema objects is fresh, anything else (another id, or `0` with objects) is `Foreign`; for ours, `user_version` above the newest migration is `NewerSchema { found, supported }`, and the schema (`type`, `name`, `tbl_name`, `sql` of every `sqlite_schema` row except SQLite's internal objects, selected by the literal prefix `lower(substr(name, 1, 7)) = 'sqlite_'`, sorted; `LIKE 'sqlite_%'` is not used, since its `_` matches any character and would hide a table such as `sqliteXextra`. SQLite refuses user objects whose name starts with `sqlite_` in any case, so the prefix selects internal objects only) must equal the fingerprint the code ships for that version, else `SchemaMismatch { names }`. Every check of an existing database happens here, before any change.

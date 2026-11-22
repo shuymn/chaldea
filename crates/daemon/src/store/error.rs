@@ -223,6 +223,8 @@ impl std::error::Error for ReadError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OpenError {
+    /// A `StoreConfig` value is out of range; nothing was touched.
+    Config(String),
     /// Creating or opening the file failed.
     Io(String),
     NotADatabase,
@@ -273,6 +275,7 @@ impl From<rusqlite::Error> for OpenError {
 impl fmt::Display for OpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            OpenError::Config(m) => write!(f, "store configuration: {m}"),
             OpenError::Io(m) => write!(f, "io: {m}"),
             OpenError::NotADatabase => f.write_str("the file is not a database"),
             OpenError::Foreign { application_id } => {

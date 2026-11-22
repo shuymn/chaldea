@@ -328,7 +328,33 @@ fn initialize_or_migrate(
     check_fingerprint(conn, supported)
 }
 
+/// Checks the configuration's ranges before anything touches the path.
+fn check_config(cfg: &StoreConfig) -> Result<(), OpenError> {
+    if !(1..=super::MAX_READERS).contains(&cfg.readers) {
+        return Err(OpenError::Config(format!(
+            "readers {} is outside 1..={}",
+            cfg.readers,
+            super::MAX_READERS
+        )));
+    }
+    if !(1..=super::MAX_WRITER_QUEUE).contains(&cfg.writer_queue) {
+        return Err(OpenError::Config(format!(
+            "writer_queue {} is outside 1..={}",
+            cfg.writer_queue,
+            super::MAX_WRITER_QUEUE
+        )));
+    }
+    if i32::try_from(cfg.busy_timeout.as_millis()).is_err() {
+        return Err(OpenError::Config(format!(
+            "busy_timeout {:?} exceeds i32::MAX milliseconds",
+            cfg.busy_timeout
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn open(cfg: StoreConfig, faults: Arc<Faults>) -> Result<Store, OpenError> {
+    check_config(&cfg)?;
     let projection_version = faults
         .projection_version
         .unwrap_or(super::schema::PROJECTION_VERSION);

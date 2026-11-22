@@ -58,18 +58,24 @@ use writer::{ErasedJob, Faults, TypedJob, WriterExit};
 pub struct StoreConfig {
     /// `<state_dir>/chaldea.db`. The directory must exist; `open` never creates one.
     pub path: PathBuf,
-    /// Read-only connections in the pool (4 in the daemon).
+    /// Read-only connections in the pool (4 in the daemon), 1 to [`MAX_READERS`].
     pub readers: usize,
-    /// Jobs the writer queue holds (256 in the daemon); `submit` fails at once beyond it.
+    /// Jobs the writer queue holds (256 in the daemon), 1 to [`MAX_WRITER_QUEUE`]; `submit`
+    /// fails at once beyond it.
     pub writer_queue: usize,
-    /// SQLite's busy-handler budget for the write lock (5 s in the daemon). Not a wall-clock
-    /// bound the store promises.
+    /// SQLite's busy-handler budget for the write lock (5 s in the daemon), at most
+    /// `i32::MAX` milliseconds (SQLite's range). Not a wall-clock bound the store promises.
     pub busy_timeout: Duration,
     /// Source of `recorded_at` and of the deadline checks; tests pass a fixed clock.
     pub clock: Arc<dyn Clock>,
     /// Source of event ids and of the epoch; tests pass a counter.
     pub ids: Arc<dyn IdSource>,
 }
+
+/// The largest reader pool `open` accepts.
+pub const MAX_READERS: usize = 64;
+/// The largest writer queue `open` accepts (the queue's buffer is allocated up front).
+pub const MAX_WRITER_QUEUE: usize = 65_536;
 
 /// The time source: a monotonic instant for deadlines and the RFC 3339 UTC timestamp
 /// (millisecond precision) recorded with events.

@@ -456,3 +456,31 @@ fn refuses_a_non_utf8_database() {
         }
     }
 }
+
+/// Configuration out of range is an open error, not a panic, and touches nothing.
+#[test]
+fn oversized_configuration_returns_an_open_error() {
+    type Change = fn(&mut chaldea_daemon::store::StoreConfig);
+    let cases: [(&str, Change); 5] = [
+        ("busy_timeout", |c| {
+            c.busy_timeout = Duration::from_millis(u64::from(i32::MAX.unsigned_abs()) + 1);
+        }),
+        ("readers max", |c| c.readers = usize::MAX),
+        ("readers 0", |c| c.readers = 0),
+        ("writer_queue max", |c| c.writer_queue = usize::MAX),
+        ("writer_queue 0", |c| c.writer_queue = 0),
+    ];
+    for (what, change) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chaldea.db");
+        let mut cfg = config(path.clone(), FixedClock::new(T0));
+        change(&mut cfg);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Store::open(cfg)));
+        assert!(
+            matches!(result, Ok(Err(OpenError::Config(_)))),
+            "{what}: {:?}",
+            result.map(|r| r.map(|_| ()))
+        );
+        assert!(!path.exists(), "{what}: the file was created");
+    }
+}
