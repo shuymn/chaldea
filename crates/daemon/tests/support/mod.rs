@@ -1075,9 +1075,11 @@ impl Model {
             continuity: cont(&format!("g-{file_id}")),
         };
         b.new_generation = Some(g.clone());
-        b.advance_to.continuity = g.continuity.clone();
+        // Unused: offset 0's evidence is the generation's, which the cursor below expects.
+        b.advance_to.continuity = cont("unused");
         let jt = self.job_transcripts.entry(t).or_default();
-        if jt.continued {
+        // A job starts at most one generation per thread, and never after lines.
+        if jt.continued || jt.started {
             self.fails = true;
         }
         jt.started = true;

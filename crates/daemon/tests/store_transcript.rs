@@ -504,3 +504,36 @@ fn identical_hook_source_alias_is_existing() {
         [Appended::Existing(_)]
     ));
 }
+
+/// Two generations of one thread in one job are refused; nothing commits.
+#[test]
+fn two_generations_for_one_thread_do_not_share_a_commit() {
+    let s = TestStore::new();
+    let (t, l) = (thread(1), launch(1));
+    bound_thread(&s, t, l, Some(A));
+    let before = head(&s, t);
+    let mut a = batch(t, l, A, None);
+    a.new_generation = Some(new_generation("f1"));
+    let mut b = batch(t, l, A, Some(pos(1, A, "f1", 0)));
+    b.new_generation = Some(new_generation("f2"));
+
+    let result = s.run(move |tx| {
+        tx.append_transcript(a)?;
+        tx.append_transcript(b)?;
+        Ok(())
+    });
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!((head(&s, t), cursor(&s, t)), (before, None));
+}
+
+/// At offset 0 both continuities come from the generation's annex.
+#[test]
+fn generation_zero_uses_the_annex_evidence() {
+    let s = TestStore::new();
+    let (t, l) = (thread(1), launch(1));
+    bound_thread(&s, t, l, Some(A));
+    start_generation(&s, t, l, A, "f1");
+    let c = cursor(&s, t).unwrap();
+    assert_eq!(c.event_continuity.0, "g-f1");
+    assert_eq!(c.read_continuity.0, "g-f1");
+}

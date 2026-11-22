@@ -693,10 +693,16 @@ impl<'c> WriteTx<'c> {
         };
         let stream = StreamId::Thread(b.thread_id);
         let mut out = Vec::new();
-        let (generation, file_id) = if let Some(g) = &b.new_generation {
-            // 3. A generation commits alone at offset 0.
+        let (generation, file_id, read_continuity) = if let Some(g) = &b.new_generation {
+            // 3. A generation commits alone at offset 0, and a job starts at most one per
+            // thread.
             if !b.lines.is_empty() || job.continued {
                 return Err(StoreError::GenerationWithLines);
+            }
+            if job.started_generation {
+                return Err(StoreError::BadBatch(
+                    "a job starts at most one generation per thread",
+                ));
             }
             if b.advance_to.read_offset != 0 {
                 return Err(StoreError::BadBatch(
@@ -724,7 +730,9 @@ impl<'c> WriteTx<'c> {
                 annex: Some(EventAnnex::Transcript(g.continuity.clone())),
                 blobs: Vec::new(),
             })?);
-            (generation, g.file_id.clone())
+            // Offset 0 has one evidence, the generation's annex (the projection sets both
+            // continuities from it, live and in rebuild); `advance_to.continuity` is unused.
+            (generation, g.file_id.clone(), g.continuity.0.clone())
         } else {
             // 4. A continuation of the expected generation.
             if job.started_generation {
@@ -781,7 +789,11 @@ impl<'c> WriteTx<'c> {
                     blobs: l.blobs,
                 })?);
             }
-            (expect.generation, expect.file_id.clone())
+            (
+                expect.generation,
+                expect.file_id.clone(),
+                b.advance_to.continuity.0.clone(),
+            )
         };
         // The cursor advance, bound to the post-append generation and file_id.
         let changed = self.conn.execute(
@@ -789,7 +801,7 @@ impl<'c> WriteTx<'c> {
              WHERE thread_id = ?3 AND generation = ?4 AND file_id = ?5 AND read_offset <= ?1",
             rusqlite::params![
                 to_i64(b.advance_to.read_offset)?,
-                b.advance_to.continuity.0,
+                read_continuity,
                 b.thread_id.to_string(),
                 to_i64(generation)?,
                 file_id,
