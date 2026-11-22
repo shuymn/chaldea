@@ -10,17 +10,12 @@ use std::time::{Duration, Instant};
 use chaldea_core::ids::{IdempotencyKey, StreamId};
 use chaldea_daemon::store::{Checkpoint, OpenError, ReadError, Store, SubmitError};
 use rusqlite::{Connection, OpenFlags};
-use support::{FixedClock, T0, TestStore, config, registered, soon, thread};
+use support::{FixedClock, T0, TestStore, config, registered, shutdown_checked, soon, thread};
 
 const WAIT: Duration = Duration::from_secs(30);
 
 fn open(path: &Path) -> Result<Store, OpenError> {
     Store::open(config(path.to_path_buf(), FixedClock::new(T0)))
-}
-
-fn close(store: &Store) {
-    let report = store.shutdown(Instant::now() + Duration::from_secs(20));
-    assert!(report.writer_exited, "{report:?}");
 }
 
 fn host_head(store: &Store) -> u64 {
@@ -165,7 +160,7 @@ fn uninitialized_file_is_reused() {
         .blocking_wait()
         .unwrap();
     assert_eq!(host_head(&store), 1);
-    close(&store);
+    shutdown_checked(&store);
 }
 
 /// Both runners run the bundled SQLite.
@@ -228,7 +223,7 @@ fn second_store_serializes_writes() {
                 .is_some()
         );
     }
-    close(&other);
+    shutdown_checked(&other);
 }
 
 /// The nested multibyte directory for the long-path tests: at least `bytes` UTF-8 bytes in
@@ -288,10 +283,10 @@ fn long_multibyte_path() {
     let paths = store.paths();
     assert!(paths.wal.exists(), "no -wal at {bytes} bytes");
     assert!(paths.shm.exists(), "no -shm at {bytes} bytes");
-    close(&store);
+    shutdown_checked(&store);
     let store = open(&path).unwrap_or_else(|e| panic!("reopen at {bytes} bytes: {e}"));
     assert_eq!(host_head(&store), 5, "{bytes} bytes");
-    close(&store);
+    shutdown_checked(&store);
 }
 
 /// On Windows the store selects the `win32-longpath` VFS: the default VFS cannot open the path.
@@ -321,7 +316,7 @@ fn long_path_vfs_is_selected() {
         .unwrap()
         .blocking_wait()
         .unwrap_or_else(|e| panic!("write at {bytes} bytes: {e}"));
-    close(&store);
+    shutdown_checked(&store);
 }
 
 /// After shutdown no clone can submit or read.
@@ -423,7 +418,7 @@ fn shutdown_releases_every_file() {
     } else {
         let store = open(&paths.db).unwrap();
         assert_eq!(host_head(&store), 1);
-        close(&store);
+        shutdown_checked(&store);
     }
 }
 
@@ -451,7 +446,7 @@ fn refuses_a_non_utf8_database() {
                 })
                 .unwrap()
                 .blocking_wait();
-            close(&store);
+            shutdown_checked(&store);
             assert!(result.is_ok(), "{result:?}");
         }
     }

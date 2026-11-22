@@ -169,19 +169,15 @@ pub(crate) fn message(e: &rusqlite::Error) -> String {
 
 /// Every row of `table`, as text, for before/after comparisons.
 pub(crate) fn dump(c: &Connection, table: &str) -> Vec<String> {
-    let mut stmt = c
-        .prepare(&format!("SELECT * FROM \"{table}\" ORDER BY 1"))
-        .unwrap();
-    let n = stmt.column_count();
-    stmt.query_map([], |r| {
-        Ok((0..n)
-            .map(|i| format!("{:?}", r.get::<_, rusqlite::types::Value>(i).unwrap()))
-            .collect::<Vec<_>>()
-            .join("|"))
-    })
-    .unwrap()
-    .collect::<Result<_, _>>()
-    .unwrap()
+    super::support::table_rows(c, table)
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|v| format!("{v:?}"))
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
 }
 
 /// One-shot gates on `Faults::mark` points: an armed point signals `reached` and blocks

@@ -135,24 +135,13 @@ fn dump(c: &rusqlite::Connection) -> BTreeMap<String, Vec<Vec<Value>>> {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    let mut out = BTreeMap::new();
-    for t in tables {
-        let mut st = c
-            .prepare(&format!("SELECT * FROM \"{t}\" ORDER BY 1"))
-            .unwrap();
-        let n = st.column_count();
-        let rows = st
-            .query_map([], |r| {
-                (0..n)
-                    .map(|i| r.get::<_, Value>(i))
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        out.insert(t, rows);
-    }
-    out
+    tables
+        .into_iter()
+        .map(|t| {
+            let rows = support::table_rows(c, &t);
+            (t, rows)
+        })
+        .collect()
 }
 
 /// A job whose second event fails `apply` leaves every table as it was.

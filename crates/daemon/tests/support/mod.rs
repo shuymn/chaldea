@@ -113,6 +113,30 @@ pub fn config(path: PathBuf, clock: Arc<FixedClock>) -> StoreConfig {
     }
 }
 
+/// Shuts `s` down with a 20 s deadline and asserts the writer exited.
+pub fn shutdown_checked(s: &Store) -> ShutdownReport {
+    let r = s.shutdown(Instant::now() + Duration::from_secs(20));
+    assert!(r.writer_exited, "{r:?}");
+    r
+}
+
+/// Every row of `table` as typed values, in `SELECT * … ORDER BY 1` order.
+#[must_use]
+pub fn table_rows(c: &rusqlite::Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let mut st = c
+        .prepare(&format!("SELECT * FROM \"{table}\" ORDER BY 1"))
+        .unwrap();
+    let n = st.column_count();
+    st.query_map([], |r| {
+        (0..n)
+            .map(|i| r.get::<_, rusqlite::types::Value>(i))
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
 #[must_use]
 pub fn soon() -> Instant {
     Instant::now() + Duration::from_secs(60)

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use chaldea_core::ids::StreamId;
 
 use super::helpers::{open_with, raw};
-use super::support::{registered, soon, thread};
+use super::support::{registered, shutdown_checked, soon, thread};
 use crate::store::writer::Faults;
 use crate::store::{Checkpoint, Store, StoreError, SubmitError, WriteError};
 
@@ -25,11 +25,6 @@ fn append_one(s: &Store, n: u128) -> Result<(), WriteError> {
     .blocking_wait()
 }
 
-fn shutdown(s: &Store) {
-    let r = s.shutdown(Instant::now() + Duration::from_secs(20));
-    assert!(r.writer_exited, "{r:?}");
-}
-
 /// A creates the file; B opens, initializes, and commits an event; A then fails after
 /// step 5. `open` never deletes a file, so reopening shows B's event.
 #[test]
@@ -42,7 +37,7 @@ fn concurrent_open_failure_keeps_the_other_stores_data() {
         after_create: Some(Box::new(move || {
             let b = open_with(&path, Faults::default()).unwrap();
             append_one(&b, 1).unwrap();
-            shutdown(&b);
+            shutdown_checked(&b);
             ran2.store(true, Ordering::SeqCst);
         })),
         ..Faults::default()
@@ -53,7 +48,7 @@ fn concurrent_open_failure_keeps_the_other_stores_data() {
     assert!(ran.load(Ordering::SeqCst));
     let reopened = open_with(dir.path(), Faults::default()).unwrap();
     assert_eq!(host_head(&reopened), 1, "B's event is gone");
-    shutdown(&reopened);
+    shutdown_checked(&reopened);
 }
 
 /// A projection version other than the stored one, higher or lower, rebuilds at open.
@@ -62,7 +57,7 @@ fn projection_version_change_rebuilds() {
     let dir = tempfile::tempdir().unwrap();
     let s = open_with(dir.path(), Faults::default()).unwrap();
     append_one(&s, 1).unwrap();
-    shutdown(&s);
+    shutdown_checked(&s);
     let path = dir.path().join("chaldea.db");
     for version in [2, 1] {
         // Tamper with a projection row, so only a rebuild restores it.
@@ -84,7 +79,7 @@ fn projection_version_change_rebuilds() {
             .unwrap();
         assert_eq!(cwd, "/work/repo", "version {version} did not rebuild");
         assert_eq!(info.projection_version, version.to_string());
-        shutdown(&s);
+        shutdown_checked(&s);
     }
 }
 
@@ -120,8 +115,8 @@ fn stale_projection_version_cannot_write() {
         assert!(Instant::now() < deadline);
     }
     assert_eq!(host_head(&new), 2);
-    shutdown(&old);
-    shutdown(&new);
+    shutdown_checked(&old);
+    shutdown_checked(&new);
 }
 
 /// A shutdown that finishes in time closes the readers before the writer starts its

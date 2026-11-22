@@ -9,7 +9,8 @@ use chaldea_core::ids::StreamId;
 
 use super::helpers::{Gates, store_with};
 use super::support::{
-    batch, bound, launch, new_generation, registered, reserved, soon, started, thread,
+    batch, bound, launch, new_generation, registered, reserved, shutdown_checked, soon, started,
+    thread,
 };
 use crate::store::writer::{CommitFault, Faults};
 use crate::store::{JobError, Store, StoreError, SubmitError, WriteError, WriteTx};
@@ -28,11 +29,6 @@ fn count_events(s: &Store) -> u64 {
         Ok(r.head(StreamId::Host, 0)?.head_seq + r.head(StreamId::Thread(thread(1)), 0)?.head_seq)
     })
     .unwrap()
-}
-
-fn shutdown(s: &Store) {
-    let r = s.shutdown(Instant::now() + Duration::from_secs(20));
-    assert!(r.writer_exited, "{r:?}");
 }
 
 /// A `CHECK` failure ends only the statement; the closure catches it, writes again, and
@@ -60,7 +56,7 @@ fn caught_statement_error_still_rolls_back() {
         "{reply:?}"
     );
     assert_eq!(count_events(&s), 0);
-    shutdown(&s);
+    shutdown_checked(&s);
 }
 
 /// A `RAISE(ROLLBACK)` ends the transaction; the closure catches it, writes again, and
@@ -120,7 +116,7 @@ fn caught_transaction_error_does_not_autocommit() {
     let threads = s.read(soon(), |r| r.threads()).unwrap();
     assert_eq!(threads.len(), 1, "{threads:?}");
     assert_eq!(threads[0].transcript_path.as_deref(), Some(A));
-    shutdown(&s);
+    shutdown_checked(&s);
 }
 
 /// `SQLITE_FULL` during a job rolls it back (`DiskFull`); the next job succeeds once space
@@ -163,7 +159,7 @@ fn disk_full_rolls_back_and_recovers() {
     })
     .unwrap();
     assert_eq!(count_events(&s), 2);
-    shutdown(&s);
+    shutdown_checked(&s);
 }
 
 /// `COMMIT` failing with the transaction still open rolls back; the next job succeeds.
@@ -180,7 +176,7 @@ fn commit_failure_with_open_transaction_rolls_back() {
     assert_eq!(count_events(&s), 0);
     run(&s, |tx| Ok(tx.append(vec![registered(thread(1), false)])?)).unwrap();
     assert_eq!(count_events(&s), 1);
-    shutdown(&s);
+    shutdown_checked(&s);
 }
 
 /// `COMMIT` failing after the transaction ended is `CommitUnknown`; the writer is retired
@@ -204,7 +200,7 @@ fn commit_failure_with_ended_transaction_is_unknown() {
     assert!(matches!(next, Some(SubmitError::Failed)), "{next:?}");
     // Reads continue; this fault committed for real.
     assert_eq!(count_events(&s), 1);
-    shutdown(&s);
+    shutdown_checked(&s);
 }
 
 /// In the failed state every queued job gets `Failed` and new submissions are refused.
@@ -241,7 +237,7 @@ fn failed_state_drains_the_queue() {
         Err(SubmitError::Failed)
     ));
     assert_eq!(count_events(&s), 1);
-    shutdown(&s);
+    shutdown_checked(&s);
 }
 
 /// A writer that ends outside a job resolves queued tickets `WriterGone` and refuses new
