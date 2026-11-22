@@ -1090,3 +1090,26 @@ fn resize_after_vt_failure_is_pty_only() {
     assert!(r.child.log().contains(&FakeEvent::Resize(to)));
     assert_eq!(r.session.size(), to);
 }
+
+/// PR2-CL-16 / CL-24: a `channel_sink` never makes the drain wait for its receiver:
+/// with the receiver's side held, the drain still reaches the next query.
+#[test]
+fn channel_sink_never_stalls_the_drain() {
+    let r = rig();
+    let (sink, rx) = channel_sink(1024);
+    r.session.subscribe(sink, soon()).unwrap();
+    let held = rx.hold();
+    r.child.emit(b"x\x1b[5n");
+    let reached = wait_for(Duration::from_secs(5), || {
+        r.child.writes() == vec![b"\x1b[0n".to_vec()]
+    });
+    drop(held);
+    assert!(reached, "the drain waited for the receiver");
+    assert_eq!(
+        rx.recv_timeout(WAIT).unwrap(),
+        Received::Bytes {
+            offset: 0,
+            bytes: b"x".to_vec()
+        }
+    );
+}

@@ -4,7 +4,7 @@
 use std::fmt;
 use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
 use std::thread::JoinHandle;
@@ -963,52 +963,57 @@ fn waiter_main(sh: &Shared, child: &dyn PtyChild, stop: &AtomicBool) {
     }
 }
 
-/// A bounded byte channel sink: when full it drops bytes, records `Lagged`, and stops;
+/// A byte channel sink bounded by `capacity` queued bytes. Its producer never waits for
+/// the receiver: when the bytes do not fit it drops them, records `Lagged`, and stops;
 /// `End` is always recorded.
 #[must_use]
 pub fn channel_sink(capacity: usize) -> (OutputSink, OutputReceiver) {
-    let state = Arc::new((Mutex::new(ChannelState::default()), Condvar::new()));
-    let s = state.clone();
-    let sink: OutputSink = Box::new(move |ev| {
-        let (m, cv) = &*s;
-        let mut st = lock(m);
-        let flow = match ev {
-            OutputEvent::Bytes { offset, bytes } => {
-                if st.lagged.is_some() {
-                    Flow::Stop
-                } else if st.queued + bytes.len() > capacity {
-                    st.lagged = Some(offset);
-                    Flow::Stop
-                } else {
-                    st.queued += bytes.len();
-                    st.chunks.push_back((offset, bytes.to_vec()));
-                    Flow::Continue
-                }
+    // Unbounded in messages, bounded in bytes by `queued`: `send` never blocks.
+    let (tx, rx) = mpsc::channel::<Received>();
+    let queued = Arc::new(AtomicUsize::new(0));
+    let q = queued.clone();
+    let mut stopped = false;
+    let sink: OutputSink = Box::new(move |ev| match ev {
+        OutputEvent::Bytes { offset, bytes } => {
+            if stopped {
+                return Flow::Stop;
             }
-            OutputEvent::End(end) => {
-                st.end = Some(end.clone());
+            // The drain is the only producer, so the check and the add do not race.
+            if q.load(Ordering::Acquire) + bytes.len() > capacity {
+                stopped = true;
+                let _ = tx.send(Received::Lagged { at: offset });
+                return Flow::Stop;
+            }
+            q.fetch_add(bytes.len(), Ordering::AcqRel);
+            let sent = tx.send(Received::Bytes {
+                offset,
+                bytes: bytes.to_vec(),
+            });
+            if sent.is_ok() {
                 Flow::Continue
+            } else {
+                Flow::Stop
             }
-        };
-        drop(st);
-        cv.notify_all();
-        flow
+        }
+        OutputEvent::End(end) => {
+            let _ = tx.send(Received::End(end.clone()));
+            Flow::Continue
+        }
     });
-    (sink, OutputReceiver { state })
-}
-
-#[derive(Default)]
-struct ChannelState {
-    chunks: std::collections::VecDeque<(u64, Vec<u8>)>,
-    queued: usize,
-    lagged: Option<u64>,
-    end: Option<OutputEnd>,
-    terminal_taken: bool,
+    let receiver = OutputReceiver {
+        rx: Mutex::new(rx),
+        queued,
+        done: AtomicBool::new(false),
+    };
+    (sink, receiver)
 }
 
 /// The receiving end of [`channel_sink`].
 pub struct OutputReceiver {
-    state: Arc<(Mutex<ChannelState>, Condvar)>,
+    rx: Mutex<mpsc::Receiver<Received>>,
+    queued: Arc<AtomicUsize>,
+    /// The terminal item (`Lagged` or `End`) was returned.
+    done: AtomicBool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1025,38 +1030,27 @@ pub enum Received {
 }
 
 impl OutputReceiver {
+    /// Holds the receiver's side of the channel until dropped (tests only): the sink must
+    /// still make progress.
+    #[cfg(feature = "fake")]
+    pub fn hold(&self) -> impl Sized + '_ {
+        lock(&self.rx)
+    }
+
     /// Every queued chunk, then `Lagged` if a byte was dropped, else `End`; then
     /// `Disconnected`. `Timeout` when nothing arrives within `timeout`.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Received, RecvTimeoutError> {
-        let deadline = Instant::now() + timeout;
-        let (m, cv) = &*self.state;
-        let mut st = lock(m);
-        loop {
-            if let Some((offset, bytes)) = st.chunks.pop_front() {
-                st.queued -= bytes.len();
-                return Ok(Received::Bytes { offset, bytes });
-            }
-            if !st.terminal_taken {
-                if let Some(at) = st.lagged {
-                    st.terminal_taken = true;
-                    return Ok(Received::Lagged { at });
-                }
-                if let Some(end) = st.end.clone() {
-                    st.terminal_taken = true;
-                    return Ok(Received::End(end));
-                }
-            } else {
-                return Err(RecvTimeoutError::Disconnected);
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(RecvTimeoutError::Timeout);
-            }
-            st = cv
-                .wait_timeout(st, left)
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0;
+        if self.done.load(Ordering::Acquire) {
+            return Err(RecvTimeoutError::Disconnected);
         }
+        let item = lock(&self.rx).recv_timeout(timeout)?;
+        match &item {
+            Received::Bytes { bytes, .. } => {
+                self.queued.fetch_sub(bytes.len(), Ordering::AcqRel);
+            }
+            Received::End(_) | Received::Lagged { .. } => self.done.store(true, Ordering::Release),
+        }
+        Ok(item)
     }
 }
 
