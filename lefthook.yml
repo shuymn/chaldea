@@ -32,7 +32,7 @@ pre-commit:
       glob:
         - "crates/**/Cargo.toml"
         - "Cargo.{toml,lock}"
-      run: deps="$(cargo tree -p chaldea-testkit -e normal --target all --prefix none)" && bad="$(printf '%s\n' "$deps" | grep -E '^chaldea-' | grep -Ev '^chaldea-(testkit|core) ' || true)" && [ -z "$bad" ]
+      run: deps="$(cargo tree -p chaldea-testkit -e normal --target all --prefix none)" && bad="$(printf '%s\n' "$deps" | awk '/^chaldea-/ && !/^chaldea-(testkit|core) /')" && [ -z "$bad" ]
     pty-hooks-fmt:
       root: spikes/pty-hooks/
       glob: "*.rs"

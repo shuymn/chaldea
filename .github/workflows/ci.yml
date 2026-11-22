@@ -72,7 +72,7 @@ jobs:
       - name: Check testkit dependencies
         run: |
           deps="$(cargo tree -p chaldea-testkit -e normal --target all --prefix none)"
-          bad="$(grep -E '^chaldea-' <<<"$deps" | grep -Ev '^chaldea-(testkit|core) ' || true)"
+          bad="$(awk '/^chaldea-/ && !/^chaldea-(testkit|core) /' <<<"$deps")"
           [ -z "$bad" ] || { echo "testkit depends on: $bad"; exit 1; }
 
   pty-hooks:
