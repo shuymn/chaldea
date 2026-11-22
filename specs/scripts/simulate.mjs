@@ -1,6 +1,7 @@
 // Simulates each spec with fixed seeds and checks every invariant
 // (docs/design/formal-specs.md "CI"). Fails on a violation, and when a witness is never
 // reached across all seeds of its spec (the simulation stopped covering it).
+import { availableParallelism } from "node:os";
 import { quint } from "./quint.mjs";
 
 const SEEDS = [1, 2, 3, 4];
@@ -61,7 +62,9 @@ const SPECS = [
       "heldEventsOnHost",
       "noMixedEpochs",
       "renderedStateAtCursor",
+      "appliedKeepsHeld",
       "olderResponsesChangeNothing",
+      "epochOnlyFromCurrentForward",
       "epochNeverRegresses",
       "convergedAfterQuiesce",
     ],
@@ -77,6 +80,8 @@ const SPECS = [
       "witnessHasMore",
       "witnessOnlyHeadsRecover",
       "witnessCoalescedSubscribe",
+      "witnessVanishedStream",
+      "witnessReadFailedRetried",
     ],
   },
   {
@@ -90,27 +95,35 @@ const SPECS = [
       "unknownNeverReexecuted",
       "noInProgressAfterRestart",
       "timeoutOnlyWithoutIntent",
+      "timeoutOnlyWhenExpiredObserved",
       "inProgressOnlyWithReceipt",
     ],
     witnesses: [
       "witnessReplay",
+      "witnessReplayNon200",
       "witnessReplayAfterOutcomeUnknown",
+      "witnessDurableUnobserved",
       "witnessInProgress",
       "witnessDuplicateWhileInProgress",
       "witnessUnknownAfterCrash",
       "witnessConflict",
+      "witnessTimeoutBeforeSubmit",
       "witnessTimeoutThenIntent",
       "witnessCommitUnknownCommitted",
     ],
   },
 ];
 
-// Every (spec, seed) pair runs in parallel, one Node process each.
+// Every (spec, seed) pair is one Node process; at most one per available core runs at once.
 const started = Date.now();
 const runs = SPECS.flatMap((s) => SEEDS.map((seed) => ({ ...s, seed })));
-const results = await Promise.all(
-  runs.map(({ spec, seed, invariants, witnesses }) =>
-    quint([
+const results = new Array(runs.length);
+let next = 0;
+async function worker() {
+  while (next < runs.length) {
+    const k = next++;
+    const { spec, seed, invariants, witnesses } = runs[k];
+    results[k] = await quint([
       "run", spec,
       "--seed", String(seed),
       "--max-samples", String(MAX_SAMPLES),
@@ -118,9 +131,10 @@ const results = await Promise.all(
       "--invariants", ...invariants,
       "--witnesses", ...witnesses,
       "--verbosity", "2",
-    ], { capture: true }),
-  ),
-);
+    ], { capture: true });
+  }
+}
+await Promise.all(Array.from({ length: Math.min(availableParallelism(), runs.length) }, worker));
 const seconds = ((Date.now() - started) / 1000).toFixed(1);
 
 let failed = false;
