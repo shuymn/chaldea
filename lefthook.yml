@@ -35,8 +35,8 @@ pre-commit:
         - "Cargo.{toml,lock}"
       run: deps="$(cargo tree -p chaldea-testkit -e normal --target all --prefix none)" && bad="$(printf '%s\n' "$deps" | awk '/^chaldea-/ && !/^chaldea-(testkit|core) /')" && [ -z "$bad" ]
     # specs/ checks (docs/design/formal-specs.md). Globs are repository-relative; `root`
-    # only sets the working directory. pnpm installs the pinned Quint when node_modules is
-    # missing or older than the lockfile.
+    # only sets the working directory. The frozen install comes first (pnpm skips it when
+    # node_modules is up to date), so every run uses the pinned Quint.
     specs-check:
       root: specs/
       glob:
