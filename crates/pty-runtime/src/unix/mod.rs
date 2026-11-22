@@ -165,7 +165,11 @@ fn validate(spec: &SpawnSpec) -> Result<(), SpawnError> {
 fn kind_of(e: &Error, program: &Path) -> NeverStartedKind {
     match e.raw_os_error() {
         // `metadata` follows symlinks: a link whose target vanished is a missing program.
-        Some(libc::ENOENT) if std::fs::metadata(program).is_err() => NeverStartedKind::NotFound,
+        // Only a `NotFound` answer shows that; any other error (a directory without search
+        // permission) leaves the cause open.
+        Some(libc::ENOENT) if matches!(std::fs::metadata(program), Err(e) if e.kind() == ErrorKind::NotFound) => {
+            NeverStartedKind::NotFound
+        }
         Some(libc::EACCES) => NeverStartedKind::PermissionDenied,
         _ => NeverStartedKind::Setup,
     }

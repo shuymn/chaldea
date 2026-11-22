@@ -766,3 +766,23 @@ fn vanished_symlink_target_is_not_found() {
         other => panic!("{:?}", other.map(|_| ())),
     }
 }
+
+#[test]
+fn enoent_is_not_found_only_when_the_program_is_missing() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("kind");
+    let enoent = std::io::Error::from_raw_os_error(libc::ENOENT);
+    assert_eq!(
+        super::kind_of(&enoent, &dir.0.join("missing")),
+        NeverStartedKind::NotFound
+    );
+    // A program in a directory without search permission: `metadata` fails `EACCES`,
+    // which does not show that the program is gone.
+    let sub = dir.0.join("closed");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("agent"), b"").unwrap();
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let kind = super::kind_of(&enoent, &sub.join("agent"));
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(kind, NeverStartedKind::Setup);
+}
