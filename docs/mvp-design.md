@@ -187,7 +187,7 @@ queued ──(gate open; attempt persisted)──▶ sending ──(text + submi
 
 **Residual constraint.** Hooks are asynchronous processes and carry no CLI-side ordering against the daemon's PTY writes, so ack attribution and readiness remain inferences. The contract guarantees only that (a) no input is ever resent automatically, (b) no input is acked without a text match, and (c) any ambiguity leaves the gate closed or the input `unconfirmed`. Later PRs do not need to close this gap.
 
-Alternatives: auto-resend (rejected by arch §4.3; an extra Return can accept a popup, arch §5); ack by screen echo (invariant 1); readiness inferred from DECSET 2004 or the screen (invariant 1; Codex sets 2004 while a review dialog is up, spike §3); special-case rules per input source (every source added new cases, so the gate trusts only positive evidence).
+Alternatives: auto-resend (rejected by arch §4.3; an extra Return can accept a popup, arch §5); ack by screen echo (invariant 1); readiness inferred from DECSET 2004 or the screen (invariant 1; Codex sets 2004 while a review dialog is up, spike §3); special-case rules per input source (rejected: the gate requires the same positive evidence from every source).
 
 Public: state names, payloads, `send`, `ready`, `input resolve`, `input cancel`, the `readiness_evidence` modes. Internal: window, timeout, and settle defaults. The states beyond the architecture's four are §8 D3.
 
@@ -409,7 +409,7 @@ Each PR keeps `core` + `FakePty` tests green on macOS and Windows CI; macOS firs
 | 15 | **First tests 1 and 2** on a real Windows host (**Codex keyed input**, **human paste through attach**) | 14 | Cross-OS E2E |
 | 16 | Mailbox, agent tokens, `task set`, worktree ownership and remove | 10 | **closes Agent Control** once 11, 14, 16 are all merged |
 | 17 | `stateright` Sync model | 7 | Verification |
-| 18 | PWA read path: validators, pairing, thread list/view, paging, `GenericEvent`, client reducer | 7 | Sync & PWA |
+| 18 | PWA read path: `packages/contracts/package.json`, validators, pairing, thread list/view, paging, `GenericEvent`, client reducer | 7 | Sync & PWA |
 | 19 | PWA input: `<textarea>` IME guards, send, ready, input resolve, approvals, VT snapshot, keypad; Playwright | 18, 13 | **closes Sync & PWA** |
 | 20 | Extension & Rescue: one-shot hooks, `POST /events`, rescue role, A2UI, `surface_action` | 16, 19 | **closes Extension & Rescue** |
 | 21 | `chaldea doctor` and `GET /api/doctor` | 14, 16 | Cross-OS E2E |
