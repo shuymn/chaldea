@@ -185,7 +185,10 @@ module sync {
   // notification that arrived during its fetch.
   // Ghosts for the invariants, updated where the events happen: `lastFwd`, `lastBwd` (the
   // latest request issued), `resetAt` (requests up to this id are of an older generation),
-  // `cancelled` (requests given up), `lost` (streams a lost frame named since connecting).
+  // `cancelled` (requests given up), `lost` (streams a lost frame named since connecting),
+  // `owed` (streams whose resync was asked for after their forward request was issued: a
+  // backward page of another epoch or a failed read; a forward request issued later pays
+  // it).
   type Client = {
     epoch: int,
     copies: int -> Copy,
@@ -201,7 +204,14 @@ module sync {
     resetAt: int -> int,
     cancelled: Set[int],
     lost: Set[int],
+    owed: Set[int],
   }
+
+  /// F1: the thread status a client shows: from the thread stream once it follows it and
+  /// holds its copy; until then, the value a host snapshot read at its `as_of_seq`.
+  pure def shownThreadStatus(cl: Client): int =
+    if (cl.want.contains(THREAD) and cl.copies.get(THREAD).epoch != 0) cl.copies.get(THREAD).proj.status
+    else cl.copies.get(HOST).threadStatus
 
   pure def zeros(x: int): int = 0
   pure def falses(x: int): bool = false
@@ -221,6 +231,7 @@ module sync {
     resetAt: STREAMS.mapBy(zeros),
     cancelled: Set(),
     lost: Set(),
+    owed: Set(),
   }
 
   pure def dueOf(cl: Client, x: int): bool = and {
@@ -246,7 +257,11 @@ module sync {
 
   type Action =
     // `connected`: both clients start with an open socket whose subscribe was answered.
-    | Init({ hostEvents: int, threadEvents: int, big: bool, want2: Set[int], connected: bool, replayMaxEvents: int, replayMaxBytes: int })
+    // `racing`: the start of a database swap race (`racingState`).
+    | Init({
+        hostEvents: int, threadEvents: int, big: bool, want2: Set[int], connected: bool, racing: bool,
+        replayMaxEvents: int, replayMaxBytes: int,
+      })
     | Append({ stream: int, kind: Kind, size: int })
     | Restart
     // `threadKept`: the new database has the thread too.
@@ -278,11 +293,11 @@ module sync {
   // other action); each invariant also reads its own field.
   type Checks = {
     gap: bool, held: bool, mixed: bool, rendered: bool, kept: bool,
-    older: bool, regress: bool, establish: bool,
+    older: bool, regress: bool, establish: bool, owed: bool,
   }
   pure val ALL_OK: Checks = {
     gap: true, held: true, mixed: true, rendered: true, kept: true,
-    older: true, regress: true, establish: true,
+    older: true, regress: true, establish: true, owed: true,
   }
 
   type Last = { act: Action, calls: List[Call], prevClients: int -> Client, inner: Checks }
@@ -386,6 +401,7 @@ module sync {
     need: STREAMS.mapBy(x => not(xs.contains(x)) and cl.need.get(x)),
     more: STREAMS.mapBy(x => not(xs.contains(x)) and cl.more.get(x)),
     seen: STREAMS.mapBy(x => if (xs.contains(x)) 0 else cl.seen.get(x)),
+    owed: cl.owed.exclude(xs),
   }
 
   // A `subscribe` of the client's followed set, replacing an unanswered one.
@@ -407,7 +423,10 @@ module sync {
     val id = s.nextId
     val cl = s.clients.get(c)
     val cl2 = match dir {
-      | Fwd => { ...cl, fwd: cl.fwd.set(x, id), lastFwd: cl.lastFwd.set(x, id), need: cl.need.set(x, false), more: cl.more.set(x, false) }
+      | Fwd => {
+          ...cl, fwd: cl.fwd.set(x, id), lastFwd: cl.lastFwd.set(x, id), need: cl.need.set(x, false), more: cl.more.set(x, false),
+          owed: cl.owed.exclude(Set(x)),
+        }
       | Bwd => { ...cl, bwd: cl.bwd.set(x, id), lastBwd: cl.lastBwd.set(x, id) }
     }
     val r = { id: id, client: c, stream: x, dir: dir, q: q }
@@ -537,7 +556,7 @@ module sync {
         | NotFound => start(sendSubscribe(setClient(s0, c, dropStreams(cl1, Set(x), s.nextId)), c))
         | _ => {
             val cl2 = match p.body {
-              | ReadFailed => match p.req.dir { | Fwd => { ...cl1, need: cl1.need.set(x, true) } | Bwd => cl1 }
+              | ReadFailed => match p.req.dir { | Fwd => { ...cl1, need: cl1.need.set(x, true), owed: cl1.owed.union(Set(x)) } | Bwd => cl1 }
               | Page(pg) => match p.req.dir {
                   | Fwd =>
                     if (p.epoch != cl1.epoch) {
@@ -545,7 +564,8 @@ module sync {
                       if (p.req.q.after > 0) sw
                       else {
                         val cp = { ...appendEvs(EMPTY_COPY, p.epoch, pg.events), moreBefore: pg.hasMoreBefore }
-                        { ...sw, copies: sw.copies.set(x, cp), need: sw.need.set(x, false), more: sw.more.set(x, pg.hasMore) }
+                        // A resync asked for after this request was issued stays due.
+                        { ...sw, copies: sw.copies.set(x, cp), need: sw.need.set(x, cl1.need.get(x)), more: sw.more.set(x, pg.hasMore) }
                       }
                     } else {
                       val old = cl1.copies.get(x)
@@ -554,7 +574,7 @@ module sync {
                       { ...cl1, copies: cl1.copies.set(x, cp), more: cl1.more.set(x, pg.hasMore) }
                     }
                   | Bwd =>
-                    if (p.epoch != cl1.epoch) { ...cl1, need: cl1.need.set(x, true) }
+                    if (p.epoch != cl1.epoch) { ...cl1, need: cl1.need.set(x, true), owed: cl1.owed.union(Set(x)) }
                     else {
                       val cp = cl1.copies.get(x)
                       { ...cl1, copies: cl1.copies.set(x, { ...cp, events: pg.events.concat(cp.events), moreBefore: pg.hasMoreBefore }) }
@@ -569,7 +589,9 @@ module sync {
                   // built from the old copy and are of an older generation.
                   val base = if (p.epoch != cl1.epoch) switchEpoch(cl1, p.epoch)
                     else clearRequests(cl1, Set(x))
-                  { ...base, copies: base.copies.set(x, cp), need: base.need.set(x, false), more: base.more.set(x, false) }
+                  // The fetch consumed the stream's `need` when it was issued; a resync asked
+                  // for since then stays due.
+                  { ...base, copies: base.copies.set(x, cp), need: base.need.set(x, cl1.need.get(x)), more: base.more.set(x, false) }
                 }
               | _ => cl1
             }
@@ -706,16 +728,21 @@ module sync {
   /// carried: a forward page keeps the held events and appends its own, a backward page
   /// prepends its own, a snapshot holds exactly its recent events up to `as_of_seq`;
   /// a page moves the cursor to its last event (from the cursor before it and the page).
+  /// A response that establishes or switches the epoch starts from an empty copy: a forward
+  /// page that does not start at the stream's beginning leaves it empty.
   pure def keptOk(prev: int -> Client, a: Action, s: State): bool = match a {
     | Deliver(p) => {
         val before = prev.get(p.req.client)
         val after = s.clients.get(p.req.client)
-        val was = before.copies.get(p.req.stream)
+        val switched = before.epoch != p.epoch
+        val was = if (switched) EMPTY_COPY else before.copies.get(p.req.stream)
         val now = after.copies.get(p.req.stream)
-        val applied = not(older(before, p.req)) and p.epoch == before.epoch and p.epoch == after.epoch
+        val applied = not(older(before, p.req)) and p.epoch == after.epoch
         applied implies match p.body {
           | Page(pg) => match p.req.dir {
-              | Fwd => and {
+              | Fwd =>
+                if (switched and p.req.q.after > 0) seqsOf(now.events) == Set() and now.hi == 0
+                else and {
                   seqsOf(now.events) == seqsOf(was.events).union(seqsOf(pg.events)),
                   now.hi == (if (pg.events.length() == 0) was.hi else pg.events[pg.events.length() - 1].seq),
                 }
@@ -736,6 +763,7 @@ module sync {
       | Deliver(p) => and {
           p.req.client == c,
           p.req.dir == Fwd,
+          match p.body { | Page(_) => true | Snap(_) => true | _ => false },
           not(older(prev.get(c), p.req)),
           s.clients.get(c).epoch == p.epoch,
         }
@@ -743,6 +771,14 @@ module sync {
       | Quiesce(_) => true
       | _ => false
     })
+
+  /// mvp §2.4 "Backward history" ("it triggers a forward resync"): a resync asked for after
+  /// a stream's forward request was issued is not lost when that request's response is
+  /// applied: the stream stays due until a later forward request is issued.
+  pure def owedOk(s: State): bool = CLIENTS.forall(c => {
+    val cl = s.clients.get(c)
+    cl.owed.forall(x => cl.fwd.get(x) != 0 or dueOf(cl, x))
+  })
 
   /// The same, read the other way: a client never goes back to an epoch the host left.
   /// Epochs are random ids in the contract; the model numbers them in creation order.
@@ -757,12 +793,14 @@ module sync {
     older: olderOk(prev.clients, a, s),
     regress: regressOk(prev.clients, s),
     establish: establishOk(prev.clients, a, s),
+    owed: owedOk(s),
   }
 
   pure def both(x: Checks, y: Checks): Checks = {
     gap: x.gap and y.gap, held: x.held and y.held, mixed: x.mixed and y.mixed,
     rendered: x.rendered and y.rendered, kept: x.kept and y.kept, older: x.older and y.older,
     regress: x.regress and y.regress, establish: x.establish and y.establish,
+    owed: x.owed and y.owed,
   }
 
   // ---------------------------------------------------------------------------
@@ -784,9 +822,14 @@ module sync {
     }
   })
 
-  // One step inside `quiesce`: its result, with its checks folded in. Only a delivery
-  // changes a client's copies or epoch (the host does not write during a `quiesce`), so
-  // the other steps cannot break an invariant that held before them and are not checked.
+  // One step inside `quiesce`: its result, with its checks folded in. The invariants read
+  // the host, the clients' copies and epochs, the step's response, and (`owedOk`) whether
+  // an owed stream is due or fetched. Only a delivery changes copies or epochs (the host
+  // does not write during a `quiesce`); the other steps only make a stream due or fetched
+  // (a fetch pays the owed resync, a timeout or reconnect sets `need`, a frame raises
+  // `seen`), so they are not checked. An invariant that reads anything else, or that
+  // another step could falsify (`sockets`, a stream stopping being due), must widen the
+  // steps checked here.
   type Drain = { o: Out, refreshes: int, done: bool, checks: Checks }
 
   pure def drainStep(d: Drain, a: Action, o2: Out): Drain = {
@@ -874,17 +917,31 @@ module sync {
   pure def connectedState(s: State): State =
     CLIENTS.fold(s, (t, c) => serverSubscribe(connect(t, c).st, c).st)
 
-  action initFrom(hostEvents: int, threadEvents: int, big: bool, want2: Set[int], connected: bool): bool = all {
+  /// A start the random walk rarely reaches by itself: client 1 holds a host snapshot of
+  /// epoch 1 (three events, older events below it); its next forward fetch was answered in
+  /// epoch 1 with a snapshot; the database was then replaced, and a backward page was
+  /// answered in the new epoch. Both responses are in transit, in either order of arrival.
+  pure def racingState(s: State): Out =
+    val o1 = serve(fetch(s, 1, HOST, 2).st, 1)
+    val s2 = deliver(o1.st, 1).st
+    val s3 = appendEv(appendEv(s2, HOST, Plain, 3).st, HOST, Plain, 3).st
+    val o4 = serve(fetch(s3, 1, HOST, 2).st, 2)
+    val s5 = resetDb(o4.st, true)
+    val o6 = serve(fetchBack(s5, 1, HOST, 1).st, 3)
+    { st: o6.st, calls: o1.calls.concat(o4.calls).concat(o6.calls) }
+
+  action initFrom(hostEvents: int, threadEvents: int, big: bool, want2: Set[int], connected: bool, racing: bool): bool = all {
     val s0 = initialState(hostEvents, threadEvents, big, want2)
-    val s = if (connected) connectedState(s0) else s0
+    val o = if (racing) racingState(s0) else start(if (connected) connectedState(s0) else s0)
+    val s = o.st
     all {
       st' = s,
       last' = {
         act: Init({
           hostEvents: hostEvents, threadEvents: threadEvents, big: big, want2: want2, connected: connected,
-          replayMaxEvents: REPLAY_MAX_EVENTS, replayMaxBytes: REPLAY_MAX_BYTES,
+          racing: racing, replayMaxEvents: REPLAY_MAX_EVENTS, replayMaxBytes: REPLAY_MAX_BYTES,
         }),
-        calls: [],
+        calls: o.calls,
         prevClients: s.clients,
         inner: ALL_OK,
       },
@@ -893,7 +950,7 @@ module sync {
 
   /// Both clients disconnected (the named traces start here).
   action initWith(hostEvents: int, threadEvents: int, big: bool, want2: Set[int]): bool =
-    initFrom(hostEvents, threadEvents, big, want2, false)
+    initFrom(hostEvents, threadEvents, big, want2, false, false)
 
   action init = {
     nondet h = 0.to(3).oneOf()
@@ -901,7 +958,9 @@ module sync {
     nondet big = Bool.oneOf()
     nondet w = Set(Set(HOST), Set(THREAD), STREAMS).oneOf()
     nondet connected = Bool.oneOf()
-    initFrom(h, t, big, w, connected)
+    // One start in four is the swap race, with the three host events it needs.
+    nondet racing = Set(false, false, false, true).oneOf()
+    initFrom(if (racing) 3 else h, t, big, w, connected and not(racing), racing)
   }
 
   action appendA(x: int, kind: Kind, sz: int): bool = all {
@@ -1085,6 +1144,7 @@ module sync {
   /// mvp §2.4 "only a forward response … may establish a new epoch"; F2.
   val epochOnlyFromCurrentForward = establishOk(last.prevClients, last.act, st) and last.inner.establish
   val epochNeverRegresses = regressOk(last.prevClients, st) and last.inner.regress
+  val owedResyncStaysDue = owedOk(st) and last.inner.owed
 
   /// mvp §2.4 "Live notifications", CL-13, http §8 D15: after connectivity returns and
   /// writes stop, every client converges to the host's events and rendered state of each
@@ -1105,6 +1165,7 @@ module sync {
     olderResponsesChangeNothing,
     epochOnlyFromCurrentForward,
     epochNeverRegresses,
+    owedResyncStaysDue,
     convergedAfterQuiesce,
   }
 
@@ -1161,6 +1222,13 @@ module sync {
       }
     | _ => false
   }
+  // A current forward response of the epoch held is applied while a resync asked for after
+  // its request was issued is owed; the stream stays due.
+  val witnessResyncKept = match last.act {
+    | Deliver(p) => p.req.dir == Fwd and appliedHere(p) and
+        last.prevClients.get(p.req.client).owed.contains(p.req.stream) and dueOf(st.clients.get(p.req.client), p.req.stream)
+    | _ => false
+  }
   val witnessTooManyEvents = planned(last.calls, PSnapshot(TooManyEvents))
   val witnessTooManyBytes = planned(last.calls, PSnapshot(TooManyBytes))
   val witnessEpochChanged = planned(last.calls, PSnapshot(EpochChanged))
@@ -1175,7 +1243,7 @@ module sync {
     | Quiesce(q) => q.onlyHeads and converged(st)
     | _ => false
   }
-  val witnessCoalescedSubscribe = match last.act {
+  val witnessPendingSubscribeReplaced = match last.act {
     | Resubscribe(r) => r.replacedPending
     | _ => false
   }

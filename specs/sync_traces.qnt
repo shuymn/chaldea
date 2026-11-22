@@ -270,6 +270,35 @@ module sync_traces {
       .then(deliverA(2))
       .expect(seqs(cp(st, 1, THREAD)) == [5])
 
+  /// mvp §2.4 "Backward history": a backward page of another epoch asks for a forward
+  /// resync. A forward snapshot of the old epoch, requested before that, is still current
+  /// and is applied; the resync it did not answer stays due, and the next forward fetch
+  /// switches the client to the new epoch.
+  run trace_resync_kept_after_stale_snapshot =
+    initWith(3, 0, false, Set(HOST))
+      .then(fetchA(1, HOST, 2))
+      .then(serveA(1))
+      .then(deliverA(1))
+      .expect(cp(st, 1, HOST).hi == 3 and cp(st, 1, HOST).moreBefore)
+      .then(appendA(HOST, Plain, 3))
+      .then(appendA(HOST, Plain, 3))
+      .then(fetchA(1, HOST, 2))
+      .then(serveA(2))
+      .expect(planned(last.calls, PSnapshot(TooManyBytes)))
+      .then(reset(true))
+      .then(fetchBackA(1, HOST, 1))
+      .then(serveA(3))
+      .then(deliverA(3))
+      // The resync waits for the forward request in flight.
+      .expect(epochOf(st, 1) == 1 and st.clients.get(1).need.get(HOST) and not(due(st, 1, HOST)))
+      .then(deliverA(2))
+      .expect(epochOf(st, 1) == 1 and cp(st, 1, HOST).hi == 5 and due(st, 1, HOST))
+      .then(fetchA(1, HOST, 2))
+      .then(serveA(4))
+      .expect(planned(last.calls, PSnapshot(EpochChanged)))
+      .then(deliverA(4))
+      .expect(epochOf(st, 1) == 2)
+
   /// A `stream_advanced` for a commit after the page was read arrives while the fetch is in
   /// flight; the page, without `has_more`, leaves the stream due (the head observed is
   /// newer than the cursor).
@@ -430,6 +459,7 @@ module sync_traces {
         converged(st),
         cp(st, 1, HOST).threadStatus == 0,
         cp(st, 1, THREAD).proj.status == 1,
+        shownThreadStatus(st.clients.get(1)) == 1,
         projOf(logOf(st.host, 1, THREAD)).status == 1,
       })
 }

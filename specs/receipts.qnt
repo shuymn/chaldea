@@ -18,8 +18,9 @@
  *   intent job looks the receipt up and, for `New`, inserts it `in_progress` with the
  *   intent in one transaction; the runner starts the effect once after it observes the
  *   intent committed with an effect pending, and completes the receipt in a later job;
- *   the request replies from what the runner observed, once it is done or the grace has
- *   ended; a restart turns `in_progress` into `unknown_after_crash`.
+ *   the request replies once the runner observed an outcome, or when the grace ends from
+ *   what the runner observed by then (the runner goes on observing after the reply); a
+ *   restart turns `in_progress` into `unknown_after_crash`.
  *
  * Abstracted: a request identity is a number (`hash`); hash 1 is a command completed in
  * its intent job (`send`), hash 2 a command with an effect (`stop`); a result is a number
@@ -138,6 +139,9 @@ module receipts {
     markedUnknown: Set[int],
     afterUnknown: Set[int],
     committed: Set[int],
+    // Per attempt, what its runner had observed when the grace ended or it replied, whichever
+    // came first (Submitted before any observation).
+    byGrace: int -> Progress,
     replies: List[ReplyRecord],
   }
 
@@ -177,6 +181,7 @@ module receipts {
     markedUnknown: Set(),
     afterUnknown: Set(),
     committed: Set(),
+    byGrace: Map(),
     replies: [],
   }
 
@@ -188,6 +193,11 @@ module receipts {
   pure def setWriter(s: State, a: int, w: WriterReply): State = setAttempt(s, a, at => { ...at, writer: w })
 
   pure def seen(s: State, a: int, p: Progress): State = setAttempt(s, a, at => { ...at, progress: p })
+
+  // The ghost: an observation made before the grace ended and before the reply.
+  pure def noteByGrace(s: State, a: int): State =
+    val at = s.attempts.get(a)
+    if (at.grace or at.replied) s else { ...s, byGrace: s.byGrace.set(a, at.progress) }
 
   pure def without(m: a -> b, k: a): a -> b = m.keys().exclude(Set(k)).mapBy(x => m.get(x))
 
@@ -304,6 +314,7 @@ module receipts {
         cmd: c, token: t, hash: h, submitted: false, deadline: false, grace: false,
         writer: NoReply, progress: Submitted, live: true, replied: false,
       }),
+      byGrace: st.byGrace.put(a, Submitted),
     })),
   }
 
@@ -330,13 +341,26 @@ module receipts {
     },
   }
 
-  /// The reply grace after the deadline ends (`write_reply_grace`).
+  /// The request replies `r` from what its runner observed, and records the facts.
+  pure def answer(s: State, a: int, r: Reply): State =
+    val at = s.attempts.get(a)
+    {
+      ...setAttempt(s, a, x => { ...x, replied: true }),
+      replies: s.replies.append({
+        attempt: a, cmd: at.cmd, token: at.token, hash: at.hash, reply: r,
+        receipt: existing(s, at.cmd), observed: at.progress, submitted: at.submitted,
+      }),
+    }
+
+  /// The reply grace after the deadline ends (`write_reply_grace`): a submitted request
+  /// that has not replied replies now, from what its runner observed by now; a writer
+  /// reply observed later does not change it (PR7-CL-8: "taken at or after then" is 503).
   action grace(a: int): bool = all {
     has(st, a),
     val at = st.attempts.get(a)
     all {
-      at.live, at.deadline, not(at.grace), not(at.replied),
-      commit(Grace(a), start(setAttempt(st, a, x => { ...x, grace: true }))),
+      at.live, at.submitted, at.deadline, not(at.grace), not(at.replied),
+      commit(Grace(a), start(answer(setAttempt(st, a, x => { ...x, grace: true }), a, replyOf(at.progress)))),
     },
   }
 
@@ -381,7 +405,7 @@ module receipts {
       at.live,
       at.writer != NoReply,
       val s1 = setWriter(st, a, NoReply)
-      commit(Observe(a), start(match at.writer {
+      commit(Observe(a), start(noteByGrace(match at.writer {
         | WPending => startEffect(seen(s1, a, IntentCommitted), a)
         | WLookup(l) => seen(s1, a, Done(OLookup(l)))
         | WCompleted(r) => seen(s1, a, Done(OCompleted(r)))
@@ -391,7 +415,7 @@ module receipts {
         | WCompletionDone(r) => seen(s1, a, Done(OCompleted(r)))
         | WCompletionFailed => seen(s1, a, Done(OCompletionFailed))
         | NoReply => st
-      })),
+      }, a))),
     },
   }
 
@@ -417,15 +441,9 @@ module receipts {
     val done = match at.progress { | Done(_) => at.submitted | _ => false }
     all {
       at.live, not(at.replied),
-      done or at.grace or (not(at.submitted) and at.deadline),
+      done or (not(at.submitted) and at.deadline),
       val r = if (not(at.submitted)) RTimeout else replyOf(at.progress)
-      commit(ReplyTo(a), start({
-        ...setAttempt(st, a, x => { ...x, replied: true }),
-        replies: st.replies.append({
-          attempt: a, cmd: at.cmd, token: at.token, hash: at.hash, reply: r,
-          receipt: existing(st, at.cmd), observed: at.progress, submitted: at.submitted,
-        }),
-      })),
+      commit(ReplyTo(a), start(answer(st, a, r))),
     },
   }
 
@@ -471,6 +489,11 @@ module receipts {
   pure def activeOf(s: State): Set[int] =
     val xs = s.attempts.keys().filter(a => s.attempts.get(a).live and not(s.attempts.get(a).replied))
     if (xs.size() == 0) Set(0) else xs
+  // The runners with a writer reply to observe, replied or not (0 when there is none): a
+  // runner outlives its request.
+  pure def observableOf(s: State): Set[int] =
+    val xs = s.attempts.keys().filter(a => s.attempts.get(a).live and s.attempts.get(a).writer != NoReply)
+    if (xs.size() == 0) Set(0) else xs
   pure def anyOf(s: State): Set[int] = if (s.attempts.keys().size() == 0) Set(0) else s.attempts.keys()
 
   // Retries are frequent: a client keeps its `command_id`, token, and request. Time
@@ -481,6 +504,7 @@ module receipts {
     nondet h = HASHES.oneOf()
     nondet a = activeOf(st).oneOf()
     nondet r = anyOf(st).oneOf()
+    nondet o = observableOf(st).oneOf()
     nondet w = Set(Ok, Ok, UnknownCommitted, UnknownRolledBack).oneOf()
     nondet ok = Bool.oneOf()
     nondet rc = Bool.oneOf()
@@ -495,8 +519,8 @@ module receipts {
       writerFinish(w),
       writerFinish(Ok),
       writerFail,
-      observe(a),
-      observe(a),
+      observe(o),
+      observe(o),
       effectDone(c, ok),
       replyTo(a),
       replyTo(a),
@@ -569,6 +593,11 @@ module receipts {
     r.observed == IntentCommitted or r.observed == Done(OLookup(LInProgress)),
   })
 
+  /// http §2.8, PR7-CL-8: a submitted request replies from what its runner observed by
+  /// the end of the grace; an outcome observed later does not change the reply (it is 503
+  /// `outcome_unknown` if nothing was observed by then).
+  val replyFromObservedByGrace = repliesOf(st).forall(r => r.submitted implies r.reply == replyOf(st.byGrace.get(r.attempt)))
+
   val allInvariants = and {
     oneIntentPerCommand,
     oneEffectPerCommand,
@@ -580,6 +609,7 @@ module receipts {
     timeoutOnlyWithoutIntent,
     timeoutOnlyWhenExpiredObserved,
     inProgressOnlyWithReceipt,
+    replyFromObservedByGrace,
   }
 
   // Witnesses (`simulate` fails when one is never reached), from recorded replies.
@@ -597,6 +627,17 @@ module receipts {
   val witnessDurableUnobserved = replied(st, r => r.reply == ROutcomeUnknown and r.observed == Submitted and
     st.committed.contains(r.attempt) and r.receipt != NoReceipt)
   val witnessInProgress = replied(st, r => r.reply == RInProgress)
+  // The runner observed its intent committed after its request replied, and started the
+  // effect.
+  val witnessEffectAfterReply = match last.act {
+    | Observe(a) => st.attempts.get(a).replied and st.attempts.get(a).progress == IntentCommitted
+    | _ => false
+  }
+  // The grace ended with nothing observed, and the runner observed `Expired` afterwards.
+  val witnessExpiredAfterGrace = match last.act {
+    | Observe(a) => st.attempts.get(a).grace and st.attempts.get(a).progress == Done(OExpired)
+    | _ => false
+  }
   val witnessDuplicateWhileInProgress = lookedUp(l => l == LInProgress)
   val witnessUnknownAfterCrash = replied(st, r => r.reply == RUnknownAfterCrash)
   val witnessConflict = replied(st, r => r.reply == RConflict)

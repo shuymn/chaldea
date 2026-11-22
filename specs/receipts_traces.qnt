@@ -72,7 +72,6 @@ module receipts_traces {
       .expect(st.effects.keys() == Set(1))
       .then(deadline(1))
       .then(grace(1))
-      .then(replyTo(1))
       .expect(replyAt(st, 0) == RInProgress)
       .then(send(1, 1, STOP))
       .then(submit(2))
@@ -113,7 +112,7 @@ module receipts_traces {
       .expect(replyAt(st, 1) == RResult({ n: 1, status: 409 }))
 
   /// http-surface §8 D14: the intent committed and is durable, but the runner has not
-  /// observed the writer's reply when the grace ends, so the reply is 503
+  /// observed the writer's reply when the grace ends, so the request replies 503
   /// `outcome_unknown`; the retry of the same request replays the stored result.
   run trace_outcome_unknown_then_replay =
     init
@@ -121,9 +120,8 @@ module receipts_traces {
       .then(submit(1))
       .then(writerStart)
       .then(deadline(1))
-      .then(grace(1))
       .then(writerFinish(Ok))
-      .then(replyTo(1))
+      .then(grace(1))
       .expect(and {
         replyAt(st, 0) == ROutcomeUnknown,
         witnessDurableUnobserved,
@@ -141,7 +139,6 @@ module receipts_traces {
       .then(writerFinish(Ok))
       .then(deadline(1))
       .then(grace(1))
-      .then(replyTo(1))
       .expect(and {
         st.receipts.get(1).status == InProgress,
         replyAt(st, 0) == ROutcomeUnknown,
@@ -165,7 +162,6 @@ module receipts_traces {
       .then(submit(1))
       .then(deadline(1))
       .then(grace(1))
-      .then(replyTo(1))
       .expect(replyAt(st, 0) == ROutcomeUnknown)
       .then(send(1, 1, SEND))
       .then(submit(2))
@@ -178,6 +174,56 @@ module receipts_traces {
       .expect(replyAt(st, 1) == RTimeout and st.committed == Set())
       .then(roundTrip(1, 1, SEND, 3))
       .expect(replyAt(st, 2) == RResult(ok(1)))
+
+  /// http-surface §2.8, PR7-CL-8: `Expired` observed within the grace is 408.
+  run trace_expired_observed_within_grace =
+    init
+      .then(send(1, 1, SEND))
+      .then(submit(1))
+      .then(deadline(1))
+      .then(writerStart)
+      .then(observe(1))
+      .then(replyTo(1))
+      .expect(replyAt(st, 0) == RTimeout and st.committed == Set())
+
+  /// PR7-CL-8: a writer reply taken at or after the end of the grace is 503
+  /// `outcome_unknown`: the request replied when the grace ended, and `Expired` observed
+  /// afterwards does not change it.
+  run trace_refused_expired_after_grace =
+    init
+      .then(send(1, 1, SEND))
+      .then(submit(1))
+      .then(deadline(1))
+      .then(grace(1))
+      .expect(replyAt(st, 0) == ROutcomeUnknown)
+      .then(writerStart)
+      .then(observe(1))
+      .expect(and {
+        st.attempts.get(1).progress == Done(OExpired),
+        st.replies == [st.replies[0]],
+        replyAt(st, 0) == ROutcomeUnknown,
+      })
+
+  /// http-surface PR7-CL-19: the runner outlives its request. The request replies 503
+  /// before the runner observed its intent committed; the runner then starts the effect
+  /// once and completes the receipt, and a retry with the same `command_id` replays it.
+  run trace_effect_after_outcome_unknown =
+    init
+      .then(send(1, 1, STOP))
+      .then(submit(1))
+      .then(writerStart)
+      .then(writerFinish(Ok))
+      .then(deadline(1))
+      .then(grace(1))
+      .expect(replyAt(st, 0) == ROutcomeUnknown)
+      .then(observe(1))
+      .expect(st.effects.keys() == Set(1) and witnessEffectAfterReply)
+      .then(effectDone(1, true))
+      .then(writerStart)
+      .then(writerFinish(Ok))
+      .then(observe(1))
+      .then(roundTrip(1, 1, STOP, 2))
+      .expect(replyAt(st, 1) == RResult(ok(1)) and st.effectStarts.get(1) == 1 and st.replies.length() == 2)
 
   /// mvp §2.4 "Restart": a crash while the effect runs leaves the receipt
   /// `unknown_after_crash`; a retry gets 409 `unknown_after_crash` and the effect never
