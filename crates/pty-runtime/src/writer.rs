@@ -799,8 +799,15 @@ fn write_next_unit(sh: &Shared, input: &mut dyn Write) {
             return;
         }
     }
-    // Dispatch boundary: the first write call's permission.
+    // Dispatch boundary: the first write call's permission. The deadline is part of it,
+    // decided here under the queue lock.
     crate::probe!(sh, Dispatching);
+    if Instant::now() >= not_after {
+        q.settle_slot(WriteOutcome::NotStarted(Refusal::Expired), &mut fired);
+        drop(q);
+        fired.fire(sh);
+        return;
+    }
     let pos = q.input_pos;
     if let Some(s) = q.slot.as_mut() {
         s.dispatched = true;

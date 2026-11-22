@@ -570,8 +570,8 @@ pub enum ProbePoint {
     Permitted,
     /// The drain is about to parse a piece, with the VT lock held.
     PieceParsing,
-    /// The writer is about to grant a unit's first write permission, with the queue lock
-    /// held: every check has passed.
+    /// The writer is about to decide a unit's first write permission, with the queue lock
+    /// held: every check but the final deadline check has passed.
     Dispatching,
 }
 

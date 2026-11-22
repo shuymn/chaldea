@@ -1159,3 +1159,26 @@ fn panic_after_acceptance_marks_the_span_uncertain() {
         "the call wrote more than the prefix"
     );
 }
+
+/// PR2-CL-3 / CL-5: `not_after` is part of the first-permission decision: a unit whose
+/// deadline passes after its recheck and before that permission is refused `Expired`.
+#[test]
+fn deadline_passed_before_first_permission_expires() {
+    for recheck in [false, true] {
+        let r = rig();
+        let probe = r.session.probe();
+        let park = probe.park(ProbePoint::Dispatching);
+        let not_after = Instant::now() + ms(200);
+        let g = Guard {
+            recheck: recheck.then(|| -> chaldea_pty_runtime::Recheck { Box::new(|_| Ok(())) }),
+            ..Guard::until(not_after)
+        };
+        let p = submit(&r.session, key(b"late"), g);
+        assert!(probe.wait(ProbePoint::Dispatching, 1, soon()));
+        // Waiting out the deadline, not ordering threads.
+        std::thread::sleep(not_after.saturating_duration_since(Instant::now()) + ms(20));
+        park.release();
+        assert_refused(&p.wait(), &Refusal::Expired);
+        assert!(r.child.input().is_empty(), "recheck: {recheck}");
+    }
+}
