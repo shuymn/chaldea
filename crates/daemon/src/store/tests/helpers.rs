@@ -183,3 +183,49 @@ pub(crate) fn dump(c: &Connection, table: &str) -> Vec<String> {
     .collect::<Result<_, _>>()
     .unwrap()
 }
+
+/// One-shot gates on `Faults::mark` points: an armed point signals `reached` and blocks
+/// until the test drops its release sender (or 30 s pass).
+#[derive(Clone, Default)]
+pub(crate) struct Gates(Arc<std::sync::Mutex<Vec<Gate>>>);
+
+struct Gate {
+    point: &'static str,
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl Gates {
+    /// Faults whose marks pass through these gates.
+    pub(crate) fn faults(&self) -> Faults {
+        let gates = self.0.clone();
+        Faults {
+            on_point: Some(Box::new(move |point| {
+                let gate = {
+                    let mut g = gates.lock().unwrap();
+                    g.iter().position(|x| x.point == point).map(|i| g.remove(i))
+                };
+                if let Some(gate) = gate {
+                    let _ = gate.reached.send(());
+                    let _ = gate.release.recv_timeout(Duration::from_secs(30));
+                }
+            })),
+            ..Faults::default()
+        }
+    }
+
+    /// Arms `point` once; returns the `reached` receiver and the release sender.
+    pub(crate) fn arm(
+        &self,
+        point: &'static str,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        self.0.lock().unwrap().push(Gate {
+            point,
+            reached: reached_tx,
+            release: release_rx,
+        });
+        (reached_rx, release_tx)
+    }
+}

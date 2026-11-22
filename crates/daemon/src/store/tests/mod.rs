@@ -12,5 +12,6 @@ mod open;
 mod readers;
 mod rebuild;
 mod schema_tests;
+mod shutdown;
 mod triggers;
 mod writer;

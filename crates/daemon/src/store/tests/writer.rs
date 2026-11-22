@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use chaldea_core::ids::StreamId;
 
-use super::helpers::store_with;
+use super::helpers::{Gates, store_with};
 use super::support::{
     batch, bound, launch, new_generation, registered, reserved, soon, started, thread,
 };
@@ -187,26 +187,21 @@ fn commit_failure_with_open_transaction_rolls_back() {
 /// and later submissions fail.
 #[test]
 fn commit_failure_with_ended_transaction_is_unknown() {
-    let faults = Faults::default();
+    let gates = Gates::default();
+    let faults = gates.faults();
     *faults.commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
     let (_dir, s, _) = store_with(faults);
+    // Hold the writer at the start of its failed state: admission must already be refused
+    // when the reply arrives.
+    let (_reached, release) = gates.arm("fail_begin");
     let reply = run(&s, |tx| Ok(tx.append(vec![registered(thread(1), false)])?));
     assert!(
         matches!(reply, Err(WriteError::CommitUnknown(_))),
         "{reply:?}"
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match s.submit(soon(), |_| Ok(())) {
-            Err(SubmitError::Failed) => break,
-            Ok(t) => assert!(matches!(t.blocking_wait(), Err(WriteError::Failed(_)))),
-            Err(e) => panic!("{e:?}"),
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the writer never entered the failed state"
-        );
-    }
+    let next = s.submit(soon(), |_| Ok(())).err();
+    drop(release);
+    assert!(matches!(next, Some(SubmitError::Failed)), "{next:?}");
     // Reads continue; this fault committed for real.
     assert_eq!(count_events(&s), 1);
     shutdown(&s);

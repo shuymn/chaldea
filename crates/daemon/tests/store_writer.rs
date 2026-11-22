@@ -187,3 +187,25 @@ fn full_queue_fails_at_once() {
     }
     assert_eq!(host_head(&s), 2);
 }
+
+/// A job that waits on another job's ticket would wait for its own writer: the wait is
+/// refused at once instead of deadlocking.
+#[test]
+fn waiting_on_a_ticket_inside_a_job_is_refused() {
+    let s = TestStore::new();
+    let store = s.store().clone();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let inner = store.clone();
+        let r = store
+            .submit(soon(), move |_| {
+                let ticket = inner.submit(soon(), |_| Ok(())).unwrap();
+                Ok(ticket.blocking_wait())
+            })
+            .unwrap()
+            .blocking_wait();
+        let _ = tx.send(r);
+    });
+    let r = rx.recv_timeout(WAIT).expect("the outer job returned");
+    assert!(matches!(r, Ok(Err(WriteError::WouldDeadlock))), "{r:?}");
+}

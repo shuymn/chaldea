@@ -4,7 +4,7 @@
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use super::error::{OpenError, StoreError};
 use super::readers::Pool;
 use super::schema::{APPLICATION_ID, FINGERPRINTS, MIGRATIONS};
 use super::writer::{self, Faults, WriterCtx};
-use super::{Inner, Shared, Store, StoreConfig, StorePaths, WriterHandle};
+use super::{Inner, Shared, Store, StoreConfig, StorePaths};
 
 /// Which connection is being set up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,27 +405,19 @@ pub(crate) fn open(cfg: StoreConfig, faults: Arc<Faults>) -> Result<Store, OpenE
     for _ in 0..cfg.readers {
         readers.push(connect(&path, Role::Reader, cfg.busy_timeout)?);
     }
-    let pool = Arc::new(Pool::new(readers));
+    let pool = Arc::new(Pool::new(readers, faults.clone()));
     let (tx, rx) = mpsc::sync_channel(cfg.writer_queue);
-    let shared = Arc::new(Shared {
-        sender: Mutex::new(Some(tx)),
-        failed: AtomicBool::new(false),
-        shutting_down: AtomicBool::new(false),
-    });
+    let shared = Arc::new(Shared::new(tx));
     let (notifier, _) = broadcast::channel(1024);
-    let (readers_done_tx, readers_done_rx) = mpsc::channel();
-    let (exit_tx, exit_rx) = mpsc::channel();
     let join = writer::spawn(WriterCtx {
         conn: Some(conn),
         rx,
-        clock: cfg.clock.clone(),
-        ids: cfg.ids.clone(),
+        clock: cfg.clock,
+        ids: cfg.ids,
         shared: shared.clone(),
         notifier: notifier.clone(),
         faults: faults.clone(),
         projection_version,
-        readers_done: readers_done_rx,
-        exit: exit_tx,
         jobs_run: 0,
         jobs_expired: 0,
     })
@@ -444,14 +436,8 @@ pub(crate) fn open(cfg: StoreConfig, faults: Arc<Faults>) -> Result<Store, OpenE
                 wal: paths_wal.into(),
                 shm: paths_shm.into(),
             },
-            notifier,
-            writer: Mutex::new(Some(WriterHandle {
-                join,
-                readers_done: readers_done_tx,
-                exit: exit_rx,
-            })),
-            writer_report: Mutex::new(None),
-            clock: cfg.clock,
+            notifier: Mutex::new(Some(notifier)),
+            writer: Mutex::new(Some(join)),
             faults,
         }),
     })

@@ -484,3 +484,18 @@ fn oversized_configuration_returns_an_open_error() {
         assert!(!path.exists(), "{what}: the file was created");
     }
 }
+
+/// After shutdown, commit notifications close even while a clone lives.
+#[test]
+fn shutdown_closes_commit_notifications_with_a_live_clone() {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let s = TestStore::new();
+    let clone = s.store().clone();
+    let mut notifications = clone.subscribe();
+    assert!(clone.shutdown(soon()).writer_exited);
+    assert!(matches!(
+        notifications.try_recv(),
+        Err(TryRecvError::Closed)
+    ));
+}

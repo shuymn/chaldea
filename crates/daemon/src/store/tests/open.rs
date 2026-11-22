@@ -172,13 +172,22 @@ fn in_time_shutdown_checkpoints_after_readers() {
     assert!(report.readers_returned, "{report:?}");
     assert!(report.writer_exited, "{report:?}");
     assert_eq!(report.checkpoint, Checkpoint::Complete, "{report:?}");
-    assert_eq!(
-        *s.inner.faults.marks.lock().unwrap(),
-        [
-            "reader_released",
-            "readers_closed",
-            "checkpoint_begin",
-            "checkpoint_end"
-        ]
-    );
+    // The boundaries this claim is about, in the order they were reached.
+    let order = [
+        "reader_released",
+        "readers_closed",
+        "checkpoint_begin",
+        "checkpoint_end",
+    ];
+    let marks: Vec<&str> = s
+        .inner
+        .faults
+        .marks
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .filter(|m| order.contains(m))
+        .collect();
+    assert_eq!(marks, order);
 }

@@ -50,19 +50,27 @@ pub struct Page {
 struct PoolState {
     idle: Vec<Connection>,
     lent: usize,
+    /// Connections not yet closed: idle, lent, or being closed by a drain.
+    open: usize,
     closed: bool,
     drained: bool,
 }
 
 pub(crate) struct Pool {
+    faults: std::sync::Arc<super::writer::Faults>,
     state: Mutex<PoolState>,
     cv: Condvar,
 }
 
 impl Pool {
-    pub(crate) fn new(conns: Vec<Connection>) -> Self {
+    pub(crate) fn new(
+        conns: Vec<Connection>,
+        faults: std::sync::Arc<super::writer::Faults>,
+    ) -> Self {
         Pool {
+            faults,
             state: Mutex::new(PoolState {
+                open: conns.len(),
                 idle: conns,
                 lent: 0,
                 closed: false,
@@ -101,11 +109,13 @@ impl Pool {
         let mut s = lock(&self.state);
         s.lent -= 1;
         if s.drained {
+            drop(s);
             drop(conn);
+            lock(&self.state).open -= 1;
         } else {
             s.idle.push(conn);
+            drop(s);
         }
-        drop(s);
         self.cv.notify_all();
     }
 
@@ -146,11 +156,12 @@ impl Pool {
         self.cv.notify_all();
     }
 
-    /// Waits until every lent connection came back, or the deadline.
-    pub(crate) fn wait_returned(&self, deadline: Instant) -> bool {
+    /// Waits until every connection is closed (lent ones come back and are closed), or the
+    /// deadline. Only meaningful after `drain`.
+    pub(crate) fn wait_closed(&self, deadline: Instant) -> bool {
         let mut s = lock(&self.state);
         loop {
-            if s.lent == 0 {
+            if s.open == 0 {
                 return true;
             }
             let now = Instant::now();
@@ -165,17 +176,23 @@ impl Pool {
         }
     }
 
-    pub(crate) fn lent(&self) -> usize {
-        lock(&self.state).lent
+    /// Connections not yet closed.
+    pub(crate) fn open(&self) -> usize {
+        lock(&self.state).open
     }
 
-    /// Closes every idle connection; one still lent is closed when it comes back.
+    /// Closes every idle connection; one still lent is closed when it comes back. `open`
+    /// counts a connection until it is closed, so a concurrent caller waits for this one.
     pub(crate) fn drain(&self) {
         let mut s = lock(&self.state);
         s.drained = true;
         let idle = std::mem::take(&mut s.idle);
         drop(s);
+        let n = idle.len();
+        self.faults.mark("drain_taken");
         drop(idle);
+        lock(&self.state).open -= n;
+        self.cv.notify_all();
     }
 }
 

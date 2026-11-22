@@ -2,9 +2,10 @@
 //! transaction per job, deadlines decided under the lock, poisoning, the failed state, and
 //! the shutdown checkpoint (`docs/design/event-store.md` §2.2, §5).
 
+use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -105,11 +106,16 @@ pub(crate) struct Faults {
     pub(crate) projection_version: Option<u32>,
     /// Ordered marks of shutdown's call boundaries.
     pub(crate) marks: Mutex<Vec<&'static str>>,
+    /// Called at each mark, after recording it; a test can block there.
+    pub(crate) on_point: Option<Box<dyn Fn(&'static str) + Send + Sync>>,
 }
 
 impl Faults {
     pub(crate) fn mark(&self, what: &'static str) {
         lock(&self.marks).push(what);
+        if let Some(f) = &self.on_point {
+            f(what);
+        }
     }
 }
 
@@ -155,16 +161,38 @@ pub(crate) struct WriterCtx {
     pub(crate) notifier: broadcast::Sender<Committed>,
     pub(crate) faults: Arc<super::writer::Faults>,
     pub(crate) projection_version: u32,
-    pub(crate) readers_done: Receiver<()>,
-    pub(crate) exit: Sender<WriterExit>,
     pub(crate) jobs_run: u64,
     pub(crate) jobs_expired: u64,
+}
+
+thread_local! {
+    /// True on a store writer thread, where waiting on a ticket would wait for itself.
+    static ON_WRITER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the calling thread is a store writer thread (inside a job).
+pub(crate) fn on_writer_thread() -> bool {
+    ON_WRITER.with(Cell::get)
+}
+
+/// Publishes `WriterExit::gone()` if the writer thread ends without a report (a panic
+/// outside a job), so every `shutdown` caller sees the end.
+struct ExitGuard(Arc<Shared>);
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        self.0.publish_exit(WriterExit::gone());
+    }
 }
 
 pub(crate) fn spawn(ctx: WriterCtx) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("store-writer".into())
-        .spawn(move || ctx.run())
+        .spawn(move || {
+            ON_WRITER.with(|w| w.set(true));
+            let _guard = ExitGuard(ctx.shared.clone());
+            ctx.run();
+        })
 }
 
 fn is_busy(e: &rusqlite::Error) -> bool {
@@ -230,7 +258,7 @@ impl WriterCtx {
             }
         }
         // The queue closed (shutdown): wait until the readers are closed, then checkpoint.
-        let _ = self.readers_done.recv();
+        self.shared.wait_readers_closed();
         self.faults.mark("checkpoint_begin");
         let checkpoint = match self.conn.as_ref() {
             None => Checkpoint::NotRun,
@@ -245,26 +273,42 @@ impl WriterCtx {
         };
         self.faults.mark("checkpoint_end");
         drop(self.conn.take());
-        let _ = self.exit.send(WriterExit {
+        self.shared.publish_exit(WriterExit {
             checkpoint,
             jobs_run: self.jobs_run,
             jobs_expired: self.jobs_expired,
         });
+        self.faults.mark("exit_published");
+    }
+
+    /// Publishes the failed state before any reply that ends the writer: from then on no
+    /// clone's `submit` is admitted.
+    fn retire(&self) {
+        let mut sender = lock(&self.shared.sender);
+        self.shared.failed.store(true, Ordering::SeqCst);
+        drop(sender.take());
+    }
+
+    /// Retires the writer, then replies.
+    fn reply_and_fail(&self, job: JobBox, e: WriteError) -> Next {
+        self.retire();
+        job.reply(Err(e));
+        Next::Fail
     }
 
     /// The failed state: the connection is retired, no clone can submit, and every queued
     /// job gets `Failed`; the thread then ends.
     fn fail(mut self) {
-        self.shared.failed.store(true, Ordering::SeqCst);
+        self.faults.mark("fail_begin");
+        self.retire();
         drop(self.conn.take());
-        drop(lock(&self.shared.sender).take());
         while let Ok(job) = self.rx.recv() {
             job.reply(Err(WriteError::Failed(StoreError::Sqlite {
                 extended_code: -1,
                 message: "the store writer is in the failed state".into(),
             })));
         }
-        let _ = self.exit.send(WriterExit {
+        self.shared.publish_exit(WriterExit {
             checkpoint: Checkpoint::NotRun,
             jobs_run: self.jobs_run,
             jobs_expired: self.jobs_expired,
@@ -273,8 +317,7 @@ impl WriterCtx {
 
     fn run_job(&mut self, mut job: JobBox) -> Next {
         let Some(conn) = self.conn.as_ref() else {
-            job.reply(Err(WriteError::WriterGone));
-            return Next::Fail;
+            return self.reply_and_fail(job, WriteError::WriterGone);
         };
         // 1. Expired in the queue.
         if self.clock.now().0 > job.not_after() {
@@ -290,9 +333,11 @@ impl WriterCtx {
                 return Next::Continue;
             }
             let e = StoreError::from(e);
-            let fatal = e.is_fatal();
+            if e.is_fatal() {
+                return self.reply_and_fail(job, WriteError::Failed(e));
+            }
             job.reply(Err(WriteError::Failed(e)));
-            return if fatal { Next::Fail } else { Next::Continue };
+            return Next::Continue;
         }
         // 3. The deadline again, under the lock; recorded_at comes from this read.
         let (now, recorded_at) = self.clock.now();
@@ -303,17 +348,13 @@ impl WriterCtx {
                     count(&self.shared, &mut self.jobs_expired);
                     Next::Continue
                 }
-                Err(e) => {
-                    job.reply(Err(WriteError::Failed(e)));
-                    Next::Fail
-                }
+                Err(e) => self.reply_and_fail(job, WriteError::Failed(e)),
             };
         }
         // 4. Another process may have rebuilt the projections with another `apply`.
         if let Err(e) = check_projection_version(conn, self.projection_version) {
             let _ = rollback(conn);
-            job.reply(Err(WriteError::Failed(e)));
-            return Next::Fail;
+            return self.reply_and_fail(job, WriteError::Failed(e));
         }
         // 5. The closure.
         let mut tx = WriteTx::new(
@@ -330,13 +371,11 @@ impl WriterCtx {
         // 7. Roll back after an error, a panic, or a poisoned WriteTx.
         if poison.is_some() || !matches!(ran, Ran::Ok) {
             if let Err(e) = rollback(conn) {
-                job.reply(Err(WriteError::Failed(e)));
-                return Next::Fail;
+                return self.reply_and_fail(job, WriteError::Failed(e));
             }
             if let Some(e) = poison {
                 if e.is_fatal() {
-                    job.reply(Err(WriteError::Failed(e)));
-                    return Next::Fail;
+                    return self.reply_and_fail(job, WriteError::Failed(e));
                 }
                 job.reply(Err(WriteError::RolledBack(e)));
             } else {
@@ -381,15 +420,9 @@ impl WriterCtx {
                     job.reply(Err(WriteError::RolledBack(e)));
                     Next::Continue
                 }
-                Err(e) => {
-                    job.reply(Err(WriteError::Failed(e)));
-                    Next::Fail
-                }
+                Err(e) => self.reply_and_fail(job, WriteError::Failed(e)),
             },
-            Err(e) => {
-                job.reply(Err(WriteError::CommitUnknown(e)));
-                Next::Fail
-            }
+            Err(e) => self.reply_and_fail(job, WriteError::CommitUnknown(e)),
         }
     }
 }

@@ -26,8 +26,8 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -140,6 +140,10 @@ pub enum WriteError {
     Failed(StoreError),
     /// The writer thread ended without replying: outcome unknown.
     WriterGone,
+    /// `blocking_wait` was called on a store writer thread (inside a job): the ticket's job
+    /// cannot run until the calling job returns, so the wait is refused. The ticket's job
+    /// stays queued and runs later; its result is dropped.
+    WouldDeadlock,
 }
 
 impl fmt::Display for WriteError {
@@ -153,6 +157,9 @@ impl fmt::Display for WriteError {
             WriteError::CommitUnknown(e) => write!(f, "the commit outcome is unknown: {e}"),
             WriteError::Failed(e) => write!(f, "the store writer failed: {e}"),
             WriteError::WriterGone => f.write_str("the writer ended without replying"),
+            WriteError::WouldDeadlock => {
+                f.write_str("a job cannot wait on a ticket: the writer runs one job at a time")
+            }
         }
     }
 }
@@ -206,12 +213,16 @@ impl<R> Future for WriteTicket<R> {
 
 impl<R> WriteTicket<R> {
     /// Waits for the reply. No deadline of its own: the writer replies to every accepted
-    /// job, and a dropped reply is `WriterGone`. Must not be called inside an async runtime.
+    /// job, and a dropped reply is `WriterGone`. Must not be called inside an async runtime;
+    /// inside a job (on a writer thread) it returns `WouldDeadlock` at once.
     ///
     /// # Errors
     ///
     /// The job's [`WriteError`].
     pub fn blocking_wait(self) -> Result<R, WriteError> {
+        if writer::on_writer_thread() {
+            return Err(WriteError::WouldDeadlock);
+        }
         self.0
             .blocking_recv()
             .unwrap_or(Err(WriteError::WriterGone))
@@ -252,15 +263,76 @@ type JobBox = Box<dyn ErasedJob>;
 
 /// State shared by every clone and the writer thread.
 pub(crate) struct Shared {
+    /// The queue sender; taken once, under this lock, by the intake transition (shutdown)
+    /// or by the writer retiring (failed state).
     sender: Mutex<Option<SyncSender<JobBox>>>,
     failed: AtomicBool,
     shutting_down: AtomicBool,
+    /// Shutdown's progress, which every `shutdown` caller and the writer observe.
+    stop: Mutex<Stop>,
+    stop_cv: Condvar,
 }
 
-struct WriterHandle {
-    join: JoinHandle<()>,
-    readers_done: std::sync::mpsc::Sender<()>,
-    exit: Receiver<WriterExit>,
+#[derive(Default)]
+struct Stop {
+    /// Every reader connection was closed (or the first caller's deadline passed).
+    readers_closed: bool,
+    /// The writer's final report; published after it closed its connection.
+    exit: Option<WriterExit>,
+}
+
+impl Shared {
+    pub(crate) fn new(sender: SyncSender<JobBox>) -> Self {
+        Shared {
+            sender: Mutex::new(Some(sender)),
+            failed: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            stop: Mutex::new(Stop::default()),
+            stop_cv: Condvar::new(),
+        }
+    }
+
+    /// Lets the writer checkpoint.
+    fn close_readers(&self) {
+        lock(&self.stop).readers_closed = true;
+        self.stop_cv.notify_all();
+    }
+
+    pub(crate) fn wait_readers_closed(&self) {
+        let mut s = lock(&self.stop);
+        while !s.readers_closed {
+            s = self.stop_cv.wait(s).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Records the writer's report (the first one wins).
+    pub(crate) fn publish_exit(&self, exit: WriterExit) {
+        let mut s = lock(&self.stop);
+        if s.exit.is_none() {
+            s.exit = Some(exit);
+        }
+        drop(s);
+        self.stop_cv.notify_all();
+    }
+
+    /// The writer's report, waiting for it until `deadline`.
+    fn wait_exit(&self, deadline: Instant) -> Option<WriterExit> {
+        let mut s = lock(&self.stop);
+        loop {
+            if let Some(e) = &s.exit {
+                return Some(e.clone());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            s = self
+                .stop_cv
+                .wait_timeout(s, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
 }
 
 struct Inner {
@@ -268,11 +340,10 @@ struct Inner {
     pool: Arc<Pool>,
     epoch: chaldea_core::ids::Epoch,
     paths: StorePaths,
-    notifier: broadcast::Sender<Committed>,
-    writer: Mutex<Option<WriterHandle>>,
-    /// The writer's final report, once `shutdown` received it.
-    writer_report: Mutex<Option<WriterExit>>,
-    clock: Arc<dyn Clock>,
+    /// Taken by shutdown, so subscribers see `Closed` once the writer's clone drops too.
+    notifier: Mutex<Option<broadcast::Sender<Committed>>>,
+    /// Joined only once the thread has finished.
+    writer: Mutex<Option<JoinHandle<()>>>,
     faults: Arc<Faults>,
 }
 
@@ -330,12 +401,14 @@ impl Store {
         R: Send + 'static,
     {
         let shared = &self.inner.shared;
+        let (tx, rx) = oneshot::channel();
+        let job: JobBox = Box::new(TypedJob::new(not_after, job, tx));
+        // Admission is decided under the sender lock, which the writer holds while it
+        // publishes the failed state.
+        let guard = lock(&shared.sender);
         if shared.failed.load(Ordering::SeqCst) {
             return Err(SubmitError::Failed);
         }
-        let (tx, rx) = oneshot::channel();
-        let job: JobBox = Box::new(TypedJob::new(not_after, job, tx));
-        let guard = lock(&shared.sender);
         let Some(sender) = guard.as_ref() else {
             return Err(if shared.failed.load(Ordering::SeqCst) {
                 SubmitError::Failed
@@ -372,46 +445,48 @@ impl Store {
     /// Commit notifications, published after each committed job's reply.
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<Committed> {
-        self.inner.notifier.subscribe()
+        if let Some(n) = lock(&self.inner.notifier).as_ref() {
+            return n.subscribe();
+        }
+        // After shutdown: a receiver that is already closed.
+        broadcast::channel(1).1
     }
 
     /// Stops intake for every clone, drains the queue, waits for lent readers, lets the
-    /// writer checkpoint and exit, and reports what it observed by `deadline` (§5).
+    /// writer checkpoint and exit, and reports what it observed by `deadline` (§5). Any
+    /// clone may call it, concurrently too: each caller waits only until its own deadline.
     pub fn shutdown(&self, deadline: Instant) -> ShutdownReport {
         let inner = &self.inner;
-        inner.shared.shutting_down.store(true, Ordering::SeqCst);
-        // (1) No clone can submit, and the pool lends no more connections.
-        drop(lock(&inner.shared.sender).take());
-        inner.pool.close();
-        // (2) The writer runs the queued jobs meanwhile. (3) Wait for lent readers.
-        let readers_returned = inner.pool.wait_returned(deadline);
-        let readers_abandoned = inner.pool.lent();
-        inner.pool.drain();
-        let mut handle = lock(&inner.writer);
-        if let Some(h) = handle.as_ref() {
-            inner.faults.mark("readers_closed");
-            let _ = h.readers_done.send(());
-        }
-        // (4) The writer checkpoints and exits. (5) Wait for it until the deadline.
-        let mut report = lock(&inner.writer_report);
-        if report.is_none()
-            && let Some(h) = handle.as_ref()
+        // (1) One intake transition: once `submit` refuses, `read` refuses too.
         {
-            let wait = deadline.saturating_duration_since(inner.clock.now().0);
-            match h.exit.recv_timeout(wait) {
-                Ok(exit) => *report = Some(exit),
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    *report = Some(WriterExit::gone());
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            let mut sender = lock(&inner.shared.sender);
+            inner.shared.shutting_down.store(true, Ordering::SeqCst);
+            drop(sender.take());
+            inner.pool.close();
+        }
+        drop(lock(&inner.notifier).take());
+        inner.faults.mark("intake_closed");
+        // (2) The writer runs the queued jobs meanwhile. (3) Close every reader connection:
+        // idle ones now, lent ones as they come back; wait until all are closed.
+        inner.pool.drain();
+        let readers_returned = inner.pool.wait_closed(deadline);
+        let readers_abandoned = inner.pool.open();
+        if readers_returned {
+            inner.faults.mark("readers_closed");
+        }
+        inner.shared.close_readers();
+        // (4) The writer checkpoints and exits. (5) Wait for its report until the deadline.
+        let exit = inner.shared.wait_exit(deadline);
+        let writer_exited = exit.is_some();
+        if writer_exited {
+            let mut w = lock(&inner.writer);
+            if w.as_ref().is_some_and(JoinHandle::is_finished)
+                && let Some(h) = w.take()
+            {
+                let _ = h.join();
             }
         }
-        let writer_exited = report.is_some();
-        if writer_exited && let Some(h) = handle.take() {
-            // The writer sent its report as its last act or ended; the join is immediate.
-            let _ = h.join.join();
-        }
-        let exit = report.clone().unwrap_or_else(WriterExit::not_reached);
+        let exit = exit.unwrap_or_else(WriterExit::not_reached);
         ShutdownReport {
             readers_returned,
             readers_abandoned,
@@ -425,10 +500,14 @@ impl Store {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // The last clone went away without `shutdown`: stop intake and let the writer finish
-        // on its own (its `readers_done` sender drops with the handle).
-        drop(lock(&self.shared.sender).take());
-        self.pool.close();
+        // The last clone went away without `shutdown`: stop intake, close the readers, and
+        // let the writer finish on its own.
+        {
+            let mut sender = lock(&self.shared.sender);
+            drop(sender.take());
+            self.pool.close();
+        }
         self.pool.drain();
+        self.shared.close_readers();
     }
 }
