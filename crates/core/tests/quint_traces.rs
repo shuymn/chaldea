@@ -6,8 +6,10 @@
 //! model's mirror of the reducers gave: acceptance and, for `reduce`, the `StatusChanged`
 //! output. After every step this test checks that the real functions agree on each call,
 //! that the thread state and every input state equal the model's, and that `gate` on the
-//! step's projection gives the model's decision. A reducer that drifts from the spec fails
-//! here; `npm run traces:check` in `specs/` keeps the traces equal to the spec.
+//! step's projection gives the model's decision. It guards only the branches the traces
+//! record: a reducer branch, gate reason, or rejection no trace reaches is the job of the
+//! `proptest` suites (`input_step.rs`, `state_reduce.rs`). `pnpm run traces:check` in
+//! `specs/` keeps the traces equal to the spec.
 
 #![allow(
     clippy::disallowed_methods,
