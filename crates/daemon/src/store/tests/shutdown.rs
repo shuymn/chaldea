@@ -20,6 +20,90 @@ fn in_thread(s: &Store, deadline: Duration) -> mpsc::Receiver<ShutdownReport> {
     rx
 }
 
+/// Sets the fault from inside a running job, so the writer panics right after it, outside
+/// any job, and publishes its exit on its own.
+fn end_writer_on_its_own(s: &Store) {
+    let faults = s.inner.faults.clone();
+    s.submit(soon(), move |_| {
+        faults
+            .panic_outside_job
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap()
+    .blocking_wait()
+    .unwrap();
+}
+
+/// Waits (bounded) until the writer has published its exit.
+fn wait_for_exit(s: &Store) {
+    let deadline = Instant::now() + WAIT;
+    while crate::store::lock(&s.inner.shared.stop).exit.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the writer never published its exit"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// Has a job install a thread-local on the writer thread whose destructor signals entry
+/// and then blocks (bounded) until released; returns the entry receiver and the release
+/// sender.
+fn hold_writer_teardown(s: &Store) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+    use std::cell::RefCell;
+
+    struct Held {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv_timeout(Duration::from_secs(30));
+        }
+    }
+    thread_local! {
+        static HELD: RefCell<Option<Held>> = const { RefCell::new(None) };
+    }
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    s.submit(soon(), move |_| {
+        HELD.with(|h| {
+            *h.borrow_mut() = Some(Held {
+                entered: entered_tx,
+                release: release_rx,
+            });
+        });
+        Ok(())
+    })
+    .unwrap()
+    .blocking_wait()
+    .unwrap();
+    (entered_rx, release_tx)
+}
+
+/// Waits (bounded) until the writer thread's main function has returned, while the store
+/// still holds its handle.
+fn wait_for_finished_writer(s: &Store) {
+    let deadline = Instant::now() + WAIT;
+    while !s
+        .inner
+        .writer
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(std::thread::JoinHandle::is_finished)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the writer's main never returned"
+        );
+        std::thread::yield_now();
+    }
+}
+
 /// When `submit` reports `Closed`, `read` does too: intake closes in one transition.
 #[test]
 fn intake_closes_for_submit_and_read_together() {
@@ -137,22 +221,12 @@ fn reported_writer_exit_has_closed_notifications() {
 /// intake and finishing: a later call that reports the exit finds notifications closed.
 #[test]
 fn later_report_of_an_early_writer_exit_has_closed_notifications() {
-    use std::sync::atomic::Ordering;
     use tokio::sync::broadcast::error::TryRecvError;
 
     let gates = Gates::default();
     let (_dir, s) = store_with(gates.faults());
     let mut notifications = s.subscribe();
-    // Set from inside a running job, so the writer panics right after it, outside any job,
-    // and publishes its exit.
-    let faults = s.inner.faults.clone();
-    s.submit(soon(), move |_| {
-        faults.panic_outside_job.store(true, Ordering::SeqCst);
-        Ok(())
-    })
-    .unwrap()
-    .blocking_wait()
-    .unwrap();
+    end_writer_on_its_own(&s);
     let (reached, release) = gates.arm("intake_transition");
     let a = in_thread(&s, Duration::from_secs(30));
     reached.recv_timeout(WAIT).expect("the owner closed intake");
@@ -209,16 +283,254 @@ fn later_call_reports_only_progress_by_its_deadline() {
     let b = in_thread(&s, Duration::from_millis(300));
     waited.recv_timeout(WAIT).expect("the later call timed out");
     drop(release_writer);
-    let deadline = Instant::now() + WAIT;
-    while crate::store::lock(&s.inner.shared.stop).exit.is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "the writer never published its exit"
-        );
-        std::thread::yield_now();
-    }
+    wait_for_exit(&s);
     drop(release_b);
     let b = b.recv_timeout(WAIT).expect("the later call returns");
     assert!(!b.writer_exited, "{b:?}");
     assert_eq!(b.checkpoint, crate::store::Checkpoint::NotRun, "{b:?}");
+}
+
+/// The owner closes notifications outside the intake locks: a receiver's waker, run inline
+/// when the last notification sender drops, can take the queue-sender lock (as `submit`
+/// does) and the shutdown-state lock without waiting for the owner.
+#[test]
+fn closing_notifications_leaves_the_intake_locks_free() {
+    use std::future::Future;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Wake, Waker};
+
+    use crate::store::Shared;
+
+    struct Probe {
+        shared: Arc<Shared>,
+        result: Mutex<mpsc::Sender<(bool, bool)>>,
+    }
+    impl Wake for Probe {
+        fn wake(self: Arc<Self>) {
+            let sender = self.shared.sender.try_lock().is_ok();
+            let stop = self.shared.stop.try_lock().is_ok();
+            let _ = self.result.lock().unwrap().send((sender, stop));
+        }
+    }
+
+    let gates = Gates::default();
+    let (_dir, s) = store_with(gates.faults());
+    let mut notifications = s.subscribe();
+    let (result_tx, result_rx) = mpsc::channel();
+    let waker = Waker::from(Arc::new(Probe {
+        shared: s.inner.shared.clone(),
+        result: Mutex::new(result_tx),
+    }));
+    let mut recv = Box::pin(notifications.recv());
+    assert!(
+        recv.as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    // The writer ends on its own and drops its notification sender, so the owner's drop of
+    // the store's sender is the last one and wakes the receiver inline. The writer stays
+    // held at its last step until the probe ran, so its own use of the shutdown-state lock
+    // cannot meet the probe.
+    let (exiting, release) = gates.arm("writer_exiting");
+    end_writer_on_its_own(&s);
+    exiting
+        .recv_timeout(WAIT)
+        .expect("the writer dropped its sender");
+    let owner = in_thread(&s, Duration::from_secs(5));
+    let (sender_free, stop_free) = result_rx
+        .recv_timeout(WAIT)
+        .expect("the receiver was woken");
+    drop(release);
+    let report = owner.recv_timeout(WAIT).expect("the owner returns");
+    assert!(sender_free, "the waker found the queue-sender lock held");
+    assert!(stop_free, "the waker found the shutdown-state lock held");
+    assert!(report.writer_exited, "{report:?}");
+    assert!(matches!(
+        recv.as_mut().poll(&mut Context::from_waker(&waker)),
+        Poll::Ready(Err(_))
+    ));
+}
+
+/// An owner whose exit wait timed out detaches the writer's handle even once the thread's
+/// main function has returned: it does not wait in `join` for thread-local destructors.
+#[test]
+fn timed_out_owner_detaches_a_finished_writer() {
+    let gates = Gates::default();
+    let (_dir, s) = store_with(gates.faults());
+    let (entered_rx, release_dtor) = hold_writer_teardown(&s);
+    let (exiting, release_writer) = gates.arm("writer_exiting");
+    let (waited, release_owner) = gates.arm("owner_waited");
+    let a = in_thread(&s, Duration::from_millis(300));
+    exiting
+        .recv_timeout(WAIT)
+        .expect("the writer is held at its last step");
+    waited
+        .recv_timeout(WAIT)
+        .expect("the owner's exit wait timed out");
+    drop(release_writer);
+    entered_rx
+        .recv_timeout(WAIT)
+        .expect("the writer runs its thread-local destructor");
+    wait_for_finished_writer(&s);
+    drop(release_owner);
+    let a = a.recv_timeout(Duration::from_secs(5));
+    drop(release_dtor);
+    let a = a.expect("the owner returns without joining the writer");
+    let kept = s.inner.writer.lock().unwrap().is_some();
+    assert!(!a.writer_exited, "{a:?}");
+    assert!(!kept, "the owner left the writer's handle in the store");
+}
+
+/// A later call that reaches the shared state only after its deadline, by when both reports
+/// have been published, still leaves out what was published after its deadline.
+#[test]
+fn later_call_past_its_deadline_leaves_out_late_reports() {
+    let gates = Gates::default();
+    let (_dir, s) = store_with(gates.faults());
+    let (exiting, release_writer) = gates.arm("writer_exiting");
+    let a = in_thread(&s, Duration::from_millis(300))
+        .recv_timeout(WAIT)
+        .expect("the owner returns by its deadline");
+    assert!(!a.writer_exited, "{a:?}");
+    exiting
+        .recv_timeout(WAIT)
+        .expect("the writer is held at its last step");
+    // The later call's deadline has passed before the writer publishes its exit.
+    let (begun, release_b) = gates.arm("observe_begin");
+    let b = in_thread(&s, Duration::ZERO);
+    begun
+        .recv_timeout(WAIT)
+        .expect("the later call is about to observe");
+    drop(release_writer);
+    wait_for_exit(&s);
+    drop(release_b);
+    let b = b.recv_timeout(WAIT).expect("the later call returns");
+    assert!(!b.writer_exited, "{b:?}");
+    assert_eq!(b.checkpoint, crate::store::Checkpoint::NotRun, "{b:?}");
+}
+
+/// The writer ended on its own while the owner has claimed the shutdown but not yet closed
+/// notifications: a later call does not report the exit, since a receiver is still open.
+#[test]
+fn later_call_waits_for_the_notification_close_to_report_the_exit() {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let gates = Gates::default();
+    let (_dir, s) = store_with(gates.faults());
+    let mut notifications = s.subscribe();
+    end_writer_on_its_own(&s);
+    wait_for_exit(&s);
+    let (claimed, release) = gates.arm("owner_claimed");
+    let a = in_thread(&s, Duration::from_secs(30));
+    claimed
+        .recv_timeout(WAIT)
+        .expect("the owner claimed shutdown");
+    let b = in_thread(&s, Duration::from_millis(300))
+        .recv_timeout(WAIT)
+        .expect("a later call returns by its deadline");
+    let notification = notifications.try_recv();
+    drop(release);
+    let a = a.recv_timeout(WAIT).expect("the owner returns");
+    assert!(
+        !b.writer_exited || matches!(notification, Err(TryRecvError::Closed)),
+        "{b:?}, notification {notification:?}"
+    );
+    assert!(a.writer_exited, "{a:?}");
+}
+
+/// A later call held past its deadline while the owner then closes notifications: the
+/// writer's exit was published in time, but the close was not, so the exit is left out.
+#[test]
+fn later_call_leaves_out_a_notification_close_after_its_deadline() {
+    let gates = Gates::default();
+    let (_dir, s) = store_with(gates.faults());
+    end_writer_on_its_own(&s);
+    wait_for_exit(&s);
+    let (claimed, release_a) = gates.arm("owner_claimed");
+    let a = in_thread(&s, Duration::from_secs(30));
+    claimed
+        .recv_timeout(WAIT)
+        .expect("the owner claimed shutdown");
+    let (begun, release_b) = gates.arm("observe_begin");
+    let b = in_thread(&s, Duration::ZERO);
+    begun
+        .recv_timeout(WAIT)
+        .expect("the later call is about to observe");
+    drop(release_a);
+    let a = a.recv_timeout(WAIT).expect("the owner returns");
+    drop(release_b);
+    let b = b.recv_timeout(WAIT).expect("the later call returns");
+    assert!(a.writer_exited, "{a:?}");
+    assert!(!b.writer_exited, "{b:?}");
+}
+
+/// A later call held past its deadline while the owner then publishes its report: the
+/// owner's reader outcome is left out.
+#[test]
+fn later_call_leaves_out_an_owner_report_after_its_deadline() {
+    let gates = Gates::default();
+    let (_dir, s) = store_with(gates.faults());
+    end_writer_on_its_own(&s);
+    wait_for_exit(&s);
+    let (closed, release_a) = gates.arm("intake_transition");
+    let a = in_thread(&s, Duration::from_secs(30));
+    closed
+        .recv_timeout(WAIT)
+        .expect("the owner closed notifications");
+    let (begun, release_b) = gates.arm("observe_begin");
+    let b = in_thread(&s, Duration::ZERO);
+    begun
+        .recv_timeout(WAIT)
+        .expect("the later call is about to observe");
+    drop(release_a);
+    let a = a.recv_timeout(WAIT).expect("the owner returns");
+    drop(release_b);
+    let b = b.recv_timeout(WAIT).expect("the later call returns");
+    assert!(a.readers_returned, "{a:?}");
+    assert!(!b.readers_returned, "{b:?}");
+}
+
+/// An owner whose writer reported in time returns by its deadline with the exit, without
+/// waiting for the thread's teardown: a thread-local destructor the job installed is still
+/// running when the owner returns.
+#[test]
+fn owner_detaches_a_reported_writer_still_tearing_down() {
+    let gates = Gates::default();
+    let (_dir, s) = store_with(gates.faults());
+    let (entered, release_dtor) = hold_writer_teardown(&s);
+    let (waited, release_owner) = gates.arm("owner_waited");
+    let a_deadline = Instant::now() + WAIT;
+    let a = in_thread(&s, WAIT);
+    waited
+        .recv_timeout(WAIT)
+        .expect("the owner's exit wait ended");
+    entered
+        .recv_timeout(WAIT)
+        .expect("the writer runs its thread-local destructor");
+    wait_for_finished_writer(&s);
+    drop(release_owner);
+    let a = a.recv_timeout(a_deadline.saturating_duration_since(Instant::now()));
+    let kept = s.inner.writer.lock().unwrap().is_some();
+    drop(release_dtor);
+    let a = a.expect("the owner returns by its deadline");
+    assert!(a.writer_exited, "{a:?}");
+    assert!(!kept, "the owner left the writer's handle in the store");
+}
+
+/// The owner, held after releasing the writer until past its deadline, leaves out a writer
+/// report published after that deadline, as every later caller does.
+#[test]
+fn owner_leaves_out_a_writer_report_after_its_deadline() {
+    let gates = Gates::default();
+    let (_dir, s) = store_with(gates.faults());
+    let (released, release_owner) = gates.arm("writer_released");
+    let a = in_thread(&s, Duration::ZERO);
+    released
+        .recv_timeout(WAIT)
+        .expect("the owner released the writer");
+    wait_for_exit(&s);
+    drop(release_owner);
+    let a = a.recv_timeout(WAIT).expect("the owner returns");
+    assert!(!a.writer_exited, "{a:?}");
+    assert_eq!(a.checkpoint, crate::store::Checkpoint::NotRun, "{a:?}");
 }
