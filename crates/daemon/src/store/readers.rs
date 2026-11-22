@@ -921,10 +921,17 @@ impl<'a> ReadTx<'a> {
     /// # Errors
     ///
     /// A store error.
-    pub fn surface(&self, s: &SurfaceId) -> Result<Option<SurfaceRow>, StoreError> {
+    pub fn surface(
+        &self,
+        stream: StreamId,
+        s: &SurfaceId,
+    ) -> Result<Option<SurfaceRow>, StoreError> {
         self.guard(|| {
             Ok(self
-                .surface_rows("WHERE surface_id = ?1", [s.0.clone()])?
+                .surface_rows(
+                    "WHERE stream_id = ?1 AND surface_id = ?2",
+                    [stream.to_string(), s.0.clone()],
+                )?
                 .pop())
         })
     }

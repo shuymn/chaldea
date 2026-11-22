@@ -22,7 +22,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[V1];
 /// in the order of `MIGRATIONS`. `schema_tests::shipped_fingerprints_match_the_migrations`
 /// recomputes them, so a DDL edit without a migration fails a test.
 pub(crate) const FINGERPRINTS: &[&str] =
-    &["c9c5a420e8924feb117918ad67de0138bc50381fe84e100b92fe3168c4d0d7b9"];
+    &["5edc542e0d4bec60b31ea9bb397bde06bae509e4366ac30c27fffdb9a812f536"];
 
 const V1: &str = r#"
 CREATE TABLE meta (
@@ -405,13 +405,14 @@ CREATE TABLE proj_approvals (
 ) STRICT;
 
 CREATE TABLE proj_surfaces (
-  surface_id  TEXT PRIMARY KEY,
   stream_id   TEXT NOT NULL,
+  surface_id  TEXT NOT NULL,
   scope_kind  TEXT NOT NULL CHECK (scope_kind IN ('host', 'workspace', 'thread')),
   scope_id    TEXT,
   payload     TEXT NOT NULL CHECK (json_valid(payload)),
   updated_seq INTEGER NOT NULL CHECK (updated_seq >= 1),
-  CHECK ((scope_kind = 'host' AND scope_id IS NULL) OR (scope_kind <> 'host' AND scope_id IS NOT NULL))
+  CHECK ((scope_kind = 'host' AND scope_id IS NULL) OR (scope_kind <> 'host' AND scope_id IS NOT NULL)),
+  PRIMARY KEY (stream_id, surface_id)
 ) STRICT;
 
 CREATE TABLE proj_worktrees (

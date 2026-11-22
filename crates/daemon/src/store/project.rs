@@ -390,9 +390,11 @@ pub(crate) fn apply(p: &mut ProjectionTx<'_>, e: &StoredEvent) -> Result<(), Sto
         }
         TypedEvent::SurfaceUpdate(s) => {
             if s.components.is_empty() {
+                // A surface belongs to the stream whose events record it, so an update on one
+                // stream never changes another stream's surface of the same id.
                 p.exec(
-                    "DELETE FROM proj_surfaces WHERE surface_id = ?1",
-                    [s.surface_id.0.clone()],
+                    "DELETE FROM proj_surfaces WHERE stream_id = ?1 AND surface_id = ?2",
+                    [env.stream_id.to_string(), s.surface_id.0.clone()],
                 )?;
             } else {
                 let (kind, id) = match &s.scope {
@@ -405,7 +407,7 @@ pub(crate) fn apply(p: &mut ProjectionTx<'_>, e: &StoredEvent) -> Result<(), Sto
                 p.exec(
                     "INSERT INTO proj_surfaces (surface_id, stream_id, scope_kind, scope_id, payload, updated_seq)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT (surface_id) DO UPDATE SET stream_id = excluded.stream_id,
+                     ON CONFLICT (stream_id, surface_id) DO UPDATE SET
                        scope_kind = excluded.scope_kind, scope_id = excluded.scope_id,
                        payload = excluded.payload, updated_seq = excluded.updated_seq",
                     rusqlite::params![s.surface_id.0, env.stream_id.to_string(), kind, id, to_json(s)?, seq],

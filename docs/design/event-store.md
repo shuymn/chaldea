@@ -481,7 +481,7 @@ With `recursive_triggers=ON` the delete triggers also refuse `REPLACE` on these 
 | `proj_launches` | `launch_id` | `thread_id` (FK), `reserved_seq`, `expected_previous`, `agent`, `argv_digest`, `manual`, `worktree_id`, `pid`, `start_time`, `pgid_or_job`, `cli_version`, `exit_code`, `exit_signal`, `exit_reason`, `death_confirmed`, `death_method`, `session_id`; gate evidence: `readiness_seq`, `readiness_evidence`, `write_basis` (the annex JSON), `last_write_seq`, `last_human_write_seq`, `last_turn_start_seq` |
 | `proj_inputs` | `input_id` | `thread_id`, `launch_id`, `state`, `text` (`Content` JSON), `encoding`, `origin`, `created_by`, `sent_after_seq`, `ack_seq`, `created_seq` |
 | `proj_approvals` | `approval_id` | `thread_id`, `launch_id`, `requested` (payload JSON), `opened_seq`, `outcome`, `resolved_seq` |
-| `proj_surfaces` | `surface_id` | `stream_id`, `scope_kind`, `scope_id`, `payload` (the update's JSON), `updated_seq` |
+| `proj_surfaces` | `(stream_id, surface_id)` | `scope_kind`, `scope_id`, `payload` (the update's JSON), `updated_seq` |
 | `proj_worktrees` | `worktree_id` | `record` (`WorktreeChanged` JSON), `state`, `owner_thread_id`, `workspace_id`, `updated_seq` |
 | `proj_transcript_cursors` | `thread_id` | `generation`, `path`, `file_id`, `event_offset`, `event_continuity`, `read_offset`, `read_continuity`; `CHECK (read_offset >= event_offset)` |
 
@@ -536,7 +536,7 @@ pub(crate) struct StoredEvent { pub envelope: EventEnvelope, pub occurred_explic
 | `approval_requested` / `approval_resolved` | insert the card / set `outcome`, `resolved_seq` (only from `outcome IS NULL`) |
 | `input_created` | insert the input with `state = initial_state`, `launch_id` from the payload (may be null) |
 | `input_state_changed` | `state = to` by `UPDATE … WHERE state = from` (one row, else error); `sent_after_seq` when set; for `to = sending`: the input's `launch_id = COALESCE(launch_id, envelope launch_id)` (error if both are null) and that launch's `last_write_seq = seq` |
-| `surface_update` | upsert the surface; empty `components` deletes it (scope and stream agree by `CHECK`, §2.4) |
+| `surface_update` | upsert the surface of the event's stream; empty `components` deletes it (scope and stream agree by `CHECK`, §2.4). A surface's identity is `(stream_id, surface_id)`, so an update on one stream never changes or removes another stream's surface of the same id, and every change a snapshot shows is an event of that snapshot's stream |
 | `worktree_changed` | upsert the record |
 | `mailbox_message`, `assistant_message`, `tool_activity`, `vt_snapshot_taken`, `raw_unknown` | none (read from `events` by kind) |
 
@@ -602,7 +602,7 @@ impl ReadTx<'_> {
     pub fn inputs(&self, t: ThreadId, states: &[InputState]) -> Result<Vec<InputRow>, StoreError>;
     pub fn approval(&self, a: ApprovalId) -> Result<Option<ApprovalRow>, StoreError>;
     pub fn open_approvals(&self, t: ThreadId) -> Result<Vec<ApprovalRow>, StoreError>;
-    pub fn surface(&self, s: &SurfaceId) -> Result<Option<SurfaceRow>, StoreError>;
+    pub fn surface(&self, stream: StreamId, s: &SurfaceId) -> Result<Option<SurfaceRow>, StoreError>;
     pub fn worktree(&self, w: &WorktreeId) -> Result<Option<WorktreeRow>, StoreError>;
     pub fn worktrees(&self) -> Result<Vec<WorktreeRow>, StoreError>;
     pub fn transcript_cursor(&self, t: ThreadId) -> Result<Option<TranscriptCursor>, StoreError>;

@@ -261,7 +261,7 @@ fn lookups_smoke() {
         assert_eq!(r.inputs(t, &[InputState::Sent])?.len(), 0);
         assert_eq!(r.approval(a)?.unwrap().requested, requested);
         assert_eq!(r.open_approvals(t)?.len(), 1);
-        let sr = r.surface(&SurfaceId("panel".into()))?.unwrap();
+        let sr = r.surface(st, &SurfaceId("panel".into()))?.unwrap();
         assert_eq!((sr.stream_id, &sr.update), (st, &surface));
         assert_eq!(r.worktree(&w2)?.unwrap().record.owner_thread_id, Some(t));
         assert_eq!(r.worktrees()?.len(), 1);
@@ -272,4 +272,49 @@ fn lookups_smoke() {
         assert!(r.integrity_check(10)?.is_empty());
         Ok(())
     });
+}
+
+/// An update on a thread stream never changes a host surface of the same id: the host
+/// snapshot is unchanged or the host stream records the change.
+#[test]
+fn host_surface_removal_is_visible_in_host_replay() {
+    let s = TestStore::new();
+    let t = thread(1);
+    let mut panel = SurfaceUpdate {
+        surface_id: SurfaceId("panel".into()),
+        scope: SurfaceScope::Host,
+        components: vec![Component::Text { text: "hi".into() }],
+    };
+    s.append(vec![
+        registered(t, false),
+        event(
+            StreamId::Host,
+            "panel",
+            TypedEvent::SurfaceUpdate(panel.clone()),
+        ),
+    ])
+    .unwrap();
+    #[expect(
+        clippy::redundant_closure_for_method_calls,
+        reason = "the method path is not general over the ReadTx lifetime"
+    )]
+    let (before, head) = s.read(|r| r.host_snapshot());
+    assert_eq!(before.surfaces.len(), 1);
+
+    panel.scope = SurfaceScope::Thread { thread_id: t };
+    panel.components.clear();
+    let change = s.append(vec![event(
+        StreamId::Thread(t),
+        "remove-panel",
+        TypedEvent::SurfaceUpdate(panel),
+    )]);
+    if change.is_ok() {
+        let (after, page) = s.read(|r| {
+            Ok((
+                r.host_snapshot()?.0,
+                r.events_after(StreamId::Host, head, 10)?,
+            ))
+        });
+        assert!(after.surfaces == before.surfaces || !page.events.is_empty());
+    }
 }
