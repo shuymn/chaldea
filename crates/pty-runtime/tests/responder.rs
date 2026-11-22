@@ -227,7 +227,7 @@ fn overflow_is_reported() {
     hold.release();
     a.wait();
     assert!(wait_until(|| r.child.writes().len() == 65));
-    assert_eq!(r.session.status().responder.written, 64);
+    assert_eq!(r.session.status().responder.dispatched, 64);
 }
 
 /// PR2-CL-11: replies queued when the child exits, and new ones after, are discarded and
@@ -251,7 +251,7 @@ fn replies_after_exit_are_discarded() {
     assert_eq!(a.wait().outcome, WriteOutcome::Written);
     let st = r.session.status();
     assert_eq!(st.responder.dropped_after_end, 4);
-    assert_eq!(st.responder.written, 0);
+    assert_eq!(st.responder.dispatched, 0);
     assert_eq!(r.child.writes(), vec![b"A".to_vec()]);
     assert!(reply_records(&r).is_empty());
 }
@@ -291,7 +291,7 @@ fn queued_reply_is_counted_on_input_breakage() {
     assert!(matches!(a.wait().outcome, WriteOutcome::Incomplete { .. }));
     assert!(r.events.wait(|e| matches!(e, SessionEvent::InputBroken(_))));
     let st = r.session.status().responder;
-    assert_eq!((st.dropped_after_end, st.written), (1, 0));
+    assert_eq!((st.dropped_after_end, st.dispatched), (1, 0));
     assert!(r.child.writes().is_empty());
     assert!(reply_records(&r).is_empty());
 }

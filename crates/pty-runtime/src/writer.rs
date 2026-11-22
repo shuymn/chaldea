@@ -720,7 +720,7 @@ fn write_reply(sh: &Shared, input: &mut dyn Write) {
         });
         (seq, r.bytes)
     };
-    sh.responder.written.fetch_add(1, Ordering::Relaxed);
+    sh.responder.dispatched.fetch_add(1, Ordering::Relaxed);
     write_parts(sh, input, seq, &[Part::Bytes(bytes)]);
 }
 

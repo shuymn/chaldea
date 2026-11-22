@@ -164,7 +164,7 @@ proptest! {
         for p in &pending {
             p.wait();
         }
-        prop_assert!(wait_until(|| r.session.status().responder.written >= queries
+        prop_assert!(wait_until(|| r.session.status().responder.dispatched >= queries
             && r.session.writes_after(0).unwrap().iter().all(|x| x.outcome != WriteOutcome::InProgress)));
         let recs = r.session.writes_after(0).unwrap();
         prop_assert_eq!(recs.len() as u64, pending.len() as u64 + queries);

@@ -134,8 +134,9 @@ pub struct VtUnavailable;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ResponderStatus {
-    /// Replies dispatched to the PTY.
-    pub written: u64,
+    /// Replies dispatched: given their write permission. Delivery is in each reply's
+    /// record (`writes_after`): a dispatched reply can still fail in the backend.
+    pub dispatched: u64,
     /// Replies the lane could not hold.
     pub dropped_overflow: u64,
     /// Replies discarded after exit, input breakage, or close.
@@ -180,7 +181,7 @@ pub struct Released {
 
 #[derive(Default)]
 pub(crate) struct ResponderCounters {
-    pub(crate) written: AtomicU64,
+    pub(crate) dispatched: AtomicU64,
     pub(crate) dropped_overflow: AtomicU64,
     pub(crate) dropped_after_end: AtomicU64,
 }
@@ -798,7 +799,7 @@ impl Session {
             input_broken: self.sh.input_broken.load(Ordering::Acquire),
             vt_failed,
             responder: ResponderStatus {
-                written: r.written.load(Ordering::Relaxed),
+                dispatched: r.dispatched.load(Ordering::Relaxed),
                 dropped_overflow: r.dropped_overflow.load(Ordering::Relaxed),
                 dropped_after_end: r.dropped_after_end.load(Ordering::Relaxed),
                 stopped: vt_failed,
