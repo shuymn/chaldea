@@ -11,6 +11,7 @@ const INVARIANTS = [
   "sendingAtMostOnce",
   "writtenAtMostOnce",
   "sendingOnlyThroughOpenGate",
+  "dispatchOnlyThroughRecheck",
   "oneInFlightPerLaunch",
   "earlierLaunchesNeverBlock",
   "terminalStatesImmutable",
@@ -18,6 +19,8 @@ const INVARIANTS = [
   "unconfirmedAttentionIff",
   "gateTimeoutOnlyWhileQueued",
   "noStartupCauseAfterBindOrExit",
+  "stallOnlyForUpgradedCodex",
+  "openCardsAwaitApproval",
   "lateResolutionChangesNothing",
   "restartRecovers",
   "exitedLaunchHasNoPendingInput",
@@ -27,6 +30,7 @@ const INVARIANTS = [
   "exitedTurnUnknown",
   "taskOnlyByTaskSet",
   "gateEvidenceIsBound",
+  "openGateEvidenceOfCurrentTurn",
   "supervisorInputsAccepted",
 ];
 
@@ -40,6 +44,9 @@ const WITNESSES = [
   "witnessPositionalAcked",
   "witnessResumeBlocked",
   "witnessOpenAfterEarlierUnconfirmed",
+  "witnessBufferedPromotion",
+  "witnessLateResolutionBesideOpenCard",
+  "witnessTwoCardsOpen",
 ];
 
 // The seeds run in parallel, one Node process each.

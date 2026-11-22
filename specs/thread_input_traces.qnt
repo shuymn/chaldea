@@ -2,24 +2,33 @@
 /**
  * Named deterministic traces of `thread_input` (docs/design/formal-specs.md "Trace
  * bridge"). Each `trace_*` run is exported as ITF to `specs/traces/` and replayed against
- * the real reducers by crates/core/tests/quint_traces.rs. `trace_hole_*` and
- * `trace_finding_*` runs reach a state that a contract invariant forbids, or a gap in it,
- * using inputs the reducers accept; each ends with an `expect` that states the gap.
+ * the real reducers by crates/core/tests/quint_traces.rs.
+ *
+ * - `trace_refused_*` runs end where the contract refuses a race a reviewer found: the
+ *   writer's recheck cancels the input, or no readiness evidence is admitted.
+ * - `trace_coverage_*` runs reach reducer and gate branches the other traces shadow.
+ * - `trace_hole_*` and `trace_finding_*` runs reach a state that a contract invariant
+ *   forbids, or a gap in it, using inputs the reducers accept; each ends with an `expect`
+ *   that states the gap (docs/design/formal-specs.md §3).
  */
 module thread_input_traces {
   import thread_input.* from "./thread_input"
 
-  // A bound, running launch with readiness evidence (Claude: bracketed paste, 2004 on).
+  pure val CODEX: LaunchConfig = { adapter: CodexPositional, mode: StopSettle, needsBracketedPaste: false, upgraded: true }
+
+  // A bound, running Claude launch with `SessionStart` evidence (bracketed paste, 2004 on).
   run readyLaunch =
     initWith(true)
-      .then(reserve(false, false, true))
+      .then(reserve(CLAUDE))
       .then(spawn)
       .then(decset(true))
+      .then(sessionStartHook)
       .then(bind)
       .then(ready(SessionStart))
       .expect(last.gate == Open)
 
-  /// mvp §2.3: gate open -> sending -> dispatched -> sent -> attributed ack.
+  /// mvp §2.3: gate open -> sending -> dispatched -> sent -> attributed ack; the turn's
+  /// `Stop` and its settle evidence reopen the gate.
   run trace_send_ack =
     readyLaunch
       .then(send(1))
@@ -45,9 +54,25 @@ module thread_input_traces {
       .then(outcome(1, true))
       .expect(stateOf(st, 1) == Acked)
 
+  /// mvp §2.3 "Ack": a same-text hook before the input dispatched is a `user_message`; it
+  /// leaves no candidate, so the hook after the dispatch acks the input.
+  run trace_undispatched_match_ignored =
+    readyLaunch
+      .then(send(1))
+      .then(open(1))
+      .then(prompt(Set(1)))
+      .expect(st.inputs.get(1).candidate == NoCandidate)
+      .then(turnStop)
+      .then(ready(StopSettled))
+      .then(dispatch(1))
+      .expect(st.inputs.get(1).dispatched)
+      .then(prompt(Set(1)))
+      .then(outcome(1, true))
+      .expect(stateOf(st, 1) == Acked)
+
   /// mvp §2.3: a `key` write after the input's write makes the ack non-attributable; the
-  /// input is resolved by the owner. Evidence of the same turn does not reopen the gate;
-  /// `chaldea ready` does.
+  /// input is resolved by the owner. Evidence of the same turn as an attach write does not
+  /// reopen the gate; `chaldea ready` does.
   run trace_key_write_not_attributable =
     readyLaunch
       .then(send(1))
@@ -59,24 +84,57 @@ module thread_input_traces {
       .expect(stateOf(st, 1) == Unconfirmed and st.thread.attention.contains(InputUnconfirmed(1)))
       .then(resolveInput(1, false))
       .expect(stateOf(st, 1) == Dismissed and st.thread.attention == Set())
+      .then(turnStop)
       .then(humanWrite(Attach))
       .then(ready(StopSettled))
       .expect(last.gate == Closed(EvidenceOfSameTurn))
       .then(ownerReady)
       .expect(last.gate == Open)
 
-  /// mvp §2.3: a card key closes nothing beyond the last write; the next evidence of the
-  /// same turn reopens the gate, unlike after a raw key.
+  /// mvp §2.3, §2.10: a card key answers its own open card and closes nothing beyond the
+  /// last write; the next evidence of the same turn reopens the gate.
   run trace_card_key =
     readyLaunch
       .then(prompt(Set()))
-      .then(cardOpen)
-      .then(humanWrite(CardKey))
-      .then(cardResolve)
+      .then(cardOpen(1))
+      .then(humanWrite(CardKey(1)))
+      .then(cardResolve(1))
       .expect(st.thread.turn == TurnRunning)
       .then(turnStop)
       .then(ready(StopSettled))
       .expect(last.gate == Open)
+
+  /// mvp §2.10: cards have identity. `Stop` supersedes card 1; card 2 opens in the next
+  /// turn; card 1's late resolution feeds nothing and its key is refused, so the turn
+  /// keeps awaiting card 2.
+  run trace_cards_with_identity =
+    readyLaunch
+      .then(prompt(Set()))
+      .then(cardOpen(1))
+      .then(turnStop)
+      .then(prompt(Set()))
+      .then(cardOpen(2))
+      .then(lateResolve(1))
+      .expect(last.calls == [] and st.thread.turn == AwaitingApproval)
+      .expect(not(openCards(st).contains(1)))
+      .then(humanWrite(CardKey(2)))
+      .then(cardResolve(2))
+      .expect(st.thread.turn == TurnRunning)
+
+  /// mvp §2.10, state.rs:362-367: `Stop` supersedes both cards; a late resolution changes
+  /// nothing. The task axis changes only on `task_set`.
+  run trace_late_card_resolution =
+    readyLaunch
+      .then(prompt(Set()))
+      .then(cardOpen(1))
+      .then(cardOpen(2))
+      .then(turnStop)
+      .then(lateResolve(1))
+      .expect(st.thread == last.prevThread)
+      .then(setTask(TaskCompleted))
+      .then(stop)
+      .then(exit(ExitStopped, true))
+      .expect(st.thread.task == TaskCompleted and st.thread.turn == TurnUnknown)
 
   /// mvp §2.3, §2.4 "Restart", §2.9: a restart turns `sending` into `unconfirmed` and
   /// `queued` into `cancelled`; the resume is refused until death is confirmed; the
@@ -92,8 +150,10 @@ module thread_input_traces {
       .then(reserveRefused)
       .expect(st.thread.attention.contains(ResumeBlocked))
       .then(confirmDeath)
-      .then(reserve(false, false, false))
+      .then(reserve(CLAUDE))
       .then(spawn)
+      .then(decset(true))
+      .then(sessionStartHook)
       .then(bind)
       .then(ready(SessionStart))
       .expect(last.gate == Open and stateOf(st, 1) == Unconfirmed)
@@ -123,47 +183,118 @@ module thread_input_traces {
       .expect(st.thread.attention == Set())
 
   /// mvp §2.3 "Codex positional first prompt": `sending` with the reservation, `sent` at
-  /// `launch_started`, acked by the first `UserPromptSubmit` after binding.
+  /// `launch_started`, acked by the first `UserPromptSubmit` after binding; the upgraded
+  /// CLI's `startup_stall` clears on binding.
   run trace_positional_prompt =
     initWith(true)
-      .then(reserve(true, false, false))
+      .then(reserve(CODEX))
       .then(spawn)
       .expect(stateOf(st, 1) == Sent)
       .then(stall)
+      .then(sessionStartHook)
       .then(bind)
       .expect(st.thread.attention == Set())
       .then(prompt(Set(1)))
       .expect(stateOf(st, 1) == Acked)
 
+  /// mvp §2.9 "Binding": hooks of an unbound Codex launch are buffered with their intake
+  /// facts and promoted in order at binding: the prompt acks the positional input, the
+  /// `Stop` and its settle evidence open the gate.
+  run trace_buffered_promotion =
+    initWith(false)
+      .then(reserve(CODEX))
+      .then(spawn)
+      .then(bufferPrompt(Set(1)))
+      .then(bufferStop)
+      .then(bufferReady(StopSettled))
+      .then(sessionStartHook)
+      .then(bind)
+      .expect(stateOf(st, 1) == Acked and last.gate == Open and st.gp.evidenceTurn == 1)
+
   /// A positional prompt whose spawn is confirmed not to have started is rejected; one
   /// whose launch crashed before `launch_started` is `unconfirmed`.
   run trace_positional_spawn_outcomes =
     initWith(false)
-      .then(reserve(true, false, false))
+      .then(reserve(CODEX))
       .then(spawnFail)
       .expect(stateOf(st, 1) == Rejected)
-      .then(reserve(true, false, false))
+      .then(reserve(CODEX))
       .then(restart)
       .expect(stateOf(st, 2) == Unconfirmed and st.thread.attention == Set(InputUnconfirmed(2)))
 
-  /// mvp §2.10, state.rs:362-367: `Stop` supersedes the cards; a late resolution changes
-  /// nothing. The task axis changes only on `task_set`.
-  run trace_late_card_resolution =
+  /// Refused: evidence of the same turn as a `key` write arrives after the gate opened;
+  /// the writer's recheck sees `EvidenceOfSameTurn` and cancels with zero bytes.
+  run trace_refused_recheck_same_turn_evidence =
     readyLaunch
-      .then(prompt(Set()))
-      .then(cardOpen)
-      .then(cardOpen)
+      .then(humanWrite(Key))
+      .then(ownerReady)
+      .then(send(1))
+      .then(open(1))
       .then(turnStop)
-      .then(lateResolve)
-      .expect(last.calls[0].changes == [])
-      .then(setTask(TaskCompleted))
-      .then(stop)
-      .then(exit(ExitStopped, true))
-      .expect(st.thread.task == TaskCompleted and st.thread.turn == TurnUnknown)
+      .then(ready(StopSettled))
+      .expect(gate(recheckView(st, 1)) == Closed(EvidenceOfSameTurn))
+      .then(dispatch(1))
+      .expect(stateOf(st, 1) == Cancelled and st.writer == [WHuman])
 
-  /// Hole 4a: after a restart the reducer accepts a relaunch reservation, because
-  /// `Exited` carries no death bit and `Reserved` checks only `resume_blocked`
-  /// (state.rs:174, :278-288); mvp §2.9:323 requires death confirmed.
+  /// Refused: a VT reply after the admitted basis, then newer owner evidence; the recheck
+  /// keeps the basis the send relied on and cancels with zero bytes.
+  run trace_refused_recheck_reply_after_basis =
+    readyLaunch
+      .then(send(1))
+      .then(open(1))
+      .then(vtReply)
+      .then(ownerReady)
+      .expect(gate(recheckView(st, 1)) == Open)
+      .then(dispatch(1))
+      .expect(stateOf(st, 1) == Cancelled and st.writer == [WReply])
+
+  /// Refused: an interrupt is not a `Stop`, so no settle evidence of that turn exists and
+  /// the gate stays closed (mvp §2.3:173, :175).
+  run trace_refused_interrupt_readiness =
+    readyLaunch
+      .then(humanWrite(Key))
+      .then(prompt(Set()))
+      .then(interrupt)
+      .expect(not(readyAllowed(st, StopSettled)) and not(readyAllowed(st, PostDecision)))
+      .expect(last.gate == Closed(WriteAfterEvidence))
+
+  /// Coverage: `BracketedPasteOff`, `InputInFlight`, a rejected and a cancelled input.
+  run trace_coverage_gate_reasons =
+    readyLaunch
+      .then(decset(false))
+      .expect(last.gate == Closed(BracketedPasteOff))
+      .then(decset(true))
+      .then(send(1))
+      .then(open(1))
+      .then(dispatch(1))
+      .then(outcome(1, true))
+      .then(ownerReady)
+      .expect(last.gate == Closed(InputInFlight))
+      .then(send(2))
+      .then(rejectInput(2))
+      .expect(stateOf(st, 2) == Rejected)
+
+  /// Coverage: `Interrupted`, exit recovery of a `sent` and a `queued` input
+  /// (`LaunchExited`), `resolve --delivered`, and a refused step.
+  run trace_coverage_exit_recovery =
+    readyLaunch
+      .then(send(1))
+      .then(open(1))
+      .then(dispatch(1))
+      .then(outcome(1, true))
+      .then(send(2))
+      .then(interrupt)
+      .expect(st.thread.turn == TurnUnknown)
+      .then(exit(ExitNormal, true))
+      .expect(stateOf(st, 1) == Unconfirmed and stateOf(st, 2) == Cancelled)
+      .then(resolveInput(1, true))
+      .expect(stateOf(st, 1) == Acked and st.thread.attention == Set())
+      .then(rawStep(1, Resolved(true)))
+      .expect(not(last.calls[0].ok))
+
+  /// Hole a: after a restart the reducer accepts a relaunch reservation, because `Exited`
+  /// carries no death bit and `Reserved` checks only `resume_blocked` (state.rs:174,
+  /// :278-288); mvp §2.9:323 requires death confirmed.
   run trace_hole_a_reserve_without_death =
     readyLaunch
       .then(restart)
@@ -171,7 +302,7 @@ module thread_input_traces {
       .then(raw(Reserved(true)))
       .expect(st.thread.process == Starting and not(reservedOnlyAfterDeath))
 
-  /// Hole 4b: `sending` -> `cancelled` on a failed recheck writes zero bytes, but the
+  /// Hole b: `sending` -> `cancelled` on a failed recheck writes zero bytes, but the
   /// attempt already advanced the last write (mvp §2.1:115), so the gate stays closed
   /// (`WriteAfterEvidence`) with no write since the evidence.
   run trace_hole_b_recheck_keeps_gate_closed =
@@ -185,35 +316,51 @@ module thread_input_traces {
       .then(send(2))
       .expect(last.gate == Closed(WriteAfterEvidence) and st.writer.length() == st.gp.basis)
 
-  /// Hole 4c: the reducer raises a startup cause in any process state; one raised while
+  /// Hole c: the reducer raises a startup cause in any process state; one raised while
   /// `exited` survives `Reserved` into the next launch (state.rs:369-371, :278-291).
   run trace_hole_c_stale_startup_cause =
     readyLaunch
       .then(exit(ExitNormal, true))
       .then(raw(AttentionRaised(StartupStall)))
       .expect(not(noStartupCauseAfterBindOrExit))
-      .then(reserve(false, false, false))
+      .then(reserve(CLAUDE))
       .expect(st.thread.process == Starting and st.thread.attention == Set(StartupStall))
 
-  /// Hole 4d: the reducer accepts readiness of an unbound launch (state.rs:333-336); the
-  /// gate then opens after binding on evidence older than the binding.
+  /// Hole d: the reducer accepts readiness of an unbound launch (state.rs:333-336); fed
+  /// directly instead of buffered, it opens the gate after binding on evidence older
+  /// than the binding.
   run trace_hole_d_unbound_readiness =
     initWith(true)
-      .then(reserve(false, false, false))
+      .then(reserve(CLAUDE))
       .then(spawn)
+      .then(decset(true))
       .then(rawReadyUnbound(StopSettled))
       .expect(st.thread.turn == Idle)
+      .then(sessionStartHook)
       .then(bind)
       .expect(last.gate == Open and not(gateEvidenceIsBound))
+
+  /// Finding: `ApprovalsAllResolved` carries no card identity; fed for card 1 after card 2
+  /// opened in the next turn, it ends the turn's wait for card 2 (state.rs:362-367).
+  run trace_finding_resolution_without_card_identity =
+    readyLaunch
+      .then(prompt(Set()))
+      .then(cardOpen(1))
+      .then(turnStop)
+      .then(prompt(Set()))
+      .then(cardOpen(2))
+      .then(raw(ApprovalsAllResolved))
+      .expect(st.thread.turn == TurnRunning and not(openCardsAwaitApproval))
 
   /// Finding: a VT reply after `launch_started` is a counted write after the positional
   /// prompt's anchor, so its ack is never attributable (mvp §2.3:182 with the default
   /// counted classes, docs/design/pty-runtime.md §2.3 "Basis").
   run trace_finding_positional_vt_reply =
     initWith(true)
-      .then(reserve(true, false, false))
+      .then(reserve(CODEX))
       .then(spawn)
       .then(vtReply)
+      .then(sessionStartHook)
       .then(bind)
       .then(prompt(Set(1)))
       .expect(stateOf(st, 1) == Unconfirmed)
