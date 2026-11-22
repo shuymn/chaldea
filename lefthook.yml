@@ -1,6 +1,7 @@
 # The same checks CI runs: the workflow linters of the shared gha workflow, the
-# secret scan of the shared security workflow, and the workspace and pty-hooks
-# spike checks of ci.yml (tests on push, since they take several seconds).
+# secret scan of the shared security workflow, and the workspace, specs, and
+# pty-hooks spike checks of ci.yml (tests and the specs simulation on push, since
+# they take several seconds).
 pre-commit:
   commands:
     actionlint:
@@ -33,6 +34,11 @@ pre-commit:
         - "crates/**/Cargo.toml"
         - "Cargo.{toml,lock}"
       run: deps="$(cargo tree -p chaldea-testkit -e normal --target all --prefix none)" && bad="$(printf '%s\n' "$deps" | awk '/^chaldea-/ && !/^chaldea-(testkit|core) /')" && [ -z "$bad" ]
+    # specs/ checks (docs/design/formal-specs.md); `npm ci` installs the pinned Quint.
+    specs-check:
+      root: specs/
+      glob: ["*.qnt", "traces/*", "scripts/*", "package*.json"]
+      run: mise exec -- npm ci --no-fund --no-audit --silent && mise exec -- npm run --silent typecheck && mise exec -- npm run --silent traces:check
     pty-hooks-fmt:
       root: spikes/pty-hooks/
       glob: "*.rs"
@@ -51,6 +57,10 @@ pre-push:
         - "Cargo.{toml,lock}"
         - "rust-toolchain.toml"
       run: cargo test --workspace --locked --no-fail-fast
+    specs-simulate:
+      root: specs/
+      glob: ["*.qnt", "scripts/*", "package*.json"]
+      run: mise exec -- npm ci --no-fund --no-audit --silent && mise exec -- npm run --silent simulate
     pty-hooks-test:
       root: spikes/pty-hooks/
       glob: "*.{rs,toml,lock,txt}"
