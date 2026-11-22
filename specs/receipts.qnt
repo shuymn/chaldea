@@ -2,28 +2,33 @@
 /**
  * Q-B, command side: command receipts keyed by `command_id` across retries, lost replies,
  * writer contention, and daemon restarts (docs/mvp-design.md §2.4 "Commands";
- * docs/design/http-surface.md §2.8, §8 D6, D14; docs/design/formal-specs.md §7).
+ * docs/design/http-surface.md §2.5 "Deadlines", §2.8, §8 D6, D14;
+ * docs/design/formal-specs.md §7).
  *
  * Two layers, as in Q-A:
  *
  * - `checkReceipt` mirrors `crates/core/src/command.rs` `check_receipt`. Every step
  *   records its calls (`last.calls`), and the committed traces replay against the real
  *   function (crates/core/tests/quint_sync_traces.rs).
- * - The protocol layer is the contract: one writer runs jobs one at a time in order
- *   (store §2.2); a command's intent job looks the receipt up and, for `New`, inserts it
- *   `in_progress` with the intent in one transaction; a registered runner starts the
- *   effect once and completes the receipt in a later job; the request replies from the
- *   progress it sees by its deadline plus the reply grace; a restart turns `in_progress`
- *   into `unknown_after_crash`.
+ * - The protocol layer is the contract, with four things kept apart: the request's
+ *   admission deadline (`deadline`; the writer does not start its intent job after it),
+ *   the end of the reply grace (`grace`), what the store made durable (`receipts`), and
+ *   what the runner observed of the writer's reply (`writer` until `observe`, then
+ *   `progress`). One writer runs jobs one at a time in order (store §2.2); a command's
+ *   intent job looks the receipt up and, for `New`, inserts it `in_progress` with the
+ *   intent in one transaction; the runner starts the effect once after it observes the
+ *   intent committed with an effect pending, and completes the receipt in a later job;
+ *   the request replies from what the runner observed, once it is done or the grace has
+ *   ended; a restart turns `in_progress` into `unknown_after_crash`.
  *
  * Abstracted: a request identity is a number (`hash`); hash 1 is a command completed in
  * its intent job (`send`), hash 2 a command with an effect (`stop`); a result is a number
- * standing for the stored status and body; the deadline is an explicit `tick`; a lost
- * reply is a client that retries anyway (`send` with the same `command_id`, token, and
- * hash). The intent's events are counted, not stored.
+ * with the stored HTTP status (200, or 409 for an effect that refused); a lost reply is a
+ * client that retries anyway (`send` with the same `command_id`, token, and hash). The
+ * intent's events are counted, not stored.
  * Not modelled: token checks and authorization refusals (the job writes nothing), `busy`
  * and queue-full replies, the completion budget's retries (a completion that cannot
- * commit is `CompletionFailed`), the shutdown drain.
+ * commit is `CompletionFailed`), the shutdown drain, real time.
  */
 module receipts {
   // ---------------------------------------------------------------------------
@@ -39,10 +44,12 @@ module receipts {
   // Reducer layer: crates/core/src/command.rs `check_receipt`
   // ---------------------------------------------------------------------------
 
-  type ReceiptStatus = InProgress | Completed(int) | UnknownAfterCrash
+  // `CommandResult`: `n` stands for the body, `status` is its HTTP status.
+  type Result = { n: int, status: int }
+  type ReceiptStatus = InProgress | Completed(Result) | UnknownAfterCrash
   type Receipt = { token: int, hash: int, status: ReceiptStatus }
   type Existing = NoReceipt | Has(Receipt)
-  type Lookup = New | LInProgress | Replay(int) | Conflict | LUnknownAfterCrash
+  type Lookup = New | LInProgress | Replay(Result) | Conflict | LUnknownAfterCrash
 
   /// `command::check_receipt`: ownership and the request first, then the status.
   pure def checkReceipt(ex: Existing, token: int, hash: int): Lookup = match ex {
@@ -63,31 +70,55 @@ module receipts {
   pure val SEND = 1
   pure def withEffect(hash: int): bool = hash != SEND
 
-  type Job = Intent(int) | Complete({ cmd: int, attempt: int, result: int })
+  type Job = Intent(int) | Complete({ cmd: int, attempt: int, result: Result })
   type WriterSlot = Idle | Busy(Job)
-  // What the runner publishes (`Progress`), with the store outcome of the intent job.
+  // The writer's reply to the runner, before the runner observes it (store §2.2 outcomes).
+  type WriterReply =
+    | NoReply
+    | WLookup(Lookup)
+    | WCompleted(Result)
+    | WPending
+    | WExpired
+    | WCommitUnknown
+    | WFailed
+    | WCompletionDone(Result)
+    | WCompletionFailed
+  // What the runner observed and published (`Progress`), with the store outcome.
   type Outcome =
     | OLookup(Lookup)
-    | OCompleted(int)
+    | OCompleted(Result)
     | OExpired
     | OCommitUnknown
     | OFailed
     | OCompletionFailed
-  type Progress = Submitted | JobRunning | IntentCommitted | Done(Outcome)
-  // The HTTP reply (http-surface §2.8 table).
+  type Progress = Submitted | IntentCommitted | Done(Outcome)
+  // The HTTP reply (http §2.8 table).
   type Reply =
-    | RResult(int)
+    | RResult(Result)
     | RInProgress
     | RConflict
     | RUnknownAfterCrash
     | RTimeout
     | ROutcomeUnknown
     | RStoreFailed
-  type Attempt = { cmd: int, token: int, hash: int, progress: Progress, deadlinePassed: bool, live: bool, replied: bool }
+  // One request. `submitted`: its body was read and its intent job queued; `deadline`: its
+  // admission deadline passed; `grace`: the reply grace after it ended; `live`: the daemon
+  // that holds it has not restarted.
+  type Attempt = {
+    cmd: int, token: int, hash: int,
+    submitted: bool, deadline: bool, grace: bool,
+    writer: WriterReply, progress: Progress,
+    live: bool, replied: bool,
+  }
   // The writer's outcome for a job: committed, or `CommitUnknown` that did or did not commit.
   type WriteOutcome = Ok | UnknownCommitted | UnknownRolledBack
 
-  type ReplyRecord = { attempt: int, cmd: int, token: int, hash: int, reply: Reply, receipt: Existing }
+  // A reply with the facts at reply time: the durable receipt, what the runner observed,
+  // whether the intent job had been submitted.
+  type ReplyRecord = {
+    attempt: int, cmd: int, token: int, hash: int, reply: Reply,
+    receipt: Existing, observed: Progress, submitted: bool,
+  }
 
   type State = {
     receipts: int -> Receipt,
@@ -95,15 +126,15 @@ module receipts {
     running: WriterSlot,
     // The writer's failed state (store §2.2): every later job fails until a restart.
     failed: bool,
-    // Effects started and not yet finished, per command.
-    effects: int -> { attempt: int, result: int },
+    // Effects started and not yet finished, per command, with their runner's request.
+    effects: int -> int,
     attempts: int -> Attempt,
     nextResult: int,
     // History the invariants read (ghosts).
     intents: int -> int,
     effectStarts: int -> int,
     creator: int -> { token: int, hash: int },
-    stored: int -> int,
+    stored: int -> Result,
     markedUnknown: Set[int],
     afterUnknown: Set[int],
     committed: Set[int],
@@ -115,11 +146,14 @@ module receipts {
   type Action =
     | Init
     | Send({ cmd: int, token: int, hash: int })
-    | Tick(int)
+    | Submit(int)
+    | Deadline(int)
+    | Grace(int)
     | WriterStart
     | WriterFinish(WriteOutcome)
     | WriterFail
-    | EffectDone(int)
+    | Observe(int)
+    | EffectDone({ cmd: int, ok: bool })
     | ReplyTo(int)
     | Restart(bool)
 
@@ -148,8 +182,12 @@ module receipts {
 
   pure def existing(s: State, c: int): Existing = if (s.receipts.keys().contains(c)) Has(s.receipts.get(c)) else NoReceipt
 
-  pure def setProgress(s: State, a: int, p: Progress): State =
-    { ...s, attempts: s.attempts.set(a, { ...s.attempts.get(a), progress: p }) }
+  pure def setAttempt(s: State, a: int, f: Attempt => Attempt): State =
+    { ...s, attempts: s.attempts.set(a, f(s.attempts.get(a))) }
+
+  pure def setWriter(s: State, a: int, w: WriterReply): State = setAttempt(s, a, at => { ...at, writer: w })
+
+  pure def seen(s: State, a: int, p: Progress): State = setAttempt(s, a, at => { ...at, progress: p })
 
   pure def without(m: a -> b, k: a): a -> b = m.keys().exclude(Set(k)).mapBy(x => m.get(x))
 
@@ -157,35 +195,37 @@ module receipts {
 
   /// The intent job's writes for `New`: the receipt `in_progress` (completed in the same
   /// job for `send`) with the intent, in one transaction.
-  pure def commitIntent(s: State, a: int, r: int): State =
+  pure def commitIntent(s: State, a: int): State =
     val at = s.attempts.get(a)
-    val status = if (withEffect(at.hash)) InProgress else Completed(r)
+    val r = { n: s.nextResult, status: 200 }
     {
       ...s,
-      receipts: s.receipts.put(at.cmd, { token: at.token, hash: at.hash, status: status }),
+      receipts: s.receipts.put(at.cmd, {
+        token: at.token, hash: at.hash, status: if (withEffect(at.hash)) InProgress else Completed(r),
+      }),
       intents: s.intents.set(at.cmd, s.intents.get(at.cmd) + 1),
       creator: s.creator.put(at.cmd, { token: at.token, hash: at.hash }),
       stored: if (withEffect(at.hash)) s.stored else s.stored.put(at.cmd, r),
       committed: s.committed.union(Set(a)),
       afterUnknown: if (s.markedUnknown.contains(at.cmd)) s.afterUnknown.union(Set(at.cmd)) else s.afterUnknown,
-      nextResult: s.nextResult + 1,
+      nextResult: if (withEffect(at.hash)) s.nextResult else s.nextResult + 1,
     }
 
   /// The completion job's write.
-  pure def commitCompletion(s: State, c: int, r: int): State =
+  pure def commitCompletion(s: State, c: int, r: Result): State =
     { ...s, receipts: s.receipts.set(c, { ...s.receipts.get(c), status: Completed(r) }), stored: s.stored.put(c, r) }
 
-  /// The runner starts the effect once, after the intent committed.
-  pure def startEffect(s: State, a: int, r: int): State =
+  /// The runner starts the effect once, after it observed the intent committed.
+  pure def startEffect(s: State, a: int): State =
     val c = s.attempts.get(a).cmd
     {
       ...s,
-      effects: s.effects.put(c, { attempt: a, result: r }),
+      effects: s.effects.put(c, a),
       effectStarts: s.effectStarts.set(c, s.effectStarts.get(c) + 1),
       afterUnknown: if (s.markedUnknown.contains(c)) s.afterUnknown.union(Set(c)) else s.afterUnknown,
     }
 
-  /// The request's reply from the progress it sees (http-surface §2.8; mvp §2.4).
+  /// The request's reply from what the runner observed (http §2.8; mvp §2.4).
   pure def replyOf(p: Progress): Reply = match p {
     | Done(o) => match o {
         | OLookup(l) => match l {
@@ -203,7 +243,42 @@ module receipts {
       }
     | IntentCommitted => RInProgress
     | Submitted => ROutcomeUnknown
-    | JobRunning => ROutcomeUnknown
+  }
+
+  type Finished = { ok: bool, o: Out }
+
+  /// The running job ends with `w`: durable writes, and a reply the runner has not yet
+  /// observed. `CommitUnknown` puts the writer in its failed state. A job that writes
+  /// nothing (any lookup but `New`) ends `Ok`.
+  pure def finish(s: State, w: WriteOutcome): Finished = match s.running {
+    | Idle => { ok: false, o: { st: s, calls: [] } }
+    | Busy(j) => match j {
+        | Intent(a) => {
+            val at = s.attempts.get(a)
+            val ex = existing(s, at.cmd)
+            val l = checkReceipt(ex, at.token, at.hash)
+            val call = CheckReceipt({ existing: ex, token: at.token, hash: at.hash, lookup: l })
+            val s1 = { ...s, running: Idle }
+            if (l != New) { ok: w == Ok, o: { st: setWriter(s1, a, WLookup(l)), calls: [call] } }
+            else {
+              val s2 = if (w == UnknownRolledBack) s1 else commitIntent(s1, a)
+              val s3 = match w {
+                | Ok => setWriter(s2, a, if (withEffect(at.hash)) WPending else WCompleted({ n: s1.nextResult, status: 200 }))
+                | _ => setWriter({ ...s2, failed: true }, a, WCommitUnknown)
+              }
+              { ok: true, o: { st: s3, calls: [call] } }
+            }
+          }
+        | Complete(cj) => {
+            val s1 = { ...s, running: Idle }
+            val s2 = if (w == UnknownRolledBack) s1 else commitCompletion(s1, cj.cmd, cj.result)
+            val s3 = match w {
+              | Ok => setWriter(s2, cj.attempt, WCompletionDone(cj.result))
+              | _ => setWriter({ ...s2, failed: true }, cj.attempt, WCompletionFailed)
+            }
+            { ok: true, o: { st: s3, calls: [] } }
+          }
+      }
   }
 
   // ---------------------------------------------------------------------------
@@ -215,31 +290,57 @@ module receipts {
     last' = { act: a, calls: o.calls },
   }
 
+  pure def start(s: State): Out = { st: s, calls: [] }
+
   action init = all { st' = INITIAL, last' = { act: Init, calls: [] } }
 
-  /// A request (or a retry with the same `command_id`): the runner is registered and the
-  /// intent job submitted.
+  /// A request (or a retry with the same `command_id`) arrives; its body is being read.
   action send(c: int, t: int, h: int): bool = all {
     st.attempts.keys().size() < MAX_ATTEMPTS,
     val a = st.attempts.keys().size() + 1
-    commit(Send({ cmd: c, token: t, hash: h }), { st: {
+    commit(Send({ cmd: c, token: t, hash: h }), start({
       ...st,
-      attempts: st.attempts.put(a, { cmd: c, token: t, hash: h, progress: Submitted, deadlinePassed: false, live: true, replied: false }),
-      queue: st.queue.append(Intent(a)),
-    }, calls: [] }),
+      attempts: st.attempts.put(a, {
+        cmd: c, token: t, hash: h, submitted: false, deadline: false, grace: false,
+        writer: NoReply, progress: Submitted, live: true, replied: false,
+      }),
+    })),
   }
 
-  /// The request's deadline passes.
-  action tick(a: int): bool = all {
-    st.attempts.keys().contains(a),
+  pure def has(s: State, a: int): bool = s.attempts.keys().contains(a)
+
+  /// The body was read before the deadline: the runner is registered and the intent job
+  /// submitted.
+  action submit(a: int): bool = all {
+    has(st, a),
     val at = st.attempts.get(a)
     all {
-      at.live, not(at.replied), not(at.deadlinePassed),
-      commit(Tick(a), { st: { ...st, attempts: st.attempts.set(a, { ...at, deadlinePassed: true }) }, calls: [] }),
+      at.live, not(at.submitted), not(at.deadline), not(at.replied),
+      commit(Submit(a), start({ ...setAttempt(st, a, x => { ...x, submitted: true }), queue: st.queue.append(Intent(a)) })),
     },
   }
 
-  /// The writer takes the next job; an intent job whose deadline passed is `Expired`
+  /// The admission deadline passes: the writer will not start this request's intent job.
+  action deadline(a: int): bool = all {
+    has(st, a),
+    val at = st.attempts.get(a)
+    all {
+      at.live, not(at.deadline), not(at.replied),
+      commit(Deadline(a), start(setAttempt(st, a, x => { ...x, deadline: true }))),
+    },
+  }
+
+  /// The reply grace after the deadline ends (`write_reply_grace`).
+  action grace(a: int): bool = all {
+    has(st, a),
+    val at = st.attempts.get(a)
+    all {
+      at.live, at.deadline, not(at.grace), not(at.replied),
+      commit(Grace(a), start(setAttempt(st, a, x => { ...x, grace: true }))),
+    },
+  }
+
+  /// The writer takes the next job; an intent job whose deadline passed replies `Expired`
   /// without running (store §2.2 step 3).
   action writerStart: bool = all {
     not(st.failed),
@@ -249,50 +350,10 @@ module receipts {
     val s1 = { ...st, queue: tail(st.queue) }
     match j {
       | Intent(a) =>
-        if (st.attempts.get(a).deadlinePassed) commit(WriterStart, { st: setProgress(s1, a, Done(OExpired)), calls: [] })
-        else commit(WriterStart, { st: setProgress({ ...s1, running: Busy(j) }, a, JobRunning), calls: [] })
-      | Complete(_) => commit(WriterStart, { st: { ...s1, running: Busy(j) }, calls: [] })
+        if (st.attempts.get(a).deadline) commit(WriterStart, start(setWriter(s1, a, WExpired)))
+        else commit(WriterStart, start({ ...s1, running: Busy(j) }))
+      | Complete(_) => commit(WriterStart, start({ ...s1, running: Busy(j) }))
     },
-  }
-
-  type Finished = { ok: bool, o: Out }
-
-  /// The running job ends with `w`. `CommitUnknown` puts the writer in its failed state.
-  /// A job that writes nothing (any lookup but `New`) ends `Ok`.
-  pure def finish(s: State, w: WriteOutcome): Finished = match s.running {
-    | Idle => { ok: false, o: { st: s, calls: [] } }
-    | Busy(j) => match j {
-        | Intent(a) => {
-            val at = s.attempts.get(a)
-            val ex = existing(s, at.cmd)
-            val l = checkReceipt(ex, at.token, at.hash)
-            val call = CheckReceipt({ existing: ex, token: at.token, hash: at.hash, lookup: l })
-            val s1 = { ...s, running: Idle }
-            val r = s.nextResult
-            if (l != New) { ok: w == Ok, o: { st: setProgress(s1, a, Done(OLookup(l))), calls: [call] } }
-            else {
-              val s2 = if (w == UnknownRolledBack) s1 else commitIntent(s1, a, r)
-              val s3 = match w {
-                | Ok => if (withEffect(at.hash)) setProgress(startEffect(s2, a, r), a, IntentCommitted) else setProgress(s2, a, Done(OCompleted(r)))
-                | _ => setProgress({ ...s2, failed: true }, a, Done(OCommitUnknown))
-              }
-              { ok: true, o: { st: s3, calls: [call] } }
-            }
-          }
-        | Complete(cj) => {
-            val s1 = { ...s, running: Idle }
-            val s2 = if (w == UnknownRolledBack) s1 else commitCompletion(s1, cj.cmd, cj.result)
-            val waiting = s.attempts.get(cj.attempt).progress == IntentCommitted
-            val s3 = match w {
-              | Ok => if (waiting) setProgress(s2, cj.attempt, Done(OCompleted(cj.result))) else s2
-              | _ => {
-                  val f = { ...s2, failed: true }
-                  if (waiting) setProgress(f, cj.attempt, Done(OCompletionFailed)) else f
-                }
-            }
-            { ok: true, o: { st: s3, calls: [] } }
-          }
-      }
   }
 
   action writerFinish(w: WriteOutcome): bool = all {
@@ -306,61 +367,93 @@ module receipts {
     st.queue.length() > 0,
     val s1 = { ...st, queue: tail(st.queue) }
     match head(st.queue) {
-      | Intent(a) => commit(WriterFail, { st: setProgress(s1, a, Done(OFailed)), calls: [] })
-      | Complete(cj) => commit(WriterFail, {
-          st: if (st.attempts.get(cj.attempt).progress == IntentCommitted) setProgress(s1, cj.attempt, Done(OCompletionFailed)) else s1,
-          calls: [],
-        })
+      | Intent(a) => commit(WriterFail, start(setWriter(s1, a, WFailed)))
+      | Complete(cj) => commit(WriterFail, start(setWriter(s1, cj.attempt, WCompletionFailed)))
     },
   }
 
-  /// The effect reports its terminal result; the runner submits the completion.
-  action effectDone(c: int): bool = all {
-    st.effects.keys().contains(c),
-    val e = st.effects.get(c)
-    commit(EffectDone(c), { st: {
-      ...st,
-      effects: without(st.effects, c),
-      queue: st.queue.append(Complete({ cmd: c, attempt: e.attempt, result: e.result })),
-    }, calls: [] }),
+  /// The runner observes the writer's reply and publishes it; after an intent committed
+  /// with its effect pending, it starts the effect, once.
+  action observe(a: int): bool = all {
+    has(st, a),
+    val at = st.attempts.get(a)
+    all {
+      at.live,
+      at.writer != NoReply,
+      val s1 = setWriter(st, a, NoReply)
+      commit(Observe(a), start(match at.writer {
+        | WPending => startEffect(seen(s1, a, IntentCommitted), a)
+        | WLookup(l) => seen(s1, a, Done(OLookup(l)))
+        | WCompleted(r) => seen(s1, a, Done(OCompleted(r)))
+        | WExpired => seen(s1, a, Done(OExpired))
+        | WCommitUnknown => seen(s1, a, Done(OCommitUnknown))
+        | WFailed => seen(s1, a, Done(OFailed))
+        | WCompletionDone(r) => seen(s1, a, Done(OCompleted(r)))
+        | WCompletionFailed => seen(s1, a, Done(OCompletionFailed))
+        | NoReply => st
+      })),
+    },
   }
 
-  /// The request replies once its runner is done or its deadline plus the grace passed.
+  /// The effect reports its terminal result (it ran, or it refused: a stored 409); the
+  /// runner submits the completion.
+  action effectDone(c: int, ok: bool): bool = all {
+    st.effects.keys().contains(c),
+    val a = st.effects.get(c)
+    val r = { n: st.nextResult, status: if (ok) 200 else 409 }
+    commit(EffectDone({ cmd: c, ok: ok }), start({
+      ...st,
+      effects: without(st.effects, c),
+      queue: st.queue.append(Complete({ cmd: c, attempt: a, result: r })),
+      nextResult: st.nextResult + 1,
+    })),
+  }
+
+  /// The request replies once its runner is done, or once the grace ended; a body not
+  /// read by the deadline is 408 with nothing submitted.
   action replyTo(a: int): bool = all {
-    st.attempts.keys().contains(a),
+    has(st, a),
     val at = st.attempts.get(a)
-    val ready = match at.progress { | Done(_) => true | _ => at.deadlinePassed }
+    val done = match at.progress { | Done(_) => at.submitted | _ => false }
     all {
-      at.live, not(at.replied), ready,
-      commit(ReplyTo(a), { st: {
-        ...st,
-        attempts: st.attempts.set(a, { ...at, replied: true }),
-        replies: st.replies.append({ attempt: a, cmd: at.cmd, token: at.token, hash: at.hash, reply: replyOf(at.progress), receipt: existing(st, at.cmd) }),
-      }, calls: [] }),
+      at.live, not(at.replied),
+      done or at.grace or (not(at.submitted) and at.deadline),
+      val r = if (not(at.submitted)) RTimeout else replyOf(at.progress)
+      commit(ReplyTo(a), start({
+        ...setAttempt(st, a, x => { ...x, replied: true }),
+        replies: st.replies.append({
+          attempt: a, cmd: at.cmd, token: at.token, hash: at.hash, reply: r,
+          receipt: existing(st, at.cmd), observed: at.progress, submitted: at.submitted,
+        }),
+      })),
     },
   }
 
   /// A daemon crash and restart: the running job committed or not; every connection,
-  /// queued job, and running effect is gone; every `in_progress` receipt becomes
-  /// `unknown_after_crash` before commands are accepted again (mvp §2.4 "Restart").
+  /// runner, queued job, unobserved reply, and running effect is gone; every `in_progress`
+  /// receipt becomes `unknown_after_crash` before commands are accepted again (mvp §2.4
+  /// "Restart").
   action restart(runningCommitted: bool): bool = all {
     runningCommitted implies st.running != Idle,
-    val s1 = match st.running {
-      | Idle => st
+    val o1: Out = match st.running {
+      | Idle => start(st)
       | Busy(j) =>
-        if (not(runningCommitted)) st
+        if (not(runningCommitted)) start(st)
         else match j {
           | Intent(a) => {
               val at = st.attempts.get(a)
-              if (checkReceipt(existing(st, at.cmd), at.token, at.hash) != New) st
-              else {
-                // The effect never started: the runner had not seen the commit.
-                commitIntent(st, a, st.nextResult)
+              val ex = existing(st, at.cmd)
+              val l = checkReceipt(ex, at.token, at.hash)
+              {
+                // The effect never started: the runner had not observed the commit.
+                st: if (l != New) st else commitIntent(st, a),
+                calls: [CheckReceipt({ existing: ex, token: at.token, hash: at.hash, lookup: l })],
               }
             }
-          | Complete(cj) => commitCompletion(st, cj.cmd, cj.result)
+          | Complete(cj) => start(commitCompletion(st, cj.cmd, cj.result))
         }
     }
+    val s1 = o1.st
     val pending = s1.receipts.keys().filter(c => s1.receipts.get(c).status == InProgress)
     commit(Restart(runningCommitted), { st: {
       ...s1,
@@ -370,43 +463,45 @@ module receipts {
       running: Idle,
       failed: false,
       effects: Map(),
-      attempts: s1.attempts.keys().mapBy(a => { ...s1.attempts.get(a), live: false }),
-    }, calls: [] }),
+      attempts: s1.attempts.keys().mapBy(a => { ...s1.attempts.get(a), live: false, writer: NoReply }),
+    }, calls: o1.calls }),
   }
 
-  pure def someAttempt(s: State): Set[int] = if (s.attempts.keys().size() == 0) Set(0) else s.attempts.keys()
+  // The attempts a step can act on: live and not replied (0 when there is none).
+  pure def activeOf(s: State): Set[int] =
+    val xs = s.attempts.keys().filter(a => s.attempts.get(a).live and not(s.attempts.get(a).replied))
+    if (xs.size() == 0) Set(0) else xs
+  pure def anyOf(s: State): Set[int] = if (s.attempts.keys().size() == 0) Set(0) else s.attempts.keys()
 
-  // Retries are frequent: a client keeps its `command_id`, token, and request.
-  action clientStep = {
+  // Retries are frequent: a client keeps its `command_id`, token, and request. Time
+  // (deadlines, graces) and restarts are rarer than work, so most attempts get a reply.
+  action step = {
     nondet c = CMDS.oneOf()
     nondet t = TOKENS.oneOf()
     nondet h = HASHES.oneOf()
-    nondet a = someAttempt(st).oneOf()
+    nondet a = activeOf(st).oneOf()
+    nondet r = anyOf(st).oneOf()
+    nondet w = Set(Ok, Ok, UnknownCommitted, UnknownRolledBack).oneOf()
+    nondet ok = Bool.oneOf()
+    nondet rc = Bool.oneOf()
     any {
       send(c, t, h),
-      all { st.attempts.keys().contains(a), val at = st.attempts.get(a) send(at.cmd, at.token, at.hash) },
+      all { has(st, r), val at = st.attempts.get(r) send(at.cmd, at.token, at.hash) },
+      all { has(st, r), val at = st.attempts.get(r) send(at.cmd, at.token, at.hash) },
+      submit(a),
+      submit(a),
+      writerStart,
+      writerStart,
+      writerFinish(w),
+      writerFinish(Ok),
+      writerFail,
+      observe(a),
+      observe(a),
+      effectDone(c, ok),
+      replyTo(a),
+      replyTo(a),
+      any { deadline(a), grace(a), restart(rc) },
     }
-  }
-
-  action writerStep = {
-    nondet w = Set(Ok, Ok, UnknownCommitted, UnknownRolledBack).oneOf()
-    any { writerStart, writerFinish(Ok), writerFinish(w), writerFail }
-  }
-
-  action requestStep = {
-    nondet a = someAttempt(st).oneOf()
-    nondet c = CMDS.oneOf()
-    any { replyTo(a), tick(a), effectDone(c) }
-  }
-
-  action step = any {
-    clientStep,
-    writerStep,
-    writerStep,
-    requestStep,
-    requestStep,
-    nondet rc = Bool.oneOf()
-    restart(rc),
   }
 
   // ---------------------------------------------------------------------------
@@ -421,22 +516,23 @@ module receipts {
   /// mvp §2.4 "Insert", CL-8, PR7-CL-18: one `command_id` causes at most one intent.
   val oneIntentPerCommand = CMDS.forall(c => st.intents.get(c) <= 1)
 
-  /// CL-8, PR7-CL-19 "its effect shall start exactly once": at most one effect per
-  /// `command_id`, across retries and restarts.
+  /// CL-8, PR7-CL-19: at most one effect per `command_id`, across retries and restarts.
+  /// (That a healthy runner starts and completes the effect after it observed the intent
+  /// committed is liveness, left to PR 7c and PR 17.)
   val oneEffectPerCommand = CMDS.forall(c => st.effectStarts.get(c) <= 1)
 
   /// mvp §2.4 "Insert": the receipt and the intent commit together or not at all.
   val receiptIffIntent = CMDS.forall(c => st.receipts.keys().contains(c) iff st.intents.get(c) >= 1)
 
   /// mvp §2.4 `ReceiptLookup`, CL-8: a stored result goes only to the token and request
-  /// that created the receipt, and it is the stored one.
+  /// that created the receipt, and it is the stored one (status and body).
   val replayOnlyToCreator = repliesOf(st).forall(r => match r.reply {
     | RResult(res) => isCreator(st, r) and st.stored.keys().contains(r.cmd) and st.stored.get(r.cmd) == res
     | _ => true
   })
 
-  /// mvp §2.4 `Conflict` "revealing nothing", http-surface §2.8 "Receipt visibility":
-  /// another token or request learns nothing about the receipt's state.
+  /// mvp §2.4 `Conflict` "revealing nothing", http §2.8 "Receipt visibility": another
+  /// token or request learns nothing about the receipt's state.
   val othersLearnNothing = repliesOf(st).forall(r => match r.reply {
     | RInProgress => isCreator(st, r)
     | RUnknownAfterCrash => isCreator(st, r)
@@ -457,14 +553,21 @@ module receipts {
   }
 
   /// mvp §2.4 "A 408 describes the current attempt only: its deadline prevented its intent
-  /// from running"; http-surface §2.8 "Why 408 is exact": an attempt answered 408 never
-  /// commits its intent, now or later.
+  /// from running": an attempt answered 408 never commits its intent, now or later.
   val timeoutOnlyWithoutIntent = repliesOf(st).forall(r => r.reply == RTimeout implies not(st.committed.contains(r.attempt)))
 
-  /// http-surface §8 D14 ("409 `in_progress` would claim a receipt that may never exist"):
-  /// a 409 `in_progress` is answered only when the receipt exists at reply time (it may
-  /// have completed since the job read it; the retry then replays).
-  val inProgressOnlyWithReceipt = repliesOf(st).forall(r => r.reply == RInProgress implies r.receipt != NoReceipt)
+  /// http §2.8 "Why 408 is exact": 408 only for a body not read by the deadline (nothing
+  /// submitted) or after the runner observed `Expired`.
+  val timeoutOnlyWhenExpiredObserved = repliesOf(st).forall(r => r.reply == RTimeout implies
+    (not(r.submitted) or r.observed == Done(OExpired)))
+
+  /// http §8 D14 ("409 `in_progress` would claim a receipt that may never exist"): a 409
+  /// `in_progress` only when the receipt exists at reply time and the runner observed it
+  /// `in_progress` (its own intent committed, or the lookup found it).
+  val inProgressOnlyWithReceipt = repliesOf(st).forall(r => r.reply == RInProgress implies and {
+    r.receipt != NoReceipt,
+    r.observed == IntentCommitted or r.observed == Done(OLookup(LInProgress)),
+  })
 
   val allInvariants = and {
     oneIntentPerCommand,
@@ -475,21 +578,30 @@ module receipts {
     unknownNeverReexecuted,
     noInProgressAfterRestart,
     timeoutOnlyWithoutIntent,
+    timeoutOnlyWhenExpiredObserved,
     inProgressOnlyWithReceipt,
   }
 
-  // Witnesses (`simulate` fails when one is never reached).
+  // Witnesses (`simulate` fails when one is never reached), from recorded replies.
   pure def replied(s: State, p: ReplyRecord => bool): bool = s.replies.indices().exists(i => p(s.replies[i]))
-  pure def lookedUp(cs: List[Call], l: Lookup => bool): bool = cs.indices().exists(i => match cs[i] { | CheckReceipt(k) => l(k.lookup) })
+  def lookedUp(l: Lookup => bool): bool = last.calls.indices().exists(i => match last.calls[i] { | CheckReceipt(k) => l(k.lookup) })
+  pure def sameRequest(x: ReplyRecord, y: ReplyRecord): bool = x.cmd == y.cmd and x.token == y.token and x.hash == y.hash
+  pure def viaReplay(r: ReplyRecord): bool = match r.observed { | Done(o) => match o { | OLookup(l) => match l { | Replay(_) => true | _ => false } | _ => false } | _ => false }
 
-  val witnessReplay = lookedUp(last.calls, l => match l { | Replay(_) => true | _ => false })
-  val witnessReplayAfterOutcomeUnknown = replied(st, r => match r.reply { | RResult(_) => true | _ => false } and
-    replied(st, u => u.cmd == r.cmd and u.attempt < r.attempt and u.reply == ROutcomeUnknown))
+  val witnessReplay = lookedUp(l => match l { | Replay(_) => true | _ => false })
+  val witnessReplayNon200 = lookedUp(l => match l { | Replay(res) => res.status != 200 | _ => false })
+  // A retry of the same request after 503 `outcome_unknown` gets the stored result.
+  val witnessReplayAfterOutcomeUnknown = replied(st, r => viaReplay(r) and
+    replied(st, u => sameRequest(u, r) and u.attempt < r.attempt and u.reply == ROutcomeUnknown))
+  // http §8 D14: the intent is durable, the runner has not observed it, and the reply is 503.
+  val witnessDurableUnobserved = replied(st, r => r.reply == ROutcomeUnknown and r.observed == Submitted and
+    st.committed.contains(r.attempt) and r.receipt != NoReceipt)
   val witnessInProgress = replied(st, r => r.reply == RInProgress)
-  val witnessDuplicateWhileInProgress = lookedUp(last.calls, l => l == LInProgress)
+  val witnessDuplicateWhileInProgress = lookedUp(l => l == LInProgress)
   val witnessUnknownAfterCrash = replied(st, r => r.reply == RUnknownAfterCrash)
   val witnessConflict = replied(st, r => r.reply == RConflict)
-  val witnessTimeoutThenIntent = replied(st, r => r.reply == RTimeout and
+  val witnessTimeoutBeforeSubmit = replied(st, r => r.reply == RTimeout and not(r.submitted))
+  val witnessTimeoutThenIntent = replied(st, r => r.reply == RTimeout and r.submitted and
     st.committed.exists(a => a > r.attempt and st.attempts.get(a).cmd == r.cmd))
   val witnessCommitUnknownCommitted = match last.act { | WriterFinish(w) => w == UnknownCommitted | _ => false }
 }

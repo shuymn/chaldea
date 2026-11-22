@@ -9,10 +9,13 @@
 //! not replayed: the store is PR 6's, the HTTP and WebSocket code PR 7's (its tests and
 //! PR 17's `stateright` model check them), the client PR 18's.
 //!
-//! `decide_replay`'s bounds are scaled in the model; each sync trace's `Init` names the
-//! model bounds, and one model seq stands for `REPLAY_MAX_EVENTS / replayMaxEvents`
-//! seqs, one size unit for `REPLAY_MAX_BYTES / replayMaxBytes` bytes. Every comparison in
-//! `decide_replay` is linear in seqs and bytes, so the scaled call takes the same branch.
+//! `decide_replay`'s bounds are scaled in the model: one model seq stands for
+//! [`SEQ_SCALE`] seqs and one size unit for [`BYTE_SCALE`] bytes, fixed here from the
+//! contract's bounds (10 000 events, 8 MiB). Each sync trace's `Init` names the model
+//! bounds, and the test checks that they scale to the contract's and that core's constants
+//! are the contract's. Every comparison in `decide_replay` is linear in seqs and bytes, so
+//! the scaled call takes the same branch; the real boundaries (a bound and the bound + 1)
+//! and the branch order on unscaled values are `tests/sync_command.rs`'s.
 //! `pnpm run traces:check` in `specs/` keeps the traces equal to the specs.
 
 #![allow(
@@ -122,6 +125,14 @@ fn calls(name: &str, itf: &Value) -> Vec<(String, Value)> {
 
 // ---- decide_replay ----------------------------------------------------------------------------
 
+/// The contract's replay bounds (mvp §2.4), written out rather than read from core so that
+/// a changed constant fails here.
+const CONTRACT_MAX_EVENTS: u64 = 10_000;
+const CONTRACT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Seqs per model seq and bytes per model size unit.
+const SEQ_SCALE: u64 = 5_000;
+const BYTE_SCALE: u64 = 2 * 1024 * 1024;
+
 struct Scale {
     seq: u64,
     bytes: u64,
@@ -131,20 +142,19 @@ impl Scale {
     fn of(name: &str, itf: &Value) -> Scale {
         let (init, v) = tag(&list(&itf["states"])[0]["last"]["act"]);
         assert_eq!(init, "Init", "{name}: the first state is not Init");
-        let (events, bytes) = (uint(&v["replayMaxEvents"]), uint(&v["replayMaxBytes"]));
         assert_eq!(
-            REPLAY_MAX_EVENTS % events,
-            0,
-            "{name}: event bound does not scale"
+            uint(&v["replayMaxEvents"]) * SEQ_SCALE,
+            CONTRACT_MAX_EVENTS,
+            "{name}: the model's event bound does not scale to the contract's"
         );
         assert_eq!(
-            REPLAY_MAX_BYTES % bytes,
-            0,
-            "{name}: byte bound does not scale"
+            uint(&v["replayMaxBytes"]) * BYTE_SCALE,
+            CONTRACT_MAX_BYTES,
+            "{name}: the model's byte bound does not scale to the contract's"
         );
         Scale {
-            seq: REPLAY_MAX_EVENTS / events,
-            bytes: REPLAY_MAX_BYTES / bytes,
+            seq: SEQ_SCALE,
+            bytes: BYTE_SCALE,
         }
     }
 }
@@ -198,6 +208,8 @@ fn plan(v: &Value, scale: &Scale) -> Result<ReplayPlan, QueryError> {
 
 #[test]
 fn sync_traces_replay_against_decide_replay() {
+    assert_eq!(REPLAY_MAX_EVENTS, CONTRACT_MAX_EVENTS);
+    assert_eq!(REPLAY_MAX_BYTES, CONTRACT_MAX_BYTES);
     let mut checked = 0;
     for (name, itf) in read_traces("sync") {
         let scale = Scale::of(&name, &itf);
@@ -227,11 +239,11 @@ fn request_sha256(v: &Value) -> [u8; 32] {
     [u8::try_from(uint(v)).expect("hash fits u8"); 32]
 }
 
-/// A model result stands for a stored status and body.
+/// A model result is a stored HTTP status and a number standing for the body.
 fn result(v: &Value) -> CommandResult {
     CommandResult {
-        http_status: 200,
-        body: format!("{{\"result\":{}}}", uint(v)),
+        http_status: u16::try_from(uint(&v["status"])).expect("status fits u16"),
+        body: format!("{{\"result\":{}}}", uint(&v["n"])),
     }
 }
 
