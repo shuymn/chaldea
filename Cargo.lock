@@ -210,9 +210,21 @@ dependencies = [
  "alacritty_terminal",
  "chaldea-core",
  "chaldea-pty-runtime",
+ "libc",
  "proptest",
+ "rustix",
  "serde_json",
  "unicode-width",
+]
+
+[[package]]
+name = "chaldea-testkit"
+version = "0.1.0"
+dependencies = [
+ "chaldea-pty-runtime",
+ "rustix",
+ "serde_json",
+ "signal-hook",
 ]
 
 [[package]]

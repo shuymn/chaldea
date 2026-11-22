@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/pty-runtime"]
+members = ["crates/core", "crates/pty-runtime", "crates/testkit"]
 resolver = "3"
 
 [workspace.package]
@@ -25,6 +25,12 @@ jsonschema = { version = "=0.60.2", default-features = false }
 alacritty_terminal = { version = "=0.26.0", default-features = false }
 # The width table alacritty_terminal uses (same version as its lock entry), for grid decoding.
 unicode-width = "=0.2.3"
+# The macOS PTY backend (docs/design/pty-unix.md): rustix for safe syscalls (already in the
+# lock through alacritty_terminal), libc for the pre_exec body and libproc.
+rustix = { version = "=1.1.6", default-features = false, features = ["std", "pty", "process", "event", "termios", "fs"] }
+libc = "=0.2.191"
+# testkit's FakeCli: `flag::register` sets handlers without `unsafe`.
+signal-hook = { version = "=0.4.6", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

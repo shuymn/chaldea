@@ -693,3 +693,22 @@ impl Drop for Park {
         self.inner.cv.notify_all();
     }
 }
+
+/// The identity of a live or zombie process by pid, in the native backend's format (pid,
+/// start stamp, process group); `None` when no process has that pid. A test route only:
+/// the public lookup arrives with its first consumer (`docs/design/pty-unix.md` §2.1).
+///
+/// # Errors
+///
+/// The process exists but its record cannot be read (another user's process).
+#[cfg(target_os = "macos")]
+pub fn identify(pid: u32) -> io::Result<Option<ProcessIdentity>> {
+    crate::unix::identify(pid)
+}
+
+/// How many times the macOS writer has entered its full-queue `poll`, process-wide.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn unix_writer_polls() -> u64 {
+    crate::unix::WRITER_POLLS.load(Ordering::Acquire)
+}
