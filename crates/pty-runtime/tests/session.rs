@@ -1113,3 +1113,38 @@ fn channel_sink_never_stalls_the_drain() {
         }
     );
 }
+
+/// PR2-CL-19: when the failure teardown cannot confirm the tree dead, the error says so,
+/// while the input, the PTY, and the drain it did release are not reported abandoned.
+#[test]
+fn failed_spawn_reports_unconfirmed_kill_with_ends_released() {
+    let (e, log) = spawn_fault(
+        StartFault::Writer,
+        FakeScript {
+            kill: KillBehavior::Ignore,
+            ..FakeScript::default()
+        },
+    );
+    match e.cleanup() {
+        Cleanup::Unresolved {
+            kill: Some(k),
+            close: Some(c),
+            drain_abandoned,
+        } => {
+            assert!(!k.tree_dead && k.survivors.len() == 1, "{k:?}");
+            assert!(c.elapsed.is_some(), "the PTY was released");
+            assert!(!*drain_abandoned, "the drain ended");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        log,
+        vec![
+            FakeEvent::Spawned,
+            FakeEvent::Kill { extra: vec![] },
+            FakeEvent::InputDropped,
+            FakeEvent::ControlClosed,
+            FakeEvent::OutputClosed,
+        ]
+    );
+}

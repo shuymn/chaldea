@@ -274,3 +274,24 @@ fn startup_queries_use_the_spawn_size() {
         vec![b"\x1b[8;40;120t".to_vec(), b"\x1b[4;640;960t".to_vec()]
     );
 }
+
+/// PR2-CL-11: a reply queued when the input breaks is discarded and counted, with no
+/// record and no write.
+#[test]
+fn queued_reply_is_counted_on_input_breakage() {
+    let r = rig();
+    let probe = r.session.probe();
+    r.child.fail_writes_after(0, std::io::ErrorKind::BrokenPipe);
+    let hold = r.child.hold_writes();
+    let a = submit(&r.session, key(b"A"), open());
+    assert!(hold.wait_entered(soon()));
+    r.child.emit(b"\x1b[5n");
+    assert!(probe.wait(ProbePoint::ReplyEnqueued, 1, soon()));
+    hold.release();
+    assert!(matches!(a.wait().outcome, WriteOutcome::Incomplete { .. }));
+    assert!(r.events.wait(|e| matches!(e, SessionEvent::InputBroken(_))));
+    let st = r.session.status().responder;
+    assert_eq!((st.dropped_after_end, st.written), (1, 0));
+    assert!(r.child.writes().is_empty());
+    assert!(reply_records(&r).is_empty());
+}
