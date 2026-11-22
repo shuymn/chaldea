@@ -161,9 +161,21 @@ macro_rules! event_kinds {
                 }
             }
 
+            /// `None` for an unknown kind. A known kind's payload must be a JSON object:
+            /// serde also reads a struct from a JSON array, which the schema refuses, so
+            /// that form is rejected before typed decoding.
             fn decode_payload(kind: &str, raw: &RawValue) -> Option<Result<Self, serde_json::Error>> {
+                let object = || {
+                    if raw.get().trim_start().starts_with('{') {
+                        Ok(raw.get())
+                    } else {
+                        Err(<serde_json::Error as serde::de::Error>::custom("payload is not a JSON object"))
+                    }
+                };
                 match kind {
-                    $($kind => Some(serde_json::from_str::<$payload>(raw.get()).map(TypedEvent::$variant)),)*
+                    $($kind => Some(object().and_then(|text| {
+                        serde_json::from_str::<$payload>(text).map(TypedEvent::$variant)
+                    })),)*
                     _ => None,
                 }
             }
@@ -219,10 +231,8 @@ impl TypedEvent {
         }
         match TypedEvent::decode_payload(e.kind.as_str(), &e.payload) {
             None => Err(generic(GenericReason::UnknownKind)),
-            // serde also reads a struct from a JSON array; the schema allows only an
-            // object, so Rust refuses the array form too.
-            Some(Ok(t)) if e.payload.get().trim_start().starts_with('{') => Ok(t),
-            Some(_) => Err(generic(GenericReason::PayloadInvalid)),
+            Some(Err(_)) => Err(generic(GenericReason::PayloadInvalid)),
+            Some(Ok(t)) => Ok(t),
         }
     }
 }

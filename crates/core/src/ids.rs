@@ -233,7 +233,7 @@ impl std::error::Error for ParseIdError {}
 /// on the wire (stream ids are compared as strings by clients and the relay).
 fn parse_canonical_uuid(s: &str) -> Option<Uuid> {
     let u = Uuid::try_parse(s).ok()?;
-    (u.hyphenated().to_string() == s).then_some(u)
+    (u.hyphenated().encode_lower(&mut Uuid::encode_buffer()) == s).then_some(u)
 }
 
 const UUID_PATTERN: &str = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";

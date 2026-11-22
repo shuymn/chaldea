@@ -306,10 +306,7 @@ impl<'de> Deserialize<'de> for EventsResponse {
             stream_id: StreamId,
             epoch: Epoch,
             events: Vec<EventEnvelope>,
-            #[serde(
-                serialize_with = "crate::wire::ser_safe_u64",
-                deserialize_with = "crate::wire::safe_u64"
-            )]
+            #[serde(deserialize_with = "crate::wire::safe_u64")]
             head_seq: u64,
             has_more: bool,
             has_more_before: bool,
@@ -319,10 +316,7 @@ impl<'de> Deserialize<'de> for EventsResponse {
             stream_id: StreamId,
             epoch: Epoch,
             snapshot: StreamSnapshot,
-            #[serde(
-                serialize_with = "crate::wire::ser_safe_u64",
-                deserialize_with = "crate::wire::safe_u64"
-            )]
+            #[serde(deserialize_with = "crate::wire::safe_u64")]
             as_of_seq: u64,
             reason: SnapshotReason,
         }
