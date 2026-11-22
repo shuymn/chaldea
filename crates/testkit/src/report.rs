@@ -1,33 +1,38 @@
 //! The report stream between a FakeCli process and its test.
 //!
 //! Wire format: each FakeCli process connects its own TCP stream to the test's
-//! [`ReportListener`], writes a hello line, then mode events, one JSON object per line, and
-//! never closes the stream: it closes when the process exits. The test may send `ping`
-//! lines; the fixture answers each with `{"event":"pong","inq":n}`, `inq` being the bytes
-//! waiting on its stdin when that is a terminal. EOF is death, `pong` is life.
+//! [`ReportListener`], writes a hello line, then mode events, one JSON object per line. It
+//! ends its side of the stream only as it exits: a killed process by the kernel, and a
+//! normal exit by `shutdown(Write)` right before the process ends, after its last line
+//! (Windows resets a socket still open at process exit, and the reset discards what the
+//! test has not read yet). The test may send `ping` lines; the fixture answers each with
+//! `{"event":"pong","inq":n}`, `inq` being the bytes waiting on its stdin when that is a
+//! terminal. EOF is death (or an exit already under way), `pong` is life.
 //!
 //! The test side also has [`Cleanup`], which kills fixtures by verified identity.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process::Child;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// The fixture side: a stream that is never closed before the process exits.
-pub(crate) struct Reporter {
-    stream: Option<Mutex<TcpStream>>,
-}
+/// The process's report stream, once connected, and whether it has ended. It lives as
+/// long as the process; [`end`] ends it.
+static STREAM: OnceLock<Mutex<(TcpStream, bool)>> = OnceLock::new();
+
+/// The fixture side of the report stream.
+pub(crate) struct Reporter;
 
 impl Reporter {
     /// Connects to `addr` and starts the thread answering `ping`; with no address (or a
-    /// failed connect) events are discarded.
+    /// failed connect) events are discarded. A process connects once.
     pub(crate) fn connect(addr: Option<&str>, inq: fn() -> Option<u64>) -> Reporter {
         let Some(stream) = addr.and_then(|a| TcpStream::connect(a).ok()) else {
-            return Reporter { stream: None };
+            return Reporter;
         };
         if let (Ok(read), Ok(mut write)) = (stream.try_clone(), stream.try_clone()) {
             std::thread::spawn(move || {
@@ -42,25 +47,33 @@ impl Reporter {
                 }
             });
         }
-        Reporter {
-            stream: Some(Mutex::new(stream)),
-        }
+        let _ = STREAM.set(Mutex::new((stream, false)));
+        Reporter
     }
 
+    /// Writes one line; nothing once the stream has ended.
+    #[allow(
+        clippy::unused_self,
+        reason = "a line is sent by the process that connected"
+    )]
     pub(crate) fn send(&self, v: &Value) {
-        if let Some(s) = &self.stream {
-            let mut s = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _ = writeln!(s, "{v}");
+        if let Some(s) = STREAM.get() {
+            let mut s = s.lock().unwrap_or_else(PoisonError::into_inner);
+            if !s.1 {
+                let _ = writeln!(s.0, "{v}");
+            }
         }
     }
 }
 
-impl Drop for Reporter {
-    fn drop(&mut self) {
-        // The stream lives as long as the process: EOF must mean exit.
-        if let Some(s) = self.stream.take() {
-            std::mem::forget(s);
-        }
+/// Ends the report stream right before a normal exit: no line is written after it, and
+/// the test reads every line written, then EOF. Without it the socket would still be open
+/// at process exit, which Windows resets, discarding the lines the test has not read.
+pub(crate) fn end() {
+    if let Some(s) = STREAM.get() {
+        let mut s = s.lock().unwrap_or_else(PoisonError::into_inner);
+        s.1 = true;
+        let _ = s.0.shutdown(Shutdown::Write);
     }
 }
 
@@ -293,8 +306,8 @@ impl Fixture {
         }
     }
 
-    /// Whether the stream closed (the process exited) by `deadline`. Events read meanwhile
-    /// stay queued for `next_event`.
+    /// Whether the stream closed (the process exited, or its normal exit is under way) by
+    /// `deadline`. Events read meanwhile stay queued for `next_event`.
     pub fn closed_by(&mut self, deadline: Instant) -> bool {
         loop {
             match self.read_value(deadline) {

@@ -128,16 +128,19 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> i32 {
     if let Some(secs) = o.max_life_secs {
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(secs));
+            crate::report::end();
             std::process::exit(0);
         });
     }
-    match o.mode {
+    let code = match o.mode {
         Mode::Echo => echo::run(&o),
         Mode::Queries => queries::run(&o),
         Mode::Attachable => attachable::run(&o),
         Mode::SpawnTree => spawn_tree::run(&o),
         Mode::Sleeper => sleeper::run(&o),
-    }
+    };
+    crate::report::end();
+    code
 }
 
 /// Lists the fds, connects the report stream, and sends the hello. The fds are listed
