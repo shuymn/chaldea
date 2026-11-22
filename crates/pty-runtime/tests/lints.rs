@@ -191,9 +191,7 @@ fn attributes(code: &str) -> Vec<(bool, String, String)> {
                 }
                 let after: String = b[j..]
                     .iter()
-                    .collect::<String>()
-                    .trim_start()
-                    .chars()
+                    .skip_while(|c| c.is_whitespace())
                     .take(40)
                     .collect();
                 out.push((inner, body, after));
