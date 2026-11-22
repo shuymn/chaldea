@@ -51,7 +51,7 @@ Two layers in one module:
 | `st.evidenceCandidate`, `stopCount` | the signal that may become readiness evidence: Claude's `SessionStart`, or a `Stop` identified by launch, turn, and intake order; any later hook of the launch invalidates it | mvp §2.3:173 |
 | `st.gp` | gate evidence of the current launch: bound and its seq, readiness seq, kind, basis, launch and turn, last write, last gate-closing human write, last turn start, bracketed paste needed and on | mvp §2.1:115 |
 | `st.writer` | counted writes of the current launch, in writer order | docs/design/pty-runtime.md §2.3 |
-| `st.buffer`, `bufferCandidate` | hooks of an unbound launch with their intake facts; the buffered `Stop` a settle completion may still name | mvp §2.9:325 |
+| `st.buffer`, `bufferedStop` | hooks of an unbound launch with their intake facts; the buffered `Stop` a settle completion may still name | mvp §2.9:325 |
 | `st.inputs` | per input: state, launch, positional, `sent_after_seq`, its attempt's seq, last write before it and admitted basis, dispatched, write position, pending ack candidate with its intake facts | mvp §2.3 |
 | `st.cards` | per card: launch, turn, open / ran / superseded / expired | mvp §2.10 |
 | `st.sendCount`, `writeCount`, `sendRecords`, `dispatchRecords`, `ackRecords`, `ownerDelivered`, `cardKeys`, `reservations` | history the invariants read: facts recorded where they happen | — |

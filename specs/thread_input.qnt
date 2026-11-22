@@ -32,9 +32,6 @@ module thread_input {
   pure val MAX_INPUTS = 3
   pure val MAX_CARDS = 2
   pure val INPUT_IDS = 1.to(MAX_INPUTS)
-  // Every VT reply is a counted write: the default policy (`ClassSet::ALL`,
-  // docs/design/pty-runtime.md §2.3 "Basis", D3).
-  pure val REPLIES_COUNTED = true
 
   // ---------------------------------------------------------------------------
   // Reducer layer: crates/core/src/state.rs
@@ -330,7 +327,7 @@ module thread_input {
     evidence: Evidence,
     // The writer position captured with the evidence at its intake.
     basis: int,
-    // The launch and turn the evidence belongs to (-1: no evidence candidate backed it).
+    // The launch and turn the evidence belongs to (`readinessSeq == 0`: no evidence).
     evidenceLaunch: int,
     evidenceTurn: int,
     lastWrite: int,
@@ -405,8 +402,8 @@ module thread_input {
     gp: GateProjection,
     writer: List[Origin],
     buffer: List[BufferedHook],
-    // The candidate the buffered hooks would leave, tracked at their intake.
-    bufferCandidate: EvidenceCandidate,
+    // The buffered `Stop` a settle completion may still name, tracked at intake (0: none).
+    bufferedStop: int,
     inputs: int -> Input,
     cards: int -> Card,
     // History for the invariants.
@@ -524,7 +521,7 @@ module thread_input {
     gp: NO_GATE_EVIDENCE,
     writer: [],
     buffer: [],
-    bufferCandidate: NoEvidenceCandidate,
+    bufferedStop: 0,
     inputs: Map(),
     cards: Map(),
     sendCount: Map(),
@@ -543,9 +540,9 @@ module thread_input {
   pure def openCards(s: State): Set[int] =
     s.cards.keys().filter(c => s.cards.get(c).launch == s.launch and s.cards.get(c).state == CardIsOpen)
 
-  /// `blocks_gate`: an in-flight input of the current launch; earlier launches never block.
-  pure def inFlightCurrent(s: State): bool =
-    s.inputs.keys().exists(id => s.inputs.get(id).launch == s.launch and isInFlight(stateOf(s, id)))
+  /// `blocks_gate`: the in-flight inputs of the current launch; earlier launches never block.
+  pure def inFlightIds(s: State): Set[int] =
+    s.inputs.keys().filter(id => s.inputs.get(id).launch == s.launch and isInFlight(stateOf(s, id)))
 
   pure def gateView(s: State): GateView = {
     bound: s.gp.bound,
@@ -556,7 +553,7 @@ module thread_input {
     lastWrite: s.gp.lastWrite,
     lastHumanWrite: s.gp.lastHumanWrite,
     lastTurnStart: s.gp.lastTurnStart,
-    inFlight: inFlightCurrent(s),
+    inFlight: inFlightIds(s).size() > 0,
     needsBracketedPaste: s.gp.needsBracketedPaste,
     bracketedPasteOn: s.gp.bracketedPasteOn,
   }
@@ -569,18 +566,13 @@ module thread_input {
     {
       ...gateView(s),
       lastWrite: if (s.gp.lastWrite == i.attemptSeq) i.lastWriteBefore else s.gp.lastWrite,
-      inFlight: s.inputs.keys().exists(o => o != id and s.inputs.get(o).launch == s.launch and isInFlight(stateOf(s, o))),
+      inFlight: inFlightIds(s).exclude(Set(id)).size() > 0,
     }
-
-  pure def counted(o: Origin): bool = match o {
-    | WReply => REPLIES_COUNTED
-    | _ => true
-  }
 
   /// No counted write other than the input's own started after its write position.
   pure def noOtherWriteAfter(s: State, id: int): bool =
     val pos = s.inputs.get(id).writePos
-    s.writer.indices().forall(j => j < pos or not(counted(s.writer[j])) or s.writer[j] == WInput(id))
+    s.writer.indices().forall(j => j < pos or s.writer[j] == WInput(id))
 
   /// The facts of a hook matching `id` at its intake, the hook's seq being `hookSeq`.
   pure def intakeFacts(s: State, id: int, matches: Set[int], hookSeq: int): AckRecord =
@@ -611,12 +603,6 @@ module thread_input {
   pure def stopBacks(s: State, c: EvidenceCandidate, id: int): bool = match c {
     | StopCandidate(r) => r.id == id and r.launch == s.launch and r.turn == s.turnNo
     | _ => false
-  }
-
-  /// The id of the current `Stop` candidate, or 0.
-  pure def candidateStop(c: EvidenceCandidate): int = match c {
-    | StopCandidate(r) => r.id
-    | _ => 0
   }
 
   pure def incr(m: int -> int, id: int): int -> int =
@@ -821,7 +807,7 @@ module thread_input {
       gp: { ...NO_GATE_EVIDENCE, needsBracketedPaste: c.needsBracketedPaste },
       writer: [],
       buffer: [],
-      bufferCandidate: NoEvidenceCandidate,
+      bufferedStop: 0,
       reservations: st.reservations.append(st.deathConfirmed),
     }
     val id = firstFree(st)
@@ -879,7 +865,7 @@ module thread_input {
     st.hooksLive,
     not(st.sessionStartSeen),
     commit(SessionStartHook, start({ ...st,
-      sessionStartSeen: true, evidenceCandidate: NoEvidenceCandidate, bufferCandidate: NoEvidenceCandidate })),
+      sessionStartSeen: true, evidenceCandidate: NoEvidenceCandidate, bufferedStop: 0 })),
   }
 
   /// A human starts the first turn of a manual Codex launch through attach (an attach
@@ -918,10 +904,10 @@ module thread_input {
     })
     // Replaying the buffer cannot revive a `Stop` that a later hook invalidated at intake:
     // an unsettled `Stop` candidate survives only if it is the one still live there.
-    val live = candidateStop(st.bufferCandidate)
+    val live = st.bufferedStop
     commit(Bind, withState(o3, s => { ...s,
       buffer: [],
-      bufferCandidate: NoEvidenceCandidate,
+      bufferedStop: 0,
       evidenceCandidate: match s.evidenceCandidate {
         | StopCandidate(r) => if (r.id == live) s.evidenceCandidate else NoEvidenceCandidate
         | _ => s.evidenceCandidate
@@ -971,7 +957,7 @@ module thread_input {
     matchable(st, matches),
     commit(BufferPrompt(matches), start({ ...st,
       buffer: st.buffer.append(BufPrompt({ matches: matches, facts: factsNow(st, matches) })),
-      bufferCandidate: NoEvidenceCandidate,
+      bufferedStop: 0,
     })),
   }
 
@@ -984,8 +970,7 @@ module thread_input {
     commit(BufferStop, start({ ...st,
       stopCount: id,
       buffer: st.buffer.append(BufStop(id)),
-      // The turn of a buffered `Stop` is known only at promotion; the launch is current.
-      bufferCandidate: StopCandidate({ launch: st.launch, turn: -1, id: id }),
+      bufferedStop: id,
     })),
   }
 
@@ -998,13 +983,13 @@ module thread_input {
     st.buffer.length() < 3,
     kindAllowed(st.cfg, ev),
     match ev {
-      | StopSettled => candidateStop(st.bufferCandidate) == stop and stop != 0
+      | StopSettled => st.bufferedStop == stop and stop != 0
       | PostDecision => stop == 0
       | _ => false
     },
     commit(BufferReady({ kind: ev, stop: stop }), start({ ...st,
       buffer: st.buffer.append(BufReady({ kind: ev, basis: st.writer.length(), stop: stop })),
-      bufferCandidate: NoEvidenceCandidate,
+      bufferedStop: 0,
     })),
   }
 
@@ -1307,9 +1292,6 @@ module thread_input {
     alive(st),
     commit(Decset(on), start({ ...st, gp: { ...st.gp, bracketedPasteOn: on } })),
   }
-
-  pure def inFlightIds(s: State): Set[int] =
-    s.inputs.keys().filter(id => s.inputs.get(id).launch == s.launch and isInFlight(stateOf(s, id)))
 
   // The simulator picks uniformly among the enabled branches of `any`, so the actions are
   // grouped: progress along a launch and an input, hooks, and disturbances.

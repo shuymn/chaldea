@@ -1,6 +1,6 @@
 // Exports the named traces of thread_input_traces.qnt as ITF and compares them with the
-// committed files under specs/traces/ (`--check`, the default), or rewrites those files
-// (`--write`). The replay test crates/core/tests/quint_traces.rs reads the committed files.
+// committed files under specs/traces/ (the default), or rewrites those files (`--write`).
+// The replay test crates/core/tests/quint_traces.rs reads the committed files.
 //
 // Normalized form: the top-level `#meta` (a timestamp and the source path) is dropped and
 // each state is one line, so the output depends only on the spec. The comparison ignores
@@ -28,8 +28,8 @@ function readOrNull(path) {
 }
 
 // Returns the exit status; the caller removes `tmp` whatever happens here.
-function run(tmp, write) {
-  const r = quint(["test", SPEC, "--match", "^trace_", "--out-itf", join(tmp, "{test}.itf.json")]);
+async function run(tmp, write) {
+  const r = await quint(["test", SPEC, "--match", "^trace_", "--out-itf", join(tmp, "{test}.itf.json")]);
   if (r.status !== 0) {
     console.error(`quint test failed (exit ${r.status})`);
     return 1;
@@ -71,7 +71,7 @@ function run(tmp, write) {
 
 const tmp = mkdtempSync(join(tmpdir(), "chaldea-quint-"));
 try {
-  process.exitCode = run(tmp, process.argv.includes("--write"));
+  process.exitCode = await run(tmp, process.argv.includes("--write"));
 } finally {
   rmSync(tmp, { recursive: true, force: true });
 }

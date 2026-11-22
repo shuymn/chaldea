@@ -312,7 +312,7 @@ module thread_input_traces {
       .then(bufferPrompt(Set(1)))
       .then(bufferStop)
       .then(sessionStartHook)
-      .expect(st.bufferCandidate == NoEvidenceCandidate)
+      .expect(st.bufferedStop == 0)
       .then(bind)
       .expect(stateOf(st, 1) == Acked and last.gate == Closed(NoEvidence))
       .expect(not(readyAllowed(st, StopSettled, st.stopCount)))
@@ -372,7 +372,7 @@ module thread_input_traces {
       .then(ready(PostDecision, 0))
       .expect(last.gate == Open and st.gp.evidenceTurn == 1)
 
-  /// Coverage: `BracketedPasteOff`, `InputInFlight`, a rejected and a cancelled input.
+  /// Coverage: `BracketedPasteOff`, `InputInFlight`, and a rejected input.
   run trace_coverage_gate_reasons =
     readyLaunch
       .then(decset(false))

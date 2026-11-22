@@ -1,7 +1,7 @@
 // Simulates thread_input.qnt with fixed seeds and checks every invariant
 // (docs/design/formal-specs.md "CI"). Fails on a violation, and when a witness is never
 // reached across all seeds (the simulation stopped covering it).
-import { quintAsync } from "./quint.mjs";
+import { quint } from "./quint.mjs";
 
 const SEEDS = [1, 2, 3, 4];
 const MAX_SAMPLES = 1000;
@@ -56,7 +56,7 @@ const WITNESSES = [
 const started = Date.now();
 const results = await Promise.all(
   SEEDS.map((seed) =>
-    quintAsync([
+    quint([
       "run", "thread_input.qnt",
       "--seed", String(seed),
       "--max-samples", String(MAX_SAMPLES),
@@ -64,7 +64,7 @@ const results = await Promise.all(
       "--invariants", ...INVARIANTS,
       "--witnesses", ...WITNESSES,
       "--verbosity", "2",
-    ]),
+    ], { capture: true }),
   ),
 );
 const seconds = ((Date.now() - started) / 1000).toFixed(1);
