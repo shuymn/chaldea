@@ -1,0 +1,193 @@
+//! `chaldea-fake-cli` (`docs/design/pty-unix.md` §2.8):
+//!
+//! ```text
+//! chaldea-fake-cli --mode <echo|queries|attachable|spawn-tree|sleeper> [--report <127.0.0.1:port>]
+//!                  [--role <role>] [--roles <list>] [--max-life-secs <n>] [--reply-timeout-ms <n>]
+//!                  [--raw] [--setsid] [--escape-orphan] [--orphan-keeps-tty]
+//! ```
+//!
+//! An unknown mode or flag exits 2.
+
+mod attachable;
+mod echo;
+mod queries;
+mod sleeper;
+mod spawn_tree;
+mod term;
+
+use std::ffi::OsString;
+use std::time::Duration;
+
+use serde_json::{Value, json};
+
+use crate::report::Reporter;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Echo,
+    Queries,
+    Attachable,
+    SpawnTree,
+    Sleeper,
+}
+
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Echo => "echo",
+            Mode::Queries => "queries",
+            Mode::Attachable => "attachable",
+            Mode::SpawnTree => "spawn-tree",
+            Mode::Sleeper => "sleeper",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Opts {
+    pub(crate) mode: Mode,
+    pub(crate) report: Option<String>,
+    pub(crate) role: Option<String>,
+    pub(crate) roles: Option<Vec<String>>,
+    pub(crate) max_life_secs: Option<u64>,
+    pub(crate) reply_timeout: Duration,
+    pub(crate) raw: bool,
+    pub(crate) setsid: bool,
+    pub(crate) escape_orphan: bool,
+    pub(crate) orphan_keeps_tty: bool,
+}
+
+fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
+    let mut it = args
+        .into_iter()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned());
+    let mut mode = None;
+    let mut o = Opts {
+        mode: Mode::Sleeper,
+        report: None,
+        role: None,
+        roles: None,
+        max_life_secs: None,
+        reply_timeout: Duration::from_millis(500),
+        raw: false,
+        setsid: false,
+        escape_orphan: false,
+        orphan_keeps_tty: false,
+    };
+    while let Some(flag) = it.next() {
+        let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
+        match flag.as_str() {
+            "--mode" => {
+                mode = Some(match value()?.as_str() {
+                    "echo" => Mode::Echo,
+                    "queries" => Mode::Queries,
+                    "attachable" => Mode::Attachable,
+                    "spawn-tree" => Mode::SpawnTree,
+                    "sleeper" => Mode::Sleeper,
+                    m => return Err(format!("unknown mode {m}")),
+                });
+            }
+            "--report" => o.report = Some(value()?),
+            "--role" => o.role = Some(value()?),
+            "--roles" => {
+                let v = value()?;
+                o.roles = Some(if v == "none" {
+                    Vec::new()
+                } else {
+                    v.split(',').map(str::to_owned).collect()
+                });
+            }
+            "--max-life-secs" => {
+                o.max_life_secs = Some(value()?.parse().map_err(|e| format!("{flag}: {e}"))?);
+            }
+            "--reply-timeout-ms" => {
+                let ms: u64 = value()?.parse().map_err(|e| format!("{flag}: {e}"))?;
+                o.reply_timeout = Duration::from_millis(ms);
+            }
+            "--raw" => o.raw = true,
+            "--setsid" => o.setsid = true,
+            "--escape-orphan" => o.escape_orphan = true,
+            "--orphan-keeps-tty" => o.orphan_keeps_tty = true,
+            f => return Err(format!("unknown flag {f}")),
+        }
+    }
+    o.mode = mode.ok_or("--mode is required")?;
+    Ok(o)
+}
+
+/// Runs FakeCli with `args` (`args[0]` is the program name); returns the exit code.
+pub fn main(args: impl IntoIterator<Item = OsString>) -> i32 {
+    let o = match parse(args) {
+        Ok(o) => o,
+        Err(msg) => {
+            eprintln!("chaldea-fake-cli: {msg}");
+            return 2;
+        }
+    };
+    if let Some(secs) = o.max_life_secs {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(secs));
+            std::process::exit(0);
+        });
+    }
+    match o.mode {
+        Mode::Echo => echo::run(&o),
+        Mode::Queries => queries::run(&o),
+        Mode::Attachable => attachable::run(&o),
+        Mode::SpawnTree => spawn_tree::run(&o),
+        Mode::Sleeper => sleeper::run(&o),
+    }
+}
+
+/// Lists the fds, connects the report stream, and sends the hello. The fds are listed
+/// before connecting, so the stream is not among them.
+pub(crate) fn hello(o: &Opts, raw: bool) -> Reporter {
+    let fds = term::open_fds();
+    let rep = Reporter::connect(o.report.as_deref(), term::inq);
+    let role = o.role.clone().unwrap_or_else(|| o.mode.name().to_owned());
+    let mut v = json!({
+        "event": "hello",
+        "mode": o.mode.name(),
+        "role": role,
+        "pid": std::process::id(),
+        "raw": raw,
+        "fds": fds,
+    });
+    if let Value::Object(m) = &mut v
+        && let Value::Object(t) = term::identity()
+    {
+        m.extend(t);
+    }
+    rep.send(&v);
+    rep
+}
+
+/// Enters raw mode when asked (`--raw`) or when the mode reads stdin, only on a terminal.
+pub(crate) fn enter_raw(o: &Opts, reads_stdin: bool) -> bool {
+    (o.raw || reads_stdin) && term::stdin_is_tty() && term::make_raw()
+}
+
+/// The arguments a child FakeCli process inherits: report address and life bound.
+pub(crate) fn child_args(o: &Opts, role: &str) -> Vec<String> {
+    let mut a = vec![
+        "--mode".to_owned(),
+        "sleeper".to_owned(),
+        "--role".to_owned(),
+        role.to_owned(),
+    ];
+    if let Some(r) = &o.report {
+        a.extend(["--report".to_owned(), r.clone()]);
+    }
+    if let Some(s) = o.max_life_secs {
+        a.extend(["--max-life-secs".to_owned(), s.to_string()]);
+    }
+    a
+}
+
+/// Sleeps until the process is ended by a signal or `--max-life-secs`.
+pub(crate) fn idle() -> ! {
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
