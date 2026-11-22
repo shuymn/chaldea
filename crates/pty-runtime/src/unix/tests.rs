@@ -682,3 +682,38 @@ fn identity_without_a_record_has_an_empty_start() {
     assert_eq!(id.start_time, "");
     assert!(wait_dead(id.pid));
 }
+
+#[test]
+fn vanished_symlink_target_is_not_found() {
+    let _s = serial();
+    let dir = TempDir::new("link");
+    let outer = dir.0.join("agent");
+    let inner = dir.0.join("inner");
+    std::os::unix::fs::symlink("/usr/bin/true", &inner).unwrap();
+    std::os::unix::fs::symlink(&inner, &outer).unwrap();
+    let gone = inner.clone();
+    let pty = UnixPty {
+        hooks: Hooks {
+            stage: Some(Box::new(move |s| {
+                if matches!(s, Stage::Validated) {
+                    std::fs::remove_file(&gone).unwrap();
+                }
+                false
+            })),
+            ..Hooks::default()
+        },
+    };
+    let (r, _) = spawn(&pty, &spec(&[outer.to_str().unwrap()], &dir.0));
+    match r {
+        Err(SpawnError::NeverStarted {
+            kind,
+            error,
+            cleanup,
+        }) => {
+            assert_eq!(kind, NeverStartedKind::NotFound, "{error}");
+            assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+            assert_eq!(cleanup, Cleanup::Confirmed);
+        }
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+}

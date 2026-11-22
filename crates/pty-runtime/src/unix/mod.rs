@@ -164,9 +164,8 @@ fn validate(spec: &SpawnSpec) -> Result<(), SpawnError> {
 /// The kind of a failure the forked child reported (§2.2 stage 4).
 fn kind_of(e: &Error, program: &Path) -> NeverStartedKind {
     match e.raw_os_error() {
-        Some(libc::ENOENT) if std::fs::symlink_metadata(program).is_err() => {
-            NeverStartedKind::NotFound
-        }
+        // `metadata` follows symlinks: a link whose target vanished is a missing program.
+        Some(libc::ENOENT) if std::fs::metadata(program).is_err() => NeverStartedKind::NotFound,
         Some(libc::EACCES) => NeverStartedKind::PermissionDenied,
         _ => NeverStartedKind::Setup,
     }
