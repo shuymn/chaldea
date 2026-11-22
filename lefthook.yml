@@ -42,6 +42,7 @@ pre-commit:
       glob:
         - "specs/*.qnt"
         - "specs/traces/*"
+        - "specs/traces/*/*"
         - "specs/scripts/*"
         - "specs/package.json"
         - "specs/pnpm-*.yaml"
@@ -62,6 +63,7 @@ pre-push:
         - "crates/**/*"
         - "packages/contracts/**/*"
         - "specs/traces/*"
+        - "specs/traces/*/*"
         - "Cargo.{toml,lock}"
         - "rust-toolchain.toml"
       run: cargo test --workspace --locked --no-fail-fast
