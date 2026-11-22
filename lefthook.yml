@@ -45,7 +45,7 @@ pre-commit:
         - "specs/scripts/*"
         - "specs/package.json"
         - "specs/pnpm-*.yaml"
-      run: '{ [ node_modules/.modules.yaml -nt pnpm-lock.yaml ] || mise exec -- pnpm install --frozen-lockfile --silent; } && mise exec -- pnpm run --silent typecheck && mise exec -- pnpm run --silent traces:check'
+      run: 'mise exec -- pnpm install --frozen-lockfile --silent && mise exec -- pnpm run --silent typecheck && mise exec -- pnpm run --silent traces:check'
     pty-hooks-fmt:
       root: spikes/pty-hooks/
       glob: "*.rs"
@@ -72,7 +72,7 @@ pre-push:
         - "specs/scripts/*"
         - "specs/package.json"
         - "specs/pnpm-*.yaml"
-      run: '{ [ node_modules/.modules.yaml -nt pnpm-lock.yaml ] || mise exec -- pnpm install --frozen-lockfile --silent; } && mise exec -- pnpm run --silent simulate'
+      run: 'mise exec -- pnpm install --frozen-lockfile --silent && mise exec -- pnpm run --silent simulate'
     pty-hooks-test:
       root: spikes/pty-hooks/
       glob: "*.{rs,toml,lock,txt}"

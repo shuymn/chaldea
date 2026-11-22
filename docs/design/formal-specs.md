@@ -155,7 +155,7 @@ pnpm run traces:check   # spec and specs/traces/ agree
 pnpm run traces:write   # regenerate specs/traces/ after a spec change
 ```
 
-The `specs` job of `ci.yml` (`ubuntu-latest`, mise pinned in `mise-action`) installs Node and pnpm through mise and runs those checks. `lefthook.yml` runs typecheck and the trace check on commit and the simulation on push for changes under `specs/`, installs only when `node_modules` is missing or older than the lockfile, and runs the workspace tests on push when a trace changes. The simulation size reaches every witness: at 250 samples × 30 steps an attributed ack through the gate was reached in under 1 % of traces. The four seeds run in about 15 s on a development machine.
+The `specs` job of `ci.yml` (`ubuntu-latest`, mise pinned in `mise-action`) installs Node and pnpm through mise and runs those checks. `lefthook.yml` runs typecheck and the trace check on commit and the simulation on push for changes under `specs/`, each after `pnpm install --frozen-lockfile` (about 50 ms when `node_modules` is up to date), and runs the workspace tests on push when a trace changes. `verifyDepsBeforeRun: error` in `pnpm-workspace.yaml` also makes every `pnpm run` fail while `node_modules` does not match `package.json` and the lockfile. The simulation size reaches every witness: at 250 samples × 30 steps an attributed ack through the gate was reached in under 1 % of traces. The four seeds run in about 15 s on a development machine.
 
 **Apalache** (`quint verify`) is not in CI and is unverified: it needs a Java runtime and downloads Apalache, and whether it accepts the spec's list folds and maps of records is untested. To try it: `pnpm exec quint verify thread_input.qnt --invariant allInvariants --max-steps 10`.
 
