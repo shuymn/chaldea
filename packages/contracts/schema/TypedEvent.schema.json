@@ -265,7 +265,8 @@
               "type": "integer"
             },
             "grid": {
-              "$ref": "#/$defs/Content"
+              "$ref": "#/$defs/Content",
+              "description": "The grid in the `vt_snapshot_taken` encoding."
             },
             "rows": {
               "format": "uint16",
@@ -1565,6 +1566,7 @@
           "type": "integer"
         },
         "row": {
+          "description": "Zero-based cell coordinates in the grid.",
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0,
@@ -1609,7 +1611,8 @@
           "$ref": "#/$defs/VtCursor"
         },
         "grid": {
-          "$ref": "#/$defs/Content"
+          "$ref": "#/$defs/Content",
+          "description": "A JSON array of exactly `rows` rows, top to bottom, each an array of at most\n`cols` cell strings, left to right. `\"\"` is the second cell of a wide character and\ndirectly follows it; every other cell is non-empty (a blank cell is `\" \"`). Trailing\nblank cells are omitted; a reader fills them back to `cols`. A grid of any other\nshape is an unreadable snapshot. Above 64 KiB the grid is a blob, fetched before\ndecoding (`docs/design/pty-runtime.md` §2.6)."
         },
         "modes": {
           "$ref": "#/$defs/VtModes"

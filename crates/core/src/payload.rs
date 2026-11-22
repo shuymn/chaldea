@@ -387,6 +387,7 @@ pub enum Component {
         markdown: String,
     },
     VtSnapshot {
+        /// The grid in the `vt_snapshot_taken` encoding.
         grid: Content,
         cols: u16,
         rows: u16,
@@ -416,6 +417,7 @@ pub struct SurfaceUpdate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
 pub struct VtCursor {
+    /// Zero-based cell coordinates in the grid.
     pub row: u16,
     pub col: u16,
     pub visible: bool,
@@ -430,6 +432,12 @@ pub struct VtModes {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
 pub struct VtSnapshotTaken {
+    /// A JSON array of exactly `rows` rows, top to bottom, each an array of at most
+    /// `cols` cell strings, left to right. `""` is the second cell of a wide character and
+    /// directly follows it; every other cell is non-empty (a blank cell is `" "`). Trailing
+    /// blank cells are omitted; a reader fills them back to `cols`. A grid of any other
+    /// shape is an unreadable snapshot. Above 64 KiB the grid is a blob, fetched before
+    /// decoding (`docs/design/pty-runtime.md` §2.6).
     pub grid: Content,
     pub cols: u16,
     pub rows: u16,
