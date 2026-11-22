@@ -481,7 +481,11 @@ pub(crate) fn validate(
                 return Err(SubmitError::BadShape("empty bytes part"));
             }
             Part::Bytes(_) => {}
-            Part::Pause(d) => pause += *d,
+            Part::Pause(d) => {
+                pause = pause
+                    .checked_add(*d)
+                    .ok_or(SubmitError::BadShape("total pause over the limit"))?;
+            }
         }
     }
     if pause > max_pause {

@@ -815,6 +815,10 @@ fn bad_shapes_are_refused() {
             vec![b("a"), pause(3000), b("b"), pause(3000), b("c")],
             "total pause over the limit",
         ),
+        (
+            vec![b("a"), Part::Pause(Duration::MAX), b("b"), pause(1), b("c")],
+            "total pause over the limit",
+        ),
     ];
     for (parts, why) in cases {
         let (done, _rx) = completion_channel();
