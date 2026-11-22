@@ -138,7 +138,7 @@ pub struct NewHookDelivery {
 }
 
 /// `(sha256, data)` of the blobs an event stores.
-type BlobRows = Vec<(String, Vec<u8>)>;
+type BlobRows<'a> = Vec<(String, &'a [u8])>;
 /// `(sha256, path)` of the blob references an event records.
 type RefRows = Vec<(String, String)>;
 
@@ -195,37 +195,6 @@ struct TaskCause {
 struct TranscriptJob {
     started_generation: bool,
     continued: bool,
-}
-
-/// An event ready to store.
-struct Row {
-    stream_id: StreamId,
-    key: IdempotencyKey,
-    typed: TypedEvent,
-    thread_id: Option<ThreadId>,
-    launch_id: Option<LaunchId>,
-    command_id: Option<CommandId>,
-    source: Source,
-    occurred_at: Option<Timestamp>,
-    annex: Option<EventAnnex>,
-    blobs: Vec<BlobInput>,
-}
-
-impl From<NewEvent> for Row {
-    fn from(e: NewEvent) -> Self {
-        Row {
-            stream_id: e.stream_id,
-            key: e.idempotency_key,
-            typed: e.event,
-            thread_id: e.thread_id,
-            launch_id: e.launch_id,
-            command_id: e.command_id,
-            source: canonical_source(e.source),
-            occurred_at: e.occurred_at,
-            annex: e.annex,
-            blobs: e.blobs,
-        }
-    }
 }
 
 /// The job's transaction. Every method runs inside it; the first error poisons it, and
@@ -351,9 +320,12 @@ impl<'c> WriteTx<'c> {
     fn append_inner(&mut self, events: Vec<NewEvent>) -> Result<Vec<Appended>, StoreError> {
         let mut out = Vec::with_capacity(events.len());
         for e in events {
-            let row = Row::from(e);
+            let row = NewEvent {
+                source: canonical_source(e.source),
+                ..e
+            };
             if is_transcript(&row.source)
-                || matches!(row.typed, TypedEvent::TranscriptGeneration(_))
+                || matches!(row.event, TypedEvent::TranscriptGeneration(_))
             {
                 return Err(StoreError::TranscriptViaAppend);
             }
@@ -365,9 +337,9 @@ impl<'c> WriteTx<'c> {
     /// The one validation step every path that stores an event runs: typed `Content` and
     /// blob inputs (§2.5), and the annex form the kind requires (§2.6). Returns the blobs
     /// to insert and the refs to write.
-    fn validate_event(&self, row: &Row) -> Result<(BlobRows, RefRows), StoreError> {
+    fn validate_event<'r>(&self, row: &'r NewEvent) -> Result<(BlobRows<'r>, RefRows), StoreError> {
         // Annex.
-        match (&row.typed, &row.annex) {
+        match (&row.event, &row.annex) {
             (TypedEvent::ReadinessObserved(_), Some(EventAnnex::Readiness(b))) => {
                 if Some(b.launch_id) != row.launch_id {
                     return Err(AnnexError::LaunchMismatch.into());
@@ -380,10 +352,10 @@ impl<'c> WriteTx<'c> {
                 return Err(AnnexError::Missing("readiness").into());
             }
             (_, Some(EventAnnex::Readiness(_))) => {
-                return Err(AnnexError::Unexpected(row.typed.kind()).into());
+                return Err(AnnexError::Unexpected(row.event.kind()).into());
             }
             (_, Some(EventAnnex::Transcript(_))) if !is_transcript(&row.source) => {
-                return Err(AnnexError::Unexpected(row.typed.kind()).into());
+                return Err(AnnexError::Unexpected(row.event.kind()).into());
             }
             (_, None) if is_transcript(&row.source) => {
                 return Err(AnnexError::Missing("transcript").into());
@@ -399,7 +371,7 @@ impl<'c> WriteTx<'c> {
             inputs.push((sha256_hex(&b.data), &b.data, false));
         }
         let mut refs: Vec<(String, String)> = Vec::new();
-        for c in contents(&row.typed) {
+        for c in contents(&row.event) {
             match c {
                 Content::Inline { inline, encoding } => check_inline(inline, *encoding)?,
                 Content::Blob {
@@ -453,20 +425,20 @@ impl<'c> WriteTx<'c> {
             if !used {
                 return Err(ContentError::UnreferencedBlob(sha).into());
             }
-            if !blobs.iter().any(|(s, _): &(String, Vec<u8>)| *s == sha) {
-                blobs.push((sha, data.to_vec()));
+            if !blobs.iter().any(|(s, _): &(String, &[u8])| *s == sha) {
+                blobs.push((sha, data));
             }
         }
         Ok((blobs, refs))
     }
 
     /// Steps 1–5 of `append` for one event whose boundary checks passed.
-    fn append_row(&mut self, row: Row) -> Result<Appended, StoreError> {
+    fn append_row(&mut self, row: NewEvent) -> Result<Appended, StoreError> {
         // 1. Validation.
         let (blobs, refs) = self.validate_event(&row)?;
-        let kind = row.typed.kind();
+        let kind = row.event.kind();
         let payload = row
-            .typed
+            .event
             .to_payload()
             .map_err(StoreError::decode)?
             .get()
@@ -477,7 +449,7 @@ impl<'c> WriteTx<'c> {
             .conn
             .query_row(
                 &format!("SELECT {EVENT_COLUMNS} FROM events WHERE stream_id = ?1 AND idempotency_key = ?2"),
-                [row.stream_id.to_string(), row.key.0.clone()],
+                [row.stream_id.to_string(), row.idempotency_key.0.clone()],
                 RawRow::read,
             )
             .optional()?;
@@ -497,13 +469,13 @@ impl<'c> WriteTx<'c> {
                 None => Ok(Appended::Existing(stored.envelope)),
                 Some(field) => Err(StoreError::KeyConflict {
                     stream_id: row.stream_id,
-                    key: row.key,
+                    key: row.idempotency_key,
                     field,
                 }),
             };
         }
         // The derived status_changed(TaskState) needs its task_set earlier in the job.
-        if let TypedEvent::StatusChanged(StatusChanged::TaskState { from, to, .. }) = &row.typed {
+        if let TypedEvent::StatusChanged(StatusChanged::TaskState { from, to, .. }) = &row.event {
             let thread = row.thread_id.ok_or(StoreError::TaskChangeWithoutCause)?;
             let (from, to) = (enum_text(from), enum_text(to));
             let cause = self
@@ -513,7 +485,7 @@ impl<'c> WriteTx<'c> {
                 .ok_or(StoreError::TaskChangeWithoutCause)?;
             cause.used = true;
         }
-        let task_before = match (&row.typed, row.thread_id) {
+        let task_before = match (&row.event, row.thread_id) {
             (TypedEvent::TaskSet(_), Some(t)) => project::task_state(self.conn, t)?,
             _ => None,
         };
@@ -551,7 +523,7 @@ impl<'c> WriteTx<'c> {
                 stream,
                 event_id.to_string(),
                 chaldea_core::SCHEMA_VERSION,
-                row.key.0,
+                row.idempotency_key.0,
                 kind,
                 row.thread_id.map(|t| t.to_string()),
                 row.launch_id.map(|l| l.to_string()),
@@ -572,7 +544,7 @@ impl<'c> WriteTx<'c> {
                 seq: super::rows::to_u64(seq)?,
                 event_id,
                 schema_version: chaldea_core::SCHEMA_VERSION,
-                idempotency_key: row.key,
+                idempotency_key: row.idempotency_key,
                 kind: chaldea_core::ids::EventKindTag(kind.to_owned()),
                 thread_id: row.thread_id,
                 launch_id: row.launch_id,
@@ -588,7 +560,7 @@ impl<'c> WriteTx<'c> {
         // 5. Projection.
         project::apply(&mut ProjectionTx::new(self.conn), &stored)?;
         if let (TypedEvent::TaskSet(t), Some(thread), Some(from)) =
-            (&row.typed, row.thread_id, task_before)
+            (&row.event, row.thread_id, task_before)
         {
             let to = enum_text(&t.to);
             if from != to {
@@ -714,10 +686,10 @@ impl<'c> WriteTx<'c> {
                 .entry(b.thread_id)
                 .or_default()
                 .started_generation = true;
-            out.push(self.append_row(Row {
+            out.push(self.append_row(NewEvent {
                 stream_id: stream,
-                key: IdempotencyKey(format!("transcript_generation:{generation}")),
-                typed: TypedEvent::TranscriptGeneration(TranscriptGeneration {
+                idempotency_key: IdempotencyKey(format!("transcript_generation:{generation}")),
+                event: TypedEvent::TranscriptGeneration(TranscriptGeneration {
                     generation,
                     path: b.path.clone(),
                     file_id: g.file_id.clone(),
@@ -773,13 +745,13 @@ impl<'c> WriteTx<'c> {
                         "a line cannot be a transcript_generation",
                     ));
                 }
-                out.push(self.append_row(Row {
+                out.push(self.append_row(NewEvent {
                     stream_id: stream,
-                    key: IdempotencyKey(format!(
+                    idempotency_key: IdempotencyKey(format!(
                         "transcript:{}:{}",
                         expect.generation, l.offset_start
                     )),
-                    typed: l.event,
+                    event: l.event,
                     thread_id: Some(b.thread_id),
                     launch_id: Some(b.launch_id),
                     command_id: None,
