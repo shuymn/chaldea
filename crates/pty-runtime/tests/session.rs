@@ -1169,3 +1169,22 @@ fn recv_timeout_holds_its_bound_against_another_receiver() {
     assert_eq!(r, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
     assert!(took < Duration::from_secs(1), "{took:?}");
 }
+
+/// PR2-CL-24: a copy that outlasts the deadline inside its last row still returns
+/// `VtUnavailable`, not a late snapshot.
+#[test]
+fn snapshot_checks_its_deadline_before_returning() {
+    let r = rig_with(FakeScript::default(), Limits::default(), 80, 1);
+    let mut out = b"a".to_vec();
+    out.extend("\u{301}".repeat(2_000_000).as_bytes());
+    r.child.emit(&out);
+    wait_parsed(&r.session, out.len() as u64);
+    let t = Instant::now();
+    let got = r.session.snapshot(Instant::now() + ms(1));
+    assert!(
+        got.is_err(),
+        "a snapshot returned {:?} after a 1 ms deadline",
+        t.elapsed()
+    );
+    assert!(r.session.snapshot(soon()).is_ok());
+}

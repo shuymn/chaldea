@@ -115,7 +115,7 @@ fn cell_text(cell: &GridCell) -> String {
 
 /// The walker: a wide character is a `WideLead` and its spacer a `WideTail`; orphan
 /// halves and leading wide-char spacers are blank `Single` cells. `None` once `deadline`
-/// passes, checked before each row.
+/// passes, checked before each row and before returning.
 pub(crate) fn walk<T: EventListener>(
     term: &Term<T>,
     output_offset: u64,
@@ -160,6 +160,11 @@ pub(crate) fn walk<T: EventListener>(
             c += 1;
         }
         lines.push(Line { cells });
+    }
+    // A row can be long (zero-width characters join their base cell): the copy must still
+    // have ended by the deadline.
+    if Instant::now() >= deadline {
+        return None;
     }
     let p = grid.cursor.point;
     let modes = crate::vt::term_modes(term);
