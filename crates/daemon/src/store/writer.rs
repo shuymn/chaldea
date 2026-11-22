@@ -104,18 +104,26 @@ pub(crate) struct Faults {
     pub(crate) after_create: Option<Box<dyn Fn() + Send + Sync>>,
     /// The projection version this store uses instead of the code's.
     pub(crate) projection_version: Option<u32>,
-    /// Ordered marks of shutdown's call boundaries.
+    /// Ordered marks of shutdown's call boundaries (unit tests only).
+    #[cfg(test)]
     pub(crate) marks: Mutex<Vec<&'static str>>,
+    #[cfg(test)]
     /// Called at each mark, after recording it; a test can block there.
     pub(crate) on_point: Option<Box<dyn Fn(&'static str) + Send + Sync>>,
 }
 
 impl Faults {
+    /// Records a call boundary for unit tests; a no-op in other builds.
     pub(crate) fn mark(&self, what: &'static str) {
-        lock(&self.marks).push(what);
-        if let Some(f) = &self.on_point {
-            f(what);
+        #[cfg(test)]
+        {
+            lock(&self.marks).push(what);
+            if let Some(f) = &self.on_point {
+                f(what);
+            }
         }
+        #[cfg(not(test))]
+        let _ = what;
     }
 }
 

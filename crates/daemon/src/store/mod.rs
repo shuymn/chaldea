@@ -511,7 +511,6 @@ impl Store {
             return self.observe(deadline);
         }
         inner.faults.mark("intake_transition");
-        inner.faults.mark("intake_closed");
         // (2) The writer runs the queued jobs meanwhile. (3) Close every reader connection:
         // idle ones now, lent ones as they come back, until the deadline; then let the writer
         // checkpoint.

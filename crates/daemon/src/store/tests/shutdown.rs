@@ -25,7 +25,7 @@ fn in_thread(s: &Store, deadline: Duration) -> mpsc::Receiver<ShutdownReport> {
 fn intake_closes_for_submit_and_read_together() {
     let gates = Gates::default();
     let (_dir, s, _) = store_with(gates.faults());
-    let (reached, release) = gates.arm("intake_closed");
+    let (reached, release) = gates.arm("intake_transition");
     let a = in_thread(&s, Duration::from_secs(30));
     reached.recv_timeout(WAIT).expect("shutdown closed intake");
     let submitted = s.submit(soon(), |_| Ok(())).err();
