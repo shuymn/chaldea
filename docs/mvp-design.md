@@ -371,7 +371,7 @@ spikes/pty-hooks/   # unchanged until issue #1 removes it
 
 | Spike module | Destination | Decision |
 |---|---|---|
-| `src/os/drain.rs` | `pty-runtime` | Lift; the consumer becomes a sink callback with an ordered handoff of held output and end. |
+| `src/os/drain.rs` | `pty-runtime` | Lift without the hold: the session's sink is passed into spawn and fed from the first byte. |
 | `src/vt.rs` | `pty-runtime` | Lift. |
 | `src/os/unix.rs` | `pty-runtime::unix` | Lift kill and enumeration; drop console and probe helpers. |
 | `src/os/windows.rs` | `pty-runtime::windows`; parent job check in `daemon` | Lift the backend, handle wrappers, teardown order; drop the window observer, calibration, keys probe, registry reads. |
