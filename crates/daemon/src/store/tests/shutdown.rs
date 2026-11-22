@@ -271,19 +271,20 @@ fn closing_notifications_leaves_the_intake_locks_free() {
             .is_pending()
     );
     // The writer ends on its own and drops its notification sender, so the owner's drop of
-    // the store's sender is the last one and wakes the receiver inline.
+    // the store's sender is the last one and wakes the receiver inline. The writer stays
+    // held at its last step until the probe ran, so its own use of the shutdown-state lock
+    // cannot meet the probe.
     let (exiting, release) = gates.arm("writer_exiting");
     end_writer_on_its_own(&s);
     exiting
         .recv_timeout(WAIT)
         .expect("the writer dropped its sender");
-    drop(release);
-    let report = in_thread(&s, Duration::from_secs(5))
-        .recv_timeout(WAIT)
-        .expect("the owner returns");
+    let owner = in_thread(&s, Duration::from_secs(5));
     let (sender_free, stop_free) = result_rx
         .recv_timeout(WAIT)
         .expect("the receiver was woken");
+    drop(release);
+    let report = owner.recv_timeout(WAIT).expect("the owner returns");
     assert!(sender_free, "the waker found the queue-sender lock held");
     assert!(stop_free, "the waker found the shutdown-state lock held");
     assert!(report.writer_exited, "{report:?}");
