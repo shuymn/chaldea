@@ -191,15 +191,10 @@ impl UnixPty {
         _held: &MutexGuard<'static, ()>,
     ) -> std::io::Result<(std::io::PipeReader, std::io::PipeWriter)> {
         #[cfg(test)]
-        let pair = match &self.hooks.pipe {
-            Some(make) => make()?,
-            None => std::io::pipe()?,
-        };
-        #[cfg(not(test))]
-        let pair = std::io::pipe()?;
-        #[cfg(test)]
-        self.hooks.on(&tests::Stage::WakeUnderLock);
-        Ok(pair)
+        if let Some(make) = &self.hooks.pipe {
+            return make();
+        }
+        std::io::pipe()
     }
 
     fn open_ends(&self, spec: &SpawnSpec) -> std::io::Result<Ends> {

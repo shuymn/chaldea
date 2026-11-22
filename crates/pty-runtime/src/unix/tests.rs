@@ -33,8 +33,6 @@ pub(crate) fn serial() -> MutexGuard<'static, ()> {
 pub(crate) enum Stage {
     /// Validation passed; nothing is created yet.
     Validated,
-    /// Stage 2: the wake pipe was just created, still inside the spawn lock.
-    WakeUnderLock,
     /// Stage 4: the lock is held, before `Command::spawn`.
     LockAcquired,
     /// Stage 5, before the identity read; the hook returning true fails the read.
@@ -295,12 +293,19 @@ fn drain_start_failure_releases_everything() {
     let dir = TempDir::new("drain");
     let reached = Arc::new(Mutex::new(Vec::new()));
     let r2 = reached.clone();
+    let r3 = reached.clone();
     let pty = UnixPty {
         hooks: Hooks {
             fail_drain_start: true,
             stage: Some(Box::new(move |s| {
                 r2.lock().unwrap().push(format!("{s:?}"));
                 false
+            })),
+            // Stage 2 ends with the wake pipe created.
+            pipe: Some(Box::new(move || {
+                let pair = std::io::pipe()?;
+                r3.lock().unwrap().push("pipe()".to_owned());
+                Ok(pair)
             })),
             ..Hooks::default()
         },
@@ -314,7 +319,7 @@ fn drain_start_failure_releases_everything() {
         }
         other => panic!("{:?}", other.map(|_| ())),
     }
-    assert_eq!(*reached.lock().unwrap(), vec!["Validated", "WakeUnderLock"]);
+    assert_eq!(*reached.lock().unwrap(), vec!["Validated", "pipe()"]);
     assert_eq!(super::sys::child_pids(), before);
 }
 

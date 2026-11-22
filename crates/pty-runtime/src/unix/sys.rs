@@ -682,7 +682,7 @@ mod tests {
                     std::io::pipe()
                 })),
                 stage: Some(Box::new(move |s| {
-                    if matches!(s, Stage::WakeUnderLock | Stage::LockAcquired) {
+                    if matches!(s, Stage::LockAcquired) {
                         s2.lock()
                             .unwrap()
                             .push((format!("{s:?}"), spawn_lock_held()));
@@ -698,7 +698,6 @@ mod tests {
             *seen.lock().unwrap(),
             vec![
                 ("pipe()".to_owned(), true),
-                ("WakeUnderLock".to_owned(), true),
                 ("LockAcquired".to_owned(), true)
             ]
         );
