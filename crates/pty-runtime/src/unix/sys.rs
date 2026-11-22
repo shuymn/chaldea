@@ -281,7 +281,7 @@ mod tests {
     use std::ffi::c_int;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
@@ -422,13 +422,11 @@ mod tests {
         let _ = p.teardown();
     }
 
-    static BLOCK_READ: AtomicI32 = AtomicI32::new(-1);
-
+    /// A daemon handler that must never run in the child: it holds the child for 3 s, so a
+    /// spawn that runs it misses the 1 s bound, and a broken build still ends the child.
     extern "C" fn blocking_handler(_: c_int) {
-        let mut b = 0u8;
-        // SAFETY: `read` is async-signal-safe; one byte into a local. Nobody writes the
-        // pipe, so this blocks: a daemon handler that must never run in the child.
-        unsafe { libc::read(BLOCK_READ.load(Ordering::Relaxed), (&raw mut b).cast(), 1) };
+        // SAFETY: `sleep` is async-signal-safe and takes no pointer.
+        unsafe { libc::sleep(3) };
     }
 
     #[test]
@@ -436,8 +434,6 @@ mod tests {
         if !in_helper("pending_signal_does_not_run_a_daemon_handler") {
             return;
         }
-        let (r, _w) = std::io::pipe().unwrap();
-        BLOCK_READ.store(std::os::fd::AsRawFd::as_raw_fd(&r), Ordering::Relaxed);
         let action = libc::sigaction {
             sa_sigaction: blocking_handler as *const () as usize,
             sa_mask: 0,
