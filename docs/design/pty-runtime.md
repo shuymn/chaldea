@@ -1,10 +1,10 @@
 # Design: `crates/pty-runtime` (MVP PR 2)
 
-Status: design, not implemented. Scope is the PR 2 row of `docs/mvp-design.md` §4 (cited as "mvp §N"): the `PtyRuntime` trait, `FakePty`, the single writer with its origin log, the drain, the VT responder, and the snapshot. Its design obligations: the writer records origin and position of every write; the VT responder replies in one write each; wide characters occupy two cells in snapshots.
+Status: implemented in PR 2. Scope is the PR 2 row of `docs/mvp-design.md` §4 (cited as "mvp §N"): the `PtyRuntime` trait, `FakePty`, the single writer with its origin log, the drain, the VT responder, and the snapshot. Its design obligations: the writer records origin and position of every write; the VT responder replies in one write each; wide characters occupy two cells in snapshots.
 
 **What the crate does and does not decide.** The crate records facts: the origin, order, byte span, and start and finish of every write; the terminal modes; the screen. Gate and ack policy (which writes close the gate or make an ack ambiguous, VT replies included) stay in the daemon and `core` (PR 10). The crate's guards only enforce conditions the daemon states per write.
 
-Out of scope, designed in their own PRs: the Unix backend (PR 3), the Windows ConPTY backend (PR 4), `testkit` and FakeCli (PR 3), the input encoders in `core::input` (PR 5), the gate, send path, and supervisor in the daemon (PR 10), and attach's repaint (PR 11). This document fixes only what those PRs need from this crate: what a backend must supply (§2.1) and what the daemon can rely on (§2.2–§2.6).
+Designed elsewhere: the macOS backend, `testkit`, and FakeCli (`docs/design/pty-unix.md`), the Windows backend (`docs/design/pty-windows.md`), the input encoders in `core::input` (PR 5), the gate, send path, and supervisor in the daemon (PR 10), and attach's repaint (PR 11). This document fixes what those need from this crate: what a backend must supply (§2.1) and what the daemon can rely on (§2.2–§2.6).
 
 Sources read for this document (paths are relative to each root):
 
@@ -17,63 +17,15 @@ Sources read for this document (paths are relative to each root):
 | herdr (`herdrdev/herdr`) | `e8d7d97` | `src/pty/actor.rs`, `src/pty/actor/unix.rs`, `src/pty/backend.rs`, `src/pane/terminal.rs` |
 | Codex (`openai/codex`, sparse `codex-rs/utils/pty`) | `8653ca9` (default branch 2026-11-22) | `src/pty.rs`, `src/process.rs` |
 
-## 1. Goal and Files
+## 1. Goal and Dependencies
 
 **Goal.** A library crate, `chaldea-pty-runtime`, that turns a backend's raw PTY (a child process, an output read end, an input write end, a resize control) into a `Session`: one drain thread that reads output until EOF and feeds a headless `alacritty_terminal` VT, one writer thread that is the only code writing to the PTY and records every write with its origin and byte span, and one waiter thread that observes child exit. All of it is tested on macOS and Windows CI through `FakePty`, with no real PTY.
 
-**Files.**
+**Dependencies** (exact pins and their reasons are in the root and crate `Cargo.toml`). `alacritty_terminal =0.26.0` (default features off) is the version the spike ran on both hosts and the one prior-art row 3a and spike §3 read in source; its only optional feature (`serde`) is not needed. Its parser, `vte 0.15.0`, is reached through `alacritty_terminal::vte` (no direct dependency). `unicode-width =0.2.3` is the version alacritty locks, so it adds nothing to the build; `decode_grid` uses it to tell a wide character from a narrow one, since the grid encoding has no lead marker. `alacritty_terminal` also compiles its own `tty` module and that module's dependencies (`rustix-openpty`, `signal-hook`, `polling` on Unix; `miow`, `piper`, `windows-sys 0.59` on Windows); this crate never calls them. No `tokio` (D2) and no `portable-pty`; the backends' dependencies are in their documents' §1.
 
-```
-Cargo.toml                                # members += "crates/pty-runtime"; [workspace.dependencies] += alacritty_terminal
-crates/pty-runtime/Cargo.toml             # chaldea-pty-runtime; feature `fake`; [lints] workspace = true (PR 3 changes it, D7)
-crates/pty-runtime/src/lib.rs             # re-exports; crate doc states the lock and callback rules and the no-tokio rule
-crates/pty-runtime/src/backend.rs         # PtyRuntime (sealed), SpawnSpec, PtySize, DrainSink, SpawnedPty (internal owning guard), PtyChild,
-                                          # PtyControl, ProcessIdentity, ChildExit, KillReport, CloseReport, SpawnError, Cleanup
-crates/pty-runtime/src/session.rs         # Session, SessionConfig, SessionEvent, SessionStatus, CloseBounds, CloseOutcome, close order
-crates/pty-runtime/src/writer.rs          # WriteUnit, Part, Guard, Basis, WriteContext, WriteRecord, WriteOutcome, Refusal, counters, slot, ring
-crates/pty-runtime/src/origin.rs          # WriteOrigin, OriginClass, ClassSet, ReplyKind, mapping to core::payload::HumanWriteOrigin
-crates/pty-runtime/src/limits.rs          # Limits (defaults from core::input::MAX_PROMPT_BYTES), CloseBounds
-crates/pty-runtime/src/drain.rs           # lifted from spikes/pty-hooks/src/os/drain.rs without the hold; unit tests inside
-crates/pty-runtime/src/vt.rs              # lifted from spikes/pty-hooks/src/vt.rs: Vt, Responder, NoSync, packed ModeWord
-crates/pty-runtime/src/snapshot.rs        # Snapshot, Line, Cell, CellWidth, grid encoding, to_payload, decode_grid
-crates/pty-runtime/src/fake.rs            # #[cfg(feature = "fake")] FakePty, FakeScript, FakeChild, Probe
-crates/pty-runtime/tests/{writer,responder,snapshot,session}.rs
-crates/core/src/input.rs                  # pub const MAX_PROMPT_BYTES: usize = 256 * 1024 (D8)
-crates/core/tests/golden/events/vt_snapshot_taken.json, crates/core/tests/golden.rs
-                                          # grid golden values (event and Component::VtSnapshot) in the §2.6 encoding
-.github/workflows/ci.yml, lefthook.yml    # `workspace` job: add the pty-runtime dependency check (§7)
-```
-
-PR 3 adds `src/unix/` (`#[cfg(target_os = "macos")]`), `native()`, and `with_spawn_lock()` with the process-wide spawn lock; PR 4 adds `src/windows/` (`#[cfg(windows)]`) and the Windows arm of `native()`; neither changes a type of this PR. The Windows backend is `docs/design/pty-windows.md`.
-
-**`Cargo.toml`.** Exact pins, as the rest of the workspace:
-
-```toml
-# root [workspace.dependencies]
-alacritty_terminal = { version = "=0.26.0", default-features = false }
-
-# crates/pty-runtime/Cargo.toml
-[dependencies]
-chaldea-core = { path = "../core" }
-alacritty_terminal.workspace = true
-serde_json.workspace = true          # the snapshot grid encoding (§2.6)
-unicode-width.workspace = true       # decode_grid's width check (§2.6); alacritty's own width table
-
-[dev-dependencies]
-chaldea-pty-runtime = { path = ".", features = ["fake"] }   # integration tests use FakePty
-proptest.workspace = true
-
-[features]
-fake = []
-```
-
-`alacritty_terminal =0.26.0` is the version the spike ran on both hosts and the one prior-art row 3a and spike §3 read in source; its only optional feature (`serde`) is not needed. Its parser, `vte 0.15.0`, is reached through `alacritty_terminal::vte` (no direct dependency). `unicode-width =0.2.3` is the version alacritty locks, so it adds nothing to the build; `decode_grid` uses it to tell a wide character from a narrow one, since the grid encoding has no lead marker. It also compiles its own `tty` module and that module's dependencies (`rustix-openpty`, `signal-hook`, `polling` on Unix; `miow`, `piper`, `windows-sys 0.59` on Windows); this crate never calls them. No `tokio`, no `portable-pty` in this PR (PR 3 adds `rustix` and `libc` under `[target.'cfg(target_os = "macos")'.dependencies]`).
-
-**Workspace and CI.** The crate joins `members`. The `workspace` job runs unchanged (fmt, clippy `-D warnings`, `cargo test --workspace --locked`, which now includes this crate's tests on `macos-latest` and `windows-latest`) and gains one step: `pty-runtime` has no `tokio` in its normal dependency tree (§7). `lefthook.yml` mirrors it.
+**Workspace and CI.** The `workspace` job runs this crate's tests on `macos-latest` and `windows-latest` and checks that `pty-runtime` has no `tokio` in its normal dependency tree (§7); `lefthook.yml` mirrors it.
 
 ## 2. Types and Functions
-
-Names may change in review; shapes may not.
 
 **Threading model.** The crate is synchronous: std threads, blocking I/O, no async runtime. PTY ends block on both OSes (the macOS master is nonblocking behind a reader and writer that block in `poll` and stop on close; ConPTY uses synchronous anonymous pipes), so an async runtime would only wrap them in blocking tasks, as Codex does (`utils/pty/src/pty.rs:241`, `:285`). Every callback the crate invokes (`Completion`, `OutputSink`, `on_event`) must return without blocking, and the crate never waits on a caller. The daemon bridges to tokio by passing callbacks that `try_send` on a tokio channel or complete a `oneshot`, and calls `close`, `kill`, and `resize` from `spawn_blocking`.
 
@@ -90,7 +42,7 @@ Names may change in review; shapes may not.
 ### 2.1 Backend Seam: `PtyRuntime`
 
 ```rust
-/// Starts a child in a new PTY. Sealed: implemented by `unix` (PR 3), `windows` (PR 4),
+/// Starts a child in a new PTY. Sealed: implemented by `unix`, `windows`,
 /// and `fake::FakePty`. Object safe; the daemon holds `Arc<dyn PtyRuntime>` and calls only
 /// `Session::spawn`, since it cannot build a `DrainSink`.
 pub trait PtyRuntime: Send + Sync + sealed::Sealed {
@@ -159,17 +111,17 @@ pub enum SpawnError {
 pub enum Cleanup { Confirmed, Unresolved { kill: Option<KillReport>, close: Option<CloseReport>, drain_abandoned: bool } }
 ```
 
-**What each backend must supply** (the obligations PR 3 and PR 4 implement against this trait unchanged):
+**What each backend must supply** (implemented by `docs/design/pty-unix.md` and `docs/design/pty-windows.md`):
 
-- `spawn` returns either a `SpawnedPty` or an error after releasing everything it created: no process alive, no handle or descriptor open (spike F-2c). When it cannot prove that, the error carries `Cleanup::Unresolved`. Every release attempts the kill first and releases I/O even when the kill could not prove death (then `Unresolved`). Once a process exists, release follows `SpawnedParts::teardown`: kill the tree, drop the input write end, close the PTY while the drain reads, finish the drain. On Windows, a failure before any process exists closes the pseudoconsole while the drain reads, then drops the input write end, finishes the drain, and drops the job (spike §4.6).
+- `spawn` returns either a `SpawnedPty` or an error after releasing everything it created: no process alive, no handle or descriptor open (spike F-2c). When it cannot prove that, the error carries `Cleanup::Unresolved`. Every release attempts the kill first and releases I/O even when the kill could not prove death (then `Unresolved`). Once a process exists, release follows `SpawnedParts::teardown`: kill the tree, drop the input write end, close the PTY while the drain reads, finish the drain. Before any process exists the order is the backend's (Windows: close while the drain reads, then input, drain, job; `docs/design/pty-windows.md` §2.2, spike §4.6).
 - The PTY is opened at `spec.size`: the session initialises the VT and the responder's size from it before the drain starts.
 - The child's environment is exactly `spec.env` (macOS: `Command::env_clear` then `envs`; Windows: an explicit `CREATE_UNICODE_ENVIRONMENT` block). The scrub list is the daemon's (mvp §2.7 "Env scrub").
 - The backend starts a `Drain` (§2.4) over its output read end with the given `DrainSink`, so every output byte reaches the session's VT from the first one. Windows starts it right after `CreatePseudoConsole`, before `CreateProcessW` (spike §4.6); macOS after the PTY is opened and sized. The reader the drain owns returns `Ok(0)` once every slave end is closed: the Unix backend maps the master's `EIO` after hangup to EOF, and drops the parent's slave handle right after spawn (spike §4.7); on Windows conhost is the last writer of the output pipe and closes its end at `ClosePseudoConsole`, or earlier if conhost dies.
 - **Dropping `input` writes no bytes.** portable-pty's writer writes `\n` + VEOF on drop (`unix.rs:351-361`); the macOS backend writes through its own handle on a dup of the master fd, and the Windows backend through the input pipe's write end; neither drop writes anything. With this obligation the session can release the input whenever the writer thread finishes, without an ordering hazard against a live CLI.
 - `input` accepts each `write` call whole or fails: the macOS writer loops on a nonblocking master until every byte is accepted, and returns a short count only after progress followed by close or an error; Windows `WriteFile` on a synchronous pipe completes fully. A short write is tolerated by the writer (it loops) and recorded (§2.3).
 - `PtyChild::wait_timeout` never blocks past `timeout` (Windows `WaitForSingleObject(timeout)`; macOS `waitid(WNOWAIT)` polling; the backend owns reaping) and must not hold a lock `kill_tree` needs.
-- `kill_tree` is the PR 3 / PR 4 tree kill (`killpg` HUP→TERM→KILL plus `getsid` scan; job termination) applied also to every identity in `extra` that is still alive with the same start time, and returns by its deadline; `tree_dead: false` with survivors when it could not prove death. The caller passes its full list of recorded descendants on every call (the first stop, a retry after a busy report or `tree_dead: false`, and `close` after an earlier `kill`). The Windows backend keeps no unresolved identity across calls; the macOS backend keeps its stored targets as internal margin (`docs/design/pty-unix.md` §2.5), which the full-list rule makes invisible to the caller. `method` names how the kill ran: `unix_*` on macOS; `windows_job`, `windows_job_incomplete` (the job's member list may be incomplete), or `windows_busy` (another kill of the same child held the kill state) on Windows, and `windows_process` for the process-only kill of a failed spawn.
-- `PtyControl::close` on Windows hands `ClosePseudoConsole` to a close worker thread started before `CreatePseudoConsole` and waits for it until the caller's deadline, since some builds block in it until output is read. `CloseReport::elapsed` is `Some` when the close operation returned; a hung close shows as `elapsed: None` and `Released::control == false`.
+- `kill_tree` is the PR 3 / PR 4 tree kill (`killpg` HUP→TERM→KILL plus `getsid` scan; job termination) applied also to every identity in `extra` that is still alive with the same start time, and returns by its deadline; `tree_dead: false` with survivors when it could not prove death. The caller passes its full list of recorded descendants on every call (the first stop, a retry after a busy report or `tree_dead: false`, and `close` after an earlier `kill`). What a backend keeps across calls is internal margin that the full-list rule makes invisible to the caller (`docs/design/pty-unix.md` §2.5, `docs/design/pty-windows.md` §2.5). `method` names how the kill ran: `unix_*` on macOS; `windows_job`, `windows_job_incomplete` (the job's member list may be incomplete), or `windows_busy` (another kill of the same child held the kill state) on Windows, and `windows_process` for the process-only kill of a failed spawn.
+- `PtyControl::close` returns by the caller's deadline even when the OS close blocks (Windows: `ClosePseudoConsole` on a close worker started before the pseudoconsole exists, since some builds block until output is read; `docs/design/pty-windows.md` §2.3). `CloseReport::elapsed` is `Some` when the close operation returned; a hung close shows as `elapsed: None` and `Released::control == false`.
 - `evidence` carries what doctor and the real-host runs record (Windows: `job_branch` = `job_list` or `suspended`, `conpty_module`, and `job_list_error` when the job-list attempt failed and the suspended branch ran).
 - Every `unsafe` block lives in `unix::sys` or `windows::sys` (D7).
 
@@ -479,7 +431,7 @@ impl Probe {
 | | B. A reply lane also served inside a unit's pause | herdr writes responses during a submission's delay (`actor.rs:155-163`, test `:563-578`) | Rejected: a unit's bytes would no longer be one span, and a reply could land between a prompt and its submit with unverified effect on the CLI. |
 | | C. A reply lane served only at unit boundaries, in sampled batches | — | **Adopted.** Contiguous spans; no starvation of either lane. |
 | **Reply atomicity** | A. Fail a reply or escape-bearing part on a short accept | — | Rejected: the split hazard is conhost's, and the Windows backend obligation is whole acceptance on a synchronous pipe; the Unix tty does not lose split sequences. |
-| | B. One write call per part, looping on a short accept and counting splits | — | **Adopted**; revisited if PR 4 observes short writes. |
+| | B. One write call per part, looping on a short accept and counting splits | — | **Adopted**; revisit if a backend shows short writes (`split_writes > 0`). |
 | **Gate basis** | A. The spike's revocable `GateState` (2004 epoch + revocation flag) as the whole recheck | spike `pty.rs:21-63` | Partly adopted: the 2004 epoch is `Guard::bracketed_paste`. Revocation and the rest of mvp §2.3's gate live in the daemon. |
 | | B. A watermark of write completions the daemon has applied | — | Rejected: VT replies have no completion, so the watermark could never pass a startup reply, and a lost notification would stall every send. |
 | | C. The writer position captured with the readiness evidence at intake, checked at the dispatch boundary | herdr orders responses against input by offset (`src/pane/terminal.rs:1491-1530`) | **Adopted.** Needs no notification stream; which origins count stays the daemon's. |
@@ -600,19 +552,13 @@ Obligation mapping: "origin and position of every write" → CL-1, CL-4, CL-21, 
 
 ## 7. Tests and Completion Commands
 
-All tests above run in `cargo test --workspace --locked` on `macos-latest` and `windows-latest` with `FakePty`; none needs a real PTY, so PR 2 adds no OS-specific test. The VT, responder, and snapshot tests feed `Vt` directly or through `FakeChild::emit`. Tests wait for a thread to reach a point with `WriteHold::wait_entered` or `Probe::wait` / `park` before acting, so "while the writer is blocked" or "during the pause" is a fact, not a timing guess. Timing assertions use generous bounds (seconds) so they hold on loaded runners; pauses in tests are 10–50 ms. Drain tests are unit tests in `src/drain.rs` because `Drain` is crate-private.
+All tests above run in `cargo test --workspace --locked` on `macos-latest` and `windows-latest` with `FakePty`; none needs a real PTY. The real-PTY tests of each backend are in its document's §7. The VT, responder, and snapshot tests feed `Vt` directly or through `FakeChild::emit`. Tests wait for a thread to reach a point with `WriteHold::wait_entered` or `Probe::wait` / `park` before acting, so "while the writer is blocked" or "during the pause" is a fact, not a timing guess. Timing assertions use generous bounds (seconds) so they hold on loaded runners; pauses in tests are 10–50 ms. Drain tests are unit tests in `src/drain.rs` because `Drain` is crate-private.
 
-Completion commands (mvp §5, extended):
+Completion commands: those of mvp §5, plus the dependency check of PR2-CL-25:
 
 ```
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-deps="$(cargo tree -p chaldea-core -e normal --prefix none)" && ! grep -Eq '^(tokio|rusqlite|axum) ' <<<"$deps"
 deps="$(cargo tree -p chaldea-pty-runtime -e normal --prefix none)" && ! grep -Eq '^tokio ' <<<"$deps"
 ```
-
-plus the `workspace` job green on both runners with the new step, and the `pty-hooks` job unchanged.
 
 ## 8. Decisions
 
@@ -628,15 +574,11 @@ plus the `workspace` job green on both runners with the new step, and the `pty-h
 
 **D6. `FakePty` is behind a `fake` feature**, enabled for this crate's tests through a self dev-dependency and for the daemon's tests through its dev-dependency, so no default-feature build contains it (`--all-features` does).
 
-**D7. Backends need `unsafe`; the workspace forbids it.** The root `[workspace.lints.rust] unsafe_code = "forbid"` cannot be relaxed by `#[allow]`. PR 2 writes no `unsafe` and keeps `[lints] workspace = true`. PR 3 gives this crate its own `[lints]` table (the workspace clippy set plus `unsafe_code = "deny"`) and allows `unsafe` only in `unix::sys` (and PR 4's Windows module); the workspace value stays `forbid` for every other crate.
+**D7. Backends need `unsafe`; the workspace forbids it.** The root `[workspace.lints.rust] unsafe_code = "forbid"` cannot be relaxed by `#[allow]`. This crate has its own `[lints]` table (the workspace clippy set plus `unsafe_code = "deny"`, `docs/design/pty-unix.md` §2.7) and allows `unsafe` only in `unix::sys` and `windows::sys`; the workspace value stays `forbid` for every other crate.
 
 **D8. Prompt text is limited to `core::input::MAX_PROMPT_BYTES` = 256 KiB UTF-8**, added to `core` in PR 2 because this crate's defaults derive from it. `send` (PR 10) and recognised attach pastes (PR 11) refuse longer text before admission, with zero bytes; PR 5 bounds the encoded size. The writer limits (§5) are internal, configurable defaults: about 9 MiB per unit and 16 MiB queued per session instead of the 144 MiB a 4 MiB body limit would imply. Raising the limit later is compatible.
 
-**D9. `vt_snapshot_taken.grid` is JSON rows of cell strings** with the semantics of §2.6. It makes the geometry exact and observable by the PWA (a wide character provably takes two columns, column positions after it do not depend on font rendering), which is how the PR 2 obligation reaches the reader and what P-12's legible CJK snapshot needs. No v1 producer has persisted a grid yet (the store arrives in PR 6), so this is the cheapest point to fix it. PR 2 updates the `core` golden values (`vt_snapshot_taken.json`, `Component::VtSnapshot`). Rejected: LF-joined text (geometry left to the PWA's font) and text plus a wide-column list (two structures that must agree). Attributes added later are additive only as a separate field, since cells stay strings.
-
-### Open Questions
-
-None that change a public contract or are irreversible.
+**D9. `vt_snapshot_taken.grid` is JSON rows of cell strings** with the semantics of §2.6. It makes the geometry exact and observable by the PWA (a wide character provably takes two columns, column positions after it do not depend on font rendering), which is how the PR 2 obligation reaches the reader and what P-12's legible CJK snapshot needs. It was fixed before any producer persisted a grid (the store arrives in PR 6), so the change kept `schema_version` 1 (mvp §2.1). Rejected: LF-joined text (geometry left to the PWA's font) and text plus a wide-column list (two structures that must agree). Attributes added later are additive only as a separate field, since cells stay strings.
 
 ## Related Text in Other Documents
 
