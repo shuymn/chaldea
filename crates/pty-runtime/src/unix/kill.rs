@@ -2026,4 +2026,18 @@ mod tests {
         assert!(!r.tree_dead, "{r:?}");
         assert!(r.survivors.iter().any(|s| s.pid == E), "{r:?}");
     }
+
+    #[test]
+    fn child_listed_before_its_parent_is_covered() {
+        // C (pid 250) is the `setsid` child of P (pid 300), a recorded escapee; the list
+        // reaches C first, so C is covered only once the same pass reads P.
+        let sim = Sim::new();
+        sim.world.borrow_mut().procs.get_mut(&L).unwrap().st = St::Zombie;
+        sim.world.borrow_mut().add(300, 1, 300, 300, 3_000);
+        sim.world.borrow_mut().add(250, 300, 250, 250, 3_100);
+        let r = sim.kill(&[sim.identity(300)], 5_000, &state());
+        assert!(r.tree_dead, "{r:?}");
+        assert!(!sim.alive(250));
+        assert!(!sim.alive(300));
+    }
 }
