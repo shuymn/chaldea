@@ -532,7 +532,6 @@ pub struct Model {
     pub launches: BTreeMap<LaunchId, MLaunch>,
     pub inputs: BTreeMap<InputId, MInput>,
     pub open_approvals: BTreeMap<ApprovalId, ThreadId>,
-    pub host_seq: u64,
     pub events: usize,
     next: u128,
     ops: Vec<Op>,
@@ -570,18 +569,9 @@ impl Model {
     }
 
     fn push(&mut self, e: NewEvent) {
-        let seq = match e.stream_id {
-            StreamId::Host => {
-                self.host_seq += 1;
-                self.host_seq
-            }
-            StreamId::Thread(t) => {
-                let th = self.threads.get_mut(&t).expect("thread");
-                th.seq += 1;
-                th.seq
-            }
-        };
-        let _ = seq;
+        if let StreamId::Thread(t) = e.stream_id {
+            self.threads.get_mut(&t).expect("thread").seq += 1;
+        }
         self.events += 1;
         self.pending_retryable.push(e.clone());
         match self.ops.last_mut() {

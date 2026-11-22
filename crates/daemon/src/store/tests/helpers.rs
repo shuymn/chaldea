@@ -1,7 +1,7 @@
 //! Helpers for the privileged unit tests: stores with fault points, production-configured raw
 //! connections, and raw event inserts.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,11 +22,10 @@ pub(crate) fn open_with(dir: &Path, faults: Faults) -> Result<Store, crate::stor
 }
 
 /// A temp directory and a store in it with the given fault points.
-pub(crate) fn store_with(faults: Faults) -> (TempDir, Store, PathBuf) {
+pub(crate) fn store_with(faults: Faults) -> (TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let store = open_with(dir.path(), faults).unwrap();
-    let path = dir.path().join("chaldea.db");
-    (dir, store, path)
+    (dir, store)
 }
 
 /// A read-write connection with the production settings.

@@ -24,7 +24,7 @@ fn in_thread(s: &Store, deadline: Duration) -> mpsc::Receiver<ShutdownReport> {
 #[test]
 fn intake_closes_for_submit_and_read_together() {
     let gates = Gates::default();
-    let (_dir, s, _) = store_with(gates.faults());
+    let (_dir, s) = store_with(gates.faults());
     let (reached, release) = gates.arm("intake_transition");
     let a = in_thread(&s, Duration::from_secs(30));
     reached.recv_timeout(WAIT).expect("shutdown closed intake");
@@ -45,7 +45,7 @@ fn intake_closes_for_submit_and_read_together() {
 #[test]
 fn shorter_shutdown_returns_by_its_deadline() {
     let gates = Gates::default();
-    let (_dir, s, _) = store_with(gates.faults());
+    let (_dir, s) = store_with(gates.faults());
     let (go_tx, go_rx) = mpsc::channel::<()>();
     let (started_tx, started_rx) = mpsc::channel::<()>();
     let job = s
@@ -75,7 +75,7 @@ fn shorter_shutdown_returns_by_its_deadline() {
 #[test]
 fn checkpoint_waits_for_the_owner_to_finish_with_the_readers() {
     let gates = Gates::default();
-    let (_dir, s, _) = store_with(gates.faults());
+    let (_dir, s) = store_with(gates.faults());
     let (taken, release_readers) = gates.arm("drain_taken");
     let (checkpoint, release_checkpoint) = gates.arm("checkpoint_begin");
     let a = in_thread(&s, Duration::from_secs(30));
@@ -111,7 +111,7 @@ fn reported_writer_exit_has_closed_notifications() {
     use tokio::sync::broadcast::error::TryRecvError;
 
     let gates = Gates::default();
-    let (_dir, s, _) = store_with(gates.faults());
+    let (_dir, s) = store_with(gates.faults());
     let mut notifications = s.subscribe();
     let (reached, release) = gates.arm("writer_exiting");
     let result = in_thread(&s, Duration::from_secs(2));
@@ -141,7 +141,7 @@ fn later_report_of_an_early_writer_exit_has_closed_notifications() {
     use tokio::sync::broadcast::error::TryRecvError;
 
     let gates = Gates::default();
-    let (_dir, s, _) = store_with(gates.faults());
+    let (_dir, s) = store_with(gates.faults());
     let mut notifications = s.subscribe();
     // Set from inside a running job, so the writer panics right after it, outside any job,
     // and publishes its exit.
@@ -175,7 +175,7 @@ fn later_report_of_an_early_writer_exit_has_closed_notifications() {
 #[test]
 fn owner_detaches_a_writer_still_running() {
     let gates = Gates::default();
-    let (_dir, s, _) = store_with(gates.faults());
+    let (_dir, s) = store_with(gates.faults());
     let (reached, release) = gates.arm("writer_exiting");
     let a = in_thread(&s, Duration::from_millis(500))
         .recv_timeout(WAIT)
@@ -196,7 +196,7 @@ fn owner_detaches_a_writer_still_running() {
 #[test]
 fn later_call_reports_only_progress_by_its_deadline() {
     let gates = Gates::default();
-    let (_dir, s, _) = store_with(gates.faults());
+    let (_dir, s) = store_with(gates.faults());
     let (exiting, release_writer) = gates.arm("writer_exiting");
     let a = in_thread(&s, Duration::from_millis(300))
         .recv_timeout(WAIT)

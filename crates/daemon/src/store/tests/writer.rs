@@ -35,7 +35,7 @@ fn count_events(s: &Store) -> u64 {
 /// returns `Ok`: the job still rolls back, earlier insert included.
 #[test]
 fn caught_statement_error_still_rolls_back() {
-    let (_dir, s, _) = store_with(Faults::default());
+    let (_dir, s) = store_with(Faults::default());
     let reply = run(&s, |tx| {
         tx.append(vec![registered(thread(1), false)])?;
         // thread_registered on a thread stream breaks the membership CHECK.
@@ -63,7 +63,7 @@ fn caught_statement_error_still_rolls_back() {
 /// returns `Ok`: nothing autocommits and the earlier insert is gone.
 #[test]
 fn caught_transaction_error_does_not_autocommit() {
-    let (_dir, s, _) = store_with(Faults::default());
+    let (_dir, s) = store_with(Faults::default());
     let (t, l) = (thread(1), launch(1));
     run(&s, move |tx| {
         tx.append(vec![registered(t, false)])?;
@@ -123,7 +123,7 @@ fn caught_transaction_error_does_not_autocommit() {
 /// exists.
 #[test]
 fn disk_full_rolls_back_and_recovers() {
-    let (_dir, s, _) = store_with(Faults::default());
+    let (_dir, s) = store_with(Faults::default());
     run(&s, |tx| Ok(tx.append(vec![registered(thread(1), false)])?)).unwrap();
     let reply = run(&s, |tx| {
         let pages: i64 = tx
@@ -134,15 +134,10 @@ fn disk_full_rolls_back_and_recovers() {
             .pragma_update(None, "max_page_count", pages)
             .unwrap();
         tx.append(vec![registered(thread(2), false)])?;
-        let big = super::support::raw_unknown(
-            StreamId::Host,
-            "big",
-            crate::store::prepare_content(vec![7u8; 1 << 20], "application/octet-stream")
-                .unwrap()
-                .content,
-        );
-        let mut big = big;
-        big.blobs = vec![super::support::blob_input(&vec![7u8; 1 << 20])];
+        let prepared =
+            crate::store::prepare_content(vec![7u8; 1 << 20], "application/octet-stream").unwrap();
+        let mut big = super::support::raw_unknown(StreamId::Host, "big", prepared.content);
+        big.blobs = prepared.blob.into_iter().collect();
         tx.append(vec![big])?;
         Ok(())
     });
@@ -167,7 +162,7 @@ fn disk_full_rolls_back_and_recovers() {
 fn commit_failure_with_open_transaction_rolls_back() {
     let faults = Faults::default();
     *faults.commit.lock().unwrap() = Some(CommitFault::BusyBeforeCommit);
-    let (_dir, s, _) = store_with(faults);
+    let (_dir, s) = store_with(faults);
     let reply = run(&s, |tx| Ok(tx.append(vec![registered(thread(1), false)])?));
     assert!(
         matches!(reply, Err(WriteError::RolledBack(StoreError::Busy))),
@@ -186,7 +181,7 @@ fn commit_failure_with_ended_transaction_is_unknown() {
     let gates = Gates::default();
     let faults = gates.faults();
     *faults.commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
-    let (_dir, s, _) = store_with(faults);
+    let (_dir, s) = store_with(faults);
     // Hold the writer at the start of its failed state: admission must already be refused
     // when the reply arrives.
     let (_reached, release) = gates.arm("fail_begin");
@@ -208,7 +203,7 @@ fn commit_failure_with_ended_transaction_is_unknown() {
 fn failed_state_drains_the_queue() {
     let faults = Faults::default();
     *faults.commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
-    let (_dir, s, _) = store_with(faults);
+    let (_dir, s) = store_with(faults);
     let (go_tx, go_rx) = mpsc::channel::<()>();
     let first = s
         .submit(soon(), move |tx| {
@@ -244,7 +239,7 @@ fn failed_state_drains_the_queue() {
 /// submissions.
 #[test]
 fn writer_gone_resolves_tickets() {
-    let (_dir, s, _) = store_with(Faults::default());
+    let (_dir, s) = store_with(Faults::default());
     let (go_tx, go_rx) = mpsc::channel::<()>();
     let (started_tx, started_rx) = mpsc::channel::<()>();
     let first = s
@@ -284,7 +279,7 @@ fn writer_gone_resolves_tickets() {
 /// returned.
 #[test]
 fn writer_blocked_past_the_deadline() {
-    let (_dir, s, _) = store_with(Faults::default());
+    let (_dir, s) = store_with(Faults::default());
     let (go_tx, go_rx) = mpsc::channel::<()>();
     let (started_tx, started_rx) = mpsc::channel::<()>();
     let job = s
