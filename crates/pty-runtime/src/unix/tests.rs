@@ -347,7 +347,9 @@ fn identity_failure(kill_expired: bool) -> (SpawnError, u32, u32, Vec<&'static s
             &[
                 "/bin/sh",
                 "-c",
-                "/bin/sleep 30 & echo $!; exec /bin/sleep 30",
+                // Both ignore SIGHUP, so the hangup the teardown's master close sends the
+                // session does not kill them: only the kill under test does.
+                "trap '' HUP; /bin/sleep 30 & echo $!; exec /bin/sleep 30",
             ],
             &dir.0,
         ),
