@@ -70,9 +70,10 @@ pub(crate) struct MasterReader {
     master: OwnedFd,
     wake: Arc<Wake>,
     after_wake: Option<u64>,
-    /// Runs between a `poll` that saw the master ready and the `read` (tests: F16).
+    /// Runs once, between the first `poll` that saw the master ready and its `read`
+    /// (tests: F16).
     #[cfg(test)]
-    pub(crate) after_poll: Option<Box<dyn FnMut() + Send>>,
+    pub(crate) after_poll: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl MasterReader {
@@ -134,7 +135,7 @@ impl Read for MasterReader {
                     None => buf.len(),
                 };
                 #[cfg(test)]
-                if let Some(f) = self.after_poll.as_mut() {
+                if let Some(f) = self.after_poll.take() {
                     f();
                 }
                 match rustix::io::read(&self.master, &mut buf[..max]) {
@@ -459,12 +460,8 @@ mod tests {
         let p = pair();
         let (mut reader, _input, control) = ends(&p.master);
         let slave = dup(&p.slave);
-        let mut fired = false;
         reader.after_poll = Some(Box::new(move || {
-            if !fired {
-                fired = true;
-                tcflush(&slave, QueueSelector::OFlush).unwrap();
-            }
+            tcflush(&slave, QueueSelector::OFlush).unwrap();
         }));
         rustix::io::write(&p.slave, b"abc").unwrap();
         let (tx, rx) = mpsc::channel();

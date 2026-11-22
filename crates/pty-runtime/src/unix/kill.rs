@@ -850,8 +850,6 @@ mod tests {
     type Hook = Box<dyn FnMut(&mut World, Ev)>;
     type ListFn = Box<dyn FnMut(usize) -> io::Result<(Vec<u32>, bool)>>;
     type ClockFn = Box<dyn FnMut(Ev) -> Duration>;
-    /// Clock advance of every call an event kind matches.
-    type Cost = (fn(Ev) -> bool, Duration);
 
     struct Sim {
         base: Instant,
@@ -860,16 +858,14 @@ mod tests {
         log: RefCell<Vec<Ev>>,
         owned: Cell<bool>,
         lost: Cell<bool>,
-        /// Clock advance per call of each kind.
-        cost: RefCell<Vec<Cost>>,
         hook: RefCell<Option<Hook>>,
-        /// Extra clock advance decided per call.
+        /// Clock advance decided per call.
         clock: RefCell<Option<ClockFn>>,
         list: RefCell<Option<ListFn>>,
         getsid_err: RefCell<BTreeMap<u32, i32>>,
-        /// Results for the next ownership checks, taken in order before the normal rule
-        /// (a scripted `false` leaves `lost` clear, as a failed `waitid` other than `ECHILD`).
-        owned_script: RefCell<std::collections::VecDeque<bool>>,
+        /// The next ownership check fails and leaves `lost` clear, as a failed `waitid`
+        /// other than `ECHILD`; later checks follow the normal rule.
+        owned_fails_once: Cell<bool>,
         /// Ownership checks return the leader's record, as the real check does.
         owned_reads: Cell<bool>,
     }
@@ -890,12 +886,11 @@ mod tests {
                 log: RefCell::new(Vec::new()),
                 owned: Cell::new(true),
                 lost: Cell::new(false),
-                cost: RefCell::new(Vec::new()),
                 hook: RefCell::new(None),
                 clock: RefCell::new(None),
                 list: RefCell::new(None),
                 getsid_err: RefCell::new(BTreeMap::new()),
-                owned_script: RefCell::new(std::collections::VecDeque::new()),
+                owned_fails_once: Cell::new(false),
                 owned_reads: Cell::new(false),
             }
         }
@@ -945,8 +940,13 @@ mod tests {
             *self.hook.borrow_mut() = Some(Box::new(f));
         }
 
+        /// A clock that advances `d` at every call `kind` matches.
         fn cost(&self, kind: fn(Ev) -> bool, d: Duration) {
-            self.cost.borrow_mut().push((kind, d));
+            *self.clock.borrow_mut() = Some(Box::new(
+                move |ev| {
+                    if kind(ev) { d } else { Duration::ZERO }
+                },
+            ));
         }
 
         fn enter(&self, ev: Ev) {
@@ -959,15 +959,7 @@ mod tests {
                 .borrow_mut()
                 .as_mut()
                 .map_or(Duration::ZERO, |f| f(ev));
-            let add: Duration = jump
-                + self
-                    .cost
-                    .borrow()
-                    .iter()
-                    .filter(|(k, _)| k(ev))
-                    .map(|(_, d)| *d)
-                    .sum();
-            self.now.set(self.now.get() + add);
+            self.now.set(self.now.get() + jump);
         }
 
         fn alive(&self, pid: u32) -> bool {
@@ -1000,8 +992,8 @@ mod tests {
             self.enter(Ev::Owned);
             let in_time = self.base + self.now.get() < deadline;
             let read = self.owned_reads.get().then(|| self.lookup(L));
-            if let Some(v) = self.owned_script.borrow_mut().pop_front() {
-                return (v, read);
+            if self.owned_fails_once.replace(false) {
+                return (false, read);
             }
             if !self.owned.get() {
                 self.lost.set(true);
@@ -1703,7 +1695,7 @@ mod tests {
     }
 
     #[test]
-    fn member_cut_from_the_extension_is_tracked_by_the_next_call() {
+    fn member_is_retained_when_the_deadline_follows_the_ownership_check() {
         // M, a live child of the leader in its group, is read by the census; the clock
         // passes the deadline right after the ownership check that follows the pass.
         let sim = Sim::new();
@@ -1713,14 +1705,7 @@ mod tests {
         let r = sim.kill(&[], 1_000, &st);
         assert!(!r.tree_dead, "{r:?}");
         assert!(r.survivors.contains(&sim.identity(200)), "{r:?}");
-        // Between the calls M leaves the session and the leader exits.
-        {
-            let mut w = sim.world.borrow_mut();
-            let m = w.procs.get_mut(&200).unwrap();
-            (m.ppid, m.pgid, m.sid) = (1, 200, 200);
-            w.procs.get_mut(&L).unwrap().st = St::Zombie;
-        }
-        *sim.clock.borrow_mut() = None;
+        leave_and_orphan(&sim, 200, |w| w.procs.get_mut(&L).unwrap().st = St::Zombie);
         let r = sim.kill(&[], 1_000, &st);
         assert!(!r.tree_dead, "{r:?}");
         assert!(sim.alive(200));
@@ -2163,7 +2148,7 @@ mod tests {
         // The first ownership check fails without loss; later ones hold. M (session `L`,
         // its own group) is never retained or signalled by pid.
         let sim = Sim::new();
-        sim.owned_script.borrow_mut().push_back(false);
+        sim.owned_fails_once.set(true);
         // Each pass takes 1 ms, so passes that cannot prove anything reach the deadline.
         sim.cost(|e| e == Ev::PidCount, Duration::from_millis(1));
         sim.world.borrow_mut().procs.get_mut(&L).unwrap().st = St::Zombie;
@@ -2185,7 +2170,7 @@ mod tests {
         // The first ownership check fails without loss; later ones hold. The tree is
         // already dead and every pass is clean, but death is not proven.
         let sim = Sim::new();
-        sim.owned_script.borrow_mut().push_back(false);
+        sim.owned_fails_once.set(true);
         // Each pass takes 1 ms, so passes that cannot prove anything reach the deadline.
         sim.cost(|e| e == Ev::PidCount, Duration::from_millis(1));
         sim.world.borrow_mut().procs.get_mut(&L).unwrap().st = St::Zombie;
