@@ -338,13 +338,11 @@ impl Shared {
         self.wait_until(None, |s| s.readers_released.then_some(()));
     }
 
-    /// Records the writer's report (the first one wins).
+    /// Records the writer's report; the writer thread's `ExitGuard` publishes it once.
     pub(crate) fn publish_exit(&self, exit: WriterExit) {
         self.update(|s| {
-            if s.exit.is_none() {
-                s.exit = Some(exit);
-                s.exit_at = Some(Instant::now());
-            }
+            s.exit = Some(exit);
+            s.exit_at = Some(Instant::now());
         });
     }
 
@@ -445,24 +443,17 @@ impl Store {
         // Admission is decided under the sender lock, which the writer holds while it
         // publishes the failed state.
         let guard = lock(&shared.sender);
+        // Retirement sets `failed` under this same lock, so one check decides.
         if shared.failed.load(Ordering::SeqCst) {
             return Err(SubmitError::Failed);
         }
         let Some(sender) = guard.as_ref() else {
-            return Err(if shared.failed.load(Ordering::SeqCst) {
-                SubmitError::Failed
-            } else {
-                SubmitError::Closed
-            });
+            return Err(SubmitError::Closed);
         };
         match sender.try_send(job) {
             Ok(()) => Ok(WriteTicket(rx)),
             Err(TrySendError::Full(_)) => Err(SubmitError::QueueFull),
-            Err(TrySendError::Disconnected(_)) => Err(if shared.failed.load(Ordering::SeqCst) {
-                SubmitError::Failed
-            } else {
-                SubmitError::Closed
-            }),
+            Err(TrySendError::Disconnected(_)) => Err(SubmitError::Closed),
         }
     }
 

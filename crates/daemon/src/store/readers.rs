@@ -48,7 +48,6 @@ pub struct Page {
 
 struct PoolState {
     idle: Vec<Connection>,
-    lent: usize,
     /// Connections not yet closed: idle, lent, or being closed by a drain.
     open: usize,
     closed: bool,
@@ -71,7 +70,6 @@ impl Pool {
             state: Mutex::new(PoolState {
                 open: conns.len(),
                 idle: conns,
-                lent: 0,
                 closed: false,
                 drained: false,
             }),
@@ -86,7 +84,6 @@ impl Pool {
                 return Err(ReadError::Closed);
             }
             if let Some(c) = s.idle.pop() {
-                s.lent += 1;
                 return Ok(c);
             }
             let now = Instant::now();
@@ -106,7 +103,6 @@ impl Pool {
             let _ = conn.execute_batch("ROLLBACK");
         }
         let mut s = lock(&self.state);
-        s.lent -= 1;
         if s.drained {
             drop(s);
             drop(conn);

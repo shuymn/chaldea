@@ -153,7 +153,7 @@ impl WriterExit {
 }
 
 pub(crate) struct WriterCtx {
-    pub(crate) conn: Option<Connection>,
+    pub(crate) conn: Connection,
     pub(crate) rx: Receiver<JobBox>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) ids: Arc<dyn IdSource>,
@@ -274,16 +274,15 @@ impl WriterCtx {
         // readers (closed, or abandoned at its deadline), then checkpoint.
         self.shared.wait_readers_released();
         self.faults.mark("checkpoint_begin");
-        let checkpoint = match self.conn.as_ref() {
-            None => Checkpoint::NotRun,
-            Some(conn) => match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+        let checkpoint = match self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
                 r.get::<_, i64>(0)
             }) {
-                Ok(0) => Checkpoint::Complete,
-                Ok(_) => Checkpoint::Busy,
-                Err(e) if is_busy(&e) => Checkpoint::Busy,
-                Err(e) => Checkpoint::Error(StoreError::from(e).to_string()),
-            },
+            Ok(0) => Checkpoint::Complete,
+            Ok(_) => Checkpoint::Busy,
+            Err(e) if is_busy(&e) => Checkpoint::Busy,
+            Err(e) => Checkpoint::Error(StoreError::from(e).to_string()),
         };
         self.faults.mark("checkpoint_end");
         WriterExit {
@@ -308,12 +307,11 @@ impl WriterCtx {
         Next::Fail
     }
 
-    /// The failed state: the connection is retired, no clone can submit, and every queued
-    /// job gets `Failed`; the thread then ends.
-    fn fail(mut self) -> WriterExit {
+    /// The failed state, entered after `reply_and_fail` retired the writer: the connection
+    /// is closed and every queued job gets `Failed`; the thread then ends.
+    fn fail(self) -> WriterExit {
         self.faults.mark("fail_begin");
-        self.retire();
-        drop(self.conn.take());
+        drop(self.conn);
         while let Ok(job) = self.rx.recv() {
             job.reply(Err(WriteError::Failed(StoreError::Sqlite {
                 extended_code: -1,
@@ -328,9 +326,7 @@ impl WriterCtx {
     }
 
     fn run_job(&mut self, mut job: JobBox) -> Next {
-        let Some(conn) = self.conn.as_ref() else {
-            return self.reply_and_fail(job, WriteError::WriterGone);
-        };
+        let conn = &self.conn;
         // 1. Expired in the queue.
         if self.clock.now().0 > job.not_after() {
             job.reply(Err(WriteError::Expired));

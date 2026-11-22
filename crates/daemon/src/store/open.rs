@@ -410,7 +410,7 @@ pub(crate) fn open(cfg: StoreConfig, faults: Arc<Faults>) -> Result<Store, OpenE
     let shared = Arc::new(Shared::new(tx));
     let (notifier, _) = broadcast::channel(1024);
     let join = writer::spawn(WriterCtx {
-        conn: Some(conn),
+        conn,
         rx,
         clock: cfg.clock,
         ids: cfg.ids,
