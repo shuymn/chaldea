@@ -304,7 +304,7 @@ module thread_input_traces {
       .expect(last.gate == Open and st.gp.evidenceTurn == 2)
 
   /// Refused: `SessionStart` after a buffered `Stop` is a later hook, so that `Stop`
-  /// settles nothing and binding opens no gate.
+  /// settles nothing, not even after binding replays it, and no input is written.
   run trace_refused_buffered_settle_after_session_start =
     initWith(false)
       .then(reserve(CODEX))
@@ -315,14 +315,32 @@ module thread_input_traces {
       .expect(st.bufferCandidate == NoEvidenceCandidate)
       .then(bind)
       .expect(stateOf(st, 1) == Acked and last.gate == Closed(NoEvidence))
+      .expect(not(readyAllowed(st, StopSettled, st.stopCount)))
+      .then(send(2))
+      .expect(last.gate == Closed(NoEvidence) and stateOf(st, 2) == Queued)
+
+  /// mvp §2.9:325: a `Stop` buffered after `SessionStart` stays live through binding, so
+  /// its settle completion opens the gate.
+  run trace_buffered_stop_after_session_start =
+    initWith(false)
+      .then(reserve(CODEX))
+      .then(spawn)
+      .then(bufferPrompt(Set(1)))
+      .then(sessionStartHook)
+      .then(bufferStop)
+      .then(bind)
+      .then(settle)
+      .expect(stateOf(st, 1) == Acked and last.gate == Open and st.gp.evidenceTurn == 1)
 
   /// Refused (mvp §2.10:336): a key sent from card 1 after `Stop` superseded it is refused
-  /// at the write boundary: nothing written, no event.
+  /// at the write boundary while card 2 of the next turn is open: nothing written, no event.
   run trace_refused_superseded_card_key =
     readyLaunch
       .then(prompt(Set()))
       .then(cardOpen(1))
       .then(turnStop)
+      .then(prompt(Set()))
+      .then(cardOpen(2))
       .then(humanWrite(cardKey(st, 1)))
       .expect(last.calls == [] and st.writer == [] and st.gp.lastWrite == 0 and st.cardKeys == [])
 

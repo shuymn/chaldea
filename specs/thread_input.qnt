@@ -916,7 +916,17 @@ module thread_input {
           applyReady(acc, r.kind, r.basis, evidenceTurnOf(acc.st, r.kind))
         else acc
     })
-    commit(Bind, withState(o3, s => { ...s, buffer: [], bufferCandidate: NoEvidenceCandidate })),
+    // Replaying the buffer cannot revive a `Stop` that a later hook invalidated at intake:
+    // an unsettled `Stop` candidate survives only if it is the one still live there.
+    val live = candidateStop(st.bufferCandidate)
+    commit(Bind, withState(o3, s => { ...s,
+      buffer: [],
+      bufferCandidate: NoEvidenceCandidate,
+      evidenceCandidate: match s.evidenceCandidate {
+        | StopCandidate(r) => if (r.id == live) s.evidenceCandidate else NoEvidenceCandidate
+        | _ => s.evidenceCandidate
+      },
+    })),
   }
 
   /// Readiness evidence from the adapter (mvp §2.3 "Gate", `readiness_evidence` modes);

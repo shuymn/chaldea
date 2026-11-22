@@ -68,7 +68,7 @@ Two layers in one module:
 | `spawn` / `spawnFail` | `launch_started` moves the positional prompt to `sent` with `sent_after_seq` = its seq; a confirmed spawn failure rejects it | mvp §2.3:186 |
 | `manualFirstTurn` | a human starts a manual Codex launch's first turn through attach (an attach write); its hooks fire from then on | mvp §2.7:303 |
 | `sessionStartHook`, `bind` | the launch's `SessionStart` arrives and invalidates pending candidates; binding records `session_bound` (a turn start), makes Claude's `SessionStart` the evidence candidate, and promotes the buffered hooks in intake order with their intake facts | mvp §2.1:115, §2.7, §2.9:325 |
-| `bufferPrompt`, `bufferStop`, `bufferReady(ev, stop)` | hooks of an unbound live launch, buffered; a settle completion only for the buffered `Stop` it names while no later hook arrived; promotion applies it only if that `Stop` is then the current turn's candidate | mvp §2.9:325 |
+| `bufferPrompt`, `bufferStop`, `bufferReady(ev, stop)` | hooks of an unbound live launch, buffered; a settle completion only for the buffered `Stop` it names while no later hook arrived; promotion applies it only if that `Stop` is then the current turn's candidate, and keeps an unsettled `Stop` as the candidate only if it was still live at intake | mvp §2.9:325 |
 | `ready(ev, stop)` | evidence of the current bound live launch, of a kind its adapter and mode produce: `SessionStart` backed by Claude's own; a settle completion only for the `Stop` it names, of the current launch and turn, with no later hook since; a post-decision signal on its own entry once a turn started | mvp §2.3:171-173, §2.7 |
 | `ownerReady` | `chaldea ready`: the bound launch only; otherwise refused, writing nothing | mvp §2.3:171 |
 | `prompt(matches)` | bound `UserPromptSubmit`: turn start, supersedes cards, invalidates the evidence candidate; ack attribution from the hook's intake facts (unique match, same launch, after the attempt, dispatched, no other counted write after it); an undispatched match is a `user_message`, a dispatched one acks or is kept as the `sending` input's candidate | mvp §2.3:182; docs/design/pty-runtime.md §2.3 "Ack attribution" |
@@ -147,7 +147,7 @@ All are checked by `pnpm run simulate` (§5). Each reads facts recorded where th
 - readiness after a Codex interrupt (no `Stop` backs it);
 - a settle completion after a late card resolution of the same launch (a later hook);
 - a late `Stop` of the previous turn backing the current turn, or a settle completion of a `Stop` that a later one replaced;
-- a buffered settle completion after `SessionStart` (a later hook), so binding opens no gate;
+- a buffered `Stop` followed by `SessionStart` (a later hook): neither a buffered settle completion nor one after binding counts, and no input is written (`trace_buffered_stop_after_session_start` shows a `Stop` buffered after `SessionStart` still settling);
 - a key from a card that `Stop` superseded (nothing written, no event).
 
 `trace_undispatched_match_ignored` shows a same-text hook before the dispatch leaving no candidate, `trace_cards_with_identity` a late resolution of a superseded card while the next turn's card is open, `trace_manual_first_turn` a manual Codex launch with no hook before its first turn, and `trace_post_decision_own_entry` post-decision evidence taken in before any `Stop`.
