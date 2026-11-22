@@ -317,7 +317,7 @@ struct UnixControl { master: OwnedFd, wake: Arc<Wake>, wake_write: PipeWriter } 
 ```
 
 - `resize(size)`: `tcsetwinsize(&master, { ws_row, ws_col, ws_xpixel: cols × 8, ws_ypixel: rows × 16 })`; the kernel sends `SIGWINCH` to the foreground group (F1). The `io::Error` keeps its errno. Never blocks.
-- `close(deadline)`: sets `closed`, writes the wake byte once on the nonblocking write end (`EAGAIN` means a byte is already there; `EINTR`, not expected for a nonblocking write, is retried at most three times), drops its fds, returns `CloseReport { elapsed: Some(..) }`. It never blocks, so the deadline is always met; `close_bounded` (PR2 §2.4) is Windows-only. Dropping a `UnixControl` without `close` does the same.
+- `close(deadline)`: sets `closed`, writes the wake byte once on the nonblocking write end (`EAGAIN` means a byte is already there; `EINTR`, not expected for a nonblocking write, is retried at most three times), drops its fds, returns `CloseReport { elapsed: Some(..) }`. It never blocks, so the deadline is always met. Dropping a `UnixControl` without `close` does the same.
 
 ### 2.7 The `unsafe` Carve-Out (PR2 D7)
 
