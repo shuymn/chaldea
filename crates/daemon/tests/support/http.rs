@@ -52,9 +52,20 @@ impl SkewClock {
     }
 }
 
+impl SkewClock {
+    fn offset(&self) -> Duration {
+        Duration::from_millis(self.offset_ms.load(Ordering::SeqCst))
+    }
+}
+
 impl MonotonicClock for SkewClock {
     fn now(&self) -> Instant {
-        Instant::now() + Duration::from_millis(self.offset_ms.load(Ordering::SeqCst))
+        Instant::now() + self.offset()
+    }
+
+    /// `at` less the current offset (an instant before the platform's earliest is long past).
+    fn real(&self, at: Instant) -> Instant {
+        at.checked_sub(self.offset()).unwrap_or_else(Instant::now)
     }
 }
 

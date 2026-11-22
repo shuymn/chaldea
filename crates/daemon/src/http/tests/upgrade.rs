@@ -138,30 +138,30 @@ async fn http10_upgrade_is_400() {
     srv.stop().await;
 }
 
-/// The socket task waits for its admission: an admission held between the final read and
-/// the ticket removal for longer than the hand-over bound still hands the socket over, so
-/// a spent ticket always yields a usable socket.
+/// The socket task waits for its admission: its hand-over bound starts only after the
+/// ticket is removed, so a spent ticket always has a task waiting for its socket. The
+/// admission is held between the final read and the removal until the socket task has
+/// parked; no hand-over bound has started by then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admission_held_past_the_hand_over_bound() {
+async fn hand_over_bound_starts_after_the_ticket_is_removed() {
     let srv = TestServer::start(ws_mounts()).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
     let s = super::shared(&srv);
     let (reached, release) = s.faults.inner.arm_removal_gate();
+    let parked = s.faults.inner.arm_first_park();
     let url = format!("ws://127.0.0.1:{}/api/ws?ticket={ticket}", srv.port);
     let client = tokio::spawn(tokio_tungstenite::connect_async(url));
-    tokio::time::timeout(Duration::from_secs(10), reached)
-        .await
-        .expect("admission reached the gate")
-        .unwrap();
-    // Accept, the connection, and the registered socket task.
-    assert_eq!(srv.server.tasks(), 3);
-    // Give a hand-over timer that started at registration (the short deadline) time to
-    // end the socket task; a socket task tied to its admission stays.
-    let bound = Instant::now() + super::support::http::DEADLINE + Duration::from_secs(1);
-    while srv.server.tasks() == 3 && Instant::now() < bound {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    for (what, signal) in [
+        ("admission reached the gate", reached),
+        ("the socket task parked", parked),
+    ] {
+        tokio::time::timeout(Duration::from_secs(10), signal)
+            .await
+            .expect(what)
+            .unwrap();
     }
+    assert_eq!(s.faults.inner.steps(), Vec::<&str>::new());
     drop(release);
     let (mut ws, resp) = tokio::time::timeout(Duration::from_secs(10), client)
         .await
@@ -175,6 +175,10 @@ async fn admission_held_past_the_hand_over_bound() {
         .unwrap()
         .unwrap();
     assert!(hello.to_text().unwrap().contains("\"hello\""), "{hello:?}");
+    assert_eq!(
+        s.faults.inner.steps(),
+        ["ticket removed", "hand-over bound started"]
+    );
     ws.close(None).await.unwrap();
     srv.stop().await;
 }

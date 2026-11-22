@@ -57,15 +57,24 @@ pub use upgrade::{ShutdownSignal, UpgradeGrant, UpgradedSocket};
 /// checks, and ticket expiry are all read on it; tests inject one.
 pub trait MonotonicClock: Send + Sync + 'static {
     fn now(&self) -> Instant;
+
+    /// The real instant (`Instant` time, for timers and the store's waits) at which this
+    /// clock reads `at`: a function of the clock's state, never a second reading of either
+    /// clock, so a thread preempted between two readings cannot move a deadline.
+    fn real(&self, at: Instant) -> Instant;
 }
 
-/// [`Instant::now`].
+/// [`Instant::now`]: its instants are real ones.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemMonotonic;
 
 impl MonotonicClock for SystemMonotonic {
     fn now(&self) -> Instant {
         Instant::now()
+    }
+
+    fn real(&self, at: Instant) -> Instant {
+        at
     }
 }
 
@@ -158,9 +167,9 @@ impl Shared {
     }
 
     /// The real instant (for timers and the store's waits) at which the server's clock
-    /// reaches `at`.
+    /// reaches `at`; `at` itself with the system clock.
     pub(crate) fn real(&self, at: Instant) -> Instant {
-        Instant::now() + at.saturating_duration_since(self.cfg.clock.now())
+        self.cfg.clock.real(at)
     }
 
     /// [`Shared::real`] as a tokio instant.
@@ -313,6 +322,29 @@ impl Faults {
     pub(crate) async fn before_ticket_removal(&self) {
         #[cfg(test)]
         self.inner.before_ticket_removal().await;
+    }
+
+    /// Records a step of an upgrade, for tests that check the steps' order.
+    pub(crate) fn step(&self, _step: &'static str) {
+        #[cfg(test)]
+        self.inner.step(_step);
+    }
+
+    /// A socket task as registered: in tests, it signals the first time it parks.
+    pub(crate) fn socket_task<F>(&self, fut: F) -> impl Future<Output = ()> + Send + 'static
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        #[cfg(test)]
+        return self.inner.signal_first_park(fut);
+        #[cfg(not(test))]
+        fut
+    }
+
+    /// Runs after a cutoff timer was set and before the work it bounds starts.
+    pub(crate) async fn cutoff_set(&self) {
+        #[cfg(test)]
+        self.inner.cutoff_set().await;
     }
 
     /// An injected accept error, taken before each real accept.

@@ -27,6 +27,30 @@ pub(crate) struct Points {
     pub(crate) submits: AtomicUsize,
     /// Held once by an upgrade admission between its final read and the ticket removal.
     pub(crate) removal_gate: Mutex<Option<Gate>>,
+    /// Held once right after a read's or a write reply's cutoff timer was set.
+    pub(crate) cutoff_gate: Mutex<Option<Gate>>,
+    /// Told the first time the next registered socket task parks.
+    pub(crate) first_park: Mutex<Option<oneshot::Sender<()>>>,
+    /// The upgrade steps recorded, in order.
+    pub(crate) steps: Mutex<Vec<&'static str>>,
+}
+
+/// Arms a gate: the returned receiver fires when the gate is reached, and the waiter goes
+/// on once the returned sender is used or dropped.
+fn arm(slot: &Mutex<Option<Gate>>) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some((reached_tx, release_rx));
+    (reached_rx, release_tx)
+}
+
+/// Passes a gate: if armed, tells the test and waits for the release.
+async fn pass(slot: &Mutex<Option<Gate>>) {
+    let gate = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if let Some((reached, release)) = gate {
+        let _ = reached.send(());
+        let _ = release.await;
+    }
 }
 
 /// The armed hook if its skip count is used up; otherwise counts one skip.
@@ -105,24 +129,64 @@ impl Points {
     /// Arms the gate: the returned receiver fires when an admission reaches it, and the
     /// admission goes on once the returned sender is used or dropped.
     pub(crate) fn arm_removal_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
-        let (reached_tx, reached_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        *self
-            .removal_gate
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some((reached_tx, release_rx));
-        (reached_rx, release_tx)
+        arm(&self.removal_gate)
     }
 
     pub(crate) async fn before_ticket_removal(&self) {
-        let gate = self
-            .removal_gate
+        pass(&self.removal_gate).await;
+    }
+
+    /// Arms the cutoff gate, as [`Points::arm_removal_gate`].
+    pub(crate) fn arm_cutoff_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        arm(&self.cutoff_gate)
+    }
+
+    pub(crate) async fn cutoff_set(&self) {
+        pass(&self.cutoff_gate).await;
+    }
+
+    pub(crate) fn step(&self, step: &'static str) {
+        self.steps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(step);
+    }
+
+    pub(crate) fn steps(&self) -> Vec<&'static str> {
+        self.steps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The returned receiver fires the first time the next registered socket task parks.
+    pub(crate) fn arm_first_park(&self) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        *self
+            .first_park
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(tx);
+        rx
+    }
+
+    pub(crate) fn signal_first_park<F>(&self, fut: F) -> impl Future<Output = ()> + Send + 'static
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let mut signal = self
+            .first_park
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some((reached, release)) = gate {
-            let _ = reached.send(());
-            let _ = release.await;
-        }
+        let mut fut = Box::pin(fut);
+        std::future::poll_fn(move |cx| {
+            let r = fut.as_mut().poll(cx);
+            if r.is_pending()
+                && let Some(s) = signal.take()
+            {
+                let _ = s.send(());
+            }
+            r
+        })
     }
 }

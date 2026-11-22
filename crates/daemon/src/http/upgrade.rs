@@ -106,10 +106,12 @@ pub(crate) async fn admit(
     };
     let shutdown = shared.shutdown_signal();
     let hand_over = shared.cfg.short_deadline;
+    let s = shared.clone();
     let task = async move {
         if admitted.await.is_err() {
             return;
         }
+        s.faults.step("hand-over bound started");
         let Ok(Ok(socket)) = tokio::time::timeout(hand_over, rx).await else {
             return;
         };
@@ -121,6 +123,7 @@ pub(crate) async fn admit(
             })
             .await;
     };
+    let task = shared.faults.socket_task(task);
     if shared.registry.spawn(TaskKind::Socket, task).is_err() {
         return ApiError::shutting_down().into_response();
     }
@@ -137,6 +140,7 @@ pub(crate) async fn admit(
     {
         return ApiError::unauthorized().into_response();
     }
+    shared.faults.step("ticket removed");
     // 6. `101`; axum's upgrade task hands the socket to the registered task.
     let _ = admitted_tx.send(());
     ws.on_upgrade(move |socket| async move {

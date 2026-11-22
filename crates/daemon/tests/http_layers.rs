@@ -758,3 +758,44 @@ async fn http10_gets_the_same_rules() {
     }
     srv.stop().await;
 }
+
+/// A read handler's result taken at or after the deadline is discarded: the handler moves
+/// the server's clock past the deadline and answers at once, so its result and the cutoff
+/// are both ready when the guard takes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_handler_result_is_408() {
+    let clock = Arc::new(support::http::SkewClock::default());
+    let c = clock.clone();
+    let mounts = Mounts::mvp().with(Mount::read(
+        spec(&Method::GET, "/").unwrap(),
+        move |_ctx: ReadCtx, _req| {
+            c.skew(Duration::from_secs(3600));
+            async { Ok(ok_response()) }
+        },
+    ));
+    let cfg_clock = clock.clone();
+    let srv = TestServer::start_with(mounts, move |cfg| cfg.clock = cfg_clock).await;
+    let r = srv.send(&srv.req("GET", "/")).await;
+    clock.skew(Duration::ZERO);
+    assert_eq!(r.outcome(), (408, code("request_timeout")));
+    srv.stop().await;
+}
+
+/// The cutoff timers run on real time converted from the server's clock: with the clock
+/// moved an hour forward, a read mount that never answers is still cut off at its budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skewed_clock_keeps_the_timers() {
+    let mounts = Mounts::mvp().with(Mount::read(
+        spec(&Method::GET, "/").unwrap(),
+        |_ctx: ReadCtx, _req| std::future::pending::<Result<Response<Body>, ApiError>>(),
+    ));
+    let srv = TestServer::start(mounts).await;
+    srv.clock.skew(Duration::from_secs(3600));
+    let started = Instant::now();
+    let r = srv.send(&srv.req("GET", "/")).await;
+    let took = started.elapsed();
+    srv.clock.skew(Duration::ZERO);
+    assert_eq!(r.outcome(), (408, code("request_timeout")));
+    assert!(took < DEADLINE + Duration::from_millis(900), "{took:?}");
+    srv.stop().await;
+}
