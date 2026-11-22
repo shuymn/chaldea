@@ -423,8 +423,8 @@ pub(crate) fn create_process(
         return Err(io::Error::last_os_error());
     }
     let process = owned(pi.hProcess)?;
-    created(&process);
     let thread = owned(pi.hThread)?;
+    created(&process);
     Ok(Created {
         process,
         thread,

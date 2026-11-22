@@ -440,8 +440,6 @@ impl PtyRuntime for WindowsPty {
             let marker = held.clone();
             #[cfg(test)]
             let marker = marker.or_else(|| self.hooks.marker());
-            #[cfg(test)]
-            self.hooks.keep_peek(&out_r);
             hooks::MarkerReader::new(out_r, marker)
         };
         #[cfg(not(any(test, feature = "fake")))]

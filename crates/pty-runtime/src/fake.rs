@@ -782,7 +782,8 @@ pub fn windows_track_close_threads(on: bool) {
 }
 
 /// Waits (bounded by `timeout`) for the tracked threads of close workers whose close
-/// returned; true when all have exited.
+/// returned; true when all of them (the batch this call took) have exited. Use one tracking
+/// arm at a time and one sweep at a time.
 #[cfg(windows)]
 #[must_use]
 pub fn windows_close_threads_exited(timeout: Duration) -> bool {

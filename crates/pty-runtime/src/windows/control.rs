@@ -195,6 +195,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+    // Every test here closes a worker, which registers with the close-thread registry that
+    // `windows::tests` asserts on, so they share its lock.
+    use crate::windows::tests::serial;
 
     /// Waits (bounded) for the thread behind `join` to exit, on its handle.
     fn exited(join: &JoinHandle<()>) -> bool {
@@ -222,6 +225,7 @@ mod tests {
     /// late completion is already queued as the caller reads it.
     #[test]
     fn hung_close_worker_is_bounded() {
+        let _s = serial();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let mut w = CloseWorker::start("conpty-close-test").unwrap();
         w.arm(Box::new(move || {
@@ -259,6 +263,7 @@ mod tests {
     /// An unarmed worker told to close acknowledges and exits.
     #[test]
     fn unarmed_worker_exits() {
+        let _s = serial();
         let w = CloseWorker::start("conpty-close-test").unwrap();
         assert!(w.close(Instant::now() + WAIT).is_some());
         // Dropped unarmed: the thread exits.
@@ -272,6 +277,7 @@ mod tests {
     /// A worker dropped while armed still runs the close on its own thread.
     #[test]
     fn dropped_armed_worker_runs_the_close() {
+        let _s = serial();
         let (tx, rx) = mpsc::channel();
         let mut w = CloseWorker::start("conpty-close-test").unwrap();
         w.arm(Box::new(move || {
@@ -285,6 +291,7 @@ mod tests {
     /// on drop, so the closure's `try_unwrap` succeeds on both paths.
     #[test]
     fn close_and_drop_release_the_control_reference_first() {
+        let _s = serial();
         let closed = Arc::new(AtomicBool::new(false));
         let c = WindowsControl::new(
             Double {

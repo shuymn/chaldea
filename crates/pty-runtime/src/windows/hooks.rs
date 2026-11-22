@@ -577,8 +577,10 @@ pub(crate) fn kept_close_threads() -> usize {
 }
 
 /// Takes the kept close threads out of the registry, waits (bounded, without the
-/// registry's lock) on their handles, joins those signalled, and returns whether all were;
-/// the others go back while tracking is on.
+/// registry's lock) on their handles, joins those signalled, and returns whether all of
+/// this batch were; the others go back while tracking is on. The result covers only the
+/// batch it took: the probe is meant for one arm at a time, used serially (one sweep at a
+/// time, no disarm and rearm during a sweep).
 pub(crate) fn close_threads_exited(timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     let batch = std::mem::take(&mut close_threads().kept);
