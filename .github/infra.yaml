@@ -74,6 +74,12 @@ spec:
               app: github-actions
             - context: security / betterleaks
               app: github-actions
+            - context: mise-lock (macos-latest)
+              app: github-actions
+            - context: mise-lock (ubuntu-latest)
+              app: github-actions
+            - context: mise-lock (windows-latest)
+              app: github-actions
   actions:
     enabled: true
     allowed_actions: selected
