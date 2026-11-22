@@ -31,6 +31,9 @@ const INVARIANTS = [
   "taskOnlyByTaskSet",
   "gateEvidenceIsBound",
   "openGateEvidenceOfCurrentTurn",
+  "ackedHasCause",
+  "cardKeysOnlyToOpenCards",
+  "interruptedOnlyForCodex",
   "supervisorInputsAccepted",
 ];
 

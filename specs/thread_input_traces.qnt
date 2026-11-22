@@ -15,6 +15,14 @@ module thread_input_traces {
   import thread_input.* from "./thread_input"
 
   pure val CODEX: LaunchConfig = { adapter: CodexPositional, mode: StopSettle, needsBracketedPaste: false, upgraded: true }
+  pure val CODEX_MANUAL: LaunchConfig = { ...CODEX, adapter: CodexManual }
+  pure val CLAUDE_POST_DECISION: LaunchConfig = { ...CLAUDE, mode: PostDecisionMode }
+
+  /// The settle completion of the latest `Stop`.
+  action settle: bool = ready(StopSettled, st.stopCount)
+
+  /// A key sent from card `c` of the current launch.
+  pure def cardKey(s: State, c: int): HumanOrigin = CardKey({ launch: s.launch, card: c })
 
   // A bound, running Claude launch with `SessionStart` evidence (bracketed paste, 2004 on).
   run readyLaunch =
@@ -24,8 +32,20 @@ module thread_input_traces {
       .then(decset(true))
       .then(sessionStartHook)
       .then(bind)
-      .then(ready(SessionStart))
+      .then(ready(SessionStart, 0))
       .expect(last.gate == Open)
+
+  // A bound Codex launch whose positional prompt was acked and whose first turn settled.
+  run readyCodex =
+    initWith(true)
+      .then(reserve(CODEX))
+      .then(spawn)
+      .then(sessionStartHook)
+      .then(bind)
+      .then(prompt(Set(1)))
+      .then(turnStop)
+      .then(settle)
+      .expect(stateOf(st, 1) == Acked and last.gate == Open)
 
   /// mvp §2.3: gate open -> sending -> dispatched -> sent -> attributed ack; the turn's
   /// `Stop` and its settle evidence reopen the gate.
@@ -40,7 +60,7 @@ module thread_input_traces {
       .then(prompt(Set(1)))
       .expect(stateOf(st, 1) == Acked)
       .then(turnStop)
-      .then(ready(StopSettled))
+      .then(settle)
       .expect(last.gate == Open)
 
   /// mvp §2.3 "Ack": an ack arriving while `sending` is kept and applied once `sent`.
@@ -63,7 +83,7 @@ module thread_input_traces {
       .then(prompt(Set(1)))
       .expect(st.inputs.get(1).candidate == NoCandidate)
       .then(turnStop)
-      .then(ready(StopSettled))
+      .then(settle)
       .then(dispatch(1))
       .expect(st.inputs.get(1).dispatched)
       .then(prompt(Set(1)))
@@ -86,7 +106,7 @@ module thread_input_traces {
       .expect(stateOf(st, 1) == Dismissed and st.thread.attention == Set())
       .then(turnStop)
       .then(humanWrite(Attach))
-      .then(ready(StopSettled))
+      .then(settle)
       .expect(last.gate == Closed(EvidenceOfSameTurn))
       .then(ownerReady)
       .expect(last.gate == Open)
@@ -97,16 +117,15 @@ module thread_input_traces {
     readyLaunch
       .then(prompt(Set()))
       .then(cardOpen(1))
-      .then(humanWrite(CardKey(1)))
+      .then(humanWrite(cardKey(st, 1)))
       .then(cardResolve(1))
       .expect(st.thread.turn == TurnRunning)
       .then(turnStop)
-      .then(ready(StopSettled))
+      .then(settle)
       .expect(last.gate == Open)
 
   /// mvp §2.10: cards have identity. `Stop` supersedes card 1; card 2 opens in the next
-  /// turn; card 1's late resolution feeds nothing and its key is refused, so the turn
-  /// keeps awaiting card 2.
+  /// turn; card 1's late resolution feeds nothing, so the turn keeps awaiting card 2.
   run trace_cards_with_identity =
     readyLaunch
       .then(prompt(Set()))
@@ -117,7 +136,7 @@ module thread_input_traces {
       .then(lateResolve(1))
       .expect(last.calls == [] and st.thread.turn == AwaitingApproval)
       .expect(not(openCards(st).contains(1)))
-      .then(humanWrite(CardKey(2)))
+      .then(humanWrite(cardKey(st, 2)))
       .then(cardResolve(2))
       .expect(st.thread.turn == TurnRunning)
 
@@ -155,7 +174,7 @@ module thread_input_traces {
       .then(decset(true))
       .then(sessionStartHook)
       .then(bind)
-      .then(ready(SessionStart))
+      .then(ready(SessionStart, 0))
       .expect(last.gate == Open and stateOf(st, 1) == Unconfirmed)
       .then(send(3))
       .then(open(3))
@@ -206,7 +225,7 @@ module thread_input_traces {
       .then(spawn)
       .then(bufferPrompt(Set(1)))
       .then(bufferStop)
-      .then(bufferReady(StopSettled))
+      .then(bufferReady(StopSettled, 1))
       .then(sessionStartHook)
       .then(bind)
       .expect(stateOf(st, 1) == Acked and last.gate == Open and st.gp.evidenceTurn == 1)
@@ -231,7 +250,7 @@ module thread_input_traces {
       .then(send(1))
       .then(open(1))
       .then(turnStop)
-      .then(ready(StopSettled))
+      .then(settle)
       .expect(gate(recheckView(st, 1)) == Closed(EvidenceOfSameTurn))
       .then(dispatch(1))
       .expect(stateOf(st, 1) == Cancelled and st.writer == [WHuman])
@@ -248,15 +267,92 @@ module thread_input_traces {
       .then(dispatch(1))
       .expect(stateOf(st, 1) == Cancelled and st.writer == [WReply])
 
-  /// Refused: an interrupt is not a `Stop`, so no settle evidence of that turn exists and
-  /// the gate stays closed (mvp §2.3:173, :175).
+  /// Refused: a Codex interrupt is not a `Stop`, so no settle evidence of that turn
+  /// exists and the gate stays closed (mvp §2.3:173, :175).
   run trace_refused_interrupt_readiness =
-    readyLaunch
+    readyCodex
       .then(humanWrite(Key))
       .then(prompt(Set()))
       .then(interrupt)
-      .expect(not(readyAllowed(st, StopSettled)) and not(readyAllowed(st, PostDecision)))
+      .expect(not(readyAllowed(st, StopSettled, st.stopCount)))
       .expect(last.gate == Closed(WriteAfterEvidence))
+
+  /// Refused: a card resolution after `Stop` is a later hook of the launch, so the settle
+  /// completion of that `Stop` no longer counts; the gate stays closed and the input waits.
+  run trace_refused_settle_after_late_resolution =
+    readyLaunch
+      .then(prompt(Set()))
+      .then(cardOpen(1))
+      .then(turnStop)
+      .then(lateResolve(1))
+      .expect(not(readyAllowed(st, StopSettled, st.stopCount)))
+      .then(send(1))
+      .expect(last.gate == Closed(TurnNotIdle) and stateOf(st, 1) == Queued)
+
+  /// Refused: a late `Stop` of the previous turn cannot back the current turn's evidence,
+  /// nor can it once the current turn's own `Stop` replaced it; that `Stop` can.
+  run trace_refused_late_stop_of_earlier_turn =
+    readyLaunch
+      .then(prompt(Set()))
+      .then(turnStop)
+      .then(prompt(Set()))
+      .then(stopOfTurn(1))
+      .expect(not(readyAllowed(st, StopSettled, st.stopCount)) and st.thread.turn == TurnRunning)
+      .then(turnStop)
+      .expect(not(readyAllowed(st, StopSettled, st.stopCount - 1)))
+      .then(settle)
+      .expect(last.gate == Open and st.gp.evidenceTurn == 2)
+
+  /// Refused: `SessionStart` after a buffered `Stop` is a later hook, so that `Stop`
+  /// settles nothing and binding opens no gate.
+  run trace_refused_buffered_settle_after_session_start =
+    initWith(false)
+      .then(reserve(CODEX))
+      .then(spawn)
+      .then(bufferPrompt(Set(1)))
+      .then(bufferStop)
+      .then(sessionStartHook)
+      .expect(st.bufferCandidate == NoEvidenceCandidate)
+      .then(bind)
+      .expect(stateOf(st, 1) == Acked and last.gate == Closed(NoEvidence))
+
+  /// Refused (mvp §2.10:336): a key sent from card 1 after `Stop` superseded it is refused
+  /// at the write boundary: nothing written, no event.
+  run trace_refused_superseded_card_key =
+    readyLaunch
+      .then(prompt(Set()))
+      .then(cardOpen(1))
+      .then(turnStop)
+      .then(humanWrite(cardKey(st, 1)))
+      .expect(last.calls == [] and st.writer == [] and st.gp.lastWrite == 0 and st.cardKeys == [])
+
+  /// mvp §2.7: a manual Codex launch fires no hook until a human starts the first turn
+  /// through attach; its hooks then bind and settle the launch.
+  run trace_manual_first_turn =
+    initWith(false)
+      .then(reserve(CODEX_MANUAL))
+      .then(spawn)
+      .expect(not(st.hooksLive) and st.thread.attention == Set())
+      .then(manualFirstTurn)
+      .then(sessionStartHook)
+      .then(bind)
+      .then(prompt(Set()))
+      .then(turnStop)
+      .then(settle)
+      .expect(last.gate == Open)
+
+  /// mvp §2.3 `post_decision`: the CLI's post-decision signal is its own entry for the
+  /// current turn, taken in before the daemon took in the turn's `Stop`.
+  run trace_post_decision_own_entry =
+    initWith(true)
+      .then(reserve(CLAUDE_POST_DECISION))
+      .then(spawn)
+      .then(decset(true))
+      .then(sessionStartHook)
+      .then(bind)
+      .then(prompt(Set()))
+      .then(ready(PostDecision, 0))
+      .expect(last.gate == Open and st.gp.evidenceTurn == 1)
 
   /// Coverage: `BracketedPasteOff`, `InputInFlight`, a rejected and a cancelled input.
   run trace_coverage_gate_reasons =
@@ -277,19 +373,19 @@ module thread_input_traces {
   /// Coverage: `Interrupted`, exit recovery of a `sent` and a `queued` input
   /// (`LaunchExited`), `resolve --delivered`, and a refused step.
   run trace_coverage_exit_recovery =
-    readyLaunch
-      .then(send(1))
-      .then(open(1))
-      .then(dispatch(1))
-      .then(outcome(1, true))
+    readyCodex
       .then(send(2))
+      .then(open(2))
+      .then(dispatch(2))
+      .then(outcome(2, true))
+      .then(send(3))
       .then(interrupt)
       .expect(st.thread.turn == TurnUnknown)
       .then(exit(ExitNormal, true))
-      .expect(stateOf(st, 1) == Unconfirmed and stateOf(st, 2) == Cancelled)
-      .then(resolveInput(1, true))
-      .expect(stateOf(st, 1) == Acked and st.thread.attention == Set())
-      .then(rawStep(1, Resolved(true)))
+      .expect(stateOf(st, 2) == Unconfirmed and stateOf(st, 3) == Cancelled)
+      .then(resolveInput(2, true))
+      .expect(stateOf(st, 2) == Acked and st.thread.attention == Set())
+      .then(rawStep(2, Resolved(true)))
       .expect(not(last.calls[0].ok))
 
   /// Hole a: after a restart the reducer accepts a relaunch reservation, because `Exited`
@@ -327,18 +423,17 @@ module thread_input_traces {
       .expect(st.thread.process == Starting and st.thread.attention == Set(StartupStall))
 
   /// Hole d: the reducer accepts readiness of an unbound launch (state.rs:333-336); fed
-  /// directly instead of buffered, it opens the gate after binding on evidence older
-  /// than the binding.
+  /// directly instead of buffered on a Codex launch, whose hooks before binding are
+  /// buffered, it survives binding as evidence older than the binding.
   run trace_hole_d_unbound_readiness =
-    initWith(true)
-      .then(reserve(CLAUDE))
+    initWith(false)
+      .then(reserve(CODEX))
       .then(spawn)
-      .then(decset(true))
       .then(rawReadyUnbound(StopSettled))
       .expect(st.thread.turn == Idle)
       .then(sessionStartHook)
       .then(bind)
-      .expect(last.gate == Open and not(gateEvidenceIsBound))
+      .expect(not(gateEvidenceIsBound) and last.gate == Closed(InputInFlight))
 
   /// Finding: `ApprovalsAllResolved` carries no card identity; fed for card 1 after card 2
   /// opened in the next turn, it ends the turn's wait for card 2 (state.rs:362-367).

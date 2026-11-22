@@ -264,8 +264,9 @@ module thread_input {
 
   // Who wrote to the launch's PTY, in writer order. Every origin here is counted.
   type Origin = WInput(int) | WHuman | WReply
-  // A card key names the card it was sent from (§2.10: refused once that card is closed).
-  type HumanOrigin = Attach | Key | CardKey(int)
+  // A card key carries the launch and card it was sent from (mvp §2.10:336: refused once
+  // that card is no longer open).
+  type HumanOrigin = Attach | Key | CardKey({ launch: int, card: int })
 
   // The launch's adapter (mvp §2.7): Claude binds by `--session-id` and its `SessionStart`
   // is readiness evidence; a Codex launch has a positional first prompt, or none (a manual
@@ -295,10 +296,13 @@ module thread_input {
   // intake facts and applied once `sent` is recorded.
   type Candidate = NoCandidate | HasCandidate(AckRecord)
 
-  // A signal the adapter may turn into readiness evidence: Claude's `SessionStart`, or the
-  // `Stop` of a turn, which a later event of the launch invalidates (the settle interval
-  // itself stays abstract).
-  type EvidenceCandidate = NoEvidenceCandidate | SessionStartCandidate | StopCandidate(int)
+  // A `Stop` hook, identified by its launch, the turn it belongs to, and its intake order.
+  type StopRef = { launch: int, turn: int, id: int }
+
+  // A signal the adapter may turn into readiness evidence: Claude's `SessionStart`, or a
+  // `Stop` whose settle interval (abstract) may complete. Any later hook of the launch
+  // invalidates it, and a settle completion names the `Stop` it was started for.
+  type EvidenceCandidate = NoEvidenceCandidate | SessionStartCandidate | StopCandidate(StopRef)
 
   type Input = {
     state: InState,
@@ -342,8 +346,8 @@ module thread_input {
   // A hook of an unbound launch, buffered with the facts of its intake (mvp §2.9 "Binding").
   type BufferedHook =
     | BufPrompt({ matches: Set[int], facts: int -> AckRecord })
-    | BufStop
-    | BufReady({ kind: Evidence, basis: int })
+    | BufStop(int)
+    | BufReady({ kind: Evidence, basis: int, stop: int })
 
   // What the gate looked like when an input entered `sending` through the gate.
   type SendRecord = {
@@ -357,8 +361,29 @@ module thread_input {
     pasteOk: bool,
   }
 
-  // What the writer saw at the dispatch boundary of an input.
-  type DispatchRecord = { writesSinceBasis: int, gate: GateDecision }
+  // The raw facts at the dispatch boundary of an input, before the write: the invariant
+  // re-derives the recheck from them instead of reading the guard's view.
+  type DispatchRecord = {
+    writerLength: int,
+    admittedBasis: int,
+    sameLaunch: bool,
+    bound: bool,
+    process: Proc,
+    turn: Turn,
+    readinessSeq: int,
+    evidence: Evidence,
+    lastWrite: int,
+    attemptSeq: int,
+    lastWriteBefore: int,
+    lastHumanWrite: int,
+    lastTurnStart: int,
+    otherInFlight: int,
+    needsBracketedPaste: bool,
+    bracketedPasteOn: bool,
+  }
+
+  // A card key the writer accepted, with the card's state at that moment.
+  type CardKeyRecord = { keyLaunch: int, launch: int, cardLaunch: int, cardOpen: bool }
 
   type State = {
     thread: ThreadState,
@@ -371,6 +396,11 @@ module thread_input {
     sessionStartSeen: bool,
     // Turns started in the current launch (bound `UserPromptSubmit`s).
     turnNo: int,
+    // The launch's hooks fire: from the start, except a manual Codex launch, whose hooks
+    // start with the turn a human starts (mvp §2.7: no hook before the first turn).
+    hooksLive: bool,
+    // `Stop` hooks taken in so far, for their intake order.
+    stopCount: int,
     evidenceCandidate: EvidenceCandidate,
     gp: GateProjection,
     writer: List[Origin],
@@ -385,6 +415,9 @@ module thread_input {
     sendRecords: int -> SendRecord,
     dispatchRecords: int -> DispatchRecord,
     ackRecords: int -> AckRecord,
+    // Inputs the owner resolved as delivered (`chaldea input resolve --delivered`).
+    ownerDelivered: Set[int],
+    cardKeys: List[CardKeyRecord],
     // Per reservation the reducer accepted: was the previous launch's death confirmed.
     reservations: List[bool],
   }
@@ -402,13 +435,14 @@ module thread_input {
     | Spawn
     | SpawnFail
     | SessionStartHook
+    | ManualFirstTurn
     | Bind
-    | Ready(Evidence)
+    | Ready({ kind: Evidence, stop: int })
     | OwnerReady
     | Prompt(Set[int])
     | BufferPrompt(Set[int])
     | BufferStop
-    | BufferReady(Evidence)
+    | BufferReady({ kind: Evidence, stop: int })
     | HumanWrite(HumanOrigin)
     | VtReply
     | Send(int)
@@ -424,7 +458,7 @@ module thread_input {
     | Exit({ reason: ExitReason, deathConfirmed: bool })
     | Restart
     | ConfirmDeath
-    | TurnStop
+    | TurnStop(int)
     | Interrupt
     | CardOpen(int)
     | CardResolve(int)
@@ -484,6 +518,8 @@ module thread_input {
     deathConfirmed: true,
     sessionStartSeen: false,
     turnNo: 0,
+    hooksLive: false,
+    stopCount: 0,
     evidenceCandidate: NoEvidenceCandidate,
     gp: NO_GATE_EVIDENCE,
     writer: [],
@@ -496,6 +532,8 @@ module thread_input {
     sendRecords: Map(),
     dispatchRecords: Map(),
     ackRecords: Map(),
+    ownerDelivered: Set(),
+    cardKeys: [],
     reservations: [],
   }
 
@@ -559,7 +597,9 @@ module thread_input {
     r.sameLaunch and r.afterAttempt and r.uniqueMatch and r.dispatched and r.noInterveningWrite
 
   /// Whether the launch's adapter and readiness mode can produce this evidence kind
-  /// (mvp §2.3 `readiness_evidence` modes, §2.7).
+  /// (mvp §2.3 `readiness_evidence` modes, §2.7). Model assumption: under `none` Claude's
+  /// `SessionStart` is no evidence either (§2.3:173 "only `chaldea ready`"), although
+  /// §2.7:303 lists it before the after-turn mode; PR 10 decides.
   pure def kindAllowed(c: LaunchConfig, ev: Evidence): bool = match ev {
     | SessionStart => c.adapter == Claude and c.mode != OwnerOnly
     | StopSettled => c.mode == StopSettle
@@ -567,11 +607,16 @@ module thread_input {
     | OwnerAsserted => true
   }
 
-  /// The turn an evidence candidate backs `ev` for, or -1 when it backs none.
-  pure def candidateTurn(c: EvidenceCandidate, ev: Evidence): int = match c {
-    | NoEvidenceCandidate => -1
-    | SessionStartCandidate => if (ev == SessionStart) 0 else -1
-    | StopCandidate(t) => if (ev == StopSettled or ev == PostDecision) t else -1
+  /// Whether the current candidate is the `Stop` `id` of the current launch and turn.
+  pure def stopBacks(s: State, c: EvidenceCandidate, id: int): bool = match c {
+    | StopCandidate(r) => r.id == id and r.launch == s.launch and r.turn == s.turnNo
+    | _ => false
+  }
+
+  /// The id of the current `Stop` candidate, or 0.
+  pure def candidateStop(c: EvidenceCandidate): int = match c {
+    | StopCandidate(r) => r.id
+    | _ => 0
   }
 
   pure def incr(m: int -> int, id: int): int -> int =
@@ -644,7 +689,7 @@ module thread_input {
     withState(o, s => { ...s, cards: s.cards.keys().mapBy(c =>
       if (openCards(s).contains(c)) { ...s.cards.get(c), state: closed } else s.cards.get(c)) })
 
-  /// A later hook event of the launch invalidates a pending evidence candidate.
+  /// A later hook of the launch invalidates a pending evidence candidate.
   pure def invalidate(o: Out): Out = withState(o, s => { ...s, evidenceCandidate: NoEvidenceCandidate })
 
   pure def exitLaunch(o: Out, reason: ExitReason, deathConfirmed: bool, ii: InputInput, launch: int): Out =
@@ -683,11 +728,11 @@ module thread_input {
       else o2
     }
 
-  /// A `Stop`: the turn becomes `unknown`, the cards are superseded, and the stop is the
-  /// candidate for the turn's readiness evidence.
-  pure def applyStop(o: Out): Out =
+  /// A `Stop` of the current `turn`: the turn becomes `unknown`, the cards are superseded,
+  /// and the stop replaces any pending candidate.
+  pure def applyStop(o: Out, turn: int, id: int): Out =
     val o1 = closeCards(red(bump(o), TurnStopped), CardSuperseded)
-    withState(o1, s => { ...s, evidenceCandidate: StopCandidate(s.turnNo) })
+    withState(o1, s => { ...s, evidenceCandidate: StopCandidate({ launch: s.launch, turn: turn, id: id }) })
 
   /// `readiness_observed` with the basis captured at the evidence's intake, consuming the
   /// candidate that backs it.
@@ -699,16 +744,33 @@ module thread_input {
       gp: { ...s.gp, readinessSeq: s.seq, evidence: ev, basis: basis, evidenceLaunch: s.launch, evidenceTurn: turn },
     })
 
-  /// Whether `ready(ev)` may be observed now: the evidence is of the current bound live
-  /// launch, its kind is one the adapter's mode produces, and a candidate of the current
-  /// turn backs it.
-  pure def readyAllowed(s: State, ev: Evidence): bool = and {
+  /// Whether evidence `ev` may be taken in for the current launch and turn, given the
+  /// candidate the launch holds: `SessionStart` backed by Claude's own, a settle completion
+  /// only for the `Stop` it names when that is still the current turn's candidate, and a
+  /// post-decision signal on its own entry for a turn that started (the CLI emits it after
+  /// every `Stop` hook decided, whatever the daemon has taken in yet).
+  pure def evidenceBacked(s: State, c: EvidenceCandidate, ev: Evidence, stop: int): bool = and {
+    kindAllowed(s.cfg, ev),
+    match ev {
+      | SessionStart => c == SessionStartCandidate and stop == 0
+      | StopSettled => stopBacks(s, c, stop)
+      | PostDecision => s.turnNo >= 1 and stop == 0
+      | OwnerAsserted => false
+    },
+  }
+
+  /// Whether `ready(ev, stop)` may be observed now: the evidence is of the current bound
+  /// live launch, whose hooks fire, and is backed (`evidenceBacked`).
+  pure def readyAllowed(s: State, ev: Evidence, stop: int): bool = and {
     alive(s),
     s.gp.bound,
-    ev != OwnerAsserted,
-    kindAllowed(s.cfg, ev),
-    candidateTurn(s.evidenceCandidate, ev) == s.turnNo,
+    s.hooksLive,
+    evidenceBacked(s, s.evidenceCandidate, ev, stop),
   }
+
+  /// The turn an evidence of kind `ev` belongs to: the bind turn for `SessionStart`, the
+  /// current turn otherwise.
+  pure def evidenceTurnOf(s: State, ev: Evidence): int = if (ev == SessionStart) 0 else s.turnNo
 
   // ---------------------------------------------------------------------------
   // Actions
@@ -754,6 +816,7 @@ module thread_input {
       deathConfirmed: false,
       sessionStartSeen: false,
       turnNo: 0,
+      hooksLive: c.adapter != CodexManual,
       evidenceCandidate: NoEvidenceCandidate,
       gp: { ...NO_GATE_EVIDENCE, needsBracketedPaste: c.needsBracketedPaste },
       writer: [],
@@ -810,10 +873,27 @@ module thread_input {
   }
 
   /// The launch's `SessionStart` arrived; binding (its ancestry check) may still be pending.
+  /// As a later hook it invalidates pending candidates.
   action sessionStartHook: bool = all {
     alive(st),
+    st.hooksLive,
     not(st.sessionStartSeen),
-    commit(SessionStartHook, start({ ...st, sessionStartSeen: true })),
+    commit(SessionStartHook, start({ ...st,
+      sessionStartSeen: true, evidenceCandidate: NoEvidenceCandidate, bufferCandidate: NoEvidenceCandidate })),
+  }
+
+  /// A human starts the first turn of a manual Codex launch through attach (an attach
+  /// write); its hooks fire from then on (mvp §2.7, §2.9 "Resume").
+  action manualFirstTurn: bool = all {
+    st.thread.process == Running,
+    st.cfg.adapter == CodexManual,
+    not(st.hooksLive),
+    val o1 = bump(start(st))
+    commit(ManualFirstTurn, withState(o1, s => { ...s,
+      hooksLive: true,
+      writer: s.writer.append(WHuman),
+      gp: { ...s.gp, lastWrite: s.seq, lastHumanWrite: s.seq },
+    })),
   }
 
   /// `session_bound`, also a turn start (mvp §2.1:115), then the buffered hooks of the
@@ -830,19 +910,20 @@ module thread_input {
     })
     val o3 = st.buffer.foldl(o2, (acc, h) => match h {
       | BufPrompt(p) => applyPrompt(acc, p.matches, p.facts)
-      | BufStop => applyStop(acc)
+      | BufStop(id) => applyStop(acc, acc.st.turnNo, id)
       | BufReady(r) =>
-        if (candidateTurn(acc.st.evidenceCandidate, r.kind) == acc.st.turnNo)
-          applyReady(acc, r.kind, r.basis, acc.st.turnNo)
+        if (evidenceBacked(acc.st, acc.st.evidenceCandidate, r.kind, r.stop))
+          applyReady(acc, r.kind, r.basis, evidenceTurnOf(acc.st, r.kind))
         else acc
     })
     commit(Bind, withState(o3, s => { ...s, buffer: [], bufferCandidate: NoEvidenceCandidate })),
   }
 
-  /// Readiness evidence from the adapter (mvp §2.3 "Gate", `readiness_evidence` modes).
-  action ready(ev: Evidence): bool = all {
-    readyAllowed(st, ev),
-    commit(Ready(ev), applyReady(start(st), ev, st.writer.length(), candidateTurn(st.evidenceCandidate, ev))),
+  /// Readiness evidence from the adapter (mvp §2.3 "Gate", `readiness_evidence` modes);
+  /// `stop` names the `Stop` a settle completion was started for.
+  action ready(ev: Evidence, stop: int): bool = all {
+    readyAllowed(st, ev, stop),
+    commit(Ready({ kind: ev, stop: stop }), applyReady(start(st), ev, st.writer.length(), evidenceTurnOf(st, ev))),
   }
 
   /// `chaldea ready`: accepted only for the current bound launch; otherwise refused,
@@ -865,6 +946,7 @@ module thread_input {
   /// the text match.
   action prompt(matches: Set[int]): bool = all {
     alive(st),
+    st.hooksLive,
     st.gp.bound,
     matchable(st, matches),
     commit(Prompt(matches), applyPrompt(start(st), matches, factsNow(st, matches))),
@@ -873,6 +955,7 @@ module thread_input {
   /// Hooks of an unbound live launch are buffered with their intake facts (mvp §2.9).
   action bufferPrompt(matches: Set[int]): bool = all {
     alive(st),
+    st.hooksLive,
     not(st.gp.bound),
     st.buffer.length() < 3,
     matchable(st, matches),
@@ -884,37 +967,67 @@ module thread_input {
 
   action bufferStop: bool = all {
     alive(st),
+    st.hooksLive,
     not(st.gp.bound),
     st.buffer.length() < 3,
-    commit(BufferStop, start({ ...st, buffer: st.buffer.append(BufStop), bufferCandidate: StopCandidate(0) })),
+    val id = st.stopCount + 1
+    commit(BufferStop, start({ ...st,
+      stopCount: id,
+      buffer: st.buffer.append(BufStop(id)),
+      // The turn of a buffered `Stop` is known only at promotion; the launch is current.
+      bufferCandidate: StopCandidate({ launch: st.launch, turn: -1, id: id }),
+    })),
   }
 
-  action bufferReady(ev: Evidence): bool = all {
+  /// A settle completion or post-decision signal of an unbound launch, buffered. A settle
+  /// completion names its `Stop`, which must still be the buffered candidate.
+  action bufferReady(ev: Evidence, stop: int): bool = all {
     alive(st),
+    st.hooksLive,
     not(st.gp.bound),
     st.buffer.length() < 3,
-    ev == StopSettled or ev == PostDecision,
     kindAllowed(st.cfg, ev),
-    st.bufferCandidate != NoEvidenceCandidate,
-    commit(BufferReady(ev), start({ ...st,
-      buffer: st.buffer.append(BufReady({ kind: ev, basis: st.writer.length() })),
+    match ev {
+      | StopSettled => candidateStop(st.bufferCandidate) == stop and stop != 0
+      | PostDecision => stop == 0
+      | _ => false
+    },
+    commit(BufferReady({ kind: ev, stop: stop }), start({ ...st,
+      buffer: st.buffer.append(BufReady({ kind: ev, basis: st.writer.length(), stop: stop })),
       bufferCandidate: NoEvidenceCandidate,
     })),
   }
 
   /// A human write (`human_write`): attach and `key` set the last write and the last
-  /// gate-closing human write; a card key, only while its card is open, sets the last
-  /// write only (mvp §2.1:115, §2.3:174, §2.10:336).
+  /// gate-closing human write. A card key sets the last write only, and the write boundary
+  /// accepts it only while its card is open in its launch, which must be current; otherwise
+  /// it is refused with nothing written (mvp §2.1:115, §2.3:174, §2.10:336).
   action humanWrite(o: HumanOrigin): bool = all {
     alive(st),
     match o {
-      | CardKey(c) => openCards(st).contains(c)
-      | _ => true
+      | CardKey(k) =>
+        if (k.launch == st.launch and openCards(st).contains(k.card)) {
+          val o1 = bump(start(st))
+          val rec = {
+            keyLaunch: k.launch,
+            launch: st.launch,
+            cardLaunch: if (st.cards.keys().contains(k.card)) st.cards.get(k.card).launch else 0,
+            cardOpen: st.cards.keys().contains(k.card) and st.cards.get(k.card).state == CardIsOpen,
+          }
+          commit(HumanWrite(o), withState(o1, s => { ...s,
+            gp: { ...s.gp, lastWrite: s.seq },
+            writer: st.writer.append(WHuman),
+            cardKeys: st.cardKeys.append(rec),
+          }))
+        } else commit(HumanWrite(o), start(st))
+      | _ => {
+          val o1 = bump(start(st))
+          commit(HumanWrite(o), withState(o1, s => { ...s,
+            gp: { ...s.gp, lastWrite: s.seq, lastHumanWrite: s.seq },
+            writer: st.writer.append(WHuman),
+          }))
+        }
     },
-    val o1 = bump(start(st))
-    val isCard = match o { | CardKey(_) => true | _ => false }
-    val gp = { ...o1.st.gp, lastWrite: o1.st.seq, lastHumanWrite: if (isCard) st.gp.lastHumanWrite else o1.st.seq }
-    commit(HumanWrite(o), withState(o1, s => { ...s, gp: gp, writer: st.writer.append(WHuman) })),
   }
 
   /// A VT reply: a counted write with no event.
@@ -984,7 +1097,26 @@ module thread_input {
     not(st.inputs.get(id).positional),
     not(st.inputs.get(id).dispatched),
     if (recheckPasses(st, id)) {
-      val rec = { writesSinceBasis: st.writer.length() - st.inputs.get(id).admittedBasis, gate: gate(recheckView(st, id)) }
+      val i = st.inputs.get(id)
+      val rec = {
+        writerLength: st.writer.length(),
+        admittedBasis: i.admittedBasis,
+        sameLaunch: i.launch == st.launch,
+        bound: st.gp.bound,
+        process: st.thread.process,
+        turn: st.thread.turn,
+        readinessSeq: st.gp.readinessSeq,
+        evidence: st.gp.evidence,
+        lastWrite: st.gp.lastWrite,
+        attemptSeq: i.attemptSeq,
+        lastWriteBefore: i.lastWriteBefore,
+        lastHumanWrite: st.gp.lastHumanWrite,
+        lastTurnStart: st.gp.lastTurnStart,
+        otherInFlight: INPUT_IDS.filter(o => o != id and has(st, o) and st.inputs.get(o).launch == st.launch
+          and Set(Sending, Sent, Unconfirmed).contains(stateOf(st, o))).size(),
+        needsBracketedPaste: st.gp.needsBracketedPaste,
+        bracketedPasteOn: st.gp.bracketedPasteOn,
+      }
       val w = st.writer.append(WInput(id))
       val o1 = setInput(start(st), id, i => { ...i, dispatched: true, writePos: w.length() - 1 })
       commit(Dispatch(id), withState(o1, s => { ...s,
@@ -1046,7 +1178,8 @@ module thread_input {
   action resolveInput(id: int, delivered: bool): bool = all {
     has(st, id),
     stateOf(st, id) == Unconfirmed,
-    commit(ResolveInput({ id: id, delivered: delivered }), bump(stp(start(st), id, Resolved(delivered)))),
+    commit(ResolveInput({ id: id, delivered: delivered }), withState(bump(stp(start(st), id, Resolved(delivered))),
+      s => { ...s, ownerDelivered: if (delivered) s.ownerDelivered.union(Set(id)) else s.ownerDelivered })),
   }
 
   action stop: bool = all {
@@ -1080,15 +1213,29 @@ module thread_input {
     commit(ConfirmDeath, withState(red(bump(start(st)), DeathConfirmed), s => { ...s, deathConfirmed: true })),
   }
 
-  action turnStop: bool = all {
+  /// A `Stop` hook of turn `t`: the current turn, or a late one of the previous turn. A
+  /// late `Stop` ends nothing (its turn is over), but as a later hook it replaces the
+  /// pending candidate with one for its own turn, which backs no evidence of the current.
+  action stopOfTurn(t: int): bool = all {
     alive(st),
+    st.hooksLive,
     st.gp.bound,
-    commit(TurnStop, applyStop(start(st))),
+    t >= 0,
+    t == st.turnNo or t == st.turnNo - 1,
+    val id = st.stopCount + 1
+    val o1 = withState(start(st), s => { ...s, stopCount: id })
+    commit(TurnStop(t), if (t == st.turnNo) applyStop(o1, t, id)
+      else withState(o1, s => { ...s, evidenceCandidate: StopCandidate({ launch: s.launch, turn: t, id: id }) })),
   }
 
-  /// Codex's `Interrupt` hook: supersedes the cards; no readiness candidate.
+  action turnStop: bool = stopOfTurn(st.turnNo)
+
+  /// Codex's `Interrupt` hook (Claude has none, mvp §2.2:135): supersedes the cards and
+  /// invalidates the evidence candidate without making one.
   action interrupt: bool = all {
     alive(st),
+    st.hooksLive,
+    st.cfg.adapter != Claude,
     st.gp.bound,
     commit(Interrupt, closeCards(invalidate(red(bump(start(st)), Interrupted)), CardSuperseded)),
   }
@@ -1096,6 +1243,7 @@ module thread_input {
   /// `approval_requested` for card `c` of the current turn.
   action cardOpen(c: int): bool = all {
     alive(st),
+    st.hooksLive,
     st.gp.bound,
     not(st.cards.keys().contains(c)),
     val o1 = invalidate(red(bump(start(st)), ApprovalOpened))
@@ -1114,11 +1262,12 @@ module thread_input {
   }
 
   /// Evidence correlated to a card that `Stop`, an interrupt, a prompt or exit already
-  /// closed: it resolves nothing and feeds no reducer input.
+  /// closed: it resolves nothing and feeds no reducer input, but as a later hook of the
+  /// launch (`PostToolUse`) it invalidates the evidence candidate.
   action lateResolve(c: int): bool = all {
     st.cards.keys().contains(c),
     Set(CardSuperseded, CardExpired).contains(st.cards.get(c).state),
-    commit(LateResolve(c), start(st)),
+    commit(LateResolve(c), if (alive(st) and st.cards.get(c).launch == st.launch) invalidate(start(st)) else start(st)),
   }
 
   /// No `SessionStart` 20 s after `launch_started` of a non-manual launch (mvp §2.2:142).
@@ -1164,9 +1313,11 @@ module thread_input {
     confirmDeath,
     spawn,
     sessionStartHook,
+    manualFirstTurn,
     bind,
     nondet ev = Set(SessionStart, StopSettled, PostDecision).oneOf()
-    ready(ev),
+    nondet sid = 0.to(st.stopCount).oneOf()
+    ready(ev, sid),
     ownerReady,
     turnStop,
   }
@@ -1193,9 +1344,13 @@ module thread_input {
     },
     bufferStop,
     nondet ev = Set(StopSettled, PostDecision).oneOf()
-    bufferReady(ev),
+    nondet sid = 0.to(st.stopCount).oneOf()
+    bufferReady(ev, sid),
     nondet c = 1.to(MAX_CARDS).oneOf()
-    any { cardOpen(c), cardResolve(c), lateResolve(c), humanWrite(CardKey(c)) },
+    nondet kl = 1.to(MAX_LAUNCHES).oneOf()
+    any { cardOpen(c), cardResolve(c), lateResolve(c), humanWrite(CardKey({ launch: kl, card: c })) },
+    // A late `Stop` of the previous turn.
+    stopOfTurn(st.turnNo - 1),
   }
 
   action disturbanceStep = any {
@@ -1288,12 +1443,26 @@ module thread_input {
       and not(r.otherInFlight) and r.pasteOk
   })
 
-  /// mvp §2.3:177, docs/design/pty-runtime.md §2.3 "Basis": at the first byte, no counted
-  /// write since the admitted basis and the whole gate, without the input's own attempt,
-  /// open.
+  /// mvp §2.3:171-177, docs/design/pty-runtime.md §2.3 "Basis": at the first byte, the
+  /// recheck holds, re-derived here from the facts the dispatch recorded rather than from
+  /// `recheckView`/`gate`: the same launch, no counted write since the admitted basis, and
+  /// every gate condition, where the input's own attempt does not count as a write.
   val dispatchOnlyThroughRecheck = st.dispatchRecords.keys().forall(id => {
     val r = st.dispatchRecords.get(id)
-    r.writesSinceBasis == 0 and r.gate == Open
+    val write = if (r.lastWrite == r.attemptSeq) r.lastWriteBefore else r.lastWrite
+    val laterTurn = r.lastTurnStart > r.lastHumanWrite and r.readinessSeq > r.lastTurnStart
+    and {
+      r.sameLaunch,
+      r.writerLength == r.admittedBasis,
+      r.bound,
+      r.process == Running,
+      r.readinessSeq > 0,
+      r.readinessSeq > write,
+      r.lastHumanWrite == 0 or r.evidence == OwnerAsserted or laterTurn,
+      r.turn == Idle,
+      r.otherInFlight == 0,
+      r.needsBracketedPaste implies r.bracketedPasteOn,
+    }
   }) and st.writeCount.keys().forall(id => st.inputs.get(id).positional or st.dispatchRecords.keys().contains(id))
 
   /// mvp §2.3:171: no other input of the current launch is in flight, so at most one is.
@@ -1400,13 +1569,39 @@ module thread_input {
   /// mvp §2.3:171, §2.9:325: gate evidence is of the bound launch, after its binding.
   val gateEvidenceIsBound = st.gp.readinessSeq == 0 or (st.gp.bound and st.gp.readinessSeq > st.gp.boundSeq)
 
+  /// The evidence each adapter produces per `readiness_evidence` mode (mvp §2.3, §2.7),
+  /// written out independently of `kindAllowed`. Owner assertion is every mode's.
+  pure val EVIDENCE_TABLE: Set[(Adapter, ReadinessMode, Evidence)] = Set(
+    (Claude, StopSettle, SessionStart), (Claude, PostDecisionMode, SessionStart),
+    (Claude, StopSettle, StopSettled), (CodexPositional, StopSettle, StopSettled), (CodexManual, StopSettle, StopSettled),
+    (Claude, PostDecisionMode, PostDecision), (CodexPositional, PostDecisionMode, PostDecision),
+    (CodexManual, PostDecisionMode, PostDecision),
+  )
+
   /// mvp §2.3:171-173, §2.7: an open gate rests on evidence of the current launch and
-  /// turn, of a kind the launch's adapter and mode produce.
+  /// turn, of a kind the launch's adapter and mode produce (`EVIDENCE_TABLE`).
   val openGateEvidenceOfCurrentTurn = last.gate == Open implies and {
     st.gp.evidenceLaunch == st.launch,
     st.gp.evidenceTurn == st.turnNo,
-    kindAllowed(st.cfg, st.gp.evidence),
+    st.gp.evidence == OwnerAsserted or EVIDENCE_TABLE.contains((st.cfg.adapter, st.cfg.mode, st.gp.evidence)),
   }
+
+  /// mvp §2.3:182-184: an input becomes `acked` only through an attributable intake
+  /// record or the owner resolving it as delivered.
+  val ackedHasCause = st.inputs.keys().forall(id =>
+    stateOf(st, id) == Acked implies (st.ackRecords.keys().contains(id) or st.ownerDelivered.contains(id)))
+
+  /// mvp §2.10:336: every card key the writer accepted was sent from a card open in the
+  /// current launch.
+  val cardKeysOnlyToOpenCards = st.cardKeys.indices().forall(j => {
+    val r = st.cardKeys[j]
+    r.keyLaunch == r.launch and r.cardLaunch == r.launch and r.cardOpen
+  })
+
+  /// mvp §2.2:135, §2.7:301: `Interrupted` is fed only for a Codex launch; Claude has no
+  /// interrupt hook.
+  val interruptedOnlyForCodex = last.calls.indices().forall(j =>
+    last.calls[j].kind == Reduce(Interrupted) implies st.cfg.adapter != Claude)
 
   /// The supervisor feeds the reducers only inputs they accept, except the reservation of
   /// `ReserveRefused`, which must be refused.
@@ -1445,6 +1640,9 @@ module thread_input {
     taskOnlyByTaskSet,
     gateEvidenceIsBound,
     openGateEvidenceOfCurrentTurn,
+    ackedHasCause,
+    cardKeysOnlyToOpenCards,
+    interruptedOnlyForCodex,
     supervisorInputsAccepted,
   }
 
