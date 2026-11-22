@@ -633,10 +633,12 @@ pub(crate) fn writer_main(sh: &Arc<Shared>, handoff: &Receiver<Box<dyn Write + S
         let mut fired = Fired::default();
         {
             let mut q = lock(&sh.q);
+            // A dispatched unit panicked inside a permitted backend call, which may have
+            // written more than the confirmed prefix: its span is uncertain, as after close.
             if q.slot.as_ref().is_some_and(|s| s.dispatched) {
                 q.settle_slot(
                     WriteOutcome::Incomplete {
-                        error: "writer_panicked".into(),
+                        error: "unknown_after_panic".into(),
                     },
                     &mut fired,
                 );

@@ -1016,7 +1016,7 @@ fn writer_panic_settles_everything() {
     assert_eq!(
         rec.outcome,
         WriteOutcome::Incomplete {
-            error: "writer_panicked".into()
+            error: "unknown_after_panic".into()
         }
     );
     assert!(r.session.status().input_broken);
@@ -1124,4 +1124,34 @@ fn cancelled_recheck_capture_is_dropped_unlocked() {
     assert_eq!(seen, Some(1));
     hold.release();
     a.wait();
+}
+
+/// PR2-CL-1: a write call that unwinds after the backend accepted its bytes leaves an
+/// uncertain span, as `unknown_after_close` does: the record keeps its confirmed prefix
+/// and says the last permitted call may have written more.
+#[test]
+fn panic_after_acceptance_marks_the_span_uncertain() {
+    let r = rig();
+    submit(&r.session, key(b"pre"), open()).wait();
+    r.child.on_input(|bytes| {
+        assert!(bytes != b"abc", "script bug after acceptance");
+        Vec::new()
+    });
+    let rec = submit(&r.session, key(b"abc"), open()).wait();
+    assert_eq!(
+        rec.outcome,
+        WriteOutcome::Incomplete {
+            error: "unknown_after_panic".into()
+        }
+    );
+    assert_eq!(
+        (rec.byte_start, rec.bytes_written),
+        (3, 0),
+        "the confirmed prefix"
+    );
+    assert_eq!(
+        r.child.input(),
+        b"preabc",
+        "the call wrote more than the prefix"
+    );
 }
