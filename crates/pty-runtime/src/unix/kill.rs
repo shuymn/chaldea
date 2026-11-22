@@ -1862,27 +1862,23 @@ mod tests {
 
     #[test]
     fn absence_from_the_list_does_not_prune_a_target() {
-        // The deadline passes at the recheck's first lookup (the leader's), before E is
-        // looked up: E was only absent from the lists, so it stays a target.
+        // After ownership is lost the call returns, before its deadline, as soon as no
+        // target is live in a pass. E was only absent from the lists, so it stays a
+        // target; the exited leader, which a lookup showed a zombie, is pruned.
         let (sim, extra) = omitted_escapee();
-        let mut leader_lookups = 0;
-        *sim.clock.borrow_mut() = Some(Box::new(move |ev| {
-            if ev == Ev::Lookup(L) {
-                leader_lookups += 1;
-                // Two census passes (the new zombie, then a clean pass), then the recheck.
-                if leader_lookups == 3 {
-                    return Duration::from_secs(10);
-                }
-            }
-            Duration::ZERO
-        }));
+        sim.owned.set(false);
+        sim.lost.set(true);
         let st = state();
         let r = sim.kill(&extra, 1_000, &st);
         assert!(!r.tree_dead, "{r:?}");
-        *sim.clock.borrow_mut() = None;
+        assert!(sim.now.get() < Duration::from_millis(1_000));
+        let targets = st.lock().unwrap().targets.clone();
+        assert!(targets.contains_key(&(300, 3_000)), "{targets:?}");
+        assert!(!targets.contains_key(&(L, START)), "{targets:?}");
+        // A later call with a complete list still names E.
         *sim.list.borrow_mut() = None;
         let r = sim.kill(&[], 1_000, &st);
-        assert!(!r.tree_dead, "{r:?}");
+        assert!(r.survivors.iter().any(|s| s.pid == 300), "{r:?}");
         assert!(sim.alive(300));
     }
 
