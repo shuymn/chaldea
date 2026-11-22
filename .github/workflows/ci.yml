@@ -57,7 +57,7 @@ jobs:
 
       # The Windows tests are compiled only on Windows: a cfg mistake that compiles a whole
       # test binary or suite out must fail here instead of passing silently. Each binary
-      # must list its sentinel tests (docs/design/pty-windows.md §1).
+      # must list its sentinel tests (docs/design/pty-windows.md §1, docs/design/event-store.md §7).
       - name: List the Windows tests
         if: runner.os == 'Windows'
         run: |
@@ -76,6 +76,8 @@ jobs:
           require "$list" env_is_exactly_the_spec
           list="$(cargo test -p chaldea-testkit --test pty_windows --locked -- --list)"
           require "$list" spawn_tree_dies_and_unrelated_survives
+          list="$(cargo test -p chaldea-daemon --test store_open --locked -- --list)"
+          require "$list" long_path_vfs_is_selected
 
       # core is Sans-IO: no async runtime, store, or HTTP server in its dependency tree.
       # A here-string, not a pipe: under `bash -eo pipefail`, `grep -q` exiting on the
