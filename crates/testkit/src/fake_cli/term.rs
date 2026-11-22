@@ -58,12 +58,12 @@ mod imp {
         let Ok(dir) = std::fs::read_dir("/dev/fd") else {
             return Value::Null;
         };
+        // The handle is the only directory among them; it is checked while still open.
         let mut fds: Vec<i32> = dir
             .flatten()
             .filter_map(|e| e.file_name().to_str()?.parse().ok())
+            .filter(|fd| !std::fs::metadata(format!("/dev/fd/{fd}")).is_ok_and(|m| m.is_dir()))
             .collect();
-        // The handle is the only directory among them.
-        fds.retain(|fd| !std::fs::metadata(format!("/dev/fd/{fd}")).is_ok_and(|m| m.is_dir()));
         fds.sort_unstable();
         json!(fds)
     }
