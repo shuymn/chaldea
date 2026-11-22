@@ -16,6 +16,10 @@ serde_json.workspace = true
 rustix.workspace = true
 signal-hook.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# Console mode and size without `unsafe` in testkit.
+winapi-util.workspace = true
+
 [dev-dependencies]
 chaldea-pty-runtime = { path = "../pty-runtime", features = ["fake"] }
 

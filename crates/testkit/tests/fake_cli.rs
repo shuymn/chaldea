@@ -27,10 +27,20 @@ fn identify(pid: u32) -> Option<String> {
         .map(|i| i.start_time)
 }
 
+#[cfg(windows)]
+fn identify(pid: u32) -> Option<String> {
+    chaldea_pty_runtime::fake::identify(pid)
+        .ok()
+        .flatten()
+        .map(|i| i.start_time)
+}
+
 fn cleanup() -> Cleanup {
     #[cfg(target_os = "macos")]
     return Cleanup::new(Some(identify));
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    return Cleanup::new(Some(identify)).kill_with(chaldea_pty_runtime::fake::kill_verified);
+    #[cfg(not(any(target_os = "macos", windows)))]
     Cleanup::new(None)
 }
 
@@ -219,4 +229,198 @@ fn queries_in_pipe_mode_reports_each_unanswered_query() {
         ]
     );
     assert_eq!(exit_code(&mut c), Some(1));
+}
+
+// ---- PR4-CL-24 ----
+
+/// A fresh file path in the OS temp dir (the file itself is removed on drop).
+struct TempPath(std::path::PathBuf);
+
+impl TempPath {
+    fn new(tag: &str) -> TempPath {
+        TempPath(
+            std::env::temp_dir().join(format!("chaldea-fakecli-{tag}-{}.json", std::process::id())),
+        )
+    }
+}
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn report_process_writes_the_file() {
+    let out = TempPath::new("report");
+    let path = out.0.to_str().unwrap();
+    let mut c = fake(&["--mode", "report-process", "--out", path, "--", "a b", ""])
+        .env_clear()
+        .env("K", "v")
+        .spawn()
+        .unwrap();
+    assert_eq!(exit_code(&mut c), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&out.0).unwrap()).unwrap();
+    let argv: Vec<&str> = v["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        &argv[1..],
+        ["--mode", "report-process", "--out", path, "--", "a b", ""]
+    );
+    assert_eq!(v["env"], serde_json::json!([["K", "v"]]));
+    assert!(v["cwd"].is_string());
+    assert_eq!(v["stdin_console"], false, "stdin is a pipe");
+    assert!(!std::path::Path::new(&format!("{path}.tmp")).exists());
+}
+
+#[test]
+fn emit_output_reports_lines() {
+    let l = ReportListener::bind().unwrap();
+    let mut cl = cleanup();
+    let report = l.arg();
+    let mut c = fake(&[
+        "--mode",
+        "spawn-tree",
+        "--roles",
+        "none",
+        "--emit-output",
+        "--report",
+        &report,
+        "--max-life-secs",
+        "60",
+    ]);
+    c.stdout(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    cl.own(child);
+    let mut f = l.accept(soon()).unwrap();
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(stdout));
+    for n in 0..3u64 {
+        let ev = f.next_event(soon()).unwrap().unwrap();
+        assert_eq!(
+            (&ev["event"], &ev["n"]),
+            (&"output".into(), &n.into()),
+            "{ev}"
+        );
+        // The event acknowledges a completed write: the line is already in the pipe.
+        assert_eq!(lines.next().unwrap().unwrap(), format!("OUTPUT-{n}"));
+    }
+}
+
+#[test]
+fn validate_input_checks_the_pattern() {
+    for (payload, ok) in [
+        (
+            (0..1000u32)
+                .map(|i| b'a' + u8::try_from(i % 26).unwrap())
+                .collect::<Vec<u8>>(),
+            true,
+        ),
+        (vec![b'a'; 1000], false),
+    ] {
+        let l = ReportListener::bind().unwrap();
+        let mut c = fake(&[
+            "--mode",
+            "echo",
+            "--validate-input",
+            "1000",
+            "--report",
+            &l.arg(),
+            "--max-life-secs",
+            "60",
+        ])
+        .spawn()
+        .unwrap();
+        let mut f = l.accept(soon()).unwrap();
+        std::io::Write::write_all(c.stdin.as_mut().unwrap(), &payload).unwrap();
+        let ev = f.next_event(soon()).unwrap().unwrap();
+        assert_eq!(ev["event"], "validated", "{ev}");
+        assert_eq!(
+            (&ev["bytes"], &ev["ok"]),
+            (&1000.into(), &ok.into()),
+            "{ev}"
+        );
+        assert_eq!(exit_code(&mut c), Some(0));
+    }
+    // Too few bytes: EOF first.
+    let l = ReportListener::bind().unwrap();
+    let mut c = fake(&[
+        "--mode",
+        "echo",
+        "--validate-input",
+        "10",
+        "--report",
+        &l.arg(),
+    ])
+    .spawn()
+    .unwrap();
+    let mut f = l.accept(soon()).unwrap();
+    let mut stdin = c.stdin.take().unwrap();
+    std::io::Write::write_all(&mut stdin, b"abc").unwrap();
+    drop(stdin);
+    let ev = f.next_event(soon()).unwrap().unwrap();
+    assert_eq!(
+        (&ev["bytes"], &ev["ok"]),
+        (&3.into(), &false.into()),
+        "{ev}"
+    );
+    assert_eq!(exit_code(&mut c), Some(0));
+}
+
+/// The test starts `double-fork-parent` and holds its `Child`: the parent exits, then the
+/// grandchild reports and answers.
+#[test]
+fn double_forked_outlives_its_parent() {
+    let l = ReportListener::bind().unwrap();
+    let mut cl = cleanup();
+    let mut parent = fake(&[
+        "--mode",
+        "sleeper",
+        "--role",
+        "double-fork-parent",
+        "--report",
+        &l.arg(),
+        "--max-life-secs",
+        "60",
+    ])
+    .spawn()
+    .unwrap();
+    assert_eq!(exit_code(&mut parent), Some(0), "the parent exited");
+    let mut g = l.accept(soon()).unwrap();
+    cl.track(g.hello.pid);
+    assert_eq!(g.hello.role, "double-forked");
+    assert_ne!(g.hello.pid, parent.id());
+    assert!(g.ping(soon()).is_some(), "the grandchild is alive");
+}
+
+#[cfg(windows)]
+#[test]
+fn breakaway_role_reports_its_result() {
+    let l = ReportListener::bind().unwrap();
+    let mut cl = cleanup();
+    let child = fake(&[
+        "--mode",
+        "spawn-tree",
+        "--roles",
+        "breakaway",
+        "--report",
+        &l.arg(),
+        "--max-life-secs",
+        "60",
+    ])
+    .spawn()
+    .unwrap();
+    cl.own(child);
+    let mut root = l.accept(soon()).unwrap();
+    let ev = root.next_event(soon()).unwrap().unwrap();
+    assert_eq!(ev["event"], "breakaway", "{ev}");
+    let result = ev["result"].as_str().unwrap();
+    assert!(result == "accepted" || result == "denied", "{ev}");
+    let role = l.accept(soon()).unwrap();
+    cl.track(role.hello.pid);
+    assert_eq!(role.hello.role, "breakaway");
 }

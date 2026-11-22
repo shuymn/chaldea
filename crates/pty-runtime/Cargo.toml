@@ -22,6 +22,10 @@ rustix.workspace = true
 # The pre_exec body and libproc, which have no safe wrapper (unix::sys only).
 libc.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# The ConPTY, job, and process calls (windows::sys only).
+windows-sys.workspace = true
+
 [dev-dependencies]
 # Integration tests use FakePty.
 chaldea-pty-runtime = { path = ".", features = ["fake"] }
@@ -32,8 +36,9 @@ proptest.workspace = true
 fake = []
 
 # The crate's own table (docs/design/pty-unix.md §2.7): `deny` instead of the workspace's
-# `forbid`, so `unix::sys` alone can allow `unsafe`; the workspace clippy set is restated
-# because `workspace = true` cannot be combined with local keys (tests/lints.rs checks it).
+# `forbid`, so `unix::sys` and `windows::sys` alone can allow `unsafe`; the workspace clippy
+# set is restated because `workspace = true` cannot be combined with local keys
+# (tests/lints.rs checks it).
 [lints.rust]
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"

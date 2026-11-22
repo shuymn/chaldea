@@ -5,22 +5,26 @@
 //! |---|---|
 //! | `plain` | child of spawn-tree |
 //! | `ignore-term` | SIGHUP and SIGTERM handlers installed |
-//! | `double-forked` | its parent `double-fork-parent` exited (`getppid() == 1`) |
+//! | `double-forked` | its parent `double-fork-parent` exited: `getppid() == 1` on Unix; on Windows its stdin, a pipe the parent holds until it exits, reached EOF |
 //! | `own-group` | spawned in its own process group, same session |
 //! | `setsid` | `--setsid`: its own session; its parent stays alive; starts `setsid-child` |
 //! | `setsid-child` | child of a `setsid` sleeper |
 //! | `setsid-orphan` | `--setsid`, parent `orphan-parent` exited; starts `orphan-child` |
 //! | `orphan-child` | child of `setsid-orphan` |
 //! | `unrelated` | started by the test itself |
+//! | `breakaway` | Windows: started by spawn-tree with `CREATE_BREAKAWAY_FROM_JOB` (or without it once denied) |
 //!
-//! Windows supports `plain`, `double-forked`, and `unrelated`.
+//! Windows supports `plain`, `double-forked`, `breakaway`, and `unrelated`.
 
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use super::{Opts, child_args};
 
-/// How long a role waits to be reparented before it reports anyway.
+/// How long a role waits to be reparented (Unix) or for its parent's exit (Windows) before
+/// it reports anyway.
 const ORPHAN_WAIT: Duration = Duration::from_secs(10);
 
 pub(crate) fn run(o: &Opts) -> i32 {
@@ -31,8 +35,27 @@ pub(crate) fn run(o: &Opts) -> i32 {
     }
     match role {
         "plain" | "unrelated" => {}
+        #[cfg(windows)]
+        "breakaway" => {}
+        #[cfg(unix)]
         "double-fork-parent" => {
             return exit_after_spawn(&mut sleeper(o, "double-forked"));
+        }
+        // No reparenting on Windows: the child waits for its stdin, which this process keeps
+        // open until it exits.
+        #[cfg(not(unix))]
+        "double-fork-parent" => {
+            let mut c = sleeper(o, "double-forked");
+            c.stdin(std::process::Stdio::piped());
+            return match c.spawn() {
+                Ok(mut child) => {
+                    if let Some(stdin) = child.stdin.take() {
+                        std::mem::forget(stdin);
+                    }
+                    0
+                }
+                Err(_) => 1,
+            };
         }
         "double-forked" => wait_orphaned(),
         #[cfg(unix)]
@@ -91,6 +114,7 @@ pub(crate) fn sleeper(o: &Opts, role: &str) -> Command {
 }
 
 /// Spawns `cmd` and exits at once, so the child is reparented.
+#[cfg(unix)]
 fn exit_after_spawn(cmd: &mut Command) -> i32 {
     match cmd.spawn() {
         Ok(_) => 0,
@@ -98,7 +122,8 @@ fn exit_after_spawn(cmd: &mut Command) -> i32 {
     }
 }
 
-/// Waits until the parent has exited and the process was reparented to launchd/init.
+/// Waits until the parent has exited: reparented to launchd/init on Unix, stdin at EOF on
+/// Windows.
 fn wait_orphaned() {
     #[cfg(unix)]
     {
@@ -110,5 +135,15 @@ fn wait_orphaned() {
         }
     }
     #[cfg(not(unix))]
-    let _ = (Instant::now(), ORPHAN_WAIT);
+    {
+        use std::io::Read;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut sink = [0u8; 256];
+            let mut stdin = std::io::stdin();
+            while matches!(stdin.read(&mut sink), Ok(n) if n > 0) {}
+            let _ = tx.send(());
+        });
+        let _ = rx.recv_timeout(ORPHAN_WAIT);
+    }
 }

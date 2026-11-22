@@ -346,10 +346,15 @@ impl Fixture {
 /// when no live process has that pid.
 pub type Identify = fn(u32) -> Option<String>;
 
+/// Kills a process by pid and recorded start, verifying the start on the handle it kills
+/// through (Windows: `fake::kill_verified`); true when it was killed.
+pub type KillVerified = fn(u32, &str) -> bool;
+
 /// Kills every registered fixture still alive with its recorded start, and every owned
 /// child, on drop (an assertion failure included).
 pub struct Cleanup {
     identify: Option<Identify>,
+    kill: Option<KillVerified>,
     ids: Vec<(u32, String)>,
     children: Vec<Child>,
 }
@@ -361,9 +366,18 @@ impl Cleanup {
     pub fn new(identify: Option<Identify>) -> Cleanup {
         Cleanup {
             identify,
+            kill: None,
             ids: Vec::new(),
             children: Vec::new(),
         }
+    }
+
+    /// Kills each tracked identity with `kill` on drop, instead of the Unix signal after an
+    /// `identify` check.
+    #[must_use]
+    pub fn kill_with(mut self, kill: KillVerified) -> Cleanup {
+        self.kill = Some(kill);
+        self
     }
 
     /// Records `pid` with its current start.
@@ -381,8 +395,13 @@ impl Cleanup {
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
+        if let Some(kill) = self.kill {
+            for (pid, start) in &self.ids {
+                let _ = kill(*pid, start);
+            }
+        }
         #[cfg(unix)]
-        for (pid, start) in &self.ids {
+        for (pid, start) in self.ids.iter().filter(|_| self.kill.is_none()) {
             if self.identify.and_then(|f| f(*pid)).as_ref() == Some(start)
                 && let Some(p) = i32::try_from(*pid)
                     .ok()

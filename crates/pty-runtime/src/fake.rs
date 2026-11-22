@@ -712,3 +712,82 @@ pub fn identify(pid: u32) -> io::Result<Option<ProcessIdentity>> {
 pub fn unix_writer_polls() -> u64 {
     crate::unix::WRITER_POLLS.load(Ordering::Acquire)
 }
+
+#[cfg(windows)]
+pub use crate::windows::hooks::{
+    FaultReport, Gate, GateControl, TraceEntry, Watch, WindowsFault, gate,
+};
+
+/// Injects `f` into the next native spawn on the calling thread.
+#[cfg(windows)]
+pub fn windows_inject_next(f: WindowsFault) {
+    crate::windows::hooks::inject_next(f);
+}
+
+/// What the last native spawn on the calling thread did: the call trace, the gate and
+/// milestone results, and the suspended child's exit.
+#[cfg(windows)]
+#[must_use]
+pub fn windows_fault_report() -> Option<FaultReport> {
+    crate::windows::hooks::report()
+}
+
+/// Arms `f` on the calling (spawn) thread; it runs there right after the next teardown's
+/// kill.
+#[cfg(windows)]
+pub fn windows_on_teardown_kill(f: Box<dyn FnOnce() + Send>) {
+    crate::windows::hooks::on_teardown_kill(f);
+}
+
+/// The identity of a live process by pid (an exited one is `None`), with an empty group.
+///
+/// # Errors
+///
+/// The process exists but cannot be opened or read.
+#[cfg(windows)]
+pub fn identify(pid: u32) -> io::Result<Option<ProcessIdentity>> {
+    crate::windows::hooks::identify(pid)
+}
+
+/// Terminates `pid` through one handle after checking its creation time on that handle;
+/// true when the termination call succeeded.
+#[cfg(windows)]
+#[must_use]
+pub fn kill_verified(pid: u32, start_time: &str) -> bool {
+    crate::windows::hooks::kill_verified(pid, start_time)
+}
+
+/// One handle on the process `id` names, verified by creation time on that handle.
+///
+/// # Errors
+///
+/// The process cannot be opened, or another process has its pid.
+#[cfg(windows)]
+pub fn windows_watch(id: &ProcessIdentity) -> io::Result<Watch> {
+    crate::windows::hooks::watch(id)
+}
+
+/// `GetProcessHandleCount` of this process.
+#[cfg(windows)]
+#[must_use]
+pub fn process_handle_count() -> Option<u32> {
+    crate::windows::sys_handle_count()
+}
+
+/// Waits (bounded by `timeout`) for the threads of close workers whose close returned;
+/// true when all have exited.
+#[cfg(windows)]
+#[must_use]
+pub fn windows_close_threads_exited(timeout: Duration) -> bool {
+    crate::windows::hooks::close_threads_exited(timeout)
+}
+
+/// Whether `pid` is in the job of the live session led by `leader_pid`.
+///
+/// # Errors
+///
+/// No live session has that leader, or `pid` cannot be opened.
+#[cfg(windows)]
+pub fn windows_in_job(leader_pid: u32, pid: u32) -> io::Result<bool> {
+    crate::windows::hooks::in_job(leader_pid, pid)
+}

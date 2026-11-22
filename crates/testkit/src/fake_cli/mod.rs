@@ -1,16 +1,20 @@
 //! `chaldea-fake-cli` (`docs/design/pty-unix.md` §2.8):
 //!
 //! ```text
-//! chaldea-fake-cli --mode <echo|queries|attachable|spawn-tree|sleeper> [--report <127.0.0.1:port>]
-//!                  [--role <role>] [--roles <list>] [--max-life-secs <n>] [--reply-timeout-ms <n>]
-//!                  [--raw] [--setsid] [--escape-orphan] [--orphan-keeps-tty]
+//! chaldea-fake-cli --mode <echo|queries|attachable|spawn-tree|sleeper|report-process>
+//!                  [--report <127.0.0.1:port>] [--role <role>] [--roles <list>]
+//!                  [--max-life-secs <n>] [--reply-timeout-ms <n>] [--raw] [--setsid]
+//!                  [--escape-orphan] [--orphan-keeps-tty] [--out <path>] [--emit-output]
+//!                  [--validate-input <n>] [-- <ignored argument>...]
 //! ```
 //!
-//! An unknown mode or flag exits 2.
+//! An unknown mode or flag exits 2. Arguments after `--` are ignored (`report-process`
+//! records them with the rest of its argv; `docs/design/pty-windows.md` §2.8).
 
 mod attachable;
 mod echo;
 mod queries;
+mod report_process;
 mod sleeper;
 mod spawn_tree;
 mod term;
@@ -29,6 +33,7 @@ pub(crate) enum Mode {
     Attachable,
     SpawnTree,
     Sleeper,
+    ReportProcess,
 }
 
 impl Mode {
@@ -39,6 +44,7 @@ impl Mode {
             Mode::Attachable => "attachable",
             Mode::SpawnTree => "spawn-tree",
             Mode::Sleeper => "sleeper",
+            Mode::ReportProcess => "report-process",
         }
     }
 }
@@ -55,6 +61,12 @@ pub(crate) struct Opts {
     pub(crate) setsid: bool,
     pub(crate) escape_orphan: bool,
     pub(crate) orphan_keeps_tty: bool,
+    /// `report-process`: the file to write.
+    pub(crate) out: Option<String>,
+    /// `spawn-tree`: write `OUTPUT-<n>` lines and acknowledge each.
+    pub(crate) emit_output: bool,
+    /// `echo`: read exactly this many bytes and check the `a`–`z` pattern.
+    pub(crate) validate_input: Option<usize>,
 }
 
 fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
@@ -74,6 +86,9 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
         setsid: false,
         escape_orphan: false,
         orphan_keeps_tty: false,
+        out: None,
+        emit_output: false,
+        validate_input: None,
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -85,6 +100,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
                     "attachable" => Mode::Attachable,
                     "spawn-tree" => Mode::SpawnTree,
                     "sleeper" => Mode::Sleeper,
+                    "report-process" => Mode::ReportProcess,
                     m => return Err(format!("unknown mode {m}")),
                 });
             }
@@ -109,6 +125,12 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
             "--setsid" => o.setsid = true,
             "--escape-orphan" => o.escape_orphan = true,
             "--orphan-keeps-tty" => o.orphan_keeps_tty = true,
+            "--out" => o.out = Some(value()?),
+            "--emit-output" => o.emit_output = true,
+            "--validate-input" => {
+                o.validate_input = Some(value()?.parse().map_err(|e| format!("{flag}: {e}"))?);
+            }
+            "--" => break,
             f => return Err(format!("unknown flag {f}")),
         }
     }
@@ -138,6 +160,7 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> i32 {
         Mode::Attachable => attachable::run(&o),
         Mode::SpawnTree => spawn_tree::run(&o),
         Mode::Sleeper => sleeper::run(&o),
+        Mode::ReportProcess => report_process::run(&o),
     };
     crate::report::end();
     code
