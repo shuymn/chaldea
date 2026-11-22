@@ -25,6 +25,10 @@ use std::path::{Path, PathBuf};
 
 use chaldea_core::MAX_SAFE_INTEGER;
 use chaldea_core::event::{EventEnvelope, GenericEvent, TypedEvent};
+use chaldea_core::http::{
+    CommandRequest, ErrorBody, PairCodeResponse, PairRequest, PairResponse, ThreadsResponse,
+    WorktreesResponse, WsTicketRequest, WsTicketResponse,
+};
 use chaldea_core::sync::{EventsResponse, WsClientMessage, WsServerMessage};
 use schemars::JsonSchema;
 use serde_json::Value;
@@ -90,12 +94,30 @@ fn generate(out: &Path) -> (PathBuf, PathBuf) {
     export_ts::<EventsResponse>(&cfg);
     export_ts::<WsServerMessage>(&cfg);
     export_ts::<WsClientMessage>(&cfg);
+    export_ts::<CommandRequest>(&cfg);
+    export_ts::<ErrorBody>(&cfg);
+    export_ts::<WsTicketRequest>(&cfg);
+    export_ts::<WsTicketResponse>(&cfg);
+    export_ts::<PairCodeResponse>(&cfg);
+    export_ts::<PairRequest>(&cfg);
+    export_ts::<PairResponse>(&cfg);
+    export_ts::<ThreadsResponse>(&cfg);
+    export_ts::<WorktreesResponse>(&cfg);
 
     export_schema::<EventEnvelope>(&schema);
     export_schema::<TypedEvent>(&schema);
     export_schema::<EventsResponse>(&schema);
     export_schema::<WsServerMessage>(&schema);
     export_schema::<WsClientMessage>(&schema);
+    export_schema::<CommandRequest>(&schema);
+    export_schema::<ErrorBody>(&schema);
+    export_schema::<WsTicketRequest>(&schema);
+    export_schema::<WsTicketResponse>(&schema);
+    export_schema::<PairCodeResponse>(&schema);
+    export_schema::<PairRequest>(&schema);
+    export_schema::<PairResponse>(&schema);
+    export_schema::<ThreadsResponse>(&schema);
+    export_schema::<WorktreesResponse>(&schema);
 
     (ts, schema)
 }

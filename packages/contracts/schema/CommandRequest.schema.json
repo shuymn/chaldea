@@ -1,0 +1,26 @@
+{
+  "$defs": {
+    "CommandId": {
+      "description": "A client-generated id that makes a mutating request idempotent (§2.4).",
+      "format": "uuid",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The body of `POST /api/commands/{name}`. `args` is kept as raw JSON so the daemon can\nrefuse duplicate members before any conversion; it must be an object.",
+  "properties": {
+    "args": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "command_id": {
+      "$ref": "#/$defs/CommandId"
+    }
+  },
+  "required": [
+    "command_id",
+    "args"
+  ],
+  "title": "CommandRequest",
+  "type": "object"
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A single-use pair code from `POST /api/pair-codes`, valid `expires_in` seconds.",
+  "properties": {
+    "code": {
+      "type": "string"
+    },
+    "expires_in": {
+      "format": "uint32",
+      "maximum": 4294967295,
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "code",
+    "expires_in"
+  ],
+  "title": "PairCodeResponse",
+  "type": "object"
+}

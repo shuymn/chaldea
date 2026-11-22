@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A single-use WebSocket ticket, valid `expires_in` seconds.",
+  "properties": {
+    "expires_in": {
+      "format": "uint32",
+      "maximum": 4294967295,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "ticket": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "ticket",
+    "expires_in"
+  ],
+  "title": "WsTicketResponse",
+  "type": "object"
+}
