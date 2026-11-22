@@ -1,6 +1,6 @@
 # MVP Design: Local-First Chaldea
 
-Status: design, not implemented. It plans the local-first MVP of issue #2. Canonical constraints: `AGENTS.md` and `docs/architecture.md` (cited as "arch §N"). Mechanism decisions: `docs/prior-art.md` (cited as "prior-art row N"). Spike evidence: `docs/spikes/pty-hooks-spike.md` (cited as "spike §N" or by its case ids such as "spike A-8", with report ids) and `spikes/pty-hooks/src/`.
+Status: PRs 1–4 implemented (PR 2–4 designs: `docs/design/pty-runtime.md`, `pty-unix.md`, `pty-windows.md`); the rest is design. It plans the local-first MVP of issue #2. Canonical constraints: `AGENTS.md` and `docs/architecture.md` (cited as "arch §N"). Mechanism decisions: `docs/prior-art.md` (cited as "prior-art row N"). Spike evidence: `docs/spikes/pty-hooks-spike.md` (cited as "spike §N" or by its case ids such as "spike A-8", with report ids) and `spikes/pty-hooks/src/`.
 
 **What this document fixes.** Only what PR 1 freezes or what every later PR depends on: the public wire types and payloads, the state machines and their transition rules, the HTTP/CLI surface and its authorization matrix, the receipt and idempotency contract, the sync API contract, and the PR plan. Behaviour owned by one later PR is listed as that PR's **design obligations** (§4) and designed in its own document when the PR starts.
 
@@ -187,7 +187,7 @@ queued ──(gate open; attempt persisted)──▶ sending ──(text + submi
 
 **Residual constraint.** Hooks are asynchronous processes and carry no CLI-side ordering against the daemon's PTY writes, so ack attribution and readiness remain inferences. The contract guarantees only that (a) no input is ever resent automatically, (b) no input is acked without a text match, and (c) any ambiguity leaves the gate closed or the input `unconfirmed`. Later PRs do not need to close this gap.
 
-Alternatives: auto-resend (rejected by arch §4.3; an extra Return can accept a popup, arch §5); ack by screen echo (invariant 1); readiness inferred from DECSET 2004 or the screen (invariant 1; Codex sets 2004 while a review dialog is up, spike §3); special-case rules per input source (three review rounds kept finding new cases, so the gate trusts only positive evidence).
+Alternatives: auto-resend (rejected by arch §4.3; an extra Return can accept a popup, arch §5); ack by screen echo (invariant 1); readiness inferred from DECSET 2004 or the screen (invariant 1; Codex sets 2004 while a review dialog is up, spike §3); special-case rules per input source (rejected: the gate requires the same positive evidence from every source).
 
 Public: state names, payloads, `send`, `ready`, `input resolve`, `input cancel`, the `readiness_evidence` modes. Internal: window, timeout, and settle defaults. The states beyond the architecture's four are §8 D3.
 
@@ -357,7 +357,7 @@ fuzz/               # cargo-fuzz targets (nightly, outside the stable workspace)
 spikes/pty-hooks/   # unchanged until issue #1 removes it
 ```
 
-**Dependency direction.** `core` ← `pty-runtime` ← `daemon` ← `cli`; `testkit` may depend on `core` and on no other workspace crate; on Windows it reaches the console through `winapi-util`, keeping `forbid(unsafe_code)`. `core` depends on `serde`, `serde_json` (`raw_value`), `ts-rs`, `schemars`, `uuid`, `unicode-normalization`, `unicode-segmentation`, `subtle`, `sha2`. Sans-IO is enforced by `crates/core/clippy.toml` (disallowing `std::fs`, `std::net`, `std::process`, `Instant::now`, `SystemTime::now`, `std::thread::spawn`) and a CI check that `core` has no `tokio`. `unsafe_code = "forbid"` stays workspace-wide except in `pty-runtime`, whose own `[lints]` table (from PR 3) uses `deny` and allows `unsafe` only in its two `sys` modules (`unix::sys` and `windows::sys`).
+**Dependency direction.** `core` ← `pty-runtime` ← `daemon` ← `cli`; `testkit` may depend on `core` and on no other workspace crate; on Windows it reaches the console through `winapi-util`, keeping `forbid(unsafe_code)`. `core` depends on `serde`, `serde_json` (`raw_value`), `ts-rs`, `schemars`, `uuid`, `unicode-normalization`, `unicode-segmentation`, `subtle`, `sha2`. Sans-IO is enforced by `crates/core/clippy.toml` (disallowing `std::fs`, `std::net`, `std::process`, `Instant::now`, `SystemTime::now`, `std::thread::spawn`) and a CI check that `core` has no `tokio`. `unsafe_code = "forbid"` stays workspace-wide except in `pty-runtime`, whose own `[lints]` table (`docs/design/pty-unix.md` §2.7) uses `deny` and allows `unsafe` only in its two `sys` modules (`unix::sys` and `windows::sys`).
 
 **Single binary.** `chaldea hook-emit` dispatches before any runtime or config initialization and uses std networking only (arch §2). Console subsystem on Windows; no GUI-subsystem variant (prior-art row 9, spike C-5 `go`).
 
@@ -409,7 +409,7 @@ Each PR keeps `core` + `FakePty` tests green on macOS and Windows CI; macOS firs
 | 15 | **First tests 1 and 2** on a real Windows host (**Codex keyed input**, **human paste through attach**) | 14 | Cross-OS E2E |
 | 16 | Mailbox, agent tokens, `task set`, worktree ownership and remove | 10 | **closes Agent Control** once 11, 14, 16 are all merged |
 | 17 | `stateright` Sync model | 7 | Verification |
-| 18 | PWA read path: validators, pairing, thread list/view, paging, `GenericEvent`, client reducer | 7 | Sync & PWA |
+| 18 | PWA read path: `packages/contracts/package.json`, validators, pairing, thread list/view, paging, `GenericEvent`, client reducer | 7 | Sync & PWA |
 | 19 | PWA input: `<textarea>` IME guards, send, ready, input resolve, approvals, VT snapshot, keypad; Playwright | 18, 13 | **closes Sync & PWA** |
 | 20 | Extension & Rescue: one-shot hooks, `POST /events`, rescue role, A2UI, `surface_action` | 16, 19 | **closes Extension & Rescue** |
 | 21 | `chaldea doctor` and `GET /api/doctor` | 14, 16 | Cross-OS E2E |
@@ -447,22 +447,7 @@ Each PR keeps `core` + `FakePty` tests green on macOS and Windows CI; macOS firs
 
 **Goal.** A Cargo workspace whose `crates/core` holds the contracts of §2.1–§2.4 as types and pure functions, generated TypeScript and JSON Schema committed with a drift check, and a CI job on macOS and Windows.
 
-**Files.**
-
-```
-Cargo.toml                                # members = ["crates/core"], resolver = "3", edition 2024, MIT OR Apache-2.0,
-                                          # [workspace.lints] unsafe_code = "forbid", clippy pedantic subset
-rust-toolchain.toml                       # 1.96.0, rustfmt + clippy
-crates/core/Cargo.toml                    # chaldea-core; exact pins: serde, serde_json (raw_value), ts-rs, schemars, uuid; dev: proptest
-crates/core/clippy.toml                   # Sans-IO disallowed list (§3)
-crates/core/src/{lib,ids,event,payload,state,input,sync,command}.rs
-crates/core/tests/contracts_export.rs     # generate TS + JSON Schema to a temp dir, diff with committed files
-crates/core/tests/golden/                 # golden JSON per event kind
-packages/contracts/src/generated/, packages/contracts/schema/   # committed output; package.json arrives in PR 18
-.github/workflows/ci.yml, lefthook.yml    # `workspace` job (macos-latest, windows-latest) and hooks
-```
-
-**Types and functions** (names may change in review, shapes may not):
+**Types and functions:**
 
 ```rust
 pub const SCHEMA_VERSION: u32 = 1;
@@ -650,4 +635,3 @@ Not applied here; proposals for `docs/architecture.md`, `docs/prior-art.md`, `AG
 - **arch §2 / AGENTS.md invariant 5**: the token kinds (`owner`, `agent`, `hook`, `rescue`, `extension`) next to "regular vs Rescue".
 - **arch §5 open items**: the Windows hook receiver item concerns the axum receiver; keep `deadline_slow_head` (EOF, no side effect) and `non_numeric_content_length` (400) as checks to run on CI and the real host.
 - **prior-art**: rows for event store and replay (T3 Code v1/v2, `decideThreadResume`), command receipts, scoped auth and pairing (T3 Code), thread/turn status and schema fixtures (Codex app-server), worktree removal checks (T3 Code vs herdr), herdr's Codex-on-Windows paste-boundary key (`src/app/api/agents.rs:14-33`), `PermissionRequest` without a tool id in both CLIs, and Codex's trust hash covering the hook timeout.
-- **README status**: "MVP implementation has not started" changes when PR 1 merges.
