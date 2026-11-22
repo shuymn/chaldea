@@ -42,11 +42,15 @@ pub(crate) enum Stage {
 }
 
 type StageFn = Box<dyn Fn(&Stage) -> bool + Send + Sync>;
+type PipeFn =
+    Box<dyn Fn() -> std::io::Result<(std::io::PipeReader, std::io::PipeWriter)> + Send + Sync>;
 
 /// Test-only behaviour of one `UnixPty`.
 #[derive(Default)]
 pub(crate) struct Hooks {
     pub(crate) stage: Option<StageFn>,
+    /// Replaces the wake pipe's constructor, so a test observes the call itself.
+    pub(crate) pipe: Option<PipeFn>,
     pub(crate) fail_drain_start: bool,
     pub(crate) stdio_dev_null: bool,
     pub(crate) pre_exec: PreExecTest,

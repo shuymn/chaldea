@@ -671,8 +671,16 @@ mod tests {
         let _s = serial();
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let s2 = seen.clone();
+        let s3 = seen.clone();
         let pty = UnixPty {
             hooks: Hooks {
+                // The constructor itself records whether the lock is held when it runs.
+                pipe: Some(Box::new(move || {
+                    s3.lock()
+                        .unwrap()
+                        .push(("pipe()".to_owned(), spawn_lock_held()));
+                    std::io::pipe()
+                })),
                 stage: Some(Box::new(move |s| {
                     if matches!(s, Stage::WakeUnderLock | Stage::LockAcquired) {
                         s2.lock()
@@ -689,6 +697,7 @@ mod tests {
         assert_eq!(
             *seen.lock().unwrap(),
             vec![
+                ("pipe()".to_owned(), true),
                 ("WakeUnderLock".to_owned(), true),
                 ("LockAcquired".to_owned(), true)
             ]
