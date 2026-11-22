@@ -1,6 +1,7 @@
-//! The `unsafe` carve-out (`docs/design/pty-unix.md` §2.7): one `#[allow(unsafe_code)]`, on
-//! `unix::sys`, and a crate lints table that restates the workspace's clippy set with only
-//! the listed additions. Every other crate keeps the workspace table (`forbid`).
+//! The `unsafe` carve-out (`docs/design/pty-unix.md` §2.7, `docs/design/pty-windows.md`
+//! §2.7): exactly two `#[allow(unsafe_code)]`, on `unix::sys` and `windows::sys`, and a
+//! crate lints table that restates the workspace's clippy set with only the listed
+//! additions. Every other crate keeps the workspace table (`forbid`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -247,17 +248,21 @@ fn unsafe_is_allowed_only_in_sys() {
             }
         }
         assert!(
-            !uses_unsafe(&code) || rel == "src/unix/sys.rs",
-            "unsafe outside unix::sys: {rel}"
+            !uses_unsafe(&code) || rel == "src/unix/sys.rs" || rel == "src/windows/sys.rs",
+            "unsafe outside unix::sys and windows::sys: {rel}"
         );
     }
+    allows.sort();
+    let allow = |m: &str| {
+        (
+            m.to_owned(),
+            "[allow(unsafe_code)]".to_owned(),
+            "mod sys;".to_owned(),
+        )
+    };
     assert_eq!(
         allows,
-        vec![(
-            "src/unix/mod.rs".to_owned(),
-            "[allow(unsafe_code)]".to_owned(),
-            "mod sys;".to_owned()
-        )]
+        vec![allow("src/unix/mod.rs"), allow("src/windows/mod.rs")]
     );
 }
 

@@ -31,6 +31,20 @@ rustix = { version = "=1.1.6", default-features = false, features = ["std", "pty
 libc = "=0.2.191"
 # testkit's FakeCli: `flag::register` sets handlers without `unsafe`.
 signal-hook = { version = "=0.4.6", default-features = false }
+# The Windows ConPTY backend (docs/design/pty-windows.md §1): declarations only, already in
+# the lock through winapi-util; each feature adds the declarations its comment names.
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation",           # HANDLE, FILETIME, DuplicateHandle, error codes, WAIT_*
+  "Win32_Security",             # gates CreateProcessW and CreateJobObjectW (SECURITY_ATTRIBUTES pointers)
+  "Win32_System_Console",       # CreatePseudoConsole, ResizePseudoConsole, ClosePseudoConsole, COORD, HPCON
+  "Win32_System_JobObjects",    # job create, limits, assign, terminate, accounting, pid list, IsProcessInJob
+  "Win32_System_Threading",     # CreateProcessW, attribute list, OpenProcess, GetProcessTimes, waits, ResumeThread
+  "Win32_System_LibraryLoader", # GetModuleHandleW, GetModuleFileNameW (the conpty_module evidence)
+  "Win32_System_Pipes",         # PeekNamedPipe (test helper for CL-21)
+  "Win32_Globalization",        # CompareStringOrdinal (environment key order and equality)
+] }
+# testkit's FakeCli on Windows: console mode and size without `unsafe` (already in the lock).
+winapi-util = "=0.1.11"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

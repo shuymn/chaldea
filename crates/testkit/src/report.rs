@@ -7,7 +7,8 @@
 //! (Windows resets a socket still open at process exit, and the reset discards what the
 //! test has not read yet). The test may send `ping` lines; the fixture answers each with
 //! `{"event":"pong","inq":n}`, `inq` being the bytes waiting on its stdin when that is a
-//! terminal. EOF is death (or an exit already under way), `pong` is life.
+//! terminal. EOF is death (or an exit already under way), `pong` is life. Other lines go to
+//! the mode's command handler, if it registered one (`spawn-tree --emit-output`: `emit`).
 //!
 //! The test side also has [`Cleanup`], which kills fixtures by verified identity.
 
@@ -23,6 +24,14 @@ use serde_json::{Value, json};
 /// The process's report stream, once connected, and whether it has ended. It lives as
 /// long as the process; [`end`] ends it.
 static STREAM: OnceLock<Mutex<(TcpStream, bool)>> = OnceLock::new();
+
+/// The mode's handler of the test's lines other than `ping`.
+static COMMAND: OnceLock<fn(&str)> = OnceLock::new();
+
+/// Routes the test's lines other than `ping` to `f`, on the stream's reader thread.
+pub(crate) fn on_command(f: fn(&str)) {
+    let _ = COMMAND.set(f);
+}
 
 /// The fixture side of the report stream.
 pub(crate) struct Reporter;
@@ -43,6 +52,8 @@ impl Reporter {
                         if writeln!(write, "{pong}").is_err() {
                             return;
                         }
+                    } else if let Some(f) = COMMAND.get() {
+                        f(line.trim());
                     }
                 }
             });
@@ -322,6 +333,18 @@ impl Fixture {
         }
     }
 
+    /// Sends one command line to the fixture (`emit` for `spawn-tree --emit-output`).
+    ///
+    /// # Errors
+    ///
+    /// The stream is closed or the write failed.
+    pub fn send(&mut self, line: &str) -> io::Result<()> {
+        if self.closed {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        writeln!(self.writer, "{line}")
+    }
+
     /// Sends `ping` and waits for the `pong`; `None` when the stream closed or the deadline
     /// passed first.
     pub fn ping(&mut self, deadline: Instant) -> Option<Pong> {
@@ -346,10 +369,15 @@ impl Fixture {
 /// when no live process has that pid.
 pub type Identify = fn(u32) -> Option<String>;
 
+/// Kills a process by pid and recorded start, verifying the start on the handle it kills
+/// through (Windows: `fake::kill_verified`); true when it was killed.
+pub type KillVerified = fn(u32, &str) -> bool;
+
 /// Kills every registered fixture still alive with its recorded start, and every owned
 /// child, on drop (an assertion failure included).
 pub struct Cleanup {
     identify: Option<Identify>,
+    kill: Option<KillVerified>,
     ids: Vec<(u32, String)>,
     children: Vec<Child>,
 }
@@ -361,9 +389,18 @@ impl Cleanup {
     pub fn new(identify: Option<Identify>) -> Cleanup {
         Cleanup {
             identify,
+            kill: None,
             ids: Vec::new(),
             children: Vec::new(),
         }
+    }
+
+    /// Kills each tracked identity with `kill` on drop, instead of the Unix signal after an
+    /// `identify` check.
+    #[must_use]
+    pub fn kill_with(mut self, kill: KillVerified) -> Cleanup {
+        self.kill = Some(kill);
+        self
     }
 
     /// Records `pid` with its current start.
@@ -381,8 +418,13 @@ impl Cleanup {
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
+        if let Some(kill) = self.kill {
+            for (pid, start) in &self.ids {
+                let _ = kill(*pid, start);
+            }
+        }
         #[cfg(unix)]
-        for (pid, start) in &self.ids {
+        for (pid, start) in self.ids.iter().filter(|_| self.kill.is_none()) {
             if self.identify.and_then(|f| f(*pid)).as_ref() == Some(start)
                 && let Some(p) = i32::try_from(*pid)
                     .ok()

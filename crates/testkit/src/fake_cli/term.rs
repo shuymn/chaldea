@@ -1,5 +1,6 @@
 //! The fixture's view of its terminal and process ids. Unix-only facts are `null`
-//! elsewhere.
+//! elsewhere; on Windows the console comes from `winapi-util`
+//! (`docs/design/pty-windows.md` §2.8).
 
 use serde_json::{Value, json};
 
@@ -77,24 +78,42 @@ mod imp {
     }
 
     /// `(cols, rows, xpixel, ypixel)` of the terminal on stdin.
-    pub(crate) fn size() -> Option<(u16, u16, u16, u16)> {
+    pub(crate) fn size() -> Option<(u16, u16, Option<u16>, Option<u16>)> {
         let w = tcgetwinsize(stdin()).ok()?;
-        Some((w.ws_col, w.ws_row, w.ws_xpixel, w.ws_ypixel))
+        Some((w.ws_col, w.ws_row, Some(w.ws_xpixel), Some(w.ws_ypixel)))
     }
 }
 
-#[cfg(not(unix))]
+/// Windows: console mode and size through `winapi-util` (no `unsafe` in testkit). ConPTY
+/// has no pixel size, and there is no safe input-event count.
+#[cfg(windows)]
 mod imp {
     use std::io::IsTerminal;
 
     use serde_json::{Value, json};
+    use winapi_util::HandleRef;
+    use winapi_util::console::{mode, screen_buffer_info, set_mode};
+
+    const ENABLE_PROCESSED_INPUT: u32 = 0x1;
+    const ENABLE_LINE_INPUT: u32 = 0x2;
+    const ENABLE_ECHO_INPUT: u32 = 0x4;
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x200;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x4;
 
     pub(crate) fn stdin_is_tty() -> bool {
         std::io::stdin().is_terminal()
     }
 
+    /// Raw input with VT input on stdin, VT processing on stdout, so reading modes get the
+    /// bytes as on Unix.
     pub(crate) fn make_raw() -> bool {
-        false
+        let (Ok(i), Ok(o)) = (mode(HandleRef::stdin()), mode(HandleRef::stdout())) else {
+            return false;
+        };
+        let i = (i & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+            | ENABLE_VIRTUAL_TERMINAL_INPUT;
+        set_mode(HandleRef::stdin(), i).is_ok()
+            && set_mode(HandleRef::stdout(), o | ENABLE_VIRTUAL_TERMINAL_PROCESSING).is_ok()
     }
 
     pub(crate) fn identity() -> Value {
@@ -109,16 +128,24 @@ mod imp {
         None
     }
 
-    pub(crate) fn size() -> Option<(u16, u16, u16, u16)> {
-        None
+    /// The console window's size; no pixels.
+    pub(crate) fn size() -> Option<(u16, u16, Option<u16>, Option<u16>)> {
+        let r = screen_buffer_info(HandleRef::stdout()).ok()?.window_rect();
+        let cols = u16::try_from(i32::from(r.right) - i32::from(r.left) + 1).ok()?;
+        let rows = u16::try_from(i32::from(r.bottom) - i32::from(r.top) + 1).ok()?;
+        Some((cols, rows, None, None))
     }
 }
 
 pub(crate) use imp::{identity, inq, make_raw, open_fds, size, stdin_is_tty};
 
-/// A `size` or `winch` event; null fields when there is no terminal size.
-pub(crate) fn size_event(event: &str) -> Value {
-    match size() {
+/// A `size` or `winch` event for a size already read; null fields when there is no
+/// terminal size.
+pub(crate) fn size_event_of(
+    event: &str,
+    size: Option<(u16, u16, Option<u16>, Option<u16>)>,
+) -> Value {
+    match size {
         Some((cols, rows, x, y)) => {
             json!({"event": event, "cols": cols, "rows": rows, "xpixel": x, "ypixel": y})
         }

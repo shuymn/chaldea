@@ -790,6 +790,10 @@ impl Session {
     }
 
     /// Tree kill only; I/O stays up.
+    ///
+    /// `extra` is the caller's full list of the launch's recorded descendants, on every
+    /// call, retries included; the report's survivors are diagnostic, not a list to
+    /// resubmit. A supervisor retries through `kill` while the session is available.
     pub fn kill(&self, extra: &[ProcessIdentity], deadline: Instant) -> KillReport {
         let report = self.child.kill_tree(extra, deadline);
         *lock(&self.last_kill) = Some(report.clone());
@@ -797,6 +801,10 @@ impl Session {
     }
 
     /// The bounded close order of §2.2.
+    ///
+    /// `extra` is the caller's full list of the launch's recorded descendants, as for
+    /// [`Session::kill`]. When this consuming close cannot prove death (`tree_dead: false`),
+    /// the caller keeps the launch unresolved.
     #[must_use = "the outcome says what was confirmed released"]
     pub fn close(mut self, extra: &[ProcessIdentity], bounds: CloseBounds) -> CloseOutcome {
         self.close_inner(extra, bounds)
@@ -917,6 +925,8 @@ impl Session {
     }
 }
 
+/// An implicit drop closes with an empty `extra`: best-effort cleanup that can never name
+/// the recorded descendants, so it is never a death proof.
 impl Drop for Session {
     fn drop(&mut self) {
         if !self.closed {

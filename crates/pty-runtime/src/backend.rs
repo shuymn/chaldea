@@ -130,6 +130,11 @@ pub trait PtyChild: Send + Sync {
     fn wait_timeout(&self, timeout: Duration) -> io::Result<Option<ChildExit>>;
     /// Kills the whole tree plus the recorded descendants in `extra`; idempotent; returns
     /// by `deadline`.
+    ///
+    /// The caller passes its full list of recorded descendants on every call: the first
+    /// stop, a retry after a busy report or `tree_dead: false`, and a close after an earlier
+    /// kill. A report's survivors are diagnostic (one entry per pid, possibly naming the
+    /// leader instead of an extra) and are never the list to resubmit.
     fn kill_tree(&self, extra: &[ProcessIdentity], deadline: Instant) -> KillReport;
 }
 
@@ -275,10 +280,16 @@ impl SpawnedParts {
             ..
         } = self;
         let kill = child.kill_tree(&[], Instant::now() + TEARDOWN_KILL);
+        #[cfg(all(windows, any(test, feature = "fake")))]
+        crate::windows::hooks::after_teardown_kill();
         drop(input);
+        #[cfg(all(windows, any(test, feature = "fake")))]
+        crate::windows::hooks::before_teardown_close();
         let close = control.close(Instant::now() + TEARDOWN_CLOSE);
         #[cfg(all(test, target_os = "macos"))]
         crate::unix::trace::record("drain_finish");
+        #[cfg(all(windows, any(test, feature = "fake")))]
+        crate::windows::hooks::trace("drain_finish", true, 0, Ok(0));
         let end = output.finish(TEARDOWN_DRAIN);
         let drain_abandoned = end.is_none();
         if kill.tree_dead && close.elapsed.is_some() && !drain_abandoned {

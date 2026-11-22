@@ -50,7 +50,7 @@ pre-push:
         - "packages/contracts/**/*"
         - "Cargo.{toml,lock}"
         - "rust-toolchain.toml"
-      run: cargo test --workspace --locked
+      run: cargo test --workspace --locked --no-fail-fast
     pty-hooks-test:
       root: spikes/pty-hooks/
       glob: "*.{rs,toml,lock,txt}"

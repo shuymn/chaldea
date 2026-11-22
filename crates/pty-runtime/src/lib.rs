@@ -24,11 +24,11 @@
 //!
 //! `fake` adds [`fake::FakePty`] and the test probes; no default-feature build has them.
 
-// Off macOS, until the Windows backend (PR 4) builds a `SpawnedPty`, only `FakePty` does, so
-// a default-feature build there has no caller of the drain and spawn internals.
+// On an OS without a native backend only `FakePty` builds a `SpawnedPty`, so a default-feature
+// build there has no caller of the drain and spawn internals.
 #![cfg_attr(
-    all(not(feature = "fake"), not(target_os = "macos")),
-    allow(dead_code, reason = "the Windows backend arrives in PR 4")
+    all(not(feature = "fake"), not(any(target_os = "macos", windows))),
+    allow(dead_code, reason = "no native backend on this OS")
 )]
 
 mod backend;
@@ -41,6 +41,19 @@ mod spawn;
 #[cfg(target_os = "macos")]
 mod unix;
 mod vt;
+#[cfg(windows)]
+mod windows;
+/// The platform-independent parts of the Windows backend (the kill engine over a synthetic
+/// `JobOs`, the chunked exit wait, and the command-line, environment-block, and cwd rules),
+/// unit-tested on every OS.
+#[cfg(all(test, not(windows)))]
+#[path = "windows"]
+mod windows {
+    #![allow(dead_code, reason = "only their unit tests run off Windows")]
+    mod cmdline;
+    mod kill;
+    mod wait;
+}
 mod writer;
 
 #[cfg(feature = "fake")]
@@ -74,6 +87,8 @@ pub use spawn::with_spawn_lock;
 #[cfg(target_os = "macos")]
 pub use unix::native;
 pub use vt::ModeView;
+#[cfg(windows)]
+pub use windows::native;
 pub use writer::{
     Basis, Completion, CompletionReceiver, Guard, LogTruncated, MAX_PARTS, Part, Recheck, Refusal,
     SubmitError, WriteContext, WriteOutcome, WriteRecord, WriteTicket, WriteUnit,

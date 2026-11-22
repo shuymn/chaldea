@@ -5,7 +5,6 @@
 //! The sink exists before the backend spawns, so no output is held for a late consumer.
 
 use std::io::{self, Read};
-use std::sync::mpsc::channel;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -140,28 +139,6 @@ impl Drain {
     }
 }
 
-/// Runs a close that may block (`ClosePseudoConsole` on builds that wait for its output
-/// to be read) on a helper thread: its duration, or `None` when it did not return within
-/// `bound` (the `conpty-close` thread is abandoned and the close recorded as hung).
-#[allow(dead_code, reason = "used by the Windows backend (PR 4)")]
-pub(crate) fn close_bounded(
-    close: impl FnOnce() + Send + 'static,
-    bound: Duration,
-) -> Option<Duration> {
-    let t = Instant::now();
-    let (tx, rx) = channel();
-    let spawned = std::thread::Builder::new()
-        .name("conpty-close".into())
-        .spawn(move || {
-            close();
-            let _ = tx.send(());
-        });
-    if spawned.is_err() {
-        return None;
-    }
-    rx.recv_timeout(bound).ok().map(|()| t.elapsed())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,10 +221,10 @@ mod tests {
         assert_eq!(d.finish(Duration::from_secs(5)), Some(OutputEnd::Eof));
     }
 
-    /// PR2-CL-16 / CL-24: `finish` returns by its bound when the output never ends, and
-    /// a close that hangs is reported (no duration) within its bound.
+    /// PR2-CL-16: `finish` returns by its bound when the output never ends (the bounded
+    /// pseudoconsole close is the Windows close worker's, `windows::control`).
     #[test]
-    fn hung_close_is_bounded() {
+    fn finish_is_bounded_without_an_end() {
         let (r, w) = io::pipe().unwrap();
         let (sink, _) = recording();
         let d = Drain::start(r, sink).unwrap();
@@ -255,15 +232,6 @@ mod tests {
         assert_eq!(d.finish(Duration::from_millis(100)), None);
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
         drop(w);
-
-        let t = Instant::now();
-        let r = close_bounded(
-            || std::thread::sleep(Duration::from_millis(1500)),
-            Duration::from_millis(100),
-        );
-        assert_eq!(r, None);
-        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
-        assert!(close_bounded(|| {}, Duration::from_secs(5)).is_some());
     }
 
     /// The drain keeps reading when the sink is slow to return nothing: the sink is never

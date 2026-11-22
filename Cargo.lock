@@ -215,6 +215,7 @@ dependencies = [
  "rustix",
  "serde_json",
  "unicode-width",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -225,6 +226,7 @@ dependencies = [
  "rustix",
  "serde_json",
  "signal-hook",
+ "winapi-util",
 ]
 
 [[package]]
