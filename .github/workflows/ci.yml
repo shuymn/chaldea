@@ -79,13 +79,14 @@ jobs:
           list="$(cargo test -p chaldea-daemon --test store_open --locked -- --list)"
           require "$list" long_path_vfs_is_selected
 
-      # core is Sans-IO: no async runtime, store, or HTTP server in its dependency tree.
+      # core is Sans-IO: no async runtime, store, HTTP stack, or random source in its
+      # dependency tree (core::auth and core::http are pure policy and wire types).
       # A here-string, not a pipe: under `bash -eo pipefail`, `grep -q` exiting on the
       # first match makes the writer die of SIGPIPE, and the negated pipeline would pass.
       - name: Check core dependencies
         run: |
           deps="$(cargo tree -p chaldea-core -e normal --prefix none)"
-          ! grep -Eq '^(tokio|rusqlite|axum) ' <<<"$deps"
+          ! grep -Eq '^(tokio|rusqlite|axum|hyper|tower|getrandom) ' <<<"$deps"
 
       # pty-runtime is synchronous: std threads and blocking I/O, no async runtime.
       - name: Check pty-runtime dependencies
