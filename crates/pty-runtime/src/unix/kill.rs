@@ -1886,9 +1886,10 @@ mod tests {
 
     #[test]
     fn member_read_before_getsid_is_retained() {
-        // The deadline passes right after the census read M, before its `getsid`.
+        // The deadline passes right after the census read M, before its `getsid`. M was
+        // reparented (its parent exited), so only its group covers it.
         let sim = Sim::new();
-        sim.world.borrow_mut().add(200, L, L, L, 2_000).dies = [false; 3];
+        sim.world.borrow_mut().add(200, 1, L, L, 2_000).dies = [false; 3];
         jump_at(&sim, Ev::Lookup(200));
         let st = state();
         assert!(!sim.kill(&[], 1_000, &st).tree_dead);
@@ -1939,6 +1940,10 @@ mod tests {
         };
         let st = state();
         assert!(!sim.kill(&[stale], 1_000, &st).tree_dead);
+        // The read of M disproved the stale generation and retained M's.
+        let targets = st.lock().unwrap().targets.clone();
+        assert!(!targets.contains_key(&(200, 999)), "{targets:?}");
+        assert!(targets.contains_key(&(200, 2_000)), "{targets:?}");
         leave_and_orphan(&sim, 200, |w| w.procs.get_mut(&L).unwrap().st = St::Zombie);
         retry_tracks(&sim, &st, 200);
     }
@@ -2039,5 +2044,20 @@ mod tests {
         assert!(r.tree_dead, "{r:?}");
         assert!(!sim.alive(250));
         assert!(!sim.alive(300));
+    }
+
+    #[test]
+    fn membership_needs_ownership_for_the_call() {
+        // Ownership cannot be established (and was never lost): a live process in the
+        // leader's group and session is not covered, and death is not proven.
+        let sim = Sim::new();
+        sim.owned.set(false);
+        sim.world.borrow_mut().procs.get_mut(&L).unwrap().st = St::Zombie;
+        sim.world.borrow_mut().add(200, 1, L, L, 2_000);
+        let st = state();
+        let r = sim.kill(&[], 300, &st);
+        assert!(!r.tree_dead, "{r:?}");
+        let targets = st.lock().unwrap().targets.clone();
+        assert!(!targets.contains_key(&(200, 2_000)), "{targets:?}");
     }
 }
