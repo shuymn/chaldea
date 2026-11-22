@@ -516,3 +516,21 @@ fn owner_detaches_a_reported_writer_still_tearing_down() {
     assert!(a.writer_exited, "{a:?}");
     assert!(!kept, "the owner left the writer's handle in the store");
 }
+
+/// The owner, held after releasing the writer until past its deadline, leaves out a writer
+/// report published after that deadline, as every later caller does.
+#[test]
+fn owner_leaves_out_a_writer_report_after_its_deadline() {
+    let gates = Gates::default();
+    let (_dir, s) = store_with(gates.faults());
+    let (released, release_owner) = gates.arm("writer_released");
+    let a = in_thread(&s, Duration::ZERO);
+    released
+        .recv_timeout(WAIT)
+        .expect("the owner released the writer");
+    wait_for_exit(&s);
+    drop(release_owner);
+    let a = a.recv_timeout(WAIT).expect("the owner returns");
+    assert!(!a.writer_exited, "{a:?}");
+    assert_eq!(a.checkpoint, crate::store::Checkpoint::NotRun, "{a:?}");
+}

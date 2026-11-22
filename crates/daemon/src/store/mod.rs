@@ -530,8 +530,14 @@ impl Store {
             inner.faults.mark("readers_closed");
         }
         inner.shared.update(|s| s.readers_released = true);
-        // (4) The writer checkpoints and its thread ends. (5) Wait for that until the deadline.
-        let exit = inner.shared.wait_until(Some(deadline), |s| s.exit.clone());
+        inner.faults.mark("writer_released");
+        // (4) The writer checkpoints and its thread ends. (5) Wait for that until the deadline;
+        // like every caller, the owner counts only a report published by its deadline.
+        let exit = inner.shared.wait_until(Some(deadline), |s| {
+            s.exit
+                .clone()
+                .filter(|_| s.exit_at.is_some_and(|t| t <= deadline))
+        });
         inner.faults.mark("owner_waited");
         // The owner always detaches the thread: `join` would also wait for thread-local
         // destructors, which no deadline bounds. A report published later still reaches
