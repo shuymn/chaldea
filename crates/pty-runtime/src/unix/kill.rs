@@ -688,10 +688,16 @@ pub(crate) fn kill_tree<O: Os>(
     // Prove.
     while !call.expired() {
         (pass, owned) = call.round(&mut st);
-        let now_live = call.live_set(&mut pass, owned, &st);
-        if pass.complete || !now_live.is_empty() {
-            live = now_live;
+        let mut now_live = call.live_set(&mut pass, owned, &st);
+        if !pass.complete {
+            // A pass that could not run cannot clear what an earlier one saw.
+            for s in &live {
+                if !now_live.iter().any(|n| n.pid == s.pid) {
+                    now_live.push(*s);
+                }
+            }
         }
+        live = now_live;
         if live.is_empty() {
             match call.prove(&pass, owned, &st) {
                 None => return finish(&call, &mut st, &pass, true, Vec::new()),
@@ -1533,10 +1539,13 @@ mod tests {
 
     #[test]
     fn failed_list_keeps_the_last_survivors() {
-        // A stage 5 leader (no recorded start) is no target, so only a pass finds it. Once
-        // the list fails, no pass can run; the report keeps the leader seen before.
+        // An unreadable session member is never recorded as a target (it has no start),
+        // so only a pass finds it. Once the list fails, no pass can run; the report keeps
+        // the member seen before.
+        const U: u32 = 200;
         let sim = Sim::new();
-        immortal(&sim, L);
+        sim.world.borrow_mut().add(U, L, U, L, 30).st = St::Unreadable;
+        immortal(&sim, U);
         let failing = std::rc::Rc::new(Cell::new(false));
         let f2 = failing.clone();
         sim.on(move |_, ev| {
@@ -1549,18 +1558,14 @@ mod tests {
                 if failing.get() {
                     Vec::new()
                 } else {
-                    vec![1, ME, L, X]
+                    vec![1, ME, L, U, X]
                 },
                 false,
             ))
         }));
-        let leader = Leader {
-            start: None,
-            ..sim.leader()
-        };
-        let r = kill_tree(&sim, leader, &[], sim.at(500), &state());
+        let r = sim.kill(&[], 500, &state());
         assert!(!r.tree_dead, "{r:?}");
-        assert!(r.survivors.iter().any(|s| s.pid == L), "{r:?}");
+        assert!(r.survivors.iter().any(|s| s.pid == U), "{r:?}");
     }
 
     #[test]
