@@ -958,8 +958,10 @@ module sync {
     nondet big = Bool.oneOf()
     nondet w = Set(Set(HOST), Set(THREAD), STREAMS).oneOf()
     nondet connected = Bool.oneOf()
-    // One start in four is the swap race, with the three host events it needs.
-    nondet racing = Set(false, false, false, true).oneOf()
+    // About half the starts are the swap race, with the three host events it needs. The
+    // witness counts come from this mix; with fewer racing starts, `witnessOnlyHeadsRecover`
+    // is not reached at the CI size.
+    nondet racing = Bool.oneOf()
     initFrom(if (racing) 3 else h, t, big, w, connected and not(racing), racing)
   }
 
