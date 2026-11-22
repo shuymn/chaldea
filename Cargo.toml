@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core"]
+members = ["crates/core", "crates/pty-runtime"]
 resolver = "3"
 
 [workspace.package]
@@ -21,6 +21,10 @@ proptest = "=1.12.0"
 # Dev only: checks that the generated JSON Schema agrees with Rust decoding. No default
 # features, so no HTTP or file reference resolution.
 jsonschema = { version = "=0.60.2", default-features = false }
+# The headless VT of crates/pty-runtime. Its only optional feature (`serde`) is not needed.
+alacritty_terminal = { version = "=0.26.0", default-features = false }
+# The width table alacritty_terminal uses (same version as its lock entry), for grid decoding.
+unicode-width = "=0.2.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
