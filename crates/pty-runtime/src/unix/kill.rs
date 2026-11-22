@@ -746,6 +746,7 @@ mod tests {
 
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
+    use std::rc::Rc;
 
     use super::*;
 
@@ -1011,9 +1012,12 @@ mod tests {
     }
 
     impl Os for Sim {
+        /// The deadline is checked before the leader is read, as in the real check: a read
+        /// that uses up the budget still returns ownership.
         fn owned(&self, deadline: Instant) -> (bool, Option<Lookup>) {
             self.enter(Ev::Owned);
-            let read = self.owned_reads.get().then(|| self.record(L));
+            let in_time = self.base + self.now.get() < deadline;
+            let read = self.owned_reads.get().then(|| self.lookup(L));
             if let Some(v) = self.owned_script.borrow_mut().pop_front() {
                 return (v, read);
             }
@@ -1021,7 +1025,7 @@ mod tests {
                 self.lost.set(true);
                 return (false, read);
             }
-            (self.base + self.now.get() < deadline, read)
+            (in_time, read)
         }
 
         fn lost(&self) -> bool {
@@ -1517,13 +1521,34 @@ mod tests {
         );
     }
 
+    /// A clock that jumps 10 s at the first event `at` after the `n`th event `after`; the
+    /// flag shows that it did.
+    fn jump_at_after(sim: &Sim, after: Ev, n: usize, at: Ev) -> Rc<Cell<bool>> {
+        let fired = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&fired);
+        let mut seen = 0;
+        *sim.clock.borrow_mut() = Some(Box::new(move |ev| {
+            if ev == after {
+                seen += 1;
+            } else if seen >= n && ev == at && !flag.get() {
+                flag.set(true);
+                return Duration::from_secs(10);
+            }
+            Duration::ZERO
+        }));
+        fired
+    }
+
     #[test]
     fn lookup_consuming_the_budget_stops_before_the_signal() {
+        // 300, a child of the leader outside its group, is signalled by pid. The lookup of
+        // 300 that would authorise that signal (the first one after the HUP to the group)
+        // shows the recorded start and ends past the deadline.
         let sim = Sim::new();
         sim.world.borrow_mut().add(300, L, 300, 300, 3_000);
-        // The lookup of 300 that would authorise its signal ends past the deadline.
-        sim.cost(|e| e == Ev::Lookup(300), Duration::from_millis(1_000));
+        let fired = jump_at_after(&sim, Ev::Killpg(L, Sig::Hup), 1, Ev::Lookup(300));
         let r = sim.kill(&[], 1_000, &state());
+        assert!(fired.get(), "{:?}", sim.log());
         assert!(!r.tree_dead);
         assert!(
             !sim.log().iter().any(|e| matches!(e, Ev::Kill(300, _))),
@@ -1534,10 +1559,14 @@ mod tests {
 
     #[test]
     fn deadline_inside_owned_stops_before_killpg() {
+        // The ownership check before the first group signal (the third check of the call)
+        // holds, but its read of the leader ends past the deadline.
         let sim = Sim::new();
         immortal(&sim, L);
-        sim.cost(|e| e == Ev::Owned, Duration::from_millis(1_000));
+        sim.owned_reads.set(true);
+        let fired = jump_at_after(&sim, Ev::Owned, 3, Ev::Lookup(L));
         let r = sim.kill(&[], 500, &state());
+        assert!(fired.get(), "{:?}", sim.log());
         assert!(!r.tree_dead);
         assert!(
             !sim.log().iter().any(|e| matches!(e, Ev::Killpg(..))),
@@ -2235,7 +2264,12 @@ mod tests {
         let st = state();
         let r = sim.kill(&[], 500, &st);
         assert!(!r.tree_dead, "{r:?}");
-        assert!(!sim.log().iter().any(|e| matches!(e, Ev::Lookup(_))));
+        let lookups: Vec<Ev> = sim
+            .log()
+            .into_iter()
+            .filter(|e| matches!(e, Ev::Lookup(_)))
+            .collect();
+        assert_eq!(lookups, vec![Ev::Lookup(L)], "only the check's own read");
         assert!(r.survivors.iter().all(|s| s.pid != L), "{r:?}");
         assert!(st.lock().unwrap().targets.is_empty());
     }
