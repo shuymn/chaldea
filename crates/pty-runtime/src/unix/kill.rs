@@ -1532,6 +1532,38 @@ mod tests {
     }
 
     #[test]
+    fn failed_list_keeps_the_last_survivors() {
+        // A stage 5 leader (no recorded start) is no target, so only a pass finds it. Once
+        // the list fails, no pass can run; the report keeps the leader seen before.
+        let sim = Sim::new();
+        immortal(&sim, L);
+        let failing = std::rc::Rc::new(Cell::new(false));
+        let f2 = failing.clone();
+        sim.on(move |_, ev| {
+            if matches!(ev, Ev::Killpg(..)) {
+                f2.set(true);
+            }
+        });
+        *sim.list.borrow_mut() = Some(Box::new(move |_| {
+            Ok((
+                if failing.get() {
+                    Vec::new()
+                } else {
+                    vec![1, ME, L, X]
+                },
+                false,
+            ))
+        }));
+        let leader = Leader {
+            start: None,
+            ..sim.leader()
+        };
+        let r = kill_tree(&sim, leader, &[], sim.at(500), &state());
+        assert!(!r.tree_dead, "{r:?}");
+        assert!(r.survivors.iter().any(|s| s.pid == L), "{r:?}");
+    }
+
+    #[test]
     fn deadline_between_list_retries_stops_the_pass() {
         let sim = Sim::new();
         *sim.list.borrow_mut() = Some(Box::new(|cap| Ok((vec![1; cap], true))));
