@@ -120,32 +120,34 @@ jobs:
 
       - uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
         with:
+          version: 2026.10.17
           install: false
           cache: false
 
-      # Only Node: Quint comes from specs/package-lock.json.
-      - name: Install Node
+      # Only Node and pnpm: Quint comes from specs/pnpm-lock.yaml.
+      - name: Install Node and pnpm
         env:
           MISE_YES: 1
         run: |
           mise trust mise.toml >/dev/null
-          mise install --locked node
+          mise install --locked node pnpm
 
+      # specs/pnpm-workspace.yaml denies every dependency build script.
       - name: Install Quint
         working-directory: specs
-        run: mise exec -- npm ci --no-fund --no-audit
+        run: mise exec -- pnpm install --frozen-lockfile
 
       - name: Typecheck
         working-directory: specs
-        run: mise exec -- npm run typecheck
+        run: mise exec -- pnpm run typecheck
 
       - name: Simulate
         working-directory: specs
-        run: mise exec -- npm run simulate
+        run: mise exec -- pnpm run simulate
 
       - name: Check traces
         working-directory: specs
-        run: mise exec -- npm run traces:check
+        run: mise exec -- pnpm run traces:check
 
   pty-hooks:
     name: pty-hooks (${{ matrix.os }})

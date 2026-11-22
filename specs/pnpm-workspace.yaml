@@ -1,0 +1,4 @@
+# Dependencies may not run install scripts. protobufjs (through Quint) has a
+# postinstall that Quint does not need.
+allowBuilds:
+  protobufjs: false

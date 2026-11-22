@@ -8,9 +8,10 @@ lefthook = "2"
 actionlint = "1"
 betterleaks = "1"
 ghalint = "1"
-# Runs the Quint specs under specs/ (docs/design/formal-specs.md); Quint itself is
-# pinned in specs/package.json and its lockfile.
+# Run the Quint specs under specs/ (docs/design/formal-specs.md); Quint itself is
+# pinned in specs/package.json and specs/pnpm-lock.yaml.
 node = "24"
+pnpm = "12"
 
 # Rust is not listed: spikes/pty-hooks is a standalone project whose toolchain
 # is pinned by its own rust-toolchain.toml, which rustup reads directly.

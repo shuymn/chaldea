@@ -34,11 +34,18 @@ pre-commit:
         - "crates/**/Cargo.toml"
         - "Cargo.{toml,lock}"
       run: deps="$(cargo tree -p chaldea-testkit -e normal --target all --prefix none)" && bad="$(printf '%s\n' "$deps" | awk '/^chaldea-/ && !/^chaldea-(testkit|core) /')" && [ -z "$bad" ]
-    # specs/ checks (docs/design/formal-specs.md); `npm ci` installs the pinned Quint.
+    # specs/ checks (docs/design/formal-specs.md). Globs are repository-relative; `root`
+    # only sets the working directory. pnpm installs the pinned Quint when node_modules is
+    # missing or older than the lockfile.
     specs-check:
       root: specs/
-      glob: ["*.qnt", "traces/*", "scripts/*", "package*.json"]
-      run: mise exec -- npm ci --no-fund --no-audit --silent && mise exec -- npm run --silent typecheck && mise exec -- npm run --silent traces:check
+      glob:
+        - "specs/*.qnt"
+        - "specs/traces/*"
+        - "specs/scripts/*"
+        - "specs/package.json"
+        - "specs/pnpm-*.yaml"
+      run: '{ [ node_modules/.modules.yaml -nt pnpm-lock.yaml ] || mise exec -- pnpm install --frozen-lockfile --silent; } && mise exec -- pnpm run --silent typecheck && mise exec -- pnpm run --silent traces:check'
     pty-hooks-fmt:
       root: spikes/pty-hooks/
       glob: "*.rs"
@@ -54,13 +61,18 @@ pre-push:
       glob:
         - "crates/**/*"
         - "packages/contracts/**/*"
+        - "specs/traces/*"
         - "Cargo.{toml,lock}"
         - "rust-toolchain.toml"
       run: cargo test --workspace --locked --no-fail-fast
     specs-simulate:
       root: specs/
-      glob: ["*.qnt", "scripts/*", "package*.json"]
-      run: mise exec -- npm ci --no-fund --no-audit --silent && mise exec -- npm run --silent simulate
+      glob:
+        - "specs/*.qnt"
+        - "specs/scripts/*"
+        - "specs/package.json"
+        - "specs/pnpm-*.yaml"
+      run: '{ [ node_modules/.modules.yaml -nt pnpm-lock.yaml ] || mise exec -- pnpm install --frozen-lockfile --silent; } && mise exec -- pnpm run --silent simulate'
     pty-hooks-test:
       root: spikes/pty-hooks/
       glob: "*.{rs,toml,lock,txt}"
