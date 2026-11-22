@@ -533,3 +533,41 @@ fn readiness_basis_is_refused() {
     ));
     assert_eq!(s.read(move |r| r.launch(l)).unwrap().write_basis, None);
 }
+
+/// A `user_message` attributed to an input of another launch is refused.
+#[test]
+fn attributed_prompt_must_match_the_inputs_launch() {
+    use chaldea_core::payload::UserMessage;
+
+    let s = TestStore::new();
+    let (t, l1, l2, i) = (thread(1), launch(1), launch(2), input(1));
+    let mut next = reserved(t, l2);
+    if let TypedEvent::LaunchReserved(r) = &mut next.event {
+        r.expected_previous = Some(l1);
+    }
+    s.append(vec![
+        registered(t, false),
+        reserved(t, l1),
+        started(t, l1),
+        created(t, i, Some(l1)),
+        sending(t, i, "send"),
+        support::exited(t, l1),
+        next,
+        started(t, l2),
+    ])
+    .unwrap();
+
+    let mut e = event(
+        StreamId::Thread(t),
+        "prompt-l2",
+        TypedEvent::UserMessage(UserMessage {
+            prompt: Content::text("hi"),
+            input_id: Some(i),
+        }),
+    );
+    e.launch_id = Some(l2);
+    e.source = source(SourceKind::Hook);
+    let result = s.append(vec![e]);
+    let ack = s.read(move |r| r.input(i)).unwrap().ack_seq;
+    assert!(result.is_err() && ack.is_none(), "{result:?}, ack {ack:?}");
+}

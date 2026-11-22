@@ -264,11 +264,19 @@ pub(crate) fn apply(p: &mut ProjectionTx<'_>, e: &StoredEvent) -> Result<(), Sto
                     rusqlite::params![seq, launch.to_string(), thread.to_string()],
                 )?;
             }
+            // The prompt acknowledges an input only of the launch that submitted it (mvp
+            // §2.3); without an envelope launch nothing matches.
             if let Some(input) = m.input_id {
                 p.exec_one(
                     "user_message ack",
-                    "UPDATE proj_inputs SET ack_seq = ?1 WHERE input_id = ?2 AND thread_id = ?3",
-                    rusqlite::params![seq, input.to_string(), thread.to_string()],
+                    "UPDATE proj_inputs SET ack_seq = ?1
+                     WHERE input_id = ?2 AND thread_id = ?3 AND launch_id = ?4",
+                    rusqlite::params![
+                        seq,
+                        input.to_string(),
+                        thread.to_string(),
+                        env.launch_id.map(|l| l.to_string())
+                    ],
                 )?;
             }
         }

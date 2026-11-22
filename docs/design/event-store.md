@@ -529,7 +529,7 @@ pub(crate) struct StoredEvent { pub envelope: EventEnvelope, pub occurred_explic
 | other transcript-sourced events | `event_offset = offset_end`, `event_continuity` from the annex, `read_offset = max(read_offset, offset_end)` |
 | `readiness_observed` | launch `readiness_seq = seq`, `readiness_evidence`, `write_basis` from the annex |
 | `human_write` | launch `last_write_seq = seq`; also `last_human_write_seq = seq` for `attach` and `key` |
-| `user_message` | with an envelope `launch_id`: that launch's `last_turn_start_seq = seq`; without one (a hook that bound no launch cannot produce it, but a stored event may lack it), no launch change; with `input_id`, that input's `ack_seq = seq` |
+| `user_message` | with an envelope `launch_id`: that launch's `last_turn_start_seq = seq`; without one (a hook that bound no launch cannot produce it, but a stored event may lack it), no launch change; with `input_id`, that input's `ack_seq = seq`, only when the input belongs to the thread and to the envelope's launch (mvp §2.3: an acknowledgement is a `UserPromptSubmit` of the same launch); otherwise, or without an envelope launch, the job rolls back. Matching the prompt to its input stays the producer's |
 | `status_changed` (`process_state`, `turn_state`, `attention`) | the column set to `to` by `UPDATE … WHERE <column> = from` (one row, else error); the only event that changes these after registration |
 | `task_set` | `task_state = to` |
 | `status_changed` (`task_state`) | none: it stays in the public history as the record of its `task_set` |
