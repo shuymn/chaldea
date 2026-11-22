@@ -46,7 +46,6 @@ pub(crate) async fn read_until<R: Send + 'static>(
 ) -> Result<R, ApiError> {
     // The cutoff is set before the read starts.
     let cutoff = shared.timer(deadline);
-    shared.faults.cutoff_set().await;
     let s = shared.clone();
     let handle = tokio::task::spawn_blocking(move || {
         s.faults.before_read();
@@ -54,6 +53,10 @@ pub(crate) async fn read_until<R: Send + 'static>(
         s.faults.after_read();
         r
     });
+    shared
+        .faults
+        .before_cutoff_wait(|| handle.is_finished())
+        .await;
     match timeout_at(cutoff, handle).await {
         Err(_) => Err(ApiError::request_timeout()),
         Ok(Err(_)) => Err(ApiError::internal()),
@@ -175,9 +178,9 @@ pub(crate) async fn await_write<R: Send + 'static>(
     // The reply cutoff is set before the job is submitted.
     let reply_by = deadline + shared.cfg.write_reply_grace;
     let cutoff = shared.timer(reply_by);
-    shared.faults.cutoff_set().await;
     let rx =
         observe_write(shared, deadline, job, after_ok).map_err(|_| ApiError::shutting_down())?;
+    shared.faults.before_cutoff_wait(|| !rx.is_empty()).await;
     match timeout_at(cutoff, rx).await {
         Err(_) | Ok(Err(_)) => Err(ApiError::outcome_unknown()),
         Ok(Ok(_)) if shared.passed(reply_by) => Err(ApiError::outcome_unknown()),

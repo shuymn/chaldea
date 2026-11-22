@@ -69,14 +69,15 @@ async fn hold_writer(srv: &TestServer) -> std::sync::mpsc::Sender<()> {
     release
 }
 
-/// The reply cutoff is set first (held at its gate); the job waits behind a held writer past
-/// its `not_after`; the server's clock then passes `deadline + write_reply_grace`; the writer
-/// is released and replies `Expired`. The request resumes with that reply ready and its real
-/// timer still pending, so only the explicit check decides: 503 `outcome_unknown`, not 408.
+/// The waiter is held at its gate while its job waits behind a held writer past
+/// `deadline + write_reply_grace` (and so past its `not_after`); the writer is then released
+/// and replies `Expired`. Released, the waiter polls with both the reply and the timer ready,
+/// and `timeout_at` takes the ready reply, so only the explicit check decides: 503
+/// `outcome_unknown`, not 408.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reply_after_the_grace_is_outcome_unknown() {
     let srv = TestServer::start_with(Mounts::mvp(), |c| {
-        c.write_reply_grace = Duration::from_secs(10);
+        c.write_reply_grace = Duration::from_millis(100);
     })
     .await;
     let s = shared(&srv);
@@ -89,25 +90,23 @@ async fn reply_after_the_grace_is_outcome_unknown() {
         tokio::spawn(async move { await_write(&w, deadline, Box::new(|_tx| Ok(())), None).await });
     tokio::time::timeout(Duration::from_secs(10), reached)
         .await
-        .expect("the cutoff was set")
+        .expect("the waiter reached its gate")
         .unwrap();
-    drop(release);
     eventually(Duration::from_secs(10), "the job was submitted", || {
         s.faults.inner.submits() == before + 1
     })
     .await;
-    // The store decides expiry on real time: let the job's `not_after` pass.
+    // Lower bounds: the reply cutoff and the job's `not_after` have passed in real time.
     tokio::time::sleep_until(tokio::time::Instant::from_std(
-        deadline + Duration::from_millis(50),
+        deadline + Duration::from_millis(150),
     ))
     .await;
-    srv.clock.skew(Duration::from_secs(3600));
     writer.send(()).unwrap();
-    let r = tokio::time::timeout(Duration::from_secs(10), waiter)
+    drop(release);
+    let r = tokio::time::timeout(Duration::from_secs(20), waiter)
         .await
         .expect("the write reply was taken")
         .unwrap();
-    srv.clock.skew(Duration::ZERO);
     assert_eq!(r, Err(ApiError::outcome_unknown()));
     assert!(srv.sink.0.lock().unwrap().is_empty());
     srv.stop().await;

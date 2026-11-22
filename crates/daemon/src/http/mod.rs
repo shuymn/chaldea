@@ -341,10 +341,11 @@ impl Faults {
         fut
     }
 
-    /// Runs after a cutoff timer was set and before the work it bounds starts.
-    pub(crate) async fn cutoff_set(&self) {
+    /// Runs after the work a cutoff bounds has started and before its waiter first polls
+    /// the result against the cutoff; `ready` tells whether the result is in.
+    pub(crate) async fn before_cutoff_wait(&self, _ready: impl Fn() -> bool) {
         #[cfg(test)]
-        self.inner.cutoff_set().await;
+        self.inner.before_cutoff_wait(_ready).await;
     }
 
     /// An injected accept error, taken before each real accept.

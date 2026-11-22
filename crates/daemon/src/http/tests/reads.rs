@@ -100,31 +100,33 @@ async fn late_read_success_is_408() {
 }
 
 /// The same for a store error other than reader-pool exhaustion: taken after the cutoff it
-/// is 408, not its §2.9 mapping. The cutoff timer is set first (held at its gate), the
-/// server's clock then passes the deadline, and only then does the read run: the waiter
-/// resumes with the `DiskFull` result ready and its real timer still pending, so only the
-/// explicit check decides.
+/// is 408, not its §2.9 mapping. The waiter is held at its gate while the `DiskFull` read
+/// finishes and the real cutoff passes; released, it polls with both the result and the
+/// timer ready, and `timeout_at` takes the ready result, so only the explicit check decides.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_read_error_is_408() {
     let srv = TestServer::start(Mounts::mvp()).await;
     let s = shared(&srv);
     let (reached, release) = s.faults.inner.arm_cutoff_gate();
     let w = s.clone();
-    let deadline = srv.clock.now() + Duration::from_secs(5);
+    let deadline = srv.clock.now() + Duration::from_millis(200);
     let waiter = tokio::spawn(async move {
         read_until(&w, deadline, |_| Err::<(), _>(StoreError::DiskFull)).await
     });
     tokio::time::timeout(Duration::from_secs(10), reached)
         .await
-        .expect("the cutoff was set")
+        .expect("the waiter reached its gate")
         .unwrap();
-    srv.clock.skew(Duration::from_secs(3600));
+    // A lower bound: the real cutoff (the deadline itself, the clock not skewed) has passed.
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        deadline + Duration::from_millis(50),
+    ))
+    .await;
     drop(release);
-    let r = tokio::time::timeout(Duration::from_secs(10), waiter)
+    let r = tokio::time::timeout(Duration::from_secs(20), waiter)
         .await
         .expect("the read ends")
         .unwrap();
-    srv.clock.skew(Duration::ZERO);
     assert_eq!(r, Err(ApiError::request_timeout()));
     srv.stop().await;
 }

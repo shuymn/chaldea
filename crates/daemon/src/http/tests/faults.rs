@@ -27,7 +27,8 @@ pub(crate) struct Points {
     pub(crate) submits: AtomicUsize,
     /// Held once by an upgrade admission between its final read and the ticket removal.
     pub(crate) removal_gate: Mutex<Option<Gate>>,
-    /// Held once right after a read's or a write reply's cutoff timer was set.
+    /// Held once by a read's or a write reply's waiter before it first polls its result
+    /// against the cutoff.
     pub(crate) cutoff_gate: Mutex<Option<Gate>>,
     /// Told the first time the next registered socket task parks.
     pub(crate) first_park: Mutex<Option<oneshot::Sender<()>>>,
@@ -136,13 +137,30 @@ impl Points {
         pass(&self.removal_gate).await;
     }
 
-    /// Arms the cutoff gate, as [`Points::arm_removal_gate`].
+    /// Arms the cutoff gate, as [`Points::arm_removal_gate`]; after the release the waiter
+    /// also waits (at most 10 s) until its result is in, so it then polls a ready result.
     pub(crate) fn arm_cutoff_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         arm(&self.cutoff_gate)
     }
 
-    pub(crate) async fn cutoff_set(&self) {
+    pub(crate) async fn before_cutoff_wait(&self, ready: impl Fn() -> bool) {
+        let armed = self
+            .cutoff_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
+        if !armed {
+            return;
+        }
         pass(&self.cutoff_gate).await;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < until,
+                "the result never came in"
+            );
+            tokio::task::yield_now().await;
+        }
     }
 
     pub(crate) fn step(&self, step: &'static str) {
