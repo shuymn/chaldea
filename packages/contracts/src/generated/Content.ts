@@ -7,11 +7,13 @@ import type { Encoding } from "./Encoding";
  */
 export type Content = { inline: string, encoding: Encoding, } | { blob: BlobRef, 
 /**
- * The first `PREVIEW_LIMIT_BYTES` bytes decoded as UTF-8, invalid sequences
- * replaced by U+FFFD.
+ * The first `PREVIEW_LIMIT_BYTES` bytes decoded as UTF-8, each invalid
+ * sequence replaced by U+FFFD. A valid character that crosses the limit is left
+ * out, not replaced.
  */
 preview: string, 
 /**
- * True when any sequence was replaced.
+ * True when any invalid sequence was replaced; a character left out at the
+ * limit does not set it.
  */
 preview_lossy: boolean, };

@@ -324,11 +324,11 @@
               "$ref": "#/$defs/BlobRef"
             },
             "preview": {
-              "description": "The first `PREVIEW_LIMIT_BYTES` bytes decoded as UTF-8, invalid sequences\nreplaced by U+FFFD.",
+              "description": "The first `PREVIEW_LIMIT_BYTES` bytes decoded as UTF-8, each invalid\nsequence replaced by U+FFFD. A valid character that crosses the limit is left\nout, not replaced.",
               "type": "string"
             },
             "preview_lossy": {
-              "description": "True when any sequence was replaced.",
+              "description": "True when any invalid sequence was replaced; a character left out at the\nlimit does not set it.",
               "type": "boolean"
             }
           },

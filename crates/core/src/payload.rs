@@ -16,7 +16,7 @@ use crate::state::TaskState;
 
 /// Above this many bytes, content moves to a blob (§2.1 `Content`).
 pub const INLINE_LIMIT_BYTES: usize = 64 * 1024;
-/// A blob's `preview` is its first this many bytes, decoded lossily as UTF-8.
+/// A blob's `preview` is its first this many bytes, decoded as UTF-8 (see `Content::Blob`).
 pub const PREVIEW_LIMIT_BYTES: usize = 1024;
 
 /// Every payload field that can be large: inline text or bytes, or a blob reference.
@@ -29,10 +29,12 @@ pub enum Content {
     },
     Blob {
         blob: BlobRef,
-        /// The first `PREVIEW_LIMIT_BYTES` bytes decoded as UTF-8, invalid sequences
-        /// replaced by U+FFFD.
+        /// The first `PREVIEW_LIMIT_BYTES` bytes decoded as UTF-8, each invalid
+        /// sequence replaced by U+FFFD. A valid character that crosses the limit is left
+        /// out, not replaced.
         preview: String,
-        /// True when any sequence was replaced.
+        /// True when any invalid sequence was replaced; a character left out at the
+        /// limit does not set it.
         preview_lossy: bool,
     },
 }
