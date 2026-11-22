@@ -287,6 +287,9 @@ struct Stop {
     /// The writer thread's report, published as its last statement, and when.
     exit: Option<WriterExit>,
     exit_at: Option<Instant>,
+    /// When the owner dropped the store's notification sender, published after the drop;
+    /// a later caller reports the writer's exit only once this is set too.
+    notifications_closed_at: Option<Instant>,
 }
 
 impl Shared {
@@ -348,13 +351,17 @@ impl Shared {
 
     /// A later caller's view: the owner's and the writer's reports, as published by
     /// `deadline`. Completion and timeout are decided, and the reports read, under one lock
-    /// acquisition; on every return, a report published after the deadline is left out.
+    /// acquisition; on every return, a report published after the deadline is left out, and
+    /// the writer's exit counts only once the store's notification sender is closed too.
     fn observe(&self, deadline: Instant) -> (Option<ShutdownReport>, Option<WriterExit>) {
         let by = |at: Option<Instant>| at.is_some_and(|t| t <= deadline);
         let mut s = lock(&self.stop);
         loop {
             let report = s.report.clone().filter(|_| by(s.report_at));
-            let exit = s.exit.clone().filter(|_| by(s.exit_at));
+            let exit = s
+                .exit
+                .clone()
+                .filter(|_| by(s.exit_at) && by(s.notifications_closed_at));
             let now = Instant::now();
             if (report.is_some() && exit.is_some()) || now >= deadline {
                 return (report, exit);
@@ -487,25 +494,31 @@ impl Store {
     pub fn shutdown(&self, deadline: Instant) -> ShutdownReport {
         let inner = &self.inner;
         // (1) One intake transition, by the owner: once `submit` refuses, `read` does too.
-        let owner = {
+        let notifier = {
             let mut sender = lock(&inner.shared.sender);
             let mut stop = lock(&inner.shared.stop);
             if stop.owned {
-                false
+                None
             } else {
-                // Everything a later caller may rely on is done before it can see `owned`:
-                // intake closed and the store's notification sender dropped.
+                // Intake closes before a later caller can see `owned`.
                 inner.shared.shutting_down.store(true, Ordering::SeqCst);
                 drop(sender.take());
                 inner.pool.close();
-                drop(lock(&inner.notifier).take());
                 stop.owned = true;
-                true
+                Some(lock(&inner.notifier).take())
             }
         };
-        if !owner {
+        let Some(notifier) = notifier else {
             return self.observe(deadline);
-        }
+        };
+        inner.faults.mark("owner_claimed");
+        // Dropping the last notification sender wakes receivers inline, and a waker may call
+        // `submit`: the sender drops outside the intake locks, and its close is published
+        // after the drop, before a later caller may report the writer's exit.
+        drop(notifier);
+        inner
+            .shared
+            .update(|s| s.notifications_closed_at = Some(Instant::now()));
         inner.faults.mark("intake_transition");
         // (2) The writer runs the queued jobs meanwhile. (3) Close every reader connection:
         // idle ones now, lent ones as they come back, until the deadline; then let the writer
