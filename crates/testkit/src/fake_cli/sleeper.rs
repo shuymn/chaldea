@@ -15,7 +15,7 @@
 //!
 //! Windows supports `plain`, `double-forked`, and `unrelated`.
 
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use super::{Opts, child_args};
@@ -54,9 +54,9 @@ pub(crate) fn run(o: &Opts) -> i32 {
                 cmd.arg("--raw");
             }
             if !o.orphan_keeps_tty {
-                cmd.stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null());
+                cmd.stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
             }
             return exit_after_spawn(&mut cmd);
         }

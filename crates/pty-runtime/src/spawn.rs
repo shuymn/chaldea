@@ -26,7 +26,7 @@ pub(crate) fn spawn_lock() -> MutexGuard<'static, ()> {
 }
 
 /// Whether some thread holds the lock (tests only).
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn spawn_lock_held() -> bool {
     matches!(
         SPAWN_LOCK.try_lock(),
