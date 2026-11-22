@@ -357,7 +357,7 @@ fuzz/               # cargo-fuzz targets (nightly, outside the stable workspace)
 spikes/pty-hooks/   # unchanged until issue #1 removes it
 ```
 
-**Dependency direction.** `core` ← `pty-runtime` ← `daemon` ← `cli`; `testkit` depends on `core`. `core` depends on `serde`, `serde_json` (`raw_value`), `ts-rs`, `schemars`, `uuid`, `unicode-normalization`, `unicode-segmentation`, `subtle`, `sha2`. Sans-IO is enforced by `crates/core/clippy.toml` (disallowing `std::fs`, `std::net`, `std::process`, `Instant::now`, `SystemTime::now`, `std::thread::spawn`) and a CI check that `core` has no `tokio`. `unsafe_code = "forbid"` stays workspace-wide except in `pty-runtime`, whose own `[lints]` table (from PR 3) uses `deny` and allows `unsafe` only in its backend modules.
+**Dependency direction.** `core` ← `pty-runtime` ← `daemon` ← `cli`; `testkit` may depend on `core` and on no other workspace crate. `core` depends on `serde`, `serde_json` (`raw_value`), `ts-rs`, `schemars`, `uuid`, `unicode-normalization`, `unicode-segmentation`, `subtle`, `sha2`. Sans-IO is enforced by `crates/core/clippy.toml` (disallowing `std::fs`, `std::net`, `std::process`, `Instant::now`, `SystemTime::now`, `std::thread::spawn`) and a CI check that `core` has no `tokio`. `unsafe_code = "forbid"` stays workspace-wide except in `pty-runtime`, whose own `[lints]` table (from PR 3) uses `deny` and allows `unsafe` only in its backend modules.
 
 **Single binary.** `chaldea hook-emit` dispatches before any runtime or config initialization and uses std networking only (arch §2). Console subsystem on Windows; no GUI-subsystem variant (prior-art row 9, spike C-5 `go`).
 
