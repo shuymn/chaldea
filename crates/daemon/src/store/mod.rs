@@ -348,20 +348,16 @@ impl Shared {
 
     /// A later caller's view: the owner's and the writer's reports, as published by
     /// `deadline`. Completion and timeout are decided, and the reports read, under one lock
-    /// acquisition; at a timeout, a report published after the deadline is left out.
+    /// acquisition; on every return, a report published after the deadline is left out.
     fn observe(&self, deadline: Instant) -> (Option<ShutdownReport>, Option<WriterExit>) {
+        let by = |at: Option<Instant>| at.is_some_and(|t| t <= deadline);
         let mut s = lock(&self.stop);
         loop {
-            if s.report.is_some() && s.exit.is_some() {
-                return (s.report.clone(), s.exit.clone());
-            }
+            let report = s.report.clone().filter(|_| by(s.report_at));
+            let exit = s.exit.clone().filter(|_| by(s.exit_at));
             let now = Instant::now();
-            if now >= deadline {
-                let by = |at: Option<Instant>| at.is_some_and(|t| t <= deadline);
-                return (
-                    s.report.clone().filter(|_| by(s.report_at)),
-                    s.exit.clone().filter(|_| by(s.exit_at)),
-                );
+            if (report.is_some() && exit.is_some()) || now >= deadline {
+                return (report, exit);
             }
             s = self
                 .stop_cv
@@ -542,6 +538,7 @@ impl Store {
     /// owner's report and the writer thread's exit), then reports what it observed: the
     /// owner's reader outcome once the owner returned, and the writer's exit if it ended.
     fn observe(&self, deadline: Instant) -> ShutdownReport {
+        self.inner.faults.mark("observe_begin");
         let (owner, exit) = self.inner.shared.observe(deadline);
         self.inner.faults.mark("observe_waited");
         match owner {
