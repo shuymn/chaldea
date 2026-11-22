@@ -348,7 +348,7 @@ fn grid_examples() {
 #[test]
 fn malformed_grids_are_rejected() {
     type Check = fn(&GridError) -> bool;
-    let cases: [(&str, Check); 11] = [
+    let cases: [(&str, Check); 12] = [
         ("not json", |e| matches!(e, GridError::NotJson(_))),
         (r#"{"rows":[]}"#, |e| *e == GridError::NotAnArray),
         ("[[]]", |e| {
@@ -375,6 +375,10 @@ fn malformed_grids_are_rejected() {
         }),
         (r#"[[1],[]]"#, |e| {
             *e == GridError::NotAString { row: 0, col: 0 }
+        }),
+        // A non-string anywhere in a row wins over the row's wide-pair errors.
+        (r#"[["",1],[]]"#, |e| {
+            *e == GridError::NotAString { row: 0, col: 1 }
         }),
         (r#"[[""],[]]"#, |e| {
             *e == GridError::EmptyWithoutLead { row: 0, col: 0 }

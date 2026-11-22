@@ -186,10 +186,11 @@ pub(crate) struct ResponderCounters {
     pub(crate) dropped_after_end: AtomicU64,
 }
 
+/// A subscriber. It gets whole pieces only: each piece advances `output_offset` and takes
+/// the current subscribers under one VT lock hold, so a subscriber registered after that
+/// (its snapshot at the new offset) gets the next piece first.
 struct Sub {
     id: SubscriptionId,
-    /// The first output offset this subscriber receives.
-    start: u64,
     sink: OutputSink,
 }
 
@@ -197,20 +198,20 @@ struct Sub {
 pub(crate) struct VtState {
     vt: Vt,
     output_offset: u64,
+    /// Every subscriber except those of a dispatch in progress; during a dispatch, only
+    /// the ones added since it began.
     subs: Vec<Sub>,
-    /// Changes made while a dispatch runs, applied after it.
-    pending_add: Vec<Sub>,
+    /// Removals asked for during a dispatch, applied after it.
     pending_remove: Vec<SubscriptionId>,
     dispatching: bool,
     /// Subscribers taken out for the dispatch in progress.
     in_dispatch: usize,
-    output_end: Option<OutputEnd>,
     next_sub: u64,
 }
 
 impl VtState {
     fn sub_count(&self) -> usize {
-        self.subs.len() + self.in_dispatch + self.pending_add.len()
+        self.subs.len() + self.in_dispatch
     }
 }
 
@@ -279,11 +280,9 @@ impl Shared {
                     vt,
                     output_offset: 0,
                     subs: Vec::new(),
-                    pending_add: Vec::new(),
                     pending_remove: Vec::new(),
                     dispatching: false,
                     in_dispatch: 0,
-                    output_end: None,
                     next_sub: 1,
                 }),
                 control: Mutex::new(None),
@@ -428,13 +427,9 @@ impl Shared {
             self.emit(SessionEvent::VtFailed);
         }
         dispatch.retain_mut(|sub| {
-            if end <= sub.start {
-                return true;
-            }
-            let from = usize::try_from(sub.start.saturating_sub(offset)).unwrap_or(0);
             let ev = OutputEvent::Bytes {
-                offset: offset + from as u64,
-                bytes: &piece[from..],
+                offset,
+                bytes: piece,
             };
             matches!(
                 catch_unwind(AssertUnwindSafe(|| (sub.sink)(ev))),
@@ -443,11 +438,12 @@ impl Shared {
         });
         let mut st = lock(&self.vt);
         let removed = std::mem::take(&mut st.pending_remove);
-        let (gone, kept): (Vec<Sub>, Vec<Sub>) =
-            dispatch.into_iter().partition(|s| removed.contains(&s.id));
-        let mut subs = kept;
-        subs.append(&mut st.pending_add);
-        st.subs = subs;
+        let gone: Vec<Sub> = dispatch
+            .extract_if(.., |s| removed.contains(&s.id))
+            .collect();
+        // Survivors first, then the subscribers added during the dispatch.
+        dispatch.append(&mut st.subs);
+        st.subs = dispatch;
         st.dispatching = false;
         st.in_dispatch = 0;
         drop(st);
@@ -457,13 +453,11 @@ impl Shared {
 
     fn end(&self, end: &OutputEnd) {
         let subs = {
+            // Published under the VT lock, where `subscribe` reads it.
             let mut st = lock(&self.vt);
-            st.output_end = Some(end.clone());
             let _ = self.output_end.set(end.clone());
-            let mut subs = std::mem::take(&mut st.subs);
-            subs.append(&mut st.pending_add);
             st.pending_remove.clear();
-            subs
+            std::mem::take(&mut st.subs)
         };
         for mut sub in subs {
             let _ = catch_unwind(AssertUnwindSafe(|| (sub.sink)(OutputEvent::End(end))));
@@ -733,32 +727,20 @@ impl Session {
         };
         let id = SubscriptionId(st.next_sub);
         st.next_sub += 1;
-        if let Some(end) = st.output_end.clone() {
+        if let Some(end) = self.sh.output_end.get() {
             drop(st);
-            let _ = catch_unwind(AssertUnwindSafe(|| sink(OutputEvent::End(&end))));
+            let _ = catch_unwind(AssertUnwindSafe(|| sink(OutputEvent::End(end))));
             return Ok((snap, id));
         }
-        let sub = Sub {
-            id,
-            start: st.output_offset,
-            sink,
-        };
-        if st.dispatching {
-            st.pending_add.push(sub);
-        } else {
-            st.subs.push(sub);
-        }
+        st.subs.push(Sub { id, sink });
         Ok((snap, id))
     }
 
     pub fn unsubscribe(&self, id: SubscriptionId) {
         let mut st = lock(&self.sh.vt);
         // Taken out and dropped after unlocking: a sink's captures may call the session.
-        let mut removed = take_sub(&mut st.subs, id);
-        if removed.is_none() {
-            removed = take_sub(&mut st.pending_add, id);
-        }
-        if st.dispatching {
+        let removed = take_sub(&mut st.subs, id);
+        if removed.is_none() && st.dispatching {
             st.pending_remove.push(id);
         }
         drop(st);
@@ -896,7 +878,7 @@ impl Session {
             match sh.vt.try_lock() {
                 Ok(st) => {
                     let snap = st.vt.snapshot(st.output_offset, deadline);
-                    let after_end = snap.is_some() && st.output_end.is_some();
+                    let after_end = snap.is_some() && sh.output_end.get().is_some();
                     (snap, after_end)
                 }
                 Err(_) => (None, false),

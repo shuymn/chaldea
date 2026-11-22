@@ -205,7 +205,7 @@ impl Snapshot {
 
 /// JSON rows of cell strings; trailing blank `Single` cells omitted.
 fn encode_grid(lines: &[Line]) -> String {
-    let rows: Vec<Value> = lines
+    let rows: Vec<Vec<&str>> = lines
         .iter()
         .map(|line| {
             let keep = line
@@ -213,15 +213,10 @@ fn encode_grid(lines: &[Line]) -> String {
                 .iter()
                 .rposition(|c| !c.is_blank())
                 .map_or(0, |i| i + 1);
-            Value::Array(
-                line.cells[..keep]
-                    .iter()
-                    .map(|c| Value::String(c.text.clone()))
-                    .collect(),
-            )
+            line.cells[..keep].iter().map(|c| c.text.as_str()).collect()
         })
         .collect();
-    Value::Array(rows).to_string()
+    serde_json::to_string(&rows).expect("string rows always serialize")
 }
 
 /// Why a grid is unreadable.
@@ -267,7 +262,7 @@ pub fn decode_grid(grid: &str, cols: u16, rows: u16) -> Result<Vec<Line>, GridEr
         });
     }
     let mut lines = Vec::with_capacity(rs.len());
-    for (r, row) in rs.iter().enumerate() {
+    for (r, row) in rs.into_iter().enumerate() {
         let Value::Array(cs) = row else {
             return Err(GridError::RowNotAnArray { row: r });
         };
@@ -277,18 +272,18 @@ pub fn decode_grid(grid: &str, cols: u16, rows: u16) -> Result<Vec<Line>, GridEr
                 cells: cs.len(),
             });
         }
-        let mut texts = Vec::with_capacity(cs.len());
-        for (c, cell) in cs.iter().enumerate() {
-            let Value::String(s) = cell else {
-                return Err(GridError::NotAString { row: r, col: c });
-            };
-            texts.push(s.as_str());
+        // Every cell is checked to be a string before the wide-pair checks.
+        if let Some(c) = cs.iter().position(|cell| !cell.is_string()) {
+            return Err(GridError::NotAString { row: r, col: c });
         }
         let mut cells: Vec<Cell> = Vec::with_capacity(usize::from(cols));
-        for (c, s) in texts.iter().enumerate() {
-            if s.is_empty() {
+        for (c, cell) in cs.into_iter().enumerate() {
+            let Value::String(text) = cell else {
+                unreachable!("checked above");
+            };
+            if text.is_empty() {
                 let lead =
-                    c > 0 && is_wide(texts[c - 1]) && cells[c - 1].width == CellWidth::Single;
+                    c > 0 && cells[c - 1].width == CellWidth::Single && is_wide(&cells[c - 1].text);
                 if !lead {
                     return Err(GridError::EmptyWithoutLead { row: r, col: c });
                 }
@@ -296,7 +291,7 @@ pub fn decode_grid(grid: &str, cols: u16, rows: u16) -> Result<Vec<Line>, GridEr
                 cells.push(Cell::tail());
             } else {
                 cells.push(Cell {
-                    text: (*s).to_owned(),
+                    text,
                     width: CellWidth::Single,
                 });
             }

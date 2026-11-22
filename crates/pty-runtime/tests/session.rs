@@ -158,8 +158,13 @@ fn subscribe_is_gapless() {
     let chunk = b"abc\x1b[1mdef\x1b[0mghi";
     r.child.emit(chunk);
     wait_parsed(&session, chunk.len() as u64);
+    // Parsing runs ahead of dispatch; wait for the sinks before checking bytes.
+    assert!(wait_until(|| all.lock().unwrap().len() >= chunk.len()));
     let (offset, got) = inner.lock().unwrap().clone().unwrap();
     assert_eq!(offset, 3, "subscribed after the first piece");
+    assert!(wait_until(
+        || got.lock().unwrap().bytes.len() >= chunk.len() - 3
+    ));
     assert_eq!(got.lock().unwrap().bytes, &chunk[3..]);
     assert_eq!(*all.lock().unwrap(), chunk);
 
@@ -184,8 +189,11 @@ fn subscribe_is_gapless() {
     wait_parsed(&session, base + stream.len() as u64);
     let full: Vec<u8> = chunk.iter().chain(stream.iter()).copied().collect();
     for (offset, got) in subs {
-        let g = got.lock().unwrap();
         let from = usize::try_from(offset).unwrap();
+        assert!(wait_until(
+            || got.lock().unwrap().bytes.len() >= full.len() - from
+        ));
+        let g = got.lock().unwrap();
         assert_eq!(g.bytes, &full[from..], "subscriber at {offset}");
         if let Some(first) = g.first {
             assert_eq!(first, offset);

@@ -25,7 +25,8 @@ pub(crate) enum DrainEvent<'a> {
 
 #[derive(Default)]
 struct Progress {
-    /// Bytes read and passed to the sink.
+    /// Bytes read and passed to the sink; kept only for `FakePty`'s startup barrier.
+    #[cfg(any(test, feature = "fake"))]
     delivered: u64,
     /// Set after the sink got the end.
     end: Option<OutputEnd>,
@@ -69,8 +70,11 @@ impl Drain {
                         bytes: &buf[..n],
                     });
                     offset += n as u64;
-                    lock(&st.progress).delivered = offset;
-                    st.changed.notify_all();
+                    #[cfg(any(test, feature = "fake"))]
+                    {
+                        lock(&st.progress).delivered = offset;
+                        st.changed.notify_all();
+                    }
                 };
                 drop(output);
                 sink.deliver(DrainEvent::End(&end));
@@ -80,14 +84,9 @@ impl Drain {
         Ok(Drain { state, join })
     }
 
-    /// Output bytes read and passed to the sink so far.
-    #[cfg_attr(not(test), allow(dead_code, reason = "used by drain tests and doctor"))]
-    pub(crate) fn bytes(&self) -> u64 {
-        lock(&self.state.progress).delivered
-    }
-
     /// Waits until the sink has processed at least `n` bytes or the output ended; false
     /// past `deadline`.
+    #[cfg(any(test, feature = "fake"))]
     pub(crate) fn wait_delivered(&self, n: u64, deadline: Instant) -> bool {
         let mut p = lock(&self.state.progress);
         loop {
@@ -268,7 +267,7 @@ mod tests {
     }
 
     /// The drain keeps reading when the sink is slow to return nothing: the sink is never
-    /// waited on beyond its own call, and `bytes` counts what was delivered.
+    /// waited on beyond its own call, and exactly what was delivered is counted.
     #[test]
     fn delivered_bytes_are_counted() {
         let (r, mut w) = io::pipe().unwrap();
@@ -276,7 +275,7 @@ mod tests {
         let d = Drain::start(r, sink).unwrap();
         w.write_all(&[b'x'; 100_000]).unwrap();
         assert!(d.wait_delivered(100_000, Instant::now() + Duration::from_secs(5)));
-        assert_eq!(d.bytes(), 100_000);
+        assert!(!d.wait_delivered(100_001, Instant::now() + Duration::from_millis(200)));
         drop(w);
         assert_eq!(d.finish(Duration::from_secs(5)), Some(OutputEnd::Eof));
     }

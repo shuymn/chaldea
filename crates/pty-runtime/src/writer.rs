@@ -280,7 +280,13 @@ struct Slot {
     id: u64,
     record: WriteRecord,
     done: Option<Completion>,
-    dispatched: bool,
+}
+
+impl Slot {
+    /// Whether the first write permission was granted (`started_at` is set with it).
+    fn dispatched(&self) -> bool {
+        self.record.started_at.is_some()
+    }
 }
 
 const REPLY: u64 = 0;
@@ -354,7 +360,8 @@ impl Queue {
                 evicted_through: self.evicted_through,
             });
         }
-        let mut out: Vec<WriteRecord> = self.ring.iter().filter(|r| r.seq > seq).cloned().collect();
+        let from = self.ring.partition_point(|r| r.seq <= seq);
+        let mut out: Vec<WriteRecord> = self.ring.range(from..).cloned().collect();
         if let Some(s) = &self.slot
             && s.record.seq > seq
         {
@@ -375,9 +382,13 @@ impl Queue {
                 s.record.finished_at = Some(Instant::now());
             }
             s.record.outcome = outcome;
-            self.log(s.record.clone());
-            if let Some(done) = s.done {
-                fired.completions.push((done, s.record));
+            match s.done {
+                Some(done) => {
+                    self.log(s.record.clone());
+                    fired.completions.push((done, s.record));
+                }
+                // A reply has no completion: its record moves into the ring.
+                None => self.log(s.record),
             }
         }
     }
@@ -410,7 +421,7 @@ impl Queue {
         if self
             .slot
             .as_ref()
-            .is_some_and(|s| s.id == id && !s.dispatched)
+            .is_some_and(|s| s.id == id && !s.dispatched())
         {
             self.settle_slot(WriteOutcome::NotStarted(Refusal::Cancelled), fired);
             return true;
@@ -426,7 +437,7 @@ impl Queue {
             self.user_bytes -= item.bytes;
             self.settle_queued(item, Refusal::Closed, fired);
         }
-        if self.slot.as_ref().is_some_and(|s| !s.dispatched) {
+        if self.slot.as_ref().is_some_and(|s| !s.dispatched()) {
             self.settle_slot(WriteOutcome::NotStarted(Refusal::Closed), fired);
         }
         self.discard_replies()
@@ -434,7 +445,7 @@ impl Queue {
 
     /// Close step 6: a dispatched unit still in the slot is settled by the closer.
     pub(crate) fn abandon_slot(&mut self, fired: &mut Fired) {
-        if self.slot.as_ref().is_some_and(|s| s.dispatched) {
+        if self.slot.as_ref().is_some_and(Slot::dispatched) {
             self.settle_slot(
                 WriteOutcome::Incomplete {
                     error: "unknown_after_close".into(),
@@ -564,10 +575,8 @@ fn facts(sh: &Shared) -> Facts {
     }
 }
 
+/// The caller has checked `closed` under the same queue lock.
 fn pre_check(q: &Queue, f: Facts, guard: &Guard, seq: u64) -> Option<Refusal> {
-    if q.closed {
-        return Some(Refusal::Closed);
-    }
     if f.exited {
         return Some(Refusal::ChildExited);
     }
@@ -639,7 +648,7 @@ pub(crate) fn writer_main(sh: &Arc<Shared>, handoff: &Receiver<Box<dyn Write + S
             let mut q = lock(&sh.q);
             // A dispatched unit panicked inside a permitted backend call, which may have
             // written more than the confirmed prefix: its span is uncertain, as after close.
-            if q.slot.as_ref().is_some_and(|s| s.dispatched) {
+            if q.slot.as_ref().is_some_and(Slot::dispatched) {
                 q.settle_slot(
                     WriteOutcome::Incomplete {
                         error: "unknown_after_panic".into(),
@@ -689,16 +698,12 @@ fn serve(sh: &Shared, input: &mut dyn Write) {
 fn write_reply(sh: &Shared, input: &mut dyn Write) {
     let (seq, bytes) = {
         let mut q = lock(&sh.q);
+        // Close, exit, and input breakage each clear the lane under the queue lock, and
+        // enqueue refuses after them, so a reply popped here may be written. The lane can
+        // be empty when the sampled batch was cleared.
         let Some(r) = q.replies.pop_front() else {
             return;
         };
-        let f = facts(sh);
-        if q.closed || f.exited || f.broken {
-            sh.responder
-                .dropped_after_end
-                .fetch_add(1, Ordering::Relaxed);
-            return;
-        }
         let seq = q.next_seq();
         let record = WriteRecord {
             seq,
@@ -716,7 +721,6 @@ fn write_reply(sh: &Shared, input: &mut dyn Write) {
             id: REPLY,
             record,
             done: None,
-            dispatched: true,
         });
         (seq, r.bytes)
     };
@@ -758,7 +762,6 @@ fn write_next_unit(sh: &Shared, input: &mut dyn Write) {
             outcome: WriteOutcome::InProgress,
         },
         done: Some(done),
-        dispatched: false,
     });
     let before = facts(sh);
     if let Some(r) = pre_check(&q, before, &guard, seq) {
@@ -810,7 +813,6 @@ fn write_next_unit(sh: &Shared, input: &mut dyn Write) {
     }
     let pos = q.input_pos;
     if let Some(s) = q.slot.as_mut() {
-        s.dispatched = true;
         s.record.started_at = Some(Instant::now());
         s.record.byte_start = pos;
     }
