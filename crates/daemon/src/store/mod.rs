@@ -281,10 +281,12 @@ struct Stop {
     /// The owner has finished with the readers (closed, or abandoned at its deadline); the
     /// writer may checkpoint.
     readers_released: bool,
-    /// The owner's report, once it returned.
+    /// The owner's report, once it returned, and when it was published.
     report: Option<ShutdownReport>,
-    /// The writer thread's report, published as its last statement.
+    report_at: Option<Instant>,
+    /// The writer thread's report, published as its last statement, and when.
     exit: Option<WriterExit>,
+    exit_at: Option<Instant>,
 }
 
 impl Shared {
@@ -341,8 +343,34 @@ impl Shared {
         self.update(|s| {
             if s.exit.is_none() {
                 s.exit = Some(exit);
+                s.exit_at = Some(Instant::now());
             }
         });
+    }
+
+    /// A later caller's view: the owner's and the writer's reports, as published by
+    /// `deadline`. Completion and timeout are decided, and the reports read, under one lock
+    /// acquisition; at a timeout, a report published after the deadline is left out.
+    fn observe(&self, deadline: Instant) -> (Option<ShutdownReport>, Option<WriterExit>) {
+        let mut s = lock(&self.stop);
+        loop {
+            if s.report.is_some() && s.exit.is_some() {
+                return (s.report.clone(), s.exit.clone());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                let by = |at: Option<Instant>| at.is_some_and(|t| t <= deadline);
+                return (
+                    s.report.clone().filter(|_| by(s.report_at)),
+                    s.exit.clone().filter(|_| by(s.exit_at)),
+                );
+            }
+            s = self
+                .stop_cv
+                .wait_timeout(s, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
     }
 }
 
@@ -478,18 +506,20 @@ impl Store {
             if stop.owned {
                 false
             } else {
-                stop.owned = true;
-                drop(stop);
+                // Everything a later caller may rely on is done before it can see `owned`:
+                // intake closed and the store's notification sender dropped.
                 inner.shared.shutting_down.store(true, Ordering::SeqCst);
                 drop(sender.take());
                 inner.pool.close();
+                drop(lock(&inner.notifier).take());
+                stop.owned = true;
                 true
             }
         };
         if !owner {
             return self.observe(deadline);
         }
-        drop(lock(&inner.notifier).take());
+        inner.faults.mark("intake_transition");
         inner.faults.mark("intake_closed");
         // (2) The writer runs the queued jobs meanwhile. (3) Close every reader connection:
         // idle ones now, lent ones as they come back, until the deadline; then let the writer
@@ -503,17 +533,18 @@ impl Store {
         inner.shared.update(|s| s.readers_released = true);
         // (4) The writer checkpoints and its thread ends. (5) Wait for that until the deadline.
         let exit = inner.shared.wait_until(Some(deadline), |s| s.exit.clone());
-        if exit.is_some() {
-            // The report is the thread's last statement; join it once it has returned.
-            let mut w = lock(&inner.writer);
-            if w.as_ref().is_some_and(JoinHandle::is_finished)
-                && let Some(h) = w.take()
-            {
-                let _ = h.join();
-            }
+        // The owner always gives up the thread's handle: it joins a thread that has returned
+        // and detaches one still running, whose report still reaches `Shared`.
+        if let Some(h) = lock(&inner.writer).take()
+            && h.is_finished()
+        {
+            let _ = h.join();
         }
         let report = report(readers_returned, readers_abandoned, exit);
-        inner.shared.update(|s| s.report = Some(report.clone()));
+        inner.shared.update(|s| {
+            s.report = Some(report.clone());
+            s.report_at = Some(Instant::now());
+        });
         report
     }
 
@@ -521,13 +552,8 @@ impl Store {
     /// owner's report and the writer thread's exit), then reports what it observed: the
     /// owner's reader outcome once the owner returned, and the writer's exit if it ended.
     fn observe(&self, deadline: Instant) -> ShutdownReport {
-        let shared = &self.inner.shared;
-        let done = |s: &Stop| (s.report.is_some() && s.exit.is_some()).then_some(());
-        shared.wait_until(Some(deadline), done);
-        let (owner, exit) = {
-            let s = lock(&shared.stop);
-            (s.report.clone(), s.exit.clone())
-        };
+        let (owner, exit) = self.inner.shared.observe(deadline);
+        self.inner.faults.mark("observe_waited");
         match owner {
             Some(r) => report(r.readers_returned, r.readers_abandoned, exit),
             None => report(false, self.inner.pool.open(), exit),

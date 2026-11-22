@@ -132,3 +132,93 @@ fn reported_writer_exit_has_closed_notifications() {
         Err(TryRecvError::Closed)
     ));
 }
+
+/// The writer ended on its own (a panic outside a job) while the owner is between closing
+/// intake and finishing: a later call that reports the exit finds notifications closed.
+#[test]
+fn later_report_of_an_early_writer_exit_has_closed_notifications() {
+    use std::sync::atomic::Ordering;
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let gates = Gates::default();
+    let (_dir, s, _) = store_with(gates.faults());
+    let mut notifications = s.subscribe();
+    // Set from inside a running job, so the writer panics right after it, outside any job,
+    // and publishes its exit.
+    let faults = s.inner.faults.clone();
+    s.submit(soon(), move |_| {
+        faults.panic_outside_job.store(true, Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap()
+    .blocking_wait()
+    .unwrap();
+    let (reached, release) = gates.arm("intake_transition");
+    let a = in_thread(&s, Duration::from_secs(30));
+    reached.recv_timeout(WAIT).expect("the owner closed intake");
+    let b = in_thread(&s, Duration::from_secs(2))
+        .recv_timeout(WAIT)
+        .expect("a later call returns by its deadline");
+    let notification = notifications.try_recv();
+    drop(release);
+    a.recv_timeout(Duration::from_secs(40))
+        .expect("the owner returns");
+    assert!(b.writer_exited, "{b:?}");
+    assert!(
+        matches!(notification, Err(TryRecvError::Closed)),
+        "{notification:?}"
+    );
+}
+
+/// The owner returns before the writer thread ends: it still gives up the thread's handle
+/// (detaching it), so no store clone keeps it.
+#[test]
+fn owner_detaches_a_writer_still_running() {
+    let gates = Gates::default();
+    let (_dir, s, _) = store_with(gates.faults());
+    let (reached, release) = gates.arm("writer_exiting");
+    let a = in_thread(&s, Duration::from_millis(500))
+        .recv_timeout(WAIT)
+        .expect("the owner returns by its deadline");
+    reached
+        .recv_timeout(WAIT)
+        .expect("the writer reached its last step");
+    let kept = s.inner.writer.lock().unwrap().is_some();
+    drop(release);
+    assert!(!a.writer_exited, "{a:?}");
+    assert!(!kept, "the owner left the writer's handle in the store");
+    let later = s.shutdown(Instant::now() + WAIT);
+    assert!(later.writer_exited, "{later:?}");
+}
+
+/// A later call that timed out reports only what was published by its deadline, even when
+/// the writer exits before it reads the state.
+#[test]
+fn later_call_reports_only_progress_by_its_deadline() {
+    let gates = Gates::default();
+    let (_dir, s, _) = store_with(gates.faults());
+    let (exiting, release_writer) = gates.arm("writer_exiting");
+    let a = in_thread(&s, Duration::from_millis(300))
+        .recv_timeout(WAIT)
+        .expect("the owner returns by its deadline");
+    assert!(!a.writer_exited, "{a:?}");
+    exiting
+        .recv_timeout(WAIT)
+        .expect("the writer is held at its last step");
+    let (waited, release_b) = gates.arm("observe_waited");
+    let b = in_thread(&s, Duration::from_millis(300));
+    waited.recv_timeout(WAIT).expect("the later call timed out");
+    drop(release_writer);
+    let deadline = Instant::now() + WAIT;
+    while crate::store::lock(&s.inner.shared.stop).exit.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the writer never published its exit"
+        );
+        std::thread::yield_now();
+    }
+    drop(release_b);
+    let b = b.recv_timeout(WAIT).expect("the later call returns");
+    assert!(!b.writer_exited, "{b:?}");
+    assert_eq!(b.checkpoint, crate::store::Checkpoint::NotRun, "{b:?}");
+}
