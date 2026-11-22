@@ -1044,7 +1044,11 @@ impl OutputReceiver {
         if self.done.load(Ordering::Acquire) {
             return Err(RecvTimeoutError::Disconnected);
         }
-        let item = lock(&self.rx).recv_timeout(timeout)?;
+        // One deadline for both: another receiver may hold the receiving side.
+        let deadline = Instant::now() + timeout;
+        let rx = try_lock_until(&self.rx, deadline).ok_or(RecvTimeoutError::Timeout)?;
+        let item = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))?;
+        drop(rx);
         match &item {
             Received::Bytes { bytes, .. } => {
                 self.queued.fetch_sub(bytes.len(), Ordering::AcqRel);

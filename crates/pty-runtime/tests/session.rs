@@ -1148,3 +1148,24 @@ fn failed_spawn_reports_unconfirmed_kill_with_ends_released() {
         ]
     );
 }
+
+/// PR2-CL-24: one deadline bounds both waiting for the receiver's side and the receive,
+/// so a receiver held elsewhere (another `recv_timeout`) cannot extend this call.
+#[test]
+fn recv_timeout_holds_its_bound_against_another_receiver() {
+    let (_sink, rx) = channel_sink(64);
+    let rx = Arc::new(rx);
+    let held = rx.hold();
+    let r2 = rx.clone();
+    let (tx, done) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let t = Instant::now();
+        let r = r2.recv_timeout(ms(10));
+        let _ = tx.send((r, t.elapsed()));
+    });
+    let got = done.recv_timeout(Duration::from_secs(2));
+    drop(held);
+    let (r, took) = got.expect("recv_timeout did not return while the receiver was held");
+    assert_eq!(r, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+    assert!(took < Duration::from_secs(1), "{took:?}");
+}
