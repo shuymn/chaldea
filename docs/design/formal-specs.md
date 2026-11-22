@@ -174,12 +174,12 @@ From `specs/`:
 ```
 pnpm install --frozen-lockfile
 pnpm run typecheck      # quint typecheck of every spec and traces file
-pnpm run simulate       # each spec x seeds 1-4 in parallel, --max-samples 1000, --max-steps 40, all invariants and witnesses
+pnpm run simulate       # each spec x seeds 1-4, pooled over the cores, --max-samples 1000, --max-steps 40, all invariants and witnesses
 pnpm run traces:check   # spec and specs/traces/ agree
 pnpm run traces:write   # regenerate specs/traces/ after a spec change
 ```
 
-The `specs` job of `ci.yml` (`ubuntu-latest`, mise pinned in `mise-action`) installs Node and pnpm through mise and runs those checks. `lefthook.yml` runs typecheck and the trace check on commit and the simulation on push for changes under `specs/`, each after `pnpm install --frozen-lockfile` (about 50 ms when `node_modules` is up to date), and runs the workspace tests on push when a trace changes. `verifyDepsBeforeRun: error` in `pnpm-workspace.yaml` also makes every `pnpm run` fail while `node_modules` does not match `package.json` and the lockfile. The simulation size reaches every witness. The twelve runs (three specs, four seeds) take about 25 s in parallel on a development machine (Q-A alone about 15 s); install, typecheck, simulation, and trace check from an empty `node_modules` (pnpm store warm) about 40 s. The simulation is about 200 CPU-seconds, so CI's four vCPUs need about a minute for it (estimated, not measured on CI).
+The `specs` job of `ci.yml` (`ubuntu-latest`, mise pinned in `mise-action`) installs Node and pnpm through mise and runs those checks. `lefthook.yml` runs typecheck and the trace check on commit and the simulation on push for changes under `specs/`, each after `pnpm install --frozen-lockfile` (about 50 ms when `node_modules` is up to date), and runs the workspace tests on push when a trace changes. `verifyDepsBeforeRun: error` in `pnpm-workspace.yaml` also makes every `pnpm run` fail while `node_modules` does not match `package.json` and the lockfile. The simulation size reaches every witness. The twelve runs (three specs, four seeds) run at most one per available core (`os.availableParallelism()`) and take about 40 s on a 12-core development machine (Q-A alone about 14 s per seed). The simulation is about 265 CPU-seconds, so CI's four vCPUs need about 70 s for it (estimated, not measured on CI).
 
 **Apalache** (`quint verify`) is not in CI and is unverified: it needs a Java runtime and downloads Apalache, and whether it accepts the spec's list folds and maps of records is untested. To try it: `pnpm exec quint verify thread_input.qnt --invariant allInvariants --max-steps 10`.
 
@@ -188,68 +188,70 @@ The `specs` job of `ci.yml` (`ubuntu-latest`, mise pinned in `mise-action`) inst
 - **PR 9** implements the buffering and promotion the model's `buffer*` actions and `bind` state (hole d).
 - **PR 10** makes the supervisor layer real: each guard here is a checklist item, it decides holes a–c and the recheck-attempt choice of §3, and it grows the model where §1 says. A changed guard changes the spec and its traces in the same PR.
 - **PR 13–14** correlate card resolutions and card keys by `approval_id` (the card finding).
-- **PR 7b, 7c, 18** implement what Q-B states; §7.4 lists the obligations it hands them.
+- **PR 7b, 7c, 8, 18** implement what Q-B states; §7.4 lists the obligations it hands them.
 - **PR 17**'s `stateright` model checks the Rust sync code; Q-B checks the contract it implements (§7.7).
 - **Phase 2 relay**: §7.1 says where it plugs into Q-B.
 
 ## 7. Q-B: Sync Seam
 
-Q-B checks the Sync Seam protocol of mvp §2.4 and the PR 7 design (http §2.6–§2.8, §8 D14, D15) under interleavings before PR 7b (sync reads, WebSocket) and 7c (commands, receipts) implement it. It assumes PR 6's store guarantees (store §2.2, §2.7, §2.8): atomic commits, gapless per-stream `seq`, idempotency, an epoch fixed when the database is created, and one read snapshot per call. Two modules, simulated and traced separately:
+Q-B checks the Sync Seam protocol of mvp §2.4 and the PR 7 design (http §2.5–§2.8, §8 D14, D15) under interleavings before PR 7b (sync reads, WebSocket) and 7c (commands, receipts) implement it. It assumes PR 6's store guarantees (store §2.2, §2.7, §2.8): atomic commits, gapless per-stream `seq`, idempotency, an epoch fixed when the database is created, and one read snapshot per call. Where mvp §2.4 leaves a rule open, the model implements the proposed contract text of §7.4 (F1, F2), to land in mvp §2.4 with PR 7. Two modules, simulated and traced separately:
 
-- `specs/sync.qnt`: replay, paging, snapshots, epochs, and notify-then-pull;
-- `specs/receipts.qnt`: command receipts across retries, lost replies, writer contention, and restarts.
+- `specs/sync.qnt`: replay, paging, snapshots, epochs, stream existence, and notify-then-pull;
+- `specs/receipts.qnt`: command receipts across retries, lost replies, deadlines, writer contention, and restarts.
 
 ### 7.1 What Q-B Models
 
 Each module has the two layers of Q-A: a mirror of the `core` function, `decideReplay` of `sync::decide_replay` and `checkReceipt` of `command::check_receipt`, branch for branch, whose calls each step records for the replay (§7.5); and the protocol as actions whose guards and effects are the contract.
 
-**Actors** (`sync.qnt`). One host, authoritative: one database with its epoch and a log per stream; a new database is the next epoch with empty streams (the old epochs' logs stay as ghosts, since a client may still hold their events). Two clients, PWA-like: client 1 follows both streams, client 2 a nondeterministic set; each holds one epoch, a local copy per stream (events ending at its cursor, the cursor, the rendered state), a fetch due flag per stream, and its current requests. The network: requests and responses are sets, so any can be lost, delayed, or overtaken (one request per connection orders none of them, mvp §2.5); each client's socket is a FIFO of frames, any of which can be lost (a lagging receiver or a coalesced frame). A daemon restart drops every socket and every request in flight; responses already sent may still arrive.
+**Actors** (`sync.qnt`). One host, authoritative: one database with its epoch, a log per stream, and the set of streams that exist; a new database is the next epoch with empty streams, and a thread stream may not exist in it (`reset(threadKept)`); the old epochs' logs stay as ghosts, since a client may still hold their events. The host answers each request from one read: 404 for a stream that does not exist, otherwise `decide_replay` and a page or a snapshot; a read may also fail (408 at its cutoff, 503 `busy`). A host snapshot carries no events (`HostSnapshot`), a thread snapshot one recent event. Two clients, PWA-like: client 1 follows both streams, client 2 a nondeterministic set; each holds one epoch, a local copy per stream (events ending at its cursor, the cursor, the rendered state, whether older events exist), the heads its socket announced for the epoch held, `has_more` per stream, and its current forward and backward request per stream. The network: requests and responses are sets, so any can be lost, delayed, or overtaken (one request per connection orders none of them, mvp §2.5). Each socket keeps, as http §2.6 does, the heads it knows (`known`, merged by subscribes, refreshes, and commits) and builds one frame at send selection: `heads` when one is due (a subscribe or a refresh since the last), otherwise `stream_advanced` for a stream whose known head passed the one announced; a frame in flight can be lost. A daemon restart drops every socket and every request in flight; responses already sent may still arrive.
 
-**Bounds.** Two streams (host, thread), two epochs, five events per stream and epoch, four requests plus responses in flight, event sizes 1 or 3 units. `decide_replay`'s bounds are scaled: `REPLAY_MAX_EVENTS` 2 (one model seq stands for 5 000), `REPLAY_MAX_BYTES` 4 units (one unit for 2 MiB); each comparison in `decide_replay` is linear, so the scaled call takes the same branch, and the replay checks it at the real bounds. A snapshot carries one recent event.
+**Bounds.** Two streams (host, thread), two epochs, five events per stream and epoch, four requests plus responses in flight, event sizes 1 or 3 units. `decide_replay`'s bounds are scaled: `REPLAY_MAX_EVENTS` 2 (one model seq stands for 5 000), `REPLAY_MAX_BYTES` 4 units (one unit for 2 MiB); each comparison in `decide_replay` is linear, so the scaled call takes the same branch (§7.5).
 
-**What a client renders** is a stream's projection, `Proj`: the latest `surface_update` and a counter of the thread's status changes. A snapshot carries it as of `as_of_seq`; events after it update it. A host snapshot also carries the thread's status read in the same snapshot (its `ThreadInfo`, a field of another stream; §7.4 F1).
+**What a client renders** is a stream's projection, `Proj`: the latest `surface_update` and a counter of the thread's status changes. A snapshot carries it as of `as_of_seq`; events after it update it. A host snapshot also carries the thread's status from the same read, a field the thread stream owns, kept only as an initial value (F1).
 
-**Client rules** (the model's reading of mvp §2.4; PR 18 implements them, §7.4):
+**Client rules** (PR 18 implements them, §7.4):
 
 | Rule | Source |
 |---|---|
 | A forward fetch sends the cursor and the epoch held (none before the first response) | mvp §2.4 "Replay" |
-| The current request per stream and direction is the latest issued; it stops being current when answered or timed out, when a snapshot replaces that stream's copy, and for every stream on an epoch switch or reconnect. A response to any other request is of an older generation and changes nothing | mvp §2.4 "a response from an older request generation is discarded"; the scope is the model's (§7.4 F2) |
-| A forward response with another epoch switches epoch and every local copy together: all copies dropped, every followed stream due; a forward page becomes the new copy only if it starts at the stream's beginning | mvp §2.4 "only a forward response … may establish a new epoch" |
-| A backward page with another epoch switches nothing and makes a forward resync due | mvp §2.4 "Backward history" |
-| A same-epoch snapshot (a bound or `CursorAhead`) replaces the stream's copy | mvp §2.4 "Snapshot fallback" |
-| `has_more` makes the next forward page due | — (PR 18 obligation; convergence also holds through `heads` without it, more slowly) |
-| `stream_advanced` or a `heads` entry above the cursor of a followed stream makes a fetch due; `heads` is a snapshot of the listed streams | mvp §2.4 "Live notifications"; http §8 D15 |
-| Reconnect: a new socket, a `subscribe` of the followed set, and a refetch of every followed stream | mvp §2.4 "the client refetches on every reconnect" |
-| `subscribe` replaces the set; a later one replaces an unanswered one, answered by one `heads` for the latest set | http §2.6, §8 D15 |
+| A request is current until answered, timed out, or made older by an event of F2; a response to any other request is discarded and changes nothing | F2 |
+| A forward response with another epoch than the one held, none included, establishes or switches the epoch and every local copy together: all copies dropped, every other request older, every followed stream due; a page becomes the new copy only if it starts at the stream's beginning | mvp §2.4 "only a forward response … may establish a new epoch"; F2 |
+| A backward page with another epoch switches nothing and makes a forward resync due; a backward page is fetched only while `has_more_before` (or a snapshot's `as_of_seq` above its recent events) says older events exist, from the oldest event held or `as_of_seq + 1` | mvp §2.4 "Backward history" |
+| A same-epoch snapshot (a bound or `CursorAhead`) replaces the stream's copy and makes the stream's other requests older | mvp §2.4 "Snapshot fallback"; F2 |
+| A followed stream is due while its fetch was asked for (first fetch, reconnect, epoch switch, failed read), while `has_more`, or while a head announced on the socket of the epoch held is above the cursor; a delivered response does not clear an announced head | mvp §2.4 "Live notifications"; http §8 D15 |
+| A 404 ends following the stream: its copy is dropped and a `subscribe` without it is sent; `heads` lists only existing streams | §7.4 obligations (PR 18) |
+| A failed read (408, 503) leaves the forward fetch due | §7.4 obligations (PR 18) |
+| Reconnect: a new socket, a `subscribe` of the followed set, a refetch of every followed stream, announced heads forgotten | mvp §2.4 "the client refetches on every reconnect" |
+| `subscribe` replaces the set (the empty set and the same set included); a later one replaces an unanswered one, answered by one `heads` for the latest set | http §2.6, §8 D15 |
+| Fields a snapshot carries for another stream are rendered from that stream | F1 |
 
-**Convergence is a bounded-liveness check.** The `quiesce` action restores connectivity (every client without a socket reconnects), stops writes and losses, and runs the protocol on one fixed fair schedule (responses, requests, subscribes, frames, due fetches, timeouts of lost requests, then up to two heads refreshes) for at most 60 steps; `convergedAfterQuiesce` then requires every client to hold the host's epoch, cursor, and rendered state for each stream it follows. A bound rather than an "eventually": Quint's simulator checks state predicates, and an unbounded liveness property cannot fail in a finite run, while a step bound fails as soon as the protocol stalls (dropping the periodic `heads` does, §7.6). The schedule is one fair schedule, not all of them; the simulator samples the same transitions in every order as ordinary steps, where the safety invariants are checked, but the intermediate states inside one `quiesce` are not. Fewer than 40 steps were needed over 1 000 samples.
+**Convergence is a bounded-liveness check.** The `quiesce` action restores connectivity (every client without a socket reconnects), stops writes and losses, and runs the protocol on one fixed fair schedule (responses, requests, subscribes, frames, due fetches, timeouts of lost requests, then up to two heads refreshes) for at most 60 steps; `convergedAfterQuiesce` then requires every client to follow only existing streams and to hold the host's epoch, cursor, and rendered state for each. A bound rather than an "eventually": Quint's simulator checks state predicates, and an unbounded liveness property cannot fail in a finite run, while a step bound fails as soon as the protocol stalls. The schedule is one fair schedule, not all of them; the simulator samples the same transitions in every order as ordinary steps, and `trace_notified_during_fetch` and `trace_notified_after_response` fix both orders of a notification and a response. Inside a `quiesce`, the safety invariants are evaluated after every response delivered (`last.inner`): only a delivery changes a copy or a client's epoch, and the host does not change, so the state invariants cannot change on the other steps and the step invariants hold trivially on them.
 
-**Actors** (`receipts.qnt`). Clients sending a command with a `command_id`, a token, and a request identity (two of each; identity 1 is a command completed in its intent job, `send`; identity 2 one with an effect, `stop`), and retrying with the same three at any time (a lost reply is a retry). One writer runs jobs one at a time in order (store §2.2): an intent job whose deadline passed is `Expired` without running; otherwise it looks the receipt up and, for `New`, inserts it `in_progress` with the intent in one transaction (completed in the same job for `send`); its outcome is `Ok` or `CommitUnknown` that did or did not commit, the latter putting the writer in its failed state, where every queued job is `Failed`. The runner starts the effect once after an `Ok` intent and submits the completion when the effect reports. The request replies from the progress it sees once its runner is done or its deadline plus the grace passed (http §2.8 table). A restart decides the running job, drops every connection, queued job, and effect, and turns every `in_progress` receipt into `unknown_after_crash`.
+**Actors** (`receipts.qnt`). Clients sending a command with a `command_id`, a token, and a request identity (two of each; identity 1 is a command completed in its intent job, `send`; identity 2 one with an effect, `stop`), and retrying with the same three at any time (a lost reply is a retry). Four things are kept apart per request (http §2.5, §2.8): its admission deadline (`deadline`: a body not read by then is 408 with nothing submitted, and the writer does not start an intent job after it), the end of the reply grace (`grace`), what the store made durable (`receipts`), and what the runner observed of the writer's reply (`observe`). One writer runs jobs one at a time in order (store §2.2): an intent job past its deadline replies `Expired` without running; otherwise it looks the receipt up and, for `New`, inserts it `in_progress` with the intent in one transaction (completed in the same job for `send`); its outcome is `Ok` or `CommitUnknown` that did or did not commit, the latter putting the writer in its failed state, where every queued job is `Failed`. The runner starts the effect once after it observed the intent committed with the effect pending, and submits the completion when the effect reports a result (200, or a stored 409 when it refused). The request replies from what the runner observed, once it is done or the grace ended (http §2.8 table): unobserved is 503 `outcome_unknown`, even with the receipt durable (http §8 D14). A restart decides the running job (its lookup recorded), drops every connection, runner, queued job, unobserved reply, and effect, and turns every `in_progress` receipt into `unknown_after_crash`.
 
-**Not modelled.** Authorization and 404s, blobs, tickets, token revocation, the socket's read and send deadlines (a socket that misses them is a disconnect), `hello`, `busy` and queue-full replies, the completion budget's retries (a completion that cannot commit is `CompletionFailed`), the shutdown drain, and the store's internals.
+**Not modelled.** Authorization (a stream the token may not read is the same 404 as a missing one), blobs, tickets, token revocation, the socket's read and send deadlines (a socket that misses them is a disconnect), `hello`, `busy` and queue-full replies to commands, the completion budget's retries (a completion that cannot commit is `CompletionFailed`), the shutdown drain, real time, and the store's internals.
 
 **Phase 2 relay.** The host stays the only authority, so a relay is one more actor between the clients and the host. In `sync.qnt` it would hold a per-stream cache keyed by `stream_id` and `epoch`, answer `serve` from it (a head at most the host's, of the host's epoch or an older one) or forward the request, and send its own notifications; the client rules and every invariant stay as they are, and convergence is checked after the relay catches up. In `receipts.qnt` it forwards `send` attempts unchanged by `command_id`, possibly losing or repeating them, which the clients' retries already cover.
 
 ### 7.2 State and Actions
 
-`sync.qnt` (`st`, one record; `last`: the action, the `decide_replay` calls, the clients before the step):
+`sync.qnt` (`st`, one record; `last`: the action, the `decide_replay` calls, the clients before the step, the invariants inside a `quiesce`):
 
 | Variable | Meaning |
 |---|---|
-| `st.host` | the current epoch and every epoch's log per stream |
-| `st.clients` | per client: epoch held, copy per stream, current forward and backward request per stream, fetch due, followed set; ghosts `lastFwd`, `lastBwd`, `resetAt` for the generation invariant |
-| `st.sockets` | per client's socket: open, subscription set, unanswered subscribe, frames in order |
+| `st.host` | the current epoch, every epoch's log per stream, the streams each epoch has |
+| `st.clients` | per client: epoch held, copy per stream, current forward and backward request per stream, fetch asked for, `has_more`, announced heads and the epoch of the socket that announced them, followed set; ghosts `lastFwd`, `lastBwd`, `resetAt`, `cancelled` (generations) and `lost` (streams a lost frame named) |
+| `st.sockets` | per client's socket: open, subscription set, unanswered subscribe, known and announced heads, `heads` due, the frame in flight |
 | `st.reqs`, `st.resps`, `st.nextId` | requests not yet served and responses in transit, by request id |
 
 | Action | What |
 |---|---|
-| `appendA(x, kind, size)` | the host commits one event; every open socket subscribed to its stream gets `stream_advanced` |
-| `restart`, `reset` | a daemon restart; a new database (the next epoch) with a restart |
-| `connectA(c)`, `disconnectA(c)`, `resubscribeA(c, w)` | reconnect (subscribe and refetch), a dropped socket, a new followed set |
+| `appendA(x, kind, size)` | the host commits one event; its head merges into every subscribed socket's `known` |
+| `restart`, `reset(threadKept)` | a daemon restart; a new database (the next epoch), with or without the thread stream, with a restart |
+| `connectA(c)`, `disconnectA(c)`, `resubscribeA(c, w)` | reconnect (subscribe and refetch), a dropped socket, a new followed set (any, the empty and the same set included) |
 | `fetchA(c, x, limit)`, `fetchBackA(c, x, limit)`, `timeoutA(c, x, dir)` | a forward fetch from the cursor, a backward page before the oldest event held, a request given up |
-| `serveA(id)`, `loseReq(id)`, `loseResp(id)`, `deliverA(id)` | the host answers from one read snapshot; the network loses a request or response; the client applies a response |
-| `serverSubscribeA(c)`, `headsRefreshA(c)`, `recvNoteA(c)`, `dropNote(c, i)` | `heads` for the latest subscribe; the periodic `heads`; the client takes the next frame; a frame is lost |
+| `serveA(id)`, `failReadA(id)`, `loseReq(id)`, `loseResp(id)`, `deliverA(id)` | the host answers from one read; the read fails; the network loses a request or response; the client applies a response |
+| `serverSubscribeA(c)`, `headsRefreshA(c)`, `sendFrameA(c)`, `recvNoteA(c)`, `dropNote(c)` | the latest subscribe is answered (`heads` due); a refresh (`heads` due); the socket selects and builds a frame; the client takes it; it is lost |
 | `quiesce` | connectivity returns, writes stop, and the protocol runs to its fixpoint (§7.1) |
 | `rawFetch(c, x, q)` | a forward request with any query (replay coverage of refusals and `CursorAhead`) |
 
@@ -257,69 +259,114 @@ Each module has the two layers of Q-A: a mirror of the `core` function, `decideR
 
 | Variable | Meaning |
 |---|---|
-| `st.receipts` | per `command_id`: token, request identity, status |
+| `st.receipts` | per `command_id`: token, request identity, status (a stored result is a body and an HTTP status) |
 | `st.queue`, `st.running`, `st.failed` | the writer's jobs, the job it runs, its failed state |
-| `st.effects`, `st.attempts` | effects running; per request: identity, progress, deadline passed, connection alive, replied |
-| `st.intents`, `effectStarts`, `creator`, `stored`, `markedUnknown`, `afterUnknown`, `committed`, `replies` | history the invariants read |
+| `st.effects`, `st.attempts` | effects running; per request: identity, submitted, deadline passed, grace over, the writer's unobserved reply, what the runner observed, connection alive, replied |
+| `st.intents`, `effectStarts`, `creator`, `stored`, `markedUnknown`, `afterUnknown`, `committed`, `replies` | history the invariants read; each reply records the durable receipt, the observation, and whether its job was submitted |
 
 | Action | What |
 |---|---|
-| `send(c, t, h)` | a request or a retry: its runner registered and its intent job queued |
-| `tick(a)` | the request's deadline passes |
-| `writerStart`, `writerFinish(w)`, `writerFail` | the writer takes the next job (an expired intent job ends `Expired`), ends it `Ok` or `CommitUnknown`, or fails a queued job |
-| `effectDone(c)` | the effect reports; the runner queues the completion |
-| `replyTo(a)` | the request replies from its progress |
+| `send(c, t, h)` | a request or a retry arrives; its body is being read |
+| `submit(a)`, `deadline(a)`, `grace(a)` | the body was read in time and the intent job queued; the admission deadline passes; the reply grace ends |
+| `writerStart`, `writerFinish(w)`, `writerFail` | the writer takes the next job (an expired intent job replies `Expired`), ends it `Ok` or `CommitUnknown`, or fails a queued job |
+| `observe(a)` | the runner observes the writer's reply; on a committed intent with its effect pending it starts the effect |
+| `effectDone(c, ok)` | the effect reports a result (200, or 409 when it refused); the runner queues the completion |
+| `replyTo(a)` | the request replies from what the runner observed |
 | `restart(committed)` | a crash and restart; the running job committed or not |
 
 ### 7.3 Invariants
 
-All are checked by `pnpm run simulate`. Each reads facts recorded where they happen; the last column is a spec mutation that violates it, judged by the exit status of a run at the CI size with only that invariant (§7.6).
+All are checked by `pnpm run simulate`. Each reads facts recorded where they happen; the last column is the spec mutation of §7.6 that violates it.
 
 | Invariant | Statement | Source | Violated by |
 |---|---|---|---|
-| `noGapNoDup` | a copy holds consecutive events ending at its cursor, none twice, none missing after a snapshot's recent events | mvp §2.4; CL-13 "without duplicates"; CL-9 | applying responses of any generation |
-| `heldEventsOnHost` | every event a client holds is the host's event at that position of the epoch the client holds, and the cursor is within that epoch's head | mvp §2.4; CL-13 | prepending a backward page of another epoch |
+| `noGapNoDup` | a copy's events are consecutive and end at its cursor | mvp §2.4; CL-13 "without duplicates"; CL-9 | a forward fetch from one before the cursor |
+| `heldEventsOnHost` | every event a client holds is the host's event at that position of the copy's epoch, the cursor is within that epoch's head, and the copy says older events exist exactly when its oldest event held is above 1 | mvp §2.4; CL-13 | a snapshot claiming older events when it holds all |
 | `noMixedEpochs` | every copy and every event a client holds is of the epoch it holds | mvp §2.4 "switching epoch and local state together" | an epoch switch that keeps the other streams' copies |
 | `renderedStateAtCursor` | what a copy renders is the host's projection at the copy's cursor | mvp §2.4 "Everything a client renders is in a snapshot or in events after `as_of_seq`" | forward events not applied to the rendered state |
-| `olderResponsesChangeNothing` | a response of an older generation (by the ghosts, not by the guard) leaves the client unchanged | mvp §2.4 "a response from an older request generation is discarded" | applying responses of any generation |
-| `epochNeverRegresses` | a client never goes back to an epoch the host left (the model numbers epochs in creation order to state it) | mvp §2.4 "only a forward response … may establish a new epoch" | an epoch switch that keeps the other streams' requests current: caught only by `trace_refused_stale_epoch_after_switch` |
-| `convergedAfterQuiesce` | after connectivity returns and writes stop, every client converges within 60 fair steps (§7.1) | mvp §2.4 "Live notifications"; CL-13; http §8 D15 | no periodic `heads` |
+| `appliedKeepsHeld` | an applied response keeps what the copy held and adds what it carried: a forward page the held events plus its own with the cursor at its last, a backward page the held events plus its own, a snapshot exactly its recent events at `as_of_seq` | mvp §2.4 "Replay", "Backward history", "Snapshot fallback" | a forward page replacing the held events |
+| `olderResponsesChangeNothing` | a response of an older generation, by the ghosts recorded at the events of F2 (not by the guard), leaves the client unchanged | F2 | each dropped `clearRequests` call: on reconnect, epoch establishment or switch, dropped stream, same-epoch snapshot; a timeout that keeps the request current |
+| `epochOnlyFromCurrentForward` | a client's epoch changes only on a forward response, current by the ghosts, carrying that epoch | mvp §2.4 "only a forward response … may establish a new epoch"; F2 | a backward page of another epoch switching the epoch |
+| `epochNeverRegresses` | a client never goes back to an epoch the host left (the model numbers epochs in creation order to state it) | mvp §2.4 | applying responses of any generation |
+| `convergedAfterQuiesce` | after connectivity returns and writes stop, every client follows only existing streams and holds the host's state of each within 60 fair steps (§7.1) | mvp §2.4 "Live notifications"; CL-13; http §8 D15 | a stream due only on `need` and `has_more`, not on an announced head |
 | `oneIntentPerCommand` | one `command_id` causes at most one intent | mvp §2.4 "Insert"; CL-8; PR7-CL-18 | `check_receipt` answering `New` for `in_progress` |
-| `oneEffectPerCommand` | one `command_id` starts at most one effect, across retries and restarts | CL-8; PR7-CL-19 | `check_receipt` answering `New` for `unknown_after_crash` |
-| `receiptIffIntent` | a receipt exists exactly when its intent committed | mvp §2.4 "Insert" | a restart deleting `in_progress` receipts |
-| `replayOnlyToCreator` | a stored result goes only to the token and request that created the receipt, and is the stored one | mvp §2.4 `ReceiptLookup`; CL-8 | `check_receipt` ignoring the request identity |
+| `oneEffectPerCommand` | one `command_id` starts at most one effect, across retries and restarts (at most once; that a healthy runner starts and completes it is liveness, §7.4) | CL-8; PR7-CL-19 | starting the effect on a lookup |
+| `receiptIffIntent` | a receipt exists exactly when its intent committed | mvp §2.4 "Insert" | an intent not counted |
+| `replayOnlyToCreator` | a stored result, status and body, goes only to the token and request that created the receipt | mvp §2.4 `ReceiptLookup`; CL-8 | `check_receipt` ignoring the token |
 | `othersLearnNothing` | another token or request never gets `in_progress` or `unknown_after_crash` | mvp §2.4 `Conflict`; http §2.8 "Receipt visibility" | reading the status before ownership |
-| `unknownNeverReexecuted` | no intent or effect after `unknown_after_crash`, and the receipt stays so | mvp §2.4 "Restart" | `check_receipt` answering `New` for `unknown_after_crash` |
+| `unknownNeverReexecuted` | no intent or effect after `unknown_after_crash`, and the receipt stays so | mvp §2.4 "Restart" | an effect surviving the restart |
 | `noInProgressAfterRestart` | no receipt is `in_progress` right after a restart | mvp §2.4 "Restart" | a restart that marks nothing |
-| `timeoutOnlyWithoutIntent` | a request answered 408 never commits its intent, now or later | mvp §2.4 "A 408 describes the current attempt only"; http §2.8 "Why 408 is exact" | 408 while the writer runs the job |
-| `inProgressOnlyWithReceipt` | 409 `in_progress` only when the receipt exists at reply time (it may have completed since the job read it; the retry replays) | http §8 D14 | 409 `in_progress` for a job still queued |
+| `timeoutOnlyWithoutIntent` | a request answered 408 never commits its intent, now or later | mvp §2.4 "A 408 describes the current attempt only" | 408 for any request past its deadline |
+| `timeoutOnlyWhenExpiredObserved` | 408 only with nothing submitted or after the runner observed `Expired` | http §2.8 "Why 408 is exact"; PR7-CL-8 | 408 for an unobserved job |
+| `inProgressOnlyWithReceipt` | 409 `in_progress` only when the receipt exists at reply time and the runner observed it (its intent committed, or the lookup found it `in_progress`) | http §8 D14 | 409 `in_progress` from the durable receipt alone |
 
-**Witnesses.** `sync.qnt` (11): an epoch switch, convergence across epochs, an older response discarded, a backward page applied, a backward page of another epoch, each snapshot reason the protocol takes (`TooManyEvents`, `TooManyBytes`, `EpochChanged`), `has_more`, a stream only a heads refresh recovers, a replaced subscribe. `receipts.qnt` (8): a replay, a replay after 503 `outcome_unknown`, 409 `in_progress`, a duplicate while `in_progress`, 409 `unknown_after_crash`, 409 `conflict`, a 408 followed by the command running, a `CommitUnknown` that committed.
+**Witnesses**, built from recorded facts (the response, the client before and after the step, the reply records). `sync.qnt` (13): an epoch switch, convergence across epochs, an older response discarded, a backward page applied, a current backward page of another epoch leaving a resync due, each snapshot reason the protocol takes (`TooManyEvents`, `TooManyBytes`, `EpochChanged`), a current forward page that advanced the cursor with `has_more` and left the stream due, a stream only a heads refresh recovers after a lost frame named it, a replaced subscribe, a 404 ending a followed stream, a failed read leaving the fetch due. `receipts.qnt` (11): a replay, a replay of a stored non-200, a replay to the same request after its 503 `outcome_unknown`, a 503 with the receipt durable and the result unobserved (D14), 409 `in_progress`, a duplicate while `in_progress`, 409 `unknown_after_crash`, 409 `conflict`, a 408 before submission, a 408 followed by the command running, a `CommitUnknown` that committed.
 
 ### 7.4 Findings
 
-**F1. Snapshot fields of another stream.** A host snapshot carries each thread's `ThreadInfo` (axes and attention) and a thread snapshot the current launch's worktree, read in the same snapshot (store §2.7; http §2.7 "which can change without that stream advancing"). They change through thread-stream events and `worktree_changed` on the host stream, so the snapshot's stream does not advance and nothing tells a client following only that stream. `trace_finding_cross_stream_snapshot_field`: client 2 follows the host stream, gets a host snapshot, the thread's status changes, and after `quiesce` the client has converged on the host stream's events and surfaces yet shows the old status. mvp §2.4 "Everything a client renders is in a snapshot or in events after `as_of_seq`" holds only for fields of the snapshot's own stream. Options: (a) PR 18 renders thread axes and attention only from the thread streams it follows and the worktree from the host stream (or `/api/worktrees`), treating these snapshot fields as initial values; a thread list then follows every listed thread stream, within the 1024-stream cap; (b) the daemon appends a host-stream event (a thread status summary) on every axis or attention change, so the host stream carries what the thread list renders (a change to mvp §2.1 "Streams"); (c) state in mvp §2.4 that these fields are current only at `as_of_seq`, and leave the choice to PR 18. The model's convergence covers the snapshot's own stream only.
+**F1. Snapshot fields of another stream.** A host snapshot carries each thread's `ThreadInfo` (axes and attention), and a thread snapshot `thread.closed` and the current launch's worktree, read in the same read (store §2.7; http §2.7 "which can change without that stream advancing"). They change through events of another stream (thread-stream events; `thread_closed` and `worktree_changed` on the host stream), so the snapshot's stream does not advance and nothing tells a client following only that stream. Decision: PR 18 renders each such field from the stream that owns it, and the snapshot's value is an initial value. Proposed contract text, to land in mvp §2.4 "Snapshot fallback" with PR 7:
 
-**F2. The scope of a request generation.** mvp §2.4 discards "a response from an older request generation" without saying what a generation is. Q-B needs all of: (1) only the latest request per stream and direction is current (`trace_refused_older_generation`: an abandoned forward page arriving after the newer one would duplicate events); (2) an epoch switch or reconnect makes every earlier request of every stream older (`trace_refused_stale_epoch_after_switch`: with per-stream generations, a thread-stream page of the old epoch, requested before the switch on the host stream, is a forward response with another epoch and switches the client back to the epoch the host left); (3) a snapshot that replaces a stream's copy makes that stream's earlier backward request older (`trace_refused_backward_after_snapshot`: its page would be prepended to the new copy with a gap). Options: state these three in mvp §2.4 as the generation's definition, or state the observable rule (apply a forward page only at the cursor it was requested from, a backward page only before the oldest event it was requested for, and adopt a new epoch only from a response requested after the last switch) and leave the bookkeeping to PR 18.
+> A snapshot's `as_of_seq` is the head of the requested stream. A field the snapshot carries that another stream owns is that stream's value at the same database read, and it does not advance with the requested stream: in a host snapshot, each thread's axes and attention (owned by the thread stream); in a thread snapshot, `thread.closed` and the current launch's worktree (owned by the host stream). A client renders such a field from its owning stream: thread list membership and `closed` from the host stream, axes and attention from the thread stream, the worktree from the host stream or `GET /api/worktrees`.
 
-**Model results.** Every invariant holds over the CI simulation. Within one epoch a client that sends its epoch never sees `CursorAhead`, since its cursor never passes the head; only a client that lost its epoch but kept a cursor can (`trace_coverage_queries` reaches it with a raw query). A forward replay page of another epoch reaches a client only when its query omitted the epoch. An intent job of a command with an effect that ends `CommitUnknown` after committing leaves the receipt `in_progress` with no effect started; PR 8 stops the daemon on the failed writer, and the restart turns it into `unknown_after_crash`, so that command never runs and its retry learns only that the outcome is unknown (`trace_commit_unknown_then_restart`), as store §2.2 states.
+`trace_cross_stream_field_from_owner`: client 1 gets a host snapshot, the thread's status changes, and after `quiesce` the thread copy shows the new status while the host copy keeps the value read. The model's convergence covers each followed stream's own state.
+
+**F2. The scope of a request generation.** mvp §2.4 discards "a response from an older request generation" without saying what a generation is. Proposed contract text, to land in mvp §2.4 "Replay" with PR 7:
+
+> A client keeps one current request per stream and direction (forward, backward): the latest it issued. A request stops being current when its response arrives, when it times out or is cancelled, when the client establishes or switches the epoch or reconnects (every request issued before, on every stream; the forward response that establishes or switches the epoch is applied), and when the client replaces a stream's copy with a snapshot or stops following the stream (that stream's requests issued before). A response to a request that is not current is from an older request generation: the client discards it, and it changes no local state, the epoch included.
+
+Each part has a refused trace: the latest request only (`trace_refused_older_generation`: an abandoned forward page arriving after the newer one would duplicate events); an epoch switch (`trace_refused_stale_epoch_after_switch`: a thread-stream page of the old epoch would switch the client back to the epoch the host left); the first establishment (`trace_refused_stale_epoch_at_first_establishment`: before the client holds an epoch, a host page of epoch 1 is in transit, the database is replaced, and a thread page of epoch 2 establishes the epoch; the host page would switch the client back to epoch 1); a snapshot replacing a copy (`trace_refused_backward_after_snapshot`: its earlier backward page would be prepended to the new copy with a gap); a timeout (`trace_refused_older_generation`). The model records each event as a ghost (`resetAt`, `cancelled`) apart from the client's own bookkeeping, so dropping any of the client's invalidations fails `olderResponsesChangeNothing` (§7.6).
+
+**Model results.** Every invariant holds over the CI simulation. Within one epoch a client that sends its epoch never sees `CursorAhead`, since its cursor never passes the head; only a client that lost its epoch but kept a cursor can (`trace_coverage_queries` reaches it with a raw query). A forward replay page of another epoch reaches a client only when its query omitted the epoch. With announced heads kept across a delivery, a notification that arrives during a fetch still makes the next fetch due (`trace_notified_during_fetch`). An intent job of a command with an effect that ends `CommitUnknown` after committing leaves the receipt `in_progress` with no effect started; PR 8 stops the daemon on the failed writer, and the restart turns it into `unknown_after_crash`, so that command never runs and its retry learns only that the outcome is unknown (`trace_commit_unknown_then_restart`), as store §2.2 states.
 
 **Obligations handed on.**
 
-- **PR 7b**: one read snapshot for head, decision, and page or snapshot (`serve`); `heads` on every subscribe for the latest set and on every refresh for the whole set; a commit notifies every open socket subscribed to its stream; restart drops sockets.
-- **PR 7c**: 503 `outcome_unknown` while the writer has not replied (never 408, never 409); 408 only after `Expired`; `check_receipt` before any write, the receipt and the intent in one job; `receipts_mark_unknown_after_crash` before commands are accepted.
-- **PR 18**: the client rules of §7.1, including the generation of F2 and the choice of F1; continue while `has_more`; refetch every followed stream on reconnect; treat every `heads` frame as a snapshot of the listed streams.
+- **PR 7b**: http §6.2 PR7-CL-9–11 (one read per answer, the 404 for an unknown stream, snapshot contents) and PR7-CL-16 (`heads` for the latest subscribed set, refreshes, a commit announced by `stream_advanced` or `heads`); a `heads` frame omits streams that do not exist.
+- **PR 7c**: http §6.2 PR7-CL-8 (deadlines and 408) and PR7-CL-18–20 (receipts, the effect once with the receipt completed by the runner, fatal store outcomes reported). Liveness the model does not check: after the runner observed an intent committed with its effect pending, a healthy runner starts the effect and completes the receipt (with PR 17).
+- **PR 8**: `receipts_mark_unknown_after_crash` at startup, before commands are accepted.
+- **PR 18**: the client rules of §7.1 with F1 and F2; keep announced heads across a delivery (a `stream_advanced` or `heads` that arrives during a fetch); continue while `has_more` and page backward only while `has_more_before`; on a 404 for a followed stream (it is not in the current database, as after a database swap), stop following it: drop its copy, `subscribe` without it, and stop displaying it; retry a failed read (408, 503); refetch every followed stream on reconnect. Its fast-check reducer covers the `has_more` and reconnect cases.
 
 ### 7.5 Trace Bridge
 
-`sync_traces.qnt` (13 traces) and `receipts_traces.qnt` (8) follow Q-A's naming: `trace_refused_*` end where the client discards a response or does not switch, `trace_coverage_*` reach `decide_replay` branches the protocol never takes (`limit` out of range checked first, `after_seq` with `before_seq`, the default limit, `CursorAhead`, `after_seq` at the head with the largest limit), `trace_finding_*` end with an `expect` stating the finding. `trace_byte_bound` puts a forward replay exactly at both bounds.
+`sync_traces.qnt` (20 traces) and `receipts_traces.qnt` (12) follow Q-A's naming: `trace_refused_*` end where the client discards a response or does not switch, or where a receipt reply is not what a reviewer might expect (503 rather than 408 or 409); `trace_coverage_*` reach `decide_replay` branches the protocol never takes (`limit` out of range checked first, `after_seq` with `before_seq`, the default limit, `CursorAhead`, `after_seq` at the head with the largest limit, and two reasons at once: `EpochChanged` over `CursorAhead`, `TooManyEvents` over `TooManyBytes`). `trace_byte_bound` puts a forward replay exactly at both bounds; `trace_forward_paging`, `trace_host_snapshot_then_backward`, and `trace_thread_snapshot_then_backward` check `has_more` and `has_more_before` and the first backward boundary (`as_of_seq + 1` after a host snapshot); `trace_stored_409_replayed` stores and replays a 409.
 
-`crates/core/tests/quint_sync_traces.rs` replays every recorded call: `decide_replay` with each query and head scaled back by the factors the trace's `Init` names (asserting they divide the real bounds), the epochs as `epoch-<n>`, and the plan compared exactly; `check_receipt` with receipts, tokens, and request hashes built from the model's numbers and the lookup compared exactly. Reverting any branch of either function (the epoch check, `CursorAhead`, the event bound's `>`, the byte bound, `after_seq` with `before_seq`; the token check, the request-hash check, `in_progress`, `unknown_after_crash`) fails it. The store, the HTTP and WebSocket layers, and the client are not replayed: no `core` function implements them.
+`crates/core/tests/quint_sync_traces.rs` replays every recorded call: `decide_replay` with each query and head multiplied by fixed scales (5 000 seqs, 2 MiB), after asserting that the trace's model bounds times those scales are the contract's 10 000 events and 8 MiB and that `core`'s constants equal them, the epochs as `epoch-<n>`, and the plan compared exactly; `check_receipt` with receipts, tokens, request hashes, and stored results (HTTP status and body) built from the model's numbers, the lookup compared exactly, the restart's lookup included. Reverting any branch of either function (the epoch check, `CursorAhead`, the event bound's `>`, the byte bound, `after_seq` with `before_seq`; the token check, the request-hash check, `in_progress`, `unknown_after_crash`, the stored status) fails it. Scaled values cannot sit one seq or one byte past a real bound, so the real `+1` boundaries and the branch order on unscaled values are guarded by `crates/core/tests/sync_command.rs`. The store, the HTTP and WebSocket layers, and the client are not replayed: no `core` function implements them.
 
 ### 7.6 Results
 
-The CI size (seeds 1–4, 1 000 samples, 40 steps per spec) reaches every witness of both modules. On a development machine `sync.qnt` takes about 13 s per seed and `receipts.qnt` about 12 s; with Q-A, the twelve runs take about 25 s in parallel. Each mutation of §7.3 fails at that size on all four seeds, except the one caught only by its named trace.
+The CI size (seeds 1–4, 1 000 samples, 40 steps per spec) reaches every witness of both modules; the rarest are a stream only a heads refresh recovers (5 of 4 000 traces), a backward page of another epoch (9), and a replay after 503 (7). On a development machine one seed takes about 17 s for `sync.qnt` and 8 s for `receipts.qnt` alone; with Q-A, the twelve runs take about 40 s pooled over 12 cores.
+
+Each invariant has a spec mutation that violates it, judged by the exit status of `quint run` at the CI size with only that invariant (1 on all four seeds unless stated), and by the named traces (`quint test`):
+
+| Mutation | Invariant | Seeds failing | Named traces failing |
+|---|---|---|---|
+| a forward fetch from one before the cursor | `noGapNoDup` | 4 | 3 |
+| a snapshot claiming older events when it holds all | `heldEventsOnHost` | 4 | — |
+| an epoch switch keeping the other copies | `noMixedEpochs` | 4 | 2 |
+| forward events not applied to the rendered state | `renderedStateAtCursor` | 4 | 3 |
+| a forward page replacing the held events | `appliedKeepsHeld` (and `noGapNoDup`) | 4 | `trace_forward_paging` |
+| no `clearRequests` on reconnect | `olderResponsesChangeNothing` | 4 | — |
+| no `clearRequests` on an epoch switch | `olderResponsesChangeNothing` | 4 | 2 |
+| no `clearRequests` when a stream is dropped | `olderResponsesChangeNothing` | 4 | — |
+| no `clearRequests` on a same-epoch snapshot | `olderResponsesChangeNothing` | 1 of 4 | `trace_refused_backward_after_snapshot` |
+| a timeout that keeps the request current | `olderResponsesChangeNothing` | 4 | 2 |
+| the first establishment appending without a switch (the pre-fix rule) | `olderResponsesChangeNothing` | 4 | `trace_refused_stale_epoch_at_first_establishment` |
+| no current-request check | `olderResponsesChangeNothing`, `epochNeverRegresses` | 4 | 4 |
+| a backward page of another epoch switching the epoch | `epochOnlyFromCurrentForward` | 4 | `trace_refused_backward_epoch_switch` |
+| a stream not due on an announced head | `convergedAfterQuiesce` | 4 | 4 |
+| a stream not due on `has_more` | — (heads recover it) | 0 | `trace_forward_paging` |
+| `check_receipt` answering `New` for `in_progress` | `oneIntentPerCommand` | 4 | 1 |
+| the effect started on a lookup | `oneEffectPerCommand` | 4 | 3 |
+| an intent not counted | `receiptIffIntent` | 4 | 2 |
+| `check_receipt` ignoring the token | `replayOnlyToCreator` | 4 | `trace_conflict` |
+| the status read before ownership | `othersLearnNothing` | 4 | `trace_conflict` |
+| an effect surviving the restart | `unknownNeverReexecuted` | 4 | — |
+| a restart that marks nothing | `noInProgressAfterRestart` | 4 | 3 |
+| 408 for any request past its deadline | `timeoutOnlyWithoutIntent` | 4 | 4 |
+| 408 for an unobserved job | `timeoutOnlyWhenExpiredObserved` | 4 | 3 |
+| 409 `in_progress` from the durable receipt alone | `inProgressOnlyWithReceipt` | 4 | 2 |
+
+CI runs the four seeds and the named traces, so every mutation fails CI. `has_more` alone is not needed for convergence while `heads` refreshes run, so only its named trace guards it.
 
 ### 7.7 What PR 17 Still Covers
 
-Q-B checks the protocol with the store's guarantees assumed. PR 17's `stateright` model checks the Rust code where Q-B abstracts: the writer thread, the store's commit and crash behaviour (a crash during an append, `CommitUnknown` recovery), the socket loop's single `merge` and frame selection (here a FIFO with losses), the runner's effect and completion under the real deadlines and grace, offline buffering in the client, and retry after a lost response against the real handlers. PR 18's fast-check reducer checks the client rules of §7.1.
+Q-B checks the protocol with the store's guarantees assumed. PR 17's `stateright` model checks the Rust code where Q-B abstracts: the writer thread, the store's commit and crash behaviour (a crash during an append, `CommitUnknown` recovery), the socket loop's single `merge` and frame selection, the runner's effect and completion under real time (a heads refresh against the reply grace, the deadlines), crashes at every point of a command, the liveness of §7.4 PR 7c, and retry after a lost response against the real handlers. PR 18's fast-check reducer checks the client rules of §7.1.
