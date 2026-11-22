@@ -62,7 +62,8 @@ pub(crate) struct Leader {
 }
 
 /// Targets kept across calls: `(pid, start)` → the process group last seen (0 unknown).
-/// Resolved targets are pruned at the end of each call.
+/// A target is pruned only after a direct lookup of it resolved it (§2.5, the retention
+/// invariant).
 #[derive(Debug, Default)]
 pub(crate) struct KillState {
     targets: BTreeMap<(u32, u64), u32>,
@@ -123,8 +124,9 @@ impl Pass {
             return Status::Unresolved;
         }
         if self.complete && !self.seen.contains(&pid) {
-            // Not in a complete list: gone before the pass.
-            return Status::Resolved;
+            // Not in a complete list: not live for this pass, but never proof that it is
+            // gone (the list can omit a live process; the recheck looks it up).
+            return Status::Absent;
         }
         Status::Unresolved
     }
@@ -135,7 +137,9 @@ enum Status {
     Live,
     /// Unreadable, or the pass could not tell.
     Unresolved,
-    /// Gone, a zombie, or another process at that pid.
+    /// Absent from a complete list; resolved only by a lookup of its own.
+    Absent,
+    /// A lookup of that pid showed it gone, a zombie, or another process.
     Resolved,
 }
 
@@ -168,6 +172,11 @@ struct Call<'a, O: Os> {
     /// Zombies seen in this call.
     zombies: BTreeSet<(u32, u64)>,
     ticks: usize,
+    /// Identities a direct lookup in this call resolved: the only ones that may be pruned.
+    dead: BTreeSet<(u32, u64)>,
+    /// Session members this call observed live and readable, retained as targets at the
+    /// end of the call whatever the exit path.
+    observed: BTreeMap<(u32, u64), u32>,
 }
 
 impl<O: Os> Call<'_, O> {
@@ -320,12 +329,15 @@ impl<O: Os> Call<'_, O> {
             }
             children.entry(proc.ppid).or_default().push(*proc);
         }
-        let mut queue: VecDeque<u32> = st
-            .targets
-            .keys()
-            .filter(|(pid, start)| pass.status(*pid, *start) == Status::Live)
-            .map(|(pid, _)| *pid)
-            .collect();
+        let mut queue: VecDeque<u32> = VecDeque::new();
+        for (pid, start) in st.targets.keys() {
+            if self.tick() {
+                return false;
+            }
+            if pass.status(*pid, *start) == Status::Live {
+                queue.push_back(*pid);
+            }
+        }
         let mut visited: HashSet<u32> = queue.iter().copied().collect();
         while let Some(pid) = queue.pop_front() {
             if self.tick() {
@@ -340,6 +352,9 @@ impl<O: Os> Call<'_, O> {
         }
         // Refresh the group of every live target.
         for ((pid, start), pgid) in &mut st.targets {
+            if self.tick() {
+                return false;
+            }
             if let Some((p, _)) = pass.live.get(pid)
                 && p.start == *start
             {
@@ -349,16 +364,25 @@ impl<O: Os> Call<'_, O> {
         true
     }
 
-    /// Every target not resolved, plus (while owned) every live or unreadable session
-    /// member the pass saw, recorded as a target or not. Once the deadline has passed, the
-    /// pass is unclean and every remaining target is kept without a status check.
+    /// Every target live or unresolved in the pass, plus (while owned) every live or
+    /// unreadable session member the pass saw, recorded as a target or not; live members are
+    /// also kept as observed. Once the deadline has passed, the pass is unclean and every
+    /// remaining target is kept without a status check.
     fn live_set(&mut self, pass: &mut Pass, owned: bool, st: &KillState) -> Vec<Survivor> {
         let mut out: BTreeMap<u32, Survivor> = BTreeMap::new();
         let mut cut = false;
         self.ticks = 0;
         for ((pid, start), pgid) in &st.targets {
             cut = cut || self.tick();
-            if cut || pass.status(*pid, *start) != Status::Resolved {
+            let status = if cut {
+                Status::Unresolved
+            } else {
+                pass.status(*pid, *start)
+            };
+            if status == Status::Resolved {
+                self.dead.insert((*pid, *start));
+            }
+            if matches!(status, Status::Live | Status::Unresolved) {
                 out.insert(
                     *pid,
                     Survivor {
@@ -374,6 +398,7 @@ impl<O: Os> Call<'_, O> {
             for (proc, sid) in pass.live.values() {
                 cut = cut || self.tick();
                 if proc.pgid == l || *sid == Some(l) {
+                    self.observed.insert((proc.pid, proc.start), proc.pgid);
                     out.entry(proc.pid).or_insert(Survivor {
                         pid: proc.pid,
                         start: Some(proc.start),
@@ -382,6 +407,7 @@ impl<O: Os> Call<'_, O> {
                 }
             }
             for (pid, sid) in &pass.unreadable {
+                cut = cut || self.tick();
                 if *sid == Some(l) {
                     out.entry(*pid).or_insert(Survivor {
                         pid: *pid,
@@ -398,13 +424,13 @@ impl<O: Os> Call<'_, O> {
     }
 
     /// Before a pass may prove death: every recorded identity looked up by itself, so one
-    /// the list omitted is still seen. `None` when the deadline cut it short; otherwise
-    /// the identities still live or unreadable.
-    fn recheck(&mut self, st: &KillState) -> Option<Vec<Survivor>> {
+    /// the list omitted is still seen. The identities found live or unreadable, kept also
+    /// when the deadline cuts the recheck short, and whether it finished.
+    fn recheck(&mut self, st: &KillState) -> (Vec<Survivor>, bool) {
         let mut out = Vec::new();
         if self.leader.start.is_none() {
             if self.expired() {
-                return None;
+                return (out, false);
             }
             if matches!(
                 self.os.lookup(self.leader.pid),
@@ -419,14 +445,16 @@ impl<O: Os> Call<'_, O> {
         }
         for ((pid, start), pgid) in &st.targets {
             if self.expired() {
-                return None;
+                return (out, false);
             }
             let unresolved = match self.os.lookup(*pid) {
                 Lookup::Live(p) => p.start == *start,
                 Lookup::Unreadable => true,
                 Lookup::Zombie(_) | Lookup::Gone => false,
             };
-            if unresolved {
+            if !unresolved {
+                self.dead.insert((*pid, *start));
+            } else {
                 out.push(Survivor {
                     pid: *pid,
                     start: Some(*start),
@@ -434,7 +462,7 @@ impl<O: Os> Call<'_, O> {
                 });
             }
         }
-        Some(out)
+        (out, true)
     }
 
     /// The group (after a fresh ownership check) and every target outside it, each by a
@@ -514,18 +542,32 @@ impl<O: Os> Call<'_, O> {
         }
     }
 
-    /// The proof step of a pass with no live member or target: `Ok` with the report when
-    /// it proves death, else the identities a recheck still found (empty when nothing
-    /// may be proven yet).
+    /// The proof step of a pass with no live member or target: `None` when it proves
+    /// death, else the identities a recheck found live (empty when nothing may be proven
+    /// yet).
     fn prove(&mut self, pass: &Pass, owned: bool, st: &KillState) -> Option<Vec<Survivor>> {
         if !(pass.clean && owned) {
             return Some(Vec::new());
         }
         match self.recheck(st) {
-            Some(r) if r.is_empty() => None,
-            Some(r) => Some(r),
-            None => Some(Vec::new()),
+            (found, true) if found.is_empty() => None,
+            (found, _) => Some(found),
         }
+    }
+
+    /// Replaces `live` with this pass's live set; after a pass that could not complete,
+    /// the survivors an earlier pass saw stay too (such a pass cannot show they died).
+    fn observe(&mut self, pass: &mut Pass, owned: bool, st: &KillState, live: &mut Vec<Survivor>) {
+        let now = self.live_set(pass, owned, st);
+        if pass.complete {
+            *live = now;
+            return;
+        }
+        let mut merged: BTreeMap<u32, Survivor> = now.into_iter().map(|s| (s.pid, s)).collect();
+        for s in live.drain(..) {
+            merged.entry(s.pid).or_insert(s);
+        }
+        *live = merged.into_values().collect();
     }
 }
 
@@ -643,20 +685,22 @@ pub(crate) fn kill_tree<O: Os>(
         deadline,
         zombies: BTreeSet::new(),
         ticks: 0,
+        dead: BTreeSet::new(),
+        observed: BTreeMap::new(),
     };
     let budget = deadline - t0;
 
-    // Opening pass: an already dead tree returns before any signal. `live` always holds
-    // the last survivors observed, so a pass that cannot run does not empty the report.
+    // Opening pass: an already dead tree returns before any signal. `live` holds the
+    // survivors observed so far; every census updates it (`observe`).
     let (mut pass, mut owned) = call.round(&mut st);
-    let mut live;
+    let mut live = Vec::new();
     loop {
-        live = call.live_set(&mut pass, owned, &st);
+        call.observe(&mut pass, owned, &st, &mut live);
         if !live.is_empty() {
             break;
         }
         match call.prove(&pass, owned, &st) {
-            None => return finish(&call, &mut st, &pass, true, Vec::new()),
+            None => return finish(&mut call, &mut st, true, Vec::new()),
             Some(r) if !r.is_empty() => {
                 live = r;
                 break;
@@ -664,7 +708,7 @@ pub(crate) fn kill_tree<O: Os>(
             Some(_) => {}
         }
         if os.lost() || call.expired() {
-            return finish(&call, &mut st, &pass, false, live);
+            return finish(&mut call, &mut st, false, live);
         }
         if !pass.churn_only {
             break;
@@ -677,34 +721,27 @@ pub(crate) fn kill_tree<O: Os>(
             call.signal(Sig::Hup, &st);
             call.grace(t0 + (budget / 4).min(Duration::from_millis(500)), &st);
             // Extends the targets with what appeared since the HUP.
-            let _ = call.round(&mut st);
+            (pass, owned) = call.round(&mut st);
+            call.observe(&mut pass, owned, &st, &mut live);
             call.signal(Sig::Term, &st);
             call.grace(t0 + (budget / 2).min(Duration::from_secs(2)), &st);
         }
-        (pass, _) = call.round(&mut st);
+        (pass, owned) = call.round(&mut st);
+        call.observe(&mut pass, owned, &st, &mut live);
         call.signal(Sig::Kill, &st);
     }
 
     // Prove.
     while !call.expired() {
         (pass, owned) = call.round(&mut st);
-        let mut now_live = call.live_set(&mut pass, owned, &st);
-        if !pass.complete {
-            // A pass that could not run cannot clear what an earlier one saw.
-            for s in &live {
-                if !now_live.iter().any(|n| n.pid == s.pid) {
-                    now_live.push(*s);
-                }
-            }
-        }
-        live = now_live;
+        call.observe(&mut pass, owned, &st, &mut live);
         if live.is_empty() {
             match call.prove(&pass, owned, &st) {
-                None => return finish(&call, &mut st, &pass, true, Vec::new()),
+                None => return finish(&mut call, &mut st, true, Vec::new()),
                 Some(r) if !r.is_empty() => live = r,
                 Some(_) => {
                     if os.lost() {
-                        return finish(&call, &mut st, &pass, false, live);
+                        return finish(&mut call, &mut st, false, live);
                     }
                     if !pass.churn_only {
                         call.sleep(STEP);
@@ -716,24 +753,42 @@ pub(crate) fn kill_tree<O: Os>(
         call.signal(Sig::Kill, &st);
         call.sleep(STEP);
     }
-    finish(&call, &mut st, &pass, false, live)
+    finish(&mut call, &mut st, false, live)
 }
 
-/// Prunes the targets the last pass resolved (a survivor is never pruned) and builds the
-/// report from held state.
+/// Applies the retention invariant and builds the report from held state. Every session
+/// member observed live and every reported survivor with a start become targets, on every
+/// exit path; then only identities a direct lookup resolved are pruned, never a survivor.
+/// Retention always completes (no syscall, bounded by the identities the call holds);
+/// pruning stops at the deadline, which only keeps more.
 fn finish<O: Os>(
-    call: &Call<'_, O>,
+    call: &mut Call<'_, O>,
     st: &mut KillState,
-    pass: &Pass,
     tree_dead: bool,
     live: Vec<Survivor>,
 ) -> KillReport {
-    st.targets.retain(|(pid, start), _| {
-        pass.status(*pid, *start) != Status::Resolved
-            || live
-                .iter()
-                .any(|s| s.pid == *pid && s.start == Some(*start))
-    });
+    for (id, pgid) in &call.observed {
+        st.targets.entry(*id).or_insert(*pgid);
+    }
+    let mut kept = BTreeSet::new();
+    for s in &live {
+        if let Some(start) = s.start {
+            kept.insert((s.pid, start));
+            st.targets
+                .entry((s.pid, start))
+                .or_insert(s.pgid.unwrap_or(0));
+        }
+    }
+    call.ticks = 0;
+    let dead = std::mem::take(&mut call.dead);
+    for id in &dead {
+        if call.tick() {
+            break;
+        }
+        if !kept.contains(id) {
+            st.targets.remove(id);
+        }
+    }
     let tree_dead = tree_dead && !call.os.lost();
     KillReport {
         method: method(call.os).to_owned(),
@@ -1266,6 +1321,8 @@ mod tests {
             deadline: sim.at(5_000),
             zombies: BTreeSet::new(),
             ticks: 0,
+            dead: BTreeSet::new(),
+            observed: BTreeMap::new(),
         };
         let first = call.pass();
         assert!(
@@ -1681,36 +1738,186 @@ mod tests {
         assert!(!sim.alive(L));
     }
 
-    #[test]
-    fn extension_cut_by_the_deadline_is_not_proof() {
-        // The leader is no longer listed; M, a live session member in its own group, is
-        // seen by the pass, ownership holds, and the clock expires at the first clock
-        // check inside the extension, before M is recorded as a target.
-        let sim = Sim::new();
-        {
-            let mut w = sim.world.borrow_mut();
-            w.procs.remove(&L);
-            w.add(200, 1, 200, L, 2_000).dies = [false; 3];
-            for pid in 1_000..1_300 {
-                w.add(pid, 1, pid, pid, u64::from(pid));
-            }
-        }
+    /// A clock that jumps 10 s at the `n`th clock read after the first ownership check.
+    fn jump_at_nth_now_after_owned(sim: &Sim, n: usize) {
         let mut owned_seen = false;
+        let mut nows = 0;
         *sim.clock.borrow_mut() = Some(Box::new(move |ev| match ev {
-            Ev::Owned => {
+            Ev::Owned if !owned_seen => {
                 owned_seen = true;
                 Duration::ZERO
             }
             Ev::Now if owned_seen => {
-                owned_seen = false;
-                Duration::from_secs(10)
+                nows += 1;
+                if nows == n {
+                    Duration::from_secs(10)
+                } else {
+                    Duration::ZERO
+                }
             }
             _ => Duration::ZERO,
         }));
-        let r = sim.kill(&[], 1_000, &state());
+    }
+
+    #[test]
+    fn extension_cut_at_the_256th_entry_makes_the_pass_unclean() {
+        // Ownership holds and the census is clean; the clock passes the deadline at the
+        // check of the 256th entry of the extension (its second clock read).
+        let sim = Sim::new();
+        {
+            let mut w = sim.world.borrow_mut();
+            for pid in 1_000..1_300 {
+                w.add(pid, 1, pid, pid, u64::from(pid));
+            }
+        }
+        jump_at_nth_now_after_owned(&sim, 2);
+        let mut call = Call {
+            os: &sim,
+            leader: sim.leader(),
+            deadline: sim.at(1_000),
+            zombies: BTreeSet::new(),
+            ticks: 0,
+            dead: BTreeSet::new(),
+            observed: BTreeMap::new(),
+        };
+        let mut st = KillState::default();
+        let (pass, owned) = call.round(&mut st);
+        assert!(owned);
+        assert!(pass.complete);
+        assert!(!pass.clean);
+        assert!(call.expired());
+        assert_eq!(call.ticks, 257);
+    }
+
+    #[test]
+    fn member_cut_from_the_extension_is_tracked_by_the_next_call() {
+        // M, a live child of the leader in its group, is seen by the census; the clock
+        // passes the deadline at the extension's first check, before M is recorded.
+        let sim = Sim::new();
+        sim.world.borrow_mut().add(200, L, L, L, 2_000).dies = [false; 3];
+        jump_at_nth_now_after_owned(&sim, 1);
+        let st = state();
+        let r = sim.kill(&[], 1_000, &st);
         assert!(!r.tree_dead, "{r:?}");
-        assert!(r.survivors.iter().any(|s| s.pid == 200), "{r:?}");
+        assert!(r.survivors.contains(&sim.identity(200)), "{r:?}");
+        // Between the calls M leaves the session and the leader exits.
+        {
+            let mut w = sim.world.borrow_mut();
+            let m = w.procs.get_mut(&200).unwrap();
+            (m.ppid, m.pgid, m.sid) = (1, 200, 200);
+            w.procs.get_mut(&L).unwrap().st = St::Zombie;
+        }
+        *sim.clock.borrow_mut() = None;
+        let r = sim.kill(&[], 1_000, &st);
+        assert!(!r.tree_dead, "{r:?}");
         assert!(sim.alive(200));
+    }
+
+    /// The recorded escapee E (its parent gone, its own session) and a recorded target
+    /// that sorts after it and no longer exists; the leader has exited. Every list omits E.
+    fn omitted_escapee() -> (Sim, Vec<ProcessIdentity>) {
+        const E: u32 = 300;
+        let sim = Sim::new();
+        sim.world.borrow_mut().procs.get_mut(&L).unwrap().st = St::Zombie;
+        sim.world.borrow_mut().add(E, 1, E, E, 3_000).dies = [false; 3];
+        *sim.list.borrow_mut() = Some(Box::new(|_| Ok((vec![1, ME, L, X], false))));
+        let extra = vec![
+            sim.identity(E),
+            ProcessIdentity {
+                pid: 400,
+                start_time: "4000".into(),
+                group: "400".into(),
+            },
+        ];
+        (sim, extra)
+    }
+
+    #[test]
+    fn recheck_cut_after_finding_a_target_keeps_it() {
+        // The recheck finds E alive; the deadline passes before the next identity.
+        let (sim, extra) = omitted_escapee();
+        *sim.clock.borrow_mut() = Some(Box::new(|ev| {
+            if ev == Ev::Lookup(300) {
+                Duration::from_secs(10)
+            } else {
+                Duration::ZERO
+            }
+        }));
+        let st = state();
+        let r = sim.kill(&extra, 1_000, &st);
+        assert!(!r.tree_dead, "{r:?}");
+        assert!(
+            r.survivors
+                .iter()
+                .any(|s| s.pid == 300 && s.start_time == "3000"),
+            "{r:?}"
+        );
+        // A later call with a complete list still tracks E.
+        *sim.clock.borrow_mut() = None;
+        *sim.list.borrow_mut() = None;
+        let r = sim.kill(&[], 1_000, &st);
+        assert!(!r.tree_dead, "{r:?}");
+        assert!(sim.alive(300));
+    }
+
+    #[test]
+    fn absence_from_the_list_does_not_prune_a_target() {
+        // The deadline passes at the recheck's first lookup (the leader's), before E is
+        // looked up: E was only absent from the lists, so it stays a target.
+        let (sim, extra) = omitted_escapee();
+        let mut leader_lookups = 0;
+        *sim.clock.borrow_mut() = Some(Box::new(move |ev| {
+            if ev == Ev::Lookup(L) {
+                leader_lookups += 1;
+                // Two census passes (the new zombie, then a clean pass), then the recheck.
+                if leader_lookups == 3 {
+                    return Duration::from_secs(10);
+                }
+            }
+            Duration::ZERO
+        }));
+        let st = state();
+        let r = sim.kill(&extra, 1_000, &st);
+        assert!(!r.tree_dead, "{r:?}");
+        *sim.clock.borrow_mut() = None;
+        *sim.list.borrow_mut() = None;
+        let r = sim.kill(&[], 1_000, &st);
+        assert!(!r.tree_dead, "{r:?}");
+        assert!(sim.alive(300));
+    }
+
+    #[test]
+    fn member_first_seen_in_an_escalation_census_stays_reported() {
+        // U, an unreadable session member (never a target: no start), appears after the
+        // HUP; the list fails from the first KILL on.
+        const U: u32 = 200;
+        let sim = Sim::new();
+        immortal(&sim, L);
+        let phase = std::rc::Rc::new(Cell::new(0u8));
+        let p2 = phase.clone();
+        sim.on(move |w, ev| match ev {
+            Ev::Killpg(_, Sig::Hup) if p2.get() == 0 => {
+                let u = w.add(U, L, U, L, 30);
+                u.st = St::Unreadable;
+                u.dies = [false; 3];
+                p2.set(1);
+            }
+            Ev::Killpg(_, Sig::Kill) => p2.set(2),
+            _ => {}
+        });
+        *sim.list.borrow_mut() = Some(Box::new(move |_| {
+            Ok((
+                match phase.get() {
+                    0 => vec![1, ME, L, X],
+                    1 => vec![1, ME, L, X, U],
+                    _ => Vec::new(),
+                },
+                false,
+            ))
+        }));
+        let r = sim.kill(&[], 5_000, &state());
+        assert!(!r.tree_dead, "{r:?}");
+        assert!(r.survivors.iter().any(|s| s.pid == U), "{r:?}");
     }
 
     #[test]
@@ -1719,6 +1926,8 @@ mod tests {
         // record, it is churn only the first time.
         let sim = Sim::new();
         sim.world.borrow_mut().add(600, 1, 600, 600, 0).st = St::ForeignZombie;
+        // Each pass takes 1 ms, so a regression that rescans forever reaches the deadline.
+        sim.cost(|e| e == Ev::PidCount, Duration::from_millis(1));
         let r = sim.kill(&[], 5_000, &state());
         assert!(r.tree_dead, "{r:?}");
         assert!(!sim.alive(L));
