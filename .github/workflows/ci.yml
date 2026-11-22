@@ -16,6 +16,52 @@ concurrency:
 permissions: {}
 
 jobs:
+  workspace:
+    name: workspace (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rustup reads the channel and components from rust-toolchain.toml.
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # Includes the contract drift check (crates/core/tests/contracts_export.rs).
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      # core is Sans-IO: no async runtime, store, or HTTP server in its dependency tree.
+      # A here-string, not a pipe: under `bash -eo pipefail`, `grep -q` exiting on the
+      # first match makes the writer die of SIGPIPE, and the negated pipeline would pass.
+      - name: Check core dependencies
+        run: |
+          deps="$(cargo tree -p chaldea-core -e normal --prefix none)"
+          ! grep -Eq '^(tokio|rusqlite|axum) ' <<<"$deps"
+
   pty-hooks:
     name: pty-hooks (${{ matrix.os }})
     strategy:

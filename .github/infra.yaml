@@ -68,6 +68,10 @@ spec:
         required_status_checks:
           strict_required_status_checks_policy: true
           contexts:
+            - context: workspace (macos-latest)
+              app: github-actions
+            - context: workspace (windows-latest)
+              app: github-actions
             - context: pty-hooks (macos-latest)
               app: github-actions
             - context: pty-hooks (windows-latest)
