@@ -58,13 +58,12 @@ fn set(v: &Value) -> &[Value] {
         .unwrap_or_else(|| panic!("not an ITF set: {v}"))
 }
 
-fn map(v: &Value) -> Vec<(&Value, &Value)> {
+fn map(v: &Value) -> impl Iterator<Item = (&Value, &Value)> {
     v["#map"]
         .as_array()
         .unwrap_or_else(|| panic!("not an ITF map: {v}"))
         .iter()
         .map(|kv| (&kv[0], &kv[1]))
-        .collect()
 }
 
 fn list(v: &Value) -> &[Value] {
@@ -135,14 +134,13 @@ fn cause(v: &Value) -> AttentionCause {
     }
 }
 
+fn attention(v: &Value) -> BTreeSet<AttentionCause> {
+    set(v).iter().map(cause).collect()
+}
+
 /// An attention set as `StatusChanged` carries it: sorted.
 fn causes(v: &Value) -> Vec<AttentionCause> {
-    set(v)
-        .iter()
-        .map(cause)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+    attention(v).into_iter().collect()
 }
 
 fn evidence(v: &Value) -> ReadinessEvidence {
@@ -290,7 +288,7 @@ fn thread_state(v: &Value) -> ThreadState {
         process: process(&v["process"]),
         turn: turn(&v["turn"]),
         task: task(&v["task"]),
-        attention: set(&v["attention"]).iter().map(cause).collect(),
+        attention: attention(&v["attention"]),
     }
 }
 
@@ -299,7 +297,6 @@ type Inputs = BTreeMap<u64, (u64, InputState)>;
 
 fn inputs(v: &Value) -> Inputs {
     map(v)
-        .into_iter()
         .map(|(k, i)| (int(k), (int(&i["launch"]), input_state(&i["state"]))))
         .collect()
 }
