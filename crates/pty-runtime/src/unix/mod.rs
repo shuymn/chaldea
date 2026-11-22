@@ -19,6 +19,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, MutexGuard};
+use std::time::Instant;
 
 use rustix::fs::{Access, Mode, OFlags};
 use rustix::pty::OpenptFlags;
@@ -26,8 +27,8 @@ use rustix::pty::OpenptFlags;
 use self::child::UnixChild;
 use self::io::{MasterReader, MasterWriter, UnixControl, Wake, winsize};
 use crate::backend::{
-    Cleanup, DrainSink, NeverStartedKind, PtyRuntime, SpawnError, SpawnSpec, SpawnedParts,
-    SpawnedPty, TEARDOWN_DRAIN, sealed,
+    Cleanup, DrainSink, NeverStartedKind, PtyControl, PtyRuntime, SpawnError, SpawnSpec,
+    SpawnedParts, SpawnedPty, TEARDOWN_DRAIN, sealed,
 };
 use crate::drain::Drain;
 use crate::spawn::spawn_lock;
@@ -75,7 +76,106 @@ impl PtyRuntime for UnixPty {
         reason = "spawn is rare; the error carries its cleanup evidence by value"
     )]
     fn spawn(&self, spec: &SpawnSpec, output: DrainSink) -> Result<SpawnedPty, SpawnError> {
-        self.spawn_inner(spec, output)
+        validate(spec)?;
+        #[cfg(test)]
+        self.hooks.on(&tests::Stage::Validated);
+        let Ends {
+            slave,
+            reader,
+            input,
+            control,
+        } = self.open_ends(spec).map_err(setup)?;
+
+        // Stage 3.
+        #[cfg(test)]
+        let drain = if self.hooks.fail_drain_start {
+            drop(reader);
+            Err(Error::other("drain start failed (test)"))
+        } else {
+            Drain::start(reader, output)
+        };
+        #[cfg(not(test))]
+        let drain = Drain::start(reader, output);
+        let drain = match drain {
+            Ok(d) => d,
+            Err(e) => {
+                drop((input, control, slave));
+                return Err(setup(e));
+            }
+        };
+
+        // Stage 4.
+        let program = Path::new(&spec.argv[0]);
+        let spawned = self.start_child(spec, &slave);
+        let pid = match spawned {
+            Ok(pid) => pid,
+            Err(e) => {
+                drop(slave);
+                drop(input);
+                // The deadline means nothing here: closing the control never blocks.
+                let close = Box::new(control).close(Instant::now());
+                let end = drain.finish(TEARDOWN_DRAIN);
+                let cleanup = if end.is_some() {
+                    Cleanup::Confirmed
+                } else {
+                    Cleanup::Unresolved {
+                        kill: None,
+                        close: Some(close),
+                        drain_abandoned: true,
+                    }
+                };
+                return Err(SpawnError::NeverStarted {
+                    kind: kind_of(&e, program),
+                    error: e,
+                    cleanup,
+                });
+            }
+        };
+
+        // Stage 5.
+        drop(slave);
+        #[cfg(test)]
+        let fail = self.hooks.on(&tests::Stage::Spawned { pid });
+        #[cfg(not(test))]
+        let fail = false;
+        let start = if fail {
+            Err(Error::other("identity read failed (test)"))
+        } else {
+            sys::bsd_info(pid)
+                .map(|i| i.start)
+                .map_err(Error::from_raw_os_error)
+        };
+        let child = Arc::new(UnixChild::new(pid, start.as_ref().ok().copied()));
+        #[cfg(test)]
+        {
+            if self.hooks.kill_expired {
+                child
+                    .kill_expired
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            *self
+                .hooks
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(child.clone());
+        }
+        let parts = SpawnedParts {
+            child,
+            output: drain,
+            input: Box::new(input),
+            control: Box::new(control),
+            size: spec.size,
+            evidence: Vec::new(),
+        };
+        match start {
+            Ok(_) => Ok(SpawnedPty::new(parts)),
+            Err(error) => Err(SpawnError::StartedThenFailed {
+                stage: "identity",
+                error,
+                identity: None,
+                cleanup: parts.teardown(),
+            }),
+        }
     }
 }
 
@@ -231,112 +331,6 @@ impl UnixPty {
         })
     }
 
-    #[allow(
-        clippy::result_large_err,
-        reason = "spawn is rare; the error carries its cleanup evidence by value"
-    )]
-    fn spawn_inner(&self, spec: &SpawnSpec, output: DrainSink) -> Result<SpawnedPty, SpawnError> {
-        validate(spec)?;
-        #[cfg(test)]
-        self.hooks.on(&tests::Stage::Validated);
-        let Ends {
-            slave,
-            reader,
-            input,
-            control,
-        } = self.open_ends(spec).map_err(setup)?;
-
-        // Stage 3.
-        #[cfg(test)]
-        let drain = if self.hooks.fail_drain_start {
-            drop(reader);
-            Err(Error::other("drain start failed (test)"))
-        } else {
-            Drain::start(reader, output)
-        };
-        #[cfg(not(test))]
-        let drain = Drain::start(reader, output);
-        let drain = match drain {
-            Ok(d) => d,
-            Err(e) => {
-                drop((input, control, slave));
-                return Err(setup(e));
-            }
-        };
-
-        // Stage 4.
-        let program = Path::new(&spec.argv[0]);
-        let spawned = self.start_child(spec, &slave);
-        let pid = match spawned {
-            Ok(pid) => pid,
-            Err(e) => {
-                drop(slave);
-                drop(input);
-                let close = Box::new(control).close_now();
-                let end = drain.finish(TEARDOWN_DRAIN);
-                let cleanup = if end.is_some() {
-                    Cleanup::Confirmed
-                } else {
-                    Cleanup::Unresolved {
-                        kill: None,
-                        close: Some(close),
-                        drain_abandoned: true,
-                    }
-                };
-                return Err(SpawnError::NeverStarted {
-                    kind: kind_of(&e, program),
-                    error: e,
-                    cleanup,
-                });
-            }
-        };
-
-        // Stage 5.
-        drop(slave);
-        #[cfg(test)]
-        let fail = self.hooks.on(&tests::Stage::Spawned { pid });
-        #[cfg(not(test))]
-        let fail = false;
-        let start = if fail {
-            Err(Error::other("identity read failed (test)"))
-        } else {
-            sys::bsd_info(pid)
-                .map(|i| i.start)
-                .map_err(Error::from_raw_os_error)
-        };
-        let child = Arc::new(UnixChild::new(pid, start.as_ref().ok().copied()));
-        #[cfg(test)]
-        {
-            if self.hooks.kill_expired {
-                child
-                    .kill_expired
-                    .store(true, std::sync::atomic::Ordering::Release);
-            }
-            *self
-                .hooks
-                .child
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(child.clone());
-        }
-        let parts = SpawnedParts {
-            child,
-            output: drain,
-            input: Box::new(input),
-            control: Box::new(control),
-            size: spec.size,
-            evidence: Vec::new(),
-        };
-        match start {
-            Ok(_) => Ok(SpawnedPty::new(parts)),
-            Err(error) => Err(SpawnError::StartedThenFailed {
-                stage: "identity",
-                error,
-                identity: None,
-                cleanup: parts.teardown(),
-            }),
-        }
-    }
-
     /// Stage 4: the `Command` under the spawn lock; the pid on success.
     fn start_child(&self, spec: &SpawnSpec, slave: &OwnedFd) -> std::io::Result<u32> {
         let stdio = || -> std::io::Result<Stdio> {
@@ -369,13 +363,6 @@ impl UnixPty {
         };
         // std never waits for it; the `UnixChild` owns its wait status from here.
         Ok(child.id())
-    }
-}
-
-impl UnixControl {
-    /// `close` with no meaningful deadline: it never blocks.
-    fn close_now(self: Box<Self>) -> crate::backend::CloseReport {
-        crate::backend::PtyControl::close(self, std::time::Instant::now())
     }
 }
 

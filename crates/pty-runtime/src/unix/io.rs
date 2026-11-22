@@ -271,9 +271,28 @@ impl UnixControl {
             wake_write: Some(wake_write),
         }
     }
+}
 
-    /// Sets the flag, then writes the byte once on the nonblocking write end.
-    fn fire(&mut self) {
+impl PtyControl for UnixControl {
+    fn resize(&self, size: PtySize) -> io::Result<()> {
+        tcsetwinsize(&self.master, winsize(size)).map_err(Into::into)
+    }
+
+    fn close(self: Box<Self>, _deadline: Instant) -> CloseReport {
+        #[cfg(test)]
+        super::trace::record("control_close");
+        let t = Instant::now();
+        drop(self);
+        CloseReport {
+            elapsed: Some(t.elapsed()),
+        }
+    }
+}
+
+impl Drop for UnixControl {
+    /// Sets the flag, then writes the byte once on the nonblocking write end and closes
+    /// it; the master closes after this, with the fields.
+    fn drop(&mut self) {
         self.wake.closed.store(true, Ordering::Release);
         if let Some(w) = self.wake_write.take() {
             for _ in 0..=WAKE_RETRIES {
@@ -284,29 +303,6 @@ impl UnixControl {
                 }
             }
         }
-    }
-}
-
-impl PtyControl for UnixControl {
-    fn resize(&self, size: PtySize) -> io::Result<()> {
-        tcsetwinsize(&self.master, winsize(size)).map_err(Into::into)
-    }
-
-    fn close(mut self: Box<Self>, _deadline: Instant) -> CloseReport {
-        #[cfg(test)]
-        super::trace::record("control_close");
-        let t = Instant::now();
-        self.fire();
-        drop(self);
-        CloseReport {
-            elapsed: Some(t.elapsed()),
-        }
-    }
-}
-
-impl Drop for UnixControl {
-    fn drop(&mut self) {
-        self.fire();
     }
 }
 
