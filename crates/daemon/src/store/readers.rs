@@ -2,7 +2,6 @@
 //! (`docs/design/event-store.md` §2.2 "Readers", §2.7).
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::sync::{Condvar, Mutex};
 use std::time::Instant;
@@ -205,6 +204,29 @@ pub struct ReadTx<'a> {
     /// The enclosing `WriteTx`'s poison slot: a read error inside a job poisons it too.
     poison: Option<&'a RefCell<Option<StoreError>>>,
 }
+
+/// Every input state; the exhaustive match below stops compiling when a state is added.
+const ALL_INPUT_STATES: [InputState; 8] = [
+    InputState::Queued,
+    InputState::Sending,
+    InputState::Sent,
+    InputState::Acked,
+    InputState::Unconfirmed,
+    InputState::Rejected,
+    InputState::Cancelled,
+    InputState::Dismissed,
+];
+
+const _: fn(InputState) = |s| match s {
+    InputState::Queued
+    | InputState::Sending
+    | InputState::Sent
+    | InputState::Acked
+    | InputState::Unconfirmed
+    | InputState::Rejected
+    | InputState::Cancelled
+    | InputState::Dismissed => {}
+};
 
 /// Clamps a cursor to SQLite's integer range.
 fn clamp(v: u64) -> i64 {
@@ -524,10 +546,13 @@ impl<'a> ReadTx<'a> {
                     last_turn_start_seq: l.last_turn_start_seq,
                 },
             );
-            let inputs = self
-                .input_rows("WHERE thread_id = ?1 ORDER BY created_seq", [t.to_string()])?
+            let active: Vec<InputState> = ALL_INPUT_STATES
                 .into_iter()
-                .filter(|i| !i.state.is_terminal())
+                .filter(|s| !s.is_terminal())
+                .collect();
+            let inputs = self
+                .inputs_in(t, &active)?
+                .into_iter()
                 .map(|i| InputInfo {
                     input_id: i.input_id,
                     launch_id: i.launch_id,
@@ -774,6 +799,16 @@ impl<'a> ReadTx<'a> {
         })
     }
 
+    /// The thread's inputs in `states`, selected in SQL so other rows are never read.
+    fn inputs_in(&self, t: ThreadId, states: &[InputState]) -> Result<Vec<InputRow>, StoreError> {
+        let wanted: Vec<String> = states.iter().map(enum_text).collect();
+        let wanted = serde_json::to_string(&wanted).map_err(StoreError::decode)?;
+        self.input_rows(
+            "WHERE thread_id = ?1 AND state IN (SELECT value FROM json_each(?2)) ORDER BY created_seq",
+            [t.to_string(), wanted],
+        )
+    }
+
     fn input_rows(&self, tail: &str, params: impl Params) -> Result<Vec<InputRow>, StoreError> {
         type Raw = (
             String,
@@ -846,14 +881,7 @@ impl<'a> ReadTx<'a> {
     ///
     /// A store error.
     pub fn inputs(&self, t: ThreadId, states: &[InputState]) -> Result<Vec<InputRow>, StoreError> {
-        self.guard(|| {
-            let wanted: BTreeSet<String> = states.iter().map(enum_text).collect();
-            Ok(self
-                .input_rows("WHERE thread_id = ?1 ORDER BY created_seq", [t.to_string()])?
-                .into_iter()
-                .filter(|i| wanted.contains(&enum_text(&i.state)))
-                .collect())
-        })
+        self.guard(|| self.inputs_in(t, states))
     }
 
     fn approval_rows(

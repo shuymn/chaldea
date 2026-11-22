@@ -318,3 +318,52 @@ fn host_surface_removal_is_visible_in_host_replay() {
         assert!(after.surfaces == before.surfaces || !page.events.is_empty());
     }
 }
+
+/// The thread snapshot and `inputs(t, states)` select by state in SQL: a terminal input's
+/// row is never read (here its stored text no longer decodes, so reading it would fail).
+#[test]
+fn terminal_inputs_are_not_loaded() {
+    let mut s = TestStore::new();
+    let t = thread(1);
+    let created = |n: u128| {
+        event(
+            StreamId::Thread(t),
+            &format!("input-{n}"),
+            TypedEvent::InputCreated(InputCreated {
+                input_id: input(n),
+                launch_id: None,
+                initial_state: InputInitialState::Queued,
+                text: Content::text("hello"),
+                encoding: InputEncoding::WinKeys,
+                origin: InputOrigin::Pwa,
+                created_by: Actor::Human,
+            }),
+        )
+    };
+    s.append(vec![registered(t, false), created(1), created(2)])
+        .unwrap();
+    s.shutdown();
+    {
+        let c = rusqlite::Connection::open(s.path()).unwrap();
+        let changed = c
+            .execute(
+                "UPDATE proj_inputs SET state = 'cancelled', text = '1' WHERE input_id = ?1",
+                [input(2).to_string()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+    // The projection version is unchanged, so reopening does not rebuild over the edit.
+    s.reopen();
+    let (snapshot, queued) =
+        s.read(move |r| Ok((r.thread_snapshot(t)?, r.inputs(t, &[InputState::Queued])?)));
+    let ids: Vec<_> = snapshot
+        .unwrap()
+        .0
+        .inputs
+        .iter()
+        .map(|i| i.input_id)
+        .collect();
+    assert_eq!(ids, [input(1)]);
+    assert_eq!(queued.len(), 1);
+}
