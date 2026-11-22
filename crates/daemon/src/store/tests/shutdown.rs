@@ -235,7 +235,7 @@ fn later_call_reports_only_progress_by_its_deadline() {
 
 /// The owner closes notifications outside the intake locks: a receiver's waker, run inline
 /// when the last notification sender drops, can take the queue-sender lock (as `submit`
-/// does) without waiting for the owner.
+/// does) and the shutdown-state lock without waiting for the owner.
 #[test]
 fn closing_notifications_leaves_the_intake_locks_free() {
     use std::future::Future;
@@ -246,12 +246,13 @@ fn closing_notifications_leaves_the_intake_locks_free() {
 
     struct Probe {
         shared: Arc<Shared>,
-        result: Mutex<mpsc::Sender<bool>>,
+        result: Mutex<mpsc::Sender<(bool, bool)>>,
     }
     impl Wake for Probe {
         fn wake(self: Arc<Self>) {
-            let free = self.shared.sender.try_lock().is_ok();
-            let _ = self.result.lock().unwrap().send(free);
+            let sender = self.shared.sender.try_lock().is_ok();
+            let stop = self.shared.stop.try_lock().is_ok();
+            let _ = self.result.lock().unwrap().send((sender, stop));
         }
     }
 
@@ -280,10 +281,11 @@ fn closing_notifications_leaves_the_intake_locks_free() {
     let report = in_thread(&s, Duration::from_secs(5))
         .recv_timeout(WAIT)
         .expect("the owner returns");
-    let free = result_rx
+    let (sender_free, stop_free) = result_rx
         .recv_timeout(WAIT)
         .expect("the receiver was woken");
-    assert!(free, "the waker found the queue-sender lock held");
+    assert!(sender_free, "the waker found the queue-sender lock held");
+    assert!(stop_free, "the waker found the shutdown-state lock held");
     assert!(report.writer_exited, "{report:?}");
     assert!(matches!(
         recv.as_mut().poll(&mut Context::from_waker(&waker)),
@@ -359,7 +361,9 @@ fn timed_out_owner_detaches_a_finished_writer() {
     let a = a.recv_timeout(Duration::from_secs(5));
     drop(release_dtor);
     let a = a.expect("the owner returns without joining the writer");
+    let kept = s.inner.writer.lock().unwrap().is_some();
     assert!(!a.writer_exited, "{a:?}");
+    assert!(!kept, "the owner left the writer's handle in the store");
 }
 
 /// A later call that reaches the shared state only after its deadline, by when both reports
@@ -417,4 +421,56 @@ fn later_call_waits_for_the_notification_close_to_report_the_exit() {
         "{b:?}, notification {notification:?}"
     );
     assert!(a.writer_exited, "{a:?}");
+}
+
+/// A later call held past its deadline while the owner then closes notifications: the
+/// writer's exit was published in time, but the close was not, so the exit is left out.
+#[test]
+fn later_call_leaves_out_a_notification_close_after_its_deadline() {
+    let gates = Gates::default();
+    let (_dir, s) = store_with(gates.faults());
+    end_writer_on_its_own(&s);
+    wait_for_exit(&s);
+    let (claimed, release_a) = gates.arm("owner_claimed");
+    let a = in_thread(&s, Duration::from_secs(30));
+    claimed
+        .recv_timeout(WAIT)
+        .expect("the owner claimed shutdown");
+    let (begun, release_b) = gates.arm("observe_begin");
+    let b = in_thread(&s, Duration::ZERO);
+    begun
+        .recv_timeout(WAIT)
+        .expect("the later call is about to observe");
+    drop(release_a);
+    let a = a.recv_timeout(WAIT).expect("the owner returns");
+    drop(release_b);
+    let b = b.recv_timeout(WAIT).expect("the later call returns");
+    assert!(a.writer_exited, "{a:?}");
+    assert!(!b.writer_exited, "{b:?}");
+}
+
+/// A later call held past its deadline while the owner then publishes its report: the
+/// owner's reader outcome is left out.
+#[test]
+fn later_call_leaves_out_an_owner_report_after_its_deadline() {
+    let gates = Gates::default();
+    let (_dir, s) = store_with(gates.faults());
+    end_writer_on_its_own(&s);
+    wait_for_exit(&s);
+    let (closed, release_a) = gates.arm("intake_transition");
+    let a = in_thread(&s, Duration::from_secs(30));
+    closed
+        .recv_timeout(WAIT)
+        .expect("the owner closed notifications");
+    let (begun, release_b) = gates.arm("observe_begin");
+    let b = in_thread(&s, Duration::ZERO);
+    begun
+        .recv_timeout(WAIT)
+        .expect("the later call is about to observe");
+    drop(release_a);
+    let a = a.recv_timeout(WAIT).expect("the owner returns");
+    drop(release_b);
+    let b = b.recv_timeout(WAIT).expect("the later call returns");
+    assert!(a.readers_returned, "{a:?}");
+    assert!(!b.readers_returned, "{b:?}");
 }
