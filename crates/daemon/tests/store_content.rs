@@ -487,3 +487,22 @@ fn media_types_per_reference() {
         assert_eq!(body.media_type, "application/octet-stream");
     }
 }
+
+/// Two separately prepared references to the same bytes in one event: one body, a ref per
+/// media type.
+#[test]
+fn separately_prepared_equal_blobs_commit_both_refs() {
+    let s = TestStore::new();
+    let t = StreamId::Thread(thread(1));
+    let bytes = format!("\"{}\"", "x".repeat(79_998)).into_bytes();
+    let a = prep(bytes.clone(), TEXT);
+    let b = prep(bytes.clone(), JSON);
+    let hash = sha(&a.content);
+    let mut e = event(t, "k", tool(a.content, b.content));
+    e.blobs = vec![a.blob.unwrap(), b.blob.unwrap()];
+
+    s.append(vec![e]).unwrap();
+    let body = blob_of(&s, t, &hash).unwrap();
+    assert_eq!(body.data, bytes);
+    assert_eq!(body.media_type, "application/octet-stream");
+}

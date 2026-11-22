@@ -408,10 +408,16 @@ impl<'c> WriteTx<'c> {
                     preview_lossy,
                 } => {
                     check_blob_ref(blob)?;
-                    if let Some(i) = inputs.iter_mut().find(|i| i.0 == blob.sha256) {
+                    // Inputs are matched by hash: equal hashes are equal bytes, so a reference
+                    // uses every input of its hash, and the body is inserted once below.
+                    let mut supplied = None;
+                    for i in inputs.iter_mut().filter(|i| i.0 == blob.sha256) {
                         i.2 = true;
-                        let head = &i.1[..i.1.len().min(PREVIEW_READ_BYTES)];
-                        check_against(blob, preview, *preview_lossy, i.1.len() as u64, head)?;
+                        supplied = Some(i.1);
+                    }
+                    if let Some(data) = supplied {
+                        let head = &data[..data.len().min(PREVIEW_READ_BYTES)];
+                        check_against(blob, preview, *preview_lossy, data.len() as u64, head)?;
                     } else {
                         let stored: Option<(i64, Vec<u8>)> = self
                             .conn
