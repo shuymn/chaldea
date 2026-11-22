@@ -54,6 +54,28 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
+      # The Windows tests are compiled only on Windows: a cfg mistake that compiles a whole
+      # test binary or suite out must fail here instead of passing silently. Each binary
+      # must list its sentinel tests (docs/design/pty-windows.md §1).
+      - name: List the Windows tests
+        if: runner.os == 'Windows'
+        run: |
+          require() {
+            local list="$1"
+            shift
+            for t in "$@"; do
+              grep -Fxq "$t: test" <<<"$list" || { echo "not compiled: $t"; exit 1; }
+            done
+          }
+          list="$(cargo test -p chaldea-pty-runtime --lib --locked -- --list)"
+          require "$list" \
+            windows::tests::dropping_the_child_kills_through_the_job \
+            windows::kill::tests::job_empty_and_handles_signalled_proves_death
+          list="$(cargo test -p chaldea-pty-runtime --test windows_spawn --locked -- --list)"
+          require "$list" env_is_exactly_the_spec
+          list="$(cargo test -p chaldea-testkit --test pty_windows --locked -- --list)"
+          require "$list" spawn_tree_dies_and_unrelated_survives
+
       # core is Sans-IO: no async runtime, store, or HTTP server in its dependency tree.
       # A here-string, not a pipe: under `bash -eo pipefail`, `grep -q` exiting on the
       # first match makes the writer die of SIGPIPE, and the negated pipeline would pass.
