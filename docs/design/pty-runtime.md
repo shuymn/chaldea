@@ -12,6 +12,7 @@ Sources read for this document (paths are relative to each root):
 |---|---|---|
 | Spike `spikes/pty-hooks/src/` | this repository | `pty.rs` (writer, gate), `vt.rs` (responder, snapshot), `os/drain.rs`, `os/mod.rs`, `paste.rs` (`win_keys` records), §4.4–§4.7 of `docs/spikes/pty-hooks-spike.md` |
 | `alacritty_terminal` | crate 0.26.0 | `event.rs`, `term/mod.rs`, `term/cell.rs` |
+| `vte` | crate 0.15.0 (alacritty's parser) | `src/ansi.rs` (synchronized updates) |
 | `portable-pty` | crate 0.8.1 | `lib.rs`, `unix.rs` |
 | herdr (`herdrdev/herdr`) | `e8d7d97` | `src/pty/actor.rs`, `src/pty/actor/unix.rs`, `src/pty/backend.rs`, `src/pane/terminal.rs` |
 | Codex (`openai/codex`, sparse `codex-rs/utils/pty`) | `8653ca9` (default branch 2026-11-22) | `src/pty.rs`, `src/process.rs` |
@@ -25,18 +26,19 @@ Sources read for this document (paths are relative to each root):
 ```
 Cargo.toml                                # members += "crates/pty-runtime"; [workspace.dependencies] += alacritty_terminal
 crates/pty-runtime/Cargo.toml             # chaldea-pty-runtime; feature `fake`; [lints] workspace = true (PR 3 changes it, D7)
-crates/pty-runtime/src/lib.rs             # re-exports; crate doc states the lock order and the no-tokio rule
+crates/pty-runtime/src/lib.rs             # re-exports; crate doc states the lock and callback rules and the no-tokio rule
 crates/pty-runtime/src/backend.rs         # PtyRuntime (sealed), SpawnSpec, PtySize, SpawnedPty (owning guard), PtyChild, PtyControl,
                                           # ProcessIdentity, ChildExit, KillReport, CloseReport, SpawnError
 crates/pty-runtime/src/session.rs         # Session, SessionConfig, SessionEvent, SessionStatus, CloseBounds, CloseOutcome, close order
-crates/pty-runtime/src/writer.rs          # WriteUnit, Part, Guard, Basis, WriteContext, WriteRecord, WriteOutcome, Refusal, counters, ring
+crates/pty-runtime/src/writer.rs          # WriteUnit, Part, Guard, Basis, WriteContext, WriteRecord, WriteOutcome, Refusal, counters, slot, ring
 crates/pty-runtime/src/origin.rs          # WriteOrigin, OriginClass, ClassSet, ReplyKind, mapping to core::payload::HumanWriteOrigin
-crates/pty-runtime/src/limits.rs          # Limits, CloseBounds defaults, the max_unit_bytes derivation
+crates/pty-runtime/src/limits.rs          # Limits (defaults from core::input::MAX_PROMPT_BYTES), CloseBounds
 crates/pty-runtime/src/drain.rs           # lifted from spikes/pty-hooks/src/os/drain.rs; ordered handoff to a sink; unit tests inside
-crates/pty-runtime/src/vt.rs              # lifted from spikes/pty-hooks/src/vt.rs: Vt, Responder, packed ModeWord
-crates/pty-runtime/src/snapshot.rs        # Snapshot, Line, Cell, CellWidth, grid encoding, to_payload
-crates/pty-runtime/src/fake.rs            # #[cfg(feature = "fake")] FakePty, FakeScript, FakeChild, fault hooks
+crates/pty-runtime/src/vt.rs              # lifted from spikes/pty-hooks/src/vt.rs: Vt, Responder, NoSync, packed ModeWord
+crates/pty-runtime/src/snapshot.rs        # Snapshot, Line, Cell, CellWidth, grid encoding, to_payload, decode_grid
+crates/pty-runtime/src/fake.rs            # #[cfg(feature = "fake")] FakePty, FakeScript, FakeChild, Probe
 crates/pty-runtime/tests/{writer,responder,snapshot,session}.rs
+crates/core/src/input.rs                  # pub const MAX_PROMPT_BYTES: usize = 256 * 1024 (D8)
 crates/core/tests/golden/events/vt_snapshot_taken.json, crates/core/tests/golden.rs
                                           # grid golden values (event and Component::VtSnapshot) in the §2.6 encoding
 .github/workflows/ci.yml, lefthook.yml    # `workspace` job: add the pty-runtime dependency check (§7)
@@ -64,7 +66,7 @@ proptest.workspace = true
 fake = []
 ```
 
-`alacritty_terminal =0.26.0` is the version the spike ran on both hosts and the one prior-art row 3a and spike §3 read in source; its only optional feature (`serde`) is not needed. It also compiles its own `tty` module and that module's dependencies (`rustix-openpty`, `signal-hook`, `polling` on Unix; `miow`, `piper`, `windows-sys 0.59` on Windows); this crate never calls them. No `tokio`, no `portable-pty` in this PR (PR 3 adds `portable-pty =0.8.1` under `[target.'cfg(unix)'.dependencies]`).
+`alacritty_terminal =0.26.0` is the version the spike ran on both hosts and the one prior-art row 3a and spike §3 read in source; its only optional feature (`serde`) is not needed. Its parser, `vte 0.15.0`, is reached through `alacritty_terminal::vte` (no direct dependency). It also compiles its own `tty` module and that module's dependencies (`rustix-openpty`, `signal-hook`, `polling` on Unix; `miow`, `piper`, `windows-sys 0.59` on Windows); this crate never calls them. No `tokio`, no `portable-pty` in this PR (PR 3 adds `portable-pty =0.8.1` under `[target.'cfg(unix)'.dependencies]`).
 
 **Workspace and CI.** The crate joins `members`. The `workspace` job runs unchanged (fmt, clippy `-D warnings`, `cargo test --workspace --locked`, which now includes this crate's tests on `macos-latest` and `windows-latest`) and gains one step: `pty-runtime` has no `tokio` in its normal dependency tree (§7). `lefthook.yml` mirrors it.
 
@@ -72,14 +74,15 @@ fake = []
 
 Names may change in review; shapes may not.
 
-**Threading model.** The crate is synchronous: std threads, blocking I/O, no async runtime. PTY ends are blocking on both OSes (portable-pty's reader and writer are blocking `Read`/`Write`, `lib.rs:97-102`; ConPTY uses synchronous anonymous pipes), so an async runtime would only wrap them in blocking tasks, as Codex does (`utils/pty/src/pty.rs:241`, `:285`). Callers never wait on the crate's threads except through the bounded methods named in §5: every callback the crate invokes (`Completion`, `OutputSink`, `on_event`) must return without blocking, and the crate never waits on a caller. The daemon bridges to tokio by passing callbacks that `try_send` on a tokio channel or complete a `oneshot`; it calls the bounded blocking methods (`close`, `kill`, `resize`) from `spawn_blocking`.
+**Threading model.** The crate is synchronous: std threads, blocking I/O, no async runtime. PTY ends are blocking on both OSes (portable-pty's reader and writer are blocking `Read`/`Write`, `lib.rs:97-102`; ConPTY uses synchronous anonymous pipes), so an async runtime would only wrap them in blocking tasks, as Codex does (`utils/pty/src/pty.rs:241`, `:285`). Every callback the crate invokes (`Completion`, `OutputSink`, `on_event`) must return without blocking, and the crate never waits on a caller. The daemon bridges to tokio by passing callbacks that `try_send` on a tokio channel or complete a `oneshot`, and calls `close`, `kill`, and `resize` from `spawn_blocking`.
 
-**Locks and order.** Control lock → VT lock → queue lock; no code takes them in another order, and no lock is held while a caller's callback runs, except where §2.3 and §2.4 say so.
+**Locks and callbacks.** Lock order: control lock → VT lock → queue lock; no code takes them in another order.
 
-- *Control lock* guards `PtyControl`; only `resize` and close step 4 take it. The drain thread never does.
-- *VT lock* guards the `Term`, the parser, and the subscriber list. The drain thread holds it while it parses one piece of output and the responder enqueues replies.
-- *Queue lock* guards both write lanes, the in-progress slot, the counters, and the ring.
+- *Control lock* guards `PtyControl`; only `resize` and close step 4 take it.
+- *VT lock* guards the `Term`, the parser, the subscriber list, and the output end. The drain thread holds it while it parses one piece of output.
+- *Queue lock* guards both write lanes, the unit slot, the counters, and the ring.
 - Modes are read from one atomic word (§2.6), without a lock.
+- **No callback runs under an internal lock.** Code records the state change and takes the callbacks to fire while it holds a lock, then fires them after unlocking. This holds for completions (writer, `cancel`, close), sinks, and every `on_event`, including `ReplyDropped`. A callback may therefore call any `Session` method except `close`.
 
 ### 2.1 Backend Seam: `PtyRuntime`
 
@@ -125,7 +128,7 @@ pub trait PtyChild: Send + Sync {
     fn kill_tree(&self, extra: &[ProcessIdentity], deadline: Instant) -> KillReport;
 }
 pub trait PtyControl: Send {
-    /// Resizes the PTY; returns without waiting for output to be read.
+    /// Resizes the PTY. Not bounded by the crate: ConPTY's resize can wait on conhost.
     fn resize(&self, size: PtySize) -> io::Result<()>;
     /// Releases the PTY itself (Unix master, Windows pseudoconsole); returns by `deadline`.
     fn close(self: Box<Self>, deadline: Instant) -> CloseReport;
@@ -137,17 +140,18 @@ pub struct KillReport { pub method: String, pub tree_dead: bool, pub survivors: 
 pub struct CloseReport { pub elapsed: Option<Duration> }                              // None: did not return by the deadline
 
 pub enum SpawnError {
-    /// The child provably never existed: the confirmed `spawn_failed` of mvp §2.3.
-    NeverStarted { kind: NeverStartedKind, error: io::Error },     // NotFound | PermissionDenied | Setup
+    /// The child provably never existed: the confirmed `spawn_failed` of mvp §2.3. Resources
+    /// created before it (a pseudoconsole and its drain) may still be unreleased.
+    NeverStarted { kind: NeverStartedKind, error: io::Error, cleanup: Cleanup },   // NotFound | PermissionDenied | Setup
     /// A process existed and setup then failed. A Codex positional prompt may have run.
     StartedThenFailed { stage: &'static str, error: io::Error, identity: Option<ProcessIdentity>, cleanup: Cleanup },
 }
-pub enum Cleanup { Confirmed, Unresolved { kill: KillReport, close: CloseReport } }
+pub enum Cleanup { Confirmed, Unresolved { kill: Option<KillReport>, close: Option<CloseReport> } }
 ```
 
 **What each backend must supply** (the obligations PR 3 and PR 4 implement against this trait unchanged):
 
-- `spawn` returns either a `SpawnedPty` or an error after releasing everything it created: no process alive, no handle or descriptor open (spike F-2c). When it cannot prove that, the error is `StartedThenFailed` with `Cleanup::Unresolved`. On Windows the release order is: terminate job and process, close the pseudoconsole while the drain reads, close pipe ends (spike §4.6).
+- `spawn` returns either a `SpawnedPty` or an error after releasing everything it created: no process alive, no handle or descriptor open (spike F-2c). When it cannot prove that, the error carries `Cleanup::Unresolved`. On Windows the release order is: terminate job and process, close the pseudoconsole while the drain reads, close pipe ends (spike §4.6).
 - The child's environment is exactly `spec.env` (portable-pty: `env_clear` then `env`; Windows: an explicit `CREATE_UNICODE_ENVIRONMENT` block). The scrub list is the daemon's (mvp §2.7 "Env scrub").
 - `output` is a `Drain` (§2.4) the backend started over its output read end. Windows starts it right after `CreatePseudoConsole`, before `CreateProcessW` (spike §4.6); Unix after `openpty`. The reader the drain owns returns `Ok(0)` once every slave end is closed: the Unix backend maps the master's `EIO` after hangup to EOF, and drops the parent's slave handle right after spawn (spike §4.7).
 - **Dropping `input` writes no bytes.** portable-pty's writer writes `\n` + VEOF on drop (`unix.rs:351-361`), so PR 3 must not hand that writer over; it writes through its own handle on a dup of the master fd. With this obligation the session can release the input whenever the writer thread finishes, without an ordering hazard against a live CLI.
@@ -169,9 +173,9 @@ pub enum SessionEvent { Exited(ChildExit), WaitFailed(String), OutputEnded(Outpu
 pub enum OutputEnd { Eof, Error(String) }
 
 impl Session {
-    /// Consumes the guard. Creates the waiter and writer threads, then hands the input to the
-    /// writer, then attaches the VT sink to the drain. On any failure the guard's teardown runs
-    /// and `StartError` carries its reports; the input stays in the guard until every thread exists.
+    /// Consumes the guard: attaches the VT sink to the drain, creates the waiter and writer
+    /// threads, then hands the input to the writer. On any failure the guard's teardown runs
+    /// (threads already created are stopped and joined first) and `StartError` carries its reports.
     pub fn start(pty: SpawnedPty, config: SessionConfig) -> Result<Session, StartError>;
     pub fn identity(&self) -> &ProcessIdentity;
     pub fn evidence(&self) -> &[(&'static str, String)];
@@ -182,40 +186,44 @@ impl Session {
     pub fn writes_after(&self, seq: u64) -> Result<Vec<WriteRecord>, LogTruncated>;   // diagnostic ring
 
     pub fn modes(&self) -> ModeView;                                     // one atomic load
-    pub fn snapshot(&self) -> Result<Snapshot, VtUnavailable>;           // §2.6
-    pub fn subscribe(&self, sink: OutputSink) -> Result<(Snapshot, SubscriptionId), SubscribeError>;
+    pub fn snapshot(&self, deadline: Instant) -> Result<Snapshot, VtUnavailable>;      // §2.6
+    pub fn subscribe(&self, sink: OutputSink, deadline: Instant) -> Result<(Snapshot, SubscriptionId), SubscribeError>;
     pub fn unsubscribe(&self, id: SubscriptionId);
     pub fn resize(&self, size: PtySize) -> io::Result<()>;
 
     pub fn status(&self) -> SessionStatus;                               // exit, output end, input state, vt_failed, ResponderStatus
     pub fn kill(&self, extra: &[ProcessIdentity], deadline: Instant) -> KillReport;   // tree kill only; I/O stays up
     pub fn close(self, extra: &[ProcessIdentity], bounds: CloseBounds) -> CloseOutcome;
-    #[cfg(feature = "fake")] pub fn fail_vt_on_next_piece(&self);         // VT panic injection for tests
+    #[cfg(feature = "fake")] pub fn probe(&self) -> Probe;               // test signals (§2.7)
+    #[cfg(feature = "fake")] pub fn fail_vt_on_next_piece(&self);
 }
 impl Drop for Session { /* close(&[], CloseBounds::default()) unless already closed */ }
 
 pub type OutputSink = Box<dyn FnMut(OutputEvent<'_>) -> Flow + Send>;   // non-blocking; may move between threads
-pub enum OutputEvent<'a> { Bytes { offset: u64, bytes: &'a [u8] }, End(&'a OutputEnd), Lagged { at: u64 } }
+pub enum OutputEvent<'a> { Bytes { offset: u64, bytes: &'a [u8] }, End(&'a OutputEnd) }
 pub enum Flow { Continue, Stop }
-pub fn channel_sink(capacity: usize) -> (OutputSink, OutputReceiver);   // std bounded channel
+pub fn channel_sink(capacity: usize) -> (OutputSink, OutputReceiver);   // std bounded byte channel + terminal slot
+pub enum Received { Bytes { offset: u64, bytes: Vec<u8> }, End(OutputEnd), Lagged { at: u64 } }   // OutputReceiver::recv_timeout
 ```
 
-**Start.** The guard keeps `input` until the waiter and writer threads exist; a thread-creation failure runs the guard's teardown (§2.1), so the tree is killed before any PTY end is released and no half-started thread owns an endpoint. The initial `PtySize` comes from the guard, so the VT and the responder answer `CSI 18 t` correctly before any resize.
+**Start.** `start` attaches the VT sink first (held startup output is parsed, its replies queued in the reply lane), then creates the waiter and writer threads, then hands the input to the writer. Until the handoff the guard owns every endpoint, so a `HoldOverflow` or a thread-creation failure runs the guard's teardown with nothing owned elsewhere; the tree is killed before any PTY end is released. The initial `PtySize` comes from the guard, so the responder answers `CSI 18 t` correctly before any resize.
 
 **Exit publication.** The waiter stores the exit in an atomic (`Release`) before calling `on_event(Exited)`, so a submit triggered by that event sees the exit and is refused.
 
-**Resize.** Under the control lock: validate (`PtySize`), call `control.resize(size)` without the VT lock (ConPTY's resize can wait on conhost, which can wait on the drain; spike `pty.rs:385-399` also resized outside the VT lock), then on success take the VT lock and resize the grid and the size the responder reports. On failure neither side changes. Guarantee, stated in parse order: output parsed after the VT resize is laid out at the new size; a chunk read before the resize call may be parsed at either size. Resize is independent of the writer: whether a resize during a unit invalidates that unit's gate decision is PR 10 / PR 11 policy, which can express it through the unit's `recheck`.
+**Resize.** Under the control lock: validate (`PtySize`), call `control.resize(size)` without the VT lock (ConPTY's resize can wait on conhost, which can wait on the drain; spike `pty.rs:385-399` also resized outside the VT lock), then on success take the VT lock and resize the grid and the size the responder reports. On failure neither side changes. Resize is not bounded and holds only the control lock, so a stalled resize blocks neither writes nor the drain; the daemon calls it off its runtime. Guarantee, stated in parse order: output parsed after the VT resize is laid out at the new size; a chunk read before the resize call may be parsed at either size. A resize between a unit's text and its submit is outside the crate's guarantee; PR 10 / PR 11 decide whether to resize during a unit.
 
-**Subscribe.** A diagnostic snapshot plus the output bytes after its offset, with no gap and no duplicate. Under the VT lock the session takes the snapshot (with its `output_offset`) and registers the sink with that offset. The drain dispatches each piece with its offset after releasing the VT lock, and a subscriber receives only bytes at or after its own offset. It is not a replay checkpoint: the snapshot holds no pending escape sequence, rendition, or saved terminal state, so replaying the suffix on an outer terminal can render differently; attach's repaint is PR 11's design. After output ended, `subscribe` returns the snapshot and the sink immediately receives `End`. At most `limits.subscribers` sinks; a sink that returns `Stop` or panics is removed and never called again. `channel_sink` returns `Stop` when its channel is full, and its receiver then yields `Lagged { at }` (the offset of the first undelivered byte), distinct from `End`.
+**Subscribe.** A diagnostic snapshot plus the output bytes after its offset, with no gap and no duplicate. Under the VT lock (taken by `try_lock` until `deadline`, else `VtUnavailable`) the session takes the snapshot with its `output_offset`, registers the sink with that offset, and reads the output end; the drain publishes the end under the same lock, so a subscriber racing EOF gets exactly one `End` (from dispatch, or at once after registration when the output already ended). The drain dispatches each piece with its offset after releasing the VT lock, and a subscriber receives only bytes at or after its own offset. It is not a replay checkpoint: the snapshot holds no pending escape sequence, rendition, or saved terminal state; attach's repaint is PR 11's design. At most `limits.subscribers` sinks; a sink that returns `Stop` or panics is removed and never called again. `channel_sink` keeps the terminal status apart from byte capacity: when its byte channel is full it drops the bytes, records `Lagged { at }` (the offset of the first dropped byte), and returns `Stop`; `End` is always recorded. Its receiver yields every queued byte chunk, then `Lagged` if a byte was dropped, else `End`.
 
 **Close order** (`close`, `Drop`, and the failure teardown of `SpawnedPty`). Every step has an absolute budget from `CloseBounds`; a step that runs out of budget is reported and the next step runs.
 
-1. **Close the queue** (under the queue lock, on the closing thread): new `submit` calls fail `Closed`; every queued, uncancelled unit completes `NotStarted(Closed)` at once (cancelled units were already completed by `cancel`). Settling never depends on the writer thread.
-2. **Kill** `kill_tree(extra, kill)` unless the tree is already reported dead.
-3. **Release the input**: signal the writer and wait up to `input` for it to drop `input` and exit. A writer blocked in `write` keeps `input` until that write returns; since dropping writes no bytes (§2.1), the late drop is harmless.
+1. **Close the queue** (closed flag set under the queue lock): new `submit` calls fail `Closed`; every queued unit, and a unit in the slot that has not dispatched, is settled `NotStarted(Closed)`; their completions fire after unlocking. Settling never depends on the writer thread.
+2. **Kill** `kill_tree(extra, kill)` unless the tree is already reported dead and `extra` is empty.
+3. **Release the input**: signal the writer and wait up to `input` for it to drop `input` and exit. A writer blocked in `write` keeps `input` until that write returns; it makes no further write call (§2.3), and dropping writes no bytes (§2.1).
 4. **Close the PTY** `control.close(close)` under the control lock, while the drain keeps reading (ConPTY is never closed under an undrained pipe).
 5. **Finish the drain** `Drain::finish(drain)`: wait for EOF or a read error and join the drain thread, else abandon it.
-6. **Join** the writer and waiter threads within `join`. If the writer has not finished, the closer takes the in-progress completion from its take-once slot and fires it as `Incomplete { error: "unknown_after_close" }` with the bytes known written so far; a writer that returns later finds the slot empty.
+6. **Join** the writer and waiter threads within `join`. If a dispatched unit is still in the slot, the closer takes it and fires its completion as `Incomplete { error: "unknown_after_close" }` with the bytes known written so far; a writer that returns later finds the slot empty.
+
+Then `final_snapshot` is taken with `snapshot(now + join)`; it is `VtUnavailable` if an abandoned drain still holds the VT lock.
 
 ```rust
 pub struct CloseBounds { pub kill: Duration, pub input: Duration, pub close: Duration, pub drain: Duration, pub join: Duration }
@@ -223,16 +231,16 @@ pub struct CloseOutcome {
     pub kill: KillReport, pub close: CloseReport, pub output: Option<OutputEnd>,
     pub released: Released,               // what is confirmed released, not just abandoned
     pub abandoned: Vec<&'static str>,     // threads still running: "pty-writer", "pty-drain", "pty-wait", "conpty-close"
-    pub final_snapshot: Result<Snapshot, VtUnavailable>,   // taken after step 5
+    pub final_snapshot: Result<Snapshot, VtUnavailable>,
     pub final_after_end: bool,            // true when the drain ended before the snapshot was taken
     pub elapsed: Duration,
 }
 pub struct Released { pub input: bool, pub control: bool, pub output: bool, pub tree_dead: bool }
 ```
 
-`close` returns within the sum of the budgets (bounded return). Confirmed release is what `Released` says; an abandoned thread still owns its endpoint until its blocking call returns or the process exits. A snapshot taken by the daemon before `close` is pre-teardown; `final_snapshot` is the one taken after the output ended (closing ConPTY can be what lets the last output arrive).
+`close` returns within the sum of the budgets (bounded return). Confirmed release is what `Released` says; an abandoned thread still owns its endpoint until its blocking call returns or the process exits. A snapshot taken by the daemon before `close` is pre-teardown; `final_snapshot` with `final_after_end` is the one taken after the output ended (closing ConPTY can be what lets the last output arrive).
 
-**After child exit.** The writer refuses every unit that has not started (`NotStarted(ChildExited)`, zero bytes) and stops a started unit before its next `Bytes` part (§2.3). VT replies are discarded and counted (§2.5). The drain keeps reading until EOF, which can come later than exit while descendants hold the PTY. The session stays up until `close`; it never kills or closes on its own.
+**After child exit.** The writer refuses every unit that has not dispatched (`NotStarted(ChildExited)`, zero bytes) and stops a dispatched unit before its next `Bytes` part (§2.3). Queued VT replies are discarded (§2.5). The drain keeps reading until EOF, which can come later than exit while descendants hold the PTY. The session stays up until `close`; it never kills or closes on its own.
 
 ### 2.3 Single Writer and Origin Log
 
@@ -241,7 +249,7 @@ One writer thread per session is the only code that writes to `input`. Callers s
 ```rust
 pub struct WriteUnit { pub origin: WriteOrigin, pub parts: Vec<Part> }
 pub enum Part {
-    Bytes(Vec<u8>),          // non-empty; one write call (looped on a short accept); the encoder keeps every escape sequence inside one part
+    Bytes(Vec<u8>),          // non-empty; one write call on whole acceptance; the encoder keeps every escape sequence inside one part
     Pause(Duration),         // between two Bytes parts only
 }
 // Shape, checked at submit: 1–8 parts, first and last part Bytes, no empty Bytes, no two
@@ -268,17 +276,17 @@ pub struct Guard {
     pub bracketed_paste: Option<u64>,          // refuse unless 2004 is on with this epoch (ModeView)
     pub recheck: Option<Recheck>,              // the daemon's gate / card recheck
 }
-pub struct Basis { pub seq: u64, pub counted: ClassSet }   // counted classes are the daemon's policy
+pub struct Basis { pub seq: u64, pub counted: ClassSet }   // a last_started value the daemon captured; counted classes are its policy
 pub type Recheck = Box<dyn FnOnce(&WriteContext) -> Result<(), String> + Send>;
 pub struct WriteContext { pub seq: u64, pub modes: ModeView, pub last_started: [u64; 3] }  // per OriginClass
 
 pub type Completion = Box<dyn FnOnce(&WriteRecord) + Send>;            // non-blocking; called exactly once
 pub fn completion_channel() -> (Completion, CompletionReceiver);        // recv_deadline(Instant)
 pub struct WriteTicket { /* … */ }
-impl WriteTicket { pub fn cancel(&self) -> bool; }                      // true: never starts; completes Cancelled now
+impl WriteTicket { pub fn cancel(&self) -> bool; }                      // true: never dispatches; completes Cancelled
 
 pub struct WriteRecord {
-    pub seq: u64,                    // per session, from 1, gapless, assigned when the unit starts or is refused
+    pub seq: u64,                    // per session, from 1, gapless, assigned when the writer dequeues the unit
     pub origin: WriteOrigin,
     pub submitted_at: Instant, pub started_at: Option<Instant>, pub finished_at: Option<Instant>,
     pub byte_start: u64,             // input bytes written before this unit
@@ -293,30 +301,32 @@ pub enum SubmitError { Closed, QueueFull, BadShape(&'static str), UnitTooLarge, 
 pub struct ModeView { pub modes: TermModes, pub bracketed_paste_epoch: u64 }
 ```
 
-**Writer loop.** The writer serves two lanes: replies (§2.5) and user units (FIFO). **Progress rule:** at each unit boundary it takes the number of replies queued at that moment, writes exactly those, then takes one user unit. Replies arriving meanwhile wait for the next boundary, so a stream of replies cannot starve user units, and a reply waits at most for the unit in progress (its writes plus at most `max_pause`). No reply is written inside a unit.
+**Writer loop and progress.** The writer serves two lanes: replies (§2.5) and user units (FIFO). At each unit boundary it takes the number of replies queued at that moment, writes exactly that batch, then dequeues one user unit. So a user unit is dequeued after at most one reply batch, and a reply queued after a batch was sampled is written after at most the rest of that batch and one user unit. No reply is written inside a unit.
 
-For the user unit, before its first byte the writer assigns its `seq` and checks, in this fixed order, recording `NotStarted(reason)` with zero bytes on the first failure: queue closed; child exited; input broken; `not_after` passed (`Expired`); `basis` (see below); `bracketed_paste` (2004 off, or its epoch differs, gives `BracketedPasteChanged`); then `recheck`, run on the writer thread inside `catch_unwind` with every earlier unit finished and nothing else writing. **Final check:** after the recheck returns, the writer re-reads the exit, input-broken, mode-word, and deadline atomics immediately before the first write call and refuses on any change (a recheck can take time while the drain parses a `DECRST 2004`). The writer thread's exclusive ownership of `input` is the arbitration lock of mvp §2.3: a recheck that passes is followed by the unit's first byte with no write of any origin in between. Tests assert the order only where a consumer depends on it (`Expired` before `Recheck`; `ChildExited` before everything except `Closed`).
+**One slot from dequeue to finish.** The writer moves a dequeued unit into the take-once slot and assigns its `seq` there, before any check. Close and the writer both settle the slot's completion only by taking the unit out of the slot under the queue lock, so exactly one of them fires it: close settles an undispatched unit `NotStarted(Closed)` and a dispatched one `Incomplete { unknown_after_close }` (§2.2).
 
-**Basis.** `Basis::seq` is the highest write `seq` whose completion the daemon's gate view has applied, completions being applied in `seq` order (mvp §4 PR 10 obligation). The writer refuses `WriteSinceBasis` if a unit of a class in `counted` started with `seq > basis.seq`, and `BasisUnknown` if `basis.seq` is above the highest `seq` assigned so far (a basis the writer cannot verify). Refused units never count; a started unit counts from its first write call, whatever it wrote. The check reads the monotonic counters, never the ring, so ring eviction cannot hide a write.
+**Before the first byte** the writer checks, in this fixed order, and on the first failure records `NotStarted(reason)` with zero bytes: queue closed; child exited; input broken; `not_after` passed (`Expired`); `basis`; `bracketed_paste` (2004 off, or its epoch differs, gives `BracketedPasteChanged`); then `recheck`, run outside the queue lock inside `catch_unwind`, with every earlier unit finished and nothing else writing. **Dispatch boundary:** after the recheck returns, the writer takes the queue lock and re-checks that the unit is still in the slot, the queue is open, and the exit, input-broken, mode-word, and deadline facts are unchanged; it then marks the unit dispatched and advances `last_started` for its class, and only after unlocking makes the first write call. The writer thread's exclusive ownership of `input` is the arbitration lock of mvp §2.3: a recheck that passes is followed by the unit's first byte with no write of any origin in between. Tests assert the order only where a consumer depends on it (`ChildExited` before every other check except `Closed`; `Expired` before `Recheck`).
 
-**Started units.** A started unit is committed: `not_after` no longer applies (herdr: "committed Enter cannot expire", `src/pty/actor.rs:698-713`). Before each later `Bytes` part the writer checks the exit atomic: if the child has exited, the remaining parts are skipped and the record is `Incomplete { error: "child_exited" }`, so a submit is never sent to a descendant that still holds the PTY. During a `Pause` the writer waits on the queue condvar until the pause ends, the queue closes, or the child exits; a close gives `Incomplete { error: "closed_in_pause" }`. An I/O error ends the unit as `Incomplete` with the bytes written so far and marks the input broken: every later unit is refused `InputBroken` and `on_event(InputBroken)` fires once.
+**Basis.** `Basis::seq` is a `last_started(counted)` value the daemon captured when it recorded the readiness evidence the send relies on (mvp §4 PR 10). The writer refuses `WriteSinceBasis` if `last_started(counted)` at the dispatch boundary is above `basis.seq`, and `BasisUnknown` if `basis.seq` is above the highest `seq` assigned before this unit (a basis from another session). The candidate's own class counter advances only at its own dispatch, so it is never compared with itself. With the default `counted = ClassSet::ALL`, a startup reply before readiness is inside the basis and a reply after readiness refuses the send. A write that happens between the CLI emitting the readiness hook and the daemon's intake of it is ordered by intake: this is the residual constraint of mvp §2.3, not closed here.
 
-**Short writes.** Each `Bytes` part is passed to `write`; if the call accepts less, the writer writes the rest in further calls and increments `split_writes`. The backends guarantee whole acceptance (§2.1), so a nonzero `split_writes` is a backend defect made visible, not a normal path.
+**Started units.** A dispatched unit is committed: `not_after` no longer applies (herdr: "committed Enter cannot expire", `src/pty/actor.rs:698-713`). Before every write call after the first (a later `Bytes` part, or the rest of a short accept) the writer checks under the queue lock that the queue is open and the child has not exited; otherwise it makes no further call and records `Incomplete { error: "closed" | "child_exited" }`, so a submit is never sent after close or to a descendant that still holds the PTY. During a `Pause` the writer waits on the queue condvar until the pause ends, the queue closes, or the child exits. An I/O error, or `Ok(0)` for a non-empty part, ends the unit as `Incomplete` with the bytes written so far and marks the input broken: every later unit is refused `InputBroken` and `on_event(InputBroken)` fires once.
 
-**Position and the origin log.** `seq` orders all records of a session, started or refused. A unit's span is contiguous, and the spans of started units, in `seq` order, partition the input stream exactly. Three monotonic counters, `last_started(class)` for `Input`, `Human`, `Reply`, advance when a unit of that class makes its first write call; they are independent of the ring. The writer puts the record in the in-progress slot and advances the counter before its first write call, so a hook that arrives while a human write is blocked already sees it. Records also go to a ring of `limits.log_records` entries; `writes_after(seq)` returns a copy of the records after `seq`, or `LogTruncated`. The ring is diagnostic: no guard and no ack rule depends on it.
+**Short writes.** If a `write` call accepts less than its part, the writer writes the rest in further calls and increments `split_writes`. The backends guarantee whole acceptance (§2.1), so a nonzero `split_writes` is a backend defect made visible.
+
+**Position and the origin log.** `seq` orders all records of a session, dispatched or refused. A unit's span is contiguous, and the spans of dispatched units, in `seq` order, partition the input stream exactly. Three monotonic counters, `last_started(class)` for `Input`, `Human`, `Reply`, advance at a unit's dispatch, before its first write call; so a hook that arrives while a human write is blocked already sees it. They are independent of the ring. Records also go to a ring of `limits.log_records` entries; `writes_after(seq)` returns a copy of the records after `seq` (the in-progress one included), or `LogTruncated`. The ring is diagnostic: no guard and no ack rule depends on it.
 
 **How the daemon uses it** (PR 10 and PR 11 decide the details; these are the facts they get):
 
-- **Send path.** Admit with `Basis { seq: applied, counted }`, where `counted` is the adapter's policy (default `ClassSet::ALL`, VT replies included, keeping mvp §2.3's "last write of any origin" literal); `bracketed_paste` for bracketed paste; and a `recheck` that re-reads the daemon's in-memory gate view (process running, same launch, turn idle, no other input in flight except this one). Submit `WriteUnit { Input, [text, Pause(submit delay), submit] }`.
-- **Outcome mapping** to `core::input::InputInput`: `Written` → `WriteCompleted`; `NotStarted(_)` and every synchronous `SubmitError` → `RecheckFailed` (known zero bytes, so `cancelled`); `Incomplete` → `WriteOutcomeUnknown`. A completion can arrive after `launch_exited` has already moved the input to `unconfirmed`; the daemon then ignores it. The daemon validates shape and size before committing `sending` where it can, so `SubmitError` after `sending` is the rare case.
-- **Ack attribution.** At hook intake the daemon reads `last_started(counted)`; a counted unit with `seq` in `(input.seq, that value]` makes the ack non-attributable. A write that started after the hook was received does not. Which classes count is the same per-adapter policy.
+- **Send path.** Store `last_started(counted)` with each readiness evidence at its intake; admit with `Basis { seq: that value, counted }`, where `counted` is the adapter's policy (default `ClassSet::ALL`, keeping mvp §2.3's "last write of any origin" literal); `bracketed_paste` for bracketed paste; and a `recheck` that re-reads the daemon's in-memory gate view. Submit `WriteUnit { Input, [text, Pause(submit delay), submit] }`.
+- **Outcome mapping** to `core::input::InputInput`: `Written` → `WriteCompleted`; `NotStarted(_)` and every synchronous `SubmitError` → `RecheckFailed` (known zero bytes, so `cancelled`); `Incomplete` → `WriteOutcomeUnknown`. A completion that arrives after `launch_exited` already moved the input to `unconfirmed` is ignored.
+- **Ack attribution.** At hook intake the daemon reads `last_started` for the input's class and for `counted`. The hook is a candidate for an input only if the input had dispatched by then (`last_started(Input) ≥ input.seq`); a counted unit with `seq` in `(input.seq, last_started(counted)]` makes it non-attributable.
 - **`human_write`.** The completion of an `Attach`, `Key`, or `CardKey` unit carries the record; `origin.human_write()` gives the payload's origin. A partial human write (`Incomplete` with `bytes_written > 0`) is still a human write.
 
-**Bounds.** `submit` never waits for queue space or PTY I/O: the user lane holds at most `limits.queue_units` units and `limits.queue_bytes` bytes; past that it fails `QueueFull` with nothing written and no record. A unit with a bad shape, over `limits.max_unit_bytes`, or with origin `VtReply` fails at submit.
+**Bounds.** `submit` never waits for queue space or PTY I/O: past `limits.queue_units` units or `limits.queue_bytes` bytes it fails `QueueFull` with nothing written and no record. A unit with a bad shape, over `limits.max_unit_bytes`, or with origin `VtReply` fails at submit.
 
 ### 2.4 Drain
 
-Lifted from `spikes/pty-hooks/src/os/drain.rs`: the drain owns the output read end and reads until EOF or a read error on every path, holds output (up to `DRAIN_HOLD` = 1 MiB) until its consumer attaches, then forwards everything through EOF, never depends on its consumer, and reports how it ended (`OutputEnd::Eof` or `Error`, never confusing the two). One change: the consumer is a sink callback with an ordered handoff instead of the spike's unbounded `mpsc::channel` reader (`drain.rs:93`, `:157-176`), so the crate holds no unbounded buffer and output needs one thread, not two.
+Lifted from `spikes/pty-hooks/src/os/drain.rs`: the drain owns the output read end and reads until EOF or a read error on every path, holds output (up to `DRAIN_HOLD` = 1 MiB) until its consumer attaches, then forwards everything through EOF, never depends on its consumer outside the attach handoff, and reports how it ended (`OutputEnd::Eof` or `Error`, never confusing the two). The consumer is a sink callback with an ordered handoff instead of the spike's unbounded `mpsc::channel` reader (`drain.rs:93`, `:157-176`), so the crate holds no unbounded buffer and output needs one thread, not two.
 
 ```rust
 pub(crate) struct Drain { /* thread "pty-drain" */ }
@@ -331,13 +341,13 @@ impl Drain {
 pub(crate) fn close_bounded(close: impl FnOnce() + Send + 'static, bound: Duration) -> Option<Duration>;
 ```
 
-**Ordered handoff.** `attach` runs on the attaching thread: it delivers the held bytes, in order and outside the drain's lock, then any further bytes the drain held meanwhile, and, if the read loop already ended, the `End`; only when the held buffer is empty does it switch the slot to live under the lock, after which the drain thread calls the sink directly. Bytes therefore reach the sink in read order exactly once, and a startup query followed by silence is parsed (and answered) without waiting for another read.
+**Ordered handoff.** Under the drain lock `attach` fails with `HoldOverflow` if output beyond the hold was read, else takes the held batch and the end if one was observed, and marks the slot as handing off. Outside the lock it delivers that batch, then the end, to the sink on the attaching thread, then switches the slot to live under the lock. While the slot is handing off, the drain thread waits on the lock's condvar before delivering its next chunk, which then goes the live path. So the handoff is one pass over a batch fixed at one moment, bytes reach the sink in read order exactly once, and a startup query followed by silence is parsed and answered without waiting for another read.
 
-**Guarantees.** (a) Every byte read is passed to the attached sink in order, or, before attach, held; output beyond the hold before attach makes `attach` fail with `HoldOverflow`, which fails `Session::start` (an incomplete screen is never shown as complete). (b) The drain thread never blocks on a consumer. The session's sink splits each chunk before every ESC byte, feeds each piece to the VT under the VT lock and publishes the mode word after it (§2.6), then releases the lock and dispatches the piece to subscribers. VT feeding and each subscriber call run inside `catch_unwind`: a VT panic sets `vt_failed` (snapshots return `VtUnavailable`, the responder stops, `on_event(VtFailed)` fires) and reading continues; a subscriber panic or `Stop` removes that subscriber. A subscriber that calls `subscribe` or `unsubscribe` from inside its callback has the change applied after the current dispatch. (c) Reading continues after the session's consumers are gone, until EOF, so a child is never blocked on a full output pipe. (d) `finish` waits at most its bound for the end after `control.close`, then joins or abandons the thread.
+**Guarantees.** (a) Every byte read is passed to the attached sink in order, or, before attach, held; overflow before attach fails `Session::start` (an incomplete screen is never shown as complete). (b) The session's sink splits each chunk before every ESC byte, feeds each piece to the VT under the VT lock and publishes the mode word after it (§2.6), then releases the lock and dispatches the piece to subscribers. VT feeding and each subscriber call run inside `catch_unwind`: a VT panic sets `vt_failed` (snapshots return `VtUnavailable`, the responder stops, `on_event(VtFailed)` fires) and reading continues; a subscriber panic or `Stop` removes that subscriber. A subscriber that calls `subscribe` or `unsubscribe` from inside its callback has the change applied after the current dispatch. (c) Reading continues after the session's consumers are gone, until EOF, so a child is never blocked on a full output pipe. (d) `finish` waits at most its bound for the end after `control.close`, then joins or abandons the thread.
 
 ### 2.5 VT Responder
 
-Lifted from `spikes/pty-hooks/src/vt.rs`: `Term<Responder>` with `Config { kitty_keyboard: true, .. }` and a `vte` `Processor`, fed by the drain thread. The `EventListener` turns each reply event into one reply write of origin `VtReply { kind }`:
+Lifted from `spikes/pty-hooks/src/vt.rs`: `Term<Responder>` with `Config { kitty_keyboard: true, .. }`, fed by the drain thread through a `vte::ansi::Processor<NoSync>`. `NoSync` implements vte's `Timeout` trait with `pending_timeout()` always false, so the parser never buffers a synchronized update (`CSI ?2026h`): it would otherwise hold every action until `CSI ?2026l` or a 150 ms timeout (`vte 0.15.0 src/ansi.rs:36`, `:298-311`, `:478-488`, `:1606-1607`), hiding 2004 transitions and queries inside it. The `EventListener` turns each reply event into one reply write of origin `VtReply { kind }`:
 
 | Query | alacritty event | Reply | `ReplyKind` |
 |---|---|---|---|
@@ -351,9 +361,9 @@ Lifted from `spikes/pty-hooks/src/vt.rs`: `Term<Responder>` with `Config { kitty
 
 **Limits of the contract.** OSC 52 clipboard reads (`ClipboardLoad`, `event.rs:31`) and stores get no reply and no effect: the daemon has no clipboard to give a CLI. Colors and pixel sizes are nominal. Character widths are the pinned emulator's. On Windows, conhost answers DSR and DA itself and swallows OSC 10/11; the responder answers what reaches it (kitty), and replies conhost writes are outside this crate's ordering and log (prior-art row 3b). Every other event is ignored.
 
-**One reply per write.** Each event becomes its own reply write of exactly that reply, one `write` call and one record; replies are never merged with each other or with other bytes (mvp §4 PR 2 obligation; conhost loses a sequence split across writes, arch §5).
+**One reply per write.** Each event becomes its own reply write of exactly that reply: one `write` call on whole acceptance and one record; replies are never merged with each other or with other bytes (mvp §4 PR 2 obligation; conhost loses a sequence split across writes, arch §5).
 
-**Ordering.** Replies are enqueued under the VT lock while the piece that caused them is parsed, into the reply lane (FIFO, at most `limits.reply_queue` replies), and written at unit boundaries by the progress rule (§2.3): in query order, ahead of user units queued before them, never inside a unit. Replies have no guard. A reply that does not fit the lane, or arrives after child exit or input breakage, is discarded: it gets no record, `ResponderStatus` counts it (`dropped_overflow`, `dropped_after_end`), and `on_event(ReplyDropped)` fires for an overflow, since a CLI may be waiting for it.
+**Ordering.** Replies are enqueued while the piece that caused them is parsed, into the reply lane (FIFO, at most `limits.reply_queue` replies), and written in batches at unit boundaries (§2.3): in query order, never inside a unit. Replies have no guard. A reply that does not fit the lane is discarded and counted (`ResponderStatus::dropped_overflow`) and `on_event(ReplyDropped)` fires after the VT lock is released, since a CLI may be waiting for it. Once child exit or input breakage is observed, queued and new replies are discarded and counted (`dropped_after_end`). A discarded reply gets no record.
 
 ### 2.6 Snapshot
 
@@ -383,11 +393,13 @@ pub struct TermModes {
 }
 ```
 
-**Walker** (rewrite of `vt.rs:234-268`). For each visible row and column of `term.grid()`: a cell with `WIDE_CHAR` is `WideLead` with `cell.c` plus its `zerowidth()` chars; a cell with `WIDE_CHAR_SPACER` is `WideTail` with empty text; a `LEADING_WIDE_CHAR_SPACER` (the last column left blank when a wide character wrapped, `term/cell.rs:22-28`) is a `Single` `" "`; every other cell is `Single` with `cell.c` plus zero-width chars. A wide character therefore occupies two cells, and the cells of a line always number `cols`, so column positions after it are exact. Width is alacritty's: an emoji with VS16 (`❤️`) stays one cell (spike §3).
+**Walker** (rewrite of `vt.rs:234-268`). For each visible row and column of `term.grid()`: a cell with `WIDE_CHAR` followed by a `WIDE_CHAR_SPACER` is `WideLead` with `cell.c` plus its `zerowidth()` chars, and that spacer is its `WideTail` with empty text; every other cell is `Single` with `cell.c` plus zero-width chars, or `" "` when that is empty. An orphan flag, a `WIDE_CHAR` without its spacer or a `WIDE_CHAR_SPACER` without its lead (left by an erase of one half, `term/mod.rs:1519`, or a shrink), becomes a `Single` `" "`, as does a `LEADING_WIDE_CHAR_SPACER` (the last column left blank when a wide character wrapped, `term/cell.rs:22-28`). So a wide character occupies exactly two cells, every line has `cols` cells, and column positions after it are exact. Width is alacritty's: an emoji with VS16 (`❤️`) stays one cell (spike §3).
 
-**Mode word.** `TermModes` (10 bits) and `bracketed_paste_epoch` (54 bits) are packed into one `AtomicU64`, so `modes()` is one tear-free load. The drain splits each chunk before every ESC byte and publishes the word after parsing each piece; the epoch increments on every change of `bracketed_paste`, so `DECRST 2004` followed by `DECSET 2004` within one read advances it twice.
+**Mode word.** `TermModes` (10 bits) and `bracketed_paste_epoch` (54 bits) are packed into one `AtomicU64`, so `modes()` is one tear-free load. The drain splits each chunk before every ESC byte and publishes the word after parsing each piece; with `NoSync` every action is applied as it is parsed, so the epoch increments on every change of `bracketed_paste`, including two within one read or inside a synchronized update.
 
-**Grid encoding (D9).** `to_payload` gives `VtSnapshotTaken { grid, cols, rows, cursor: VtCursor { row, col, visible }, modes: VtModes { bracketed_paste, alternate_screen } }` with `grid = Content::text(json)`:
+**Snapshot budget.** `snapshot(deadline)` takes the VT lock with `try_lock` until `deadline` and copies the grid; past the deadline, or after a VT panic, it returns `VtUnavailable`.
+
+**Grid encoding (D9).** `to_payload` gives `VtSnapshotTaken { grid, cols, rows, cursor: VtCursor { row, col, visible }, modes: VtModes { bracketed_paste, alternate_screen } }` with `grid = Content::text(json)`. The A2UI `vt_snapshot` component carries the same encoding under the same rules.
 
 - The JSON is an array of exactly `rows` arrays, one per screen row, top to bottom; each holds at most `cols` strings, one per cell, left to right.
 - `""` means a `WideTail` and nothing else; it must directly follow a `WideLead`. A `Single` or `WideLead` string is never empty; a blank cell is `" "`.
@@ -413,27 +425,35 @@ pub struct FakeScript {
     pub fail: Option<SpawnError>,                                // spawn returns this
     pub startup_output: Vec<u8>,                                 // written to the pipe before spawn returns
     pub kill: KillBehavior,                                      // ExitOnKill (default) | Ignore | ExitAfter(Duration)
+    pub hang_control_close: bool,                                // control.close blocks until its deadline, CloseReport { elapsed: None }
 }
 pub struct FakeChild { /* … */ }
 impl FakeChild {
     pub fn emit(&self, bytes: &[u8]);                            // child output (blocks only on a full pipe)
     pub fn on_input(&self, f: impl FnMut(&[u8]) -> Vec<u8> + Send + 'static);  // scripted reaction, e.g. echo or queries
     pub fn close_output(&self);                                  // EOF
-    pub fn fail_output(&self, kind: io::ErrorKind);              // the drain's next read returns this error
+    pub fn fail_output(&self, kind: io::ErrorKind);              // sets the error, then writes a wake byte the reader swallows
     pub fn exit(&self, e: ChildExit);
     pub fn hold_writes(&self) -> WriteHold;                      // the next write() blocks until released or dropped
     pub fn fail_writes_after(&self, bytes: u64, kind: io::ErrorKind);
     pub fn short_writes(&self, max: usize);                      // write() accepts at most `max` bytes per call
     pub fn panic_on_next_write(&self);
+    pub fn fail_next_resize(&self);
     pub fn writes(&self) -> Vec<Vec<u8>>;                        // every write() call's bytes, in order (call boundaries kept)
     pub fn input(&self) -> Vec<u8>;
     pub fn log(&self) -> Vec<FakeEvent>;  // Spawned, WriteEntered, Write(n), Resize(size), ResizeFailed, Kill { extra }, InputDropped, ControlClosed, OutputClosed, Exited
-    pub fn fail_next_resize(&self);
 }
 impl WriteHold { pub fn wait_entered(&self, deadline: Instant) -> bool; pub fn release(self); }
+
+pub struct Probe { /* … */ }                                    // Session::probe()
+pub enum ProbePoint { ReplyEnqueued, PauseEntered, RecheckEntered, HoldOverflowed }
+impl Probe {
+    pub fn wait(&self, p: ProbePoint, n: u64, deadline: Instant) -> bool;   // the n-th occurrence was reached
+    pub fn park(&self, p: ProbePoint) -> Park;                              // the next occurrence blocks until the Park is released
+}
 ```
 
-`Session` has `#[cfg(feature = "fake")]` start faults (`SessionConfig::start_fault: Option<StartFault>` with `Writer` and `Waiter`, failing that thread's creation) and `fail_vt_on_next_piece`. Identity: `pid` from a counter, `start_time` `fake-<n>`, `group` `fake-<n>`. `kill_tree` records its `extra` and reports `method: "fake"` and `tree_dead` per `KillBehavior`. `WriteHold::wait_entered` is the deterministic signal that the writer is blocked inside `write`; `FakeEvent` order is what the close-order tests assert.
+`SessionConfig` has a `#[cfg(feature = "fake")]` start fault (`StartFault::Writer`, `StartFault::Waiter`, failing that thread's creation). Identity: `pid` from a counter, `start_time` `fake-<n>`, `group` `fake-<n>`. `kill_tree` records its `extra` and reports `method: "fake"` and `tree_dead` per `KillBehavior`. `WriteHold::wait_entered` and `Probe` are the deterministic signals that a thread is at a given point; `FakeEvent` order is what the close-order tests assert.
 
 ## 3. Structure Options
 
@@ -449,19 +469,22 @@ impl WriteHold { pub fn wait_entered(&self, deadline: Instant) -> bool; pub fn r
 | | C. A dedicated writer thread with queues | spike `pty.rs:161-234`; herdr Windows writer thread (`src/pty/actor.rs:229-232`, `:313-345`) | **Adopted**, with a bounded user lane (herdr bounds its input channel and fails fast when full, `actor.rs:87-115`) and per-unit guards checked before the first byte (spike `pty.rs:187-205`). |
 | | D. One thread doing nonblocking reads and writes with `poll` | herdr Unix actor (`src/pty/actor/unix.rs:391`, `:541`) | Rejected: Unix-only (herdr itself uses threads on Windows); it would put OS-specific I/O outside the backends. |
 | **Reply placement** | A. Replies in the same FIFO as user units | spike `pty.rs:86-100` (one channel) | Rejected: a reply waits behind every queued unit. |
-| | B. A reply lane also served inside a unit's pause | herdr writes responses during a submission's delay (`actor.rs:155-163`, test `:563-578`) | Rejected: a unit's bytes would no longer be one span, so spans could not partition the stream, and a reply could land between a prompt and its submit with unverified effect on the CLI. |
-| | C. A reply lane served only at unit boundaries, by a snapshot count | — | **Adopted.** Contiguous spans; bounded reply delay; no starvation of user units. |
+| | B. A reply lane also served inside a unit's pause | herdr writes responses during a submission's delay (`actor.rs:155-163`, test `:563-578`) | Rejected: a unit's bytes would no longer be one span, and a reply could land between a prompt and its submit with unverified effect on the CLI. |
+| | C. A reply lane served only at unit boundaries, in sampled batches | — | **Adopted.** Contiguous spans; no starvation of either lane. |
 | **Reply atomicity** | A. Fail a reply or escape-bearing part on a short accept | — | Rejected: the split hazard is conhost's, and the Windows backend obligation is whole acceptance on a synchronous pipe; the Unix tty does not lose split sequences. |
 | | B. One write call per part, looping on a short accept and counting splits | — | **Adopted**; revisited if PR 4 observes short writes. |
-| **Gate recheck** | A. The spike's revocable `GateState` (2004 epoch + revocation flag) as the whole recheck | spike `pty.rs:21-63` | Partly adopted: the 2004 epoch is `Guard::bracketed_paste`. Revocation and the rest of mvp §2.3's gate live in the daemon. |
-| | B. Mechanical checks in the writer (deadline, exit, basis, 2004, final atomics) plus a daemon closure run on the writer thread | — | **Adopted.** The basis closes the window where a human write happened but is not yet in the gate view; which origins count stays the daemon's. |
+| **Gate basis** | A. The spike's revocable `GateState` (2004 epoch + revocation flag) as the whole recheck | spike `pty.rs:21-63` | Partly adopted: the 2004 epoch is `Guard::bracketed_paste`. Revocation and the rest of mvp §2.3's gate live in the daemon. |
+| | B. A watermark of write completions the daemon has applied | — | Rejected: VT replies have no completion, so the watermark could never pass a startup reply, and a lost notification would stall every send. |
+| | C. The writer position captured with the readiness evidence at intake, checked at the dispatch boundary | herdr orders responses against input by offset (`src/pane/terminal.rs:1491-1530`) | **Adopted.** Needs no notification stream; which origins count stays the daemon's. |
 | **Origin log** | A. Unbounded in memory | — | Rejected: attach keystrokes grow it without bound. |
 | | B. Only in the event store | — | Rejected: one event per keystroke and per reply; mvp §2.1 appends `human_write` only on the first human write after evidence. |
-| | C. Monotonic per-class counters for decisions, a bounded ring for diagnostics | herdr orders responses against input by offset (`src/pane/terminal.rs:1491-1530`) | **Adopted.** Ring eviction cannot hide a write from a guard or an ack. |
+| | C. Monotonic per-class counters for decisions, a bounded ring for diagnostics | — | **Adopted.** Ring eviction cannot hide a write from a guard or an ack. |
+| **Synchronized updates** | A. vte's default `StdSyncHandler` buffering | alacritty's renderer uses it to avoid tearing | Rejected: a headless VT has no frames to tear; buffering hides mode changes and queries from the gate and the responder. |
+| | B. `NoSync`: never buffer | — | **Adopted.** |
 | **Resize locking** | A. Resize PTY and VT under the VT lock | — | Rejected: ConPTY's resize can wait on conhost, conhost on the drain, the drain on the VT lock. |
 | | B. A control lock; PTY first without the VT lock, then the VT | spike `pty.rs:385-399` | **Adopted.** |
 | **Output consumers** | A. Channel reader per consumer (spike `drain.rs:157-176`) | spike | Rejected: unbounded channel, one extra thread. |
-| | B. Sink callbacks with an ordered handoff | herdr `on_read` callback (`actor.rs:22`, `:39-44`) | **Adopted.** The drain can never be blocked by a consumer. |
+| | B. Sink callbacks with an ordered handoff | herdr `on_read` callback (`actor.rs:22`, `:39-44`) | **Adopted.** The drain can never be blocked by a consumer after attach. |
 | **Async** | A. tokio in `pty-runtime` | Codex `utils/pty` | Rejected (see §2 threading model). |
 | | B. std threads, callbacks, and a no-tokio CI check | spike | **Adopted.** |
 
@@ -471,22 +494,21 @@ Every MVP path where bytes reach the PTY or PTY output is consumed:
 
 | Path | PR | How this design covers it |
 |---|---|---|
-| Send path: text + submit | 10 (encoders 5) | `Input` unit `[text, Pause, submit]`, `Guard` with applied basis, 2004 epoch, and gate recheck; outcome mapping and ack facts in §2.3. |
-| Codex positional first prompt | 10, 14 | No PTY write: it is in `SpawnSpec::argv`; `SpawnError` tells whether it may have run. |
-| Attach typing and recognised pastes | 11 | `Attach` units; a paste is one unit without submit; queued behind any input unit, never inside it; `QueueFull` is returned to the attach client. |
-| Attach screen | 11 | `subscribe` gives a diagnostic snapshot plus gapless bytes after it and reports `Lagged`; the repaint mechanism is PR 11's. `resize` follows the attach client's size. |
+| Send path: text + submit | 10 (encoders 5) | `Input` unit `[text, Pause, submit]`, `Guard` with the readiness basis, 2004 epoch, and gate recheck; outcome mapping and ack facts in §2.3; prompt size refused before admission (D8). |
+| Codex positional first prompt | 10, 14 | No PTY write: it is in `SpawnSpec::argv`, anchored by `launch_started`; `SpawnError` tells whether it may have run. |
+| Attach typing and recognised pastes | 11 | `Attach` units; a paste is one unit without submit, refused before admission above the prompt limit; queued behind any input unit, never inside it; `QueueFull` is returned to the attach client. |
+| Attach screen and size | 11 | `subscribe` gives a diagnostic snapshot plus gapless bytes after it and reports `Lagged`; the repaint mechanism is PR 11's. `resize` follows the attach client's size; resizing during a unit is PR 10 / PR 11 policy. |
 | Raw `key`, keypad, `surface_action send_key` | 10, 19, 20 | `Key` units with a recheck (process running, owner). Arrow encoding reads `modes().app_cursor`; a recheck can refuse when the mode changed since encoding. |
 | Approval card keys | 10, 19 | `CardKey { approval_id }` with a recheck that the card is still open (409 otherwise, mvp §2.10); class `Human`, mapped to `card_key`, which does not close the gate. |
 | VT responder | 2 | `VtReply` writes in the reply lane, one write each, at unit boundaries (§2.5); class `Reply`, counted by default. |
-| Gate timeout, attention, approval card snapshot | 10, 13 | `snapshot().to_payload()` → `vt_snapshot_taken`; `CloseOutcome::final_snapshot` after teardown. |
-| Gate's DECSET 2004 condition | 10 | `ModeView` before the decision, `Guard::bracketed_paste` and the final check at the writer. |
-| Resize during a unit | 10, 11 | Independent of the writer; the daemon's recheck can refuse a unit whose decision a resize invalidated. |
+| Gate timeout, attention, approval card snapshot | 10, 13 | `snapshot(deadline).to_payload()` → `vt_snapshot_taken`; `CloseOutcome::final_snapshot` after teardown. |
+| Gate's DECSET 2004 condition | 10 | `ModeView` before the decision, `Guard::bracketed_paste` and the dispatch boundary at the writer. |
 | Doctor PTY round trip | 21 | A `Session` over the native backend: VT query (responder record), paste echo (`Input` or `Key` unit), tree kill; `evidence` carries the ConPTY module. |
 | Thread state | all | No API turns output into state input: output reaches only the VT, sinks, and snapshots (invariant 1). |
 
 ## 5. Resource Paths
 
-`Limits` defaults (internal; PR 10 may tune): `queue_units` 256, `queue_bytes` = `max_unit_bytes`, `max_pause` 5 s, `reply_queue` 64, `log_records` 4096, `subscribers` 8, `DRAIN_HOLD` 1 MiB. `max_unit_bytes` = 4 MiB (the mvp §2.5 body limit) × 36 + 64 = 150 995 008 bytes: 36 is the worst-case `win_keys` expansion per input byte, one LF becoming a Shift+Enter record pair `ESC[13;28;13;1;16;1_ESC[13;28;13;0;16;1_` of 36 bytes (spike `paste.rs:427`; a two-byte UTF-8 scalar becomes at most 34 bytes), and 64 covers the padding spaces and the submit. A test derives it from these constants, so any prompt the HTTP layer accepts fits one unit. `CloseBounds` defaults: `kill` 5 s, `input` 1 s, `close` 2 s, `drain` 2 s, `join` 1 s. The waiter polls `wait_timeout(100 ms)`.
+`Limits` defaults (internal; configurable per session): `queue_units` 256, `max_unit_bytes` 9 437 248 (`core::input::MAX_PROMPT_BYTES` 256 KiB × 36 + 64), `queue_bytes` 16 MiB, `max_pause` 5 s, `reply_queue` 64, `log_records` 4096, `subscribers` 8, `DRAIN_HOLD` 1 MiB. 36 is the worst-case `win_keys` expansion per input byte, one LF becoming a 36-byte Shift+Enter record pair (spike `paste.rs:427`); 64 covers the padding spaces and the submit; PR 5 supplies the exact encoded-size bound of its encoders. `CloseBounds` defaults: `kill` 5 s, `input` 1 s, `close` 2 s, `drain` 2 s, `join` 1 s. The waiter polls `wait_timeout(100 ms)`.
 
 | Resource | Created by | Bound | Ends on |
 |---|---|---|---|
@@ -494,10 +516,10 @@ Every MVP path where bytes reach the PTY or PTY output is consumed:
 | `pty-writer` thread | `Session::start` | one per session | close step 3, or after an I/O error once the queue is closed; joined in step 6 or abandoned |
 | `pty-wait` thread | `Session::start` | one per session | exit observed, `WaitFailed`, or close; polls every 100 ms |
 | Windows close helper | backend (`close_bounded`) | one per close | `ClosePseudoConsole` returns; abandoned past its bound and reported |
-| User lane | `Session` | 256 units, `queue_bytes` | close step 1 completes the rest `Closed` |
-| Reply lane | `Session` | 64 replies | discarded and counted at close |
+| User lane | `Session` | 256 units, 16 MiB | close step 1 settles the rest `Closed` |
+| Reply lane | `Session` | 64 replies | discarded and counted on exit, input breakage, or close |
+| Unit slot, counters | `Session` | one slot, 3 counters | the slot's completion fires once (writer or closer) |
 | Origin log ring | `Session` | 4096 records | dropped with the session |
-| Counters, in-progress slot | `Session` | 3 counters, one slot | dropped with the session; the slot's completion fires once (writer or closer) |
 | Drain hold | `Drain` | 1 MiB | handed to the sink at attach |
 | Subscribers | `subscribe` | 8 | `Stop`, panic, `unsubscribe`, output end, close |
 | Completion | `submit` | one per unit | exactly once: written, refused, incomplete, `Cancelled` at cancel, `Closed` at close, or `unknown_after_close` |
@@ -509,19 +531,19 @@ Every MVP path where bytes reach the PTY or PTY output is consumed:
 |---|---|
 | Spawn failure | The backend returns `NeverStarted` or `StartedThenFailed` with its cleanup result (§2.1); nothing is handed over. |
 | `SpawnedPty` dropped without `start` | Its teardown: kill, drop input (no bytes), close, finish drain, each bounded. |
-| `Session::start` fails (hold overflow, thread creation) | The guard's teardown; `StartError` carries its reports. The input is still in the guard, so no thread owns it. |
-| Child exit | Exit published, then `Exited` once; not-started units refused `ChildExited`; a started unit stops before its next part; drain continues to EOF; session stays until close. |
+| `Session::start` fails (hold overflow, thread creation) | Created threads are stopped and joined, then the guard's teardown runs; `StartError` carries its reports. |
+| Child exit | Exit published, then `Exited` once; undispatched units refused `ChildExited`; a dispatched unit stops before its next write call; drain continues to EOF; session stays until close. |
 | `kill` | `kill_tree(extra, deadline)`; I/O stays up so the final output and snapshot remain available. |
 | `close` / `Drop` | Close order of §2.2, each step bounded; blocked threads abandoned and named; `Released` says what was confirmed. `Drop` blocks at most the sum of the `CloseBounds`; the daemon calls `close` itself from `spawn_blocking`. |
 | Reader EOF | `OutputEnded(Eof)`; sinks get `End`; the VT and snapshots stay. |
 | Read error | `OutputEnded(Error)`, never reported as EOF. |
-| Write error | Unit `Incomplete`; `InputBroken`; later units refused. |
+| Write error or `Ok(0)` | Unit `Incomplete`; `InputBroken`; later units refused. |
 | Panic in a sink (VT or subscriber) | Caught on the drain thread; VT → `VtFailed`, subscriber → removed; reading continues. |
 | Panic in a recheck or completion | Recheck → `NotStarted(RecheckPanicked)`; completion → ignored. |
-| Panic in the writer thread (e.g. a backend `write`) | A drop guard closes the queue, completes queued units `NotStarted(Closed)`, records the unit in progress as `Incomplete { error: "writer_panicked" }`, marks input broken. |
+| Panic in the writer thread (e.g. a backend `write`) | A drop guard closes the queue, settles queued units `NotStarted(Closed)`, records the slot's unit as `Incomplete { error: "writer_panicked" }` if dispatched, marks input broken. |
 | Panic in the waiter | Drop guard emits `WaitFailed`. |
 
-Every wait of the crate is bounded: `CompletionReceiver::recv_deadline`, `OutputReceiver::recv_timeout`, `kill(deadline)`, `close(bounds)` (all six steps), `wait_timeout`, `Drain::finish(bound)`, `close_bounded`, the writer's pause (`max_pause`). Two blocking calls have no deadline of their own, a `write` to a child that stopped reading and a `read` the backend has not unblocked; close does not wait on them past its budgets, reports their threads as abandoned, and their endpoints are released when the call returns.
+Every wait of the crate is bounded except `resize`: `CompletionReceiver::recv_deadline`, `OutputReceiver::recv_timeout`, `snapshot` and `subscribe` (their deadline), `kill(deadline)`, `close(bounds)` (all six steps and the final snapshot), `wait_timeout`, `Drain::finish(bound)`, `close_bounded`, the writer's pause (`max_pause`). Two blocking calls have no deadline of their own, a `write` to a child that stopped reading and a `read` the backend has not unblocked; close does not wait on them past its budgets, reports their threads as abandoned, and their endpoints are released when the call returns.
 
 ## 6. Purpose Layer and Plan Layer
 
@@ -542,39 +564,40 @@ Checked by running this crate's tests on `macos-latest` and `windows-latest` CI 
 
 | ID | Claim (EARS) | Source | Falsifying test |
 |---|---|---|---|
-| PR2-CL-1 | When a unit starts or is refused, the writer shall assign it the next `seq` and record its origin; the spans of started units shall be contiguous and, in `seq` order, partition the PTY input stream. | PR 2 obligation | `writer::records_partition_the_input_stream`, proptest `writer::records_partition_under_random_units` (random units, replies, and refusals) |
-| PR2-CL-2 | While a unit is in progress, no byte of another unit or of a reply shall be written; replies shall be written only at unit boundaries. | §2.3, §2.5 | `writer::human_write_waits_for_the_unit`, `writer::reply_waits_for_the_unit_boundary` (reply emitted during a pause lands after the submit) |
-| PR2-CL-3 | If a unit is cancelled, closed, after child exit, after input breakage, past `not_after`, after a counted write past its basis, with an unverifiable basis, with 2004 off or its epoch changed, or its recheck fails or panics, then the writer shall record `NotStarted` with that reason and write zero bytes. | mvp §2.3 | `writer::each_refusal_writes_zero_bytes` (one case per reason), `writer::expired_precedes_recheck` |
-| PR2-CL-4 | When a basis is given, the writer shall refuse if a unit of a counted class started with a higher `seq`, including a partial or still-blocked write, and shall not refuse for a class outside `counted` or for refused units, whatever the ring holds. | §2.3 basis | `writer::basis_counts_a_blocked_human_write` (`hold_writes` + `wait_entered`), `writer::basis_counts_a_partial_human_write` (`fail_writes_after`), `writer::basis_ignores_uncounted_classes`, `writer::basis_survives_ring_eviction` (5000 replies) |
-| PR2-CL-5 | When a recheck passes, every earlier unit shall have finished, and the writer shall refuse if the exit, input, mode word, or deadline changed before the first write call. | mvp §2.3 arbitration lock | `writer::recheck_sees_every_earlier_write`, `writer::decrst_during_recheck_refuses` (barrier inside the recheck) |
-| PR2-CL-6 | When a unit has started, the writer shall write its remaining parts regardless of `not_after`; if the queue closes during a pause or the child exits before a later part, the rest shall be skipped and the record shall be `Incomplete`. | herdr committed submit; mvp §2.3 | `writer::started_unit_ignores_its_deadline`, `writer::close_in_pause_skips_the_submit`, `writer::exit_in_pause_skips_the_submit` |
-| PR2-CL-7 | If a write fails, then the unit shall be `Incomplete` with the bytes written, `InputBroken` shall fire once, and later units shall be refused. | §2.3 | `writer::write_error_breaks_input` |
-| PR2-CL-8 | When `submit` gets a full lane, a bad shape, a unit over `max_unit_bytes`, or a `VtReply` origin, it shall fail at once with nothing written and no record, without waiting for queue space or PTY I/O; `max_unit_bytes` shall cover the largest body under the worst `win_keys` expansion. | §2.3 bounds, §5 | `writer::full_queue_fails_without_blocking` (writes held), `writer::bad_shapes_are_refused`, `limits::max_unit_bytes_covers_the_largest_body` |
-| PR2-CL-9 | When the VT emits a reply, the writer shall write it as one write call holding exactly that reply, in query order. | PR 2 obligation | `responder::each_reply_is_one_write`, proptest `responder::replies_are_single_writes` (random output with embedded known queries; asserts the exact count and bytes of the replies) |
-| PR2-CL-10 | When the CLI sends DA1, DA2, DSR 5, DSR 6, the kitty query, DECRQM, CSI 14 t, CSI 18 t, or OSC 4/10/11/12, the responder shall answer as in §2.5, ahead of user units queued before it; an OSC 52 read shall get no reply. | arch §4.5; spike B-5 | `responder::answers_each_query`, `responder::reply_precedes_queued_units`, `responder::clipboard_read_is_not_answered` (an OSC 52 read followed by DSR 5: exactly one reply, `ESC[0n`) |
-| PR2-CL-11 | Under a stream of replies, a queued user unit shall still be written at the next boundary; a reply the lane cannot hold shall be counted and reported by `ReplyDropped`. | §2.3 progress rule | `responder::replies_cannot_starve_units` (`on_input` answers every reply with a new query), `responder::overflow_is_reported` (65 queries behind a held write) |
-| PR2-CL-12 | When the grid holds a wide character, the snapshot shall give it a `WideLead` and a `WideTail` cell, every line shall have `cols` cells, zero-width characters shall join their base cell, and a wrapped wide character shall leave a blank cell at the line end. | PR 2 obligation | `snapshot::wide_chars_occupy_two_cells`, `snapshot::wrapped_wide_char_leaves_a_blank`, `snapshot::combining_mark_joins_its_base` |
-| PR2-CL-13 | The mode word shall reflect DECSET 2004, 1049, 25, DECCKM, DECKPAM, and kitty flags in one load, and the 2004 epoch shall advance on every transition, including two within one read. | mvp §2.3 gate | `snapshot::modes_follow_decset`, `snapshot::epoch_counts_transitions_within_a_read`, proptest `snapshot::mode_word_is_never_torn` |
+| PR2-CL-1 | When the writer dequeues a unit, it shall assign it the next `seq` and record its origin; the spans of dispatched units shall be contiguous and, in `seq` order, partition the PTY input stream. | PR 2 obligation | `writer::records_partition_the_input_stream`, proptest `writer::records_partition_under_random_units` (random units, replies, and refusals) |
+| PR2-CL-2 | While a unit is in progress, no byte of another unit or of a reply shall be written; replies shall be written only at unit boundaries. | §2.3, §2.5 | `writer::human_write_waits_for_the_unit`, `writer::reply_waits_for_the_unit_boundary` (query emitted after `PauseEntered`; its reply lands after the submit) |
+| PR2-CL-3 | If a unit is cancelled, closed, after child exit, after input breakage, past `not_after`, after a counted write past its basis, with a basis above the head, with 2004 off or its epoch changed, or its recheck fails or panics, then the writer shall record `NotStarted` with that reason and write zero bytes. | mvp §2.3 | `writer::each_refusal_writes_zero_bytes` (one case per reason), `writer::child_exited_precedes_other_checks`, `writer::expired_precedes_recheck` |
+| PR2-CL-4 | When a unit dispatches, `last_started` for its class shall advance before its first write call; a basis shall refuse when a counted class advanced past it and shall not refuse for a class outside `counted`, whatever the ring holds. | §2.3 basis | `writer::last_started_advances_on_dispatch` (`hold_writes` + `wait_entered`: counter and in-progress span read while blocked; `fail_writes_after`: partial span), `writer::stale_basis_refuses_with_healthy_input`, `writer::reply_before_basis_admits_after_refuses`, `writer::counted_human_after_reply_only_eviction` (`log_records` 8) |
+| PR2-CL-5 | When a recheck passes, every earlier unit shall have finished, and the writer shall refuse if the queue closed or the exit, input, mode word, or deadline changed before the dispatch boundary. | mvp §2.3 arbitration lock | `writer::recheck_sees_every_earlier_write`, `writer::decrst_during_recheck_refuses`, `writer::close_during_recheck_settles_once` (`park(RecheckEntered)`) |
+| PR2-CL-6 | When a unit has dispatched, the writer shall write its remaining parts regardless of `not_after`; if the queue closes or the child exits before a later write call, no further call shall be made and the record shall be `Incomplete`. | herdr committed submit; mvp §2.3 | `writer::started_unit_ignores_its_deadline`, `writer::close_in_pause_skips_the_submit`, `writer::exit_in_pause_skips_the_submit` (both after `PauseEntered`), `writer::close_during_blocked_write_suppresses_the_rest` (release a held write with a part pending) |
+| PR2-CL-7 | If a write fails or returns `Ok(0)` for a non-empty part, then the unit shall be `Incomplete` with the bytes written, `InputBroken` shall fire once, and later units shall be refused. | §2.3 | `writer::write_error_breaks_input`, `writer::write_zero_breaks_input` |
+| PR2-CL-8 | When `submit` gets a full lane, a bad shape, a unit over the configured `max_unit_bytes`, or a `VtReply` origin, it shall fail at once with nothing written and no record, without waiting for queue space or PTY I/O. | §2.3 bounds | `writer::full_queue_fails_without_blocking` (writes held), `writer::bad_shapes_are_refused`, `writer::unit_at_limit_accepted_limit_plus_one_refused`, `writer::reply_origin_is_refused` |
+| PR2-CL-9 | When the VT emits a reply, the writer shall write it as one write call holding exactly that reply on whole acceptance, in query order. | PR 2 obligation | `responder::each_reply_is_one_write`, proptest `responder::replies_are_single_writes` (random output with embedded known queries; asserts the exact count and bytes of the replies) |
+| PR2-CL-10 | When the CLI sends DA1, DA2, DSR 5, DSR 6, the kitty query, DECRQM, CSI 14 t, CSI 18 t, or OSC 4/10/11/12, the responder shall answer as in §2.5, and replies in a sampled batch shall precede the next user unit; an OSC 52 read shall get no reply. | arch §4.5; spike B-5 | `responder::answers_each_query`, `responder::batch_precedes_the_next_unit`, `responder::clipboard_read_is_not_answered` (an OSC 52 read followed by DSR 5: exactly one reply, `ESC[0n`) |
+| PR2-CL-11 | Under a stream of replies, a queued user unit shall be dequeued after at most one batch; a reply the lane cannot hold, or queued when exit or input breakage is observed, shall be discarded, counted, and an overflow reported by `ReplyDropped`. | §2.3 progress rule | `responder::replies_cannot_starve_units` (`on_input` answers each reply with a new query; `wait(ReplyEnqueued)` before releasing the writer), `responder::overflow_is_reported` (65 queries behind a held write), `responder::replies_after_exit_are_discarded` |
+| PR2-CL-12 | When the grid holds a wide character, the snapshot shall give it a `WideLead` and a `WideTail` cell, every line shall have `cols` cells, zero-width characters shall join their base cell, a wrapped wide character shall leave a blank cell at the line end, and an orphan half shall become a blank `Single`. | PR 2 obligation | `snapshot::wide_chars_occupy_two_cells`, `snapshot::wrapped_wide_char_leaves_a_blank`, `snapshot::combining_mark_joins_its_base`, `snapshot::erased_half_of_a_wide_char_is_blank` (ECH on the lead, then on the tail; literal wire values), `snapshot::alt_screen_shrink_leaves_no_orphan` |
+| PR2-CL-13 | The mode word shall reflect DECSET 2004, 1049, 25, DECCKM, DECKPAM, and kitty flags in one load, and the 2004 epoch shall advance on every transition, including two within one read and inside a synchronized update. | mvp §2.3 gate | `snapshot::modes_follow_decset`, `snapshot::epoch_counts_transitions_within_a_read`, `snapshot::sync_update_does_not_hide_2004` (`CSI ?2026h ?2004l ?2004h ?2026l`: epoch +2), `snapshot::unterminated_sync_update_still_answers` (`?2026h` then DSR 5 and silence), `snapshot::mode_word_is_never_torn` (a reader thread checks every loaded word against the set of words the writer published) |
 | PR2-CL-14 | When a valid size is given, the PTY shall be resized first, then the grid and the responder's size, and output parsed after that shall be laid out at the new size; an invalid size or a failed PTY resize shall change neither side; the size before any resize shall be the spawn size. | spike C-4 | `session::resize_moves_pty_grid_and_responder`, `session::failed_resize_changes_nothing` (`fail_next_resize`), `session::invalid_size_is_refused`, `session::startup_size_answers_csi_18t` |
-| PR2-CL-15 | When a sink subscribes, it shall get a snapshot and then exactly the output bytes after the snapshot's offset; after output ended it shall get `End` at once; a full `channel_sink` shall yield `Lagged`, distinct from `End`. | §2.2 subscribe | `session::subscribe_is_gapless` (subscribe between pieces of one chunk), `session::subscribe_after_end_gets_end`, `session::full_channel_sink_lags` |
-| PR2-CL-16 | The drain shall read until EOF or a read error on every path, deliver held bytes and an already-observed end at attach in order without another read, report a read error as an error, refuse an overflowed hold, and never block on a sink; a panicking or stopping sink shall not stop it. | spike F-2c, §4.6 | unit tests in `src/drain.rs`: `final_output_reaches_the_sink`, `read_error_is_not_eof`, `hold_overflow_is_reported`, `hung_close_is_bounded`, `startup_query_then_silence_is_delivered`, `end_before_attach_is_delivered`; `session::sink_panic_keeps_draining`, `session::vt_panic_marks_vt_failed` (`fail_vt_on_next_piece`), `session::read_error_reaches_status` (`fail_output`) |
-| PR2-CL-17 | When a session closes, it shall settle every queued completion itself, kill the tree with the given extra identities, release the input, close the PTY, finish the drain, and join threads, in that order, each step within its budget. | spike §4.7 | `session::close_order` (FakeEvent order, `Kill { extra }`), `session::close_settles_queued_units_with_a_blocked_writer` |
+| PR2-CL-15 | When a sink subscribes, it shall get a snapshot and then exactly the output bytes after the snapshot's offset, and exactly one `End`; a `channel_sink` shall yield every queued chunk, then `Lagged` only if a byte was dropped, else `End`. | §2.2 subscribe | `session::subscribe_is_gapless` (subscribe between pieces of one chunk), `session::subscribe_racing_eof_gets_one_end`, `session::full_channel_sink_at_eof_ends`, `session::full_channel_sink_on_bytes_lags` |
+| PR2-CL-16 | The drain shall read until EOF or a read error on every path, deliver a batch held at attach and an already-observed end in order without another read, report a read error as an error, refuse an overflowed hold, and never block on a sink after attach; a panicking or stopping sink shall not stop it. | spike F-2c, §4.6 | unit tests in `src/drain.rs`: `final_output_reaches_the_sink`, `read_error_is_not_eof`, `hold_overflow_is_reported`, `hung_close_is_bounded`, `startup_query_then_silence_is_delivered`, `end_before_attach_is_delivered`, `refill_during_handoff_goes_live`; `session::sink_panic_keeps_draining`, `session::vt_panic_marks_vt_failed` (`fail_vt_on_next_piece`), `session::read_error_reaches_status` (`fail_output` on a blocked read) |
+| PR2-CL-17 | When a session closes, it shall settle every queued and undispatched completion itself, kill the tree with the given extra identities, release the input, close the PTY, finish the drain, and join threads, in that order, each step within its budget. | spike §4.7 | `session::close_order` (FakeEvent order, `Kill { extra }`), `session::close_settles_queued_units_with_a_blocked_writer`, `session::close_kills_again_for_new_extra` (`kill(&[])` then `close(&[d])`) |
 | PR2-CL-18 | If the writer is blocked when `close` runs, then `close` shall return within the sum of its budgets, fire the in-progress completion once as `Incomplete { unknown_after_close }`, name the writer as abandoned, and report the input as not released. | §2.2 close | `session::close_is_bounded_with_a_blocked_write` (`hold_writes` + `wait_entered`, `KillBehavior::Ignore`; completion count checked after the hold is released) |
-| PR2-CL-19 | If a `SpawnedPty` is dropped without `start`, or `start` fails, then the tree shall be killed before the input is dropped and the PTY closed, and dropping the input shall write no bytes. | §2.1, §2.2 start | `session::dropped_spawn_tears_down`, `session::start_failure_kills_first` (hold overflow via `FakeScript::startup_output`; `StartFault::Writer`; `StartFault::Waiter`) |
-| PR2-CL-20 | When the child exits, the session shall publish the exit before `Exited`, emit `Exited` once, and refuse every unit not yet started with zero bytes. | mvp §4 PR 10 "write-boundary recheck after exit" | `session::exit_is_reported_once`, `session::submit_from_exited_callback_is_refused` |
-| PR2-CL-21 | `last_started` shall be monotonic per class and independent of the ring; `writes_after` shall return every record after `seq`, or `LogTruncated`. | §2.3 | `writer::counters_are_monotonic`, `writer::writes_after_reports_truncation` |
+| PR2-CL-19 | If a `SpawnedPty` is dropped without `start`, or `start` fails, then the tree shall be killed before the input is dropped and the PTY closed, no thread shall own an endpoint, and dropping the input shall write no bytes. | §2.1, §2.2 start | `session::dropped_spawn_tears_down`, `session::start_failure_kills_first` (hold overflow via `FakeScript::startup_output` and `wait(HoldOverflowed)`; `StartFault::Writer`; `StartFault::Waiter`) |
+| PR2-CL-20 | When the child exits, the session shall publish the exit before `Exited`, emit `Exited` once, and refuse every unit not yet dispatched with zero bytes. | mvp §4 PR 10 "write-boundary recheck after exit" | `session::exit_is_reported_once`, `session::submit_from_exited_callback_is_refused` |
+| PR2-CL-21 | `last_started` shall be monotonic per class and independent of the ring; `writes_after` shall return every record after `seq`, the in-progress one included, or `LogTruncated`. | §2.3 | `writer::counters_are_monotonic`, `writer::writes_after_reports_truncation`, `writer::writes_after_shows_the_blocked_write` |
 | PR2-CL-22 | `WriteOrigin` shall map `Attach`, `Key`, `CardKey` to the `human_write` origins and to class `Human`, `Input` to `Input`, `VtReply` to `Reply`. | mvp §2.1, §2.3 | `origin::maps_to_human_write_origins_and_classes` |
-| PR2-CL-23 | `Snapshot::to_payload` shall carry cols, rows, the zero-based cursor, `VtModes`, and the grid in the §2.6 encoding, and `decode_grid` shall reject every malformed shape listed there. | D9; mvp §2.1 `vt_snapshot_taken` | `snapshot::payload_matches_the_snapshot`, `snapshot::grid_examples` (the §2.6 examples as literal strings), `snapshot::malformed_grids_are_rejected`; `core` golden `vt_snapshot_taken.json` |
-| PR2-CL-24 | When `close` waits, each step shall end by its budget, and every other bounded method of §5 shall return by its deadline. | §5 | `session::close_steps_end_by_their_budgets` (blocked write, `KillBehavior::Ignore`, no output EOF), `session::receivers_end_by_their_deadlines` |
+| PR2-CL-23 | `Snapshot::to_payload` shall carry cols, rows, the zero-based cursor, `VtModes`, and the grid in the §2.6 encoding, and `decode_grid` shall reject every malformed shape listed there. | D9; mvp §2.1 `vt_snapshot_taken` | `snapshot::payload_matches_the_snapshot`, `snapshot::grid_examples` (the §2.6 examples as literal strings), `snapshot::malformed_grids_are_rejected`; `core` goldens `vt_snapshot_taken.json` and `Component::VtSnapshot` |
+| PR2-CL-24 | When `close` waits, each step and the final snapshot shall end by their budgets, and every other bounded method of §5 shall return by its deadline. | §5 | `session::close_steps_end_by_their_budgets` (blocked write, `KillBehavior::Ignore`, `hang_control_close`, no output EOF), `session::snapshot_with_a_held_vt_lock_is_unavailable` (`park` the drain mid-piece), `session::receivers_end_by_their_deadlines` |
 | PR2-CL-25 | `chaldea-pty-runtime` shall build without tokio. | D2 | CI dependency check (§7) |
 | PR2-CL-26 | When a backend accepts a part short, the writer shall complete it in further calls and record the number of splits. | §2.3 short writes | `writer::short_writes_are_counted` (`short_writes(3)`) |
 | PR2-CL-27 | If an approval card or other recheck condition closes after a unit was submitted, then the recheck shall refuse it with zero bytes. | mvp §2.10 | `writer::card_key_refused_after_enqueue` |
+| PR2-CL-28 | No callback of the crate shall run while an internal lock is held. | §2 locks and callbacks | `session::callbacks_may_reenter` (a completion that cancels another ticket, a `ReplyDropped` handler that takes a snapshot, a sink that subscribes; each finishes) |
 
 Obligation mapping: "origin and position of every write" → CL-1, CL-4, CL-21, CL-22; "replies in one write each" → CL-9, CL-10, CL-11; "wide characters on two cells" → CL-12, CL-23.
 
 ## 7. Tests and Completion Commands
 
-All tests above run in `cargo test --workspace --locked` on `macos-latest` and `windows-latest` with `FakePty`; none needs a real PTY, so PR 2 adds no OS-specific test. The VT, responder, and snapshot tests feed `Vt` directly or through `FakeChild::emit`; writer tests block the writer with `hold_writes` and wait for `wait_entered` before acting, so "while the writer is blocked" is a fact, not a timing guess. Timing assertions use generous bounds (seconds, not milliseconds) so they hold on loaded runners; pauses in tests are 10–50 ms. Drain tests are unit tests in `src/drain.rs` because `Drain` is crate-private.
+All tests above run in `cargo test --workspace --locked` on `macos-latest` and `windows-latest` with `FakePty`; none needs a real PTY, so PR 2 adds no OS-specific test. The VT, responder, and snapshot tests feed `Vt` directly or through `FakeChild::emit`. Tests wait for a thread to reach a point with `WriteHold::wait_entered` or `Probe::wait` / `park` before acting, so "while the writer is blocked" or "during the pause" is a fact, not a timing guess. Timing assertions use generous bounds (seconds) so they hold on loaded runners; pauses in tests are 10–50 ms. Drain tests are unit tests in `src/drain.rs` because `Drain` is crate-private.
 
 Completion commands (mvp §5, extended):
 
@@ -596,15 +619,15 @@ plus the `workspace` job green on both runners with the new step, and the `pty-h
 
 **D3. The crate records; the daemon decides what counts.** Every write carries its origin and class, including VT replies (`Reply`). Which classes close the gate or make an ack ambiguous is the daemon's per-adapter policy, passed as `Basis::counted` and applied to `last_started`; the default counts every class, so mvp §2.3's "last write of any origin" holds literally. Exempting replies for an adapter needs evidence that the CLI consumes them separately (PR 12 captures, the P-13 query log) and is added as an adapter capability.
 
-**D4. Replies only at unit boundaries.** A unit's bytes stay one contiguous span, and no reply lands between a prompt and its submit. The cost is a reply delay of at most one unit (bounded by `max_pause` plus its writes); a CLI that waits for a reply during that time waits that long.
+**D4. Replies only at unit boundaries.** A unit's bytes stay one contiguous span, and no reply lands between a prompt and its submit. The cost is that a reply can wait for one unit in progress (its writes plus at most `max_pause`); a CLI that waits for a reply during that time waits that long.
 
-**D5. Every `NotStarted` and every synchronous `SubmitError` maps to `RecheckFailed`, and every `Incomplete` to `WriteOutcomeUnknown`.** Zero bytes is certain only before the first write call; an I/O error even at zero bytes is treated as unknown, as mvp §2.3 does for any write outcome it cannot prove.
+**D5. Every `NotStarted` and every synchronous `SubmitError` maps to `RecheckFailed`, and every `Incomplete` to `WriteOutcomeUnknown`.** Zero bytes is certain only before the dispatch boundary; an I/O error even at zero bytes is treated as unknown, as mvp §2.3 does for any write outcome it cannot prove.
 
 **D6. `FakePty` is behind a `fake` feature**, enabled for this crate's tests through a self dev-dependency and for the daemon's tests through its dev-dependency, so no default-feature build contains it (`--all-features` does).
 
 **D7. Backends need `unsafe`; the workspace forbids it.** The root `[workspace.lints.rust] unsafe_code = "forbid"` cannot be relaxed by `#[allow]`. PR 2 writes no `unsafe` and keeps `[lints] workspace = true`. PR 3 gives this crate its own `[lints]` table (the workspace clippy set plus `unsafe_code = "deny"`) and allows `unsafe` only in `unix.rs` / `windows.rs`; the workspace value stays `forbid` for every other crate.
 
-**D8. Writer limits and close budgets are internal defaults** (§5); none is part of a public contract. `max_unit_bytes` is derived from the body limit and the `win_keys` expansion so that no accepted prompt is refused for size here; PR 10 can cap prompts lower before `sending`.
+**D8. Prompt text is limited to `core::input::MAX_PROMPT_BYTES` = 256 KiB UTF-8**, added to `core` in PR 2 because this crate's defaults derive from it. `send` (PR 10) and recognised attach pastes (PR 11) refuse longer text before admission, with zero bytes; PR 5 bounds the encoded size. The writer limits (§5) are internal, configurable defaults: about 9 MiB per unit and 16 MiB queued per session instead of the 144 MiB a 4 MiB body limit would imply. Raising the limit later is compatible.
 
 **D9. `vt_snapshot_taken.grid` is JSON rows of cell strings** with the semantics of §2.6. It makes the geometry exact and observable by the PWA (a wide character provably takes two columns, column positions after it do not depend on font rendering), which is how the PR 2 obligation reaches the reader and what P-12's legible CJK snapshot needs. No v1 producer has persisted a grid yet (the store arrives in PR 6), so this is the cheapest point to fix it. PR 2 updates the `core` golden values (`vt_snapshot_taken.json`, `Component::VtSnapshot`). Rejected: LF-joined text (geometry left to the PWA's font) and text plus a wide-column list (two structures that must agree). Attributes added later are additive only as a separate field, since cells stay strings.
 
@@ -614,7 +637,7 @@ None that change a public contract or are irreversible.
 
 ## Related Text in Other Documents
 
-- `docs/mvp-design.md` §2.1 `vt_snapshot_taken` states the grid encoding (D9).
+- `docs/mvp-design.md` §2.1 `vt_snapshot_taken` and §2.8 `vt_snapshot` state the grid encoding (D9); §2.3 states the prompt limit (D8).
 - `docs/mvp-design.md` §3 spike table: the drain is lifted with its consumer changed to a sink with an ordered handoff (§2.4); the `unsafe_code` carve-out of D7.
-- `docs/mvp-design.md` §4 PR 10 obligations: the write basis is the highest writer `seq` whose completion the gate view has applied (§2.3).
+- `docs/mvp-design.md` §4 PR 10 obligations: the readiness basis and the ack candidate rule (§2.3).
 - `docs/architecture.md` §4.5: the trait seals spawn and OS differences; the session built on it provides the operations.
