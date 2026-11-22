@@ -74,3 +74,44 @@ proptest! {
         prop_assert!(diff.is_empty(), "{:#?}", diff);
     }
 }
+
+/// The projection dump keys rows by every primary-key column: two surfaces of one stream
+/// are two rows.
+#[test]
+fn projection_dump_keeps_two_surfaces_in_one_stream() {
+    use chaldea_core::event::TypedEvent;
+    use chaldea_core::ids::{StreamId, SurfaceId};
+    use chaldea_core::payload::{Component, SurfaceScope, SurfaceUpdate};
+
+    let s = TestStore::new();
+    s.append(
+        ["a", "b"]
+            .into_iter()
+            .map(|id| {
+                super::support::event(
+                    StreamId::Host,
+                    id,
+                    TypedEvent::SurfaceUpdate(SurfaceUpdate {
+                        surface_id: SurfaceId(id.into()),
+                        scope: SurfaceScope::Host,
+                        components: vec![Component::Text { text: id.into() }],
+                    }),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+
+    let counts = s
+        .run(|tx| {
+            let sql_count: i64 = tx
+                .raw()
+                .query_row("SELECT count(*) FROM proj_surfaces", [], |row| row.get(0))
+                .map_err(StoreError::from)?;
+            let dump = dump_projections(tx.raw())?;
+            Ok((sql_count, dump["proj_surfaces"].rows.len()))
+        })
+        .unwrap();
+
+    assert_eq!(counts, (2, 2));
+}

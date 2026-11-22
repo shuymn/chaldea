@@ -529,6 +529,22 @@ pub(crate) fn dump_projections(
         let mut stmt = conn.prepare(&format!("SELECT * FROM \"{t}\""))?;
         let columns: Vec<String> = stmt.column_names().map(str::to_owned).collect();
         let n = columns.len();
+        // The primary-key columns in key order (`pk` is the 1-based position in the key).
+        let mut pk: Vec<(i64, usize)> = Vec::new();
+        let mut info = conn.prepare(&format!("PRAGMA table_info(\"{t}\")"))?;
+        let mut q = info.query([])?;
+        while let Some(r) = q.next()? {
+            let (name, at): (String, i64) = (r.get("name")?, r.get("pk")?);
+            if at > 0
+                && let Some(i) = columns.iter().position(|c| *c == name)
+            {
+                pk.push((at, i));
+            }
+        }
+        pk.sort_unstable();
+        if pk.is_empty() {
+            return Err(ProjectionError(format!("{t} has no primary key")).into());
+        }
         let mut rows = BTreeMap::new();
         let mut q = stmt.query([])?;
         while let Some(r) = q.next()? {
@@ -536,7 +552,8 @@ pub(crate) fn dump_projections(
             for i in 0..n {
                 values.push(r.get::<_, Value>(i)?);
             }
-            let key = format!("{:?}", values[0]);
+            let key: Vec<&Value> = pk.iter().map(|&(_, i)| &values[i]).collect();
+            let key = format!("{key:?}");
             rows.insert(key, values);
         }
         out.insert(t, TableDump { columns, rows });
