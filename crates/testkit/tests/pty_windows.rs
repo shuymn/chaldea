@@ -127,19 +127,17 @@ fn wait_exit(rx: &Receiver<SessionEvent>) -> i32 {
     }
 }
 
-/// A session running FakeCli with a report stream, its listener and root fixture, its
-/// events, and a cleanup tracking every fixture.
+/// A session running FakeCli with a report stream (its events are dropped), its listener
+/// and root fixture, and a cleanup tracking every fixture.
 struct Rig {
     session: Session,
     listener: ReportListener,
     root: Fixture,
     cleanup: FixtureCleanup,
-    #[allow(dead_code, reason = "kept so the event sender never fails")]
-    events: Receiver<SessionEvent>,
 }
 
 fn rig_spec(listener: ReportListener, s: &SpawnSpec) -> Rig {
-    let (config, events) = events();
+    let config = SessionConfig::new(|_| {});
     let session = Session::spawn(&*native(), s, config).unwrap_or_else(|e| panic!("{e}"));
     let mut cleanup = fixture_cleanup();
     let root = listener.accept(soon()).unwrap();
@@ -149,7 +147,6 @@ fn rig_spec(listener: ReportListener, s: &SpawnSpec) -> Rig {
         listener,
         root,
         cleanup,
-        events,
     }
 }
 

@@ -283,7 +283,6 @@ pub(crate) fn hold_until_teardown(m: Arc<Marker>) {
 struct MarkerState {
     carry: Vec<u8>,
     seen: bool,
-    hold: bool,
     held_since: Option<Instant>,
     released: bool,
     /// The reader is blocked in the hold right now.
@@ -310,15 +309,11 @@ pub(crate) struct Marker {
 }
 
 impl Marker {
-    /// `hold`: once the marker is seen, the next read blocks until released (or
-    /// `HOOK_WAIT`).
-    pub(crate) fn new(marker: &'static [u8], hold: bool) -> Arc<Marker> {
+    /// Once the marker is seen, the next read blocks until released (or `HOOK_WAIT`).
+    fn new(marker: &'static [u8]) -> Arc<Marker> {
         Arc::new(Marker {
             marker,
-            st: Mutex::new(MarkerState {
-                hold,
-                ..MarkerState::default()
-            }),
+            st: Mutex::new(MarkerState::default()),
             cv: Condvar::new(),
         })
     }
@@ -399,7 +394,7 @@ impl Marker {
     fn wait_hold(&self) {
         let mut st = self.lock();
         loop {
-            if !(st.hold && st.seen) || st.released {
+            if !st.seen || st.released {
                 break;
             }
             let since = *st.held_since.get_or_insert_with(Instant::now);
@@ -446,7 +441,7 @@ impl Marker {
 }
 
 /// The test's end of one spawn's holding output-marker reader (`AfterSpawn`,
-/// `HoldOutput`). The test keeps it through its assertions, so what the reader recorded
+/// `HoldOutput`, and the unit tests' hook). The test keeps it through its assertions, so what the reader recorded
 /// outlives the spawn's own references, and no other spawn can replace it. One probe serves
 /// one spawn.
 #[derive(Clone)]
@@ -456,7 +451,7 @@ impl OutputProbe {
     /// A probe whose reader holds once it has seen `marker`.
     #[must_use]
     pub fn new(marker: &'static [u8]) -> OutputProbe {
-        OutputProbe(Marker::new(marker, true))
+        OutputProbe(Marker::new(marker))
     }
 
     /// Whether the reader is parked in its hold by `deadline` (no read outstanding).

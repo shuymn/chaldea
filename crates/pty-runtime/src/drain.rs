@@ -224,7 +224,7 @@ mod tests {
     /// PR2-CL-16: `finish` returns by its bound when the output never ends (the bounded
     /// pseudoconsole close is the Windows close worker's, `windows::control`).
     #[test]
-    fn hung_close_is_bounded() {
+    fn finish_is_bounded_without_an_end() {
         let (r, w) = io::pipe().unwrap();
         let (sink, _) = recording();
         let d = Drain::start(r, sink).unwrap();

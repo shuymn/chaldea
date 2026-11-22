@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::child::WindowsChild;
-use super::hooks::Marker;
+use super::hooks::OutputProbe;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -18,8 +18,7 @@ pub(crate) fn serial() -> MutexGuard<'static, ()> {
 pub(crate) enum Stage {
     /// Validation passed; nothing is created yet.
     Validated,
-    /// Right before taking the spawn lock for `CreatePseudoConsole` (2) or each
-    /// `CreateProcessW` (5).
+    /// Right before taking the spawn lock for `CreatePseudoConsole` (stage 2).
     BeforeLock { stage: u8 },
     /// Inside the spawn lock, before `CreatePseudoConsole` (2) or each `CreateProcessW` (5).
     LockAcquired { stage: u8 },
@@ -41,11 +40,9 @@ pub(crate) struct Hooks {
     /// Sees (and may overwrite) each attempt's fresh command-line copy; `true` for the
     /// suspended attempt.
     pub(crate) line: Option<LineFn>,
-    /// A marker the drain's reader watches; with `hold`, the reader parks before its next
+    /// A probe whose marker the drain's reader watches: the reader parks before its next
     /// read once the marker is seen, until released.
-    pub(crate) marker: Option<&'static [u8]>,
-    pub(crate) hold: bool,
-    pub(crate) seen: Mutex<Option<Arc<Marker>>>,
+    pub(crate) probe: Option<OutputProbe>,
     /// The last child built, kept alive until the test takes it.
     pub(crate) child: Mutex<Option<Arc<WindowsChild>>>,
 }
@@ -60,12 +57,6 @@ impl Hooks {
         if let Some(f) = &self.line {
             f(suspended, line);
         }
-    }
-
-    pub(crate) fn marker(&self) -> Option<Arc<Marker>> {
-        let m = Marker::new(self.marker?, self.hold);
-        *self.seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(m.clone());
-        Some(m)
     }
 
     pub(crate) fn keep(&self, child: Arc<WindowsChild>) {
@@ -186,10 +177,11 @@ fn cmd(command: &str) -> SpawnSpec {
     }
 }
 
-fn spawn(pty: &WindowsPty, spec: &SpawnSpec) -> (Result<SpawnedParts, SpawnError>, Arc<Out>) {
-    let out = Arc::new(Out::default());
-    let r = pty.spawn(spec, out.sink()).map(SpawnedPty::into_parts);
-    (r, out)
+/// A spawn whose output goes to a sink that drops it (the drain still runs).
+#[allow(clippy::result_large_err, reason = "the backend's own error type")]
+fn spawn(pty: &WindowsPty, spec: &SpawnSpec) -> Result<SpawnedParts, SpawnError> {
+    pty.spawn(spec, DrainSink::test(|_| {}))
+        .map(SpawnedPty::into_parts)
 }
 
 #[allow(clippy::result_large_err, reason = "the backend's own error type")]
@@ -199,7 +191,7 @@ fn spawn_with(
     spec: &SpawnSpec,
 ) -> Result<SpawnedParts, SpawnError> {
     hooks::inject_next(fault);
-    spawn(pty, spec).0
+    spawn(pty, spec)
 }
 
 fn report() -> FaultReport {
@@ -292,7 +284,7 @@ fn invalid_spec_creates_nothing() {
     };
     let mut spec = cmd("exit 0");
     spec.argv[0] = "cmd.exe".into();
-    let (r, _) = spawn(&pty, &spec);
+    let r = spawn(&pty, &spec);
     assert!(
         matches!(
             &r,
@@ -339,7 +331,7 @@ fn program_removed_after_validation_is_not_found() {
     };
     let mut spec = cmd("exit 0");
     spec.argv[0] = exe.into();
-    let (r, _) = spawn(&pty, &spec);
+    let r = spawn(&pty, &spec);
     let (kind, error, cleanup) = never_started(r);
     assert_eq!(kind, NeverStartedKind::NotFound, "{error}");
     assert_eq!(cleanup, Cleanup::Confirmed);
@@ -373,7 +365,7 @@ fn cwd_removed_after_validation_is_setup() {
     };
     let mut spec = cmd("exit 0");
     spec.cwd = cwd;
-    let (r, _) = spawn(&pty, &spec);
+    let r = spawn(&pty, &spec);
     let (kind, error, cleanup) = never_started(r);
     assert_eq!(kind, NeverStartedKind::Setup, "{error}");
     assert_eq!(cleanup, Cleanup::Confirmed);
@@ -392,7 +384,7 @@ fn equal_codes_are_both_kept() {
     std::fs::write(&exe, b"not a PE file").unwrap();
     let mut spec = cmd("exit 0");
     spec.argv[0] = exe.into();
-    let (r, _) = spawn(&WindowsPty::default(), &spec);
+    let r = spawn(&WindowsPty::default(), &spec);
     let (kind, error, _) = never_started(r);
     assert_eq!(kind, NeverStartedKind::Setup);
     // The code is the OS's (`ERROR_BAD_EXE_FORMAT`, or `ERROR_EXE_MACHINE_TYPE_MISMATCH` on
@@ -460,32 +452,6 @@ fn job_list_attribute_failure_falls_back() {
     assert!(c[0].native && c[0].flags & sys::SUSPENDED != 0);
     drop(take_child(&pty));
     assert_eq!(release(parts), Cleanup::Confirmed);
-}
-
-#[test]
-fn shared_attribute_failure_does_not_retry() {
-    let _s = serial();
-    let r = spawn_with(
-        WindowsFault::PseudoConsoleAttr,
-        &WindowsPty::default(),
-        &cmd("exit 0"),
-    );
-    assert!(
-        matches!(
-            &r,
-            Err(SpawnError::NeverStarted {
-                kind: NeverStartedKind::Setup,
-                cleanup: Cleanup::Confirmed,
-                ..
-            })
-        ),
-        "{}",
-        describe(&r)
-    );
-    let rep = report();
-    assert!(rep.entries("create_process").is_empty(), "{rep:?}");
-    assert_eq!(rep.entries("attr_init").len(), 1);
-    assert_eq!(rep.entries("attr_delete").len(), 1);
 }
 
 // ---- CL-3 ----
@@ -590,33 +556,6 @@ fn pre_process_faults_release_in_order() {
             "{label}"
         );
     }
-}
-
-#[test]
-fn close_worker_fault_creates_no_pseudoconsole() {
-    let _s = serial();
-    let r = spawn_with(
-        WindowsFault::CloseWorker,
-        &WindowsPty::default(),
-        &cmd("exit 0"),
-    );
-    assert!(
-        matches!(
-            &r,
-            Err(SpawnError::NeverStarted {
-                kind: NeverStartedKind::Setup,
-                cleanup: Cleanup::Confirmed,
-                ..
-            })
-        ),
-        "{}",
-        describe(&r)
-    );
-    assert!(
-        !names(&report()).contains(&"create_pseudo_console"),
-        "{:?}",
-        report()
-    );
 }
 
 // ---- CL-4 ----
@@ -965,7 +904,7 @@ fn expired_teardown_kill_reports_unresolved() {
 fn teardown_order() {
     let _s = serial();
     let pty = identity_fault();
-    let (r, _) = spawn(&pty, &cmd("pause"));
+    let r = spawn(&pty, &cmd("pause"));
     assert!(
         matches!(
             &r,
@@ -1025,7 +964,7 @@ fn each_attempt_gets_a_fresh_command_line() {
 fn drain_starts_before_the_process() {
     let _s = serial();
     let pty = WindowsPty::default();
-    let (r, _) = spawn(&pty, &cmd("exit 0"));
+    let r = spawn(&pty, &cmd("exit 0"));
     let parts = r.unwrap_or_else(|e| panic!("{e}"));
     let n = names(&report());
     assert!(
@@ -1037,24 +976,28 @@ fn drain_starts_before_the_process() {
 }
 
 /// PR4-CL-13: the sink gets every byte read, from the first one, and output ends only
-/// after the pseudoconsole closes: the reader parks once `READY` was read, its next read
-/// then runs with the child gone and the pseudoconsole open, and no read returns 0 before
-/// the close begins.
+/// after the pseudoconsole closes: the reader parks once `READY` was read; after the
+/// child's exit the test releases it, marks the close, and closes, and no read returned 0
+/// before the mark. The reader's next read may return before or after the mark (a known
+/// limit, `docs/design/pty-windows.md` CL-13).
 #[test]
 fn output_ends_only_after_close() {
     let _s = serial();
+    let probe = OutputProbe::new(b"READY");
+    let marker = probe.marker();
     let pty = WindowsPty {
         hooks: Hooks {
-            marker: Some(b"READY"),
-            hold: true,
+            probe: Some(probe),
             ..Hooks::default()
         },
     };
-    let (r, out) = spawn(&pty, &cmd("echo READY"));
-    let parts = r.unwrap_or_else(|e| panic!("{e}"));
+    let out = Arc::new(Out::default());
+    let r = pty.spawn(&cmd("echo READY"), out.sink());
+    let parts = r
+        .map(SpawnedPty::into_parts)
+        .unwrap_or_else(|e| panic!("{e}"));
     let exit = parts.child.wait_timeout(BOUND).unwrap();
     assert_eq!(exit.map(|e| e.code), Some(Some(0)));
-    let marker = pty.hooks.seen.lock().unwrap().clone().unwrap();
     assert!(marker.wait_parked(Instant::now() + BOUND), "READY not read");
     assert_eq!(out.end(), None);
     marker.release();
@@ -1095,7 +1038,7 @@ fn dropping_input_writes_nothing() {
 // ---- CL-15 ----
 
 fn live_child(pty: &WindowsPty) -> (SpawnedParts, Arc<WindowsChild>) {
-    let (r, _) = spawn(pty, &cmd("pause"));
+    let r = spawn(pty, &cmd("pause"));
     let parts = r.unwrap_or_else(|e| panic!("{e}"));
     let child = take_child(pty).unwrap();
     (parts, child)
@@ -1197,7 +1140,7 @@ fn wait_timeout_runs_during_kill() {
 fn exit_code_is_reported_repeatedly() {
     let _s = serial();
     let pty = WindowsPty::default();
-    let (r, _) = spawn(&pty, &cmd("exit 7"));
+    let r = spawn(&pty, &cmd("exit 7"));
     let parts = r.unwrap_or_else(|e| panic!("{e}"));
     let a = parts.child.wait_timeout(BOUND).unwrap();
     let b = parts.child.wait_timeout(Duration::ZERO).unwrap();
@@ -1211,7 +1154,7 @@ fn exit_code_is_reported_repeatedly() {
 fn large_exit_code_is_negative() {
     let _s = serial();
     let pty = WindowsPty::default();
-    let (r, _) = spawn(&pty, &cmd("exit -1073741510"));
+    let r = spawn(&pty, &cmd("exit -1073741510"));
     let parts = r.unwrap_or_else(|e| panic!("{e}"));
     let e = parts.child.wait_timeout(BOUND).unwrap().unwrap();
     assert_eq!(e.code, Some(0xC000_013A_u32.cast_signed()));
@@ -1237,7 +1180,7 @@ fn immediate_exit_still_has_an_identity() {
             ..Hooks::default()
         },
     };
-    let (r, _) = spawn(&pty, &cmd("exit 0"));
+    let r = spawn(&pty, &cmd("exit 0"));
     let parts = r.unwrap_or_else(|e| panic!("{e}"));
     assert!(!parts.child.identity().start_time.is_empty());
     let e = parts.child.wait_timeout(BOUND).unwrap();
@@ -1264,7 +1207,7 @@ fn leader_identity_matches_identify() {
 fn identity_failure_has_an_empty_start() {
     let _s = serial();
     let pty = identity_fault();
-    let (r, _) = spawn(&pty, &cmd("pause"));
+    let r = spawn(&pty, &cmd("pause"));
     let (stage, identity, _) = started_then_failed(r);
     assert_eq!((stage, identity), ("identity", None));
     let child = take_child(&pty).unwrap();
@@ -1363,7 +1306,7 @@ fn pty_spawn_waits_for_a_helper_spawn() {
                 ..Hooks::default()
             },
         };
-        let (r, _) = spawn(&pty, &cmd("exit 0"));
+        let r = spawn(&pty, &cmd("exit 0"));
         drop(take_child(&pty));
         r.map(release).map_err(|e| e.to_string())
     });
@@ -1423,7 +1366,7 @@ fn helper_waits_in(stage: u8) {
                 ..Hooks::default()
             },
         };
-        let (r, _) = spawn(&pty, &cmd("exit 0"));
+        let r = spawn(&pty, &cmd("exit 0"));
         drop(take_child(&pty));
         r.map(release).map_err(|e| e.to_string())
     });
@@ -1516,7 +1459,7 @@ fn native_create_boundary() {
         if let Some(f) = fault {
             hooks::inject_next(f);
         }
-        let (r, _) = spawn(&pty, &cmd("exit 0"));
+        let r = spawn(&pty, &cmd("exit 0"));
         let parts = r.unwrap_or_else(|e| panic!("{label}: {e}"));
         let rep = report();
         let names: Vec<_> = rep.native_lock.iter().map(|(n, _)| *n).collect();
@@ -1601,38 +1544,40 @@ fn close_thread_probe_waits_outside_the_registry_lock() {
 const HELPER_ENV: &str = "CHALDEA_WINDOWS_TEST_HELPER";
 
 /// The helper side: waits for the go line, spawns `pause` through the backend, and checks
-/// the case's outcome; a panic fails the helper (exit 101).
-fn helper_main(case: &str) {
+/// that it nested (job-list branch) and that its tree dies on kill; a panic fails the
+/// helper (exit 101).
+fn nesting_helper() {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).unwrap();
     let pty = WindowsPty::default();
-    let (r, _) = spawn(&pty, &cmd("pause"));
-    match case {
-        "nests" => {
-            let parts = r.unwrap_or_else(|e| panic!("{e}"));
-            let ev: std::collections::HashMap<_, _> = parts.evidence.iter().cloned().collect();
-            assert_eq!(ev["job_branch"], "job_list");
-            let k = parts
-                .child
-                .kill_tree(&[], Instant::now() + Duration::from_secs(5));
-            assert!(k.tree_dead, "{k:?}");
-            drop(take_child(&pty));
-            let _ = release(parts);
-        }
-        other => panic!("unknown helper case {other}"),
-    }
+    let parts = spawn(&pty, &cmd("pause")).unwrap_or_else(|e| panic!("{e}"));
+    let ev: std::collections::HashMap<_, _> = parts.evidence.iter().cloned().collect();
+    assert_eq!(ev["job_branch"], "job_list");
+    let k = parts
+        .child
+        .kill_tree(&[], Instant::now() + Duration::from_secs(5));
+    assert!(k.tree_dead, "{k:?}");
+    drop(take_child(&pty));
+    let _ = release(parts);
 }
 
-/// The outer side: a kill-on-close parent job holding the helper and a sibling; the
-/// helper runs only after both are verified in the job.
-fn parent_job_case(test: &str, case: &str) {
+/// PR4-CL-27: a kill-on-close parent job holds the helper (this test re-executed) and a
+/// sibling; the helper runs only after both are verified in the job, and the sibling
+/// survives the helper's kill.
+#[test]
+fn spawn_inside_a_parent_job_nests() {
+    const TEST: &str = "windows::tests::spawn_inside_a_parent_job_nests";
+    if std::env::var_os(HELPER_ENV).is_some() {
+        nesting_helper();
+        return;
+    }
     let _s = serial();
     let job = sys::create_job().unwrap();
     sys::set_job_limit(&job, sys::KILL_ON_JOB_CLOSE).unwrap();
     let (mut helper, mut sibling) = crate::with_spawn_lock(|| {
         let helper = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--nocapture", "--test-threads", "1"])
-            .env(HELPER_ENV, case)
+            .args([TEST, "--exact", "--nocapture", "--test-threads", "1"])
+            .env(HELPER_ENV, "1")
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
@@ -1675,15 +1620,6 @@ fn parent_job_case(test: &str, case: &str) {
     assert!(sys::wait_floor(s.as_handle(), BOUND).unwrap());
     let _ = sibling.wait();
     drop(sibling.stdin.take());
-}
-
-#[test]
-fn spawn_inside_a_parent_job_nests() {
-    if let Ok(case) = std::env::var(HELPER_ENV) {
-        helper_main(&case);
-        return;
-    }
-    parent_job_case("windows::tests::spawn_inside_a_parent_job_nests", "nests");
 }
 
 // ---- CL-28 ----

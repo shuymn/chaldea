@@ -80,32 +80,47 @@ pub(crate) fn command_line(argv: &[OsString]) -> Vec<u16> {
     out
 }
 
-/// Whether two keys of `env` are equal under `cmp`.
-pub(crate) fn has_duplicate_key(env: &[(OsString, OsString)], cmp: Compare) -> bool {
-    let mut keys: Vec<Vec<u16>> = env.iter().map(|(k, _)| wide(k)).collect();
-    keys.sort_by(|a, b| cmp(a, b));
-    keys.windows(2)
-        .any(|w| cmp(&w[0], &w[1]) == Ordering::Equal)
+/// Why an environment cannot form a block.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EnvError {
+    /// An empty key, a key containing `=`, or a NUL in a key or value.
+    Invalid,
+    /// Two keys equal under the comparison.
+    Duplicate,
 }
 
-/// The environment block: `env` sorted by `cmp`, each `KEY=VALUE\0`, then a final `\0`; an
-/// empty `env` gives `\0\0`.
-pub(crate) fn env_block(env: &[(OsString, OsString)], cmp: Compare) -> Vec<u16> {
-    let mut entries: Vec<(Vec<u16>, Vec<u16>)> =
-        env.iter().map(|(k, v)| (wide(k), wide(v))).collect();
+/// The environment block, each entry encoded once: every entry checked, then `env` sorted
+/// once by `cmp` and adjacent keys compared for duplicates, then each `KEY=VALUE\0` in that
+/// order and a final `\0`; an empty `env` gives `\0\0`.
+pub(crate) fn env_block(env: &[(OsString, OsString)], cmp: Compare) -> Result<Vec<u16>, EnvError> {
+    let eq = u16::from(b'=');
+    let mut entries = Vec::with_capacity(env.len());
+    for (k, v) in env {
+        let (k, v) = (wide(k), wide(v));
+        if k.is_empty() || k.contains(&eq) || k.contains(&0) || v.contains(&0) {
+            return Err(EnvError::Invalid);
+        }
+        entries.push((k, v));
+    }
     entries.sort_by(|a, b| cmp(&a.0, &b.0));
+    if entries
+        .windows(2)
+        .any(|w| cmp(&w[0].0, &w[1].0) == Ordering::Equal)
+    {
+        return Err(EnvError::Duplicate);
+    }
     let mut out = Vec::new();
     if entries.is_empty() {
         out.push(0);
     }
     for (k, v) in entries {
         out.extend(k);
-        out.push(u16::from(b'='));
+        out.push(eq);
         out.extend(v);
         out.push(0);
     }
     out.push(0);
-    out
+    Ok(out)
 }
 
 /// What the current directory passed to `CreateProcessW` is.
@@ -220,21 +235,39 @@ mod tests {
             ("A".into(), "1".into()),
             ("C".into(), "3".into()),
         ];
-        let got = env_block(&env, cmp());
+        let got = env_block(&env, cmp()).unwrap();
         assert_eq!(text(&got), "A=1\0b=2\0C=3\0\0");
     }
 
     #[test]
     fn empty_env_block_is_two_nuls() {
-        assert_eq!(env_block(&[], cmp()), vec![0, 0]);
+        assert_eq!(env_block(&[], cmp()), Ok(vec![0, 0]));
     }
 
     #[test]
     fn keys_differing_in_case_are_duplicates() {
         let env = vec![("Path".into(), "a".into()), ("PATH".into(), "b".into())];
-        assert!(has_duplicate_key(&env, cmp()));
+        assert_eq!(env_block(&env, cmp()), Err(EnvError::Duplicate));
         let env = vec![("A".into(), "a".into()), ("B".into(), "b".into())];
-        assert!(!has_duplicate_key(&env, cmp()));
+        assert!(env_block(&env, cmp()).is_ok());
+    }
+
+    /// Entry checks come before the duplicate check.
+    #[test]
+    fn invalid_entries_are_refused() {
+        let entry = |k: &str, v: &str| vec![(OsString::from(k), OsString::from(v))];
+        for env in [
+            entry("", "a"),
+            entry("A=B", "a"),
+            entry("A\0", "a"),
+            entry("A", "a\0"),
+        ] {
+            assert_eq!(env_block(&env, cmp()), Err(EnvError::Invalid), "{env:?}");
+        }
+        let mut env = entry("A", "a");
+        env.extend(entry("a", "b"));
+        env.extend(entry("", "c"));
+        assert_eq!(env_block(&env, cmp()), Err(EnvError::Invalid));
     }
 
     /// A model of Win32 path normalization for the corpus on non-Windows hosts, over UTF-16

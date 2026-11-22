@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use self::child::{KILL_CODE, WindowsChild};
-use self::cmdline::{Buffers, Cwd, MAX_COMMAND_LINE};
+use self::cmdline::{Buffers, Cwd, EnvError, MAX_COMMAND_LINE};
 use self::control::{CloseWorker, WindowsControl};
 use crate::backend::{
     Cleanup, CloseReport, DrainSink, KillReport, NeverStartedKind, ProcessIdentity, PtyChild,
@@ -439,7 +439,8 @@ impl PtyRuntime for WindowsPty {
         let reader = {
             let marker = held.clone();
             #[cfg(test)]
-            let marker = marker.or_else(|| self.hooks.marker());
+            let marker =
+                marker.or_else(|| self.hooks.probe.as_ref().map(hooks::OutputProbe::marker));
             hooks::MarkerReader::new(out_r, marker)
         };
         #[cfg(not(any(test, feature = "fake")))]
@@ -704,14 +705,11 @@ fn validate(spec: &SpawnSpec) -> Result<Buffers, SpawnError> {
             ));
         }
     };
-    for (k, v) in &spec.env {
-        if k.is_empty() || cmdline::wide(k).contains(&u16::from(b'=')) || has_nul(k) || has_nul(v) {
-            return Err(invalid("invalid environment entry"));
-        }
-    }
-    if cmdline::has_duplicate_key(&spec.env, sys::compare_ordinal_ignore_case) {
-        return Err(invalid("duplicate environment key"));
-    }
+    let env = match cmdline::env_block(&spec.env, sys::compare_ordinal_ignore_case) {
+        Ok(env) => env,
+        Err(EnvError::Invalid) => return Err(invalid("invalid environment entry")),
+        Err(EnvError::Duplicate) => return Err(invalid("duplicate environment key")),
+    };
     let line = cmdline::command_line(&spec.argv);
     if line.len() > MAX_COMMAND_LINE {
         return Err(invalid("command line longer than 32767 units"));
@@ -719,7 +717,7 @@ fn validate(spec: &SpawnSpec) -> Result<Buffers, SpawnError> {
     Ok(Buffers {
         app: cmdline::wide_nul(argv0),
         cmdline: line,
-        env: cmdline::env_block(&spec.env, sys::compare_ordinal_ignore_case),
+        env,
         cwd,
     })
 }
@@ -787,8 +785,6 @@ impl WindowsPty {
         let mut line = bufs.cmdline.clone();
         #[cfg(test)]
         self.hooks.command_line(suspended, &mut line);
-        #[cfg(test)]
-        self.hooks.on(&tests::Stage::BeforeLock { stage: 5 });
         let guard = spawn_lock();
         #[cfg(test)]
         self.hooks.on(&tests::Stage::LockAcquired { stage: 5 });
