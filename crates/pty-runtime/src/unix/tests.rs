@@ -377,8 +377,15 @@ fn identity_failure_kills_the_started_tree() {
         }
         SpawnError::NeverStarted { .. } => panic!("{e}"),
     }
+    // The kill signals the tree; the release points come in order around it.
+    assert!(order.contains(&"killpg"), "{order:?}");
+    let release: Vec<&str> = order
+        .iter()
+        .copied()
+        .filter(|p| !matches!(*p, "killpg" | "kill"))
+        .collect();
     assert_eq!(
-        order,
+        release,
         ["kill_tree", "input_drop", "control_close", "drain_finish"]
     );
     assert!(wait_dead(leader) && wait_dead(bg));
@@ -389,8 +396,14 @@ fn identity_failure_kills_the_started_tree() {
 #[test]
 fn zero_kill_budget_reports_unresolved() {
     let _s = serial();
-    let (e, leader, bg, _, pty) = identity_failure(true);
+    let (e, leader, bg, order, pty) = identity_failure(true);
     let (ls, bs) = (start_of(leader), start_of(bg));
+    // The zero-budget kill sent no signal (both fixtures ignore SIGHUP, so liveness alone
+    // would not show it).
+    assert!(
+        !order.iter().any(|p| matches!(*p, "killpg" | "kill")),
+        "{order:?}"
+    );
     match e {
         SpawnError::StartedThenFailed { cleanup, .. } => match cleanup {
             Cleanup::Unresolved { kill: Some(k), .. } => assert!(!k.tree_dead),
@@ -404,7 +417,8 @@ fn zero_kill_budget_reports_unresolved() {
     kill_verified(bg, bs);
     kill_verified(leader, ls);
     drop(take_child(&pty));
-    assert!(reap(leader));
+    // `Drop` reaps the leader if the SIGKILL already ended it; otherwise the test does.
+    assert!(reap(leader) || table::lookup(leader) == Lookup::Gone);
     assert!(wait_dead(bg));
 }
 

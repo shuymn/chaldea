@@ -284,12 +284,16 @@ impl Os for RealOs<'_> {
     }
 
     fn killpg(&self, pgid: u32, sig: Sig) {
+        #[cfg(test)]
+        super::trace::record("killpg");
         if let Ok(p) = pid_of(pgid) {
             let _ = rustix::process::kill_process_group(p, signal_of(sig));
         }
     }
 
     fn kill(&self, pid: u32, sig: Sig) {
+        #[cfg(test)]
+        super::trace::record("kill");
         if let Ok(p) = pid_of(pid) {
             let _ = rustix::process::kill_process(p, signal_of(sig));
         }
@@ -437,5 +441,30 @@ mod tests {
         assert_eq!(*os.calls.borrow(), vec![Call::Now, Call::Waitid, Call::Now]);
         assert!(!own.lost());
         assert!(own.owned(&Script::new(), None));
+    }
+
+    #[test]
+    fn real_ownership_check_returns_the_leader_record() {
+        // A real child that has exited and is still unreaped: the adapter's check holds and
+        // hands back the zombie record it read.
+        let _s = crate::unix::tests::serial();
+        let mut child =
+            crate::with_spawn_lock(|| std::process::Command::new("/usr/bin/true").spawn()).unwrap();
+        let pid = child.id();
+        let end = Instant::now() + Duration::from_secs(10);
+        while waitid_nowait(pid).unwrap().is_none() {
+            assert!(Instant::now() < end);
+            std::thread::yield_now();
+        }
+        let Lookup::Zombie(start) = crate::unix::table::lookup(pid) else {
+            panic!("not a zombie");
+        };
+        let own = Ownership::new(pid, Some(start));
+        let checked = Os::owned(
+            &RealOs { own: &own },
+            Instant::now() + Duration::from_secs(10),
+        );
+        child.wait().unwrap();
+        assert_eq!(checked, (true, Some(Lookup::Zombie(start))));
     }
 }
