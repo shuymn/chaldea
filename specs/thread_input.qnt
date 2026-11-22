@@ -1052,17 +1052,19 @@ module thread_input {
     stateOf(st, id) == Queued,
     st.inputs.get(id).launch == st.launch,
     gate(gateView(st)) == Open,
-    val v = gateView(st)
-    val laterTurn = v.lastTurnStart != 0 and v.lastHumanWrite < v.lastTurnStart and v.lastTurnStart < v.readinessSeq
+    // Recorded from the state itself, not from the guard's view.
+    val g = st.gp
+    val laterTurn = g.lastTurnStart != 0 and g.lastHumanWrite < g.lastTurnStart and g.lastTurnStart < g.readinessSeq
     val rec = {
-      bound: v.bound,
-      running: v.process == Running,
-      idle: v.turn == Idle,
-      evidenceSeq: v.readinessSeq,
-      lastWrite: v.lastWrite,
-      sameTurnOk: v.lastHumanWrite == 0 or v.evidence == OwnerAsserted or laterTurn,
-      otherInFlight: v.inFlight,
-      pasteOk: not(v.needsBracketedPaste) or v.bracketedPasteOn,
+      bound: g.bound,
+      running: st.thread.process == Running,
+      idle: st.thread.turn == Idle,
+      evidenceSeq: g.readinessSeq,
+      lastWrite: g.lastWrite,
+      sameTurnOk: g.lastHumanWrite == 0 or g.evidence == OwnerAsserted or laterTurn,
+      otherInFlight: INPUT_IDS.exists(o => has(st, o) and st.inputs.get(o).launch == st.launch
+        and Set(Sending, Sent, Unconfirmed).contains(stateOf(st, o))),
+      pasteOk: not(g.needsBracketedPaste) or g.bracketedPasteOn,
     }
     val o1 = setInput(start(st), id, i => { ...i,
       sentAfterSeq: st.seq, attemptSeq: st.seq + 1, lastWriteBefore: st.gp.lastWrite, admittedBasis: st.gp.basis,
@@ -1533,7 +1535,10 @@ module thread_input {
   /// facts, and every record is of the same launch, after the attempt, a unique match, a
   /// dispatched write, with no other counted write after it.
   val ackOnlyWhenAttributable = and {
-    st.ackRecords.keys().forall(id => attributable(st.ackRecords.get(id))),
+    st.ackRecords.keys().forall(id => {
+      val r = st.ackRecords.get(id)
+      r.sameLaunch and r.afterAttempt and r.uniqueMatch and r.dispatched and r.noInterveningWrite
+    }),
     last.calls.indices().forall(j => match last.calls[j].kind {
       | Step(c) => (c.input == AckAttributed and last.calls[j].ok) implies st.ackRecords.keys().contains(c.id)
       | _ => true

@@ -87,13 +87,13 @@ Two layers in one module:
 
 ## 2. Invariants
 
-All are checked by `pnpm run simulate` (§5). Each reads facts recorded where they happen, so breaking the guard it protects violates it (checked by mutating the guard).
+All are checked by `pnpm run simulate` (§5). Each reads facts recorded where they happen, so breaking the guard it protects violates it (checked by mutating the guard). One mutation needs a larger run: dropping the gate-closing human write from the recheck view violates `dispatchOnlyThroughRecheck` after about 5,000 samples per seed, so at the CI size `trace_refused_recheck_same_turn_evidence` catches it.
 
 | Invariant | Statement | Source |
 |---|---|---|
 | `sendingAtMostOnce` | an input enters `sending` at most once | CL-4; `input.rs:3-4` |
 | `writtenAtMostOnce` | an input's text is dispatched at most once | arch §4.3; mvp §2.3:183 |
-| `sendingOnlyThroughOpenGate` | `sending` through the gate only when bound, running, idle, evidence newer than the last write and not of the same turn as a gate-closing human write, no other in-flight input of the launch, bracketed paste on where needed (the positional prompt is exempt) | mvp §2.3:171, :174; CL-5 |
+| `sendingOnlyThroughOpenGate` | `sending` through the gate only when bound, running, idle, evidence newer than the last write and not of the same turn as a gate-closing human write, no other in-flight input of the launch, bracketed paste on where needed (the positional prompt is exempt); recorded from the state, not from the guard's view | mvp §2.3:171, :174; CL-5 |
 | `dispatchOnlyThroughRecheck` | every dispatched input passed the recheck at its first byte, re-derived from the facts the dispatch recorded rather than from the guard's view: the same launch, no counted write since the admitted basis, and each gate condition with the input's own attempt not counted as a write | mvp §2.3:171-177 |
 | `oneInFlightPerLaunch` | at most one in-flight input per launch | mvp §2.3:171 |
 | `earlierLaunchesNeverBlock` | the gate equals the gate with `in_flight` counted over the current launch's inputs only | mvp §2.3:171; CL-6 |
@@ -107,7 +107,7 @@ All are checked by `pnpm run simulate` (§5). Each reads facts recorded where th
 | `lateResolutionChangesNothing` | a resolution after `Stop`, interrupt, prompt, or exit changes nothing | mvp §2.10:335 |
 | `restartRecovers` | a restart turns `sending`/`sent` into `unconfirmed` and `queued` into `cancelled` | mvp §2.4:214; CL-6 |
 | `exitedLaunchHasNoPendingInput` | after exit no input is `queued`, `sending`, or `sent` | mvp §2.3:183, :185 |
-| `ackOnlyWhenAttributable` | every `AckAttributed` fed has a record of the hook's intake facts, and every record is attributable | mvp §2.3:182; CL-7 |
+| `ackOnlyWhenAttributable` | every `AckAttributed` fed has a record of the hook's intake facts, and every record shows all five (same launch, after the attempt, unique match, dispatched, no other counted write after it), checked directly rather than through the guard's `attributable` | mvp §2.3:182; CL-7 |
 | `reservedOnlyAfterDeath` | every reservation the reducer accepted came after the previous launch's death was confirmed | mvp §2.9:323; CL-18 |
 | `resumeBlockedOnlyWhileDeathUnconfirmed` | `resume_blocked` only while exited with death unconfirmed | mvp §2.2:146 |
 | `exitedTurnUnknown` | an exited launch's turn is `unknown` | mvp §2.2:135 |
