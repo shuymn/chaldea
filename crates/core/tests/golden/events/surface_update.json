@@ -1,0 +1,66 @@
+{
+  "command_id": "01930000-0000-7000-8000-000000000040",
+  "event_id": "01930000-0000-7000-8000-000000010015",
+  "idempotency_key": "command:01930000-0000-7000-8000-000000000040:21",
+  "kind": "surface_update",
+  "launch_id": "01930000-0000-7000-8000-000000000010",
+  "occurred_at": "2026-11-22T09:45:00.123Z",
+  "payload": {
+    "components": [
+      {
+        "markdown": "**Stalled** on a trust prompt",
+        "type": "markdown"
+      },
+      {
+        "items": [
+          {
+            "text": "Press 1 to trust",
+            "type": "text"
+          }
+        ],
+        "type": "list"
+      },
+      {
+        "label": "Note",
+        "name": "note",
+        "type": "text_input"
+      },
+      {
+        "cols": 80,
+        "grid": {
+          "encoding": "utf8",
+          "inline": "Do you trust this folder?"
+        },
+        "rows": 24,
+        "type": "vt_snapshot"
+      },
+      {
+        "action": {
+          "action_id": "trust",
+          "args": {
+            "keys": "1"
+          },
+          "kind": "send_key"
+        },
+        "label": "Trust",
+        "type": "button"
+      }
+    ],
+    "scope": {
+      "kind": "thread",
+      "thread_id": "0193abcd-ef01-7000-8000-000000000001"
+    },
+    "surface_id": "rescue-panel"
+  },
+  "recorded_at": "2026-11-22T09:45:00.125Z",
+  "schema_version": 1,
+  "seq": 21,
+  "source": {
+    "agent": "claude",
+    "cli_version": "2.1.326",
+    "kind": "command",
+    "transcript": null
+  },
+  "stream_id": "thread:0193abcd-ef01-7000-8000-000000000001",
+  "thread_id": "0193abcd-ef01-7000-8000-000000000001"
+}

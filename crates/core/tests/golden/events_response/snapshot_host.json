@@ -1,0 +1,54 @@
+{
+  "as_of_seq": 7,
+  "epoch": "ep-7c1d",
+  "mode": "snapshot",
+  "reason": "too_many_events",
+  "snapshot": {
+    "stream": "host",
+    "surfaces": [
+      {
+        "components": [],
+        "scope": {
+          "kind": "workspace",
+          "workspace_id": "ws-5f2c"
+        },
+        "surface_id": "host-status"
+      }
+    ],
+    "threads": [
+      {
+        "agent": "claude",
+        "attention": [
+          {
+            "input_id": "01930000-0000-7000-8000-000000000020",
+            "kind": "input_gate_timeout"
+          }
+        ],
+        "closed": false,
+        "cwd": "/work/chaldea",
+        "parent_thread_id": null,
+        "process_state": "running",
+        "role": "standard",
+        "task_state": "active",
+        "thread_id": "0193abcd-ef01-7000-8000-000000000001",
+        "turn_state": "awaiting_approval",
+        "workspace_id": "ws-5f2c"
+      }
+    ],
+    "worktrees": [
+      {
+        "base_commit": "cee7556d0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+        "base_ref": "main",
+        "branch": "chaldea/a1b2c3d4",
+        "created_by": "thread:0193abcd-ef01-7000-8000-000000000001",
+        "owner_thread_id": "01930000-0000-7000-8000-000000000002",
+        "path": "/work/state/chaldea/wt/a1b2c3d4",
+        "repo": "/work/chaldea",
+        "state": "active",
+        "workspace_id": "ws-5f2c",
+        "worktree_id": "a1b2c3d4"
+      }
+    ]
+  },
+  "stream_id": "host"
+}

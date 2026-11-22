@@ -1,0 +1,102 @@
+{
+  "$defs": {
+    "Epoch": {
+      "description": "Random id stored at database creation; a change tells a client to resync (§2.4).",
+      "type": "string"
+    },
+    "StreamHeadEntry": {
+      "properties": {
+        "head_seq": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stream_id": {
+          "$ref": "#/$defs/StreamId"
+        }
+      },
+      "required": [
+        "stream_id",
+        "head_seq"
+      ],
+      "type": "object"
+    },
+    "StreamId": {
+      "pattern": "^(host|thread:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+      "type": "string"
+    },
+    "Timestamp": {
+      "description": "RFC 3339 UTC with millisecond precision, e.g. `2026-11-22T09:45:00.123Z`.",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Server to client on `GET /api/ws`. Notify-then-pull: the client fetches events with\n`GET /api/events`.",
+  "oneOf": [
+    {
+      "properties": {
+        "epoch": {
+          "$ref": "#/$defs/Epoch"
+        },
+        "server_time": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "type": {
+          "const": "hello",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "epoch",
+        "server_time"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "head_seq": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stream_id": {
+          "$ref": "#/$defs/StreamId"
+        },
+        "type": {
+          "const": "stream_advanced",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "stream_id",
+        "head_seq"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Sent on every `subscribe` and every 30 s.",
+      "properties": {
+        "heads": {
+          "items": {
+            "$ref": "#/$defs/StreamHeadEntry"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "heads",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "heads"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "WsServerMessage"
+}

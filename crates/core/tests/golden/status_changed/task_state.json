@@ -1,0 +1,6 @@
+{
+  "cause": "task_set",
+  "field": "task_state",
+  "from": "active",
+  "to": "blocked"
+}

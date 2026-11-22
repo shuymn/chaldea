@@ -1,0 +1,47 @@
+[workspace]
+members = ["crates/core"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shuymn/chaldea"
+publish = false
+
+# Exact pins (=x.y.z), as in spikes/pty-hooks: every upgrade is an explicit change.
+[workspace.dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.154", features = ["raw_value"] }
+ts-rs = { version = "=12.0.1", features = ["no-serde-warnings", "serde-json-impl", "uuid-impl"] }
+schemars = { version = "=1.2.3", features = ["raw_value", "uuid1"] }
+uuid = { version = "=1.29.1", features = ["serde"] }
+proptest = "=1.12.0"
+# Dev only: checks that the generated JSON Schema agrees with Rust decoding. No default
+# features, so no HTTP or file reference resolution.
+jsonschema = { version = "=0.60.2", default-features = false }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# A pedantic subset: lints that catch real mistakes in contract code, without
+# the style-only ones.
+[workspace.lints.clippy]
+cast_lossless = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+checked_conversions = "warn"
+explicit_into_iter_loop = "warn"
+explicit_iter_loop = "warn"
+implicit_clone = "warn"
+inefficient_to_string = "warn"
+manual_let_else = "warn"
+match_wildcard_for_single_variants = "warn"
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+unnested_or_patterns = "warn"
+wildcard_imports = "warn"

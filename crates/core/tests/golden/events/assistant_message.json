@@ -1,0 +1,31 @@
+{
+  "command_id": "01930000-0000-7000-8000-000000000040",
+  "event_id": "01930000-0000-7000-8000-00000001000c",
+  "idempotency_key": "command:01930000-0000-7000-8000-000000000040:12",
+  "kind": "assistant_message",
+  "launch_id": "01930000-0000-7000-8000-000000000010",
+  "occurred_at": "2026-11-22T09:45:00.123Z",
+  "payload": {
+    "text": {
+      "encoding": "utf8",
+      "inline": "Done."
+    },
+    "turn_ref": null
+  },
+  "recorded_at": "2026-11-22T09:45:00.125Z",
+  "schema_version": 1,
+  "seq": 12,
+  "source": {
+    "agent": "claude",
+    "cli_version": "2.1.326",
+    "kind": "transcript",
+    "transcript": {
+      "file_id": "16777230:9876543",
+      "generation": 2,
+      "offset_end": 18432,
+      "path": "/work/.claude/projects/x/s.jsonl"
+    }
+  },
+  "stream_id": "thread:0193abcd-ef01-7000-8000-000000000001",
+  "thread_id": "0193abcd-ef01-7000-8000-000000000001"
+}

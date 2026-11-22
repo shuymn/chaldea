@@ -1,6 +1,6 @@
 # The same checks CI runs: the workflow linters of the shared gha workflow, the
-# secret scan of the shared security workflow, and the pty-hooks spike checks
-# of ci.yml (tests on push, since they take several seconds).
+# secret scan of the shared security workflow, and the workspace and pty-hooks
+# spike checks of ci.yml (tests on push, since they take several seconds).
 pre-commit:
   commands:
     actionlint:
@@ -11,6 +11,15 @@ pre-commit:
       run: mise exec -- ghalint run
     betterleaks:
       run: mise exec -- betterleaks git --pre-commit --staged --redact --no-banner --verbose --validation=false
+    workspace-fmt:
+      glob: "crates/**/*.rs"
+      run: cargo fmt --all --check
+    workspace-clippy:
+      glob:
+        - "crates/**/*.{rs,toml}"
+        - "Cargo.{toml,lock}"
+        - "rust-toolchain.toml"
+      run: cargo clippy --workspace --all-targets --locked -- -D warnings
     pty-hooks-fmt:
       root: spikes/pty-hooks/
       glob: "*.rs"
@@ -22,6 +31,13 @@ pre-commit:
 
 pre-push:
   commands:
+    workspace-test:
+      glob:
+        - "crates/**/*"
+        - "packages/contracts/**/*"
+        - "Cargo.{toml,lock}"
+        - "rust-toolchain.toml"
+      run: cargo test --workspace --locked
     pty-hooks-test:
       root: spikes/pty-hooks/
       glob: "*.{rs,toml,lock,txt}"

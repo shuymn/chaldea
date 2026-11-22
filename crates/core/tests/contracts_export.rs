@@ -1,0 +1,194 @@
+//! Drift check for the generated contracts: the committed TypeScript under
+//! `packages/contracts/src/generated/` and JSON Schema under `packages/contracts/schema/`
+//! must equal what the Rust types generate, byte for byte.
+//!
+//! Regenerate the committed files after changing a public type, from the repository root:
+//!
+//! ```text
+//! CHALDEA_BLESS=1 cargo test -p chaldea-core --test contracts_export
+//! ```
+//!
+//! Output is deterministic by construction on every OS: one flat directory per format
+//! (ts-rs writes `/` in import paths on Windows too), LF line endings written by the
+//! generators and kept by `.gitattributes`, and JSON objects with sorted keys
+//! (`serde_json` without `preserve_order`).
+
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "this test writes and compares files; core itself stays Sans-IO"
+)]
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use chaldea_core::MAX_SAFE_INTEGER;
+use chaldea_core::event::{EventEnvelope, GenericEvent, TypedEvent};
+use chaldea_core::sync::{EventsResponse, WsClientMessage, WsServerMessage};
+use schemars::JsonSchema;
+use serde_json::Value;
+use ts_rs::{Config, TS};
+
+const TS_DIR: &str = "packages/contracts/src/generated";
+const SCHEMA_DIR: &str = "packages/contracts/schema";
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn export_ts<T: TS + 'static>(cfg: &Config) {
+    T::export_all(cfg).unwrap_or_else(|e| panic!("ts-rs export failed: {e}"));
+}
+
+/// schemars marks integer widths only with `format`, which validators treat as an
+/// annotation. State each width's bounds as `minimum`/`maximum` so that a validator
+/// refuses what Rust refuses; `u64` stops at `MAX_SAFE_INTEGER`, as Rust decoding does.
+fn bound_integers(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            let bounds: Option<(i64, u64)> = match map.get("format").and_then(Value::as_str) {
+                Some("uint8") => Some((0, u64::from(u8::MAX))),
+                Some("uint16") => Some((0, u64::from(u16::MAX))),
+                Some("uint32") => Some((0, u64::from(u32::MAX))),
+                Some("uint64") => Some((0, MAX_SAFE_INTEGER)),
+                Some("int32") => Some((i64::from(i32::MIN), i32::MAX.unsigned_abs().into())),
+                _ => None,
+            };
+            if let Some((min, max)) = bounds {
+                map.insert("minimum".to_owned(), min.into());
+                map.insert("maximum".to_owned(), max.into());
+            }
+            map.values_mut().for_each(bound_integers);
+        }
+        Value::Array(items) => items.iter_mut().for_each(bound_integers),
+        _ => {}
+    }
+}
+
+fn export_schema<T: JsonSchema>(dir: &Path) {
+    let mut schema = serde_json::to_value(schemars::schema_for!(T)).expect("schema serializes");
+    bound_integers(&mut schema);
+    let name = T::schema_name();
+    let mut text = serde_json::to_string_pretty(&schema).expect("schema serializes");
+    text.push('\n');
+    fs::write(dir.join(format!("{name}.schema.json")), text).expect("write schema");
+}
+
+/// Writes every generated file under `out/ts` and `out/schema`.
+fn generate(out: &Path) -> (PathBuf, PathBuf) {
+    let ts = out.join("ts");
+    let schema = out.join("schema");
+    fs::create_dir_all(&ts).expect("create ts dir");
+    fs::create_dir_all(&schema).expect("create schema dir");
+
+    // JSON numbers, not bigint: every u64 on the wire (seq, sizes) stays below 2^53.
+    let cfg = Config::new().with_out_dir(&ts).with_large_int("number");
+    export_ts::<EventEnvelope>(&cfg);
+    export_ts::<TypedEvent>(&cfg);
+    export_ts::<GenericEvent>(&cfg);
+    export_ts::<EventsResponse>(&cfg);
+    export_ts::<WsServerMessage>(&cfg);
+    export_ts::<WsClientMessage>(&cfg);
+
+    export_schema::<EventEnvelope>(&schema);
+    export_schema::<TypedEvent>(&schema);
+    export_schema::<EventsResponse>(&schema);
+    export_schema::<WsServerMessage>(&schema);
+    export_schema::<WsClientMessage>(&schema);
+
+    (ts, schema)
+}
+
+/// Files under `dir`, keyed by their `/`-separated relative path.
+fn read_tree(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else {
+                let rel = path.strip_prefix(base).expect("under base");
+                let key = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                out.insert(key, fs::read(&path).expect("read file"));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+fn first_difference(a: &[u8], b: &[u8]) -> String {
+    let (a, b) = (String::from_utf8_lossy(a), String::from_utf8_lossy(b));
+    for (n, (la, lb)) in a.split('\n').zip(b.split('\n')).enumerate() {
+        if la != lb {
+            return format!("line {}: committed {la:?}, generated {lb:?}", n + 1);
+        }
+    }
+    "line count differs".to_owned()
+}
+
+fn compare(label: &str, committed: &Path, generated: &Path) -> Vec<String> {
+    let want = read_tree(generated);
+    let have = read_tree(committed);
+    let mut problems = Vec::new();
+    for (name, bytes) in &want {
+        match have.get(name) {
+            None => problems.push(format!("{label}/{name}: missing")),
+            Some(h) if h != bytes => {
+                problems.push(format!("{label}/{name}: {}", first_difference(h, bytes)));
+            }
+            Some(_) => {}
+        }
+    }
+    for name in have.keys().filter(|n| !want.contains_key(*n)) {
+        problems.push(format!("{label}/{name}: not generated (stale)"));
+    }
+    problems
+}
+
+fn replace_dir(target: &Path, source: &Path) {
+    if target.exists() {
+        fs::remove_dir_all(target).expect("remove old output");
+    }
+    fs::create_dir_all(target).expect("create output dir");
+    for (name, bytes) in read_tree(source) {
+        let path = target.join(&name);
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create parent");
+        fs::write(path, bytes).expect("write output");
+    }
+}
+
+#[test]
+fn committed_contracts_equal_generated_output() {
+    let tmp = std::env::temp_dir().join(format!("chaldea-contracts-{}", std::process::id()));
+    if tmp.exists() {
+        fs::remove_dir_all(&tmp).expect("clear temp dir");
+    }
+    let (ts, schema) = generate(&tmp);
+    let root = repo_root();
+
+    if std::env::var_os("CHALDEA_BLESS").is_some() {
+        replace_dir(&root.join(TS_DIR), &ts);
+        replace_dir(&root.join(SCHEMA_DIR), &schema);
+    }
+
+    let mut problems = compare(TS_DIR, &root.join(TS_DIR), &ts);
+    problems.extend(compare(SCHEMA_DIR, &root.join(SCHEMA_DIR), &schema));
+    fs::remove_dir_all(&tmp).expect("remove temp dir");
+
+    assert!(
+        problems.is_empty(),
+        "generated contracts drifted from the committed files; regenerate with \
+         `CHALDEA_BLESS=1 cargo test -p chaldea-core --test contracts_export`:\n{}",
+        problems.join("\n")
+    );
+}

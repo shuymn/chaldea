@@ -1,0 +1,24 @@
+{
+  "command_id": "01930000-0000-7000-8000-000000000040",
+  "event_id": "01930000-0000-7000-8000-000000010009",
+  "idempotency_key": "command:01930000-0000-7000-8000-000000000040:9",
+  "kind": "readiness_observed",
+  "launch_id": "01930000-0000-7000-8000-000000000010",
+  "occurred_at": "2026-11-22T09:45:00.123Z",
+  "payload": {
+    "by": "daemon",
+    "evidence": "stop_settled",
+    "launch_id": "01930000-0000-7000-8000-000000000010"
+  },
+  "recorded_at": "2026-11-22T09:45:00.125Z",
+  "schema_version": 1,
+  "seq": 9,
+  "source": {
+    "agent": "claude",
+    "cli_version": "2.1.326",
+    "kind": "command",
+    "transcript": null
+  },
+  "stream_id": "thread:0193abcd-ef01-7000-8000-000000000001",
+  "thread_id": "0193abcd-ef01-7000-8000-000000000001"
+}

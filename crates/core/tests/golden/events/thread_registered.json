@@ -1,0 +1,28 @@
+{
+  "command_id": "01930000-0000-7000-8000-000000000040",
+  "event_id": "01930000-0000-7000-8000-000000010001",
+  "idempotency_key": "command:01930000-0000-7000-8000-000000000040:1",
+  "kind": "thread_registered",
+  "launch_id": "01930000-0000-7000-8000-000000000010",
+  "occurred_at": "2026-11-22T09:45:00.123Z",
+  "payload": {
+    "agent": "claude",
+    "cwd": "/work/chaldea",
+    "parent_thread_id": null,
+    "role": "standard",
+    "task": "Implement PR 1",
+    "thread_id": "0193abcd-ef01-7000-8000-000000000001",
+    "workspace_id": "ws-5f2c"
+  },
+  "recorded_at": "2026-11-22T09:45:00.125Z",
+  "schema_version": 1,
+  "seq": 1,
+  "source": {
+    "agent": "claude",
+    "cli_version": "2.1.326",
+    "kind": "command",
+    "transcript": null
+  },
+  "stream_id": "host",
+  "thread_id": "0193abcd-ef01-7000-8000-000000000001"
+}
