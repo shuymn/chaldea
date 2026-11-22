@@ -2,7 +2,7 @@
 
 PTY-launched AI coding agent client and multi-host control plane for macOS / Windows hosts and Android remote access.
 
-**Status**: Core design fixed; the PTY/hooks spike is complete on macOS and Windows (`spikes/pty-hooks/`); MVP implementation has not started.
+**Status**: Core design fixed; the PTY/hooks spike is complete on macOS and Windows (`spikes/pty-hooks/`); MVP implementation has started with the core contracts crate (`crates/core/`); see `docs/mvp-design.md` for the plan.
 
 ## Design Summary
 

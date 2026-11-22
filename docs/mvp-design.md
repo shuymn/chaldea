@@ -497,7 +497,7 @@ pub enum InputState { Queued, Sending, Sent, Acked, Unconfirmed, Rejected, Cance
 pub enum InputInput { GateOpened { sent_after_seq: u64 }, WriteCompleted, WriteOutcomeUnknown, Rejected(RejectReason),
     Cancelled, RecheckFailed, LaunchExited, DaemonRestarted, AckAttributed, AckNotAttributable, AckWindowExpired, Resolved { delivered: bool } }
 pub fn step(state: InputState, input: &InputInput) -> Result<InputState, InvalidTransition>;
-pub fn gate(g: &GateView) -> GateDecision;    // Open | Closed(reason); GateView holds bound, process_state, evidence and its kind (incl. owner_asserted), last gate-closing write, last_turn_start, turn, in-flight, 2004
+pub fn gate(g: &GateView) -> GateDecision;    // Open | Closed(reason); GateView holds bound, process_state, evidence and its kind (incl. owner_asserted), last write of any origin, last gate-closing human write, last_turn_start, turn, in-flight, 2004
 
 pub fn decide_replay(q: &EventsQuery, head: StreamHead, epoch: &Epoch) -> Result<ReplayPlan, QueryError>;
 pub enum ReceiptLookup { New, InProgress, Replay(CommandResult), Conflict, UnknownAfterCrash }
@@ -520,7 +520,7 @@ pub fn check_receipt(existing: Option<&CommandReceipt>, token: TokenId, request_
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-deps="$(cargo tree -p chaldea-core -e normal --prefix none)" && ! printf '%s\n' "$deps" | grep -Eq '^(tokio|rusqlite|axum) '
+deps="$(cargo tree -p chaldea-core -e normal --prefix none)" && ! grep -Eq '^(tokio|rusqlite|axum) ' <<<"$deps"
 ```
 
 plus the `workspace` job green on both runners and the `pty-hooks` job unchanged.
@@ -642,9 +642,6 @@ Decisions that change public behaviour or are irreversible. D1, D3, D7, and D8 w
 
 Not applied here; proposals for `docs/architecture.md`, `docs/prior-art.md`, `AGENTS.md`.
 
-- **arch §4.1**: `epoch` checked in both directions, `mode: replay | snapshot` with `as_of_seq`, `before_seq` paging, notify-then-pull with subscribe-time and periodic heads, WS tickets plus `Origin` check, receipt states including `unknown_after_crash`.
-- **arch §4.2**: the event kinds of §2.1 (adding launch, session, transcript generation, readiness, human write, input, task, worktree, and snapshot kinds; `artifact_diff` deferred), two stream kinds, open-envelope decoding, attention as a cause set beside the three axes.
-- **arch §4.3**: the eight input states (D3), the positive-evidence input gate, and ack attribution by stream position.
 - **arch §4.4**: Rescue acts on PTYs through human-clicked `surface_action`s only; `attention` is an outbound hook on raise and clear.
 - **arch §2 / AGENTS.md invariant 5**: the token kinds (`owner`, `agent`, `hook`, `rescue`, `extension`) next to "regular vs Rescue".
 - **arch §5 open items**: the Windows hook receiver item concerns the axum receiver; keep `deadline_slow_head` (EOF, no side effect) and `non_numeric_content_length` (400) as checks to run on CI and the real host.
