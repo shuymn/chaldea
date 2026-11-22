@@ -519,9 +519,14 @@ impl Store {
         inner.shared.update(|s| s.readers_released = true);
         // (4) The writer checkpoints and its thread ends. (5) Wait for that until the deadline.
         let exit = inner.shared.wait_until(Some(deadline), |s| s.exit.clone());
-        // The owner always gives up the thread's handle: it joins a thread that has returned
-        // and detaches one still running, whose report still reaches `Shared`.
-        if let Some(h) = lock(&inner.writer).take()
+        inner.faults.mark("owner_waited");
+        // The owner always gives up the thread's handle. It joins a thread that published its
+        // report and has returned; otherwise it detaches the thread, whose report still
+        // reaches `Shared`. After a timed-out wait it always detaches: `join` also waits for
+        // thread-local destructors, which `is_finished` does not cover.
+        let handle = lock(&inner.writer).take();
+        if let Some(h) = handle
+            && exit.is_some()
             && h.is_finished()
         {
             let _ = h.join();

@@ -233,6 +233,77 @@ fn later_call_reports_only_progress_by_its_deadline() {
     assert_eq!(b.checkpoint, crate::store::Checkpoint::NotRun, "{b:?}");
 }
 
+/// An owner whose exit wait timed out detaches the writer's handle even once the thread's
+/// main function has returned: it does not wait in `join` for thread-local destructors.
+#[test]
+fn timed_out_owner_detaches_a_finished_writer() {
+    use std::cell::RefCell;
+
+    struct Held {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv_timeout(Duration::from_secs(30));
+        }
+    }
+    thread_local! {
+        static HELD: RefCell<Option<Held>> = const { RefCell::new(None) };
+    }
+
+    let gates = Gates::default();
+    let (_dir, s) = store_with(gates.faults());
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_dtor, release_rx) = mpsc::channel();
+    s.submit(soon(), move |_| {
+        HELD.with(|h| {
+            *h.borrow_mut() = Some(Held {
+                entered: entered_tx,
+                release: release_rx,
+            });
+        });
+        Ok(())
+    })
+    .unwrap()
+    .blocking_wait()
+    .unwrap();
+    let (exiting, release_writer) = gates.arm("writer_exiting");
+    let (waited, release_owner) = gates.arm("owner_waited");
+    let a = in_thread(&s, Duration::from_millis(300));
+    exiting
+        .recv_timeout(WAIT)
+        .expect("the writer is held at its last step");
+    waited
+        .recv_timeout(WAIT)
+        .expect("the owner's exit wait timed out");
+    drop(release_writer);
+    entered_rx
+        .recv_timeout(WAIT)
+        .expect("the writer runs its thread-local destructor");
+    let deadline = Instant::now() + WAIT;
+    while !s
+        .inner
+        .writer
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(std::thread::JoinHandle::is_finished)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the writer's main never returned"
+        );
+        std::thread::yield_now();
+    }
+    drop(release_owner);
+    let a = a.recv_timeout(Duration::from_secs(5));
+    drop(release_dtor);
+    let a = a.expect("the owner returns without joining the writer");
+    assert!(!a.writer_exited, "{a:?}");
+}
+
 /// A later call that reaches the shared state only after its deadline, by when both reports
 /// have been published, still leaves out what was published after its deadline.
 #[test]
