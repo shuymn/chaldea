@@ -178,8 +178,9 @@ pub enum NeverStartedKind {
 
 #[derive(Debug)]
 pub enum SpawnError {
-    /// The child provably never existed: the confirmed `spawn_failed`. Resources created
-    /// before it (a pseudoconsole and its drain) may still be unreleased.
+    /// The program provably never executed; any process created for it has been reaped:
+    /// the confirmed `spawn_failed`. Resources created before it (a pseudoconsole and its
+    /// drain) may still be unreleased.
     NeverStarted {
         kind: NeverStartedKind,
         error: io::Error,
@@ -276,6 +277,8 @@ impl SpawnedParts {
         let kill = child.kill_tree(&[], Instant::now() + TEARDOWN_KILL);
         drop(input);
         let close = control.close(Instant::now() + TEARDOWN_CLOSE);
+        #[cfg(all(test, target_os = "macos"))]
+        crate::unix::trace::record("drain_finish");
         let end = output.finish(TEARDOWN_DRAIN);
         let drain_abandoned = end.is_none();
         if kill.tree_dead && close.elapsed.is_some() && !drain_abandoned {

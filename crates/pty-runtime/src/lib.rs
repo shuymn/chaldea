@@ -24,11 +24,11 @@
 //!
 //! `fake` adds [`fake::FakePty`] and the test probes; no default-feature build has them.
 
-// Until the native backends (PR 3, PR 4) build a `SpawnedPty`, only `FakePty` does, so a
-// default-feature build has no caller of the drain and spawn internals.
+// Off macOS, until the Windows backend (PR 4) builds a `SpawnedPty`, only `FakePty` does, so
+// a default-feature build there has no caller of the drain and spawn internals.
 #![cfg_attr(
-    not(feature = "fake"),
-    allow(dead_code, reason = "the native backends arrive in PR 3 and PR 4")
+    all(not(feature = "fake"), not(target_os = "macos")),
+    allow(dead_code, reason = "the Windows backend arrives in PR 4")
 )]
 
 mod backend;
@@ -37,6 +37,9 @@ mod limits;
 mod origin;
 mod session;
 mod snapshot;
+mod spawn;
+#[cfg(target_os = "macos")]
+mod unix;
 mod vt;
 mod writer;
 
@@ -67,6 +70,9 @@ pub use session::{
     SubscriptionId, VtUnavailable, channel_sink,
 };
 pub use snapshot::{Cell, CellWidth, Cursor, GridError, Line, Snapshot, TermModes, decode_grid};
+pub use spawn::with_spawn_lock;
+#[cfg(target_os = "macos")]
+pub use unix::native;
 pub use vt::ModeView;
 pub use writer::{
     Basis, Completion, CompletionReceiver, Guard, LogTruncated, MAX_PARTS, Part, Recheck, Refusal,

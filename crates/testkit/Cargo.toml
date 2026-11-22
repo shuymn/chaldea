@@ -1,0 +1,23 @@
+[package]
+name = "chaldea-testkit"
+description = "Test fixtures of Chaldea: chaldea-fake-cli, a stand-in for an agent CLI, and its report stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Normal dependencies: no workspace crate other than chaldea-core (CI checks it).
+[dependencies]
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+signal-hook.workspace = true
+
+[dev-dependencies]
+chaldea-pty-runtime = { path = "../pty-runtime", features = ["fake"] }
+
+[lints]
+workspace = true

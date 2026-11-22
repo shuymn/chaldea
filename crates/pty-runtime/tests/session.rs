@@ -956,7 +956,9 @@ fn callbacks_may_reenter() {
         rx.recv_deadline(soon()).unwrap().outcome,
         WriteOutcome::NotStarted(Refusal::Cancelled)
     );
-    assert!(cancelled.load(Ordering::SeqCst));
+    // `cancel` fires the cancelled unit's completion before it returns, so the first
+    // completion stores its result only after `rx` has received.
+    assert!(wait_until(|| cancelled.load(Ordering::SeqCst)));
 
     // A sink that subscribes another sink.
     let inner: Arc<Mutex<Option<Arc<Mutex<Got>>>>> = Arc::default();

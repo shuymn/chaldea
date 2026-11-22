@@ -27,6 +27,12 @@ pre-commit:
         - "crates/**/Cargo.toml"
         - "Cargo.{toml,lock}"
       run: deps="$(cargo tree -p chaldea-pty-runtime -e normal --prefix none)" && ! printf '%s\n' "$deps" | grep -Eq '^tokio '
+    # testkit may depend on no workspace crate other than core.
+    testkit-deps:
+      glob:
+        - "crates/**/Cargo.toml"
+        - "Cargo.{toml,lock}"
+      run: deps="$(cargo tree -p chaldea-testkit -e normal --target all --prefix none)" && bad="$(printf '%s\n' "$deps" | awk '/^chaldea-/ && !/^chaldea-(testkit|core) /')" && [ -z "$bad" ]
     pty-hooks-fmt:
       root: spikes/pty-hooks/
       glob: "*.rs"

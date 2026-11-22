@@ -16,6 +16,12 @@ serde_json.workspace = true
 # Decoding checks that a wide character has its tail, with alacritty's width table.
 unicode-width.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Safe wrappers for the PTY, waits, signals, poll, and termios.
+rustix.workspace = true
+# The pre_exec body and libproc, which have no safe wrapper (unix::sys only).
+libc.workspace = true
+
 [dev-dependencies]
 # Integration tests use FakePty.
 chaldea-pty-runtime = { path = ".", features = ["fake"] }
@@ -25,6 +31,31 @@ proptest.workspace = true
 # FakePty and the test probes; no default-feature build contains them (design D6).
 fake = []
 
-# PR 3 replaces this with the crate's own table (design D7).
-[lints]
-workspace = true
+# The crate's own table (docs/design/pty-unix.md §2.7): `deny` instead of the workspace's
+# `forbid`, so `unix::sys` alone can allow `unsafe`; the workspace clippy set is restated
+# because `workspace = true` cannot be combined with local keys (tests/lints.rs checks it).
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+cast_lossless = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+checked_conversions = "warn"
+explicit_into_iter_loop = "warn"
+explicit_iter_loop = "warn"
+implicit_clone = "warn"
+inefficient_to_string = "warn"
+manual_let_else = "warn"
+match_wildcard_for_single_variants = "warn"
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+unnested_or_patterns = "warn"
+wildcard_imports = "warn"
+# Local additions.
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"

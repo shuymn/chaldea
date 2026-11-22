@@ -44,7 +44,7 @@ crates/core/tests/golden/events/vt_snapshot_taken.json, crates/core/tests/golden
 .github/workflows/ci.yml, lefthook.yml    # `workspace` job: add the pty-runtime dependency check (§7)
 ```
 
-PR 3 adds `src/unix.rs` (`#[cfg(unix)]`) and PR 4 adds `src/windows.rs` (`#[cfg(windows)]`) plus a `native()` constructor; neither changes a type of this PR.
+PR 3 adds `src/unix/` (`#[cfg(target_os = "macos")]`), `native()`, and `with_spawn_lock()` with the process-wide spawn lock; PR 4 adds `src/windows/` (`#[cfg(windows)]`) and the Windows arm of `native()`; neither changes a type of this PR.
 
 **`Cargo.toml`.** Exact pins, as the rest of the workspace:
 
@@ -67,7 +67,7 @@ proptest.workspace = true
 fake = []
 ```
 
-`alacritty_terminal =0.26.0` is the version the spike ran on both hosts and the one prior-art row 3a and spike §3 read in source; its only optional feature (`serde`) is not needed. Its parser, `vte 0.15.0`, is reached through `alacritty_terminal::vte` (no direct dependency). `unicode-width =0.2.3` is the version alacritty locks, so it adds nothing to the build; `decode_grid` uses it to tell a wide character from a narrow one, since the grid encoding has no lead marker. It also compiles its own `tty` module and that module's dependencies (`rustix-openpty`, `signal-hook`, `polling` on Unix; `miow`, `piper`, `windows-sys 0.59` on Windows); this crate never calls them. No `tokio`, no `portable-pty` in this PR (PR 3 adds `portable-pty =0.8.1` under `[target.'cfg(unix)'.dependencies]`).
+`alacritty_terminal =0.26.0` is the version the spike ran on both hosts and the one prior-art row 3a and spike §3 read in source; its only optional feature (`serde`) is not needed. Its parser, `vte 0.15.0`, is reached through `alacritty_terminal::vte` (no direct dependency). `unicode-width =0.2.3` is the version alacritty locks, so it adds nothing to the build; `decode_grid` uses it to tell a wide character from a narrow one, since the grid encoding has no lead marker. It also compiles its own `tty` module and that module's dependencies (`rustix-openpty`, `signal-hook`, `polling` on Unix; `miow`, `piper`, `windows-sys 0.59` on Windows); this crate never calls them. No `tokio`, no `portable-pty` in this PR (PR 3 adds `rustix` and `libc` under `[target.'cfg(target_os = "macos")'.dependencies]`).
 
 **Workspace and CI.** The crate joins `members`. The `workspace` job runs unchanged (fmt, clippy `-D warnings`, `cargo test --workspace --locked`, which now includes this crate's tests on `macos-latest` and `windows-latest`) and gains one step: `pty-runtime` has no `tokio` in its normal dependency tree (§7). `lefthook.yml` mirrors it.
 
@@ -75,7 +75,7 @@ fake = []
 
 Names may change in review; shapes may not.
 
-**Threading model.** The crate is synchronous: std threads, blocking I/O, no async runtime. PTY ends are blocking on both OSes (portable-pty's reader and writer are blocking `Read`/`Write`, `lib.rs:97-102`; ConPTY uses synchronous anonymous pipes), so an async runtime would only wrap them in blocking tasks, as Codex does (`utils/pty/src/pty.rs:241`, `:285`). Every callback the crate invokes (`Completion`, `OutputSink`, `on_event`) must return without blocking, and the crate never waits on a caller. The daemon bridges to tokio by passing callbacks that `try_send` on a tokio channel or complete a `oneshot`, and calls `close`, `kill`, and `resize` from `spawn_blocking`.
+**Threading model.** The crate is synchronous: std threads, blocking I/O, no async runtime. PTY ends block on both OSes (the macOS master is nonblocking behind a reader and writer that block in `poll` and stop on close; ConPTY uses synchronous anonymous pipes), so an async runtime would only wrap them in blocking tasks, as Codex does (`utils/pty/src/pty.rs:241`, `:285`). Every callback the crate invokes (`Completion`, `OutputSink`, `on_event`) must return without blocking, and the crate never waits on a caller. The daemon bridges to tokio by passing callbacks that `try_send` on a tokio channel or complete a `oneshot`, and calls `close`, `kill`, and `resize` from `spawn_blocking`.
 
 **Locks and callbacks.** Lock order: control lock → VT lock → queue lock; no code takes them in another order.
 
@@ -145,8 +145,9 @@ pub struct KillReport { pub method: String, pub tree_dead: bool, pub survivors: 
 pub struct CloseReport { pub elapsed: Option<Duration> }                              // None: did not return by the deadline
 
 pub enum SpawnError {
-    /// The child provably never existed: the confirmed `spawn_failed` of mvp §2.3. Resources
-    /// created before it (a pseudoconsole and its drain) may still be unreleased.
+    /// The program provably never executed; any process created for it has been reaped:
+    /// the confirmed `spawn_failed` of mvp §2.3. Resources created before it (a
+    /// pseudoconsole and its drain) may still be unreleased.
     NeverStarted { kind: NeverStartedKind, error: io::Error, cleanup: Cleanup },   // NotFound | PermissionDenied | Setup
     /// A process existed and setup then failed. A Codex positional prompt may have run.
     StartedThenFailed { stage: &'static str, error: io::Error, identity: Option<ProcessIdentity>, cleanup: Cleanup },
@@ -158,15 +159,15 @@ pub enum Cleanup { Confirmed, Unresolved { kill: Option<KillReport>, close: Opti
 
 - `spawn` returns either a `SpawnedPty` or an error after releasing everything it created: no process alive, no handle or descriptor open (spike F-2c). When it cannot prove that, the error carries `Cleanup::Unresolved`. On Windows the release order is: terminate job and process, close the pseudoconsole while the drain reads, close pipe ends (spike §4.6).
 - The PTY is opened at `spec.size`: the session initialises the VT and the responder's size from it before the drain starts.
-- The child's environment is exactly `spec.env` (portable-pty: `env_clear` then `env`; Windows: an explicit `CREATE_UNICODE_ENVIRONMENT` block). The scrub list is the daemon's (mvp §2.7 "Env scrub").
-- The backend starts a `Drain` (§2.4) over its output read end with the given `DrainSink`, so every output byte reaches the session's VT from the first one. Windows starts it right after `CreatePseudoConsole`, before `CreateProcessW` (spike §4.6); Unix after `openpty`. The reader the drain owns returns `Ok(0)` once every slave end is closed: the Unix backend maps the master's `EIO` after hangup to EOF, and drops the parent's slave handle right after spawn (spike §4.7).
-- **Dropping `input` writes no bytes.** portable-pty's writer writes `\n` + VEOF on drop (`unix.rs:351-361`), so PR 3 must not hand that writer over; it writes through its own handle on a dup of the master fd. With this obligation the session can release the input whenever the writer thread finishes, without an ordering hazard against a live CLI.
-- `input` accepts each `write` call whole or fails: the Unix master fd is blocking; Windows `WriteFile` on a synchronous pipe completes fully. A short write is tolerated by the writer (it loops) and recorded (§2.3).
-- `PtyChild::wait_timeout` never blocks past `timeout` (Windows `WaitForSingleObject(timeout)`; Unix `try_wait` polling) and must not hold a lock `kill_tree` needs.
+- The child's environment is exactly `spec.env` (macOS: `Command::env_clear` then `envs`; Windows: an explicit `CREATE_UNICODE_ENVIRONMENT` block). The scrub list is the daemon's (mvp §2.7 "Env scrub").
+- The backend starts a `Drain` (§2.4) over its output read end with the given `DrainSink`, so every output byte reaches the session's VT from the first one. Windows starts it right after `CreatePseudoConsole`, before `CreateProcessW` (spike §4.6); macOS after the PTY is opened and sized. The reader the drain owns returns `Ok(0)` once every slave end is closed: the Unix backend maps the master's `EIO` after hangup to EOF, and drops the parent's slave handle right after spawn (spike §4.7).
+- **Dropping `input` writes no bytes.** portable-pty's writer writes `\n` + VEOF on drop (`unix.rs:351-361`); the macOS backend writes through its own handle on a dup of the master fd, whose drop writes nothing. With this obligation the session can release the input whenever the writer thread finishes, without an ordering hazard against a live CLI.
+- `input` accepts each `write` call whole or fails: the macOS writer loops on a nonblocking master until every byte is accepted, and returns a short count only after progress followed by close or an error; Windows `WriteFile` on a synchronous pipe completes fully. A short write is tolerated by the writer (it loops) and recorded (§2.3).
+- `PtyChild::wait_timeout` never blocks past `timeout` (Windows `WaitForSingleObject(timeout)`; macOS `waitid(WNOWAIT)` polling; the backend owns reaping) and must not hold a lock `kill_tree` needs.
 - `kill_tree` is the PR 3 / PR 4 tree kill (`killpg` HUP→TERM→KILL plus `getsid` scan; job termination) applied also to every identity in `extra` that is still alive with the same start time, and returns by its deadline; `tree_dead: false` with survivors when it could not prove death.
 - `PtyControl::close` on Windows runs `ClosePseudoConsole` through the lifted `close_bounded` helper (`spikes/pty-hooks/src/os/drain.rs:182-197`), since some builds block in it until output is read.
 - `evidence` carries what doctor and the real-host runs record (Windows: `job_branch` = `job_list` or `suspended`, `conpty_module`).
-- Every `unsafe` block lives in `unix.rs` / `windows.rs` (D7).
+- Every `unsafe` block lives in `unix::sys` (and PR 4's Windows module) (D7).
 
 ### 2.2 `Session`
 
@@ -624,7 +625,7 @@ plus the `workspace` job green on both runners with the new step, and the `pty-h
 
 **D6. `FakePty` is behind a `fake` feature**, enabled for this crate's tests through a self dev-dependency and for the daemon's tests through its dev-dependency, so no default-feature build contains it (`--all-features` does).
 
-**D7. Backends need `unsafe`; the workspace forbids it.** The root `[workspace.lints.rust] unsafe_code = "forbid"` cannot be relaxed by `#[allow]`. PR 2 writes no `unsafe` and keeps `[lints] workspace = true`. PR 3 gives this crate its own `[lints]` table (the workspace clippy set plus `unsafe_code = "deny"`) and allows `unsafe` only in `unix.rs` / `windows.rs`; the workspace value stays `forbid` for every other crate.
+**D7. Backends need `unsafe`; the workspace forbids it.** The root `[workspace.lints.rust] unsafe_code = "forbid"` cannot be relaxed by `#[allow]`. PR 2 writes no `unsafe` and keeps `[lints] workspace = true`. PR 3 gives this crate its own `[lints]` table (the workspace clippy set plus `unsafe_code = "deny"`) and allows `unsafe` only in `unix::sys` (and PR 4's Windows module); the workspace value stays `forbid` for every other crate.
 
 **D8. Prompt text is limited to `core::input::MAX_PROMPT_BYTES` = 256 KiB UTF-8**, added to `core` in PR 2 because this crate's defaults derive from it. `send` (PR 10) and recognised attach pastes (PR 11) refuse longer text before admission, with zero bytes; PR 5 bounds the encoded size. The writer limits (§5) are internal, configurable defaults: about 9 MiB per unit and 16 MiB queued per session instead of the 144 MiB a 4 MiB body limit would imply. Raising the limit later is compatible.
 
