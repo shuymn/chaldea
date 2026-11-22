@@ -1,0 +1,7 @@
+# Dependencies may not run install scripts. protobufjs (through Quint) has a
+# postinstall that Quint does not need.
+allowBuilds:
+  protobufjs: false
+
+# `pnpm run` fails when node_modules does not match package.json and the lockfile.
+verifyDepsBeforeRun: error

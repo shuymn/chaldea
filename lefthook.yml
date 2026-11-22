@@ -1,6 +1,7 @@
 # The same checks CI runs: the workflow linters of the shared gha workflow, the
-# secret scan of the shared security workflow, and the workspace and pty-hooks
-# spike checks of ci.yml (tests on push, since they take several seconds).
+# secret scan of the shared security workflow, and the workspace, specs, and
+# pty-hooks spike checks of ci.yml (tests and the specs simulation on push, since
+# they take several seconds).
 pre-commit:
   commands:
     actionlint:
@@ -33,6 +34,18 @@ pre-commit:
         - "crates/**/Cargo.toml"
         - "Cargo.{toml,lock}"
       run: deps="$(cargo tree -p chaldea-testkit -e normal --target all --prefix none)" && bad="$(printf '%s\n' "$deps" | awk '/^chaldea-/ && !/^chaldea-(testkit|core) /')" && [ -z "$bad" ]
+    # specs/ checks (docs/design/formal-specs.md). Globs are repository-relative; `root`
+    # only sets the working directory. The frozen install comes first (pnpm skips it when
+    # node_modules is up to date), so every run uses the pinned Quint.
+    specs-check:
+      root: specs/
+      glob:
+        - "specs/*.qnt"
+        - "specs/traces/*"
+        - "specs/scripts/*"
+        - "specs/package.json"
+        - "specs/pnpm-*.yaml"
+      run: 'mise exec -- pnpm install --frozen-lockfile --silent && mise exec -- pnpm run --silent typecheck && mise exec -- pnpm run --silent traces:check'
     pty-hooks-fmt:
       root: spikes/pty-hooks/
       glob: "*.rs"
@@ -48,9 +61,18 @@ pre-push:
       glob:
         - "crates/**/*"
         - "packages/contracts/**/*"
+        - "specs/traces/*"
         - "Cargo.{toml,lock}"
         - "rust-toolchain.toml"
       run: cargo test --workspace --locked --no-fail-fast
+    specs-simulate:
+      root: specs/
+      glob:
+        - "specs/*.qnt"
+        - "specs/scripts/*"
+        - "specs/package.json"
+        - "specs/pnpm-*.yaml"
+      run: 'mise exec -- pnpm install --frozen-lockfile --silent && mise exec -- pnpm run --silent simulate'
     pty-hooks-test:
       root: spikes/pty-hooks/
       glob: "*.{rs,toml,lock,txt}"
