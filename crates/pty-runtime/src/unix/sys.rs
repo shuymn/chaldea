@@ -42,8 +42,16 @@ pub(crate) fn install_pre_exec(cmd: &mut Command, bound: c_int, #[cfg(test)] tes
         if unsafe { libc::setsid() } < 0 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: `TIOCSCTTY` takes an integer argument; fd 0 is the slave std placed there.
-        if unsafe { libc::ioctl(0, libc::c_ulong::from(libc::TIOCSCTTY), 0) } < 0 {
+        // SAFETY: `TIOCSCTTY` ignores its argument; Darwin's wrapper reads it as a pointer, so a
+        // null pointer is passed. fd 0 is the slave std placed there.
+        if unsafe {
+            libc::ioctl(
+                0,
+                libc::c_ulong::from(libc::TIOCSCTTY),
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        } < 0
+        {
             return Err(io::Error::last_os_error());
         }
         let mut fd = 3;
