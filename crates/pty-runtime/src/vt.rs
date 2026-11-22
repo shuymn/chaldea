@@ -149,8 +149,11 @@ impl Vt {
             cols: cols.clone(),
             rows: rows.clone(),
         };
+        // No scrollback: only the visible screen is ever read, and history would cost
+        // tens of MiB per session at full length.
         let config = Config {
             kitty_keyboard: true,
+            scrolling_history: 0,
             ..Config::default()
         };
         let term = Term::new(config, &Size::from(size), responder);

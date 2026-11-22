@@ -421,3 +421,18 @@ fn core_goldens_are_valid_grids() {
         assert!(!lines[0].text().is_empty(), "{file}");
     }
 }
+
+/// The VT keeps no scrollback: growing the height keeps the visible content in place
+/// (nothing is pulled back from history) and the cell invariants hold.
+#[test]
+fn growing_the_height_keeps_the_visible_content() {
+    let r = rig_sized(10, 3);
+    emit_parsed(&r, b"a\r\nb\r\nc\r\nd\r\ne");
+    let texts = |s: &Snapshot| s.lines.iter().map(Line::text).collect::<Vec<_>>();
+    assert_eq!(texts(&snap(&r)), ["c", "d", "e"]);
+    let _ = r.session.resize(PtySize::new(10, 5).unwrap()).unwrap();
+    let s = snap(&r);
+    assert_well_formed(&s);
+    assert_eq!(texts(&s), ["c", "d", "e", "", ""]);
+    assert_eq!(s.cursor.row, 2);
+}

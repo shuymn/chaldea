@@ -346,7 +346,7 @@ pub(crate) fn close_bounded(close: impl FnOnce() + Send + 'static, bound: Durati
 
 ### 2.5 VT Responder
 
-Lifted from `spikes/pty-hooks/src/vt.rs`: `Term<Responder>` with `Config { kitty_keyboard: true, .. }`, fed by the drain thread through a `vte::ansi::Processor<NoSync>`. `NoSync` implements vte's `Timeout` trait with `pending_timeout()` always false, so the parser never buffers a synchronized update (`CSI ?2026h`): it would otherwise hold every action until `CSI ?2026l` or a 150 ms timeout (`vte 0.15.0 src/ansi.rs:36`, `:298-311`, `:478-488`, `:1606-1607`), hiding 2004 transitions and queries inside it. The `EventListener` turns each reply event into one reply write of origin `VtReply { kind }`:
+Lifted from `spikes/pty-hooks/src/vt.rs`: `Term<Responder>` with `Config { kitty_keyboard: true, scrolling_history: 0, .. }`, fed by the drain thread through a `vte::ansi::Processor<NoSync>`. `NoSync` implements vte's `Timeout` trait with `pending_timeout()` always false, so the parser never buffers a synchronized update (`CSI ?2026h`): it would otherwise hold every action until `CSI ?2026l` or a 150 ms timeout (`vte 0.15.0 src/ansi.rs:36`, `:298-311`, `:478-488`, `:1606-1607`), hiding 2004 transitions and queries inside it. The `EventListener` turns each reply event into one reply write of origin `VtReply { kind }`:
 
 | Query | alacritty event | Reply | `ReplyKind` |
 |---|---|---|---|
@@ -395,6 +395,8 @@ pub struct TermModes {
 **Walker** (rewrite of `vt.rs:234-268`). For each visible row and column of `term.grid()`: a cell with `WIDE_CHAR` followed by a `WIDE_CHAR_SPACER` is `WideLead` with `cell.c` plus its `zerowidth()` chars, and that spacer is its `WideTail` with empty text; every other cell is `Single` with `cell.c` plus zero-width chars, or `" "` when that is empty. An orphan flag, a `WIDE_CHAR` without its spacer or a `WIDE_CHAR_SPACER` without its lead (left by an erase of one half, `term/mod.rs:1519`, or a shrink), becomes a `Single` `" "`, as does a `LEADING_WIDE_CHAR_SPACER` (the last column left blank when a wide character wrapped, `term/cell.rs:22-28`). So a wide character occupies exactly two cells, every line has `cols` cells, and column positions after it are exact. Width is alacritty's: an emoji with VS16 (`❤️`) stays one cell (spike §3).
 
 **Mode word.** `TermModes` (10 bits) and `bracketed_paste_epoch` (54 bits) are packed into one `AtomicU64`, so `modes()` is one tear-free load. The drain splits each chunk before every ESC byte and publishes the word after parsing each piece; with `NoSync` every action is applied as it is parsed, so the epoch increments on every change of `bracketed_paste`, including two within one read or inside a synchronized update.
+
+**No scrollback.** The VT keeps no history (`scrolling_history: 0`): only the visible screen is read, and full history (10 000 rows) would cost about 28 MiB per 120-column session. Growing the height adds blank rows below the visible content instead of pulling history back.
 
 **Snapshot budget.** `snapshot(deadline)` takes the VT lock with `try_lock` until `deadline` and copies the grid; past the deadline, or after a VT panic, it returns `VtUnavailable`.
 
