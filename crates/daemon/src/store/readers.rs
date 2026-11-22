@@ -333,14 +333,9 @@ impl<'a> ReadTx<'a> {
             streams
                 .iter()
                 .map(|s| {
-                    let h: i64 = sql(self.conn.query_row(
-                        "SELECT coalesce(max(seq), 0) FROM events WHERE stream_id = ?1",
-                        [s.to_string()],
-                        |r| r.get(0),
-                    ))?;
                     Ok(StreamHeadEntry {
                         stream_id: *s,
-                        head_seq: to_u64(h)?,
+                        head_seq: self.stream_head(*s)?,
                     })
                 })
                 .collect()
@@ -483,16 +478,7 @@ impl<'a> ReadTx<'a> {
         s: StreamId,
         kind: &str,
     ) -> Result<Option<EventEnvelope>, StoreError> {
-        self.guard(|| {
-            Ok(self
-                .events(
-                    &format!(
-                        "SELECT {EVENT_COLUMNS} FROM events WHERE stream_id = ?1 AND kind = ?2 ORDER BY seq DESC LIMIT 1"
-                    ),
-                    rusqlite::params![s.to_string(), kind],
-                )?
-                .pop())
-        })
+        self.guard(|| self.latest_of_kind_raw(s, kind))
     }
 
     fn stream_head(&self, s: StreamId) -> Result<u64, StoreError> {

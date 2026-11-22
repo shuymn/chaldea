@@ -704,7 +704,7 @@ impl<'c> WriteTx<'c> {
             })?);
             // Offset 0 has one evidence, the generation's annex (the projection sets both
             // continuities from it, live and in rebuild); `advance_to.continuity` is unused.
-            (generation, g.file_id.clone(), g.continuity.0.clone())
+            (generation, g.file_id.as_str(), g.continuity.0.as_str())
         } else {
             // 4. A continuation of the expected generation.
             if job.started_generation {
@@ -763,8 +763,8 @@ impl<'c> WriteTx<'c> {
             }
             (
                 expect.generation,
-                expect.file_id.clone(),
-                b.advance_to.continuity.0.clone(),
+                expect.file_id.as_str(),
+                b.advance_to.continuity.0.as_str(),
             )
         };
         // The cursor advance, bound to the post-append generation and file_id.
@@ -891,9 +891,6 @@ impl<'c> WriteTx<'c> {
             }
             let (routing, name, position, pending) = match d.routing {
                 NewRouting::Appended(events) => {
-                    if events.is_empty() {
-                        return Err(StoreError::BadRouting("no events"));
-                    }
                     let (_, (s, q)) = tx.routing_events(events)?;
                     (Routing::Appended { stream_id: s, seq: q }, "appended", Some((s, q)), None)
                 }
@@ -955,9 +952,6 @@ impl<'c> WriteTx<'c> {
             }
             let (appended, (stream, seq), name) = match to {
                 Promotion::Appended(events) => {
-                    if events.is_empty() {
-                        return Err(StoreError::BadRouting("no events"));
-                    }
                     let (a, p) = tx.routing_events(events)?;
                     (a, p, "appended")
                 }

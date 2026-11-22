@@ -580,24 +580,24 @@ pub(crate) fn compare_projections(
             continue;
         }
         let col = |name: &str| m.columns.iter().position(|c| c == name);
+        let rewind = if t == "proj_transcript_cursors" {
+            match (
+                col("event_offset"),
+                col("event_continuity"),
+                col("read_offset"),
+                col("read_continuity"),
+            ) {
+                (Some(eo), Some(ec), Some(ro), Some(rc)) => Some((eo, ec, ro, rc)),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let keys: BTreeSet<&String> = m.rows.keys().chain(r.rows.keys()).collect();
         for k in keys {
             let (Some(mr), Some(rr)) = (m.rows.get(k), r.rows.get(k)) else {
                 diff.push(format!("{t} {k}: row missing on one side"));
                 continue;
-            };
-            let rewind = if t == "proj_transcript_cursors" {
-                match (
-                    col("event_offset"),
-                    col("event_continuity"),
-                    col("read_offset"),
-                    col("read_continuity"),
-                ) {
-                    (Some(eo), Some(ec), Some(ro), Some(rc)) => Some((eo, ec, ro, rc)),
-                    _ => None,
-                }
-            } else {
-                None
             };
             for (i, name) in m.columns.iter().enumerate() {
                 if let Some((eo, ec, ro, rc)) = rewind {
