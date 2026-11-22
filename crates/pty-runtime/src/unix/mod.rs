@@ -18,7 +18,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 
 use rustix::fs::{Access, Mode, OFlags};
 use rustix::pty::OpenptFlags;
@@ -180,6 +180,18 @@ struct Ends {
 }
 
 impl UnixPty {
+    /// The wake pipe (§2.3). It takes the spawn lock's guard, so it is created only while
+    /// the lock is held: std makes the pipe close-on-exec in a second step (§2.1).
+    fn wake_pipe(
+        &self,
+        _held: &MutexGuard<'static, ()>,
+    ) -> std::io::Result<(std::io::PipeReader, std::io::PipeWriter)> {
+        let pair = std::io::pipe()?;
+        #[cfg(test)]
+        self.hooks.on(&tests::Stage::WakeUnderLock);
+        Ok(pair)
+    }
+
     fn open_ends(&self, spec: &SpawnSpec) -> std::io::Result<Ends> {
         // Stage 1: close-on-exec from creation (rustix declares CLOEXEC only for Linux and BSDs;
         // macOS honours the bit).
@@ -202,13 +214,7 @@ impl UnixPty {
         let dup = || rustix::io::fcntl_dupfd_cloexec(&master, 0);
         let (r, w, c) = (dup()?, dup()?, dup()?);
         drop(master);
-        let (wake_r, wake_w) = {
-            let _g = spawn_lock();
-            let pair = std::io::pipe()?;
-            #[cfg(test)]
-            self.hooks.on(&tests::Stage::WakeUnderLock);
-            pair
-        };
+        let (wake_r, wake_w) = self.wake_pipe(&spawn_lock())?;
         let fl = rustix::fs::fcntl_getfl(&wake_w)?;
         rustix::fs::fcntl_setfl(&wake_w, fl | OFlags::NONBLOCK)?;
         let wake = Wake::new(wake_r);
