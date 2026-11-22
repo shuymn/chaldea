@@ -69,13 +69,19 @@ impl KindCounts {
         self.accept + self.connection + self.socket + self.write + self.runner
     }
 
+    /// `self` less `other`, kind by kind; `other` is a subset (the tasks of a snapshot still
+    /// running), so nothing goes below zero.
     pub(crate) fn minus(&self, other: &KindCounts) -> KindCounts {
+        let sub = |a: usize, b: usize| {
+            debug_assert!(b <= a, "{b} tasks left of {a}");
+            a.saturating_sub(b)
+        };
         KindCounts {
-            accept: self.accept - other.accept,
-            connection: self.connection - other.connection,
-            socket: self.socket - other.socket,
-            write: self.write - other.write,
-            runner: self.runner - other.runner,
+            accept: sub(self.accept, other.accept),
+            connection: sub(self.connection, other.connection),
+            socket: sub(self.socket, other.socket),
+            write: sub(self.write, other.write),
+            runner: sub(self.runner, other.runner),
         }
     }
 }

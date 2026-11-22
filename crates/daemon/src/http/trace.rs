@@ -1,4 +1,5 @@
-//! Secrets in logs (design §2.10): the request span records the method, the route template,
+//! Secrets in logs (design §2.10): the request span records the method (a fixed label), the
+//! route template,
 //! the status, the latency, and the token id; never the URI, the query, header values, or
 //! bodies. [`redact_secrets`] is the second line PR 8's log formatter applies.
 
@@ -11,11 +12,28 @@ const PREFIXES: [&str; 3] = ["chdt_", "chdp_", "chd_"];
 /// The route field of a request that matched no route.
 pub(crate) const UNMATCHED: &str = "unmatched";
 
+/// The method as recorded: the standard methods by name, any extension method as `other`
+/// (an extension method is client text, like a header value).
+fn method_label(method: &axum::http::Method) -> &'static str {
+    match method.as_str() {
+        "GET" => "GET",
+        "HEAD" => "HEAD",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "DELETE" => "DELETE",
+        "CONNECT" => "CONNECT",
+        "OPTIONS" => "OPTIONS",
+        "TRACE" => "TRACE",
+        "PATCH" => "PATCH",
+        _ => "other",
+    }
+}
+
 /// Opens the request span: one per request, outermost.
 pub(crate) fn request_span(method: &axum::http::Method) -> Span {
     tracing::info_span!(
         "request",
-        method = %method,
+        method = method_label(method),
         route = Empty,
         status = Empty,
         latency_ms = Empty,

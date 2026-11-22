@@ -92,6 +92,15 @@ pub struct RouteSpec {
     pub owner_pr: u8,
 }
 
+impl RouteSpec {
+    /// The static PWA's routes, the only ones whose handlers set their own caching
+    /// (mvp §2.5; PR 18).
+    #[must_use]
+    pub fn is_pwa(&self) -> bool {
+        matches!(self.path, "/" | "/assets/{*path}")
+    }
+}
+
 const OWNER: &[TokenKind] = &[TokenKind::Owner];
 const READERS: &[TokenKind] = &[TokenKind::Owner, TokenKind::Agent, TokenKind::Rescue];
 const OWNER_RESCUE: &[TokenKind] = &[TokenKind::Owner, TokenKind::Rescue];

@@ -53,8 +53,8 @@ pub use tickets::TicketPurpose;
 pub use trace::redact_secrets;
 pub use upgrade::{ShutdownSignal, UpgradeGrant, UpgradedSocket};
 
-/// A monotonic clock for ticket expiry and for the late-result check of reads (design
-/// §2.3); tests inject one.
+/// The server's monotonic clock (design §2.3): request origins, deadlines, the cutoff
+/// checks, and ticket expiry are all read on it; tests inject one.
 pub trait MonotonicClock: Send + Sync + 'static {
     fn now(&self) -> Instant;
 }
@@ -90,6 +90,7 @@ pub struct HttpConfig {
     pub max_connections: usize,
     /// A WebSocket ticket's lifetime.
     pub ticket_ttl: Duration,
+    /// The clock every request instant and deadline is read on.
     pub clock: Arc<dyn MonotonicClock>,
 }
 
@@ -149,6 +150,22 @@ pub(crate) struct Shared {
 impl Shared {
     pub(crate) fn shutdown_signal(&self) -> ShutdownSignal {
         ShutdownSignal::new(self.shutdown.subscribe())
+    }
+
+    /// Whether the server's clock has reached `at`.
+    pub(crate) fn passed(&self, at: Instant) -> bool {
+        self.cfg.clock.now() >= at
+    }
+
+    /// The real instant (for timers and the store's waits) at which the server's clock
+    /// reaches `at`.
+    pub(crate) fn real(&self, at: Instant) -> Instant {
+        Instant::now() + at.saturating_duration_since(self.cfg.clock.now())
+    }
+
+    /// [`Shared::real`] as a tokio instant.
+    pub(crate) fn timer(&self, at: Instant) -> tokio::time::Instant {
+        tokio::time::Instant::from_std(self.real(at))
     }
 
     pub(crate) fn nudge(&self) {
@@ -284,6 +301,18 @@ impl Faults {
     pub(crate) fn after_read(&self) {
         #[cfg(test)]
         self.inner.after_read();
+    }
+
+    /// Counts one write job submitted to the store.
+    pub(crate) fn write_submitted(&self) {
+        #[cfg(test)]
+        self.inner.write_submitted();
+    }
+
+    /// Runs in an upgrade admission between the final read and the ticket removal.
+    pub(crate) async fn before_ticket_removal(&self) {
+        #[cfg(test)]
+        self.inner.before_ticket_removal().await;
     }
 
     /// An injected accept error, taken before each real accept.

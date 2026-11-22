@@ -11,8 +11,9 @@ use super::support::http::TestServer;
 use super::{handshake, hello_then_hold, mint_ticket, shared};
 use crate::http::ctx::read_until;
 use crate::http::tickets::TicketPurpose;
-use crate::http::{ApiError, Mount, Mounts, spec};
+use crate::http::{ApiError, Mount, Mounts, ReadCtx, spec};
 use crate::store::StoreError;
+use axum::body::Body;
 
 /// Holds every reader of the pool until the returned sender is dropped.
 fn hold_readers(srv: &TestServer, n: usize) -> mpsc::Sender<()> {
@@ -95,6 +96,35 @@ async fn late_read_success_is_408() {
     let r = read_until(&s, Instant::now() + Duration::from_secs(5), |_| Ok(1)).await;
     assert_eq!(r, Err(ApiError::request_timeout()));
     srv.clock.skew(Duration::ZERO);
+    srv.stop().await;
+}
+
+/// The same for a store error other than reader-pool exhaustion: taken after the cutoff it
+/// is 408, not its §2.9 mapping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_read_error_is_408() {
+    let srv = TestServer::start(Mounts::mvp()).await;
+    let s = shared(&srv);
+    let clock = srv.clock.clone();
+    s.faults
+        .inner
+        .arm_after_read(0, move || clock.skew(Duration::from_secs(3600)));
+    let r = read_until(&s, Instant::now() + Duration::from_secs(5), |_| {
+        Err::<(), _>(StoreError::DiskFull)
+    })
+    .await;
+    assert_eq!(r, Err(ApiError::request_timeout()));
+    srv.clock.skew(Duration::ZERO);
+    srv.stop().await;
+}
+
+/// A body complete only after the deadline is 408, even when it is ready at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_body_is_408() {
+    let srv = TestServer::start(Mounts::mvp()).await;
+    let ctx = ReadCtx::new(None, Instant::now() - Duration::from_secs(1), shared(&srv));
+    let r = ctx.body_within(Body::from("late"), 4).await;
+    assert_eq!(r, Err(ApiError::request_timeout()));
     srv.stop().await;
 }
 

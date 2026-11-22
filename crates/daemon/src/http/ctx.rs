@@ -17,13 +17,14 @@ use super::auth::{Authorized, Principal, verify_in_job, verify_in_read};
 use super::error::{ApiError, WriteFailure, read_error, write_failure};
 use super::registry::{Closing, TaskKind};
 use super::{Shared, StoreFatal};
-use crate::store::{JobError, ReadTx, StoreError, SubmitError, WriteError, WriteTx};
+use crate::store::{JobError, ReadError, ReadTx, StoreError, SubmitError, WriteError, WriteTx};
 
-/// The instant of the connection's first head byte: the request's origin.
+/// The instant of the connection's first head byte, on the server's clock: the request's
+/// origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestStart(pub Instant);
 
-/// The request's deadline: `RequestStart` plus the route's budget.
+/// The request's deadline on the server's clock: `RequestStart` plus the route's budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Deadline(pub Instant);
 
@@ -32,15 +33,12 @@ pub(crate) type Job<R> = Box<dyn FnOnce(&mut WriteTx<'_>) -> Result<R, JobError>
 /// Runs after a job committed, from the task that observed it.
 pub(crate) type AfterOk = Box<dyn FnOnce() + Send>;
 
-fn tokio_instant(i: Instant) -> tokio::time::Instant {
-    tokio::time::Instant::from_std(i)
-}
-
 /// One `Store::read` in `spawn_blocking`, with the pool's wait ending at `deadline` and the
 /// result awaited until `deadline` and no longer (design §2.3 "one cutoff"). A store outcome
-/// returned before the cutoff maps through §2.9; a read not returned by it is 408; a
-/// successful result taken at or after the deadline (by the server's clock) is discarded
-/// as 408. A read cut off this way finishes on its own and has no effect.
+/// taken before the cutoff maps through §2.9; a read not returned by it is 408, and so is any
+/// result taken at or after the deadline (by the server's clock), except reader-pool
+/// exhaustion, whose wait ends at the cutoff itself (503 `busy`). A read cut off this way
+/// finishes on its own and has no effect.
 pub(crate) async fn read_until<R: Send + 'static>(
     shared: &Arc<Shared>,
     deadline: Instant,
@@ -49,21 +47,17 @@ pub(crate) async fn read_until<R: Send + 'static>(
     let s = shared.clone();
     let handle = tokio::task::spawn_blocking(move || {
         s.faults.before_read();
-        let r = s.store.read(deadline, f);
+        let r = s.store.read(s.real(deadline), f);
         s.faults.after_read();
         r
     });
-    match timeout_at(tokio_instant(deadline), handle).await {
+    match timeout_at(shared.timer(deadline), handle).await {
         Err(_) => Err(ApiError::request_timeout()),
         Ok(Err(_)) => Err(ApiError::internal()),
+        Ok(Ok(Err(ReadError::Busy))) => Err(ApiError::busy()),
+        Ok(Ok(_)) if shared.passed(deadline) => Err(ApiError::request_timeout()),
         Ok(Ok(Err(e))) => Err(read_error(&e)),
-        Ok(Ok(Ok(v))) => {
-            if shared.cfg.clock.now() >= deadline {
-                Err(ApiError::request_timeout())
-            } else {
-                Ok(v)
-            }
-        }
+        Ok(Ok(Ok(v))) => Ok(v),
     }
 }
 
@@ -76,15 +70,18 @@ pub(crate) async fn verify_until(
     read_until(shared, deadline, move |tx| verify_in_read(tx, &sha256)).await?
 }
 
-/// Collects `body` until `deadline` (408), at most `max` bytes (413).
+/// Collects `body` until `deadline` (408), at most `max` bytes (413). A body completed at or
+/// after the deadline (by the server's clock) is 408 too, even when it was ready at once.
 pub(crate) async fn body_within(
+    shared: &Shared,
     body: Body,
     deadline: Instant,
     max: u64,
 ) -> Result<Bytes, ApiError> {
     let max = usize::try_from(max).unwrap_or(usize::MAX);
-    match timeout_at(tokio_instant(deadline), Limited::new(body, max).collect()).await {
+    match timeout_at(shared.timer(deadline), Limited::new(body, max).collect()).await {
         Err(_) => Err(ApiError::request_timeout()),
+        Ok(_) if shared.passed(deadline) => Err(ApiError::request_timeout()),
         Ok(Ok(collected)) => Ok(collected.to_bytes()),
         Ok(Err(e)) => {
             let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e.as_ref());
@@ -99,16 +96,18 @@ pub(crate) async fn body_within(
     }
 }
 
-/// Submits `job`, awaits its ticket (the writer answers every accepted job, store §5),
-/// reports a fatal outcome to the lifecycle sink, and runs `after_ok` on success. Called
-/// by an already registered task: an observer of [`observe_write`] or a command runner.
+/// Submits `job` with `not_after` (on the server's clock), awaits its ticket (the writer
+/// answers every accepted job, store §5), reports a fatal outcome to the lifecycle sink, and
+/// runs `after_ok` on success. Called by an already registered task: an observer of
+/// [`observe_write`] or a command runner.
 pub(crate) async fn run_write<R: Send + 'static>(
     shared: &Shared,
     not_after: Instant,
     job: Job<R>,
     after_ok: Option<AfterOk>,
 ) -> Result<R, WriteFailure> {
-    let ticket = match shared.store.submit(not_after, job) {
+    shared.faults.write_submitted();
+    let ticket = match shared.store.submit(shared.real(not_after), job) {
         Ok(t) => t,
         Err(e) => {
             if e == SubmitError::Failed {
@@ -156,20 +155,26 @@ pub(crate) fn observe_write<R: Send + 'static>(
     Ok(rx)
 }
 
-/// A plain write's reply: the job submitted with `not_after = deadline` through an
-/// observer, its result awaited until `deadline + write_reply_grace`; no reply by then is
-/// 503 `outcome_unknown` (never `in_progress`: no receipt exists).
+/// A plain write's reply: past the deadline, 408 with nothing submitted; otherwise the job
+/// submitted with `not_after = deadline` through an observer, its result awaited until
+/// `deadline + write_reply_grace`. No reply by then, or a reply taken at or after it (by the
+/// server's clock), is 503 `outcome_unknown` (never `in_progress`: no receipt exists); the
+/// observer still sees the job through.
 pub(crate) async fn await_write<R: Send + 'static>(
     shared: &Arc<Shared>,
     deadline: Instant,
     job: Job<R>,
     after_ok: Option<AfterOk>,
 ) -> Result<R, ApiError> {
+    if shared.passed(deadline) {
+        return Err(ApiError::request_timeout());
+    }
     let rx =
         observe_write(shared, deadline, job, after_ok).map_err(|_| ApiError::shutting_down())?;
     let reply_by = deadline + shared.cfg.write_reply_grace;
-    match timeout_at(tokio_instant(reply_by), rx).await {
+    match timeout_at(shared.timer(reply_by), rx).await {
         Err(_) | Ok(Err(_)) => Err(ApiError::outcome_unknown()),
+        Ok(Ok(_)) if shared.passed(reply_by) => Err(ApiError::outcome_unknown()),
         Ok(Ok(r)) => r.map_err(write_failure),
     }
 }
@@ -237,7 +242,7 @@ impl ReadCtx {
     ///
     /// 408, 413, or 400 for a body that ended abnormally.
     pub async fn body_within(&self, body: Body, max: u64) -> Result<Bytes, ApiError> {
-        body_within(body, self.deadline, max).await
+        body_within(&self.shared, body, self.deadline, max).await
     }
 }
 
@@ -278,7 +283,7 @@ impl WriteCtx {
     ///
     /// 408, 413, or 400 for a body that ended abnormally.
     pub async fn body_within(&self, body: Body, max: u64) -> Result<Bytes, ApiError> {
-        body_within(body, self.deadline, max).await
+        body_within(&self.shared, body, self.deadline, max).await
     }
 
     /// One write without a receipt: the token (if any) is verified first in the job's

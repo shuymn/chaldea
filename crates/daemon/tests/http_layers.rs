@@ -71,6 +71,16 @@ async fn host_rejections() {
                 "absolute userinfo",
                 Req::new(p, "GET", &format!("http://user@127.0.0.1:{p}{path}")).bearer(&token),
             ),
+            (
+                "absolute localhost, Host 127.0.0.1",
+                Req::new(p, "GET", &format!("http://localhost:{p}{path}")).bearer(&token),
+            ),
+            (
+                "absolute 127.0.0.1, Host localhost",
+                Req::new(p, "GET", &format!("http://127.0.0.1:{p}{path}"))
+                    .host(Some(&format!("localhost:{p}")))
+                    .bearer(&token),
+            ),
         ];
         for (name, req) in cases {
             let r = srv.send(&req).await;
@@ -90,6 +100,9 @@ async fn host_rejections() {
         for req in [
             base().host(Some(&format!("LocalHost:{p}"))),
             Req::new(p, "GET", &format!("http://127.0.0.1:{p}{path}")).bearer(&token),
+            Req::new(p, "GET", &format!("http://LOCALHOST:{p}{path}"))
+                .host(Some(&format!("localhost:{p}")))
+                .bearer(&token),
         ] {
             assert_eq!(srv.send(&req).await.outcome(), want, "{path}");
         }
@@ -117,6 +130,11 @@ async fn bearer_rejections() {
     let stale_agent = srv
         .token(TokenKind::Agent, Some(t2), Some(LaunchId::from_u128(22)))
         .await;
+    // An agent token whose launch exists and has not exited, but is another thread's
+    // current launch: only the current-launch comparison refuses it.
+    let (t4, l4) = (ThreadId::from_u128(4), LaunchId::from_u128(41));
+    let _ = srv.agent(t4, l4).await;
+    let foreign_launch_agent = srv.token(TokenKind::Agent, Some(t2), Some(l4)).await;
     let unknown = format!("chd_{}", "Q".repeat(43));
     let agent = srv
         .agent(ThreadId::from_u128(3), LaunchId::from_u128(31))
@@ -156,6 +174,10 @@ async fn bearer_rejections() {
         ("revoked", get().bearer(&revoked)),
         ("agent_token_after_launch_exit", get().bearer(&exited_agent)),
         ("agent launch not current", get().bearer(&stale_agent)),
+        (
+            "agent launch live but not its thread's",
+            get().bearer(&foreign_launch_agent),
+        ),
     ];
     for (name, req) in cases {
         let r = srv.send(&req).await;
@@ -426,8 +448,11 @@ async fn get_with_body_is_400() {
         .send(&get().header("Content-Length", "5").body(b"hello"))
         .await;
     assert_eq!(r.outcome(), (400, code("bad_request")));
-    let r = srv.send(&get().header("Content-Length", "0")).await;
-    assert_eq!(r.outcome(), (501, code("not_implemented")));
+    // Any spelling of zero is no body.
+    for zero in ["0", "00"] {
+        let r = srv.send(&get().header("Content-Length", zero)).await;
+        assert_eq!(r.outcome(), (501, code("not_implemented")), "{zero}");
+    }
     srv.stop().await;
 }
 
@@ -664,5 +689,72 @@ async fn reserved_launch_token_is_current() {
     srv.append(vec![exited(t, l1)]).await;
     srv.append(vec![reserved(t, l2)]).await;
     assert_eq!(srv.send(&get()).await.status, 401);
+    srv.stop().await;
+}
+
+/// A handler that would answer at once is not invoked once the deadline has passed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ready_read_past_deadline_is_408() {
+    let (mounts, calls) = counting_root();
+    let srv = TestServer::start_with(mounts, |c| c.short_deadline = Duration::ZERO).await;
+    let r = srv.send(&srv.req("GET", "/")).await;
+    assert_eq!(r.outcome(), (408, code("request_timeout")));
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the handler ran");
+    srv.stop().await;
+}
+
+/// Deadlines are on the server's clock: a clock moved forward by more than the short
+/// deadline before the request takes nothing from the request's budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skewed_clock_keeps_the_budget() {
+    let srv = TestServer::start(Mounts::mvp()).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    srv.clock.skew(DEADLINE * 30);
+    let r = srv
+        .send(&srv.req("GET", "/api/threads").bearer(&owner))
+        .await;
+    srv.clock.skew(Duration::ZERO);
+    assert_eq!(r.outcome(), (501, code("not_implemented")));
+    srv.stop().await;
+}
+
+/// HTTP/1.0 requests get the same rules: the guard decides, and the connection carries one
+/// request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http10_gets_the_same_rules() {
+    let (mounts, calls) = counting_root();
+    let srv = TestServer::start(mounts).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let http10 = |r: &Req| {
+        let mut b = r.bytes();
+        let line_end = b.windows(2).position(|w| w == b"\r\n").unwrap();
+        b.splice(line_end - 8..line_end, b"HTTP/1.0".iter().copied());
+        b
+    };
+    let r = support::http::send(srv.port, &http10(&srv.req("GET", "/"))).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.header("connection"), Some("close"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    for (name, req, want) in [
+        (
+            "bad Host",
+            srv.req("GET", "/").host(Some("evil:1")),
+            (421, code("misdirected_request")),
+        ),
+        (
+            "no token",
+            srv.req("GET", "/api/threads"),
+            (401, code("unauthorized")),
+        ),
+        (
+            "owner",
+            srv.req("GET", "/api/threads").bearer(&owner),
+            (501, code("not_implemented")),
+        ),
+    ] {
+        let r = support::http::send(srv.port, &http10(&req)).await;
+        assert_eq!(r.outcome(), want, "{name}: {r:?}");
+        assert_eq!(r.header("connection"), Some("close"), "{name}");
+    }
     srv.stop().await;
 }

@@ -137,4 +137,13 @@ fn deny_hides_unreadable_objects() {
         deny_for(&g, &auth(TokenKind::Hook, None), s),
         ApiError::not_found()
     );
+    // A thread that does not exist is 404 for every kind, `Grant::All` included.
+    let missing = ThreadId::from_u128(0xdead);
+    for kind in [TokenKind::Owner, TokenKind::Rescue, TokenKind::Agent] {
+        assert_eq!(
+            deny_for(&g, &auth(kind, Some(p)), missing),
+            ApiError::not_found(),
+            "{kind:?}"
+        );
+    }
 }

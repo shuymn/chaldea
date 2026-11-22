@@ -3,7 +3,9 @@
 //! Every fallible check runs before the ticket is removed: the handshake, the socket task's
 //! registration, and the final admission read. The socket task is registered before the
 //! `101`, so every socket is in the registry from before `101` to its exit; axum's own
-//! upgrade task only hands the socket over.
+//! upgrade task only hands the socket over. Until the ticket is removed the socket task
+//! waits on its admission, which ends it by refusing; only then does its hand-over bound
+//! start, so a spent ticket always has a task waiting for its socket.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -62,15 +64,14 @@ pub struct UpgradedSocket {
     pub shutdown: ShutdownSignal,
 }
 
-/// Whether any `Connection` token is `close`: an upgrade asking to close cannot keep the
-/// connection for the socket.
+/// Whether any `Connection` token is `close`, in any value, UTF-8 or not: an upgrade asking
+/// to close cannot keep the connection for the socket.
 fn asks_close(headers: &HeaderMap) -> bool {
     headers
         .get_all(header::CONNECTION)
         .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .any(|t| t.trim().eq_ignore_ascii_case("close"))
+        .flat_map(|v| v.as_bytes().split(|b| *b == b','))
+        .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"close"))
 }
 
 /// Steps 3–6 of the redemption; every refusal keeps the ticket and releases the task.
@@ -91,8 +92,10 @@ pub(crate) async fn admit(
     if asks_close(&parts.headers) {
         return ApiError::bad_request().into_response();
     }
-    // The socket task, registered before the ticket is spent. Dropping `tx` on any refusal
-    // below ends it at once.
+    // The socket task, registered before the ticket is spent. It waits on `admitted` while
+    // admission runs: a refusal below drops the sender and ends the task at once. The
+    // hand-over bound starts only once the ticket is removed.
+    let (admitted_tx, admitted) = oneshot::channel::<()>();
     let (tx, rx) = oneshot::channel::<WebSocket>();
     let grant = UpgradeGrant {
         token_id: principal.token_id,
@@ -104,6 +107,9 @@ pub(crate) async fn admit(
     let shutdown = shared.shutdown_signal();
     let hand_over = shared.cfg.short_deadline;
     let task = async move {
+        if admitted.await.is_err() {
+            return;
+        }
         let Ok(Ok(socket)) = tokio::time::timeout(hand_over, rx).await else {
             return;
         };
@@ -122,6 +128,7 @@ pub(crate) async fn admit(
     if let Err(e) = verify_until(&shared, deadline, principal.token_sha256).await {
         return e.into_response();
     }
+    shared.faults.before_ticket_removal().await;
     // 5. The conditional removal decides single use.
     if shared
         .tickets
@@ -131,6 +138,7 @@ pub(crate) async fn admit(
         return ApiError::unauthorized().into_response();
     }
     // 6. `101`; axum's upgrade task hands the socket to the registered task.
+    let _ = admitted_tx.send(());
     ws.on_upgrade(move |socket| async move {
         let _ = tx.send(socket);
     })

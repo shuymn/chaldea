@@ -13,6 +13,7 @@ mod listener;
 mod reads;
 mod registry;
 mod upgrade;
+mod writes;
 
 use std::sync::Arc;
 use std::time::Duration;

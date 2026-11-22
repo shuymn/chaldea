@@ -102,7 +102,12 @@ impl Service<Request<Incoming>> for OuterService {
         let span = request_span(req.method());
         let shared = self.shared.clone();
         let router = self.router.clone();
-        let start = RequestStart(self.first_byte.get().copied().unwrap_or_else(Instant::now));
+        let start = RequestStart(
+            self.first_byte
+                .get()
+                .copied()
+                .unwrap_or_else(|| shared.cfg.clock.now()),
+        );
         let fut = async move {
             let started = Instant::now();
             let (mut parts, body) = req.into_parts();
@@ -112,7 +117,11 @@ impl Service<Request<Incoming>> for OuterService {
                 shared: shared.clone(),
             });
             let resp = match check_host(&parts.headers, &parts.uri, shared.cfg.port) {
-                Err(e) => e.into_response(),
+                Err(e) => {
+                    // Rejected before routing: no route template applies.
+                    Span::current().record("route", tracing::field::display(UNMATCHED));
+                    e.into_response()
+                }
                 Ok(()) => match router.oneshot(Request::from_parts(parts, body)).await {
                     Ok(r) => r,
                     Err(never) => match never {},
@@ -157,17 +166,19 @@ fn is_own_authority(v: &str, port: u16) -> bool {
     host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost")
 }
 
-/// Exactly one `Host`, naming the daemon; an absolute-form target carries exactly such an
-/// authority (no userinfo, same port). Else 421.
+/// Exactly one `Host`, naming the daemon; an absolute-form target carries exactly that
+/// authority (`localhost` compared ASCII case-insensitively; no userinfo). Else 421.
 fn check_host(headers: &HeaderMap, uri: &axum::http::Uri, port: u16) -> Result<(), ApiError> {
     let mut hosts = headers.get_all(header::HOST).iter();
     let (Some(host), None) = (hosts.next(), hosts.next()) else {
         return Err(ApiError::misdirected_request());
     };
-    let ok = host.to_str().is_ok_and(|h| is_own_authority(h, port))
-        && uri
-            .authority()
-            .is_none_or(|a| is_own_authority(a.as_str(), port));
+    let ok = host.to_str().is_ok_and(|h| {
+        is_own_authority(h, port)
+            && uri
+                .authority()
+                .is_none_or(|a| a.as_str().eq_ignore_ascii_case(h))
+    });
     if ok {
         Ok(())
     } else {
@@ -222,10 +233,16 @@ impl Service<Request<Body>> for GuardService {
         let this = self.clone();
         Box::pin(async move {
             Span::current().record("route", tracing::field::display(this.spec.path));
-            Ok(match this.handle(req).await {
+            let mut resp = match this.handle(req).await {
                 Ok(r) => r,
                 Err(e) => e.into_response(),
-            })
+            };
+            // Only the PWA's routes keep their own caching (mvp §2.5).
+            if !this.spec.is_pwa() {
+                resp.headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            }
+            Ok(resp)
         })
     }
 }
@@ -245,7 +262,7 @@ impl GuardService {
         let start = parts
             .extensions
             .get::<RequestStart>()
-            .map_or_else(Instant::now, |s| s.0);
+            .map_or_else(|| shared.cfg.clock.now(), |s| s.0);
         let deadline = start + shared.cfg.short_deadline;
 
         // 2. Method: exactly the spec's (`HEAD` is not accepted on `GET` routes).
@@ -266,7 +283,10 @@ impl GuardService {
         if matches!(self.endpoint, Endpoint::Unimplemented) {
             return Err(ApiError::not_implemented());
         }
-        // 9. Deadline, then the handler.
+        // 9. Deadline, then the handler: none is invoked once the deadline has passed.
+        if shared.passed(deadline) {
+            return Err(ApiError::request_timeout());
+        }
         parts.extensions.insert(Deadline(deadline));
         let max = usize::try_from(shared.cfg.max_body_bytes).unwrap_or(usize::MAX);
         let req = Request::from_parts(parts, Body::new(Limited::new(body, max)));
@@ -274,9 +294,12 @@ impl GuardService {
             Endpoint::Unimplemented => Err(ApiError::not_implemented()),
             Endpoint::Read(h) => {
                 let ctx = ReadCtx::new(admitted.principal, deadline, shared.clone());
-                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), h.call(ctx, req))
-                    .await
-                    .unwrap_or_else(|_| Err(ApiError::request_timeout()))
+                match tokio::time::timeout_at(shared.timer(deadline), h.call(ctx, req)).await {
+                    // A result taken at or after the deadline is discarded.
+                    Ok(_) if shared.passed(deadline) => Err(ApiError::request_timeout()),
+                    Ok(r) => r,
+                    Err(_) => Err(ApiError::request_timeout()),
+                }
             }
             Endpoint::Write(h) => {
                 let ctx = WriteCtx::new(admitted.principal, deadline, shared.clone());
@@ -411,40 +434,35 @@ fn check_origin(rule: OriginRule, headers: &HeaderMap) -> Result<(), ApiError> {
 
 /// Steps 6 and 7: any `Transfer-Encoding` is 400 (checked first: hyper has removed
 /// `Content-Length` when both came); `POST` needs exactly one `Content-Length` (411) within
-/// the body bound (413); `GET` has none other than `0` (400).
+/// the body bound (413); `GET` has none other than a zero length, however spelled (400).
 fn check_framing(method: &Method, headers: &HeaderMap, max: u64) -> Result<(), ApiError> {
     if headers.contains_key(header::TRANSFER_ENCODING) {
         return Err(ApiError::bad_request());
     }
+    let length = |v: &HeaderValue| v.to_str().ok().and_then(|v| v.parse::<u64>().ok());
     let lengths: Vec<&HeaderValue> = headers.get_all(header::CONTENT_LENGTH).iter().collect();
     if *method == Method::POST {
         let [len] = lengths.as_slice() else {
             return Err(ApiError::length_required());
         };
-        let len: u64 = len
-            .to_str()
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .ok_or_else(ApiError::bad_request)?;
+        let len = length(len).ok_or_else(ApiError::bad_request)?;
         if len > max {
             return Err(ApiError::payload_too_large());
         }
-    } else if lengths.iter().any(|v| v.as_bytes() != b"0") {
+    } else if lengths.iter().any(|v| length(v) != Some(0)) {
         return Err(ApiError::bad_request());
     }
     Ok(())
 }
 
 /// The ticket of a query that is exactly one `ticket` parameter: a missing or repeated
-/// `ticket` is 401, any other parameter 400 `bad_query`.
+/// `ticket` is 401, any other parameter (an empty one included) 400 `bad_query`.
 fn ticket_param(query: Option<&str>) -> Result<&str, ApiError> {
     let mut ticket = None;
     let mut count = 0;
-    for pair in query
-        .unwrap_or_default()
-        .split('&')
-        .filter(|p| !p.is_empty())
-    {
+    // An absent or empty query has no parameter at all.
+    let pairs = query.filter(|q| !q.is_empty()).map(|q| q.split('&'));
+    for pair in pairs.into_iter().flatten() {
         match pair.split_once('=') {
             Some(("ticket", v)) => {
                 count += 1;
@@ -509,6 +527,10 @@ mod tests {
             Err(ApiError::bad_query())
         );
         assert_eq!(ticket_param(Some("ticketx")), Err(ApiError::bad_query()));
+        // Empty segments are parameters too.
+        for q in [format!("ticket={t}&"), format!("&&ticket={t}"), "&".into()] {
+            assert_eq!(ticket_param(Some(&q)), Err(ApiError::bad_query()), "{q}");
+        }
     }
 
     #[test]

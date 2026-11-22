@@ -106,6 +106,79 @@ async fn upgrade_asking_close_is_400() {
     srv.stop().await;
 }
 
+/// A `Connection` value that is not UTF-8 still counts its `close` token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_utf8_connection_close_is_400() {
+    let srv = TestServer::start(ws_mounts()).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
+    let mut bytes = handshake(&srv, &ticket, "Upgrade").head();
+    // A second `Connection` header, `close, \xff`, just before the blank line.
+    bytes.truncate(bytes.len() - 2);
+    bytes.extend_from_slice(b"Connection: close, \xff\r\n\r\n");
+    let r = super::support::http::send(srv.port, &bytes).await;
+    assert_eq!(r.outcome(), (400, Some("bad_request".to_owned())));
+    redeem_with_client(&srv, &ticket).await;
+    srv.stop().await;
+}
+
+/// An HTTP/1.0 request cannot upgrade: the handshake is 400 and the ticket is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http10_upgrade_is_400() {
+    let srv = TestServer::start(ws_mounts()).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
+    let mut bytes = handshake(&srv, &ticket, "Upgrade").bytes();
+    let line_end = bytes.windows(2).position(|w| w == b"\r\n").unwrap();
+    bytes.splice(line_end - 8..line_end, b"HTTP/1.0".iter().copied());
+    let r = super::support::http::send(srv.port, &bytes).await;
+    assert_eq!(r.outcome(), (400, Some("bad_request".to_owned())), "{r:?}");
+    assert_eq!(r.header("connection"), Some("close"));
+    redeem_with_client(&srv, &ticket).await;
+    srv.stop().await;
+}
+
+/// The socket task waits for its admission: an admission held between the final read and
+/// the ticket removal for longer than the hand-over bound still hands the socket over, so
+/// a spent ticket always yields a usable socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission_held_past_the_hand_over_bound() {
+    let srv = TestServer::start(ws_mounts()).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
+    let s = super::shared(&srv);
+    let (reached, release) = s.faults.inner.arm_removal_gate();
+    let url = format!("ws://127.0.0.1:{}/api/ws?ticket={ticket}", srv.port);
+    let client = tokio::spawn(tokio_tungstenite::connect_async(url));
+    tokio::time::timeout(Duration::from_secs(10), reached)
+        .await
+        .expect("admission reached the gate")
+        .unwrap();
+    // Accept, the connection, and the registered socket task.
+    assert_eq!(srv.server.tasks(), 3);
+    // Give a hand-over timer that started at registration (the short deadline) time to
+    // end the socket task; a socket task tied to its admission stays.
+    let bound = Instant::now() + super::support::http::DEADLINE + Duration::from_secs(1);
+    while srv.server.tasks() == 3 && Instant::now() < bound {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(release);
+    let (mut ws, resp) = tokio::time::timeout(Duration::from_secs(10), client)
+        .await
+        .expect("the handshake ends")
+        .unwrap()
+        .expect("a 101");
+    assert_eq!(resp.status(), 101);
+    let hello = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("hello within 5 s: the socket was handed over")
+        .unwrap()
+        .unwrap();
+    assert!(hello.to_text().unwrap().contains("\"hello\""), "{hello:?}");
+    ws.close(None).await.unwrap();
+    srv.stop().await;
+}
+
 /// A socket that ignores shutdown is still in the registry at the deadline: it gets an
 /// abort request and is counted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -4,11 +4,13 @@
 
 mod support;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{Method, Response};
-use chaldea_daemon::http::{ApiError, KindCounts, Mount, Mounts, WriteCtx, spec};
+use chaldea_daemon::http::{ApiError, KindCounts, Mount, Mounts, ReadCtx, WriteCtx, spec};
 use support::http::{TestServer, connect};
 use tokio::io::AsyncWriteExt;
 
@@ -30,22 +32,37 @@ async fn listener_released_with_no_connections() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_stops_accepting() {
-    let mut srv = TestServer::start(Mounts::mvp()).await;
+    // `GET /` counts its dispatches, so any request this server serves after shutdown shows.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let mounts = Mounts::mvp().with(Mount::read(
+        spec(&Method::GET, "/").unwrap(),
+        move |_ctx: ReadCtx, _req| {
+            c.fetch_add(1, Ordering::SeqCst);
+            async { Ok(Response::new(Body::empty())) }
+        },
+    ));
+    let mut srv = TestServer::start(mounts).await;
     let port = srv.port;
+    assert_eq!(srv.send(&srv.req("GET", "/")).await.status, 200);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "positive control");
     srv.shutdown_http(Instant::now() + Duration::from_secs(10))
         .await;
     match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
         Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused, "{e}"),
         Ok(mut s) => {
-            // Something else bound the port meanwhile: it must not be this server.
+            // Something holds the port: whatever answers, this server dispatches nothing.
             let _ = s.write_all(&srv.req("GET", "/").bytes()).await;
-            let (out, _) = support::http::read_to_end(&mut s).await;
-            assert!(
-                !String::from_utf8_lossy(&out).contains("not_found"),
-                "a closed server answered"
-            );
+            let _ =
+                tokio::time::timeout(Duration::from_secs(5), support::http::read_to_end(&mut s))
+                    .await;
         }
     }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a request was served after shutdown"
+    );
     srv.store.shutdown();
 }
 

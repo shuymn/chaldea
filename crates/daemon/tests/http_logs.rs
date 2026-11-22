@@ -41,8 +41,24 @@ impl Write for Writer {
     }
 }
 
-fn text(log: &Arc<Mutex<Vec<u8>>>) -> String {
-    String::from_utf8_lossy(&log.lock().unwrap()).into_owned()
+/// The tests of this binary share one global subscriber; they run one at a time so each
+/// reads only its own records.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// What was logged since `from` bytes.
+fn since(log: &Arc<Mutex<Vec<u8>>>, from: usize) -> String {
+    String::from_utf8_lossy(&log.lock().unwrap()[from..]).into_owned()
+}
+
+fn len(log: &Arc<Mutex<Vec<u8>>>) -> usize {
+    log.lock().unwrap().len()
+}
+
+/// The completion records in `log`.
+fn records(log: &str) -> usize {
+    log.lines()
+        .filter(|l| l.contains("request finished"))
+        .count()
 }
 
 /// A line that records a finished request for `route` with `status`.
@@ -56,7 +72,9 @@ fn has_record(log: &str, route: &str, status: u16) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn secrets_absent() {
+    let _serial = SERIAL.lock().await;
     let log = captured();
+    let from = len(&log);
     let srv = TestServer::start(Mounts::mvp()).await;
     let p = srv.port;
     let owner = srv.token(TokenKind::Owner, None, None).await;
@@ -76,7 +94,7 @@ async fn secrets_absent() {
     srv.send(&srv.req("POST", "/hook").bearer(&hook).body(b"{}"))
         .await;
     srv.send(&srv.req("GET", "/nowhere")).await;
-    let before = text(&log);
+    let before = since(&log, from);
     for (route, status) in [
         ("/api/threads", 501),
         ("/api/ws", 401),
@@ -90,11 +108,13 @@ async fn secrets_absent() {
         );
     }
     assert!(before.contains("token_id="), "the token id is recorded");
+    assert_eq!(records(&before), 5, "one record per request:\n{before}");
 
     // Secrets and markers, in accepted and rejected requests alike.
     let ticket = format!("chdt_{}", "T".repeat(43));
     let code = format!("chdp_{}", "P".repeat(43));
     let unknown = format!("chd_{}", "U".repeat(43));
+    let method = format!("chd_{}", "M".repeat(43));
     let query_marker = "QUERYMARKER7a";
     let body_marker = "BODYMARKER7a";
     let reqs = [
@@ -122,12 +142,21 @@ async fn secrets_absent() {
     for r in &reqs {
         srv.send(r).await;
     }
+    // An extension method shaped like a token: 405, and the method is not recorded.
+    let r = srv.send(&srv.req(&method, "/api/threads")).await;
+    assert_eq!(r.status, 405);
     srv.stop().await;
-    let all = text(&log);
+    let all = since(&log, from);
+    assert_eq!(
+        records(&all),
+        5 + reqs.len() + 1,
+        "one record per request:\n{all}"
+    );
     for secret in [
         owner.as_str(),
         hook.as_str(),
         unknown.as_str(),
+        method.as_str(),
         ticket.as_str(),
         code.as_str(),
         query_marker,
@@ -145,28 +174,31 @@ async fn secrets_absent() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn span_is_outermost() {
+    let _serial = SERIAL.lock().await;
     let log = captured();
+    let from = len(&log);
     let srv = TestServer::start(Mounts::mvp()).await;
     srv.send(&srv.req("GET", "/api/threads").host(Some("evil:1")))
         .await;
     srv.send(&srv.req("GET", "/span-outermost-404")).await;
     srv.stop().await;
-    let all = text(&log);
+    let all = since(&log, from);
     assert!(
-        all.lines()
-            .any(|l| l.contains("request finished") && l.contains("status=421")),
+        has_record(&all, "unmatched", 421),
         "no record of the 421:\n{all}"
     );
     assert!(
         has_record(&all, "unmatched", 404),
         "no record of the 404:\n{all}"
     );
+    assert_eq!(records(&all), 2, "one record per request:\n{all}");
 }
 
 /// Credential headers reach every layer already marked sensitive, so a `Debug` of the
 /// headers prints `Sensitive` instead of the value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn credential_headers_are_marked_sensitive() {
+    let _serial = SERIAL.lock().await;
     use axum::body::Body;
     use axum::http::{Method, Response, header};
     use chaldea_daemon::http::{Mount, ReadCtx, spec};

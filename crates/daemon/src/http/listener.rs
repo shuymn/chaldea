@@ -2,7 +2,8 @@
 //! loop", "ConnIo").
 //!
 //! Its own loop instead of `axum::serve`, which sets no timer (so no header read timeout)
-//! and no connection bound. HTTP/1.1 only, one request per connection.
+//! and no connection bound. HTTP/1.1 (HTTP/1.0 requests get the same rules), one request
+//! per connection.
 
 use std::io;
 use std::pin::Pin;
@@ -21,7 +22,7 @@ use tokio::time::Sleep;
 
 use super::guard::OuterService;
 use super::registry::TaskKind;
-use super::{MAX_HEADERS, Shared};
+use super::{MAX_HEADERS, MonotonicClock, Shared};
 
 /// Accept errors that concern one connection only; the loop goes on at once (as axum's).
 fn is_connection_error(e: &io::Error) -> bool {
@@ -95,6 +96,7 @@ async fn serve_connection(
     let io = TokioIo::new(ConnIo::new(
         stream,
         first_byte.clone(),
+        shared.cfg.clock.clone(),
         shared.cfg.write_stall_timeout,
     ));
     let service = TowerToHyperService::new(OuterService::new(shared.clone(), router, first_byte));
@@ -120,20 +122,28 @@ async fn serve_connection(
 }
 
 /// The connection's transport: records the request origin (the first read that returns
-/// bytes) and fails a write that accepts no byte for `stall` (design §2.2 "ConnIo").
+/// bytes, on the server's clock) and fails a write that accepts no byte for `stall` (design
+/// §2.2 "ConnIo").
 pub(crate) struct ConnIo<T> {
     io: T,
     first_byte: Arc<OnceLock<Instant>>,
+    clock: Arc<dyn MonotonicClock>,
     stall: Duration,
     /// Armed while a write is pending with no byte accepted since it started.
     timer: Option<Pin<Box<Sleep>>>,
 }
 
 impl<T> ConnIo<T> {
-    pub(crate) fn new(io: T, first_byte: Arc<OnceLock<Instant>>, stall: Duration) -> Self {
+    pub(crate) fn new(
+        io: T,
+        first_byte: Arc<OnceLock<Instant>>,
+        clock: Arc<dyn MonotonicClock>,
+        stall: Duration,
+    ) -> Self {
         ConnIo {
             io,
             first_byte,
+            clock,
             stall,
             timer: None,
         }
@@ -177,7 +187,8 @@ impl<T: AsyncRead + Unpin> AsyncRead for ConnIo<T> {
         let before = buf.filled().len();
         let r = Pin::new(&mut self.io).poll_read(cx, buf);
         if matches!(r, Poll::Ready(Ok(()))) && buf.filled().len() > before {
-            self.first_byte.get_or_init(Instant::now);
+            let clock = &self.clock;
+            self.first_byte.get_or_init(|| clock.now());
         }
         r
     }

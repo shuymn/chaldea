@@ -256,8 +256,9 @@ impl TokenService {
         }
     }
 
-    /// Issues a new `owner` token in one write. With `issuer`, the issuing token is
-    /// verified in the same transaction first (a revoked issuer: 401, nothing inserted).
+    /// Issues a new `owner` token in one write by `deadline` (on the server's clock). With
+    /// `issuer`, the issuing token is verified in the same transaction first (a revoked
+    /// issuer: 401, nothing inserted).
     ///
     /// # Errors
     ///
@@ -304,12 +305,13 @@ impl TokenService {
     }
 }
 
-/// The refusal for an object `auth` may not act on: 404 when it cannot read the object's
-/// thread (identical to a missing one), else 403 (design §2.5 "Hiding").
+/// The refusal for an object `auth` may not act on: 404 when its thread does not exist or
+/// `auth` cannot read it (identical to a missing one), else 403 (design §2.5 "Hiding").
 #[must_use]
 pub fn deny_for(g: &ThreadGraph, auth: &Authorized, target: ThreadId) -> ApiError {
-    let readable = grant(auth.kind, Action::ReadStream)
-        .is_some_and(|gr| may_act_on_thread(g, auth.thread, gr, target));
+    let readable = g.contains(target)
+        && grant(auth.kind, Action::ReadStream)
+            .is_some_and(|gr| may_act_on_thread(g, auth.thread, gr, target));
     if readable {
         ApiError::forbidden()
     } else {

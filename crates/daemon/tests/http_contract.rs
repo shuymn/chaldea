@@ -155,6 +155,38 @@ async fn not_error_bodies() {
     srv.stop().await;
 }
 
+/// Every non-PWA response is `no-store` whatever its handler set; a PWA mount keeps its own
+/// caching.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_caching_is_no_store() {
+    let cached = || {
+        Response::builder()
+            .header("Cache-Control", "public, max-age=60")
+            .body(Body::from("x"))
+            .unwrap()
+    };
+    let mounts = Mounts::mvp()
+        .with(Mount::read(
+            spec(&Method::GET, "/api/threads").unwrap(),
+            move |_ctx: ReadCtx, _req| async move { Ok(cached()) },
+        ))
+        .with(Mount::read(
+            spec(&Method::GET, "/").unwrap(),
+            move |_ctx: ReadCtx, _req| async move { Ok(cached()) },
+        ));
+    let srv = TestServer::start(mounts).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let r = srv
+        .send(&srv.req("GET", "/api/threads").bearer(&owner))
+        .await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    let r = srv.send(&srv.req("GET", "/")).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("cache-control"), Some("public, max-age=60"));
+    srv.stop().await;
+}
+
 #[test]
 fn command_request_args_must_be_an_object() {
     let v = validator("CommandRequest");
