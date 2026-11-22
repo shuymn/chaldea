@@ -174,9 +174,6 @@ struct Call<'a, O: Os> {
     ticks: usize,
     /// Identities a direct lookup in this call resolved: the only ones that may be pruned.
     dead: BTreeSet<(u32, u64)>,
-    /// Session members this call observed live and readable, retained as targets at the
-    /// end of the call whatever the exit path.
-    observed: BTreeMap<(u32, u64), u32>,
 }
 
 impl<O: Os> Call<'_, O> {
@@ -365,8 +362,7 @@ impl<O: Os> Call<'_, O> {
     }
 
     /// Every target live or unresolved in the pass, plus (while owned) every live or
-    /// unreadable session member the pass saw, recorded as a target or not; live members are
-    /// also kept as observed. Once the deadline has passed, the pass is unclean and every
+    /// unreadable session member the pass saw, recorded as a target or not. Once the deadline has passed, the pass is unclean and every
     /// remaining target is kept without a status check.
     fn live_set(&mut self, pass: &mut Pass, owned: bool, st: &KillState) -> Vec<Survivor> {
         let mut out: BTreeMap<u32, Survivor> = BTreeMap::new();
@@ -398,7 +394,6 @@ impl<O: Os> Call<'_, O> {
             for (proc, sid) in pass.live.values() {
                 cut = cut || self.tick();
                 if proc.pgid == l || *sid == Some(l) {
-                    self.observed.insert((proc.pid, proc.start), proc.pgid);
                     out.entry(proc.pid).or_insert(Survivor {
                         pid: proc.pid,
                         start: Some(proc.start),
@@ -686,7 +681,6 @@ pub(crate) fn kill_tree<O: Os>(
         zombies: BTreeSet::new(),
         ticks: 0,
         dead: BTreeSet::new(),
-        observed: BTreeMap::new(),
     };
     let budget = deadline - t0;
 
@@ -756,20 +750,19 @@ pub(crate) fn kill_tree<O: Os>(
     finish(&mut call, &mut st, false, live)
 }
 
-/// Applies the retention invariant and builds the report from held state. Every session
-/// member observed live and every reported survivor with a start become targets, on every
-/// exit path; then only identities a direct lookup resolved are pruned, never a survivor.
-/// Retention always completes (no syscall, bounded by the identities the call holds);
-/// pruning stops at the deadline, which only keeps more.
+/// Applies the retention invariant and builds the report from held state. Every reported
+/// survivor with a start becomes a target, on every exit path (with the members and
+/// descendants the extension recorded, every identity the call observed live is then a
+/// target: a member the extension could not record is in the live set, hence a survivor);
+/// then only identities a direct lookup resolved are pruned, never a survivor. Retention
+/// always completes (no syscall, bounded by the survivors); pruning stops at the deadline,
+/// which only keeps more.
 fn finish<O: Os>(
     call: &mut Call<'_, O>,
     st: &mut KillState,
     tree_dead: bool,
     live: Vec<Survivor>,
 ) -> KillReport {
-    for (id, pgid) in &call.observed {
-        st.targets.entry(*id).or_insert(*pgid);
-    }
     let mut kept = BTreeSet::new();
     for s in &live {
         if let Some(start) = s.start {
@@ -1322,7 +1315,6 @@ mod tests {
             zombies: BTreeSet::new(),
             ticks: 0,
             dead: BTreeSet::new(),
-            observed: BTreeMap::new(),
         };
         let first = call.pass();
         assert!(
@@ -1778,7 +1770,6 @@ mod tests {
             zombies: BTreeSet::new(),
             ticks: 0,
             dead: BTreeSet::new(),
-            observed: BTreeMap::new(),
         };
         let mut st = KillState::default();
         let (pass, owned) = call.round(&mut st);
