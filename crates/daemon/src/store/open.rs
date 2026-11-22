@@ -60,11 +60,7 @@ pub(crate) fn connect(
 }
 
 /// The per-connection settings, none of which writes the file, each read back.
-pub(crate) fn configure(
-    conn: &Connection,
-    role: Role,
-    busy_timeout: Duration,
-) -> Result<(), OpenError> {
+fn configure(conn: &Connection, role: Role, busy_timeout: Duration) -> Result<(), OpenError> {
     conn.busy_timeout(busy_timeout)?;
     let ms = i64::try_from(busy_timeout.as_millis()).unwrap_or(i64::MAX);
     expect_pragma(conn, "busy_timeout", ms)?;
@@ -158,7 +154,7 @@ pub(crate) fn supported_version() -> u32 {
 /// `sqlite_schema` row except SQLite's internal objects, sorted. Internal objects are
 /// selected by the literal prefix `sqlite_` (not `LIKE 'sqlite_%'`, whose `_` matches any
 /// character and would hide a table such as `sqliteXextra`).
-pub(crate) fn schema_dump(conn: &Connection) -> Result<Vec<[String; 4]>, StoreError> {
+fn schema_dump(conn: &Connection) -> Result<Vec<[String; 4]>, StoreError> {
     let mut stmt = conn.prepare(
         "SELECT type, name, tbl_name, coalesce(sql, '') FROM sqlite_schema
          WHERE lower(substr(name, 1, 7)) <> 'sqlite_'

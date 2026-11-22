@@ -221,7 +221,7 @@ fn is_busy(e: &rusqlite::Error) -> bool {
 }
 
 /// Reads `meta.projection_version` and refuses when it is not `code`.
-pub(crate) fn check_projection_version(conn: &Connection, code: u32) -> Result<(), StoreError> {
+fn check_projection_version(conn: &Connection, code: u32) -> Result<(), StoreError> {
     let stored: String = conn.query_row(
         "SELECT value FROM meta WHERE key = 'projection_version'",
         [],

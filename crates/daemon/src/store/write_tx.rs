@@ -139,7 +139,7 @@ pub struct NewHookDelivery {
 
 /// `(sha256, data)` of the blobs an event stores.
 type BlobRows<'a> = Vec<(String, &'a [u8])>;
-/// `(sha256, path)` of the blob references an event records.
+/// `(sha256, media_type)` of the blob references an event records.
 type RefRows = Vec<(String, String)>;
 
 #[expect(
