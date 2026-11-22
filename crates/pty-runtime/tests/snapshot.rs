@@ -7,15 +7,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chaldea_core::payload::{Content, VtCursor, VtModes};
-use chaldea_pty_runtime::fake::FakeScript;
 use chaldea_pty_runtime::{
-    Cell, CellWidth, Cursor, GridError, Limits, Line, PtySize, Snapshot, TermModes, decode_grid,
+    Cell, CellWidth, Cursor, GridError, Line, PtySize, Snapshot, TermModes, decode_grid,
 };
 use common::*;
-
-fn rig_sized(cols: u16, rows: u16) -> Rig {
-    rig_with(FakeScript::default(), Limits::default(), cols, rows)
-}
 
 fn snap(r: &Rig) -> Snapshot {
     r.session.snapshot(soon()).unwrap()

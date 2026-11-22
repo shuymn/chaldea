@@ -5,8 +5,8 @@ mod common;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use chaldea_pty_runtime::fake::{FakeScript, ProbePoint};
-use chaldea_pty_runtime::{ChildExit, Limits, ReplyKind, SessionEvent, WriteOrigin, WriteOutcome};
+use chaldea_pty_runtime::fake::ProbePoint;
+use chaldea_pty_runtime::{ChildExit, ReplyKind, SessionEvent, WriteOrigin, WriteOutcome};
 use common::*;
 use proptest::prelude::*;
 
@@ -254,25 +254,6 @@ fn replies_after_exit_are_discarded() {
     assert_eq!(st.responder.dispatched, 0);
     assert_eq!(r.child.writes(), vec![b"A".to_vec()]);
     assert!(reply_records(&r).is_empty());
-}
-
-/// Replies to startup queries are answered at the spawn size (also PR2-CL-14).
-#[test]
-fn startup_queries_use_the_spawn_size() {
-    let r = rig_with(
-        FakeScript {
-            startup_output: b"\x1b[18t\x1b[14t".to_vec(),
-            ..FakeScript::default()
-        },
-        Limits::default(),
-        120,
-        40,
-    );
-    assert!(wait_until(|| r.child.writes().len() == 2));
-    assert_eq!(
-        r.child.writes(),
-        vec![b"\x1b[8;40;120t".to_vec(), b"\x1b[4;640;960t".to_vec()]
-    );
 }
 
 /// PR2-CL-11: a reply queued when the input breaks is discarded and counted, with no

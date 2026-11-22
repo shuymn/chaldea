@@ -60,6 +60,10 @@ pub fn rig() -> Rig {
     rig_with(FakeScript::default(), Limits::default(), 80, 24)
 }
 
+pub fn rig_sized(cols: u16, rows: u16) -> Rig {
+    rig_with(FakeScript::default(), Limits::default(), cols, rows)
+}
+
 pub fn rig_limits(limits: Limits) -> Rig {
     rig_with(FakeScript::default(), limits, 80, 24)
 }
@@ -82,17 +86,8 @@ pub fn rig_with(script: FakeScript, limits: Limits, cols: u16, rows: u16) -> Rig
 }
 
 /// Polls `f` (a state check, not an ordering signal) until it holds or `WAIT` passes.
-pub fn wait_until(mut f: impl FnMut() -> bool) -> bool {
-    let deadline = soon();
-    loop {
-        if f() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
+pub fn wait_until(f: impl FnMut() -> bool) -> bool {
+    wait_for(WAIT, f)
 }
 
 /// Polls `f` for at most `d`; for checking that something does not become visible.

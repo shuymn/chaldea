@@ -83,22 +83,39 @@ fn invalid_size_is_refused() {
     }
 }
 
-/// PR2-CL-14: before any resize, a startup `CSI 18 t` is answered at the spawn size.
+/// PR2-CL-14: before any resize, startup size queries (`CSI 18 t` characters, `CSI 14 t`
+/// pixels) are answered at the spawn size.
 #[test]
 fn startup_size_answers_csi_18t() {
-    let r = rig_with(
-        FakeScript {
-            startup_output: b"\x1b[18t".to_vec(),
-            ..FakeScript::default()
-        },
-        Limits::default(),
-        132,
-        43,
-    );
-    assert!(wait_until(
-        || r.child.writes() == vec![b"\x1b[8;43;132t".to_vec()]
-    ));
-    assert_eq!(r.fake.spawns()[0].size, PtySize::new(132, 43).unwrap());
+    // (cols, rows, startup output, expected replies)
+    type Case = (u16, u16, &'static [u8], &'static [&'static [u8]]);
+    let cases: [Case; 2] = [
+        (132, 43, b"\x1b[18t", &[b"\x1b[8;43;132t"]),
+        (
+            120,
+            40,
+            b"\x1b[18t\x1b[14t",
+            &[b"\x1b[8;40;120t", b"\x1b[4;640;960t"],
+        ),
+    ];
+    for (cols, rows, startup, replies) in cases {
+        let r = rig_with(
+            FakeScript {
+                startup_output: startup.to_vec(),
+                ..FakeScript::default()
+            },
+            Limits::default(),
+            cols,
+            rows,
+        );
+        let want: Vec<Vec<u8>> = replies.iter().map(|b| b.to_vec()).collect();
+        assert!(
+            wait_until(|| r.child.writes().len() >= want.len()),
+            "{cols}x{rows}"
+        );
+        assert_eq!(r.child.writes(), want, "{cols}x{rows}");
+        assert_eq!(r.fake.spawns()[0].size, PtySize::new(cols, rows).unwrap());
+    }
 }
 
 /// Bytes and ends a sink got.
@@ -603,7 +620,10 @@ fn spawn_fault(fault: StartFault, script: FakeScript) -> (SpawnError, Vec<FakeEv
     let mut config = SessionConfig::new(|_| {});
     config.start_fault = Some(fault);
     let e = Session::spawn(&fake, &spec(80, 24), config).unwrap_err();
-    let log = fake.take_child().unwrap().log();
+    let child = fake.take_child().unwrap();
+    let log = child.log();
+    // Ends a drain abandoned by a hanging close: the reader keeps the write end.
+    child.close_output();
     (e, log)
 }
 
@@ -812,6 +832,8 @@ fn close_steps_end_by_their_budgets() {
             tree_dead: false
         }
     );
+    // Ends the abandoned drain and writer: the reader keeps the write end.
+    r.child.close_output();
     drop(hold);
 }
 

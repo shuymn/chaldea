@@ -177,6 +177,8 @@ proptest! {
 fn human_write_waits_for_the_unit() {
     let r = rig();
     let probe = r.session.probe();
+    // Parked before the pause starts, so the key is queued while the unit is in it.
+    let park = probe.park(ProbePoint::PauseEntered);
     let i = submit(
         &r.session,
         unit(input_origin(1), vec![b("text"), pause(30), b("\r")]),
@@ -184,6 +186,7 @@ fn human_write_waits_for_the_unit() {
     );
     assert!(probe.wait(ProbePoint::PauseEntered, 1, soon()));
     let k = submit(&r.session, key(b"K"), open());
+    park.release();
     i.wait();
     k.wait();
     assert_eq!(
@@ -197,6 +200,8 @@ fn human_write_waits_for_the_unit() {
 fn reply_waits_for_the_unit_boundary() {
     let r = rig();
     let probe = r.session.probe();
+    // Parked before the pause starts, so the reply is queued while the unit is in it.
+    let park = probe.park(ProbePoint::PauseEntered);
     let i = submit(
         &r.session,
         unit(input_origin(1), vec![b("text"), pause(30), b("\r")]),
@@ -205,6 +210,7 @@ fn reply_waits_for_the_unit_boundary() {
     assert!(probe.wait(ProbePoint::PauseEntered, 1, soon()));
     r.child.emit(DSR5);
     assert!(probe.wait(ProbePoint::ReplyEnqueued, 1, soon()));
+    park.release();
     assert_eq!(i.wait().outcome, WriteOutcome::Written);
     assert!(wait_until(|| r.child.writes().len() == 3));
     assert_eq!(
