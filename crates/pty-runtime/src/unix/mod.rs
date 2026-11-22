@@ -17,7 +17,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, MutexGuard};
+use std::sync::Arc;
 use std::time::Instant;
 
 use rustix::fs::{Access, Mode, OFlags};
@@ -30,7 +30,7 @@ use crate::backend::{
     SpawnedParts, SpawnedPty, TEARDOWN_DRAIN, sealed,
 };
 use crate::drain::Drain;
-use crate::spawn::spawn_lock;
+use crate::spawn::{SpawnGuard, spawn_lock};
 
 #[cfg(any(test, feature = "fake"))]
 pub(crate) use self::io::WRITER_POLLS;
@@ -287,7 +287,7 @@ impl UnixPty {
     /// the lock is held: std makes the pipe close-on-exec in a second step (§2.1).
     fn wake_pipe(
         &self,
-        _held: &MutexGuard<'static, ()>,
+        _held: &SpawnGuard,
     ) -> std::io::Result<(std::io::PipeReader, std::io::PipeWriter)> {
         #[cfg(test)]
         if let Some(make) = &self.hooks.pipe {
