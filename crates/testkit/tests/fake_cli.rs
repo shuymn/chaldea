@@ -120,7 +120,12 @@ fn spawn_tree_roles_report_directly() {
 
 #[test]
 fn sleeper_ends_after_max_life() {
+    // The watchdog starts with the process, so the stream closes no sooner than the bound
+    // after the spawn began, and within it plus `SLACK` for process start and teardown.
+    const LIFE: Duration = Duration::from_secs(1);
+    const SLACK: Duration = Duration::from_millis(1500);
     let l = ReportListener::bind().unwrap();
+    let started = Instant::now();
     let mut child = fake(&[
         "--mode",
         "sleeper",
@@ -134,6 +139,8 @@ fn sleeper_ends_after_max_life() {
     let mut f = l.accept(soon()).unwrap();
     assert!(f.ping(soon()).is_some());
     assert!(f.closed_by(soon()));
+    let lived = started.elapsed();
+    assert!(lived >= LIFE && lived < LIFE + SLACK, "{lived:?}");
     assert_eq!(exit_code(&mut child), Some(0));
 }
 
