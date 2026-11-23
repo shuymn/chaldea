@@ -29,6 +29,8 @@
  * misses them is a `disconnect`), token revocation.
  */
 module sync {
+  import common.* from "./common"
+
   // ---------------------------------------------------------------------------
   // Bounds
   // ---------------------------------------------------------------------------
@@ -51,7 +53,6 @@ module sync {
   pure def min2(a: int, b: int): int = if (a < b) a else b
   pure def max2(a: int, b: int): int = if (a > b) a else b
   pure def minOf(s: Set[int]): int = s.fold(1000000, (a, b) => min2(a, b))
-  pure def without(m: a -> b, k: a): a -> b = m.keys().exclude(Set(k)).mapBy(x => m.get(x))
   pure def seqsOf(evs: List[Ev]): Set[int] = evs.indices().map(i => evs[i].seq)
 
   // ---------------------------------------------------------------------------
@@ -132,12 +133,13 @@ module sync {
   type Dir = Fwd | Bwd
   type Req = { id: int, client: int, stream: int, dir: Dir, q: Query }
   type Body =
-    | Page({ events: List[Ev], headSeq: int, hasMore: bool, hasMoreBefore: bool })
+    | Page({ events: List[Ev], hasMore: bool, hasMoreBefore: bool })
     // `recent`: none for the host stream. `threadStatus`: in a host snapshot, the thread's
     // status read in the same snapshot (`ThreadInfo`, a field of another stream); NONE in a
     // thread snapshot.
-    | Snap({ asOf: int, recent: List[Ev], proj: Proj, threadStatus: int, reason: Reason })
-    | BadQuery(QueryError)
+    | Snap({ asOf: int, recent: List[Ev], proj: Proj, threadStatus: int })
+    // 400: `decide_replay` refused the query (the recorded call holds the error).
+    | BadQuery
     // 404: the stream does not exist in the current database.
     | NotFound
     // A read that failed (408 at its cutoff, 503 `busy`): retryable, no state.
@@ -150,21 +152,27 @@ module sync {
   // the subscription set `S`, the latest subscribe not yet answered (a later one replaces
   // it), `known` and `announced` heads per stream of `S`, a heads refresh due, and the one
   // frame in flight. Frames are built at send selection from `known`.
+  type Frame = NoFrame | InFlight(Note)
   type Socket = {
     open: bool,
-    epoch: int,
     subs: Set[int],
     pending: Set[int],
     hasPending: bool,
     known: int -> int,
     announced: int -> int,
     headsDue: bool,
-    queue: List[Note],
+    frame: Frame,
   }
   pure val CLOSED: Socket = {
-    open: false, epoch: 0, subs: Set(), pending: Set(), hasPending: false,
-    known: Map(), announced: Map(), headsDue: false, queue: [],
+    open: false, subs: Set(), pending: Set(), hasPending: false,
+    known: Map(), announced: Map(), headsDue: false, frame: NoFrame,
   }
+
+  /// The frame in flight; callers check that there is one (`Heads(Map())` otherwise).
+  pure def frameNote(so: Socket): Note = match so.frame { | InFlight(n) => n | NoFrame => Heads(Map()) }
+
+  /// The streams the frame in flight names (none without one).
+  pure def frameNames(so: Socket): Set[int] = match so.frame { | InFlight(n) => noteNames(n) | NoFrame => Set() }
 
   // A client's local copy of one stream. `epoch` 0: no local state. `hi` is the cursor:
   // everything up to it is known (from a snapshot or events); `events` are the envelopes
@@ -187,8 +195,8 @@ module sync {
   // latest request issued), `resetAt` (requests up to this id are of an older generation),
   // `cancelled` (requests given up), `lost` (streams a lost frame named since connecting),
   // `owed` (streams whose resync was asked for after their forward request was issued: a
-  // backward page of another epoch or a failed read; a forward request issued later pays
-  // it).
+  // backward page of another epoch or a failed forward read; a forward request issued
+  // later pays it).
   type Client = {
     epoch: int,
     copies: int -> Copy,
@@ -389,7 +397,7 @@ module sync {
       sockEpoch: s.host.epoch,
       lost: Set(),
     }
-    start(setSocket(setClient(s, c, cl2), c, { ...CLOSED, open: true, epoch: s.host.epoch, pending: cl.want, hasPending: true }))
+    start(setSocket(setClient(s, c, cl2), c, { ...CLOSED, open: true, pending: cl.want, hasPending: true }))
 
   pure def disconnect(s: State, c: int): Out = start(setSocket(s, c, CLOSED))
 
@@ -479,26 +487,24 @@ module sync {
       val body = match plan {
         | PForward(f) => {
             val n = min2(hd, f.after + f.limit)
-            Page({ events: evs.slice(f.after, n), headSeq: hd, hasMore: hd > n, hasMoreBefore: f.after >= 1 })
+            Page({ events: evs.slice(f.after, n), hasMore: hd > n, hasMoreBefore: f.after >= 1 })
           }
         | PBackward(b) => {
             val top = min2(b.before - 1, hd)
             val bottom = max2(1, top - b.limit + 1)
             Page({
               events: if (top >= 1) evs.slice(bottom - 1, top) else [],
-              headSeq: hd,
               hasMore: hd >= max2(b.before, 1),
               hasMoreBefore: top >= 1 and bottom > 1,
             })
           }
-        | PSnapshot(reason) => Snap({
+        | PSnapshot(_) => Snap({
             asOf: hd,
             recent: if (r.stream == HOST) [] else evs.slice(max2(0, hd - SNAPSHOT_RECENT_EVENTS), hd),
             proj: projOf(evs),
             threadStatus: if (r.stream == HOST and hasStream(h, THREAD)) projOf(logOf(h, h.epoch, THREAD)).status else NONE,
-            reason: reason,
           })
-        | PRefused(e) => BadQuery(e)
+        | PRefused(_) => BadQuery
       }
       {
         st: { ...s1, resps: s.resps.put(id, { req: r, epoch: h.epoch, body: body }) },
@@ -539,7 +545,8 @@ module sync {
   /// another epoch than the one held (none included) establishes or switches the epoch,
   /// becoming the stream's copy only if it starts at the stream's beginning; a backward
   /// page with another epoch only makes a forward resync due; a 404 ends following the
-  /// stream; a failed read makes the fetch due again.
+  /// stream; a failed forward read makes the forward fetch due again, and a failed backward
+  /// read only ends that request.
   pure def deliver(s: State, id: int): Out =
     val p = s.resps.get(id)
     val c = p.req.client
@@ -628,7 +635,7 @@ module sync {
 
   pure def advancing(so: Socket): Set[int] = so.subs.filter(x => so.known.get(x) > so.announced.get(x))
 
-  pure def canSend(so: Socket): bool = so.open and so.queue.length() == 0 and (so.headsDue or advancing(so).size() > 0)
+  pure def canSend(so: Socket): bool = so.open and so.frame == NoFrame and (so.headsDue or advancing(so).size() > 0)
 
   /// Send selection (http §2.6): `heads` with every stream of `S` if due, else
   /// `stream_advanced` for one stream whose known head is newer than the announced one.
@@ -642,7 +649,7 @@ module sync {
       | Heads(m) => m
       | Advanced(a) => so.announced.set(a.stream, a.head)
     }
-    start(setSocket(s, c, { ...so, queue: [n], announced: announced, headsDue: false }))
+    start(setSocket(s, c, { ...so, frame: InFlight(n), announced: announced, headsDue: false }))
 
   pure def noteNames(n: Note): Set[int] = match n {
     | Advanced(a) => Set(a.stream)
@@ -651,9 +658,8 @@ module sync {
 
   /// Notify-then-pull: the client records the newest head it observed per followed stream;
   /// a `heads` frame is a snapshot of every listed stream's head.
-  pure def recvNote(s: State, c: int): Out =
+  pure def recvNote(s: State, c: int, n: Note): Out =
     val so = s.sockets.get(c)
-    val n = head(so.queue)
     val cl = s.clients.get(c)
     val seen2 = STREAMS.mapBy(x => {
       val h = match n {
@@ -662,7 +668,7 @@ module sync {
       }
       if (cl.want.contains(x)) max2(cl.seen.get(x), h) else cl.seen.get(x)
     })
-    start(setSocket(setClient(s, c, { ...cl, seen: seen2 }), c, { ...so, queue: tail(so.queue) }))
+    start(setSocket(setClient(s, c, { ...cl, seen: seen2 }), c, { ...so, frame: NoFrame }))
 
   // ---------------------------------------------------------------------------
   // Invariants as functions of the step (each cites its source; the vals below)
@@ -807,7 +813,8 @@ module sync {
 
   // ---------------------------------------------------------------------------
   // Convergence: connectivity returns, writes stop, and the protocol runs on a
-  // deterministic fair schedule (bounded liveness); every step inside is checked
+  // deterministic fair schedule for a bounded number of steps (bounded liveness); the
+  // safety invariants are checked after every delivery inside
   // ---------------------------------------------------------------------------
 
   /// Some followed stream is behind the host in the same epoch after a lost frame named
@@ -820,7 +827,7 @@ module sync {
       cl.want.contains(p._2), cl.lost.contains(p._2), cp.epoch == s.host.epoch, cp.hi < headOf(s.host, p._2),
       not(dueOf(cl, p._2)), cl.fwd.get(p._2) == 0, so.open, not(so.hasPending), not(so.headsDue),
       not(advancing(so).contains(p._2)),
-      so.queue.indices().forall(i => not(noteNames(so.queue[i]).contains(p._2))),
+      not(frameNames(so).contains(p._2)),
     }
   })
 
@@ -854,7 +861,7 @@ module sync {
   pure def drainOne(d: Drain): Drain = if (d.done) d else {
     val s = d.o.st
     val subscribing = CLIENTS.filter(c => s.sockets.get(c).open and s.sockets.get(c).hasPending)
-    val notified = CLIENTS.filter(c => s.sockets.get(c).open and s.sockets.get(c).queue.length() > 0)
+    val notified = CLIENTS.filter(c => s.sockets.get(c).open and s.sockets.get(c).frame != NoFrame)
     val sending = CLIENTS.filter(c => canSend(s.sockets.get(c)))
     val fetching = CLIENTS.filter(c => dueStreams(s, c).size() > 0)
     val stuck = CLIENTS.filter(c => lostStreams(s, c).size() > 0)
@@ -868,11 +875,11 @@ module sync {
       drainStep(d, ServerSubscribe(minOf(subscribing)), serverSubscribe(s, minOf(subscribing)))
     } else if (notified.size() > 0) {
       val c = minOf(notified)
-      drainStep(d, RecvNote({ client: c, note: head(s.sockets.get(c).queue) }), recvNote(s, c))
+      drainStep(d, RecvNote({ client: c, note: frameNote(s.sockets.get(c)) }), recvNote(s, c, frameNote(s.sockets.get(c))))
     } else if (sending.size() > 0) {
       val c = minOf(sending)
       val o2 = sendFrame(s, c)
-      drainStep(d, SendFrame({ client: c, note: head(o2.st.sockets.get(c).queue) }), o2)
+      drainStep(d, SendFrame({ client: c, note: frameNote(o2.st.sockets.get(c)) }), o2)
     } else if (fetching.size() > 0) {
       val c = minOf(fetching)
       val o2 = fetch(s, c, minOf(dueStreams(s, c)), 2)
@@ -888,8 +895,8 @@ module sync {
     } else { ...d, done: true }
   }
 
-  pure def drain(s: State): Drain =
-    range(0, DRAIN_STEPS).foldl(restore({ o: start(s), refreshes: DRAIN_REFRESHES, done: false, checks: ALL_OK }), (d, _) => drainOne(d))
+  /// Up to DRAIN_STEPS steps of the schedule, from the state after reconnecting.
+  pure def drain(restored: Drain): Drain = range(0, DRAIN_STEPS).foldl(restored, (d, _) => drainOne(d))
 
   /// Every client follows only streams the host has, and has, for each, the host's epoch,
   /// cursor, and rendered state.
@@ -1058,42 +1065,41 @@ module sync {
   action sendFrameA(c: int): bool = all {
     canSend(st.sockets.get(c)),
     val o = sendFrame(st, c)
-    commit(SendFrame({ client: c, note: head(o.st.sockets.get(c).queue) }), o),
+    commit(SendFrame({ client: c, note: frameNote(o.st.sockets.get(c)) }), o),
   }
 
   action recvNoteA(c: int): bool = all {
     st.sockets.get(c).open,
-    st.sockets.get(c).queue.length() > 0,
-    commit(RecvNote({ client: c, note: head(st.sockets.get(c).queue) }), recvNote(st, c)),
+    st.sockets.get(c).frame != NoFrame,
+    val n = frameNote(st.sockets.get(c))
+    commit(RecvNote({ client: c, note: n }), recvNote(st, c, n)),
   }
 
   /// A lost notification: the frame in flight never reaches the client (its socket's
-  /// receiver lagged, or the frame was coalesced away). The client's ghost records which
-  /// streams it named.
+  /// receiver lagged). The client's ghost records which streams it named.
   action dropNote(c: int): bool = all {
-    val q = st.sockets.get(c).queue
+    val so = st.sockets.get(c)
     all {
-      q.length() > 0,
+      so.frame != NoFrame,
       val cl = st.clients.get(c)
-      commit(DropNote({ client: c, note: q[0] }), start(
-        setClient(setSocket(st, c, { ...st.sockets.get(c), queue: [] }), c, { ...cl, lost: cl.lost.union(noteNames(q[0])) }))),
+      commit(DropNote({ client: c, note: frameNote(so) }), start(
+        setClient(setSocket(st, c, { ...so, frame: NoFrame }), c, { ...cl, lost: cl.lost.union(frameNames(so)) }))),
     },
   }
 
-  /// Connectivity returns and writes stop: the protocol runs to its fixpoint on a fair
-  /// deterministic schedule (`drain`), every step of it checked.
+  /// Connectivity returns (every client without a socket reconnects) and writes stop; the
+  /// protocol then runs up to DRAIN_STEPS steps of a fair deterministic schedule (`drain`),
+  /// with the safety invariants checked after every delivery.
   action quiesce: bool = {
-    val d = drain(st)
-    val restored = restore({ o: start(st), refreshes: 0, done: false, checks: ALL_OK }).o.st
-    commitWith(Quiesce({ onlyHeads: onlyHeadsRecover(restored) }), d.o, d.checks)
+    val restored = restore({ o: start(st), refreshes: DRAIN_REFRESHES, done: false, checks: ALL_OK })
+    val d = drain(restored)
+    commitWith(Quiesce({ onlyHeads: onlyHeadsRecover(restored.o.st) }), d.o, d.checks)
   }
 
-  pure def someId(ids: Set[int]): Set[int] = if (ids.size() == 0) Set(0) else ids
-
   action networkStep = any {
-    nondet id = someId(st.reqs.keys()).oneOf()
+    nondet id = orNone(st.reqs.keys()).oneOf()
     any { serveA(id), serveA(id), failReadA(id), loseReq(id) },
-    nondet id = someId(st.resps.keys()).oneOf()
+    nondet id = orNone(st.resps.keys()).oneOf()
     any { deliverA(id), deliverA(id), loseResp(id) },
     nondet c = CLIENTS.oneOf()
     any { serverSubscribeA(c), sendFrameA(c), sendFrameA(c), recvNoteA(c), recvNoteA(c), dropNote(c), headsRefreshA(c) },
@@ -1151,10 +1157,9 @@ module sync {
   val owedResyncStaysDue = owedOk(st) and last.inner.owed
 
   /// mvp §2.4 "Live notifications", CL-13, http §8 D15: after connectivity returns and
-  /// writes stop, every client converges to the host's events and rendered state of each
-  /// stream it follows, and follows no stream the host lacks, within DRAIN_STEPS steps of
-  /// a fair schedule, despite lost responses and frames, disconnects, restarts, and epoch
-  /// changes before it.
+  /// writes stop, within DRAIN_STEPS steps of a fair schedule every client follows only
+  /// streams the host has and holds, for each, the host's epoch, cursor, and rendered state,
+  /// despite lost responses and frames, disconnects, restarts, and epoch changes before it.
   val convergedAfterQuiesce = match last.act {
     | Quiesce(_) => converged(st)
     | _ => true
@@ -1200,7 +1205,7 @@ module sync {
     | Quiesce(_) => CLIENTS.exists(c => last.prevClients.get(c).epoch != 0 and last.prevClients.get(c).epoch < st.host.epoch) and converged(st)
     | _ => false
   }
-  val witnessOlderDiscarded = match last.act {
+  val witnessOlderForwardArrived = match last.act {
     | Deliver(p) => p.req.dir == Fwd and older(last.prevClients.get(p.req.client), p.req) and
         match p.body { | Page(pg) => pg.events.length() > 0 | Snap(_) => true | _ => false }
     | _ => false
@@ -1247,7 +1252,7 @@ module sync {
     | Quiesce(q) => q.onlyHeads and converged(st)
     | _ => false
   }
-  val witnessPendingSubscribeReplaced = match last.act {
+  val witnessResubscribeWhilePending = match last.act {
     | Resubscribe(r) => r.replacedPending
     | _ => false
   }

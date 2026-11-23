@@ -18,10 +18,10 @@ module sync_traces {
   pure def seqs(k: Copy): List[int] = k.events.foldl([], (l, e) => l.append(e.seq))
   pure def due(s: State, c: int, x: int): bool = dueOf(s.clients.get(c), x)
   pure def epochOf(s: State, c: int): int = s.clients.get(c).epoch
-  pure def page(s: State, id: int): { events: List[Ev], headSeq: int, hasMore: bool, hasMoreBefore: bool } =
+  pure def page(s: State, id: int): { events: List[Ev], hasMore: bool, hasMoreBefore: bool } =
     match s.resps.get(id).body {
       | Page(pg) => pg
-      | _ => { events: [], headSeq: -1, hasMore: false, hasMoreBefore: false }
+      | _ => { events: [], hasMore: false, hasMoreBefore: false }
     }
 
   // Client 1 connected, its subscribe answered and the `heads` frame taken in.
@@ -351,7 +351,7 @@ module sync_traces {
       .then(appendA(HOST, Plain, 1))
       .then(headsRefreshA(1))
       .then(sendFrameA(1))
-      .expect(st.sockets.get(1).queue == [Heads(Map(HOST -> 2, THREAD -> 0))] and not(canSend(st.sockets.get(1))))
+      .expect(st.sockets.get(1).frame == InFlight(Heads(Map(HOST -> 2, THREAD -> 0))) and not(canSend(st.sockets.get(1))))
 
   /// mvp §2.4 "the client refetches on every reconnect": a commit while the socket was
   /// down produced no notification.
@@ -380,18 +380,18 @@ module sync_traces {
       .then(resubscribeA(2, STREAMS))
       .then(serverSubscribeA(2))
       .then(sendFrameA(2))
-      .expect(st.sockets.get(2).queue == [Heads(Map(HOST -> 1, THREAD -> 1))] and not(st.sockets.get(2).hasPending))
+      .expect(st.sockets.get(2).frame == InFlight(Heads(Map(HOST -> 1, THREAD -> 1))) and not(st.sockets.get(2).hasPending))
       .then(recvNoteA(2))
       .then(resubscribeA(2, Set()))
       .then(serverSubscribeA(2))
       .then(sendFrameA(2))
-      .expect(st.sockets.get(2).queue == [Heads(Map())] and st.clients.get(2).want == Set())
+      .expect(st.sockets.get(2).frame == InFlight(Heads(Map())) and st.clients.get(2).want == Set())
       .then(recvNoteA(2))
       .then(resubscribeA(2, Set(HOST)))
       .then(resubscribeA(2, Set(HOST)))
       .then(serverSubscribeA(2))
       .then(sendFrameA(2))
-      .expect(st.sockets.get(2).queue == [Heads(Map(HOST -> 1))])
+      .expect(st.sockets.get(2).frame == InFlight(Heads(Map(HOST -> 1))))
 
   /// `decide_replay` branches the protocol does not take: `limit` out of range (checked
   /// first), `after_seq` with `before_seq`, the default limit, `CursorAhead`, `after_seq`

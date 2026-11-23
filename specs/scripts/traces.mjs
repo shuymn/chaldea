@@ -10,13 +10,10 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { quint, specsDir } from "./quint.mjs";
+import { FAMILIES } from "./specs.mjs";
 
 // Each traces module and the directory of its committed traces (relative to specs/).
-const SPECS = [
-  { spec: "thread_input_traces.qnt", dir: "traces" },
-  { spec: "sync_traces.qnt", dir: "traces/sync" },
-  { spec: "receipts_traces.qnt", dir: "traces/receipts" },
-];
+const SPECS = FAMILIES.map(({ traces, dir }) => ({ spec: traces, dir }));
 
 const isTrace = (f) => f.endsWith(".itf.json");
 

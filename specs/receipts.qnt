@@ -32,6 +32,8 @@
  * commit is `CompletionFailed`), the shutdown drain, real time.
  */
 module receipts {
+  import common.* from "./common"
+
   // ---------------------------------------------------------------------------
   // Bounds
   // ---------------------------------------------------------------------------
@@ -82,7 +84,6 @@ module receipts {
     | WExpired
     | WCommitUnknown
     | WFailed
-    | WCompletionDone(Result)
     | WCompletionFailed
   // What the runner observed and published (`Progress`), with the store outcome.
   type Outcome =
@@ -199,7 +200,6 @@ module receipts {
     val at = s.attempts.get(a)
     if (at.grace or at.replied) s else { ...s, byGrace: s.byGrace.set(a, at.progress) }
 
-  pure def without(m: a -> b, k: a): a -> b = m.keys().exclude(Set(k)).mapBy(x => m.get(x))
 
   type Out = { st: State, calls: List[Call] }
 
@@ -283,7 +283,7 @@ module receipts {
             val s1 = { ...s, running: Idle }
             val s2 = if (w == UnknownRolledBack) s1 else commitCompletion(s1, cj.cmd, cj.result)
             val s3 = match w {
-              | Ok => setWriter(s2, cj.attempt, WCompletionDone(cj.result))
+              | Ok => setWriter(s2, cj.attempt, WCompleted(cj.result))
               | _ => setWriter({ ...s2, failed: true }, cj.attempt, WCompletionFailed)
             }
             { ok: true, o: { st: s3, calls: [] } }
@@ -359,7 +359,7 @@ module receipts {
     has(st, a),
     val at = st.attempts.get(a)
     all {
-      at.live, at.submitted, at.deadline, not(at.grace), not(at.replied),
+      at.live, at.submitted, at.deadline, not(at.replied),
       commit(Grace(a), start(answer(setAttempt(st, a, x => { ...x, grace: true }), a, replyOf(at.progress)))),
     },
   }
@@ -412,7 +412,6 @@ module receipts {
         | WExpired => seen(s1, a, Done(OExpired))
         | WCommitUnknown => seen(s1, a, Done(OCommitUnknown))
         | WFailed => seen(s1, a, Done(OFailed))
-        | WCompletionDone(r) => seen(s1, a, Done(OCompleted(r)))
         | WCompletionFailed => seen(s1, a, Done(OCompletionFailed))
         | NoReply => st
       }, a))),
@@ -433,8 +432,8 @@ module receipts {
     })),
   }
 
-  /// The request replies once its runner is done, or once the grace ended; a body not
-  /// read by the deadline is 408 with nothing submitted.
+  /// The request replies once its runner observed an outcome (the grace's end replies in
+  /// `grace`); a body not read by the deadline is 408 with nothing submitted.
   action replyTo(a: int): bool = all {
     has(st, a),
     val at = st.attempts.get(a)
@@ -487,14 +486,12 @@ module receipts {
 
   // The attempts a step can act on: live and not replied (0 when there is none).
   pure def activeOf(s: State): Set[int] =
-    val xs = s.attempts.keys().filter(a => s.attempts.get(a).live and not(s.attempts.get(a).replied))
-    if (xs.size() == 0) Set(0) else xs
+    orNone(s.attempts.keys().filter(a => s.attempts.get(a).live and not(s.attempts.get(a).replied)))
   // The runners with a writer reply to observe, replied or not (0 when there is none): a
   // runner outlives its request.
   pure def observableOf(s: State): Set[int] =
-    val xs = s.attempts.keys().filter(a => s.attempts.get(a).live and s.attempts.get(a).writer != NoReply)
-    if (xs.size() == 0) Set(0) else xs
-  pure def anyOf(s: State): Set[int] = if (s.attempts.keys().size() == 0) Set(0) else s.attempts.keys()
+    orNone(s.attempts.keys().filter(a => s.attempts.get(a).live and s.attempts.get(a).writer != NoReply))
+  pure def anyOf(s: State): Set[int] = orNone(s.attempts.keys())
 
   // Retries are frequent: a client keeps its `command_id`, token, and request. Time
   // (deadlines, graces) and restarts are rarer than work, so most attempts get a reply.
@@ -505,7 +502,7 @@ module receipts {
     nondet a = activeOf(st).oneOf()
     nondet r = anyOf(st).oneOf()
     nondet o = observableOf(st).oneOf()
-    nondet w = Set(Ok, Ok, UnknownCommitted, UnknownRolledBack).oneOf()
+    nondet w = Set(Ok, UnknownCommitted, UnknownRolledBack).oneOf()
     nondet ok = Bool.oneOf()
     nondet rc = Bool.oneOf()
     any {

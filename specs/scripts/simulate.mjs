@@ -3,6 +3,7 @@
 // reached across all seeds of its spec (the simulation stopped covering it).
 import { availableParallelism } from "node:os";
 import { quint } from "./quint.mjs";
+import { FAMILIES } from "./specs.mjs";
 
 const SEEDS = [1, 2, 3, 4];
 const MAX_SAMPLES = 1000;
@@ -53,10 +54,10 @@ const THREAD_INPUT_WITNESSES = [
   "witnessTwoCardsOpen",
 ];
 
-const SPECS = [
-  { spec: "thread_input.qnt", invariants: THREAD_INPUT_INVARIANTS, witnesses: THREAD_INPUT_WITNESSES },
-  {
-    spec: "sync.qnt",
+// The invariants and witnesses of each model.
+const CHECKS = {
+  "thread_input.qnt": { invariants: THREAD_INPUT_INVARIANTS, witnesses: THREAD_INPUT_WITNESSES },
+  "sync.qnt": {
     invariants: [
       "noGapNoDup",
       "heldEventsOnHost",
@@ -72,7 +73,7 @@ const SPECS = [
     witnesses: [
       "witnessEpochSwitch",
       "witnessConvergedAcrossEpochs",
-      "witnessOlderDiscarded",
+      "witnessOlderForwardArrived",
       "witnessBackwardApplied",
       "witnessBackwardEpochMismatch",
       "witnessTooManyEvents",
@@ -80,14 +81,13 @@ const SPECS = [
       "witnessEpochChanged",
       "witnessHasMore",
       "witnessOnlyHeadsRecover",
-      "witnessPendingSubscribeReplaced",
+      "witnessResubscribeWhilePending",
       "witnessResyncKept",
       "witnessVanishedStream",
       "witnessReadFailedRetried",
     ],
   },
-  {
-    spec: "receipts.qnt",
+  "receipts.qnt": {
     invariants: [
       "oneIntentPerCommand",
       "oneEffectPerCommand",
@@ -117,18 +117,22 @@ const SPECS = [
       "witnessCommitUnknownCommitted",
     ],
   },
-];
+};
+
+const SPECS = FAMILIES.map(({ model }) => {
+  if (!(model in CHECKS)) throw new Error(`no invariants or witnesses listed for ${model}`);
+  return { spec: model, ...CHECKS[model] };
+});
 
 // Every (spec, seed) pair is one Node process; at most one per available core runs at once.
 const started = Date.now();
-const runs = SPECS.flatMap((s) => SEEDS.map((seed) => ({ ...s, seed })));
-const results = new Array(runs.length);
+const runs = SPECS.flatMap((s) => SEEDS.map((seed) => ({ ...s, seed, result: null })));
 let next = 0;
 async function worker() {
   while (next < runs.length) {
-    const k = next++;
-    const { spec, seed, invariants, witnesses } = runs[k];
-    results[k] = await quint([
+    const run = runs[next++];
+    const { spec, seed, invariants, witnesses } = run;
+    run.result = await quint([
       "run", spec,
       "--seed", String(seed),
       "--max-samples", String(MAX_SAMPLES),
@@ -144,8 +148,7 @@ const seconds = ((Date.now() - started) / 1000).toFixed(1);
 
 let failed = false;
 const seen = new Map(SPECS.map((s) => [s.spec, Object.fromEntries(s.witnesses.map((w) => [w, 0]))]));
-results.forEach(({ status, out }, k) => {
-  const { spec, seed, invariants } = runs[k];
+runs.forEach(({ spec, seed, invariants, result: { status, out } }) => {
   if (status !== 0) {
     failed = true;
     console.log(out);

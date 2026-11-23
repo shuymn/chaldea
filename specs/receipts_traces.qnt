@@ -17,7 +17,7 @@ module receipts_traces {
 
   pure def ok(n: int): Result = { n: n, status: 200 }
   pure def replyAt(s: State, i: int): Reply = s.replies[i].reply
-  def lookupNow(l: Lookup): bool = last.calls.indices().exists(i => match last.calls[i] { | CheckReceipt(k) => k.lookup == l })
+  def lookupNow(expected: Lookup): bool = lookedUp(l => l == expected)
 
   /// One attempt from arrival to a reply observed from the writer's answer to its intent
   /// job (`a` is its attempt id).
