@@ -52,14 +52,24 @@ jobs:
 
       # A-W1 (docs/design/daemon-lifecycle.md §2.12): the detach tests need this runner's
       # processes to be in no job or in jobs a child can leave. The preflight runs before any
-      # detach test, and must have run and passed exactly once, so a renamed or compiled-out
-      # test fails the step instead of passing with zero tests. Its output (the recorded job
-      # state and the helper's report) is printed whether it passes or fails.
+      # detach test. Its test executable is run directly, as this shell starts it, and that
+      # run decides the step: it must have run and passed exactly once, so a renamed or
+      # compiled-out test fails the step instead of passing with zero tests. The same test is
+      # also run under `cargo test`, which may put the processes it starts in a job of its
+      # own, and only printed. Both outputs (the recorded job state and the helper's report)
+      # are printed whether they pass or fail.
       - name: Check that a detached child leaves the runner's job
         if: runner.os == 'Windows'
         run: |
+          test=host::windows::tests::runner_can_break_away
+          exe="$(cargo test -p chaldea-pty-runtime --lib --locked --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .target.name == "chaldea_pty_runtime") | .executable')"
+          [ -n "$exe" ] || { echo "the test executable was not found"; exit 1; }
+          echo "== under cargo test (printed only) =="
+          cargo test -p chaldea-pty-runtime --lib --locked -- "$test" --exact --nocapture 2>&1 || true
+          echo "== run directly: $exe =="
           status=0
-          out="$(cargo test -p chaldea-pty-runtime --lib --locked -- host::windows::tests::runner_can_break_away --exact --nocapture 2>&1)" || status=$?
+          out="$("$(cygpath -u "$exe")" "$test" --exact --nocapture 2>&1)" || status=$?
           printf '%s\n' "$out"
           [ "$status" -eq 0 ] && grep -q '^test result: ok\. 1 passed' <<<"$out"
 
