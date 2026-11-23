@@ -103,6 +103,8 @@ struct Stub {
     handled: Arc<AtomicUsize>,
     /// Accept passes that found the backlog empty.
     idle: Arc<AtomicUsize>,
+    /// Counts `settled`'s waits for an unhandled connection (a test gate).
+    settling: AtomicUsize,
     stop: Arc<AtomicBool>,
     held: Arc<Mutex<Vec<TcpStream>>>,
     accept: Option<JoinHandle<()>>,
@@ -159,10 +161,12 @@ impl Stub {
                                 serve(s, reply, at, walk, &reqs, &held);
                             });
                         }
-                        Err(_) => {
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             idle.fetch_add(1, Ordering::SeqCst);
                             std::thread::sleep(POLL);
                         }
+                        // The accept loop ends; `drain` then fails at its bound.
+                        Err(e) => panic!("accept: {e}"),
                     }
                 }
             })
@@ -173,6 +177,7 @@ impl Stub {
             accepted,
             handled,
             idle,
+            settling: AtomicUsize::new(0),
             stop,
             held,
             accept: Some(accept),
@@ -223,6 +228,7 @@ impl Stub {
         self.drain();
         let end = Instant::now() + WAIT;
         while self.handled.load(Ordering::SeqCst) < self.accepted.load(Ordering::SeqCst) {
+            self.settling.fetch_add(1, Ordering::SeqCst);
             assert!(
                 Instant::now() < end,
                 "connections not handled: {:?}",
@@ -343,29 +349,32 @@ fn stub_settles_after_every_connection_is_handled() {
     let mut first = TcpStream::connect(("127.0.0.1", stub.port)).unwrap();
     first.write_all(req).unwrap();
     stub.wait_reqs(1);
-    let second = TcpStream::connect(("127.0.0.1", stub.port)).unwrap();
-    // The second request is written after a delay, so `settled` is called while it is
-    // still being read.
-    let writer = std::thread::spawn(move || {
-        let mut second = second;
-        std::thread::sleep(Duration::from_millis(200));
-        second.write_all(req).unwrap();
-        second
-    });
+    let mut second = TcpStream::connect(("127.0.0.1", stub.port)).unwrap();
     let end = Instant::now() + WAIT;
     while stub.accepted.load(Ordering::SeqCst) < 2 {
         assert!(Instant::now() < end);
         std::thread::sleep(POLL);
     }
-    assert_eq!(stub.settled().len(), 2);
-    let _second = writer.join().unwrap();
+    // The gate: the second request is written only once `settled` has found that connection
+    // unhandled and waits, or has returned without waiting.
+    let n = std::thread::scope(|sc| {
+        let settled = sc.spawn(|| stub.settled().len());
+        let end = Instant::now() + WAIT;
+        while stub.settling.load(Ordering::SeqCst) < 1 && !settled.is_finished() {
+            assert!(Instant::now() < end, "settled did not start");
+            std::thread::sleep(POLL);
+        }
+        second.write_all(req).unwrap();
+        settled.join().unwrap()
+    });
+    assert_eq!(n, 2);
     // A connection closed without a request is handled too: `settled` does not wait out
     // its bound.
     drop(TcpStream::connect(("127.0.0.1", stub.port)).unwrap());
     let t = Instant::now();
     assert_eq!(stub.settled().len(), 2);
     assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
-    drop(first);
+    drop((first, second));
 }
 
 // ---- Running a child ----
@@ -912,14 +921,18 @@ impl Reports {
         let (ev, halt) = (events.clone(), stop.clone());
         let accept = std::thread::spawn(move || {
             while !halt.load(Ordering::SeqCst) {
-                let Ok((s, _)) = l.accept() else {
-                    std::thread::sleep(POLL);
-                    continue;
+                let s = match l.accept() {
+                    Ok((s, _)) => s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(POLL);
+                        continue;
+                    }
+                    Err(e) => panic!("report accept: {e}"),
                 };
                 let ev = ev.clone();
                 std::thread::spawn(move || {
-                    let _ = s.set_nonblocking(false);
-                    let _ = s.set_read_timeout(Some(WAIT));
+                    s.set_nonblocking(false).unwrap();
+                    s.set_read_timeout(Some(WAIT)).unwrap();
                     for line in BufReader::new(s).lines().map_while(Result::ok) {
                         ev.lock()
                             .unwrap()
