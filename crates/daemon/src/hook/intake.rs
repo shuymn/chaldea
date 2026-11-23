@@ -45,6 +45,18 @@ pub struct IntakeOrder {
     /// Run once between a waiter's check of `pending` and its await (tests only).
     #[cfg(test)]
     pub(crate) between_check_and_await: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Run once by `intake` before it takes the lock (tests only).
+    #[cfg(test)]
+    pub(crate) before_lock: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// Runs and clears a test hook.
+#[cfg(test)]
+fn run_once(slot: &Mutex<Option<Box<dyn FnOnce() + Send>>>) {
+    let f = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if let Some(f) = f {
+        f();
+    }
 }
 
 /// One taken ordinal; dropping it releases the ordinal for the binding order.
@@ -95,6 +107,8 @@ impl IntakeOrder {
         probe: &dyn IntakeProbe,
         now: impl FnOnce() -> Instant,
     ) -> (IntakeTicket, Option<IntakeFacts>, Instant) {
+        #[cfg(test)]
+        run_once(&self.before_lock);
         let mut map = self.launches.lock().unwrap_or_else(PoisonError::into_inner);
         let e = map.entry(l).or_insert_with(|| LaunchIntake {
             next: stored_max.saturating_add(1),
@@ -142,16 +156,7 @@ impl IntakeOrder {
                 return;
             }
             #[cfg(test)]
-            {
-                let f = self
-                    .between_check_and_await
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take();
-                if let Some(f) = f {
-                    f();
-                }
-            }
+            run_once(&self.between_check_and_await);
             notified.await;
         }
     }

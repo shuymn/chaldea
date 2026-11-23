@@ -222,8 +222,6 @@ impl HookIngest {
             return Ok(reply(&d.first_reply));
         }
         // 5. Intake: the ordinal, the facts, and the pid wait's origin together.
-        #[cfg(test)]
-        self.points.before_intake().await;
         let (ticket, facts, intake_at) = self.order.intake(
             pre.launch.launch_id,
             pre.stored_max,
@@ -239,6 +237,8 @@ impl HookIngest {
             Some(pid) => {
                 let procs = self.seams.procs.clone();
                 let max = self.cfg.max_chain;
+                #[cfg(test)]
+                self.points.walk_submitted();
                 let walk = tokio::task::spawn_blocking(move || procs.chain(pid, max));
                 match until_deadline(&shared, deadline, || walk).await? {
                     Ok(a) => Chain::from_ancestry(a),

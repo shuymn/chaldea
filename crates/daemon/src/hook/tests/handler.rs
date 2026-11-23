@@ -159,18 +159,18 @@ async fn pid_wait_timings() {
     h.assert_raw(&l, x.emit, R::Unbound);
     h.stop().await;
 
-    // The pid wait starts at intake, with the ordinal and the facts: time spent before
-    // intake (here 1.2 s of server clock, past a 1 s wait counted from before intake) does
-    // not shorten it, so a start committed right after intake binds.
+    // The pid wait starts at intake, sampled under the intake lock with the ordinal and the
+    // facts: time spent before the lock (here 1.2 s of server clock, past a 1 s wait counted
+    // from any earlier sample) does not shorten it, so a start committed right after intake
+    // binds.
     let h = HookServer::start().await;
     let l = unstarted(&h).await;
-    let (before_intake, go) = h.ingest.points.arm_before_intake();
+    let clock = h.srv.clock.clone();
+    *h.ingest.order.before_lock.lock().unwrap() =
+        Some(Box::new(move || clock.skew(Duration::from_millis(1200))));
     let (after_intake, go_on) = h.ingest.points.arm_intake(1);
     let x = Hook::of(&l, "SessionStart", "s");
     let reply = h.spawn_post(&x);
-    reached(before_intake).await;
-    h.srv.clock.skew(Duration::from_millis(1200));
-    go.send(()).unwrap();
     reached(after_intake).await;
     start_now(&h, &l).await;
     go_on.send(()).unwrap();
@@ -485,10 +485,7 @@ async fn handler_rejections() {
         timeout
     );
     h.srv.clock.skew(Duration::ZERO);
-    assert!(
-        h.chains.walked.lock().unwrap().is_empty(),
-        "the handler ran"
-    );
+    assert_eq!(h.ingest.points.walks(), 0, "the handler ran");
     assert_eq!(h.snapshot(&l), before);
     h.stop().await;
 
@@ -552,12 +549,7 @@ async fn handler_rejections() {
     open.send(()).unwrap();
     assert_eq!(outcome(&reply.await.unwrap()), timeout);
     h.srv.clock.skew(Duration::ZERO);
-    // A walk spawned anyway would record itself on its blocking thread within this window.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        h.chains.walked.lock().unwrap().is_empty(),
-        "walked after the deadline"
-    );
+    assert_eq!(h.ingest.points.walks(), 0, "walked after the deadline");
     assert_eq!(h.snapshot(&l), before);
     h.stop().await;
 
