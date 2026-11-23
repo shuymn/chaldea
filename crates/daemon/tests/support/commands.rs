@@ -201,6 +201,12 @@ fn parse<T: Serialize + for<'de> Deserialize<'de>>(
 
 struct Counter(Arc<Probe>);
 
+/// `test_counter` alone, with a probe of its own, for tests that only call `prepare`.
+#[must_use]
+pub fn counter() -> Box<dyn CommandHandler> {
+    Box::new(Counter(Arc::default()))
+}
+
 impl CommandHandler for Counter {
     fn name(&self) -> &'static str {
         "test_counter"

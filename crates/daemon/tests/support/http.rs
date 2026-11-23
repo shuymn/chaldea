@@ -547,6 +547,39 @@ pub async fn eventually(within: Duration, what: &str, mut cond: impl FnMut() -> 
     }
 }
 
+/// Sends `req` on its own task; the reply is the task's output.
+pub fn spawn_send(srv: &TestServer, req: &Req) -> tokio::task::JoinHandle<Reply> {
+    let (port, bytes) = (srv.port, req.bytes());
+    tokio::spawn(async move { send(port, &bytes).await })
+}
+
+/// Waits (at most 10 s) for a message on a gate's `reached` receiver.
+pub async fn reached(rx: tokio::sync::oneshot::Receiver<()>) {
+    tokio::time::timeout(Duration::from_secs(10), rx)
+        .await
+        .expect("the gate was reached within 10 s")
+        .unwrap();
+}
+
+/// Waits (at most 10 s) for a message on a gate's `reached` receiver from a writer thread.
+pub async fn reached_sync(rx: std::sync::mpsc::Receiver<()>) {
+    tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .expect("the gate was reached within 10 s");
+}
+
+/// Events on the host stream carrying `id`.
+#[must_use]
+pub fn host_events_of(srv: &TestServer, id: CommandId) -> usize {
+    srv.store
+        .read(|tx| tx.events_after(StreamId::Host, 0, 1000))
+        .events
+        .iter()
+        .filter(|e| e.command_id == Some(id))
+        .count()
+}
+
 /// The head of `stream` in `heads`.
 #[must_use]
 pub fn head_of(heads: &[StreamHeadEntry], stream: StreamId) -> Option<u64> {

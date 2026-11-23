@@ -9,17 +9,18 @@ use std::time::{Duration, Instant};
 use axum::http::StatusCode;
 use chaldea_core::auth::TokenKind;
 use chaldea_core::command::{ReceiptStatus, request_identity};
-use chaldea_core::ids::{CommandId, StreamId};
+use chaldea_core::ids::CommandId;
 use proptest::prelude::*;
 use serde_json::value::RawValue;
 
 use super::eventually;
 use super::shared;
-use super::support::commands::{CounterArgs, Probe, slow_body};
+use super::support::commands::{CounterArgs, Probe, counter, slow_body};
 use super::support::http::{
-    Reply, Req, TestServer, connect, parse, read_to_end, send, settled, write,
+    TestServer, connect, host_events_of, parse, reached, reached_sync, read_to_end, settled,
+    spawn_send, write,
 };
-use super::support::{TestStore, soon};
+use super::support::soon;
 use crate::http::auth::sha256;
 use crate::http::commands::{Admitted, prepare_args, run};
 use crate::http::{ApiError, CommandRegistry, MonotonicClock, Shared, StoreFatal};
@@ -34,30 +35,11 @@ fn code(s: &str) -> Option<String> {
     Some(s.to_owned())
 }
 
-fn spawn_send(srv: &TestServer, req: &Req) -> tokio::task::JoinHandle<Reply> {
-    let (port, bytes) = (srv.port, req.bytes());
-    tokio::spawn(async move { send(port, &bytes).await })
-}
-
 async fn joined<T>(h: tokio::task::JoinHandle<T>) -> T {
     tokio::time::timeout(Duration::from_secs(20), h)
         .await
         .expect("done within 20 s")
         .unwrap()
-}
-
-async fn reached(rx: tokio::sync::oneshot::Receiver<()>) {
-    tokio::time::timeout(Duration::from_secs(10), rx)
-        .await
-        .expect("the gate was reached within 10 s")
-        .unwrap();
-}
-
-async fn reached_sync(rx: std::sync::mpsc::Receiver<()>) {
-    tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(10)))
-        .await
-        .unwrap()
-        .expect("the hold was reached within 10 s");
 }
 
 /// A command for `commands::run`, prepared as the dispatcher prepares it.
@@ -94,15 +76,6 @@ async fn fill_queue(
     }
     assert_eq!(queued.len(), 256);
     (writer, queued)
-}
-
-fn host_events_of(srv: &TestServer, id: CommandId) -> usize {
-    srv.store
-        .read(|tx| tx.events_after(StreamId::Host, 0, 1000))
-        .events
-        .iter()
-        .filter(|e| e.command_id == Some(id))
-        .count()
 }
 
 /// 32 concurrent requests with one `command_id` reach the writer as 32 jobs (all queued
@@ -997,18 +970,10 @@ fn receipt_replies() {
 
 // ---- request identity (PR7-CL-23) -----------------------------------------------------------
 
-/// The identity of `args` under `name`, as the dispatcher computes it.
-fn identity(r: &CommandRegistry, name: &str, args: &str) -> Result<[u8; 32], ApiError> {
-    let handler = r.handler(name).expect("a test handler");
+/// The identity of `args` under `test_counter`, as the dispatcher computes it.
+fn identity(args: &str) -> Result<[u8; 32], ApiError> {
     let raw: Box<RawValue> = serde_json::from_str(args).unwrap();
-    prepare_args(handler.as_ref(), name, &raw).map(|(_, id)| id)
-}
-
-/// The test registry, for the identity tests (no server).
-fn identity_registry() -> (TestStore, CommandRegistry) {
-    let store = TestStore::new();
-    let commands = super::support::commands::registry(store.store(), &Arc::new(Probe::default()));
-    (store, commands)
+    prepare_args(counter().as_ref(), "test_counter", &raw).map(|(_, id)| id)
 }
 
 /// A JSON spelling of `v` with each object's members in an order picked by `seed`, optional
@@ -1094,13 +1059,12 @@ proptest! {
     /// order (at every level, a map field included), whitespace, or float spelling.
     #[test]
     fn identity_is_canonical(args in counter_args(), seed_a in any::<u64>(), seed_b in any::<u64>()) {
-        let (_store, r) = identity_registry();
         let value = serde_json::to_value(&args).unwrap();
         let (mut a, mut b) = (String::new(), String::new());
         spell(&value, &mut seed_a.clone(), &mut a);
         spell(&value, &mut seed_b.clone(), &mut b);
-        let ia = identity(&r, "test_counter", &a).unwrap();
-        let ib = identity(&r, "test_counter", &b).unwrap();
+        let ia = identity(&a).unwrap();
+        let ib = identity(&b).unwrap();
         prop_assert_eq!(ia, ib, "{} vs {}", a, b);
     }
 }
@@ -1109,10 +1073,9 @@ proptest! {
 /// `serde_json` round differently without its `float_roundtrip` feature.
 #[test]
 fn decimal_respelling_keeps_identity() {
-    let (_store, r) = identity_registry();
     assert_eq!(
-        identity(&r, "test_counter", r#"{"n":1,"ratio":10000000000000001}"#).unwrap(),
-        identity(&r, "test_counter", r#"{"n":1,"ratio":10000000000000001.0}"#).unwrap()
+        identity(r#"{"n":1,"ratio":10000000000000001}"#).unwrap(),
+        identity(r#"{"n":1,"ratio":10000000000000001.0}"#).unwrap()
     );
 }
 
@@ -1120,9 +1083,8 @@ fn decimal_respelling_keeps_identity() {
 /// is another identity; `1.0` for an integer field is refused.
 #[test]
 fn identity_covers_name_and_values() {
-    let (_store, r) = identity_registry();
     let base = r#"{"n":1,"label":"a","ratio":0.5,"tags":["x"],"env":{"k":"v"},"layers":[{"a":1}]}"#;
-    let id = identity(&r, "test_counter", base).unwrap();
+    let id = identity(base).unwrap();
     for other in [
         r#"{"n":2,"label":"a","ratio":0.5,"tags":["x"],"env":{"k":"v"},"layers":[{"a":1}]}"#,
         r#"{"n":1,"label":"b","ratio":0.5,"tags":["x"],"env":{"k":"v"},"layers":[{"a":1}]}"#,
@@ -1132,17 +1094,13 @@ fn identity_covers_name_and_values() {
         r#"{"n":1,"label":"a","ratio":0.5,"tags":["x"],"env":{"K":"v"},"layers":[{"a":1}]}"#,
         r#"{"n":1,"label":"a","ratio":0.5,"tags":["x"],"env":{"k":"v"},"layers":[{"a":2}]}"#,
     ] {
-        assert_ne!(identity(&r, "test_counter", other).unwrap(), id, "{other}");
+        assert_ne!(identity(other).unwrap(), id, "{other}");
     }
     // The same normalized arguments under another name.
-    let handler = r.handler("test_counter").unwrap();
     let raw: Box<RawValue> = serde_json::from_str(base).unwrap();
-    let normalized = handler.prepare(&raw).unwrap().normalized;
+    let normalized = counter().prepare(&raw).unwrap().normalized;
     assert_eq!(request_identity("test_counter", &normalized), id);
     assert_ne!(request_identity("test_completed", &normalized), id);
     // Number spellings: an integer field refuses `1.0`.
-    assert_eq!(
-        identity(&r, "test_counter", r#"{"n":1.0}"#),
-        Err(ApiError::bad_args())
-    );
+    assert_eq!(identity(r#"{"n":1.0}"#), Err(ApiError::bad_args()));
 }

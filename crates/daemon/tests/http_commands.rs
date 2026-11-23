@@ -15,7 +15,9 @@ use chaldea_core::payload::{WorktreeChanged, WorktreeState};
 use chaldea_daemon::http::Mounts;
 use chaldea_daemon::store::TokenSelector;
 use support::commands::{completed_body, slow_body};
-use support::http::{Reply, TestServer, eventually, send, settled};
+use support::http::{
+    Reply, TestServer, eventually, host_events_of, reached, reached_sync, settled, spawn_send,
+};
 use support::{event, registered_under, reserved, soon, started};
 
 fn cid(n: u128) -> CommandId {
@@ -26,42 +28,11 @@ fn code(s: &str) -> Option<String> {
     Some(s.to_owned())
 }
 
-/// Events on the host stream carrying `id`.
-fn events_of(srv: &TestServer, id: CommandId) -> usize {
-    srv.store
-        .read(|tx| tx.events_after(StreamId::Host, 0, 1000))
-        .events
-        .iter()
-        .filter(|e| e.command_id == Some(id))
-        .count()
-}
-
-/// Sends `req` on its own task; the reply is the task's output.
-fn spawn_send(srv: &TestServer, req: &support::http::Req) -> tokio::task::JoinHandle<Reply> {
-    let (port, bytes) = (srv.port, req.bytes());
-    tokio::spawn(async move { send(port, &bytes).await })
-}
-
 async fn joined(h: tokio::task::JoinHandle<Reply>) -> Reply {
     tokio::time::timeout(Duration::from_secs(20), h)
         .await
         .expect("the reply within 20 s")
         .unwrap()
-}
-
-/// Waits (at most 10 s) for a message on a gate's `reached` receiver from a writer thread.
-async fn reached_sync(rx: std::sync::mpsc::Receiver<()>) {
-    tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(10)))
-        .await
-        .unwrap()
-        .expect("the gate was reached within 10 s");
-}
-
-async fn reached(rx: tokio::sync::oneshot::Receiver<()>) {
-    tokio::time::timeout(Duration::from_secs(10), rx)
-        .await
-        .expect("the gate was reached within 10 s")
-        .unwrap();
 }
 
 fn completed(r: &Reply) -> CommandResult {
@@ -103,7 +74,7 @@ async fn replay_is_byte_equal() {
         .await;
     assert_eq!((again.status, &again.body), (first.status, &first.body));
     assert_eq!(probe.intents(), 1);
-    assert_eq!(events_of(&srv, cid(2)), 1);
+    assert_eq!(host_events_of(&srv, cid(2)), 1);
 
     // A stored non-2xx result replays the same way.
     let refusal = srv.command(
@@ -491,7 +462,7 @@ async fn revoked_between_guard_and_job() {
     assert_eq!(settled(revoke).await.unwrap(), 1);
     assert_eq!(joined(r).await.outcome(), (401, code("unauthorized")));
     assert_eq!(srv.receipt(cid(1)), None);
-    assert_eq!((probe.intents(), events_of(&srv, cid(1))), (0, 0));
+    assert_eq!((probe.intents(), host_events_of(&srv, cid(1))), (0, 0));
     srv.stop().await;
 }
 
@@ -549,7 +520,7 @@ async fn object_denials() {
         let r = srv.send(&srv.command(name, &agent, id, args)).await;
         assert_eq!(&r.outcome(), want, "{name} {args}");
         assert_eq!(srv.receipt(id), None, "{name} {args}");
-        assert_eq!(events_of(&srv, id), 0);
+        assert_eq!(host_events_of(&srv, id), 0);
     }
     assert_eq!(probe.intents(), 0);
     // Positive controls: a direct child, and the agent's own worktree.
