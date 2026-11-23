@@ -302,13 +302,16 @@ impl TestServer {
         c
     }
 
-    /// Opens `GET /api/ws` with `ticket`; the handshake's error otherwise.
+    /// Opens `GET /api/ws` with `ticket`; the handshake's error otherwise. The handshake
+    /// ends within [`WS_WAIT`] or the test fails.
     pub async fn ws_with(
         &self,
         ticket: &str,
     ) -> Result<WsClient, tokio_tungstenite::tungstenite::Error> {
         let url = format!("ws://127.0.0.1:{}/api/ws?ticket={ticket}", self.port);
-        let (ws, resp) = tokio_tungstenite::connect_async(url).await?;
+        let (ws, resp) = tokio::time::timeout(WS_WAIT, tokio_tungstenite::connect_async(url))
+            .await
+            .expect("the WebSocket handshake ends within the wait")?;
         assert_eq!(resp.status(), 101);
         Ok(WsClient { ws, closed: None })
     }
