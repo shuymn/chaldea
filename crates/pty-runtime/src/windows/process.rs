@@ -81,11 +81,13 @@ impl<O: WinOs> Table for Snapshot<O> {
         let Ok(start) = self.os.creation_time(&h) else {
             return Lookup::Unreadable;
         };
-        // Created after the snapshot: the pid's snapshot process exited and a later one took
-        // the pid before the open, so the row and the handle are two processes. The walk
-        // fails closed here. Both are system-time stamps, so a clock step can refuse a live
-        // process or let a reuse through, as for the walk's start-time check (§2.5); a reuse
-        // within the clock's resolution of the snapshot is not seen.
+        // An ambiguity check. A handle created after the time sampled before the snapshot
+        // may belong to a later process that took the pid after the row's process exited, so
+        // the row and the handle may be two processes; the walk fails closed. It also refuses
+        // a process created between that sample and the snapshot, whose row is its own. Both
+        // are system-time stamps, so a clock step can refuse a live process or let a reuse
+        // through, as for the walk's start-time check (§2.5); a reuse within the clock's
+        // resolution of the sample is not seen.
         if start > self.taken {
             return Lookup::Unreadable;
         }
