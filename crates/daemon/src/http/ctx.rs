@@ -52,7 +52,8 @@ pub(crate) async fn read_until<R: Send + 'static>(
 }
 
 /// [`read_until`]; with `strict`, reader-pool exhaustion taken at or after `deadline` is 408
-/// too, like every other result.
+/// too, like every other result. A ready result is classified by the one clock sample taken
+/// when the wait returned it.
 async fn read_cut<R: Send + 'static>(
     shared: &Arc<Shared>,
     deadline: Instant,
@@ -69,8 +70,12 @@ async fn read_cut<R: Send + 'static>(
         .await;
     match timeout_at(cutoff, handle).await {
         Err(_) => Err(ApiError::request_timeout()),
-        Ok(_) if strict && shared.passed(deadline) => Err(ApiError::request_timeout()),
-        Ok(joined) => take_read(shared, deadline, joined),
+        Ok(joined) => {
+            let late = shared.passed(deadline);
+            #[cfg(test)]
+            shared.faults.after_cutoff_sample().await;
+            classify(late, strict, joined)
+        }
     }
 }
 
@@ -104,9 +109,16 @@ pub(crate) fn take_read<R>(
     deadline: Instant,
     joined: Joined<R>,
 ) -> Result<R, ApiError> {
+    classify(shared.passed(deadline), false, joined)
+}
+
+/// A read's result against one clock sample: `late` (taken at or after the deadline) is
+/// 408, a failed join included, except reader-pool exhaustion unless `strict` (its wait ends
+/// at the cutoff itself: 503 `busy`); otherwise the store outcome maps through §2.9.
+fn classify<R>(late: bool, strict: bool, joined: Joined<R>) -> Result<R, ApiError> {
     match joined {
-        Ok(Err(ReadError::Busy)) => Err(ApiError::busy()),
-        _ if shared.passed(deadline) => Err(ApiError::request_timeout()),
+        Ok(Err(ReadError::Busy)) if !strict => Err(ApiError::busy()),
+        _ if late => Err(ApiError::request_timeout()),
         Err(_) => Err(ApiError::internal()),
         Ok(Err(e)) => Err(read_error(&e)),
         Ok(Ok(v)) => Ok(v),

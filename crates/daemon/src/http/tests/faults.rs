@@ -32,6 +32,9 @@ pub(crate) struct Points {
     /// Held once by a read's or a write reply's waiter before it first polls its result
     /// against the cutoff.
     pub(crate) cutoff_gate: Mutex<Option<Gate>>,
+    /// Held once by a read's waiter between its cutoff sample and the classification of its
+    /// result.
+    pub(crate) sample_gate: Mutex<Option<Gate>>,
     /// Told the first time the next registered socket task parks.
     pub(crate) first_park: Mutex<Option<oneshot::Sender<()>>>,
     /// The upgrade steps recorded, in order.
@@ -216,6 +219,15 @@ impl Points {
             );
             tokio::task::yield_now().await;
         }
+    }
+
+    /// Arms the sample gate, as [`Points::arm_removal_gate`].
+    pub(crate) fn arm_sample_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        arm(&self.sample_gate)
+    }
+
+    pub(crate) async fn after_cutoff_sample(&self) {
+        pass(&self.sample_gate).await;
     }
 
     /// Arms the socket send gate, as [`Points::arm_removal_gate`].

@@ -277,3 +277,30 @@ async fn read_by_cutoff_precedes_the_outcome() {
     drop(ctx);
     srv.stop().await;
 }
+
+/// `WriteCtx::read_by` classifies a ready result by the clock sample taken when its wait
+/// returned it: a result taken before `by` wins even when the waiter resumes past `by`.
+#[tokio::test]
+async fn read_by_classifies_with_one_sample() {
+    let srv = TestServer::start(Mounts::mvp()).await;
+    let s = shared(&srv);
+    let ctx =
+        crate::http::WriteCtx::new(None, srv.clock.now() + Duration::from_secs(10), s.clone());
+    let (reached, release) = s.faults.arm_sample_gate();
+    let by = srv.clock.now() + Duration::from_secs(5);
+    let clock = srv.clock.clone();
+    let skew = async move {
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .expect("the waiter took its sample")
+            .unwrap();
+        clock.skew(Duration::from_secs(10));
+        drop(release);
+    };
+    let (r, ()) = tokio::join!(ctx.read_by(by, |_| Ok(7)), skew);
+    assert!(srv.clock.now() > by, "the waiter resumed past `by`");
+    assert_eq!(r, Ok(7));
+    srv.clock.skew(Duration::ZERO);
+    drop(ctx);
+    srv.stop().await;
+}
