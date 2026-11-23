@@ -24,8 +24,7 @@
     reason = "this test reads the committed trace files; core itself stays Sans-IO"
 )]
 
-use std::fs;
-use std::path::{Path, PathBuf};
+mod itf;
 
 use chaldea_core::command::{
     CommandReceipt, CommandResult, ReceiptLookup, ReceiptStatus, check_receipt,
@@ -35,39 +34,8 @@ use chaldea_core::sync::{
     EventsQuery, QueryError, REPLAY_MAX_BYTES, REPLAY_MAX_EVENTS, ReplayPlan, SnapshotReason,
     StreamHead, decide_replay,
 };
+use itf::{int, list, tag, uint};
 use serde_json::Value;
-
-fn traces_dir(sub: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../specs/traces")
-        .join(sub)
-}
-
-// ITF encoding (https://apalache-mc.org/docs/adr/015adr-trace.html): integers as
-// `{"#bigint": "<n>"}`, sum type values as `{"tag": .., "value": ..}`, records as objects,
-// lists as arrays.
-
-fn int(v: &Value) -> i64 {
-    let s = v["#bigint"]
-        .as_str()
-        .unwrap_or_else(|| panic!("not an ITF integer: {v}"));
-    s.parse().unwrap_or_else(|e| panic!("bad integer {s}: {e}"))
-}
-
-fn uint(v: &Value) -> u64 {
-    u64::try_from(int(v)).unwrap_or_else(|_| panic!("negative integer: {v}"))
-}
-
-fn list(v: &Value) -> &[Value] {
-    v.as_array().unwrap_or_else(|| panic!("not a list: {v}"))
-}
-
-fn tag(v: &Value) -> (&str, &Value) {
-    let t = v["tag"]
-        .as_str()
-        .unwrap_or_else(|| panic!("not a variant: {v}"));
-    (t, &v["value"])
-}
 
 /// The model writes -1 for an omitted query parameter.
 fn opt(v: &Value) -> Option<u64> {
@@ -79,48 +47,18 @@ fn epoch(n: u64) -> Epoch {
     Epoch(format!("epoch-{n}"))
 }
 
-fn read_traces(sub: &str) -> Vec<(String, Value)> {
-    let mut files: Vec<PathBuf> = fs::read_dir(traces_dir(sub))
-        .unwrap_or_else(|e| panic!("specs/traces/{sub}: {e}"))
-        .map(|e| e.expect("directory entry").path())
-        .filter(|p| p.to_str().is_some_and(|s| s.ends_with(".itf.json")))
-        .collect();
-    files.sort();
-    assert!(!files.is_empty(), "no trace under specs/traces/{sub}");
-    files
-        .iter()
-        .map(|path| {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .expect("UTF-8 file name")
-                .to_owned();
-            let text = fs::read_to_string(path).expect("read trace");
-            let itf = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
-            (name, itf)
-        })
-        .collect()
-}
-
-/// Every call of every step, with where it was made.
-fn calls(name: &str, itf: &Value) -> Vec<(String, Value)> {
+/// Every call of every step, in order, with where it was made.
+fn calls<'a>(name: &'a str, itf: &'a Value) -> impl Iterator<Item = (String, &'a Value)> + 'a {
     list(&itf["states"])
         .iter()
         .enumerate()
-        .flat_map(|(k, s)| {
+        .flat_map(move |(k, s)| {
             let last = &s["last"];
             list(&last["calls"])
                 .iter()
                 .enumerate()
-                .map(|(j, c)| {
-                    (
-                        format!("{name} state {k} call {j} ({})", last["act"]),
-                        c.clone(),
-                    )
-                })
-                .collect::<Vec<_>>()
+                .map(move |(j, c)| (format!("{name} state {k} call {j} ({})", last["act"]), c))
         })
-        .collect()
 }
 
 // ---- decide_replay ----------------------------------------------------------------------------
@@ -133,59 +71,49 @@ const CONTRACT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const SEQ_SCALE: u64 = 5_000;
 const BYTE_SCALE: u64 = 2 * 1024 * 1024;
 
-struct Scale {
-    seq: u64,
-    bytes: u64,
+/// Checks that the trace's model bounds times the fixed scales are the contract's.
+fn check_bounds(name: &str, itf: &Value) {
+    let (init, v) = tag(&list(&itf["states"])[0]["last"]["act"]);
+    assert_eq!(init, "Init", "{name}: the first state is not Init");
+    assert_eq!(
+        uint(&v["replayMaxEvents"]) * SEQ_SCALE,
+        CONTRACT_MAX_EVENTS,
+        "{name}: the model's event bound does not scale to the contract's"
+    );
+    assert_eq!(
+        uint(&v["replayMaxBytes"]) * BYTE_SCALE,
+        CONTRACT_MAX_BYTES,
+        "{name}: the model's byte bound does not scale to the contract's"
+    );
 }
 
-impl Scale {
-    fn of(name: &str, itf: &Value) -> Scale {
-        let (init, v) = tag(&list(&itf["states"])[0]["last"]["act"]);
-        assert_eq!(init, "Init", "{name}: the first state is not Init");
-        assert_eq!(
-            uint(&v["replayMaxEvents"]) * SEQ_SCALE,
-            CONTRACT_MAX_EVENTS,
-            "{name}: the model's event bound does not scale to the contract's"
-        );
-        assert_eq!(
-            uint(&v["replayMaxBytes"]) * BYTE_SCALE,
-            CONTRACT_MAX_BYTES,
-            "{name}: the model's byte bound does not scale to the contract's"
-        );
-        Scale {
-            seq: SEQ_SCALE,
-            bytes: BYTE_SCALE,
-        }
-    }
-}
-
-fn query(v: &Value, scale: &Scale) -> EventsQuery {
+fn query(v: &Value) -> EventsQuery {
     EventsQuery {
         stream_id: StreamId::Thread(ThreadId::from_u128(1)),
-        after_seq: opt(&v["after"]).map(|n| n * scale.seq),
-        before_seq: opt(&v["before"]).map(|n| n * scale.seq),
+        after_seq: opt(&v["after"]).map(|n| n * SEQ_SCALE),
+        before_seq: opt(&v["before"]).map(|n| n * SEQ_SCALE),
         limit: opt(&v["limit"]).map(|n| u32::try_from(n).expect("limit fits u32")),
         epoch: Some(uint(&v["epoch"])).filter(|&e| e != 0).map(epoch),
     }
 }
 
-fn head(v: &Value, scale: &Scale) -> StreamHead {
+fn head(v: &Value) -> StreamHead {
     StreamHead {
-        head_seq: uint(&v["headSeq"]) * scale.seq,
-        cum_bytes_at_head: uint(&v["cumHead"]) * scale.bytes,
-        cum_bytes_at_after: uint(&v["cumAfter"]) * scale.bytes,
+        head_seq: uint(&v["headSeq"]) * SEQ_SCALE,
+        cum_bytes_at_head: uint(&v["cumHead"]) * BYTE_SCALE,
+        cum_bytes_at_after: uint(&v["cumAfter"]) * BYTE_SCALE,
     }
 }
 
-fn plan(v: &Value, scale: &Scale) -> Result<ReplayPlan, QueryError> {
+fn plan(v: &Value) -> Result<ReplayPlan, QueryError> {
     let limit = |p: &Value| u32::try_from(uint(&p["limit"])).expect("limit fits u32");
     match tag(v) {
         ("PForward", p) => Ok(ReplayPlan::Forward {
-            after_seq: uint(&p["after"]) * scale.seq,
+            after_seq: uint(&p["after"]) * SEQ_SCALE,
             limit: limit(p),
         }),
         ("PBackward", p) => Ok(ReplayPlan::Backward {
-            before_seq: uint(&p["before"]) * scale.seq,
+            before_seq: uint(&p["before"]) * SEQ_SCALE,
             limit: limit(p),
         }),
         ("PSnapshot", r) => Ok(ReplayPlan::Snapshot {
@@ -211,16 +139,16 @@ fn sync_traces_replay_against_decide_replay() {
     assert_eq!(REPLAY_MAX_EVENTS, CONTRACT_MAX_EVENTS);
     assert_eq!(REPLAY_MAX_BYTES, CONTRACT_MAX_BYTES);
     let mut checked = 0;
-    for (name, itf) in read_traces("sync") {
-        let scale = Scale::of(&name, &itf);
+    for (name, itf) in itf::read_traces("sync") {
+        check_bounds(&name, &itf);
         for (at, call) in calls(&name, &itf) {
-            let (kind, c) = tag(&call);
+            let (kind, c) = tag(call);
             assert_eq!(kind, "DecideReplay", "{at}: unknown call");
-            let q = query(&c["q"], &scale);
-            let h = head(&c["head"], &scale);
+            let q = query(&c["q"]);
+            let h = head(&c["head"]);
             assert_eq!(
                 decide_replay(&q, h, &epoch(uint(&c["epoch"]))),
-                plan(&c["plan"], &scale),
+                plan(&c["plan"]),
                 "{at}: decide_replay({q:?}, {h:?})"
             );
             checked += 1;
@@ -279,9 +207,9 @@ fn lookup(v: &Value) -> ReceiptLookup {
 #[test]
 fn receipts_traces_replay_against_check_receipt() {
     let mut checked = 0;
-    for (name, itf) in read_traces("receipts") {
+    for (name, itf) in itf::read_traces("receipts") {
         for (at, call) in calls(&name, &itf) {
-            let (kind, c) = tag(&call);
+            let (kind, c) = tag(call);
             assert_eq!(kind, "CheckReceipt", "{at}: unknown call");
             let existing = receipt(&c["existing"]);
             assert_eq!(

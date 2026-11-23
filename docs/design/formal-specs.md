@@ -14,7 +14,7 @@ Status: Q-A (issue #13, target 2) and Q-B, the Sync Seam (target 1), implemented
 | `specs/traces/*.itf.json`, `traces/sync/`, `traces/receipts/` | those traces, exported as ITF and normalized |
 | `specs/scripts/{quint,specs,simulate,traces}.mjs` | the Quint runner, the ordered list of spec families, the seeded simulation, the trace export and freshness check |
 | `specs/package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml` | Quint, exact-pinned; dependency build scripts denied |
-| `crates/core/tests/quint_traces.rs`, `quint_sync_traces.rs` | the replay tests (Q-A; Q-B) |
+| `crates/core/tests/quint_traces.rs`, `quint_sync_traces.rs` | the replay tests (Q-A; Q-B), with their shared trace loader and ITF decoders in `tests/itf/` |
 
 ## 1. What Q-A Models
 
