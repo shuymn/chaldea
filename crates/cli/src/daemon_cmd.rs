@@ -952,14 +952,23 @@ fn follow_up(until: Instant, mut observe: impl FnMut() -> Seen) -> Option<String
 }
 
 /// The channel closed without a verdict: what can be observed for at most 2 s, never at or
-/// past the deadline (Windows: the child's exit, waited on; macOS: the lock, polled).
+/// past the deadline (Windows: the child's exit, waited on; macOS: the lock, polled). The
+/// closed channel alone says nothing of the daemon's state, so only an observation names one.
 fn eof_follow_up(launched: &mut Launched, dir: &Path, deadline: Instant) -> ExitCode {
     let until = deadline.min(Instant::now() + EOF_FOLLOW_UP);
     let log = dir.join(names::LOG);
     let observed = match launched {
         Launched::Child(c) if cfg!(windows) => Some(match c.exit_before(until) {
             Ok(Some(s)) => format!("it exited ({s})"),
-            Ok(None) => format!("it is still running (pid {})", c.id()),
+            // The wait's end is not a state observed before it.
+            Ok(None) if until >= deadline => {
+                "its exit was not observed before the deadline".to_owned()
+            }
+            Ok(None) => format!(
+                "its exit was not observed within {} s (pid {})",
+                EOF_FOLLOW_UP.as_secs(),
+                c.id()
+            ),
             Err(e) => format!("its status cannot be read: {e}"),
         }),
         _ => follow_up(until, || match lifecycle::probe(dir) {
@@ -974,7 +983,7 @@ fn eof_follow_up(launched: &mut Launched, dir: &Path, deadline: Instant) -> Exit
     }
     .unwrap_or_else(|| "nothing could be observed before the deadline".to_owned());
     fail(&format!(
-        "the daemon exited before reporting readiness: {observed}; see {}",
+        "the daemon closed its readiness channel without a verdict: {observed}; see {}",
         log.display()
     ))
 }

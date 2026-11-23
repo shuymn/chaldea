@@ -409,8 +409,9 @@ fn explicit_port_conflict() {
 }
 
 /// PR8-CL-14: a child that closes the channel without a line 13.5 s in and keeps running with
-/// the lock: the follow-up is cut by the 15 s deadline, with what it last saw (the lock held,
-/// or the child running), so the starter exits 1 at 15 s, before the child exits at 18.5 s.
+/// the lock: the follow-up is cut by the 15 s deadline, so the starter exits 1 at 15 s, before
+/// the child exits at 18.5 s, with what it saw before the deadline (macOS: the lock held;
+/// Windows: no exit observed).
 fn eof_follow_up_within_deadline() {
     let labels = Labels::new();
     let d = state();
@@ -424,11 +425,28 @@ fn eof_follow_up_within_deadline() {
     );
     let took = t.elapsed();
     assert_eq!(code, 1, "{out}{err}");
-    assert!(err.contains("exited before reporting readiness"), "{err}");
     assert!(
-        err.contains("still holds the state directory") || err.contains("still running"),
+        err.contains("closed its readiness channel without a verdict"),
         "{err}"
     );
+    #[cfg(not(windows))]
+    assert!(
+        err.contains("a daemon still holds the state directory"),
+        "{err}"
+    );
+    // The exit wait ends at the deadline: that end is no observation of the daemon's state.
+    #[cfg(windows)]
+    {
+        assert!(
+            err.contains("exit was not observed before the deadline"),
+            "{err}"
+        );
+        assert!(!err.contains("it is still running"), "{err}");
+        assert!(
+            !err.contains("the daemon exited before reporting readiness"),
+            "{err}"
+        );
+    }
     assert!(took >= READY_TIMEOUT, "{took:?}");
     assert!(took < READY_TIMEOUT + Duration::from_secs(1), "{took:?}");
 }
@@ -662,7 +680,10 @@ fn startup_failure_output_is_redacted() {
     let silent = tmp.path().join("s").join(&token);
     let (code, out, err) = start(&labels, &silent, &[], &[(EOF_CHILD_MS, OsStr::new("0"))]);
     assert_eq!(code, 1, "{out}{err}");
-    assert!(err.contains("exited before reporting readiness"), "{err}");
+    assert!(
+        err.contains("closed its readiness channel without a verdict"),
+        "{err}"
+    );
     assert!(err.contains("chd_<redacted>"), "{err}");
     assert!(!out.contains(&token) && !err.contains(&token), "{out}{err}");
 }
