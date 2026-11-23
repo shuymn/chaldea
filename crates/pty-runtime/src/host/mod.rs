@@ -36,6 +36,18 @@ pub fn exit_now(code: i32) -> ! {
     imp::exit_now(code)
 }
 
+/// Test support (`fake`, macOS): registers a C `atexit` handler that writes
+/// `EXIT-HANDLER-RAN` to stderr, so a test sees whether a process ended through the C exit
+/// path (`std::process::exit`) rather than [`exit_now`].
+///
+/// # Errors
+///
+/// `atexit` refused the handler.
+#[cfg(all(feature = "fake", target_os = "macos"))]
+pub fn mark_exit_handlers() -> io::Result<()> {
+    crate::unix::sys::mark_exit_handlers()
+}
+
 // ---- Identity ----
 
 /// The identity of a live process by pid; `None` when no process has that pid or it has

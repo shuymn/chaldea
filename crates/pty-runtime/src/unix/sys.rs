@@ -158,6 +158,29 @@ pub(crate) fn exit_now(code: c_int) -> ! {
     unsafe { libc::_exit(code) }
 }
 
+/// What [`mark_exit_handlers`]'s handler writes to fd 2.
+#[cfg(any(test, feature = "fake"))]
+pub(crate) const EXIT_MARK: &str = "EXIT-HANDLER-RAN\n";
+
+#[cfg(any(test, feature = "fake"))]
+extern "C" fn exit_marker() {
+    let msg = EXIT_MARK.as_bytes();
+    // SAFETY: writes a static buffer of `msg.len()` bytes to fd 2.
+    let _ = unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
+}
+
+/// Registers an `atexit` handler that writes [`EXIT_MARK`] to fd 2, so a test sees whether
+/// a process ended through the C exit path.
+#[cfg(any(test, feature = "fake"))]
+pub(crate) fn mark_exit_handlers() -> io::Result<()> {
+    // SAFETY: registers a handler that only writes a static buffer to fd 2.
+    if unsafe { libc::atexit(exit_marker) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::other("atexit refused the handler"))
+    }
+}
+
 /// `proc_listallpids` with a null buffer: an estimate of the number of processes.
 pub(crate) fn pid_count() -> io::Result<usize> {
     // SAFETY: a size query: a null buffer of length 0.
@@ -560,20 +583,13 @@ mod tests {
         false
     }
 
-    extern "C" fn exit_marker() {
-        let msg = b"EXIT-HANDLER-RAN\n";
-        // SAFETY: writes a static buffer of `msg.len()` bytes to fd 2.
-        let _ = unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
-    }
-
     /// `exit_now` ends the process with its code and runs no `atexit` handler;
     /// `std::process::exit`, the control, runs it.
     #[test]
     fn exit_now_skips_exit_handlers() {
         const MODE: &str = "CHALDEA_EXIT_NOW_MODE";
         if let Ok(mode) = std::env::var(MODE) {
-            // SAFETY: registers a handler that only writes to fd 2.
-            assert_eq!(unsafe { libc::atexit(exit_marker) }, 0);
+            mark_exit_handlers().unwrap();
             if mode == "now" {
                 exit_now(7);
             }
@@ -608,14 +624,17 @@ mod tests {
                 }
                 if Instant::now() >= end {
                     let _ = child.kill();
-                    let _ = child.wait();
+                    let reap = Instant::now() + Duration::from_secs(30);
+                    while matches!(child.try_wait(), Ok(None)) && Instant::now() < reap {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
                     panic!("{mode}: the helper did not exit");
                 }
                 std::thread::sleep(Duration::from_millis(10));
             };
             let err = reader.join().unwrap();
             assert_eq!(status.code(), Some(7), "{mode}: {err}");
-            assert_eq!(err.contains("EXIT-HANDLER-RAN"), ran, "{mode}: {err}");
+            assert_eq!(err.contains(EXIT_MARK), ran, "{mode}: {err}");
         }
     }
 
