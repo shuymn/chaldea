@@ -1263,3 +1263,28 @@ fn fake_cli_reports_an_emitters_output() {
     assert_eq!(e["stdout_len"], 0, "{e}");
     assert!(e["stderr_len"].as_u64().unwrap() > 0, "{e}");
 }
+
+/// §2.14: a handshake line counts only with its LF: `go` cut by EOF is EOF.
+#[test]
+fn nested_child_rejects_unterminated_go() {
+    let stub = Stub::start(&[Reply::Status(200)]);
+    let reports = Reports::start();
+    let mut cmd = fake(&["--mode", "echo", "--nested-child"], &reports, &stub);
+    let r = run(&mut cmd, Stdin::Bytes(b"go".to_vec()));
+    assert_eq!((r.code, stub.settled().len()), (Some(1), 1));
+    assert_eq!(reports.wait("handshake_failed", 1)[0]["reason"], "eof");
+}
+
+/// §2.14: an emitter that cannot be started fails the nested sequence: the child reports it
+/// and exits 1 before `sent`, and the parent, seeing EOF, exits 1 too.
+#[test]
+fn nested_echo_fails_when_its_emitter_cannot_spawn() {
+    let stub = Stub::start(&[Reply::Status(200)]);
+    let reports = Reports::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = fake(&["--mode", "echo", "--nested"], &reports, &stub);
+    cmd.arg("--emitter").arg(dir.path().join("absent-emitter"));
+    let r = run(&mut cmd, Stdin::Bytes(Vec::new()));
+    assert_eq!(reports.wait("emitted", 1)[0]["spawn_failed"], true);
+    assert_eq!((r.code, stub.accepted()), (Some(1), 0));
+}

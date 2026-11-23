@@ -10,10 +10,12 @@
 //! arguments of `inherited_args`), which emits a `SessionStart` of another session before
 //! and after this process's own.
 //!
-//! The order is a handshake of exact lines: the child writes `sent` after its first hook,
-//! the parent writes `go` after its own. A side that gets EOF, another line, or nothing
-//! within [`HANDSHAKE`] reports `handshake_failed` (`side`, `reason`), emits no further hook,
-//! and exits 1; the parent kills and reaps the child first.
+//! The order is a handshake of exact lines, each counted only with its LF or CRLF: the child
+//! writes `sent` after its first hook, the parent writes `go` after its own. A side that gets
+//! EOF (an unterminated line included), another line, or nothing within [`HANDSHAKE`]
+//! reports `handshake_failed` (`side`, `reason`), emits no further hook, and exits 1; so does
+//! a side whose emitter could not be started (reported as `emitted` with `spawn_failed`),
+//! before it writes its line. The parent ends the child first.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
@@ -100,10 +102,14 @@ impl<'a> Prompts<'a> {
         Some(p)
     }
 
-    fn emit(&self, payload: &Value, rep: &Reporter) {
+    /// Runs the emitter with `payload` and reports it; false when it could not be started.
+    fn emit(&self, payload: &Value, rep: &Reporter) -> bool {
         let name = payload["hook_event_name"].clone();
         let r = hooks::emit_all(self.emitter, self.agent, std::slice::from_ref(payload)).pop();
-        hooks::report_emitted(rep, &name, r.flatten().as_ref());
+        let r = r.flatten();
+        let started = r.is_some();
+        hooks::report_emitted(rep, &name, r.as_ref());
+        started
     }
 
     /// The nested sequence (B-11): the nested FakeCli emits its `SessionStart`, this process
@@ -131,10 +137,7 @@ impl<'a> Prompts<'a> {
                 );
                 false
             }
-            Ok(()) => {
-                self.emit(&session_start(&self.session), rep);
-                true
-            }
+            Ok(()) => self.emit(&session_start(&self.session), rep),
         };
         if ok {
             if let Some(mut stdin) = stdin {
@@ -212,7 +215,9 @@ fn nested_child(o: &Opts) -> i32 {
         session: hooks::random_uuid(),
         line: Vec::new(),
     };
-    p.emit(&session_start(&p.session), &rep);
+    if !p.emit(&session_start(&p.session), &rep) {
+        return 1;
+    }
     let mut out = std::io::stdout();
     let _ = out.write_all(b"sent\n");
     let _ = out.flush();
@@ -221,7 +226,9 @@ fn nested_child(o: &Opts) -> i32 {
         rep.send(&json!({"event": "handshake_failed", "side": "child", "reason": b.name()}));
         return 1;
     }
-    p.emit(&session_start(&p.session), &rep);
+    if !p.emit(&session_start(&p.session), &rep) {
+        return 1;
+    }
     0
 }
 
@@ -243,14 +250,27 @@ impl Broken {
     }
 }
 
-/// The lines of `r` (without their LF or CRLF), read on a thread; the channel closes at EOF
-/// or a read error.
+/// The LF- or CRLF-terminated lines of `r`, without their terminator, read on a thread; the
+/// channel closes at EOF or a read error, and an unterminated last line is not sent.
 fn lines_of(r: Option<impl Read + Send + 'static>) -> Receiver<String> {
     let (tx, rx) = mpsc::channel();
     if let Some(r) = r {
         std::thread::spawn(move || {
-            for line in BufReader::new(r).lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
+            let mut r = BufReader::new(r);
+            loop {
+                let mut line = Vec::new();
+                match r.read_until(b'\n', &mut line) {
+                    Ok(_) if line.ends_with(b"\n") => {}
+                    _ => return,
+                }
+                line.pop();
+                if line.ends_with(b"\r") {
+                    line.pop();
+                }
+                if tx
+                    .send(String::from_utf8_lossy(&line).into_owned())
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -323,8 +343,8 @@ mod tests {
         assert!(t.elapsed() >= Duration::from_millis(50));
         drop(tx);
         assert_eq!(expect_line(&rx, "go", until()), Err(Broken::Eof));
-        // CRLF and LF lines are the same line; EOF without a line is EOF.
-        let rx = lines_of(Some(std::io::Cursor::new(b"sent\r\ngo\n".to_vec())));
+        // CRLF and LF lines are the same line; an unterminated line is EOF.
+        let rx = lines_of(Some(std::io::Cursor::new(b"sent\r\ngo\ngo".to_vec())));
         assert_eq!(expect_line(&rx, "sent", until()), Ok(()));
         assert_eq!(expect_line(&rx, "go", until()), Ok(()));
         assert_eq!(expect_line(&rx, "go", until()), Err(Broken::Eof));
