@@ -9,7 +9,7 @@ use axum::body::Bytes;
 use chaldea_core::event::{Source, TypedEvent};
 use chaldea_core::ids::{Agent, IdempotencyKey, LaunchId, Open, StreamId, ThreadId};
 use chaldea_core::payload::{RawUnknown, RawUnknownReason, SessionBound, SourceKind};
-use chaldea_core::state::{StateInput, reduce};
+use chaldea_core::state::{StateInput, StatusChanged, reduce};
 use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
@@ -22,9 +22,9 @@ use super::payload::{Decoded, HookHead, decode};
 use super::request::HookHeaders;
 use crate::http::{ApiError, Authorized};
 use crate::store::{
-    BufferedHook, EventAnnex, HookDelivery, HookDeliveryLookup, HookReply, JobError, LaunchRow,
-    NewEvent, NewHookDelivery, NewRouting, Promotion, StoreError, ThreadRow, WriteTx,
-    prepare_content,
+    BufferedHook, BufferedSummary, EventAnnex, HookDelivery, HookDeliveryLookup, HookReply,
+    JobError, LaunchRow, NewEvent, NewHookDelivery, NewRouting, Promotion, StoreError, ThreadRow,
+    WriteTx, prepare_content,
 };
 
 pub(crate) const JSON: &str = "application/json";
@@ -178,7 +178,8 @@ enum Decision {
         annex: Option<EventAnnex>,
     },
     Interpret,
-    Bind,
+    /// The binding, with the reducer's status changes for `SessionBound`.
+    Bind(Vec<StatusChanged>),
     Buffer,
     Overflow,
 }
@@ -227,17 +228,21 @@ pub(crate) fn run(
     let (Some(l), Some(t)) = (tx.read().launch(launch)?, tx.read().thread(thread)?) else {
         return Err(super::refused_internal());
     };
-    // 3. Expire while unbound.
-    if l.session_id.is_none() {
-        buffer::expire(tx, launch, &d.cfg)?;
-    }
+    // 3. Expire while unbound; the buffer's summary after it serves rows 12–13.
+    let summary = if l.session_id.is_none() {
+        Some(buffer::expire_in(tx, launch, &d.cfg)?.1)
+    } else {
+        None
+    };
     // 4. Expand, then decide.
     let json = match (&d.head, d.headers.truncated) {
         (Head::Hook(_), false) => serde_json::from_slice::<serde_json::Value>(&d.body).ok(),
         _ => None,
     };
-    let decision = decide(d, tx, &l, &t, thread, json.is_some())?;
-    let overflow = matches!(decision, Decision::Overflow);
+    let decision = decide(d, tx, &l, &t, thread, json.is_some(), summary)?;
+    // The buffered deliveries received after an overflowing one, promoted once it is
+    // recorded.
+    let mut later = Vec::new();
     let body = || d.body.to_vec();
     // 5. Record.
     let routing = match decision {
@@ -284,12 +289,10 @@ pub(crate) fn run(
                 )?),
             }
         }
-        Decision::Bind => {
+        Decision::Bind(changes) => {
             let Head::Hook(h) = &d.head else {
                 return Err(super::refused_internal());
             };
-            let (_, changes) = reduce(&t.state, &StateInput::SessionBound)
-                .map_err(|_| super::refused_internal())?;
             let mut events = vec![envelope(
                 thread,
                 &l,
@@ -332,7 +335,13 @@ pub(crate) fn run(
         Decision::Overflow => {
             // Receipt order: the buffered deliveries received before this one first, the
             // later ones after it is recorded.
-            buffer::drain_unbound(tx, launch, |o| o < d.ordinal)?;
+            let earlier;
+            (earlier, later) = tx
+                .read()
+                .buffered_deliveries(launch)?
+                .into_iter()
+                .partition(|b| b.receipt_ordinal < d.ordinal);
+            buffer::promote_unbound(tx, launch, earlier)?;
             NewRouting::RawUnknown(raw_event(
                 thread,
                 &l,
@@ -358,9 +367,7 @@ pub(crate) fn run(
         HookDeliveryLookup::New(HookDelivery { first_reply, .. })
         | HookDeliveryLookup::Replay(HookDelivery { first_reply, .. }) => first_reply,
     };
-    if overflow {
-        buffer::drain_unbound(tx, launch, |_| true)?;
-    }
+    buffer::promote_unbound(tx, launch, later)?;
     // 6. Bind.
     if bind {
         bind_and_promote(d, tx, thread, launch, json.as_ref())?;
@@ -411,6 +418,7 @@ fn decide(
     t: &ThreadRow,
     thread: ThreadId,
     expanded: bool,
+    summary: Option<BufferedSummary>,
 ) -> Result<Decision, JobError> {
     use RawUnknownReason as R;
     // Rows 1–2.
@@ -457,7 +465,7 @@ fn decide(
             return Ok(raw(R::ForeignSession));
         }
         return Ok(match reduce(&t.state, &StateInput::SessionBound) {
-            Ok(_) => Decision::Bind,
+            Ok((_, changes)) => Decision::Bind(changes),
             Err(_) => raw(R::Unbound),
         });
     }
@@ -465,7 +473,10 @@ fn decide(
     if !selected {
         return Ok(raw(R::ForeignSession));
     }
-    let summary = tx.read().buffered_summary(l.launch_id)?;
+    let summary = match summary {
+        Some(s) => s,
+        None => tx.read().buffered_summary(l.launch_id)?,
+    };
     Ok(if buffer::fits(&summary, d.body.len() as u64, &d.cfg) {
         Decision::Buffer
     } else {
@@ -555,7 +566,6 @@ fn promotion(
     let Decoded::Hook(h) = decode(&body) else {
         return raw_of(R::SchemaMismatch, JSON, body);
     };
-    let h = h.into_owned();
     if h.session_id != session
         || meta.thread_header != Some(thread)
         || (rule == BindingRule::Ancestry && !chain_eligible(&meta.chain, l, &d.cfg))

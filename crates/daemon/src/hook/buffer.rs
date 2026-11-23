@@ -10,7 +10,7 @@ use super::HookConfig;
 use super::ancestry::Link;
 use super::intake::IntakeFacts;
 use super::route::{JSON, raw_event};
-use crate::store::{BufferedSummary, Promotion, StoreError, WriteTx};
+use crate::store::{BufferedDelivery, BufferedSummary, Promotion, StoreError, WriteTx};
 
 /// `BufferedHook.meta`, version 1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -56,22 +56,23 @@ pub(crate) fn fits(s: &BufferedSummary, len: u64, cfg: &HookConfig) -> bool {
     count_ok && s.body_bytes.saturating_add(len) <= cfg.buffer_max_bytes
 }
 
-/// Promotes the buffered deliveries of `launch` whose receipt ordinal `take` accepts to
-/// `raw_unknown` `unbound`, in receipt order. Returns how many.
-pub(crate) fn drain_unbound(
+/// Promotes every buffered delivery of `launch` to `raw_unknown` `unbound`, in receipt
+/// order. Returns how many.
+fn drain_unbound(tx: &mut WriteTx<'_>, launch: LaunchId) -> Result<usize, StoreError> {
+    let rows = tx.read().buffered_deliveries(launch)?;
+    promote_unbound(tx, launch, rows)
+}
+
+/// Promotes `rows`, buffered deliveries of `launch` read in this job, to `raw_unknown`
+/// `unbound`, in their order. Returns how many.
+pub(crate) fn promote_unbound(
     tx: &mut WriteTx<'_>,
     launch: LaunchId,
-    take: impl Fn(u64) -> bool,
+    rows: Vec<BufferedDelivery>,
 ) -> Result<usize, StoreError> {
     let Some(l) = tx.read().launch(launch)? else {
         return Ok(0);
     };
-    let rows: Vec<_> = tx
-        .read()
-        .buffered_deliveries(launch)?
-        .into_iter()
-        .filter(|b| take(b.receipt_ordinal))
-        .collect();
     let n = rows.len();
     for b in rows {
         let e = raw_event(
@@ -101,18 +102,33 @@ pub fn expire(
     launch: LaunchId,
     cfg: &HookConfig,
 ) -> Result<usize, StoreError> {
+    expire_in(tx, launch, cfg).map(|(n, _)| n)
+}
+
+/// [`expire`], with the buffer's summary after it: empty once it expired.
+pub(crate) fn expire_in(
+    tx: &mut WriteTx<'_>,
+    launch: LaunchId,
+    cfg: &HookConfig,
+) -> Result<(usize, BufferedSummary), StoreError> {
     let summary = tx.read().buffered_summary(launch)?;
-    let Some(earliest) = summary.earliest_received_at else {
-        return Ok(0);
+    let Some(earliest) = &summary.earliest_received_at else {
+        return Ok((0, summary));
     };
     let (Some(now), Some(oldest)) = (millis(&tx.recorded_at().0), millis(&earliest.0)) else {
-        return Ok(0);
+        return Ok((0, summary));
     };
     let ttl = i64::try_from(cfg.buffer_ttl.as_millis()).unwrap_or(i64::MAX);
     if now.saturating_sub(oldest) > ttl {
-        drain_unbound(tx, launch, |_| true)
+        let n = drain_unbound(tx, launch)?;
+        let empty = BufferedSummary {
+            count: 0,
+            body_bytes: 0,
+            earliest_received_at: None,
+        };
+        Ok((n, empty))
     } else {
-        Ok(0)
+        Ok((0, summary))
     }
 }
 
@@ -125,7 +141,7 @@ pub fn expire(
 ///
 /// A store error.
 pub fn resolve_unbindable(tx: &mut WriteTx<'_>, launch: LaunchId) -> Result<usize, StoreError> {
-    drain_unbound(tx, launch, |_| true)
+    drain_unbound(tx, launch)
 }
 
 /// Milliseconds since the Unix epoch of a store stamp `YYYY-MM-DDTHH:MM:SS.mmmZ`
