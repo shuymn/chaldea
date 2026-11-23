@@ -533,6 +533,10 @@ impl Store {
         let Some(notifier) = notifier else {
             return self.observe(deadline);
         };
+        #[cfg(test)]
+        {
+            *lock(&inner.faults.shutdown_deadline) = Some(deadline);
+        }
         inner.faults.mark("owner_claimed");
         // Dropping the last notification sender wakes receivers inline, and a waker may call
         // `submit`: the sender drops outside the intake locks, and its close is published

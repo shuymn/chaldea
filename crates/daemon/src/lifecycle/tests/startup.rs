@@ -123,10 +123,11 @@ fn submit_failed_is_fatal() {
     // Retire the writer: a commit whose outcome is unknown puts it in the failed state.
     *store_faults.commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
     let store = run.store();
-    let r = store
-        .submit(Instant::now() + Duration::from_secs(5), |_tx| Ok(()))
-        .unwrap()
-        .blocking_wait();
+    let r = super::settle(
+        store
+            .submit(Instant::now() + Duration::from_secs(5), |_tx| Ok(()))
+            .unwrap(),
+    );
     assert!(r.is_err());
     park.release();
     let r = run.join();
@@ -252,7 +253,7 @@ fn range_exhaustion() {
     let run = start(
         foreground(&dir.path, None),
         TestComponents::default(),
-        faults,
+        faults.clone(),
     );
     let log = run.log.clone();
     let r = run.join();
@@ -265,6 +266,8 @@ fn range_exhaustion() {
     assert!(text.contains("--port <n>"), "{text}");
     assert!(!dir.path.join(names::PORT).exists());
     assert_eq!((*PORT_RANGE.start(), *PORT_RANGE.end()), (7373, 7472));
+    // Every one of the 100 ports was tried before the range was reported exhausted.
+    assert_eq!(faults.bind_attempts.load(Ordering::SeqCst), 100);
 }
 
 #[test]
@@ -516,34 +519,15 @@ fn failure_at_each_step() {
     }
 }
 
-/// Step 11: a panicking `build` is `panic`; the startup task took its writer with it (no
-/// verdict), and the lock stays held.
-#[test]
-fn panic_at_step_11() {
-    let dir = state();
-    let ready = RecordingReady::new(&dir.path);
-    let comps = TestComponents {
-        panic_in_build: true,
-        ..TestComponents::default()
-    };
-    let run = start(
-        detached(&dir.path, Some(free_port()), &ready),
-        comps,
-        Arc::default(),
-    );
-    let r = run.join();
-    assert_eq!((r.code.code(), r.reason), (1, Some(FailReason::Panic)));
-    assert_eq!(r.lock, LockDisposition::HeldUntilExit);
-    assert!(ready.lines().is_empty());
-    assert!(!dir.path.join(names::RECORD).exists());
-}
-
 /// Step 14: a readiness write error is ignored; the daemon serves.
 #[test]
 fn ready_write_error_is_ignored() {
+    static CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     struct Broken;
     impl super::ReadyWriter for Broken {
-        fn write_line(&mut self, _: &str) -> std::io::Result<()> {
+        fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+            assert!(line.starts_with("ready "), "{line}");
+            CALLED.store(true, Ordering::SeqCst);
             Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
         }
         fn close(self: Box<Self>) {}
@@ -567,6 +551,8 @@ fn ready_write_error_is_ignored() {
         None
     )
     .is_ok()));
+    // Step 14 called the writer (its error ignored) before the daemon served on.
+    assert!(super::wait_for(WAIT, || CALLED.load(Ordering::SeqCst)));
     gate.request(super::StopCause::Signal(super::SignalName::Term));
     assert_eq!(run.join().code.code(), 0);
 }
@@ -693,4 +679,173 @@ fn stop_after_port_rename() {
     assert_eq!(run.serving(), b);
     run.stop();
     run.join();
+}
+
+// ---- Review round 1 ----
+
+/// A private directory with a complete marker and nothing else.
+pub(super) fn marked(dir: &Path) {
+    chaldea_pty_runtime::host::create_private_dir(dir).unwrap();
+    let mut f = chaldea_pty_runtime::host::create_private_file(&dir.join(names::MARKER)).unwrap();
+    std::io::Write::write_all(&mut f, super::super::state_dir::MARKER_CONTENT).unwrap();
+}
+
+/// PR8-CL-2: a database or sidecar with a second hard link (here from another directory) is
+/// refused before the store opens it; nothing of the second state directory is opened.
+#[test]
+fn refuses_hard_linked_database_files() {
+    let a = state();
+    let run = start(
+        foreground(&a.path, Some(free_port())),
+        TestComponents::default(),
+        Arc::default(),
+    );
+    run.serving();
+    run.stop();
+    assert_eq!(run.join().code.code(), 0);
+    for name in [names::DB, "chaldea.db-wal"] {
+        let b = state();
+        marked(&b.path);
+        let source = a.path.join(format!("{name}.source"));
+        if name == names::DB {
+            std::fs::hard_link(a.path.join(names::DB), b.path.join(name)).unwrap();
+        } else {
+            std::fs::write(&source, b"").unwrap();
+            std::fs::hard_link(&source, b.path.join(name)).unwrap();
+        }
+        let run = start(
+            foreground(&b.path, Some(free_port())),
+            TestComponents::default(),
+            Arc::default(),
+        );
+        let log = run.log.clone();
+        let r = run.join();
+        assert_eq!(
+            (r.code.code(), r.reason),
+            (1, Some(FailReason::StoreOpen)),
+            "{name}: {}",
+            log.text()
+        );
+        assert!(log.text().contains("hard link"), "{name}: {}", log.text());
+        for other in names::DB_FILES {
+            if other != name {
+                assert!(!b.path.join(other).exists(), "{name}: {other} was created");
+            }
+        }
+    }
+}
+
+/// PR8-CL-6: a receipt left `in_progress` is `unknown_after_crash` for the first request the
+/// next daemon serves.
+#[test]
+fn first_request_reads_the_reconciled_receipt() {
+    async fn read_receipt(
+        ctx: crate::http::ReadCtx,
+        _req: Request<Body>,
+    ) -> Result<Response, ApiError> {
+        let status = ctx
+            .read(|tx, _auth| {
+                tx.receipt(CMD)
+                    .map_err(|_| ApiError::internal())
+                    .map(|r| r.map(|r| format!("{:?}", r.status)))
+            })
+            .await?;
+        Ok((StatusCode::OK, status.unwrap_or_default()).into_response())
+    }
+    let dir = state();
+    let run = start(
+        foreground(&dir.path, Some(free_port())),
+        TestComponents::default(),
+        Arc::default(),
+    );
+    run.serving();
+    run.stop();
+    run.join();
+    let store = open_store(&dir.path);
+    super::settle(
+        store
+            .submit(Instant::now() + WAIT, |tx| {
+                let t = chaldea_core::ids::TokenId::from_u128(0x6a);
+                Ok(tx.receipt_begin(CMD, t, [7; 32])?)
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    close(&store);
+    let comps = TestComponents {
+        mounts: Some(Mounts::mvp().with(Mount::read(
+            spec(&Method::GET, "/api/threads").unwrap(),
+            read_receipt,
+        ))),
+        ..TestComponents::default()
+    };
+    let run = start(
+        foreground(&dir.path, Some(free_port())),
+        comps,
+        Arc::default(),
+    );
+    let port = run.serving();
+    let (code, body) = request(
+        port,
+        "GET",
+        "/api/threads",
+        Some(&token_of(&dir.path)),
+        None,
+    )
+    .unwrap();
+    assert_eq!(code, 200, "{body}");
+    assert!(body.ends_with("UnknownAfterCrash"), "{body}");
+    run.stop();
+    run.join();
+}
+
+/// D12: a start that moved the saved port A to `--port B` says the pairing origin changed.
+#[test]
+fn port_override_says_to_re_pair() {
+    let dir = state();
+    let (a, b) = (free_port(), free_port());
+    let run = start(
+        foreground(&dir.path, Some(a)),
+        TestComponents::default(),
+        Arc::default(),
+    );
+    run.serving();
+    run.stop();
+    run.join();
+    let run = start(
+        foreground(&dir.path, Some(b)),
+        TestComponents::default(),
+        Arc::default(),
+    );
+    assert_eq!(run.serving(), b);
+    let text = run.log.text();
+    assert!(
+        text.contains(&format!("port {b} replaces the saved port {a}"))
+            && text.contains("chaldea open"),
+        "{text}"
+    );
+    run.stop();
+    run.join();
+}
+
+/// The lifecycle refuses `port: Some(0)` (the CLI's parser already does): nothing binds an
+/// ephemeral port or saves `0`.
+#[test]
+fn port_zero_is_refused() {
+    let dir = state();
+    let run = start(
+        foreground(&dir.path, Some(0)),
+        TestComponents::default(),
+        Arc::default(),
+    );
+    let log = run.log.clone();
+    let r = run.join();
+    assert_eq!(
+        (r.code.code(), r.reason),
+        (1, Some(FailReason::PortUnavailable)),
+        "{}",
+        log.text()
+    );
+    assert!(log.text().contains("port 0"), "{}", log.text());
+    assert!(!dir.path.join(names::PORT).exists());
 }

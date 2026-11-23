@@ -58,6 +58,7 @@ pub(crate) struct Started {
     pub(crate) lock: Option<InstanceLock>,
     pub(crate) store: Option<Store>,
     pub(crate) server: Option<HttpServer>,
+    /// Drains HTTP's registry: from step 11 (the server exists); serving from step 13.
     pub(crate) serve: Option<ServeHandle>,
     pub(crate) participants: Vec<Box<dyn ShutdownParticipant>>,
     /// The `port` rename of step 13 committed this port.
@@ -99,6 +100,8 @@ pub(crate) struct Shared {
     pub(crate) lock_attempted: AtomicBool,
     /// The canonical state directory, once step 4 accepted it.
     pub(crate) dir: OnceLock<PathBuf>,
+    /// A record of this run was renamed into place: step 5 of the shutdown may remove it.
+    pub(crate) record_published: AtomicBool,
 }
 
 pub(crate) struct StartupCtx {
@@ -115,14 +118,15 @@ pub(crate) struct StartupCtx {
     pub(crate) faults: Arc<super::faults::Faults>,
 }
 
-/// The step boundary: parks (tests), then returns `Stopped` if the gate fired.
+/// The step boundary: parks (tests), then returns `Stopped` if the gate fired or a console end
+/// arrived (which does not fire the gate; the coordinator is exiting).
 macro_rules! boundary {
     ($cx:expr, $st:ident, $n:expr) => {
         #[cfg(test)]
         if let Some(p) = $cx.faults.parked(super::faults::Point::Before($n)) {
             p.hold().await;
         }
-        if $cx.gate.fired() {
+        if $cx.gate.fired() || $cx.gate.crashed().is_some() {
             $st.outcome = Outcome::Stopped;
             return $st;
         }
@@ -212,6 +216,8 @@ fn bind(
 ) -> Result<(std::net::TcpListener, u16), String> {
     let try_bind = |p: u16| -> std::io::Result<std::net::TcpListener> {
         #[cfg(test)]
+        faults.bind_attempts.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
         if faults.bind_fails() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AddrInUse,
@@ -222,6 +228,9 @@ fn bind(
         l.set_nonblocking(true)?;
         Ok(l)
     };
+    if requested == Some(0) {
+        return Err("port 0 is not a valid port; pass `--port <n>` with n in 1–65535".to_owned());
+    }
     if let Some(p) = requested {
         return try_bind(p)
             .map(|l| (l, p))
@@ -352,7 +361,25 @@ pub(crate) async fn run(mut cx: StartupCtx) -> Started {
     };
     for f in names::DB_FILES {
         match host::is_plain_file_or_absent(&dir.join(f)) {
-            Ok(true) => {}
+            Ok(true) => match host::hard_links(&dir.join(f)) {
+                Ok(n) if n > 1 => {
+                    return st.failed(
+                        FailReason::StoreOpen,
+                        format!(
+                            "{} has {n} hard links; the database must have one: copy it to a new file and move that into place",
+                            dir.join(f).display()
+                        ),
+                    );
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return st.failed(
+                        FailReason::StoreOpen,
+                        format!("{} cannot be inspected: {e}", dir.join(f).display()),
+                    );
+                }
+            },
             Ok(false) => {
                 return st.failed(
                     FailReason::StoreOpen,
@@ -383,13 +410,15 @@ pub(crate) async fn run(mut cx: StartupCtx) -> Started {
         let cap = LOG_CAP;
         match LogFile::open(dir.clone(), cap) {
             Ok(f) => {
+                // Handed to the log thread from here on, acknowledged or not: the shutdown
+                // must see the switch away acknowledged before it releases the lock.
+                st.log_file = true;
                 if !cx.log.switch(LogTarget::File(f), cx.budgets.log_flush) {
                     return st.failed(
                         FailReason::Internal,
                         "the log thread did not switch to daemon.log",
                     );
                 }
-                st.log_file = true;
             }
             Err(e) => {
                 return st.failed(
@@ -423,6 +452,7 @@ pub(crate) async fn run(mut cx: StartupCtx) -> Started {
     if let Err(e) = written {
         return st.failed(FailReason::Internal, e);
     }
+    cx.shared.record_published.store(true, Ordering::SeqCst);
 
     // Step 8: the store, awaited to its return (an open can rebuild projections).
     boundary!(cx, st, 8);
@@ -529,6 +559,9 @@ pub(crate) async fn run(mut cx: StartupCtx) -> Started {
     });
     st.participants = built.participants;
     let server = HttpServer::new(HttpConfig::new(port), store.clone(), sink, built.mounts);
+    // From here the registry can hold startup's own work (the owner token's write observer):
+    // the coordinator drains it whether or not step 13 serves.
+    st.serve = Some(server.shutdown_handle());
 
     // Step 12: the token service, then the owner token file.
     boundary!(cx, st, 12);
@@ -603,6 +636,12 @@ pub(crate) async fn run(mut cx: StartupCtx) -> Started {
             return st.failed(FailReason::Internal, e);
         }
         st.port_saved = Some(port);
+        if let Some(old) = saved {
+            cx.log.warn(&format!(
+                "port {port} replaces the saved port {old} for {}; this changes the pairing origin: re-pair with `chaldea open`",
+                dir.display()
+            ));
+        }
     }
     #[cfg(test)]
     if let Some(p) = cx.faults.parked(super::faults::Point::AfterPortRename) {

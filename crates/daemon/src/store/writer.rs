@@ -110,6 +110,9 @@ pub(crate) struct Faults {
     #[cfg(test)]
     /// Called at each mark, after recording it; a test can block there.
     pub(crate) on_point: Option<Box<dyn Fn(&'static str) + Send + Sync>>,
+    /// The deadline the first `Store::shutdown` call received (unit tests only).
+    #[cfg(test)]
+    pub(crate) shutdown_deadline: Mutex<Option<std::time::Instant>>,
 }
 
 impl Faults {

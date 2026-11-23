@@ -1,15 +1,16 @@
 //! The coordinator (design §2.8) in process: PR8-CL-4 (a clean stop releases), CL-5 (order and
-//! ends), CL-10 (console end), CL-23 (only our record), CL-26 (isolated runs register nothing).
+//! ends), CL-23 (only our record), CL-26 (isolated runs register nothing). Console ends keep
+//! the lock, so their tests are helper processes (`helpers.rs`).
 
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use super::super::faults::Faults;
+use super::super::faults::{Faults, Point};
 use super::super::files::{LockProbe, probe};
-use super::super::gate::{ConsoleEvent, SignalName, StopCause, any_registered};
+use super::super::gate::{ConsoleEvent, any_registered};
 use super::super::{FailReason, LockDisposition, names};
 use super::{Recorder, TestComponents, WAIT, foreground, free_port, start, state};
-use crate::store::test_faults::Faults as StoreFaults;
+use crate::store::test_faults::{CommitFault, Faults as StoreFaults};
 
 /// PR8-CL-4: a stop with every condition met releases the lock in process.
 #[test]
@@ -57,6 +58,8 @@ fn order_and_ends() {
         ..TestComponents::default()
     };
     let faults = Arc::new(Faults::default());
+    let sf = Arc::new(StoreFaults::default());
+    *faults.store_faults.lock().unwrap() = Some(sf.clone());
     let run = start(
         foreground(&dir.path, Some(free_port())),
         comps,
@@ -68,6 +71,8 @@ fn order_and_ends() {
     let r = run.join();
     assert_eq!(r.code.code(), 0);
     let c = gate.stopping().unwrap().cutoff;
+    // The real `Store::shutdown` received exactly the cutoff.
+    assert_eq!(*sf.shutdown_deadline.lock().unwrap(), Some(c));
     let marks: Vec<(String, Option<Instant>)> = faults.marks();
     let names: Vec<&str> = marks.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(
@@ -84,130 +89,6 @@ fn order_and_ends() {
         ["first", "second"]
     );
     assert!(seen.iter().all(|s| s.2 == c - Duration::from_secs(3)));
-}
-
-fn store_shutdown_called(sf: &StoreFaults) -> bool {
-    sf.marks.lock().unwrap().contains(&"owner_claimed")
-}
-
-/// PR8-CL-10: a console end while serving, and one while HTTP drains after a signal, returns
-/// within 200 ms holding the lock, without calling `Store::shutdown`.
-#[test]
-fn console_end_exits_without_store_shutdown() {
-    // While serving.
-    let dir = state();
-    let sf = Arc::new(StoreFaults::default());
-    let faults = Arc::new(Faults::default());
-    *faults.store_faults.lock().unwrap() = Some(sf.clone());
-    let run = start(
-        foreground(&dir.path, Some(free_port())),
-        TestComponents::default(),
-        faults,
-    );
-    run.serving();
-    let gate = run.gate();
-    let t0 = Instant::now();
-    gate.crash_exit(ConsoleEvent::Close);
-    let r = run.join();
-    assert!(
-        t0.elapsed() < Duration::from_millis(200),
-        "{:?}",
-        t0.elapsed()
-    );
-    assert_eq!(
-        (r.code.code(), r.reason, r.lock),
-        (
-            1,
-            Some(FailReason::ConsoleEnd),
-            LockDisposition::HeldUntilExit
-        )
-    );
-    assert!(!store_shutdown_called(&sf));
-
-    // After a signal, while HTTP drains a connection that sent half a head.
-    let dir = state();
-    let sf = Arc::new(StoreFaults::default());
-    let faults = Arc::new(Faults::default());
-    *faults.store_faults.lock().unwrap() = Some(sf.clone());
-    let run = start(
-        foreground(&dir.path, Some(free_port())),
-        TestComponents::default(),
-        faults.clone(),
-    );
-    let port = run.serving();
-    let mut half = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-    std::io::Write::write_all(&mut half, b"GET /api/threads HTTP/1.1\r\n").unwrap();
-    let gate = run.gate();
-    std::thread::sleep(Duration::from_millis(100));
-    gate.request(StopCause::Signal(SignalName::Term));
-    assert!(super::wait_for(WAIT, || faults
-        .marks()
-        .iter()
-        .any(|m| m.0 == "http")));
-    std::thread::sleep(Duration::from_millis(100));
-    let t0 = Instant::now();
-    gate.crash_exit(ConsoleEvent::Close);
-    let r = run.join();
-    assert!(
-        t0.elapsed() < Duration::from_millis(200),
-        "{:?}",
-        t0.elapsed()
-    );
-    assert_eq!(
-        (r.reason, r.lock),
-        (Some(FailReason::ConsoleEnd), LockDisposition::HeldUntilExit)
-    );
-    assert!(!store_shutdown_called(&sf));
-    drop(half);
-}
-
-/// PR8-CL-10: a console end while `Store::shutdown` blocks on a held reader returns within
-/// 200 ms instead of waiting for `C + 250 ms`; the lock is not released.
-#[test]
-fn console_end_during_store_shutdown() {
-    let dir = state();
-    let faults = Arc::new(Faults::default());
-    let run = start(
-        foreground(&dir.path, Some(free_port())),
-        TestComponents::default(),
-        faults.clone(),
-    );
-    run.serving();
-    let store = run.store();
-    let (hold_tx, hold_rx) = mpsc::channel::<()>();
-    let (in_tx, in_rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        store
-            .read(Instant::now() + WAIT, move |_tx| {
-                in_tx.send(()).unwrap();
-                let _ = hold_rx.recv_timeout(WAIT);
-                Ok(())
-            })
-            .ok();
-    });
-    in_rx.recv_timeout(WAIT).unwrap();
-    let gate = run.gate();
-    gate.request(StopCause::Signal(SignalName::Term));
-    assert!(super::wait_for(WAIT, || faults
-        .marks()
-        .iter()
-        .any(|m| m.0 == "store")));
-    std::thread::sleep(Duration::from_millis(200));
-    let t0 = Instant::now();
-    gate.crash_exit(ConsoleEvent::Close);
-    let r = run.join();
-    assert!(
-        t0.elapsed() < Duration::from_millis(200),
-        "{:?}",
-        t0.elapsed()
-    );
-    assert_eq!(
-        (r.reason, r.lock),
-        (Some(FailReason::ConsoleEnd), LockDisposition::HeldUntilExit)
-    );
-    assert_eq!(probe(&dir.path).unwrap(), LockProbe::Held);
-    hold_tx.send(()).unwrap();
-    reader.join().unwrap();
 }
 
 /// PR8-CL-23: a record naming another instance is never removed; our own is.
@@ -272,4 +153,142 @@ fn isolated_runs_register_nothing() {
     assert!(la.text().contains(&format!("127.0.0.1:{pa}")));
     assert!(!la.text().contains(&format!("127.0.0.1:{pb}")));
     assert!(lb.text().contains(&format!("127.0.0.1:{pb}")));
+}
+
+// ---- Review round 1 ----
+
+/// A console end after the lock decision of a run that never took the lock reports
+/// `NeverTaken`, not a held lock.
+#[test]
+fn console_end_after_the_lock_decision_keeps_never_taken() {
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    let before_lock = faults.park(Point::Before(5));
+    let decided = faults.park(Point::AfterLockDecision);
+    let run = start(
+        foreground(&dir.path, Some(free_port())),
+        TestComponents::default(),
+        faults,
+    );
+    assert!(before_lock.wait_reached(WAIT));
+    run.stop();
+    before_lock.release();
+    assert!(decided.wait_reached(WAIT));
+    run.gate().crash_exit(ConsoleEvent::Close);
+    decided.release();
+    let r = run.join();
+    assert_eq!(
+        (r.reason, r.lock),
+        (Some(FailReason::ConsoleEnd), LockDisposition::NeverTaken)
+    );
+}
+
+/// PR8-CL-19 (§2.9): a panic before the runtime exists took no lock.
+#[test]
+fn panic_before_the_runtime_is_never_taken() {
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    faults
+        .panic_before_runtime
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let r = start(
+        foreground(&dir.path, Some(free_port())),
+        TestComponents::default(),
+        faults,
+    )
+    .join();
+    assert_eq!(
+        (r.code.code(), r.reason, r.lock),
+        (1, Some(FailReason::Panic), LockDisposition::NeverTaken)
+    );
+    assert!(!dir.path.exists());
+}
+
+/// A step-12 owner-token write still in flight when the start fails is drained with HTTP
+/// (the server never served): its fatal outcome reaches the exit reason.
+#[test]
+fn token_write_is_drained_before_serve() {
+    let dir = state();
+    let sf = Arc::new(StoreFaults::default());
+    let faults = Arc::new(Faults::default());
+    *faults.store_faults.lock().unwrap() = Some(sf.clone());
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Mutex::new(Some(release_rx));
+    let comps = TestComponents {
+        on_build: Some(Box::new(move |ctx| {
+            let rx = release_rx.lock().unwrap().take().unwrap();
+            // Holds the writer, so the token issue of step 12 waits in the queue past its
+            // reply cutoff.
+            let ticket = ctx
+                .store
+                .submit(Instant::now() + WAIT, move |_tx| {
+                    entered_tx.send(()).unwrap();
+                    let _ = rx.recv_timeout(WAIT);
+                    Ok(())
+                })
+                .unwrap();
+            drop(ticket);
+        })),
+        ..TestComponents::default()
+    };
+    let run = start(
+        foreground(&dir.path, Some(free_port())),
+        comps,
+        faults.clone(),
+    );
+    entered_rx.recv_timeout(WAIT).unwrap();
+    // The start fails at step 12 (the issue's reply never came); HTTP drains its observer.
+    assert!(
+        super::wait_for(WAIT, || faults.marks().iter().any(|m| m.0 == "http")),
+        "HTTP was not drained: {:?}\n{}",
+        faults.marks(),
+        run.log.text()
+    );
+    // The held job's commit is reported unknown; the writer fails every queued job after it.
+    *sf.commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
+    release_tx.send(()).unwrap();
+    let log = run.log.clone();
+    let r = run.join();
+    assert_eq!(
+        (r.code.code(), r.reason),
+        (1, Some(FailReason::StoreFatal)),
+        "{}",
+        log.text()
+    );
+    let marks: Vec<String> = faults.marks().into_iter().map(|m| m.0).collect();
+    let http = marks.iter().position(|m| m == "http").unwrap();
+    let store = marks.iter().position(|m| m == "store").unwrap();
+    assert!(http < store, "{marks:?}");
+}
+
+/// Windows: a reader holding `daemon.json` without delete sharing keeps it from being
+/// removed; the stop retries, then names the record in a warning.
+#[cfg(windows)]
+#[test]
+fn record_removal_failure_is_reported() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x1;
+    let dir = state();
+    let run = start(
+        foreground(&dir.path, Some(free_port())),
+        TestComponents::default(),
+        Arc::default(),
+    );
+    run.serving();
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(dir.path.join(names::RECORD))
+        .unwrap();
+    run.stop();
+    let log = run.log.clone();
+    let r = run.join();
+    drop(held);
+    assert_eq!(r.code.code(), 0, "{}", log.text());
+    assert!(
+        log.text().contains("daemon.json") && log.text().contains("could not be removed"),
+        "{}",
+        log.text()
+    );
 }

@@ -31,8 +31,14 @@ pub(crate) fn run_daemon(
     cfg: DaemonConfig,
     components: Box<dyn Components>,
     env: RunEnv,
+    shared: Arc<startup::Shared>,
 ) -> ExitReport {
     let log = env.log.clone();
+    #[cfg(test)]
+    assert!(
+        !env.faults.panic_before_runtime.load(Ordering::SeqCst),
+        "injected panic before the runtime"
+    );
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name(RUNTIME_THREAD)
@@ -57,12 +63,13 @@ pub(crate) fn run_daemon(
         let _ = env.faults.runtime.set((rt.handle().clone(), workers));
     }
     let budgets = cfg.budgets;
+    let seen = shared.clone();
     let coordinator = Coordinator {
         gate: gate.clone(),
         log: log.clone(),
         budgets,
         instance: uuid::Uuid::new_v4().to_string(),
-        shared: Arc::new(startup::Shared::default()),
+        shared,
         #[cfg(test)]
         probe: env.faults.probe.lock().ok().and_then(|mut p| p.take()),
         #[cfg(not(test))]
@@ -75,7 +82,12 @@ pub(crate) fn run_daemon(
         .unwrap_or_else(|_| {
             log.error("exiting: code 1 (panic in the coordinator)");
             log.flush(budgets.log_flush);
-            ExitReport::failed(FailReason::Panic, LockDisposition::HeldUntilExit)
+            let lock = if seen.lock_attempted.load(Ordering::SeqCst) {
+                LockDisposition::HeldUntilExit
+            } else {
+                LockDisposition::NeverTaken
+            };
+            ExitReport::failed(FailReason::Panic, lock)
         });
     // Blocking tasks (an abandoned `Store::shutdown` or `Store::open`) keep running until the
     // process exits; neither a return nor an unwind waits for them.
@@ -83,8 +95,37 @@ pub(crate) fn run_daemon(
     report
 }
 
+/// How long step 5 retries the removal of our record, and how often.
+const RECORD_REMOVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const RECORD_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// A console end was observed: no further step starts.
 struct Crashed;
+
+/// The deadline passed before the awaited future completed.
+struct Elapsed;
+
+/// Awaits `fut` until `end`, deadline first: the deadline is checked before every poll, so a
+/// completion first observable after `end` never wins over it (design §2.8).
+async fn deadline_first<F: Future>(end: Instant, fut: F) -> Result<F::Output, Elapsed> {
+    let mut fut = std::pin::pin!(fut);
+    let mut sleep = std::pin::pin!(tokio::time::sleep_until(tokio::time::Instant::from_std(
+        end
+    )));
+    std::future::poll_fn(|cx| {
+        if Instant::now() >= end {
+            return std::task::Poll::Ready(Err(Elapsed));
+        }
+        if let std::task::Poll::Ready(v) = fut.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Ok(v));
+        }
+        if sleep.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(Err(Elapsed));
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
 
 #[cfg(test)]
 type Probe = Option<tokio::sync::mpsc::UnboundedReceiver<std::sync::mpsc::Sender<()>>>;
@@ -183,6 +224,37 @@ impl Coordinator {
         self.finish(ExitReport::failed(FailReason::ConsoleEnd, lock))
     }
 
+    /// The lock as a crash exit before the lock decision leaves it: held when startup tried
+    /// to take it, otherwise never taken.
+    fn unreleased(&self) -> LockDisposition {
+        if self.shared.lock_attempted.load(Ordering::SeqCst) {
+            LockDisposition::HeldUntilExit
+        } else {
+            LockDisposition::NeverTaken
+        }
+    }
+
+    /// Removes our record, retrying for a bounded time (Windows refuses the removal while
+    /// another process holds the file without delete sharing); a record left behind is named
+    /// in the log.
+    fn remove_record(&self, path: &std::path::Path) {
+        let end = Instant::now() + RECORD_REMOVAL;
+        loop {
+            match std::fs::remove_file(path) {
+                Ok(()) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(e) if Instant::now() >= end => {
+                    self.log.warn(&format!(
+                        "the discovery record {} could not be removed: {e}",
+                        path.display()
+                    ));
+                    return;
+                }
+                Err(_) => std::thread::sleep(RECORD_RETRY),
+            }
+        }
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the shutdown sequence of design §2.8 in order, one place"
@@ -220,7 +292,9 @@ impl Coordinator {
                     // Nothing to write to until step 6 opens `daemon.log`.
                     let _ = self.log.switch(LogTarget::Discard, self.budgets.log_flush);
                 }
-                task = Some(tokio::spawn(startup::run(StartupCtx {
+                #[cfg(test)]
+                let returned = env.faults.clone();
+                let startup = startup::run(StartupCtx {
                     state_dir: cfg.state_dir,
                     port: cfg.port,
                     mode: cfg.mode,
@@ -232,14 +306,20 @@ impl Coordinator {
                     shared: self.shared.clone(),
                     #[cfg(test)]
                     faults: env.faults.clone(),
-                })));
+                });
+                task = Some(tokio::spawn(async move {
+                    let st = startup.await;
+                    #[cfg(test)]
+                    let _ = returned.startup_returned.set(Instant::now());
+                    st
+                }));
             }
         }
 
         // Wait for the first request, taking the startup task's return meanwhile.
         loop {
             if self.gate.crashed().is_some() {
-                return self.crash_exit(LockDisposition::HeldUntilExit);
+                return self.crash_exit(self.unreleased());
             }
             if self.gate.fired() {
                 break;
@@ -268,15 +348,16 @@ impl Coordinator {
         if let Some(t) = task.take() {
             let end = cutoff - b.startup_join_before;
             self.mark("startup_join", Some(end));
-            match self
-                .guarded(tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(end),
-                    t,
-                ))
-                .await
+            #[cfg(test)]
+            if let Some(p) = self
+                .faults
+                .parked(super::faults::Point::CoordinatorBeforeJoin)
             {
-                Err(Crashed) => return self.crash_exit(LockDisposition::HeldUntilExit),
-                Ok(Err(_elapsed)) => {
+                p.hold_blocking();
+            }
+            match self.guarded(deadline_first(end, t)).await {
+                Err(Crashed) => return self.crash_exit(self.unreleased()),
+                Ok(Err(Elapsed)) => {
                     self.log.error(
                         "the startup did not reach a step boundary in time: exiting with the instance lock held",
                     );
@@ -298,7 +379,8 @@ impl Coordinator {
             }
         };
 
-        // 2. HTTP until C − 5 s, awaited to its return.
+        // 2. HTTP until C − 5 s, awaited to its return; also a server that never served, whose
+        // registry can hold startup's own writes (the owner token's observer).
         let mut http_aborted = false;
         if let Some(serve) = st.serve.take() {
             let end = cutoff - b.http_before;
@@ -316,10 +398,18 @@ impl Coordinator {
             }
         }
 
+        #[cfg(test)]
+        if let Some(p) = self.faults.parked(super::faults::Point::AfterHttp) {
+            p.hold().await;
+        }
+
         // 3. The participants in order, until C − 3 s.
         let participants = std::mem::take(&mut st.participants);
         let end = cutoff - b.store_before;
         for p in &participants {
+            if self.gate.crashed().is_some() {
+                return self.crash_exit(held_now(&st));
+            }
             self.mark(&format!("participant:{}", p.name()), Some(end));
             let fut = tokio::time::timeout_at(tokio::time::Instant::from_std(end), p.shutdown(end));
             if self.guarded(fut).await.is_err() {
@@ -332,6 +422,13 @@ impl Coordinator {
         let mut store_report: Option<ShutdownReport> = None;
         let store_opened = st.store.is_some();
         if let Some(store) = st.store.take() {
+            #[cfg(test)]
+            if let Some(p) = self.faults.parked(super::faults::Point::BeforeStore) {
+                p.hold().await;
+            }
+            if self.gate.crashed().is_some() {
+                return self.crash_exit(held_now(&st));
+            }
             self.mark("store", Some(cutoff));
             #[cfg(test)]
             let faults = self.faults.clone();
@@ -340,10 +437,22 @@ impl Coordinator {
                 let _ = faults
                     .store_shutdown_thread
                     .set(std::thread::current().id());
-                store.shutdown(cutoff)
+                let r = store.shutdown(cutoff);
+                #[cfg(test)]
+                let _ = faults.store_shutdown_done.set(Instant::now());
+                r
             });
-            let until = tokio::time::Instant::from_std(cutoff + b.report_grace);
-            match self.guarded(tokio::time::timeout_at(until, h)).await {
+            #[cfg(test)]
+            if let Some(p) = self
+                .faults
+                .parked(super::faults::Point::CoordinatorBeforeStoreWait)
+            {
+                p.hold_blocking();
+            }
+            match self
+                .guarded(deadline_first(cutoff + b.report_grace, h))
+                .await
+            {
                 Err(Crashed) => return self.crash_exit(held_now(&st)),
                 Ok(Ok(Ok(r))) => {
                     self.log.info(&format!(
@@ -363,12 +472,13 @@ impl Coordinator {
             return self.crash_exit(held_now(&st));
         }
 
-        // 5. Remove our record, never another instance's.
-        if let Some(dir) = self.shared.dir.get()
+        // 5. Remove our record, never another instance's, and only when this run published one.
+        if self.shared.record_published.load(Ordering::SeqCst)
+            && let Some(dir) = self.shared.dir.get()
             && let Ok(Some(r)) = files::read_record(dir)
             && r.instance == self.instance
         {
-            let _ = std::fs::remove_file(dir.join(names::RECORD));
+            self.remove_record(&dir.join(names::RECORD));
         }
 
         // 6. The lock rule, read once.
@@ -397,6 +507,13 @@ impl Coordinator {
                     if !self.log.switch(after, b.log_flush) {
                         why.push("the log thread did not acknowledge leaving daemon.log");
                     }
+                    #[cfg(test)]
+                    if let Some(p) = self.faults.parked(super::faults::Point::AfterLogSwitch) {
+                        p.hold().await;
+                    }
+                }
+                if self.gate.crashed().is_some() {
+                    why.push("a console end arrived before the release");
                 }
                 if why.is_empty() {
                     l.release();
@@ -411,12 +528,12 @@ impl Coordinator {
                 }
             }
         };
+        #[cfg(test)]
+        if let Some(p) = self.faults.parked(super::faults::Point::AfterLockDecision) {
+            p.hold().await;
+        }
         if self.gate.crashed().is_some() {
-            return self.crash_exit(if lock == LockDisposition::Released {
-                LockDisposition::Released
-            } else {
-                LockDisposition::HeldUntilExit
-            });
+            return self.crash_exit(lock);
         }
 
         // 7. The outcome; a detached child that never sent `ready` gets its verdict now.

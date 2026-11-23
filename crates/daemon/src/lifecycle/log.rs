@@ -106,7 +106,18 @@ pub(crate) struct LogFile {
     cap: u64,
     /// Since when rotation has failed; nothing is written until a retry succeeds.
     broken_since: Option<Instant>,
+    /// The rotation's rename committed but the new `daemon.log` is not open yet: the next
+    /// attempt only opens it.
+    renamed: bool,
     dropped: u64,
+    /// How long after a failed rotation the next attempt waits.
+    retry: Duration,
+    /// Test-only: the next `n` reopens after a committed rename fail.
+    #[cfg(test)]
+    pub(crate) fail_reopen: u32,
+    /// Test-only: the next append writes only this many bytes, then fails.
+    #[cfg(test)]
+    pub(crate) partial_write: Option<usize>,
 }
 
 impl LogFile {
@@ -120,27 +131,49 @@ impl LogFile {
             size,
             cap,
             broken_since: None,
+            renamed: false,
             dropped: 0,
+            retry: ROTATION_RETRY,
+            #[cfg(test)]
+            fail_reopen: 0,
+            #[cfg(test)]
+            partial_write: None,
         })
     }
 
+    /// Test-only: the wait after a failed rotation.
+    #[cfg(test)]
+    pub(crate) fn set_retry(&mut self, retry: Duration) {
+        self.retry = retry;
+    }
+
     fn rotate(&mut self) -> io::Result<()> {
-        let old = self.dir.join(names::LOG_OLD);
-        if !host::is_plain_file_or_absent(&old)? {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "daemon.log.1 is not a regular file",
-            ));
+        if !self.renamed {
+            let old = self.dir.join(names::LOG_OLD);
+            if !host::is_plain_file_or_absent(&old)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "daemon.log.1 is not a regular file",
+                ));
+            }
+            std::fs::rename(self.dir.join(names::LOG), &old)?;
+            self.renamed = true;
         }
-        std::fs::rename(self.dir.join(names::LOG), &old)?;
-        self.file = host::open_no_follow(&self.dir.join(names::LOG), Access::AppendCreate)?;
-        self.size = 0;
+        #[cfg(test)]
+        if self.fail_reopen > 0 {
+            self.fail_reopen -= 1;
+            return Err(io::Error::other("injected reopen failure"));
+        }
+        let file = host::open_no_follow(&self.dir.join(names::LOG), Access::AppendCreate)?;
+        self.size = file.metadata().map_or(0, |m| m.len());
+        self.file = file;
+        self.renamed = false;
         Ok(())
     }
 
     pub(crate) fn write(&mut self, line: &str) {
         if let Some(since) = self.broken_since
-            && since.elapsed() < ROTATION_RETRY
+            && since.elapsed() < self.retry
         {
             self.dropped += 1;
             return;
@@ -167,9 +200,23 @@ impl LogFile {
     }
 
     fn append(&mut self, line: &str) {
+        #[cfg(test)]
+        if let Some(n) = self.partial_write.take() {
+            let _ = self.file.write_all(&line.as_bytes()[..n.min(line.len())]);
+            self.after_failed_write();
+            return;
+        }
         if self.file.write_all(line.as_bytes()).is_ok() {
             self.size += line.len() as u64;
+        } else {
+            self.after_failed_write();
         }
+    }
+
+    /// A failed write may have left part of the line: count what the file holds, or treat it
+    /// as full when its size cannot be read.
+    fn after_failed_write(&mut self) {
+        self.size = self.file.metadata().map_or(self.cap, |m| m.len());
     }
 
     #[cfg(test)]

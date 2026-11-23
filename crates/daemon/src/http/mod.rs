@@ -296,6 +296,15 @@ impl HttpServer {
         }
     }
 
+    /// A handle that drains the registry without serving: for a server whose startup ended
+    /// before `serve` but may have registered work (a token write's observer).
+    #[must_use]
+    pub fn shutdown_handle(&self) -> ServeHandle {
+        ServeHandle {
+            shared: self.shared.clone(),
+        }
+    }
+
     /// Token issuance, verification, and revocation.
     #[must_use]
     pub fn tokens(&self) -> &TokenService {

@@ -291,14 +291,17 @@ pub(crate) fn write_replace(
         }
     }
     let tmp = dir.join(format!(".{name}.tmp-{instance}"));
+    // Only a temporary file this call created is ours to remove.
+    let mut created = false;
     let written = (|| {
         let mut f = host::create_private_file(&tmp)?;
+        created = true;
         hook(name, ReplaceStage::Write)?;
         f.write_all(bytes)?;
         f.sync_all()
     })();
     if let Err(e) = written {
-        if e.kind() != io::ErrorKind::AlreadyExists {
+        if created {
             let _ = std::fs::remove_file(&tmp);
         }
         return Err(ReplaceError::Io(e));

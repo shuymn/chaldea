@@ -306,3 +306,83 @@ fn linked_record_is_refused() {
     assert_eq!(discover(d.path()), Discovery::Unknown);
     l.release();
 }
+
+// ---- Review round 1 ----
+
+/// An `AlreadyExists` after this call created its temporary (here injected at the write) still
+/// removes the temporary: cleanup follows what the call created, not the error's kind.
+#[test]
+fn already_exists_after_create_removes_the_temp() {
+    let d = dir();
+    let hook = |_: &str, s: ReplaceStage| {
+        if s == ReplaceStage::Write {
+            Err(io::Error::from(io::ErrorKind::AlreadyExists))
+        } else {
+            Ok(())
+        }
+    };
+    let e = write_replace(d.path(), "port", b"7373\n", INSTANCE, &hook).unwrap_err();
+    assert!(matches!(e, ReplaceError::Io(_)), "{e:?}");
+    assert!(temps(d.path()).is_empty(), "{:?}", temps(d.path()));
+    assert!(!d.path().join("port").exists());
+}
+
+/// Creates a FIFO with `/usr/bin/mkfifo` (no writer ever opens it).
+#[cfg(target_os = "macos")]
+pub(super) fn mkfifo(path: &Path) {
+    let out = super::super::spawn_locked(
+        std::process::Command::new("/usr/bin/mkfifo")
+            .args(["-m", "600"])
+            .arg(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+    assert!(out.success());
+}
+
+/// Runs `f` on a thread and returns its result if it finishes within 2 s; otherwise opens
+/// `fifo` for writing (which releases a reader blocked in `open`) and returns `None`.
+#[cfg(target_os = "macos")]
+pub(super) fn without_blocking<T: Send + 'static>(
+    fifo: &Path,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t = std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(v) => {
+            t.join().unwrap();
+            Some(v)
+        }
+        Err(_) => {
+            let _w = std::fs::OpenOptions::new().write(true).open(fifo).unwrap();
+            let _ = rx.recv_timeout(Duration::from_secs(10));
+            None
+        }
+    }
+}
+
+/// A FIFO at `port`, `daemon.json`, or `owner.token` is refused at once instead of blocking
+/// the opener.
+#[cfg(target_os = "macos")]
+#[test]
+fn fifo_entries_do_not_block_readers() {
+    use super::super::files::{check_token_file, read_port, read_record};
+    for name in [names::PORT, names::RECORD, names::OWNER_TOKEN] {
+        let d = dir();
+        let fifo = d.path().join(name);
+        mkfifo(&fifo);
+        let p = d.path().to_path_buf();
+        let refused = without_blocking(&fifo, move || match name {
+            names::PORT => read_port(&p).is_err(),
+            names::RECORD => read_record(&p).is_err(),
+            _ => check_token_file(&p).is_err(),
+        });
+        assert_eq!(refused, Some(true), "{name}");
+    }
+}

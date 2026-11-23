@@ -75,6 +75,10 @@ fn is_link(m: &std::fs::Metadata) -> bool {
 
 /// Creates or adopts `dir` (absolute) and returns its canonical path.
 pub(crate) fn prepare(dir: &Path, instance: &str) -> Result<PathBuf, Refused> {
+    // Without trailing separators, so the final entry itself is inspected: `dir/` would
+    // resolve a link named `dir` to its target. A root keeps its separator.
+    let normal: PathBuf = dir.components().collect();
+    let dir = normal.as_path();
     let refuse = |why: String| {
         Refused(format!(
             "the state directory {} is refused: {why}",
@@ -121,11 +125,19 @@ pub(crate) fn prepare(dir: &Path, instance: &str) -> Result<PathBuf, Refused> {
     std::fs::canonicalize(dir).map_err(|e| refuse(format!("it cannot be resolved: {e}")))
 }
 
-/// Empty, ignoring unfinished marker temporaries.
+/// Empty, ignoring unfinished marker temporaries (regular files only).
 fn is_empty(dir: &Path) -> io::Result<bool> {
     for entry in std::fs::read_dir(dir)? {
-        let name = entry?.file_name();
-        if !name.to_string_lossy().starts_with(MARKER_TMP_PREFIX) {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(MARKER_TMP_PREFIX)
+        {
+            return Ok(false);
+        }
+        let m = std::fs::symlink_metadata(entry.path())?;
+        if is_link(&m) || !m.file_type().is_file() {
             return Ok(false);
         }
     }
@@ -147,15 +159,18 @@ fn validate_marker(dir: &Path) -> io::Result<bool> {
 /// Publishes the marker without replacing anything: a private temporary, linked to
 /// `CHALDEA_STATE` (which fails if the name exists), then the temporary removed. A concurrent
 /// start that won leaves a complete marker, which is validated instead.
-fn publish_marker(dir: &Path, instance: &str) -> Result<(), String> {
+pub(crate) fn publish_marker(dir: &Path, instance: &str) -> Result<(), String> {
     let tmp = dir.join(format!("{MARKER_TMP_PREFIX}{instance}"));
+    // Only a temporary file this call created is ours to remove.
+    let mut created = false;
     let written = (|| {
         let mut f = host::create_private_file(&tmp)?;
+        created = true;
         f.write_all(MARKER_CONTENT)?;
         f.sync_all()
     })();
     if let Err(e) = written {
-        if e.kind() != io::ErrorKind::AlreadyExists {
+        if created {
             let _ = std::fs::remove_file(&tmp);
         }
         return Err(format!("its marker cannot be written: {e}"));

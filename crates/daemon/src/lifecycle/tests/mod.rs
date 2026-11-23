@@ -38,6 +38,18 @@ use crate::store::Store;
 /// Every bounded wait of these tests.
 pub(super) const WAIT: Duration = Duration::from_secs(30);
 
+/// Waits for a write's reply for at most [`WAIT`] (the writer may be parked by a fault).
+pub(super) fn settle<R: Send + 'static>(
+    ticket: crate::store::WriteTicket<R>,
+) -> Result<R, crate::store::WriteError> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(ticket.blocking_wait());
+    });
+    rx.recv_timeout(WAIT)
+        .expect("the write's reply did not arrive in time")
+}
+
 /// A fresh state directory path (absent) under a private temp directory.
 pub(super) struct Dir {
     _tmp: TempDir,

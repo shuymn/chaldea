@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -94,6 +94,20 @@ pub(crate) enum Point {
     Inside(u8),
     /// After the `port` rename of step 13.
     AfterPortRename,
+    /// The coordinator, after HTTP's shutdown returned and before the participants.
+    AfterHttp,
+    /// The coordinator, right before it submits `Store::shutdown`.
+    BeforeStore,
+    /// The coordinator, after the log thread acknowledged leaving `daemon.log` and before the
+    /// release.
+    AfterLogSwitch,
+    /// The coordinator, after the lock decision.
+    AfterLockDecision,
+    /// The coordinator's thread held (blocking) before it awaits the startup join.
+    CoordinatorBeforeJoin,
+    /// The coordinator's thread held (blocking) after it submitted `Store::shutdown` and
+    /// before it awaits the report.
+    CoordinatorBeforeStoreWait,
 }
 
 /// What a test injects into one run and what the run publishes back.
@@ -125,6 +139,14 @@ pub(crate) struct Faults {
     /// Requests only the coordinator's select loop answers.
     pub(crate) probe:
         Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<std::sync::mpsc::Sender<()>>>>,
+    /// When the startup task returned.
+    pub(crate) startup_returned: OnceLock<Instant>,
+    /// When `Store::shutdown` returned on its blocking thread.
+    pub(crate) store_shutdown_done: OnceLock<Instant>,
+    /// Step 10's bind attempts.
+    pub(crate) bind_attempts: AtomicU32,
+    /// The run panics before its runtime exists.
+    pub(crate) panic_before_runtime: AtomicBool,
 }
 
 impl Faults {

@@ -6,7 +6,7 @@ use std::path::Path;
 use chaldea_pty_runtime::host::{self, EntryKind, Privacy};
 
 use super::super::names;
-use super::super::state_dir::{MARKER_CONTENT, prepare};
+use super::super::state_dir::{MARKER_CONTENT, prepare, publish_marker};
 
 const INSTANCE: &str = "00000000-0000-4000-8000-000000000002";
 
@@ -96,18 +96,22 @@ fn adopts_with_only_a_marker_temp() {
     );
 }
 
-/// An existing marker with other content: the link fails, the file is unchanged, and the
-/// directory is refused after validating it.
+/// Publishing over an existing marker with other content (a concurrent writer that won): the
+/// link fails, the file is unchanged, no temporary is left, and the marker is validated and
+/// refused.
 #[test]
 fn marker_link_does_not_replace() {
     let tmp = tempfile::tempdir().unwrap();
     let d = tmp.path().join("state");
     host::create_private_dir(&d).unwrap();
     std::fs::write(d.join(names::MARKER), "not ours").unwrap();
+    let e = publish_marker(&d, INSTANCE).unwrap_err();
+    assert!(e.contains("carries a marker that is not Chaldea's"), "{e}");
+    assert_eq!(std::fs::read(d.join(names::MARKER)).unwrap(), b"not ours");
+    assert_eq!(listing(&d).len(), 1, "{:?}", listing(&d));
+    // Through `prepare`, the non-empty directory is validated and refused the same way.
     let e = prepare(&d, INSTANCE).unwrap_err();
     assert!(e.0.contains("not a Chaldea state directory"), "{}", e.0);
-    assert_eq!(std::fs::read(d.join(names::MARKER)).unwrap(), b"not ours");
-    assert_eq!(listing(&d).len(), 1);
 }
 
 #[test]
@@ -191,7 +195,85 @@ fn refuses_users_ace_under_profile() {
 fn refuses_existing_public_dir() {
     let public = chaldea_pty_runtime::fake::public_folder().unwrap();
     assert!(public.is_dir());
+    let verdict = host::privacy(&public, EntryKind::Directory).unwrap();
+    assert_ne!(verdict, Privacy::Private);
     let e = prepare(&public, INSTANCE).unwrap_err();
-    assert!(!e.0.is_empty());
+    assert!(e.0.contains("not private"), "{}", e.0);
     assert!(!public.join(names::MARKER).exists());
+}
+
+// ---- Review round 1 ----
+
+/// A trailing separator does not make a linked final component look like its target: still
+/// refused, the target untouched.
+#[test]
+fn refuses_a_linked_final_component_with_a_trailing_separator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("real");
+    host::create_private_dir(&target).unwrap();
+    let link = tmp.path().join("state");
+    chaldea_pty_runtime::fake::make_link(&link, &target).unwrap();
+    let mut seps = vec!["/"];
+    if cfg!(windows) {
+        seps.push("\\");
+    }
+    for sep in seps {
+        let mut spelling = link.clone().into_os_string();
+        spelling.push(sep);
+        let e = prepare(Path::new(&spelling), INSTANCE).unwrap_err();
+        assert!(e.0.contains("link"), "{sep}: {}", e.0);
+        assert!(listing(&target).is_empty(), "{sep}");
+    }
+}
+
+/// The unfinished-marker exception covers only a regular file: a directory of that name
+/// makes the directory non-empty.
+#[test]
+fn marker_temp_exception_is_a_regular_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("state");
+    host::create_private_dir(&d).unwrap();
+    std::fs::create_dir(d.join(".CHALDEA_STATE.tmp-dead")).unwrap();
+    let e = prepare(&d, INSTANCE).unwrap_err();
+    assert!(e.0.contains("not a Chaldea state directory"), "{}", e.0);
+    assert!(!d.join(names::MARKER).exists());
+}
+
+/// A FIFO at `CHALDEA_STATE` is refused at once instead of blocking the marker check.
+#[cfg(target_os = "macos")]
+#[test]
+fn fifo_marker_does_not_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("state");
+    host::create_private_dir(&d).unwrap();
+    let fifo = d.join(names::MARKER);
+    super::files::mkfifo(&fifo);
+    let p = d.clone();
+    let refused = super::files::without_blocking(&fifo, move || prepare(&p, INSTANCE).is_err());
+    assert_eq!(refused, Some(true));
+}
+
+/// Windows: a state directory path longer than `MAX_PATH` (260) is created and inspected
+/// alike, private.
+#[cfg(windows)]
+#[test]
+fn creates_a_state_dir_beyond_max_path() {
+    let tmp = tempfile::tempdir_in(host::default_state_base().unwrap()).unwrap();
+    let mut parent = tmp.path().to_path_buf();
+    for c in ['a', 'b', 'c'] {
+        parent.push(c.to_string().repeat(90));
+    }
+    std::fs::create_dir_all(&parent).unwrap();
+    let d = parent.join("state");
+    assert!(d.as_os_str().len() > 260, "{}", d.as_os_str().len());
+    let canonical = prepare(&d, INSTANCE).unwrap();
+    assert!(canonical.ends_with("state"));
+    assert_eq!(
+        host::privacy(&d, EntryKind::Directory).unwrap(),
+        Privacy::Private
+    );
+    assert_eq!(
+        std::fs::read(d.join(names::MARKER)).unwrap(),
+        MARKER_CONTENT
+    );
 }

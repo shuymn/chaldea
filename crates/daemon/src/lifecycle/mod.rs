@@ -426,15 +426,34 @@ pub(crate) fn run_process_with(
 
 fn run_env(cfg: DaemonConfig, components: Box<dyn Components>, env: RunEnv) -> ExitReport {
     let log = env.log.clone();
+    if env.process
+        && let Some(why) = process::setup_error()
+    {
+        log.error(why);
+        log.error("exiting: code 1 (internal)");
+        log.flush(cfg.budgets.log_flush);
+        return ExitReport::failed(FailReason::Internal, LockDisposition::NeverTaken);
+    }
+    let shared = Arc::new(startup::Shared::default());
+    let seen = shared.clone();
     match catch_unwind(AssertUnwindSafe(move || {
-        shutdown::run_daemon(cfg, components, env)
+        shutdown::run_daemon(cfg, components, env, shared)
     })) {
         Ok(report) => report,
         Err(_) => {
-            // A panic before the runtime existed or one escaping it (design §2.9).
+            // A panic before the runtime existed or one escaping it (design §2.9): the lock
+            // is held only if startup reached step 5.
             log.error("exiting: code 1 (panic)");
             log.flush(Budgets::DEFAULT.log_flush);
-            ExitReport::failed(FailReason::Panic, LockDisposition::HeldUntilExit)
+            let lock = if seen
+                .lock_attempted
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                LockDisposition::HeldUntilExit
+            } else {
+                LockDisposition::NeverTaken
+            };
+            ExitReport::failed(FailReason::Panic, lock)
         }
     }
 }

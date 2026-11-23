@@ -31,6 +31,14 @@ const STEP_ENV: &str = "CHALDEA_LIFECYCLE_STEP";
 
 /// When the controller requested the stop.
 static STOPPED_AT: OnceLock<Instant> = OnceLock::new();
+/// When the controller signalled a console end.
+static CRASHED_AT: OnceLock<Instant> = OnceLock::new();
+/// `run` returned (the controller may still be checking what it left).
+static RETURNED: AtomicBool = AtomicBool::new(false);
+
+fn returned() -> bool {
+    wait_for(WAIT, || RETURNED.load(Ordering::SeqCst))
+}
 
 /// The helper's view of its own run.
 struct Ctl {
@@ -62,6 +70,16 @@ impl Ctl {
         let _ = STOPPED_AT.set(Instant::now());
         self.gate().request(StopCause::Signal(SignalName::Term));
     }
+
+    fn crash(&self) {
+        let gate = self.gate();
+        let _ = CRASHED_AT.set(Instant::now());
+        gate.crash_exit(ConsoleEvent::Close);
+    }
+
+    fn marked(&self, what: &str) -> bool {
+        wait_for(WAIT, || self.faults.marks().iter().any(|m| m.0 == what))
+    }
 }
 
 /// Runs the helper side: the controller on a thread, `run` on this one, then the exit.
@@ -79,10 +97,26 @@ fn helper(
     };
     let controller = std::thread::spawn(move || controller(&ctl));
     let r = run_process_with(cfg, Box::new(comps), faults);
-    // The controller's own reports come before the exit.
-    wait_for(Duration::from_secs(10), || controller.is_finished());
-    if let Some(t) = STOPPED_AT.get() {
-        report(&format!("since_stop_ms={}", t.elapsed().as_millis()));
+    RETURNED.store(true, Ordering::SeqCst);
+    let (since_stop, since_crash) = (
+        STOPPED_AT.get().map(Instant::elapsed),
+        CRASHED_AT.get().map(Instant::elapsed),
+    );
+    // The controller's own reports come before the exit; its failure fails the helper.
+    if !wait_for(Duration::from_secs(10), || controller.is_finished()) {
+        eprintln!("the controller did not finish");
+        super::super::flush_process_log(Duration::from_millis(100));
+        std::process::exit(102);
+    }
+    if controller.join().is_err() {
+        super::super::flush_process_log(Duration::from_millis(100));
+        std::process::exit(101);
+    }
+    if let Some(t) = since_stop {
+        report(&format!("since_stop_ms={}", t.as_millis()));
+    }
+    if let Some(t) = since_crash {
+        report(&format!("since_crash_ms={}", t.as_millis()));
     }
     helper_exit(&r, pause)
 }
@@ -204,10 +238,7 @@ fn live_reader_keeps_the_lock() {
                 c.serving();
                 let store = c.store();
                 *sf.commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
-                let r = store
-                    .submit(Instant::now() + WAIT, |_tx| Ok(()))
-                    .unwrap()
-                    .blocking_wait();
+                let r = super::settle(store.submit(Instant::now() + WAIT, |_tx| Ok(())).unwrap());
                 assert!(r.is_err());
                 let (tx, rx) = mpsc::channel();
                 std::thread::spawn(move || {
@@ -402,26 +433,27 @@ fn console_end_recovers_on_restart() {
             |c| {
                 c.serving();
                 let store = c.store();
-                store
-                    .submit(Instant::now() + WAIT, |tx| {
-                        let t = chaldea_core::ids::TokenId::from_u128(0x600d);
-                        tx.token_insert(NewToken {
-                            token_id: t,
-                            kind: TokenKind::Owner,
-                            sha256: [1; 32],
-                            thread_id: None,
-                            launch_id: None,
-                        })?;
-                        tx.receipt_begin(
-                            chaldea_core::ids::CommandId::from_u128(0x8a),
-                            t,
-                            [7; 32],
-                        )?;
-                        Ok(())
-                    })
-                    .unwrap()
-                    .blocking_wait()
-                    .unwrap();
+                super::settle(
+                    store
+                        .submit(Instant::now() + WAIT, |tx| {
+                            let t = chaldea_core::ids::TokenId::from_u128(0x600d);
+                            tx.token_insert(NewToken {
+                                token_id: t,
+                                kind: TokenKind::Owner,
+                                sha256: [1; 32],
+                                thread_id: None,
+                                launch_id: None,
+                            })?;
+                            tx.receipt_begin(
+                                chaldea_core::ids::CommandId::from_u128(0x8a),
+                                t,
+                                [7; 32],
+                            )?;
+                            Ok(())
+                        })
+                        .unwrap(),
+                )
+                .unwrap();
                 let (tx, rx) = mpsc::channel();
                 let ticket = store
                     .submit(Instant::now() + WAIT, move |w| {
@@ -765,7 +797,10 @@ fn prepare_is_idempotent() {
             .spawn(|| panic!("once"))
             .unwrap()
             .join();
-        report(&format!("checks set={set} second_install={again}"));
+        report(&format!(
+            "checks set={set} second_install={again} runs={}",
+            super::super::process::setup_runs()
+        ));
         super::super::flush_process_log(Duration::from_secs(1));
         std::process::exit(0);
     }
@@ -773,6 +808,7 @@ fn prepare_is_idempotent() {
     let c = h.expect("checks", WAIT);
     assert_eq!(field(&c, "set"), "true", "{c}");
     assert_eq!(field(&c, "second_install"), "false", "{c}");
+    assert_eq!(field(&c, "runs"), "1", "{c}");
     assert_eq!(h.wait(WAIT), Some(0));
     assert_eq!(
         h.stderr().matches("panic in thread at ").count(),
@@ -855,4 +891,428 @@ fn foreground_stderr_is_redacted() {
     assert!(!err.contains(TOKEN) && !err.contains("chdt_FFFF"), "{err}");
     let owner = token_of(&dir.path);
     assert!(!err.contains(&owner), "{err}");
+}
+
+// ---- Review round 1 ----
+
+/// PR8-CL-4: the switch to `daemon.log` at step 6 handed to the log thread but not
+/// acknowledged in time fails the start; the file target may still be active, so the lock is
+/// kept until the exit.
+#[test]
+fn step6_unacknowledged_log_switch_keeps_the_lock() {
+    if in_helper() {
+        let dir = helper_dir();
+        let ready = RecordingReady::new(&dir);
+        let faults = Arc::new(Faults::default());
+        faults.withhold_log_ack.store(true, Ordering::SeqCst);
+        helper(
+            detached(&dir, Some(free_port()), &ready),
+            TestComponents::default(),
+            faults,
+            Duration::from_secs(2),
+            |_| {},
+        );
+    }
+    let (mut h, dir) = parent("step6_unacknowledged_log_switch_keeps_the_lock", &[]);
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "reason"), "internal", "{r}");
+    assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
+    held_then_free(&mut h, &dir.path);
+}
+
+/// PR8-CL-10: a console end that arrives after HTTP's shutdown returned starts no participant
+/// and no store shutdown.
+#[test]
+fn console_end_after_http_starts_no_participant() {
+    if in_helper() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sf = Arc::new(StoreFaults::default());
+        let faults = Arc::new(Faults::default());
+        *faults.store_faults.lock().unwrap() = Some(sf.clone());
+        let park = faults.park(Point::AfterHttp);
+        let comps = TestComponents {
+            participants: vec![Box::new(super::Recorder {
+                name: "first",
+                seen: seen.clone(),
+            })],
+            ..TestComponents::default()
+        };
+        helper(fg(), comps, faults, Duration::from_secs(2), move |c| {
+            c.serving();
+            c.stop();
+            assert!(park.wait_reached(WAIT));
+            c.crash();
+            park.release();
+            assert!(returned());
+            report(&format!(
+                "checks participants={} store_shutdown={}",
+                seen.lock().unwrap().len(),
+                sf.marks.lock().unwrap().contains(&"owner_claimed")
+            ));
+        });
+    }
+    let (mut h, dir) = parent("console_end_after_http_starts_no_participant", &[]);
+    let c = h.expect("checks", WAIT);
+    assert_eq!(field(&c, "participants"), "0", "{c}");
+    assert_eq!(field(&c, "store_shutdown"), "false", "{c}");
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "reason"), "console_end", "{r}");
+    assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
+    held_then_free(&mut h, &dir.path);
+}
+
+/// PR8-CL-10: with no participants, a console end that arrives before the store's shutdown
+/// is submitted keeps it from being submitted.
+#[test]
+fn console_end_before_the_store_submit() {
+    if in_helper() {
+        let sf = Arc::new(StoreFaults::default());
+        let faults = Arc::new(Faults::default());
+        *faults.store_faults.lock().unwrap() = Some(sf.clone());
+        let park = faults.park(Point::BeforeStore);
+        helper(
+            fg(),
+            TestComponents::default(),
+            faults,
+            Duration::from_secs(2),
+            move |c| {
+                c.serving();
+                c.stop();
+                assert!(park.wait_reached(WAIT));
+                c.crash();
+                park.release();
+                assert!(returned());
+                report(&format!(
+                    "checks store_shutdown={}",
+                    sf.marks.lock().unwrap().contains(&"owner_claimed")
+                ));
+            },
+        );
+    }
+    let (mut h, dir) = parent("console_end_before_the_store_submit", &[]);
+    let c = h.expect("checks", WAIT);
+    assert_eq!(field(&c, "store_shutdown"), "false", "{c}");
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "reason"), "console_end", "{r}");
+    held_then_free(&mut h, &dir.path);
+}
+
+/// PR8-CL-10: a console end during the log switch before the release keeps the lock.
+#[test]
+fn console_end_during_the_log_switch_keeps_the_lock() {
+    if in_helper() {
+        let dir = helper_dir();
+        let ready = RecordingReady::new(&dir);
+        let faults = Arc::new(Faults::default());
+        let park = faults.park(Point::AfterLogSwitch);
+        helper(
+            detached(&dir, Some(free_port()), &ready),
+            TestComponents::default(),
+            faults,
+            Duration::from_secs(2),
+            move |c| {
+                c.serving();
+                c.stop();
+                assert!(park.wait_reached(WAIT));
+                c.crash();
+                park.release();
+            },
+        );
+    }
+    let (mut h, dir) = parent("console_end_during_the_log_switch_keeps_the_lock", &[]);
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "reason"), "console_end", "{r}");
+    assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
+    held_then_free(&mut h, &dir.path);
+}
+
+/// PR8-CL-10: a console end during startup (parked before step 9) returns at once holding the
+/// lock, and the startup task does not run step 9 meanwhile: a receipt left `in_progress`
+/// stays so.
+#[test]
+fn console_end_during_startup() {
+    if in_helper() {
+        let faults = Arc::new(Faults::default());
+        let park = faults.park(Point::Before(9));
+        helper(
+            fg(),
+            TestComponents::default(),
+            faults,
+            Duration::from_secs(2),
+            move |c| {
+                assert!(park.wait_reached(WAIT));
+                c.crash();
+                park.release();
+            },
+        );
+    }
+    let dir = state();
+    let run = super::start(
+        foreground(&dir.path, Some(free_port())),
+        TestComponents::default(),
+        Arc::default(),
+    );
+    run.serving();
+    run.stop();
+    assert_eq!(run.join().code.code(), 0);
+    let store = super::startup::open_store(&dir.path);
+    super::settle(
+        store
+            .submit(Instant::now() + WAIT, |tx| {
+                let t = chaldea_core::ids::TokenId::from_u128(0x6b);
+                Ok(tx.receipt_begin(chaldea_core::ids::CommandId::from_u128(0x8a), t, [7; 32])?)
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    super::startup::close(&store);
+    let mut h = Helper::spawn(
+        &format!("{PREFIX}console_end_during_startup"),
+        &dir.path,
+        &[],
+    );
+    let since = h.expect("since_crash_ms", WAIT);
+    let ms: u64 = field(&since, "since_crash_ms").parse().unwrap();
+    assert!(ms < 200, "{ms} ms");
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "reason"), "console_end", "{r}");
+    assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
+    held_then_free(&mut h, &dir.path);
+    assert_eq!(
+        super::startup::receipt(&dir.path),
+        Some(chaldea_core::command::ReceiptStatus::InProgress)
+    );
+}
+
+/// PR8-CL-25: a startup task that returns after the join's end, first observed with the end
+/// already passed, does not win: the exit is bare and holds the lock.
+#[test]
+fn join_ready_after_its_end_is_a_bare_exit() {
+    if in_helper() {
+        let faults = Arc::new(Faults::default());
+        let inside = faults.park(Point::Inside(8));
+        let coordinator = faults.park(Point::CoordinatorBeforeJoin);
+        helper(
+            fg(),
+            TestComponents::default(),
+            faults,
+            Duration::from_secs(2),
+            move |c| {
+                assert!(inside.wait_reached(WAIT));
+                c.stop();
+                let end = c.gate().stopping().unwrap().cutoff - Duration::from_secs(6);
+                assert!(coordinator.wait_reached(WAIT));
+                // Past the join's end, the startup task returns while the coordinator is held.
+                assert!(wait_for(WAIT, || Instant::now() > end + Duration::from_millis(200)));
+                inside.release();
+                assert!(wait_for(WAIT, || c.faults.startup_returned.get().is_some()));
+                coordinator.release();
+            },
+        );
+    }
+    let (mut h, dir) = parent("join_ready_after_its_end_is_a_bare_exit", &[]);
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "reason"), "startup_unjoined", "{r}");
+    assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
+    held_then_free(&mut h, &dir.path);
+}
+
+/// PR8-CL-4: a store report first observed after `C + 250 ms` does not count: the lock is
+/// kept.
+#[test]
+fn store_report_after_its_end_keeps_the_lock() {
+    if in_helper() {
+        let faults = Arc::new(Faults::default());
+        let coordinator = faults.park(Point::CoordinatorBeforeStoreWait);
+        helper(
+            fg(),
+            TestComponents::default(),
+            faults,
+            Duration::from_secs(2),
+            move |c| {
+                c.serving();
+                c.stop();
+                let cutoff = c.gate().stopping().unwrap().cutoff;
+                assert!(coordinator.wait_reached(WAIT));
+                assert!(wait_for(WAIT, || c
+                    .faults
+                    .store_shutdown_done
+                    .get()
+                    .is_some()));
+                assert!(wait_for(WAIT, || Instant::now()
+                    > cutoff + Duration::from_millis(250 + 200)));
+                coordinator.release();
+            },
+        );
+    }
+    let (mut h, dir) = parent("store_report_after_its_end_keeps_the_lock", &[]);
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
+    held_then_free(&mut h, &dir.path);
+    assert!(
+        h.stderr()
+            .contains("the store's shutdown report was not seen"),
+        "{}",
+        h.stderr()
+    );
+}
+
+/// A process whose inherited signal state could not be reset does not start a daemon.
+#[test]
+fn failed_signal_reset_fails_the_start() {
+    if in_helper() {
+        super::super::process::fail_signal_reset_for_test();
+        helper(
+            fg(),
+            TestComponents::default(),
+            Arc::default(),
+            Duration::ZERO,
+            |c| {
+                // If it serves anyway, stop it so the helper reports.
+                if wait_for(Duration::from_secs(5), || c.faults.port.get().is_some()) {
+                    c.stop();
+                }
+            },
+        );
+    }
+    let (mut h, dir) = parent("failed_signal_reset_fails_the_start", &[]);
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "code"), "1", "{r}");
+    assert_eq!(field(&r, "reason"), "internal", "{r}");
+    assert_eq!(field(&r, "lock"), "NeverTaken", "{r}");
+    h.wait(WAIT);
+    assert!(h.stderr().contains("signal state"), "{}", h.stderr());
+    assert!(!dir.path.exists());
+}
+
+// ---- Console ends and panics that keep the lock, moved out of the in-process tests ----
+
+/// PR8-CL-10: a console end while serving, and one while HTTP drains after a signal, returns
+/// within 200 ms holding the lock, without calling `Store::shutdown`.
+#[test]
+fn console_end_exits_without_store_shutdown() {
+    if in_helper() {
+        let draining = std::env::var(STEP_ENV).is_ok_and(|v| v == "draining");
+        let sf = Arc::new(StoreFaults::default());
+        let faults = Arc::new(Faults::default());
+        *faults.store_faults.lock().unwrap() = Some(sf.clone());
+        helper(
+            fg(),
+            TestComponents::default(),
+            faults,
+            Duration::from_secs(2),
+            move |c| {
+                let port = c.serving();
+                let mut half = None;
+                if draining {
+                    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+                    std::io::Write::write_all(&mut s, b"GET /api/threads HTTP/1.1\r\n").unwrap();
+                    half = Some(s);
+                    std::thread::sleep(Duration::from_millis(100));
+                    c.stop();
+                    assert!(c.marked("http"));
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                c.crash();
+                assert!(returned());
+                report(&format!(
+                    "checks store_shutdown={}",
+                    sf.marks.lock().unwrap().contains(&"owner_claimed")
+                ));
+                drop(half);
+            },
+        );
+    }
+    for case in ["serving", "draining"] {
+        let (mut h, dir) = parent(
+            "console_end_exits_without_store_shutdown",
+            &[(STEP_ENV, case)],
+        );
+        let c = h.expect("checks", WAIT);
+        assert_eq!(field(&c, "store_shutdown"), "false", "{case}: {c}");
+        let since = h.expect("since_crash_ms", WAIT);
+        let ms: u64 = field(&since, "since_crash_ms").parse().unwrap();
+        assert!(ms < 200, "{case}: {ms} ms");
+        let r = h.expect("returned", WAIT);
+        assert_eq!(field(&r, "code"), "1", "{case}: {r}");
+        assert_eq!(field(&r, "reason"), "console_end", "{case}: {r}");
+        assert_eq!(field(&r, "lock"), "HeldUntilExit", "{case}: {r}");
+        held_then_free(&mut h, &dir.path);
+    }
+}
+
+/// PR8-CL-10: a console end while `Store::shutdown` blocks on a held reader returns within
+/// 200 ms instead of waiting for `C + 250 ms`; the lock is not released.
+#[test]
+fn console_end_during_store_shutdown() {
+    if in_helper() {
+        helper(
+            fg(),
+            TestComponents::default(),
+            Arc::default(),
+            Duration::from_secs(2),
+            |c| {
+                c.serving();
+                let store = c.store();
+                let (in_tx, in_rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = store.read(Instant::now() + WAIT, move |_r| -> Result<(), _> {
+                        let _ = in_tx.send(());
+                        loop {
+                            std::thread::park();
+                        }
+                    });
+                });
+                in_rx.recv_timeout(WAIT).unwrap();
+                c.stop();
+                assert!(c.marked("store"));
+                std::thread::sleep(Duration::from_millis(200));
+                c.crash();
+            },
+        );
+    }
+    let (mut h, dir) = parent("console_end_during_store_shutdown", &[]);
+    let since = h.expect("since_crash_ms", WAIT);
+    let ms: u64 = field(&since, "since_crash_ms").parse().unwrap();
+    assert!(ms < 200, "{ms} ms");
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "reason"), "console_end", "{r}");
+    assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
+    held_then_free(&mut h, &dir.path);
+}
+
+/// Step 11: a panicking `build` is `panic`; the startup task took its writer with it (no
+/// verdict), and the lock stays held.
+#[test]
+fn panic_at_step_11() {
+    if in_helper() {
+        let dir = helper_dir();
+        let ready = RecordingReady::new(&dir);
+        let main_ready = ready.clone();
+        let comps = TestComponents {
+            panic_in_build: true,
+            ..TestComponents::default()
+        };
+        prepare_process();
+        let r = run_process_with(
+            detached(&dir, Some(free_port()), &ready),
+            Box::new(comps),
+            Arc::default(),
+        );
+        report(&format!(
+            "checks verdicts={} record={}",
+            main_ready.lines().len(),
+            dir.join(names::RECORD).exists()
+        ));
+        helper_exit(&r, Duration::from_secs(2));
+    }
+    let (mut h, dir) = parent("panic_at_step_11", &[]);
+    let c = h.expect("checks", WAIT);
+    assert_eq!(field(&c, "verdicts"), "0", "{c}");
+    assert_eq!(field(&c, "record"), "false", "{c}");
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "code"), "1", "{r}");
+    assert_eq!(field(&r, "reason"), "panic", "{r}");
+    assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
+    held_then_free(&mut h, &dir.path);
 }
