@@ -159,6 +159,25 @@ async fn pid_wait_timings() {
     h.assert_raw(&l, x.emit, R::Unbound);
     h.stop().await;
 
+    // The pid wait starts at intake, with the ordinal and the facts: time spent before
+    // intake (here 1.2 s of server clock, past a 1 s wait counted from before intake) does
+    // not shorten it, so a start committed right after intake binds.
+    let h = HookServer::start().await;
+    let l = unstarted(&h).await;
+    let (before_intake, go) = h.ingest.points.arm_before_intake();
+    let (after_intake, go_on) = h.ingest.points.arm_intake(1);
+    let x = Hook::of(&l, "SessionStart", "s");
+    let reply = h.spawn_post(&x);
+    reached(before_intake).await;
+    h.srv.clock.skew(Duration::from_millis(1200));
+    go.send(()).unwrap();
+    reached(after_intake).await;
+    start_now(&h, &l).await;
+    go_on.send(()).unwrap();
+    ok(&reply.await.unwrap());
+    assert_eq!(h.launch_row(l.launch).session_id.as_deref(), Some("s"));
+    h.stop().await;
+
     // The pid-wait deadline is the request deadline: 408, nothing written.
     let h = HookServer::start_with(
         HookConfig {
@@ -269,6 +288,49 @@ async fn store_outcomes_map() {
     assert_eq!(outcome(&h.post(&x).await), (503, Some("busy".into())));
     release.send(()).unwrap();
     super::support::http::settled(filler).await.unwrap();
+    assert!(h.delivery(l.launch, x.emit).is_none());
+    h.stop().await;
+
+    // J5: `RolledBack(DiskFull)`: the database may not grow, and a raw body needs pages.
+    let h = HookServer::start().await;
+    let l = h.codex(1).await;
+    bind(&h, &l, "s").await;
+    h.run(|tx| {
+        let pages: i64 = tx
+            .raw()
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .map_err(crate::store::StoreError::from)?;
+        tx.raw()
+            .execute_batch(&format!("PRAGMA max_page_count = {pages}"))
+            .map_err(crate::store::StoreError::from)?;
+        Ok(())
+    })
+    .await;
+    let x = Hook::new(&l, &vec![b'x'; 256 * 1024]);
+    assert_eq!(outcome(&h.post(&x).await), (503, Some("disk_full".into())));
+    assert!(h.delivery(l.launch, x.emit).is_none());
+    h.stop().await;
+
+    // J2: `WriteError::Busy`: another connection holds the write lock past the writer's busy
+    // timeout.
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FixedClock::new(T0);
+    let mut cfg = config(dir.path().join("chaldea.db"), clock.clone());
+    cfg.busy_timeout = Duration::from_millis(100);
+    let ts = TestStore {
+        store: Some(crate::store::Store::open(cfg).unwrap()),
+        clock,
+        dir,
+    };
+    let h = HookServer::start_on(ts, HookConfig::default(), |_| {}).await;
+    let l = h.codex(1).await;
+    bind(&h, &l, "s").await;
+    let other = rusqlite::Connection::open(h.srv.store.path()).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let x = Hook::of(&l, "Stop", "s");
+    assert_eq!(outcome(&h.post(&x).await), (503, Some("busy".into())));
+    other.execute_batch("ROLLBACK").unwrap();
+    drop(other);
     assert!(h.delivery(l.launch, x.emit).is_none());
     h.stop().await;
 
@@ -479,6 +541,26 @@ async fn handler_rejections() {
     let HookServer { srv, .. } = h;
     let _ = srv.into_store(WAIT).await;
 
+    // H6: the deadline passed before the walk: 408, and no walk starts.
+    let h = HookServer::start().await;
+    let l = h.codex(1).await;
+    let before = h.snapshot(&l);
+    let (gate, open) = h.ingest.points.arm_intake(1);
+    let reply = h.spawn_post(&Hook::of(&l, "SessionStart", "s"));
+    reached(gate).await;
+    h.srv.clock.skew(Duration::from_secs(3));
+    open.send(()).unwrap();
+    assert_eq!(outcome(&reply.await.unwrap()), timeout);
+    h.srv.clock.skew(Duration::ZERO);
+    // A walk spawned anyway would record itself on its blocking thread within this window.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        h.chains.walked.lock().unwrap().is_empty(),
+        "walked after the deadline"
+    );
+    assert_eq!(h.snapshot(&l), before);
+    h.stop().await;
+
     // H6: the walk held past the deadline.
     let h = HookServer::start().await;
     let l = h.codex(1).await;
@@ -492,18 +574,18 @@ async fn handler_rejections() {
     assert_eq!(h.snapshot(&l), before);
     h.stop().await;
 
-    // H6: the binding order held past the deadline by a lower ordinal.
+    // H6: the binding order held past the deadline by a lower ordinal. The lower request
+    // holds its ticket at the job point, which its own deadline does not end, so ordinal 1
+    // stays pending through the `SessionStart`'s whole deadline.
     let h = HookServer::start().await;
     let l = h.codex(1).await;
-    h.chains
-        .set(7001, super::support::hook::direct(7001, "codex"));
-    let (walking, release) = h.chains.hold(7001);
-    let lower = h.spawn_post(&Hook::of(&l, "UserPromptSubmit", "s").pid(Some(7001)));
-    reached_sync(walking).await;
+    let (gate, open) = h.ingest.points.arm_job(1);
+    let lower = h.spawn_post(&Hook::of(&l, "UserPromptSubmit", "s"));
+    reached(gate).await;
     let start = Hook::of(&l, "SessionStart", "s");
     assert_eq!(outcome(&h.post(&start).await), timeout);
     assert!(h.delivery(l.launch, start.emit).is_none());
-    drop(release);
+    open.send(()).unwrap();
     let _ = lower.await;
     h.stop().await;
 }

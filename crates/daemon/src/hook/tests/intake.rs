@@ -34,9 +34,9 @@ async fn resolves(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn intake_order() {
     let order = Arc::new(IntakeOrder::default());
-    let (t1, _) = order.intake(l(), 7, &NoIntakeFacts);
-    let (t2, _) = order.intake(l(), 0, &NoIntakeFacts);
-    let (t3, _) = order.intake(l(), 0, &NoIntakeFacts);
+    let (t1, _, _) = order.intake(l(), 7, &NoIntakeFacts, Instant::now);
+    let (t2, _, _) = order.intake(l(), 0, &NoIntakeFacts, Instant::now);
+    let (t3, _, _) = order.intake(l(), 0, &NoIntakeFacts, Instant::now);
     assert_eq!((t1.ordinal(), t2.ordinal(), t3.ordinal()), (8, 9, 10));
     // The lowest never waits.
     assert!(resolves(&order, &t1, WAIT).await);
@@ -49,8 +49,8 @@ async fn intake_order() {
 
     // A release between the check and the await: the future already observes it.
     let order = Arc::new(IntakeOrder::default());
-    let (a, _) = order.intake(l(), 0, &NoIntakeFacts);
-    let (b, _) = order.intake(l(), 0, &NoIntakeFacts);
+    let (a, _, _) = order.intake(l(), 0, &NoIntakeFacts, Instant::now);
+    let (b, _, _) = order.intake(l(), 0, &NoIntakeFacts, Instant::now);
     let a = Arc::new(std::sync::Mutex::new(Some(a)));
     let a2 = a.clone();
     *order.between_check_and_await.lock().unwrap() = Some(Box::new(move || {
@@ -77,7 +77,7 @@ async fn release_points() {
     // Success: released when `submit` returns, not when the job runs.
     let (srv, ctx) = server_and_ctx().await;
     let order = Arc::new(IntakeOrder::default());
-    let (t, _) = order.intake(l(), 0, &NoIntakeFacts);
+    let (t, _, _) = order.intake(l(), 0, &NoIntakeFacts, Instant::now);
     let release_writer = srv.hold_writer().await;
     let (gate, open) = shared(&srv).faults.arm_submit_gate();
     let ctx = Arc::new(ctx);
@@ -99,7 +99,7 @@ async fn release_points() {
 
     // Failure: the store refuses the submission.
     let (srv, ctx) = server_and_ctx().await;
-    let (t, _) = order.intake(l(), 0, &NoIntakeFacts);
+    let (t, _, _) = order.intake(l(), 0, &NoIntakeFacts, Instant::now);
     let ordinal = t.ordinal();
     srv.store.store().shutdown(Instant::now() + WAIT);
     assert_eq!(
@@ -115,7 +115,7 @@ async fn release_points() {
 
     // Registry refusal: the observer is never registered.
     let (mut srv, ctx) = server_and_ctx().await;
-    let (t, _) = order.intake(l(), 0, &NoIntakeFacts);
+    let (t, _, _) = order.intake(l(), 0, &NoIntakeFacts, Instant::now);
     let ordinal = t.ordinal();
     srv.shutdown_http(Instant::now() + WAIT).await;
     assert_eq!(

@@ -11,6 +11,8 @@ type Gate = (oneshot::Sender<()>, oneshot::Receiver<()>);
 #[derive(Default)]
 pub(crate) struct Points {
     pre_read: Mutex<Option<Gate>>,
+    /// Held after the pre-read, before intake.
+    before_intake: Mutex<Option<Gate>>,
     /// Held after intake by the request whose ordinal matches.
     intake: Mutex<Option<(u64, Gate)>>,
     subscribe: Mutex<Option<Gate>>,
@@ -60,6 +62,19 @@ impl Points {
     pub(crate) async fn before_pre_read(&self) {
         let g = self
             .pre_read
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        pass(g).await;
+    }
+
+    pub(crate) fn arm_before_intake(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        arm(&self.before_intake)
+    }
+
+    pub(crate) async fn before_intake(&self) {
+        let g = self
+            .before_intake
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();

@@ -221,16 +221,21 @@ impl HookIngest {
         if let Some(d) = &pre.delivery {
             return Ok(reply(&d.first_reply));
         }
-        // 5. Intake.
-        let intake_at = shared.cfg.clock.now();
-        let (ticket, facts) =
-            self.order
-                .intake(pre.launch.launch_id, pre.stored_max, &*self.seams.intake);
+        // 5. Intake: the ordinal, the facts, and the pid wait's origin together.
+        #[cfg(test)]
+        self.points.before_intake().await;
+        let (ticket, facts, intake_at) = self.order.intake(
+            pre.launch.launch_id,
+            pre.stored_max,
+            &*self.seams.intake,
+            || shared.cfg.clock.now(),
+        );
         #[cfg(test)]
         self.points.after_intake(ticket.ordinal()).await;
         // 6. Ancestry walk.
         let chain = match headers.emitter_pid {
             None => Chain::no_pid(),
+            Some(_) if shared.passed(deadline) => return Err(ApiError::request_timeout()),
             Some(pid) => {
                 let procs = self.seams.procs.clone();
                 let max = self.cfg.max_chain;

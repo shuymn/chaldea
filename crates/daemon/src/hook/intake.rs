@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use chaldea_core::ids::LaunchId;
 use serde::{Deserialize, Serialize};
@@ -84,14 +85,16 @@ impl Drop for IntakeTicket {
 }
 
 impl IntakeOrder {
-    /// The next ordinal of `l` (an absent entry starts at `stored_max + 1`) and `probe`'s
-    /// facts, in one critical section, so receipt order and the order of intake facts agree.
+    /// The next ordinal of `l` (an absent entry starts at `stored_max + 1`), `probe`'s facts,
+    /// and the intake instant from `now` (the pid wait's origin), in one critical section, so
+    /// receipt order, the order of intake facts, and the pid wait's start agree.
     pub fn intake(
         self: &Arc<Self>,
         l: LaunchId,
         stored_max: u64,
         probe: &dyn IntakeProbe,
-    ) -> (IntakeTicket, Option<IntakeFacts>) {
+        now: impl FnOnce() -> Instant,
+    ) -> (IntakeTicket, Option<IntakeFacts>, Instant) {
         let mut map = self.launches.lock().unwrap_or_else(PoisonError::into_inner);
         let e = map.entry(l).or_insert_with(|| LaunchIntake {
             next: stored_max.saturating_add(1),
@@ -102,6 +105,7 @@ impl IntakeOrder {
         e.next = e.next.saturating_add(1);
         e.pending.insert(ordinal);
         let facts = probe.facts(l);
+        let at = now();
         drop(map);
         (
             IntakeTicket {
@@ -110,6 +114,7 @@ impl IntakeOrder {
                 order: self.clone(),
             },
             facts,
+            at,
         )
     }
 
