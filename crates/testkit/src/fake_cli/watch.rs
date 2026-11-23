@@ -3,7 +3,7 @@
 //! children that kills each at its deadline, reaps it, and collects its counted outputs,
 //! independently of the order in which their results are then reported.
 
-use std::io::Read;
+use std::io::{self, Read};
 use std::process::Child;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
@@ -68,6 +68,36 @@ pub(crate) fn exit_code(code: Option<i32>, seen: Instant, deadline: Instant) -> 
     if seen < deadline { code } else { None }
 }
 
+/// What one poll of a running child decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Next {
+    /// Still running before its deadline.
+    Wait,
+    /// Exited: its code by [`exit_code`], and the instant read after the poll.
+    Exited(Option<i32>, Instant),
+    /// Still running at its deadline, or the poll failed: kill it (a failure, `None`).
+    Kill(Instant),
+}
+
+/// Polls a running child once with `try_wait` (its exit code when it has exited), retrying
+/// an interrupted call, and classifies the result by the clock read after the poll returned.
+pub(crate) fn next(
+    mut try_wait: impl FnMut() -> io::Result<Option<Option<i32>>>,
+    deadline: Instant,
+) -> Next {
+    loop {
+        let r = try_wait();
+        let at = Instant::now();
+        return match r {
+            Ok(Some(code)) => Next::Exited(exit_code(code, at, deadline), at),
+            Ok(None) if at < deadline => Next::Wait,
+            Ok(None) => Next::Kill(at),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => Next::Kill(at),
+        };
+    }
+}
+
 /// An output counted at `at` is kept only when it closed by `cutoff`.
 pub(crate) fn by_cutoff((len, at): (usize, Instant), cutoff: Instant) -> Option<usize> {
     (at <= cutoff).then_some(len)
@@ -97,27 +127,30 @@ pub(crate) fn settle(ws: Vec<Watched>) -> Vec<Settled> {
     let mut pending: Vec<Vec<bool>> = ws.iter().map(|w| vec![true; w.outputs.len()]).collect();
     let mut ws = ws;
     loop {
-        let now = Instant::now();
         let mut busy = false;
         for (i, w) in ws.iter_mut().enumerate() {
             let cutoff = w.deadline + REAP;
             match state[i] {
-                State::Running => match w.child.try_wait() {
-                    Ok(Some(s)) => {
-                        done[i].code = exit_code(s.code(), now, w.deadline);
-                        done[i].elapsed = now - w.launched;
-                        state[i] = State::Reaped;
+                State::Running => {
+                    let child = &mut w.child;
+                    match next(|| child.try_wait().map(|s| s.map(|s| s.code())), w.deadline) {
+                        Next::Wait => busy = true,
+                        Next::Exited(code, at) => {
+                            done[i].code = code;
+                            done[i].elapsed = at - w.launched;
+                            state[i] = State::Reaped;
+                        }
+                        Next::Kill(at) => {
+                            let _ = w.child.kill();
+                            done[i].elapsed = at - w.launched;
+                            state[i] = State::Killed;
+                            busy = true;
+                        }
                     }
-                    Ok(None) if now < w.deadline => busy = true,
-                    _ => {
-                        let _ = w.child.kill();
-                        done[i].elapsed = now - w.launched;
-                        state[i] = State::Killed;
-                        busy = true;
-                    }
-                },
+                }
                 State::Killed => {
-                    if matches!(w.child.try_wait(), Ok(None)) && now < cutoff {
+                    let reaped = !matches!(w.child.try_wait(), Ok(None));
+                    if !reaped && Instant::now() < cutoff {
                         busy = true;
                     } else {
                         state[i] = State::Reaped;
@@ -134,7 +167,7 @@ pub(crate) fn settle(ws: Vec<Watched>) -> Vec<Settled> {
                         done[i].outputs[j] = by_cutoff(c, cutoff);
                         pending[i][j] = false;
                     }
-                    Err(TryRecvError::Empty) if now < cutoff => busy = true,
+                    Err(TryRecvError::Empty) if Instant::now() < cutoff => busy = true,
                     Err(_) => pending[i][j] = false,
                 }
             }
@@ -157,6 +190,49 @@ mod tests {
         assert_eq!(exit_code(Some(0), deadline, deadline), None);
         assert_eq!(exit_code(Some(0), deadline + POLL, deadline), None);
         assert_eq!(exit_code(None, deadline - POLL, deadline), None);
+    }
+
+    /// The decision uses the clock read after the poll: an exit status returned by a poll
+    /// that ends after the deadline is not a success.
+    #[test]
+    fn a_poll_that_returns_after_the_deadline_is_not_a_success() {
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let late = || {
+            std::thread::sleep(Duration::from_millis(40));
+            Ok(Some(Some(0)))
+        };
+        let Next::Exited(code, at) = next(late, deadline) else {
+            panic!("not an exit")
+        };
+        assert!(at >= deadline);
+        assert_eq!(code, None);
+        // Before the deadline: the code is kept.
+        let far = Instant::now() + Duration::from_secs(30);
+        assert!(matches!(
+            next(|| Ok(Some(Some(0))), far),
+            Next::Exited(Some(0), _)
+        ));
+    }
+
+    /// An interrupted poll is retried; any other poll error kills the child.
+    #[test]
+    fn a_poll_error_kills_unless_interrupted() {
+        let far = Instant::now() + Duration::from_secs(30);
+        let mut calls = 0;
+        let interrupted_once = || {
+            calls += 1;
+            if calls == 1 {
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            } else {
+                Ok(None)
+            }
+        };
+        assert_eq!(next(interrupted_once, far), Next::Wait);
+        assert_eq!(calls, 2);
+        assert!(matches!(
+            next(|| Err(io::Error::other("ECHILD")), far),
+            Next::Kill(_)
+        ));
     }
 
     #[test]
