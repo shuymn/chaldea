@@ -770,6 +770,26 @@ fn truncates_over_4_mib() {
     assert_eq!(reqs.len(), 1);
     assert!(reqs[0].all("X-Chaldea-Body-Truncated").is_empty());
     assert_eq!(reqs[0].body.len(), MIB4);
+    // One byte over, closed at once: truncated.
+    let stub = Stub::start(&[Reply::Status(200)]);
+    assert_quiet(&emit_to(&stub.url(), Stdin::Bytes(stdin[..=MIB4].to_vec())));
+    let reqs = stub.settled();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].one("X-Chaldea-Body-Truncated"), "1");
+    assert!(reqs[0].body == stdin[..MIB4]);
+}
+
+/// CL-25: stdin over 4 MiB that is still open at the 1.5 s cut sends nothing, like any
+/// stdin still open then.
+#[test]
+fn oversized_stdin_still_open_sends_nothing() {
+    let stub = Stub::start(&[Reply::Status(200)]);
+    let r = emit_to(
+        &stub.url(),
+        Stdin::LateEof(Duration::from_secs(4), vec![b'x'; MIB4 + 1]),
+    );
+    assert_quiet(&r);
+    assert_eq!(stub.accepted(), 0);
 }
 
 /// The threads of `pid`, from `ps -M` (one line per thread after the header).

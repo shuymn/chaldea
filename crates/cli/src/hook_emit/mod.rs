@@ -106,6 +106,12 @@ pub(crate) struct Body {
     pub(crate) truncated: bool,
 }
 
+/// What the stdin reader hands over: its result and when it completed.
+pub(crate) struct StdinDone {
+    pub(crate) result: std::io::Result<Vec<u8>>,
+    pub(crate) at: Instant,
+}
+
 /// Reads stdin on a thread, up to `MAX_BODY + 1` bytes, until `until`: `None` when it is
 /// still open then, or the read failed.
 fn read_stdin(until: Instant) -> Option<Body> {
@@ -113,23 +119,46 @@ fn read_stdin(until: Instant) -> Option<Body> {
     let reader = std::thread::Builder::new()
         .name("hook-emit-stdin".to_owned())
         .spawn(move || {
-            let mut buf = Vec::new();
-            let r = std::io::stdin()
-                .lock()
-                .take(MAX_BODY as u64 + 1)
-                .read_to_end(&mut buf)
-                .map(|_| buf);
-            let _ = tx.send(r);
+            let result = read_capped(&mut std::io::stdin().lock());
+            let _ = tx.send(StdinDone {
+                result,
+                at: Instant::now(),
+            });
         });
     if reader.is_err() {
         return None;
     }
-    let r = rx.recv_timeout(until.saturating_duration_since(Instant::now()));
-    stdin_outcome(r.ok(), Instant::now(), until)
+    receive_stdin(&SystemClock, &rx, until)
 }
 
-/// A stdin result observed at `seen`: sent only when it arrived before `until` (a result
-/// first seen at or after the cut is not sent), a longer one truncated to `MAX_BODY`.
+/// Reads `r` to EOF, keeping at most `MAX_BODY + 1` bytes: past that the rest is read and
+/// discarded, so the result (a truncated prefix included) exists only once the input
+/// ended. An input still open at the cut is therefore never sent, whatever its size.
+pub(crate) fn read_capped(r: &mut impl Read) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    r.by_ref().take(MAX_BODY as u64 + 1).read_to_end(&mut buf)?;
+    if buf.len() > MAX_BODY {
+        std::io::copy(r, &mut std::io::sink())?;
+    }
+    Ok(buf)
+}
+
+/// Takes the reader's result, classified by when the reader completed, not by when this
+/// thread woke: a result completed before `until` and already queued is sent even when the
+/// receive happens after `until`.
+pub(crate) fn receive_stdin(
+    clock: &dyn Clock,
+    rx: &mpsc::Receiver<StdinDone>,
+    until: Instant,
+) -> Option<Body> {
+    let d = rx
+        .recv_timeout(until.saturating_duration_since(clock.now()))
+        .ok()?;
+    stdin_outcome(Some(d.result), d.at, until)
+}
+
+/// A stdin result completed at `seen`: sent only when it completed before `until` (a result
+/// completed at or after the cut is not sent), a longer one truncated to `MAX_BODY`.
 pub(crate) fn stdin_outcome(
     r: Option<std::io::Result<Vec<u8>>>,
     seen: Instant,
@@ -398,6 +427,43 @@ mod tests {
         for final_status in [200, 201, 400, 401, 403, 404, 411, 413, 421, 500, 502, 504] {
             assert_eq!(next(Ok(final_status)), Next::Stop, "{final_status}");
         }
+    }
+
+    #[test]
+    fn a_result_completed_before_the_cut_is_sent_when_received_after_it() {
+        let t0 = Instant::now();
+        let until = t0 + ms(1500);
+        let (tx, rx) = mpsc::channel();
+        tx.send(StdinDone {
+            result: Ok(b"{}".to_vec()),
+            at: until - ms(10),
+        })
+        .unwrap();
+        // The receiver wakes 10 ms after the cut.
+        let clock = TestClock::at(until + ms(10));
+        let got = receive_stdin(&clock, &rx, until).map(|b| b.bytes);
+        assert_eq!(got.as_deref(), Some(&b"{}"[..]));
+        // Completed at the cut: not sent, whenever it is received.
+        tx.send(StdinDone {
+            result: Ok(b"{}".to_vec()),
+            at: until,
+        })
+        .unwrap();
+        let clock = TestClock::at(until - ms(1));
+        assert!(receive_stdin(&clock, &rx, until).is_none());
+        // Nothing by the cut: not sent.
+        let clock = TestClock::at(until);
+        assert!(receive_stdin(&clock, &rx, until).is_none());
+    }
+
+    #[test]
+    fn an_oversized_input_is_read_to_its_end() {
+        let mut input = std::io::Cursor::new(vec![b'x'; MAX_BODY + 4096]);
+        let got = read_capped(&mut input).unwrap();
+        assert_eq!(got.len(), MAX_BODY + 1);
+        assert_eq!(input.position(), (MAX_BODY + 4096) as u64, "drained to EOF");
+        let mut short = std::io::Cursor::new(b"{}".to_vec());
+        assert_eq!(read_capped(&mut short).unwrap(), b"{}");
     }
 
     #[test]
