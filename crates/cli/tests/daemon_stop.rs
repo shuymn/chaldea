@@ -36,6 +36,10 @@ fn main() {
             name: "identity_mismatch_signals_nothing",
             run: identity_mismatch_signals_nothing,
         },
+        Case {
+            name: "unobserved_exit_claims_no_state",
+            run: unobserved_exit_claims_no_state,
+        },
     ]);
 }
 
@@ -133,22 +137,20 @@ fn replacement_does_not_confuse_completion() {
     assert_eq!(second.stop_and_wait(&d.path), 0);
 }
 
-/// PR8-CL-15: the lock held and a valid record naming a live unrelated process with another
-/// start time: discovery is `Unknown`, so `stop` waits for a record and exits 4 at its
-/// deadline; the process was never signalled.
-fn identity_mismatch_signals_nothing() {
+/// The lock of `dir` held by this test and a record naming `pid` with `start_time` in
+/// `state`: `daemon stop` runs to its deadline (exit 4) and its stderr is returned.
+fn stop_times_out(pid: u32, start_time: String, state: RecordState) -> String {
     let labels = Labels::new();
-    let d = state();
+    let d = support::state();
     marked_dir(&d.path);
     let lock = std::fs::File::create(d.path.join(names::LOCK)).unwrap();
     lock.try_lock().unwrap();
-    let mut sleeper = Sleeper::start();
     let record = DiscoveryRecord {
         version: 1,
         instance: uuid::Uuid::new_v4().to_string(),
-        pid: sleeper.pid(),
-        start_time: "1".to_owned(),
-        state: RecordState::Serving,
+        pid,
+        start_time,
+        state,
         port: Some(1),
         url: None,
         started_at: String::new(),
@@ -164,13 +166,34 @@ fn identity_mismatch_signals_nothing() {
     let code = s.wait_within(STOP_WAIT + WAIT).code();
     assert_eq!(code, Some(4), "{}{}", s.stdout(), s.stderr());
     assert!(t.elapsed() >= STOP_WAIT, "{:?}", t.elapsed());
-    assert!(
-        s.stderr().contains("has not published its identity"),
-        "{}",
-        s.stderr()
-    );
-    assert!(sleeper.alive(), "the unrelated process was signalled");
     drop(lock);
+    s.stderr()
+}
+
+/// PR8-CL-15: the lock held and a valid record naming a live unrelated process with another
+/// start time: discovery is `Unknown`, so `stop` waits for a record and exits 4 at its
+/// deadline saying no daemon could be identified; the process was never signalled.
+fn identity_mismatch_signals_nothing() {
+    let mut sleeper = Sleeper::start();
+    let err = stop_times_out(sleeper.pid(), "1".to_owned(), RecordState::Serving);
+    assert!(err.contains("could be identified within 15 s"), "{err}");
+    assert!(!err.contains("a daemon holds"), "{err}");
+    assert!(sleeper.alive(), "the unrelated process was signalled");
+}
+
+/// PR8-CL-15: a `stopping` record of a live process that never exits (the lock held): `stop`
+/// sends nothing, waits for the exit, and exits 4 at its deadline saying the exit was not
+/// observed, never that the process is still running.
+fn unobserved_exit_claims_no_state() {
+    let mut sleeper = Sleeper::start();
+    let start_time = host::process_identity(sleeper.pid())
+        .unwrap()
+        .unwrap()
+        .start_time;
+    let err = stop_times_out(sleeper.pid(), start_time, RecordState::Stopping);
+    assert!(err.contains("was not observed within 15 s"), "{err}");
+    assert!(!err.contains("still running"), "{err}");
+    assert!(sleeper.alive(), "the process was signalled");
 }
 
 /// A live process the test owns: a child of this binary blocked on its stdin.

@@ -75,6 +75,14 @@ fn main() {
             run: stopping_after_the_answer_is_not_reported_started,
         },
         Case {
+            name: "late_discovery_after_the_answer_claims_no_state",
+            run: late_discovery_after_the_answer_claims_no_state,
+        },
+        Case {
+            name: "unconfirmed_winner_claims_no_holder",
+            run: unconfirmed_winner_claims_no_holder,
+        },
+        Case {
             name: "detached_log_is_redacted",
             run: detached_log_is_redacted,
         },
@@ -644,6 +652,72 @@ fn stopping_after_the_answer_is_not_reported_started() {
         stopper.stdout(),
         stopper.stderr()
     );
+}
+
+/// PR8-CL-14: the serving check answered 200, and its last discovery runs only after the
+/// deadline (paused between them until 2 s past it): the start times out (exit 4) saying that
+/// serving was not confirmed, never that the daemon did not answer. The daemon serves on.
+fn late_discovery_after_the_answer_claims_no_state() {
+    let labels = Labels::new();
+    let d = state();
+    let _stop = StopOnDrop(&labels, &d.path);
+    let gate = Gate::new();
+    let t = Instant::now();
+    let mut starter = Gated {
+        gate: &gate,
+        p: Proc::spawn(&mut cmd(
+            &labels,
+            &d.path,
+            &["daemon", "start"],
+            &[(SERVE_PAUSE, gate.path().as_os_str())],
+        )),
+    };
+    assert!(gate.reached(WAIT), "the serving check never answered");
+    // The starter's deadline counts from its own start, after the spawn: 2 s of margin.
+    std::thread::sleep((READY_TIMEOUT + Duration::from_secs(2)).saturating_sub(t.elapsed()));
+    gate.release();
+    let p = &mut starter.p;
+    assert_eq!(p.code(), 4, "{}{}", p.stdout(), p.stderr());
+    let err = p.stderr();
+    assert!(err.contains("was not confirmed within 15 s"), "{err}");
+    assert!(!err.contains("did not answer"), "{err}");
+    assert!(!p.stdout().contains("daemon started"), "{}", p.stdout());
+    let _ = serving(&d.path);
+    stop(&labels, &d.path);
+}
+
+/// PR8-CL-14: a winner parked at step 9 (starting, the lock held) for longer than a second
+/// start's deadline: that start gets `already_running` and times out (exit 4) saying no daemon
+/// was confirmed serving, never asserting that a daemon holds the directory.
+fn unconfirmed_winner_claims_no_holder() {
+    let labels = Labels::new();
+    let d = state();
+    let _stop = StopOnDrop(&labels, &d.path);
+    let gate = Gate::new();
+    let _winner = Gated {
+        gate: &gate,
+        p: Proc::spawn(&mut cmd(
+            &labels,
+            &d.path,
+            &["daemon", "start"],
+            &[(PARK_RECONCILER, gate.path().as_os_str())],
+        )),
+    };
+    assert!(gate.reached(WAIT), "the winner never parked");
+    let (code, out, err) = start(&labels, &d.path, &[], &[]);
+    assert_eq!(code, 4, "{out}{err}");
+    assert!(err.contains("another daemon holds"), "{err}");
+    assert!(
+        err.contains("no daemon was confirmed serving") && err.contains("within 15 s"),
+        "{err}"
+    );
+    assert!(!err.contains("but did not report serving"), "{err}");
+    gate.release();
+    assert!(wait_for(|| matches!(
+        discover(&d.path),
+        Discovery::Serving(_)
+    )));
+    stop(&labels, &d.path);
 }
 
 /// PR8-CL-20: `chd_`, `chdt_`, `chdp_` secrets in a message, a field, and a span field of a

@@ -881,7 +881,7 @@ fn confirm_started(
         None => fail_with(
             ExitCode::Timeout,
             &format!(
-                "the daemon (pid {pid}) reported ready but did not answer on port {port} within 15 s; it may still be running: `chaldea daemon stop` stops it (and says `not running` when no daemon is left)"
+                "the daemon (pid {pid}) reported ready, but its serving on port {port} was not confirmed within 15 s; it may still be running: `chaldea daemon stop` stops it (and says `not running` when no daemon is left)"
             ),
         ),
     }
@@ -920,7 +920,7 @@ fn await_running(
         None => fail_with(
             ExitCode::Timeout,
             &format!(
-                "a daemon holds {} but did not report serving within 15 s; it may still be starting",
+                "no daemon was confirmed serving {} within 15 s; another start's daemon may still be starting",
                 dir.display()
             ),
         ),
@@ -1009,7 +1009,7 @@ pub(crate) fn stop(dir: &Path, seams: &mut Seams) -> ExitCode {
             return fail_with(
                 ExitCode::Timeout,
                 &format!(
-                    "a daemon holds {} but has not published its identity",
+                    "no daemon of {} could be identified within 15 s: no record naming a live daemon was read",
                     dir.display()
                 ),
             );
@@ -1077,7 +1077,10 @@ pub(crate) fn stop(dir: &Path, seams: &mut Seams) -> ExitCode {
         }
         Gone::TimedOut => fail_with(
             ExitCode::Timeout,
-            &format!("still running after 15 s (pid {})", target.pid),
+            &format!(
+                "the daemon's exit (pid {}) was not observed within 15 s",
+                target.pid
+            ),
         ),
     }
 }

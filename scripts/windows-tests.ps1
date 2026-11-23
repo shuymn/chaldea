@@ -53,6 +53,8 @@ $StartTests = @(
     'stopped_after_ready_is_not_reported_started',
     'stopping_winner_is_not_reported_running',
     'stopping_after_the_answer_is_not_reported_started',
+    'late_discovery_after_the_answer_claims_no_state',
+    'unconfirmed_winner_claims_no_holder',
     'detached_log_is_redacted',
     'startup_failure_output_is_redacted',
     'child_receives_the_resolved_dir'
