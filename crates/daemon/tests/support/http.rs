@@ -4,7 +4,7 @@
 //! in-flight bodies, and EOF are observable exactly.
 
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -47,13 +47,19 @@ impl LifecycleSink for RecordingSink {
     }
 }
 
-/// The real monotonic clock plus a settable offset, or frozen at one instant.
+/// The real monotonic clock plus a settable offset, frozen at one instant, or stopped.
 #[derive(Default)]
 pub struct SkewClock {
     offset_ms: AtomicU64,
     /// While set: the instant `now` returns, and the real instant it was set at.
     frozen: Mutex<Option<(Instant, Instant)>>,
+    /// Frozen with no later instant ever arriving ([`SkewClock::stop`]).
+    stopped: AtomicBool,
 }
+
+/// How far ahead a stopped clock puts the real instant of a later reading: beyond every
+/// bound a test waits for.
+const NEVER: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl SkewClock {
     pub fn skew(&self, by: Duration) {
@@ -63,7 +69,17 @@ impl SkewClock {
 
     /// Stops the clock at `at`; real time keeps running for timers.
     pub fn freeze(&self, at: Instant) {
+        self.stopped.store(false, Ordering::SeqCst);
         *self.frozen.lock().unwrap() = Some((at, Instant::now()));
+    }
+
+    /// Stops the clock at its current reading for good: no later reading arrives, so a
+    /// deadline taken from it never passes and its timers do not fire while the test runs.
+    /// A server on this clock answers by its work alone, however slowly the host runs it.
+    pub fn stop(&self) {
+        let at = self.now();
+        self.freeze(at);
+        self.stopped.store(true, Ordering::SeqCst);
     }
 
     fn offset(&self) -> Duration {
@@ -80,10 +96,12 @@ impl MonotonicClock for SkewClock {
     }
 
     /// `at` less the current offset (or, frozen, the real instant as far from the freeze
-    /// as `at` is from the frozen reading); when that is before the platform's earliest
-    /// instant it is long past, and the fixture reads `Instant::now()` instead.
+    /// as `at` is from the frozen reading; stopped, [`NEVER`] from now for an `at` after
+    /// the reading); when that is before the platform's earliest instant it is long past,
+    /// and the fixture reads `Instant::now()` instead.
     fn real(&self, at: Instant) -> Instant {
         match *self.frozen.lock().unwrap() {
+            Some((f, _)) if at > f && self.stopped.load(Ordering::SeqCst) => Instant::now() + NEVER,
             Some((f, r)) if at >= f => r + (at - f),
             Some((f, r)) => r.checked_sub(f - at).unwrap_or_else(Instant::now),
             None => at.checked_sub(self.offset()).unwrap_or_else(Instant::now),
