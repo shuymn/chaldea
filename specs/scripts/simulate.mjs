@@ -1,13 +1,15 @@
-// Simulates thread_input.qnt with fixed seeds and checks every invariant
+// Simulates each spec with fixed seeds and checks every invariant
 // (docs/design/formal-specs.md "CI"). Fails on a violation, and when a witness is never
-// reached across all seeds (the simulation stopped covering it).
+// reached across all seeds of its spec (the simulation stopped covering it).
+import { availableParallelism } from "node:os";
 import { quint } from "./quint.mjs";
+import { FAMILIES } from "./specs.mjs";
 
 const SEEDS = [1, 2, 3, 4];
 const MAX_SAMPLES = 1000;
 const MAX_STEPS = 40;
 
-const INVARIANTS = [
+const THREAD_INPUT_INVARIANTS = [
   "sendingAtMostOnce",
   "writtenAtMostOnce",
   "sendingOnlyThroughOpenGate",
@@ -37,7 +39,7 @@ const INVARIANTS = [
   "supervisorInputsAccepted",
 ];
 
-const WITNESSES = [
+const THREAD_INPUT_WITNESSES = [
   "witnessAcked",
   "witnessAckedThroughGate",
   "witnessLateAck",
@@ -52,41 +54,118 @@ const WITNESSES = [
   "witnessTwoCardsOpen",
 ];
 
-// The seeds run in parallel, one Node process each.
+// The invariants and witnesses of each model.
+const CHECKS = {
+  "thread_input.qnt": { invariants: THREAD_INPUT_INVARIANTS, witnesses: THREAD_INPUT_WITNESSES },
+  "sync.qnt": {
+    invariants: [
+      "noGapNoDup",
+      "heldEventsOnHost",
+      "noMixedEpochs",
+      "renderedStateAtCursor",
+      "appliedKeepsHeld",
+      "olderResponsesChangeNothing",
+      "epochOnlyFromCurrentForward",
+      "epochNeverRegresses",
+      "owedResyncStaysDue",
+      "convergedAfterQuiesce",
+    ],
+    witnesses: [
+      "witnessEpochSwitch",
+      "witnessConvergedAcrossEpochs",
+      "witnessOlderForwardArrived",
+      "witnessBackwardApplied",
+      "witnessBackwardEpochMismatch",
+      "witnessTooManyEvents",
+      "witnessTooManyBytes",
+      "witnessEpochChanged",
+      "witnessHasMore",
+      "witnessOnlyHeadsRecover",
+      "witnessResubscribeWhilePending",
+      "witnessResyncKept",
+      "witnessVanishedStream",
+      "witnessReadFailedRetried",
+    ],
+  },
+  "receipts.qnt": {
+    invariants: [
+      "oneIntentPerCommand",
+      "oneEffectPerCommand",
+      "receiptIffIntent",
+      "replayOnlyToCreator",
+      "othersLearnNothing",
+      "unknownNeverReexecuted",
+      "noInProgressAfterRestart",
+      "timeoutOnlyWithoutIntent",
+      "timeoutOnlyWhenExpiredObserved",
+      "inProgressOnlyWithReceipt",
+      "replyFromObservedByGrace",
+    ],
+    witnesses: [
+      "witnessReplay",
+      "witnessReplayNon200",
+      "witnessReplayAfterOutcomeUnknown",
+      "witnessDurableUnobserved",
+      "witnessInProgress",
+      "witnessEffectAfterReply",
+      "witnessExpiredAfterGrace",
+      "witnessDuplicateWhileInProgress",
+      "witnessUnknownAfterCrash",
+      "witnessConflict",
+      "witnessTimeoutBeforeSubmit",
+      "witnessTimeoutThenIntent",
+      "witnessCommitUnknownCommitted",
+    ],
+  },
+};
+
+const SPECS = FAMILIES.map(({ model }) => {
+  if (!(model in CHECKS)) throw new Error(`no invariants or witnesses listed for ${model}`);
+  return { spec: model, ...CHECKS[model] };
+});
+
+// Every (spec, seed) pair is one Node process; at most one per available core runs at once.
 const started = Date.now();
-const results = await Promise.all(
-  SEEDS.map((seed) =>
-    quint([
-      "run", "thread_input.qnt",
+const runs = SPECS.flatMap((s) => SEEDS.map((seed) => ({ ...s, seed, result: null })));
+let next = 0;
+async function worker() {
+  while (next < runs.length) {
+    const run = runs[next++];
+    const { spec, seed, invariants, witnesses } = run;
+    run.result = await quint([
+      "run", spec,
       "--seed", String(seed),
       "--max-samples", String(MAX_SAMPLES),
       "--max-steps", String(MAX_STEPS),
-      "--invariants", ...INVARIANTS,
-      "--witnesses", ...WITNESSES,
+      "--invariants", ...invariants,
+      "--witnesses", ...witnesses,
       "--verbosity", "2",
-    ], { capture: true }),
-  ),
-);
+    ], { capture: true });
+  }
+}
+await Promise.all(Array.from({ length: Math.min(availableParallelism(), runs.length) }, worker));
 const seconds = ((Date.now() - started) / 1000).toFixed(1);
 
-const seen = Object.fromEntries(WITNESSES.map((w) => [w, 0]));
 let failed = false;
-results.forEach(({ status, out }, k) => {
-  const seed = SEEDS[k];
+const seen = new Map(SPECS.map((s) => [s.spec, Object.fromEntries(s.witnesses.map((w) => [w, 0]))]));
+runs.forEach(({ spec, seed, invariants, result: { status, out } }) => {
   if (status !== 0) {
     failed = true;
     console.log(out);
-    console.log(`seed ${seed}: FAILED (exit ${status})`);
+    console.log(`${spec} seed ${seed}: FAILED (exit ${status})`);
     return;
   }
+  const counts = seen.get(spec);
   for (const m of out.matchAll(/^(\w+) was witnessed in (\d+) trace/gm)) {
-    if (m[1] in seen) seen[m[1]] += Number(m[2]);
+    if (m[1] in counts) counts[m[1]] += Number(m[2]);
   }
-  console.log(`seed ${seed}: ok, ${MAX_SAMPLES} samples x ${MAX_STEPS} steps, ${INVARIANTS.length} invariants`);
+  console.log(`${spec} seed ${seed}: ok, ${MAX_SAMPLES} samples x ${MAX_STEPS} steps, ${invariants.length} invariants`);
 });
-console.log(`${SEEDS.length} seeds in ${seconds} s`);
-for (const [w, n] of Object.entries(seen)) {
-  console.log(`${w}: ${n} of ${SEEDS.length * MAX_SAMPLES} traces`);
-  if (n === 0) failed = true;
+console.log(`${runs.length} runs in ${seconds} s`);
+for (const [spec, counts] of seen) {
+  for (const [w, n] of Object.entries(counts)) {
+    console.log(`${spec} ${w}: ${n} of ${SEEDS.length * MAX_SAMPLES} traces`);
+    if (n === 0) failed = true;
+  }
 }
 process.exit(failed ? 1 : 0);

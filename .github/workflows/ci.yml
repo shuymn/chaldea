@@ -103,7 +103,7 @@ jobs:
 
   # The Quint specs (docs/design/formal-specs.md): typecheck, seeded simulation of every
   # invariant, and the check that specs/traces/ equals what the spec exports. The traces
-  # are replayed against the reducers by the workspace job's tests, which need no Node.
+  # are replayed against core by the workspace job's tests, which need no Node.
   specs:
     name: specs
     runs-on: ubuntu-latest
