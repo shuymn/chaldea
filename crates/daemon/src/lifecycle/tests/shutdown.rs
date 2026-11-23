@@ -375,3 +375,151 @@ fn record_removal_is_retried() {
         }
     }
 }
+
+// ---- Review round 3 ----
+
+/// A re-read of the record that fails (a Windows sharing violation) is retried within the
+/// removal's deadline; one that keeps failing is named in a warning.
+#[test]
+fn record_verify_failure_is_retried() {
+    use std::sync::atomic::Ordering;
+    for (fails, removed) in [(1, true), (u32::MAX, false)] {
+        let dir = state();
+        let faults = Arc::new(Faults::default());
+        let run = start(
+            foreground(&dir.path, Some(free_port())),
+            TestComponents::default(),
+            faults.clone(),
+        );
+        run.serving();
+        faults.record_verify_fails.store(fails, Ordering::SeqCst);
+        run.stop();
+        let log = run.log.clone();
+        let r = run.join();
+        assert_eq!(r.code.code(), 0, "{}", log.text());
+        let path = dir.path.join(names::RECORD);
+        if removed {
+            assert!(!path.exists(), "{}", log.text());
+        } else {
+            assert!(path.exists());
+            assert!(
+                log.text().contains("daemon.json") && log.text().contains("could not be verified"),
+                "{}",
+                log.text()
+            );
+        }
+    }
+}
+
+/// The command handlers the components built are the ones the server runs, and HTTP's drain
+/// waits for their runner: a command whose effect is still running when the stop arrives
+/// completes before the store shuts down, and the lock is released.
+#[test]
+fn built_commands_are_served_and_drained() {
+    use chaldea_core::auth::{Action, CommandSpec};
+    use chaldea_core::canonical::CanonicalJson;
+    use chaldea_core::command::{CommandResult, ReceiptStatus};
+    use futures_util::future::BoxFuture;
+    use serde_json::value::RawValue;
+
+    use crate::http::{
+        ApiError, CommandEffect, CommandHandler, CommandRegistry, EffectRun, Intent, Prepared,
+    };
+
+    static SPECS: &[CommandSpec] = &[CommandSpec {
+        name: "test_lifecycle_effect",
+        action: Action::Send,
+        owner_pr: 8,
+    }];
+    type Gate = Mutex<Option<(mpsc::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>;
+    struct Held(Gate);
+    impl CommandHandler for Held {
+        fn name(&self) -> &'static str {
+            "test_lifecycle_effect"
+        }
+        fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError> {
+            let v: serde_json::Value = serde_json::from_str(args.get()).unwrap();
+            Ok(Prepared {
+                normalized: CanonicalJson::of(&v).unwrap(),
+                intent: Box::new(|_tx, _auth, _ctx| Ok(Intent::Pending(EffectRun::new(())))),
+            })
+        }
+        fn effect(&self) -> Option<&dyn CommandEffect> {
+            Some(self)
+        }
+    }
+    impl CommandEffect for Held {
+        fn run(&self, _run: EffectRun) -> BoxFuture<'static, CommandResult> {
+            let gate = self.0.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some((started, release)) = gate {
+                    let _ = started.send(());
+                    let _ = release.await;
+                }
+                CommandResult {
+                    http_status: 200,
+                    body: "{}".to_owned(),
+                }
+            })
+        }
+    }
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let mut commands = CommandRegistry::mvp_plus(SPECS);
+    commands.register(Box::new(Held(Mutex::new(Some((started_tx, release_rx))))));
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    let run = start(
+        foreground(&dir.path, Some(free_port())),
+        TestComponents {
+            commands: Some(commands),
+            ..TestComponents::default()
+        },
+        faults.clone(),
+    );
+    let port = run.serving();
+    let token = super::token_of(&dir.path);
+    let cmd = chaldea_core::ids::CommandId::from_u128(0x8c);
+    let body = format!(r#"{{"command_id":"{cmd}","args":{{}}}}"#);
+    let client = std::thread::spawn(move || {
+        super::request(
+            port,
+            "POST",
+            "/api/commands/test_lifecycle_effect",
+            Some(&token),
+            Some(&body),
+        )
+    });
+    started_rx
+        .recv_timeout(WAIT)
+        .expect("the registered handler's effect did not start");
+    run.stop();
+    assert!(super::wait_for(WAIT, || faults
+        .marks()
+        .iter()
+        .any(|m| m.0 == "http")));
+    let _ = release_tx.send(());
+    let log = run.log.clone();
+    let r = run.join();
+    let _ = client.join();
+    assert_eq!(
+        (r.code.code(), r.lock),
+        (0, LockDisposition::Released),
+        "{}",
+        log.text()
+    );
+    let marks: Vec<String> = faults.marks().into_iter().map(|m| m.0).collect();
+    let at = |w: &str| marks.iter().position(|m| m == w).unwrap();
+    assert!(at("http") < at("store"), "{marks:?}");
+    let store = super::startup::open_store(&dir.path);
+    let receipt = store
+        .read(Instant::now() + WAIT, move |tx| tx.receipt(cmd))
+        .unwrap()
+        .expect("a receipt");
+    super::startup::close(&store);
+    assert!(
+        matches!(receipt.status, ReceiptStatus::Completed(ref c) if c.http_status == 200),
+        "{receipt:?}"
+    );
+}

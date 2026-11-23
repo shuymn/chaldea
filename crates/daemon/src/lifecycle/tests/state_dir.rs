@@ -299,6 +299,7 @@ fn strips_only_trailing_separators() {
             r"\\?\C:\work\missing\..\state\",
             r"\\?\C:\work\missing\..\state",
         ),
+        (r"\\?\C:\work\state/", r"\\?\C:\work\state/"),
         (r"\\?\C:\", r"\\?\C:\"),
         (r"C:\", r"C:\"),
     ];
@@ -322,4 +323,21 @@ fn refuses_verbatim_path_with_parent_component() {
     let result = prepare(path, INSTANCE);
     assert!(result.is_err(), "{result:?}");
     assert!(!parent.join("state").exists());
+}
+
+/// A verbatim path ending in `/` keeps it: `/` is part of a verbatim spelling, not a
+/// separator, so nothing is created at the path without it.
+#[cfg(windows)]
+#[test]
+fn refuses_verbatim_path_with_trailing_forward_slash() {
+    let tmp = tempfile::tempdir_in(host::default_state_base().unwrap()).unwrap();
+    let parent = std::fs::canonicalize(tmp.path()).unwrap();
+    let target = parent.join("state");
+    let mut raw = target.as_os_str().to_os_string();
+    raw.push("/");
+    let path = Path::new(&raw);
+
+    let result = prepare(path, INSTANCE);
+    assert!(!target.exists(), "rewrote {path:?} and created {target:?}");
+    assert!(result.is_err(), "{result:?}");
 }

@@ -228,6 +228,27 @@ impl Coordinator {
         self.finish(ExitReport::failed(FailReason::ConsoleEnd, lock))
     }
 
+    /// The wait between removal attempts (a test may lengthen it and observe its first poll).
+    fn record_wait(&self) -> impl Future<Output = ()> + use<> {
+        #[cfg(test)]
+        let (wait, faults) = (
+            self.faults
+                .record_retry
+                .lock()
+                .ok()
+                .and_then(|w| *w)
+                .unwrap_or(RECORD_RETRY),
+            self.faults.clone(),
+        );
+        #[cfg(not(test))]
+        let wait = RECORD_RETRY;
+        async move {
+            #[cfg(test)]
+            faults.record_sleeping.store(true, Ordering::SeqCst);
+            tokio::time::sleep(wait).await;
+        }
+    }
+
     /// Whether the startup join's end (`C − startup_join_before`) has passed.
     fn join_ended(&self) -> bool {
         self.gate
@@ -259,7 +280,8 @@ impl Coordinator {
     /// Removes our record, retrying for a bounded time (Windows refuses the removal while
     /// another process holds the file without delete sharing); a record left behind is named
     /// in the log. Every attempt first re-reads the record and removes it only while it still
-    /// names this run; a console end ends the retries at once.
+    /// names this run; a re-read that fails for now is retried the same way, and a console end
+    /// ends the retries at once.
     async fn remove_record(&mut self, dir: &std::path::Path) -> Result<(), Crashed> {
         let path = dir.join(names::RECORD);
         let path = path.as_path();
@@ -268,9 +290,38 @@ impl Coordinator {
             if self.gate.crashed().is_some() {
                 return Err(Crashed);
             }
-            match files::read_record(dir) {
+            #[cfg(test)]
+            let read = self
+                .faults
+                .record_verify()
+                .and_then(|()| files::read_record(dir));
+            #[cfg(not(test))]
+            let read = files::read_record(dir);
+            match read {
                 Ok(Some(r)) if r.instance == self.instance => {}
-                _ => return Ok(()),
+                Ok(_) => return Ok(()),
+                // Not a record of ours to judge: malformed, of another version, or not a
+                // regular file.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+                    ) =>
+                {
+                    return Ok(());
+                }
+                // Unreadable for now (a Windows sharing violation): retried like a removal.
+                Err(e) if Instant::now() >= end => {
+                    self.log.warn(&format!(
+                        "the discovery record {} could not be verified for removal: {e}",
+                        path.display()
+                    ));
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.guarded(self.record_wait()).await?;
+                    continue;
+                }
             }
             #[cfg(test)]
             let removed = self
@@ -294,7 +345,7 @@ impl Coordinator {
                     if let Some(p) = self.faults.parked(super::faults::Point::RecordRetry) {
                         p.hold().await;
                     }
-                    self.guarded(tokio::time::sleep(RECORD_RETRY)).await?;
+                    self.guarded(self.record_wait()).await?;
                 }
             }
         }
@@ -375,13 +426,24 @@ impl Coordinator {
                     #[cfg(test)]
                     if let Some(p) = self.faults.parked(super::faults::Point::CoordinatorWaiting) {
                         p.hold_blocking();
+                        // The test released the startup task first: wait until its join is
+                        // ready, so the select sees both branches.
+                        let end = Instant::now() + std::time::Duration::from_secs(10);
+                        while !t.is_finished() && Instant::now() < end {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
                     }
                     tokio::select! {
                         biased;
                         r = t => {
                             task = None;
-                            // Consumed only before the join's end, as in step 1: a stop may
-                            // have fired while this loop was not polled.
+                            #[cfg(test)]
+                            self.faults.first_wait_took_startup.store(true, Ordering::SeqCst);
+                            // As in step 1: a console end first, then the join's end (a stop
+                            // may have fired while this loop was not polled).
+                            if self.gate.crashed().is_some() {
+                                return self.crash_exit(self.unreleased());
+                            }
                             if self.join_ended() {
                                 return self.unjoined();
                             }

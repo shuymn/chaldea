@@ -162,6 +162,14 @@ pub(crate) struct Faults {
     pub(crate) record_remove_attempts: AtomicU32,
     /// The coordinator queued the log switch away from `daemon.log`.
     pub(crate) log_switch_queued: AtomicBool,
+    /// The next `n` re-reads of the record before a removal fail (`u32::MAX`: every one).
+    pub(crate) record_verify_fails: AtomicU32,
+    /// The wait between removal attempts instead of 50 ms.
+    pub(crate) record_retry: Mutex<Option<Duration>>,
+    /// The wait between removal attempts was first polled.
+    pub(crate) record_sleeping: AtomicBool,
+    /// The coordinator took the startup task's result in its wait for the first request.
+    pub(crate) first_wait_took_startup: AtomicBool,
 }
 
 impl Faults {
@@ -212,6 +220,18 @@ impl Faults {
             io::ErrorKind::PermissionDenied,
             "injected removal failure",
         ))
+    }
+
+    /// Fails a re-read of the record while injected failures remain (a sharing violation).
+    pub(crate) fn record_verify(&self) -> io::Result<()> {
+        let left = self.record_verify_fails.load(Ordering::SeqCst);
+        if left == 0 {
+            return Ok(());
+        }
+        if left != u32::MAX {
+            self.record_verify_fails.fetch_sub(1, Ordering::SeqCst);
+        }
+        Err(io::Error::other("injected sharing violation"))
     }
 
     pub(crate) fn bind_fails(&self) -> bool {

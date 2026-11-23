@@ -83,6 +83,8 @@ pub(super) struct TestComponents {
     pub(super) participants: Vec<Box<dyn ShutdownParticipant>>,
     pub(super) panic_in_build: bool,
     pub(super) on_build: Option<OnBuild>,
+    /// The command handlers; [`crate::http::CommandRegistry::mvp`] when absent.
+    pub(super) commands: Option<crate::http::CommandRegistry>,
 }
 
 impl Components for TestComponents {
@@ -102,7 +104,10 @@ impl Components for TestComponents {
         }
         Built {
             mounts: self.mounts.take().unwrap_or_else(Mounts::mvp),
-            commands: crate::http::CommandRegistry::mvp(),
+            commands: self
+                .commands
+                .take()
+                .unwrap_or_else(crate::http::CommandRegistry::mvp),
             participants: std::mem::take(&mut self.participants),
         }
     }

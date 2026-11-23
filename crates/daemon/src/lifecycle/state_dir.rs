@@ -126,7 +126,8 @@ pub(crate) fn prepare(dir: &Path, instance: &str) -> Result<PathBuf, Refused> {
 }
 
 /// `path` without its trailing separators; a root keeps its own, and nothing else changes (a
-/// rebuild from components would resolve `..` in a Windows verbatim path).
+/// rebuild from components would resolve `..` in a Windows verbatim path). In a verbatim path
+/// only `\` is a separator.
 pub(crate) fn without_trailing_separators(path: &Path) -> PathBuf {
     #[cfg(unix)]
     {
@@ -143,8 +144,13 @@ pub(crate) fn without_trailing_separators(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        // In a verbatim path (`\\?\`) only `\` separates; `/` is part of a name.
+        let verbatim = matches!(
+            path.components().next(),
+            Some(std::path::Component::Prefix(p)) if p.kind().is_verbatim()
+        );
         let mut w: Vec<u16> = path.as_os_str().encode_wide().collect();
-        let sep = |c: &u16| *c == u16::from(b'\\') || *c == u16::from(b'/');
+        let sep = |c: &u16| *c == u16::from(b'\\') || (!verbatim && *c == u16::from(b'/'));
         while w.last().is_some_and(sep)
             && Path::new(&std::ffi::OsString::from_wide(&w))
                 .parent()

@@ -25,8 +25,9 @@ const FINAL_FLUSH: Duration = Duration::from_millis(100);
 /// call.
 ///
 /// `hook-emit` is decided first, before process setup, the runtime, or any configuration
-/// (hook-ingest §2.13, mvp §3 "Single binary"). PR 9a's emitter goes in that branch; until
-/// then it answers as clap does for an unknown subcommand (exit 2), without the setup.
+/// (hook-ingest §2.13, mvp §3 "Single binary"). PR 9a's emitter goes in that branch, and 9a
+/// extends this signature with the emitter's test seam (`Stall`); until then the branch
+/// answers as clap does for an unknown subcommand (exit 2), without the setup.
 pub fn dispatch(args: &[OsString]) -> ! {
     if args.get(1).is_some_and(|a| a == "hook-emit") {
         let code = parse(args).map_or_else(|e| usage_error(&e), |_| ExitCode::Usage.code());

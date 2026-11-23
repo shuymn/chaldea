@@ -1325,10 +1325,13 @@ fn panic_at_step_11() {
 // ---- Review round 2 ----
 
 /// PR8-CL-25: the startup task returning after the join's end while the coordinator still
-/// waits for the first request (both ready when it resumes) is a bare exit, as in the join.
+/// waits for the first request (both ready when it resumes) is a bare exit, as in the join;
+/// with a console end also pending, the exit is the console end's. Each case asserts that the
+/// coordinator took the result in that wait.
 #[test]
 fn late_startup_in_the_first_wait_is_a_bare_exit() {
     if in_helper() {
+        let crash = std::env::var(STEP_ENV).is_ok_and(|v| v == "crash");
         let faults = Arc::new(Faults::default());
         let inside = faults.park(Point::Inside(8));
         let waiting = faults.park(Point::CoordinatorWaiting);
@@ -1343,26 +1346,42 @@ fn late_startup_in_the_first_wait_is_a_bare_exit() {
                 c.stop();
                 let end = c.gate().stopping().unwrap().cutoff - Duration::from_secs(6);
                 assert!(wait_for(WAIT, || Instant::now() > end + Duration::from_millis(200)));
+                if crash {
+                    c.crash();
+                }
                 inside.release();
                 assert!(wait_for(WAIT, || c.faults.startup_returned.get().is_some()));
                 waiting.release();
+                assert!(wait_for(WAIT, returned));
+                report(&format!(
+                    "checks first_wait={}",
+                    c.faults.first_wait_took_startup.load(Ordering::SeqCst)
+                ));
             },
         );
     }
-    let (mut h, dir) = parent("late_startup_in_the_first_wait_is_a_bare_exit", &[]);
-    let r = h.expect("returned", WAIT);
-    assert_eq!(field(&r, "reason"), "startup_unjoined", "{r}");
-    assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
-    held_then_free(&mut h, &dir.path);
+    for (step, reason) in [("signal", "startup_unjoined"), ("crash", "console_end")] {
+        let (mut h, dir) = parent(
+            "late_startup_in_the_first_wait_is_a_bare_exit",
+            &[(STEP_ENV, step)],
+        );
+        let c = h.expect("checks", WAIT);
+        assert_eq!(field(&c, "first_wait"), "true", "{step}: {c}");
+        let r = h.expect("returned", WAIT);
+        assert_eq!(field(&r, "reason"), reason, "{step}: {r}");
+        assert_eq!(field(&r, "lock"), "HeldUntilExit", "{step}: {r}");
+        held_then_free(&mut h, &dir.path);
+    }
 }
 
-/// PR8-CL-10: a console end while the record's removal is retried ends the retries at once.
+/// PR8-CL-10: a console end while the record's removal waits to retry ends the wait at once:
+/// the wait is 2 s here, and the exit comes within 200 ms of the console end.
 #[test]
 fn console_end_during_the_record_retry() {
     if in_helper() {
         let faults = Arc::new(Faults::default());
         faults.record_remove_fails.store(u32::MAX, Ordering::SeqCst);
-        let park = faults.park(Point::RecordRetry);
+        *faults.record_retry.lock().unwrap() = Some(Duration::from_secs(2));
         helper(
             fg(),
             TestComponents::default(),
@@ -1371,9 +1390,11 @@ fn console_end_during_the_record_retry() {
             move |c| {
                 c.serving();
                 c.stop();
-                assert!(park.wait_reached(WAIT));
+                assert!(wait_for(WAIT, || c
+                    .faults
+                    .record_sleeping
+                    .load(Ordering::SeqCst)));
                 c.crash();
-                park.release();
                 assert!(wait_for(WAIT, returned));
                 report(&format!(
                     "checks attempts={}",
