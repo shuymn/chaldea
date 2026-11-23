@@ -393,8 +393,7 @@ fn reports_discard_an_unterminated_last_frame() {
     drop(s);
     assert_eq!(reports.wait("a", 1).len(), 1);
     // The reader has ended on the cut frame without failing.
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(reports.of("a").len(), 1);
+    assert_eq!(reports.final_of("a").len(), 1);
 }
 
 /// A complete frame that is not JSON is a fixture failure.
@@ -406,6 +405,23 @@ fn reports_fail_on_a_malformed_frame() {
     s.write_all(b"{bad}\n{\"event\":\"a\"}\n").unwrap();
     drop(s);
     reports.wait("a", 1);
+}
+
+/// A malformed frame after the last awaited event still fails the test: the fixture drains
+/// its readers before it is dropped.
+#[test]
+#[should_panic(expected = "malformed report frame")]
+fn reports_fail_on_a_malformed_tail_after_the_last_expected_event() {
+    let reports = Reports::start();
+    let mut s = TcpStream::connect(&reports.addr).unwrap();
+    s.set_write_timeout(Some(WAIT)).unwrap();
+
+    s.write_all(b"{\"event\":\"a\"}\n").unwrap();
+    assert_eq!(reports.wait("a", 1).len(), 1);
+    s.write_all(b"{bad}\n").unwrap();
+    s.shutdown(Shutdown::Write).unwrap();
+    drop(s);
+    drop(reports);
 }
 
 // ---- Running a child ----
@@ -918,7 +934,12 @@ fn hook_emit_runs_before_process_setup() {
 // ---- FakeCli hook emission (§2.14) ----
 
 impl Drop for Reports {
+    /// Drains the readers and fails on a malformed frame read after the test's last look,
+    /// unless the test is already failing.
     fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let _ = self.final_of("");
+        }
         self.stop.store(true, Ordering::SeqCst);
         if let Some(a) = self.accept.take() {
             let _ = a.join();
@@ -946,8 +967,21 @@ struct Reports {
     addr: String,
     /// The events, and the first complete frame that was not JSON.
     events: Arc<Mutex<(Vec<Value>, Option<String>)>>,
+    /// Reader threads still running.
+    open: Arc<AtomicUsize>,
+    /// Passes of the accept loop that found no pending connection.
+    idle: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
+}
+
+/// Counts a reader thread as ended when it returns.
+struct Reader(Arc<AtomicUsize>);
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Reports {
@@ -957,19 +991,26 @@ impl Reports {
         let addr = l.local_addr().unwrap().to_string();
         let events = Arc::new(Mutex::new((Vec::new(), None)));
         let stop = Arc::new(AtomicBool::new(false));
-        let (ev, halt) = (events.clone(), stop.clone());
+        let open = Arc::new(AtomicUsize::new(0));
+        let idle = Arc::new(AtomicUsize::new(0));
+        let (ev, halt, readers, passes) =
+            (events.clone(), stop.clone(), open.clone(), idle.clone());
         let accept = std::thread::spawn(move || {
             while !halt.load(Ordering::SeqCst) {
                 let s = match l.accept() {
                     Ok((s, _)) => s,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        passes.fetch_add(1, Ordering::SeqCst);
                         std::thread::sleep(POLL);
                         continue;
                     }
                     Err(e) => panic!("report accept: {e}"),
                 };
                 let ev = ev.clone();
+                readers.fetch_add(1, Ordering::SeqCst);
+                let reader = Reader(readers.clone());
                 std::thread::spawn(move || {
+                    let _reader = reader;
                     s.set_nonblocking(false).unwrap();
                     s.set_read_timeout(Some(WAIT)).unwrap();
                     // Complete frames only: an unterminated last one (a process killed while
@@ -997,9 +1038,29 @@ impl Reports {
         Reports {
             addr,
             events,
+            open,
+            idle,
             stop,
             accept: Some(accept),
         }
+    }
+
+    /// Waits (bounded) until every connection made so far was accepted and every reader has
+    /// reached its stream's end, so no frame is still unread; panics past the bound.
+    fn drain(&self) {
+        let from = self.idle.load(Ordering::SeqCst);
+        let end = Instant::now() + WAIT;
+        while self.idle.load(Ordering::SeqCst) < from + 2 || self.open.load(Ordering::SeqCst) > 0 {
+            assert!(Instant::now() < end, "report readers did not drain");
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// The events named `event` once every reader has drained (the final count); panics
+    /// once a malformed frame was read.
+    fn final_of(&self, event: &str) -> Vec<Value> {
+        self.drain();
+        self.of(event)
     }
 
     /// The events named `event` so far; panics once a malformed frame was read.
@@ -1227,7 +1288,7 @@ fn fake_cli_hooks_runs_its_script() {
     emitted_quietly(&reports, 6);
     assert_eq!(reports.wait("wait_file", 1)[0]["found"], true);
     assert_eq!(reports.wait("nested", 1)[0]["code"], 0);
-    assert_eq!(reports.of("emitted").len(), 6);
+    assert_eq!(reports.final_of("emitted").len(), 6);
 }
 
 #[test]
@@ -1254,7 +1315,7 @@ fn fake_cli_nested_child_needs_go() {
         assert_eq!(r.code, Some(1), "{what:?}");
         assert_eq!(stub.settled().len(), 1, "{what:?}");
         assert_eq!(reports.wait("handshake_failed", 1).len(), 1, "{what:?}");
-        assert_eq!(reports.of("emitted").len(), 1, "{what:?}");
+        assert_eq!(reports.final_of("emitted").len(), 1, "{what:?}");
     }
 }
 
@@ -1276,7 +1337,7 @@ fn fake_cli_nested_parent_needs_sent() {
     let failed = reports.wait("handshake_failed", 1);
     assert_eq!(failed[0]["reason"], "eof", "{failed:?}");
     // No run of the parent; the nested child's own run killed it before its report.
-    let emitted = reports.of("emitted");
+    let emitted = reports.final_of("emitted");
     assert!(emitted.is_empty(), "{emitted:?}");
     assert_eq!(stub.accepted(), 0);
 }
@@ -1393,5 +1454,5 @@ fn fake_cli_nested_parent_stops_when_its_emitter_cannot_spawn() {
     assert_eq!((started, failed), (1, 1), "{emitted:?}");
     // No `go`: the parent ended the child, which emitted nothing more.
     reports.wait("nested", 1);
-    assert_eq!(reports.of("emitted").len(), 2);
+    assert_eq!(reports.final_of("emitted").len(), 2);
 }
