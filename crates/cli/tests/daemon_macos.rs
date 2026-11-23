@@ -11,6 +11,7 @@ mod support;
 
 use std::ffi::OsStr;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use chaldea_daemon::lifecycle::{prepare_process, spawn_locked};
 use chaldea_pty_runtime::fake;
@@ -64,6 +65,7 @@ fn inherited_signal_state_is_reset() {
         let got = run_helper(
             "inherited_signal_state_is_reset",
             &[(MODE, OsStr::new(mode))],
+            Duration::from_secs(30),
             |_| {},
         );
         assert_eq!(got, want, "{mode}");

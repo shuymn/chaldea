@@ -83,7 +83,9 @@ jobs:
           list="$(cargo test -p chaldea-daemon --lib --locked -- --list)"
           require "$list" \
             lifecycle::tests::state_dir::refuses_users_ace_under_profile \
-            lifecycle::tests::files::refuses_reparse_point
+            lifecycle::tests::state_dir::creates_a_state_dir_beyond_max_path \
+            lifecycle::tests::files::refuses_reparse_point \
+            lifecycle::tests::shutdown::record_removal_failure_is_reported
           list="$(cargo test -p chaldea-cli --test daemon_windows --locked -- --list)"
           require "$list" ctrl_c_and_ctrl_break_stop stop_event_is_global
 

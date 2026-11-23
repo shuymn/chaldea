@@ -24,6 +24,18 @@ use tempfile::TempDir;
 
 /// Every bounded wait of these tests.
 pub const WAIT: Duration = Duration::from_secs(30);
+
+/// Waits for a write's reply for at most [`WAIT`] (the writer may be parked by a fault) and
+/// returns the job's value.
+pub fn settle<R: Send + 'static>(ticket: chaldea_daemon::store::WriteTicket<R>) -> R {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(ticket.blocking_wait().map_err(|e| e.to_string()));
+    });
+    rx.recv_timeout(WAIT)
+        .expect("the write's reply did not arrive in time")
+        .expect("the write failed")
+}
 const POLL: Duration = Duration::from_millis(20);
 
 /// A fresh state directory path (absent) under a private temp directory.
@@ -101,6 +113,8 @@ pub struct Proc {
     stderr_lines: Receiver<String>,
     stderr: Arc<Mutex<String>>,
     stdout: Arc<Mutex<String>>,
+    /// Collector threads that saw their pipe close.
+    collected: Arc<std::sync::atomic::AtomicUsize>,
     status: Option<ExitStatus>,
 }
 
@@ -108,8 +122,10 @@ fn collect(
     r: impl Read + Send + 'static,
     into: Arc<Mutex<String>>,
     lines: Option<mpsc::Sender<String>>,
+    done: Arc<std::sync::atomic::AtomicUsize>,
 ) {
     std::thread::spawn(move || {
+        let _done = Done(done);
         for line in BufReader::new(r).lines() {
             let Ok(line) = line else { break };
             {
@@ -124,19 +140,53 @@ fn collect(
     });
 }
 
+/// Counts a collector as finished when its thread ends (also by a panic).
+struct Done(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Done {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Kills `child` (a process this test started) and reaps it within 10 s.
+pub fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let end = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < end {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(POLL);
+    }
+    eprintln!("pid {} was not reaped within 10 s of its kill", child.id());
+}
+
 impl Proc {
     pub fn spawn(cmd: &mut Command) -> Proc {
         let mut child = spawn_locked(cmd).unwrap();
         let (tx, rx) = mpsc::channel();
         let stderr = Arc::new(Mutex::new(String::new()));
         let stdout = Arc::new(Mutex::new(String::new()));
-        collect(child.stderr.take().unwrap(), stderr.clone(), Some(tx));
-        collect(child.stdout.take().unwrap(), stdout.clone(), None);
+        let collected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        collect(
+            child.stderr.take().unwrap(),
+            stderr.clone(),
+            Some(tx),
+            collected.clone(),
+        );
+        collect(
+            child.stdout.take().unwrap(),
+            stdout.clone(),
+            None,
+            collected.clone(),
+        );
         Proc {
             child,
             stderr_lines: rx,
             stderr,
             stdout,
+            collected,
             status: None,
         }
     }
@@ -174,38 +224,39 @@ impl Proc {
         }
     }
 
-    /// Waits (bounded) for the exit; kills it and panics past the deadline.
+    /// Waits (bounded by `WAIT`) for the exit; kills it and panics past the deadline.
     pub fn wait(&mut self) -> ExitStatus {
+        self.wait_within(WAIT)
+    }
+
+    /// Waits for the exit within `within`, then for both output collectors to finish (10 s);
+    /// kills it and panics past the deadline, with what it printed so far.
+    pub fn wait_within(&mut self, within: Duration) -> ExitStatus {
         if let Some(s) = self.status {
             return s;
         }
-        let end = Instant::now() + WAIT;
+        let end = Instant::now() + within;
         loop {
             if let Some(s) = self.child.try_wait().unwrap() {
                 self.status = Some(s);
-                // Let the collectors drain the closed pipes.
-                let drained = Instant::now() + Duration::from_secs(2);
-                while Instant::now() < drained && !self.stderr_lines_closed() {
+                let drained = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < drained
+                    && self.collected.load(std::sync::atomic::Ordering::SeqCst) < 2
+                {
                     std::thread::sleep(POLL);
                 }
                 return s;
             }
             if Instant::now() >= end {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                panic!("the process did not exit; stderr:\n{}", self.stderr());
+                kill_and_reap(&mut self.child);
+                panic!(
+                    "pid {} did not exit within {within:?}; stdout:\n{}\nstderr:\n{}",
+                    self.pid(),
+                    self.stdout(),
+                    self.stderr()
+                );
             }
             std::thread::sleep(POLL);
-        }
-    }
-
-    fn stderr_lines_closed(&self) -> bool {
-        loop {
-            match self.stderr_lines.try_recv() {
-                Ok(_) => {}
-                Err(mpsc::TryRecvError::Empty) => return false,
-                Err(mpsc::TryRecvError::Disconnected) => return true,
-            }
         }
     }
 
@@ -239,8 +290,7 @@ impl Proc {
 impl Drop for Proc {
     fn drop(&mut self) {
         if self.status.is_none() && matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            kill_and_reap(&mut self.child);
         }
     }
 }
@@ -311,7 +361,9 @@ pub fn get_status(port: u16, path: &str, token: Option<&str>) -> u16 {
     std::str::from_utf8(&head[9..12]).unwrap().parse().unwrap()
 }
 
-/// Every entry of `dir` with its bytes (directories empty) and modification time.
+/// Every entry of `dir` with its bytes and modification time. Directories and `daemon.lock`
+/// carry no bytes: the lock file is data-less, and Windows refuses reading a byte range
+/// another process locked.
 #[must_use]
 pub fn listing(dir: &Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
     let mut v: Vec<_> = std::fs::read_dir(dir)
@@ -319,9 +371,10 @@ pub fn listing(dir: &Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
         .map(|e| {
             let e = e.unwrap();
             let m = e.metadata().unwrap();
-            let bytes = if m.is_file() {
+            let bytes = if m.is_file() && e.file_name() != names::LOCK {
                 std::fs::read(e.path()).unwrap()
             } else {
+                assert_eq!(m.len(), 0, "{:?} has content", e.file_name());
                 Vec::new()
             };
             (
@@ -391,8 +444,13 @@ pub fn report(line: &str) {
 }
 
 /// Runs `test` of this test binary as a helper process with `env` (and `tweak` applied to the
-/// command), requires its success within `WAIT`, and returns its first report line.
-pub fn run_helper(test: &str, env: &[(&str, &OsStr)], tweak: impl FnOnce(&mut Command)) -> String {
+/// command), requires its success within `within`, and returns its first report line.
+pub fn run_helper(
+    test: &str,
+    env: &[(&str, &OsStr)],
+    within: Duration,
+    tweak: impl FnOnce(&mut Command),
+) -> String {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args([test, "--exact", "--nocapture", "--test-threads=1"])
         .stdin(Stdio::null())
@@ -403,7 +461,7 @@ pub fn run_helper(test: &str, env: &[(&str, &OsStr)], tweak: impl FnOnce(&mut Co
     }
     tweak(&mut cmd);
     let mut p = Proc::spawn(&mut cmd);
-    let code = p.code();
+    let code = p.wait_within(within).code().expect("exited by a signal");
     let out = p.stdout();
     assert_eq!(
         code,

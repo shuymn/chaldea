@@ -1,11 +1,13 @@
-//! Windows binary tests: PR8-CL-9 (Ctrl-C and Ctrl-Break stop a serving daemon) and the stop
-//! listener half of PR8-CL-15 (the stop event is global, owner-only, and stops the daemon).
+//! Windows binary tests: PR8-CL-9 (Ctrl-C and Ctrl-Break stop a serving daemon, also one that
+//! inherited Ctrl-C ignored) and the stop listener half of PR8-CL-15 (the stop event is
+//! global, owner-only, and stops the daemon).
 #![cfg(windows)]
 
 mod support;
 
 use std::ffi::OsStr;
 use std::os::windows::process::CommandExt;
+use std::time::Duration;
 
 use chaldea_daemon::lifecycle::LockProbe;
 use chaldea_pty_runtime::fake::{self, CtrlEvent};
@@ -18,19 +20,23 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
 const EVENT: &str = "CHALDEA_CL9_EVENT";
 
-/// In a helper on its own console: start a daemon there, ignore Ctrl-C only afterwards (so
-/// the daemon does not inherit the ignore), send the event, and report the exit code and the
-/// lock.
+/// In a helper on its own console: ignore Ctrl-C (an attribute the daemon inherits, as from
+/// `start /b`), start a daemon there, send the event, and report the exit code and the lock.
+/// Each step is printed to stderr, so a failure names the step it stopped at.
 fn on_new_console(event: &str) {
     let dir = state();
+    fake::ignore_ctrl_c().unwrap();
+    eprintln!("cl9 {event}: the helper ignores Ctrl-C; the daemon inherits that");
     let mut cmd = run_cmd(&dir.path, Some(free_port()));
     if event == "break" {
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
     let mut d = Proc::spawn(&mut cmd);
-    fake::ignore_ctrl_c().unwrap();
-    d.serving();
+    eprintln!("cl9 {event}: daemon pid {}", d.pid());
+    let port = d.serving();
+    eprintln!("cl9 {event}: serving on {port}");
     let attached = fake::console_processes().unwrap();
+    eprintln!("cl9 {event}: console processes {attached:?}");
     assert!(
         attached.contains(&d.pid()),
         "{attached:?} lacks {}",
@@ -40,9 +46,17 @@ fn on_new_console(event: &str) {
         "c" => fake::send_ctrl_event(CtrlEvent::CtrlC, 0).unwrap(),
         _ => fake::send_ctrl_event(CtrlEvent::CtrlBreak, d.pid()).unwrap(),
     }
-    let code = d.code();
-    eprintln!("daemon stderr:\n{}", d.stderr());
-    report(&format!("code={code} lock={:?}", lock_state(&dir.path)));
+    eprintln!("cl9 {event}: event sent");
+    let status = d.wait_within(Duration::from_secs(20));
+    eprintln!(
+        "cl9 {event}: daemon exited {status:?}; its stderr:\n{}",
+        d.stderr()
+    );
+    report(&format!(
+        "code={} lock={:?}",
+        status.code().unwrap_or(-1),
+        lock_state(&dir.path)
+    ));
 }
 
 #[test]
@@ -55,6 +69,7 @@ fn ctrl_c_and_ctrl_break_stop() {
         let got = run_helper(
             "ctrl_c_and_ctrl_break_stop",
             &[(EVENT, OsStr::new(event))],
+            Duration::from_secs(90),
             |c| {
                 c.creation_flags(CREATE_NEW_CONSOLE);
             },
