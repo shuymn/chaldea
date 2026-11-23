@@ -1,5 +1,6 @@
-//! Stored credentials (`docs/design/http-surface.md` PR7-CL-25, the token cases): the
-//! store holds each token's SHA-256, never its plaintext, in the database or its WAL.
+//! Stored credentials (`docs/design/http-surface.md` PR7-CL-25): the store holds each
+//! token's SHA-256, never its plaintext, in the database or its WAL; tickets and pair codes
+//! never reach it.
 
 mod support;
 
@@ -72,7 +73,23 @@ async fn issue_owner_refuses_a_revoked_issuer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_plaintext_at_rest() {
     let mut srv = TestServer::start(Mounts::mvp()).await;
-    let tokens = issue_all(&srv).await;
+    let mut tokens: Vec<(String, String)> = issue_all(&srv)
+        .await
+        .into_iter()
+        .map(|(k, s)| (format!("{k:?} token"), s))
+        .collect();
+    // A pairing: its code and the token it issued; tickets, one of them redeemed.
+    let owner = tokens[0].1.clone();
+    let code = srv.pair_code(&owner).await.unwrap();
+    let paired = srv.pair(&code).await;
+    assert_eq!(paired.status, 200, "{paired:?}");
+    let paired: chaldea_core::http::PairResponse = serde_json::from_slice(&paired.body).unwrap();
+    tokens.push(("pair code".into(), code));
+    tokens.push(("paired token".into(), paired.token));
+    let redeemed = srv.ticket(&owner, "events").await.unwrap();
+    drop(srv.ws_with(&redeemed).await.unwrap());
+    tokens.push(("redeemed ticket".into(), redeemed));
+    tokens.push(("ticket".into(), srv.ticket(&owner, "events").await.unwrap()));
     let paths = srv.store.store().paths();
     // The WAL while the store is open, before any checkpoint.
     let wal = std::fs::read(&paths.wal).unwrap();
@@ -80,11 +97,8 @@ async fn no_plaintext_at_rest() {
         contains(&wal, &sha(&tokens[0].1)),
         "positive control: the digest is in the WAL"
     );
-    for (kind, secret) in &tokens {
-        assert!(
-            !contains(&wal, secret.as_bytes()),
-            "a {kind:?} token is in the WAL"
-        );
+    for (what, secret) in &tokens {
+        assert!(!contains(&wal, secret.as_bytes()), "a {what} is in the WAL");
     }
     srv.shutdown_http(Instant::now() + Duration::from_secs(10))
         .await;
@@ -94,10 +108,7 @@ async fn no_plaintext_at_rest() {
         contains(&db, &sha(&tokens[0].1)),
         "positive control: the digest is in the db"
     );
-    for (kind, secret) in &tokens {
-        assert!(
-            !contains(&db, secret.as_bytes()),
-            "a {kind:?} token is in the db"
-        );
+    for (what, secret) in &tokens {
+        assert!(!contains(&db, secret.as_bytes()), "a {what} is in the db");
     }
 }

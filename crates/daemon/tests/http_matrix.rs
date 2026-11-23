@@ -12,10 +12,13 @@ use std::panic::AssertUnwindSafe;
 use axum::body::Body;
 use axum::http::{Method, Response};
 use chaldea_core::auth::{Action, MVP_COMMANDS, TokenKind, grant};
+use chaldea_core::http::WsTicketResponse;
+use chaldea_core::ids::ThreadId;
 use chaldea_daemon::http::{
     ActionRule, Credential, HttpConfig, HttpServer, Mount, MountKind, Mounts, OriginRule, ROUTES,
     ReadCtx, RouteSpec, TicketPurposeKind, spec,
 };
+use futures_util::StreamExt;
 use support::http::{Req, TestServer};
 
 use MountKind::{Read, Upgrade, Write};
@@ -32,6 +35,7 @@ enum Cred {
     PairCode,
 }
 
+#[derive(Clone, Copy)]
 struct Row {
     method: &'static str,
     path: &'static str,
@@ -42,6 +46,9 @@ struct Row {
     cred: Cred,
     action: Option<Action>,
     commands: bool,
+    /// The outcome of the probe request (no query, a `{}` body for `POST`) once the guard
+    /// admits it: the handler's answer, or 501 until the route's PR mounts one.
+    reached: (u16, Option<&'static str>),
 }
 
 const fn row(
@@ -62,6 +69,17 @@ const fn row(
         cred,
         action,
         commands: false,
+        reached: UNIMPLEMENTED,
+    }
+}
+
+const UNIMPLEMENTED: (u16, Option<&str>) = (501, Some("not_implemented"));
+
+/// `r` with the outcome its mounted handler gives the probe.
+const fn reaches(r: Row, status: u16, code: Option<&'static str>) -> Row {
+    Row {
+        reached: (status, code),
+        ..r
     }
 }
 
@@ -79,32 +97,44 @@ const INVENTORY: &[Row] = &[
         Cred::None,
         None,
     ),
-    row(
-        "POST",
-        "/api/pair",
-        "/api/pair",
-        Write,
-        PresentMatching,
-        Cred::PairCode,
+    reaches(
+        row(
+            "POST",
+            "/api/pair",
+            "/api/pair",
+            Write,
+            PresentMatching,
+            Cred::PairCode,
+            None,
+        ),
+        401,
+        Some("unauthorized"),
+    ),
+    reaches(
+        row(
+            "POST",
+            "/api/pair-codes",
+            "/api/pair-codes",
+            Read,
+            MustBeAbsent,
+            Cred::Bearer(&[Owner]),
+            None,
+        ),
+        200,
         None,
     ),
-    row(
-        "POST",
-        "/api/pair-codes",
-        "/api/pair-codes",
-        Read,
-        MustBeAbsent,
-        Cred::Bearer(&[Owner]),
-        None,
-    ),
-    row(
-        "POST",
-        "/api/ws-ticket",
-        "/api/ws-ticket",
-        Read,
-        AbsentOrMatching,
-        Cred::Bearer(READ_KINDS),
-        Some(Action::ReadStream),
+    reaches(
+        row(
+            "POST",
+            "/api/ws-ticket",
+            "/api/ws-ticket",
+            Read,
+            AbsentOrMatching,
+            Cred::Bearer(READ_KINDS),
+            Some(Action::ReadStream),
+        ),
+        400,
+        Some("bad_request"),
     ),
     row(
         "GET",
@@ -124,41 +154,57 @@ const INVENTORY: &[Row] = &[
         Cred::TicketAttach,
         Some(Action::Attach),
     ),
-    row(
-        "GET",
-        "/api/events",
-        "/api/events",
-        Read,
-        AbsentOrMatching,
-        Cred::Bearer(READ_KINDS),
-        Some(Action::ReadStream),
+    reaches(
+        row(
+            "GET",
+            "/api/events",
+            "/api/events",
+            Read,
+            AbsentOrMatching,
+            Cred::Bearer(READ_KINDS),
+            Some(Action::ReadStream),
+        ),
+        400,
+        Some("bad_query"),
     ),
-    row(
-        "GET",
-        "/api/blobs/{sha256}",
-        "/api/blobs/00",
-        Read,
-        AbsentOrMatching,
-        Cred::Bearer(READ_KINDS),
-        Some(Action::ReadBlob),
+    reaches(
+        row(
+            "GET",
+            "/api/blobs/{sha256}",
+            "/api/blobs/00",
+            Read,
+            AbsentOrMatching,
+            Cred::Bearer(READ_KINDS),
+            Some(Action::ReadBlob),
+        ),
+        400,
+        Some("bad_query"),
     ),
-    row(
-        "GET",
-        "/api/threads",
-        "/api/threads",
-        Read,
-        AbsentOrMatching,
-        Cred::Bearer(READ_KINDS),
-        Some(Action::ReadThreadList),
+    reaches(
+        row(
+            "GET",
+            "/api/threads",
+            "/api/threads",
+            Read,
+            AbsentOrMatching,
+            Cred::Bearer(READ_KINDS),
+            Some(Action::ReadThreadList),
+        ),
+        200,
+        None,
     ),
-    row(
-        "GET",
-        "/api/worktrees",
-        "/api/worktrees",
-        Read,
-        AbsentOrMatching,
-        Cred::Bearer(READ_KINDS),
-        Some(Action::ReadWorktrees),
+    reaches(
+        row(
+            "GET",
+            "/api/worktrees",
+            "/api/worktrees",
+            Read,
+            AbsentOrMatching,
+            Cred::Bearer(READ_KINDS),
+            Some(Action::ReadWorktrees),
+        ),
+        200,
+        None,
     ),
     row(
         "GET",
@@ -310,9 +356,9 @@ async fn inventory_matches_router() {
         };
         let got = srv.send(&req).await.outcome();
         let want = match r.cred {
-            // No ticket can be minted before PR 7b: the credential step refuses.
+            // No ticket: the credential step refuses (`ticket_kind_matrix` mints them).
             Cred::TicketEvents | Cred::TicketAttach => (401, code("unauthorized")),
-            _ => (501, code("not_implemented")),
+            _ => (r.reached.0, r.reached.1.map(str::to_owned)),
         };
         assert_eq!(got, want, "{} {}", r.method, r.probe);
     }
@@ -391,7 +437,7 @@ async fn route_kind_matrix() {
             let want = match kind {
                 None => (401, code("unauthorized")),
                 Some(k) if kinds.contains(&k) && r.action.is_none_or(|a| grant(k, a).is_some()) => {
-                    (501, code("not_implemented"))
+                    (r.reached.0, r.reached.1.map(str::to_owned))
                 }
                 Some(_) => (403, code("forbidden")),
             };
@@ -464,6 +510,105 @@ async fn credential_paths() {
             let rep = srv.send(&srv.req("GET", &format!("{}{q}", r.probe))).await;
             assert_eq!(rep.outcome(), want, "{}{q}", r.probe);
         }
+    }
+    srv.stop().await;
+}
+
+/// The ticket a `POST /api/ws-ticket` with `purpose` returns, or its outcome.
+async fn mint(
+    srv: &TestServer,
+    token: Option<&str>,
+    purpose: &str,
+) -> Result<String, (u16, Option<String>)> {
+    let mut req = srv
+        .req("POST", "/api/ws-ticket")
+        .body(format!(r#"{{"purpose":"{purpose}"}}"#).as_bytes());
+    if let Some(t) = token {
+        req = req.bearer(t);
+    }
+    let r = srv.send(&req).await;
+    if r.status != 200 {
+        return Err(r.outcome());
+    }
+    let body: WsTicketResponse = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(body.expires_in, 30);
+    Ok(body.ticket)
+}
+
+/// A WebSocket handshake for `path` with `ticket`.
+fn handshake(srv: &TestServer, path: &str, ticket: &str) -> Req {
+    srv.ws_handshake(&format!("{path}?ticket={ticket}"))
+}
+
+/// PR 7b's credential cells of PR7-CL-4: a ticket minted with each kind (and none) and
+/// redeemed on each ticket route, and `/api/pair` with a Bearer header and no code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn minted_ticket_matrix() {
+    let srv = TestServer::start(Mounts::mvp()).await;
+    let toks = tokens(&srv).await;
+    let agent_index = TokenKind::ALL.iter().position(|k| *k == Agent).unwrap();
+    let thread = ThreadId::from_u128(0xA000 + agent_index as u128);
+    let attach = format!("/api/attach/{thread}");
+    let other = "/api/attach/00000000-0000-0000-0000-00000000beef";
+    for kind in KINDS {
+        let tok = kind.map(|k| toks[&k].clone());
+        let events = mint(&srv, tok.as_deref(), "events").await;
+        let att = mint(&srv, tok.as_deref(), &format!("attach:{thread}")).await;
+        match kind {
+            None => {
+                assert_eq!(events, Err((401, code("unauthorized"))));
+                assert_eq!(att, Err((401, code("unauthorized"))));
+                continue;
+            }
+            Some(Hook | Extension) => {
+                assert_eq!(events, Err((403, code("forbidden"))), "{kind:?}");
+                assert_eq!(att, Err((403, code("forbidden"))), "{kind:?}");
+                continue;
+            }
+            Some(Owner) => assert!(att.is_ok(), "{att:?}"),
+            Some(_) => assert_eq!(att, Err((403, code("forbidden"))), "{kind:?}"),
+        }
+        let events = events.unwrap_or_else(|e| panic!("{kind:?}: {e:?}"));
+        // A ticket opens only its own route (and thread).
+        let r = srv.send(&handshake(&srv, &attach, &events)).await;
+        assert_eq!(r.outcome(), (401, code("unauthorized")), "{kind:?}");
+        if let Ok(att) = att {
+            let r = srv.send(&handshake(&srv, "/api/ws", &att)).await;
+            assert_eq!(r.outcome(), (401, code("unauthorized")));
+            let r = srv.send(&handshake(&srv, other, &att)).await;
+            assert_eq!(r.outcome(), (401, code("unauthorized")));
+            // PR 11 mounts the attach handler; until then the guard admits and answers 501.
+            let r = srv.send(&handshake(&srv, &attach, &att)).await;
+            assert_eq!(r.outcome(), (501, code("not_implemented")), "attach");
+        }
+        let url = format!("ws://127.0.0.1:{}/api/ws?ticket={events}", srv.port);
+        let (mut ws, resp) = tokio_tungstenite::connect_async(url)
+            .await
+            .unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+        assert_eq!(resp.status(), 101, "{kind:?}");
+        let hello = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
+            .await
+            .expect("hello within 10 s")
+            .unwrap()
+            .unwrap();
+        assert!(
+            hello.to_text().unwrap().contains(r#""type":"hello""#),
+            "{hello:?}"
+        );
+        ws.close(None).await.unwrap();
+    }
+    // `/api/pair` takes no Bearer token: without a pair code it is 401.
+    let origin = format!("http://127.0.0.1:{}", srv.port);
+    for body in ["{}".to_owned(), format!(r#"{{"code":"{}"}}"#, toks[&Owner])] {
+        let r = srv
+            .send(
+                &srv.req("POST", "/api/pair")
+                    .header("Origin", &origin)
+                    .bearer(&toks[&Owner])
+                    .body(body.as_bytes()),
+            )
+            .await;
+        assert_eq!(r.outcome(), (401, code("unauthorized")), "{body}");
     }
     srv.stop().await;
 }

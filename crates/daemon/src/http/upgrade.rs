@@ -7,7 +7,8 @@
 //! waits on its admission, which ends it by refusing; only then does its hand-over bound
 //! start, so a spent ticket always has a task waiting for its socket.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use axum::body::Body;
@@ -61,6 +62,60 @@ pub struct UpgradedSocket {
     pub socket: WebSocket,
     pub grant: UpgradeGrant,
     pub shutdown: ShutdownSignal,
+    pub(crate) shared: Arc<Shared>,
+}
+
+#[derive(Default)]
+struct SlotCounts {
+    total: usize,
+    per_token: HashMap<TokenId, usize>,
+}
+
+/// The socket caps (design §2.4 step 3, §5): counted and taken under one lock; a slot is
+/// held by its socket task and released when the task ends or the upgrade is refused.
+#[derive(Default, Clone)]
+pub(crate) struct SocketSlots(Arc<Mutex<SlotCounts>>);
+
+/// One taken socket slot; dropping it frees the slot.
+pub(crate) struct SocketSlot {
+    slots: SocketSlots,
+    token: TokenId,
+}
+
+impl SocketSlots {
+    /// A slot for `token`, unless `max` sockets in all or `per_token` for it are held.
+    pub(crate) fn take(&self, token: TokenId, max: usize, per_token: usize) -> Option<SocketSlot> {
+        let mut c = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mine = c.per_token.get(&token).copied().unwrap_or(0);
+        if c.total >= max || mine >= per_token {
+            return None;
+        }
+        c.total += 1;
+        c.per_token.insert(token, mine + 1);
+        Some(SocketSlot {
+            slots: self.clone(),
+            token,
+        })
+    }
+
+    /// Slots held.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).total
+    }
+}
+
+impl Drop for SocketSlot {
+    fn drop(&mut self) {
+        let mut c = self.slots.0.lock().unwrap_or_else(PoisonError::into_inner);
+        c.total -= 1;
+        if let Some(n) = c.per_token.get_mut(&self.token) {
+            *n -= 1;
+            if *n == 0 {
+                c.per_token.remove(&self.token);
+            }
+        }
+    }
 }
 
 /// Whether any `Connection` token is `close`, in any value, UTF-8 or not: an upgrade asking
@@ -91,6 +146,20 @@ pub(crate) async fn admit(
     if asks_close(&parts.headers) {
         return Err(ApiError::bad_request());
     }
+    let wcfg = &shared.cfg.ws;
+    let ws = ws
+        .max_message_size(wcfg.max_message_bytes)
+        .max_frame_size(wcfg.max_message_bytes)
+        .max_write_buffer_size(wcfg.max_write_buffer_bytes);
+    // The socket slot, held by the socket task from here to its exit.
+    let slot = shared
+        .sockets
+        .take(
+            principal.token_id,
+            wcfg.max_sockets,
+            wcfg.max_sockets_per_token,
+        )
+        .ok_or_else(ApiError::busy)?;
     // The socket task, registered before the ticket is spent. It waits on `admitted` while
     // admission runs: a refusal below drops the sender and ends the task at once. The
     // hand-over bound starts only once the ticket is removed.
@@ -105,9 +174,9 @@ pub(crate) async fn admit(
     };
     let shutdown = shared.shutdown_signal();
     let hand_over = shared.cfg.short_deadline;
-    #[cfg(test)]
     let s = shared.clone();
     let task = async move {
+        let _slot = slot;
         if admitted.await.is_err() {
             return;
         }
@@ -121,6 +190,7 @@ pub(crate) async fn admit(
                 socket,
                 grant,
                 shutdown,
+                shared: s,
             })
             .await;
     };

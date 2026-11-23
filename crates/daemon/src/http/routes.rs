@@ -429,10 +429,48 @@ impl Mount {
 pub struct Mounts(Vec<Mount>);
 
 impl Mounts {
-    /// Every route of [`ROUTES`], each with a 501 handler until its PR mounts one.
+    /// Every route of [`ROUTES`]: PR 7's sync reads, blobs, tickets, pairing, and the
+    /// WebSocket loop, and a 501 handler for every route whose PR has not mounted one.
+    ///
+    /// # Panics
+    ///
+    /// Never: every route named here is in [`ROUTES`].
     #[must_use]
     pub fn mvp() -> Mounts {
+        use super::{blobs, pair, sync_api, ws};
+        let at = |method: Method, path: &str| {
+            spec(&method, path).unwrap_or_else(|| panic!("{method} {path} is in ROUTES"))
+        };
         Mounts(ROUTES.iter().map(Mount::unimplemented).collect())
+            .with(Mount::read(
+                at(Method::GET, "/api/events"),
+                sync_api::events,
+            ))
+            .with(Mount::read(
+                at(Method::GET, "/api/threads"),
+                sync_api::threads,
+            ))
+            .with(Mount::read(
+                at(Method::GET, "/api/worktrees"),
+                sync_api::worktrees,
+            ))
+            .with(Mount::read(
+                at(Method::GET, "/api/blobs/{sha256}"),
+                blobs::download,
+            ))
+            .with(Mount::read(
+                at(Method::POST, "/api/ws-ticket"),
+                ws::ws_ticket,
+            ))
+            .with(Mount::upgrade(
+                at(Method::GET, "/api/ws"),
+                ws::events_socket,
+            ))
+            .with(Mount::read(
+                at(Method::POST, "/api/pair-codes"),
+                pair::pair_codes,
+            ))
+            .with(Mount::write(at(Method::POST, "/api/pair"), pair::pair))
     }
 
     /// No mounts (for building inconsistent sets in tests).

@@ -96,9 +96,9 @@ async fn secrets_absent() {
     srv.send(&srv.req("GET", "/nowhere")).await;
     let before = since(&log, from);
     for (route, status) in [
-        ("/api/threads", 501),
+        ("/api/threads", 200),
         ("/api/ws", 401),
-        ("/api/pair", 501),
+        ("/api/pair", 401),
         ("/hook", 501),
         ("unmatched", 404),
     ] {

@@ -9,16 +9,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chaldea_core::auth::TokenKind;
-use chaldea_core::http::ErrorBody;
-use chaldea_core::ids::{LaunchId, ThreadId};
+use chaldea_core::http::{ErrorBody, PairCodeResponse, WsTicketResponse};
+use chaldea_core::ids::{LaunchId, StreamId, ThreadId};
+use chaldea_core::sync::{StreamHeadEntry, WsServerMessage};
 use chaldea_daemon::http::{
     HttpConfig, HttpServer, HttpShutdownReport, LifecycleSink, MonotonicClock, Mounts, ServeHandle,
     StoreFatal, TokenService,
 };
 use chaldea_daemon::store::{NewEvent, TokenSelector};
+use futures_util::{SinkExt, StreamExt};
 use sha2::Digest as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::{TestStore, registered, reserved, soon, started};
 
@@ -28,6 +31,10 @@ pub const DEADLINE: Duration = Duration::from_secs(2);
 pub const HEAD_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long a raw client waits for a whole reply.
 pub const CLIENT_WAIT: Duration = Duration::from_secs(15);
+/// The WebSocket heads interval of test servers.
+pub const HEADS_INTERVAL: Duration = Duration::from_millis(200);
+/// How long a WebSocket client waits for one frame or the close.
+pub const WS_WAIT: Duration = Duration::from_secs(10);
 
 /// Records every fatal store outcome.
 #[derive(Default)]
@@ -39,10 +46,12 @@ impl LifecycleSink for RecordingSink {
     }
 }
 
-/// The real monotonic clock plus a settable offset.
+/// The real monotonic clock plus a settable offset, or frozen at one instant.
 #[derive(Default)]
 pub struct SkewClock {
     offset_ms: AtomicU64,
+    /// While set: the instant `now` returns, and the real instant it was set at.
+    frozen: Mutex<Option<(Instant, Instant)>>,
 }
 
 impl SkewClock {
@@ -50,9 +59,12 @@ impl SkewClock {
         self.offset_ms
             .store(u64::try_from(by.as_millis()).unwrap(), Ordering::SeqCst);
     }
-}
 
-impl SkewClock {
+    /// Stops the clock at `at`; real time keeps running for timers.
+    pub fn freeze(&self, at: Instant) {
+        *self.frozen.lock().unwrap() = Some((at, Instant::now()));
+    }
+
     fn offset(&self) -> Duration {
         Duration::from_millis(self.offset_ms.load(Ordering::SeqCst))
     }
@@ -60,13 +72,21 @@ impl SkewClock {
 
 impl MonotonicClock for SkewClock {
     fn now(&self) -> Instant {
-        Instant::now() + self.offset()
+        match *self.frozen.lock().unwrap() {
+            Some((at, _)) => at,
+            None => Instant::now() + self.offset(),
+        }
     }
 
-    /// `at` less the current offset; when that is before the platform's earliest instant it
-    /// is long past, and the fixture reads `Instant::now()` instead.
+    /// `at` less the current offset (or, frozen, the real instant as far from the freeze
+    /// as `at` is from the frozen reading); when that is before the platform's earliest
+    /// instant it is long past, and the fixture reads `Instant::now()` instead.
     fn real(&self, at: Instant) -> Instant {
-        at.checked_sub(self.offset()).unwrap_or_else(Instant::now)
+        match *self.frozen.lock().unwrap() {
+            Some((f, r)) if at >= f => r + (at - f),
+            Some((f, r)) => r.checked_sub(f - at).unwrap_or_else(Instant::now),
+            None => at.checked_sub(self.offset()).unwrap_or_else(Instant::now),
+        }
     }
 }
 
@@ -105,6 +125,7 @@ impl TestServer {
         cfg.short_deadline = DEADLINE;
         cfg.header_read_timeout = HEAD_TIMEOUT;
         cfg.write_stall_timeout = Duration::from_secs(5);
+        cfg.ws.heads_interval = HEADS_INTERVAL;
         cfg.clock = clock.clone();
         tune(&mut cfg);
         let sink = Arc::new(RecordingSink::default());
@@ -220,16 +241,233 @@ impl TestServer {
         release
     }
 
+    /// Mints a WebSocket ticket for `purpose` with the token `secret`, or the reply.
+    pub async fn ticket(&self, secret: &str, purpose: &str) -> Result<String, Reply> {
+        let r = self
+            .send(
+                &self
+                    .req("POST", "/api/ws-ticket")
+                    .bearer(secret)
+                    .body(format!(r#"{{"purpose":"{purpose}"}}"#).as_bytes()),
+            )
+            .await;
+        if r.status != 200 {
+            return Err(r);
+        }
+        let body: WsTicketResponse = serde_json::from_slice(&r.body).unwrap();
+        Ok(body.ticket)
+    }
+
+    /// Opens `GET /api/ws` with a fresh `events` ticket of `secret` and reads `hello`.
+    pub async fn ws(&self, secret: &str) -> WsClient {
+        let ticket = self.ticket(secret, "events").await.expect("a ticket");
+        let mut c = self.ws_with(&ticket).await.expect("a 101");
+        match c.next().await {
+            Some(WsServerMessage::Hello { epoch, .. }) => {
+                assert_eq!(
+                    &epoch,
+                    self.store.store().epoch(),
+                    "hello carries the epoch"
+                );
+            }
+            other => panic!("expected hello, got {other:?}"),
+        }
+        c
+    }
+
+    /// Opens `GET /api/ws` with `ticket`; the handshake's error otherwise.
+    pub async fn ws_with(
+        &self,
+        ticket: &str,
+    ) -> Result<WsClient, tokio_tungstenite::tungstenite::Error> {
+        let url = format!("ws://127.0.0.1:{}/api/ws?ticket={ticket}", self.port);
+        let (ws, resp) = tokio_tungstenite::connect_async(url).await?;
+        assert_eq!(resp.status(), 101);
+        Ok(WsClient { ws, closed: None })
+    }
+
+    /// A pair code minted with the token `secret`.
+    pub async fn pair_code(&self, secret: &str) -> Result<String, Reply> {
+        let r = self
+            .send(
+                &self
+                    .req("POST", "/api/pair-codes")
+                    .bearer(secret)
+                    .body(b"{}"),
+            )
+            .await;
+        if r.status != 200 {
+            return Err(r);
+        }
+        let body: PairCodeResponse = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body.expires_in, 60);
+        Ok(body.code)
+    }
+
+    /// `POST /api/pair` with `code` and a matching `Origin`.
+    pub async fn pair(&self, code: &str) -> Reply {
+        self.send(&self.pair_req(code)).await
+    }
+
+    /// The `POST /api/pair` request for `code`, with a matching `Origin`.
+    #[must_use]
+    pub fn pair_req(&self, code: &str) -> Req {
+        self.req("POST", "/api/pair")
+            .header("Origin", &format!("http://127.0.0.1:{}", self.port))
+            .body(format!(r#"{{"code":"{code}"}}"#).as_bytes())
+    }
+
+    /// The token row stored under the secret's digest.
+    #[must_use]
+    pub fn token_row(&self, secret: &str) -> Option<chaldea_daemon::store::TokenRow> {
+        let sha: [u8; 32] = sha2::Sha256::digest(secret.as_bytes()).into();
+        self.store.read(move |tx| tx.token_by_hash(&sha))
+    }
+
+    /// Revokes one token by its secret in a write of its own, without the nudge.
+    pub async fn revoke_quietly(&self, secret: &str) {
+        let id = self.token_row(secret).expect("token exists").token_id;
+        let n = self
+            .store
+            .store()
+            .submit(soon(), move |tx| {
+                Ok(tx.token_revoke(TokenSelector::Token(id))?)
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
     /// A request builder for this server.
     #[must_use]
     pub fn req(&self, method: &str, path: &str) -> Req {
         Req::new(self.port, method, path)
     }
 
+    /// A raw WebSocket handshake for `target`, with [`ws_key`].
+    #[must_use]
+    pub fn ws_handshake(&self, target: &str) -> Req {
+        self.req("GET", target)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", &ws_key())
+    }
+
     /// Sends `req` on a new connection and reads the reply to EOF.
     pub async fn send(&self, req: &Req) -> Reply {
         send(self.port, &req.bytes()).await
     }
+}
+
+/// A WebSocket client for `GET /api/ws`.
+pub struct WsClient {
+    pub ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+    /// The close code received, once the server closed.
+    pub closed: Option<Option<u16>>,
+}
+
+impl WsClient {
+    /// Sends `subscribe` with `ids` as given.
+    pub async fn subscribe(&mut self, ids: &[StreamId]) {
+        let ids: Vec<String> = ids.iter().map(ToString::to_string).collect();
+        self.text(&serde_json::json!({"type": "subscribe", "stream_ids": ids}).to_string())
+            .await;
+    }
+
+    pub async fn text(&mut self, t: &str) {
+        self.ws
+            .send(WsMessage::Text(t.to_owned().into()))
+            .await
+            .unwrap();
+    }
+
+    /// The next server message within [`WS_WAIT`], or `None` once the server closed or the
+    /// connection ended (the close code, if any, in `closed`). Pings are answered by the
+    /// client library and skipped.
+    pub async fn next(&mut self) -> Option<WsServerMessage> {
+        loop {
+            let m = tokio::time::timeout(WS_WAIT, self.ws.next())
+                .await
+                .expect("a frame or the close within the wait");
+            match m {
+                Some(Ok(WsMessage::Text(t))) => {
+                    return Some(
+                        serde_json::from_str(t.as_str())
+                            .unwrap_or_else(|e| panic!("not a WsServerMessage ({e}): {t}")),
+                    );
+                }
+                Some(Ok(WsMessage::Close(f))) => {
+                    self.closed = Some(f.map(|f| u16::from(f.code)));
+                    return None;
+                }
+                Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => {}
+                Some(Ok(other)) => panic!("unexpected frame {other:?}"),
+                Some(Err(_)) | None => {
+                    self.closed.get_or_insert(None);
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// The next `heads` frame whose streams are exactly `want` (frames before it skipped,
+    /// each checked by `seen`).
+    pub async fn heads_for(
+        &mut self,
+        want: &[StreamId],
+        mut seen: impl FnMut(&WsServerMessage),
+    ) -> Vec<StreamHeadEntry> {
+        let mut want: Vec<StreamId> = want.to_vec();
+        want.sort();
+        loop {
+            let m = self.next().await.expect("open");
+            seen(&m);
+            if let WsServerMessage::Heads { heads } = &m {
+                let mut got: Vec<StreamId> = heads.iter().map(|h| h.stream_id).collect();
+                got.sort();
+                if got == want {
+                    return heads.clone();
+                }
+            }
+        }
+    }
+
+    /// Reads until the server closes; returns the close code (if a close frame came) and
+    /// the messages before it.
+    pub async fn until_closed(&mut self) -> (Option<u16>, Vec<WsServerMessage>) {
+        let mut before = Vec::new();
+        while let Some(m) = self.next().await {
+            before.push(m);
+        }
+        (self.closed.flatten(), before)
+    }
+}
+
+/// A `Sec-WebSocket-Key`: the sample nonce of RFC 6455 §1.3, encoded here.
+#[must_use]
+pub fn ws_key() -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(b"the sample nonce")
+}
+
+/// Waits until `cond` holds, polling with yields, at most `within`.
+pub async fn eventually(within: Duration, what: &str, mut cond: impl FnMut() -> bool) {
+    let until = Instant::now() + within;
+    while !cond() {
+        assert!(Instant::now() < until, "not within {within:?}: {what}");
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The head of `stream` in `heads`.
+#[must_use]
+pub fn head_of(heads: &[StreamHeadEntry], stream: StreamId) -> Option<u64> {
+    heads
+        .iter()
+        .find(|h| h.stream_id == stream)
+        .map(|h| h.head_seq)
 }
 
 /// A raw HTTP/1.1 request.
