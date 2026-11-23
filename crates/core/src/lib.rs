@@ -10,6 +10,7 @@
 use std::fmt;
 
 pub mod auth;
+pub mod canonical;
 pub mod command;
 pub mod event;
 pub mod http;
