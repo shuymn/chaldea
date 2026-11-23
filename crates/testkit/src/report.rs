@@ -43,22 +43,22 @@ impl Reporter {
         let Some(stream) = addr.and_then(|a| TcpStream::connect(a).ok()) else {
             return Reporter;
         };
-        if let (Ok(read), Ok(mut write)) = (stream.try_clone(), stream.try_clone()) {
+        let read = stream.try_clone();
+        let _ = STREAM.set(Mutex::new((stream, false)));
+        if let Ok(read) = read {
             std::thread::spawn(move || {
                 for line in BufReader::new(read).lines() {
                     let Ok(line) = line else { return };
                     if line.trim() == "ping" {
-                        let pong = json!({"event": "pong", "inq": inq()});
-                        if write.write_all(format!("{pong}\n").as_bytes()).is_err() {
-                            return;
-                        }
+                        // Through the event writer's lock, so a pong never lands inside an
+                        // event line.
+                        Reporter.send(&json!({"event": "pong", "inq": inq()}));
                     } else if let Some(f) = COMMAND.get() {
                         f(line.trim());
                     }
                 }
             });
         }
-        let _ = STREAM.set(Mutex::new((stream, false)));
         Reporter
     }
 
