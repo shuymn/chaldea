@@ -1,19 +1,27 @@
-//! `host` on Windows: std for opens (with `FILE_FLAG_OPEN_REPARSE_POINT`) and attributes,
-//! `windows::sys` for security descriptors, known folders, and events.
+//! `host` on Windows: std for opens (with `FILE_FLAG_OPEN_REPARSE_POINT`), attributes, and
+//! creation flags, `windows::sys` for security descriptors, known folders, events, the job
+//! state, the standard handles, and `ShellExecuteExW`.
 
+use std::ffi::OsStr;
 use std::fs::{File, Metadata, OpenOptions};
-use std::io;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsHandle;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::{Child, ChildStdout, Command};
+use std::sync::{Arc, mpsc};
+use std::time::Instant;
 
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, READ_CONTROL,
 };
 
-use super::{Access, EntryKind, Privacy, ProcessIdentity, SigchldDisposition, SignalState};
+use super::{
+    Access, Breakaway, EntryKind, JobLimits, JobState, LaunchctlOutput, Privacy, ProcessIdentity,
+    ReadyArg, ReadyRead, SigchldDisposition, SignalState, StopTarget,
+};
 use crate::windows::sys::{self, ACE_ALLOWED, ACE_DENIED, AceInfo, SecurityInfo};
 
 /// `ERROR_INVALID_PARAMETER`: `OpenProcess` of a pid no process has.
@@ -264,8 +272,196 @@ pub(super) fn listen_for_stop(
     Ok((name, StopInner { cancel }))
 }
 
+// ---- Detaching (design §2.10, §2.12) ----
+
+pub(super) fn detach_session() -> io::Result<()> {
+    Ok(())
+}
+
+pub(super) fn leave_launchd_job() -> io::Result<()> {
+    Ok(())
+}
+
+pub(super) fn euid() -> u32 {
+    0
+}
+
+pub(super) fn current_umask() -> u32 {
+    0
+}
+
+pub(super) fn launchctl(_args: &[&OsStr], _deadline: Instant) -> io::Result<LaunchctlOutput> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "launchctl is macOS only",
+    ))
+}
+
+/// `DETACHED_PROCESS`, `CREATE_NEW_PROCESS_GROUP`, `CREATE_BREAKAWAY_FROM_JOB` (`winbase.h`).
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+/// The creation flags of a detached child.
+#[must_use]
+pub fn detached_flags(breakaway: Breakaway) -> u32 {
+    let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    match breakaway {
+        Breakaway::NotRequested => base,
+        Breakaway::Explicit => base | CREATE_BREAKAWAY_FROM_JOB,
+    }
+}
+
+pub(super) fn configure_detached(cmd: &mut Command, breakaway: Breakaway) {
+    cmd.creation_flags(detached_flags(breakaway));
+}
+
+pub(super) fn uninherit_std_handles() -> io::Result<()> {
+    sys::uninherit_std_handles()
+}
+
+// ---- Readiness channel: the child's stdout pipe ----
+
+pub(super) struct ReadyInner {
+    rx: Option<mpsc::Receiver<io::Result<ReadyRead>>>,
+}
+
+pub(super) fn ready_dir(_inner: &ReadyInner) -> Option<&Path> {
+    None
+}
+
+/// The longest verdict line the starter accepts.
+const MAX_READY_LINE: u64 = 4096;
+
+pub(super) fn ready_attach(inner: &mut ReadyInner, stdout: ChildStdout) {
+    let (tx, rx) = mpsc::channel();
+    // Ends at the line, at the pipe's end, or with the process (a starter that timed out).
+    std::thread::spawn(move || {
+        let mut line = Vec::new();
+        let r = BufReader::new(stdout)
+            .take(MAX_READY_LINE)
+            .read_until(b'\n', &mut line);
+        let out = match r {
+            Ok(_) if line.last() == Some(&b'\n') => {
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                Ok(ReadyRead::Line(String::from_utf8_lossy(&line).into_owned()))
+            }
+            Ok(_) => Ok(ReadyRead::Eof),
+            // The child closed its end (ERROR_BROKEN_PIPE) is the end of the channel.
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(ReadyRead::Eof),
+            Err(e) => Err(e),
+        };
+        let _ = tx.send(out);
+    });
+    inner.rx = Some(rx);
+}
+
+pub(super) fn ready_channel_in(_temp: &Path) -> io::Result<(ReadyInner, ReadyArg)> {
+    Ok((ReadyInner { rx: None }, ReadyArg::Stdout))
+}
+
+pub(super) fn ready_read(
+    inner: &mut ReadyInner,
+    deadline: Instant,
+    _child: Option<&mut Child>,
+) -> io::Result<ReadyRead> {
+    let Some(rx) = &inner.rx else {
+        return Err(io::Error::other("the child's stdout was not attached"));
+    };
+    // Deadline first: a line first observed after the deadline does not win.
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Ok(ReadyRead::TimedOut);
+    }
+    match rx.recv_timeout(left) {
+        Ok(r) => {
+            inner.rx = None;
+            r
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(ReadyRead::TimedOut),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(ReadyRead::Eof),
+    }
+}
+
+pub(super) struct ReadyWriterInner(File);
+
+pub(super) fn ready_writer(arg: &ReadyArg) -> io::Result<ReadyWriterInner> {
+    match arg {
+        ReadyArg::Stdout => Ok(ReadyWriterInner(File::from(sys::take_std_output()?))),
+        ReadyArg::Socket(_) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the readiness channel on Windows is stdout",
+        )),
+    }
+}
+
+pub(super) fn ready_write(inner: &mut ReadyWriterInner, line: &str) -> io::Result<()> {
+    inner.0.write_all(line.as_bytes())
+}
+
+pub(super) fn ready_close(inner: ReadyWriterInner) {
+    // Dropping the file closes the pipe handle.
+    drop(inner);
+}
+
+// ---- Parent job (design §2.12) ----
+
+/// The job limit flags (`winnt.h`).
+const KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+const BREAKAWAY_OK: u32 = 0x0000_0800;
+const SILENT_BREAKAWAY_OK: u32 = 0x0000_1000;
+
+/// The [`JobState`] of `IsProcessInJob` and the immediate job's `LimitFlags`.
+#[must_use]
+pub fn job_state_of(flags: Option<u32>) -> JobState {
+    match flags {
+        None => JobState::NONE,
+        Some(f) => JobState {
+            in_job: true,
+            immediate: Some(JobLimits {
+                kill_on_close: f & KILL_ON_JOB_CLOSE != 0,
+                breakaway_ok: f & BREAKAWAY_OK != 0,
+                silent_breakaway_ok: f & SILENT_BREAKAWAY_OK != 0,
+            }),
+        },
+    }
+}
+
+pub(super) fn job_state() -> io::Result<JobState> {
+    Ok(job_state_of(sys::own_job_flags()?))
+}
+
+pub(super) fn has_console() -> Option<bool> {
+    Some(sys::has_console_window())
+}
+
+// ---- Stop ----
+
+/// Windows sets the event first; a missing event is checked against the identity after.
+pub(super) const CHECK_BEFORE_DELIVERY: bool = false;
+/// `ERROR_FILE_NOT_FOUND`: no event of that name.
+pub(super) const DELIVERY_GONE: i32 = 2;
+/// `ERROR_ACCESS_DENIED`.
+pub(super) const DELIVERY_DENIED: i32 = 5;
+
+pub(super) fn deliver_stop(target: &StopTarget) -> io::Result<()> {
+    let h = sys::open_event_modify(&super::stop_event_name(&target.instance))?;
+    sys::set_event(&h)
+}
+
+// ---- Browser ----
+
+pub(super) fn open_url(url: &str) -> io::Result<()> {
+    sys::shell_open(url)
+}
+
 #[cfg(test)]
 mod tests {
+    use windows_sys::Win32::System::Threading::{PROCESS_SET_QUOTA, PROCESS_TERMINATE};
+
     use super::*;
 
     const USER: &str = "S-1-5-21-1-2-3-1001";
@@ -397,6 +593,122 @@ mod tests {
         let h = sys::open_event_modify(l.name()).unwrap();
         sys::set_event(&h).unwrap();
         rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    }
+
+    /// The helper role of this module's job tests (set only in the helper's environment).
+    const HELPER: &str = "CHALDEA_HOST_JOB_HELPER";
+
+    /// Runs this test binary's `test` as a helper with `role`, `flags` as its creation flags,
+    /// and `before_go` applied to its pid before it is told to go (stdin); returns its `@@ `
+    /// report. Every wait is bounded (60 s); the helper is killed past it.
+    fn helper(test: &str, role: &str, flags: u32, before_go: impl FnOnce(u32)) -> String {
+        use std::io::{Read as _, Write as _};
+        use std::os::windows::process::CommandExt as _;
+        use std::process::Stdio;
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([test, "--exact", "--nocapture", "--test-threads=1"])
+            .env(HELPER, role)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(flags);
+        let mut child = crate::with_spawn_lock(|| cmd.spawn()).unwrap();
+        let mut out = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = out.read_to_string(&mut s);
+            s
+        });
+        before_go(child.id());
+        child.stdin.take().unwrap().write_all(b"go\n").unwrap();
+        let end = Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if Instant::now() >= end {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("helper {role} did not exit within 60 s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let out = reader.join().unwrap();
+        assert!(status.success(), "helper {role}: {status:?}\n{out}");
+        out.lines()
+            .find_map(|l| l.find("@@ ").map(|i| l[i + 3..].to_owned()))
+            .unwrap_or_else(|| panic!("no report from helper {role}:\n{out}"))
+    }
+
+    /// The helper side: waits for `go`, then reports this process's job state.
+    fn report_job_state() {
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        let state = super::job_state().unwrap();
+        println!("@@ {state:?}");
+    }
+
+    /// The CI sentinel of design §2.12: a process assigned to a job reads that job as its
+    /// immediate job, with the limits it was given.
+    #[test]
+    fn job_state_reads_the_immediate_job() {
+        if std::env::var_os(HELPER).is_some() {
+            report_job_state();
+            return;
+        }
+        for (flags, want) in [
+            (KILL_ON_JOB_CLOSE | BREAKAWAY_OK, (true, true, false)),
+            (KILL_ON_JOB_CLOSE | SILENT_BREAKAWAY_OK, (true, false, true)),
+            (0, (false, false, false)),
+        ] {
+            let job = sys::create_job().unwrap();
+            sys::set_job_limit(&job, flags).unwrap();
+            let got = helper(
+                "host::windows::tests::job_state_reads_the_immediate_job",
+                "report",
+                0,
+                |pid| {
+                    let p = sys::open_process(pid, PROCESS_SET_QUOTA | PROCESS_TERMINATE).unwrap();
+                    sys::assign(&job, &p).unwrap();
+                },
+            );
+            let expected = JobState {
+                in_job: true,
+                immediate: Some(JobLimits {
+                    kill_on_close: want.0,
+                    breakaway_ok: want.1,
+                    silent_breakaway_ok: want.2,
+                }),
+            };
+            assert_eq!(got, format!("{expected:?}"), "flags {flags:#x}");
+        }
+    }
+
+    /// A-W1 (design §2.12), the CI preflight: this process's job state allows the starter's
+    /// launch, and a helper launched with the flags the starter would choose is in no job.
+    #[test]
+    fn runner_can_break_away() {
+        if std::env::var_os(HELPER).is_some() {
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            println!("@@ in_job={}", sys::in_any_job_now().unwrap());
+            return;
+        }
+        let state = super::job_state().unwrap();
+        eprintln!("A-W1: this test process's job state: {state:?}");
+        let breakaway = super::super::breakaway_for(&state).unwrap_or_else(|| {
+            panic!("A-W1 does not hold: the immediate job allows no breakaway: {state:?}")
+        });
+        let got = helper(
+            "host::windows::tests::runner_can_break_away",
+            "probe",
+            detached_flags(breakaway),
+            |_| {},
+        );
+        assert_eq!(
+            got, "in_job=false",
+            "job state {state:?}, breakaway {breakaway:?}"
+        );
     }
 
     fn uuid_like() -> String {

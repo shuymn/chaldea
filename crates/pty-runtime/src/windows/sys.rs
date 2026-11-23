@@ -1128,3 +1128,139 @@ pub(crate) fn console_processes() -> io::Result<Vec<u32>> {
     pids.truncate(usize::try_from(n).unwrap_or(0).min(64));
     Ok(pids)
 }
+
+// ---- Parent job, console, standard handles, browser (`host`, daemon-lifecycle §2.10–§2.13) ----
+
+/// Whether `process` is in any job (`IsProcessInJob(process, NULL)`).
+pub(crate) fn in_any_job(process: HANDLE) -> io::Result<bool> {
+    let mut result = 0;
+    // SAFETY: `process` is a valid handle (or the current-process pseudo-handle) for the call;
+    // a null job handle asks about any job; `result` is a local.
+    if unsafe { IsProcessInJob(process, std::ptr::null_mut(), &raw mut result) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(result != 0)
+}
+
+/// Whether this process is in any job.
+#[cfg(test)]
+pub(crate) fn in_any_job_now() -> io::Result<bool> {
+    in_any_job(current_process())
+}
+
+/// Whether `process` (an open handle) is in any job.
+#[cfg(feature = "fake")]
+pub(crate) fn handle_in_any_job(process: &OwnedHandle) -> io::Result<bool> {
+    in_any_job(raw(process))
+}
+
+/// This process's job state: `None` in no job, else the immediate job's `LimitFlags`
+/// (`QueryInformationJobObject(NULL, JobObjectExtendedLimitInformation)`, L13).
+pub(crate) fn own_job_flags() -> io::Result<Option<u32>> {
+    if !in_any_job(current_process())? {
+        return Ok(None);
+    }
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    // SAFETY: a null job handle queries the immediate job of the calling process; `info` is a
+    // zeroed struct of integers whose size is passed.
+    let ok = unsafe {
+        QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            (&raw mut info).cast(),
+            len_u32(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Some(info.BasicLimitInformation.LimitFlags))
+}
+
+/// `GetConsoleWindow() != NULL`.
+pub(crate) fn has_console_window() -> bool {
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
+    // SAFETY: no arguments.
+    !unsafe { GetConsoleWindow() }.is_null()
+}
+
+/// Clears `HANDLE_FLAG_INHERIT` on this process's standard input, output, and error handles;
+/// an absent handle is skipped. Errors are reported after every handle was tried.
+pub(crate) fn uninherit_std_handles() -> io::Result<()> {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    let mut first = None;
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: plain call.
+        let h = unsafe { GetStdHandle(id) };
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        // SAFETY: `h` is this process's standard handle, valid for the call.
+        if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) } == 0 && first.is_none() {
+            first = Some(io::Error::last_os_error());
+        }
+    }
+    first.map_or(Ok(()), Err)
+}
+
+/// Takes ownership of this process's standard output handle and sets the process's standard
+/// output to NULL, so std's `Stdout` writes nowhere and nothing else closes the handle.
+pub(crate) fn take_std_output() -> io::Result<OwnedHandle> {
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE, SetStdHandle};
+    // SAFETY: plain call.
+    let h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if h.is_null() || h == INVALID_HANDLE_VALUE {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "this process has no standard output handle",
+        ));
+    }
+    // SAFETY: plain call; NULL is accepted as the new standard handle.
+    if unsafe { SetStdHandle(STD_OUTPUT_HANDLE, std::ptr::null_mut()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `h` was this process's standard output handle; once replaced by NULL no other
+    // code of this process reaches it through `GetStdHandle`, so it is wrapped exactly once.
+    Ok(unsafe { OwnedHandle::from_raw_handle(h) })
+}
+
+/// `ShellExecuteExW` with the `open` verb on `url`, `SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI`
+/// (L21), after `CoInitializeEx` as the shell requires.
+pub(crate) fn shell_open(url: &str) -> io::Result<()> {
+    use windows_sys::Win32::System::Com::{
+        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
+    /// `SW_SHOWNORMAL` (`winuser.h`).
+    const SW_SHOWNORMAL: i32 = 1;
+    // SAFETY: reserved pointer null; a failure (already initialized another way) is fine for
+    // the shell call below.
+    let _ = unsafe {
+        CoInitializeEx(
+            std::ptr::null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).cast_unsigned(),
+        )
+    };
+    let verb = wide_str("open");
+    let file = wide_str(url);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: len_u32(size_of::<SHELLEXECUTEINFOW>()),
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: verb.as_ptr(),
+        lpFile: file.as_ptr(),
+        nShow: SW_SHOWNORMAL,
+        ..SHELLEXECUTEINFOW::default()
+    };
+    // SAFETY: `info` is fully initialized with its size; `verb` and `file` are NUL-terminated
+    // and outlive the call.
+    if unsafe { ShellExecuteExW(&raw mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}

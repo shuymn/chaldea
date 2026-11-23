@@ -502,6 +502,24 @@ pub(crate) fn block_signals(signals: &[c_int]) -> io::Result<()> {
     Ok(())
 }
 
+/// Which side of a `fork` the caller is on.
+pub(crate) enum Forked {
+    Parent,
+    Child,
+}
+
+/// `fork()`. Call only while the process has one thread (`host::leave_launchd_job`, from
+/// `dispatch` before process setup), so the child holds no lock another thread owned.
+pub(crate) fn fork() -> io::Result<Forked> {
+    // SAFETY: the caller guarantees a single-threaded process; the child continues normal
+    // Rust execution, which is sound without other threads.
+    match unsafe { libc::fork() } {
+        -1 => Err(io::Error::last_os_error()),
+        0 => Ok(Forked::Child),
+        _ => Ok(Forked::Parent),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Spawn hygiene, the spawn lock, and `bsd_info`. Tests that change process-wide state

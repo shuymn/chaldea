@@ -1,13 +1,18 @@
 //! Process-level OS primitives of the daemon and the CLI (`docs/design/daemon-lifecycle.md`
-//! §2.2): process identity, the process-wide signal state, the state directory's privacy
-//! checks and owner-only files, opens that never follow a final link, and the stop listener.
+//! §2.2): process identity, the process-wide signal state, detaching (sessions, the macOS
+//! launchd job, Windows creation flags), the readiness channel, the state directory's privacy
+//! checks and owner-only files, opens that never follow a final link, the Windows parent job,
+//! the stop channel, and the browser launch.
 //!
 //! Every function is safe; the `unsafe` calls are in `unix::sys` and `windows::sys`, the only
 //! modules allowed them (`docs/design/pty-unix.md` §2.7).
 
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdout, Command};
+use std::time::Instant;
 
 pub use crate::backend::ProcessIdentity;
 
@@ -328,4 +333,566 @@ pub fn listen_for_stop(
 #[must_use]
 pub fn stop_event_name(instance: &str) -> String {
     format!("Global\\chaldea-stop-{instance}")
+}
+
+// ---- Detaching (docs/design/daemon-lifecycle.md §2.10, §2.12) ----
+
+/// Puts this process in a session of its own (`setsid`), so it leaves the launching
+/// terminal's session and process group. `Ok` on Windows.
+///
+/// # Errors
+///
+/// The OS refused (`EPERM` when this process already leads a process group).
+pub fn detach_session() -> io::Result<()> {
+    imp::detach_session()
+}
+
+/// macOS: forks; the parent `_exit(0)`s at once (no destructor or stdio flush runs), so
+/// launchd sees its one-shot job finished, and the child returns. Call only while the
+/// process has one thread. `Ok` without forking elsewhere.
+///
+/// # Errors
+///
+/// `fork` failed (the caller is still the job's process).
+pub fn leave_launchd_job() -> io::Result<()> {
+    imp::leave_launchd_job()
+}
+
+/// What `launchctl` printed and how it exited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchctlOutput {
+    /// The exit code; `None` when a signal ended it.
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Runs `/bin/launchctl <args>` under the spawn lock, waits for it until `deadline`, and kills
+/// and reaps it past the deadline (macOS only).
+///
+/// # Errors
+///
+/// The spawn error; `TimedOut` past the deadline; `Unsupported` off macOS.
+pub fn launchctl(args: &[&OsStr], deadline: Instant) -> io::Result<LaunchctlOutput> {
+    imp::launchctl(args, deadline)
+}
+
+/// Whether the user's GUI launchd domain exists (design §2.10 "Choosing the macOS path").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuiDomain {
+    /// `launchctl print gui/<uid>` exited 0.
+    Available,
+    /// An SSH session (no probe), or `launchctl` reported the domain does not exist.
+    Absent { why: String },
+    /// Anything else: a timeout, a spawn error, another exit.
+    ProbeFailed { why: String },
+}
+
+/// The exit status of `launchctl print gui/<uid>` for a domain that does not exist (L23).
+pub const LAUNCHCTL_NO_DOMAIN: i32 = 112;
+
+/// Classifies the outcome of `launchctl print gui/<uid>` (L23): exit 0 is `Available`; exit
+/// 112 with "Could not find domain" is `Absent`; anything else is `ProbeFailed`.
+#[must_use]
+pub fn classify_gui_probe(out: &io::Result<LaunchctlOutput>) -> GuiDomain {
+    match out {
+        Ok(o) if o.code == Some(0) => GuiDomain::Available,
+        Ok(o)
+            if o.code == Some(LAUNCHCTL_NO_DOMAIN)
+                && (o.stderr.contains("Could not find domain")
+                    || o.stdout.contains("Could not find domain")) =>
+        {
+            GuiDomain::Absent {
+                why: "launchctl reports no GUI domain for this user".to_owned(),
+            }
+        }
+        Ok(o) => GuiDomain::ProbeFailed {
+            why: format!(
+                "launchctl print exited {}: {}",
+                o.code
+                    .map_or_else(|| "by a signal".to_owned(), |c| c.to_string()),
+                o.stderr.trim()
+            ),
+        },
+        Err(e) => GuiDomain::ProbeFailed {
+            why: format!("launchctl print failed: {e}"),
+        },
+    }
+}
+
+/// The user's GUI launchd domain, `gui/<euid>`.
+#[must_use]
+pub fn gui_domain_target() -> String {
+    format!("gui/{}", imp::euid())
+}
+
+/// [`gui_domain_via`] with [`launchctl`].
+#[must_use]
+pub fn gui_domain(deadline: Instant) -> GuiDomain {
+    gui_domain_via(deadline, &|args, d| launchctl(args, d))
+}
+
+/// Decides the macOS launch path: `Absent` without a probe when `SSH_CONNECTION` or `SSH_TTY`
+/// is set (the deliberate SSH path); otherwise `run` probes `print gui/<uid>` by `deadline`
+/// and [`classify_gui_probe`] decides.
+#[must_use]
+pub fn gui_domain_via(
+    deadline: Instant,
+    run: &dyn Fn(&[&OsStr], Instant) -> io::Result<LaunchctlOutput>,
+) -> GuiDomain {
+    for var in ["SSH_CONNECTION", "SSH_TTY"] {
+        if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
+            return GuiDomain::Absent {
+                why: format!("an SSH session ({var} is set)"),
+            };
+        }
+    }
+    let target = gui_domain_target();
+    classify_gui_probe(&run(&["print".as_ref(), target.as_ref()], deadline))
+}
+
+/// This process's file mode creation mask (macOS; `0` elsewhere).
+#[must_use]
+pub fn current_umask() -> u32 {
+    imp::current_umask()
+}
+
+/// Whether a detached child is created with `CREATE_BREAKAWAY_FROM_JOB` (Windows, design
+/// §2.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Breakaway {
+    /// Not in a job, or only `SILENT_BREAKAWAY_OK` (the child breaks away implicitly).
+    NotRequested,
+    /// The immediate job has `BREAKAWAY_OK`.
+    Explicit,
+}
+
+/// The starter's launch from its own [`JobState`] (design §2.12): `None` when the immediate
+/// job allows no breakaway (the start is refused before spawning).
+#[must_use]
+pub fn breakaway_for(state: &JobState) -> Option<Breakaway> {
+    if !state.in_job {
+        return Some(Breakaway::NotRequested);
+    }
+    match state.immediate {
+        Some(l) if l.breakaway_ok => Some(Breakaway::Explicit),
+        Some(l) if l.silent_breakaway_ok => Some(Breakaway::NotRequested),
+        _ => None,
+    }
+}
+
+/// Windows: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`, plus `CREATE_BREAKAWAY_FROM_JOB`
+/// for [`Breakaway::Explicit`]. Nothing elsewhere.
+pub fn configure_detached(cmd: &mut Command, breakaway: Breakaway) {
+    imp::configure_detached(cmd, breakaway);
+}
+
+/// Windows: clears the inherit flag of this process's standard handles, so a child created
+/// with handle inheritance (every std spawn) does not keep the caller's pipes or console
+/// handles open beyond the ones it is given. Nothing elsewhere.
+///
+/// # Errors
+///
+/// The OS refused.
+pub fn uninherit_std_handles() -> io::Result<()> {
+    imp::uninherit_std_handles()
+}
+
+// ---- Readiness channel (docs/design/daemon-lifecycle.md §2.10) ----
+
+/// Where a detached child writes its verdict: a Unix socket path (macOS) or its stdout pipe
+/// (Windows). Passed as `--ready <channel>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadyArg {
+    Socket(PathBuf),
+    Stdout,
+}
+
+impl ReadyArg {
+    /// The `--ready` value: the socket path, or `stdout`.
+    #[must_use]
+    pub fn to_os_string(&self) -> OsString {
+        match self {
+            ReadyArg::Socket(p) => p.clone().into_os_string(),
+            ReadyArg::Stdout => OsString::from("stdout"),
+        }
+    }
+
+    /// Parses a `--ready` value: `stdout`, or an absolute socket path.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` for anything else.
+    pub fn parse(s: &OsStr) -> io::Result<ReadyArg> {
+        if s == "stdout" {
+            return Ok(ReadyArg::Stdout);
+        }
+        let p = Path::new(s);
+        if p.is_absolute() {
+            Ok(ReadyArg::Socket(p.to_path_buf()))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--ready takes `stdout` or an absolute socket path",
+            ))
+        }
+    }
+}
+
+/// The longest readiness socket path (`<dir>/r`) placed under the temp directory; a longer
+/// one goes under `/tmp` (Darwin's `sun_path` holds 104 bytes with its NUL, L20).
+pub const READY_SOCKET_MAX: usize = 100;
+
+/// What one wait on the readiness channel saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadyRead {
+    /// One line, without its `\n`.
+    Line(String),
+    /// The channel closed (or the direct child exited) without a line.
+    Eof,
+    TimedOut,
+}
+
+/// The starter's end of the readiness channel. Dropping it removes the private directory it
+/// created (macOS).
+pub struct ReadyReader {
+    inner: imp::ReadyInner,
+}
+
+impl ReadyReader {
+    /// The private directory holding the socket (macOS), also used for the launchd plist.
+    #[must_use]
+    pub fn dir(&self) -> Option<&Path> {
+        imp::ready_dir(&self.inner)
+    }
+
+    /// Windows: the spawned child's stdout, which carries the verdict. Nothing elsewhere.
+    pub fn attach_stdout(&mut self, stdout: ChildStdout) {
+        imp::ready_attach(&mut self.inner, stdout);
+    }
+
+    /// Waits until `deadline` for one line. `child`, when given, is the directly spawned child:
+    /// its exit before it connected counts as `Eof` (macOS).
+    ///
+    /// # Errors
+    ///
+    /// The channel failed for another reason than its end.
+    pub fn read_line(
+        &mut self,
+        deadline: Instant,
+        child: Option<&mut Child>,
+    ) -> io::Result<ReadyRead> {
+        imp::ready_read(&mut self.inner, deadline, child)
+    }
+}
+
+impl std::fmt::Debug for ReadyReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadyReader")
+            .field("dir", &self.dir())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The starter's channel: macOS a Unix socket `r` in a fresh private directory `chd-<16 hex>`
+/// under the temp directory (under `/tmp` when the socket path would exceed
+/// [`READY_SOCKET_MAX`] bytes); Windows the child's stdout, attached after the spawn.
+///
+/// # Errors
+///
+/// The directory or socket cannot be created.
+pub fn ready_channel() -> io::Result<(ReadyReader, ReadyArg)> {
+    ready_channel_in(&std::env::temp_dir())
+}
+
+/// [`ready_channel`] with `temp` as the temp directory (tests of the length rule).
+///
+/// # Errors
+///
+/// As [`ready_channel`].
+pub fn ready_channel_in(temp: &Path) -> io::Result<(ReadyReader, ReadyArg)> {
+    let (inner, arg) = imp::ready_channel_in(temp)?;
+    Ok((ReadyReader { inner }, arg))
+}
+
+/// The child's end of the readiness channel.
+pub struct ReadyWriter {
+    inner: imp::ReadyWriterInner,
+}
+
+impl ReadyWriter {
+    /// Writes `line` (with its `\n`) in one write.
+    ///
+    /// # Errors
+    ///
+    /// The starter stopped reading.
+    pub fn write_line(&mut self, line: &str) -> io::Result<()> {
+        imp::ready_write(&mut self.inner, line)
+    }
+
+    /// Closes the channel explicitly (macOS: shuts the socket down; Windows: closes the
+    /// stdout handle, which dropping Rust's `Stdout` does not).
+    pub fn close(self) {
+        imp::ready_close(self.inner);
+    }
+}
+
+impl std::fmt::Debug for ReadyWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReadyWriter")
+    }
+}
+
+/// Opens the child's end: connects to the socket (macOS) or takes over the stdout handle,
+/// leaving the process's standard output pointing nowhere (Windows).
+///
+/// # Errors
+///
+/// The socket is gone (the starter left) or the handle is missing.
+pub fn ready_writer(arg: &ReadyArg) -> io::Result<ReadyWriter> {
+    Ok(ReadyWriter {
+        inner: imp::ready_writer(arg)?,
+    })
+}
+
+// ---- Windows parent job (docs/design/daemon-lifecycle.md §2.12) ----
+
+/// The limits of the immediate job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobLimits {
+    pub kill_on_close: bool,
+    pub breakaway_ok: bool,
+    pub silent_breakaway_ok: bool,
+}
+
+/// Whether this process is in any job, and the immediate job's limits (L13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobState {
+    pub in_job: bool,
+    pub immediate: Option<JobLimits>,
+}
+
+impl JobState {
+    /// In no job (every non-Windows host).
+    pub const NONE: JobState = JobState {
+        in_job: false,
+        immediate: None,
+    };
+}
+
+/// This process's [`JobState`]: `IsProcessInJob(self, NULL)` and the immediate job's extended
+/// limits (Windows); [`JobState::NONE`] elsewhere.
+///
+/// # Errors
+///
+/// The OS refused the query.
+pub fn job_state() -> io::Result<JobState> {
+    imp::job_state()
+}
+
+/// Whether this process has a console window (`GetConsoleWindow`, Windows); `None` elsewhere.
+#[must_use]
+pub fn has_console() -> Option<bool> {
+    imp::has_console()
+}
+
+// ---- Stop request (docs/design/daemon-lifecycle.md §2.10) ----
+
+/// The published daemon a stop targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopTarget {
+    pub pid: u32,
+    pub start_time: String,
+    /// The instance UUID text.
+    pub instance: String,
+}
+
+/// What became of a stop request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopSent {
+    /// `SIGTERM` was delivered (Unix) or the instance's event set (Windows).
+    Sent,
+    /// The target exited before or during the request.
+    Exited,
+    /// The pid is alive with another start time: nothing was signalled.
+    IdentityMismatch,
+    AccessDenied,
+    /// The target is alive and matching but has no stop event (Windows).
+    NoListener,
+}
+
+/// Sends a stop to `target`: Unix `SIGTERM` after checking `(pid, start_time)` (the window
+/// between check and signal is the PID race of design §6.2); Windows sets
+/// `Global\chaldea-stop-<instance>`.
+///
+/// # Errors
+///
+/// The identity lookup failed, or the delivery failed for another reason than the target's
+/// absence or denied access.
+pub fn send_stop(target: &StopTarget) -> io::Result<StopSent> {
+    send_stop_with(target, &imp::deliver_stop)
+}
+
+/// [`send_stop`] with the delivery (`kill`, or the event's open and set) replaced, for fault
+/// tests.
+///
+/// # Errors
+///
+/// As [`send_stop`].
+#[doc(hidden)]
+pub fn send_stop_with(
+    target: &StopTarget,
+    deliver: &dyn Fn(&StopTarget) -> io::Result<()>,
+) -> io::Result<StopSent> {
+    if imp::CHECK_BEFORE_DELIVERY {
+        match identity_matches(target)? {
+            Some(true) => {}
+            Some(false) => return Ok(StopSent::IdentityMismatch),
+            None => return Ok(StopSent::Exited),
+        }
+    }
+    match deliver(target) {
+        Ok(()) => Ok(StopSent::Sent),
+        Err(e) if e.raw_os_error() == Some(imp::DELIVERY_GONE) => {
+            if imp::CHECK_BEFORE_DELIVERY {
+                // `ESRCH` after a matching check: the target exited in between.
+                return Ok(StopSent::Exited);
+            }
+            // No event: tell an exited target from a live one without a listener.
+            Ok(match identity_matches(target)? {
+                None => StopSent::Exited,
+                Some(false) => StopSent::IdentityMismatch,
+                Some(true) => StopSent::NoListener,
+            })
+        }
+        Err(e)
+            if e.kind() == io::ErrorKind::PermissionDenied
+                || e.raw_os_error() == Some(imp::DELIVERY_DENIED) =>
+        {
+            Ok(StopSent::AccessDenied)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `None`: no live process has the pid; `Some(true)`: it has the recorded start time.
+fn identity_matches(target: &StopTarget) -> io::Result<Option<bool>> {
+    Ok(process_identity(target.pid)?.map(|id| id.start_time == target.start_time))
+}
+
+// ---- Browser (docs/design/daemon-lifecycle.md §2.13) ----
+
+/// How long `/usr/bin/open` may take before it is killed (macOS).
+pub const OPEN_URL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Hands `url` to the OS: macOS `/usr/bin/open <url>` under the spawn lock, waited for up to
+/// [`OPEN_URL_WAIT`]; Windows `ShellExecuteExW` with the `open` verb.
+///
+/// # Errors
+///
+/// The launcher failed, exited non-zero, or timed out.
+pub fn open_url(url: &str) -> io::Result<()> {
+    imp::open_url(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::time::{Duration, Instant};
+
+    use super::{GuiDomain, LaunchctlOutput, classify_gui_probe};
+
+    fn out(code: Option<i32>, stderr: &str) -> io::Result<LaunchctlOutput> {
+        Ok(LaunchctlOutput {
+            code,
+            stdout: String::new(),
+            stderr: stderr.to_owned(),
+        })
+    }
+
+    /// PR8-CL-13: exit 0, exit 112 with "Could not find domain", and other outputs (L23).
+    #[test]
+    fn classify_gui_probe_outputs() {
+        assert_eq!(classify_gui_probe(&out(Some(0), "")), GuiDomain::Available);
+        assert!(matches!(
+            classify_gui_probe(&out(Some(112), "Could not find domain for user gui: 9999")),
+            GuiDomain::Absent { .. }
+        ));
+        assert!(matches!(
+            classify_gui_probe(&out(Some(112), "something else")),
+            GuiDomain::ProbeFailed { .. }
+        ));
+        assert!(matches!(
+            classify_gui_probe(&out(Some(1), "")),
+            GuiDomain::ProbeFailed { .. }
+        ));
+        assert!(matches!(
+            classify_gui_probe(&Err(io::Error::from(io::ErrorKind::TimedOut))),
+            GuiDomain::ProbeFailed { .. }
+        ));
+    }
+
+    /// `SSH_CONNECTION` or `SSH_TTY` decides `Absent` without running the probe.
+    #[test]
+    fn ssh_session_skips_the_probe() {
+        if std::env::var_os("SSH_CONNECTION").is_none() && std::env::var_os("SSH_TTY").is_none() {
+            let called = std::cell::Cell::new(false);
+            let probe = |_: &[&std::ffi::OsStr], _: Instant| {
+                called.set(true);
+                out(Some(0), "")
+            };
+            assert_eq!(
+                super::gui_domain_via(Instant::now() + Duration::from_secs(1), &probe),
+                GuiDomain::Available
+            );
+            assert!(called.get());
+        }
+    }
+
+    /// The readiness channel (macOS): a socket path of at most 100 bytes, under `/tmp` when
+    /// the temp directory is long (PR8-CL-14); a line written by the child is read; a line
+    /// already there when the deadline passed does not win (deadline first); dropping the
+    /// reader removes its directory.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn long_tmpdir_uses_tmp() {
+        use super::{ReadyArg, ReadyRead, ready_channel_in, ready_writer};
+        let base = std::env::temp_dir().join(format!("chaldea-ready-{}", std::process::id()));
+        let long = base.join("x".repeat(120usize.saturating_sub(base.as_os_str().len()).max(1)));
+        std::fs::create_dir_all(&long).unwrap();
+        assert!(long.as_os_str().len() >= 100);
+        let (mut r, arg) = ready_channel_in(&long).unwrap();
+        let ReadyArg::Socket(path) = &arg else {
+            panic!("{arg:?}")
+        };
+        assert!(path.starts_with("/tmp"), "{}", path.display());
+        assert!(path.as_os_str().len() <= 100, "{}", path.display());
+        let dir = r.dir().unwrap().to_path_buf();
+        let mut w = ready_writer(&arg).unwrap();
+        w.write_line("ready 7373 1\n").unwrap();
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(r.read_line(past, None).unwrap(), ReadyRead::TimedOut);
+        assert_eq!(
+            r.read_line(Instant::now() + Duration::from_secs(5), None)
+                .unwrap(),
+            ReadyRead::Line("ready 7373 1".to_owned())
+        );
+        w.close();
+        assert_eq!(
+            r.read_line(Instant::now() + Duration::from_secs(5), None)
+                .unwrap(),
+            ReadyRead::Eof
+        );
+        drop(r);
+        assert!(!dir.exists());
+        let (r, arg) = ready_channel_in(&std::env::temp_dir()).unwrap();
+        let ReadyArg::Socket(path) = &arg else {
+            panic!("{arg:?}")
+        };
+        assert!(path.as_os_str().len() <= 100, "{}", path.display());
+        drop(r);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 }
