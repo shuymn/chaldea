@@ -359,12 +359,18 @@ async fn lost_notification_recovered_by_heads() {
         Ok(WsServerMessage::Hello { .. })
     ));
     subscribe(&mut ws, &[stream]).await;
-    // The subscribe's frame carries the old head, so the new head can come only from a
-    // refresh read after the append.
+    // Once a frame has carried the old head, the new head can come only from a refresh
+    // read after the append. A periodic frame may come before the subscribe's (empty, the
+    // set not yet replaced), so wait, bounded, for the one that names the stream.
     let old = srv.store.read(move |tx| tx.head(stream, 0)).head_seq;
-    match next(&mut ws).await.expect("open") {
-        WsServerMessage::Heads { heads } => assert_eq!(heads, [e(stream, old)]),
-        other => panic!("the subscribe's `heads` first: {other:?}"),
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        match next(&mut ws).await.expect("open") {
+            WsServerMessage::Heads { heads } if heads == [e(stream, old)] => break,
+            WsServerMessage::Heads { heads } => assert!(heads.is_empty(), "{heads:?}"),
+            other => panic!("only `heads` before the subscribe's: {other:?}"),
+        }
+        assert!(Instant::now() < until, "no `heads` with the old head");
     }
     let s = shared(&srv);
     s.faults.drop_notifications(true);
@@ -597,4 +603,48 @@ fn too_big_is_the_typed_capacity_error() {
     assert!(!too_big(&axum::Error::new(
         tungstenite::Error::ConnectionClosed
     )));
+}
+
+/// Holds `hello` at the send gate on a one-thread runtime, then blocks that thread past
+/// the send deadline so the send and its deadline are both due at the next poll; `revoke`
+/// first makes the close path the one holding the send. The send must not be delivered.
+async fn send_due_after_its_deadline(revoke: bool) {
+    let srv = TestServer::start_with(Mounts::mvp(), |c: &mut HttpConfig| {
+        c.ws.send_timeout = Duration::from_secs(1);
+        c.ws.close_grace = Duration::from_secs(4);
+        c.ws.idle_timeout = Duration::from_secs(600);
+        c.ws.heads_interval = Duration::from_secs(600);
+    })
+    .await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
+    let s = shared(&srv);
+    let (reached, held) = s.faults.arm_socket_send_gate();
+    let mut ws = open(&srv, &ticket).await;
+    wait("hello is held", reached).await;
+    if revoke {
+        srv.revoke(&owner).await;
+        eventually(Duration::from_millis(800), "the close path entered", || {
+            s.faults.steps().contains(&"socket close")
+        })
+        .await;
+    }
+    // The server shares this runtime thread: block it past the send deadline, then make
+    // the send ready before the socket task is polled again.
+    std::thread::sleep(Duration::from_millis(1100));
+    held.send(()).unwrap();
+    assert_eq!(next(&mut ws).await, Err(None), "dropped, no frame");
+    srv.stop().await;
+}
+
+/// The loop never delivers a send that became ready after its deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn loop_drops_a_send_ready_after_its_deadline() {
+    send_due_after_its_deadline(false).await;
+}
+
+/// The close path never delivers a send that became ready after its deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn close_drops_a_send_ready_after_its_deadline() {
+    send_due_after_its_deadline(true).await;
 }

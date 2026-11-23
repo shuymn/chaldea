@@ -374,3 +374,57 @@ async fn blob_slot_frees_after_a_stalled_client() {
     }
     srv.stop().await;
 }
+
+/// A refused frame on a socket whose peer never answers the close: the server stops
+/// waiting at `close_grace` and the socket task ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_ends_without_the_peer_acknowledging() {
+    let srv = quiet(|c| c.ws.close_grace = Duration::from_millis(300)).await;
+    let base = srv.server.tasks();
+    let mut ws = subscribed_socket(&srv).await;
+    ws.ws
+        .send(WsMessage::Text("not json".into()))
+        .await
+        .unwrap();
+    let (code, _) = ws.until_closed().await;
+    assert_eq!(code, Some(1003));
+    // The client stream is not polled again: its reply to the close is queued, never
+    // flushed. The client stays open while the server is observed.
+    support::http::eventually(
+        Duration::from_secs(2),
+        "the unanswered socket ended",
+        || srv.server.tasks() <= base,
+    )
+    .await;
+    drop(ws);
+    srv.stop().await;
+}
+
+/// The last allowed subscription count and message size keep an existing stream: 1023
+/// unknown ids plus `host`, and `host` alone padded to exactly 64 KiB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_boundaries_keep_an_existing_stream() {
+    let srv = quiet(|_| {}).await;
+    let mut ws = subscribed_socket(&srv).await;
+    let mut mixed: serde_json::Value =
+        serde_json::from_str(&subscribe_text(SUBSCRIPTIONS - 1, 0)).unwrap();
+    mixed["stream_ids"]
+        .as_array_mut()
+        .unwrap()
+        .push("host".into());
+    let one = r#"{"type":"subscribe","stream_ids":["host"]}"#;
+    let padded = one.to_owned() + &" ".repeat(MESSAGE_BYTES - one.len());
+    let mut got = Vec::new();
+    for text in [mixed.to_string(), padded] {
+        assert!(text.len() <= MESSAGE_BYTES);
+        ws.text(&text).await;
+        match ws.next().await.expect("open") {
+            WsServerMessage::Heads { heads } => {
+                got.push(heads.iter().map(|e| e.stream_id).collect::<Vec<_>>());
+            }
+            other => panic!("expected heads, got {other:?}"),
+        }
+    }
+    assert_eq!(got, [[StreamId::Host], [StreamId::Host]]);
+    srv.stop().await;
+}

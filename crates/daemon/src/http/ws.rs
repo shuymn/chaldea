@@ -8,8 +8,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Instant;
 
 use axum::body::Body;
@@ -23,7 +24,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
-use tokio::time::{sleep_until, timeout_at};
+use tokio::time::sleep_until;
 
 use super::Shared;
 use super::auth::{AuthFailure, verify_hash_in};
@@ -371,8 +372,8 @@ async fn close(
     let until = tokio::time::Instant::now() + shared.cfg.ws.close_grace;
     let sink = match out {
         Out::Free(s) => Some(s),
-        Out::Sending(f, send_deadline) => match timeout_at(until.min(send_deadline), f).await {
-            Ok((s, Ok(()))) => Some(s),
+        Out::Sending(f, send_deadline) => match before(until.min(send_deadline), f).await {
+            Some((s, Ok(()))) => Some(s),
             _ => None,
         },
     };
@@ -383,10 +384,10 @@ async fn close(
         code,
         reason: reason.into(),
     }));
-    if !matches!(timeout_at(until, sink.send(frame)).await, Ok(Ok(()))) {
+    if !matches!(before(until, sink.send(frame)).await, Some(Ok(()))) {
         return;
     }
-    let _ = timeout_at(until, async {
+    let _ = before(until, async {
         while let Some(Ok(m)) = stream.next().await {
             if matches!(m, Message::Close(_)) {
                 break;
@@ -394,6 +395,21 @@ async fn close(
         }
     })
     .await;
+}
+
+/// `f`'s output if it completes before `deadline`, else `None`. The deadline is checked
+/// before every poll of `f`, so a future that became ready after its deadline is dropped
+/// unpolled; `timeout_at` polls the future first and would deliver it.
+async fn before<F: Future>(deadline: tokio::time::Instant, f: F) -> Option<F::Output> {
+    let mut f = pin!(f);
+    let mut timer = pin!(sleep_until(deadline));
+    std::future::poll_fn(|cx| {
+        if tokio::time::Instant::now() >= deadline || timer.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        f.as_mut().poll(cx).map(Some)
+    })
+    .await
 }
 
 /// Whether a socket read error is an inbound message or frame over the size bound:
@@ -527,7 +543,10 @@ pub(crate) async fn events_socket(s: UpgradedSocket) {
             _ = nudge.changed() => Ev::Nudge,
             () = sleep_until(next_heads_at) => Ev::Tick,
             j = pending_opt(read.as_mut().map(|r| &mut r.handle)) => Ev::Read(j),
-            (sink, r) = pending_opt(sending) => Ev::Sent(sink, r),
+            sent = pending_opt(sending.zip(send_deadline).map(|(f, d)| before(d, f))) => match sent {
+                Some((sink, r)) => Ev::Sent(sink, r),
+                None => Ev::Dropped,
+            },
             m = stream.next() => Ev::Inbound(m),
             n = commits.recv() => Ev::Commit(n),
         };
