@@ -550,14 +550,15 @@ fn run(cmd: &mut Command, stdin: Stdin) -> Run {
         }
     }
     let status = wait_bounded(&mut c, "the child");
-    let elapsed = started.elapsed();
+    // Both samples at the exit seen, before the outputs are collected.
+    let (elapsed, spanned) = (started.elapsed(), before.elapsed());
     drop(keep);
     Run {
         code: status.code(),
         stdout: joined(&out, "stdout"),
         stderr: joined(&err, "stderr"),
         elapsed,
-        spanned: before.elapsed(),
+        spanned,
         pid: c.id(),
     }
 }

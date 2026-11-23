@@ -230,6 +230,9 @@ fn run_case(c: &Case) {
             format!("http://127.0.0.1:{}/hook", listener.port),
         );
     }
+    // The lower bound is measured from before the spawn (never shorter than the child's
+    // life), the upper bound from the spawn's return (the spawn lock's wait not counted).
+    let before = Instant::now();
     let mut child = spawn_locked(&mut cmd).unwrap();
     let started = Instant::now();
     let out = collect(child.stdout.take());
@@ -252,7 +255,7 @@ fn run_case(c: &Case) {
         }
         std::thread::sleep(POLL);
     };
-    let elapsed = started.elapsed();
+    let (elapsed, spanned) = (started.elapsed(), before.elapsed());
     drop(held);
     let out = out.recv_timeout(PARENT_BOUND).expect("stdout not closed");
     let err = err.recv_timeout(PARENT_BOUND).expect("stderr not closed");
@@ -265,8 +268,8 @@ fn run_case(c: &Case) {
         String::from_utf8_lossy(&err)
     );
     assert!(
-        c.window.contains(&elapsed),
-        "{name}: exited after {elapsed:?}, not within {:?}",
+        spanned >= c.window.start && elapsed < c.window.end,
+        "{name}: exited after {elapsed:?} ({spanned:?} from before the spawn), not within {:?}",
         c.window
     );
     assert_eq!(
