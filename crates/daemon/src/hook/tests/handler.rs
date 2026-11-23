@@ -492,6 +492,35 @@ async fn buffered_durable_before_200() {
     h.stop().await;
 }
 
+/// A hook whose job passed `Store::submit` and whose client then disconnected is still
+/// decided by the writer: reached after its `not_after`, it expires and stores nothing
+/// (§2.13 "Best-effort delivery"). The empty job after it is a FIFO barrier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submitted_hook_can_expire_after_disconnect() {
+    let h = HookServer::start().await;
+    let l = h.codex(1).await;
+    let hook = Hook::of(&l, "Stop", "s");
+    let release = h.srv.hold_writer().await;
+    let s = shared(&h.srv);
+    let before = s.faults.submits();
+    let mut conn = connect(h.srv.port).await;
+    write(&mut conn, &hook.req(&h.srv).bytes()).await;
+    eventually(WAIT, "the hook passed Store::submit", || {
+        s.faults.submits() > before && !h.ingest.order.is_pending(l.launch, 1)
+    })
+    .await;
+    let cutoff = *s.faults.submitted_not_afters().last().unwrap();
+    drop(conn);
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        cutoff + Duration::from_millis(1),
+    ))
+    .await;
+    release.send(()).unwrap();
+    h.run(|_| Ok(())).await;
+    assert!(h.delivery(l.launch, hook.emit).is_none());
+    h.stop().await;
+}
+
 /// The stopped clock `hook_ingest` runs on (`SkewClock::stop`): a hook whose job has passed
 /// `Store::submit` behind a held writer is held there past the request deadline (2 s, the
 /// test server's) and the reply grace (100 ms), and the job still answers 200.
