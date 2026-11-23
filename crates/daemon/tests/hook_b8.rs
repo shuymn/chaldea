@@ -116,8 +116,15 @@ async fn observe(
     let idle_w = idle.clone();
     let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let sent_w = sent.clone();
+    // A failed write completes only once the reader has seen the connection end, so the
+    // send error always comes in after the end, as it can when the server closes.
+    let (ended, mut ended_w) = tokio::sync::watch::channel(false);
     let writer = tokio::spawn(async move {
         let record = |n: usize| sent_w.fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+        let mut failed = async |e: io::Error| {
+            let _ = ended_w.wait_for(|e| *e).await;
+            Some(e.kind())
+        };
         match body {
             Body::Withheld => {
                 // Keep the write half open until the reader is done.
@@ -128,7 +135,7 @@ async fn observe(
             Body::All(b) | Body::InFlight(b) => {
                 for c in b.chunks(64 * 1024) {
                     if let Err(e) = wr.write_all(c).await {
-                        return Some(e.kind());
+                        return failed(e).await;
                     }
                     record(c.len());
                 }
@@ -138,7 +145,7 @@ async fn observe(
             }
             Body::Endless { chunk, every } => loop {
                 if let Err(e) = wr.write_all(&vec![b'x'; chunk]).await {
-                    return Some(e.kind());
+                    return failed(e).await;
                 }
                 record(chunk);
                 tokio::time::sleep(every).await;
@@ -168,6 +175,7 @@ async fn observe(
             Ok(Err(e)) => break End::Reset(e.kind()),
         }
     };
+    let _ = ended.send(true);
     let elapsed = replied_at.unwrap_or_else(|| first.elapsed());
     // A writer still sending once the connection ended gets its error soon: wait for it
     // (at most 1 s), then abort a writer still pending (a dropped pending write).
@@ -258,6 +266,13 @@ fn code(s: &str) -> Option<String> {
     Some(s.to_owned())
 }
 
+/// PR 7's close contract: a rejection's reply, when the client read one before the server's
+/// close (a reset can discard it), says `Connection: close`, and the server closes.
+fn assert_closed(case: &str, o: &Obs) {
+    assert!(o.status.is_none() || o.closes, "{case}: {o:?}");
+    assert!(matches!(o.end, End::Eof | End::Reset(_)), "{case}: {o:?}");
+}
+
 /// Runs each case with `body`, asserting the exact status, the case deadline, and no side
 /// effect.
 async fn table(
@@ -272,9 +287,7 @@ async fn table(
         let o = observe(h.srv.port, &req.head(), 1, Duration::ZERO, body(&req), CASE).await;
         assert_eq!(o.status.as_ref(), Some(&want), "{name}: {o:?}");
         assert!(o.elapsed < CASE, "{name}: {o:?}");
-        // PR 7's close contract: a rejection says `Connection: close` and the server closes.
-        assert!(o.closes, "{name}: {o:?}");
-        assert!(matches!(o.end, End::Eof | End::Reset(_)), "{name}: {o:?}");
+        assert_closed(name, &o);
         if withheld {
             assert_eq!(o.body_sent_before_status, 0, "{name}: {o:?}");
         }
@@ -744,18 +757,13 @@ async fn observed_slow_body() {
     )
     .await;
     print_observed("slow_body", &o);
-    // A writer still sending when the server closed reports its error.
-    if matches!(o.end, End::Eof | End::Reset(_)) {
-        assert!(o.send_error.is_some(), "{o:?}");
-    }
     assert!(
         matches!(o.status, Some((408, _)) | None),
         "never a success: {o:?}"
     );
-    assert!(
-        o.status.is_some() || matches!(o.end, End::Eof | End::Reset(_)),
-        "{o:?}"
-    );
+    assert_closed("slow body", &o);
+    // The writer was still sending when the server closed: it reports its error.
+    assert!(o.send_error.is_some(), "{o:?}");
     assert_unchanged(&h, &l, &before, "slow body");
     positive_control(&h, &l).await;
     h.stop().await;
@@ -803,10 +811,7 @@ async fn observed_body_in_flight() {
             o.status.as_ref().is_none_or(|s| s.0 == status),
             "{name}: the decided status, EOF, or a reset: {o:?}"
         );
-        assert!(
-            o.status.is_some() || matches!(o.end, End::Eof | End::Reset(_)),
-            "{name}: {o:?}"
-        );
+        assert_closed(name, &o);
         assert_unchanged(&h, &l, &before, name);
     }
     positive_control(&h, &l).await;
