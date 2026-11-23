@@ -255,7 +255,7 @@ pub static ROUTES: &[RouteSpec] = {
             21,
         ),
         post(
-            "/api/commands/{name}",
+            super::commands::COMMAND_PATH,
             M::Write,
             O::AbsentOrMatching,
             C::Bearer(OWNER_AGENT),

@@ -288,17 +288,16 @@ impl GuardService {
         }
         // 6. Framing, 7. size.
         check_framing(&parts.method, &parts.headers, shared.cfg.max_body_bytes)?;
-        let uri_path = parts.uri.path().to_owned();
+        // 8. Unimplemented: the route's handler, or the command's.
+        let command_unimplemented = spec.action == ActionRule::ByCommandName
+            && path_param(spec.path, parts.uri.path(), "name")
+                .is_none_or(|name| shared.commands.handler(name).is_none());
         // The handler's request: the deadline in its extensions, the body bounded.
         let request = move || {
             parts.extensions.insert(Deadline(deadline));
             let max = usize::try_from(shared.cfg.max_body_bytes).unwrap_or(usize::MAX);
             Request::from_parts(parts, Body::new(Limited::new(body, max)))
         };
-        // 8. Unimplemented: the route's handler, or the command's.
-        let command_unimplemented = spec.action == ActionRule::ByCommandName
-            && path_param(spec.path, &uri_path, "name")
-                .is_none_or(|name| shared.commands.handler(name).is_none());
         match &self.endpoint {
             Endpoint::Unimplemented => Err(ApiError::not_implemented()),
             _ if command_unimplemented => Err(ApiError::not_implemented()),
