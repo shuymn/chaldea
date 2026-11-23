@@ -348,7 +348,13 @@ fn stub_settles_after_every_connection_is_handled() {
     let req = b"POST /hook HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}";
     let mut first = TcpStream::connect(("127.0.0.1", stub.port)).unwrap();
     first.write_all(req).unwrap();
-    stub.wait_reqs(1);
+    // The first handler has finished: its request is recorded and its socket held.
+    let end = Instant::now() + WAIT;
+    while stub.handled.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < end, "the first handler did not finish");
+        std::thread::sleep(POLL);
+    }
+    assert_eq!((stub.reqs().len(), stub.held.lock().unwrap().len()), (1, 1));
     let mut second = TcpStream::connect(("127.0.0.1", stub.port)).unwrap();
     let end = Instant::now() + WAIT;
     while stub.accepted.load(Ordering::SeqCst) < 2 {
@@ -418,7 +424,12 @@ struct Run {
     code: Option<i32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    /// From the spawn's return to the exit seen: never longer than the child's life (the wait
+    /// for the spawn lock is not counted), for upper bounds.
     elapsed: Duration,
+    /// From before the spawn to the exit seen: never shorter than the child's life, however
+    /// late the parent reads the clock after the spawn, for lower bounds.
+    spanned: Duration,
     pid: u32,
 }
 
@@ -498,8 +509,8 @@ fn run(cmd: &mut Command, stdin: Stdin) -> Run {
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let before = Instant::now();
     let mut c = spawn_locked(cmd).unwrap();
-    // From the spawn's return: the wait for the spawn lock is not the child's time.
     let started = Instant::now();
     let out = collect(c.stdout.take());
     let err = collect(c.stderr.take());
@@ -530,6 +541,7 @@ fn run(cmd: &mut Command, stdin: Stdin) -> Run {
         stdout: joined(&out, "stdout"),
         stderr: joined(&err, "stderr"),
         elapsed,
+        spanned: before.elapsed(),
         pid: c.id(),
     }
 }
@@ -663,7 +675,7 @@ fn no_reply_gets_a_second_attempt() {
     let stub = Stub::start(&[Reply::Silent]);
     let r = emit_to(&stub.url(), Stdin::Bytes(PAYLOAD.to_vec()));
     assert_quiet(&r);
-    assert!(r.elapsed >= Duration::from_millis(2800), "{:?}", r.elapsed);
+    assert!(r.spanned >= Duration::from_millis(2800), "{:?}", r.spanned);
     let reqs = stub.settled();
     assert_eq!(reqs.len(), 2, "{reqs:?}");
     assert_eq!(one_id_attempts(&reqs), ["1", "2"]);
@@ -745,7 +757,7 @@ fn late_stdin_sends_nothing() {
         Stdin::LateEof(Duration::from_millis(2000), PAYLOAD.to_vec()),
     );
     assert_quiet(&r);
-    assert!(r.elapsed >= Duration::from_millis(1500), "{:?}", r.elapsed);
+    assert!(r.spanned >= Duration::from_millis(1500), "{:?}", r.spanned);
     assert_eq!(stub.accepted(), 0, "{:?}", stub.settled());
 }
 
@@ -755,8 +767,9 @@ fn no_request_with_open_stdin() {
     let r = emit_to(&stub.url(), Stdin::Open);
     assert_quiet(&r);
     assert!(
-        r.elapsed >= Duration::from_millis(1500) && r.elapsed < Duration::from_millis(2500),
-        "{:?}",
+        r.spanned >= Duration::from_millis(1500) && r.elapsed < Duration::from_millis(2500),
+        "{:?} / {:?}",
+        r.spanned,
         r.elapsed
     );
     assert_eq!(stub.accepted(), 0);
@@ -1372,9 +1385,12 @@ fn fake_cli_nested_parent_stops_when_its_emitter_cannot_spawn() {
     cmd.arg("--emitter").arg(&emitter);
     let r = run(&mut cmd, Stdin::Bytes(Vec::new()));
     assert_eq!(r.code, Some(1));
+    // Two report streams: their events are matched by contents, not by read order. One run
+    // started (the child's) and one did not (the parent's).
     let emitted = reports.wait("emitted", 2);
-    assert_eq!(emitted[0]["code"], 0, "{emitted:?}");
-    assert_eq!(emitted[1]["spawn_failed"], true, "{emitted:?}");
+    let started = emitted.iter().filter(|e| e["code"] == 0).count();
+    let failed = emitted.iter().filter(|e| e["spawn_failed"] == true).count();
+    assert_eq!((started, failed), (1, 1), "{emitted:?}");
     // No `go`: the parent ended the child, which emitted nothing more.
     reports.wait("nested", 1);
     assert_eq!(reports.of("emitted").len(), 2);
