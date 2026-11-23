@@ -8,8 +8,9 @@ use super::shared;
 use super::support::http::TestServer;
 use crate::http::Mounts;
 
-/// The clock crosses the code's 60 s while the exchange waits for the codes' lock: the
-/// removal reads the clock under the lock, so the code is expired and no token is issued.
+/// A hook just before the codes' lock moves the clock across the code's 60 s after the
+/// request was admitted: the removal reads the clock under the lock, so the code is expired
+/// and no token is issued.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn take_reads_the_clock_under_the_lock() {
     let srv = TestServer::start(Mounts::mvp()).await;

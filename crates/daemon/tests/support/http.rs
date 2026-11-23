@@ -241,6 +241,33 @@ impl TestServer {
         release
     }
 
+    /// Holds `n` readers of the pool (all of them, for the default pool) until the returned
+    /// sender drops.
+    pub fn hold_readers(&self, n: usize) -> std::sync::mpsc::Sender<()> {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        for _ in 0..n {
+            let store = self.store.store().clone();
+            let (held, release) = (held_tx.clone(), release_rx.clone());
+            std::thread::spawn(move || {
+                let _ = store.read(Instant::now() + Duration::from_secs(10), move |_tx| {
+                    held.send(()).unwrap();
+                    // Released when the sender drops; every holder then returns.
+                    let _ = release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(30));
+                    Ok(())
+                });
+            });
+        }
+        for _ in 0..n {
+            held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        release_tx
+    }
+
     /// Mints a WebSocket ticket for `purpose` with the token `secret`, or the reply.
     pub async fn ticket(&self, secret: &str, purpose: &str) -> Result<String, Reply> {
         let r = self

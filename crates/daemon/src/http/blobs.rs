@@ -121,7 +121,6 @@ pub(crate) async fn download(ctx: ReadCtx, req: Request<Body>) -> Result<Respons
         header::CONTENT_DISPOSITION,
         HeaderValue::from_static("attachment"),
     );
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(resp)
 }
 

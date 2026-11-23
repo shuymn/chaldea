@@ -4,6 +4,7 @@
 
 use axum::body::Body;
 use axum::http::{HeaderValue, Request, Response, header};
+use chaldea_core::MAX_SAFE_INTEGER;
 use chaldea_core::auth::Action;
 use chaldea_core::http::{ThreadsResponse, WorktreesResponse};
 use chaldea_core::ids::{Epoch, StreamId};
@@ -14,9 +15,6 @@ use super::ctx::ReadCtx;
 use super::error::{ApiError, read_error};
 use super::scope::ReadScope;
 use crate::store::{ReadError, StoreError};
-
-/// The largest integer a JSON client reads exactly (`Number.MAX_SAFE_INTEGER`).
-const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
 /// A store error inside a read closure, through the read mapping (design §2.9).
 pub(crate) fn store(e: StoreError) -> ApiError {

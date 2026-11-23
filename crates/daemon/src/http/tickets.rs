@@ -8,18 +8,17 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
-use chaldea_core::auth::TokenKind;
 use chaldea_core::ids::{ThreadId, TokenId};
 
 use super::MonotonicClock;
 use super::auth::{PAIR_CODE_PREFIX, Secret, TICKET_PREFIX};
 
 /// Tickets held at once (design §2.4).
-pub const MAX_TICKETS: usize = 1024;
+const MAX_TICKETS: usize = 1024;
 /// Tickets held at once for one token.
-pub const MAX_TICKETS_PER_TOKEN: usize = 32;
+const MAX_TICKETS_PER_TOKEN: usize = 32;
 /// Pair codes held at once.
-pub const MAX_PAIR_CODES: usize = 8;
+const MAX_PAIR_CODES: usize = 8;
 
 /// What a ticket may open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,8 +33,6 @@ pub enum TicketPurpose {
 pub(crate) struct TicketEntry {
     pub(crate) token_id: TokenId,
     pub(crate) token_sha256: [u8; 32],
-    pub(crate) kind: TokenKind,
-    pub(crate) thread: Option<ThreadId>,
     pub(crate) purpose: TicketPurpose,
     pub(crate) expires_at: Instant,
 }

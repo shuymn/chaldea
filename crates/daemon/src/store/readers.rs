@@ -617,11 +617,7 @@ impl<'a> ReadTx<'a> {
     /// A store error.
     pub fn host_snapshot(&self) -> Result<(HostSnapshot, u64), StoreError> {
         self.guard(|| {
-            let threads = self
-                .thread_rows("ORDER BY registered_seq", [])?
-                .iter()
-                .map(thread_info)
-                .collect();
+            let threads = self.thread_infos()?;
             let worktrees = self
                 .worktree_rows("ORDER BY worktree_id", [])?
                 .into_iter()

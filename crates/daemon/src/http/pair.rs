@@ -13,11 +13,8 @@ use super::error::ApiError;
 use super::sync_api::json;
 use super::tickets::PairCodeEntry;
 
-/// A JSON object body, else 400 `bad_request`; an empty body is an empty object.
+/// A JSON object body, else 400 `bad_request` (an empty body included).
 pub(crate) fn object_body(bytes: &[u8]) -> Result<Map<String, Value>, ApiError> {
-    if bytes.is_empty() {
-        return Ok(Map::new());
-    }
     match serde_json::from_slice::<Value>(bytes) {
         Ok(Value::Object(m)) => Ok(m),
         _ => Err(ApiError::bad_request()),
@@ -38,7 +35,7 @@ pub(crate) async fn pair_codes(
     let body = ctx
         .body_within(req.into_body(), shared.cfg.max_body_bytes)
         .await?;
-    if !object_body(&body)?.is_empty() {
+    if !body.is_empty() && !object_body(&body)?.is_empty() {
         return Err(ApiError::bad_request());
     }
     let issuer = ctx.principal().ok_or_else(ApiError::internal)?;
@@ -68,9 +65,6 @@ pub(crate) async fn pair(ctx: WriteCtx, req: Request<Body>) -> Result<Response<B
     let body = ctx
         .body_within(req.into_body(), shared.cfg.max_body_bytes)
         .await?;
-    if body.is_empty() {
-        return Err(ApiError::bad_request());
-    }
     let mut members = object_body(&body)?;
     let code = members.remove("code");
     if !members.is_empty() {

@@ -29,7 +29,7 @@ use tokio::time::sleep_until;
 use super::Shared;
 use super::auth::{AuthFailure, verify_hash_in};
 use super::ctx::{Joined, ReadCtx, spawn_read, take_read};
-use super::error::ApiError;
+use super::error::{ApiError, in_source_chain};
 use super::pair::secs;
 use super::scope::ReadScope;
 use super::sync_api::{json, store};
@@ -82,8 +82,6 @@ pub(crate) async fn ws_ticket(
             TicketEntry {
                 token_id: p.token_id,
                 token_sha256: p.token_sha256,
-                kind: p.kind,
-                thread: p.thread,
                 purpose,
                 expires_at: now + ttl,
             },
@@ -416,7 +414,7 @@ async fn before<F: Future>(deadline: tokio::time::Instant, f: F) -> Option<F::Ou
 /// tungstenite's `Capacity` error, found by type in the error's source chain (axum passes
 /// it on boxed).
 pub(crate) fn too_big(e: &(dyn std::error::Error + 'static)) -> bool {
-    std::iter::successors(Some(e), |err| err.source()).any(|err| {
+    in_source_chain(e, |err| {
         matches!(
             err.downcast_ref::<tungstenite::Error>(),
             Some(tungstenite::Error::Capacity(_))

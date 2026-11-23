@@ -200,16 +200,6 @@ async fn stalled_download(srv: &TestServer, req: &support::http::Req) -> TcpStre
     c
 }
 
-async fn blob_slots_cap(srv: &TestServer) {
-    let req = big_blob(srv).await;
-    let mut held = Vec::new();
-    for _ in 0..BLOB_SLOTS {
-        held.push(stalled_download(srv, &req).await);
-    }
-    busy(&srv.send(&req).await);
-    drop(held);
-}
-
 /// A socket of a fresh token, its subscribe answered.
 async fn subscribed_socket(srv: &TestServer) -> WsClient {
     let owner = srv.token(TokenKind::Owner, None, None).await;
@@ -312,7 +302,6 @@ async fn each_cap_at_its_boundary() {
     srv.stop().await;
     let srv = quiet(|_| {}).await;
     pair_codes_cap(&srv).await;
-    blob_slots_cap(&srv).await;
     srv.stop().await;
     let srv = quiet(|_| {}).await;
     sockets_cap(&srv).await;
@@ -334,8 +323,8 @@ async fn oversized_message_closes_with_1009() {
     srv.stop().await;
 }
 
-/// All four blob slots held by clients that never read past the head: a download is
-/// refused while they hold them; their connections end at the write stall, before the
+/// The blob slots' cap: all four held by clients that never read past the head (the last
+/// allowed), a download is refused with 503 `busy` while they hold them (the first refused); their connections end at the write stall, before the
 /// whole body was sent; and the next download acquires a slot and completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blob_slot_frees_after_a_stalled_client() {

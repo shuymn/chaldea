@@ -8,10 +8,8 @@ use chaldea_core::auth::TokenKind;
 use chaldea_core::ids::{StreamId, ThreadId};
 use chaldea_core::payload::Content;
 use chaldea_core::sync::{StreamHeadEntry, WsServerMessage};
-use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use super::support::http::TestServer;
+use super::support::http::{TestServer, WsClient};
 use super::support::{raw_unknown, registered, soon};
 use super::{eventually, mint_ticket, shared};
 use crate::http::tickets::TicketPurpose;
@@ -205,22 +203,6 @@ fn nudge_reads_the_token_and_revocation_ends() {
 
 // ---- the driver and admission ---------------------------------------------------------------
 
-type Client =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-async fn open(srv: &TestServer, ticket: &str) -> Client {
-    let url = format!("ws://127.0.0.1:{}/api/ws?ticket={ticket}", srv.port);
-    let (ws, resp) = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio_tungstenite::connect_async(url),
-    )
-    .await
-    .expect("the handshake ends")
-    .expect("a 101");
-    assert_eq!(resp.status(), 101);
-    ws
-}
-
 async fn redeem_status(srv: &TestServer, ticket: &str) -> u16 {
     let url = format!("ws://127.0.0.1:{}/api/ws?ticket={ticket}", srv.port);
     match tokio_tungstenite::connect_async(url).await {
@@ -228,29 +210,6 @@ async fn redeem_status(srv: &TestServer, ticket: &str) -> u16 {
         Err(tokio_tungstenite::tungstenite::Error::Http(r)) => r.status().as_u16(),
         Err(e) => panic!("{e}"),
     }
-}
-
-/// The next server message, skipping pings; `None` at the close or the end, with the close
-/// code if a close frame came.
-async fn next(ws: &mut Client) -> Result<WsServerMessage, Option<u16>> {
-    loop {
-        let m = tokio::time::timeout(Duration::from_secs(10), ws.next())
-            .await
-            .expect("a frame or the end within 10 s");
-        match m {
-            Some(Ok(WsMessage::Text(t))) => return Ok(serde_json::from_str(t.as_str()).unwrap()),
-            Some(Ok(WsMessage::Close(f))) => return Err(f.map(|f| u16::from(f.code))),
-            Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => {}
-            Some(Ok(other)) => panic!("unexpected {other:?}"),
-            Some(Err(_)) | None => return Err(None),
-        }
-    }
-}
-
-async fn subscribe(ws: &mut Client, ids: &[StreamId]) {
-    let ids: Vec<String> = ids.iter().map(ToString::to_string).collect();
-    let text = serde_json::json!({"type": "subscribe", "stream_ids": ids}).to_string();
-    ws.send(WsMessage::Text(text.into())).await.unwrap();
 }
 
 async fn wait(what: &str, rx: tokio::sync::oneshot::Receiver<()>) {
@@ -303,11 +262,11 @@ async fn control_deadlines_fire_during_a_pending_send_and_read() {
     let base = srv.server.tasks();
     // `hello`'s send held at the gate, after the startup read.
     let (reached, _send_held) = s.faults.arm_socket_send_gate();
-    let mut ws = open(&srv, &ticket).await;
+    let mut ws = srv.ws_with(&ticket).await.expect("a 101");
     wait("the send reached the gate", reached).await;
     // A subscribe's read held.
     let (read_entered, _read_held) = hold_next_read(&srv);
-    subscribe(&mut ws, &[A]).await;
+    ws.subscribe(&[A]).await;
     entered(&read_entered).await;
     let at = Instant::now();
     socket_gone(&srv, base).await;
@@ -328,16 +287,16 @@ async fn stalled_read_drops_the_socket() {
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
     let base = srv.server.tasks();
-    let mut ws = open(&srv, &ticket).await;
+    let mut ws = srv.ws_with(&ticket).await.expect("a 101");
     assert!(matches!(
-        next(&mut ws).await,
-        Ok(WsServerMessage::Hello { .. })
+        ws.next().await,
+        Some(WsServerMessage::Hello { .. })
     ));
     let (read_entered, held) = hold_next_read(&srv);
-    subscribe(&mut ws, &[A]).await;
+    ws.subscribe(&[A]).await;
     entered(&read_entered).await;
     // Dropped without a close frame, the read still held.
-    assert_eq!(next(&mut ws).await.err(), Some(None));
+    assert_eq!((ws.next().await, ws.closed), (None, Some(None)));
     socket_gone(&srv, base).await;
     drop(held);
     srv.stop().await;
@@ -353,19 +312,19 @@ async fn lost_notification_recovered_by_heads() {
     srv.append(vec![registered(t, false)]).await;
     let stream = StreamId::Thread(t);
     let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
-    let mut ws = open(&srv, &ticket).await;
+    let mut ws = srv.ws_with(&ticket).await.expect("a 101");
     assert!(matches!(
-        next(&mut ws).await,
-        Ok(WsServerMessage::Hello { .. })
+        ws.next().await,
+        Some(WsServerMessage::Hello { .. })
     ));
-    subscribe(&mut ws, &[stream]).await;
+    ws.subscribe(&[stream]).await;
     // Once a frame has carried the old head, the new head can come only from a refresh
     // read after the append. A periodic frame may come before the subscribe's (empty, the
     // set not yet replaced), so wait, bounded, for the one that names the stream.
     let old = srv.store.read(move |tx| tx.head(stream, 0)).head_seq;
     let until = Instant::now() + Duration::from_secs(10);
     loop {
-        match next(&mut ws).await.expect("open") {
+        match ws.next().await.expect("open") {
             WsServerMessage::Heads { heads } if heads == [e(stream, old)] => break,
             WsServerMessage::Heads { heads } => assert!(heads.is_empty(), "{heads:?}"),
             other => panic!("only `heads` before the subscribe's: {other:?}"),
@@ -381,7 +340,7 @@ async fn lost_notification_recovered_by_heads() {
     let cfg = &s.cfg;
     let bound = cfg.ws.heads_interval + 2 * cfg.short_deadline + 2 * cfg.ws.send_timeout;
     loop {
-        match next(&mut ws).await.expect("open") {
+        match ws.next().await.expect("open") {
             WsServerMessage::Heads { heads } if heads == [e(stream, want)] => break,
             WsServerMessage::Heads { .. } => {}
             other => panic!("only `heads` while notifications are lost: {other:?}"),
@@ -406,10 +365,14 @@ async fn send_deadline_drops_without_a_close_frame() {
     let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
     let base = srv.server.tasks();
     let (reached, _held) = shared(&srv).faults.arm_socket_send_gate();
-    let mut ws = open(&srv, &ticket).await;
+    let mut ws = srv.ws_with(&ticket).await.expect("a 101");
     wait("the send reached the gate", reached).await;
     socket_gone(&srv, base).await;
-    assert_eq!(next(&mut ws).await.err(), Some(None), "no close frame");
+    assert_eq!(
+        (ws.next().await, ws.closed),
+        (None, Some(None)),
+        "no close frame"
+    );
     assert!(!shared(&srv).faults.steps().contains(&"socket close"));
     srv.stop().await;
 }
@@ -429,7 +392,7 @@ async fn close_keeps_the_send_deadline() {
     let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
     let base = srv.server.tasks();
     let (reached, _held) = shared(&srv).faults.arm_socket_send_gate();
-    let _ws = open(&srv, &ticket).await;
+    let _ws = srv.ws_with(&ticket).await.expect("a 101");
     wait("the send reached the gate", reached).await;
     let sent_at = Instant::now();
     srv.revoke(&owner).await;
@@ -457,7 +420,7 @@ async fn shutdown_aborts_a_blocked_socket() {
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
     let (reached, _held) = shared(&srv).faults.arm_socket_send_gate();
-    let _ws = open(&srv, &ticket).await;
+    let _ws = srv.ws_with(&ticket).await.expect("a 101");
     wait("the send reached the gate", reached).await;
     let deadline = Instant::now() + Duration::from_millis(300);
     let report = srv.shutdown_http(deadline).await;
@@ -507,10 +470,10 @@ async fn final_admission_failure_keeps_ticket() {
         .arm_after_read(1, move || clock.skew(Duration::from_secs(5)));
     assert_eq!(redeem_status(&srv, &ticket).await, 408);
     assert_eq!(s.tickets.len(), 1);
-    let mut ws = open(&srv, &ticket).await;
+    let mut ws = srv.ws_with(&ticket).await.expect("a 101");
     assert!(matches!(
-        next(&mut ws).await,
-        Ok(WsServerMessage::Hello { .. })
+        ws.next().await,
+        Some(WsServerMessage::Hello { .. })
     ));
     assert_eq!(s.tickets.len(), 0);
     srv.stop().await;
@@ -530,13 +493,14 @@ async fn revoked_between_admission_and_startup() {
     wait("admission reached the gate", reached).await;
     srv.revoke_quietly(&owner).await;
     drop(release);
-    let (mut ws, resp) = tokio::time::timeout(Duration::from_secs(10), client)
+    let (ws, resp) = tokio::time::timeout(Duration::from_secs(10), client)
         .await
         .expect("the handshake ends")
         .unwrap()
         .expect("a 101");
     assert_eq!(resp.status(), 101);
-    assert_eq!(next(&mut ws).await.err(), Some(Some(1008)));
+    let mut ws = WsClient { ws, closed: None };
+    assert_eq!((ws.next().await, ws.closed), (None, Some(Some(1008))));
     srv.stop().await;
 }
 
@@ -607,7 +571,9 @@ fn too_big_is_the_typed_capacity_error() {
 
 /// Holds `hello` at the send gate on a one-thread runtime, then blocks that thread past
 /// the send deadline so the send and its deadline are both due at the next poll; `revoke`
-/// first makes the close path the one holding the send. The send must not be delivered.
+/// first makes the close path the one holding the send. The send path must not deliver it.
+/// This covers the send path only: frames other paths flush are the known limit of design
+/// §2.6 "Bounded disconnect".
 async fn send_due_after_its_deadline(revoke: bool) {
     let srv = TestServer::start_with(Mounts::mvp(), |c: &mut HttpConfig| {
         c.ws.send_timeout = Duration::from_secs(1);
@@ -620,7 +586,7 @@ async fn send_due_after_its_deadline(revoke: bool) {
     let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
     let s = shared(&srv);
     let (reached, held) = s.faults.arm_socket_send_gate();
-    let mut ws = open(&srv, &ticket).await;
+    let mut ws = srv.ws_with(&ticket).await.expect("a 101");
     wait("hello is held", reached).await;
     if revoke {
         srv.revoke(&owner).await;
@@ -633,17 +599,21 @@ async fn send_due_after_its_deadline(revoke: bool) {
     // the send ready before the socket task is polled again.
     std::thread::sleep(Duration::from_millis(1100));
     held.send(()).unwrap();
-    assert_eq!(next(&mut ws).await, Err(None), "dropped, no frame");
+    assert_eq!(
+        (ws.next().await, ws.closed),
+        (None, Some(None)),
+        "dropped, no frame"
+    );
     srv.stop().await;
 }
 
-/// The loop never delivers a send that became ready after its deadline.
+/// The loop's send path never delivers a send that became ready after its deadline.
 #[tokio::test(flavor = "current_thread")]
 async fn loop_drops_a_send_ready_after_its_deadline() {
     send_due_after_its_deadline(false).await;
 }
 
-/// The close path never delivers a send that became ready after its deadline.
+/// The close path's send never delivers a send that became ready after its deadline.
 #[tokio::test(flavor = "current_thread")]
 async fn close_drops_a_send_ready_after_its_deadline() {
     send_due_after_its_deadline(true).await;

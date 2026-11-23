@@ -47,8 +47,6 @@ pub(crate) fn mint_ticket(srv: &TestServer, secret: &str, purpose: TicketPurpose
             TicketEntry {
                 token_id: row.token_id,
                 token_sha256: sha,
-                kind: row.kind,
-                thread: row.thread_id,
                 purpose,
                 expires_at: now + s.cfg.ticket_ttl,
             },

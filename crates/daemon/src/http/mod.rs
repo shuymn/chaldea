@@ -54,7 +54,7 @@ pub use routes::{
     ActionRule, BodyRule, Credential, Mount, MountKind, Mounts, OriginRule, ROUTES, ReadHandler,
     RouteSpec, TicketPurposeKind, UpgradeHandler, WriteHandler, spec,
 };
-pub use tickets::{MAX_PAIR_CODES, MAX_TICKETS, MAX_TICKETS_PER_TOKEN, TicketPurpose};
+pub use tickets::TicketPurpose;
 pub use trace::redact_secrets;
 pub use upgrade::{ShutdownSignal, UpgradeGrant, UpgradedSocket};
 

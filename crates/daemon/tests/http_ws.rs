@@ -386,28 +386,6 @@ async fn attach_ticket_owner_only() {
     srv.stop().await;
 }
 
-/// Holds all `n` readers of the pool until the returned sender drops.
-fn hold_readers(srv: &TestServer, n: usize) -> std::sync::mpsc::Sender<()> {
-    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-    let go_rx = Arc::new(std::sync::Mutex::new(go_rx));
-    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
-    for _ in 0..n {
-        let store = srv.store.store().clone();
-        let (held, go) = (held_tx.clone(), go_rx.clone());
-        std::thread::spawn(move || {
-            let _ = store.read(Instant::now() + Duration::from_secs(10), move |_tx| {
-                held.send(()).unwrap();
-                let _ = go.lock().unwrap().recv_timeout(Duration::from_secs(30));
-                Ok(())
-            });
-        });
-    }
-    for _ in 0..n {
-        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    }
-    go_tx
-}
-
 /// A request refused for its credential lookup, its handshake, its framing, or a full
 /// socket cap does not spend a valid ticket (the final admission lookup's case is the unit
 /// test `ws::final_admission_failure_keeps_ticket`).
@@ -418,7 +396,7 @@ async fn rejected_upgrade_keeps_ticket() {
     let ticket = srv.ticket(&owner, "events").await.unwrap();
     let q = format!("?ticket={ticket}");
     // The credential lookup with the reader pool exhausted through the cutoff.
-    let release = hold_readers(&srv, 4);
+    let release = srv.hold_readers(4);
     // The pool's wait and the request's cutoff end at the same deadline: 503 or 408.
     let r = srv.send(&srv.ws_handshake(&format!("/api/ws{q}"))).await;
     assert!(

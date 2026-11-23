@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 use tokio::time::timeout_at;
 
 use super::auth::{Authorized, Principal, verify_in_read, verify_opt_in_job};
-use super::error::{ApiError, WriteFailure, read_error, write_failure};
+use super::error::{ApiError, WriteFailure, in_source_chain, read_error, write_failure};
 use super::registry::{Closing, TaskKind};
 use super::{Shared, StoreFatal};
 use crate::store::{JobError, ReadError, ReadTx, StoreError, SubmitError, WriteError, WriteTx};
@@ -131,16 +131,10 @@ pub(crate) async fn body_within(
     let max = usize::try_from(max).unwrap_or(usize::MAX);
     match until_deadline(shared, deadline, || Limited::new(body, max).collect()).await? {
         Ok(collected) => Ok(collected.to_bytes()),
-        Err(e) => {
-            let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e.as_ref());
-            while let Some(err) = cur {
-                if err.is::<LengthLimitError>() {
-                    return Err(ApiError::payload_too_large());
-                }
-                cur = err.source();
-            }
-            Err(ApiError::bad_request())
+        Err(e) if in_source_chain(e.as_ref(), <dyn std::error::Error>::is::<LengthLimitError>) => {
+            Err(ApiError::payload_too_large())
         }
+        Err(_) => Err(ApiError::bad_request()),
     }
 }
 
