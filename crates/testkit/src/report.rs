@@ -43,26 +43,28 @@ impl Reporter {
         let Some(stream) = addr.and_then(|a| TcpStream::connect(a).ok()) else {
             return Reporter;
         };
-        if let (Ok(read), Ok(mut write)) = (stream.try_clone(), stream.try_clone()) {
+        let read = stream.try_clone();
+        let _ = STREAM.set(Mutex::new((stream, false)));
+        if let Ok(read) = read {
             std::thread::spawn(move || {
                 for line in BufReader::new(read).lines() {
                     let Ok(line) = line else { return };
                     if line.trim() == "ping" {
-                        let pong = json!({"event": "pong", "inq": inq()});
-                        if writeln!(write, "{pong}").is_err() {
-                            return;
-                        }
+                        // Through the event writer's lock, so a pong never lands inside an
+                        // event line.
+                        Reporter.send(&json!({"event": "pong", "inq": inq()}));
                     } else if let Some(f) = COMMAND.get() {
                         f(line.trim());
                     }
                 }
             });
         }
-        let _ = STREAM.set(Mutex::new((stream, false)));
         Reporter
     }
 
-    /// Writes one line; nothing once the stream has ended.
+    /// Writes one line with one `write_all` under the stream's lock, which `pong` answers
+    /// share, so lines never interleave; a process killed mid-write can still leave a partial
+    /// last line, which the test's reader discards. Nothing once the stream has ended.
     #[allow(
         clippy::unused_self,
         reason = "a line is sent by the process that connected"
@@ -71,7 +73,7 @@ impl Reporter {
         if let Some(s) = STREAM.get() {
             let mut s = s.lock().unwrap_or_else(PoisonError::into_inner);
             if !s.1 {
-                let _ = writeln!(s.0, "{v}");
+                let _ = s.0.write_all(format!("{v}\n").as_bytes());
             }
         }
     }

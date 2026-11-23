@@ -10,6 +10,8 @@ pub(crate) struct Proc {
     pub(crate) ppid: u32,
     pub(crate) pgid: u32,
     pub(crate) start: u64,
+    /// The image name as `sys::BsdInfo` reads it, NUL-padded.
+    pub(crate) name: [u8; 32],
 }
 
 /// The outcome of one lookup.
@@ -40,6 +42,7 @@ fn classify(info: Result<BsdInfo, i32>, short: impl FnOnce() -> Result<bool, i32
             ppid: i.ppid,
             pgid: i.pgid,
             start: i.start,
+            name: i.name,
         }),
         Err(libc::ESRCH) => Lookup::Gone,
         Err(_) => match short() {

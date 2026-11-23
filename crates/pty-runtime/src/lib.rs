@@ -36,6 +36,7 @@ mod drain;
 pub mod host;
 mod limits;
 mod origin;
+pub mod process;
 mod session;
 mod snapshot;
 mod spawn;
@@ -45,14 +46,15 @@ mod vt;
 #[cfg(windows)]
 mod windows;
 /// The platform-independent parts of the Windows backend (the kill engine over a synthetic
-/// `JobOs`, the chunked exit wait, and the command-line, environment-block, and cwd rules),
-/// unit-tested on every OS.
+/// `JobOs`, the chunked exit wait, the command-line, environment-block, and cwd rules, and the
+/// process lookup's open and wait mappings), unit-tested on every OS.
 #[cfg(all(test, not(windows)))]
 #[path = "windows"]
 mod windows {
     #![allow(dead_code, reason = "only their unit tests run off Windows")]
     mod cmdline;
     mod kill;
+    mod process;
     mod wait;
 }
 mod writer;

@@ -151,6 +151,13 @@ pub(crate) fn fd_ceiling() -> io::Result<c_int> {
     Ok(table.max(highest.saturating_add(1)))
 }
 
+/// `_exit(code)`: ends the process now; no `atexit` handler runs and no stdio stream is
+/// flushed.
+pub(crate) fn exit_now(code: c_int) -> ! {
+    // SAFETY: `_exit` accepts any status and does not return.
+    unsafe { libc::_exit(code) }
+}
+
 /// `proc_listallpids` with a null buffer: an estimate of the number of processes.
 pub(crate) fn pid_count() -> io::Result<usize> {
     // SAFETY: a size query: a null buffer of length 0.
@@ -194,6 +201,19 @@ pub(crate) struct BsdInfo {
     pub(crate) zombie: bool,
     /// Microseconds since the Unix epoch.
     pub(crate) start: u64,
+    /// The image name, NUL-padded: `pbi_name` (at most 31 bytes), else `pbi_comm` (at most
+    /// 15) when `pbi_name` is empty.
+    pub(crate) name: [u8; 32],
+}
+
+/// `pbi_name` when it is not empty, else `pbi_comm`, as bytes padded with NULs.
+fn image_name(name: &[libc::c_char; 32], comm: &[libc::c_char; 16]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let src: &[libc::c_char] = if name[0] == 0 { comm } else { name };
+    for (o, c) in out.iter_mut().zip(src) {
+        *o = c.cast_unsigned();
+    }
+    out
 }
 
 /// `proc_pidinfo(pid, PROC_PIDTBSDINFO, 1)`, which also reads zombies; the errno on
@@ -236,6 +256,7 @@ pub(crate) fn bsd_info(pid: u32) -> Result<BsdInfo, i32> {
             .pbi_start_tvsec
             .saturating_mul(1_000_000)
             .saturating_add(info.pbi_start_tvusec),
+        name: image_name(&info.pbi_name, &info.pbi_comm),
     })
 }
 
@@ -537,6 +558,84 @@ mod tests {
         };
         assert!(status.success(), "helper {name}: {status}");
         false
+    }
+
+    /// What [`mark_exit_handlers`]'s handler writes to fd 2.
+    const EXIT_MARK: &str = "EXIT-HANDLER-RAN\n";
+
+    extern "C" fn exit_marker() {
+        let msg = EXIT_MARK.as_bytes();
+        // SAFETY: writes a static buffer of `msg.len()` bytes to fd 2.
+        let _ = unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
+    }
+
+    /// Registers an `atexit` handler that writes [`EXIT_MARK`] to fd 2, so a test sees whether
+    /// a process ended through the C exit path.
+    fn mark_exit_handlers() -> io::Result<()> {
+        // SAFETY: registers a handler that only writes a static buffer to fd 2.
+        if unsafe { libc::atexit(exit_marker) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::other("atexit refused the handler"))
+        }
+    }
+
+    /// `exit_now` ends the process with its code and runs no `atexit` handler;
+    /// `std::process::exit`, the control, runs it.
+    #[test]
+    fn exit_now_skips_exit_handlers() {
+        const MODE: &str = "CHALDEA_EXIT_NOW_MODE";
+        if let Ok(mode) = std::env::var(MODE) {
+            mark_exit_handlers().unwrap();
+            if mode == "now" {
+                exit_now(7);
+            }
+            std::process::exit(7);
+        }
+        for (mode, ran) in [("now", false), ("std", true)] {
+            let exe = std::env::current_exe().unwrap();
+            let mut child = with_spawn_lock(|| {
+                Command::new(exe)
+                    .args([
+                        "--exact",
+                        "unix::sys::tests::exit_now_skips_exit_handlers",
+                        "--nocapture",
+                    ])
+                    .env(MODE, mode)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+            })
+            .unwrap();
+            let mut err = child.stderr.take().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = std::io::Read::read_to_string(&mut err, &mut s);
+                let _ = tx.send(s);
+            });
+            let end = Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                if let Some(s) = child.try_wait().unwrap() {
+                    break s;
+                }
+                if Instant::now() >= end {
+                    let _ = child.kill();
+                    let reap = Instant::now() + Duration::from_secs(30);
+                    while matches!(child.try_wait(), Ok(None)) && Instant::now() < reap {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    panic!("{mode}: the helper did not exit");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let err = rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the helper's stderr did not close");
+            assert_eq!(status.code(), Some(7), "{mode}: {err}");
+            assert_eq!(err.contains(EXIT_MARK), ran, "{mode}: {err}");
+        }
     }
 
     fn spec(argv: &[&str], dir: &TempDir) -> SpawnSpec {

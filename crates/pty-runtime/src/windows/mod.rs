@@ -10,6 +10,7 @@ mod control;
 #[cfg(any(test, feature = "fake"))]
 pub(crate) mod hooks;
 mod kill;
+pub(crate) mod process;
 #[allow(unsafe_code)]
 pub(crate) mod sys;
 #[cfg(test)]

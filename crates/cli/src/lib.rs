@@ -1,10 +1,14 @@
 //! The `chaldea` binary's library (docs/design/daemon-lifecycle.md §2.2): [`dispatch`] is its
 //! single entry. It decides `hook-emit` first, before any process setup (hook-ingest §1,
-//! §2.13); every other command gets process setup once, argument parsing whose errors go
-//! through the redacting `diag`, the daemon's process entry, and an exit through
-//! `std::process::exit` on every path.
+//! §2.13), and runs the emitter there; every other command gets process setup once, argument
+//! parsing whose errors go through the redacting `diag`, the daemon's process entry, and an
+//! exit through `std::process::exit` on every path.
 
 mod args;
+mod hook_emit;
+
+#[doc(hidden)]
+pub use hook_emit::Stall;
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -22,17 +26,15 @@ use crate::args::{Cli, Command, DaemonCommand};
 const FINAL_FLUSH: Duration = Duration::from_millis(100);
 
 /// The `chaldea` process from its arguments (`argv[0]` first) to its exit; `main` is this one
-/// call.
+/// call, with [`Stall::Off`].
 ///
 /// `hook-emit` is decided first, before process setup, the runtime, or any configuration
-/// (hook-ingest §2.13, mvp §3 "Single binary"). PR 9a's emitter goes in that branch, and 9a
-/// extends this signature with the emitter's test seam (`Stall`); until then the branch
-/// answers as clap does for an unknown subcommand (exit 2), without the setup.
-pub fn dispatch(args: &[OsString]) -> ! {
+/// (hook-ingest §2.13, mvp §3 "Single binary"): the emitter runs there, exits 0, and prints
+/// nothing. `stall` is the emitter's test seam; only the test binary `hook_emit_stall`
+/// passes anything but [`Stall::Off`].
+pub fn dispatch(args: &[OsString], stall: Stall) -> ! {
     if args.get(1).is_some_and(|a| a == "hook-emit") {
-        let code = parse(args).map_or_else(|e| usage_error(&e), |_| ExitCode::Usage.code());
-        let _ = std::io::stdout().flush();
-        std::process::exit(code);
+        hook_emit::main(args, stall);
     }
     lifecycle::prepare_process();
     let code = match parse(args) {

@@ -49,6 +49,7 @@ windows-sys = { version = "=0.61.2", features = [
   "Win32_System_Com",           # CoTaskMemFree for the known-folder path
   "Win32_Security_Authorization", # GetSecurityInfo, SDDL conversions (state-directory privacy)
   "Win32_Storage_FileSystem",   # CreateDirectoryW, CreateFileW with an explicit descriptor
+  "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot, Process32FirstW / NextW (the parent pid of the ancestry walk)
 ] }
 # testkit's FakeCli on Windows: console mode and size without `unsafe` (already in the lock).
 winapi-util = "=0.1.11"

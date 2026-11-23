@@ -909,6 +909,7 @@ mod tests {
                         ppid: p.ppid,
                         pgid: p.pgid,
                         start: p.start,
+                        name: [0; 32],
                     }),
                 },
             }
