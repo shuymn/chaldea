@@ -250,6 +250,7 @@ mod tests {
     fn deliver<'a>(deliver: &'a dyn Fn(&StopTarget) -> std::io::Result<()>) -> host::StopSeams<'a> {
         host::StopSeams {
             identity: &host::process_identity,
+            before_open: &|| {},
             before_delivery: &|| {},
             deliver: Some(deliver),
         }
@@ -443,6 +444,7 @@ mod tests {
         };
         let seams = host::StopSeams {
             identity: &slow_identity,
+            before_open: &|| {},
             before_delivery: &|| {},
             deliver: None,
         };
@@ -473,6 +475,7 @@ mod tests {
         };
         let seams = host::StopSeams {
             identity: &late_failure,
+            before_open: &|| {},
             before_delivery: &|| {},
             deliver: None,
         };
@@ -483,6 +486,7 @@ mod tests {
         let failure = |_: u32| Err(std::io::Error::other("lookup failed"));
         let seams = host::StopSeams {
             identity: &failure,
+            before_open: &|| {},
             before_delivery: &|| {},
             deliver: None,
         };
@@ -508,6 +512,62 @@ mod tests {
         assert_eq!(host::send_stop(&t, soon()).unwrap(), StopSent::NoListener);
     }
 
+    /// PR8-CL-15 (Windows): no event, then an identity lookup that returns a live, matching
+    /// identity only at the deadline: `DeadlinePassed`, not `NoListener`.
+    #[cfg(windows)]
+    #[test]
+    fn missing_event_with_late_live_identity_times_out() {
+        use std::time::{Duration, Instant};
+        let me = host::current_identity().unwrap();
+        let target = StopTarget {
+            pid: me.pid,
+            start_time: me.start_time.clone(),
+            instance: instance(),
+        };
+        let end = Instant::now() + Duration::from_secs(1);
+        let looked_up = std::cell::Cell::new(false);
+        let identity = |_: u32| -> std::io::Result<_> {
+            looked_up.set(true);
+            std::thread::sleep(end.saturating_duration_since(Instant::now()));
+            Ok(Some(me.clone()))
+        };
+        let seams = host::StopSeams {
+            identity: &identity,
+            before_open: &|| {},
+            before_delivery: &|| {},
+            deliver: None,
+        };
+        let got = host::send_stop_with(&target, end, &seams).unwrap();
+        assert!(looked_up.get(), "the missing-event fallback did not run");
+        assert_eq!(got, StopSent::DeadlinePassed);
+    }
+
+    /// PR8-CL-15 (Windows): an `OpenEventW` in flight when the deadline passes (delayed before
+    /// the call), finding no event: `DeadlinePassed`, not `NoListener`.
+    #[cfg(windows)]
+    #[test]
+    fn open_across_the_deadline_is_the_deadline() {
+        use std::time::{Duration, Instant};
+        let me = host::current_identity().unwrap();
+        let target = StopTarget {
+            pid: me.pid,
+            start_time: me.start_time,
+            instance: instance(),
+        };
+        let end = Instant::now() + Duration::from_millis(300);
+        let delay = || std::thread::sleep(end.saturating_duration_since(Instant::now()));
+        let seams = host::StopSeams {
+            identity: &host::process_identity,
+            before_open: &delay,
+            before_delivery: &|| {},
+            deliver: None,
+        };
+        assert_eq!(
+            host::send_stop_with(&target, end, &seams).unwrap(),
+            StopSent::DeadlinePassed
+        );
+    }
+
     /// PR8-CL-15 (Windows): a pause between `OpenEventW` and `SetEvent` that crosses the
     /// deadline sets nothing; with time left, the event is set.
     #[cfg(windows)]
@@ -527,6 +587,7 @@ mod tests {
         let pause = || std::thread::sleep(end.saturating_duration_since(Instant::now()));
         let seams = host::StopSeams {
             identity: &host::process_identity,
+            before_open: &|| {},
             before_delivery: &pause,
             deliver: None,
         };

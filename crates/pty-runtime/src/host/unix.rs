@@ -231,8 +231,8 @@ fn abandon(mut child: Child) {
 /// exit itself (kqueue); `None` at the deadline.
 fn exit_before(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
     let pid = child.id();
-    decided_before(deadline, child, Child::try_wait, |_, left| {
-        sys::wait_readable_or_exit(None, Some(pid), left)
+    decided_before(deadline, child, Child::try_wait, |_, deadline| {
+        sys::wait_readable_or_exit(None, Some(pid), deadline)
     })
 }
 
@@ -453,13 +453,13 @@ pub(super) fn ready_read(
         deadline,
         inner,
         |inner| ready_step(inner, child.as_deref_mut()),
-        |inner, left| {
+        |inner, deadline| {
             // Woken by a connection, data, the peer's end, or the direct child's exit.
             let fd = match &inner.stream {
                 Some(s) => s.as_fd(),
                 None => inner.listener.as_fd(),
             };
-            sys::wait_readable_or_exit(Some(fd), pid, left)
+            sys::wait_readable_or_exit(Some(fd), pid, deadline)
         },
     )?;
     Ok(got.unwrap_or(ReadyRead::TimedOut))

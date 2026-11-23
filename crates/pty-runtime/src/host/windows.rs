@@ -374,7 +374,10 @@ pub(super) fn detached_exit_before(
     inner: &mut DetachedInner,
     deadline: Instant,
 ) -> io::Result<Option<String>> {
-    super::receive_before(deadline, |left| {
+    super::receive_before(deadline, |deadline| {
+        let Some(left) = super::time_left(deadline) else {
+            return Ok(None);
+        };
         let ms = crate::windows::wait::chunk_ms(left);
         if sys::wait(inner.process.as_handle(), ms)? {
             Ok(Some(format!(
@@ -783,8 +786,9 @@ mod tests {
         }
     }
 
-    /// A-W1 (design §2.12), the CI preflight: this process's job state allows the starter's
-    /// launch, and a helper launched with the flags the starter would choose is in no job.
+    /// A-W1 (design §2.12), the WMI lane's first test (§7): this process's job state allows the
+    /// starter's launch, and a helper launched with the flags the starter would choose is in no
+    /// job.
     #[test]
     fn runner_can_break_away() {
         if std::env::var_os(HELPER).is_some() {

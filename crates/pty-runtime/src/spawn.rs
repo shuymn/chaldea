@@ -63,7 +63,9 @@ struct Held;
 impl Drop for Held {
     fn drop(&mut self) {
         *SPAWN_LOCK.flag() = false;
-        SPAWN_LOCK.freed.notify_one();
+        // Every waiter wakes: one woken alone could find its deadline passed and return without
+        // the lock, and the waiters behind it would sleep on with the lock free.
+        SPAWN_LOCK.freed.notify_all();
     }
 }
 
@@ -79,6 +81,8 @@ fn guard() -> SpawnGuard {
 pub(crate) fn spawn_lock() -> SpawnGuard {
     let mut held = SPAWN_LOCK.flag();
     while *held {
+        #[cfg(test)]
+        let _waiting = probe::Waiting::new();
         held = SPAWN_LOCK
             .freed
             .wait(held)
@@ -101,11 +105,20 @@ pub(crate) fn spawn_lock_before(deadline: Instant) -> Option<SpawnGuard> {
         if !*held {
             break;
         }
-        held = SPAWN_LOCK
+        #[cfg(test)]
+        let waiting = probe::Waiting::new();
+        let (h, woke) = SPAWN_LOCK
             .freed
             .wait_timeout(held, left)
-            .unwrap_or_else(PoisonError::into_inner)
-            .0;
+            .unwrap_or_else(PoisonError::into_inner);
+        held = h;
+        #[cfg(test)]
+        {
+            drop(waiting);
+            probe::woke(woke.timed_out());
+        }
+        #[cfg(not(test))]
+        let _ = woke;
     }
     *held = true;
     drop(held);
@@ -162,5 +175,51 @@ mod held_here {
 
     pub(super) fn get() -> bool {
         HELD.with(Cell::get)
+    }
+}
+
+/// Test probes of the lock's waiters.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// How many threads wait on the condition variable.
+    pub(crate) static WAITING: AtomicUsize = AtomicUsize::new(0);
+
+    /// Counts one waiter while it lives.
+    pub(super) struct Waiting;
+
+    impl Waiting {
+        pub(super) fn new() -> Waiting {
+            WAITING.fetch_add(1, Ordering::SeqCst);
+            Waiting
+        }
+    }
+
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            WAITING.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    type Hook = Box<dyn FnMut(bool)>;
+
+    thread_local! {
+        static AFTER_WAKE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `f` in this thread after each wake of `spawn_lock_before`, still holding the inner
+    /// mutex, with whether the wait timed out (a test's pause before the deadline check).
+    pub(crate) fn after_wake(f: impl FnMut(bool) + 'static) {
+        AFTER_WAKE.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn woke(timed_out: bool) {
+        AFTER_WAKE.with(|h| {
+            if let Some(f) = h.borrow_mut().as_mut() {
+                f(timed_out);
+            }
+        });
     }
 }
