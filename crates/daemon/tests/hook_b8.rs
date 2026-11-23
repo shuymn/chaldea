@@ -64,6 +64,8 @@ struct Obs {
     status: Option<(u16, Option<String>)>,
     end: End,
     send_error: Option<io::ErrorKind>,
+    /// The reply carried `Connection: close`.
+    closes: bool,
     /// From the first byte written to the whole reply, or to the end without one.
     elapsed: Duration,
     /// Body bytes written before the status was read.
@@ -109,6 +111,9 @@ async fn observe(
             break;
         }
     }
+    // Set once the writer has nothing more to send (it then only keeps the write half open).
+    let idle = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let idle_w = idle.clone();
     let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let sent_w = sent.clone();
     let writer = tokio::spawn(async move {
@@ -116,6 +121,7 @@ async fn observe(
         match body {
             Body::Withheld => {
                 // Keep the write half open until the reader is done.
+                idle_w.store(true, std::sync::atomic::Ordering::SeqCst);
                 std::future::pending::<()>().await;
                 None
             }
@@ -126,6 +132,7 @@ async fn observe(
                     }
                     record(c.len());
                 }
+                idle_w.store(true, std::sync::atomic::Ordering::SeqCst);
                 std::future::pending::<()>().await;
                 None
             }
@@ -162,12 +169,24 @@ async fn observe(
         }
     };
     let elapsed = replied_at.unwrap_or_else(|| first.elapsed());
-    // The writer ends now: by its own error, or aborted (a pending write is dropped).
-    let send_error = send_error.or(if writer.is_finished() {
-        writer.await.ok().flatten()
+    // A writer still sending once the connection ended gets its error soon: wait for it
+    // (at most 1 s), then abort a writer still pending (a dropped pending write).
+    let mut writer = writer;
+    let ended = matches!(end, End::Eof | End::Reset(_));
+    let sending = !idle.load(std::sync::atomic::Ordering::SeqCst);
+    let waited = if sending && ended {
+        tokio::time::timeout(Duration::from_secs(1), &mut writer)
+            .await
+            .ok()
     } else {
-        writer.abort();
         None
+    };
+    let send_error = send_error.or(match waited {
+        Some(r) => r.ok().flatten(),
+        None => {
+            writer.abort();
+            None
+        }
     });
     let reply = out
         .windows(4)
@@ -175,6 +194,10 @@ async fn observe(
         .then(|| support::http::parse(&out, None));
     Obs {
         status: reply.as_ref().map(Reply::outcome),
+        closes: reply.as_ref().is_some_and(|r| {
+            r.header("connection")
+                .is_some_and(|v| v.eq_ignore_ascii_case("close"))
+        }),
         end,
         send_error,
         elapsed,
@@ -249,6 +272,9 @@ async fn table(
         let o = observe(h.srv.port, &req.head(), 1, Duration::ZERO, body(&req), CASE).await;
         assert_eq!(o.status.as_ref(), Some(&want), "{name}: {o:?}");
         assert!(o.elapsed < CASE, "{name}: {o:?}");
+        // PR 7's close contract: a rejection says `Connection: close` and the server closes.
+        assert!(o.closes, "{name}: {o:?}");
+        assert!(matches!(o.end, End::Eof | End::Reset(_)), "{name}: {o:?}");
         if withheld {
             assert_eq!(o.body_sent_before_status, 0, "{name}: {o:?}");
         }
@@ -718,6 +744,10 @@ async fn observed_slow_body() {
     )
     .await;
     print_observed("slow_body", &o);
+    // A writer still sending when the server closed reports its error.
+    if matches!(o.end, End::Eof | End::Reset(_)) {
+        assert!(o.send_error.is_some(), "{o:?}");
+    }
     assert!(
         matches!(o.status, Some((408, _)) | None),
         "never a success: {o:?}"
@@ -797,6 +827,39 @@ async fn duplicate_equal_length_accepted() {
     assert_eq!((r.status, r.body.len()), (200, 0), "{r:?}");
     assert_eq!(h.snapshot(&l).deliveries, before + 1);
     assert!(h.delivery(l.launch, x.emit).is_some());
+    positive_control(&h, &l).await;
+    h.stop().await;
+}
+
+/// G8 under a larger HTTP limit: with `max_body_bytes = 8 MiB`, `/hook` still answers 413
+/// for `4 MiB + 1` declared, before any body byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hook_cap_under_a_larger_http_limit() {
+    let h = HookServer::start_with(HookConfig::default(), |c| {
+        c.short_deadline = Duration::from_secs(5);
+        c.header_read_timeout = Duration::from_secs(5);
+        c.max_body_bytes = 8 * 1024 * 1024;
+        c.max_header_bytes = 8 * 1024;
+    })
+    .await;
+    let l = setup(&h).await;
+    let before = h.snapshot(&l);
+    let req = valid(&l)
+        .req(&h.srv)
+        .no_length()
+        .header("Content-Length", &(4 * MIB + 1).to_string());
+    let o = observe(
+        h.srv.port,
+        &req.head(),
+        1,
+        Duration::ZERO,
+        Body::Withheld,
+        CASE,
+    )
+    .await;
+    assert_eq!(o.status, Some((413, code("payload_too_large"))), "{o:?}");
+    assert_eq!(o.body_sent_before_status, 0);
+    assert_unchanged(&h, &l, &before, "4 MiB + 1 under an 8 MiB HTTP limit");
     positive_control(&h, &l).await;
     h.stop().await;
 }

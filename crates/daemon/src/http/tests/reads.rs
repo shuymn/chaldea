@@ -190,3 +190,90 @@ async fn lookup_failure_is_not_unauthorized() {
     srv.shutdown_http(Instant::now() + Duration::from_secs(10))
         .await;
 }
+
+/// The cutoff precedes the outcome: a failed join (the closure panicked) taken after the
+/// cutoff is 408, not 500, for `WriteCtx::read_by` and `read_until`; reader-pool exhaustion
+/// through `by` is 408 for `read_by` (not 503 `busy`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_by_cutoff_precedes_the_outcome() {
+    let srv = TestServer::start(Mounts::mvp()).await;
+    let s = shared(&srv);
+    let ctx = std::sync::Arc::new(crate::http::WriteCtx::new(
+        None,
+        srv.clock.now() + Duration::from_secs(10),
+        s.clone(),
+    ));
+    let (reached, release) = s.faults.arm_cutoff_gate();
+    let by = srv.clock.now() + Duration::from_millis(200);
+    let c = ctx.clone();
+    let waiter = tokio::spawn(async move {
+        c.read_by(by, |_| -> Result<(), StoreError> {
+            panic!("the read panics")
+        })
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), reached)
+        .await
+        .expect("the waiter reached its gate")
+        .unwrap();
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        by + Duration::from_millis(50),
+    ))
+    .await;
+    drop(release);
+    let r = tokio::time::timeout(Duration::from_secs(20), waiter)
+        .await
+        .expect("the read ends")
+        .unwrap();
+    assert_eq!(r, Err(ApiError::request_timeout()));
+
+    // `read_until` (every read's cutoff) takes the clock before the join too.
+    let (reached, release) = s.faults.arm_cutoff_gate();
+    let deadline = srv.clock.now() + Duration::from_millis(200);
+    let w = s.clone();
+    let waiter = tokio::spawn(async move {
+        read_until(&w, deadline, |_| -> Result<(), StoreError> {
+            panic!("the read panics")
+        })
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), reached)
+        .await
+        .expect("the waiter reached its gate")
+        .unwrap();
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        deadline + Duration::from_millis(50),
+    ))
+    .await;
+    drop(release);
+    let r = tokio::time::timeout(Duration::from_secs(20), waiter)
+        .await
+        .expect("the read ends")
+        .unwrap();
+    assert_eq!(r, Err(ApiError::request_timeout()));
+
+    // Exhaustion: the pool's wait ends at `by` with `Busy`, which is ready when the waiter,
+    // held at its gate past `by`, takes it.
+    let readers = srv.hold_readers(4);
+    let (reached, release) = s.faults.arm_cutoff_gate();
+    let by = srv.clock.now() + Duration::from_millis(200);
+    let c = ctx.clone();
+    let waiter = tokio::spawn(async move { c.read_by(by, |_| Ok(())).await });
+    tokio::time::timeout(Duration::from_secs(10), reached)
+        .await
+        .expect("the waiter reached its gate")
+        .unwrap();
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        by + Duration::from_millis(300),
+    ))
+    .await;
+    drop(release);
+    let r = tokio::time::timeout(Duration::from_secs(20), waiter)
+        .await
+        .expect("the read ends")
+        .unwrap();
+    assert_eq!(r, Err(ApiError::request_timeout()));
+    drop(readers);
+    drop(ctx);
+    srv.stop().await;
+}

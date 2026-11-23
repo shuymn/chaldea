@@ -48,6 +48,17 @@ pub(crate) async fn read_until<R: Send + 'static>(
     deadline: Instant,
     f: impl FnOnce(&ReadTx<'_>) -> Result<R, StoreError> + Send + 'static,
 ) -> Result<R, ApiError> {
+    read_cut(shared, deadline, f, false).await
+}
+
+/// [`read_until`]; with `strict`, reader-pool exhaustion taken at or after `deadline` is 408
+/// too, like every other result.
+async fn read_cut<R: Send + 'static>(
+    shared: &Arc<Shared>,
+    deadline: Instant,
+    f: impl FnOnce(&ReadTx<'_>) -> Result<R, StoreError> + Send + 'static,
+    strict: bool,
+) -> Result<R, ApiError> {
     // The cutoff is set before the read starts.
     let cutoff = shared.timer(deadline);
     let handle = spawn_read(shared, deadline, f);
@@ -58,6 +69,7 @@ pub(crate) async fn read_until<R: Send + 'static>(
         .await;
     match timeout_at(cutoff, handle).await {
         Err(_) => Err(ApiError::request_timeout()),
+        Ok(_) if strict && shared.passed(deadline) => Err(ApiError::request_timeout()),
         Ok(joined) => take_read(shared, deadline, joined),
     }
 }
@@ -85,17 +97,17 @@ pub(crate) fn spawn_read<R: Send + 'static>(
 }
 
 /// A read's result as taken now: any result taken at or after `deadline` (by the server's
-/// clock) is 408, except reader-pool exhaustion, whose wait ends at the cutoff itself (503
-/// `busy`); otherwise the store outcome maps through §2.9.
+/// clock), a failed join included, is 408, except reader-pool exhaustion, whose wait ends at
+/// the cutoff itself (503 `busy`); otherwise the store outcome maps through §2.9.
 pub(crate) fn take_read<R>(
     shared: &Shared,
     deadline: Instant,
     joined: Joined<R>,
 ) -> Result<R, ApiError> {
     match joined {
-        Err(_) => Err(ApiError::internal()),
         Ok(Err(ReadError::Busy)) => Err(ApiError::busy()),
-        Ok(_) if shared.passed(deadline) => Err(ApiError::request_timeout()),
+        _ if shared.passed(deadline) => Err(ApiError::request_timeout()),
+        Err(_) => Err(ApiError::internal()),
         Ok(Err(e)) => Err(read_error(&e)),
         Ok(Ok(v)) => Ok(v),
     }
@@ -446,17 +458,19 @@ impl WriteCtx {
 
     /// One read bounded by `by` (on the server's clock) instead of the request deadline:
     /// the reader pool's wait ends at `by`, and a result not returned by it, or taken at or
-    /// after it, is 408 (reader exhaustion at the cutoff: 503 `busy`), as [`read_until`].
+    /// after it, is 408, reader-pool exhaustion included (a strict cutoff, unlike
+    /// [`read_until`]'s 503 `busy` at the cutoff).
     ///
     /// # Errors
     ///
-    /// 408, 503 `busy` / `shutting_down`, 500, or `f`'s store error mapped (§2.9).
+    /// 408, 503 `busy` (exhaustion before `by`) / `shutting_down`, 500, or `f`'s store error
+    /// mapped (§2.9).
     pub(crate) async fn read_by<R: Send + 'static>(
         &self,
         by: Instant,
         f: impl FnOnce(&ReadTx<'_>) -> Result<R, StoreError> + Send + 'static,
     ) -> Result<R, ApiError> {
-        read_until(&self.shared, by, f).await
+        read_cut(&self.shared, by, f, true).await
     }
 
     /// The store's commit notifications, from now on (closed once the store shuts down).

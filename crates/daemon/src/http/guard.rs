@@ -287,7 +287,8 @@ impl GuardService {
             self.kind_and_action(p, parts.uri.path())?;
         }
         // 6. Framing, 7. size.
-        check_framing(&parts.method, &parts.headers, shared.cfg.max_body_bytes)?;
+        let body_limit = spec.body_limit(shared.cfg.max_body_bytes);
+        check_framing(&parts.method, &parts.headers, body_limit)?;
         // 8. Unimplemented: the route's handler, or the command's.
         let command_unimplemented = spec.action == ActionRule::ByCommandName
             && path_param(spec.path, parts.uri.path(), "name")
@@ -295,7 +296,7 @@ impl GuardService {
         // The handler's request: the deadline in its extensions, the body bounded.
         let request = move || {
             parts.extensions.insert(Deadline(deadline));
-            let max = usize::try_from(shared.cfg.max_body_bytes).unwrap_or(usize::MAX);
+            let max = usize::try_from(body_limit).unwrap_or(usize::MAX);
             Request::from_parts(parts, Body::new(Limited::new(body, max)))
         };
         match &self.endpoint {
