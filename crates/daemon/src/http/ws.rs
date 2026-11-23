@@ -395,14 +395,15 @@ async fn close(
     .await;
 }
 
-/// `f`'s output if it completes before `deadline`, else `None`. The deadline is checked
-/// before every poll of `f`, so a future that became ready after its deadline is dropped
-/// unpolled; `timeout_at` polls the future first and would deliver it.
+/// `f`'s output if it completes before `deadline`, else `None`. The clock is sampled
+/// immediately before every poll of `f` (after the timer's poll), so a future that became
+/// ready after its deadline is dropped unpolled; `timeout_at` polls the future first and
+/// would deliver it.
 async fn before<F: Future>(deadline: tokio::time::Instant, f: F) -> Option<F::Output> {
     let mut f = pin!(f);
     let mut timer = pin!(sleep_until(deadline));
     std::future::poll_fn(|cx| {
-        if tokio::time::Instant::now() >= deadline || timer.as_mut().poll(cx).is_ready() {
+        if timer.as_mut().poll(cx).is_ready() || tokio::time::Instant::now() >= deadline {
             return Poll::Ready(None);
         }
         f.as_mut().poll(cx).map(Some)
