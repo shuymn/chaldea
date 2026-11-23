@@ -15,7 +15,7 @@ use super::support::http::TestServer;
 use super::support::{raw_unknown, registered, soon};
 use super::{eventually, mint_ticket, shared};
 use crate::http::tickets::TicketPurpose;
-use crate::http::ws::{ReadDone, ReadReq, SocketState};
+use crate::http::ws::{ReadDone, ReadReq, SocketState, too_big};
 use crate::http::{HttpConfig, Mounts};
 use crate::store::TokenSelector;
 
@@ -359,6 +359,13 @@ async fn lost_notification_recovered_by_heads() {
         Ok(WsServerMessage::Hello { .. })
     ));
     subscribe(&mut ws, &[stream]).await;
+    // The subscribe's frame carries the old head, so the new head can come only from a
+    // refresh read after the append.
+    let old = srv.store.read(move |tx| tx.head(stream, 0)).head_seq;
+    match next(&mut ws).await.expect("open") {
+        WsServerMessage::Heads { heads } => assert_eq!(heads, [e(stream, old)]),
+        other => panic!("the subscribe's `heads` first: {other:?}"),
+    }
     let s = shared(&srv);
     s.faults.drop_notifications(true);
     srv.append(vec![raw_unknown(stream, "lost", Content::text("x"))])
@@ -376,6 +383,62 @@ async fn lost_notification_recovered_by_heads() {
         assert!(at.elapsed() < bound);
     }
     assert!(at.elapsed() < bound);
+    srv.stop().await;
+}
+
+/// A send held past its `send_timeout`: the socket is dropped at the send deadline without a
+/// close frame, and its task and slot are released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_deadline_drops_without_a_close_frame() {
+    let srv = TestServer::start_with(Mounts::mvp(), |c: &mut HttpConfig| {
+        c.ws.send_timeout = Duration::from_millis(300);
+        c.ws.idle_timeout = Duration::from_secs(600);
+        c.ws.heads_interval = Duration::from_secs(600);
+    })
+    .await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
+    let base = srv.server.tasks();
+    let (reached, _held) = shared(&srv).faults.arm_socket_send_gate();
+    let mut ws = open(&srv, &ticket).await;
+    wait("the send reached the gate", reached).await;
+    socket_gone(&srv, base).await;
+    assert_eq!(next(&mut ws).await.err(), Some(None), "no close frame");
+    assert!(!shared(&srv).faults.steps().contains(&"socket close"));
+    srv.stop().await;
+}
+
+/// A revocation while a send is held: the close path keeps the send's own deadline, so the
+/// socket is dropped by it, long before a `close_grace` that is far longer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_keeps_the_send_deadline() {
+    let srv = TestServer::start_with(Mounts::mvp(), |c: &mut HttpConfig| {
+        c.ws.send_timeout = Duration::from_secs(2);
+        c.ws.close_grace = Duration::from_secs(30);
+        c.ws.idle_timeout = Duration::from_secs(600);
+        c.ws.heads_interval = Duration::from_secs(600);
+    })
+    .await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
+    let base = srv.server.tasks();
+    let (reached, _held) = shared(&srv).faults.arm_socket_send_gate();
+    let _ws = open(&srv, &ticket).await;
+    wait("the send reached the gate", reached).await;
+    let sent_at = Instant::now();
+    srv.revoke(&owner).await;
+    let s = shared(&srv);
+    eventually(Duration::from_secs(10), "the close path entered", || {
+        s.faults.steps().contains(&"socket close")
+    })
+    .await;
+    eventually(
+        Duration::from_secs(8),
+        "dropped by the send deadline",
+        || srv.server.tasks() <= base && s.sockets.held() == 0,
+    )
+    .await;
+    assert!(sent_at.elapsed() < Duration::from_secs(8));
     srv.stop().await;
 }
 
@@ -493,4 +556,45 @@ async fn ticket_expiry_sampled_at_removal() {
     drop(release);
     assert_eq!(redeem.await.unwrap(), 401);
     std::sync::Arc::into_inner(srv).unwrap().stop().await;
+}
+
+/// An error whose text is "wrapped" and whose source is the axum error it holds.
+#[derive(Debug)]
+struct Wrapped(axum::Error);
+
+impl std::fmt::Display for Wrapped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("wrapped")
+    }
+}
+
+impl std::error::Error for Wrapped {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// The 1009 classifier finds tungstenite's capacity error by type, through axum's wrapping
+/// and any further layer, and nothing else, whatever an error's text says.
+#[test]
+fn too_big_is_the_typed_capacity_error() {
+    use tungstenite::error::CapacityError;
+    let capacity = || {
+        axum::Error::new(tungstenite::Error::Capacity(
+            CapacityError::MessageTooLong {
+                size: 65,
+                max_size: 64,
+            },
+        ))
+    };
+    assert!(too_big(&capacity()));
+    assert!(
+        too_big(&Wrapped(capacity())),
+        "under a layer whose text says nothing"
+    );
+    let lookalike = axum::Error::new(std::io::Error::other("Space limit exceeded"));
+    assert!(!too_big(&lookalike), "the text alone is not the error");
+    assert!(!too_big(&axum::Error::new(
+        tungstenite::Error::ConnectionClosed
+    )));
 }

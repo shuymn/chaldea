@@ -34,8 +34,8 @@ pub(crate) fn json<T: Serialize>(v: &T) -> Result<Response<Body>, ApiError> {
     Ok(resp)
 }
 
-/// Percent-decodes one query component (`+` is a space, as in form encoding); `None` for a
-/// broken escape or text that is not UTF-8.
+/// Percent-decodes one query component (`+` is a space, as in form encoding); `None` for an
+/// escape that is not `%` and two ASCII hex digits, or text that is not UTF-8.
 fn decode(s: &str) -> Option<String> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -44,6 +44,9 @@ fn decode(s: &str) -> Option<String> {
         match b[i] {
             b'%' => {
                 let hex = b.get(i + 1..i + 3)?;
+                if !hex.iter().all(u8::is_ascii_hexdigit) {
+                    return None;
+                }
                 let hex = std::str::from_utf8(hex).ok()?;
                 out.push(u8::from_str_radix(hex, 16).ok()?);
                 i += 3;
@@ -170,10 +173,16 @@ pub(crate) async fn events(ctx: ReadCtx, req: Request<Body>) -> Result<Response<
                             (StreamSnapshot::Host(s), head)
                         }
                         StreamId::Thread(t) => {
-                            let (s, head) = tx
+                            let (mut s, head) = tx
                                 .thread_snapshot(t)
                                 .map_err(store)?
                                 .ok_or_else(ApiError::internal)?;
+                            // The launch's worktree under `/api/worktrees`'s rule.
+                            let worktrees =
+                                ReadScope::of(tx, auth, Action::ReadWorktrees).map_err(store)?;
+                            if s.worktree.as_ref().is_some_and(|w| !worktrees.worktree(w)) {
+                                s.worktree = None;
+                            }
                             (StreamSnapshot::Thread(Box::new(s)), head)
                         }
                     };
@@ -230,10 +239,7 @@ pub(crate) async fn worktrees(
                 .map_err(store)?
                 .into_iter()
                 .map(|w| w.record)
-                .filter(|w| match &scope {
-                    ReadScope::All => true,
-                    ReadScope::Threads(_) => w.owner_thread_id.is_some_and(|t| scope.thread(t)),
-                })
+                .filter(|w| scope.worktree(w))
                 .collect())
         })
         .await?;
@@ -271,6 +277,9 @@ mod tests {
             "stream_id=host&limit",
             "stream_id=host&epoch=%zz",
             "stream_id=host&epoch=%ff",
+            "stream_id=host&epoch=%+1",
+            "stream_id=host&epoch=%-1",
+            "stream_id=host&epoch=%1",
         ] {
             assert_eq!(events_query(Some(s)), bad, "{s}");
         }

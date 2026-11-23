@@ -11,6 +11,7 @@ use chaldea_core::event::TypedEvent;
 use chaldea_core::http::{ThreadsResponse, WorktreesResponse};
 use chaldea_core::ids::{Actor, LaunchId, StreamId, ThreadId, WorkspaceId, WorktreeId};
 use chaldea_core::payload::{WorktreeChanged, WorktreeState};
+use chaldea_core::sync::{EventsResponse, StreamSnapshot};
 use chaldea_daemon::http::Mounts;
 use chaldea_daemon::store::prepare_content;
 use support::http::TestServer;
@@ -212,4 +213,94 @@ async fn rescue_and_owner_see_all() {
         }
     }
     srv.stop().await;
+}
+
+/// A thread snapshot's `worktree` follows `/api/worktrees`'s rule: an agent sees the
+/// launch's worktree only while its current owner is in self+; owner and rescue always.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_worktree_follows_the_worktree_rule() {
+    let srv = TestServer::start(Mounts::mvp()).await;
+    let id = |n: u128| ThreadId::from_u128(0xC100 + n);
+    let (parent, me, child, sibling) = (id(1), id(2), id(3), id(4));
+    srv.append(vec![
+        registered_under(parent, None),
+        registered_under(me, Some(parent)),
+        registered_under(child, Some(me)),
+        registered_under(sibling, Some(parent)),
+    ])
+    .await;
+    // `me`'s launch runs in a worktree the sibling owns now; the child's in its own.
+    let foreign = worktree(1, Some(sibling));
+    let own = worktree(2, Some(child));
+    srv.append(vec![
+        event(
+            StreamId::Host,
+            "wt:foreign",
+            TypedEvent::WorktreeChanged(foreign.clone()),
+        ),
+        event(
+            StreamId::Host,
+            "wt:own",
+            TypedEvent::WorktreeChanged(own.clone()),
+        ),
+    ])
+    .await;
+    let (lm, lc) = (LaunchId::from_u128(0xD101), LaunchId::from_u128(0xD102));
+    srv.append(vec![
+        reserved_in(me, lm, &foreign),
+        started(me, lm),
+        reserved_in(child, lc, &own),
+        started(child, lc),
+    ])
+    .await;
+    let agent = srv.token(TokenKind::Agent, Some(me), Some(lm)).await;
+    assert_eq!(snapshot_worktree(&srv, &agent, me).await, None);
+    assert_eq!(
+        snapshot_worktree(&srv, &agent, child).await,
+        Some(own.clone())
+    );
+    for kind in [TokenKind::Owner, TokenKind::Rescue] {
+        let tok = srv.token(kind, None, None).await;
+        assert_eq!(
+            snapshot_worktree(&srv, &tok, me).await,
+            Some(foreign.clone())
+        );
+        assert_eq!(
+            snapshot_worktree(&srv, &tok, child).await,
+            Some(own.clone())
+        );
+    }
+    srv.stop().await;
+}
+
+fn reserved_in(t: ThreadId, l: LaunchId, w: &WorktreeChanged) -> chaldea_daemon::store::NewEvent {
+    let mut e = reserved(t, l);
+    if let TypedEvent::LaunchReserved(r) = &mut e.event {
+        r.worktree_id = Some(w.worktree_id.clone());
+    }
+    e
+}
+
+/// The `worktree` of `t`'s thread snapshot as `token` reads it.
+async fn snapshot_worktree(srv: &TestServer, token: &str, t: ThreadId) -> Option<WorktreeChanged> {
+    let r = srv
+        .send(
+            &srv.req(
+                "GET",
+                &format!(
+                    "/api/events?stream_id={}&after_seq=999999",
+                    StreamId::Thread(t)
+                ),
+            )
+            .bearer(token),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    match serde_json::from_slice(&r.body).unwrap() {
+        EventsResponse::Snapshot {
+            snapshot: StreamSnapshot::Thread(s),
+            ..
+        } => s.worktree,
+        other => panic!("a thread snapshot: {other:?}"),
+    }
 }

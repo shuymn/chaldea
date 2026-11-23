@@ -356,8 +356,9 @@ fn send(shared: &Arc<Shared>, mut sink: Sink, msgs: Vec<Message>) -> Sending {
     })
 }
 
-/// Sends a close frame best effort within `close_grace` (after a send in flight, if it
-/// completes in time), then reads until the peer's close or the grace ends.
+/// Sends a close frame best effort within `close_grace`, then reads until the peer's close
+/// or the grace ends. A send in flight keeps its own deadline: it gets the earlier of that
+/// deadline and the grace to complete, else the socket is dropped without a close frame.
 async fn close(
     shared: &Arc<Shared>,
     out: Out,
@@ -365,10 +366,12 @@ async fn close(
     code: u16,
     reason: &str,
 ) {
+    #[cfg(test)]
+    shared.faults.step("socket close");
     let until = tokio::time::Instant::now() + shared.cfg.ws.close_grace;
     let sink = match out {
         Out::Free(s) => Some(s),
-        Out::Sending(f, _) => match timeout_at(until, f).await {
+        Out::Sending(f, send_deadline) => match timeout_at(until.min(send_deadline), f).await {
             Ok((s, Ok(()))) => Some(s),
             _ => None,
         },
@@ -393,10 +396,16 @@ async fn close(
     .await;
 }
 
-/// Whether a socket read error is an inbound message or frame over the size bound
-/// (tungstenite's `Capacity` error, which axum passes on boxed).
-fn too_big(e: &axum::Error) -> bool {
-    e.to_string().contains("Space limit exceeded")
+/// Whether a socket read error is an inbound message or frame over the size bound:
+/// tungstenite's `Capacity` error, found by type in the error's source chain (axum passes
+/// it on boxed).
+pub(crate) fn too_big(e: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(e), |err| err.source()).any(|err| {
+        matches!(
+            err.downcast_ref::<tungstenite::Error>(),
+            Some(tungstenite::Error::Capacity(_))
+        )
+    })
 }
 
 async fn pending_opt<T>(f: Option<impl Future<Output = T>>) -> T {

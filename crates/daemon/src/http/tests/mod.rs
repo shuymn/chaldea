@@ -11,6 +11,7 @@ mod errors;
 mod events;
 mod layers;
 mod listener;
+mod pair;
 mod reads;
 mod registry;
 mod upgrade;

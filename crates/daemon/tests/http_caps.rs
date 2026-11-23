@@ -1,5 +1,6 @@
 //! Resource caps (`docs/design/http-surface.md` PR7-CL-26): each cap's last allowed and
-//! first refused request, and the next request after a slot frees.
+//! first refused request, and the next request after a slot frees. The caps are the
+//! published numbers, written out here rather than read from the code.
 
 mod support;
 
@@ -9,11 +10,9 @@ use chaldea_core::auth::TokenKind;
 use chaldea_core::ids::{StreamId, ThreadId};
 use chaldea_core::payload::Content;
 use chaldea_core::sync::WsServerMessage;
-use chaldea_daemon::http::{
-    HttpConfig, MAX_PAIR_CODES, MAX_TICKETS, MAX_TICKETS_PER_TOKEN, Mounts, WsConfig,
-};
+use chaldea_daemon::http::{HttpConfig, Mounts, WsConfig};
 use chaldea_daemon::store::prepare_content;
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use support::http::{Reply, TestServer, WsClient, connect};
 use support::{raw_unknown, registered};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -37,14 +36,24 @@ async fn quiet(tune: impl FnOnce(&mut HttpConfig)) -> TestServer {
     .await
 }
 
+/// Tickets held at once, and per token.
+const TICKETS: usize = 1024;
+const TICKETS_PER_TOKEN: usize = 32;
+const PAIR_CODES: usize = 8;
+const SOCKETS: usize = 128;
+const SOCKETS_PER_TOKEN: usize = 16;
+const BLOB_SLOTS: usize = 4;
+const SUBSCRIPTIONS: usize = 1024;
+const MESSAGE_BYTES: usize = 64 * 1024;
+
 async fn tickets_cap(srv: &TestServer) {
     let mut tokens = Vec::new();
-    for _ in 0..MAX_TICKETS / MAX_TICKETS_PER_TOKEN {
+    for _ in 0..TICKETS / TICKETS_PER_TOKEN {
         tokens.push(srv.token(TokenKind::Owner, None, None).await);
     }
     let mut first = None;
     for tok in &tokens {
-        for _ in 0..MAX_TICKETS_PER_TOKEN {
+        for _ in 0..TICKETS_PER_TOKEN {
             let t = srv.ticket(tok, "events").await.expect("below the caps");
             first.get_or_insert(t);
         }
@@ -68,7 +77,7 @@ async fn tickets_cap(srv: &TestServer) {
 async fn pair_codes_cap(srv: &TestServer) {
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let mut codes = Vec::new();
-    for _ in 0..MAX_PAIR_CODES {
+    for _ in 0..PAIR_CODES {
         codes.push(srv.pair_code(&owner).await.expect("below the cap"));
     }
     busy(&srv.pair_code(&owner).await.unwrap_err());
@@ -119,12 +128,7 @@ async fn close_and_reopen(srv: &TestServer, mut ws: WsClient, token: &str) {
 }
 
 async fn sockets_cap(srv: &TestServer) {
-    let WsConfig {
-        max_sockets: max,
-        max_sockets_per_token: per,
-        ..
-    } = WsConfig::default();
-    assert_eq!((max, per), (128, 16));
+    let (max, per) = (SOCKETS, SOCKETS_PER_TOKEN);
     let mut tokens = Vec::new();
     let mut open = Vec::new();
     for _ in 0..max / per {
@@ -154,6 +158,18 @@ async fn read_head(c: &mut TcpStream) -> String {
         got.push(byte[0]);
     }
     String::from_utf8(got).unwrap()
+}
+
+/// Reads `c` to its end (EOF or a reset); the bytes read.
+async fn read_rest(c: &mut TcpStream) -> usize {
+    let mut buf = vec![0u8; 1 << 16];
+    let mut n = 0;
+    loop {
+        match c.read(&mut buf).await {
+            Ok(0) | Err(_) => return n,
+            Ok(k) => n += k,
+        }
+    }
 }
 
 /// A 32 MiB blob referenced from a new thread; its download request.
@@ -187,8 +203,7 @@ async fn stalled_download(srv: &TestServer, req: &support::http::Req) -> TcpStre
 async fn blob_slots_cap(srv: &TestServer) {
     let req = big_blob(srv).await;
     let mut held = Vec::new();
-    // The default `blob_slots`.
-    for _ in 0..4 {
+    for _ in 0..BLOB_SLOTS {
         held.push(stalled_download(srv, &req).await);
     }
     busy(&srv.send(&req).await);
@@ -205,12 +220,28 @@ async fn subscribed_socket(srv: &TestServer) -> WsClient {
 }
 
 /// Sends `m`, then reads to the end: the close code if a close frame came (best effort),
-/// and the disconnect always, within the wait.
+/// and the transport's teardown always, within `close_grace` of the refused frame.
 async fn closed_after(srv: &TestServer, m: WsMessage) -> Option<u16> {
-    let mut ws = subscribed_socket(srv).await;
+    let ws = subscribed_socket(srv).await;
+    refused_with(ws, m).await
+}
+
+async fn refused_with(mut ws: WsClient, m: WsMessage) -> Option<u16> {
+    let at = Instant::now();
     // The server may close while the client is still sending; the outcome is read below.
     let _ = ws.ws.send(m).await;
     let (code, _) = ws.until_closed().await;
+    // After the close frame, the reply to it and then the end of the stream.
+    while let Some(Ok(_)) = tokio::time::timeout(Duration::from_secs(10), ws.ws.next())
+        .await
+        .expect("the transport ends within the wait")
+    {}
+    let bound = WsConfig::default().close_grace + Duration::from_millis(500);
+    assert!(
+        at.elapsed() < bound,
+        "torn down {:?} after the frame",
+        at.elapsed()
+    );
     code
 }
 
@@ -225,34 +256,34 @@ fn subscribe_text(ids: usize, len: usize) -> String {
 }
 
 async fn socket_frame_caps(srv: &TestServer) {
-    let cfg = WsConfig::default();
-    let max_subs = cfg.max_subscriptions;
-    assert_eq!((max_subs, cfg.max_message_bytes), (1024, 64 * 1024));
+    let max_subs = SUBSCRIPTIONS;
     // The last allowed subscription count, then the first refused.
     let mut ws = subscribed_socket(srv).await;
     let text = subscribe_text(max_subs, 0);
-    assert!(text.len() <= cfg.max_message_bytes);
+    assert!(text.len() <= MESSAGE_BYTES);
     ws.text(&text).await;
     match ws.next().await.expect("open") {
         WsServerMessage::Heads { heads } => assert!(heads.is_empty(), "none exist"),
         other => panic!("unexpected {other:?}"),
     }
     let text = subscribe_text(max_subs + 1, 0);
-    assert!(text.len() <= cfg.max_message_bytes);
+    assert!(text.len() <= MESSAGE_BYTES);
     assert_eq!(
         closed_after(srv, WsMessage::Text(text.into())).await,
         Some(1008)
     );
     // An inbound message of exactly the bound, then one byte over it.
     let mut ws = subscribed_socket(srv).await;
-    let exact = subscribe_text(1, cfg.max_message_bytes);
-    assert_eq!(exact.len(), cfg.max_message_bytes);
+    let exact = subscribe_text(1, MESSAGE_BYTES);
+    assert_eq!(exact.len(), MESSAGE_BYTES);
     ws.text(&exact).await;
     assert!(matches!(
         ws.next().await,
         Some(WsServerMessage::Heads { .. })
     ));
-    let over = subscribe_text(1, cfg.max_message_bytes + 1);
+    // One byte over: the server may close while the client is still writing, so the
+    // close code is asserted exactly in `oversized_message_closes_with_1009`.
+    let over = subscribe_text(1, MESSAGE_BYTES + 1);
     let code = closed_after(srv, WsMessage::Text(over.into())).await;
     assert!(matches!(code, Some(1009) | None), "{code:?}");
     // Binary and invalid frames.
@@ -291,18 +322,31 @@ async fn each_cap_at_its_boundary() {
     srv.stop().await;
 }
 
-/// All four blob slots held by clients that never read past the head: their connections
-/// end at the write stall, and the next download acquires a slot and completes.
+/// An inbound message over a small `max_message_bytes`, sent whole before the server
+/// reads it: close code 1009 exactly, then the teardown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_message_closes_with_1009() {
+    let srv = quiet(|c| c.ws.max_message_bytes = 64).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let ws = srv.ws(&owner).await;
+    let code = refused_with(ws, WsMessage::Text(subscribe_text(0, 65).into())).await;
+    assert_eq!(code, Some(1009));
+    srv.stop().await;
+}
+
+/// All four blob slots held by clients that never read past the head: a download is
+/// refused while they hold them; their connections end at the write stall, before the
+/// whole body was sent; and the next download acquires a slot and completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blob_slot_frees_after_a_stalled_client() {
     let srv = quiet(|c| c.write_stall_timeout = Duration::from_millis(500)).await;
     let req = big_blob(&srv).await;
+    let base = srv.server.tasks();
     let mut held = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..BLOB_SLOTS {
         held.push(stalled_download(&srv, &req).await);
     }
-    // While none is read the slots stay taken (the stall bound ends them); the first
-    // download after that succeeds.
+    busy(&srv.send(&req).await);
     let until = Instant::now() + Duration::from_secs(20);
     let r = loop {
         let r = srv.send(&req).await;
@@ -314,6 +358,19 @@ async fn blob_slot_frees_after_a_stalled_client() {
     };
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(r.body.len(), 32 * 1024 * 1024);
-    drop(held);
+    // Every stalled connection was ended by the server (its task is gone while the client
+    // still has not read), short of the body.
+    support::http::eventually(
+        Duration::from_secs(10),
+        "the stalled connections ended",
+        || srv.server.tasks() <= base,
+    )
+    .await;
+    for mut c in held {
+        let got = tokio::time::timeout(Duration::from_secs(10), read_rest(&mut c))
+            .await
+            .expect("the stalled connection ends within the wait");
+        assert!(got < 32 * 1024 * 1024, "the whole body arrived: {got}");
+    }
     srv.stop().await;
 }

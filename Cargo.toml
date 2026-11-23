@@ -76,6 +76,9 @@ tracing = "=0.1.44"
 http-body-util = "=0.1.5"
 # AbortHandle for the task registry and the split WebSocket halves (already in the lock through axum).
 futures-util = { version = "=0.3.34", default-features = false, features = ["sink", "std"] }
+# The error type axum's WebSocket wraps, matched by type for the 1009 close (the version
+# axum's `ws` feature locks; no defaults: no handshake code).
+tungstenite = { version = "=0.29.0", default-features = false }
 # Dev only: the WebSocket test client (the version axum's `ws` feature locks).
 tokio-tungstenite = "=0.29.0"
 # Dev only: the capturing log subscriber of the secret-redaction tests.

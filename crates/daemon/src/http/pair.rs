@@ -61,13 +61,16 @@ pub(crate) async fn pair_codes(
 }
 
 /// `POST /api/pair` (`Origin` present and matching) with `PairRequest { code }`: a body
-/// that is not an object, or has another member, is 400; a missing, malformed, unknown,
-/// spent, or expired code is 401.
+/// that is not a JSON object (an empty one included), or has another member, is 400; a
+/// missing, malformed, unknown, spent, or expired code is 401.
 pub(crate) async fn pair(ctx: WriteCtx, req: Request<Body>) -> Result<Response<Body>, ApiError> {
     let shared = ctx.shared().clone();
     let body = ctx
         .body_within(req.into_body(), shared.cfg.max_body_bytes)
         .await?;
+    if body.is_empty() {
+        return Err(ApiError::bad_request());
+    }
     let mut members = object_body(&body)?;
     let code = members.remove("code");
     if !members.is_empty() {
@@ -80,7 +83,7 @@ pub(crate) async fn pair(ctx: WriteCtx, req: Request<Body>) -> Result<Response<B
     // 1. The conditional removal: the code is spent from here on.
     let entry = shared
         .pair_codes
-        .take(&sha256(code), shared.cfg.clock.now())
+        .take(&sha256(code), &*shared.cfg.clock)
         .ok_or_else(ApiError::unauthorized)?;
     // 2. One write: the issuer verified, then the new owner token inserted.
     let token = TokenService::new(shared)

@@ -11,6 +11,7 @@ use std::time::Instant;
 use chaldea_core::auth::TokenKind;
 use chaldea_core::ids::{ThreadId, TokenId};
 
+use super::MonotonicClock;
 use super::auth::{PAIR_CODE_PREFIX, Secret, TICKET_PREFIX};
 
 /// Tickets held at once (design §2.4).
@@ -107,6 +108,9 @@ pub(crate) struct PairCodeEntry {
 #[derive(Default)]
 pub(crate) struct PairCodes {
     map: Mutex<HashMap<[u8; 32], PairCodeEntry>>,
+    /// Run once by the next `take` before it takes the lock (design §7 fault point).
+    #[cfg(test)]
+    pub(crate) before_take_lock: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl PairCodes {
@@ -123,10 +127,20 @@ impl PairCodes {
         Ok(secret)
     }
 
-    /// Removes the code only if it is present and `now < expires_at`, `now` sampled by the
-    /// caller at the removal: the code is spent from here on, whatever the exchange answers.
-    pub(crate) fn take(&self, sha256: &[u8; 32], now: Instant) -> Option<PairCodeEntry> {
+    /// Removes the code only if it is present and `now < expires_at`, with `now` read from
+    /// `clock` under the lock, so expiry is decided at the removal: the code is spent from
+    /// here on, whatever the exchange answers.
+    pub(crate) fn take(
+        &self,
+        sha256: &[u8; 32],
+        clock: &dyn MonotonicClock,
+    ) -> Option<PairCodeEntry> {
+        #[cfg(test)]
+        if let Some(f) = lock(&self.before_take_lock).take() {
+            f();
+        }
         let mut map = lock(&self.map);
+        let now = clock.now();
         if map.get(sha256).is_some_and(|e| now < e.expires_at) {
             map.remove(sha256)
         } else {

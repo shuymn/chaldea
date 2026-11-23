@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 
 use chaldea_core::auth::{Action, Grant, ThreadGraph, grant, self_plus};
 use chaldea_core::ids::{StreamId, ThreadId};
+use chaldea_core::payload::WorktreeChanged;
 
 use super::auth::Authorized;
 use crate::store::{ReadTx, StoreError};
@@ -47,6 +48,15 @@ impl ReadScope {
         match self {
             ReadScope::All => true,
             ReadScope::Threads(ts) => ts.contains(&t),
+        }
+    }
+
+    /// Whether the token may read the worktree `w`: every worktree for `All`; for an agent,
+    /// one whose current owner is in self+ (a human-owned one is not).
+    pub(crate) fn worktree(&self, w: &WorktreeChanged) -> bool {
+        match self {
+            ReadScope::All => true,
+            ReadScope::Threads(_) => w.owner_thread_id.is_some_and(|t| self.thread(t)),
         }
     }
 

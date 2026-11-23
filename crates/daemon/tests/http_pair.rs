@@ -231,9 +231,9 @@ async fn lost_after_restart() {
     srv.stop().await;
 }
 
-/// `POST /api/pair` takes exactly `{ "code" }`: another body shape is 400, a missing or
-/// malformed code 401, and neither spends the code. `POST /api/pair-codes` takes an empty
-/// body or `{}`.
+/// `POST /api/pair` takes exactly `{ "code" }`: another body shape (an empty body included)
+/// is 400, a missing or malformed code 401, and neither spends the code.
+/// `POST /api/pair-codes` takes an empty body or `{}`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn body_rules() {
     let srv = TestServer::start(Mounts::mvp()).await;
@@ -248,7 +248,7 @@ async fn body_rules() {
             (400, code("bad_request")),
         ),
         ("{}".to_owned(), (401, code("unauthorized"))),
-        (String::new(), (401, code("unauthorized"))),
+        (String::new(), (400, code("bad_request"))),
         (r#"{"code":5}"#.to_owned(), (401, code("unauthorized"))),
         (
             r#"{"code":"chdp_short"}"#.to_owned(),
