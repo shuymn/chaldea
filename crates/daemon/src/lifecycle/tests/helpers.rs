@@ -1056,15 +1056,10 @@ fn console_end_during_startup() {
             },
         );
     }
+    // A marked state directory and a store holding an `in_progress` receipt, made without a
+    // daemon (no port to race for).
     let dir = state();
-    let run = super::start(
-        foreground(&dir.path, Some(free_port())),
-        TestComponents::default(),
-        Arc::default(),
-    );
-    run.serving();
-    run.stop();
-    assert_eq!(run.join().code.code(), 0);
+    super::super::state_dir::prepare(&dir.path, "00000000-0000-4000-8000-0000000000aa").unwrap();
     let store = super::startup::open_store(&dir.path);
     super::settle(
         store
