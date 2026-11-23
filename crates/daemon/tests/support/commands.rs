@@ -5,11 +5,15 @@
 //!
 //! - `test_counter`: completed in its intent job, which appends one event and counts the
 //!   intents run; an optional `target` thread is checked against the `task set` grant.
-//! - `test_completed`: completed in its intent job with a fixed status and body.
+//! - `test_completed`: completed in its intent job with a fixed body and a status (201
+//!   unless the arguments name one).
 //! - `test_slow_effect`: a pending intent whose effect waits for the test's release when
-//!   armed, and can revoke the caller's token.
-//! - `test_refuse`: an intent that refuses, panics, or returns `Pending` without an effect.
+//!   armed, can revoke the caller's token, and answers a status or panics by its tag.
+//! - `test_refuse`: an intent that refuses (with a status in the refusal set or outside
+//!   it), panics, or writes and returns `Pending` without an effect.
 //! - `test_worktree_remove`: the `OwnWorktree` object check.
+//! - `test_long_deadline`: completed in its intent job, with a budget of its own
+//!   ([`LONG_DEADLINE`]).
 //!
 //! The gates block inside intent closures and effects on purpose; production intents
 //! capture data only (store §5).
@@ -19,12 +23,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use chaldea_core::auth::{
     Action, CommandSpec, Grant, ThreadGraph, grant, may_act_on_thread, may_remove_worktree,
     self_plus,
 };
 use chaldea_core::canonical::CanonicalJson;
 use chaldea_core::command::CommandResult;
+use chaldea_core::http::ErrorCode;
 use chaldea_core::ids::{ThreadId, TokenId, WorktreeId};
 use chaldea_daemon::http::{
     ApiError, Authorized, CommandEffect, CommandHandler, CommandRegistry, EffectRun, Intent,
@@ -65,7 +71,16 @@ pub static TEST_COMMANDS: &[CommandSpec] = &[
         action: Action::WorktreeRemove,
         owner_pr: 7,
     },
+    CommandSpec {
+        name: "test_long_deadline",
+        action: Action::Send,
+        owner_pr: 7,
+    },
 ];
+
+/// `test_long_deadline`'s budget, from its connection's first head byte; longer than the
+/// test servers' short deadline.
+pub const LONG_DEADLINE: Duration = Duration::from_secs(30);
 
 type SyncGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 type AsyncGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
@@ -130,6 +145,7 @@ pub fn registry(store: &Store, probe: &Arc<Probe>) -> CommandRegistry {
     }));
     r.register(Box::new(Refuse));
     r.register(Box::new(WorktreeRemove));
+    r.register(Box::new(LongDeadline));
     r
 }
 
@@ -225,6 +241,9 @@ impl CommandHandler for Counter {
 #[serde(deny_unknown_fields)]
 struct TextArgs {
     text: String,
+    /// The status to answer; 201 when absent.
+    #[serde(default)]
+    status: Option<u16>,
 }
 
 /// The body `test_completed` answers for `text`: status 201, non-ASCII bytes included.
@@ -249,7 +268,7 @@ impl CommandHandler for Completed {
             normalized,
             intent: Box::new(move |_tx, _auth, _ctx| {
                 Ok(Intent::Completed(CommandResult {
-                    http_status: 201,
+                    http_status: a.status.unwrap_or(201),
                     body: completed_body(&a.text),
                 }))
             }),
@@ -337,8 +356,15 @@ impl CommandEffect for SlowEffect {
                     .await
                     .unwrap();
             }
+            // Tags that answer a status outside the result set, or panic.
+            let http_status = match run.tag.as_str() {
+                "effect_408" => 408,
+                "effect_42" => 42,
+                "effect_panic" => panic!("test_slow_effect panics in its effect"),
+                _ => 200,
+            };
             CommandResult {
-                http_status: 200,
+                http_status,
                 body: slow_body(&run.tag),
             }
         })
@@ -352,7 +378,11 @@ impl CommandEffect for SlowEffect {
 enum How {
     /// Refused with 403 `forbidden`.
     Forbidden,
-    /// `Intent::Pending` from a handler without an effect.
+    /// Refused with 408, outside the refusal set.
+    Timeout,
+    /// Refused with 200, outside the refusal set.
+    Success,
+    /// Appends one event, then returns `Intent::Pending` from a handler without an effect.
     Pending,
     /// The intent panics.
     Panic,
@@ -375,9 +405,19 @@ impl CommandHandler for Refuse {
         let (a, normalized): (RefuseArgs, _) = parse(args)?;
         Ok(Prepared {
             normalized,
-            intent: Box::new(move |_tx, _auth, _ctx| match a.how {
+            intent: Box::new(move |tx, _auth, ctx| match a.how {
                 How::Forbidden => Err(refuse(ApiError::forbidden())),
-                How::Pending => Ok(Intent::Pending(EffectRun::new(()))),
+                How::Timeout => Err(refuse(ApiError::request_timeout())),
+                How::Success => Err(refuse(ApiError::new(StatusCode::OK, ErrorCode::Internal))),
+                How::Pending => {
+                    let id = ctx.command_id();
+                    let mut e = registered(ThreadId(id.0), false);
+                    e.command_id = Some(id);
+                    e.idempotency_key =
+                        chaldea_core::ids::IdempotencyKey(format!("command:{id}:1"));
+                    tx.append(vec![e])?;
+                    Ok(Intent::Pending(EffectRun::new(())))
+                }
                 How::Panic => panic!("test_refuse panics in its intent"),
             }),
         })
@@ -430,6 +470,37 @@ impl CommandHandler for WorktreeRemove {
                     ApiError::forbidden()
                 } else {
                     ApiError::not_found()
+                }))
+            }),
+        })
+    }
+}
+
+// ---- test_long_deadline -------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoArgs {}
+
+struct LongDeadline;
+
+impl CommandHandler for LongDeadline {
+    fn name(&self) -> &'static str {
+        "test_long_deadline"
+    }
+
+    fn deadline(&self) -> Option<Duration> {
+        Some(LONG_DEADLINE)
+    }
+
+    fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError> {
+        let (NoArgs {}, normalized) = parse(args)?;
+        Ok(Prepared {
+            normalized,
+            intent: Box::new(move |_tx, _auth, _ctx| {
+                Ok(Intent::Completed(CommandResult {
+                    http_status: 200,
+                    body: r#"{"long":true}"#.to_owned(),
                 }))
             }),
         })

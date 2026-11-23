@@ -34,7 +34,7 @@ tungstenite.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 tokio-tungstenite.workspace = true
 tracing-subscriber.workspace = true
 # The contract fixtures validate captured bodies against packages/contracts/schema.

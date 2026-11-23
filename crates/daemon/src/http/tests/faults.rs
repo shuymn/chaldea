@@ -40,6 +40,11 @@ pub(crate) struct Points {
     pub(crate) drop_notifications: AtomicBool,
     /// Held once by a command runner between its registration and its first submit.
     pub(crate) runner_gate: Mutex<Option<Gate>>,
+    /// Held once by a command's reply wait at the top of its loop, before it reads the
+    /// runner's progress.
+    pub(crate) progress_gate: Mutex<Option<Gate>>,
+    /// The server's clock at each receipt completion attempt, in order.
+    pub(crate) completion_attempts: Mutex<Vec<std::time::Instant>>,
     /// Taken by the next receipt completion attempt, which holds it inside its job on the
     /// writer thread.
     pub(crate) completion_hold: Mutex<Option<WriterHold>>,
@@ -62,7 +67,7 @@ impl WriterHold {
 }
 
 /// Arms a gate: the returned receiver fires when the gate is reached, and the waiter goes
-/// on once the returned sender is used or dropped.
+/// on once the returned sender is used or dropped, or after 20 s.
 fn arm(slot: &Mutex<Option<Gate>>) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
     let (reached_tx, reached_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
@@ -77,7 +82,7 @@ async fn pass(slot: &Mutex<Option<Gate>>) -> bool {
         return false;
     };
     let _ = reached.send(());
-    let _ = release.await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(20), release).await;
     true
 }
 
@@ -200,6 +205,29 @@ impl Points {
 
     pub(crate) async fn before_runner_submit(&self) {
         pass(&self.runner_gate).await;
+    }
+
+    /// Arms the progress gate, as [`Points::arm_removal_gate`].
+    pub(crate) fn arm_progress_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        arm(&self.progress_gate)
+    }
+
+    pub(crate) async fn before_progress_read(&self) {
+        pass(&self.progress_gate).await;
+    }
+
+    pub(crate) fn completion_attempt(&self, at: std::time::Instant) {
+        self.completion_attempts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(at);
+    }
+
+    pub(crate) fn completion_attempts(&self) -> Vec<std::time::Instant> {
+        self.completion_attempts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Arms the completion hold: the returned receiver gets a message when the next

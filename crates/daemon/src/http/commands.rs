@@ -79,11 +79,58 @@ pub trait CommandHandler: Send + Sync + 'static {
 
 /// A command's effect, run once by the runner after its intent committed.
 pub trait CommandEffect: Send + Sync {
-    /// Resolves to the command's terminal result. The owning PR guarantees that it resolves
-    /// within a bound it states, and that a result it returns for work that did not happen
-    /// (a timeout, a refusal) means the work can no longer happen later. The runner adds no
-    /// timeout of its own.
+    /// Resolves to the command's terminal result, whose status is in the result set
+    /// (design §2.8 "Statuses": 2xx, 4xx except 408, 500, 504; outside it, the runner
+    /// stores and answers 500 `internal`). The owning PR guarantees that it resolves within a bound it states, and
+    /// that a result it returns for work that did not happen (a refusal, or work that ran
+    /// out of its time) means the work can no longer happen later. Work that ran out of its
+    /// time is 504 with a code of the owning PR, never 408: 408 says the request's deadline
+    /// kept its intent from committing. The runner adds no timeout of its own.
     fn run(&self, run: EffectRun) -> BoxFuture<'static, CommandResult>;
+}
+
+/// The statuses a command result may have, from a completed intent or an effect: 2xx,
+/// 4xx except 408, 500, and 504. Each is stored and replayed byte for byte; 408 is the
+/// runner's own (the deadline kept the intent from committing), and 503 and the other
+/// codes would tell a client to retry a result that replays unchanged.
+fn result_status_allowed(status: u16) -> bool {
+    matches!(status, 200..=299 | 400..=407 | 409..=499 | 500 | 504)
+}
+
+/// The statuses a command's refusal may have (the intent job rolls back with it): 4xx
+/// except 408, and 5xx.
+fn refusal_status_allowed(status: StatusCode) -> bool {
+    (status.is_client_error() || status.is_server_error()) && status != StatusCode::REQUEST_TIMEOUT
+}
+
+/// `r`, or 500 `internal` when its status is outside the result set (a programming error
+/// of its handler).
+fn checked_result(command_id: CommandId, r: CommandResult) -> CommandResult {
+    if result_status_allowed(r.http_status) {
+        return r;
+    }
+    tracing::error!(%command_id, status = r.http_status, "command result status outside the result set");
+    let body = serde_json::to_string(&ApiError::internal().body()).unwrap_or_default();
+    CommandResult {
+        http_status: 500,
+        body,
+    }
+}
+
+/// An intent's refusal as the job's refusal: one outside the refusal set, or not an
+/// [`ApiError`], is 500 `internal`.
+fn checked_refusal(command_id: CommandId, e: JobError) -> JobError {
+    let JobError::Refused(r) = e else {
+        return e;
+    };
+    match r.downcast::<ApiError>() {
+        Ok(api) if refusal_status_allowed(api.status()) => refused(*api),
+        Ok(api) => {
+            tracing::error!(%command_id, status = api.status().as_u16(), "command refusal status outside the refusal set");
+            refused(ApiError::internal())
+        }
+        Err(_) => refused(ApiError::internal()),
+    }
 }
 
 /// What an intent closure gets besides the transaction and the verified token.
@@ -343,8 +390,13 @@ pub(crate) async fn dispatch(ctx: WriteCtx, req: Request<Body>) -> Result<Respon
     let body = ctx
         .body_within(req.into_body(), shared.cfg.max_body_bytes)
         .await?;
+    // The envelope and its `args` are objects; the derive alone would also read an array.
+    let raw: &RawValue = serde_json::from_slice(&body).map_err(|_| ApiError::bad_request())?;
+    if !raw.get().starts_with('{') {
+        return Err(ApiError::bad_request());
+    }
     let envelope: CommandRequest =
-        serde_json::from_slice(&body).map_err(|_| ApiError::bad_request())?;
+        serde_json::from_str(raw.get()).map_err(|_| ApiError::bad_request())?;
     if !envelope.args.get().starts_with('{') {
         return Err(ApiError::bad_request());
     }
@@ -404,11 +456,14 @@ pub(crate) async fn run(
     await_reply(shared, rx, reply_by).await
 }
 
-/// The request's wait. A reply time reached (the server's clock at or past `reply_by`,
-/// checked before each poll, or the timer fired) decides from the progress then: an
-/// intent committed is 409 `in_progress`, anything else 503 `outcome_unknown` (a final
-/// reply taken at or after `reply_by` included, so a late `Expired` is never 408). A
-/// runner gone without a final reply (aborted at the drain deadline) is the same.
+/// The request's wait. Each turn reads the progress, then the server's clock: a `Done`
+/// read while the clock is before `reply_by` is the reply. Otherwise the reply time has
+/// been reached (the clock read after the progress at or past `reply_by`, or the timer
+/// fired), and the progress read then decides: an intent committed is 409 `in_progress`
+/// (the receipt exists and is `in_progress` when read), anything else 503
+/// `outcome_unknown` (a `Done` read at or after `reply_by` included, so a late `Expired`
+/// is never 408). A runner gone without a final reply (aborted at the drain deadline) is
+/// the same.
 async fn await_reply(
     shared: &Shared,
     mut rx: watch::Receiver<Progress>,
@@ -421,8 +476,11 @@ async fn await_reply(
         .before_cutoff_wait(|| matches!(*rx.borrow(), Progress::Done(_)))
         .await;
     loop {
-        let late = shared.passed(reply_by);
+        #[cfg(test)]
+        shared.faults.before_progress_read().await;
         let progress = rx.borrow_and_update().clone();
+        // After the read: a reply taken at or past the reply time is never sent as is.
+        let late = shared.passed(reply_by);
         match progress {
             Progress::Done(r) if !late => return r.map(result_response),
             _ if late => return Err(at_reply_time(&progress)),
@@ -506,8 +564,10 @@ async fn drive(
             return Ok(Begun::Lookup(lookup));
         }
         let mut ctx = CommandCtx { command_id };
-        match intent(tx, &auth, &mut ctx)? {
+        let decided = intent(tx, &auth, &mut ctx).map_err(|e| checked_refusal(command_id, e));
+        match decided? {
             Intent::Completed(r) => {
+                let r = checked_result(command_id, r);
                 tx.receipt_complete(command_id, &r)?;
                 Ok(Begun::Completed(r))
             }
@@ -540,6 +600,7 @@ async fn drive(
             .store_fatal(StoreFatal::ReceiptUncompleted { command_id });
         return Err(ApiError::outcome_unknown());
     };
+    let result = checked_result(command_id, result);
     if complete(shared, command_id, &result).await {
         Ok(result)
     } else {
@@ -587,6 +648,8 @@ async fn complete(shared: &Shared, command_id: CommandId, result: &CommandResult
             return false;
         }
         let not_after = (now + COMPLETION_ATTEMPT).min(budget_end);
+        #[cfg(test)]
+        shared.faults.completion_attempt(now);
         let r = result.clone();
         #[cfg(test)]
         let hold = shared.faults.take_completion_hold();

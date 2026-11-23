@@ -15,7 +15,7 @@ use chaldea_core::payload::{WorktreeChanged, WorktreeState};
 use chaldea_daemon::http::Mounts;
 use chaldea_daemon::store::TokenSelector;
 use support::commands::{completed_body, slow_body};
-use support::http::{Reply, TestServer, eventually, send};
+use support::http::{Reply, TestServer, eventually, send, settled};
 use support::{event, registered_under, reserved, soon, started};
 
 fn cid(n: u128) -> CommandId {
@@ -104,6 +104,19 @@ async fn replay_is_byte_equal() {
     assert_eq!((again.status, &again.body), (first.status, &first.body));
     assert_eq!(probe.intents(), 1);
     assert_eq!(events_of(&srv, cid(2)), 1);
+
+    // A stored non-2xx result replays the same way.
+    let refusal = srv.command(
+        "test_completed",
+        &owner,
+        cid(3),
+        r#"{"text":"no","status":409}"#,
+    );
+    let first = srv.send(&refusal).await;
+    assert_eq!(first.status, 409, "{first:?}");
+    assert_eq!(first.body, completed_body("no").as_bytes());
+    let again = srv.send(&refusal).await;
+    assert_eq!((again.status, &again.body), (first.status, &first.body));
     srv.stop().await;
 }
 
@@ -123,6 +136,7 @@ async fn other_token_conflicts() {
             tx.receipt_begin(crashed, owner_id, [7; 32])?;
             Ok(tx.receipts_mark_unknown_after_crash()?)
         })
+        .map(settled)
         .unwrap()
         .await
         .unwrap();
@@ -162,7 +176,8 @@ async fn other_token_conflicts() {
 }
 
 /// The same token with another identity (other arguments, or another command name) gets
-/// `conflict`.
+/// `conflict`, whatever the receipt's state: completed, `in_progress`, or
+/// `unknown_after_crash`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn other_identity_conflicts() {
     let (srv, probe) = TestServer::with_commands(|_| {}).await;
@@ -181,6 +196,29 @@ async fn other_identity_conflicts() {
         assert_eq!(r.body, br#"{"code":"conflict"}"#);
     }
     assert_eq!(probe.intents(), 1);
+    // In progress: the effect is held; then marked as at a restart.
+    let (effect_reached, release) = probe.hold_effect();
+    let running = spawn_send(
+        &srv,
+        &srv.command("test_slow_effect", &owner, cid(2), r#"{"tag":"i"}"#),
+    );
+    reached(effect_reached).await;
+    let other = srv.command("test_slow_effect", &owner, cid(2), r#"{"tag":"j"}"#);
+    let r = srv.send(&other).await;
+    assert_eq!(r.outcome(), (409, code("conflict")), "in progress");
+    srv.store
+        .store()
+        .submit(soon(), |tx| Ok(tx.receipts_mark_unknown_after_crash()?))
+        .map(settled)
+        .unwrap()
+        .await
+        .unwrap();
+    let r = srv.send(&other).await;
+    assert_eq!(r.outcome(), (409, code("conflict")), "unknown after crash");
+    assert_eq!(r.body, br#"{"code":"conflict"}"#);
+    drop(release);
+    joined(running).await;
+    assert_eq!(probe.effects(), 1);
     srv.stop().await;
 }
 
@@ -244,38 +282,6 @@ async fn effect_holds_receipt_in_progress() {
     srv.stop().await;
 }
 
-/// The result is replied only after its completion committed: with the completion queued
-/// behind a held writer, the waiting request gets 409 `in_progress` at its reply time and
-/// the receipt is still `in_progress`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stored_result_follows_its_completion() {
-    let (srv, probe) = TestServer::with_commands(|_| {}).await;
-    let owner = srv.token(TokenKind::Owner, None, None).await;
-    let req = srv.command("test_slow_effect", &owner, cid(1), r#"{"tag":"c"}"#);
-    let (effect_reached, release) = probe.hold_effect();
-    let first = spawn_send(&srv, &req);
-    reached(effect_reached).await;
-    let writer = srv.hold_writer().await;
-    // The effect resolves now; its completion waits behind the held writer.
-    release.send(()).unwrap();
-    assert_eq!(joined(first).await.outcome(), (409, code("in_progress")));
-    assert_eq!(
-        srv.receipt(cid(1)).unwrap().status,
-        ReceiptStatus::InProgress
-    );
-    writer.send(()).unwrap();
-    eventually(Duration::from_secs(10), "the receipt completes", || {
-        srv.receipt(cid(1)).unwrap().status != ReceiptStatus::InProgress
-    })
-    .await;
-    let replay = srv.send(&req).await;
-    assert_eq!(
-        (replay.status, replay.body.as_slice()),
-        (200, slow_body("c").as_bytes())
-    );
-    srv.stop().await;
-}
-
 /// A receipt `unknown_after_crash` answers 409 `unknown_after_crash` and nothing runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_after_crash() {
@@ -289,6 +295,7 @@ async fn unknown_after_crash() {
     srv.store
         .store()
         .submit(soon(), |tx| Ok(tx.receipts_mark_unknown_after_crash()?))
+        .map(settled)
         .unwrap()
         .await
         .unwrap();
@@ -318,9 +325,8 @@ async fn retry_after_restart_outcomes() {
             .bytes(),
     );
     let running = tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
         let mut s = support::http::connect(port).await;
-        s.write_all(&bytes).await.unwrap();
+        support::http::write(&mut s, &bytes).await;
         support::http::read_to_end(&mut s).await
     });
     reached(effect_reached).await;
@@ -369,7 +375,8 @@ async fn duplicate_member_is_400_without_receipt() {
         r#"{"n":1,"n":2}"#,
         r#"{"n":1,"env":{"a":"x","a":"y"}}"#,
         r#"{"n":1,"layers":[{"k":1},{"k":1,"k":2}]}"#,
-        r#"{"n":1,"env":{"a":"x","a":"y"}}"#,
+        // Equal only after JSON unescaping.
+        r#"{"n":1,"env":{"a":"x","\u0061":"y"}}"#,
     ];
     for (i, args) in cases.iter().enumerate() {
         let id = cid(i as u128);
@@ -393,8 +400,8 @@ async fn duplicate_member_is_400_without_receipt() {
     srv.stop().await;
 }
 
-/// `args` that is not an object, or an envelope that does not decode, is 400 `bad_request`
-/// with no receipt.
+/// `args` that is not an object, or an envelope that does not decode or is not an object,
+/// is 400 `bad_request` with no receipt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn args_must_be_an_object() {
     let (srv, probe) = TestServer::with_commands(|_| {}).await;
@@ -416,12 +423,15 @@ async fn args_must_be_an_object() {
         r#"{"command_id":"not-a-uuid","args":{"n":1}}"#.to_owned(),
         format!(r#"{{"command_id":"{}","args":{{"n":1}}"#, cid(8)),
         String::new(),
+        // The envelope's fields as an array.
+        format!(r#"["{}",{{"n":1}}]"#, cid(10)),
     ] {
         let r = srv
             .send(&srv.req("POST", path).bearer(&owner).body(body.as_bytes()))
             .await;
         assert_eq!(r.outcome(), (400, code("bad_request")), "{body}");
     }
+    assert_eq!(srv.receipt(cid(10)), None);
     assert_eq!(probe.intents(), 0);
     srv.stop().await;
 }
@@ -478,7 +488,7 @@ async fn revoked_between_guard_and_job() {
     })
     .await;
     writer.send(()).unwrap();
-    assert_eq!(revoke.await.unwrap(), 1);
+    assert_eq!(settled(revoke).await.unwrap(), 1);
     assert_eq!(joined(r).await.outcome(), (401, code("unauthorized")));
     assert_eq!(srv.receipt(cid(1)), None);
     assert_eq!((probe.intents(), events_of(&srv, cid(1))), (0, 0));
@@ -628,6 +638,7 @@ async fn writer_held_is_outcome_unknown() {
     srv.store
         .store()
         .submit(soon(), |_tx| Ok(()))
+        .map(settled)
         .unwrap()
         .await
         .unwrap();
@@ -640,14 +651,13 @@ async fn writer_held_is_outcome_unknown() {
 /// intent, runs the effect once, and completes the receipt; a retry replays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disconnect_before_outcome() {
-    use tokio::io::AsyncWriteExt;
     let (srv, probe) = TestServer::with_commands(|_| {}).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let req = srv.command("test_slow_effect", &owner, cid(1), r#"{"tag":"d"}"#);
     let writer = srv.hold_writer().await;
     let base = srv.server.tasks();
     let mut conn = support::http::connect(srv.port).await;
-    conn.write_all(&req.bytes()).await.unwrap();
+    support::http::write(&mut conn, &req.bytes()).await;
     eventually(Duration::from_secs(10), "the runner is registered", || {
         srv.server.tasks() >= base + 2
     })
@@ -665,5 +675,132 @@ async fn disconnect_before_outcome() {
         (200, slow_body("d").as_bytes())
     );
     assert_eq!(probe.effects(), 1);
+    srv.stop().await;
+}
+
+/// The body of 500 `internal`.
+const INTERNAL: &[u8] = br#"{"code":"internal"}"#;
+
+/// An effect that returns 408 after its intent committed: the result is stored and answered
+/// as 500 `internal`, on the first reply and on the replay; the effect ran once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_effect_cannot_answer_408() {
+    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let req = srv.command(
+        "test_slow_effect",
+        &owner,
+        cid(1),
+        r#"{"tag":"effect_408"}"#,
+    );
+    let first = srv.send(&req).await;
+    let replay = srv.send(&req).await;
+    assert_eq!(probe.effects(), 1);
+    assert_eq!(
+        (first.status, first.body.as_slice()),
+        (500, INTERNAL),
+        "{:?}",
+        srv.receipt(cid(1))
+    );
+    assert_eq!((replay.status, &replay.body), (first.status, &first.body));
+    assert_eq!(
+        srv.receipt(cid(1)).unwrap().status,
+        ReceiptStatus::Completed(completed(&first))
+    );
+    srv.stop().await;
+}
+
+/// A completed intent's or an effect's status outside the result set (408, 503, 302, 42) is
+/// stored and answered as 500 `internal`, and replays as such; a refusal outside the
+/// refusal set (408, 200) is 500 `internal` with no receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn statuses_outside_the_sets_are_500() {
+    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let mut stored = Vec::new();
+    for (i, status) in [408, 503, 302, 42].into_iter().enumerate() {
+        let args = format!(r#"{{"text":"s","status":{status}}}"#);
+        stored.push((cid(i as u128), "test_completed", args));
+    }
+    stored.push((
+        cid(9),
+        "test_slow_effect",
+        r#"{"tag":"effect_42"}"#.to_owned(),
+    ));
+    for (id, name, args) in &stored {
+        let req = srv.command(name, &owner, *id, args);
+        let first = srv.send(&req).await;
+        assert_eq!(
+            (first.status, first.body.as_slice()),
+            (500, INTERNAL),
+            "{args}"
+        );
+        assert_eq!(
+            srv.receipt(*id).unwrap().status,
+            ReceiptStatus::Completed(completed(&first)),
+            "{args}"
+        );
+        let replay = srv.send(&req).await;
+        assert_eq!(
+            (replay.status, &replay.body),
+            (first.status, &first.body),
+            "{args}"
+        );
+    }
+    assert_eq!(probe.effects(), 1);
+    for (i, how) in ["timeout", "success"].into_iter().enumerate() {
+        let id = cid(20 + i as u128);
+        let args = format!(r#"{{"how":"{how}"}}"#);
+        let r = srv
+            .send(&srv.command("test_refuse", &owner, id, &args))
+            .await;
+        assert_eq!((r.status, r.body.as_slice()), (500, INTERNAL), "{how}");
+        assert_eq!(srv.receipt(id), None, "{how}");
+    }
+    srv.stop().await;
+}
+
+/// An effect that panics: 503 `outcome_unknown`, `ReceiptUncompleted`, the receipt stays
+/// `in_progress` and a retry gets 409 `in_progress`; after the restart marks it, 409
+/// `unknown_after_crash`. The effect ran once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panicking_effect_is_reconciled() {
+    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let id = cid(1);
+    let args = r#"{"tag":"effect_panic"}"#;
+    let req = srv.command("test_slow_effect", &owner, id, args);
+    assert_eq!(
+        srv.send(&req).await.outcome(),
+        (503, code("outcome_unknown"))
+    );
+    assert_eq!(srv.receipt(id).unwrap().status, ReceiptStatus::InProgress);
+    assert_eq!(srv.send(&req).await.outcome(), (409, code("in_progress")));
+    assert_eq!((probe.intents(), probe.effects()), (1, 1));
+    assert_eq!(
+        *srv.sink.0.lock().unwrap(),
+        [chaldea_daemon::http::StoreFatal::ReceiptUncompleted { command_id: id }]
+    );
+    // The restart: the store reopens and marks what was in progress.
+    let (_, mut store) = srv.into_store(Duration::from_secs(10)).await;
+    let store = tokio::task::spawn_blocking(move || {
+        store.reopen();
+        let marked = store
+            .run(|tx| Ok(tx.receipts_mark_unknown_after_crash()?))
+            .unwrap();
+        assert_eq!(marked, 1);
+        store
+    })
+    .await
+    .unwrap();
+    let (srv, probe2) = TestServer::with_commands_on(store, |_| {}).await;
+    let r = srv
+        .send(&srv.command("test_slow_effect", &owner, id, args))
+        .await;
+    assert_eq!(r.outcome(), (409, code("unknown_after_crash")));
+    assert_eq!(
+        (probe.effects(), probe2.intents(), probe2.effects()),
+        (1, 0, 0)
+    );
     srv.stop().await;
 }

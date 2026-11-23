@@ -17,7 +17,7 @@ use chaldea_daemon::http::{
     CommandRegistry, HttpConfig, HttpServer, HttpShutdownReport, LifecycleSink, MonotonicClock,
     Mounts, ServeHandle, StoreFatal, TokenService,
 };
-use chaldea_daemon::store::{NewEvent, TokenSelector};
+use chaldea_daemon::store::{NewEvent, TokenSelector, WriteError, WriteTicket};
 use futures_util::{SinkExt, StreamExt};
 use sha2::Digest as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -210,6 +210,7 @@ impl TestServer {
         self.store
             .store()
             .submit(soon(), move |tx| Ok(tx.append(events)?))
+            .map(settled)
             .unwrap()
             .await
             .unwrap();
@@ -227,6 +228,7 @@ impl TestServer {
         self.store
             .store()
             .submit(soon(), move |tx| Ok(tx.token_insert(row)?))
+            .map(settled)
             .unwrap()
             .await
             .unwrap();
@@ -416,6 +418,7 @@ impl TestServer {
             .submit(soon(), move |tx| {
                 Ok(tx.token_revoke(TokenSelector::Token(id))?)
             })
+            .map(settled)
             .unwrap()
             .await
             .unwrap();
@@ -764,13 +767,32 @@ pub fn parse(bytes: &[u8], end: Option<io::ErrorKind>) -> Reply {
 /// Connects, writes `bytes`, and reads the reply to EOF.
 pub async fn send(port: u16, bytes: &[u8]) -> Reply {
     let mut s = connect(port).await;
-    s.write_all(bytes).await.unwrap();
+    write(&mut s, bytes).await;
     let (out, end) = read_to_end(&mut s).await;
     parse(&out, end)
 }
 
+/// Awaits a write's ticket within [`CLIENT_WAIT`].
+pub async fn settled<R>(t: WriteTicket<R>) -> Result<R, WriteError> {
+    tokio::time::timeout(CLIENT_WAIT, t)
+        .await
+        .expect("the writer replied within the client wait")
+}
+
+/// Connects within [`CLIENT_WAIT`].
 pub async fn connect(port: u16) -> TcpStream {
-    TcpStream::connect(("127.0.0.1", port)).await.unwrap()
+    tokio::time::timeout(CLIENT_WAIT, TcpStream::connect(("127.0.0.1", port)))
+        .await
+        .expect("connected within the client wait")
+        .unwrap()
+}
+
+/// Writes all of `bytes` within [`CLIENT_WAIT`].
+pub async fn write(s: &mut TcpStream, bytes: &[u8]) {
+    tokio::time::timeout(CLIENT_WAIT, s.write_all(bytes))
+        .await
+        .expect("written within the client wait")
+        .unwrap();
 }
 
 /// Every row of every table of the store at `path`, through a separate read-only
