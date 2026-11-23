@@ -617,7 +617,7 @@ impl ReadTx<'_> {
     pub fn buffered_launches(&self) -> Result<Vec<LaunchId>, StoreError>;
     pub fn buffered_summary(&self, l: LaunchId) -> Result<BufferedSummary, StoreError>;  // count, body bytes, MIN(received_at)
     pub fn max_receipt_ordinal(&self, l: LaunchId) -> Result<u64, StoreError>;           // 0 when none
-    pub fn binding_receipt_ordinal(&self, l: LaunchId) -> Result<Option<u64>, StoreError>;  // the delivery recorded with the launch's latest session_bound
+    pub fn binding_receipt_ordinal(&self, t: ThreadId, l: LaunchId) -> Result<Option<u64>, StoreError>;  // the delivery recorded with the launch's latest session_bound in t's stream
     pub fn hook_emit_in_thread(&self, t: ThreadId, emit: Uuid) -> Result<bool, StoreError>;  // a delivery of any launch of `t` took `emit`
     pub fn schema_info(&self) -> Result<SchemaInfo, StoreError>;   // application_id, user_version, projection_version, SQLite version
     pub fn integrity_check(&self, max_errors: u32) -> Result<Vec<String>, StoreError>;  // PRAGMA integrity_check(N); empty = ok
