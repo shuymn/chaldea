@@ -237,7 +237,10 @@ impl TestServer {
             })
             .unwrap();
         tokio::spawn(ticket);
-        entered.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), entered)
+            .await
+            .expect("the writer runs the holding job within 10 s")
+            .unwrap();
         release
     }
 

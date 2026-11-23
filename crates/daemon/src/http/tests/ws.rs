@@ -205,7 +205,13 @@ fn nudge_reads_the_token_and_revocation_ends() {
 
 async fn redeem_status(srv: &TestServer, ticket: &str) -> u16 {
     let url = format!("ws://127.0.0.1:{}/api/ws?ticket={ticket}", srv.port);
-    match tokio_tungstenite::connect_async(url).await {
+    let done = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio_tungstenite::connect_async(url),
+    )
+    .await
+    .expect("the redemption's handshake ends within 10 s");
+    match done {
         Ok((_, resp)) => resp.status().as_u16(),
         Err(tokio_tungstenite::tungstenite::Error::Http(r)) => r.status().as_u16(),
         Err(e) => panic!("{e}"),
