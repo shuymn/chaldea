@@ -18,4 +18,5 @@
 #[cfg(test)]
 extern crate self as chaldea_daemon;
 
+pub mod http;
 pub mod store;

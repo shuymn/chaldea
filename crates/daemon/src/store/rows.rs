@@ -138,15 +138,8 @@ pub struct BlobBody {
     pub media_type: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TokenKind {
-    Owner,
-    Agent,
-    Rescue,
-    Hook,
-    Extension,
-}
+/// The token kinds are `core::auth`'s, the one definition the HTTP guard and the store share.
+pub use chaldea_core::auth::TokenKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenRow {

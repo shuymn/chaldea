@@ -1,0 +1,243 @@
+{
+  "$defs": {
+    "Agent": {
+      "description": "The CLI a thread runs.",
+      "enum": [
+        "claude",
+        "codex"
+      ],
+      "type": "string"
+    },
+    "AttentionCause": {
+      "description": "One reason a thread needs a human, each with its own clearing event (§2.2 \"Attention\").",
+      "oneOf": [
+        {
+          "description": "No `SessionStart` 20 s after `launch_started` of a non-manual launch.",
+          "properties": {
+            "kind": {
+              "const": "session_start_timeout",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An expected Codex `Hooks need review` after a CLI upgrade.",
+          "properties": {
+            "kind": {
+              "const": "startup_stall",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "That input entered `unconfirmed`.",
+          "properties": {
+            "input_id": {
+              "$ref": "#/$defs/InputId"
+            },
+            "kind": {
+              "const": "input_unconfirmed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "input_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "That input stayed `queued` for 60 s.",
+          "properties": {
+            "input_id": {
+              "$ref": "#/$defs/InputId"
+            },
+            "kind": {
+              "const": "input_gate_timeout",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "input_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A resume was refused because the old launch's death is not confirmed.",
+          "properties": {
+            "kind": {
+              "const": "resume_blocked",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Epoch": {
+      "description": "Random id stored at database creation; a change tells a client to resync (§2.4).",
+      "type": "string"
+    },
+    "InputId": {
+      "description": "One prompt sent through `chaldea send`, the PWA, or `surface_action` (§2.3).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "OpenAgent": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Agent"
+        },
+        {
+          "type": "string"
+        }
+      ],
+      "description": "A known value, or a string this reader does not know."
+    },
+    "ProcessState": {
+      "enum": [
+        "starting",
+        "running",
+        "stopping",
+        "exited"
+      ],
+      "type": "string"
+    },
+    "TaskState": {
+      "enum": [
+        "none",
+        "active",
+        "blocked",
+        "completed",
+        "failed",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "ThreadId": {
+      "description": "A thread: one agent conversation across all its launches.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "ThreadInfo": {
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/OpenAgent"
+        },
+        "attention": {
+          "description": "Sorted.",
+          "items": {
+            "$ref": "#/$defs/AttentionCause"
+          },
+          "type": "array"
+        },
+        "closed": {
+          "type": "boolean"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "parent_thread_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "process_state": {
+          "$ref": "#/$defs/ProcessState"
+        },
+        "role": {
+          "$ref": "#/$defs/ThreadRole"
+        },
+        "task_state": {
+          "$ref": "#/$defs/TaskState"
+        },
+        "thread_id": {
+          "$ref": "#/$defs/ThreadId"
+        },
+        "turn_state": {
+          "$ref": "#/$defs/TurnState"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "thread_id",
+        "agent",
+        "cwd",
+        "workspace_id",
+        "role",
+        "closed",
+        "process_state",
+        "turn_state",
+        "task_state",
+        "attention"
+      ],
+      "type": "object"
+    },
+    "ThreadRole": {
+      "oneOf": [
+        {
+          "enum": [
+            "standard"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "rescue",
+          "description": "Spawned by the owner with `--role rescue`; holds a Rescue token (§2.5).",
+          "type": "string"
+        }
+      ]
+    },
+    "TurnState": {
+      "enum": [
+        "unknown",
+        "idle",
+        "running",
+        "awaiting_approval"
+      ],
+      "type": "string"
+    },
+    "WorkspaceId": {
+      "description": "Derived from the canonical path of the repository's common git directory,\nor of the cwd outside git (§2.1).",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The body of `GET /api/threads`: the threads the token can read.",
+  "properties": {
+    "epoch": {
+      "$ref": "#/$defs/Epoch"
+    },
+    "threads": {
+      "items": {
+        "$ref": "#/$defs/ThreadInfo"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "epoch",
+    "threads"
+  ],
+  "title": "ThreadsResponse",
+  "type": "object"
+}
