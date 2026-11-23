@@ -41,6 +41,8 @@ tracing-subscriber.workspace = true
 chaldea-pty-runtime = { path = "../pty-runtime", features = ["fake"] }
 proptest.workspace = true
 tempfile.workspace = true
+# Paused-clock tests (the runtime features are normal dependencies above).
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
 # The contract fixtures validate captured bodies against packages/contracts/schema.
 jsonschema.workspace = true

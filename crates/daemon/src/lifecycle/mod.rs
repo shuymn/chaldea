@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
 
-use crate::http::{HttpServer, LifecycleSink, Mounts};
+use crate::http::{CommandRegistry, HttpServer, LifecycleSink, Mounts};
 use crate::store::{JobError, Store, WriteTx};
 
 pub use files::{
@@ -181,10 +181,13 @@ pub struct BuildCtx {
     pub state_dir: PathBuf,
 }
 
-/// What the components built: the HTTP mounts and the shutdown participants (7c adds the
-/// `CommandRegistry`, design §2.14).
+/// What the components built: the HTTP mounts, the command handlers, and the shutdown
+/// participants (design §2.14).
 pub struct Built {
     pub mounts: Mounts,
+    /// Passed to `HttpServer::new` at step 11; PR 8's is [`CommandRegistry::mvp`] (every MVP
+    /// command answers 501 until its owning PR registers a handler).
+    pub commands: CommandRegistry,
     pub participants: Vec<Box<dyn ShutdownParticipant>>,
 }
 
@@ -208,7 +211,7 @@ pub trait Components: Send + 'static {
     }
 }
 
-/// PR 8's components: the receipts reconciler and [`Mounts::mvp`].
+/// PR 8's components: the receipts reconciler, [`Mounts::mvp`], and [`CommandRegistry::mvp`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MvpComponents;
 
@@ -230,6 +233,7 @@ impl Components for MvpComponents {
     fn build(&mut self, _ctx: &BuildCtx) -> Built {
         Built {
             mounts: Mounts::mvp(),
+            commands: CommandRegistry::mvp(),
             participants: Vec::new(),
         }
     }

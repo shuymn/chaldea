@@ -113,6 +113,13 @@ jobs:
           feats="$(cargo tree -p chaldea-daemon -e features --prefix none -i tokio)"
           ! grep -q '^tokio feature "process"' <<<"$feats"
 
+      # The daemon's own build (no dev-dependencies) parses decimals with serde_json's
+      # `float_roundtrip`, which command request identity relies on (http-surface §2.8).
+      - name: Check serde_json features
+        run: |
+          deps="$(cargo tree -p chaldea-daemon -e normal,features --prefix none)"
+          grep -Fxq 'serde_json feature "float_roundtrip"' <<<"$deps"
+
       # testkit may depend on no workspace crate other than core (mvp-design §3).
       - name: Check testkit dependencies
         run: |

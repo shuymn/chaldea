@@ -25,6 +25,8 @@ pub(crate) struct Points {
     pub(crate) accept_errors: Mutex<VecDeque<io::ErrorKind>>,
     /// Write jobs `run_write` submitted to the store.
     pub(crate) submits: AtomicUsize,
+    /// The `not_after` of each job `run_write` submitted, in order.
+    pub(crate) submitted_not_afters: Mutex<Vec<std::time::Instant>>,
     /// Held once by an upgrade admission between its final read and the ticket removal.
     pub(crate) removal_gate: Mutex<Option<Gate>>,
     /// Held once by a read's or a write reply's waiter before it first polls its result
@@ -38,10 +40,41 @@ pub(crate) struct Points {
     pub(crate) socket_send_gate: Mutex<Option<Gate>>,
     /// While set, sockets drop the store's commit notifications.
     pub(crate) drop_notifications: AtomicBool,
+    /// Held once by a command runner between its registration and its first submit.
+    pub(crate) runner_gate: Mutex<Option<Gate>>,
+    /// Held once by a command's reply wait at the top of its loop, before it reads the
+    /// runner's progress.
+    pub(crate) progress_gate: Mutex<Option<Gate>>,
+    /// The server's clock at each receipt completion attempt's admission, in order.
+    pub(crate) completion_attempts: Mutex<Vec<std::time::Instant>>,
+    /// Each pause between completion attempts, in order: the server's clock when it was
+    /// scheduled and the instant it wakes at.
+    pub(crate) completion_pauses: Mutex<Vec<(std::time::Instant, std::time::Instant)>>,
+    /// Connections whose first byte was read (the request origin recorded).
+    pub(crate) first_bytes: AtomicUsize,
+    /// Taken by the next receipt completion attempt, which holds it inside its job on the
+    /// writer thread.
+    pub(crate) completion_hold: Mutex<Option<WriterHold>>,
+}
+
+/// A hold inside a write job, on the writer thread: tells the test it was reached, then
+/// waits (at most 20 s) for the release.
+pub(crate) struct WriterHold {
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl WriterHold {
+    pub(crate) fn hold(self) {
+        let _ = self.reached.send(());
+        let _ = self
+            .release
+            .recv_timeout(std::time::Duration::from_secs(20));
+    }
 }
 
 /// Arms a gate: the returned receiver fires when the gate is reached, and the waiter goes
-/// on once the returned sender is used or dropped.
+/// on once the returned sender is used or dropped, or after 20 s.
 fn arm(slot: &Mutex<Option<Gate>>) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
     let (reached_tx, reached_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
@@ -56,7 +89,7 @@ async fn pass(slot: &Mutex<Option<Gate>>) -> bool {
         return false;
     };
     let _ = reached.send(());
-    let _ = release.await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(20), release).await;
     true
 }
 
@@ -125,8 +158,19 @@ impl Points {
             .map(io::Error::from)
     }
 
-    pub(crate) fn write_submitted(&self) {
+    pub(crate) fn write_submitted(&self, not_after: std::time::Instant) {
         self.submits.fetch_add(1, Ordering::SeqCst);
+        self.submitted_not_afters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(not_after);
+    }
+
+    pub(crate) fn submitted_not_afters(&self) -> Vec<std::time::Instant> {
+        self.submitted_not_afters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn submits(&self) -> usize {
@@ -170,6 +214,85 @@ impl Points {
 
     pub(crate) async fn before_socket_send(&self) {
         pass(&self.socket_send_gate).await;
+    }
+
+    /// Arms the runner gate, as [`Points::arm_removal_gate`].
+    pub(crate) fn arm_runner_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        arm(&self.runner_gate)
+    }
+
+    pub(crate) async fn before_runner_submit(&self) {
+        pass(&self.runner_gate).await;
+    }
+
+    /// Arms the progress gate, as [`Points::arm_removal_gate`].
+    pub(crate) fn arm_progress_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        arm(&self.progress_gate)
+    }
+
+    pub(crate) async fn before_progress_read(&self) {
+        pass(&self.progress_gate).await;
+    }
+
+    pub(crate) fn completion_attempt(&self, at: std::time::Instant) {
+        self.completion_attempts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(at);
+    }
+
+    pub(crate) fn completion_attempts(&self) -> Vec<std::time::Instant> {
+        self.completion_attempts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn completion_pause(&self, from: std::time::Instant, wake: std::time::Instant) {
+        self.completion_pauses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((from, wake));
+    }
+
+    pub(crate) fn completion_pauses(&self) -> Vec<(std::time::Instant, std::time::Instant)> {
+        self.completion_pauses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn first_byte_read(&self) {
+        self.first_bytes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn first_bytes(&self) -> usize {
+        self.first_bytes.load(Ordering::SeqCst)
+    }
+
+    /// Arms the completion hold: the returned receiver gets a message when the next
+    /// completion job reaches it, and the job goes on once the returned sender is used or
+    /// dropped.
+    pub(crate) fn arm_completion_hold(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self
+            .completion_hold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(WriterHold {
+            reached: reached_tx,
+            release: release_rx,
+        });
+        (reached_rx, release_tx)
+    }
+
+    pub(crate) fn take_completion_hold(&self) -> Option<WriterHold> {
+        self.completion_hold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     pub(crate) fn drop_notifications(&self, on: bool) {

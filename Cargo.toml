@@ -13,7 +13,10 @@ publish = false
 # Exact pins (=x.y.z), as in spikes/pty-hooks: every upgrade is an explicit change.
 [workspace.dependencies]
 serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = { version = "=1.0.154", features = ["raw_value"] }
+# `float_roundtrip`: every spelling of a decimal parses to the nearest `f64`, so equal
+# command arguments share one request identity (docs/design/http-surface.md §2.8). Stated
+# here: without it, only a dev-dependency (`jsonschema`) would turn it on, in tests alone.
+serde_json = { version = "=1.0.154", features = ["raw_value", "float_roundtrip"] }
 ts-rs = { version = "=12.0.1", features = ["no-serde-warnings", "serde-json-impl", "uuid-impl"] }
 schemars = { version = "=1.2.3", features = ["raw_value", "uuid1"] }
 uuid = { version = "=1.29.1", features = ["serde"] }

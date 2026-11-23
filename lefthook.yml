@@ -43,6 +43,13 @@ pre-commit:
         - "crates/**/Cargo.toml"
         - "Cargo.{toml,lock}"
       run: feats="$(cargo tree -p chaldea-daemon -e features --prefix none -i tokio)" && ! printf '%s\n' "$feats" | grep -q '^tokio feature "process"'
+    # The daemon's own build parses decimals with serde_json's `float_roundtrip`, which
+    # command request identity relies on.
+    serde-json-features:
+      glob:
+        - "crates/**/Cargo.toml"
+        - "Cargo.{toml,lock}"
+      run: deps="$(cargo tree -p chaldea-daemon -e normal,features --prefix none)" && printf '%s\n' "$deps" | grep -Fxq 'serde_json feature "float_roundtrip"'
     # testkit may depend on no workspace crate other than core.
     testkit-deps:
       glob:

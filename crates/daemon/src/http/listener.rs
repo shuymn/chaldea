@@ -92,12 +92,15 @@ async fn serve_connection(
     router: Router,
 ) {
     let first_byte = Arc::new(OnceLock::new());
-    let io = TokioIo::new(ConnIo::new(
+    let conn = ConnIo::new(
         stream,
         first_byte.clone(),
         shared.cfg.clock.clone(),
         shared.cfg.write_stall_timeout,
-    ));
+    );
+    #[cfg(test)]
+    let conn = conn.observed(shared.clone());
+    let io = TokioIo::new(conn);
     let service = TowerToHyperService::new(OuterService::new(shared.clone(), router, first_byte));
     let mut builder = http1::Builder::new();
     builder
@@ -130,6 +133,9 @@ pub(crate) struct ConnIo<T> {
     stall: Duration,
     /// Armed while a write is pending with no byte accepted since it started.
     timer: Option<Pin<Box<Sleep>>>,
+    /// Told when the first byte is read.
+    #[cfg(test)]
+    shared: Option<Arc<Shared>>,
 }
 
 impl<T> ConnIo<T> {
@@ -145,7 +151,16 @@ impl<T> ConnIo<T> {
             clock,
             stall,
             timer: None,
+            #[cfg(test)]
+            shared: None,
         }
+    }
+
+    /// Tells `shared`'s fault points when the first byte is read.
+    #[cfg(test)]
+    pub(crate) fn observed(mut self, shared: Arc<Shared>) -> Self {
+        self.shared = Some(shared);
+        self
     }
 
     /// After the inner write returned `Pending`: arms the stall timer if needed and fails
@@ -186,8 +201,14 @@ impl<T: AsyncRead + Unpin> AsyncRead for ConnIo<T> {
         let before = buf.filled().len();
         let r = Pin::new(&mut self.io).poll_read(cx, buf);
         if matches!(r, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            #[cfg(test)]
+            let fresh = self.first_byte.get().is_none();
             let clock = &self.clock;
             self.first_byte.get_or_init(|| clock.now());
+            #[cfg(test)]
+            if fresh && let Some(s) = &self.shared {
+                s.faults.first_byte_read();
+            }
         }
         r
     }

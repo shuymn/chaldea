@@ -102,6 +102,7 @@ impl Components for TestComponents {
         }
         Built {
             mounts: self.mounts.take().unwrap_or_else(Mounts::mvp),
+            commands: crate::http::CommandRegistry::mvp(),
             participants: std::mem::take(&mut self.participants),
         }
     }

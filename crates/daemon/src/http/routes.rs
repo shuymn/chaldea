@@ -66,7 +66,8 @@ pub enum Credential {
 pub enum ActionRule {
     None,
     Fixed(Action),
-    /// `{name}` must be in `core::auth::MVP_COMMANDS`; its action is checked.
+    /// `{name}` must be in the server's command table (`core::auth::MVP_COMMANDS` in the
+    /// daemon); its action is checked, and an unregistered handler is 501.
     ByCommandName,
 }
 
@@ -254,7 +255,7 @@ pub static ROUTES: &[RouteSpec] = {
             21,
         ),
         post(
-            "/api/commands/{name}",
+            super::commands::COMMAND_PATH,
             M::Write,
             O::AbsentOrMatching,
             C::Bearer(OWNER_AGENT),
@@ -429,15 +430,16 @@ impl Mount {
 pub struct Mounts(Vec<Mount>);
 
 impl Mounts {
-    /// Every route of [`ROUTES`]: PR 7's sync reads, blobs, tickets, pairing, and the
-    /// WebSocket loop, and a 501 handler for every route whose PR has not mounted one.
+    /// Every route of [`ROUTES`]: PR 7's sync reads, blobs, tickets, pairing, the WebSocket
+    /// loop, and the command dispatcher (each command 501 until its handler is registered),
+    /// and a 501 handler for every route whose PR has not mounted one.
     ///
     /// # Panics
     ///
     /// Never: every route named here is in [`ROUTES`].
     #[must_use]
     pub fn mvp() -> Mounts {
-        use super::{blobs, pair, sync_api, ws};
+        use super::{blobs, commands, pair, sync_api, ws};
         let at = |method: Method, path: &str| {
             spec(&method, path).unwrap_or_else(|| panic!("{method} {path} is in ROUTES"))
         };
@@ -471,6 +473,10 @@ impl Mounts {
                 pair::pair_codes,
             ))
             .with(Mount::write(at(Method::POST, "/api/pair"), pair::pair))
+            .with(Mount::write(
+                at(Method::POST, commands::COMMAND_PATH),
+                commands::dispatch,
+            ))
     }
 
     /// No mounts (for building inconsistent sets in tests).

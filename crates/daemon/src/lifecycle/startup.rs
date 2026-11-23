@@ -558,7 +558,13 @@ pub(crate) async fn run(mut cx: StartupCtx) -> Started {
         state_dir: dir.clone(),
     });
     st.participants = built.participants;
-    let server = HttpServer::new(HttpConfig::new(port), store.clone(), sink, built.mounts);
+    let server = HttpServer::new(
+        HttpConfig::new(port),
+        store.clone(),
+        built.commands,
+        sink,
+        built.mounts,
+    );
     // From here the registry can hold startup's own work (the owner token's write observer):
     // the coordinator drains it whether or not step 13 serves.
     st.serve = Some(server.shutdown_handle());
