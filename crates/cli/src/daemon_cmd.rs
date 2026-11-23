@@ -779,7 +779,7 @@ fn await_verdict(
         Ok(ReadyRead::TimedOut) => fail_with(
             ExitCode::Timeout,
             &format!(
-                "the daemon did not report readiness within 15 s; it may still be starting: once it has published its record, `chaldea daemon stop` reaches it; before that, {}",
+                "the daemon did not report readiness within 15 s; it may still be starting: once it has published its record, `chaldea daemon stop` stops it (and says `not running` when no daemon is left); before that, {}",
                 launched.pending()
             ),
         ),
@@ -881,7 +881,7 @@ fn confirm_started(
         None => fail_with(
             ExitCode::Timeout,
             &format!(
-                "the daemon (pid {pid}) reported ready but did not answer on port {port} within 15 s"
+                "the daemon (pid {pid}) reported ready but did not answer on port {port} within 15 s; it may still be running: `chaldea daemon stop` stops it (and says `not running` when no daemon is left)"
             ),
         ),
     }
