@@ -417,8 +417,10 @@ fn kill_and_reap(c: &mut Child) {
 }
 
 /// Kills and reaps the child on drop, a panicking test included.
+#[cfg(target_os = "macos")]
 struct Killed(Child);
 
+#[cfg(target_os = "macos")]
 impl Drop for Killed {
     fn drop(&mut self) {
         kill_and_reap(&mut self.0);
