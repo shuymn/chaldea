@@ -63,6 +63,11 @@ impl Watched {
     }
 }
 
+/// An exit with `code` seen at `seen` keeps its code only when seen before `deadline`.
+pub(crate) fn exit_code(code: Option<i32>, seen: Instant, deadline: Instant) -> Option<i32> {
+    if seen < deadline { code } else { None }
+}
+
 /// An output counted at `at` is kept only when it closed by `cutoff`.
 pub(crate) fn by_cutoff((len, at): (usize, Instant), cutoff: Instant) -> Option<usize> {
     (at <= cutoff).then_some(len)
@@ -99,7 +104,7 @@ pub(crate) fn settle(ws: Vec<Watched>) -> Vec<Settled> {
             match state[i] {
                 State::Running => match w.child.try_wait() {
                     Ok(Some(s)) => {
-                        done[i].code = if now < w.deadline { s.code() } else { None };
+                        done[i].code = exit_code(s.code(), now, w.deadline);
                         done[i].elapsed = now - w.launched;
                         state[i] = State::Reaped;
                     }
@@ -144,6 +149,15 @@ pub(crate) fn settle(ws: Vec<Watched>) -> Vec<Settled> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_exit_counts_only_when_seen_before_the_deadline() {
+        let deadline = Instant::now();
+        assert_eq!(exit_code(Some(0), deadline - POLL, deadline), Some(0));
+        assert_eq!(exit_code(Some(0), deadline, deadline), None);
+        assert_eq!(exit_code(Some(0), deadline + POLL, deadline), None);
+        assert_eq!(exit_code(None, deadline - POLL, deadline), None);
+    }
 
     #[test]
     fn an_output_counts_only_when_it_closed_by_the_cutoff() {
