@@ -149,10 +149,13 @@ fn read_status(clock: &dyn Clock, c: &mut impl Conn, deadline: Instant) -> Resul
     }
 }
 
-/// `HTTP/1.` + one digit + SP + three digits, followed by SP or CRLF; `line` ends at its
-/// first CRLF.
+/// `HTTP/1.` + one digit + SP + three digits, followed by SP or CRLF; `line` is the whole
+/// status line through its first CRLF.
 pub(crate) fn parse_status_line(line: &[u8]) -> Option<u16> {
     let rest = line.strip_prefix(b"HTTP/1.")?;
+    if !line.ends_with(b"\r\n") {
+        return None;
+    }
     let [v, b' ', a, b, c, tail @ ..] = rest else {
         return None;
     };
@@ -180,6 +183,7 @@ mod tests {
             (b"HTTP/1.0 503 Service Unavailable\r\n", 503),
             (b"HTTP/1.1 408\r\n", 408),
             (b"HTTP/1.1 401 \r\n", 401),
+            (b"HTTP/1.1 200 OK \r\n", 200),
             (b"HTTP/1.9 999 x\r\n", 999),
         ];
         for (line, code) in ok {
@@ -189,6 +193,9 @@ mod tests {
             b"",
             b"\r\n",
             b"HTTP/1.1 200",
+            b"HTTP/1.1 200 OK",
+            b"HTTP/1.1 200 OK\r",
+            b"HTTP/1.1 200 OK\n",
             b"HTTP/1.1 200OK\r\n",
             b"HTTP/1.1 20 OK\r\n",
             b"HTTP/1.1 2000 OK\r\n",
@@ -328,7 +335,8 @@ mod tests {
             Ok(200)
         );
         let calls = s.borrow().calls.clone();
-        assert_eq!(calls[0], Call::Connect(CONNECT));
+        // The 500 ms connect bound, restated from the design.
+        assert_eq!(calls[0], Call::Connect(ms(500)));
         assert_eq!(calls.iter().filter(|c| **c == Call::Read).count(), 3);
     }
 

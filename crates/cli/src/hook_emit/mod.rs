@@ -105,10 +105,7 @@ pub(crate) fn main(args: &[OsString], stall: Stall) -> ! {
         }
         Stall::PanicAfterStdin => panic!("injected hook-emit panic"),
     }
-    let agent = args
-        .get(2)
-        .and_then(|a| a.to_str())
-        .filter(|a| env::header_safe(a));
+    let agent = agent_header(args);
     let request = Request {
         env: &env,
         agent,
@@ -128,6 +125,13 @@ pub(crate) fn main(args: &[OsString], stall: Stall) -> ! {
         ))
     });
     host::exit_now(0)
+}
+
+/// The agent argument (`argv[2]`) when it is safe as a header value.
+pub(crate) fn agent_header(args: &[OsString]) -> Option<&str> {
+    args.get(2)
+        .and_then(|a| a.to_str())
+        .filter(|a| env::header_safe(a))
 }
 
 /// Stdin as it is sent.
@@ -504,6 +508,20 @@ mod tests {
         assert_eq!(b.stdin_end - t0, ms(1500));
         assert_eq!(b.work_end - t0, ms(2900));
         assert_eq!(b.watchdog - t0, ms(3000));
+    }
+
+    #[test]
+    fn the_agent_argument_is_sent_only_when_header_safe() {
+        let argv = |a: &str| vec![OsString::from("chaldea"), "hook-emit".into(), a.into()];
+        assert_eq!(agent_header(&argv("codex")), Some("codex"));
+        assert_eq!(agent_header(&argv("claude")), Some("claude"));
+        for bad in ["", "co dex", "codex\r\nX-Evil: 1", "códex"] {
+            assert_eq!(agent_header(&argv(bad)), None, "{bad:?}");
+        }
+        assert_eq!(
+            agent_header(&[OsString::from("chaldea"), "hook-emit".into()]),
+            None
+        );
     }
 
     #[test]

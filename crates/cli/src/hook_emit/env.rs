@@ -18,7 +18,7 @@ pub(crate) struct Env {
     pub(crate) host: &'static str,
     pub(crate) port: u16,
     pub(crate) token: String,
-    /// `X-Chaldea-Thread-Id`, when the variable is set to a header-safe value.
+    /// `X-Chaldea-Thread-Id`, when the variable is a hyphenated UUID.
     pub(crate) thread: Option<String>,
 }
 
@@ -39,7 +39,7 @@ pub(crate) fn from(get: impl Fn(&str) -> Option<OsString>) -> Option<Env> {
     }
     let thread = get(THREAD)
         .and_then(|t| t.into_string().ok())
-        .filter(|t| header_safe(t));
+        .filter(|t| is_uuid(t));
     Some(Env {
         host,
         port,
@@ -79,6 +79,17 @@ pub(crate) fn is_token(t: &str) -> bool {
     })
 }
 
+/// A hyphenated UUID (`8-4-4-4-12` hex digits, either case): the form of a thread id, so an
+/// optional header never makes a valid hook's head oversized or malformed.
+pub(crate) fn is_uuid(v: &str) -> bool {
+    let b = v.as_bytes();
+    b.len() == 36
+        && b.iter().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => *c == b'-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
 /// A non-empty value of visible ASCII only (no space, no control character), so it cannot
 /// change the request's framing.
 pub(crate) fn header_safe(v: &str) -> bool {
@@ -88,6 +99,8 @@ pub(crate) fn header_safe(v: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const UUID: &str = "0198c0de-0000-7000-8000-00000000000a";
 
     fn token() -> String {
         format!("chd_{}", "aZ09-_".repeat(7) + "x")
@@ -159,7 +172,7 @@ mod tests {
             match k {
                 URL => Some("http://localhost:4000/hook".into()),
                 TOKEN => Some(t.clone().into()),
-                THREAD => Some("0190-thread".into()),
+                THREAD => Some(UUID.into()),
                 _ => Some("other".into()),
             }
         });
@@ -169,12 +182,24 @@ mod tests {
                 host: "localhost",
                 port: 4000,
                 token: t.clone(),
-                thread: Some("0190-thread".to_owned()),
+                thread: Some(UUID.to_owned()),
             })
         );
         assert_eq!(*asked.borrow(), [URL, TOKEN, THREAD]);
-        // A thread id that is not header-safe is not sent; the rest stands.
-        for bad in ["", "a b", "a\r\nX: 1", "é"] {
+        // A thread id that is not a hyphenated UUID is not sent; the rest stands.
+        let long = "a".repeat(9000);
+        for bad in [
+            "",
+            "a b",
+            "a\r\nX: 1",
+            "é",
+            "0190-thread",
+            long.as_str(),
+            "0198c0de-0000-7000-8000-00000000000",
+            "0198c0de-0000-7000-8000-00000000000ag",
+            "0198c0de-0000-7000-8000_00000000000a",
+            "{0198c0de-0000-7000-8000-00000000000a}",
+        ] {
             let env = from(|k| match k {
                 URL => Some("http://127.0.0.1:4000/hook".into()),
                 TOKEN => Some(t.clone().into()),
