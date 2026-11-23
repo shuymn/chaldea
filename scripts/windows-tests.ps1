@@ -16,7 +16,9 @@ two lanes, and both must pass:
                fails if it is in a job, if a check of its profile or access fails, if a
                required test did not run and pass by name, if an output file is missing, if
                the final status is not `finished`, or on timeout. Its cleanup runs on every
-               ending and is checked against a daemon the wrapper leaves running on purpose.
+               ending: it terminates the wrapper only, stops every daemon of the run with
+               `chaldea daemon stop`, and fails the lane for any process of the run that
+               survives. A daemon the wrapper leaves running on purpose checks it.
 
 -Lane Wrapper is the wrapper itself; only the Wmi lane starts it.
 #>
@@ -120,127 +122,139 @@ function Select-Executable($Artifacts, [string] $Name, [string] $Kind, [bool] $T
     $exe
 }
 
-# Whether two clock readings of one process's start agree: CIM and .NET differ in precision.
-function Test-SameStart([datetime] $A, [datetime] $B) {
-    [Math]::Abs(($A.ToUniversalTime() - $B.ToUniversalTime()).TotalSeconds) -lt 1
+# Whether a command line contains `$Text`, ignoring case as Windows paths do.
+function Test-Names([string] $Line, [string] $Text) {
+    $Line.Contains($Text, [StringComparison]::OrdinalIgnoreCase)
 }
 
-# The run's processes in a CIM snapshot, by identity recorded independently of live ancestry:
-# a process the wrapper recorded (id and start), one of the run's executables whose command line
-# names the run root (a detached daemon of a state directory under it, whatever became of its
-# starter), and a run executable whose recorded parent is one of these and started after it.
-function Find-RunProcesses($Snapshot, $Recorded, [string[]] $Exes, [string] $RunRoot) {
-    $ours = @{}
-    do {
-        $grew = $false
-        foreach ($p in $Snapshot) {
-            $id = [uint32]$p.ProcessId
-            if ($ours.ContainsKey($id)) { continue }
-            $line = [string]$p.CommandLine
-            $isExe = $p.ExecutablePath -and ($p.ExecutablePath -in $Exes)
-            $known = $Recorded | Where-Object { $_.Id -eq $id -and (Test-SameStart $_.Start $p.CreationDate) }
-            $parent = $ours[[uint32]$p.ParentProcessId]
-            if ($known -or
-                ($isExe -and $line.Contains($RunRoot)) -or
-                ($isExe -and $parent -and $p.CreationDate -ge $parent.CreationDate)) {
-                $ours[$id] = $p
-                $grew = $true
-            }
-        }
-    } while ($grew)
-    @($ours.Values)
+# The process a CIM row describes, opened, when the creation time read through the opened
+# handle agrees with the row's to the microsecond (CIM's precision); otherwise $null. The
+# handle is opened first and kept, so a reused id is never the process waited on or
+# terminated.
+function Open-Row($Row) {
+    try { $p = [Diagnostics.Process]::GetProcessById([int]$Row.ProcessId) }
+    catch { return $null }
+    try {
+        $null = $p.Handle
+        $ticks = $p.StartTime.ToUniversalTime().Ticks - $Row.CreationDate.ToUniversalTime().Ticks
+        if ([Math]::Abs($ticks) -lt 10) { return $p }
+    }
+    catch { }
+    $p.Dispose()
+    $null
 }
 
-# The cleanup, on every ending of the lane, within one deadline: identifies the run's
-# processes and opens each (keeping the handle, so a reused id is never the one terminated),
-# runs `chaldea daemon stop` for every state directory under the run root, terminates the
-# identified processes still alive, and removes the run root. Returns what it found and did.
-function Invoke-Cleanup($Wrapper, [string] $RunDir, [string] $RunRoot, [string] $Chaldea, [string[]] $Exes) {
+# A process snapshot whose CIM operation ends within `$Ms` (at least a second: the operation's
+# timeout is in whole seconds); $null with an error recorded when less is left.
+function Get-Snapshot([int] $Ms, [string] $What, $Report) {
+    if ($Ms -lt 1000) {
+        $Report.errors += "the cleanup deadline passed before $What"
+        return $null
+    }
+    try { , @(Get-CimInstance Win32_Process -OperationTimeoutSec ([int][Math]::Floor($Ms / 1000))) }
+    catch {
+        $Report.errors += "${What}: $_"
+        $null
+    }
+}
+
+# The cleanup, on every ending of the lane, within one deadline: every wait, output included,
+# gets the time left. It terminates nothing but the wrapper, in this order:
+#   a. the wrapper, found in a snapshot by its unique argument and opened as Open-Row does, is
+#      terminated (not its descendants) and waited for;
+#   b. `chaldea daemon stop` runs for every state directory under the run root;
+#   c. a fresh snapshot lists every process whose command line names the run root or the run
+#      directory. None is terminated; each one fails the lane.
+# The run root is removed only when c found nothing. Returns what it found and did.
+function Invoke-Cleanup([string] $WrapperArg, [string] $RunDir, [string] $RunRoot, [string] $Chaldea) {
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $left = { [int][Math]::Max(0, $CleanupSeconds * 1000 - $clock.ElapsedMilliseconds) }
-    $report = [ordered]@{ found = @(); stopped_dirs = @(); terminated = @(); alive_after = @(); errors = @() }
+    $report = [ordered]@{ wrapper = @(); daemon_stop = @(); survivors = @(); run_root = ''; errors = @() }
 
-    $recorded = @()
-    if ($Wrapper) { $recorded += [pscustomobject]@{ Id = [uint32]$Wrapper.Id; Start = $Wrapper.StartTime } }
-    $procsFile = Join-Path $RunDir 'procs.txt'
-    if (Test-Path -LiteralPath $procsFile) {
-        foreach ($l in Get-Content -LiteralPath $procsFile) {
-            $f = $l -split ' '
-            if ($f.Count -eq 2) {
-                $recorded += [pscustomobject]@{ Id = [uint32]$f[0]; Start = [datetime]::new([long]$f[1], 'Utc') }
+    $rows = Get-Snapshot (& $left) 'the wrapper search' $report
+    if ($null -ne $rows) {
+        $found = @($rows | Where-Object { Test-Names $_.CommandLine $WrapperArg })
+        if ($found.Count -eq 0) { $report.wrapper += 'not running' }
+        foreach ($row in $found) {
+            $p = Open-Row $row
+            if (-not $p) {
+                $report.wrapper += "pid $($row.ProcessId): exited, or its id names another process now; not terminated"
+                continue
             }
-        }
-    }
-    $held = @()
-    try {
-        $snapshot = Get-CimInstance Win32_Process -OperationTimeoutSec ([Math]::Max(1, [int]((& $left) / 1000)))
-        foreach ($p in Find-RunProcesses $snapshot $recorded $Exes $RunRoot) {
             try {
-                $proc = [Diagnostics.Process]::GetProcessById([int]$p.ProcessId)
-                $null = $proc.Handle
-                if (Test-SameStart $proc.StartTime $p.CreationDate) {
-                    $held += $proc
-                    $report.found += [ordered]@{ pid = $p.ProcessId; path = $p.ExecutablePath; command = $p.CommandLine }
+                $what = 'had exited'
+                if (-not $p.HasExited) {
+                    $p.Kill()
+                    $what = 'terminated'
                 }
-                else { $proc.Dispose() }
+                if ($p.WaitForExit((& $left))) { $report.wrapper += "pid $($p.Id): $what; exit observed" }
+                else { $report.errors += "the wrapper (pid $($p.Id)) did not exit before the cleanup deadline" }
             }
-            catch { }
+            catch { $report.errors += "terminate the wrapper (pid $($p.Id)): $_" }
+            finally { $p.Dispose() }
         }
     }
-    catch { $report.errors += "identification: $_" }
 
+    $dirs = @()
     if (Test-Path -LiteralPath $RunRoot) {
         $dirs = @(Get-ChildItem -LiteralPath $RunRoot -Recurse -Directory -Force -ErrorAction SilentlyContinue |
             Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'daemon.lock') } |
             ForEach-Object { $_.FullName })
-        foreach ($d in $dirs) {
-            if ((& $left) -eq 0) { $report.errors += "the cleanup deadline passed before $d"; break }
-            try {
-                $psi = [Diagnostics.ProcessStartInfo]::new($Chaldea)
-                foreach ($a in @('--state-dir', $d, 'daemon', 'stop')) { $psi.ArgumentList.Add($a) }
-                $psi.UseShellExecute = $false
-                $psi.RedirectStandardOutput = $true
-                $psi.RedirectStandardError = $true
-                $stop = [Diagnostics.Process]::Start($psi)
-                $out = $stop.StandardOutput.ReadToEndAsync()
-                $err = $stop.StandardError.ReadToEndAsync()
-                if ($stop.WaitForExit((& $left))) {
-                    $null = $out.Wait(5000); $null = $err.Wait(5000)
-                    $report.stopped_dirs += "$d -> exit $($stop.ExitCode): $(($out.Result + $err.Result).Trim())"
-                }
-                else {
-                    $stop.Kill()
-                    $report.errors += "daemon stop for $d did not finish before the cleanup deadline"
-                }
-            }
-            catch { $report.errors += "daemon stop for ${d}: $_" }
+    }
+    foreach ($d in $dirs) {
+        if ((& $left) -eq 0) {
+            $report.errors += "the cleanup deadline passed before daemon stop for $d"
+            break
         }
+        try {
+            $psi = [Diagnostics.ProcessStartInfo]::new($Chaldea)
+            foreach ($a in @('--state-dir', $d, 'daemon', 'stop')) { $psi.ArgumentList.Add($a) }
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $stop = [Diagnostics.Process]::Start($psi)
+            $out = $stop.StandardOutput.ReadToEndAsync()
+            $err = $stop.StandardError.ReadToEndAsync()
+            if (-not $stop.WaitForExit((& $left))) {
+                $report.errors += "daemon stop for $d did not finish before the cleanup deadline"
+                continue
+            }
+            $entry = [ordered]@{ dir = $d; exit = $stop.ExitCode; stdout = $null; stderr = $null }
+            # A result is read only once its task completed; output still open at the deadline
+            # is reported as such.
+            if ($out.Wait((& $left))) { $entry.stdout = $out.Result.Trim() } else { $entry.stdout = '(still open at the cleanup deadline)' }
+            if ($err.Wait((& $left))) { $entry.stderr = $err.Result.Trim() } else { $entry.stderr = '(still open at the cleanup deadline)' }
+            $report.daemon_stop += $entry
+        }
+        catch { $report.errors += "daemon stop for ${d}: $_" }
     }
 
-    # The wrapper last, so it cannot start anything after its children were stopped.
-    foreach ($p in @($held | Sort-Object { $Wrapper -and $_.Id -eq $Wrapper.Id })) {
-        try {
-            if (-not $p.HasExited) {
-                $p.Kill()
-                $report.terminated += "$($p.Id)"
+    $rows = Get-Snapshot (& $left) 'the survivor snapshot' $report
+    if ($null -ne $rows) {
+        foreach ($row in $rows) {
+            $line = [string]$row.CommandLine
+            if ((Test-Names $line $RunRoot) -or (Test-Names $line $RunDir)) {
+                $report.survivors += [ordered]@{
+                    pid = $row.ProcessId
+                    started = if ($row.CreationDate) { $row.CreationDate.ToUniversalTime().ToString('o') } else { '' }
+                    command = $line
+                }
             }
         }
-        catch { $report.errors += "terminate $($p.Id): $_" }
-    }
-    foreach ($p in $held) {
-        try {
-            if (-not $p.WaitForExit((& $left))) { $report.alive_after += "$($p.Id)" }
+        if ($report.survivors.Count -eq 0) {
+            try {
+                Remove-Item -LiteralPath $RunRoot -Recurse -Force -ErrorAction Stop
+                $report.run_root = 'removed'
+            }
+            catch { $report.errors += "the run root was not removed: $_" }
         }
-        catch { $report.errors += "wait $($p.Id): $_" }
-        $p.Dispose()
+        else { $report.run_root = 'kept: processes of this run survive' }
     }
-    try { Remove-Item -LiteralPath $RunRoot -Recurse -Force -ErrorAction Stop }
-    catch { $report.errors += "the run root was not removed: $_" }
+    else { $report.run_root = 'kept: no survivor snapshot' }
     $report
 }
 
 function Invoke-WmiLane {
-    $clock = [Diagnostics.Stopwatch]::StartNew()
     $cutoff = [TimeSpan]::FromMinutes($TimeoutMinutes)
     $pty = Get-Artifacts @('-p', 'chaldea-pty-runtime', '--lib')
     $cli = Get-Artifacts @('-p', 'chaldea-cli', '--test', 'daemon_start', '--test', 'daemon_windows')
@@ -248,13 +262,12 @@ function Invoke-WmiLane {
     $startExe = Select-Executable $cli 'daemon_start' 'test' $true
     $windowsExe = Select-Executable $cli 'daemon_windows' 'test' $true
     $chaldea = Select-Executable $cli 'chaldea' 'bin' $false
-    $exes = @($ptyExe, $startExe, $windowsExe, $chaldea)
 
     $problems = @()
     # The harness's own list must match the required names both ways.
     $listed = @(& $startExe --list | ForEach-Object { if ($_ -match '^(\S+): test$') { $Matches[1] } })
-    $missing = @($StartTests | Where-Object { $_ -notin $listed })
-    $unlisted = @($listed | Where-Object { $_ -notin $StartTests })
+    $missing = @($StartTests | Where-Object { $_ -cnotin $listed })
+    $unlisted = @($listed | Where-Object { $_ -cnotin $StartTests })
     if ($missing.Count -gt 0) { $problems += "daemon_start does not list: $($missing -join ', ')" }
     if ($unlisted.Count -gt 0) { $problems += "daemon_start lists cases this script does not require: $($unlisted -join ', ')" }
 
@@ -265,10 +278,14 @@ function Invoke-WmiLane {
     $runRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "chaldea-wmi-$runId"
     New-Item -ItemType Directory -Path $tmp | Out-Null
     New-Item -ItemType Directory -Path $runRoot | Out-Null
+    # Every test executable's command line names the run directory, so the cleanup's survivor
+    # list sees it: `--skip=<run>` matches no test name, and the `daemon_start` harness ignores
+    # options it does not know.
+    $named = "--skip=$run"
     $steps = @(
-        @{ name = 'a-w1'; exe = $ptyExe; args = @($AW1, '--exact', '--nocapture'); required = @($AW1) },
-        @{ name = 'daemon_start'; exe = $startExe; args = @(); required = $StartTests },
-        @{ name = 'daemon_windows'; exe = $windowsExe; args = @('--exact') + $WmiWindowsTests; required = $WmiWindowsTests },
+        @{ name = 'a-w1'; exe = $ptyExe; args = @($AW1, '--exact', '--nocapture', $named); required = @($AW1) },
+        @{ name = 'daemon_start'; exe = $startExe; args = @($named); required = $StartTests },
+        @{ name = 'daemon_windows'; exe = $windowsExe; args = @('--exact', $named) + $WmiWindowsTests; required = $WmiWindowsTests },
         # A daemon left running on purpose, for the cleanup to find after its starter exited.
         @{ name = 'cleanup-probe'; exe = $chaldea; args = @('--state-dir', (Join-Path $runRoot 'cleanup-probe\state'), 'daemon', 'start'); required = @() }
     )
@@ -292,13 +309,16 @@ function Invoke-WmiLane {
     }
     $pwsh = (Get-Process -Id $PID).Path
     $script = Join-Path $PSScriptRoot 'windows-tests.ps1'
-    $command = "`"$pwsh`" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$script`" -Lane Wrapper -RunDir `"$run`""
+    # The argument that names this run's wrapper and no other process: the cleanup finds the
+    # wrapper by it, even when the submission failed before its id was known.
+    $wrapperArg = "-Lane Wrapper -RunDir `"$run`""
+    $command = "`"$pwsh`" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$script`" $wrapperArg"
 
     $wrapper = $null
-    $timedOut = $false
     $cleanup = $null
     try {
-        # Submission, bounded by the CIM operation timeout.
+        # Submission, bounded by the CIM operation timeout; the execution cutoff counts from it.
+        $clock = [Diagnostics.Stopwatch]::StartNew()
         $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -OperationTimeoutSec 60 -Arguments @{
             CommandLine = $command
             CurrentDirectory = $Root
@@ -306,29 +326,33 @@ function Invoke-WmiLane {
         }
         if ($created.ReturnValue -ne 0) { throw "Win32_Process.Create returned $($created.ReturnValue)" }
         $wrapperId = [uint32]$created.ProcessId
-        $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $wrapperId" -OperationTimeoutSec 30
-        $candidate = Get-Process -Id $wrapperId -ErrorAction SilentlyContinue
-        if ($candidate -and $cim -and (Test-SameStart $candidate.StartTime $cim.CreationDate)) {
-            $null = $candidate.Handle
-            $wrapper = $candidate
-        }
-        Write-Host "wrapper: pid $wrapperId, run directory $run, run root $runRoot"
+        $row = Get-CimInstance Win32_Process -Filter "ProcessId = $wrapperId" -OperationTimeoutSec 30 |
+            Where-Object { Test-Names $_.CommandLine $wrapperArg }
+        if ($row) { $wrapper = Open-Row $row }
+        Write-Host "wrapper: pid $wrapperId (opened: $([bool]$wrapper)), run directory $run, run root $runRoot"
 
-        # Execution, classified against one monotonic cutoff: a wrapper that finishes at or
-        # after it is a timeout.
+        # Execution, against the cutoff: the wrapper's end counts only when it is seen before
+        # the cutoff, through its exit when it was opened, otherwise through its final status.
+        $done = Join-Path $run 'done'
+        $ended = $false
         if ($wrapper) {
             $left = $cutoff - $clock.Elapsed
-            $exited = $left -gt [TimeSpan]::Zero -and $wrapper.WaitForExit([int][Math]::Min([int]::MaxValue, $left.TotalMilliseconds))
-            $timedOut = -not $exited -or $clock.Elapsed -ge $cutoff
+            $ended = $left -gt [TimeSpan]::Zero -and $wrapper.WaitForExit([int][Math]::Min([int]::MaxValue, $left.TotalMilliseconds))
         }
-        elseif (-not (Test-Path -LiteralPath (Join-Path $run 'done'))) {
-            $problems += "the wrapper (pid $wrapperId) could not be opened and left no final status"
+        else {
+            while (-not $ended -and $clock.Elapsed -lt $cutoff) {
+                $ended = Test-Path -LiteralPath $done
+                if (-not $ended) {
+                    Start-Sleep -Milliseconds ([int][Math]::Max(0, [Math]::Min(1000, ($cutoff - $clock.Elapsed).TotalMilliseconds)))
+                }
+            }
         }
-        if ($timedOut) { $problems += "the wrapper did not finish within $TimeoutMinutes min" }
+        if (-not $ended -or $clock.Elapsed -ge $cutoff) { $problems += "the wrapper did not finish within $TimeoutMinutes min" }
     }
     catch { $problems += "the lane failed: $_" }
     finally {
-        $cleanup = Invoke-Cleanup $wrapper $run $runRoot $chaldea $exes
+        if ($wrapper) { $wrapper.Dispose() }
+        $cleanup = Invoke-Cleanup $wrapperArg $run $runRoot $chaldea
         Write-Host "== cleanup ==`n$($cleanup | ConvertTo-Json -Depth 4)"
     }
 
@@ -359,25 +383,25 @@ function Invoke-WmiLane {
         Write-Host "== $($s.name): exit $exit ==`n-- stdout --`n$out`n-- stderr --`n$err"
         if ($exit -ne '0') { $problems += "$($s.name) exited $exit" }
         foreach ($t in $s.required) {
-            if ($out -notmatch ('(?m)^test ' + [regex]::Escape($t) + ' \.\.\. ok\b')) {
+            if ($out -cnotmatch ('(?m)^test ' + [regex]::Escape($t) + ' \.\.\. ok\b')) {
                 $problems += "$($s.name): $t did not run and pass"
             }
         }
     }
 
-    # The cleanup check: the probe daemon, whose starter exited, was found and is gone.
+    # The cleanup check: b stopped the probe daemon, whose starter exited, and c found nothing.
     $probeFile = Join-Path $run 'cleanup-probe.pid'
     if (Test-Path -LiteralPath $probeFile) {
-        $probePid = (Get-Content -LiteralPath $probeFile -Raw).Trim()
-        $found = @($cleanup.found | Where-Object { "$($_.pid)" -eq $probePid })
-        Write-Host "== cleanup check: probe daemon pid $probePid, found: $($found.Count -gt 0) =="
-        if ($found.Count -eq 0) { $problems += "the cleanup did not find the probe daemon (pid $probePid)" }
-        if (Get-Process -Id ([int]$probePid) -ErrorAction SilentlyContinue | Where-Object { $_.Path -in $exes }) {
-            $problems += "the probe daemon (pid $probePid) is still running after the cleanup"
-        }
+        $probeDir = Join-Path $runRoot 'cleanup-probe\state'
+        $probeStop = @($cleanup.daemon_stop | Where-Object { $_.dir -eq $probeDir })
+        $stopped = $probeStop.Count -eq 1 -and $probeStop[0].exit -eq 0 -and $probeStop[0].stdout -ceq 'stopped'
+        Write-Host "== cleanup check: probe daemon pid $((Get-Content -LiteralPath $probeFile -Raw).Trim()), stopped by daemon stop: $stopped =="
+        if (-not $stopped) { $problems += "daemon stop did not stop the probe daemon of $probeDir" }
     }
     else { $problems += 'cleanup-probe.pid is missing' }
-    if ($cleanup.alive_after.Count -gt 0) { $problems += "still running after the cleanup: $($cleanup.alive_after -join ', ')" }
+    foreach ($p in $cleanup.survivors) {
+        $problems += "survived the cleanup (not terminated): pid $($p.pid), started $($p.started): $($p.command)"
+    }
     if ($cleanup.errors.Count -gt 0) { $problems += "cleanup errors: $($cleanup.errors -join '; ')" }
 
     $done = Join-Path $run 'done'
@@ -392,7 +416,7 @@ function Invoke-WmiLane {
 }
 
 # Runs one step's executable with its arguments (no shell in between, so paths stay literal),
-# its stdout, stderr, and exit status into files; records its id and start for the cleanup.
+# its stdout, stderr, and exit status into files.
 function Invoke-Step($Step, [string] $Cwd) {
     $psi = [Diagnostics.ProcessStartInfo]::new($Step.exe)
     foreach ($a in @($Step.args)) { $psi.ArgumentList.Add($a) }
@@ -401,7 +425,6 @@ function Invoke-Step($Step, [string] $Cwd) {
     $psi.RedirectStandardError = $true
     $psi.WorkingDirectory = $Cwd
     $p = [Diagnostics.Process]::Start($psi)
-    Add-Content -LiteralPath (Join-Path $RunDir 'procs.txt') -Value "$($p.Id) $($p.StartTime.ToUniversalTime().Ticks)"
     $out = $p.StandardOutput.ReadToEndAsync()
     $err = $p.StandardError.ReadToEndAsync()
     $p.WaitForExit()
