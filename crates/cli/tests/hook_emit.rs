@@ -1170,3 +1170,94 @@ fn fake_cli_hooks_refuses_a_bad_script() {
     assert_eq!(reports.wait("script_error", 1).len(), 1);
     assert_eq!(stub.accepted(), 0);
 }
+
+/// §2.14: the nested child emits its second hook only after the exact `go` line; on EOF or
+/// another line it reports the failure and exits 1 after its first hook.
+#[test]
+fn fake_cli_nested_child_needs_go() {
+    for input in [&b""[..], b"stop\n", b"gone\n"] {
+        let stub = Stub::start(&[Reply::Status(200)]);
+        let reports = Reports::start();
+        let mut cmd = fake(&["--mode", "echo", "--nested-child"], &reports, &stub);
+        let r = run(&mut cmd, Stdin::Bytes(input.to_vec()));
+        let what = String::from_utf8_lossy(input);
+        assert_eq!(r.code, Some(1), "{what:?}");
+        assert_eq!(stub.settled().len(), 1, "{what:?}");
+        assert_eq!(reports.wait("handshake_failed", 1).len(), 1, "{what:?}");
+        assert_eq!(reports.of("emitted").len(), 1, "{what:?}");
+    }
+}
+
+/// §2.14: a parent whose nested child ends before `sent` reports the failure, emits nothing
+/// of its own, and exits 1. The emitter is `/bin/sh` running `hook-emit` from the working
+/// directory, a script that kills its parent: the nested child, at its first hook.
+#[cfg(target_os = "macos")]
+#[test]
+fn fake_cli_nested_parent_needs_sent() {
+    let stub = Stub::start(&[Reply::Status(200)]);
+    let reports = Reports::start();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("hook-emit"), "kill -9 $PPID\n").unwrap();
+    let mut cmd = fake(&["--mode", "echo", "--nested"], &reports, &stub);
+    // The last `--emitter` wins.
+    cmd.args(["--emitter", "/bin/sh"]).current_dir(dir.path());
+    let r = run(&mut cmd, Stdin::Bytes(Vec::new()));
+    assert_eq!(r.code, Some(1));
+    let failed = reports.wait("handshake_failed", 1);
+    assert_eq!(failed[0]["reason"], "eof", "{failed:?}");
+    // No run of the parent; the nested child's own run killed it before its report.
+    let emitted = reports.of("emitted");
+    assert!(emitted.is_empty(), "{emitted:?}");
+    assert_eq!(stub.accepted(), 0);
+}
+
+/// §2.14 `concurrent`: every emitter starts before any is answered. Each first attempt gets
+/// no reply, so a serialized step would send a retry before the next first attempt.
+#[test]
+fn concurrent_hooks_start_before_any_reply() {
+    let stub = Stub::start(&[Reply::Silent]);
+    let reports = Reports::start();
+    let script = r#"[{"concurrent":[{"n":1},{"n":2},{"n":3}]}]"#;
+    let mut cmd = fake(&["--mode", "hooks", "--script", script], &reports, &stub);
+    let r = run(&mut cmd, Stdin::Bytes(Vec::new()));
+    assert_eq!(r.code, Some(0));
+    let reqs = stub.settled();
+    let first = |q: &&Req| q.one("X-Chaldea-Attempt") == "1";
+    let mut firsts: Vec<u64> = reqs
+        .iter()
+        .filter(first)
+        .map(|q| q.json()["n"].as_u64().unwrap())
+        .collect();
+    firsts.sort_unstable();
+    assert_eq!(firsts, [1, 2, 3]);
+    let first_retry = reqs
+        .iter()
+        .filter(|q| q.one("X-Chaldea-Attempt") == "2")
+        .map(|q| q.at)
+        .min()
+        .expect("a silent first attempt is retried");
+    assert!(
+        reqs.iter().filter(first).all(|q| q.at < first_retry),
+        "{reqs:?}"
+    );
+}
+
+/// §2.14: FakeCli reports the bytes an emitter wrote. `/bin/sh` as the emitter finds no
+/// `hook-emit` script in the working directory, says so on stderr, and exits 127.
+#[cfg(target_os = "macos")]
+#[test]
+fn fake_cli_reports_an_emitters_output() {
+    let reports = Reports::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = Command::new(fake_cli());
+    cmd.args(["--mode", "hooks", "--emitter", "/bin/sh"])
+        .args(["--script", r#"[{"emit":{}}]"#, "--report", &reports.addr])
+        .args(["--max-life-secs", "60"])
+        .current_dir(dir.path());
+    let r = run(&mut cmd, Stdin::Bytes(Vec::new()));
+    assert_eq!(r.code, Some(0));
+    let e = &reports.wait("emitted", 1)[0];
+    assert_eq!(e["code"], 127, "{e}");
+    assert_eq!(e["stdout_len"], 0, "{e}");
+    assert!(e["stderr_len"].as_u64().unwrap() > 0, "{e}");
+}

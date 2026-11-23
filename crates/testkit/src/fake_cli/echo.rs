@@ -6,13 +6,19 @@
 //! CLI's hooks do: a `SessionStart` at start (session `--session-id`, else a random UUID),
 //! then a `UserPromptSubmit` per input line (split at CR or LF, bracketed-paste markers
 //! removed, empty lines skipped) with the line as `prompt`. `--nested` first starts a nested
-//! FakeCli (`echo --nested-child`, this binary, inheriting the environment), which emits a
-//! `SessionStart` of another session before and after this process's own.
+//! FakeCli (`echo --nested-child`, this binary, inheriting the environment and the
+//! arguments of `inherited_args`), which emits a `SessionStart` of another session before
+//! and after this process's own.
+//!
+//! The order is a handshake of exact lines: the child writes `sent` after its first hook,
+//! the parent writes `go` after its own. A side that gets EOF, another line, or nothing
+//! within [`HANDSHAKE`] reports `handshake_failed` (`side`, `reason`), emits no further hook,
+//! and exits 1; the parent kills and reaps the child first.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -20,8 +26,11 @@ use super::Opts;
 use super::hooks::{self, Running};
 use crate::report::Reporter;
 
-/// How long the parent waits for the nested FakeCli's first hook, and for its exit.
-const NESTED_STEP: Duration = Duration::from_secs(10);
+/// How long either side of the nested handshake waits for the other's line (one emitter run,
+/// at most 11 s with its reap, comes before each).
+const HANDSHAKE: Duration = Duration::from_secs(20);
+/// The longest the parent awaits the nested FakeCli from its launch.
+const NESTED_LIFE: Duration = Duration::from_secs(60);
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 
@@ -40,7 +49,13 @@ pub(crate) fn run(o: &Opts) -> i32 {
         rep.send(&json!({"event": "validated", "bytes": read, "ok": ok}));
         return 0;
     }
-    let mut prompts = o.emitter.as_deref().map(|e| Prompts::start(o, e, &rep));
+    let mut prompts = match o.emitter.as_deref() {
+        Some(e) => match Prompts::start(o, e, &rep) {
+            Some(p) => Some(p),
+            None => return 1,
+        },
+        None => None,
+    };
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         match stdin.read(&mut buf) {
@@ -64,8 +79,9 @@ struct Prompts<'a> {
 }
 
 impl<'a> Prompts<'a> {
-    /// Emits the `SessionStart` (inside the nested sequence with `--nested`).
-    fn start(o: &'a Opts, emitter: &'a str, rep: &Reporter) -> Prompts<'a> {
+    /// Emits the `SessionStart` (inside the nested sequence with `--nested`); `None` when
+    /// the nested sequence failed.
+    fn start(o: &'a Opts, emitter: &'a str, rep: &Reporter) -> Option<Prompts<'a>> {
         let session = o.session_id.clone().unwrap_or_else(hooks::random_uuid);
         let p = Prompts {
             emitter,
@@ -74,11 +90,13 @@ impl<'a> Prompts<'a> {
             line: Vec::new(),
         };
         if o.nested {
-            p.nested(o, rep);
+            if !p.nested(o, rep) {
+                return None;
+            }
         } else {
             p.emit(&session_start(&p.session), rep);
         }
-        p
+        Some(p)
     }
 
     fn emit(&self, payload: &Value, rep: &Reporter) {
@@ -88,37 +106,34 @@ impl<'a> Prompts<'a> {
     }
 
     /// The nested sequence (B-11): the nested FakeCli emits its `SessionStart`, this process
-    /// emits its own, then the nested one emits again and exits.
-    fn nested(&self, o: &Opts, rep: &Reporter) {
+    /// emits its own, then the nested one emits again and exits. False when it failed.
+    fn nested(&self, o: &Opts, rep: &Reporter) -> bool {
         let mut cmd = Command::new(std::env::current_exe().unwrap_or_default());
         cmd.args(["--mode", "echo", "--nested-child", "--role", "nested-child"])
             .args(["--emitter", self.emitter, "--agent", self.agent])
+            .args(super::inherited_args(o))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        if let Some(r) = &o.report {
-            cmd.args(["--report", r]);
-        }
+        let launched = Instant::now();
         let Ok(mut child) = cmd.spawn() else {
             rep.send(&json!({"event": "nested", "code": null, "spawn_failed": true}));
-            self.emit(&session_start(&self.session), rep);
-            return;
+            return false;
         };
-        let (tx, rx) = mpsc::channel();
-        if let Some(out) = child.stdout.take() {
-            std::thread::spawn(move || {
-                for line in BufReader::new(out).lines().map_while(Result::ok) {
-                    let _ = tx.send(line);
-                }
-            });
+        let lines = lines_of(child.stdout.take());
+        if let Err(b) = expect_line(&lines, "sent", launched + HANDSHAKE) {
+            rep.send(&json!({"event": "handshake_failed", "side": "parent", "reason": b.name()}));
+            let code = hooks::wait_until(&mut child, Instant::now());
+            rep.send(&json!({"event": "nested", "code": code}));
+            return false;
         }
-        let _ = rx.recv_timeout(NESTED_STEP);
         self.emit(&session_start(&self.session), rep);
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(b"go\n");
         }
-        let code = hooks::wait_bounded(&mut child, NESTED_STEP);
+        let code = hooks::wait_until(&mut child, launched + NESTED_LIFE);
         rep.send(&json!({"event": "nested", "code": code}));
+        code == Some(0)
     }
 
     /// Emits a `UserPromptSubmit` for every complete line in `bytes`.
@@ -172,7 +187,7 @@ fn strip_paste(line: &[u8]) -> Vec<u8> {
 }
 
 /// `echo --nested-child`: emits a `SessionStart` of its own session, writes `sent` to stdout,
-/// waits for a line on stdin, and emits it again.
+/// waits for the `go` line on stdin, and emits it again.
 fn nested_child(o: &Opts) -> i32 {
     let rep = super::hello(o, false);
     let Some(emitter) = o.emitter.as_deref() else {
@@ -188,10 +203,57 @@ fn nested_child(o: &Opts) -> i32 {
     let mut out = std::io::stdout();
     let _ = out.write_all(b"sent\n");
     let _ = out.flush();
-    let mut line = String::new();
-    let _ = std::io::stdin().lock().read_line(&mut line);
+    let lines = lines_of(Some(std::io::stdin()));
+    if let Err(b) = expect_line(&lines, "go", Instant::now() + HANDSHAKE) {
+        rep.send(&json!({"event": "handshake_failed", "side": "child", "reason": b.name()}));
+        return 1;
+    }
     p.emit(&session_start(&p.session), &rep);
     0
+}
+
+/// How a handshake line failed to arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Broken {
+    Eof,
+    Timeout,
+    Unexpected,
+}
+
+impl Broken {
+    fn name(self) -> &'static str {
+        match self {
+            Broken::Eof => "eof",
+            Broken::Timeout => "timeout",
+            Broken::Unexpected => "unexpected",
+        }
+    }
+}
+
+/// The lines of `r` (without their LF or CRLF), read on a thread; the channel closes at EOF
+/// or a read error.
+fn lines_of(r: Option<impl Read + Send + 'static>) -> Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    if let Some(r) = r {
+        std::thread::spawn(move || {
+            for line in BufReader::new(r).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    rx
+}
+
+/// Takes the next line of `lines`, which must be exactly `want` and arrive by `until`.
+fn expect_line(lines: &Receiver<String>, want: &str, until: Instant) -> Result<(), Broken> {
+    match lines.recv_timeout(until.saturating_duration_since(Instant::now())) {
+        Ok(l) if l == want => Ok(()),
+        Ok(_) => Err(Broken::Unexpected),
+        Err(RecvTimeoutError::Disconnected) => Err(Broken::Eof),
+        Err(RecvTimeoutError::Timeout) => Err(Broken::Timeout),
+    }
 }
 
 /// Reads up to `n` bytes (until EOF or an error); how many, and whether all were present
@@ -224,4 +286,34 @@ pub(crate) fn hex(b: &[u8]) -> String {
         let _ = write!(s, "{x:02x}");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_handshake_line_must_be_exact_and_in_time() {
+        let until = || Instant::now() + Duration::from_secs(5);
+        let (tx, rx) = mpsc::channel();
+        for l in ["go", "gone", "go ", ""] {
+            tx.send(l.to_owned()).unwrap();
+        }
+        assert_eq!(expect_line(&rx, "go", until()), Ok(()));
+        for _ in 0..3 {
+            assert_eq!(expect_line(&rx, "go", until()), Err(Broken::Unexpected));
+        }
+        // Nothing by the bound.
+        let t = Instant::now();
+        let soon = t + Duration::from_millis(50);
+        assert_eq!(expect_line(&rx, "go", soon), Err(Broken::Timeout));
+        assert!(t.elapsed() >= Duration::from_millis(50));
+        drop(tx);
+        assert_eq!(expect_line(&rx, "go", until()), Err(Broken::Eof));
+        // CRLF and LF lines are the same line; EOF without a line is EOF.
+        let rx = lines_of(Some(std::io::Cursor::new(b"sent\r\ngo\n".to_vec())));
+        assert_eq!(expect_line(&rx, "sent", until()), Ok(()));
+        assert_eq!(expect_line(&rx, "go", until()), Ok(()));
+        assert_eq!(expect_line(&rx, "go", until()), Err(Broken::Eof));
+    }
 }

@@ -228,7 +228,7 @@ pub(crate) fn enter_raw(o: &Opts, reads_stdin: bool) -> bool {
     (o.raw || reads_stdin) && term::stdin_is_tty() && term::make_raw()
 }
 
-/// The arguments a child FakeCli process inherits: report address and life bound.
+/// The arguments of a `sleeper` child FakeCli process with `role`, and what it inherits.
 pub(crate) fn child_args(o: &Opts, role: &str) -> Vec<String> {
     let mut a = vec![
         "--mode".to_owned(),
@@ -236,6 +236,13 @@ pub(crate) fn child_args(o: &Opts, role: &str) -> Vec<String> {
         "--role".to_owned(),
         role.to_owned(),
     ];
+    a.extend(inherited_args(o));
+    a
+}
+
+/// The arguments every child FakeCli process inherits: report address and life bound.
+pub(crate) fn inherited_args(o: &Opts) -> Vec<String> {
+    let mut a = Vec::new();
     if let Some(r) = &o.report {
         a.extend(["--report".to_owned(), r.clone()]);
     }
@@ -249,5 +256,36 @@ pub(crate) fn child_args(o: &Opts, role: &str) -> Vec<String> {
 pub(crate) fn idle() -> ! {
     loop {
         std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_child_inherits_the_report_and_life_bound() {
+        let args = |a: &[&str]| {
+            let mut v = vec![OsString::from("chaldea-fake-cli")];
+            v.extend(a.iter().map(OsString::from));
+            parse(v).unwrap()
+        };
+        let o = args(&[
+            "--mode",
+            "hooks",
+            "--report",
+            "127.0.0.1:9",
+            "--max-life-secs",
+            "60",
+        ]);
+        assert_eq!(
+            inherited_args(&o),
+            ["--report", "127.0.0.1:9", "--max-life-secs", "60"]
+        );
+        assert!(inherited_args(&args(&["--mode", "hooks"])).is_empty());
+        assert_eq!(
+            child_args(&o, "r")[..4],
+            ["--mode", "sleeper", "--role", "r"]
+        );
     }
 }

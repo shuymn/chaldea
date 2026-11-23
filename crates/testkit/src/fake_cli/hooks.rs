@@ -12,12 +12,16 @@
 //! | `{ "wait_file": "<path>" }` | waits until the file exists, at most [`WAIT_FILE`] |
 //!
 //! Reports: `emitted` per emitter run (`step`, `code` or null when it was killed,
-//! `elapsed_ms`, `stdout_len`, `stderr_len`); `nested` per nested run (`step`, `code`);
-//! `wait_file` (`step`, `found`); `script_error` for a script that does not parse.
+//! `elapsed_ms`, `stdout_len`, `stderr_len`, each null when the pipe was still open at the
+//! run's end); `nested` per nested run (`step`, `code`); `wait_file` (`step`, `found`);
+//! `script_error` for a script that does not parse.
+//!
+//! Every child's bounds are measured from its own launch: an emitter is killed at
+//! [`EMITTER_WAIT`], and its output pipes and reap are awaited until [`REAP`] after that.
 
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
-use std::thread::JoinHandle;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -25,9 +29,11 @@ use serde_json::{Value, json};
 use super::Opts;
 use crate::report::Reporter;
 
-/// The longest an emitter run is awaited (its own watchdog ends it at 3 s).
+/// The longest an emitter run is awaited from its launch (its own watchdog ends it at 3 s).
 pub(crate) const EMITTER_WAIT: Duration = Duration::from_secs(10);
-/// The longest a nested FakeCli is awaited.
+/// How long past a child's exit bound its output pipes and its reap are awaited.
+pub(crate) const REAP: Duration = Duration::from_secs(1);
+/// The longest a nested FakeCli is awaited from its launch.
 const NESTED_WAIT: Duration = Duration::from_secs(60);
 /// The longest a `wait_file` step waits.
 pub(crate) const WAIT_FILE: Duration = Duration::from_secs(10);
@@ -66,16 +72,15 @@ fn run_step(o: &Opts, emitter: &str, rep: &Reporter, i: usize, step: &Value) -> 
         let mut cmd = Command::new(std::env::current_exe().unwrap_or_default());
         cmd.args(["--mode", "hooks", "--role", "nested", "--emitter", emitter])
             .args(["--agent", &o.agent, "--script", &steps.to_string()])
+            .args(super::inherited_args(o))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Some(r) = &o.report {
-            cmd.args(["--report", r]);
-        }
+        let launched = Instant::now();
         let code = cmd
             .spawn()
             .ok()
-            .and_then(|mut c| wait_bounded(&mut c, NESTED_WAIT));
+            .and_then(|mut c| wait_until(&mut c, launched + NESTED_WAIT));
         rep.send(&json!({"event": "nested", "step": i, "code": code}));
     } else if let Some(Value::String(path)) = step.get("wait_file") {
         let end = Instant::now() + WAIT_FILE;
@@ -91,21 +96,25 @@ fn run_step(o: &Opts, emitter: &str, rep: &Reporter, i: usize, step: &Value) -> 
     true
 }
 
-/// One emitter run: the process, its start, and the threads collecting its outputs.
+/// One emitter run: the process, its launch and exit bound, and the threads counting its
+/// outputs.
 pub(crate) struct Running {
     child: Child,
     started: Instant,
-    stdout: JoinHandle<usize>,
-    stderr: JoinHandle<usize>,
+    /// The exit is awaited until it; past it the child is killed.
+    deadline: Instant,
+    stdout: Receiver<usize>,
+    stderr: Receiver<usize>,
 }
 
 /// The result of one emitter run.
 pub(crate) struct Emitted {
-    /// `None`: killed after [`EMITTER_WAIT`], or exited by a signal.
+    /// `None`: killed at its deadline, or exited by a signal.
     pub(crate) code: Option<i32>,
     pub(crate) elapsed: Duration,
-    pub(crate) stdout_len: usize,
-    pub(crate) stderr_len: usize,
+    /// `None`: the pipe was still open [`REAP`] after the deadline (a descendant holds it).
+    pub(crate) stdout_len: Option<usize>,
+    pub(crate) stderr_len: Option<usize>,
 }
 
 /// Starts `<emitter> hook-emit <agent>`, writes `payload` (a JSON value; a string is sent as
@@ -115,52 +124,68 @@ pub(crate) fn start(emitter: &str, agent: &str, payload: &Value) -> Option<Runni
         Value::String(s) => s.clone().into_bytes(),
         v => v.to_string().into_bytes(),
     };
-    let started = Instant::now();
-    let mut child = Command::new(emitter)
-        .args(["hook-emit", agent])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let stdout = count(child.stdout.take());
-    let stderr = count(child.stderr.take());
-    if let Some(mut stdin) = child.stdin.take() {
-        // The emitter may exit without reading (a missing environment): a broken pipe here
-        // is expected.
-        std::thread::spawn(move || {
-            let _ = stdin.write_all(&bytes);
-        });
-    }
-    Some(Running {
-        child,
-        started,
-        stdout,
-        stderr,
-    })
+    let mut cmd = Command::new(emitter);
+    cmd.args(["hook-emit", agent]);
+    Running::launch(&mut cmd, bytes, EMITTER_WAIT)
 }
 
-/// Counts the bytes of `r` until its EOF, on a thread.
-fn count(r: Option<impl Read + Send + 'static>) -> JoinHandle<usize> {
+/// Counts the bytes of `r` until its EOF, on a thread; the count arrives on the channel.
+fn count(r: Option<impl Read + Send + 'static>) -> Receiver<usize> {
+    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut r) = r {
             let _ = r.read_to_end(&mut buf);
         }
-        buf.len()
-    })
+        let _ = tx.send(buf.len());
+    });
+    rx
 }
 
 impl Running {
-    /// Waits for the exit (at most [`EMITTER_WAIT`], then kills it) and its outputs.
+    /// Starts `cmd` with piped stdio, writes `input` to its stdin and closes it; the exit is
+    /// awaited until `wait` after this launch.
+    pub(crate) fn launch(cmd: &mut Command, input: Vec<u8>, wait: Duration) -> Option<Running> {
+        let started = Instant::now();
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()?;
+        let stdout = count(child.stdout.take());
+        let stderr = count(child.stderr.take());
+        if let Some(mut stdin) = child.stdin.take() {
+            // The emitter may exit without reading (a missing environment): a broken pipe
+            // here is expected.
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(&input);
+            });
+        }
+        Some(Running {
+            child,
+            started,
+            deadline: started + wait,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Waits for the exit until the deadline (then kills it), and for its outputs and reap
+    /// until [`REAP`] after the deadline.
     pub(crate) fn finish(mut self) -> Emitted {
-        let code = wait_bounded(&mut self.child, EMITTER_WAIT);
+        let code = wait_until(&mut self.child, self.deadline);
         let elapsed = self.started.elapsed();
+        let end = self.deadline + REAP;
+        let len = |rx: &Receiver<usize>| {
+            rx.recv_timeout(end.saturating_duration_since(Instant::now()))
+                .ok()
+        };
         Emitted {
             code,
             elapsed,
-            stdout_len: self.stdout.join().unwrap_or(0),
-            stderr_len: self.stderr.join().unwrap_or(0),
+            stdout_len: len(&self.stdout),
+            stderr_len: len(&self.stderr),
         }
     }
 }
@@ -181,20 +206,22 @@ pub(crate) fn report_emitted(rep: &Reporter, step: &Value, r: Option<Emitted>) {
     rep.send(&v);
 }
 
-/// The exit code within `within`, else kills and reaps the child: `None`.
-pub(crate) fn wait_bounded(c: &mut Child, within: Duration) -> Option<i32> {
-    let end = Instant::now() + within;
+/// The exit code by `deadline`, else kills the child and reaps it until [`REAP`] after the
+/// deadline: `None`.
+pub(crate) fn wait_until(c: &mut Child, deadline: Instant) -> Option<i32> {
     loop {
         match c.try_wait() {
             Ok(Some(s)) => return s.code(),
-            Ok(None) if Instant::now() < end => std::thread::sleep(POLL),
-            _ => {
-                let _ = c.kill();
-                let _ = c.wait();
-                return None;
-            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL),
+            _ => break,
         }
     }
+    let _ = c.kill();
+    let end = deadline + REAP;
+    while matches!(c.try_wait(), Ok(None)) && Instant::now() < end {
+        std::thread::sleep(POLL);
+    }
+    None
 }
 
 /// A random version-4 UUID in hyphenated form, from the standard library's per-process hash
@@ -228,6 +255,73 @@ pub(crate) fn random_uuid() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn sh(script: &str) -> Command {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", script]);
+        c
+    }
+
+    /// Three runs that never exit, all launched before the first is finished: each is
+    /// killed at its own launch's bound, so the three end together.
+    #[cfg(unix)]
+    #[test]
+    fn each_run_is_bounded_from_its_launch() {
+        let wait = Duration::from_millis(300);
+        let t = Instant::now();
+        let runs: Vec<Running> = (0..3)
+            .map(|_| Running::launch(&mut sh("exec sleep 30"), Vec::new(), wait).unwrap())
+            .collect();
+        for r in runs {
+            let e = r.finish();
+            assert_eq!(e.code, None);
+            assert!(e.elapsed >= wait, "{:?}", e.elapsed);
+            assert_eq!((e.stdout_len, e.stderr_len), (Some(0), Some(0)));
+        }
+        // Restated: 300 ms each; serial bounds would end the last at 900 ms.
+        assert!(
+            t.elapsed() < Duration::from_millis(600),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    /// A run that exits while a descendant holds its stdout: the count is given up at the
+    /// run's end, and the descendant (its pid written to a file) is killed here.
+    #[cfg(unix)]
+    #[test]
+    fn an_output_held_open_is_bounded() {
+        let dir = std::env::temp_dir().join(format!("chaldea-hooks-{}", random_uuid()));
+        std::fs::create_dir(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        let script = format!(
+            "sleep 30 2>/dev/null & echo $! > '{}'; exit 0",
+            pidfile.display()
+        );
+        let wait = Duration::from_millis(300);
+        let t = Instant::now();
+        let e = Running::launch(&mut sh(&script), Vec::new(), wait)
+            .unwrap()
+            .finish();
+        let took = t.elapsed();
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _ = rustix::process::kill_process(
+            rustix::process::Pid::from_raw(pid).unwrap(),
+            rustix::process::Signal::KILL,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(e.code, Some(0));
+        assert_eq!(e.stdout_len, None, "stdout is held by the descendant");
+        assert_eq!(e.stderr_len, Some(0));
+        // Restated: the 300 ms bound plus the 1 s reap.
+        assert!(took < Duration::from_millis(2000), "{took:?}");
+        assert!(took >= Duration::from_millis(1300), "{took:?}");
+    }
 
     #[test]
     fn random_uuid_is_v4() {
