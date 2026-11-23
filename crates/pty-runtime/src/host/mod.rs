@@ -1033,9 +1033,10 @@ struct StopPlatform {
 }
 
 /// [`send_stop_with`]'s decisions over its steps: `open` (the event's open; nothing on Unix),
-/// then `fire` through [`act_before`]. Every observation (the identity lookups and the open)
-/// goes through [`observed_before`], so one first observed at or after the deadline is
-/// [`StopSent::DeadlinePassed`], whatever it found, before its result is interpreted.
+/// then `fire` through [`act_before`]. Every observation (the identity lookups, the open, and
+/// a delivery's report that the target is gone) goes through [`observed_before`], so one first
+/// observed at or after the deadline is [`StopSent::DeadlinePassed`], whatever it found, before
+/// its result is interpreted. Other delivery errors keep their error.
 fn stop_flow<D>(
     target: &StopTarget,
     deadline: Instant,
@@ -1074,8 +1075,10 @@ fn stop_flow<D>(
         Ok(()) => Ok(StopSent::Sent),
         Err(e) if e.raw_os_error() == Some(platform.gone) => {
             if platform.check_before {
-                // `ESRCH` after a matching check: the target exited in between.
-                return Ok(StopSent::Exited);
+                // `ESRCH` after a matching check: the target exited in between. The claim is
+                // an observation, so one first seen at or after the deadline is the deadline.
+                return Ok(observed_before(deadline, || StopSent::Exited)
+                    .unwrap_or(StopSent::DeadlinePassed));
             }
             // No event: tell an exited target from a live one without a listener.
             match identity_matches() {
@@ -1325,6 +1328,11 @@ mod tests {
     /// A waiter that a release wakes and that then finds its deadline passed (it pauses after
     /// the wake until then) does not take the release from an untimed waiter behind it: that
     /// waiter still takes the lock. The timed waiter's wake is the release, not its timeout.
+    ///
+    /// The lock here waits on `spawn::probe::ExactCondvar`, so this crate's unit tests do not
+    /// exercise `std::sync::Condvar`. The release decision checked here is shared code, and
+    /// the std path is what every other crate's tests compile (they build this crate without
+    /// `cfg(test)`) and spawn through.
     #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn an_expired_waiter_does_not_take_the_release() {
@@ -1497,6 +1505,58 @@ mod tests {
         let soon = Instant::now() + Duration::from_secs(5);
         assert_eq!(run(soon, &live, &no_event), StopSent::NoListener);
         assert_eq!(run(soon, &live, &denied), StopSent::AccessDenied);
+    }
+
+    /// The Unix stop flow (identity checked before the delivery): a delivery in flight when the
+    /// deadline passes that then reports the target gone (`ESRCH`) is `DeadlinePassed`, not
+    /// `Exited`: that report is an observation of the target's state.
+    #[test]
+    fn a_late_gone_delivery_is_the_deadline() {
+        use super::{ProcessIdentity, StopPlatform, StopSent, StopTarget, stop_flow};
+        use std::cell::Cell;
+        const GONE: i32 = 3;
+        let target = StopTarget {
+            pid: 7,
+            start_time: "1".to_owned(),
+            instance: "i".to_owned(),
+        };
+        let identity = |pid: u32| -> io::Result<Option<ProcessIdentity>> {
+            Ok(Some(ProcessIdentity {
+                pid,
+                start_time: "1".to_owned(),
+                group: String::new(),
+            }))
+        };
+        let unix = StopPlatform {
+            check_before: true,
+            gone: GONE,
+            denied: 1,
+        };
+        let run = |end: Instant, late: bool| {
+            let fired = Cell::new(false);
+            let got = stop_flow(
+                &target,
+                end,
+                unix,
+                &identity,
+                || Ok(()),
+                &|| {},
+                |()| {
+                    fired.set(true);
+                    if late {
+                        std::thread::sleep(end.saturating_duration_since(Instant::now()));
+                    }
+                    Err(io::Error::from_raw_os_error(GONE))
+                },
+            )
+            .unwrap();
+            assert!(fired.get(), "the delivery did not run");
+            got
+        };
+        let end = Instant::now() + Duration::from_millis(200);
+        assert_eq!(run(end, true), StopSent::DeadlinePassed);
+        let soon = Instant::now() + Duration::from_secs(5);
+        assert_eq!(run(soon, false), StopSent::Exited);
     }
 
     /// A message delivered while the wait blocks is received at once: the wait is handed the
