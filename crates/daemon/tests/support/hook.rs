@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use chaldea_core::auth::TokenKind;
 use chaldea_core::event::{EventEnvelope, TypedEvent};
@@ -202,7 +201,8 @@ pub type Release = std::sync::mpsc::Sender<()>;
 type Gate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
 /// Synthetic chains by emitter pid; an unknown pid's walk is `Gone(pid)`. One pid's walk
-/// can be held until released (at most 20 s).
+/// can be held until its release is used or dropped; it never releases itself, so a hold
+/// cannot end while a test still orders on it (the test bounds its own waits).
 #[derive(Default)]
 pub struct Chains {
     chains: Mutex<HashMap<u32, Ancestry>>,
@@ -240,7 +240,7 @@ impl ProcessProbe for Chains {
         let hold = self.holds.lock().unwrap().remove(&emitter_pid);
         if let Some((reached, release)) = hold {
             let _ = reached.send(());
-            let _ = release.recv_timeout(Duration::from_secs(20));
+            let _ = release.recv();
         }
         let mut a = self
             .chains
@@ -316,8 +316,8 @@ pub enum Mode {
 pub struct TestAdapter {
     pub mode: Mutex<Mode>,
     pub calls: Mutex<Vec<Call>>,
-    /// Taken by the next `interpret`, which holds there (on the writer thread) until
-    /// released, at most 20 s.
+    /// Taken by the next `interpret`, which holds there (on the writer thread) until its
+    /// release is used or dropped.
     hold: Mutex<Option<Gate>>,
 }
 
@@ -378,7 +378,7 @@ impl HookAdapter for TestAdapter {
         let hold = self.hold.lock().unwrap().take();
         if let Some((reached, release)) = hold {
             let _ = reached.send(());
-            let _ = release.recv_timeout(Duration::from_secs(20));
+            let _ = release.recv();
         }
         let mode = *self.mode.lock().unwrap();
         self.calls.lock().unwrap().push(Call {

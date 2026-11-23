@@ -203,6 +203,8 @@ async fn run_write_releasing<R: Send + 'static>(
             return Err(WriteFailure::Submit(e));
         }
     };
+    #[cfg(test)]
+    let ticket = shared.faults.signal_ticket_park(ticket);
     match ticket.await {
         Ok(r) => {
             if let Some(f) = after_ok {

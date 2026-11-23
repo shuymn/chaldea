@@ -2,7 +2,6 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
 
 use tokio::sync::oneshot;
 
@@ -39,10 +38,12 @@ fn arm_for(
     (reached_rx, release_tx)
 }
 
+/// Tells the test and waits until the release is sent or dropped; the gate never releases
+/// itself, so the test bounds its own waits.
 async fn pass(gate: Option<Gate>) {
     if let Some((reached, release)) = gate {
         let _ = reached.send(());
-        let _ = tokio::time::timeout(Duration::from_secs(20), release).await;
+        let _ = release.await;
     }
 }
 

@@ -4,10 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chaldea_core::ids::LaunchId;
+use chaldea_core::payload::RawUnknownReason;
 
-use super::support::hook::{Hook, HookServer};
+use super::support::hook::{Hook, HookServer, direct};
 use super::support::http::{TestServer, connect, write};
-use super::{WAIT, ok, reached};
+use super::{WAIT, ok, reached, reached_sync};
 use crate::hook::{IntakeOrder, NoIntakeFacts};
 use crate::http::tests::shared;
 use crate::http::{ApiError, Mounts, WriteCtx};
@@ -143,33 +144,134 @@ async fn release_points() {
     srv.store.shutdown();
 }
 
-/// A client that disconnects after its observer registered no longer holds its ticket:
-/// the observer submits the job and releases the ordinal then, and a waiting binding job
-/// commits after it.
+/// A binding `SessionStart` waits for an earlier hook of its launch (PR9-CL-6): hook 1 held
+/// in its walk, `SessionStart` 2 is seen waiting on the pending lower ordinal and `Stop` 3
+/// is buffered meanwhile; released, the stream is `session_bound`, the binding's raw,
+/// `UserPromptSubmit` 1, `Stop` 3.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn disconnect_after_registration() {
+async fn binding_waits_for_earlier_hook() {
     let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
-    let (gate, open) = shared(&h.srv).faults.arm_submit_gate();
+    h.chains.set(7001, direct(7001, "codex"));
+    let (walking, release) = h.chains.hold(7001);
+    let first = Hook::of(&l, "UserPromptSubmit", "s").pid(Some(7001));
+    let first_reply = h.spawn_post(&first);
+    reached_sync(walking).await;
+    let (waiting, at_wait) = tokio::sync::oneshot::channel();
+    *h.ingest.order.between_check_and_await.lock().unwrap() =
+        Some(Box::new(move || waiting.send(()).unwrap()));
+    let start = Hook::of(&l, "SessionStart", "s");
+    let start_reply = h.spawn_post(&start);
+    reached(at_wait).await;
+    let stop = Hook::of(&l, "Stop", "s");
+    ok(&h.post(&stop).await);
+    assert_eq!(
+        h.launch_row(l.launch).session_id,
+        None,
+        "bound before hook 1"
+    );
+    release.send(()).unwrap();
+    ok(&first_reply.await.unwrap());
+    ok(&start_reply.await.unwrap());
+    let order: Vec<uuid::Uuid> = h
+        .adapter
+        .calls()
+        .into_iter()
+        .filter(|c| c.promoted || c.event_name != "SessionStart")
+        .map(|c| c.emit_id)
+        .collect();
+    assert_eq!(
+        order,
+        vec![first.emit, stop.emit],
+        "promotion in receipt order"
+    );
+    let kinds: Vec<String> = h
+        .hook_events(l.thread)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "session_bound",
+            "raw_unknown",
+            "user_message",
+            "assistant_message"
+        ],
+        "session_bound, the binding's raw, UserPromptSubmit 1, Stop 3"
+    );
+    h.stop().await;
+}
+
+/// Of two eligible `SessionStart`s of different sessions, the one received first binds
+/// (PR9-CL-6): with the first held before its job, the second is seen waiting on the
+/// pending lower ordinal; released, the first binds and the second is `foreign_session`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn later_session_start_waits_before_the_first_submits() {
+    let h = HookServer::start().await;
+    h.srv.clock.stop();
+    let l = h.codex(1).await;
+    let first = Hook::of(&l, "SessionStart", "first");
+    let second = Hook::of(&l, "SessionStart", "second");
+    let (at_job, release_first) = h.ingest.points.arm_job(1);
+    let first_reply = h.spawn_post(&first);
+    reached(at_job).await;
+    let (waiting, at_wait) = tokio::sync::oneshot::channel();
+    *h.ingest.order.between_check_and_await.lock().unwrap() =
+        Some(Box::new(move || waiting.send(()).unwrap()));
+    let second_reply = h.spawn_post(&second);
+    reached(at_wait).await;
+    assert!(h.launch_row(l.launch).session_id.is_none());
+    release_first.send(()).unwrap();
+    ok(&first_reply.await.unwrap());
+    ok(&second_reply.await.unwrap());
+    assert_eq!(h.launch_row(l.launch).session_id.as_deref(), Some("first"));
+    h.assert_raw(&l, second.emit, RawUnknownReason::ForeignSession);
+    h.stop().await;
+}
+
+/// A queued earlier job releases its ordinal at submission: hook 1 passes `Store::submit`
+/// behind a held writer and its client disconnects; the binding `SessionStart` 2 is then
+/// submitted while hook 1 is still queued; released, hook 1 commits, then the binding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_earlier_job_releases_at_submit() {
+    let h = HookServer::start().await;
+    h.srv.clock.stop();
+    let l = h.codex(1).await;
+    let release = h.srv.hold_writer().await;
+    let s = shared(&h.srv);
+    let order = h.ingest.order.clone();
+    let before = s.faults.submits();
     let first = Hook::of(&l, "UserPromptSubmit", "s");
     let mut conn = connect(h.srv.port).await;
     write(&mut conn, &first.req(&h.srv).bytes()).await;
-    reached(gate).await;
+    super::support::http::eventually(WAIT, "hook 1 passed Store::submit", || {
+        s.faults.submits() > before && !order.is_pending(l.launch, 1)
+    })
+    .await;
     drop(conn);
     let start = Hook::of(&l, "SessionStart", "s");
     let start_reply = h.spawn_post(&start);
-    // The binding waits on ordinal 1, held by the registered observer.
-    let order = h.ingest.order.clone();
-    super::support::http::eventually(WAIT, "ordinal 2 taken", || order.is_pending(l.launch, 2))
-        .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!start_reply.is_finished(), "the binding overtook ordinal 1");
-    assert!(order.is_pending(l.launch, 1));
-    open.send(()).unwrap();
+    super::support::http::eventually(WAIT, "the binding passed Store::submit", || {
+        s.faults.submits() > before + 1 && !order.is_pending(l.launch, 2)
+    })
+    .await;
+    assert!(
+        h.delivery(l.launch, first.emit).is_none(),
+        "hook 1 ran before the writer was free"
+    );
+    release.send(()).unwrap();
     ok(&start_reply.await.unwrap());
     let d1 = h.delivery(l.launch, first.emit).expect("hook 1 committed");
     let d2 = h.delivery(l.launch, start.emit).unwrap();
-    assert!(d1.commit_ordinal < d2.commit_ordinal);
-    assert!(matches!(d1.routing, Routing::Appended { .. }), "{d1:?}");
+    assert!(
+        d1.commit_ordinal < d2.commit_ordinal,
+        "hook 1 then the binding"
+    );
+    assert!(
+        matches!(d1.routing, Routing::Appended { .. }),
+        "promoted: {d1:?}"
+    );
     h.stop().await;
 }

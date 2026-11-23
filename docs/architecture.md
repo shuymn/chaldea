@@ -6,7 +6,7 @@
 - **Multi-agent orchestration support**: An orchestrator session can spawn isolated child threads (with git worktrees), exchange messages via pull-based `mailbox`, inspect child outcomes, and keep worktree ownership metadata without losing uncommitted or unpublished work.
 - **Cross-platform hosts + Android remote**: macOS and native Windows machines act as independent hosts (local SQLite as source of truth); Android connects remotely via a single PWA (Phase 2: Cloudflare Workers + Durable Objects + Cloudflare Access) for reading, approvals, short prompts, and emergency VT keypad recovery.
 - **Japanese IME reliability**: Composing and confirming Japanese text on macOS, Windows, and Android never triggers accidental submission, and multi-byte UTF-8 prompts arrive at the target CLI in the adapter's documented expected form, through its input encoding (PTY Bracketed Paste when DECSET 2004 is on, or keyed input for Codex on Windows).
-- **Self-healing boundaries**: Unparseable CLI transcripts/hooks are preserved as `raw_unknown` (never silently dropped); stalled startup/non-hook prompts surface a live `alacritty_terminal` VT snapshot and keypad; a dedicated Rescue Agent can inspect sessions cross-cuttingly and emit scoped A2UI recovery panels.
+- **Self-healing boundaries**: Unparseable CLI transcripts/hooks that reach durable ingest are preserved as `raw_unknown` (never silently dropped; a hook can still be lost before its delivery job commits, under hook delivery's best-effort rule, `docs/design/hook-ingest.md` §2.13); stalled startup/non-hook prompts surface a live `alacritty_terminal` VT snapshot and keypad; a dedicated Rescue Agent can inspect sessions cross-cuttingly and emit scoped A2UI recovery panels.
 
 ## 2. Decision Classification
 

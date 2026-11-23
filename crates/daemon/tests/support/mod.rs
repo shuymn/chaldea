@@ -52,23 +52,35 @@ use tempfile::TempDir;
 
 pub const T0: &str = "2026-11-22T00:00:00.000Z";
 
-/// A clock whose wall time is fixed (settable) and whose instant is real.
-pub struct FixedClock(Mutex<Timestamp>);
+/// A clock whose wall time is fixed (settable) and whose instant is real, or real plus a
+/// settable lead (the writer's deadline checks read it).
+pub struct FixedClock(Mutex<Timestamp>, Mutex<Duration>);
 
 impl FixedClock {
     #[must_use]
     pub fn new(ts: &str) -> Arc<Self> {
-        Arc::new(FixedClock(Mutex::new(Timestamp(ts.to_owned()))))
+        Arc::new(FixedClock(
+            Mutex::new(Timestamp(ts.to_owned())),
+            Mutex::new(Duration::ZERO),
+        ))
     }
 
     pub fn set(&self, ts: &str) {
         *self.0.lock().unwrap() = Timestamp(ts.to_owned());
     }
+
+    /// Puts the clock's instant `by` ahead of real time.
+    pub fn lead(&self, by: Duration) {
+        *self.1.lock().unwrap() = by;
+    }
 }
 
 impl Clock for FixedClock {
     fn now(&self) -> (Instant, Timestamp) {
-        (Instant::now(), self.0.lock().unwrap().clone())
+        (
+            Instant::now() + *self.1.lock().unwrap(),
+            self.0.lock().unwrap().clone(),
+        )
     }
 }
 

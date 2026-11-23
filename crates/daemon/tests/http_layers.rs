@@ -620,8 +620,13 @@ async fn plain_write_expired_is_408() {
     let release = srv.hold_writer().await;
     let port = srv.port;
     let req = srv.req("POST", "/hook").bearer(&hook).body(b"{}");
-    let reply = tokio::spawn(async move { support::http::send(port, &req.bytes()).await });
-    let deadline = drx.recv().await.unwrap();
+    let mut reply = tokio::spawn(async move { support::http::send(port, &req.bytes()).await });
+    // The handler reports its deadline, or the request ends without reaching it (the
+    // client's own wait bounds that).
+    let deadline = tokio::select! {
+        d = drx.recv() => d.unwrap(),
+        r = &mut reply => panic!("answered before the handler ran: {:?}", r.unwrap()),
+    };
     // Release the writer just after the job's `not_after`: it takes the job late and
     // replies `Expired` within the reply grace.
     tokio::time::sleep_until(tokio::time::Instant::from_std(
@@ -644,7 +649,8 @@ async fn plain_write_unreplied_is_outcome_unknown() {
     let r = srv
         .send(&srv.req("POST", "/hook").bearer(&hook).body(b"{}"))
         .await;
-    let deadline = drx.recv().await.unwrap();
+    // The handler reports its deadline before it can answer.
+    let deadline = drx.try_recv().expect("the handler ran before the reply");
     assert!(Instant::now() >= deadline + Duration::from_millis(100));
     assert_eq!(r.outcome(), (503, code("outcome_unknown")));
     assert!(r.body.windows(14).any(|w| w == b"\"retry_after\":"));
