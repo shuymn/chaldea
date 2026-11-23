@@ -94,6 +94,10 @@ pub(crate) enum Point {
     Inside(u8),
     /// After the `port` rename of step 13.
     AfterPortRename,
+    /// The coordinator, before step 2's console-end check and the `stopping` rewrite.
+    BeforeStopping,
+    /// The `stopping` rewrite's blocking thread (blocking), before it reads the record.
+    InsideStopping,
     /// The coordinator, after HTTP's shutdown returned and before the participants.
     AfterHttp,
     /// The coordinator, right before it submits `Store::shutdown`.

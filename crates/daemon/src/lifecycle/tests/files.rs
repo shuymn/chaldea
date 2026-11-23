@@ -299,6 +299,27 @@ fn lock_released_after_the_read_is_not_running() {
     assert_eq!(got, Discovery::NotRunning);
 }
 
+/// A record rewritten to `stopping` after it was read is not answered with the `serving` read
+/// before: discovery reads the record again after its second lock check.
+#[test]
+fn discovery_does_not_return_serving_after_stopping_is_published() {
+    let d = dir();
+    let lock = InstanceLock::acquire(d.path(), Duration::ZERO).unwrap();
+    let me = host::current_identity().unwrap();
+    let serving = record(me.pid, &me.start_time);
+    write_record(d.path(), &serving);
+    let mut stopping = serving;
+    stopping.state = RecordState::Stopping;
+    let seen = super::super::files::discover_paused(d.path(), || {
+        write_record(d.path(), &stopping);
+    });
+    lock.release();
+    assert!(
+        matches!(seen, Discovery::Stopping(_) | Discovery::Unknown),
+        "{seen:?}"
+    );
+}
+
 /// A record reached through a link is never used.
 #[test]
 fn linked_record_is_refused() {

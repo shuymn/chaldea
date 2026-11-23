@@ -208,9 +208,11 @@ pub enum Discovery {
 }
 
 /// Applies the liveness rule: a record is used only when the lock is held, the record parses
-/// (read without following links), its `(pid, start_time)` is a live process, and the lock is
+/// (read without following links), its `(pid, start_time)` is a live process, the lock is
 /// still held after the record was read, so a record its daemon removed before releasing the
-/// lock is never returned once the lock is free. Never removes anything.
+/// lock is never returned once the lock is free, and the record read again after that check is
+/// unchanged, so a state the daemon published during the check (`stopping`) is never answered
+/// with the one before it. Never removes anything.
 #[must_use]
 pub fn discover(dir: &Path) -> Discovery {
     discover_paused(dir, || {})
@@ -242,7 +244,7 @@ pub(crate) fn discover_paused(dir: &Path, read: impl FnOnce()) -> Discovery {
         Some(false) => return Discovery::NotRunning,
         None => return Discovery::Unknown,
     }
-    if !alive {
+    if !alive || !matches!(read_record(dir), Ok(Some(again)) if again == r) {
         return Discovery::Unknown;
     }
     match r.state {

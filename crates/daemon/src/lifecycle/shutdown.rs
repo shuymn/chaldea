@@ -99,6 +99,9 @@ pub(crate) fn run_daemon(
 const RECORD_REMOVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const RECORD_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// The most step 2's `stopping` rewrite of our record may take, out of HTTP's budget.
+const STOPPING_REWRITE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// A console end was observed: no further step starts.
 struct Crashed;
 
@@ -372,39 +375,61 @@ impl Coordinator {
         }
     }
 
-    /// Rewrites our record with the `stopping` state; a record that is missing, unreadable,
-    /// or another instance's is left alone, and a failed rewrite is logged.
-    fn publish_stopping(&self, dir: &std::path::Path) {
-        let mut r = match files::read_record(dir) {
-            Ok(Some(r)) if r.instance == self.instance => r,
-            Ok(_) => return,
-            Err(e) => {
-                self.log.warn(&format!(
-                    "the discovery record could not be read to mark it stopping: {e}"
-                ));
-                return;
-            }
-        };
-        r.state = files::RecordState::Stopping;
+    /// Rewrites our record with the `stopping` state on a blocking thread, awaited until `end`
+    /// and guarded: a console end observed by now starts no rewrite, and one observed during it
+    /// ends the wait. A failed or unfinished rewrite is logged and shutdown goes on; one still
+    /// running at `end` does not rename after it ([`mark_stopping`]).
+    async fn publish_stopping(
+        &mut self,
+        dir: std::path::PathBuf,
+        end: Instant,
+    ) -> Result<(), Crashed> {
+        #[cfg(test)]
+        if let Some(p) = self.faults.parked(super::faults::Point::BeforeStopping) {
+            p.hold().await;
+        }
+        if self.gate.crashed().is_some() {
+            return Err(Crashed);
+        }
+        self.mark("stopping", Some(end));
+        let instance = self.instance.clone();
         #[cfg(test)]
         let faults = self.faults.clone();
-        let hook = move |n: &str, s: files::ReplaceStage| -> std::io::Result<()> {
+        let rewrite = tokio::task::spawn_blocking(move || {
             #[cfg(test)]
-            {
-                faults.replace_hook(n, s)
+            if let Some(p) = faults.parked(super::faults::Point::InsideStopping) {
+                p.hold_blocking();
             }
-            #[cfg(not(test))]
-            {
-                files::no_hook(n, s)
-            }
-        };
-        if let Err(e) =
-            files::write_replace(dir, names::RECORD, &r.to_bytes(), &self.instance, &hook)
-        {
-            self.log.warn(&format!(
+            let hook = move |n: &str, s: files::ReplaceStage| -> std::io::Result<()> {
+                if s == files::ReplaceStage::Rename && Instant::now() >= end {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "its budget ended before the rename",
+                    ));
+                }
+                #[cfg(test)]
+                {
+                    faults.replace_hook(n, s)
+                }
+                #[cfg(not(test))]
+                {
+                    files::no_hook(n, s)
+                }
+            };
+            mark_stopping(&dir, &instance, &hook)
+        });
+        match self.guarded(deadline_first(end, rewrite)).await? {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(why))) => self.log.warn(&why),
+            Ok(Err(e)) => self.log.warn(&format!(
                 "the discovery record could not be marked stopping: {e}"
-            ));
+            )),
+            Err(Elapsed) => self.log.warn(&format!(
+                "the discovery record was not marked stopping within {} ms",
+                STOPPING_REWRITE.as_millis()
+            )),
         }
+        Ok(())
     }
 
     #[allow(
@@ -547,13 +572,17 @@ impl Coordinator {
         };
 
         // 2. The record says `stopping` before HTTP shuts down, so no client takes this run
-        // for one that serves once its surface may be gone. Then HTTP until C − 5 s, awaited
+        // for one that serves once its surface may be gone; the rewrite takes at most 500 ms
+        // of HTTP's budget and never runs past it. Then HTTP until C − 5 s, awaited
         // to its return; also a server that never served, whose registry can hold startup's
         // own writes (the owner token's observer).
         if self.shared.record_published.load(Ordering::SeqCst)
             && let Some(dir) = self.shared.dir.get().cloned()
         {
-            self.publish_stopping(&dir);
+            let end = (Instant::now() + STOPPING_REWRITE).min(cutoff - b.http_before);
+            if self.publish_stopping(dir, end).await.is_err() {
+                return self.crash_exit(held_now(&st));
+            }
         }
         let mut http_aborted = false;
         if let Some(serve) = st.serve.take() {
@@ -768,4 +797,26 @@ impl Coordinator {
         drop(st.stop_listener.take());
         self.finish(ExitReport { code, reason, lock })
     }
+}
+
+/// Rewrites the record in `dir` with the `stopping` state if it is `instance`'s; a record that
+/// is missing or another instance's is left alone. `Err`: why it was not rewritten.
+fn mark_stopping(
+    dir: &std::path::Path,
+    instance: &str,
+    hook: files::ReplaceHook<'_>,
+) -> Result<(), String> {
+    let mut r = match files::read_record(dir) {
+        Ok(Some(r)) if r.instance == instance => r,
+        Ok(_) => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "the discovery record could not be read to mark it stopping: {e}"
+            ));
+        }
+    };
+    r.state = files::RecordState::Stopping;
+    files::write_replace(dir, names::RECORD, &r.to_bytes(), instance, hook)
+        .map(drop)
+        .map_err(|e| format!("the discovery record could not be marked stopping: {e}"))
 }

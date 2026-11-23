@@ -38,8 +38,8 @@ fn exited_writer_releases() {
     assert_eq!(probe(&dir.path).unwrap(), LockProbe::Free);
 }
 
-/// PR8-CL-5: HTTP, the participants in order, then the store, each with its end measured back
-/// from the cutoff.
+/// PR8-CL-5: the record's `stopping` rewrite, HTTP, the participants in order, then the
+/// store, each with its end measured back from the cutoff (the rewrite's within HTTP's).
 #[test]
 fn order_and_ends() {
     let dir = state();
@@ -77,12 +77,19 @@ fn order_and_ends() {
     let names: Vec<&str> = marks.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(
         names,
-        ["http", "participant:first", "participant:second", "store"]
+        [
+            "stopping",
+            "http",
+            "participant:first",
+            "participant:second",
+            "store"
+        ]
     );
-    assert_eq!(marks[0].1, Some(c - Duration::from_secs(5)));
-    assert_eq!(marks[1].1, Some(c - Duration::from_secs(3)));
+    assert!(marks[0].1.is_some_and(|e| e <= c - Duration::from_secs(5)));
+    assert_eq!(marks[1].1, Some(c - Duration::from_secs(5)));
     assert_eq!(marks[2].1, Some(c - Duration::from_secs(3)));
-    assert_eq!(marks[3].1, Some(c));
+    assert_eq!(marks[3].1, Some(c - Duration::from_secs(3)));
+    assert_eq!(marks[4].1, Some(c));
     let seen = seen.lock().unwrap();
     assert_eq!(
         seen.iter().map(|s| s.0).collect::<Vec<_>>(),
@@ -566,31 +573,100 @@ fn no_unlink_after_the_record_budget() {
 
 /// PR8-CL-23: the record says `stopping` before HTTP shuts down: a discovery made once HTTP's
 /// shutdown returned (paused there) sees this run stopping, not serving.
+/// The record says `stopping` before HTTP shuts down: while the rewrite runs, HTTP still
+/// accepts connections, and once HTTP's shutdown returned the record says `stopping`.
 #[test]
 fn record_says_stopping_before_http_shuts_down() {
     use super::super::files::{Discovery, discover};
     let dir = state();
     let faults = Arc::new(Faults::default());
-    let park = faults.park(Point::AfterHttp);
+    let rewriting = faults.park(Point::InsideStopping);
+    let after_http = faults.park(Point::AfterHttp);
     let run = start(
         foreground(&dir.path, Some(free_port())),
         TestComponents::default(),
         faults.clone(),
     );
-    run.serving();
+    let port = run.serving();
     let Discovery::Serving(serving) = discover(&dir.path) else {
         panic!("not serving: {:?}", discover(&dir.path))
     };
     run.stop();
-    assert!(park.wait_reached(WAIT));
+    let reached = rewriting.wait_reached(WAIT);
+    let http_up = std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
+    rewriting.release();
+    assert!(reached, "the rewrite did not start");
+    assert!(http_up, "HTTP shut down before the rewrite");
+    assert!(after_http.wait_reached(WAIT));
     let seen = discover(&dir.path);
-    park.release();
+    after_http.release();
     let log = run.log.clone();
     let r = run.join();
     assert_eq!(r.code.code(), 0, "{}", log.text());
     assert!(
         matches!(&seen, Discovery::Stopping(s) if s.instance == serving.instance),
         "{seen:?}"
+    );
+}
+
+/// A `stopping` rewrite that does not finish within its 500 ms does not hold HTTP's
+/// shutdown back: shutdown goes on and the log says why.
+#[test]
+fn stalled_stopping_rewrite_does_not_hold_http() {
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    let rewriting = faults.park(Point::InsideStopping);
+    let run = start(
+        foreground(&dir.path, Some(free_port())),
+        TestComponents::default(),
+        faults.clone(),
+    );
+    run.serving();
+    run.stop();
+    let reached = rewriting.wait_reached(WAIT);
+    let http_went_on = super::wait_for(WAIT, || faults.marks().iter().any(|m| m.0 == "http"));
+    rewriting.release();
+    assert!(reached, "the rewrite did not start");
+    assert!(http_went_on, "HTTP waited for the rewrite");
+    let log = run.log.clone();
+    let r = run.join();
+    assert_eq!(r.code.code(), 0, "{}", log.text());
+    assert!(
+        log.text().contains("was not marked stopping within 500 ms"),
+        "{}",
+        log.text()
+    );
+}
+
+/// A `stopping` rewrite that fails is logged, and shutdown goes on to a clean exit.
+#[test]
+fn failed_stopping_rewrite_is_logged() {
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    let run = start(
+        foreground(&dir.path, Some(free_port())),
+        TestComponents::default(),
+        faults.clone(),
+    );
+    run.serving();
+    assert!(super::wait_for(WAIT, || matches!(
+        super::super::files::discover(&dir.path),
+        super::super::files::Discovery::Serving(_)
+    )));
+    faults.fail_replace(names::RECORD, super::super::files::ReplaceStage::Write);
+    run.stop();
+    let log = run.log.clone();
+    let r = run.join();
+    assert_eq!(
+        (r.code.code(), r.lock),
+        (0, LockDisposition::Released),
+        "{}",
+        log.text()
+    );
+    assert!(
+        log.text().contains("could not be marked stopping"),
+        "{}",
+        log.text()
     );
 }
 

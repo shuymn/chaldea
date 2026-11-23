@@ -959,6 +959,43 @@ fn console_end_after_http_starts_no_participant() {
     held_then_free(&mut h, &dir.path);
 }
 
+/// PR8-CL-10: a console end that arrives before step 2's `stopping` rewrite starts no
+/// rewrite: the record still says `serving`.
+#[test]
+fn console_end_before_the_stopping_rewrite() {
+    if in_helper() {
+        let faults = Arc::new(Faults::default());
+        let park = faults.park(Point::BeforeStopping);
+        helper(
+            fg(),
+            TestComponents::default(),
+            faults,
+            Duration::from_secs(2),
+            move |c| {
+                c.serving();
+                c.stop();
+                assert!(park.wait_reached(WAIT));
+                c.crash();
+                park.release();
+                assert!(returned());
+                let record = std::fs::read_to_string(c.dir.join(names::RECORD)).unwrap();
+                report(&format!(
+                    "checks started={} serving={}",
+                    c.faults.marks().iter().any(|m| m.0 == "stopping"),
+                    record.contains("\"serving\"")
+                ));
+            },
+        );
+    }
+    let (mut h, dir) = parent("console_end_before_the_stopping_rewrite", &[]);
+    let c = h.expect("checks", WAIT);
+    assert_eq!(field(&c, "started"), "false", "{c}");
+    assert_eq!(field(&c, "serving"), "true", "{c}");
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "reason"), "console_end", "{r}");
+    held_then_free(&mut h, &dir.path);
+}
+
 /// PR8-CL-10: with no participants, a console end that arrives before the store's shutdown
 /// is submitted keeps it from being submitted.
 #[test]
