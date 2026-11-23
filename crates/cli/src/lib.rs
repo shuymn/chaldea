@@ -9,7 +9,6 @@ mod client;
 mod daemon_cmd;
 mod hook_emit;
 mod open;
-mod spawn;
 
 #[doc(hidden)]
 pub use hook_emit::Stall;
@@ -44,6 +43,13 @@ pub struct Seams {
     pub label_prefix: Option<String>,
     /// Runs once `daemon stop` sent its request, before it waits for completion.
     pub after_stop_sent: Option<Box<dyn FnOnce()>>,
+    /// Runs in a detached child at step 1, before it opens its readiness writer.
+    pub before_ready: Option<Box<dyn FnOnce() + Send>>,
+    /// Runs once `daemon start` read a verdict line (after the launchd job's removal), before
+    /// it acts on it.
+    pub after_verdict: Option<Box<dyn Fn()>>,
+    /// Receives the exit code just before the process exits.
+    pub on_exit: Option<Box<dyn FnOnce(i32)>>,
 }
 
 /// The `chaldea` process from its arguments (`argv[0]` first) to its exit; `main` is this one
@@ -63,8 +69,9 @@ pub fn dispatch_with(args: &[OsString], stall: Stall, mut seams: Seams) -> ! {
     if args.get(1).is_some_and(|a| a == "hook-emit") {
         hook_emit::main(args, stall);
     }
-    // The launchd job's process forks the daemon while it has one thread (design §2.2).
-    let fork_error = if from_launchd(args) {
+    // The launchd job's process forks the daemon while it has one thread (design §2.2), and
+    // only for arguments that parse: an invalid invocation exits 2 from this process.
+    let fork_error = if from_launchd(args) && parse(args).is_ok() {
         host::leave_launchd_job().err()
     } else {
         None
@@ -81,6 +88,9 @@ pub fn dispatch_with(args: &[OsString], stall: Stall, mut seams: Seams) -> ! {
     };
     lifecycle::flush_process_log(FINAL_FLUSH);
     let _ = std::io::stdout().flush();
+    if let Some(record) = seams.on_exit.take() {
+        record(code);
+    }
     std::process::exit(code);
 }
 

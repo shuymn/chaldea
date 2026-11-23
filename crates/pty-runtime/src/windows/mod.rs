@@ -5,7 +5,7 @@
 //! plus the verified recorded descendants of each call.
 
 mod child;
-mod cmdline;
+pub(crate) mod cmdline;
 mod control;
 #[cfg(any(test, feature = "fake"))]
 pub(crate) mod hooks;

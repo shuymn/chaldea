@@ -2,14 +2,12 @@
 //! creation flags, `windows::sys` for security descriptors, known folders, events, the job
 //! state, the standard handles, and `ShellExecuteExW`.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-use std::os::windows::io::AsHandle;
-use std::os::windows::process::CommandExt;
+use std::os::windows::io::{AsHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command};
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
@@ -312,12 +310,62 @@ pub fn detached_flags(breakaway: Breakaway) -> u32 {
     }
 }
 
-pub(super) fn configure_detached(cmd: &mut Command, breakaway: Breakaway) {
-    cmd.creation_flags(detached_flags(breakaway));
+pub(super) struct DetachedInner {
+    process: OwnedHandle,
+    pid: u32,
 }
 
-pub(super) fn uninherit_std_handles() -> io::Result<()> {
-    sys::uninherit_std_handles()
+/// `CreateProcessW` through `windows::sys::create_detached`: the null device for stdin and
+/// stderr, a pipe for stdout whose read end `ready` takes, and only those handles inherited.
+pub(super) fn spawn_detached(
+    exe: &Path,
+    args: &[OsString],
+    cwd: &Path,
+    breakaway: Breakaway,
+    ready: &mut ReadyInner,
+) -> io::Result<DetachedInner> {
+    use crate::windows::cmdline;
+    let (reader, writer) = std::io::pipe()?;
+    let null = OpenOptions::new().read(true).write(true).open("NUL")?;
+    let mut argv = vec![exe.as_os_str().to_owned()];
+    argv.extend(args.iter().cloned());
+    let app = cmdline::wide_nul(exe.as_os_str());
+    let mut line = cmdline::command_line(&argv);
+    let dir = cmdline::wide_nul(cwd.as_os_str());
+    let created = {
+        let held = crate::spawn::spawn_lock();
+        sys::create_detached(
+            &held,
+            &app,
+            &mut line,
+            &dir,
+            detached_flags(breakaway),
+            [null.as_handle(), writer.as_handle(), null.as_handle()],
+        )?
+    };
+    // This process's copies of the child's ends close here; the child holds its own.
+    drop(writer);
+    drop(null);
+    ready_attach(ready, reader);
+    Ok(DetachedInner {
+        process: created.process,
+        pid: created.pid,
+    })
+}
+
+pub(super) fn detached_id(inner: &DetachedInner) -> u32 {
+    inner.pid
+}
+
+pub(super) fn detached_try_wait(inner: &mut DetachedInner) -> io::Result<Option<String>> {
+    if sys::wait(inner.process.as_handle(), 0)? {
+        Ok(Some(format!(
+            "exit code: {}",
+            sys::exit_code(&inner.process)?
+        )))
+    } else {
+        Ok(None)
+    }
 }
 
 // ---- Readiness channel: the child's stdout pipe ----
@@ -333,7 +381,8 @@ pub(super) fn ready_dir(_inner: &ReadyInner) -> Option<&Path> {
 /// The longest verdict line the starter accepts.
 const MAX_READY_LINE: u64 = 4096;
 
-pub(super) fn ready_attach(inner: &mut ReadyInner, stdout: ChildStdout) {
+/// Reads the child's stdout on a thread until its first line or its end.
+fn ready_attach(inner: &mut ReadyInner, stdout: std::io::PipeReader) {
     let (tx, rx) = mpsc::channel();
     // Ends at the line, at the pipe's end, or with the process (a starter that timed out).
     std::thread::spawn(move || {
@@ -366,24 +415,24 @@ pub(super) fn ready_channel_in(_temp: &Path) -> io::Result<(ReadyInner, ReadyArg
 pub(super) fn ready_read(
     inner: &mut ReadyInner,
     deadline: Instant,
-    _child: Option<&mut Child>,
+    _child: Option<&mut DetachedInner>,
 ) -> io::Result<ReadyRead> {
-    let Some(rx) = &inner.rx else {
+    if inner.rx.is_none() {
         return Err(io::Error::other("the child's stdout was not attached"));
-    };
-    // Deadline first: a line first observed after the deadline does not win.
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() {
-        return Ok(ReadyRead::TimedOut);
     }
-    match rx.recv_timeout(left) {
-        Ok(r) => {
-            inner.rx = None;
-            r
+    super::ready_poll(deadline, || {
+        let Some(rx) = &inner.rx else {
+            return Ok(Some(ReadyRead::Eof));
+        };
+        match rx.try_recv() {
+            Ok(r) => {
+                inner.rx = None;
+                r.map(Some)
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Ok(Some(ReadyRead::Eof)),
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => Ok(ReadyRead::TimedOut),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(ReadyRead::Eof),
-    }
+    })
 }
 
 pub(super) struct ReadyWriterInner(File);
@@ -602,9 +651,23 @@ mod tests {
     /// and `before_go` applied to its pid before it is told to go (stdin); returns its `@@ `
     /// report. Every wait is bounded (60 s); the helper is killed past it.
     fn helper(test: &str, role: &str, flags: u32, before_go: impl FnOnce(u32)) -> String {
+        let (status, out) = helper_run(test, role, flags, before_go);
+        assert!(status.success(), "helper {role}: {status:?}\n{out}");
+        out.lines()
+            .find_map(|l| l.find("@@ ").map(|i| l[i + 3..].to_owned()))
+            .unwrap_or_else(|| panic!("no report from helper {role}:\n{out}"))
+    }
+
+    /// [`helper`]'s run: its exit status and its stdout and stderr, whatever they are.
+    fn helper_run(
+        test: &str,
+        role: &str,
+        flags: u32,
+        before_go: impl FnOnce(u32),
+    ) -> (std::process::ExitStatus, String) {
         use std::io::{Read as _, Write as _};
         use std::os::windows::process::CommandExt as _;
-        use std::process::Stdio;
+        use std::process::{Command, Stdio};
         let mut cmd = Command::new(std::env::current_exe().unwrap());
         cmd.args([test, "--exact", "--nocapture", "--test-threads=1"])
             .env(HELPER, role)
@@ -614,13 +677,19 @@ mod tests {
             .creation_flags(flags);
         let mut child = crate::with_spawn_lock(|| cmd.spawn()).unwrap();
         let mut out = child.stdout.take().unwrap();
+        let mut err = child.stderr.take().unwrap();
         let reader = std::thread::spawn(move || {
             let mut s = String::new();
             let _ = out.read_to_string(&mut s);
             s
         });
+        let err_reader = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = err.read_to_string(&mut s);
+            s
+        });
         before_go(child.id());
-        child.stdin.take().unwrap().write_all(b"go\n").unwrap();
+        let _ = child.stdin.take().unwrap().write_all(b"go\n");
         let end = Instant::now() + std::time::Duration::from_secs(60);
         let status = loop {
             if let Some(s) = child.try_wait().unwrap() {
@@ -634,10 +703,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
         let out = reader.join().unwrap();
-        assert!(status.success(), "helper {role}: {status:?}\n{out}");
-        out.lines()
-            .find_map(|l| l.find("@@ ").map(|i| l[i + 3..].to_owned()))
-            .unwrap_or_else(|| panic!("no report from helper {role}:\n{out}"))
+        let err = err_reader.join().unwrap();
+        (status, format!("stdout:\n{out}\nstderr:\n{err}"))
     }
 
     /// The helper side: waits for `go`, then reports this process's job state.
@@ -694,20 +761,26 @@ mod tests {
             println!("@@ in_job={}", sys::in_any_job_now().unwrap());
             return;
         }
-        let state = super::job_state().unwrap();
+        let state = super::job_state();
         eprintln!("A-W1: this test process's job state: {state:?}");
+        let state = state.unwrap_or_else(|e| panic!("A-W1: the job state cannot be read: {e}"));
         let breakaway = super::super::breakaway_for(&state).unwrap_or_else(|| {
             panic!("A-W1 does not hold: the immediate job allows no breakaway: {state:?}")
         });
-        let got = helper(
+        let flags = detached_flags(breakaway);
+        let (status, out) = helper_run(
             "host::windows::tests::runner_can_break_away",
             "probe",
-            detached_flags(breakaway),
+            flags,
             |_| {},
         );
-        assert_eq!(
-            got, "in_job=false",
-            "job state {state:?}, breakaway {breakaway:?}"
+        eprintln!("A-W1: helper (flags {flags:#x}) exited {status:?}; its output:\n{out}");
+        let report = out
+            .lines()
+            .find_map(|l| l.find("@@ ").map(|i| l[i + 3..].to_owned()));
+        assert!(
+            status.success() && report.as_deref() == Some("in_job=false"),
+            "A-W1 does not hold: job state {state:?}, breakaway {breakaway:?}, flags {flags:#x}, helper exited {status:?}, report {report:?}\n{out}"
         );
     }
 

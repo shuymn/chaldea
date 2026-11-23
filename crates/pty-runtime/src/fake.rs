@@ -1140,3 +1140,25 @@ pub fn process_in_any_job(pid: u32) -> io::Result<bool> {
     let p = crate::windows::sys::open_process(pid, crate::windows::QUERY_SYNC)?;
     crate::windows::sys::handle_in_any_job(&p)
 }
+
+/// Resumes every thread of the process `pid`, one created with `CREATE_SUSPENDED` by a caller
+/// holding no thread handle (std's spawn); the number resumed (Windows).
+///
+/// # Errors
+///
+/// The thread snapshot, an open, or a resume failed.
+#[cfg(windows)]
+pub fn resume_process(pid: u32) -> io::Result<usize> {
+    crate::windows::sys::resume_process_threads(pid)
+}
+
+/// Sets `HANDLE_FLAG_INHERIT` on `h`, so a child created with handle inheritance and no handle
+/// list (std's spawn) inherits it (Windows).
+///
+/// # Errors
+///
+/// `SetHandleInformation` failed.
+#[cfg(windows)]
+pub fn make_inheritable(h: &impl std::os::windows::io::AsRawHandle) -> io::Result<()> {
+    crate::windows::sys::make_inheritable(h)
+}

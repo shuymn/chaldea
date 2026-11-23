@@ -11,8 +11,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub use crate::backend::ProcessIdentity;
 
@@ -367,12 +366,14 @@ pub struct LaunchctlOutput {
     pub stderr: String,
 }
 
-/// Runs `/bin/launchctl <args>` under the spawn lock, waits for it until `deadline`, and kills
-/// and reaps it past the deadline (macOS only).
+/// Runs `/bin/launchctl <args>` under the spawn lock and returns what it printed and how it
+/// exited, all observed before `deadline` (macOS only). Nothing is spawned once the deadline
+/// has passed; past it, the command is killed and handed to a reaper thread, and an exit or
+/// output first observed at or after it is a timeout.
 ///
 /// # Errors
 ///
-/// The spawn error; `TimedOut` past the deadline; `Unsupported` off macOS.
+/// The spawn error; `TimedOut` at or past the deadline; `Unsupported` off macOS.
 pub fn launchctl(args: &[&OsStr], deadline: Instant) -> io::Result<LaunchctlOutput> {
     imp::launchctl(args, deadline)
 }
@@ -432,16 +433,26 @@ pub fn gui_domain(deadline: Instant) -> GuiDomain {
     gui_domain_via(deadline, &|args, d| launchctl(args, d))
 }
 
-/// Decides the macOS launch path: `Absent` without a probe when `SSH_CONNECTION` or `SSH_TTY`
-/// is set (the deliberate SSH path); otherwise `run` probes `print gui/<uid>` by `deadline`
-/// and [`classify_gui_probe`] decides.
+/// [`gui_domain_with`] with this process's environment.
 #[must_use]
 pub fn gui_domain_via(
     deadline: Instant,
     run: &dyn Fn(&[&OsStr], Instant) -> io::Result<LaunchctlOutput>,
 ) -> GuiDomain {
+    gui_domain_with(deadline, &|name| std::env::var_os(name), run)
+}
+
+/// Decides the macOS launch path: `Absent` without a probe when `env` gives a non-empty
+/// `SSH_CONNECTION` or `SSH_TTY` (the deliberate SSH path); otherwise `run` probes
+/// `print gui/<uid>` by `deadline` and [`classify_gui_probe`] decides.
+#[must_use]
+pub fn gui_domain_with(
+    deadline: Instant,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    run: &dyn Fn(&[&OsStr], Instant) -> io::Result<LaunchctlOutput>,
+) -> GuiDomain {
     for var in ["SSH_CONNECTION", "SSH_TTY"] {
-        if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
+        if env(var).is_some_and(|v| !v.is_empty()) {
             return GuiDomain::Absent {
                 why: format!("an SSH session ({var} is set)"),
             };
@@ -481,21 +492,92 @@ pub fn breakaway_for(state: &JobState) -> Option<Breakaway> {
     }
 }
 
-/// Windows: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`, plus `CREATE_BREAKAWAY_FROM_JOB`
-/// for [`Breakaway::Explicit`]. Nothing elsewhere.
-pub fn configure_detached(cmd: &mut Command, breakaway: Breakaway) {
-    imp::configure_detached(cmd, breakaway);
+/// A child `daemon start` launched directly (design §2.10): the `setsid` path on macOS, every
+/// launch on Windows.
+pub struct DetachedChild {
+    inner: imp::DetachedInner,
 }
 
-/// Windows: clears the inherit flag of this process's standard handles, so a child created
-/// with handle inheritance (every std spawn) does not keep the caller's pipes or console
-/// handles open beyond the ones it is given. Nothing elsewhere.
+impl DetachedChild {
+    #[must_use]
+    pub fn id(&self) -> u32 {
+        imp::detached_id(&self.inner)
+    }
+
+    /// Its exit, described, once it exited; `None` while it runs.
+    ///
+    /// # Errors
+    ///
+    /// Its status cannot be read.
+    pub fn try_wait(&mut self) -> io::Result<Option<String>> {
+        imp::detached_try_wait(&mut self.inner)
+    }
+}
+
+impl std::fmt::Debug for DetachedChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DetachedChild")
+            .field("pid", &self.id())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Starts `exe args` in `cwd` under the spawn lock, with this process's environment and stdin
+/// and stderr the null device. macOS: stdout the null device (the child calls `setsid`
+/// itself). Windows: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`, plus
+/// `CREATE_BREAKAWAY_FROM_JOB` for [`Breakaway::Explicit`]; stdout a pipe whose read end
+/// `ready` takes; and only those three handles inherited (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`),
+/// so the child holds nothing else of this process's caller.
 ///
 /// # Errors
 ///
-/// The OS refused.
-pub fn uninherit_std_handles() -> io::Result<()> {
-    imp::uninherit_std_handles()
+/// The spawn error (Windows `ERROR_ACCESS_DENIED` when the job refused the breakaway).
+pub fn spawn_detached(
+    exe: &Path,
+    args: &[OsString],
+    cwd: &Path,
+    breakaway: Breakaway,
+    ready: &mut ReadyReader,
+) -> io::Result<DetachedChild> {
+    Ok(DetachedChild {
+        inner: imp::spawn_detached(exe, args, cwd, breakaway, &mut ready.inner)?,
+    })
+}
+
+// ---- Deadlines ----
+
+/// `observe`'s result when it was observed before `deadline`. The deadline is checked before
+/// observing and again after, so a result first seen at or after the deadline loses to it and
+/// nothing is observed once it has passed.
+pub fn observed_before<T>(deadline: Instant, observe: impl FnOnce() -> T) -> Option<T> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let seen = observe();
+    if Instant::now() >= deadline {
+        return None;
+    }
+    Some(seen)
+}
+
+/// How often the readiness channel is polled.
+const READY_POLL: Duration = Duration::from_millis(20);
+
+/// Polls `step` every 20 ms until it decides, each step through [`observed_before`]: a
+/// verdict, end, or error first seen at or after `deadline` is `TimedOut`.
+fn ready_poll(
+    deadline: Instant,
+    mut step: impl FnMut() -> io::Result<Option<ReadyRead>>,
+) -> io::Result<ReadyRead> {
+    loop {
+        match observed_before(deadline, &mut step) {
+            None => return Ok(ReadyRead::TimedOut),
+            Some(Err(e)) => return Err(e),
+            Some(Ok(Some(r))) => return Ok(r),
+            Some(Ok(None)) => {}
+        }
+        std::thread::sleep(READY_POLL.min(deadline.saturating_duration_since(Instant::now())));
+    }
 }
 
 // ---- Readiness channel (docs/design/daemon-lifecycle.md §2.10) ----
@@ -553,8 +635,8 @@ pub enum ReadyRead {
     TimedOut,
 }
 
-/// The starter's end of the readiness channel. Dropping it removes the private directory it
-/// created (macOS).
+/// The starter's end of the readiness channel. Dropping it removes what it created (macOS:
+/// the socket, the launchd plist [`READY_PLIST`], then the directory if that left it empty).
 pub struct ReadyReader {
     inner: imp::ReadyInner,
 }
@@ -566,12 +648,8 @@ impl ReadyReader {
         imp::ready_dir(&self.inner)
     }
 
-    /// Windows: the spawned child's stdout, which carries the verdict. Nothing elsewhere.
-    pub fn attach_stdout(&mut self, stdout: ChildStdout) {
-        imp::ready_attach(&mut self.inner, stdout);
-    }
-
-    /// Waits until `deadline` for one line. `child`, when given, is the directly spawned child:
+    /// Waits until `deadline` for one line, polling every 20 ms; anything first observed at
+    /// or after `deadline` is `TimedOut`. `child`, when given, is the directly spawned child:
     /// its exit before it connected counts as `Eof` (macOS).
     ///
     /// # Errors
@@ -580,9 +658,9 @@ impl ReadyReader {
     pub fn read_line(
         &mut self,
         deadline: Instant,
-        child: Option<&mut Child>,
+        child: Option<&mut DetachedChild>,
     ) -> io::Result<ReadyRead> {
-        imp::ready_read(&mut self.inner, deadline, child)
+        imp::ready_read(&mut self.inner, deadline, child.map(|c| &mut c.inner))
     }
 }
 
@@ -594,9 +672,13 @@ impl std::fmt::Debug for ReadyReader {
     }
 }
 
+/// The name of the launchd plist the starter writes into the readiness directory (macOS).
+pub const READY_PLIST: &str = "job.plist";
+
 /// The starter's channel: macOS a Unix socket `r` in a fresh private directory `chd-<16 hex>`
-/// under the temp directory (under `/tmp` when the socket path would exceed
-/// [`READY_SOCKET_MAX`] bytes); Windows the child's stdout, attached after the spawn.
+/// under the temp directory, made absolute against the working directory (under `/tmp` when
+/// the socket path would exceed [`READY_SOCKET_MAX`] bytes); Windows the child's stdout,
+/// attached by [`spawn_detached`].
 ///
 /// # Errors
 ///
@@ -832,21 +914,145 @@ mod tests {
         ));
     }
 
-    /// `SSH_CONNECTION` or `SSH_TTY` decides `Absent` without running the probe.
+    /// PR8-CL-13: a non-empty `SSH_CONNECTION` or `SSH_TTY` decides `Absent` without running
+    /// the probe; empty or unset, the probe decides.
     #[test]
     fn ssh_session_skips_the_probe() {
-        if std::env::var_os("SSH_CONNECTION").is_none() && std::env::var_os("SSH_TTY").is_none() {
+        use std::ffi::OsString;
+        let cases: [(&[(&str, &str)], bool); 5] = [
+            (&[("SSH_CONNECTION", "10.0.0.1 1 10.0.0.2 22")], false),
+            (&[("SSH_TTY", "/dev/ttys001")], false),
+            (&[("SSH_CONNECTION", ""), ("SSH_TTY", "")], true),
+            (&[("SSH_CONNECTION", "")], true),
+            (&[], true),
+        ];
+        for (vars, probes) in cases {
             let called = std::cell::Cell::new(false);
             let probe = |_: &[&std::ffi::OsStr], _: Instant| {
                 called.set(true);
                 out(Some(0), "")
             };
-            assert_eq!(
-                super::gui_domain_via(Instant::now() + Duration::from_secs(1), &probe),
-                GuiDomain::Available
-            );
-            assert!(called.get());
+            let env = |name: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| OsString::from(v))
+            };
+            let got = super::gui_domain_with(Instant::now() + Duration::from_secs(1), &env, &probe);
+            assert_eq!(called.get(), probes, "{vars:?}");
+            if probes {
+                assert_eq!(got, GuiDomain::Available, "{vars:?}");
+            } else {
+                assert!(matches!(got, GuiDomain::Absent { .. }), "{vars:?}: {got:?}");
+            }
         }
+    }
+
+    /// A result first observed at or after the deadline loses to it; one observed before
+    /// wins; nothing is observed once the deadline has passed.
+    #[test]
+    fn observations_that_cross_the_deadline_lose() {
+        let end = Instant::now() + Duration::from_millis(100);
+        let late = super::observed_before(end, || {
+            std::thread::sleep(end.saturating_duration_since(Instant::now()));
+            true
+        });
+        assert_eq!(late, None);
+        let soon = Instant::now() + Duration::from_secs(5);
+        assert_eq!(super::observed_before(soon, || 7), Some(7));
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(
+            super::observed_before(past, || panic!("observed after the deadline")),
+            None::<()>
+        );
+    }
+
+    /// The readiness poll: a verdict first observed at or after the deadline is `TimedOut`,
+    /// as is one that a step found only at the deadline.
+    #[test]
+    fn readiness_poll_crossing_the_deadline_times_out() {
+        use super::{ReadyRead, ready_poll};
+        let end = Instant::now() + Duration::from_millis(100);
+        let got = ready_poll(end, || {
+            std::thread::sleep(end.saturating_duration_since(Instant::now()));
+            Ok(Some(ReadyRead::Line("ready 1 2".to_owned())))
+        })
+        .unwrap();
+        assert_eq!(got, ReadyRead::TimedOut);
+        let mut n = 0;
+        let got = ready_poll(Instant::now() + Duration::from_secs(5), || {
+            n += 1;
+            Ok((n == 3).then_some(ReadyRead::Eof))
+        })
+        .unwrap();
+        assert_eq!((got, n), (ReadyRead::Eof, 3));
+    }
+
+    /// Dropping the reader removes only what it created (macOS): the socket and the plist by
+    /// name, then the directory, which another file in it keeps.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reader_removes_only_its_own_files() {
+        use super::{READY_PLIST, ready_channel_in};
+        let (r, _) = ready_channel_in(&std::env::temp_dir()).unwrap();
+        let dir = r.dir().unwrap().to_path_buf();
+        std::fs::write(dir.join(READY_PLIST), b"plist").unwrap();
+        std::fs::write(dir.join("other"), b"x").unwrap();
+        drop(r);
+        let mut left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec![std::ffi::OsString::from("other")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let (r, _) = ready_channel_in(&std::env::temp_dir()).unwrap();
+        let dir = r.dir().unwrap().to_path_buf();
+        drop(r);
+        assert!(!dir.exists());
+    }
+
+    /// A relative temp directory is made absolute against the working directory (macOS), so
+    /// `--ready` carries an absolute path the child accepts. The working directory is
+    /// process-wide, so a helper (this test re-run in a temp directory) resolves `rel`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn relative_tmpdir_is_made_absolute() {
+        use super::{ReadyArg, ready_channel_in};
+        const HELPER: &str = "CHALDEA_HOST_RELATIVE_TMPDIR";
+        if std::env::var_os(HELPER).is_some() {
+            let (r, arg) = ready_channel_in(std::path::Path::new("rel")).unwrap();
+            let ReadyArg::Socket(path) = &arg else {
+                panic!("{arg:?}")
+            };
+            assert!(path.is_absolute(), "{}", path.display());
+            assert_eq!(ReadyArg::parse(path.as_os_str()).unwrap(), arg);
+            drop(r);
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("chaldea-rel-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("rel")).unwrap();
+        let out = crate::with_spawn_lock(|| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "host::tests::relative_tmpdir_is_made_absolute",
+                    "--exact",
+                    "--test-threads=1",
+                ])
+                .env(HELPER, "1")
+                .current_dir(&base)
+                .stdin(std::process::Stdio::null())
+                .output()
+        })
+        .unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && text.contains("1 passed"),
+            "{text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// The readiness channel (macOS): a socket path of at most 100 bytes, under `/tmp` when

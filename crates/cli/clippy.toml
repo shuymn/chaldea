@@ -1,5 +1,6 @@
-# Every child the CLI creates goes through a spawn-lock wrapper (`spawn_locked`,
-# docs/design/daemon-lifecycle.md §2.11), which carries the one `allow`.
+# Every child the CLI creates goes through the daemon's spawn-lock wrapper
+# (`chaldea_daemon::lifecycle::spawn_locked`) or `pty-runtime::host`, both under the spawn lock
+# (docs/design/daemon-lifecycle.md §2.11).
 
 disallowed-methods = [
   { path = "std::process::Command::spawn", reason = "spawn through spawn_locked (the spawn lock)" },

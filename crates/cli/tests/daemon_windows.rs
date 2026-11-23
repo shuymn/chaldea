@@ -216,19 +216,10 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
-/// PR8-CL-11: started from inside a kill-on-close job with `limits`, the daemon runs in no
-/// job, records so, and keeps serving after the job is closed.
-fn breaks_away(test: &str, limits: JobLimits) {
-    if std::env::var(ROLE).as_deref() == Ok("start") {
-        start_in_helper(Path::new(&std::env::var_os(DIR).unwrap()));
-        return;
-    }
-    let d = state();
-    let _stop = StopOnDrop(&d.path);
-    let job = TestJob::new(limits).unwrap();
-    let got = helper_in_jobs(test, "start", &d.path, &[&job]);
-    assert!(got.starts_with("code=0"), "{got}");
-    let r = serving_record(&d.path);
+/// PR8-CL-11: the daemon a start from inside `job` launched runs in no job, records so, and
+/// keeps serving after the job is closed; then `daemon stop` stops it.
+fn assert_broke_away(d: &Path, job: TestJob) {
+    let r = serving_record(d);
     eprintln!("parent: daemon pid {}, evidence {:?}", r.pid, r.evidence);
     assert!(
         !job.contains(r.pid).unwrap(),
@@ -243,38 +234,127 @@ fn breaks_away(test: &str, limits: JobLimits) {
     assert_eq!(r.detached.as_deref(), Some("windows"));
     job.close();
     std::thread::sleep(Duration::from_millis(500));
-    let after = serving_record(&d.path);
+    let after = serving_record(d);
     assert_eq!(after.instance, r.instance);
     assert_eq!(
-        get_status(
-            after.port.unwrap(),
-            "/api/threads",
-            Some(&token_of(&d.path))
-        ),
+        get_status(after.port.unwrap(), "/api/threads", Some(&token_of(d))),
         200
     );
     let (code, out, err) = run_to_exit(
         chaldea(&[], &[])
             .arg("--state-dir")
-            .arg(&d.path)
+            .arg(d)
             .args(["daemon", "stop"]),
     );
     assert_eq!(code, 0, "{out}{err}");
 }
 
+/// PR8-CL-11: `daemon start` run in a helper inside a kill-on-close job with `BREAKAWAY_OK`
+/// launches with the explicit breakaway.
 #[test]
 fn start_breaks_away_from_a_kill_on_close_job_with_breakaway() {
-    breaks_away(
+    if std::env::var(ROLE).as_deref() == Ok("start") {
+        start_in_helper(Path::new(&std::env::var_os(DIR).unwrap()));
+        return;
+    }
+    let d = state();
+    let _stop = StopOnDrop(&d.path);
+    let job = TestJob::new(limits(true, true, false)).unwrap();
+    let got = helper_in_jobs(
         "start_breaks_away_from_a_kill_on_close_job_with_breakaway",
-        limits(true, true, false),
+        "start",
+        &d.path,
+        &[&job],
     );
+    assert!(got.starts_with("code=0"), "{got}");
+    assert_broke_away(&d.path, job);
 }
 
+/// `CREATE_SUSPENDED` (`winbase.h`).
+const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+/// PR8-CL-11: the starter itself is in a kill-on-close job with only `SILENT_BREAKAWAY_OK`
+/// (created suspended, assigned, its membership checked, then resumed), so its own job check
+/// sees that job and launches without the flag; the child breaks away implicitly.
 #[test]
 fn start_breaks_away_from_a_kill_on_close_job_with_silent_breakaway() {
-    breaks_away(
-        "start_breaks_away_from_a_kill_on_close_job_with_silent_breakaway",
-        limits(true, false, true),
+    let d = state();
+    let _stop = StopOnDrop(&d.path);
+    let job = TestJob::new(limits(true, false, true)).unwrap();
+    let mut c = chaldea(&[], &[]);
+    c.arg("--state-dir")
+        .arg(&d.path)
+        .args(["daemon", "start"])
+        .creation_flags(CREATE_SUSPENDED);
+    let mut starter = Proc::spawn(&mut c);
+    job.assign(starter.pid()).unwrap();
+    assert!(
+        job.contains(starter.pid()).unwrap(),
+        "the starter is not in the job"
+    );
+    assert!(fake::resume_process(starter.pid()).unwrap() >= 1);
+    let code = starter.wait_within(Duration::from_secs(60)).code();
+    let (out, err) = (starter.stdout(), starter.stderr());
+    eprintln!("parent: starter exited {code:?}\nstdout:\n{out}stderr:\n{err}");
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(err.contains("breakaway: not requested"), "{err}");
+    assert_broke_away(&d.path, job);
+}
+
+/// The daemon holds no handle of the starter's caller: a caller whose second, inheritable
+/// handle to the starter's stdout pipe was inherited by the starter reads stdout to its end
+/// once the starter exits, while the daemon still serves (run in a helper, so no other test's
+/// child inherits that handle).
+#[test]
+fn daemon_holds_no_caller_handle() {
+    if std::env::var(ROLE).as_deref() == Ok("pipe") {
+        let dir = std::path::PathBuf::from(std::env::var_os(DIR).unwrap());
+        let (mut r, w) = std::io::pipe().unwrap();
+        let extra = w.try_clone().unwrap();
+        fake::make_inheritable(&extra).unwrap();
+        let mut c = chaldea(&[], &[]);
+        c.arg("--state-dir")
+            .arg(&dir)
+            .args(["daemon", "start"])
+            .stdout(Stdio::from(w))
+            .stderr(Stdio::null());
+        let mut starter = chaldea_daemon::lifecycle::spawn_locked(&mut c).unwrap();
+        drop(c);
+        drop(extra);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = std::io::Read::read_to_string(&mut r, &mut s);
+            let _ = tx.send(s);
+        });
+        let end = std::time::Instant::now() + Duration::from_secs(60);
+        let code = loop {
+            if let Some(s) = starter.try_wait().unwrap() {
+                break s.code();
+            }
+            assert!(std::time::Instant::now() < end, "the starter did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let out = rx.recv_timeout(Duration::from_secs(10));
+        let serving = matches!(discover(&dir), Discovery::Serving(_));
+        report(&format!(
+            "code={code:?} eof={} serving={serving} out={}",
+            out.is_ok(),
+            out.unwrap_or_default().replace('\n', " ")
+        ));
+        return;
+    }
+    let d = state();
+    let _stop = StopOnDrop(&d.path);
+    let got = support::run_helper(
+        "daemon_holds_no_caller_handle",
+        &[(ROLE, OsStr::new("pipe")), (DIR, d.path.as_os_str())],
+        Duration::from_secs(90),
+        |_| {},
+    );
+    assert!(
+        got.starts_with("code=Some(0) eof=true serving=true out=daemon started: "),
+        "{got}"
     );
 }
 

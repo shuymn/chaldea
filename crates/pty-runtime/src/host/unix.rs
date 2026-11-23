@@ -10,13 +10,13 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::{
     Access, Breakaway, EntryKind, JobState, LaunchctlOutput, Privacy, ProcessIdentity, ReadyArg,
-    ReadyRead, SigchldDisposition, SignalState, StopTarget, UnixSignal,
+    ReadyRead, SigchldDisposition, SignalState, StopTarget, UnixSignal, observed_before,
 };
 use crate::unix::sys;
 
@@ -219,55 +219,121 @@ fn drain(mut r: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
     rx
 }
 
-/// Waits for `child` until `deadline`; past it, kills and reaps it and returns `TimedOut`.
-/// Deadline first: an exit first observed after the deadline counts as a timeout.
-fn wait_until(child: &mut Child, deadline: Instant, what: &str) -> io::Result<ExitStatus> {
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            let _ = child.kill();
+fn timed_out(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("{what} did not finish in time"),
+    )
+}
+
+/// Kills `child` and leaves its reaping to a thread, so no wait outlives the caller's deadline.
+fn abandon(mut child: Child) {
+    let _ = child.kill();
+    if !matches!(child.try_wait(), Ok(Some(_))) {
+        std::thread::spawn(move || {
             let _ = child.wait();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("{what} did not finish in time"),
-            ));
-        }
-        if let Some(s) = child.try_wait()? {
-            return Ok(s);
+        });
+    }
+}
+
+/// Spawns `cmd` under the spawn lock unless `deadline` has passed, hands the child to
+/// `spawned`, and waits for its exit until `deadline`, polling every 10 ms: an exit first
+/// observed at or after the deadline is a timeout, and past the deadline the child is killed and
+/// handed to a reaper thread.
+fn run_until(
+    cmd: &mut Command,
+    deadline: Instant,
+    what: &str,
+    spawned: impl FnOnce(&mut Child),
+) -> io::Result<ExitStatus> {
+    if Instant::now() >= deadline {
+        return Err(timed_out(what));
+    }
+    let mut child = crate::with_spawn_lock(|| cmd.spawn())?;
+    spawned(&mut child);
+    loop {
+        match observed_before(deadline, || child.try_wait()) {
+            None => {
+                abandon(child);
+                return Err(timed_out(what));
+            }
+            Some(Ok(Some(s))) => return Ok(s),
+            Some(Ok(None)) => {}
+            Some(Err(e)) => {
+                abandon(child);
+                return Err(e);
+            }
         }
         std::thread::sleep(CHILD_POLL.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
-pub(super) fn launchctl(args: &[&OsStr], deadline: Instant) -> io::Result<LaunchctlOutput> {
-    let mut child = crate::with_spawn_lock(|| {
-        Command::new("/bin/launchctl")
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+/// The drained output, if it arrived before `deadline`.
+fn output_before(rx: Option<mpsc::Receiver<Vec<u8>>>, deadline: Instant) -> Option<String> {
+    let Some(rx) = rx else {
+        return Some(String::new());
+    };
+    let left = deadline.saturating_duration_since(Instant::now());
+    observed_before(deadline, || rx.recv_timeout(left).ok())
+        .flatten()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+/// `cmd`'s exit and output, all observed before `deadline` ([`run_until`]); output not read to
+/// its end by then (a grandchild holding the pipes) is a timeout too.
+fn output_until(cmd: &mut Command, deadline: Instant, what: &str) -> io::Result<LaunchctlOutput> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut pipes = (None, None);
+    let status = run_until(cmd, deadline, what, |c| {
+        pipes = (c.stdout.take().map(drain), c.stderr.take().map(drain));
     })?;
-    let out = child.stdout.take().map(drain);
-    let err = child.stderr.take().map(drain);
-    let status = wait_until(&mut child, deadline, "launchctl")?;
-    // The pipes close with the exit; a grandchild holding them is not waited for.
-    let take = |rx: Option<mpsc::Receiver<Vec<u8>>>| {
-        rx.and_then(|r| r.recv_timeout(Duration::from_millis(500)).ok())
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .unwrap_or_default()
+    let (Some(stdout), Some(stderr)) = (
+        output_before(pipes.0, deadline),
+        output_before(pipes.1, deadline),
+    ) else {
+        return Err(timed_out(what));
     };
     Ok(LaunchctlOutput {
         code: status.code(),
-        stdout: take(out),
-        stderr: take(err),
+        stdout,
+        stderr,
     })
 }
 
-pub(super) fn configure_detached(_cmd: &mut Command, _breakaway: Breakaway) {}
+pub(super) fn launchctl(args: &[&OsStr], deadline: Instant) -> io::Result<LaunchctlOutput> {
+    output_until(
+        Command::new("/bin/launchctl").args(args),
+        deadline,
+        "launchctl",
+    )
+}
 
-pub(super) fn uninherit_std_handles() -> io::Result<()> {
-    Ok(())
+pub(super) struct DetachedInner(Child);
+
+pub(super) fn spawn_detached(
+    exe: &Path,
+    args: &[std::ffi::OsString],
+    cwd: &Path,
+    _breakaway: Breakaway,
+    _ready: &mut ReadyInner,
+) -> io::Result<DetachedInner> {
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    Ok(DetachedInner(crate::with_spawn_lock(|| cmd.spawn())?))
+}
+
+pub(super) fn detached_id(inner: &DetachedInner) -> u32 {
+    inner.0.id()
+}
+
+pub(super) fn detached_try_wait(inner: &mut DetachedInner) -> io::Result<Option<String>> {
+    Ok(inner.0.try_wait()?.map(|s| s.to_string()))
 }
 
 // ---- Readiness channel ----
@@ -281,16 +347,20 @@ pub(super) struct ReadyInner {
 
 impl Drop for ReadyInner {
     fn drop(&mut self) {
-        // The directory this starter created, with the socket and the plist in it.
-        let _ = std::fs::remove_dir_all(&self.dir);
+        // What this starter created, by name: the socket, the plist, then the directory,
+        // which anything else in it keeps.
+        let _ = std::fs::remove_file(self.dir.join(SOCKET));
+        let _ = std::fs::remove_file(self.dir.join(super::READY_PLIST));
+        let _ = std::fs::remove_dir(&self.dir);
     }
 }
+
+/// The socket's name in the readiness directory.
+const SOCKET: &str = "r";
 
 pub(super) fn ready_dir(inner: &ReadyInner) -> Option<&Path> {
     Some(&inner.dir)
 }
-
-pub(super) fn ready_attach(_inner: &mut ReadyInner, _stdout: ChildStdout) {}
 
 /// `chd-<16 hex>`: random per call (std's per-process random hash keys plus the time).
 fn fresh_name() -> String {
@@ -306,11 +376,13 @@ fn fresh_name() -> String {
 }
 
 pub(super) fn ready_channel_in(temp: &Path) -> io::Result<(ReadyInner, ReadyArg)> {
-    let probe = temp.join("chd-0123456789abcdef").join("r");
+    // `--ready` carries an absolute path (a relative `TMPDIR` names the caller's directory).
+    let temp = std::path::absolute(temp)?;
+    let probe = temp.join("chd-0123456789abcdef").join(SOCKET);
     let base = if probe.as_os_str().len() > super::READY_SOCKET_MAX {
         Path::new("/tmp").to_path_buf()
     } else {
-        temp.to_path_buf()
+        temp
     };
     let mut tries = 0;
     let dir = loop {
@@ -336,14 +408,15 @@ pub(super) fn ready_channel_in(temp: &Path) -> io::Result<(ReadyInner, ReadyArg)
             return Err(e);
         }
     }
-    let path = dir.join("r");
+    let path = dir.join(SOCKET);
     let listener = match UnixListener::bind(&path).and_then(|l| {
         l.set_nonblocking(true)?;
         Ok(l)
     }) {
         Ok(l) => l,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir(&dir);
             return Err(e);
         }
     };
@@ -360,67 +433,66 @@ pub(super) fn ready_channel_in(temp: &Path) -> io::Result<(ReadyInner, ReadyArg)
 
 /// The longest verdict line the starter accepts.
 const MAX_READY_LINE: usize = 4096;
-const READY_POLL: Duration = Duration::from_millis(20);
 
 pub(super) fn ready_read(
     inner: &mut ReadyInner,
     deadline: Instant,
-    mut child: Option<&mut Child>,
+    mut child: Option<&mut DetachedInner>,
 ) -> io::Result<ReadyRead> {
-    loop {
-        // Deadline first: a line first observed after the deadline does not win.
-        if Instant::now() >= deadline {
-            return Ok(ReadyRead::TimedOut);
+    super::ready_poll(deadline, || ready_step(inner, child.as_deref_mut()))
+}
+
+/// One look at the channel: a connection accepted and read until it would block; `None` while
+/// nothing is decided.
+fn ready_step(
+    inner: &mut ReadyInner,
+    child: Option<&mut DetachedInner>,
+) -> io::Result<Option<ReadyRead>> {
+    if inner.stream.is_none() {
+        match inner.listener.accept() {
+            Ok((s, _)) => {
+                // Polled like the listener: no socket option is set on it, since Darwin
+                // refuses `setsockopt` once the peer shut its end down (`EINVAL`).
+                s.set_nonblocking(true)?;
+                inner.stream = Some(s);
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if let Some(c) = child
+                    && c.0.try_wait()?.is_some()
+                {
+                    // A direct child that exited without connecting decided nothing.
+                    return Ok(Some(ReadyRead::Eof));
+                }
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
         }
-        match inner.stream.as_mut() {
-            None => match inner.listener.accept() {
-                Ok((s, _)) => {
-                    // Polled like the listener: no socket option is set on it, since Darwin
-                    // refuses `setsockopt` once the peer shut its end down (`EINVAL`).
-                    s.set_nonblocking(true)?;
-                    inner.stream = Some(s);
-                    continue;
+    }
+    let Some(stream) = inner.stream.as_mut() else {
+        return Ok(None);
+    };
+    loop {
+        let mut chunk = [0u8; 512];
+        match stream.read(&mut chunk) {
+            Ok(0) => return Ok(Some(ReadyRead::Eof)),
+            Ok(n) => {
+                inner.buf.extend_from_slice(&chunk[..n]);
+                if let Some(i) = inner.buf.iter().position(|b| *b == b'\n') {
+                    let line = String::from_utf8_lossy(&inner.buf[..i]).into_owned();
+                    inner.buf.drain(..=i);
+                    return Ok(Some(ReadyRead::Line(line)));
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    if let Some(c) = child.as_deref_mut()
-                        && c.try_wait()?.is_some()
-                    {
-                        // A direct child that exited without connecting decided nothing.
-                        return Ok(ReadyRead::Eof);
-                    }
-                }
-                Err(e) => return Err(e),
-            },
-            Some(stream) => {
-                let mut chunk = [0u8; 512];
-                match stream.read(&mut chunk) {
-                    Ok(0) => return Ok(ReadyRead::Eof),
-                    Ok(n) => {
-                        inner.buf.extend_from_slice(&chunk[..n]);
-                        if let Some(i) = inner.buf.iter().position(|b| *b == b'\n') {
-                            let line = String::from_utf8_lossy(&inner.buf[..i]).into_owned();
-                            inner.buf.drain(..=i);
-                            return Ok(ReadyRead::Line(line));
-                        }
-                        if inner.buf.len() > MAX_READY_LINE {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "the readiness line is too long",
-                            ));
-                        }
-                        continue;
-                    }
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                        ) => {}
-                    Err(e) => return Err(e),
+                if inner.buf.len() > MAX_READY_LINE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the readiness line is too long",
+                    ));
                 }
             }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(e) => return Err(e),
         }
-        let left = deadline.saturating_duration_since(Instant::now());
-        std::thread::sleep(READY_POLL.min(left));
     }
 }
 
@@ -475,18 +547,80 @@ pub(super) fn deliver_stop(target: &StopTarget) -> io::Result<()> {
 // ---- Browser ----
 
 pub(super) fn open_url(url: &str) -> io::Result<()> {
-    let mut child = crate::with_spawn_lock(|| {
+    let status = run_until(
         Command::new("/usr/bin/open")
             .arg(url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-    })?;
-    let status = wait_until(&mut child, Instant::now() + super::OPEN_URL_WAIT, "open")?;
+            .stderr(Stdio::null()),
+        Instant::now() + super::OPEN_URL_WAIT,
+        "open",
+        |_| {},
+    )?;
     if status.success() {
         Ok(())
     } else {
         Err(io::Error::other(format!("open exited {status}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    use super::output_until;
+
+    fn sh(script: &str) -> Command {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", script]);
+        c
+    }
+
+    /// Nothing is spawned once the deadline has passed: a program that does not exist gives
+    /// the timeout, not the spawn error a spawn attempt would.
+    #[test]
+    fn nothing_runs_after_the_deadline() {
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let got = output_until(&mut Command::new("/nonexistent/chaldea-test"), past, "test");
+        assert_eq!(got.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        let got = output_until(
+            &mut Command::new("/nonexistent/chaldea-test"),
+            Instant::now() + Duration::from_secs(5),
+            "test",
+        );
+        assert_eq!(got.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// A command still running at the deadline, or whose output a grandchild keeps open, is a
+    /// timeout returned at the deadline, not after the command or the grandchild ends.
+    #[test]
+    fn a_command_past_its_deadline_returns_at_the_deadline() {
+        for script in ["sleep 3", "sleep 3 & echo started"] {
+            let t = Instant::now();
+            let got = output_until(&mut sh(script), t + Duration::from_millis(300), "test");
+            assert_eq!(
+                got.unwrap_err().kind(),
+                std::io::ErrorKind::TimedOut,
+                "{script}"
+            );
+            assert!(
+                t.elapsed() < Duration::from_millis(1500),
+                "{script}: {:?}",
+                t.elapsed()
+            );
+        }
+        let got = output_until(
+            &mut sh("echo out; echo err >&2; exit 3"),
+            Instant::now() + Duration::from_secs(5),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            (got.code, got.stdout.as_str(), got.stderr.as_str()),
+            (Some(3), "out\n", "err\n")
+        );
     }
 }

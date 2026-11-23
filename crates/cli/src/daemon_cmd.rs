@@ -11,20 +11,19 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use chaldea_daemon::lifecycle::{
-    self, Budgets, DaemonConfig, DetachVia, Discovery, ExitCode, LockProbe, RunMode, diag, names,
+    self, Budgets, DaemonConfig, DetachVia, Discovery, DiscoveryRecord, ExitCode, LockProbe,
+    RunMode, diag, names,
 };
 use chaldea_pty_runtime::host::{
-    self, Breakaway, GuiDomain, LaunchctlOutput, ReadyArg, ReadyRead, ReadyReader, StopSent,
-    StopTarget,
+    self, Breakaway, DetachedChild, GuiDomain, LaunchctlOutput, READY_PLIST, ReadyArg, ReadyRead,
+    ReadyReader, StopSent, StopTarget,
 };
 
 use crate::Seams;
 use crate::client;
-use crate::spawn::spawn_locked;
 
 /// `daemon start`'s one deadline (herdr's bound, design L9).
 pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -45,6 +44,8 @@ const SCAVENGE_SHARE: Duration = Duration::from_secs(2);
 const EOF_FOLLOW_UP: Duration = Duration::from_secs(2);
 /// How often discovery, the lock, or a target's identity is polled.
 const POLL: Duration = Duration::from_millis(50);
+/// The owner-token request that shows a recorded daemon serves (design §2.10).
+const SERVE_CHECK_PATH: &str = "/api/threads";
 /// The prefix of every launchd label `daemon start` submits.
 pub(crate) const LABEL_PREFIX: &str = "dev.chaldea.daemon.";
 /// `launchctl print <service>` for a service that does not exist.
@@ -104,10 +105,15 @@ pub(crate) fn run(state_dir: PathBuf, a: &RunArgs, seams: &mut Seams) -> ExitCod
         } else {
             DetachVia::Setsid
         };
-        RunMode::DetachedChild {
-            ready: lifecycle::host_ready_opener(arg),
-            via,
-        }
+        let open = lifecycle::host_ready_opener(arg);
+        let ready: lifecycle::ReadyOpener = match seams.before_ready.take() {
+            Some(pause) => Box::new(move || {
+                pause();
+                open()
+            }),
+            None => open,
+        };
+        RunMode::DetachedChild { ready, via }
     } else {
         RunMode::Foreground
     };
@@ -135,7 +141,7 @@ type Launchctl<'a> = &'a dyn Fn(&[&OsStr], Instant) -> io::Result<LaunchctlOutpu
 /// How the child was launched, for the follow-ups and the timeout message.
 enum Launched {
     /// A direct child: `setsid` (macOS without a GUI domain) or Windows.
-    Child(Child),
+    Child(DetachedChild),
     /// A launchd job in `target` (`gui/<uid>`).
     Launchd { label: String, target: String },
 }
@@ -202,7 +208,9 @@ pub(crate) fn start(state_dir: &Path, port: Option<u16>, seams: &Seams) -> ExitC
             }
             GuiDomain::Absent { why } => {
                 say(&format!("detaching through setsid: no GUI domain ({why})"));
-                spawn_direct(&exe, &child_args, &mut reader, Breakaway::NotRequested)
+                launch_direct(Breakaway::NotRequested, &mut |b| {
+                    host::spawn_detached(&exe, &child_args, &std::env::temp_dir(), b, &mut reader)
+                })
             }
             GuiDomain::Available => {
                 let mut args = child_args.clone();
@@ -218,7 +226,9 @@ pub(crate) fn start(state_dir: &Path, port: Option<u16>, seams: &Seams) -> ExitC
                 Breakaway::NotRequested => "not requested",
             }
         ));
-        spawn_direct(&exe, &child_args, &mut reader, breakaway)
+        launch_direct(breakaway, &mut |b| {
+            host::spawn_detached(&exe, &child_args, &std::env::temp_dir(), b, &mut reader)
+        })
     };
     let mut launched = match launched {
         Ok(l) => l,
@@ -231,47 +241,44 @@ pub(crate) fn start(state_dir: &Path, port: Option<u16>, seams: &Seams) -> ExitC
         state_dir,
         port,
         launchctl,
+        seams.after_verdict.as_deref(),
         deadline,
     );
     drop(reader);
     code
 }
 
-/// The direct child: `setsid` path on macOS, Windows with its creation flags.
-fn spawn_direct(
-    exe: &Path,
-    args: &[OsString],
-    reader: &mut ReadyReader,
+/// The direct child (`setsid` path on macOS, every Windows launch) through `spawn`, called
+/// once: a refused explicit breakaway (`ERROR_ACCESS_DENIED`) is the job refusal, never retried
+/// without the flag (design §2.12).
+fn launch_direct(
     breakaway: Breakaway,
+    spawn: &mut dyn FnMut(Breakaway) -> io::Result<DetachedChild>,
 ) -> Result<Launched, ExitCode> {
-    if let Err(e) = host::uninherit_std_handles() {
-        say(&format!(
-            "this terminal's handles may stay open in the daemon: {e}"
-        ));
-    }
-    let mut cmd = Command::new(exe);
-    cmd.args(args)
-        .current_dir(std::env::temp_dir())
-        .stdin(Stdio::null())
-        .stderr(Stdio::null());
-    if cfg!(windows) {
-        cmd.stdout(Stdio::piped());
-    } else {
-        cmd.stdout(Stdio::null());
-    }
-    host::configure_detached(&mut cmd, breakaway);
-    match spawn_locked(&mut cmd) {
-        Ok(mut c) => {
-            if let Some(out) = c.stdout.take() {
-                reader.attach_stdout(out);
-            }
-            Ok(Launched::Child(c))
-        }
-        // `ERROR_ACCESS_DENIED`: the job refused the breakaway; no retry without it.
+    match spawn(breakaway) {
+        Ok(c) => Ok(Launched::Child(c)),
         Err(e) if breakaway == Breakaway::Explicit && e.raw_os_error() == Some(5) => {
             Err(fail(JOB_REFUSAL))
         }
         Err(e) => Err(fail(&format!("the daemon cannot be started: {e}"))),
+    }
+}
+
+/// Polls `observe` every `period` until it decides, each observation through
+/// `host::observed_before`: `None` at the deadline, also for a result first observed at or
+/// after it.
+fn poll_until<T>(
+    deadline: Instant,
+    period: Duration,
+    mut observe: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    loop {
+        match host::observed_before(deadline, &mut observe) {
+            None => return None,
+            Some(Some(t)) => return Some(t),
+            Some(None) => {}
+        }
+        std::thread::sleep(period.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
@@ -296,19 +303,13 @@ fn lookup(launchctl: Launchctl<'_>, service: &str, until: Instant) -> Lookup {
     }
 }
 
-/// After a `bootstrap` that timed out: the label looked up every 250 ms until `until`,
-/// deadline first. `true` once it is present.
+/// After a `bootstrap` that timed out: the label looked up every 250 ms until `until`, a
+/// presence first observed at or after `until` not counting. `true` once it is present.
 fn poll_label(launchctl: Launchctl<'_>, service: &str, until: Instant) -> bool {
-    loop {
-        if Instant::now() >= until {
-            return false;
-        }
-        if lookup(launchctl, service, until) == Lookup::Present {
-            return true;
-        }
-        let left = until.saturating_duration_since(Instant::now());
-        std::thread::sleep(LABEL_POLL.min(left));
-    }
+    poll_until(until, LABEL_POLL, || {
+        (lookup(launchctl, service, until) == Lookup::Present).then_some(())
+    })
+    .is_some()
 }
 
 /// The macOS GUI-host launch (design §2.10): stale labels removed, the plist written into the
@@ -328,6 +329,7 @@ fn launch_launchd(
         launchctl,
         &target,
         prefix,
+        exe,
         now_ms,
         deadline.min(Instant::now() + SCAVENGE_SHARE),
     );
@@ -351,7 +353,7 @@ fn launch_launchd(
             )));
         }
     };
-    let path = dir.join("job.plist");
+    let path = dir.join(READY_PLIST);
     let written = host::create_private_file(&path).and_then(|mut f| {
         f.write_all(plist.as_bytes())?;
         f.sync_all()
@@ -439,8 +441,57 @@ fn stale_candidates(domain_listing: &str, prefix: &str, now_ms: u128) -> Vec<Str
     out
 }
 
-/// Removes this prefix's labels proven stale: older than 60 s and not running. Nothing else.
-fn scavenge(launchctl: Launchctl<'_>, target: &str, prefix: &str, now_ms: u128, until: Instant) {
+/// Whether `launchctl print <service>` affirmatively shows a finished job of this binary:
+/// its top-level `state = not running`, and program arguments `<program> daemon run
+/// --from-launchd …` whose program has `exe`'s file name. An empty or unrecognised listing is
+/// no proof.
+fn finished_own_job(print: &str, exe: &Path) -> bool {
+    let mut finished = false;
+    let mut program = None;
+    let mut argv: Vec<&str> = Vec::new();
+    let mut in_arguments = false;
+    for line in print.lines() {
+        if in_arguments {
+            if line == "\t}" {
+                in_arguments = false;
+            } else if let Some(a) = line.strip_prefix("\t\t") {
+                argv.push(a.trim());
+            }
+            continue;
+        }
+        // Top-level keys only: nested blocks (the resource coalition) have their own state.
+        let Some(top) = line.strip_prefix('\t').filter(|l| !l.starts_with('\t')) else {
+            continue;
+        };
+        if top == "state = not running" {
+            finished = true;
+        } else if let Some(p) = top.strip_prefix("program = ") {
+            program = Some(p.trim());
+        } else if top == "arguments = {" {
+            in_arguments = true;
+        }
+    }
+    let named = |p: &str| {
+        Path::new(p)
+            .file_name()
+            .is_some_and(|n| Some(n) == exe.file_name())
+    };
+    finished
+        && program.is_some_and(named)
+        && argv.first().copied() == program
+        && argv.get(1..4) == Some(&["daemon", "run", "--from-launchd"][..])
+}
+
+/// Removes this prefix's labels proven stale: older than 60 s, and shown finished and owned
+/// ([`finished_own_job`]). Nothing else; nothing at or after `until`.
+fn scavenge(
+    launchctl: Launchctl<'_>,
+    target: &str,
+    prefix: &str,
+    exe: &Path,
+    now_ms: u128,
+    until: Instant,
+) {
     let Ok(listing) = launchctl(&["print".as_ref(), target.as_ref()], until) else {
         return;
     };
@@ -448,18 +499,20 @@ fn scavenge(launchctl: Launchctl<'_>, target: &str, prefix: &str, now_ms: u128, 
         return;
     }
     for label in stale_candidates(&listing.stdout, prefix, now_ms) {
-        if Instant::now() >= until {
-            return;
-        }
         let service = format!("{target}/{label}");
         let Ok(p) = launchctl(&["print".as_ref(), service.as_ref()], until) else {
             continue;
         };
-        if p.code == Some(0) && !p.stdout.contains("state = running") {
-            let removed = launchctl(&["bootout".as_ref(), service.as_ref()], until);
-            if removed.is_ok_and(|o| o.code == Some(0)) {
-                say(&format!("removed the stale launchd job {label}"));
-            }
+        if p.code != Some(0) || !finished_own_job(&p.stdout, exe) {
+            continue;
+        }
+        // The removal is the side effect: never at or after the share's end.
+        if Instant::now() >= until {
+            return;
+        }
+        let removed = launchctl(&["bootout".as_ref(), service.as_ref()], until);
+        if removed.is_ok_and(|o| o.code == Some(0)) {
+            say(&format!("removed the stale launchd job {label}"));
         }
     }
 }
@@ -598,12 +651,17 @@ fn port_conflict(dir: &Path, serving: u16, requested: Option<u16>) -> Option<Exi
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the start's state, its launch, and its seams, one place"
+)]
 fn await_verdict(
     reader: &mut ReadyReader,
     launched: &mut Launched,
     dir: &Path,
     port: Option<u16>,
     launchctl: Launchctl<'_>,
+    after_verdict: Option<&dyn Fn()>,
     deadline: Instant,
 ) -> ExitCode {
     let child = match launched {
@@ -625,6 +683,9 @@ fn await_verdict(
             )),
         }
     }
+    if let (Ok(ReadyRead::Line(_)), Some(pause)) = (&read, after_verdict) {
+        pause();
+    }
     let log = dir.join(names::LOG);
     match read {
         Ok(ReadyRead::Line(line)) => match parse_verdict(&line) {
@@ -632,8 +693,7 @@ fn await_verdict(
                 if let Some(code) = port_conflict(dir, p, port) {
                     return code;
                 }
-                print_out(&format!("daemon started: http://127.0.0.1:{p} (pid {pid})"));
-                ExitCode::Ok
+                confirm_started(dir, p, pid, deadline)
             }
             Some(Verdict::Fail {
                 reason,
@@ -678,75 +738,160 @@ fn await_verdict(
     }
 }
 
-/// After `fail already_running`: the winner's record, polled every 50 ms, deadline first.
-fn await_running(dir: &Path, port: Option<u16>, deadline: Instant) -> ExitCode {
-    loop {
-        if Instant::now() >= deadline {
-            return fail_with(
-                ExitCode::Timeout,
-                &format!(
-                    "a daemon holds {} but did not report serving within 15 s; it may still be starting",
-                    dir.display()
-                ),
-            );
-        }
-        match client::discover(dir) {
-            Discovery::Serving(r) => {
-                let Some(p) = r.port else {
-                    return fail("the serving daemon's record names no port");
-                };
-                if let Some(code) = port_conflict(dir, p, port) {
-                    return code;
-                }
-                print_out(&format!(
-                    "daemon already running: http://127.0.0.1:{p} (pid {})",
-                    r.pid
-                ));
-                return ExitCode::Ok;
-            }
-            Discovery::NotRunning => {
-                return fail(&format!(
-                    "the daemon starting for {} exited; see {}",
-                    dir.display(),
-                    dir.join(names::LOG).display()
-                ));
-            }
-            Discovery::Starting(_) | Discovery::Unknown => {}
-        }
-        std::thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
+/// What one look at a recorded daemon found (design §2.10 "success only for a serving
+/// instance").
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Serving {
+    /// The record names it with the lock held, an owner-token request to it succeeded, and the
+    /// record still names the same instance after the reply.
+    Confirmed(DiscoveryRecord),
+    /// No daemon holds the directory.
+    Gone,
+    /// The record names another process than the expected one.
+    Replaced(DiscoveryRecord),
+    /// Something a later look cannot change.
+    Failed(String),
+}
+
+/// One look at the daemon serving `dir` (`expect`: the pid and port its verdict named); `None`
+/// while it is starting, or recorded but not answering (stopping).
+fn check_serving(dir: &Path, expect: Option<(u32, u16)>, deadline: Instant) -> Option<Serving> {
+    let r = match client::discover(dir) {
+        Discovery::NotRunning => return Some(Serving::Gone),
+        Discovery::Starting(_) | Discovery::Unknown => return None,
+        Discovery::Serving(r) => r,
+    };
+    if let Some((pid, port)) = expect
+        && (r.pid != pid || r.port != Some(port))
+    {
+        return Some(Serving::Replaced(r));
+    }
+    let Some(port) = r.port else {
+        return Some(Serving::Failed(
+            "the serving daemon's record names no port".to_owned(),
+        ));
+    };
+    let token = match client::read_owner_token(dir) {
+        Ok(t) => t,
+        Err(e) => return Some(Serving::Failed(format!("the owner token: {e}"))),
+    };
+    let answered = client::request(port, "GET", SERVE_CHECK_PATH, Some(&token), None, deadline)
+        .is_ok_and(|resp| resp.status == 200);
+    if !answered {
+        return None;
+    }
+    match client::discover(dir) {
+        Discovery::Serving(again) if again.instance == r.instance => Some(Serving::Confirmed(r)),
+        Discovery::NotRunning => Some(Serving::Gone),
+        _ => None,
     }
 }
 
-/// The channel closed without a verdict: what can be observed for at most 2 s, never past
-/// the deadline (Windows: the child's exit; macOS: the lock).
+/// After `ready <port> <pid>`: success only once that daemon is confirmed serving, polled every
+/// 50 ms until the deadline.
+fn confirm_started(dir: &Path, port: u16, pid: u32, deadline: Instant) -> ExitCode {
+    match poll_until(deadline, POLL, || {
+        check_serving(dir, Some((pid, port)), deadline)
+    }) {
+        Some(Serving::Confirmed(_)) => {
+            print_out(&format!(
+                "daemon started: http://127.0.0.1:{port} (pid {pid})"
+            ));
+            ExitCode::Ok
+        }
+        Some(Serving::Gone | Serving::Replaced(_)) => fail(&format!(
+            "the daemon (pid {pid}) reported ready but stopped before the start finished; see {}",
+            dir.join(names::LOG).display()
+        )),
+        Some(Serving::Failed(m)) => fail(&m),
+        None => fail_with(
+            ExitCode::Timeout,
+            &format!(
+                "the daemon (pid {pid}) reported ready but did not answer on port {port} within 15 s"
+            ),
+        ),
+    }
+}
+
+/// After `fail already_running`: the winner, once confirmed serving, polled every 50 ms until
+/// the deadline.
+fn await_running(dir: &Path, port: Option<u16>, deadline: Instant) -> ExitCode {
+    match poll_until(deadline, POLL, || check_serving(dir, None, deadline)) {
+        Some(Serving::Confirmed(r)) => {
+            let Some(p) = r.port else {
+                return fail("the serving daemon's record names no port");
+            };
+            if let Some(code) = port_conflict(dir, p, port) {
+                return code;
+            }
+            print_out(&format!(
+                "daemon already running: http://127.0.0.1:{p} (pid {})",
+                r.pid
+            ));
+            ExitCode::Ok
+        }
+        Some(Serving::Gone | Serving::Replaced(_)) => fail(&format!(
+            "the daemon starting for {} exited; see {}",
+            dir.display(),
+            dir.join(names::LOG).display()
+        )),
+        Some(Serving::Failed(m)) => fail(&m),
+        None => fail_with(
+            ExitCode::Timeout,
+            &format!(
+                "a daemon holds {} but did not report serving within 15 s; it may still be starting",
+                dir.display()
+            ),
+        ),
+    }
+}
+
+/// One follow-up observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Seen {
+    /// Decides the follow-up.
+    Final(String),
+    /// What holds for now (a child still running, a lock still held).
+    Pending(String),
+}
+
+/// Polls `observe` every 50 ms until it sees something final, each observation through
+/// `host::observed_before`: at `until`, the last observation made before it, or `None` when
+/// none was.
+fn follow_up(until: Instant, mut observe: impl FnMut() -> Seen) -> Option<String> {
+    let mut last = None;
+    loop {
+        match host::observed_before(until, &mut observe) {
+            None => return last,
+            Some(Seen::Final(s)) => return Some(s),
+            Some(Seen::Pending(s)) => last = Some(s),
+        }
+        std::thread::sleep(POLL.min(until.saturating_duration_since(Instant::now())));
+    }
+}
+
+/// The channel closed without a verdict: what can be observed for at most 2 s, never at or
+/// past the deadline (Windows: the child's exit; macOS: the lock).
 fn eof_follow_up(launched: &mut Launched, dir: &Path, deadline: Instant) -> ExitCode {
     let until = deadline.min(Instant::now() + EOF_FOLLOW_UP);
     let log = dir.join(names::LOG);
-    let observed = loop {
-        let done = Instant::now() >= until;
-        let seen = match launched {
-            Launched::Child(c) if cfg!(windows) => match c.try_wait() {
-                Ok(Some(s)) => Some(format!("it exited ({s})")),
-                Ok(None) if done => Some(format!("it is still running (pid {})", c.id())),
-                Ok(None) => None,
-                Err(e) => Some(format!("its status cannot be read: {e}")),
-            },
-            _ => match lifecycle::probe(dir) {
-                Ok(LockProbe::Free | LockProbe::Missing) => {
-                    Some("no daemon holds the state directory".to_owned())
-                }
-                Ok(LockProbe::Held) if done => {
-                    Some("a daemon still holds the state directory".to_owned())
-                }
-                Ok(LockProbe::Held) => None,
-                Err(e) => Some(format!("the lock cannot be probed: {e}")),
-            },
-        };
-        if let Some(s) = seen {
-            break s;
-        }
-        std::thread::sleep(POLL.min(until.saturating_duration_since(Instant::now())));
-    };
+    let observed = follow_up(until, || match launched {
+        Launched::Child(c) if cfg!(windows) => match c.try_wait() {
+            Ok(Some(s)) => Seen::Final(format!("it exited ({s})")),
+            Ok(None) => Seen::Pending(format!("it is still running (pid {})", c.id())),
+            Err(e) => Seen::Final(format!("its status cannot be read: {e}")),
+        },
+        _ => match lifecycle::probe(dir) {
+            Ok(LockProbe::Free | LockProbe::Missing) => {
+                Seen::Final("no daemon holds the state directory".to_owned())
+            }
+            Ok(LockProbe::Held) => {
+                Seen::Pending("a daemon still holds the state directory".to_owned())
+            }
+            Err(e) => Seen::Final(format!("the lock cannot be probed: {e}")),
+        },
+    })
+    .unwrap_or_else(|| "nothing could be observed before the deadline".to_owned());
     fail(&format!(
         "the daemon exited before reporting readiness: {observed}; see {}",
         log.display()
@@ -759,16 +904,18 @@ fn eof_follow_up(launched: &mut Launched, dir: &Path, deadline: Instant) -> Exit
 /// identity is gone.
 pub(crate) fn stop(dir: &Path, seams: &mut Seams) -> ExitCode {
     let deadline = Instant::now() + STOP_WAIT;
-    let record = loop {
-        match client::discover(dir) {
-            Discovery::NotRunning => {
-                print_out("not running");
-                return ExitCode::Ok;
-            }
-            Discovery::Starting(r) | Discovery::Serving(r) => break r,
-            Discovery::Unknown => {}
+    let found = poll_until(deadline, POLL, || match client::discover(dir) {
+        Discovery::NotRunning => Some(None),
+        Discovery::Starting(r) | Discovery::Serving(r) => Some(Some(r)),
+        Discovery::Unknown => None,
+    });
+    let record = match found {
+        Some(Some(r)) => r,
+        Some(None) => {
+            print_out("not running");
+            return ExitCode::Ok;
         }
-        if Instant::now() >= deadline {
+        None => {
             return fail_with(
                 ExitCode::Timeout,
                 &format!(
@@ -777,14 +924,22 @@ pub(crate) fn stop(dir: &Path, seams: &mut Seams) -> ExitCode {
                 ),
             );
         }
-        std::thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
     };
     let target = StopTarget {
         pid: record.pid,
         start_time: record.start_time.clone(),
         instance: record.instance.clone(),
     };
-    match host::send_stop(&target) {
+    let Some(sent) = send_before(deadline, &target, host::send_stop) else {
+        return fail_with(
+            ExitCode::Timeout,
+            &format!(
+                "the stop request was not sent within 15 s (pid {})",
+                target.pid
+            ),
+        );
+    };
+    match sent {
         Ok(StopSent::Sent) => {}
         Ok(StopSent::Exited | StopSent::IdentityMismatch) => {
             print_out("the daemon had already exited");
@@ -829,14 +984,25 @@ pub(crate) fn stop(dir: &Path, seams: &mut Seams) -> ExitCode {
     }
 }
 
+/// `send(target)` unless the deadline has passed: the request is a side effect, never issued
+/// at or after it.
+fn send_before(
+    deadline: Instant,
+    target: &StopTarget,
+    send: impl FnOnce(&StopTarget) -> io::Result<StopSent>,
+) -> Option<io::Result<StopSent>> {
+    (Instant::now() < deadline).then(|| send(target))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Gone {
     Yes,
     TimedOut,
 }
 
-/// Polls every 50 ms, deadline first, until the target's `(pid, start_time)` names no live
-/// process: generation-aware, so a new daemon on the same directory does not count.
+/// Polls every 50 ms until the target's `(pid, start_time)` names no live process, a
+/// disappearance first observed at or after the deadline not counting: generation-aware, so a
+/// new daemon on the same directory does not count.
 fn wait_gone(target: &StopTarget, deadline: Instant) -> Gone {
     wait_until_gone(deadline, || match host::process_identity(target.pid) {
         Ok(None) => true,
@@ -846,15 +1012,7 @@ fn wait_gone(target: &StopTarget, deadline: Instant) -> Gone {
 }
 
 fn wait_until_gone(deadline: Instant, mut gone: impl FnMut() -> bool) -> Gone {
-    loop {
-        if Instant::now() >= deadline {
-            return Gone::TimedOut;
-        }
-        if gone() {
-            return Gone::Yes;
-        }
-        std::thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
-    }
+    poll_until(deadline, POLL, || gone().then_some(())).map_or(Gone::TimedOut, |()| Gone::Yes)
 }
 
 #[cfg(test)]
@@ -939,10 +1097,16 @@ mod tests {
     }
 
     /// Every control character a variable can hold reaches a real launchd job unchanged (the
-    /// job writes the variable's bytes to a file).
+    /// job writes the variable's bytes to a file). Skipped, with the reason printed, without the
+    /// user's GUI domain (an SSH session), where no job can be submitted.
     #[cfg(target_os = "macos")]
     #[test]
     fn plist_round_trips_control_characters() {
+        let domain = host::gui_domain(Instant::now() + GUI_PROBE_SHARE);
+        if domain != GuiDomain::Available {
+            eprintln!("skipped: submitting a launchd job needs the user's GUI domain ({domain:?})");
+            return;
+        }
         let value: String = (1u32..32)
             .chain(127..160)
             .filter_map(char::from_u32)
@@ -1038,6 +1202,192 @@ mod tests {
             "gui/1/x",
             Instant::now() + Duration::from_secs(1)
         ));
+    }
+
+    /// A result first observed at or after the deadline loses: a target gone, a label present,
+    /// a discovery answer, a follow-up observation.
+    #[test]
+    fn observations_that_cross_the_deadline_lose() {
+        let end = Instant::now() + Duration::from_millis(100);
+        assert_eq!(
+            wait_until_gone(end, || {
+                std::thread::sleep(end.saturating_duration_since(Instant::now()));
+                true
+            }),
+            Gone::TimedOut
+        );
+
+        let end = Instant::now() + Duration::from_millis(100);
+        let late = |_: &[&OsStr], deadline: Instant| -> io::Result<LaunchctlOutput> {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            Ok(LaunchctlOutput {
+                code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        };
+        assert!(!poll_label(&late, "gui/1/test", end));
+
+        let end = Instant::now() + Duration::from_millis(100);
+        let found = poll_until(end, POLL, || {
+            std::thread::sleep(end.saturating_duration_since(Instant::now()));
+            Some(())
+        });
+        assert_eq!(found, None);
+
+        let end = Instant::now() + Duration::from_millis(300);
+        let mut n = 0;
+        let seen = follow_up(end, || {
+            n += 1;
+            if n == 1 {
+                Seen::Pending("held".to_owned())
+            } else {
+                std::thread::sleep(end.saturating_duration_since(Instant::now()));
+                Seen::Final("free".to_owned())
+            }
+        });
+        assert_eq!(seen.as_deref(), Some("held"));
+    }
+
+    /// The EOF follow-up ends at its cutoff with the last observation made before it, and a
+    /// final observation before the cutoff decides at once.
+    #[test]
+    fn follow_up_keeps_its_cutoff() {
+        let t = Instant::now();
+        let end = t + Duration::from_millis(300);
+        let seen = follow_up(end, || Seen::Pending("running".to_owned()));
+        assert_eq!(seen.as_deref(), Some("running"));
+        assert!(t.elapsed() >= Duration::from_millis(300));
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(
+            follow_up(past, || panic!("observed after the cutoff")),
+            None
+        );
+        let seen = follow_up(Instant::now() + Duration::from_secs(5), || {
+            Seen::Final("exited".to_owned())
+        });
+        assert_eq!(seen.as_deref(), Some("exited"));
+    }
+
+    /// Scavenging issues no `bootout` at or after the end of its share, even for a label it has
+    /// just proven stale; with time left, it removes that label.
+    #[test]
+    fn scavenging_removes_nothing_at_its_end() {
+        let exe = Path::new("/work/bin/chaldea");
+        let label = "dev.chaldea.daemon.1-a";
+        let run = |end: Instant, slow_print: bool| {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let fake = |args: &[&OsStr], deadline: Instant| -> io::Result<LaunchctlOutput> {
+                let args: Vec<String> = args
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                calls.borrow_mut().push(args.join(" "));
+                let stdout = match args.as_slice() {
+                    [p, t] if p == "print" && t == "gui/1" => {
+                        format!("services = {{\n\t0 - {label}\n}}")
+                    }
+                    [p, _] if p == "print" => {
+                        if slow_print {
+                            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                        }
+                        format!(
+                            "x = {{\n\tstate = not running\n\tprogram = {0}\n\targuments = {{\n\t\t{0}\n\t\tdaemon\n\t\trun\n\t\t--from-launchd\n\t}}\n}}",
+                            exe.display()
+                        )
+                    }
+                    _ => String::new(),
+                };
+                Ok(LaunchctlOutput {
+                    code: Some(0),
+                    stdout,
+                    stderr: String::new(),
+                })
+            };
+            scavenge(&fake, "gui/1", "dev.chaldea.daemon.", exe, 1_000_000, end);
+            calls.into_inner()
+        };
+        let late = run(Instant::now() + Duration::from_millis(100), true);
+        assert!(!late.iter().any(|c| c.starts_with("bootout")), "{late:?}");
+        let on_time = run(Instant::now() + Duration::from_secs(5), false);
+        assert_eq!(
+            on_time.last().map(String::as_str),
+            Some(format!("bootout gui/1/{label}").as_str()),
+            "{on_time:?}"
+        );
+    }
+
+    /// The stop request is never sent at or after the deadline.
+    #[test]
+    fn stop_request_is_not_sent_after_the_deadline() {
+        let t = StopTarget {
+            pid: 1,
+            start_time: "1".to_owned(),
+            instance: "x".to_owned(),
+        };
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        assert!(send_before(past, &t, |_| panic!("sent after the deadline")).is_none());
+        let sent = send_before(Instant::now() + Duration::from_secs(5), &t, |_| {
+            Ok(StopSent::Sent)
+        });
+        assert_eq!(sent.unwrap().unwrap(), StopSent::Sent);
+    }
+
+    /// PR8-CL-12 (design §2.12): a spawn with an explicit breakaway that fails with
+    /// `ERROR_ACCESS_DENIED` is the job refusal, with one spawn and no retry without the flag.
+    #[test]
+    fn refused_breakaway_is_not_retried() {
+        let mut calls = Vec::new();
+        let got = launch_direct(Breakaway::Explicit, &mut |b| {
+            calls.push(b);
+            Err(io::Error::from_raw_os_error(5))
+        });
+        assert!(matches!(got, Err(ExitCode::Failed)));
+        assert_eq!(calls, vec![Breakaway::Explicit]);
+    }
+
+    /// Only a listing that shows a finished job of this binary, with the starter's argument
+    /// shape, proves a stale label ours.
+    #[test]
+    fn only_finished_own_jobs_are_stale() {
+        let exe = Path::new("/work/bin/chaldea");
+        let print = |state: &str, program: &str, args: &[&str]| {
+            let mut s = format!(
+                "gui/501/dev.chaldea.daemon.1-x = {{\n\tactive count = 0\n\tstate = {state}\n\n\tprogram = {program}\n\targuments = {{\n"
+            );
+            for a in std::iter::once(&program).chain(args) {
+                s.push_str(&format!("\t\t{a}\n"));
+            }
+            s.push_str("\t}\n\n\tresource coalition = {\n\t\tstate = active\n\t}\n}\n");
+            s
+        };
+        let own = ["daemon", "run", "--from-launchd", "--detached-child"];
+        assert!(finished_own_job(
+            &print("not running", "/work/bin/chaldea", &own),
+            exe
+        ));
+        assert!(finished_own_job(
+            &print("not running", "/other/chaldea", &own),
+            exe
+        ));
+        assert!(!finished_own_job(
+            &print("running", "/work/bin/chaldea", &own),
+            exe
+        ));
+        assert!(!finished_own_job(
+            &print("not running", "/usr/bin/true", &own),
+            exe
+        ));
+        assert!(!finished_own_job(
+            &print("not running", "/work/bin/chaldea", &["daemon", "run"]),
+            exe
+        ));
+        assert!(!finished_own_job("", exe));
+        assert!(!finished_own_job("Could not find service", exe));
     }
 
     /// The starter's breakaway decision (design §2.12), every row.

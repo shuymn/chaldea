@@ -5,7 +5,6 @@ use std::ffi::OsStr;
 use std::fs::{File, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command};
 use std::time::Instant;
 
 use super::{
@@ -97,10 +96,24 @@ pub(super) fn launchctl(_args: &[&OsStr], _deadline: Instant) -> io::Result<Laun
     unsupported()
 }
 
-pub(super) fn configure_detached(_cmd: &mut Command, _breakaway: Breakaway) {}
+pub(super) struct DetachedInner;
 
-pub(super) fn uninherit_std_handles() -> io::Result<()> {
-    Ok(())
+pub(super) fn spawn_detached(
+    _exe: &Path,
+    _args: &[std::ffi::OsString],
+    _cwd: &Path,
+    _breakaway: Breakaway,
+    _ready: &mut ReadyInner,
+) -> io::Result<DetachedInner> {
+    unsupported()
+}
+
+pub(super) fn detached_id(_inner: &DetachedInner) -> u32 {
+    0
+}
+
+pub(super) fn detached_try_wait(_inner: &mut DetachedInner) -> io::Result<Option<String>> {
+    unsupported()
 }
 
 pub(super) struct ReadyInner;
@@ -109,8 +122,6 @@ pub(super) fn ready_dir(_inner: &ReadyInner) -> Option<&Path> {
     None
 }
 
-pub(super) fn ready_attach(_inner: &mut ReadyInner, _stdout: ChildStdout) {}
-
 pub(super) fn ready_channel_in(_temp: &Path) -> io::Result<(ReadyInner, ReadyArg)> {
     unsupported()
 }
@@ -118,7 +129,7 @@ pub(super) fn ready_channel_in(_temp: &Path) -> io::Result<(ReadyInner, ReadyArg
 pub(super) fn ready_read(
     _inner: &mut ReadyInner,
     _deadline: Instant,
-    _child: Option<&mut Child>,
+    _child: Option<&mut DetachedInner>,
 ) -> io::Result<ReadyRead> {
     unsupported()
 }

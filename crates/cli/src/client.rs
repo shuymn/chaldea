@@ -52,11 +52,12 @@ fn left(deadline: Instant) -> io::Result<std::time::Duration> {
 /// One request on a new connection to `127.0.0.1:<port>` with `Connection: close`, no
 /// `Origin`, and `Authorization: Bearer <token>` when given; a body is sent as JSON with its
 /// `Content-Length` (0 when absent). The response must carry a `Content-Length` of at most
-/// 1 MiB.
+/// 1 MiB and be read completely before `deadline`.
 ///
 /// # Errors
 ///
-/// A connection, I/O, or protocol error; `TimedOut` past `deadline`.
+/// A connection, I/O, or protocol error; `TimedOut` at or past `deadline`, also for a response
+/// whose last part was read at or after it.
 pub fn request(
     port: u16,
     method: &str,
@@ -86,7 +87,20 @@ pub fn request(
     }
     s.set_write_timeout(Some(left(deadline)?))?;
     s.write_all(&req)?;
+    read_response(|buf| read_some(&mut s, buf, deadline), deadline)
+}
+
+/// The response from successive `read`s into one buffer: complete only when every part was
+/// read before `deadline` (each read is followed by the deadline check).
+fn read_response(
+    mut read: impl FnMut(&mut Vec<u8>) -> io::Result<()>,
+    deadline: Instant,
+) -> io::Result<Response> {
     let mut buf = Vec::new();
+    let mut read = |buf: &mut Vec<u8>| {
+        read(buf)?;
+        left(deadline).map(|_| ())
+    };
     let head_end = loop {
         if let Some(i) = find(&buf, b"\r\n\r\n") {
             break i;
@@ -94,7 +108,7 @@ pub fn request(
         if buf.len() > MAX_HEAD {
             return Err(protocol("the response head is too large"));
         }
-        read_some(&mut s, &mut buf, deadline)?;
+        read(&mut buf)?;
     };
     let head = std::str::from_utf8(&buf[..head_end]).map_err(|_| protocol("a non-UTF-8 head"))?;
     let mut lines = head.split("\r\n");
@@ -118,7 +132,7 @@ pub fn request(
     }
     let start = head_end + 4;
     while buf.len() < start + length {
-        read_some(&mut s, &mut buf, deadline)?;
+        read(&mut buf)?;
     }
     Ok(Response {
         status,
@@ -165,7 +179,7 @@ mod tests {
 
     use chaldea_pty_runtime::host::{self, StopSent, StopTarget};
 
-    use crate::spawn::spawn_locked;
+    use chaldea_daemon::lifecycle::spawn_locked;
 
     fn instance() -> String {
         uuid::Uuid::new_v4().to_string()
@@ -257,6 +271,62 @@ mod tests {
         };
         assert_eq!(host::send_stop_with(&t, &esrch).unwrap(), StopSent::Exited);
         assert!(s.alive());
+    }
+
+    /// PR8-CL-15: a matching target whose delivery is refused (`EPERM`, Windows
+    /// `ERROR_ACCESS_DENIED`) is `AccessDenied`.
+    #[test]
+    fn send_stop_access_denied() {
+        let mut s = Sleeper::start();
+        let id = host::process_identity(s.pid()).unwrap().unwrap();
+        let t = StopTarget {
+            pid: id.pid,
+            start_time: id.start_time,
+            instance: instance(),
+        };
+        #[cfg(unix)]
+        let denied = rustix::io::Errno::PERM.raw_os_error();
+        #[cfg(windows)]
+        let denied = 5;
+        let refuse = |_: &StopTarget| -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(denied))
+        };
+        assert_eq!(
+            host::send_stop_with(&t, &refuse).unwrap(),
+            StopSent::AccessDenied
+        );
+        assert!(s.alive());
+    }
+
+    /// PR8-CL-24: a complete response whose last part is first read at or after the deadline
+    /// is a timeout, not a response; the same response read before it is accepted.
+    #[test]
+    fn response_read_at_the_deadline_is_a_timeout() {
+        use std::time::{Duration, Instant};
+        const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+        let end = Instant::now() + Duration::from_millis(100);
+        let late = super::read_response(
+            |buf| {
+                std::thread::sleep(end.saturating_duration_since(Instant::now()));
+                buf.extend_from_slice(RESPONSE);
+                Ok(())
+            },
+            end,
+        );
+        assert_eq!(
+            late.unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut,
+            "a late response was accepted"
+        );
+        let on_time = super::read_response(
+            |buf| {
+                buf.extend_from_slice(RESPONSE);
+                Ok(())
+            },
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!((on_time.status, on_time.body), (200, b"{}".to_vec()));
     }
 
     /// The request client against a listener that answers once: status and body.

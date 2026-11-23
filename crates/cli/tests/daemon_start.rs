@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 
 use chaldea_daemon::lifecycle::{Discovery, LockProbe, discover, names};
 use support::faults::{
-    self, EOF_CHILD_MS, Gate, HOLD_READER_MS, LOG_MARKERS, Labels, MARKER_PAUSE, PARK_RECONCILER,
-    TOKEN_FIELD, TOKEN_MSG, TOKEN_SPAN,
+    self, EOF_CHILD_MS, EXIT_RECORD, Gate, HOLD_READER_MS, LOG_MARKERS, Labels, MARKER_PAUSE,
+    PARK_RECONCILER, READY_PAUSE, SLOW_SHUTDOWN_MS, TOKEN_FIELD, TOKEN_MSG, TOKEN_SPAN,
+    VERDICT_PAUSE,
 };
 use support::runner::{Case, main as run_cases};
 use support::{Dir, Proc, WAIT, get_status, lock_state, state, token_of, wait_for};
@@ -56,6 +57,18 @@ fn main() {
         Case {
             name: "timeout_after_15_s_leaves_child",
             run: timeout_after_15_s_leaves_child,
+        },
+        Case {
+            name: "late_child_serves",
+            run: late_child_serves,
+        },
+        Case {
+            name: "stopped_after_ready_is_not_reported_started",
+            run: stopped_after_ready_is_not_reported_started,
+        },
+        Case {
+            name: "stopping_winner_is_not_reported_running",
+            run: stopping_winner_is_not_reported_running,
         },
         Case {
             name: "detached_log_is_redacted",
@@ -128,6 +141,24 @@ impl Drop for StopOnDrop<'_> {
         ) {
             let mut p = Proc::spawn(&mut cmd(self.0, self.1, &["daemon", "stop"], &[]));
             let _ = p.wait_within(Duration::from_secs(30));
+        }
+    }
+}
+
+/// A starter waiting on `gate` (paused there, or waiting for a child paused there): on every
+/// ending the gate is released and the starter given up to 30 s to exit by itself, so it
+/// removes its readiness channel, before `Proc`'s drop kills it.
+struct Gated<'a> {
+    gate: &'a Gate,
+    p: Proc,
+}
+
+impl Drop for Gated<'_> {
+    fn drop(&mut self) {
+        self.gate.release();
+        let end = Instant::now() + WAIT;
+        while Instant::now() < end && matches!(self.p.child.try_wait(), Ok(None)) {
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
@@ -212,20 +243,28 @@ fn fail_arrives_after_the_lock_decision() {
 }
 
 /// PR8-CL-14: a stop while the child is parked at step 9: the starter prints the stopped
-/// message and exits 1; the daemon itself stops cleanly (exit 0): its log shows the stop and a
-/// store report with both flags, no lock held at exit, and the lock is free afterwards. (Its
-/// `exiting: code` line follows the switch away from `daemon.log`, so the log cannot hold it.)
+/// message and exits 1; the daemon itself stops cleanly: its log shows the stop and a store
+/// report with both flags, no lock held at exit, the lock is free afterwards, and its exit code
+/// (recorded by the test seam just before it exits) is 0.
 fn stopped_before_ready() {
     let labels = Labels::new();
     let d = state();
     let _stop = StopOnDrop(&labels, &d.path);
     let gate = Gate::new();
-    let mut starter = Proc::spawn(&mut cmd(
-        &labels,
-        &d.path,
-        &["daemon", "start"],
-        &[(PARK_RECONCILER, gate.path().as_os_str())],
-    ));
+    let exit = tempfile::tempdir().unwrap();
+    let mut starter = Gated {
+        gate: &gate,
+        p: Proc::spawn(&mut cmd(
+            &labels,
+            &d.path,
+            &["daemon", "start"],
+            &[
+                (PARK_RECONCILER, gate.path().as_os_str()),
+                (EXIT_RECORD, exit.path().as_os_str()),
+            ],
+        )),
+    };
+    let starter = &mut starter.p;
     assert!(gate.reached(WAIT), "{}", starter.stderr());
     let mut stopper = Proc::spawn(&mut cmd(&labels, &d.path, &["daemon", "stop"], &[]));
     let log = d.path.join(names::LOG);
@@ -266,6 +305,9 @@ fn stopped_before_ready() {
     );
     assert!(!log.contains("ERROR"), "{log}");
     assert_ne!(lock_state(&d.path), LockProbe::Held);
+    let record = exit.path().join("daemon-exit");
+    assert!(wait_for(|| record.exists()), "the daemon recorded no exit");
+    assert_eq!(std::fs::read_to_string(&record).unwrap(), "0");
 }
 
 /// PR8-CL-14: two starters at once: one daemon serves, both exit 0 with its URL.
@@ -362,8 +404,9 @@ fn explicit_port_conflict() {
     stop(&labels, &d.path);
 }
 
-/// PR8-CL-14: a child that closes the channel without a line well into the deadline: the
-/// follow-up is cut at the deadline, so the starter exits 1 (not 4) by 15 s.
+/// PR8-CL-14: a child that closes the channel without a line 13.5 s in and keeps running with
+/// the lock: the follow-up is cut by the 15 s deadline, with what it last saw (the lock held,
+/// or the child running), so the starter exits 1 at 15 s, before the child exits at 18.5 s.
 fn eof_follow_up_within_deadline() {
     let labels = Labels::new();
     let d = state();
@@ -378,7 +421,11 @@ fn eof_follow_up_within_deadline() {
     let took = t.elapsed();
     assert_eq!(code, 1, "{out}{err}");
     assert!(err.contains("exited before reporting readiness"), "{err}");
-    assert!(took >= Duration::from_millis(13_500), "{took:?}");
+    assert!(
+        err.contains("still holds the state directory") || err.contains("still running"),
+        "{err}"
+    );
+    assert!(took >= READY_TIMEOUT, "{took:?}");
     assert!(took < READY_TIMEOUT + Duration::from_secs(1), "{took:?}");
 }
 
@@ -417,6 +464,116 @@ fn timeout_after_15_s_leaves_child() {
     )));
     assert_eq!(serving(&d.path).pid, pid);
     stop(&labels, &d.path);
+}
+
+/// PR8-CL-14 (D10): a child that starts only after the starter timed out and removed its
+/// readiness channel (paused before it opens its writer at step 1) continues and serves.
+fn late_child_serves() {
+    let labels = Labels::new();
+    let d = state();
+    let _stop = StopOnDrop(&labels, &d.path);
+    let gate = Gate::new();
+    let t = Instant::now();
+    let (code, out, err) = start(
+        &labels,
+        &d.path,
+        &[],
+        &[(READY_PAUSE, gate.path().as_os_str())],
+    );
+    assert_eq!(code, 4, "{out}{err}");
+    assert!(t.elapsed() >= READY_TIMEOUT, "{:?}", t.elapsed());
+    assert!(
+        gate.reached(Duration::ZERO),
+        "the child never reached step 1"
+    );
+    gate.release();
+    assert!(
+        wait_for(|| matches!(discover(&d.path), Discovery::Serving(_))),
+        "the late child did not serve"
+    );
+    let r = serving(&d.path);
+    assert_eq!(
+        get_status(r.port.unwrap(), "/api/threads", Some(&token_of(&d.path))),
+        200
+    );
+    stop(&labels, &d.path);
+}
+
+/// PR8-CL-14: the daemon that sent `ready` is stopped, and another started for the same
+/// directory, before the starter acts on the verdict: the starter reports the stop (exit 1),
+/// never the stopped daemon's URL.
+fn stopped_after_ready_is_not_reported_started() {
+    let labels = Labels::new();
+    let d = state();
+    let _stop = StopOnDrop(&labels, &d.path);
+    let gate = Gate::new();
+    let mut first = Gated {
+        gate: &gate,
+        p: Proc::spawn(&mut cmd(
+            &labels,
+            &d.path,
+            &["daemon", "start"],
+            &[(VERDICT_PAUSE, gate.path().as_os_str())],
+        )),
+    };
+    let first = &mut first.p;
+    assert!(gate.reached(WAIT), "{}", first.stderr());
+    let stopped = serving(&d.path);
+    stop(&labels, &d.path);
+    // The next daemon picks a free port from the range: the stopped one's saved port may be
+    // taken by another test by now.
+    std::fs::remove_file(d.path.join(names::PORT)).unwrap();
+    let (code, out, err) = start(&labels, &d.path, &[], &[]);
+    assert_eq!(code, 0, "{out}{err}");
+    let second = serving(&d.path);
+    assert_ne!(second.instance, stopped.instance);
+    gate.release();
+    assert_eq!(first.code(), 1, "{}{}", first.stdout(), first.stderr());
+    assert!(
+        !first.stdout().contains("daemon started"),
+        "{}",
+        first.stdout()
+    );
+    assert!(
+        first.stderr().contains("stopped before the start finished"),
+        "{}",
+        first.stderr()
+    );
+    stop(&labels, &d.path);
+}
+
+/// PR8-CL-14: a start that finds the directory held by a daemon whose HTTP surface has shut
+/// down (a 6 s shutdown participant keeps the lock and the record) does not report that daemon
+/// running: it waits, sees it exit, and exits 1.
+fn stopping_winner_is_not_reported_running() {
+    let labels = Labels::new();
+    let d = state();
+    let _stop = StopOnDrop(&labels, &d.path);
+    let (code, out, err) = start(
+        &labels,
+        &d.path,
+        &[],
+        &[(SLOW_SHUTDOWN_MS, OsStr::new("6000"))],
+    );
+    assert_eq!(code, 0, "{out}{err}");
+    let mut stopper = Proc::spawn(&mut cmd(&labels, &d.path, &["daemon", "stop"], &[]));
+    let log = d.path.join(names::LOG);
+    assert!(
+        wait_for(|| std::fs::read_to_string(&log).is_ok_and(|l| l.contains("http shutdown:"))),
+        "the HTTP surface did not shut down"
+    );
+    let (code, out, err) = start(&labels, &d.path, &[], &[]);
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(!out.contains("already running"), "{out}");
+    assert!(err.contains("exited"), "{err}");
+    assert_eq!(
+        stopper.code(),
+        0,
+        "{}{}",
+        stopper.stdout(),
+        stopper.stderr()
+    );
+    assert_eq!(discover(&d.path), Discovery::NotRunning);
 }
 
 /// PR8-CL-20: `chd_`, `chdt_`, `chdp_` secrets in a message, a field, and a span field of a

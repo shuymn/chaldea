@@ -60,10 +60,39 @@ impl ReadyWriter for HostReady {
     }
 }
 
-/// The opener of a detached child's readiness writer on `host`'s channel `arg` (`--ready`).
+/// The channel of a starter that already left (its socket gone): every write fails, which
+/// the daemon ignores, so it serves without anyone reading its verdict (design §2.10, D10).
+struct StarterGone;
+
+impl ReadyWriter for StarterGone {
+    fn write_line(&mut self, _line: &str) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "the starter left before the verdict",
+        ))
+    }
+
+    fn close(self: Box<Self>) {}
+}
+
+/// The opener of a detached child's readiness writer on `host`'s channel `arg` (`--ready`). A
+/// socket the starter already removed or stopped listening on (`ENOENT`, `ECONNREFUSED`: it
+/// timed out and left) is not an error: the child continues and serves.
 #[must_use]
 pub fn host_ready_opener(arg: ReadyArg) -> ReadyOpener {
-    Box::new(move || Ok(Box::new(HostReady(host::ready_writer(&arg)?)) as Box<dyn ReadyWriter>))
+    Box::new(move || match host::ready_writer(&arg) {
+        Ok(w) => Ok(Box::new(HostReady(w)) as Box<dyn ReadyWriter>),
+        Err(e)
+            if matches!(arg, ReadyArg::Socket(_))
+                && matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+        {
+            Ok(Box::new(StarterGone) as Box<dyn ReadyWriter>)
+        }
+        Err(e) => Err(e),
+    })
 }
 
 /// The `fail <reason> <message>` line a process that never reached [`super::run`] sends (the

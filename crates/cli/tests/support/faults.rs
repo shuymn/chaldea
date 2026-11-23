@@ -39,6 +39,17 @@ pub const HOLD_READER_MS: &str = "CHALDEA_TEST_HOLD_READER_MS";
 pub const LOG_MARKERS: &str = "CHALDEA_TEST_LOG_MARKERS";
 /// Milliseconds after which a fake detached child closes its readiness channel without a line.
 pub const EOF_CHILD_MS: &str = "CHALDEA_TEST_EOF_CHILD_MS";
+/// A gate directory: a detached child waits at it at step 1, before it opens its readiness
+/// writer.
+pub const READY_PAUSE: &str = "CHALDEA_TEST_READY_PAUSE";
+/// A gate directory: `daemon start` waits at it once it read a verdict line.
+pub const VERDICT_PAUSE: &str = "CHALDEA_TEST_VERDICT_PAUSE";
+/// A directory: a detached child writes its exit code to `<dir>/daemon-exit` just before it
+/// exits.
+pub const EXIT_RECORD: &str = "CHALDEA_TEST_EXIT_RECORD";
+
+/// How long the fake EOF child keeps the state directory's lock after closing its channel.
+const EOF_CHILD_LINGER: Duration = Duration::from_secs(5);
 
 /// The longest a gate waits.
 const GATE_MAX: Duration = Duration::from_secs(60);
@@ -149,20 +160,41 @@ pub fn enter_if_chaldea() {
     if let Some(dir) = env_path(STOP_PAUSE) {
         seams.after_stop_sent = Some(Box::new(move || wait_at(&dir)));
     }
+    if let Some(dir) = env_path(READY_PAUSE) {
+        seams.before_ready = Some(Box::new(move || wait_at(&dir)));
+    }
+    if let Some(dir) = env_path(VERDICT_PAUSE) {
+        seams.after_verdict = Some(Box::new(move || wait_at(&dir)));
+    }
+    if detached_child && let Some(dir) = env_path(EXIT_RECORD) {
+        seams.on_exit = Some(Box::new(move |code| {
+            let _ = std::fs::write(dir.join("daemon-exit"), code.to_string());
+        }));
+    }
     chaldea_cli::dispatch_with(&args, Stall::Off, seams)
 }
 
-/// A detached child that opens its readiness channel, closes it after `after` without a line,
+/// The value after `flag` in `args`.
+fn arg_after<'a>(args: &'a [OsString], flag: &str) -> Option<&'a OsString> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+}
+
+/// A detached child that opens its readiness channel and takes the state directory's lock,
+/// closes the channel after `after` without a line, keeps running with the lock for 5 s more,
 /// and exits 0.
 fn eof_child(args: &[OsString], after: Duration) -> ! {
-    let ready = args
-        .iter()
-        .position(|a| a == "--ready")
-        .and_then(|i| args.get(i + 1))
-        .expect("--ready");
+    let ready = arg_after(args, "--ready").expect("--ready");
     let w = host::ready_writer(&host::ReadyArg::parse(ready).unwrap()).unwrap();
+    let dir = PathBuf::from(arg_after(args, "--state-dir").expect("--state-dir"));
+    let _ = std::fs::create_dir_all(&dir);
+    let lock = std::fs::File::create(dir.join(chaldea_daemon::lifecycle::names::LOCK)).unwrap();
+    lock.try_lock().unwrap();
     std::thread::sleep(after);
     w.close();
+    std::thread::sleep(EOF_CHILD_LINGER);
+    drop(lock);
     std::process::exit(0)
 }
 

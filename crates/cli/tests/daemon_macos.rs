@@ -38,7 +38,7 @@ mod macos {
     use super::support::runner::Case;
     use super::support::{Proc, get_status, report, run_helper, state, token_of};
 
-    pub(super) const CASES: [Case; 10] = [
+    pub(super) const CASES: [Case; 11] = [
         Case {
             name: "inherited_signal_state_is_reset",
             run: inherited_signal_state_is_reset,
@@ -78,6 +78,10 @@ mod macos {
         Case {
             name: "stale_labels_only",
             run: stale_labels_only,
+        },
+        Case {
+            name: "invalid_launchd_invocation_exits_2",
+            run: invalid_launchd_invocation_exits_2,
         },
     ];
 
@@ -438,13 +442,27 @@ mod macos {
         assert_no_daemon(&d.path);
     }
 
-    /// Submits a one-shot job running `/usr/bin/true` under `label` and waits until it ran.
-    fn submit_finished_job(label: &str, dir: &Path) {
+    /// Submits a one-shot job running `program` with `args` (the program first) and `env`
+    /// under `label`, and waits until it ran and finished.
+    fn submit_finished_job(label: &str, dir: &Path, args: &[&OsStr], env: &[(&str, &str)]) {
         let plist = dir.join(format!("{label}.plist"));
+        let xml = |s: &str| {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        };
+        let argv: String = args
+            .iter()
+            .map(|a| format!("<string>{}</string>", xml(&a.to_string_lossy())))
+            .collect();
+        let vars: String = env
+            .iter()
+            .map(|(k, v)| format!("<key>{}</key><string>{}</string>", xml(k), xml(v)))
+            .collect();
         std::fs::write(
             &plist,
             format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>/usr/bin/true</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/></dict></plist>\n"
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array>{argv}</array><key>EnvironmentVariables</key><dict>{vars}</dict><key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string><key>RunAtLoad</key><true/><key>KeepAlive</key><false/></dict></plist>\n"
             ),
         )
         .unwrap();
@@ -465,13 +483,18 @@ mod macos {
                 &[OsStr::new("print"), OsStr::new(&service)],
                 Instant::now() + Duration::from_secs(10),
             )
-            .is_ok_and(|o| o.code == Some(0) && !o.stdout.contains("state = running"))
+            .is_ok_and(|o| {
+                o.code == Some(0)
+                    && o.stdout.contains("\n\tstate = not running")
+                    && o.stdout.contains("\n\tlast exit code = ")
+            })
         });
         assert!(ran, "{label} did not finish");
     }
 
-    /// PR8-CL-13: before submitting, a start removes this prefix's labels proven stale (not
-    /// running, older than 60 s) and keeps a recent one.
+    /// PR8-CL-13: before submitting, a start removes only this prefix's labels proven stale:
+    /// older than 60 s, shown finished, and running this binary as `daemon run --from-launchd`.
+    /// A recent own label and an old label running another program are kept.
     fn stale_labels_only() {
         require_gui();
         let labels = Labels::new();
@@ -481,27 +504,54 @@ mod macos {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        let old = format!(
-            "{}{}-{}",
-            labels.prefix,
-            now - 120_000,
-            uuid::Uuid::new_v4()
-        );
-        let recent = format!("{}{}-{}", labels.prefix, now - 5_000, uuid::Uuid::new_v4());
+        let label =
+            |age_ms: u128| format!("{}{}-{}", labels.prefix, now - age_ms, uuid::Uuid::new_v4());
+        let (old_own, recent_own, old_foreign) = (label(120_000), label(5_000), label(120_000));
         let plists = tempfile::tempdir().unwrap();
-        submit_finished_job(&old, plists.path());
-        submit_finished_job(&recent, plists.path());
+        let exe = std::env::current_exe().unwrap();
+        // This binary as `chaldea`: the invalid port exits 2 before any fork.
+        let own: [&OsStr; 6] = [
+            exe.as_os_str(),
+            OsStr::new("daemon"),
+            OsStr::new("run"),
+            OsStr::new("--from-launchd"),
+            OsStr::new("--port"),
+            OsStr::new("not-a-port"),
+        ];
+        let as_chaldea = [(faults::AS_CHALDEA, "1")];
+        submit_finished_job(&old_own, plists.path(), &own, &as_chaldea);
+        submit_finished_job(&recent_own, plists.path(), &own, &as_chaldea);
+        let mut foreign = own;
+        foreign[0] = OsStr::new("/usr/bin/true");
+        submit_finished_job(&old_foreign, plists.path(), &foreign, &[]);
         let mut p = Proc::spawn(&mut start_cmd(&labels, &d.path, &[]));
         assert_eq!(p.code(), 0, "{}{}", p.stdout(), p.stderr());
         let present = labels.present();
-        assert!(!present.contains(&old), "{present:?}");
-        assert!(present.contains(&recent), "{present:?}");
+        assert!(!present.contains(&old_own), "{present:?}");
+        assert!(present.contains(&recent_own), "{present:?}");
+        assert!(present.contains(&old_foreign), "{present:?}");
+        let err = p.stderr();
         assert!(
-            p.stderr()
-                .contains(&format!("removed the stale launchd job {old}")),
-            "{}",
-            p.stderr()
+            err.contains(&format!("removed the stale launchd job {old_own}")),
+            "{err}"
         );
+        assert!(!err.contains(&old_foreign), "{err}");
         stop(&labels, &d.path);
+    }
+
+    /// `daemon run --from-launchd` with arguments that do not parse exits 2 from the job's
+    /// process itself, before any fork (a fork's parent would exit 0).
+    fn invalid_launchd_invocation_exits_2() {
+        let labels = Labels::new();
+        let d = state();
+        // The shape the starter writes: `daemon run --from-launchd` first.
+        let mut c = faults::chaldea(&labels, &[]);
+        c.args(["daemon", "run", "--from-launchd", "--port", "not-a-port"])
+            .arg("--state-dir")
+            .arg(&d.path);
+        let mut p = Proc::spawn(&mut c);
+        assert_eq!(p.code(), 2, "{}{}", p.stdout(), p.stderr());
+        assert!(p.stderr().contains("not-a-port"), "{}", p.stderr());
+        assert_no_daemon(&d.path);
     }
 }
