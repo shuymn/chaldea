@@ -91,32 +91,26 @@ pub(crate) fn walk(t: &mut dyn Table, pid: u32, max: usize) -> Ancestry {
             end: AncestryEnd::Limit,
         };
     }
-    let mut child = match t.lookup(pid) {
-        Lookup::Live(e) => e,
-        Lookup::Gone => return ended(links, AncestryEnd::Gone(pid)),
-        Lookup::Unreadable => return ended(links, AncestryEnd::Unreadable(pid)),
-    };
+    let mut next = pid;
     loop {
-        let ppid = child.ppid;
-        if ppid == 0 || ppid == child.identity.pid {
-            links.push(child);
+        let entry = match t.lookup(next) {
+            Lookup::Live(e) => e,
+            Lookup::Gone => return ended(links, AncestryEnd::Gone(next)),
+            Lookup::Unreadable => return ended(links, AncestryEnd::Unreadable(next)),
+        };
+        if links.last().is_some_and(|child| newer(&entry, child)) {
+            return ended(links, AncestryEnd::ParentNewer(next));
+        }
+        let ppid = entry.ppid;
+        let root = ppid == 0 || ppid == entry.identity.pid;
+        links.push(entry);
+        if root {
             return ended(links, AncestryEnd::Root);
         }
-        if links.len() + 1 >= max {
-            links.push(child);
+        if links.len() >= max {
             return ended(links, AncestryEnd::Limit);
         }
-        let end = match t.lookup(ppid) {
-            Lookup::Gone => AncestryEnd::Gone(ppid),
-            Lookup::Unreadable => AncestryEnd::Unreadable(ppid),
-            Lookup::Live(parent) if newer(&parent, &child) => AncestryEnd::ParentNewer(ppid),
-            Lookup::Live(parent) => {
-                links.push(std::mem::replace(&mut child, parent));
-                continue;
-            }
-        };
-        links.push(child);
-        return ended(links, end);
+        next = ppid;
     }
 }
 
