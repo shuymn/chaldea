@@ -115,7 +115,7 @@ pub(crate) fn main(args: &[OsString], stall: Stall) -> ! {
     };
     let clock = SystemClock;
     let mut wire = Tcp { port: env.port };
-    run(&clock, t0, |k, deadline| {
+    run(&clock, budget.work_end, |k, deadline| {
         next(client::attempt(
             &clock,
             &mut wire,
@@ -224,14 +224,8 @@ pub(crate) fn next(r: Result<u16, Transport>) -> Next {
 
 /// The retry loop of §2.13 step 4: at most three attempts, each started only when its
 /// minimum time fits before the work end, checked before the backoff and again with the
-/// clock read after it. Returns the start of each attempt made.
-pub(crate) fn run(
-    clock: &dyn Clock,
-    t0: Instant,
-    mut attempt: impl FnMut(u8, Instant) -> Next,
-) -> Vec<Instant> {
-    let end = Budget::from(t0).work_end;
-    let mut starts = Vec::new();
+/// clock read after it.
+pub(crate) fn run(clock: &dyn Clock, end: Instant, mut attempt: impl FnMut(u8, Instant) -> Next) {
     for (k, backoff) in (1u8..).zip(BACKOFF) {
         if clock.now() + backoff + MIN_ATTEMPT > end {
             break;
@@ -244,12 +238,10 @@ pub(crate) fn run(
             break;
         }
         let window = if k == 1 { FIRST_ATTEMPT } else { LATER_ATTEMPT };
-        starts.push(start);
         if attempt(k, end.min(start + window)) == Next::Stop {
             break;
         }
     }
-    starts
 }
 
 /// The request of one hook (hook-ingest §2.2), with the attempt number per head.
@@ -352,15 +344,13 @@ mod tests {
         answers: &[Next],
     ) -> Vec<(u8, Duration, Duration)> {
         let seen = RefCell::new(Vec::new());
-        let starts = run(clock, t0, |k, deadline| {
+        run(clock, Budget::from(t0).work_end, |k, deadline| {
             let i = usize::from(k - 1);
             seen.borrow_mut().push((k, clock.now() - t0, deadline - t0));
             clock.advance(ms(takes[i]));
             answers[i]
         });
-        let seen = seen.into_inner();
-        assert_eq!(starts.len(), seen.len());
-        seen
+        seen.into_inner()
     }
 
     #[test]
