@@ -361,6 +361,33 @@ pub fn get_status(port: u16, path: &str, token: Option<&str>) -> u16 {
     std::str::from_utf8(&head[9..12]).unwrap().parse().unwrap()
 }
 
+/// One GET on a new connection, read through EOF (the server closes it): the status and the
+/// body, whose length matches its `Content-Length`.
+pub fn get_complete(port: u16, path: &str, token: &str) -> (u16, String) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(WAIT)).unwrap();
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    let text = String::from_utf8(raw).unwrap();
+    let (head, body) = text.split_once("\r\n\r\n").expect("a complete header");
+    let status = head[9..12].parse().unwrap();
+    let length = head
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().parse::<usize>().unwrap())
+        })
+        .expect("a Content-Length");
+    assert_eq!(body.len(), length, "{text}");
+    (status, body.to_owned())
+}
+
 /// Every entry of `dir` with its bytes and modification time. Directories and `daemon.lock`
 /// carry no bytes: the lock file is data-less, and Windows refuses reading a byte range
 /// another process locked.

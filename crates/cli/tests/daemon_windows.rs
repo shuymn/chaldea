@@ -1,6 +1,6 @@
 //! Windows binary tests: PR8-CL-9 (Ctrl-C and Ctrl-Break stop a serving daemon, also one that
-//! inherited Ctrl-C ignored) and the stop listener half of PR8-CL-15 (the stop event is
-//! global, owner-only, and stops the daemon).
+//! inherited Ctrl-C ignored), the stop listener half of PR8-CL-15 (the stop event is
+//! global, owner-only, and stops the daemon), and process setup without a console.
 #![cfg(windows)]
 
 mod support;
@@ -90,5 +90,23 @@ fn stop_event_is_global() {
     assert_eq!(allows, vec![fake::user_sid().unwrap()]);
     fake::set_stop_event(&name).unwrap();
     assert_eq!(d.code(), 0, "{}", d.stderr());
+    assert_eq!(lock_state(&dir.path), LockProbe::Free);
+}
+
+/// Process setup without a console (`DETACHED_PROCESS`): the daemon starts, and the stop
+/// event stops it.
+#[test]
+fn setup_without_console_can_start_and_stop() {
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    let dir = state();
+    let mut cmd = run_cmd(&dir.path, Some(free_port()));
+    cmd.creation_flags(DETACHED_PROCESS);
+    let mut daemon = Proc::spawn(&mut cmd);
+
+    daemon.serving();
+    let record = serving_record(&dir.path);
+    assert_eq!(record.pid, daemon.pid());
+    fake::set_stop_event(&host::stop_event_name(&record.instance)).unwrap();
+    assert_eq!(daemon.code(), 0, "{}", daemon.stderr());
     assert_eq!(lock_state(&dir.path), LockProbe::Free);
 }

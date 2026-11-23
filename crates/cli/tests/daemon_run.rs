@@ -521,7 +521,7 @@ fn restarts_keep_a_usable_saved_endpoint() {
         let before = serving_record(&dir.path);
         let token = token_of(&dir.path);
         assert_eq!(saved_port(&dir.path), format!("{port}\n"));
-        assert_eq!(get_status(port, "/api/threads", Some(&token)), 200);
+        assert_eq!(support::get_complete(port, "/api/threads", &token).0, 200);
         if killed {
             support::kill_and_reap(&mut first.child);
             let stale = chaldea_daemon::lifecycle::read_record(&dir.path)
@@ -545,7 +545,7 @@ fn restarts_keep_a_usable_saved_endpoint() {
         );
         assert_eq!(saved_port(&dir.path), format!("{port}\n"));
         assert_eq!(token_of(&dir.path), token);
-        assert_eq!(get_status(port, "/api/threads", Some(&token)), 200);
+        assert_eq!(support::get_complete(port, "/api/threads", &token).0, 200);
         assert_eq!(next.stop_and_wait(&dir.path), 0, "{}", next.stderr());
     }
 }
