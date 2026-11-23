@@ -63,6 +63,8 @@ pub use tickets::TicketPurpose;
 pub use trace::redact_secrets;
 pub use upgrade::{ShutdownSignal, UpgradeGrant, UpgradedSocket};
 
+pub(crate) use auth::{TOKEN_PREFIX, has_secret_form};
+
 /// The server's monotonic clock (design §2.3): request origins, deadlines, the cutoff
 /// checks, and ticket expiry are all read on it; tests inject one.
 pub trait MonotonicClock: Send + Sync + 'static {

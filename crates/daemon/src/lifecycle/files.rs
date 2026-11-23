@@ -371,12 +371,7 @@ pub(crate) fn read_port(dir: &Path) -> Result<Option<u16>, String> {
 /// Whether `s` is the owner token file's form: `chd_` and 43 base64url characters, then `\n`.
 pub(crate) fn token_file_form(bytes: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(bytes.strip_suffix(b"\n")?).ok()?;
-    let rest = s.strip_prefix("chd_")?;
-    (rest.len() == 43
-        && rest
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
-    .then(|| s.to_owned())
+    crate::http::has_secret_form(s, crate::http::TOKEN_PREFIX).then(|| s.to_owned())
 }
 
 /// The owner token file as step 6 found it.
