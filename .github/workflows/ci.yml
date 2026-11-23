@@ -25,7 +25,7 @@ jobs:
           - macos-latest
           - windows-latest
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
     defaults:
@@ -50,33 +50,30 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # A-W1 (docs/design/daemon-lifecycle.md §2.12): the detach tests need this runner's
-      # processes to be in no job or in jobs a child can leave. The preflight runs before any
-      # detach test. Its test executable is run directly, as this shell starts it, and that
-      # run decides the step: it must have run and passed exactly once, so a renamed or
-      # compiled-out test fails the step instead of passing with zero tests. The same test is
-      # also run under `cargo test`, which may put the processes it starts in a job of its
-      # own, and only printed. Both outputs (the recorded job state and the helper's report)
-      # are printed whether they pass or fail.
-      - name: Check that a detached child leaves the runner's job
+      # cargo puts the processes of `cargo test` in a kill-on-close job of its own that allows
+      # no breakaway, and this runner's own job allows none either, so a `daemon start` under
+      # either is refused by design (docs/design/daemon-lifecycle.md §2.12 A-W1, §7). The tests
+      # that need a successful detached start run from a wrapper started through WMI outside
+      # any job; the script fails the step if that wrapper is in a job, fails a profile or
+      # access check, or a selected test did not run and pass by name. It runs first, and the
+      # rest of the tests run even when it fails.
+      - name: Run the detached-start tests outside any job (WMI)
         if: runner.os == 'Windows'
-        run: |
-          test=host::windows::tests::runner_can_break_away
-          exe="$(cargo test -p chaldea-pty-runtime --lib --locked --no-run --message-format=json \
-            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .target.name == "chaldea_pty_runtime") | .executable')"
-          [ -n "$exe" ] || { echo "the test executable was not found"; exit 1; }
-          echo "== under cargo test (printed only) =="
-          cargo test -p chaldea-pty-runtime --lib --locked -- "$test" --exact --nocapture 2>&1 || true
-          echo "== run directly: $exe =="
-          status=0
-          out="$("$(cygpath -u "$exe")" "$test" --exact --nocapture 2>&1)" || status=$?
-          printf '%s\n' "$out"
-          [ "$status" -eq 0 ] && grep -q '^test result: ok\. 1 passed' <<<"$out"
+        shell: pwsh
+        timeout-minutes: 25
+        run: ./scripts/windows-tests.ps1 -Lane Wmi -TimeoutMinutes 15
 
       # Includes the contract drift check (crates/core/tests/contracts_export.rs). With
       # --no-fail-fast, one failing test binary does not keep the others from running.
       - name: Run tests
+        if: runner.os != 'Windows'
         run: cargo test --workspace --locked --no-fail-fast
+
+      # Every test except those of the WMI step above.
+      - name: Run tests (Windows)
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        shell: pwsh
+        run: ./scripts/windows-tests.ps1 -Lane Cargo
 
       # The run above captures passing tests' output: this prints the per-OS B-8
       # observations of the in-flight-body cases (B8-OBSERVED lines; docs/design/hook-ingest.md §7.1).
@@ -98,6 +95,7 @@ jobs:
           }
           list="$(cargo test -p chaldea-pty-runtime --lib --locked -- --list)"
           require "$list" \
+            host::windows::tests::runner_can_break_away \
             windows::tests::dropping_the_child_kills_through_the_job \
             windows::kill::tests::job_empty_and_handles_signalled_proves_death \
             host::windows::tests::created_entries_read_back_private \
