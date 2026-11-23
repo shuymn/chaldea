@@ -53,7 +53,12 @@ enum Reply {
     Close,
     /// Reads the request, writes part of a status line, closes.
     Partial,
+    /// Reads the request, answers 200 after [`SLOW_REPLY`].
+    Slow200,
 }
+
+/// How long [`Reply::Slow200`] holds its reply.
+const SLOW_REPLY: Duration = Duration::from_millis(300);
 
 /// One request the stub read.
 #[derive(Debug, Clone)]
@@ -221,6 +226,11 @@ fn serve(
                 "HTTP/1.1 {code} Stub\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             );
             let _ = s.flush();
+            let _ = s.shutdown(Shutdown::Write);
+        }
+        Reply::Slow200 => {
+            std::thread::sleep(SLOW_REPLY);
+            let _ = s.write_all(b"HTTP/1.1 200 Stub\r\nContent-Length: 0\r\n\r\n");
             let _ = s.shutdown(Shutdown::Write);
         }
         Reply::Silent => held.lock().unwrap().push(s),
@@ -884,7 +894,7 @@ fn fake_cli_echo_emits_session_start_and_prompts() {
 
 #[test]
 fn fake_cli_echo_nested_emits_around_its_own_session_start() {
-    let stub = Stub::start_with(&[Reply::Status(200)], true);
+    let stub = Stub::start_with(&[Reply::Slow200], true);
     let reports = Reports::start();
     let mut cmd = fake(
         &["--mode", "echo", "--session-id", "own", "--nested"],
@@ -902,6 +912,15 @@ fn fake_cli_echo_nested_emits_around_its_own_session_start() {
     assert_eq!(sessions[1], "own");
     assert_eq!(sessions[0], sessions[2]);
     assert_ne!(sessions[0], "own");
+    // Each hook is sent only after the previous one was answered (each reply is held 300 ms).
+    for w in reqs.windows(2) {
+        assert!(
+            w[1].at >= w[0].at + SLOW_REPLY,
+            "{:?} then {:?}",
+            w[0].at,
+            w[1].at
+        );
+    }
     for (i, q) in reqs.iter().enumerate() {
         assert_eq!(q.json()["hook_event_name"], "SessionStart");
         assert_eq!(q.one("X-Chaldea-Agent"), "codex");
