@@ -9,12 +9,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chaldea_core::auth::TokenKind;
+use chaldea_core::command::CommandReceipt;
 use chaldea_core::http::{ErrorBody, PairCodeResponse, WsTicketResponse};
-use chaldea_core::ids::{LaunchId, StreamId, ThreadId};
+use chaldea_core::ids::{CommandId, LaunchId, StreamId, ThreadId};
 use chaldea_core::sync::{StreamHeadEntry, WsServerMessage};
 use chaldea_daemon::http::{
-    HttpConfig, HttpServer, HttpShutdownReport, LifecycleSink, MonotonicClock, Mounts, ServeHandle,
-    StoreFatal, TokenService,
+    CommandRegistry, HttpConfig, HttpServer, HttpShutdownReport, LifecycleSink, MonotonicClock,
+    Mounts, ServeHandle, StoreFatal, TokenService,
 };
 use chaldea_daemon::store::{NewEvent, TokenSelector};
 use futures_util::{SinkExt, StreamExt};
@@ -118,6 +119,16 @@ impl TestServer {
         mounts: Mounts,
         tune: impl FnOnce(&mut HttpConfig),
     ) -> TestServer {
+        Self::start_full(store, mounts, CommandRegistry::mvp(), tune).await
+    }
+
+    /// As [`TestServer::start_on`], with the command handlers of `commands`.
+    pub async fn start_full(
+        store: TestStore,
+        mounts: Mounts,
+        commands: CommandRegistry,
+        tune: impl FnOnce(&mut HttpConfig),
+    ) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let clock = Arc::new(SkewClock::default());
@@ -129,7 +140,7 @@ impl TestServer {
         cfg.clock = clock.clone();
         tune(&mut cfg);
         let sink = Arc::new(RecordingSink::default());
-        let server = HttpServer::new(cfg, store.store().clone(), sink.clone(), mounts);
+        let server = HttpServer::new(cfg, store.store().clone(), commands, sink.clone(), mounts);
         let handle = server.serve(listener);
         TestServer {
             server,
@@ -141,6 +152,38 @@ impl TestServer {
         }
     }
 
+    /// A server with the test command handlers of [`super::commands`] over a new store.
+    pub async fn with_commands(
+        tune: impl FnOnce(&mut HttpConfig),
+    ) -> (TestServer, Arc<super::commands::Probe>) {
+        Self::with_commands_on(TestStore::new(), tune).await
+    }
+
+    /// As [`TestServer::with_commands`], over the given store.
+    pub async fn with_commands_on(
+        store: TestStore,
+        tune: impl FnOnce(&mut HttpConfig),
+    ) -> (TestServer, Arc<super::commands::Probe>) {
+        let probe = Arc::new(super::commands::Probe::default());
+        let commands = super::commands::registry(store.store(), &probe);
+        let srv = Self::start_full(store, Mounts::mvp(), commands, tune).await;
+        (srv, probe)
+    }
+
+    /// `POST /api/commands/{name}` with `command_id` and the raw `args` text.
+    #[must_use]
+    pub fn command(&self, name: &str, secret: &str, command_id: CommandId, args: &str) -> Req {
+        self.req("POST", &format!("/api/commands/{name}"))
+            .bearer(secret)
+            .body(format!(r#"{{"command_id":"{command_id}","args":{args}}}"#).as_bytes())
+    }
+
+    /// The receipt of `command_id`, if any.
+    #[must_use]
+    pub fn receipt(&self, command_id: CommandId) -> Option<CommandReceipt> {
+        self.store.read(move |tx| tx.receipt(command_id))
+    }
+
     /// Shuts the server down (deadline in 10 s), then the store.
     pub async fn stop(mut self) -> HttpShutdownReport {
         let report = self
@@ -148,6 +191,13 @@ impl TestServer {
             .await;
         self.store.shutdown();
         report
+    }
+
+    /// Shuts the server down (deadline `within` from now) and returns its report and the
+    /// store, still open, for a server started after it.
+    pub async fn into_store(mut self, within: Duration) -> (HttpShutdownReport, TestStore) {
+        let report = self.shutdown_http(Instant::now() + within).await;
+        (report, self.store)
     }
 
     /// Shuts only the server down.

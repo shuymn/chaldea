@@ -12,6 +12,7 @@
     reason = "test support returns the store's WriteError"
 )]
 
+pub mod commands;
 pub mod http;
 
 use std::collections::{BTreeMap, BTreeSet};

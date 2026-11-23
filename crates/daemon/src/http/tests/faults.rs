@@ -38,6 +38,27 @@ pub(crate) struct Points {
     pub(crate) socket_send_gate: Mutex<Option<Gate>>,
     /// While set, sockets drop the store's commit notifications.
     pub(crate) drop_notifications: AtomicBool,
+    /// Held once by a command runner between its registration and its first submit.
+    pub(crate) runner_gate: Mutex<Option<Gate>>,
+    /// Taken by the next receipt completion attempt, which holds it inside its job on the
+    /// writer thread.
+    pub(crate) completion_hold: Mutex<Option<WriterHold>>,
+}
+
+/// A hold inside a write job, on the writer thread: tells the test it was reached, then
+/// waits (at most 20 s) for the release.
+pub(crate) struct WriterHold {
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl WriterHold {
+    pub(crate) fn hold(self) {
+        let _ = self.reached.send(());
+        let _ = self
+            .release
+            .recv_timeout(std::time::Duration::from_secs(20));
+    }
 }
 
 /// Arms a gate: the returned receiver fires when the gate is reached, and the waiter goes
@@ -170,6 +191,40 @@ impl Points {
 
     pub(crate) async fn before_socket_send(&self) {
         pass(&self.socket_send_gate).await;
+    }
+
+    /// Arms the runner gate, as [`Points::arm_removal_gate`].
+    pub(crate) fn arm_runner_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        arm(&self.runner_gate)
+    }
+
+    pub(crate) async fn before_runner_submit(&self) {
+        pass(&self.runner_gate).await;
+    }
+
+    /// Arms the completion hold: the returned receiver gets a message when the next
+    /// completion job reaches it, and the job goes on once the returned sender is used or
+    /// dropped.
+    pub(crate) fn arm_completion_hold(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self
+            .completion_hold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(WriterHold {
+            reached: reached_tx,
+            release: release_rx,
+        });
+        (reached_rx, release_tx)
+    }
+
+    pub(crate) fn take_completion_hold(&self) -> Option<WriterHold> {
+        self.completion_hold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     pub(crate) fn drop_notifications(&self, on: bool) {

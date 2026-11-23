@@ -1,0 +1,609 @@
+//! Commands and receipts (design §2.8): the envelope, the duplicate-member scan, request
+//! identity, the dispatch seam (`CommandHandler`, `CommandRegistry`), and the
+//! `CommandRunner`, the one registered task that owns a command after the guard.
+//!
+//! The request reads and checks the body, prepares the handler's intent, and registers the
+//! runner; from then on it only watches the runner's progress until
+//! `deadline + write_reply_grace`. The runner submits the intent job (token check,
+//! `receipt_begin`, the intent, and for a completed intent `receipt_complete`, in one
+//! transaction), runs a pending intent's effect once, and completes its receipt.
+
+use std::any::Any;
+use std::collections::HashMap;
+use std::fmt;
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use axum::body::Body;
+use axum::http::{HeaderValue, Request, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use chaldea_core::auth::{CommandSpec, MVP_COMMANDS};
+use chaldea_core::canonical::CanonicalJson;
+use chaldea_core::command::{CommandResult, ReceiptLookup, request_identity};
+use chaldea_core::http::CommandRequest;
+use chaldea_core::ids::CommandId;
+use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde_json::value::RawValue;
+use tokio::sync::watch;
+use tokio::time::timeout_at;
+
+use super::auth::{Authorized, verify_opt_in_job};
+use super::ctx::{Job, WriteCtx, run_write};
+use super::error::{ApiError, WriteFailure, refused, write_failure};
+use super::guard::path_param;
+use super::registry::TaskKind;
+use super::{Shared, StoreFatal};
+use crate::store::{JobError, StoreError, SubmitError, WriteError, WriteTx};
+
+/// The command route's path template.
+pub(crate) const COMMAND_PATH: &str = "/api/commands/{name}";
+
+/// How long after its first attempt a receipt completion may still admit an attempt.
+pub(crate) const COMPLETION_BUDGET: Duration = Duration::from_secs(60);
+/// The longest `not_after` of one completion attempt.
+pub(crate) const COMPLETION_ATTEMPT: Duration = Duration::from_secs(5);
+/// The first and the largest pause between completion attempts.
+const BACKOFF_FIRST: Duration = Duration::from_millis(10);
+const BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+// ---- the dispatch seam ----------------------------------------------------------------------
+
+/// One command's handler (PR 10, 16, 20, 21; PR 7's tests register test-only ones).
+pub trait CommandHandler: Send + Sync + 'static {
+    /// The wire name; must be in the registry's command table, which gives its action.
+    fn name(&self) -> &'static str;
+
+    /// The request budget, from the connection's first head byte; `None` is the server's
+    /// short deadline (5 s). Long commands state theirs (mvp §2.5).
+    fn deadline(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Parses the duplicate-free `args` into the handler's type (400 `bad_args` when they do
+    /// not fit it) and returns its canonical form and an intent closure built from data only.
+    ///
+    /// # Errors
+    ///
+    /// The refusal to answer, normally [`ApiError::bad_args`].
+    fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError>;
+
+    /// Required for a handler whose intent can return [`Intent::Pending`]; runs on the
+    /// runner after the intent committed.
+    fn effect(&self) -> Option<&dyn CommandEffect> {
+        None
+    }
+}
+
+/// A command's effect, run once by the runner after its intent committed.
+pub trait CommandEffect: Send + Sync {
+    /// Resolves to the command's terminal result. The owning PR guarantees that it resolves
+    /// within a bound it states, and that a result it returns for work that did not happen
+    /// (a timeout, a refusal) means the work can no longer happen later. The runner adds no
+    /// timeout of its own.
+    fn run(&self, run: EffectRun) -> BoxFuture<'static, CommandResult>;
+}
+
+/// What an intent closure gets besides the transaction and the verified token.
+#[derive(Debug)]
+pub struct CommandCtx {
+    command_id: CommandId,
+}
+
+impl CommandCtx {
+    /// The request's `command_id` (the events a command writes carry it).
+    #[must_use]
+    pub fn command_id(&self) -> CommandId {
+        self.command_id
+    }
+}
+
+/// The intent closure: object authorization first, then the intent's writes. It runs in
+/// the intent job after `receipt_begin` returned `New` and never touches receipts; a
+/// refusal rolls back the whole job, the receipt row included. It captures data only
+/// (store §5).
+pub type IntentFn = Box<
+    dyn FnOnce(&mut WriteTx<'_>, &Authorized, &mut CommandCtx) -> Result<Intent, JobError> + Send,
+>;
+
+/// A prepared command.
+pub struct Prepared {
+    /// The canonical form of the handler's parsed arguments; the request identity hashes it.
+    pub normalized: CanonicalJson,
+    pub intent: IntentFn,
+}
+
+impl fmt::Debug for Prepared {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Prepared").finish_non_exhaustive()
+    }
+}
+
+/// What a committed intent leaves to do.
+pub enum Intent {
+    /// The command finished in the intent job; its receipt completes in the same job.
+    Completed(CommandResult),
+    /// The effect runs on the runner after the commit; the receipt stays `in_progress`
+    /// until it reports its result.
+    Pending(EffectRun),
+}
+
+/// The data an intent hands to its effect.
+pub struct EffectRun(Box<dyn Any + Send>);
+
+impl EffectRun {
+    pub fn new<T: Any + Send>(data: T) -> EffectRun {
+        EffectRun(Box::new(data))
+    }
+
+    /// The data, if it is a `T`.
+    ///
+    /// # Errors
+    ///
+    /// `self` unchanged when it holds another type.
+    pub fn downcast<T: Any>(self) -> Result<T, EffectRun> {
+        self.0.downcast::<T>().map(|b| *b).map_err(EffectRun)
+    }
+}
+
+impl fmt::Debug for EffectRun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EffectRun").finish_non_exhaustive()
+    }
+}
+
+/// The handlers of every command name, `Unimplemented` (501) until registered.
+pub struct CommandRegistry {
+    table: Vec<&'static CommandSpec>,
+    handlers: HashMap<&'static str, Arc<dyn CommandHandler>>,
+}
+
+impl fmt::Debug for CommandRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut names: Vec<&str> = self.handlers.keys().copied().collect();
+        names.sort_unstable();
+        f.debug_struct("CommandRegistry")
+            .field("commands", &self.table.len())
+            .field("registered", &names)
+            .finish()
+    }
+}
+
+impl CommandRegistry {
+    /// Every command of `MVP_COMMANDS`, all `Unimplemented` (D9).
+    #[must_use]
+    pub fn mvp() -> CommandRegistry {
+        CommandRegistry {
+            table: MVP_COMMANDS.iter().collect(),
+            handlers: HashMap::new(),
+        }
+    }
+
+    /// `MVP_COMMANDS` plus `extra`, all `Unimplemented`: for tests, whose handlers live under
+    /// test-only names. The daemon uses [`CommandRegistry::mvp`].
+    ///
+    /// # Panics
+    ///
+    /// When a name of `extra` repeats one already in the table.
+    #[must_use]
+    pub fn mvp_plus(extra: &'static [CommandSpec]) -> CommandRegistry {
+        let mut r = CommandRegistry::mvp();
+        for spec in extra {
+            assert!(
+                r.spec(spec.name).is_none(),
+                "command {} is in the table twice",
+                spec.name
+            );
+            r.table.push(spec);
+        }
+        r
+    }
+
+    /// Replaces the entry of `h.name()` with `h`.
+    ///
+    /// # Panics
+    ///
+    /// When the name is not in the table.
+    pub fn register(&mut self, h: Box<dyn CommandHandler>) {
+        let name = h.name();
+        let spec = self
+            .spec(name)
+            .unwrap_or_else(|| panic!("command {name} is not in the command table"));
+        self.handlers.insert(spec.name, Arc::from(h));
+    }
+
+    /// The command named `name`, with its fixed action.
+    pub(crate) fn spec(&self, name: &str) -> Option<&'static CommandSpec> {
+        self.table.iter().copied().find(|s| s.name == name)
+    }
+
+    /// The handler of `name`; `None` while it is unimplemented.
+    pub(crate) fn handler(&self, name: &str) -> Option<Arc<dyn CommandHandler>> {
+        self.handlers.get(name).cloned()
+    }
+}
+
+// ---- the request ----------------------------------------------------------------------------
+
+/// The command's budget: its handler's own deadline, or the server's short deadline (the
+/// guard measures it from the request origin).
+pub(crate) fn budget(shared: &Shared, path: &str) -> Duration {
+    path_param(COMMAND_PATH, path, "name")
+        .and_then(|name| shared.commands.handler(name))
+        .and_then(|h| h.deadline())
+        .unwrap_or(shared.cfg.short_deadline)
+}
+
+/// Why the duplicate scan stopped.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ArgsError {
+    /// An object has two members of one key (after JSON unescaping).
+    Duplicate,
+    /// Not JSON.
+    Malformed,
+}
+
+/// Scans the raw `args` for an object with two members of one key, at every depth.
+pub(crate) fn scan_duplicates(raw: &str) -> Result<(), ArgsError> {
+    let mut de = serde_json::Deserializer::from_str(raw);
+    match Scan.deserialize(&mut de).and_then(|()| de.end()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.to_string().starts_with(DUPLICATE) => Err(ArgsError::Duplicate),
+        Err(_) => Err(ArgsError::Malformed),
+    }
+}
+
+const DUPLICATE: &str = "duplicate member";
+
+/// A seed that walks one JSON value and refuses an object with a repeated key.
+#[derive(Clone, Copy)]
+struct Scan;
+
+impl<'de> DeserializeSeed<'de> for Scan {
+    type Value = ();
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Scan {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, _v: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E>(self, _v: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E>(self, _v: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E>(self, _v: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E>(self, _v: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while seq.next_element_seed(self)?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let mut keys = std::collections::HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(de::Error::custom(DUPLICATE));
+            }
+            map.next_value_seed(self)?;
+        }
+        Ok(())
+    }
+}
+
+/// The duplicate scan of `args` (400 `bad_args`, before any conversion), the handler's
+/// `prepare`, and the request identity of its normalized arguments under `name`.
+pub(crate) fn prepare_args(
+    handler: &dyn CommandHandler,
+    name: &str,
+    args: &RawValue,
+) -> Result<(Prepared, [u8; 32]), ApiError> {
+    scan_duplicates(args.get()).map_err(|_| ApiError::bad_args())?;
+    let prepared = handler.prepare(args)?;
+    let identity = request_identity(name, &prepared.normalized);
+    Ok((prepared, identity))
+}
+
+/// `POST /api/commands/{name}` after the guard: the body, the envelope, the duplicate scan,
+/// `prepare`, the identity, and the runner; then the reply at `deadline +
+/// write_reply_grace` (§2.8 table).
+pub(crate) async fn dispatch(ctx: WriteCtx, req: Request<Body>) -> Result<Response, ApiError> {
+    let shared = ctx.shared().clone();
+    let name = path_param(COMMAND_PATH, req.uri().path(), "name").unwrap_or_default();
+    // The guard answered 404 and 501 for these already.
+    let handler = shared
+        .commands
+        .handler(name)
+        .ok_or_else(ApiError::not_implemented)?;
+    let spec = shared.commands.spec(name).ok_or_else(ApiError::not_found)?;
+    let token_sha256 = ctx
+        .principal()
+        .map(|p| p.token_sha256)
+        .ok_or_else(ApiError::internal)?;
+    let body = ctx
+        .body_within(req.into_body(), shared.cfg.max_body_bytes)
+        .await?;
+    let envelope: CommandRequest =
+        serde_json::from_slice(&body).map_err(|_| ApiError::bad_request())?;
+    if !envelope.args.get().starts_with('{') {
+        return Err(ApiError::bad_request());
+    }
+    let (prepared, identity) = prepare_args(handler.as_ref(), spec.name, &envelope.args)?;
+    run(
+        &shared,
+        ctx.deadline(),
+        Admitted {
+            command_id: envelope.command_id,
+            token_sha256,
+            identity,
+            intent: prepared.intent,
+            handler,
+        },
+    )
+    .await
+}
+
+/// A command the request hands to its runner.
+pub(crate) struct Admitted {
+    pub(crate) command_id: CommandId,
+    pub(crate) token_sha256: [u8; 32],
+    pub(crate) identity: [u8; 32],
+    pub(crate) intent: IntentFn,
+    pub(crate) handler: Arc<dyn CommandHandler>,
+}
+
+/// What the runner has reached; the request reads it at reply time.
+#[derive(Debug, Clone)]
+pub(crate) enum Progress {
+    /// The intent job was handed to the writer, which has not replied.
+    Submitted,
+    /// The intent committed; its effect or completion is still running.
+    IntentCommitted,
+    /// The command's reply.
+    Done(Result<CommandResult, ApiError>),
+}
+
+/// Registers the runner (closing: 503 `shutting_down`, nothing submitted) and answers from
+/// its progress at `deadline + write_reply_grace`. Past the deadline, 408 with nothing
+/// submitted.
+pub(crate) async fn run(
+    shared: &Arc<Shared>,
+    deadline: Instant,
+    cmd: Admitted,
+) -> Result<Response, ApiError> {
+    if shared.passed(deadline) {
+        return Err(ApiError::request_timeout());
+    }
+    let reply_by = deadline + shared.cfg.write_reply_grace;
+    let (tx, rx) = watch::channel(Progress::Submitted);
+    let s = shared.clone();
+    shared
+        .registry
+        .spawn(TaskKind::Runner, runner(s, deadline, cmd, tx))
+        .map_err(|_| ApiError::shutting_down())?;
+    await_reply(shared, rx, reply_by).await
+}
+
+/// The request's wait. A reply time reached (the server's clock at or past `reply_by`,
+/// checked before each poll, or the timer fired) decides from the progress then: an
+/// intent committed is 409 `in_progress`, anything else 503 `outcome_unknown` (a final
+/// reply taken at or after `reply_by` included, so a late `Expired` is never 408). A
+/// runner gone without a final reply (aborted at the drain deadline) is the same.
+async fn await_reply(
+    shared: &Shared,
+    mut rx: watch::Receiver<Progress>,
+    reply_by: Instant,
+) -> Result<Response, ApiError> {
+    let cutoff = shared.timer(reply_by);
+    #[cfg(test)]
+    shared
+        .faults
+        .before_cutoff_wait(|| matches!(*rx.borrow(), Progress::Done(_)))
+        .await;
+    loop {
+        let late = shared.passed(reply_by);
+        let progress = rx.borrow_and_update().clone();
+        match progress {
+            Progress::Done(r) if !late => return r.map(result_response),
+            _ if late => return Err(at_reply_time(&progress)),
+            _ => {}
+        }
+        match timeout_at(cutoff, rx.changed()).await {
+            Ok(Ok(())) => {}
+            Err(_) | Ok(Err(_)) => return Err(at_reply_time(&rx.borrow())),
+        }
+    }
+}
+
+fn at_reply_time(p: &Progress) -> ApiError {
+    match p {
+        Progress::IntentCommitted => ApiError::in_progress(),
+        Progress::Submitted | Progress::Done(_) => ApiError::outcome_unknown(),
+    }
+}
+
+/// A stored or fresh command result as its HTTP reply, byte for byte.
+fn result_response(r: CommandResult) -> Response {
+    let Ok(status) = StatusCode::from_u16(r.http_status) else {
+        return ApiError::internal().into_response();
+    };
+    let mut resp = (status, r.body).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    resp
+}
+
+// ---- the runner -----------------------------------------------------------------------------
+
+/// What the intent job decided.
+enum Begun {
+    /// A receipt existed: its lookup, with nothing written.
+    Lookup(ReceiptLookup),
+    /// Completed in the intent job, receipt included.
+    Completed(CommandResult),
+    /// Committed with the receipt `in_progress`; the effect runs next.
+    Pending(EffectRun),
+}
+
+/// The registered task that owns a command: it awaits its own writes and never registers
+/// another task. It publishes `Done` last; a final result only after its receipt committed.
+async fn runner(
+    shared: Arc<Shared>,
+    deadline: Instant,
+    cmd: Admitted,
+    progress: watch::Sender<Progress>,
+) {
+    #[cfg(test)]
+    shared.faults.before_runner_submit().await;
+    let reply = drive(&shared, deadline, cmd, &progress).await;
+    progress.send_replace(Progress::Done(reply));
+}
+
+async fn drive(
+    shared: &Shared,
+    deadline: Instant,
+    cmd: Admitted,
+    progress: &watch::Sender<Progress>,
+) -> Result<CommandResult, ApiError> {
+    let Admitted {
+        command_id,
+        token_sha256,
+        identity,
+        intent,
+        handler,
+    } = cmd;
+    let has_effect = handler.effect().is_some();
+    // The single deciding point: the token, the receipt lookup and insert, the object
+    // checks and the intent's writes, in one transaction.
+    let job: Job<Begun> = Box::new(move |tx| {
+        let Some(auth) = verify_opt_in_job(tx, Some(token_sha256))? else {
+            return Err(refused(ApiError::internal()));
+        };
+        let lookup = tx.receipt_begin(command_id, auth.token_id, identity)?;
+        if lookup != ReceiptLookup::New {
+            return Ok(Begun::Lookup(lookup));
+        }
+        let mut ctx = CommandCtx { command_id };
+        match intent(tx, &auth, &mut ctx)? {
+            Intent::Completed(r) => {
+                tx.receipt_complete(command_id, &r)?;
+                Ok(Begun::Completed(r))
+            }
+            Intent::Pending(run) if has_effect => Ok(Begun::Pending(run)),
+            // A programming error: refused, so the receipt row rolls back with the rest.
+            Intent::Pending(_) => Err(refused(ApiError::internal())),
+        }
+    });
+    let run = match run_write(shared, deadline, job, None).await {
+        Err(f) => return Err(write_failure(f)),
+        Ok(Begun::Lookup(l)) => return lookup_reply(l),
+        Ok(Begun::Completed(r)) => return Ok(r),
+        Ok(Begun::Pending(run)) => run,
+    };
+    progress.send_replace(Progress::IntentCommitted);
+    // The effect, once, awaited to its terminal result with no timeout of the runner's own.
+    let effect = AssertUnwindSafe(async {
+        match handler.effect() {
+            Some(e) => Some(e.run(run).await),
+            None => None,
+        }
+    })
+    .catch_unwind()
+    .await;
+    // A panic (its payload is not logged) leaves no result to store.
+    let Ok(Some(result)) = effect else {
+        tracing::error!(%command_id, "command effect ended without a result");
+        shared
+            .sink
+            .store_fatal(StoreFatal::ReceiptUncompleted { command_id });
+        return Err(ApiError::outcome_unknown());
+    };
+    if complete(shared, command_id, &result).await {
+        Ok(result)
+    } else {
+        shared
+            .sink
+            .store_fatal(StoreFatal::ReceiptUncompleted { command_id });
+        Err(ApiError::outcome_unknown())
+    }
+}
+
+/// An existing receipt's reply (§2.8 table): one `conflict` body whatever its state.
+fn lookup_reply(l: ReceiptLookup) -> Result<CommandResult, ApiError> {
+    match l {
+        ReceiptLookup::Replay(r) => Ok(r),
+        ReceiptLookup::InProgress => Err(ApiError::in_progress()),
+        ReceiptLookup::Conflict => Err(ApiError::conflict()),
+        ReceiptLookup::UnknownAfterCrash => Err(ApiError::unknown_after_crash()),
+        ReceiptLookup::New => Err(ApiError::internal()),
+    }
+}
+
+/// Whether a completion attempt may be retried: nothing was written and the writer is
+/// healthy.
+fn retryable(f: &WriteFailure) -> bool {
+    matches!(
+        f,
+        WriteFailure::Submit(SubmitError::QueueFull)
+            | WriteFailure::Write(
+                WriteError::Expired | WriteError::Busy | WriteError::RolledBack(StoreError::Busy)
+            )
+    )
+}
+
+/// Completes the receipt: attempts with `not_after = min(now + 5 s, budget_end)`, retried
+/// with backoff on a retryable outcome. The budget (60 s from the first attempt, on the
+/// server's clock) bounds the admission of attempts only, checked before each one; an
+/// admitted attempt is awaited to its reply. No token check: the effect has run. True once
+/// a completion committed.
+async fn complete(shared: &Shared, command_id: CommandId, result: &CommandResult) -> bool {
+    let budget_end = shared.cfg.clock.now() + COMPLETION_BUDGET;
+    let mut backoff = BACKOFF_FIRST;
+    loop {
+        let now = shared.cfg.clock.now();
+        if now >= budget_end {
+            return false;
+        }
+        let not_after = (now + COMPLETION_ATTEMPT).min(budget_end);
+        let r = result.clone();
+        #[cfg(test)]
+        let hold = shared.faults.take_completion_hold();
+        let job: Job<()> = Box::new(move |tx| {
+            #[cfg(test)]
+            if let Some(h) = hold {
+                h.hold();
+            }
+            Ok(tx.receipt_complete(command_id, &r)?)
+        });
+        match run_write(shared, not_after, job, None).await {
+            Ok(()) => return true,
+            Err(f) if retryable(&f) => {}
+            Err(_) => return false,
+        }
+        let wake = (shared.cfg.clock.now() + backoff).min(budget_end);
+        tokio::time::sleep_until(shared.timer(wake)).await;
+        backoff = (backoff * 2).min(BACKOFF_MAX);
+    }
+}
