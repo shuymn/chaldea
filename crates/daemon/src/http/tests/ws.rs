@@ -330,12 +330,13 @@ async fn lost_notification_recovered_by_heads() {
     let old = srv.store.read(move |tx| tx.head(stream, 0)).head_seq;
     let until = Instant::now() + Duration::from_secs(10);
     loop {
-        match ws.next().await.expect("open") {
+        let m = ws.next().await.expect("open");
+        assert!(Instant::now() < until, "no `heads` with the old head");
+        match m {
             WsServerMessage::Heads { heads } if heads == [e(stream, old)] => break,
             WsServerMessage::Heads { heads } => assert!(heads.is_empty(), "{heads:?}"),
             other => panic!("only `heads` before the subscribe's: {other:?}"),
         }
-        assert!(Instant::now() < until, "no `heads` with the old head");
     }
     let s = shared(&srv);
     s.faults.drop_notifications(true);
