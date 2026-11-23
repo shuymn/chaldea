@@ -14,7 +14,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use super::{Access, EntryKind, Privacy, ProcessIdentity, SigchldDisposition, SignalState};
-use crate::windows::sys::{self, ACE_ALLOWED, ACE_DENIED, SecurityInfo};
+use crate::windows::sys::{self, ACE_ALLOWED, ACE_DENIED, AceInfo, SecurityInfo};
 
 /// `ERROR_INVALID_PARAMETER`: `OpenProcess` of a pid no process has.
 const ERROR_INVALID_PARAMETER: i32 = 87;
@@ -98,14 +98,6 @@ pub fn classify_entry(attributes: u32, _reparse_tag: u32, kind: EntryKind) -> Op
     (!of_kind).then_some(Privacy::NotOfKind)
 }
 
-/// One ACE as the privacy judgement sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AceView {
-    pub ace_type: u8,
-    pub flags: u8,
-    pub sid: Option<String>,
-}
-
 /// `INHERIT_ONLY_ACE` (`winnt.h`): the ACE applies only to what the directory's children
 /// inherit.
 const INHERIT_ONLY_ACE: u8 = 0x08;
@@ -127,7 +119,7 @@ fn private_trustee(sid: &str, flags: u8, user: &str, kind: EntryKind) -> bool {
 #[must_use]
 pub fn judge_descriptor(
     owner: &str,
-    dacl: Option<&[AceView]>,
+    dacl: Option<&[AceInfo]>,
     user: &str,
     kind: EntryKind,
 ) -> Privacy {
@@ -156,16 +148,12 @@ pub fn judge_descriptor(
 
 fn judge(sec: &SecurityInfo, kind: EntryKind) -> io::Result<Privacy> {
     let user = sys::user_sid()?;
-    let aces: Option<Vec<AceView>> = sec.dacl.as_ref().map(|d| {
-        d.iter()
-            .map(|a| AceView {
-                ace_type: a.ace_type,
-                flags: a.flags,
-                sid: a.sid.clone(),
-            })
-            .collect()
-    });
-    Ok(judge_descriptor(&sec.owner, aces.as_deref(), &user, kind))
+    Ok(judge_descriptor(
+        &sec.owner,
+        sec.dacl.as_deref(),
+        &user,
+        kind,
+    ))
 }
 
 /// Opens `path` itself (never a reparse point's target) for its attributes and descriptor.
@@ -271,8 +259,8 @@ mod tests {
 
     const USER: &str = "S-1-5-21-1-2-3-1001";
 
-    fn allow(sid: &str) -> AceView {
-        AceView {
+    fn allow(sid: &str) -> AceInfo {
+        AceInfo {
             ace_type: ACE_ALLOWED,
             flags: 0,
             sid: Some(sid.to_owned()),
@@ -325,7 +313,7 @@ mod tests {
             judge_descriptor(USER, Some(&users), USER, EntryKind::Directory),
             Privacy::AclGrantsOthers
         );
-        let inherit_only = |sid: &str| AceView {
+        let inherit_only = |sid: &str| AceInfo {
             ace_type: ACE_ALLOWED,
             flags: INHERIT_ONLY_ACE,
             sid: Some(sid.to_owned()),
@@ -351,7 +339,7 @@ mod tests {
         );
         let deny_everyone = [
             allow(USER),
-            AceView {
+            AceInfo {
                 ace_type: ACE_DENIED,
                 flags: 0,
                 sid: Some("S-1-1-0".to_owned()),

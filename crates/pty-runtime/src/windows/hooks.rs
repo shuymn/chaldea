@@ -640,22 +640,7 @@ pub(crate) fn job_active(leader: u32) -> io::Result<u32> {
 
 /// A live process's identity (an exited one is `None`); group empty.
 pub(crate) fn identify(pid: u32) -> io::Result<Option<ProcessIdentity>> {
-    let h = match sys::open_process(pid, super::QUERY_SYNC) {
-        Ok(h) => h,
-        Err(e) if e.raw_os_error() == Some(super::kill::ERROR_INVALID_PARAMETER) => {
-            return Ok(None);
-        }
-        Err(e) => return Err(e),
-    };
-    if sys::wait(h.as_handle(), 0)? {
-        return Ok(None);
-    }
-    let start = sys::creation_time(h.as_handle())?;
-    Ok(Some(ProcessIdentity {
-        pid,
-        start_time: start.to_string(),
-        group: String::new(),
-    }))
+    crate::host::process_identity(pid)
 }
 
 /// Terminates `pid` through one handle after checking its creation time on that handle.
