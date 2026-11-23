@@ -12,7 +12,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -445,10 +445,10 @@ fn reports_fail_when_a_reader_times_out() {
 /// A drop that fails still closes the listener.
 #[test]
 fn reports_close_their_listener_when_a_drop_fails() {
-    let mut addr = String::new();
+    let mut closed = Arc::new(AtomicBool::new(false));
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let reports = Reports::start();
-        addr.clone_from(&reports.addr);
+        closed = reports.closed.clone();
         let mut s = TcpStream::connect(&reports.addr).unwrap();
         s.write_all(b"{bad}\n").unwrap();
         drop(s);
@@ -457,7 +457,7 @@ fn reports_close_their_listener_when_a_drop_fails() {
     let msg = failed.expect_err("the drop reports the malformed frame");
     let msg = msg.downcast_ref::<String>().map_or("", String::as_str);
     assert!(msg.contains("malformed report frame"), "{msg}");
-    assert!(TcpStream::connect(&addr).is_err(), "listener still open");
+    assert!(closed.load(Ordering::SeqCst), "listener still open");
 }
 
 // ---- Running a child ----
@@ -999,6 +999,8 @@ struct Reports {
     /// Passes of the accept loop that found no pending connection.
     idle: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
+    /// Set by the accept loop once it has dropped its listener.
+    closed: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
 }
 
@@ -1008,6 +1010,16 @@ struct Reader(Arc<AtomicUsize>);
 impl Drop for Reader {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Marks the accept loop's listener as dropped; the loop binds it before the listener, so
+/// it drops after it.
+struct Closed(Arc<AtomicBool>);
+
+impl Drop for Closed {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1033,9 +1045,18 @@ impl Reports {
         let stop = Arc::new(AtomicBool::new(false));
         let open = Arc::new(AtomicUsize::new(0));
         let idle = Arc::new(AtomicUsize::new(0));
-        let (ev, halt, readers, passes) =
-            (events.clone(), stop.clone(), open.clone(), idle.clone());
+        let closed = Arc::new(AtomicBool::new(false));
+        let (ev, halt, readers, passes, done) = (
+            events.clone(),
+            stop.clone(),
+            open.clone(),
+            idle.clone(),
+            closed.clone(),
+        );
         let accept = std::thread::spawn(move || {
+            let _closed = Closed(done);
+            // Moved in after `_closed`, so the listener drops first.
+            let l = l;
             while !halt.load(Ordering::SeqCst) {
                 let s = match l.accept() {
                     Ok((s, _)) => s,
@@ -1088,6 +1109,7 @@ impl Reports {
             open,
             idle,
             stop,
+            closed,
             accept: Some(accept),
         }
     }
@@ -1108,7 +1130,8 @@ impl Reports {
 
     /// The first reader fault, if any.
     fn fault(&self) -> Option<String> {
-        self.events.lock().unwrap().1.clone()
+        let ev = self.events.lock().unwrap_or_else(PoisonError::into_inner);
+        ev.1.clone()
     }
 
     /// The events named `event` once every reader has drained (the final count); panics
@@ -1123,7 +1146,8 @@ impl Reports {
     /// The events named `event` so far; panics once a reader fault was recorded.
     fn of(&self, event: &str) -> Vec<Value> {
         let ev = self.events.lock().unwrap();
-        if let Some(fault) = &ev.1 {
+        if let Some(fault) = ev.1.clone() {
+            drop(ev);
             panic!("{fault}");
         }
         ev.0.iter()
