@@ -228,8 +228,9 @@ impl Coordinator {
         self.finish(ExitReport::failed(FailReason::ConsoleEnd, lock))
     }
 
-    /// The wait between removal attempts (a test may lengthen it and observe its first poll).
-    fn record_wait(&self) -> impl Future<Output = ()> + use<> {
+    /// The wait between removal attempts, never past `end` (a test may lengthen it and observe
+    /// its first poll).
+    fn record_wait(&self, end: Instant) -> impl Future<Output = ()> + use<> {
         #[cfg(test)]
         let (wait, faults) = (
             self.faults
@@ -242,6 +243,7 @@ impl Coordinator {
         );
         #[cfg(not(test))]
         let wait = RECORD_RETRY;
+        let wait = wait.min(end.saturating_duration_since(Instant::now()));
         async move {
             #[cfg(test)]
             faults.record_sleeping.store(true, Ordering::SeqCst);
@@ -286,9 +288,17 @@ impl Coordinator {
         let path = dir.join(names::RECORD);
         let path = path.as_path();
         let end = Instant::now() + RECORD_REMOVAL;
+        // Why the last attempt failed; once the budget is spent it is the warning.
+        let mut failed: Option<String> = None;
         loop {
             if self.gate.crashed().is_some() {
                 return Err(Crashed);
+            }
+            if let Some(why) = &failed
+                && Instant::now() >= end
+            {
+                self.log.warn(why);
+                return Ok(());
             }
             #[cfg(test)]
             let read = self
@@ -311,17 +321,22 @@ impl Coordinator {
                     return Ok(());
                 }
                 // Unreadable for now (a Windows sharing violation): retried like a removal.
-                Err(e) if Instant::now() >= end => {
-                    self.log.warn(&format!(
+                Err(e) => {
+                    failed = Some(format!(
                         "the discovery record {} could not be verified for removal: {e}",
                         path.display()
                     ));
-                    return Ok(());
-                }
-                Err(_) => {
-                    self.guarded(self.record_wait()).await?;
+                    self.guarded(self.record_wait(end)).await?;
                     continue;
                 }
+            }
+            #[cfg(test)]
+            if let Some(p) = self.faults.parked(super::faults::Point::AfterRecordVerify) {
+                p.hold().await;
+            }
+            // The last boundary: a console end observed by now issues no deletion.
+            if self.gate.crashed().is_some() {
+                return Err(Crashed);
             }
             #[cfg(test)]
             let removed = self
@@ -333,19 +348,16 @@ impl Coordinator {
             match removed {
                 Ok(()) => return Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(e) if Instant::now() >= end => {
-                    self.log.warn(&format!(
+                Err(e) => {
+                    failed = Some(format!(
                         "the discovery record {} could not be removed: {e}",
                         path.display()
                     ));
-                    return Ok(());
-                }
-                Err(_) => {
                     #[cfg(test)]
                     if let Some(p) = self.faults.parked(super::faults::Point::RecordRetry) {
                         p.hold().await;
                     }
-                    self.guarded(self.record_wait()).await?;
+                    self.guarded(self.record_wait(end)).await?;
                 }
             }
         }

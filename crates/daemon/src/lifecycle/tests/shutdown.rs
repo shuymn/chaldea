@@ -437,6 +437,10 @@ fn built_commands_are_served_and_drained() {
         fn name(&self) -> &'static str {
             "test_lifecycle_effect"
         }
+        // Short, so the request replies (409 `in_progress`) while the effect is still held.
+        fn deadline(&self) -> Option<Duration> {
+            Some(Duration::from_millis(300))
+        }
         fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError> {
             let v: serde_json::Value = serde_json::from_str(args.get()).unwrap();
             Ok(Prepared {
@@ -494,15 +498,31 @@ fn built_commands_are_served_and_drained() {
     started_rx
         .recv_timeout(WAIT)
         .expect("the registered handler's effect did not start");
+    // The request has ended and its connection left the registry; the held effect's runner
+    // is what remains registered.
+    let (status, reply) = client.join().unwrap().unwrap();
+    assert_eq!(status, 409, "{reply}");
+    let registry = faults.http_registry.get().unwrap().clone();
+    assert!(
+        super::wait_for(WAIT, || registry
+            .counts()
+            .get(crate::http::TaskKind::Connection)
+            == 0),
+        "{registry:?}"
+    );
+    assert_eq!(registry.counts().get(crate::http::TaskKind::Runner), 1);
     run.stop();
     assert!(super::wait_for(WAIT, || faults
         .marks()
         .iter()
         .any(|m| m.0 == "http")));
+    // The drain waits for the runner: the store is not shut down while the effect is held.
+    assert!(super::wait_for(WAIT, || registry.is_closing()));
+    assert_eq!(registry.counts().get(crate::http::TaskKind::Runner), 1);
+    assert!(!faults.marks().iter().any(|m| m.0 == "store"));
     let _ = release_tx.send(());
     let log = run.log.clone();
     let r = run.join();
-    let _ = client.join();
     assert_eq!(
         (r.code.code(), r.lock),
         (0, LockDisposition::Released),
@@ -521,5 +541,33 @@ fn built_commands_are_served_and_drained() {
     assert!(
         matches!(receipt.status, ReceiptStatus::Completed(ref c) if c.http_status == 200),
         "{receipt:?}"
+    );
+}
+
+/// A re-read that would first succeed after the 500 ms budget issues no deletion: the wait
+/// is capped at what remains and the deadline is checked before each attempt.
+#[test]
+fn no_deletion_after_the_record_budget() {
+    use std::sync::atomic::Ordering;
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    *faults.record_retry.lock().unwrap() = Some(Duration::from_millis(300));
+    let run = start(
+        foreground(&dir.path, Some(free_port())),
+        TestComponents::default(),
+        faults.clone(),
+    );
+    run.serving();
+    // Two refused re-reads: at 0 ms and at 300 ms; the next would be past 500 ms.
+    faults.record_verify_fails.store(2, Ordering::SeqCst);
+    run.stop();
+    let log = run.log.clone();
+    let r = run.join();
+    assert_eq!(r.code.code(), 0, "{}", log.text());
+    assert!(dir.path.join(names::RECORD).exists(), "{}", log.text());
+    assert!(
+        log.text().contains("could not be verified"),
+        "{}",
+        log.text()
     );
 }

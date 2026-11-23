@@ -259,6 +259,16 @@ impl TaskRegistry {
         counts
     }
 
+    /// The registered tasks per kind (tests).
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> KindCounts {
+        let mut counts = KindCounts::default();
+        for (kind, _) in self.lock().tasks.values() {
+            counts.add(*kind);
+        }
+        counts
+    }
+
     /// Registered tasks that have not ended.
     #[must_use]
     pub fn len(&self) -> usize {

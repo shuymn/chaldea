@@ -1480,3 +1480,32 @@ fn console_end_at_the_startup_verdict() {
     held_then_free(&mut h, &dir.path);
     assert!(!h.stderr().contains("listening on"), "{}", h.stderr());
 }
+
+/// PR8-CL-10: a console end after a re-read found the record ours and before the deletion
+/// issues no deletion: the record stays.
+#[test]
+fn console_end_after_the_record_verify() {
+    if in_helper() {
+        let faults = Arc::new(Faults::default());
+        let park = faults.park(Point::AfterRecordVerify);
+        helper(
+            fg(),
+            TestComponents::default(),
+            faults,
+            Duration::from_secs(2),
+            move |c| {
+                c.serving();
+                c.stop();
+                assert!(park.wait_reached(WAIT));
+                c.crash();
+                park.release();
+            },
+        );
+    }
+    let (mut h, dir) = parent("console_end_after_the_record_verify", &[]);
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "reason"), "console_end", "{r}");
+    assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
+    held_then_free(&mut h, &dir.path);
+    assert!(dir.path.join(names::RECORD).exists());
+}

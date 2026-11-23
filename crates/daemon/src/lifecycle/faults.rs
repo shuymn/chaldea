@@ -117,6 +117,8 @@ pub(crate) enum Point {
     BeforeLogSwitch,
     /// The coordinator's thread held (blocking) in a console-end exit, before it returns.
     CrashExit,
+    /// The coordinator, after a re-read found the record ours and before it deletes it.
+    AfterRecordVerify,
 }
 
 /// What a test injects into one run and what the run publishes back.
@@ -170,6 +172,8 @@ pub(crate) struct Faults {
     pub(crate) record_sleeping: AtomicBool,
     /// The coordinator took the startup task's result in its wait for the first request.
     pub(crate) first_wait_took_startup: AtomicBool,
+    /// The HTTP server's task registry, once step 11 built the server.
+    pub(crate) http_registry: OnceLock<crate::http::TaskRegistry>,
 }
 
 impl Faults {

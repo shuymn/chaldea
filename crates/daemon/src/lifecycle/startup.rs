@@ -568,6 +568,11 @@ pub(crate) async fn run(mut cx: StartupCtx) -> Started {
     // From here the registry can hold startup's own work (the owner token's write observer):
     // the coordinator drains it whether or not step 13 serves.
     st.serve = Some(server.shutdown_handle());
+    #[cfg(test)]
+    let _ = cx
+        .faults
+        .http_registry
+        .set(server.shared().registry.clone());
 
     // Step 12: the token service, then the owner token file.
     boundary!(cx, st, 12);
