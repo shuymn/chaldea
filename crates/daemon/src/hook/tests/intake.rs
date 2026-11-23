@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use chaldea_core::ids::LaunchId;
 use chaldea_core::payload::RawUnknownReason;
 
-use super::support::hook::{Hook, HookServer};
+use super::support::hook::{Hook, HookServer, direct};
 use super::support::http::{TestServer, connect, write};
-use super::{WAIT, ok, reached};
+use super::{WAIT, ok, reached, reached_sync};
 use crate::hook::{IntakeOrder, NoIntakeFacts};
 use crate::http::tests::shared;
 use crate::http::{ApiError, Mounts, WriteCtx};
@@ -142,6 +142,66 @@ async fn release_points() {
         "kept after a refused registration"
     );
     srv.store.shutdown();
+}
+
+/// A binding `SessionStart` waits for an earlier hook of its launch (PR9-CL-6): hook 1 held
+/// in its walk, `SessionStart` 2 is seen waiting on the pending lower ordinal and `Stop` 3
+/// is buffered meanwhile; released, the stream is `session_bound`, the binding's raw,
+/// `UserPromptSubmit` 1, `Stop` 3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn binding_waits_for_earlier_hook() {
+    let h = HookServer::start().await;
+    h.srv.clock.stop();
+    let l = h.codex(1).await;
+    h.chains.set(7001, direct(7001, "codex"));
+    let (walking, release) = h.chains.hold(7001);
+    let first = Hook::of(&l, "UserPromptSubmit", "s").pid(Some(7001));
+    let first_reply = h.spawn_post(&first);
+    reached_sync(walking).await;
+    let (waiting, at_wait) = tokio::sync::oneshot::channel();
+    *h.ingest.order.between_check_and_await.lock().unwrap() =
+        Some(Box::new(move || waiting.send(()).unwrap()));
+    let start = Hook::of(&l, "SessionStart", "s");
+    let start_reply = h.spawn_post(&start);
+    reached(at_wait).await;
+    let stop = Hook::of(&l, "Stop", "s");
+    ok(&h.post(&stop).await);
+    assert_eq!(
+        h.launch_row(l.launch).session_id,
+        None,
+        "bound before hook 1"
+    );
+    release.send(()).unwrap();
+    ok(&first_reply.await.unwrap());
+    ok(&start_reply.await.unwrap());
+    let order: Vec<uuid::Uuid> = h
+        .adapter
+        .calls()
+        .into_iter()
+        .filter(|c| c.promoted || c.event_name != "SessionStart")
+        .map(|c| c.emit_id)
+        .collect();
+    assert_eq!(
+        order,
+        vec![first.emit, stop.emit],
+        "promotion in receipt order"
+    );
+    let kinds: Vec<String> = h
+        .hook_events(l.thread)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "session_bound",
+            "raw_unknown",
+            "user_message",
+            "assistant_message"
+        ],
+        "session_bound, the binding's raw, UserPromptSubmit 1, Stop 3"
+    );
+    h.stop().await;
 }
 
 /// Of two eligible `SessionStart`s of different sessions, the one received first binds

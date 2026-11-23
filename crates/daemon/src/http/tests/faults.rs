@@ -37,6 +37,8 @@ pub(crate) struct Points {
     pub(crate) sample_gate: Mutex<Option<Gate>>,
     /// Told the first time the next registered socket task parks.
     pub(crate) first_park: Mutex<Option<oneshot::Sender<()>>>,
+    /// Told the first time the next write observer's wait for its ticket parks.
+    pub(crate) ticket_park: Mutex<Option<oneshot::Sender<()>>>,
     /// The upgrade steps recorded, in order.
     pub(crate) steps: Mutex<Vec<&'static str>>,
     /// Held once by a socket's next send before it writes.
@@ -338,6 +340,36 @@ impl Points {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// The returned receiver fires the first time the next write observer's wait for its
+    /// ticket parks (`run_write`): its job was submitted and has not answered yet.
+    pub(crate) fn arm_ticket_park(&self) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        *self
+            .ticket_park
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(tx);
+        rx
+    }
+
+    pub(crate) async fn signal_ticket_park<F: Future>(&self, fut: F) -> F::Output {
+        let mut signal = self
+            .ticket_park
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let mut fut = std::pin::pin!(fut);
+        std::future::poll_fn(move |cx| {
+            let r = fut.as_mut().poll(cx);
+            if r.is_pending()
+                && let Some(s) = signal.take()
+            {
+                let _ = s.send(());
+            }
+            r
+        })
+        .await
     }
 
     /// The returned receiver fires the first time the next registered socket task parks.

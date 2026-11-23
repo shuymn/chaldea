@@ -409,87 +409,91 @@ async fn store_outcomes_map() {
     store.store = None;
 }
 
-/// Posts `hook` (receipt `ordinal`) on a stopped clock with the writer held, and returns
-/// once the request waits for its reply (the HTTP faults' cutoff gate, armed after the
-/// pre-read so that only the reply wait meets it) and its job has passed `Store::submit`:
-/// the client task, the writer's release, and the gate's opener.
-async fn held_at_reply_wait(
-    h: &HookServer,
-    l: &Launch,
-    hook: &Hook,
-    ordinal: u64,
-) -> (
-    tokio::task::JoinHandle<super::support::http::Reply>,
-    std::sync::mpsc::Sender<()>,
-    tokio::sync::oneshot::Sender<()>,
-) {
-    let s = shared(&h.srv);
-    let release = h.srv.hold_writer().await;
-    let (at_job, go) = h.ingest.points.arm_job(ordinal);
-    let before = s.faults.submits();
-    let reply = h.spawn_post(hook);
-    reached(at_job).await;
-    let (at_wait, open) = s.faults.arm_cutoff_gate();
-    go.send(()).unwrap();
-    reached(at_wait).await;
-    eventually(WAIT, "the job passed Store::submit", || {
-        s.faults.submits() > before && !h.ingest.order.is_pending(l.launch, ordinal)
-    })
-    .await;
-    (reply, release, open)
+/// `hook`'s request as the guard hands it to the handler.
+fn request(hook: &Hook) -> axum::http::Request<axum::body::Body> {
+    let mut r = axum::http::Request::post("/hook")
+        .header("content-length", hook.body.len().to_string())
+        .header("x-chaldea-emit-id", hook.emit.to_string());
+    if let Some(a) = &hook.attempt {
+        r = r.header("x-chaldea-attempt", a);
+    }
+    if let Some(p) = hook.pid {
+        r = r.header("x-chaldea-emitter-pid", p.to_string());
+    }
+    if let Some(t) = &hook.thread {
+        r = r.header("x-chaldea-thread-id", t);
+    }
+    if let Some(a) = &hook.agent {
+        r = r.header("x-chaldea-agent", a);
+    }
+    r.body(axum::body::Body::from(hook.body.clone())).unwrap()
 }
 
-/// The reply waits for the job's commit (PR9-CL-1): the request reaches its reply wait
-/// with its job queued behind a held writer and no row; released, the row commits while the
-/// request is still held there and no reply has left; the wait let go, 200.
+/// The reply waits for the job's commit, appended (PR9-CL-1) and buffered (PR9-CL-4): the
+/// handler, polled directly with no test gate, is still pending once its write observer
+/// waits for the job's answer behind a held writer (the HTTP faults' ticket park), and
+/// nothing is stored; released, 200 and the row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reply_waits_for_commit() {
-    let h = HookServer::start().await;
-    h.srv.clock.stop();
-    let l = h.codex(1).await;
-    bind(&h, &l, "s").await;
-    let hook = Hook::of(&l, "Stop", "s");
-    let (reply, release, open) = held_at_reply_wait(&h, &l, &hook, 2).await;
-    assert!(h.delivery(l.launch, hook.emit).is_none());
-    // The job commits while the request is still held at its reply wait: no reply has
-    // left by another way.
-    release.send(()).unwrap();
-    eventually(WAIT, "the row committed", || {
-        h.delivery(l.launch, hook.emit).is_some()
-    })
-    .await;
-    assert!(
-        !reply.is_finished(),
-        "a reply that did not wait for the job"
-    );
-    open.send(()).unwrap();
-    ok(&reply.await.unwrap());
-    h.stop().await;
-}
+async fn submitted_hook_cannot_reply_before_commit() {
+    use std::future::Future;
+    use std::task::{Context, Waker};
 
-/// A buffered hook is durable before 200 (PR9-CL-4), as [`reply_waits_for_commit`] for an
-/// unbound launch.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn buffered_durable_before_200() {
-    let h = HookServer::start().await;
-    h.srv.clock.stop();
-    let l = h.codex(1).await;
-    let hook = Hook::of(&l, "UserPromptSubmit", "s");
-    let (reply, release, open) = held_at_reply_wait(&h, &l, &hook, 1).await;
-    assert!(h.delivery(l.launch, hook.emit).is_none());
-    release.send(()).unwrap();
-    eventually(WAIT, "the buffered row committed", || {
-        h.delivery(l.launch, hook.emit)
-            .is_some_and(|d| d.routing == Routing::Buffered)
-    })
-    .await;
-    assert!(
-        !reply.is_finished(),
-        "200 that did not wait for the buffered row"
-    );
-    open.send(()).unwrap();
-    ok(&reply.await.unwrap());
-    h.stop().await;
+    use crate::http::{MonotonicClock, Principal, WriteCtx};
+
+    for (event, ordinal) in [("Stop", 2), ("UserPromptSubmit", 1)] {
+        let h = HookServer::start().await;
+        h.srv.clock.stop();
+        let l = h.codex(1).await;
+        if ordinal == 2 {
+            bind(&h, &l, "s").await;
+        }
+        let hook = Hook::of(&l, event, "s");
+        let token = h.srv.token_row(&l.token).unwrap();
+        let s = shared(&h.srv);
+        let ctx = WriteCtx::new(
+            Some(Principal {
+                token_id: token.token_id,
+                token_sha256: token.sha256,
+                kind: token.kind,
+                thread: token.thread_id,
+            }),
+            h.srv.clock.now() + super::support::http::DEADLINE,
+            s.clone(),
+        );
+        let release = h.srv.hold_writer().await;
+        let parked = s.faults.arm_ticket_park();
+        let response = tokio::task::unconstrained(h.ingest.clone().handle(ctx, request(&hook)));
+        tokio::pin!(response);
+        // The write observer waits for its job's answer behind the held writer.
+        tokio::select! {
+            biased;
+            _ = &mut response => panic!("{event}: replied before its job answered"),
+            () = reached(parked) => {}
+        }
+        assert!(
+            !h.ingest.order.is_pending(l.launch, ordinal),
+            "{event}: not submitted"
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            response.as_mut().poll(&mut cx).is_pending(),
+            "{event}: replied after submit while the writer was held"
+        );
+        assert!(h.delivery(l.launch, hook.emit).is_none());
+        release.send(()).unwrap();
+        let reply = tokio::time::timeout(WAIT, response.as_mut())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.status(), axum::http::StatusCode::OK, "{event}");
+        let d = h.delivery(l.launch, hook.emit).unwrap();
+        if ordinal == 1 {
+            assert_eq!(d.routing, Routing::Buffered);
+        } else {
+            assert!(matches!(d.routing, Routing::Appended { .. }), "{d:?}");
+        }
+        h.stop().await;
+    }
 }
 
 /// A hook whose job passed `Store::submit` and whose client then disconnected is still

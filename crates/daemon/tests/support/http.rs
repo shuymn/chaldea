@@ -339,7 +339,7 @@ impl TestServer {
             .store()
             .submit(soon(), move |_tx| {
                 let _ = entered_tx.send(());
-                let _ = wait.recv_timeout(Duration::from_secs(20));
+                let _ = wait.recv();
                 Ok(())
             })
             .unwrap();

@@ -60,14 +60,6 @@ fn ok(r: &support::http::Reply) {
     assert_eq!(r.header("content-length"), Some("0"), "{r:?}");
 }
 
-/// The kinds of the hook-sourced events of `l`'s thread.
-fn kinds(h: &HookServer, l: &Launch) -> Vec<String> {
-    h.hook_events(l.thread)
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect()
-}
-
 fn session_of(l: &Launch) -> String {
     l.launch.to_string()
 }
@@ -285,58 +277,6 @@ async fn ordinals_continue_after_restart() {
 }
 
 // ---- PR9-CL-6: binding order -------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn binding_waits_for_earlier_hook() {
-    let h = server().await;
-    let l = h.codex(1).await;
-    // Hook 1 walks a chain of its own pid, held.
-    h.chains.set(7001, direct(7001, "codex"));
-    let (walking, release) = h.chains.hold(7001);
-    let first = Hook::of(&l, "UserPromptSubmit", "s").pid(Some(7001));
-    let first_reply = h.spawn_post(&first);
-    tokio::task::spawn_blocking(move || walking.recv_timeout(Duration::from_secs(10)))
-        .await
-        .unwrap()
-        .unwrap();
-    let start = Hook::of(&l, "SessionStart", "s");
-    let start_reply = h.spawn_post(&start);
-    let stop = Hook::of(&l, "Stop", "s");
-    let stop_reply = h.spawn_post(&stop);
-    // Stop 3 is buffered (the launch is unbound); the SessionStart waits for ordinal 1.
-    ok(&stop_reply.await.unwrap());
-    assert_eq!(
-        h.launch_row(l.launch).session_id,
-        None,
-        "bound before hook 1"
-    );
-    release.send(()).unwrap();
-    ok(&first_reply.await.unwrap());
-    ok(&start_reply.await.unwrap());
-    let order: Vec<Uuid> = h
-        .adapter
-        .calls()
-        .into_iter()
-        .filter(|c| c.promoted || c.event_name != "SessionStart")
-        .map(|c| c.emit_id)
-        .collect();
-    assert_eq!(
-        order,
-        vec![first.emit, stop.emit],
-        "promotion in receipt order"
-    );
-    assert_eq!(
-        kinds(&h, &l),
-        vec![
-            "session_bound",
-            "raw_unknown",
-            "user_message",
-            "assistant_message"
-        ],
-        "session_bound, the binding's raw, UserPromptSubmit 1, Stop 3"
-    );
-    h.stop().await;
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn released_gap_does_not_block() {
