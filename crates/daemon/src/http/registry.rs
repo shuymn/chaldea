@@ -202,6 +202,7 @@ impl TaskRegistry {
         run_hook(&self.inner.hooks.between_insert_and_spawn);
         tokio::spawn(Registered::new(
             Box::pin(fut),
+            kind,
             registration,
             self.clone(),
             id,
@@ -309,18 +310,23 @@ type BoxedTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// guard, so the entry outlives everything the task owns.
 struct Registered {
     fut: Abortable<BoxedTask>,
+    /// Set as the thread's task kind for each poll, for the panic hook
+    /// (`docs/design/daemon-lifecycle.md` §2.13).
+    kind: TaskKind,
     _guard: ExitGuard,
 }
 
 impl Registered {
     fn new(
         fut: BoxedTask,
+        kind: TaskKind,
         registration: AbortRegistration,
         registry: TaskRegistry,
         id: u64,
     ) -> Self {
         Registered {
             fut: Abortable::new(fut, registration),
+            kind,
             _guard: ExitGuard { registry, id },
         }
     }
@@ -330,6 +336,7 @@ impl Future for Registered {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let _kind = crate::lifecycle::TaskKindGuard::enter(self.kind);
         Pin::new(&mut self.fut).poll(cx).map(|_| ())
     }
 }

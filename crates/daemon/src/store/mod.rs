@@ -33,6 +33,14 @@ pub(crate) mod test_faults {
     pub(crate) fn open_with(cfg: StoreConfig, faults: Faults) -> Result<Store, OpenError> {
         super::open::open(cfg, Arc::new(faults))
     }
+
+    /// Opens a store with fault points the caller keeps (to arm them later).
+    pub(crate) fn open_with_shared(
+        cfg: StoreConfig,
+        faults: Arc<Faults>,
+    ) -> Result<Store, OpenError> {
+        super::open::open(cfg, faults)
+    }
 }
 
 use std::fmt;
