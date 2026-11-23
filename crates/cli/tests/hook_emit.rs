@@ -1287,4 +1287,40 @@ fn nested_echo_fails_when_its_emitter_cannot_spawn() {
     let r = run(&mut cmd, Stdin::Bytes(Vec::new()));
     assert_eq!(reports.wait("emitted", 1)[0]["spawn_failed"], true);
     assert_eq!((r.code, stub.accepted()), (Some(1), 0));
+    // The child alone: no `sent` after its failed first hook.
+    let reports = Reports::start();
+    let mut cmd = fake(&["--mode", "echo", "--nested-child"], &reports, &stub);
+    cmd.arg("--emitter").arg(dir.path().join("absent-emitter"));
+    let r = run(&mut cmd, Stdin::Bytes(b"go\n".to_vec()));
+    assert_eq!(reports.wait("emitted", 1)[0]["spawn_failed"], true);
+    assert_eq!(r.code, Some(1));
+    assert!(
+        r.stdout.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&r.stdout)
+    );
+}
+
+/// §2.14: a parent whose own emitter cannot be started writes no `go`. The emitter is a
+/// script that deletes itself, so the nested child's run starts it and the parent's cannot.
+#[cfg(target_os = "macos")]
+#[test]
+fn fake_cli_nested_parent_stops_when_its_emitter_cannot_spawn() {
+    use std::os::unix::fs::PermissionsExt;
+    let stub = Stub::start(&[Reply::Status(200)]);
+    let reports = Reports::start();
+    let dir = tempfile::tempdir().unwrap();
+    let emitter = dir.path().join("once");
+    std::fs::write(&emitter, "#!/bin/sh\nrm -- \"$0\"\n").unwrap();
+    std::fs::set_permissions(&emitter, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut cmd = fake(&["--mode", "echo", "--nested"], &reports, &stub);
+    cmd.arg("--emitter").arg(&emitter);
+    let r = run(&mut cmd, Stdin::Bytes(Vec::new()));
+    assert_eq!(r.code, Some(1));
+    let emitted = reports.wait("emitted", 2);
+    assert_eq!(emitted[0]["code"], 0, "{emitted:?}");
+    assert_eq!(emitted[1]["spawn_failed"], true, "{emitted:?}");
+    // No `go`: the parent ended the child, which emitted nothing more.
+    reports.wait("nested", 1);
+    assert_eq!(reports.of("emitted").len(), 2);
 }
