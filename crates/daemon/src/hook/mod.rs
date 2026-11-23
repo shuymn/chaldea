@@ -42,7 +42,7 @@ pub use ancestry::{Chain, Link, eligible};
 pub use buffer::{expire, resolve_unbindable};
 pub use intake::{IntakeFacts, IntakeOrder, IntakeProbe, IntakeTicket, NoIntakeFacts};
 
-use crate::http::{ApiError, AuthFailure, Mount, WriteCtx, spec, until_deadline, verify_hash_in};
+use crate::http::{ApiError, Mount, WriteCtx, spec, until_deadline, verify_in_read};
 use crate::store::{HookDelivery, HookReply, JobError, LaunchRow, ReadTx, StoreError};
 
 /// The hook body cap (mvp §2.5); the guard answers 413 above it.
@@ -363,10 +363,9 @@ fn pre_read(
     sha: &[u8; 32],
     emit: uuid::Uuid,
 ) -> Result<Result<PreRead, ApiError>, StoreError> {
-    let auth = match verify_hash_in(tx, sha) {
+    let auth = match verify_in_read(tx, sha)? {
         Ok(a) => a,
-        Err(AuthFailure::Invalid) => return Ok(Err(ApiError::unauthorized())),
-        Err(AuthFailure::Store(e)) => return Err(e),
+        Err(e) => return Ok(Err(e)),
     };
     let (Some(thread), Some(launch)) = (auth.thread, auth.launch) else {
         return Ok(Err(ApiError::unauthorized()));

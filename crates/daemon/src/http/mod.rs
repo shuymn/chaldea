@@ -63,7 +63,7 @@ pub use tickets::TicketPurpose;
 pub use trace::redact_secrets;
 pub use upgrade::{ShutdownSignal, UpgradeGrant, UpgradedSocket};
 
-pub(crate) use auth::{TOKEN_PREFIX, has_secret_form};
+pub(crate) use auth::{TOKEN_PREFIX, has_secret_form, verify_in_read};
 pub(crate) use ctx::until_deadline;
 pub(crate) use error::refused;
 
