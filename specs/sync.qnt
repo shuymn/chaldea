@@ -16,8 +16,8 @@
  *   `seq`, the epoch fixed at database creation); each socket merges heads into `known`
  *   and builds its frames at send selection (http §2.6); the network loses, delays, and
  *   reorders responses and loses frames; the client keeps one epoch, a local copy per
- *   stream, the heads it observed, and request generations (formal-specs §7.4 F2, the
- *   proposed contract text).
+ *   stream, the heads it observed, and request generations (mvp §2.4, "A client keeps one
+ *   current request per stream and direction").
  *
  * Abstracted: the host is one database with an epoch; a new database (a new epoch) starts
  * with empty streams, and a thread may not exist in it; events carry their identity
@@ -534,8 +534,8 @@ module sync {
     | Bwd => cl.bwd.get(r.stream) == r.id
   }
 
-  /// The client applies a response (mvp §2.4 "Replay", "Backward history"; formal-specs
-  /// §7.4 F2): one of an older generation changes nothing; a forward response with
+  /// The client applies a response (mvp §2.4 "Replay", "Backward history", request
+  /// generations): one of an older generation changes nothing; a forward response with
   /// another epoch than the one held (none included) establishes or switches the epoch,
   /// becoming the stream's copy only if it starts at the stream's beginning; a backward
   /// page with another epoch only makes a forward resync due; a 404 ends following the
@@ -704,7 +704,7 @@ module sync {
     and { r.cp.epoch == 0 or r.cp.epoch == held, r.cp.events.indices().forall(i => r.cp.events[i].epoch == held) }
   })
 
-  /// mvp §2.4 "Everything a client renders is in a snapshot or in events after
+  /// mvp §2.4 "the client renders that stream from the snapshot and the events after
   /// `as_of_seq`": what a copy renders of its own stream is the host's projection at the
   /// copy's cursor.
   pure def renderedOk(s: State): bool = copiesOf(s).forall(r => r.cp.epoch == 0 or
@@ -713,7 +713,7 @@ module sync {
   // A response is of an older generation when its request was given up, issued before the
   // client last established or switched epoch, reconnected, or replaced or dropped that
   // stream's copy, or when the client issued a later request for the same stream and
-  // direction (formal-specs §7.4 F2; recorded ghosts).
+  // direction (mvp §2.4 request generations; recorded ghosts).
   pure def older(cl: Client, r: Req): bool =
     val latest = match r.dir { | Fwd => cl.lastFwd.get(r.stream) | Bwd => cl.lastBwd.get(r.stream) }
     or { cl.cancelled.contains(r.id), r.id <= cl.resetAt.get(r.stream), r.id < latest }
@@ -755,9 +755,11 @@ module sync {
     | _ => true
   }
 
-  /// mvp §2.4 "only a forward response (on the active reconnect or fetch) may establish a
-  /// new epoch": a client's epoch changes only on a forward response of the current
-  /// generation (by the ghosts) that carries the new epoch.
+  /// mvp §2.4 "Its first successful forward response (a replay page or a snapshot)
+  /// establishes its epoch" and "A failed read …, a backward page, and a response from an
+  /// older request generation never set the epoch": a client's epoch changes only on a
+  /// successful forward response of the current generation (by the ghosts) that carries
+  /// the new epoch.
   pure def establishOk(prev: int -> Client, a: Action, s: State): bool = CLIENTS.forall(c =>
     s.clients.get(c).epoch != prev.get(c).epoch implies match a {
       | Deliver(p) => and {
@@ -1137,13 +1139,13 @@ module sync {
   val heldEventsOnHost = heldOk(st) and last.inner.held
   /// mvp §2.4 "switching epoch and local state together".
   val noMixedEpochs = mixedOk(st) and last.inner.mixed
-  /// mvp §2.4 "Everything a client renders is in a snapshot or in events after `as_of_seq`".
+  /// mvp §2.4 "the client renders that stream from the snapshot and the events after `as_of_seq`".
   val renderedStateAtCursor = renderedOk(st) and last.inner.rendered
   /// mvp §2.4 "Replay", "Backward history": an applied response drops nothing held.
   val appliedKeepsHeld = keptOk(last.prevClients, last.act, st) and last.inner.kept
-  /// mvp §2.4 "a response from an older request generation is discarded"; F2.
+  /// mvp §2.4 "the client discards it, and it changes no local state, the epoch included".
   val olderResponsesChangeNothing = olderOk(last.prevClients, last.act, st) and last.inner.older
-  /// mvp §2.4 "only a forward response … may establish a new epoch"; F2.
+  /// mvp §2.4 epoch rule and request generations.
   val epochOnlyFromCurrentForward = establishOk(last.prevClients, last.act, st) and last.inner.establish
   val epochNeverRegresses = regressOk(last.prevClients, st) and last.inner.regress
   val owedResyncStaysDue = owedOk(st) and last.inner.owed
