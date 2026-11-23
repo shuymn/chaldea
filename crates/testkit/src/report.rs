@@ -62,8 +62,9 @@ impl Reporter {
         Reporter
     }
 
-    /// Writes one line in one write, so a process killed while reporting leaves no partial
-    /// line; nothing once the stream has ended.
+    /// Writes one line with one `write_all` under the stream's lock, which `pong` answers
+    /// share, so lines never interleave; a process killed mid-write can still leave a partial
+    /// last line, which the test's reader discards. Nothing once the stream has ended.
     #[allow(
         clippy::unused_self,
         reason = "a line is sent by the process that connected"

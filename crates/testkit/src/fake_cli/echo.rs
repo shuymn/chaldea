@@ -252,10 +252,11 @@ impl Broken {
     }
 }
 
-/// A complete handshake line, without its terminator, and when its read completed.
+/// A complete handshake line, without its terminator, and when the reader had decoded it.
 type Frame = (String, Instant);
 
-/// The LF- or CRLF-terminated lines of `r`, read on a thread and stamped as each completes;
+/// The LF- or CRLF-terminated lines of `r`, read on a thread, each stamped after it is
+/// decoded and then published;
 /// the channel closes at EOF or a read error, and an unterminated last line is not sent.
 fn lines_of(r: Option<impl Read + Send + 'static>) -> Receiver<Frame> {
     let (tx, rx) = mpsc::channel();
@@ -282,8 +283,10 @@ fn lines_of(r: Option<impl Read + Send + 'static>) -> Receiver<Frame> {
     rx
 }
 
-/// Takes the next line of `lines`, which must be exactly `want` and have completed before
-/// `until` (a line stamped at or after it is late, even when it is already queued).
+/// Takes the next line of `lines`, which must be exactly `want` and stamped before `until`
+/// (a line stamped at or after it is late, even when it is already queued). The decision is
+/// about the frames observed and published: a line read before `until` but stamped or
+/// published after it, its reader paused in between, counts as late.
 fn expect_line(lines: &Receiver<Frame>, want: &str, until: Instant) -> Result<(), Broken> {
     match lines.recv_timeout(until.saturating_duration_since(Instant::now())) {
         Ok((_, at)) if at >= until => Err(Broken::Timeout),
