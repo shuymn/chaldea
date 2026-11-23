@@ -18,6 +18,7 @@
 
 mod auth;
 mod blobs;
+mod commands;
 mod ctx;
 mod error;
 mod guard;
@@ -46,6 +47,10 @@ use crate::store::Store;
 pub use auth::{
     AuthFailure, Authorized, MintedToken, ObjectScope, Principal, Secret, TokenService, deny_for,
     verify_hash_in, verify_secret_in,
+};
+pub use commands::{
+    CommandCtx, CommandEffect, CommandHandler, CommandRegistry, EffectRun, Intent, IntentFn,
+    Prepared,
 };
 pub use ctx::{Deadline, ReadCtx, RequestStart, WriteCtx};
 pub use error::ApiError;
@@ -200,6 +205,8 @@ pub(crate) struct Shared {
     pub(crate) store: Store,
     pub(crate) cfg: HttpConfig,
     pub(crate) registry: TaskRegistry,
+    /// The command handlers (design §2.8).
+    pub(crate) commands: commands::CommandRegistry,
     pub(crate) sink: Arc<dyn LifecycleSink>,
     pub(crate) tickets: tickets::TicketStore,
     pub(crate) pair_codes: tickets::PairCodes,
@@ -250,7 +257,8 @@ pub struct HttpServer {
 }
 
 impl HttpServer {
-    /// Builds the server and its router from `mounts`.
+    /// Builds the server and its router from `mounts`; `commands` holds the command
+    /// handlers ([`CommandRegistry::mvp`] in the daemon).
     ///
     /// # Panics
     ///
@@ -259,12 +267,14 @@ impl HttpServer {
     pub fn new(
         cfg: HttpConfig,
         store: Store,
+        commands: CommandRegistry,
         sink: Arc<dyn LifecycleSink>,
         mounts: Mounts,
     ) -> HttpServer {
         let shared = Arc::new(Shared {
             store,
             registry: TaskRegistry::new(),
+            commands,
             sink,
             tickets: tickets::TicketStore::default(),
             pair_codes: tickets::PairCodes::default(),

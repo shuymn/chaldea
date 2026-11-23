@@ -420,6 +420,14 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+#[cfg(test)]
+impl Store {
+    /// The store's fault points, for arming after open.
+    pub(crate) fn faults(&self) -> &Faults {
+        &self.inner.faults
+    }
+}
+
 impl Store {
     /// Opens (creating if missing) the database at `cfg.path` (§2.8).
     ///

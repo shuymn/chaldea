@@ -7,6 +7,7 @@ pub(crate) mod faults;
 pub(crate) use crate::store::tests::support;
 
 mod auth;
+mod commands;
 mod errors;
 mod events;
 mod layers;

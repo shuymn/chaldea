@@ -9,14 +9,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chaldea_core::auth::TokenKind;
+use chaldea_core::command::CommandReceipt;
 use chaldea_core::http::{ErrorBody, PairCodeResponse, WsTicketResponse};
-use chaldea_core::ids::{LaunchId, StreamId, ThreadId};
+use chaldea_core::ids::{CommandId, LaunchId, StreamId, ThreadId};
 use chaldea_core::sync::{StreamHeadEntry, WsServerMessage};
 use chaldea_daemon::http::{
-    HttpConfig, HttpServer, HttpShutdownReport, LifecycleSink, MonotonicClock, Mounts, ServeHandle,
-    StoreFatal, TokenService,
+    CommandRegistry, HttpConfig, HttpServer, HttpShutdownReport, LifecycleSink, MonotonicClock,
+    Mounts, ServeHandle, StoreFatal, TokenService,
 };
-use chaldea_daemon::store::{NewEvent, TokenSelector};
+use chaldea_daemon::store::{NewEvent, TokenSelector, WriteError, WriteTicket};
 use futures_util::{SinkExt, StreamExt};
 use sha2::Digest as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -118,6 +119,16 @@ impl TestServer {
         mounts: Mounts,
         tune: impl FnOnce(&mut HttpConfig),
     ) -> TestServer {
+        Self::start_full(store, mounts, CommandRegistry::mvp(), tune).await
+    }
+
+    /// As [`TestServer::start_on`], with the command handlers of `commands`.
+    pub async fn start_full(
+        store: TestStore,
+        mounts: Mounts,
+        commands: CommandRegistry,
+        tune: impl FnOnce(&mut HttpConfig),
+    ) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let clock = Arc::new(SkewClock::default());
@@ -129,7 +140,7 @@ impl TestServer {
         cfg.clock = clock.clone();
         tune(&mut cfg);
         let sink = Arc::new(RecordingSink::default());
-        let server = HttpServer::new(cfg, store.store().clone(), sink.clone(), mounts);
+        let server = HttpServer::new(cfg, store.store().clone(), commands, sink.clone(), mounts);
         let handle = server.serve(listener);
         TestServer {
             server,
@@ -141,6 +152,38 @@ impl TestServer {
         }
     }
 
+    /// A server with the test command handlers of [`super::commands`] over a new store.
+    pub async fn with_commands(
+        tune: impl FnOnce(&mut HttpConfig),
+    ) -> (TestServer, Arc<super::commands::Probe>) {
+        Self::with_commands_on(TestStore::new(), tune).await
+    }
+
+    /// As [`TestServer::with_commands`], over the given store.
+    pub async fn with_commands_on(
+        store: TestStore,
+        tune: impl FnOnce(&mut HttpConfig),
+    ) -> (TestServer, Arc<super::commands::Probe>) {
+        let probe = Arc::new(super::commands::Probe::default());
+        let commands = super::commands::registry(store.store(), &probe);
+        let srv = Self::start_full(store, Mounts::mvp(), commands, tune).await;
+        (srv, probe)
+    }
+
+    /// `POST /api/commands/{name}` with `command_id` and the raw `args` text.
+    #[must_use]
+    pub fn command(&self, name: &str, secret: &str, command_id: CommandId, args: &str) -> Req {
+        self.req("POST", &format!("/api/commands/{name}"))
+            .bearer(secret)
+            .body(format!(r#"{{"command_id":"{command_id}","args":{args}}}"#).as_bytes())
+    }
+
+    /// The receipt of `command_id`, if any.
+    #[must_use]
+    pub fn receipt(&self, command_id: CommandId) -> Option<CommandReceipt> {
+        self.store.read(move |tx| tx.receipt(command_id))
+    }
+
     /// Shuts the server down (deadline in 10 s), then the store.
     pub async fn stop(mut self) -> HttpShutdownReport {
         let report = self
@@ -148,6 +191,13 @@ impl TestServer {
             .await;
         self.store.shutdown();
         report
+    }
+
+    /// Shuts the server down (deadline `within` from now) and returns its report and the
+    /// store, still open, for a server started after it.
+    pub async fn into_store(mut self, within: Duration) -> (HttpShutdownReport, TestStore) {
+        let report = self.shutdown_http(Instant::now() + within).await;
+        (report, self.store)
     }
 
     /// Shuts only the server down.
@@ -160,6 +210,7 @@ impl TestServer {
         self.store
             .store()
             .submit(soon(), move |tx| Ok(tx.append(events)?))
+            .map(settled)
             .unwrap()
             .await
             .unwrap();
@@ -177,6 +228,7 @@ impl TestServer {
         self.store
             .store()
             .submit(soon(), move |tx| Ok(tx.token_insert(row)?))
+            .map(settled)
             .unwrap()
             .await
             .unwrap();
@@ -366,6 +418,7 @@ impl TestServer {
             .submit(soon(), move |tx| {
                 Ok(tx.token_revoke(TokenSelector::Token(id))?)
             })
+            .map(settled)
             .unwrap()
             .await
             .unwrap();
@@ -492,6 +545,39 @@ pub async fn eventually(within: Duration, what: &str, mut cond: impl FnMut() -> 
         assert!(Instant::now() < until, "not within {within:?}: {what}");
         tokio::task::yield_now().await;
     }
+}
+
+/// Sends `req` on its own task; the reply is the task's output.
+pub fn spawn_send(srv: &TestServer, req: &Req) -> tokio::task::JoinHandle<Reply> {
+    let (port, bytes) = (srv.port, req.bytes());
+    tokio::spawn(async move { send(port, &bytes).await })
+}
+
+/// Waits (at most 10 s) for a message on a gate's `reached` receiver.
+pub async fn reached(rx: tokio::sync::oneshot::Receiver<()>) {
+    tokio::time::timeout(Duration::from_secs(10), rx)
+        .await
+        .expect("the gate was reached within 10 s")
+        .unwrap();
+}
+
+/// Waits (at most 10 s) for a message on a gate's `reached` receiver from a writer thread.
+pub async fn reached_sync(rx: std::sync::mpsc::Receiver<()>) {
+    tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .expect("the gate was reached within 10 s");
+}
+
+/// Events on the host stream carrying `id`.
+#[must_use]
+pub fn host_events_of(srv: &TestServer, id: CommandId) -> usize {
+    srv.store
+        .read(|tx| tx.events_after(StreamId::Host, 0, 1000))
+        .events
+        .iter()
+        .filter(|e| e.command_id == Some(id))
+        .count()
 }
 
 /// The head of `stream` in `heads`.
@@ -714,13 +800,32 @@ pub fn parse(bytes: &[u8], end: Option<io::ErrorKind>) -> Reply {
 /// Connects, writes `bytes`, and reads the reply to EOF.
 pub async fn send(port: u16, bytes: &[u8]) -> Reply {
     let mut s = connect(port).await;
-    s.write_all(bytes).await.unwrap();
+    write(&mut s, bytes).await;
     let (out, end) = read_to_end(&mut s).await;
     parse(&out, end)
 }
 
+/// Awaits a write's ticket within [`CLIENT_WAIT`].
+pub async fn settled<R>(t: WriteTicket<R>) -> Result<R, WriteError> {
+    tokio::time::timeout(CLIENT_WAIT, t)
+        .await
+        .expect("the writer replied within the client wait")
+}
+
+/// Connects within [`CLIENT_WAIT`].
 pub async fn connect(port: u16) -> TcpStream {
-    TcpStream::connect(("127.0.0.1", port)).await.unwrap()
+    tokio::time::timeout(CLIENT_WAIT, TcpStream::connect(("127.0.0.1", port)))
+        .await
+        .expect("connected within the client wait")
+        .unwrap()
+}
+
+/// Writes all of `bytes` within [`CLIENT_WAIT`].
+pub async fn write(s: &mut TcpStream, bytes: &[u8]) {
+    tokio::time::timeout(CLIENT_WAIT, s.write_all(bytes))
+        .await
+        .expect("written within the client wait")
+        .unwrap();
 }
 
 /// Every row of every table of the store at `path`, through a separate read-only

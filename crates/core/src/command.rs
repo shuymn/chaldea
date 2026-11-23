@@ -2,7 +2,29 @@
 //!
 //! Internal: the store keeps receipts, HTTP maps a [`ReceiptLookup`] to its reply.
 
+use sha2::{Digest, Sha256};
+
+use crate::canonical::CanonicalJson;
 use crate::ids::{CommandId, TokenId};
+
+/// The domain of [`request_identity`]: a new identity scheme gets a new one.
+pub const IDENTITY_DOMAIN: &str = "chaldea-command-v1";
+
+/// The identity of a command request (`docs/design/http-surface.md` §2.8 "Request
+/// identity"): `SHA-256(IDENTITY_DOMAIN ‖ 0x00 ‖ name ‖ 0x00 ‖ normalized)`, where
+/// `normalized` is the canonical form of the handler's parsed arguments. Two requests that
+/// mean the same arguments share it whatever their key order, whitespace, or number
+/// spelling; `command_id` is the receipt key and not part of it.
+#[must_use]
+pub fn request_identity(name: &str, normalized: &CanonicalJson) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(IDENTITY_DOMAIN.as_bytes());
+    h.update([0]);
+    h.update(name.as_bytes());
+    h.update([0]);
+    h.update(normalized.as_str().as_bytes());
+    h.finalize().into()
+}
 
 /// The stored reply of a finished command.
 #[derive(Debug, Clone, PartialEq, Eq)]

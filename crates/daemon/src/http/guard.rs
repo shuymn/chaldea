@@ -16,7 +16,7 @@ use axum::body::Body;
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use axum::response::IntoResponse;
-use chaldea_core::auth::{command, grant};
+use chaldea_core::auth::grant;
 use futures_util::future::BoxFuture;
 use http_body_util::Limited;
 use hyper::body::Incoming;
@@ -26,6 +26,7 @@ use tracing::{Instrument, Span};
 
 use super::Shared;
 use super::auth::{Principal, TICKET_PREFIX, has_secret_form, parse_bearer, sha256};
+use super::commands;
 use super::ctx::{Deadline, ReadCtx, RequestStart, WriteCtx, until_deadline, verify_until};
 use super::error::ApiError;
 use super::routes::{ActionRule, Credential, Endpoint, OriginRule, RouteSpec, TicketPurposeKind};
@@ -266,7 +267,12 @@ impl GuardService {
             .extensions
             .get::<RequestStart>()
             .map_or_else(|| shared.cfg.clock.now(), |s| s.0);
-        let deadline = start + shared.cfg.short_deadline;
+        // The route's budget: a command states its own, every other route has the short one.
+        let budget = match spec.action {
+            ActionRule::ByCommandName => commands::budget(shared, parts.uri.path()),
+            _ => shared.cfg.short_deadline,
+        };
+        let deadline = start + budget;
 
         // 2. Method: exactly the spec's (`HEAD` is not accepted on `GET` routes).
         if parts.method != spec.method {
@@ -282,6 +288,10 @@ impl GuardService {
         }
         // 6. Framing, 7. size.
         check_framing(&parts.method, &parts.headers, shared.cfg.max_body_bytes)?;
+        // 8. Unimplemented: the route's handler, or the command's.
+        let command_unimplemented = spec.action == ActionRule::ByCommandName
+            && path_param(spec.path, parts.uri.path(), "name")
+                .is_none_or(|name| shared.commands.handler(name).is_none());
         // The handler's request: the deadline in its extensions, the body bounded.
         let request = move || {
             parts.extensions.insert(Deadline(deadline));
@@ -289,8 +299,8 @@ impl GuardService {
             Request::from_parts(parts, Body::new(Limited::new(body, max)))
         };
         match &self.endpoint {
-            // 8. Unimplemented.
             Endpoint::Unimplemented => Err(ApiError::not_implemented()),
+            _ if command_unimplemented => Err(ApiError::not_implemented()),
             // 9. Deadline: no handler is invoked once it has passed.
             _ if shared.passed(deadline) => Err(ApiError::request_timeout()),
             Endpoint::Read(h) => {
@@ -376,7 +386,11 @@ impl GuardService {
             ActionRule::Fixed(a) => a,
             ActionRule::ByCommandName => {
                 let name = path_param(spec.path, path, "name").unwrap_or_default();
-                command(name).ok_or_else(ApiError::not_found)?.action
+                self.shared
+                    .commands
+                    .spec(name)
+                    .ok_or_else(ApiError::not_found)?
+                    .action
             }
         };
         if grant(p.kind, action).is_some() {

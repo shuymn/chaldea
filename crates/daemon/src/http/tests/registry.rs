@@ -181,3 +181,146 @@ async fn closing_refuses() {
     );
     assert!(!polled.load(Ordering::SeqCst));
 }
+
+// ---- command runners and the closing transition (PR7-CL-20) ---------------------------------
+
+mod runners {
+    use std::time::{Duration, Instant};
+
+    use chaldea_core::auth::TokenKind;
+    use chaldea_core::command::ReceiptStatus;
+    use chaldea_core::ids::CommandId;
+    use tokio::io::AsyncWriteExt;
+
+    use super::super::support::http::{Reply, TestServer, connect, parse, read_to_end};
+    use super::super::{eventually, shared};
+    use crate::http::StoreFatal;
+    use crate::store::test_faults::CommitFault;
+
+    fn cid(n: u128) -> CommandId {
+        CommandId::from_u128(0xC0DE_2000 + n)
+    }
+
+    /// Sends `bytes` and reads to the end; a connection ended without a reply is empty.
+    fn spawn_raw(port: u16, bytes: Vec<u8>) -> tokio::task::JoinHandle<Vec<u8>> {
+        tokio::spawn(async move {
+            let mut s = connect(port).await;
+            s.write_all(&bytes).await.unwrap();
+            read_to_end(&mut s).await.0
+        })
+    }
+
+    async fn joined<T>(h: tokio::task::JoinHandle<T>) -> T {
+        tokio::time::timeout(Duration::from_secs(20), h)
+            .await
+            .expect("done within 20 s")
+            .unwrap()
+    }
+
+    fn reply(bytes: &[u8]) -> Reply {
+        parse(bytes, None)
+    }
+
+    /// A runner registered just before closing is in the snapshot: it submits after the
+    /// registry closed and completes, counted under `exited`. A request on a connection
+    /// admitted before closing that reaches its runner's registration after it gets 503
+    /// `shutting_down`, with nothing submitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_between_register_and_submit() {
+        let (mut srv, probe) = TestServer::with_commands(|_| {}).await;
+        let owner = srv.token(TokenKind::Owner, None, None).await;
+        let s = shared(&srv);
+        let (gate_reached, gate_release) = s.faults.arm_runner_gate();
+        let first = spawn_raw(
+            srv.port,
+            srv.command("test_counter", &owner, cid(1), r#"{"n":1}"#)
+                .bytes(),
+        );
+        tokio::time::timeout(Duration::from_secs(10), gate_reached)
+            .await
+            .expect("the runner reached its gate")
+            .unwrap();
+        // The second request is dispatched and waits for its body.
+        let second = srv.command("test_counter", &owner, cid(2), r#"{"n":2}"#);
+        let polls = s.faults.polls();
+        let mut conn = connect(srv.port).await;
+        conn.write_all(&second.head()).await.unwrap();
+        eventually(Duration::from_secs(10), "the body is awaited", || {
+            s.faults.polls() > polls
+        })
+        .await;
+        let before = s.faults.submits();
+        let after_closing = async {
+            eventually(Duration::from_secs(10), "the registry is closing", || {
+                s.registry.is_closing()
+            })
+            .await;
+            let body = &second.bytes()[second.head().len()..];
+            conn.write_all(body).await.unwrap();
+            let (bytes, _) = read_to_end(&mut conn).await;
+            let r = reply(&bytes);
+            assert_eq!(r.outcome(), (503, Some("shutting_down".to_owned())));
+            assert_eq!(s.faults.submits(), before, "the refused request submitted");
+            gate_release.send(()).unwrap();
+        };
+        let (report, ()) = tokio::join!(
+            srv.shutdown_http(Instant::now() + Duration::from_secs(10)),
+            after_closing
+        );
+        assert_eq!(report.exited.runner, 1, "{report:?}");
+        assert_eq!(report.abort_requested.total(), 0, "{report:?}");
+        assert_eq!(reply(&joined(first).await).status, 200);
+        assert!(matches!(
+            srv.receipt(cid(1)).unwrap().status,
+            ReceiptStatus::Completed(_)
+        ));
+        assert_eq!(srv.receipt(cid(2)), None);
+        assert_eq!(probe.intents(), 1);
+        srv.store.shutdown();
+    }
+
+    /// The intent job is held in the writer past the drain deadline, so the runner gets an
+    /// abort request; the commit then completes with an unknown outcome. Nobody reports it,
+    /// and after reopening and the restart's marking the receipt is exactly
+    /// `unknown_after_crash`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_fault_after_the_drain_deadline() {
+        let (mut srv, probe) = TestServer::with_commands(|_| {}).await;
+        let owner = srv.token(TokenKind::Owner, None, None).await;
+        let (intent_reached, intent_release) = probe.hold_intent();
+        *srv.store.store().faults().commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
+        let first = spawn_raw(
+            srv.port,
+            srv.command("test_slow_effect", &owner, cid(1), r#"{"tag":"x"}"#)
+                .bytes(),
+        );
+        tokio::task::spawn_blocking(move || intent_reached.recv_timeout(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .expect("the intent is held");
+        let report = srv
+            .shutdown_http(Instant::now() + Duration::from_millis(300))
+            .await;
+        assert_eq!(report.abort_requested.runner, 1, "{report:?}");
+        assert!(joined(first).await.is_empty(), "a reply after the abort");
+        intent_release.send(()).unwrap();
+        let mut store = srv.store;
+        let store = tokio::task::spawn_blocking(move || {
+            // The writer runs the held job to its commit, then exits.
+            store.shutdown();
+            store.reopen();
+            store
+                .run(|tx| Ok(tx.receipts_mark_unknown_after_crash()?))
+                .unwrap();
+            store
+        })
+        .await
+        .unwrap();
+        assert_eq!(*srv.sink.0.lock().unwrap(), Vec::<StoreFatal>::new());
+        assert_eq!(
+            store.read(move |tx| tx.receipt(cid(1))).unwrap().status,
+            ReceiptStatus::UnknownAfterCrash
+        );
+        assert_eq!(probe.effects(), 0);
+    }
+}

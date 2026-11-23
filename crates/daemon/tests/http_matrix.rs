@@ -721,7 +721,13 @@ fn build_router_rejects_inconsistent_mounts() {
         std::panic::catch_unwind(AssertUnwindSafe(move || {
             let sink: std::sync::Arc<dyn chaldea_daemon::http::LifecycleSink> =
                 std::sync::Arc::new(support::http::RecordingSink::default());
-            drop(HttpServer::new(HttpConfig::new(1), s, sink, m));
+            drop(HttpServer::new(
+                HttpConfig::new(1),
+                s,
+                chaldea_daemon::http::CommandRegistry::mvp(),
+                sink,
+                m,
+            ));
         }))
     };
     let hook = spec(&Method::POST, "/hook").unwrap();

@@ -128,6 +128,29 @@ impl ApiError {
     }
 
     #[must_use]
+    pub fn bad_args() -> ApiError {
+        Self::new(StatusCode::BAD_REQUEST, ErrorCode::BadArgs)
+    }
+
+    /// 409: the command's receipt is still `in_progress`; retry after `retry_after`.
+    #[must_use]
+    pub fn in_progress() -> ApiError {
+        Self::new(StatusCode::CONFLICT, ErrorCode::InProgress).with_retry_after(RETRY_AFTER_SECS)
+    }
+
+    /// 409: the `command_id` belongs to another token or another request; one body whatever
+    /// the receipt's state.
+    #[must_use]
+    pub fn conflict() -> ApiError {
+        Self::new(StatusCode::CONFLICT, ErrorCode::Conflict)
+    }
+
+    #[must_use]
+    pub fn unknown_after_crash() -> ApiError {
+        Self::new(StatusCode::CONFLICT, ErrorCode::UnknownAfterCrash)
+    }
+
+    #[must_use]
     pub fn not_implemented() -> ApiError {
         Self::new(StatusCode::NOT_IMPLEMENTED, ErrorCode::NotImplemented)
     }

@@ -4,7 +4,8 @@
 //! no-store`, and hyper's own parser responses carry no `ErrorBody` and no daemon header.
 //!
 //! PR 7a captures the codes its guard and outer layer decide; the credential, list, and
-//! command bodies join with the handlers that produce them (PR 7b, 7c).
+//! command bodies join with the handlers that produce them (PR 7b, 7c: the command codes
+//! through the test-only handlers of `support::commands`).
 
 mod support;
 
@@ -15,10 +16,11 @@ use axum::body::Body;
 use axum::http::{Method, Response};
 use chaldea_core::auth::TokenKind;
 use chaldea_core::http::{ErrorBody, ErrorCode};
-use chaldea_core::ids::{LaunchId, ThreadId};
+use chaldea_core::ids::{CommandId, LaunchId, ThreadId};
 use chaldea_daemon::http::{ApiError, Mount, Mounts, ReadCtx, spec};
 use serde_json::{Value, json};
-use support::http::{Reply, TestServer};
+use support::http::{Reply, TestServer, settled};
+use support::soon;
 
 fn validator(name: &str) -> jsonschema::Validator {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -118,6 +120,44 @@ async fn error_bodies_match_the_contract() {
     check_error_body(&r, ErrorCode::ShuttingDown, "store closed");
     srv.shutdown_http(std::time::Instant::now() + Duration::from_secs(10))
         .await;
+
+    // The command codes (§2.8): bad_args, in_progress, conflict, unknown_after_crash.
+    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let id = |n: u128| CommandId::from_u128(0xC0DE_2000 + n);
+    let r = srv
+        .send(&srv.command("test_counter", &owner, id(1), r#"{"n":"x"}"#))
+        .await;
+    check_error_body(&r, ErrorCode::BadArgs, "bad_args");
+    let (effect_reached, release) = probe.hold_effect();
+    let slow = srv.command("test_slow_effect", &owner, id(2), r#"{"tag":"c"}"#);
+    let (port, bytes) = (srv.port, slow.bytes());
+    let running = tokio::spawn(async move { support::http::send(port, &bytes).await });
+    tokio::time::timeout(Duration::from_secs(10), effect_reached)
+        .await
+        .expect("the effect started within 10 s")
+        .unwrap();
+    check_error_body(&srv.send(&slow).await, ErrorCode::InProgress, "in_progress");
+    let other = srv.command("test_slow_effect", &owner, id(2), r#"{"tag":"d"}"#);
+    check_error_body(&srv.send(&other).await, ErrorCode::Conflict, "conflict");
+    srv.store
+        .store()
+        .submit(soon(), |tx| Ok(tx.receipts_mark_unknown_after_crash()?))
+        .map(settled)
+        .unwrap()
+        .await
+        .unwrap();
+    check_error_body(
+        &srv.send(&slow).await,
+        ErrorCode::UnknownAfterCrash,
+        "unknown_after_crash",
+    );
+    drop(release);
+    tokio::time::timeout(Duration::from_secs(20), running)
+        .await
+        .expect("the first request ends within 20 s")
+        .unwrap();
+    srv.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
