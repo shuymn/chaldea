@@ -357,6 +357,27 @@ fn same_port_after_restart() {
     assert_eq!(d.stop_and_wait(&dir.path), 0);
 }
 
+/// An explicit `--port` through the real bind: with saved port X, `--port Y` (a port another
+/// daemon chose and released) serves on Y, saves Y, and says to re-pair.
+#[test]
+fn explicit_port_is_served_and_saved() {
+    let _s = serial();
+    let (a, b) = (state(), state());
+    let (mut first, x) = serve(&a.path);
+    let y = serve_once(&b.path, None);
+    assert_eq!(first.stop_and_wait(&a.path), 0, "{}", first.stderr());
+    assert_ne!(x, y);
+    let mut d = Proc::spawn(&mut run_cmd(&a.path, Some(y)));
+    assert_eq!(d.serving(), y);
+    assert_eq!(saved_port(&a.path), format!("{y}\n"));
+    assert_eq!(d.stop_and_wait(&a.path), 0);
+    let err = d.stderr();
+    assert!(
+        err.contains(&format!("port {y} replaces the saved port {x}")),
+        "{err}"
+    );
+}
+
 #[test]
 fn failed_override_keeps_the_saved_port() {
     let _s = serial();

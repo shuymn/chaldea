@@ -93,6 +93,42 @@ fn no_listener_during_reconciliation() {
     assert_eq!(run.join().code.code(), 0);
 }
 
+/// PR8-CL-6 through the real bind: a daemon chooses its port from the range and saves it; the
+/// next start on that saved port, parked in a reconciler, refuses a connect to it; released,
+/// it serves there.
+#[test]
+fn saved_port_refuses_connects_during_reconciliation() {
+    let dir = state();
+    let run = start(
+        foreground(&dir.path, None),
+        TestComponents::default(),
+        Arc::default(),
+    );
+    let port = run.serving();
+    assert!(PORT_RANGE.contains(&port), "{port}");
+    run.stop();
+    assert_eq!(run.join().code.code(), 0);
+    let park = Arc::new(super::super::faults::Park::default());
+    let comps = TestComponents {
+        extra: vec![parked_reconciler(park.clone())],
+        ..TestComponents::default()
+    };
+    let run = start(foreground(&dir.path, None), comps, Arc::default());
+    let reached = park.wait_reached(WAIT);
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    let connect = std::net::TcpStream::connect_timeout(&addr, WAIT).map_err(|e| e.kind());
+    park.release();
+    assert!(reached, "the reconciler did not run");
+    assert_eq!(
+        connect.err(),
+        Some(std::io::ErrorKind::ConnectionRefused),
+        "a connect during reconciliation was not refused"
+    );
+    assert_eq!(run.serving(), port);
+    run.stop();
+    assert_eq!(run.join().code.code(), 0);
+}
+
 /// PR8-CL-7: `SubmitError::Failed` at step 9 is a fatal store outcome.
 #[test]
 fn submit_failed_is_fatal() {
