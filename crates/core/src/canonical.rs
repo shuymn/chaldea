@@ -31,7 +31,7 @@ impl CanonicalJson {
     pub fn of<T: Serialize + ?Sized>(value: &T) -> Result<CanonicalJson, CanonicalError> {
         let node = value.serialize(NodeSerializer)?;
         let mut out = String::new();
-        write(&node, &mut out)?;
+        write(node, &mut out)?;
         Ok(CanonicalJson(out))
     }
 
@@ -59,7 +59,7 @@ impl ser::Error for CanonicalError {
     }
 }
 
-/// A serialized value with its members in serialization order (sorted only when written).
+/// A serialized value with its members in serialization order (sorted when written).
 enum Node {
     Null,
     Bool(bool),
@@ -70,15 +70,15 @@ enum Node {
     Object(Vec<(String, Node)>),
 }
 
-fn write(node: &Node, out: &mut String) -> Result<(), CanonicalError> {
+fn write(node: Node, out: &mut String) -> Result<(), CanonicalError> {
     match node {
         Node::Null => out.push_str("null"),
-        Node::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Node::Number(n) => out.push_str(n),
-        Node::String(s) => write_str(s, out)?,
+        Node::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+        Node::Number(n) => out.push_str(&n),
+        Node::String(s) => write_str(&s, out)?,
         Node::Array(items) => {
             out.push('[');
-            for (i, item) in items.iter().enumerate() {
+            for (i, item) in items.into_iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
@@ -86,21 +86,22 @@ fn write(node: &Node, out: &mut String) -> Result<(), CanonicalError> {
             }
             out.push(']');
         }
-        Node::Object(members) => {
-            // The explicit order: keys compared as UTF-8 bytes.
-            let mut sorted: Vec<&(String, Node)> = members.iter().collect();
-            sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        Node::Object(mut members) => {
+            // The explicit order: keys compared as UTF-8 bytes (a stable sort).
+            members.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
             out.push('{');
-            for (i, (key, value)) in sorted.iter().enumerate() {
-                if i > 0 {
-                    if sorted[i - 1].0 == *key {
+            let mut previous: Option<String> = None;
+            for (key, value) in members {
+                if let Some(previous) = &previous {
+                    if *previous == key {
                         return Err(CanonicalError(format!("duplicate member {key:?}")));
                     }
                     out.push(',');
                 }
-                write_str(key, out)?;
+                write_str(&key, out)?;
                 out.push(':');
                 write(value, out)?;
+                previous = Some(key);
             }
             out.push('}');
         }
