@@ -1,7 +1,8 @@
 //! The only Windows module allowed `unsafe` (`docs/design/pty-windows.md` §2.7). Each
 //! function is safe to call: handles are borrowed `OwnedHandle`s or std pipe ends, every
 //! returned handle is wrapped exactly once and only on success, and each `unsafe` block
-//! holds one operation.
+//! holds one operation. It also holds the process-level calls of `host`
+//! (`docs/design/daemon-lifecycle.md` §2.2): security descriptors, known folders, and events.
 
 use std::cmp::Ordering;
 use std::ffi::c_void;
@@ -538,7 +539,6 @@ pub(crate) fn compare_ordinal_ignore_case(a: &[u16], b: &[u16]) -> Ordering {
 }
 
 /// The current-process pseudo-handle (needs no close).
-#[cfg(any(test, feature = "fake"))]
 fn current_process() -> HANDLE {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     // SAFETY: no arguments; returns a constant pseudo-handle.
@@ -611,4 +611,410 @@ pub(crate) fn pipe_has_writer(r: &std::io::PipeReader) -> io::Result<bool> {
         return Err(e);
     }
     Ok(true)
+}
+
+// ---- Process-level primitives of `host` (docs/design/daemon-lifecycle.md §2.2) ----
+
+/// A buffer an API call allocated with `LocalAlloc`; freed once on drop.
+struct Local(*mut c_void);
+
+impl Drop for Local {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: the buffer came from an API that documents `LocalFree`, and nothing
+            // else frees it.
+            let _ = unsafe { windows_sys::Win32::Foundation::LocalFree(self.0) };
+        }
+    }
+}
+
+fn wide_str(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain([0]).collect()
+}
+
+fn wide_path(p: &std::path::Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    p.as_os_str().encode_wide().chain([0]).collect()
+}
+
+/// The units of a NUL-terminated UTF-16 string an API returned.
+fn wide_units<'a>(p: *const u16) -> &'a [u16] {
+    if p.is_null() {
+        return &[];
+    }
+    // SAFETY: `p` is a NUL-terminated string the API returned and the caller keeps alive.
+    let n = unsafe { windows_sys::Win32::Globalization::lstrlenW(p) };
+    let n = usize::try_from(n).unwrap_or(0);
+    // SAFETY: `p` points to `n` initialized units (its length without the NUL).
+    unsafe { std::slice::from_raw_parts(p, n) }
+}
+
+/// The string form (`S-1-…`) of `sid`.
+fn sid_string(sid: windows_sys::Win32::Security::PSID) -> io::Result<String> {
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    let mut out: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: `sid` is a valid SID for the duration of the call; `out` is a local.
+    if unsafe { ConvertSidToStringSidW(sid, &raw mut out) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let free = Local(out.cast());
+    let s = String::from_utf16_lossy(wide_units(out));
+    drop(free);
+    Ok(s)
+}
+
+/// The current user's SID in string form.
+pub(crate) fn user_sid() -> io::Result<String> {
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the current-process pseudo-handle needs no close; `token` is a local.
+    if unsafe { OpenProcessToken(current_process(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let token = owned(token)?;
+    let mut needed = 0u32;
+    // SAFETY: a null buffer of size 0 asks for the size only; `needed` is a local.
+    let _ = unsafe {
+        GetTokenInformation(
+            raw(&token),
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &raw mut needed,
+        )
+    };
+    let bytes = usize::try_from(needed)
+        .unwrap_or(0)
+        .max(size_of::<TOKEN_USER>());
+    let mut buf = vec![0usize; bytes.div_ceil(size_of::<usize>())];
+    // SAFETY: `buf` is pointer-aligned and at least `needed` bytes long, which is passed.
+    let ok = unsafe {
+        GetTokenInformation(
+            raw(&token),
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            len_u32(buf.len() * size_of::<usize>()),
+            &raw mut needed,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the call wrote a `TOKEN_USER` at the start of the pointer-aligned `buf`.
+    let user = unsafe { &*buf.as_ptr().cast::<TOKEN_USER>() };
+    sid_string(user.User.Sid)
+}
+
+/// A security descriptor converted from SDDL; freed on drop.
+fn descriptor(sddl: &str) -> io::Result<Local> {
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    let w = wide_str(sddl);
+    let mut sd: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `w` is NUL-terminated; `sd` is a local; the size is not requested.
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            w.as_ptr(),
+            SDDL_REVISION_1,
+            &raw mut sd,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Local(sd))
+}
+
+fn attributes(sd: &Local) -> windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+    windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        nLength: len_u32(size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()),
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: 0,
+    }
+}
+
+/// `CreateDirectoryW` with the descriptor `sddl` (its last component only).
+pub(crate) fn create_dir_with(path: &std::path::Path, sddl: &str) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+    let sd = descriptor(sddl)?;
+    let sa = attributes(&sd);
+    let w = wide_path(path);
+    // SAFETY: `w` is NUL-terminated; `sa` and the descriptor it points to outlive the call.
+    if unsafe { CreateDirectoryW(w.as_ptr(), &raw const sa) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `CreateFileW(CREATE_NEW)` for reading and writing with the descriptor `sddl`, never
+/// following a reparse point.
+pub(crate) fn create_new_file_with(
+    path: &std::path::Path,
+    sddl: &str,
+) -> io::Result<std::fs::File> {
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let sd = descriptor(sddl)?;
+    let sa = attributes(&sd);
+    let w = wide_path(path);
+    // SAFETY: `w` is NUL-terminated; `sa` and its descriptor outlive the call; no template.
+    let h = unsafe {
+        CreateFileW(
+            w.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &raw const sa,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    Ok(std::fs::File::from(owned(h)?))
+}
+
+/// One ACE of a DACL: its type and flags, and its SID for the allowed and denied types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AceInfo {
+    pub(crate) ace_type: u8,
+    pub(crate) flags: u8,
+    pub(crate) sid: Option<String>,
+}
+
+/// The owner and DACL of an object (`None`: a NULL DACL, which grants everyone).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SecurityInfo {
+    pub(crate) owner: String,
+    pub(crate) dacl: Option<Vec<AceInfo>>,
+}
+
+/// `ACCESS_ALLOWED_ACE_TYPE` and `ACCESS_DENIED_ACE_TYPE` (`winnt.h`), which share a layout.
+pub(crate) const ACE_ALLOWED: u8 = 0;
+pub(crate) const ACE_DENIED: u8 = 1;
+
+/// `GetSecurityInfo` (owner and DACL) of the file or directory open as `h`; the handle needs
+/// `READ_CONTROL`.
+pub(crate) fn security_of(h: BorrowedHandle<'_>) -> io::Result<SecurityInfo> {
+    security_of_object(
+        h,
+        windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT,
+    )
+}
+
+/// `GetSecurityInfo` (owner and DACL) of an object of `object_type` open as `h` with
+/// `READ_CONTROL`.
+pub(crate) fn security_of_object(
+    h: BorrowedHandle<'_>,
+    object_type: windows_sys::Win32::Security::Authorization::SE_OBJECT_TYPE,
+) -> io::Result<SecurityInfo> {
+    use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce,
+        OWNER_SECURITY_INFORMATION,
+    };
+    let mut owner: windows_sys::Win32::Security::PSID = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: the handle is borrowed and valid; the out-pointers are locals; group and SACL
+    // are not requested.
+    let rc = unsafe {
+        GetSecurityInfo(
+            raw(&h),
+            object_type,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &raw mut owner,
+            std::ptr::null_mut(),
+            &raw mut dacl,
+            std::ptr::null_mut(),
+            &raw mut sd,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc.cast_signed()));
+    }
+    // Owner and DACL point into `sd`, which lives until the end of this function.
+    let sd = Local(sd);
+    let owner = sid_string(owner)?;
+    if dacl.is_null() {
+        drop(sd);
+        return Ok(SecurityInfo { owner, dacl: None });
+    }
+    // SAFETY: `dacl` points to the ACL inside the live descriptor.
+    let count = unsafe { (*dacl).AceCount };
+    let mut aces = Vec::with_capacity(usize::from(count));
+    for i in 0..u32::from(count) {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `dacl` is live and `i` is below its count; `ace` is a local.
+        if unsafe { GetAce(dacl, i, &raw mut ace) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: every ACE begins with an `ACE_HEADER`, and ACEs are DWORD-aligned.
+        let header = unsafe { ace.cast::<ACE_HEADER>().read() };
+        let sid = if header.AceType == ACE_ALLOWED || header.AceType == ACE_DENIED {
+            // SAFETY: allowed and denied ACEs have the `ACCESS_ALLOWED_ACE` layout, whose
+            // `SidStart` is the first DWORD of the SID.
+            let start = unsafe { &raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart };
+            Some(sid_string(start.cast())?)
+        } else {
+            None
+        };
+        aces.push(AceInfo {
+            ace_type: header.AceType,
+            flags: header.AceFlags,
+            sid,
+        });
+    }
+    drop(sd);
+    Ok(SecurityInfo {
+        owner,
+        dacl: Some(aces),
+    })
+}
+
+/// `SHGetKnownFolderPath(id)` for the current user.
+pub(crate) fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;
+    let mut p: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: `id` is a valid GUID; flags 0 (`KF_FLAG_DEFAULT`); no token (the current
+    // user); `p` is a local.
+    let hr = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &raw mut p) };
+    let out = if hr >= 0 {
+        Ok(PathBuf::from(std::ffi::OsString::from_wide(wide_units(p))))
+    } else {
+        Err(hresult_error(hr))
+    };
+    // SAFETY: the buffer (null on some failures, which is allowed) is freed exactly once.
+    unsafe { CoTaskMemFree(p.cast()) };
+    out
+}
+
+/// `FOLDERID_LocalAppData`.
+pub(crate) fn local_app_data() -> io::Result<PathBuf> {
+    known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_LocalAppData)
+}
+
+/// `FOLDERID_Public` (tests).
+#[cfg(feature = "fake")]
+pub(crate) fn public_folder() -> io::Result<PathBuf> {
+    known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_Public)
+}
+
+/// A named auto-reset event created with the descriptor `sddl`; `AlreadyExists` when the
+/// name was taken (the existing object's handle is closed).
+pub(crate) fn create_named_event(name: &str, sddl: &str) -> io::Result<OwnedHandle> {
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, SetLastError};
+    use windows_sys::Win32::System::Threading::CreateEventW;
+    let sd = descriptor(sddl)?;
+    let sa = attributes(&sd);
+    let w = wide_str(name);
+    // SAFETY: plain call; clears the thread's last error so the next read is this call's.
+    unsafe { SetLastError(0) };
+    // SAFETY: `w` is NUL-terminated; `sa` and its descriptor outlive the call; auto-reset,
+    // initially non-signalled.
+    let h = unsafe { CreateEventW(&raw const sa, 0, 0, w.as_ptr()) };
+    // SAFETY: plain call, right after `CreateEventW` on this thread.
+    let last = unsafe { GetLastError() };
+    let h = owned(h)?;
+    if last == ERROR_ALREADY_EXISTS {
+        drop(h);
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("the event {name} already exists"),
+        ));
+    }
+    Ok(h)
+}
+
+/// An unnamed manual-reset event, initially non-signalled.
+pub(crate) fn create_event() -> io::Result<OwnedHandle> {
+    use windows_sys::Win32::System::Threading::CreateEventW;
+    // SAFETY: null attributes and name are allowed; manual-reset, non-signalled.
+    let h = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    owned(h)
+}
+
+/// `SetEvent`.
+pub(crate) fn set_event(h: &OwnedHandle) -> io::Result<()> {
+    use windows_sys::Win32::System::Threading::SetEvent;
+    // SAFETY: the handle is borrowed and valid.
+    if unsafe { SetEvent(raw(h)) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Waits without a timeout until one of `a`, `b` is signalled; 0 for `a`, 1 for `b`.
+pub(crate) fn wait_either(a: &OwnedHandle, b: &OwnedHandle) -> io::Result<usize> {
+    use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
+    let handles = [raw(a), raw(b)];
+    // SAFETY: both handles are borrowed and valid for the wait; the array length is passed.
+    let r = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, u32::MAX) };
+    match r {
+        WAIT_FAILED => Err(io::Error::last_os_error()),
+        r if r == WAIT_OBJECT_0 => Ok(0),
+        r if r == WAIT_OBJECT_0 + 1 => Ok(1),
+        r => Err(io::Error::other(format!("unexpected wait result {r:#x}"))),
+    }
+}
+
+/// `OpenEventW(EVENT_MODIFY_STATE, name)`.
+pub(crate) fn open_event_modify(name: &str) -> io::Result<OwnedHandle> {
+    use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW};
+    let w = wide_str(name);
+    // SAFETY: `w` is NUL-terminated; not inheritable.
+    let h = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, w.as_ptr()) };
+    owned(h)
+}
+
+/// Opens the named event with `READ_CONTROL` only (tests read its descriptor back).
+#[cfg(feature = "fake")]
+pub(crate) fn open_event_read_control(name: &str) -> io::Result<OwnedHandle> {
+    use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+    use windows_sys::Win32::System::Threading::OpenEventW;
+    let w = wide_str(name);
+    // SAFETY: `w` is NUL-terminated; not inheritable.
+    let h = unsafe { OpenEventW(READ_CONTROL, 0, w.as_ptr()) };
+    owned(h)
+}
+
+/// `GenerateConsoleCtrlEvent(event, group)` (tests).
+#[cfg(feature = "fake")]
+pub(crate) fn generate_ctrl_event(event: u32, group: u32) -> io::Result<()> {
+    use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;
+    // SAFETY: plain call.
+    if unsafe { GenerateConsoleCtrlEvent(event, group) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `SetConsoleCtrlHandler(NULL, TRUE)`: this process ignores Ctrl-C (tests).
+#[cfg(feature = "fake")]
+pub(crate) fn ignore_ctrl_c() -> io::Result<()> {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    // SAFETY: a null handler with TRUE sets the process's ignore attribute.
+    if unsafe { SetConsoleCtrlHandler(None, 1) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The pids attached to this process's console (tests).
+#[cfg(feature = "fake")]
+pub(crate) fn console_processes() -> io::Result<Vec<u32>> {
+    use windows_sys::Win32::System::Console::GetConsoleProcessList;
+    let mut pids = vec![0u32; 64];
+    // SAFETY: the buffer holds `pids.len()` entries, which is passed.
+    let n = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), len_u32(pids.len())) };
+    if n == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    pids.truncate(usize::try_from(n).unwrap_or(0).min(64));
+    Ok(pids)
 }

@@ -42,6 +42,10 @@ windows-sys = { version = "=0.61.2", features = [
   "Win32_System_LibraryLoader", # GetModuleHandleW, GetModuleFileNameW (the conpty_module evidence)
   "Win32_System_Pipes",         # PeekNamedPipe (test helper for CL-21)
   "Win32_Globalization",        # CompareStringOrdinal (environment key order and equality)
+  "Win32_UI_Shell",             # SHGetKnownFolderPath (the default state directory, docs/design/daemon-lifecycle.md §2.4)
+  "Win32_System_Com",           # CoTaskMemFree for the known-folder path
+  "Win32_Security_Authorization", # GetSecurityInfo, SDDL conversions (state-directory privacy)
+  "Win32_Storage_FileSystem",   # CreateDirectoryW, CreateFileW with an explicit descriptor
 ] }
 # testkit's FakeCli on Windows: console mode and size without `unsafe` (already in the lock).
 winapi-util = "=0.1.11"

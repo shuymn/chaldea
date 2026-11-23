@@ -269,7 +269,7 @@ struct UnixControl { master: OwnedFd, wake: Arc<Wake>, wake_write: PipeWriter } 
 
 `crates/pty-runtime/Cargo.toml` gets its own `[lints]` table: `[lints.rust] unsafe_code = "deny"`, `unsafe_op_in_unsafe_fn = "deny"`; `[lints.clippy]` the workspace's clippy set restated with the same values, plus `undocumented_unsafe_blocks = "deny"` and `multiple_unsafe_ops_per_block = "deny"`. `deny`, because the workspace's `forbid` cannot be lifted by an `#[allow]`; restated, because Cargo's `[lints] workspace = true` cannot be combined with crate-local keys. Every other crate keeps `[lints] workspace = true` with `forbid`.
 
-Exactly one module is allowed `unsafe`: `#[allow(unsafe_code)] mod sys;` in `src/unix/mod.rs`. Everything else, the kill engine included, is safe code over rustix and std. `sys` exposes safe functions only:
+Exactly one module is allowed `unsafe`: `#[allow(unsafe_code)] pub(crate) mod sys;` in `src/unix/mod.rs` (crate-visible so that `host` (docs/design/daemon-lifecycle.md §2.2) calls its safe functions too). Everything else, the kill engine included, is safe code over rustix and std. `sys` exposes safe functions only:
 
 | Safe function | `unsafe` operations inside | Safety argument |
 |---|---|---|

@@ -257,7 +257,7 @@ fn unsafe_is_allowed_only_in_sys() {
         (
             m.to_owned(),
             "[allow(unsafe_code)]".to_owned(),
-            "mod sys;".to_owned(),
+            "pub(crate) mod sys;".to_owned(),
         )
     };
     assert_eq!(

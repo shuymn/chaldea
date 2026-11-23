@@ -809,3 +809,253 @@ pub fn windows_job_active(leader_pid: u32) -> io::Result<u32> {
 pub fn windows_in_job(leader_pid: u32, pid: u32) -> io::Result<bool> {
     crate::windows::hooks::in_job(leader_pid, pid)
 }
+
+// ---- `host` test helpers (docs/design/daemon-lifecycle.md §2.2) ----
+
+/// Sets `SIGCHLD` to `SIG_IGN` for this process (a careless parent's state, PR8-CL-17).
+///
+/// # Errors
+///
+/// The OS refused the change.
+#[cfg(target_os = "macos")]
+pub fn ignore_sigchld() -> io::Result<()> {
+    crate::unix::sys::ignore_sigchld()
+}
+
+/// Blocks `signals` in the calling thread's mask (PR8-CL-17).
+///
+/// # Errors
+///
+/// The OS refused the change.
+#[cfg(target_os = "macos")]
+pub fn block_signals(signals: &[crate::host::UnixSignal]) -> io::Result<()> {
+    use crate::host::UnixSignal;
+    let raw: Vec<i32> = signals
+        .iter()
+        .map(|s| match s {
+            UnixSignal::Term => libc::SIGTERM,
+            UnixSignal::Int => libc::SIGINT,
+            UnixSignal::Hup => libc::SIGHUP,
+            UnixSignal::Chld => libc::SIGCHLD,
+        })
+        .collect();
+    crate::unix::sys::block_signals(&raw)
+}
+
+/// Runs a fixed system tool by absolute path under the spawn lock and requires success.
+#[cfg(any(target_os = "macos", windows))]
+fn run_tool(program: &str, args: &[&std::ffi::OsStr]) -> io::Result<()> {
+    let out = crate::with_spawn_lock(|| {
+        std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+    })?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{program} failed: {:?} {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        )))
+    }
+}
+
+/// Adds an extended ACL entry allowing `everyone` to read `path` (`chmod +a`).
+///
+/// # Errors
+///
+/// `chmod` failed.
+#[cfg(target_os = "macos")]
+pub fn grant_everyone_read_acl(path: &std::path::Path) -> io::Result<()> {
+    run_tool(
+        "/bin/chmod",
+        &[
+            "+a".as_ref(),
+            "everyone allow read".as_ref(),
+            path.as_os_str(),
+        ],
+    )
+}
+
+/// Adds an allow ACE for `BUILTIN\Users` (read) to `path` (`icacls`).
+///
+/// # Errors
+///
+/// `icacls` failed.
+#[cfg(windows)]
+pub fn grant_users_read(path: &std::path::Path) -> io::Result<()> {
+    let icacls = system32("icacls.exe")?;
+    run_tool(
+        &icacls,
+        &[
+            path.as_os_str(),
+            "/grant".as_ref(),
+            "*S-1-5-32-545:(R)".as_ref(),
+        ],
+    )
+}
+
+#[cfg(windows)]
+fn system32(exe: &str) -> io::Result<String> {
+    let root = std::env::var("SystemRoot").map_err(io::Error::other)?;
+    Ok(format!("{root}\\System32\\{exe}"))
+}
+
+/// Makes `link` point at `target`: a symlink on macOS, a directory junction on Windows (no
+/// privilege needed; `target` must be a directory there).
+///
+/// # Errors
+///
+/// The link could not be made.
+pub fn make_link(link: &std::path::Path, target: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    {
+        let cmd = system32("cmd.exe")?;
+        run_tool(
+            &cmd,
+            &[
+                "/d".as_ref(),
+                "/c".as_ref(),
+                "mklink".as_ref(),
+                "/J".as_ref(),
+                link.as_os_str(),
+                target.as_os_str(),
+            ],
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (link, target);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+/// The console events `GenerateConsoleCtrlEvent` can send.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtrlEvent {
+    CtrlC,
+    CtrlBreak,
+}
+
+/// `GenerateConsoleCtrlEvent(kind, group)` on this process's console.
+///
+/// # Errors
+///
+/// The OS refused it.
+#[cfg(windows)]
+pub fn send_ctrl_event(kind: CtrlEvent, group: u32) -> io::Result<()> {
+    let ev = match kind {
+        CtrlEvent::CtrlC => 0,
+        CtrlEvent::CtrlBreak => 1,
+    };
+    crate::windows::sys::generate_ctrl_event(ev, group)
+}
+
+/// Makes this process ignore Ctrl-C (an attribute its later children inherit).
+///
+/// # Errors
+///
+/// The OS refused it.
+#[cfg(windows)]
+pub fn ignore_ctrl_c() -> io::Result<()> {
+    crate::windows::sys::ignore_ctrl_c()
+}
+
+/// The pids attached to this process's console.
+///
+/// # Errors
+///
+/// The process has no console.
+#[cfg(windows)]
+pub fn console_processes() -> io::Result<Vec<u32>> {
+    crate::windows::sys::console_processes()
+}
+
+/// `FOLDERID_Public`, resolved through `SHGetKnownFolderPath`.
+///
+/// # Errors
+///
+/// The lookup failed.
+#[cfg(windows)]
+pub fn public_folder() -> io::Result<std::path::PathBuf> {
+    crate::windows::sys::public_folder()
+}
+
+/// Opens the named stop event with `EVENT_MODIFY_STATE` and sets it (what `daemon stop`
+/// does on Windows).
+///
+/// # Errors
+///
+/// No such event, or access denied.
+#[cfg(windows)]
+pub fn set_stop_event(name: &str) -> io::Result<()> {
+    let h = crate::windows::sys::open_event_modify(name)?;
+    crate::windows::sys::set_event(&h)
+}
+
+/// The owner SID and the allow-ACE SIDs of `path` (Windows), for read-back assertions.
+///
+/// # Errors
+///
+/// The entry cannot be opened or its descriptor read.
+#[cfg(windows)]
+pub fn descriptor_sids(path: &std::path::Path) -> io::Result<(String, Vec<String>)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsHandle;
+    let f = std::fs::OpenOptions::new()
+        .access_mode(windows_sys::Win32::Storage::FileSystem::READ_CONTROL)
+        .custom_flags(
+            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT
+                | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+        )
+        .open(path)?;
+    let sec = crate::windows::sys::security_of(f.as_handle())?;
+    let allows = sec
+        .dacl
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| a.ace_type == crate::windows::sys::ACE_ALLOWED)
+        .filter_map(|a| a.sid)
+        .collect();
+    Ok((sec.owner, allows))
+}
+
+/// The owner SID and the allow-ACE SIDs of the named event (Windows), for read-back assertions.
+///
+/// # Errors
+///
+/// No such event, or its descriptor cannot be read.
+#[cfg(windows)]
+pub fn event_sids(name: &str) -> io::Result<(String, Vec<String>)> {
+    use std::os::windows::io::AsHandle;
+    let h = crate::windows::sys::open_event_read_control(name)?;
+    let sec = crate::windows::sys::security_of_object(
+        h.as_handle(),
+        windows_sys::Win32::Security::Authorization::SE_KERNEL_OBJECT,
+    )?;
+    let allows = sec
+        .dacl
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| a.ace_type == crate::windows::sys::ACE_ALLOWED)
+        .filter_map(|a| a.sid)
+        .collect();
+    Ok((sec.owner, allows))
+}
+
+/// The current user's SID (Windows).
+///
+/// # Errors
+///
+/// The token could not be read.
+#[cfg(windows)]
+pub fn user_sid() -> io::Result<String> {
+    crate::windows::sys::user_sid()
+}
