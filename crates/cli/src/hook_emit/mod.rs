@@ -547,7 +547,7 @@ mod tests {
             host: "localhost",
             port: 4321,
             token: format!("chd_{}", "a".repeat(43)),
-            thread: Some("t-1".to_owned()),
+            thread: Some("0198C0DE-0000-7000-8000-00000000000A".to_owned()),
         };
         let id = uuid::Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
         let mut r = Request {
@@ -564,7 +564,8 @@ mod tests {
                 "POST /hook HTTP/1.1\r\nHost: localhost:4321\r\nConnection: close\r\n\
                  Authorization: Bearer chd_{a}\r\nContent-Type: application/json\r\n\
                  Content-Length: 9\r\nX-Chaldea-Emit-Id: 01234567-89ab-cdef-0123-456789abcdef\r\n\
-                 X-Chaldea-Attempt: 2\r\nX-Chaldea-Emitter-Pid: 77\r\nX-Chaldea-Thread-Id: t-1\r\n\
+                 X-Chaldea-Attempt: 2\r\nX-Chaldea-Emitter-Pid: 77\r\n\
+                 X-Chaldea-Thread-Id: 0198C0DE-0000-7000-8000-00000000000A\r\n\
                  X-Chaldea-Agent: codex\r\nX-Chaldea-Emitter-Version: {v}\r\n\r\n",
                 a = "a".repeat(43),
                 v = env!("CARGO_PKG_VERSION"),

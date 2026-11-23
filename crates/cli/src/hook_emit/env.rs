@@ -79,15 +79,11 @@ pub(crate) fn is_token(t: &str) -> bool {
     })
 }
 
-/// A hyphenated UUID (`8-4-4-4-12` hex digits, either case): the form of a thread id, so an
-/// optional header never makes a valid hook's head oversized or malformed.
+/// A hyphenated UUID (`8-4-4-4-12` hex digits, either case, any version): the form of a
+/// thread id, so an optional header never makes a valid hook's head oversized or malformed.
+/// The 36-byte length leaves `uuid`'s hyphenated form the only one it parses.
 pub(crate) fn is_uuid(v: &str) -> bool {
-    let b = v.as_bytes();
-    b.len() == 36
-        && b.iter().enumerate().all(|(i, c)| match i {
-            8 | 13 | 18 | 23 => *c == b'-',
-            _ => c.is_ascii_hexdigit(),
-        })
+    v.len() == 36 && uuid::Uuid::try_parse(v).is_ok()
 }
 
 /// A non-empty value of visible ASCII only (no space, no control character), so it cannot
