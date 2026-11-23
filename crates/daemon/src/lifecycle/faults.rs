@@ -19,6 +19,27 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Listeners the tests bound to `127.0.0.1:0` and keep for the process's lifetime. Step 10
+/// takes a clone of the one on its port instead of binding, so a test's port is never
+/// released for another process to take between the test's choice and the daemon's bind.
+static HELD: Mutex<Vec<std::net::TcpListener>> = Mutex::new(Vec::new());
+
+/// A port of this process's own: bound to `127.0.0.1:0` and never released.
+pub(crate) fn hold_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    lock(&HELD).push(l);
+    port
+}
+
+/// A clone of the held listener on `port`, if a test holds one.
+pub(crate) fn held_listener(port: u16) -> Option<io::Result<std::net::TcpListener>> {
+    lock(&HELD)
+        .iter()
+        .find(|l| l.local_addr().is_ok_and(|a| a.port() == port))
+        .map(std::net::TcpListener::try_clone)
+}
+
 /// A gate a step waits at until the test releases it.
 #[derive(Default)]
 pub(crate) struct Park {

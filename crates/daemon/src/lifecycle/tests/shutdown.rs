@@ -9,7 +9,7 @@ use super::super::faults::{Faults, Point};
 use super::super::files::{LockProbe, probe};
 use super::super::gate::{ConsoleEvent, any_registered};
 use super::super::{FailReason, LockDisposition, names};
-use super::{Recorder, TestComponents, WAIT, foreground, free_port, start, state};
+use super::{Recorder, TestComponents, WAIT, foreground, hold_port, start, state};
 use crate::store::test_faults::{CommitFault, Faults as StoreFaults};
 
 /// PR8-CL-4: a stop with every condition met releases the lock in process.
@@ -17,7 +17,7 @@ use crate::store::test_faults::{CommitFault, Faults as StoreFaults};
 fn exited_writer_releases() {
     let dir = state();
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -61,7 +61,7 @@ fn order_and_ends() {
     let sf = Arc::new(StoreFaults::default());
     *faults.store_faults.lock().unwrap() = Some(sf.clone());
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         comps,
         faults.clone(),
     );
@@ -103,7 +103,7 @@ fn order_and_ends() {
 fn removes_only_its_own_record() {
     let dir = state();
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -124,7 +124,7 @@ fn removes_only_its_own_record() {
 
     std::fs::remove_file(&path).unwrap();
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -140,12 +140,12 @@ fn removes_only_its_own_record() {
 fn isolated_runs_register_nothing() {
     let (a, b) = (state(), state());
     let ra = start(
-        foreground(&a.path, Some(free_port())),
+        foreground(&a.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
     let rb = start(
-        foreground(&b.path, Some(free_port())),
+        foreground(&b.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -171,7 +171,7 @@ fn console_end_after_the_lock_decision_keeps_never_taken() {
     let before_lock = faults.park(Point::Before(5));
     let decided = faults.park(Point::AfterLockDecision);
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         faults,
     );
@@ -197,7 +197,7 @@ fn panic_before_the_runtime_is_never_taken() {
         .panic_before_runtime
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let r = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         faults,
     )
@@ -238,7 +238,7 @@ fn token_write_is_drained_before_serve() {
         ..TestComponents::default()
     };
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         comps,
         faults.clone(),
     );
@@ -276,7 +276,7 @@ fn record_removal_failure_is_reported() {
     const FILE_SHARE_READ: u32 = 0x1;
     let dir = state();
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -317,7 +317,7 @@ fn record_retry_spares_a_replacement() {
         .store(1, std::sync::atomic::Ordering::SeqCst);
     let park = faults.park(Point::RecordRetry);
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         faults,
     );
@@ -348,7 +348,7 @@ fn record_removal_is_retried() {
         let faults = Arc::new(Faults::default());
         faults.record_remove_fails.store(fails, Ordering::SeqCst);
         let run = start(
-            foreground(&dir.path, Some(free_port())),
+            foreground(&dir.path, Some(hold_port())),
             TestComponents::default(),
             faults.clone(),
         );
@@ -388,7 +388,7 @@ fn record_verify_failure_is_retried() {
         let dir = state();
         let faults = Arc::new(Faults::default());
         let run = start(
-            foreground(&dir.path, Some(free_port())),
+            foreground(&dir.path, Some(hold_port())),
             TestComponents::default(),
             faults.clone(),
         );
@@ -476,7 +476,7 @@ fn built_commands_are_served_and_drained() {
     let dir = state();
     let faults = Arc::new(Faults::default());
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents {
             commands: Some(commands),
             ..TestComponents::default()
@@ -554,7 +554,7 @@ fn no_unlink_after_the_record_budget() {
     let faults = Arc::new(Faults::default());
     let park = faults.park(Point::AfterRecordVerify);
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         faults.clone(),
     );
@@ -574,7 +574,7 @@ fn no_unlink_after_the_record_budget() {
 /// PR8-CL-23: the record says `stopping` before HTTP shuts down: a discovery made once HTTP's
 /// shutdown returned (paused there) sees this run stopping, not serving.
 /// The record says `stopping` before HTTP shuts down: while the rewrite runs, HTTP still
-/// accepts connections, and once HTTP's shutdown returned the record says `stopping`.
+/// answers, and once HTTP's shutdown returned the record says `stopping`.
 #[test]
 fn record_says_stopping_before_http_shuts_down() {
     use super::super::files::{Discovery, discover};
@@ -583,7 +583,7 @@ fn record_says_stopping_before_http_shuts_down() {
     let rewriting = faults.park(Point::InsideStopping);
     let after_http = faults.park(Point::AfterHttp);
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         faults.clone(),
     );
@@ -593,7 +593,8 @@ fn record_says_stopping_before_http_shuts_down() {
     };
     run.stop();
     let reached = rewriting.wait_reached(WAIT);
-    let http_up = std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
+    let http_up = super::get_status(port, "/api/threads", Some(&super::token_of(&dir.path)))
+        .is_ok_and(|s| s == 200);
     rewriting.release();
     assert!(reached, "the rewrite did not start");
     assert!(http_up, "HTTP shut down before the rewrite");
@@ -617,7 +618,7 @@ fn stalled_stopping_rewrite_does_not_hold_http() {
     let faults = Arc::new(Faults::default());
     let rewriting = faults.park(Point::InsideStopping);
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         faults.clone(),
     );
@@ -644,7 +645,7 @@ fn failed_stopping_rewrite_is_logged() {
     let dir = state();
     let faults = Arc::new(Faults::default());
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         faults.clone(),
     );
@@ -679,7 +680,7 @@ fn no_deletion_after_the_record_budget() {
     let faults = Arc::new(Faults::default());
     *faults.record_retry.lock().unwrap() = Some(Duration::from_millis(300));
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         faults.clone(),
     );

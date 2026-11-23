@@ -27,7 +27,7 @@ pub mod faults;
 mod lifecycle;
 pub mod runner;
 #[allow(unused_imports, reason = "each test file uses part of these helpers")]
-pub use lifecycle::{free_port, kill_and_reap, open_store, token_of};
+pub use lifecycle::{kill_and_reap, open_store, token_of};
 
 /// Every bounded wait of these tests.
 pub const WAIT: Duration = Duration::from_secs(30);

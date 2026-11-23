@@ -14,7 +14,8 @@ mod state_dir;
 
 #[path = "../../../tests/support/lifecycle.rs"]
 mod fixtures;
-pub(super) use fixtures::{free_port, kill_and_reap, open_store, token_of};
+pub(super) use super::faults::hold_port;
+pub(super) use fixtures::{kill_and_reap, open_store, token_of};
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};

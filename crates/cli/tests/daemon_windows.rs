@@ -25,8 +25,8 @@ use chaldea_daemon::lifecycle::{
 use chaldea_pty_runtime::fake::{self, CtrlEvent, TestJob};
 use chaldea_pty_runtime::host::{self, JobLimits};
 use support::{
-    Proc, chaldea, free_port, get_status, lock_state, marked_dir, report, run_cmd, run_helper,
-    run_to_exit, serving_record, state, token_of, wait_for,
+    Proc, chaldea, get_status, lock_state, marked_dir, report, run_cmd, run_helper, run_to_exit,
+    serving_record, state, token_of, wait_for,
 };
 
 /// `CREATE_NEW_CONSOLE` and `CREATE_NEW_PROCESS_GROUP` (`winbase.h`).
@@ -42,7 +42,7 @@ fn on_new_console(event: &str) {
     let dir = state();
     fake::ignore_ctrl_c().unwrap();
     eprintln!("cl9 {event}: the helper ignores Ctrl-C; the daemon inherits that");
-    let mut cmd = run_cmd(&dir.path, Some(free_port()));
+    let mut cmd = run_cmd(&dir.path, None);
     if event == "break" {
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
@@ -96,7 +96,7 @@ fn ctrl_c_and_ctrl_break_stop() {
 #[test]
 fn stop_event_is_global() {
     let dir = state();
-    let mut d = Proc::spawn(&mut run_cmd(&dir.path, Some(free_port())));
+    let mut d = Proc::spawn(&mut run_cmd(&dir.path, None));
     d.serving();
     let r = serving_record(&dir.path);
     let name = host::stop_event_name(&r.instance);
@@ -114,7 +114,7 @@ fn stop_event_is_global() {
 fn setup_without_console_can_start_and_stop() {
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     let dir = state();
-    let mut cmd = run_cmd(&dir.path, Some(free_port()));
+    let mut cmd = run_cmd(&dir.path, None);
     cmd.creation_flags(DETACHED_PROCESS);
     let mut daemon = Proc::spawn(&mut cmd);
 

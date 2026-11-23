@@ -18,8 +18,8 @@ use super::super::files::{LockProbe, probe};
 use super::super::gate::{ConsoleEvent, ShutdownGate, SignalName, StopCause};
 use super::super::{DaemonConfig, ShutdownParticipant, names, prepare_process, run_process_with};
 use super::{
-    Helper, RecordingReady, TestComponents, WAIT, detached, field, foreground, free_port,
-    helper_dir, helper_exit, in_helper, report, request, state, token_of, wait_for,
+    Helper, RecordingReady, TestComponents, WAIT, detached, field, foreground, helper_dir,
+    helper_exit, hold_port, in_helper, report, request, state, token_of, wait_for,
 };
 use crate::http::{ApiError, Mount, Mounts, WriteCtx, spec};
 use crate::store::test_faults::{CommitFault, Faults as StoreFaults};
@@ -122,7 +122,7 @@ fn helper(
 }
 
 fn fg() -> DaemonConfig {
-    foreground(&helper_dir(), Some(free_port()))
+    foreground(&helper_dir(), Some(hold_port()))
 }
 
 /// The parent: starts the helper on a fresh state directory.
@@ -303,7 +303,7 @@ fn unacknowledged_log_switch_keeps_the_lock() {
     if in_helper() {
         let dir = helper_dir();
         let ready = RecordingReady::new(&dir);
-        let cfg = detached(&dir, Some(free_port()), &ready);
+        let cfg = detached(&dir, Some(hold_port()), &ready);
         helper(
             cfg,
             TestComponents::default(),
@@ -482,7 +482,7 @@ fn console_end_recovers_on_restart() {
         "the record was removed"
     );
     let run = super::start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -639,7 +639,7 @@ fn stop_inside_step() {
         let step: u8 = std::env::var(STEP_ENV).unwrap().parse().unwrap();
         let dir = helper_dir();
         let ready = RecordingReady::new(&dir);
-        let port = free_port();
+        let port = hold_port();
         let faults = Arc::new(Faults::default());
         let park = faults.park(Point::Inside(step));
         let cfg = detached(&dir, Some(port), &ready);
@@ -652,7 +652,7 @@ fn stop_inside_step() {
                 assert!(park.wait_reached(WAIT));
                 c.stop();
                 let second = super::start(
-                    foreground(&c.dir, Some(free_port())),
+                    foreground(&c.dir, Some(hold_port())),
                     TestComponents::default(),
                     Arc::default(),
                 )
@@ -715,7 +715,7 @@ fn unjoined_startup_is_a_bare_exit() {
         let ready = RecordingReady::new(&dir);
         let faults = Arc::new(Faults::default());
         let park = faults.park(Point::Inside(8));
-        let cfg = detached(&dir, Some(free_port()), &ready);
+        let cfg = detached(&dir, Some(hold_port()), &ready);
         let main_ready = ready.clone();
         prepare_process();
         let ctl = Ctl {
@@ -904,7 +904,7 @@ fn step6_unacknowledged_log_switch_keeps_the_lock() {
         let faults = Arc::new(Faults::default());
         faults.withhold_log_ack.store(true, Ordering::SeqCst);
         helper(
-            detached(&dir, Some(free_port()), &ready),
+            detached(&dir, Some(hold_port()), &ready),
             TestComponents::default(),
             faults,
             Duration::from_secs(2),
@@ -1044,7 +1044,7 @@ fn console_end_during_the_log_switch_keeps_the_lock() {
         let faults = Arc::new(Faults::default());
         let park = faults.park(Point::AfterLogSwitch);
         helper(
-            detached(&dir, Some(free_port()), &ready),
+            detached(&dir, Some(hold_port()), &ready),
             TestComponents::default(),
             faults,
             Duration::from_secs(2),
@@ -1335,7 +1335,7 @@ fn panic_at_step_11() {
         };
         prepare_process();
         let r = run_process_with(
-            detached(&dir, Some(free_port()), &ready),
+            detached(&dir, Some(hold_port()), &ready),
             Box::new(comps),
             Arc::default(),
         );
@@ -1457,7 +1457,7 @@ fn console_end_before_the_log_switch() {
         let faults = Arc::new(Faults::default());
         let park = faults.park(Point::BeforeLogSwitch);
         helper(
-            detached(&dir, Some(free_port()), &ready),
+            detached(&dir, Some(hold_port()), &ready),
             TestComponents::default(),
             faults,
             Duration::from_secs(2),

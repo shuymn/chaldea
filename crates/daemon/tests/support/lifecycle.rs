@@ -12,16 +12,6 @@ use std::time::{Duration, Instant};
 use chaldea_daemon::lifecycle::names;
 use chaldea_daemon::store::{RandomIds, Store, StoreConfig, SystemClock};
 
-/// A port nothing listens on right now (bound to `127.0.0.1:0`, then released).
-#[must_use]
-pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// The saved owner token (without its newline).
 #[must_use]
 pub fn token_of(dir: &Path) -> String {

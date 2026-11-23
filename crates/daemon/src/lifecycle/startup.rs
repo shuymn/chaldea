@@ -266,6 +266,12 @@ fn bind(
                 "injected bind failure",
             ));
         }
+        #[cfg(test)]
+        let l = match super::faults::held_listener(p) {
+            Some(held) => held?,
+            None => std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, p))?,
+        };
+        #[cfg(not(test))]
         let l = std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, p))?;
         l.set_nonblocking(true)?;
         Ok(l)
