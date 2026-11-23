@@ -1,5 +1,6 @@
 //! The command line (docs/design/daemon-lifecycle.md §2.2, D14).
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -38,9 +39,20 @@ pub enum DaemonCommand {
         /// Serve on this port (changes the pairing origin when it differs from the saved one).
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
         port: Option<u16>,
+        /// The launchd job's process (`daemon start` on a macOS GUI host): `dispatch` forks
+        /// before process setup when it is the first argument after `run`.
+        #[arg(long, hide = true, requires = "detached_child")]
+        from_launchd: bool,
+        /// The child `daemon start` launched: its verdict goes to `--ready`.
+        #[arg(long, hide = true, requires = "ready")]
+        detached_child: bool,
+        /// The readiness channel: a Unix socket path (macOS) or `stdout` (Windows).
+        #[arg(long, hide = true, value_name = "CHANNEL", requires = "detached_child")]
+        ready: Option<OsString>,
     },
-    /// Start the daemon detached from this terminal.
+    /// Start the daemon detached from this terminal and wait until it serves.
     Start {
+        /// Serve on this port (changes the pairing origin when it differs from the saved one).
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
         port: Option<u16>,
     },

@@ -22,8 +22,10 @@ use chaldea_daemon::lifecycle::{
 };
 use tempfile::TempDir;
 
+pub mod faults;
 #[path = "../../../daemon/tests/support/lifecycle.rs"]
 mod lifecycle;
+pub mod runner;
 #[allow(unused_imports, reason = "each test file uses part of these helpers")]
 pub use lifecycle::{free_port, kill_and_reap, open_store, token_of};
 

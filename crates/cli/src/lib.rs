@@ -5,25 +5,46 @@
 //! exit through `std::process::exit` on every path.
 
 mod args;
+mod client;
+mod daemon_cmd;
 mod hook_emit;
+mod open;
+mod spawn;
 
 #[doc(hidden)]
 pub use hook_emit::Stall;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use chaldea_daemon::lifecycle::{
-    self, Budgets, DaemonConfig, ExitCode, MvpComponents, RunMode, diag,
-};
+use chaldea_daemon::lifecycle::{self, Components, ExitCode, FailReason, diag};
+use chaldea_pty_runtime::host::{self, LaunchctlOutput, ReadyArg};
 use clap::Parser;
 
 use crate::args::{Cli, Command, DaemonCommand};
 
 /// How long [`dispatch`] waits for the log queue before exiting.
 const FINAL_FLUSH: Duration = Duration::from_millis(100);
+
+/// Test seams of the binary tests' fault entry: `dispatch` passes none. Never set by `main`.
+#[doc(hidden)]
+#[derive(Default)]
+#[allow(
+    clippy::type_complexity,
+    reason = "test seams named for what they replace"
+)]
+pub struct Seams {
+    /// `daemon run`'s components instead of `MvpComponents`.
+    pub components: Option<Box<dyn FnOnce() -> Box<dyn Components>>>,
+    /// The starter's `launchctl` instead of `host::launchctl`.
+    pub launchctl: Option<Box<dyn Fn(&[&OsStr], Instant) -> std::io::Result<LaunchctlOutput>>>,
+    /// The launchd label prefix instead of `dev.chaldea.daemon.`.
+    pub label_prefix: Option<String>,
+    /// Runs once `daemon stop` sent its request, before it waits for completion.
+    pub after_stop_sent: Option<Box<dyn FnOnce()>>,
+}
 
 /// The `chaldea` process from its arguments (`argv[0]` first) to its exit; `main` is this one
 /// call, with [`Stall::Off`].
@@ -33,21 +54,58 @@ const FINAL_FLUSH: Duration = Duration::from_millis(100);
 /// nothing. `stall` is the emitter's test seam; only the test binary `hook_emit_stall`
 /// passes anything but [`Stall::Off`].
 pub fn dispatch(args: &[OsString], stall: Stall) -> ! {
+    dispatch_with(args, stall, Seams::default())
+}
+
+/// [`dispatch`] with test seams (the binary tests' fault entry).
+#[doc(hidden)]
+pub fn dispatch_with(args: &[OsString], stall: Stall, mut seams: Seams) -> ! {
     if args.get(1).is_some_and(|a| a == "hook-emit") {
         hook_emit::main(args, stall);
     }
+    // The launchd job's process forks the daemon while it has one thread (design §2.2).
+    let fork_error = if from_launchd(args) {
+        host::leave_launchd_job().err()
+    } else {
+        None
+    };
     lifecycle::prepare_process();
     let code = match parse(args) {
         Err(e) => usage_error(&e),
-        Ok(cli) => catch_unwind(AssertUnwindSafe(|| command(cli)))
-            .unwrap_or(ExitCode::Failed)
-            .code(),
+        Ok(cli) => match fork_error {
+            Some(e) => fork_failed(&cli, &e),
+            None => catch_unwind(AssertUnwindSafe(|| command(cli, &mut seams)))
+                .unwrap_or(ExitCode::Failed)
+                .code(),
+        },
     };
     lifecycle::flush_process_log(FINAL_FLUSH);
     let _ = std::io::stdout().flush();
     std::process::exit(code);
 }
 
+/// `argv[1..4]` is exactly `daemon run --from-launchd`, the shape the starter writes.
+fn from_launchd(args: &[OsString]) -> bool {
+    args.len() >= 4 && args[1] == "daemon" && args[2] == "run" && args[3] == "--from-launchd"
+}
+
+/// The job's process could not fork: it reports on the readiness channel itself.
+fn fork_failed(cli: &Cli, e: &std::io::Error) -> i32 {
+    let message = format!("fork failed: {e}");
+    if let Command::Daemon {
+        command: DaemonCommand::Run {
+            ready: Some(ready), ..
+        },
+    } = &cli.command
+        && let Ok(arg) = ReadyArg::parse(ready)
+        && let Ok(mut w) = host::ready_writer(&arg)
+    {
+        let _ = w.write_line(&lifecycle::early_fail_line(FailReason::Internal, &message));
+        w.close();
+    }
+    let _ = writeln!(std::io::stderr(), "chaldea: {}", diag(&message));
+    ExitCode::Failed.code()
+}
 fn parse(args: &[OsString]) -> Result<Cli, clap::Error> {
     Cli::try_parse_from(args)
 }
@@ -69,40 +127,36 @@ fn fail(msg: &str) -> ExitCode {
     ExitCode::Failed
 }
 
-fn not_yet(what: &str) -> ExitCode {
-    let _ = writeln!(
-        std::io::stderr(),
-        "chaldea: `{what}` is not implemented yet; use `chaldea daemon run`"
-    );
-    ExitCode::Usage
-}
-
-fn command(cli: Cli) -> ExitCode {
+fn command(cli: Cli, seams: &mut Seams) -> ExitCode {
+    let state_dir = match lifecycle::resolve_state_dir(cli.state_dir) {
+        Ok(d) => d,
+        Err(e) => return fail(&format!("the state directory cannot be resolved: {e}")),
+    };
     match cli.command {
         Command::Daemon {
-            command: DaemonCommand::Run { port },
-        } => {
-            let state_dir = match lifecycle::resolve_state_dir(cli.state_dir) {
-                Ok(d) => d,
-                Err(e) => return fail(&format!("the state directory cannot be resolved: {e}")),
-            };
-            let report = lifecycle::run(
-                DaemonConfig {
-                    state_dir,
+            command:
+                DaemonCommand::Run {
                     port,
-                    mode: RunMode::Foreground,
-                    budgets: Budgets::DEFAULT,
+                    from_launchd,
+                    detached_child,
+                    ready,
                 },
-                Box::new(MvpComponents),
-            );
-            report.code
-        }
+        } => daemon_cmd::run(
+            state_dir,
+            &daemon_cmd::RunArgs {
+                port,
+                from_launchd,
+                detached_child,
+                ready,
+            },
+            seams,
+        ),
         Command::Daemon {
-            command: DaemonCommand::Start { .. },
-        } => not_yet("daemon start"),
+            command: DaemonCommand::Start { port },
+        } => daemon_cmd::start(&state_dir, port, seams),
         Command::Daemon {
             command: DaemonCommand::Stop,
-        } => not_yet("daemon stop"),
-        Command::Open { .. } => not_yet("open"),
+        } => daemon_cmd::stop(&state_dir, seams),
+        Command::Open { print_url } => open::run(&state_dir, print_url, &host::open_url),
     }
 }
