@@ -285,8 +285,9 @@ fn lines_of(r: Option<impl Read + Send + 'static>) -> Receiver<Frame> {
 
 /// Takes the next line of `lines`, which must be exactly `want` and stamped before `until`
 /// (a line stamped at or after it is late, even when it is already queued). The decision is
-/// about the frames observed and published: a line read before `until` but stamped or
-/// published after it, its reader paused in between, counts as late.
+/// about the frames observed and published: a line stamped before `until` but published
+/// after it, its reader paused in between, is late when the receive has already timed out,
+/// and in time when this receive is itself late and still finds it queued.
 fn expect_line(lines: &Receiver<Frame>, want: &str, until: Instant) -> Result<(), Broken> {
     match lines.recv_timeout(until.saturating_duration_since(Instant::now())) {
         Ok((_, at)) if at >= until => Err(Broken::Timeout),
