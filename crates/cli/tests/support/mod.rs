@@ -66,18 +66,23 @@ impl Drop for TempParent {
     }
 }
 
-/// The parent of every test directory: on macOS under the OS temp directory; on Windows under
-/// `FOLDERID_LocalAppData` (not `%TEMP%`, which can be redirected). Created with
-/// `host::create_private_dir`, as the daemon creates its state directory, so its owner is this
-/// account whatever owner the process's token gives new objects (an elevated administrator's
-/// token gives them `Administrators`); asserted private.
+/// Set by the Windows WMI lane (`scripts/windows-tests.ps1`): the run's own directory, under
+/// which every test directory of the run is created, so its cleanup finds them all there.
+pub const TEST_ROOT_ENV: &str = "CHALDEA_TEST_ROOT";
+
+/// The parent of every test directory: under [`TEST_ROOT_ENV`] when set; otherwise on macOS
+/// under the OS temp directory and on Windows under `FOLDERID_LocalAppData` (not `%TEMP%`,
+/// which can be redirected). Created with `host::create_private_dir`, as the daemon creates its
+/// state directory, so its owner is this account whatever owner the process's token gives new
+/// objects (an elevated administrator's token gives them `Administrators`); asserted private.
 #[must_use]
 pub fn temp_parent() -> TempParent {
     use chaldea_pty_runtime::host::{self, EntryKind, Privacy};
     #[cfg(windows)]
-    let base = host::default_state_base().unwrap();
+    let default = || host::default_state_base().unwrap();
     #[cfg(not(windows))]
-    let base = std::env::temp_dir();
+    let default = std::env::temp_dir;
+    let base = std::env::var_os(TEST_ROOT_ENV).map_or_else(default, PathBuf::from);
     let path = base.join(format!(".chaldea-test-{}", uuid::Uuid::new_v4().simple()));
     host::create_private_dir(&path).unwrap();
     let tmp = TempParent(path);
