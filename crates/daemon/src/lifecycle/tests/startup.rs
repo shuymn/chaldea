@@ -916,7 +916,7 @@ fn foreground_in_a_job_warns_and_serves() {
     let faults = Arc::new(Faults::default());
     *faults.job_state.lock().unwrap() = Some(in_a_job());
     let run = start(
-        foreground(&dir.path, None),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         faults,
     );
