@@ -296,6 +296,16 @@ fn aborted_http_task_keeps_the_lock() {
     assert!(h.stderr().contains("1 abort requested"), "{}", h.stderr());
 }
 
+/// Fault points for a detached run that is not about job membership: step 2 reads "in no job",
+/// so the run's job (`cargo test` puts its tests in one on Windows) cannot refuse it. The job
+/// check itself is covered by `daemon_windows::child_rejects_any_job` and CL-12's refusal
+/// cases.
+fn not_in_a_job() -> Arc<Faults> {
+    let faults = Arc::new(Faults::default());
+    *faults.job_state.lock().unwrap() = Some(chaldea_pty_runtime::host::JobState::NONE);
+    faults
+}
+
 /// A detached daemon whose log thread does not acknowledge leaving `daemon.log` keeps the
 /// lock.
 #[test]
@@ -307,7 +317,7 @@ fn unacknowledged_log_switch_keeps_the_lock() {
         helper(
             cfg,
             TestComponents::default(),
-            Arc::default(),
+            not_in_a_job(),
             Duration::from_secs(2),
             move |c| {
                 c.serving();
@@ -640,7 +650,7 @@ fn stop_inside_step() {
         let dir = helper_dir();
         let ready = RecordingReady::new(&dir);
         let port = hold_port();
-        let faults = Arc::new(Faults::default());
+        let faults = not_in_a_job();
         let park = faults.park(Point::Inside(step));
         let cfg = detached(&dir, Some(port), &ready);
         helper(
@@ -713,7 +723,7 @@ fn unjoined_startup_is_a_bare_exit() {
     if in_helper() {
         let dir = helper_dir();
         let ready = RecordingReady::new(&dir);
-        let faults = Arc::new(Faults::default());
+        let faults = not_in_a_job();
         let park = faults.park(Point::Inside(8));
         let cfg = detached(&dir, Some(hold_port()), &ready);
         let main_ready = ready.clone();
@@ -901,7 +911,7 @@ fn step6_unacknowledged_log_switch_keeps_the_lock() {
     if in_helper() {
         let dir = helper_dir();
         let ready = RecordingReady::new(&dir);
-        let faults = Arc::new(Faults::default());
+        let faults = not_in_a_job();
         faults.withhold_log_ack.store(true, Ordering::SeqCst);
         helper(
             detached(&dir, Some(hold_port()), &ready),
@@ -1041,7 +1051,7 @@ fn console_end_during_the_log_switch_keeps_the_lock() {
     if in_helper() {
         let dir = helper_dir();
         let ready = RecordingReady::new(&dir);
-        let faults = Arc::new(Faults::default());
+        let faults = not_in_a_job();
         let park = faults.park(Point::AfterLogSwitch);
         helper(
             detached(&dir, Some(hold_port()), &ready),
@@ -1337,7 +1347,7 @@ fn panic_at_step_11() {
         let r = run_process_with(
             detached(&dir, Some(hold_port()), &ready),
             Box::new(comps),
-            Arc::default(),
+            not_in_a_job(),
         );
         report(&format!(
             "checks verdicts={} record={}",
@@ -1454,7 +1464,7 @@ fn console_end_before_the_log_switch() {
     if in_helper() {
         let dir = helper_dir();
         let ready = RecordingReady::new(&dir);
-        let faults = Arc::new(Faults::default());
+        let faults = not_in_a_job();
         let park = faults.park(Point::BeforeLogSwitch);
         helper(
             detached(&dir, Some(hold_port()), &ready),
