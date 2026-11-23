@@ -27,11 +27,19 @@ use super::append::{EVENT_COLUMNS, RawRow};
 use super::error::{ReadError, StoreError};
 use super::lock;
 use super::rows::{
-    ApprovalRow, BlobBody, BufferedDelivery, BufferedHook, HookDelivery, HookReply, InputRow,
-    LaunchRow, Routing, SchemaInfo, SurfaceRow, ThreadRow, TokenKind, TokenRow, TranscriptCursor,
-    WorktreeRow, command_result, enum_text, opt_u64, opt_uuid, parse_enum, parse_json, parse_uuid,
-    to_u64,
+    ApprovalRow, BlobBody, BufferedDelivery, BufferedHook, BufferedSummary, HookDelivery,
+    HookReply, InputRow, LaunchRow, Routing, SchemaInfo, SurfaceRow, ThreadRow, TokenKind,
+    TokenRow, TranscriptCursor, WorktreeRow, command_result, enum_text, opt_u64, opt_uuid,
+    parse_enum, parse_json, parse_uuid, to_u64,
 };
+
+/// [`ReadTx::binding_receipt_ordinal`]'s query: the binding is searched within the thread's
+/// stream through `events_kind` (newest first), then its delivery by the launch's key.
+pub(super) const BINDING_ORDINAL_SQL: &str = "SELECT d.receipt_ordinal FROM events e
+     LEFT JOIN hook_deliveries d ON d.launch_id = e.launch_id AND d.stream_id = e.stream_id
+       AND d.seq = e.seq AND d.routing = 'appended'
+     WHERE e.stream_id = ?1 AND e.kind = 'session_bound' AND e.launch_id = ?2
+     ORDER BY e.seq DESC LIMIT 1";
 
 /// One page of a stream, as `core::sync::EventsResponse::Replay` carries it.
 #[derive(Debug, Clone, PartialEq)]
@@ -1247,6 +1255,87 @@ impl<'a> ReadTx<'a> {
                     })
                 })
                 .collect()
+        })
+    }
+
+    /// The launch's buffered deliveries: their count, the summed length of their bodies, and
+    /// the earliest `received_at` (no body is read).
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub fn buffered_summary(&self, l: LaunchId) -> Result<BufferedSummary, StoreError> {
+        self.guard(|| {
+            let (count, bytes, earliest): (i64, i64, Option<String>) = sql(self.conn.query_row(
+                "SELECT count(*), coalesce(sum(length(pending_body)), 0), min(received_at)
+                 FROM hook_deliveries WHERE launch_id = ?1 AND routing = 'buffered'",
+                [l.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ))?;
+            Ok(BufferedSummary {
+                count: to_u64(count)?,
+                body_bytes: to_u64(bytes)?,
+                earliest_received_at: earliest.map(Timestamp),
+            })
+        })
+    }
+
+    /// The largest `receipt_ordinal` of the launch's deliveries; 0 when it has none.
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub fn max_receipt_ordinal(&self, l: LaunchId) -> Result<u64, StoreError> {
+        self.guard(|| {
+            let max: i64 = sql(self.conn.query_row(
+                "SELECT coalesce(max(receipt_ordinal), 0) FROM hook_deliveries WHERE launch_id = ?1",
+                [l.to_string()],
+                |r| r.get(0),
+            ))?;
+            to_u64(max)
+        })
+    }
+
+    /// The `receipt_ordinal` of the delivery whose primary event is launch `l`'s latest
+    /// `session_bound` in thread `t`'s stream (by stream sequence); `None` when the launch is
+    /// unbound or that event was not recorded by a hook delivery.
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub fn binding_receipt_ordinal(
+        &self,
+        t: ThreadId,
+        l: LaunchId,
+    ) -> Result<Option<u64>, StoreError> {
+        self.guard(|| {
+            let ordinal: Option<Option<i64>> = sql(self
+                .conn
+                .query_row(
+                    BINDING_ORDINAL_SQL,
+                    [StreamId::Thread(t).to_string(), l.to_string()],
+                    |r| r.get(0),
+                )
+                .optional())?;
+            ordinal.flatten().map(to_u64).transpose()
+        })
+    }
+
+    /// Whether a delivery of any launch reserved in thread `t`'s stream already took
+    /// `emit` (buffered deliveries included).
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub fn hook_emit_in_thread(&self, t: ThreadId, emit: Uuid) -> Result<bool, StoreError> {
+        self.guard(|| {
+            sql(self.conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM events e JOIN hook_deliveries d
+                   ON d.launch_id = e.launch_id AND d.emit_id = ?2
+                   WHERE e.stream_id = ?1 AND e.kind = 'launch_reserved')",
+                [StreamId::Thread(t).to_string(), emit.to_string()],
+                |r| r.get(0),
+            ))
         })
     }
 

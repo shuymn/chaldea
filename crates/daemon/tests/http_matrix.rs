@@ -236,14 +236,20 @@ const INVENTORY: &[Row] = &[
             None,
         )
     },
-    row(
-        "POST",
-        "/hook",
-        "/hook",
-        Write,
-        MustBeAbsent,
-        Cred::Bearer(&[Hook]),
-        None,
+    // Mounted (PR 9): the probe's `{}` without `X-Chaldea-Emit-Id` reaches the handler,
+    // which answers 400 before the body.
+    reaches(
+        row(
+            "POST",
+            "/hook",
+            "/hook",
+            Write,
+            MustBeAbsent,
+            Cred::Bearer(&[Hook]),
+            None,
+        ),
+        400,
+        Some("bad_request"),
     ),
     row(
         "POST",

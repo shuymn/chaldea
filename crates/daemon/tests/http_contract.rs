@@ -51,7 +51,7 @@ async fn error_bodies_match_the_contract() {
     ));
     let srv = TestServer::start(mounts).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
-    let hook = srv.token(TokenKind::Hook, None, None).await;
+    let hook = srv.token_of(TokenKind::Hook, 1).await;
     let agent = srv
         .agent(ThreadId::from_u128(1), LaunchId::from_u128(2))
         .await;

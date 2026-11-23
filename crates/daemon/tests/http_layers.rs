@@ -206,7 +206,7 @@ async fn layer_order() {
     let srv = TestServer::start(Mounts::mvp()).await;
     let p = srv.port;
     let owner = srv.token(TokenKind::Owner, None, None).await;
-    let hook = srv.token(TokenKind::Hook, None, None).await;
+    let hook = srv.token_of(TokenKind::Hook, 1).await;
     let agent = srv
         .agent(ThreadId::from_u128(1), LaunchId::from_u128(2))
         .await;
@@ -282,7 +282,7 @@ async fn layer_order() {
             (411, code("length_required")),
         ),
         (
-            "size before unimplemented",
+            "size before the handler",
             Req::new(p, "POST", "/hook")
                 .bearer(&hook)
                 .no_length()
@@ -290,9 +290,9 @@ async fn layer_order() {
             (413, code("payload_too_large")),
         ),
         (
-            "unimplemented last",
+            "the handler last (no emit id: 400 before the body)",
             Req::new(p, "POST", "/hook").bearer(&hook).body(b"{}"),
-            (501, code("not_implemented")),
+            (400, code("bad_request")),
         ),
     ];
     for (name, req, want) in cases {
@@ -379,7 +379,7 @@ async fn one_request_per_connection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn te_with_content_length_is_400() {
     let srv = TestServer::start(Mounts::mvp()).await;
-    let hook = srv.token(TokenKind::Hook, None, None).await;
+    let hook = srv.token_of(TokenKind::Hook, 1).await;
     for req in [
         srv.req("POST", "/hook")
             .bearer(&hook)
@@ -402,7 +402,7 @@ async fn te_with_content_length_is_400() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn framing_and_size() {
     let srv = TestServer::start(Mounts::mvp()).await;
-    let hook = srv.token(TokenKind::Hook, None, None).await;
+    let hook = srv.token_of(TokenKind::Hook, 1).await;
     let post = || srv.req("POST", "/hook").bearer(&hook);
     let max = 4 * 1024 * 1024;
     let cases = [
@@ -418,13 +418,14 @@ async fn framing_and_size() {
                 .header("Content-Length", &(max + 1).to_string()),
             (413, code("payload_too_large")),
         ),
-        ("empty body", post(), (501, code("not_implemented"))),
+        // The handler's outcome: no emit id is 400 before any body byte.
+        ("empty body", post(), (400, code("bad_request"))),
         (
             "exactly 4 MiB declared",
             post()
                 .no_length()
                 .header("Content-Length", &max.to_string()),
-            (501, code("not_implemented")),
+            (400, code("bad_request")),
         ),
     ];
     for (name, req, want) in cases {
@@ -548,7 +549,7 @@ async fn deadline_from_first_head_byte() {
         },
     ));
     let srv = TestServer::start(mounts).await;
-    let hook = srv.token(TokenKind::Hook, None, None).await;
+    let hook = srv.token_of(TokenKind::Hook, 1).await;
     let req = srv
         .req("POST", "/hook")
         .bearer(&hook)
@@ -615,7 +616,7 @@ async fn plain_write_expired_is_408() {
         c.write_reply_grace = Duration::from_secs(1);
     })
     .await;
-    let hook = srv.token(TokenKind::Hook, None, None).await;
+    let hook = srv.token_of(TokenKind::Hook, 1).await;
     let release = srv.hold_writer().await;
     let port = srv.port;
     let req = srv.req("POST", "/hook").bearer(&hook).body(b"{}");
@@ -638,7 +639,7 @@ async fn plain_write_expired_is_408() {
 async fn plain_write_unreplied_is_outcome_unknown() {
     let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
     let srv = TestServer::start(plain_write_mount(dtx)).await;
-    let hook = srv.token(TokenKind::Hook, None, None).await;
+    let hook = srv.token_of(TokenKind::Hook, 1).await;
     let release = srv.hold_writer().await;
     let r = srv
         .send(&srv.req("POST", "/hook").bearer(&hook).body(b"{}"))

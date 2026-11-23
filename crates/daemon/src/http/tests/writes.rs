@@ -39,7 +39,7 @@ async fn body_after_the_cutoff_submits_nothing() {
         },
     ));
     let srv = start(mounts, &clock).await;
-    let hook = srv.token(TokenKind::Hook, None, None).await;
+    let hook = srv.token_of(TokenKind::Hook, 1).await;
     let s = shared(&srv);
     let before = s.faults.submits();
     let r = srv

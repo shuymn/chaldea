@@ -78,7 +78,7 @@ async fn secrets_absent() {
     let srv = TestServer::start(Mounts::mvp()).await;
     let p = srv.port;
     let owner = srv.token(TokenKind::Owner, None, None).await;
-    let hook = srv.token(TokenKind::Hook, None, None).await;
+    let hook = srv.token_of(TokenKind::Hook, 1).await;
     let origin = format!("http://127.0.0.1:{p}");
 
     // Positive control first: one record per request, with its route and status.
@@ -99,7 +99,7 @@ async fn secrets_absent() {
         ("/api/threads", 200),
         ("/api/ws", 401),
         ("/api/pair", 401),
-        ("/hook", 501),
+        ("/hook", 400),
         ("unmatched", 404),
     ] {
         assert!(
@@ -236,4 +236,74 @@ async fn credential_headers_are_marked_sensitive() {
         assert!(!debug.contains(m), "{m} in {debug}");
     }
     srv.stop().await;
+}
+
+/// No hook body and no hook token reach the log, on a recorded hook, a `raw_unknown`, a
+/// rejection, a store failure, or a panicking adapter (PR9-CL-29). The server mounts
+/// `Mounts::mvp().with(hook::mount(cfg, seams))` over the test adapter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_bodies_and_tokens_stay_out() {
+    use support::hook::{Hook, HookServer, Mode};
+
+    let _serial = SERIAL.lock().await;
+    let log = captured();
+    let from = len(&log);
+    let h = HookServer::start().await;
+    let l = h.codex(1).await;
+    let marker = "HOOKBODYMARKER9b";
+    let body = |event: &str| {
+        format!(r#"{{"hook_event_name":"{event}","session_id":"s","m":"{marker}"}}"#).into_bytes()
+    };
+    let revoked = h
+        .srv
+        .token(TokenKind::Hook, Some(l.thread), Some(l.launch))
+        .await;
+    h.srv.revoke_quietly(&revoked).await;
+    let mut statuses = Vec::new();
+    let post = async |x: Hook| h.post(&x).await.status;
+    // Recorded: a hook buffered before the binding, then the binding and an appended one.
+    statuses.push(post(Hook::new(&l, &body("Stop"))).await);
+    statuses.push(post(Hook::new(&l, &body("SessionStart"))).await);
+    statuses.push(post(Hook::new(&l, &body("Stop"))).await);
+    // raw_unknown: an unparseable body.
+    statuses.push(post(Hook::new(&l, format!(r#"{{"m":"{marker}""#).as_bytes())).await);
+    // Rejections: a revoked token, and a bad header.
+    let mut x = Hook::new(&l, &body("Stop"));
+    x.token = revoked.clone();
+    statuses.push(post(x).await);
+    let x = Hook::new(&l, &body("Stop"));
+    let r = h
+        .srv
+        .send(
+            &x.req(&h.srv)
+                .header("X-Chaldea-Emit-Id", &x.emit.to_string()),
+        )
+        .await;
+    statuses.push(r.status);
+    // A panicking adapter.
+    h.adapter.set_mode(Mode::Panic);
+    statuses.push(post(Hook::new(&l, &body("Stop"))).await);
+    h.adapter.set_mode(Mode::Plain);
+    // A store failure inside the job: a trigger refusing every delivery.
+    rusqlite::Connection::open(h.srv.store.path())
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER test_refuse BEFORE INSERT ON hook_deliveries
+             BEGIN SELECT RAISE(ABORT, 'refused by the test'); END",
+        )
+        .unwrap();
+    statuses.push(post(Hook::new(&l, &body("Stop"))).await);
+    assert_eq!(statuses, [200, 200, 200, 200, 401, 400, 500, 500]);
+    h.stop().await;
+    let all = since(&log, from);
+    for status in [200, 401, 400, 500] {
+        assert!(
+            has_record(&all, "/hook", status),
+            "no record of /hook {status}:\n{all}"
+        );
+    }
+    for secret in [marker, l.token.as_str(), revoked.as_str()] {
+        assert!(!all.contains(secret), "{secret} appears in the log:\n{all}");
+    }
+    assert!(!all.contains("chd_"), "a token appears in the log:\n{all}");
 }

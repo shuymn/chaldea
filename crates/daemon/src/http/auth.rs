@@ -131,8 +131,9 @@ pub struct Authorized {
 /// Why a token check refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthFailure {
-    /// Missing, revoked, malformed, or an agent token whose launch is not current or has
-    /// exited: 401.
+    /// Missing, revoked, malformed, an agent token whose launch is not current or has
+    /// exited, or a hook token without its thread and launch or whose launch is not of its
+    /// thread: 401.
     Invalid,
     /// The lookup failed: mapped through the store mapping, never 401.
     Store(StoreError),
@@ -167,6 +168,17 @@ pub fn verify_hash_in(tx: &ReadTx<'_>, sha256: &[u8; 32]) -> Result<Authorized, 
         }
         match tx.launch(l)? {
             Some(launch) if launch.exit_reason.is_none() => {}
+            _ => return Err(AuthFailure::Invalid),
+        }
+    }
+    if row.kind == TokenKind::Hook {
+        // One launch of one thread; it need not be current, live, or bound: late hooks are
+        // kept, and revocation ends the token (hook-ingest §2.8).
+        let (Some(t), Some(l)) = (row.thread_id, row.launch_id) else {
+            return Err(AuthFailure::Invalid);
+        };
+        match tx.launch(l)? {
+            Some(launch) if launch.thread_id == t => {}
             _ => return Err(AuthFailure::Invalid),
         }
     }

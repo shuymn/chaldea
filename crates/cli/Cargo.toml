@@ -54,6 +54,8 @@ chaldea-pty-runtime = { path = "../pty-runtime", features = ["fake"] }
 tempfile.workspace = true
 # Log lines with secret markers from a test component (PR8-CL-20).
 tracing.workspace = true
+# The runtime of `hook_e2e`'s in-process daemon server.
+tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 # Test signals by pid.

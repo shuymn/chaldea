@@ -36,7 +36,7 @@ fn reading_hook() -> Mounts {
 /// One request per rejection step, each with a 10-byte body, and its decided reply.
 async fn cases(srv: &TestServer) -> Vec<Case> {
     let owner = srv.token(TokenKind::Owner, None, None).await;
-    let hook = srv.token(TokenKind::Hook, None, None).await;
+    let hook = srv.token_of(TokenKind::Hook, 1).await;
     let agent = srv
         .agent(ThreadId::from_u128(1), LaunchId::from_u128(2))
         .await;
@@ -125,7 +125,7 @@ async fn run(withhold_body: bool) {
         );
     }
     // Positive control: a handler that reads the body polls it.
-    let hook = srv.token(TokenKind::Hook, None, None).await;
+    let hook = srv.token_of(TokenKind::Hook, 1).await;
     let before = s.faults.polls();
     let r = srv
         .send(&srv.req("POST", "/hook").bearer(&hook).body(b"{}"))

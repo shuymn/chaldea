@@ -78,6 +78,11 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked --no-fail-fast
 
+      # The run above captures passing tests' output: this prints the per-OS B-8
+      # observations of the in-flight-body cases (B8-OBSERVED lines; docs/design/hook-ingest.md §7.1).
+      - name: Show the B-8 observations
+        run: cargo test -p chaldea-daemon --test hook_b8 --locked -- observed_ --show-output
+
       # The Windows tests are compiled only on Windows: a cfg mistake that compiles a whole
       # test binary or suite out must fail here instead of passing silently. Each binary
       # must list its sentinel tests (docs/design/pty-windows.md §1, docs/design/event-store.md §7).

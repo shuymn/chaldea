@@ -94,6 +94,17 @@ pub struct RouteSpec {
 }
 
 impl RouteSpec {
+    /// The route's body bound under the server's `max_body_bytes`: `/hook` also has the hook
+    /// cap (mvp §2.5), so the guard answers 413 before the body above the smaller.
+    #[must_use]
+    pub fn body_limit(&self, http_max: u64) -> u64 {
+        if self.path == "/hook" {
+            http_max.min(crate::hook::MAX_HOOK_BODY)
+        } else {
+            http_max
+        }
+    }
+
     /// The static PWA's routes, the only ones whose handlers set their own caching
     /// (mvp §2.5; PR 18).
     #[must_use]
@@ -432,7 +443,8 @@ pub struct Mounts(Vec<Mount>);
 impl Mounts {
     /// Every route of [`ROUTES`]: PR 7's sync reads, blobs, tickets, pairing, the WebSocket
     /// loop, and the command dispatcher (each command 501 until its handler is registered),
-    /// and a 501 handler for every route whose PR has not mounted one.
+    /// PR 9's `/hook` with [`crate::hook::HookSeams::mvp`], and a 501 handler for every
+    /// route whose PR has not mounted one.
     ///
     /// # Panics
     ///
@@ -476,6 +488,10 @@ impl Mounts {
             .with(Mount::write(
                 at(Method::POST, commands::COMMAND_PATH),
                 commands::dispatch,
+            ))
+            .with(crate::hook::mount(
+                crate::hook::HookConfig::default(),
+                crate::hook::HookSeams::mvp(),
             ))
     }
 

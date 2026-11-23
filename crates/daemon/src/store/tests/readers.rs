@@ -77,3 +77,33 @@ fn undecodable_events_are_returned() {
     assert_eq!(page.events[0].payload.get(), r#"{"anything":[1,2]}"#);
     assert_eq!(page.events[1].schema_version, 2);
 }
+
+/// The binding lookup runs inside a direct hook's write: it searches the thread's stream
+/// through `events_kind`, newest first, and never scans other threads' events or sorts.
+#[test]
+fn binding_lookup_stays_in_the_stream() {
+    let s = TestStore::new();
+    let c = raw(&s.path());
+    let mut q = c
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            crate::store::readers::BINDING_ORDINAL_SQL
+        ))
+        .unwrap();
+    let plan: Vec<String> = q
+        .query_map(["thread:t", "l"], |r| r.get(3))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        plan.iter()
+            .any(|d| d == "SEARCH e USING INDEX events_kind (stream_id=? AND kind=?)"),
+        "{plan:?}"
+    );
+    assert!(
+        !plan
+            .iter()
+            .any(|d| d.starts_with("SCAN") || d.contains("TEMP B-TREE")),
+        "{plan:?}"
+    );
+}
