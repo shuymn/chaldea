@@ -160,7 +160,7 @@ impl StartupCtx {
                 files::no_hook(n, s)
             }
         };
-        match files::write_replace(dir, name, bytes, &self.instance, &hook) {
+        match files::write_replace(dir, name, bytes, &self.instance, None, &hook) {
             Ok(r) => {
                 if let Some(w) = &r.durability_warning {
                     self.log.warn(w);

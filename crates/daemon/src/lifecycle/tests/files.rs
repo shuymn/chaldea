@@ -34,12 +34,12 @@ fn temps(d: &Path) -> Vec<String> {
 fn replaces_regular_file() {
     let d = dir();
     std::fs::write(d.path().join("port"), "1\n").unwrap();
-    let r = write_replace(d.path(), "port", b"7373\n", INSTANCE, &ok).unwrap();
+    let r = write_replace(d.path(), "port", b"7373\n", INSTANCE, None, &ok).unwrap();
     assert!(r.durability_warning.is_none());
     assert_eq!(std::fs::read(d.path().join("port")).unwrap(), b"7373\n");
     assert!(temps(d.path()).is_empty());
     // An absent name is created.
-    write_replace(d.path(), "new", b"x", INSTANCE, &ok).unwrap();
+    write_replace(d.path(), "new", b"x", INSTANCE, None, &ok).unwrap();
     assert_eq!(std::fs::read(d.path().join("new")).unwrap(), b"x");
 }
 
@@ -52,7 +52,7 @@ fn refuses_symlink() {
     let target = outside.path().join("victim");
     std::fs::write(&target, "keep").unwrap();
     chaldea_pty_runtime::fake::make_link(&d.path().join("port"), &target).unwrap();
-    let e = write_replace(d.path(), "port", b"7373\n", INSTANCE, &ok).unwrap_err();
+    let e = write_replace(d.path(), "port", b"7373\n", INSTANCE, None, &ok).unwrap_err();
     assert!(matches!(e, ReplaceError::Refused), "{e:?}");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
     assert!(temps(d.path()).is_empty());
@@ -65,7 +65,7 @@ fn refuses_reparse_point() {
     let d = dir();
     let outside = dir();
     chaldea_pty_runtime::fake::make_link(&d.path().join("port"), outside.path()).unwrap();
-    let e = write_replace(d.path(), "port", b"7373\n", INSTANCE, &ok).unwrap_err();
+    let e = write_replace(d.path(), "port", b"7373\n", INSTANCE, None, &ok).unwrap_err();
     assert!(matches!(e, ReplaceError::Refused), "{e:?}");
     assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
 }
@@ -81,7 +81,7 @@ fn write_failure_removes_the_temp() {
             Ok(())
         }
     };
-    assert!(write_replace(d.path(), "port", b"7373\n", INSTANCE, &fail).is_err());
+    assert!(write_replace(d.path(), "port", b"7373\n", INSTANCE, None, &fail).is_err());
     assert_eq!(std::fs::read(d.path().join("port")).unwrap(), b"1\n");
     assert!(temps(d.path()).is_empty());
 }
@@ -99,13 +99,35 @@ fn rename_failure_keeps_the_target() {
         }
     };
     let t0 = std::time::Instant::now();
-    assert!(write_replace(d.path(), "port", b"7373\n", INSTANCE, &fail).is_err());
+    assert!(write_replace(d.path(), "port", b"7373\n", INSTANCE, None, &fail).is_err());
     // Retried every 50 ms for 500 ms.
     assert!(
         t0.elapsed() >= Duration::from_millis(500),
         "{:?}",
         t0.elapsed()
     );
+    assert_eq!(std::fs::read(d.path().join("port")).unwrap(), b"1\n");
+    assert!(temps(d.path()).is_empty());
+}
+
+/// A rename failing at its retry cutoff is not retried: one attempt, then the error, the
+/// target unchanged and no temporary left.
+#[test]
+fn rename_is_not_retried_past_its_cutoff() {
+    let d = dir();
+    std::fs::write(d.path().join("port"), "1\n").unwrap();
+    let attempts = std::sync::atomic::AtomicU32::new(0);
+    let fail = |_: &str, s: ReplaceStage| {
+        if s == ReplaceStage::Rename {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(io::Error::other("injected"))
+        } else {
+            Ok(())
+        }
+    };
+    let now = Some(std::time::Instant::now());
+    assert!(write_replace(d.path(), "port", b"7373\n", INSTANCE, now, &fail).is_err());
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(std::fs::read(d.path().join("port")).unwrap(), b"1\n");
     assert!(temps(d.path()).is_empty());
 }
@@ -121,7 +143,7 @@ fn dir_sync_failure_is_a_warning() {
             Ok(())
         }
     };
-    let r = write_replace(d.path(), "port", b"7373\n", INSTANCE, &fail).unwrap();
+    let r = write_replace(d.path(), "port", b"7373\n", INSTANCE, None, &fail).unwrap();
     assert!(
         r.durability_warning
             .as_deref()
@@ -166,7 +188,7 @@ fn temp_descriptor_is_owner_only() {
         }
         Ok(())
     };
-    write_replace(d.path(), "owner.token", b"chd_x\n", INSTANCE, &check).unwrap();
+    write_replace(d.path(), "owner.token", b"chd_x\n", INSTANCE, None, &check).unwrap();
     assert_eq!(*seen.lock().unwrap(), Some(Privacy::Private));
     assert_eq!(
         host::privacy(&d.path().join("owner.token"), EntryKind::File).unwrap(),
@@ -181,7 +203,7 @@ fn replaces_while_a_reader_holds_it() {
     let d = dir();
     std::fs::write(d.path().join("daemon.json"), "old").unwrap();
     let held = std::fs::File::open(d.path().join("daemon.json")).unwrap();
-    write_replace(d.path(), "daemon.json", b"new", INSTANCE, &ok).unwrap();
+    write_replace(d.path(), "daemon.json", b"new", INSTANCE, None, &ok).unwrap();
     drop(held);
     assert_eq!(std::fs::read(d.path().join("daemon.json")).unwrap(), b"new");
 }
@@ -357,7 +379,7 @@ fn already_exists_after_create_removes_the_temp() {
             Ok(())
         }
     };
-    let e = write_replace(d.path(), "port", b"7373\n", INSTANCE, &hook).unwrap_err();
+    let e = write_replace(d.path(), "port", b"7373\n", INSTANCE, None, &hook).unwrap_err();
     assert!(matches!(e, ReplaceError::Io(_)), "{e:?}");
     assert!(temps(d.path()).is_empty(), "{:?}", temps(d.path()));
     assert!(!d.path().join("port").exists());

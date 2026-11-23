@@ -302,11 +302,14 @@ pub(crate) struct Replaced {
 
 /// Replaces `dir/name` with `bytes`: only an absent entry or a regular file, through a
 /// temporary `.<name>.tmp-<instance>` created owner-only and a rename, which is the commit.
+/// A failed rename is retried every 50 ms until `retry_until`, or for 500 ms from the first
+/// attempt when it is `None`.
 pub(crate) fn write_replace(
     dir: &Path,
     name: &str,
     bytes: &[u8],
     instance: &str,
+    retry_until: Option<Instant>,
     hook: ReplaceHook<'_>,
 ) -> Result<Replaced, ReplaceError> {
     let target = dir.join(name);
@@ -335,7 +338,7 @@ pub(crate) fn write_replace(
         }
         return Err(ReplaceError::Io(e));
     }
-    let end = Instant::now() + RENAME_RETRY_FOR;
+    let end = retry_until.unwrap_or_else(|| Instant::now() + RENAME_RETRY_FOR);
     loop {
         let renamed =
             hook(name, ReplaceStage::Rename).and_then(|()| std::fs::rename(&tmp, &target));

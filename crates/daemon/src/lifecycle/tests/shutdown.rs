@@ -698,3 +698,90 @@ fn no_deletion_after_the_record_budget() {
         log.text()
     );
 }
+
+/// A record file of `instance` in `dir`, serving; returns its bytes.
+fn serving_record(dir: &std::path::Path, instance: &str) -> Vec<u8> {
+    use super::super::files::{DiscoveryRecord, Evidence, RecordState};
+    let bytes = DiscoveryRecord {
+        version: 1,
+        instance: instance.to_owned(),
+        pid: std::process::id(),
+        start_time: "1".to_owned(),
+        state: RecordState::Serving,
+        port: Some(7373),
+        url: Some("http://127.0.0.1:7373".to_owned()),
+        started_at: "2026-11-23T00:00:00.000Z".to_owned(),
+        detached: None,
+        evidence: Evidence::default(),
+    }
+    .to_bytes();
+    std::fs::write(dir.join(names::RECORD), &bytes).unwrap();
+    bytes
+}
+
+/// The `stopping` rewrite's thread starting at or after its cutoff does nothing: it does not
+/// read the record, creates no temporary file, and leaves `daemon.json` as it was.
+#[test]
+fn stopping_worker_started_late_does_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let before = serving_record(d.path(), "i");
+    let read = std::sync::atomic::AtomicBool::new(false);
+    let seen = Mutex::new(Vec::new());
+    let hook = |_: &str, stage| {
+        seen.lock().unwrap().push(stage);
+        Ok(())
+    };
+    let r = super::super::shutdown::mark_stopping(
+        d.path(),
+        "i",
+        Instant::now(),
+        &|| read.store(true, std::sync::atomic::Ordering::SeqCst),
+        &hook,
+    );
+    assert!(r.is_err());
+    assert!(
+        !read.load(std::sync::atomic::Ordering::SeqCst),
+        "read past the cutoff"
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "{:?}",
+        seen.lock().unwrap()
+    );
+    assert_eq!(std::fs::read(d.path().join(names::RECORD)).unwrap(), before);
+}
+
+/// The `stopping` rewrite's thread paused after its read until its cutoff creates no
+/// temporary file and leaves `daemon.json` as it was; with time left it rewrites the record.
+#[test]
+fn stopping_worker_paused_past_its_cutoff_creates_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let before = serving_record(d.path(), "i");
+    let seen = Mutex::new(Vec::new());
+    let hook = |_: &str, stage| {
+        seen.lock().unwrap().push(stage);
+        Ok(())
+    };
+    let end = Instant::now() + Duration::from_millis(200);
+    let pause = || std::thread::sleep(end.saturating_duration_since(Instant::now()));
+    let r = super::super::shutdown::mark_stopping(d.path(), "i", end, &pause, &hook);
+    assert!(r.is_err());
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "{:?}",
+        seen.lock().unwrap()
+    );
+    let temps: Vec<_> = std::fs::read_dir(d.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n.to_string_lossy().contains(".tmp-"))
+        .collect();
+    assert!(temps.is_empty(), "{temps:?}");
+    assert_eq!(std::fs::read(d.path().join(names::RECORD)).unwrap(), before);
+    let soon = Instant::now() + WAIT;
+    super::super::shutdown::mark_stopping(d.path(), "i", soon, &|| {}, &hook).unwrap();
+    assert!(matches!(
+        super::super::files::read_record(d.path()),
+        Ok(Some(r)) if r.state == super::super::files::RecordState::Stopping
+    ));
+}

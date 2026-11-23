@@ -377,8 +377,8 @@ impl Coordinator {
 
     /// Rewrites our record with the `stopping` state on a blocking thread, awaited until `end`
     /// and guarded: a console end observed by now starts no rewrite, and one observed during it
-    /// ends the wait. A failed or unfinished rewrite is logged and shutdown goes on; one still
-    /// running at `end` does not rename after it ([`mark_stopping`]).
+    /// ends the wait. A failed or unfinished rewrite is logged and shutdown goes on; the thread
+    /// itself stops at `end` ([`mark_stopping`]).
     async fn publish_stopping(
         &mut self,
         dir: std::path::PathBuf,
@@ -401,12 +401,6 @@ impl Coordinator {
                 p.hold_blocking();
             }
             let hook = move |n: &str, s: files::ReplaceStage| -> std::io::Result<()> {
-                if s == files::ReplaceStage::Rename && Instant::now() >= end {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "its budget ended before the rename",
-                    ));
-                }
                 #[cfg(test)]
                 {
                     faults.replace_hook(n, s)
@@ -416,7 +410,7 @@ impl Coordinator {
                     files::no_hook(n, s)
                 }
             };
-            mark_stopping(&dir, &instance, &hook)
+            mark_stopping(&dir, &instance, end, &|| {}, &hook)
         });
         match self.guarded(deadline_first(end, rewrite)).await? {
             Ok(Ok(Ok(()))) => {}
@@ -801,11 +795,26 @@ impl Coordinator {
 
 /// Rewrites the record in `dir` with the `stopping` state if it is `instance`'s; a record that
 /// is missing or another instance's is left alone. `Err`: why it was not rewritten.
-fn mark_stopping(
+///
+/// Nothing starts at or after `end`: not the read, not the temporary file, not a rename
+/// attempt or its retry. A call already issued at `end` may finish after it. `after_read`
+/// runs between the read and the creation of the temporary file.
+pub(super) fn mark_stopping(
     dir: &std::path::Path,
     instance: &str,
+    end: Instant,
+    after_read: &dyn Fn(),
     hook: files::ReplaceHook<'_>,
 ) -> Result<(), String> {
+    let late = || {
+        format!(
+            "the discovery record was not marked stopping: its {} ms ended",
+            STOPPING_REWRITE.as_millis()
+        )
+    };
+    if Instant::now() >= end {
+        return Err(late());
+    }
     let mut r = match files::read_record(dir) {
         Ok(Some(r)) if r.instance == instance => r,
         Ok(_) => return Ok(()),
@@ -815,8 +824,28 @@ fn mark_stopping(
             ));
         }
     };
+    after_read();
+    if Instant::now() >= end {
+        return Err(late());
+    }
     r.state = files::RecordState::Stopping;
-    files::write_replace(dir, names::RECORD, &r.to_bytes(), instance, hook)
-        .map(drop)
-        .map_err(|e| format!("the discovery record could not be marked stopping: {e}"))
+    let hook = |n: &str, s: files::ReplaceStage| {
+        if s == files::ReplaceStage::Rename && Instant::now() >= end {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "its budget ended before the rename",
+            ));
+        }
+        hook(n, s)
+    };
+    files::write_replace(
+        dir,
+        names::RECORD,
+        &r.to_bytes(),
+        instance,
+        Some(end),
+        &hook,
+    )
+    .map(drop)
+    .map_err(|e| format!("the discovery record could not be marked stopping: {e}"))
 }
