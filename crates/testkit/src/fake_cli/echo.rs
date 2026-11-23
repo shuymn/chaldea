@@ -128,7 +128,7 @@ impl<'a> Prompts<'a> {
             return false;
         };
         let lines = lines_of(child.stdout.take());
-        let stdin = child.stdin.take();
+        let mut stdin = child.stdin.take();
         let mut w = Watched::new(child, launched, NESTED_LIFE);
         let ok = match expect_line(&lines, "sent", launched + HANDSHAKE) {
             Err(b) => {
@@ -140,14 +140,16 @@ impl<'a> Prompts<'a> {
             Ok(()) => self.emit(&session_start(&self.session), rep),
         };
         if ok {
-            if let Some(mut stdin) = stdin {
+            if let Some(mut stdin) = stdin.take() {
                 let _ = stdin.write_all(b"go\n");
             }
         } else {
-            drop(stdin);
             w.end_now();
         }
         let code = watch::settle(vec![w]).remove(0).code;
+        // Closed only once the child has ended: a failing parent kills it before it can see
+        // EOF and start another report line.
+        drop(stdin);
         rep.send(&json!({"event": "nested", "code": code}));
         ok && code == Some(0)
     }

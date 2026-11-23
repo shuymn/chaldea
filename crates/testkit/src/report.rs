@@ -49,7 +49,7 @@ impl Reporter {
                     let Ok(line) = line else { return };
                     if line.trim() == "ping" {
                         let pong = json!({"event": "pong", "inq": inq()});
-                        if writeln!(write, "{pong}").is_err() {
+                        if write.write_all(format!("{pong}\n").as_bytes()).is_err() {
                             return;
                         }
                     } else if let Some(f) = COMMAND.get() {
@@ -62,7 +62,8 @@ impl Reporter {
         Reporter
     }
 
-    /// Writes one line; nothing once the stream has ended.
+    /// Writes one line in one write, so a process killed while reporting leaves no partial
+    /// line; nothing once the stream has ended.
     #[allow(
         clippy::unused_self,
         reason = "a line is sent by the process that connected"
@@ -71,7 +72,7 @@ impl Reporter {
         if let Some(s) = STREAM.get() {
             let mut s = s.lock().unwrap_or_else(PoisonError::into_inner);
             if !s.1 {
-                let _ = writeln!(s.0, "{v}");
+                let _ = s.0.write_all(format!("{v}\n").as_bytes());
             }
         }
     }
