@@ -53,11 +53,15 @@ jobs:
       # A-W1 (docs/design/daemon-lifecycle.md §2.12): the detach tests need this runner's
       # processes to be in no job or in jobs a child can leave. The preflight runs before any
       # detach test, and must have run and passed exactly once, so a renamed or compiled-out
-      # test fails the step instead of passing with zero tests.
+      # test fails the step instead of passing with zero tests. Its output (the recorded job
+      # state and the helper's report) is printed whether it passes or fails.
       - name: Check that a detached child leaves the runner's job
         if: runner.os == 'Windows'
         run: |
-          out="$(cargo test -p chaldea-pty-runtime --lib --locked -- host::windows::tests::runner_can_break_away --exact)" && grep -q '^test result: ok\. 1 passed' <<<"$out"
+          status=0
+          out="$(cargo test -p chaldea-pty-runtime --lib --locked -- host::windows::tests::runner_can_break_away --exact --nocapture 2>&1)" || status=$?
+          printf '%s\n' "$out"
+          [ "$status" -eq 0 ] && grep -q '^test result: ok\. 1 passed' <<<"$out"
 
       # Includes the contract drift check (crates/core/tests/contracts_export.rs). With
       # --no-fail-fast, one failing test binary does not keep the others from running.
@@ -107,7 +111,7 @@ jobs:
             start_breaks_away_from_a_kill_on_close_job_with_silent_breakaway \
             start_refuses_a_job_without_breakaway child_rejects_any_job \
             nested_outer_job_refuses foreground_in_a_job_warns detached_child_has_no_console \
-            no_listener_is_reported
+            no_listener_is_reported daemon_holds_no_caller_handle
 
       # core is Sans-IO: no async runtime, store, HTTP stack, or random source in its
       # dependency tree (core::auth and core::http are pure policy and wire types).
