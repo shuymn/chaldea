@@ -11,8 +11,13 @@
 //! child creation in the process therefore runs under one lock: the native backend's spawn
 //! and every closure passed to [`with_spawn_lock`].
 
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+#[cfg(not(test))]
+use std::sync::Condvar;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+use probe::ExactCondvar as Condvar;
 
 /// The lock: whether a thread holds it, and the wake-up of its waiters. The inner mutex is
 /// held only to read or flip the flag, so a waiter can give up at a deadline.
@@ -29,6 +34,33 @@ static SPAWN_LOCK: SpawnLock = SpawnLock {
 impl SpawnLock {
     fn flag(&self) -> MutexGuard<'_, bool> {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Releases `held` and blocks until a release wakes this thread, or for at most
+    /// `timeout`; `true` when the wait timed out.
+    fn wait(
+        &'static self,
+        held: MutexGuard<'static, bool>,
+        timeout: Option<Duration>,
+    ) -> (MutexGuard<'static, bool>, bool) {
+        #[cfg(not(test))]
+        match timeout {
+            None => (
+                self.freed
+                    .wait(held)
+                    .unwrap_or_else(PoisonError::into_inner),
+                false,
+            ),
+            Some(t) => {
+                let (h, woke) = self
+                    .freed
+                    .wait_timeout(held, t)
+                    .unwrap_or_else(PoisonError::into_inner);
+                (h, woke.timed_out())
+            }
+        }
+        #[cfg(test)]
+        self.freed.wait(held, timeout, || self.flag())
     }
 }
 
@@ -83,10 +115,7 @@ pub(crate) fn spawn_lock() -> SpawnGuard {
     while *held {
         #[cfg(test)]
         let _waiting = probe::Waiting::new();
-        held = SPAWN_LOCK
-            .freed
-            .wait(held)
-            .unwrap_or_else(PoisonError::into_inner);
+        held = SPAWN_LOCK.wait(held, None).0;
     }
     *held = true;
     drop(held);
@@ -107,18 +136,15 @@ pub(crate) fn spawn_lock_before(deadline: Instant) -> Option<SpawnGuard> {
         }
         #[cfg(test)]
         let waiting = probe::Waiting::new();
-        let (h, woke) = SPAWN_LOCK
-            .freed
-            .wait_timeout(held, left)
-            .unwrap_or_else(PoisonError::into_inner);
+        let (h, timed_out) = SPAWN_LOCK.wait(held, Some(left));
         held = h;
         #[cfg(test)]
         {
             drop(waiting);
-            probe::woke(woke.timed_out());
+            probe::woke(timed_out);
         }
         #[cfg(not(test))]
-        let _ = woke;
+        let _ = timed_out;
     }
     *held = true;
     drop(held);
@@ -182,7 +208,102 @@ mod held_here {
 #[cfg(test)]
 pub(crate) mod probe {
     use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+    use std::time::{Duration, Instant};
+
+    /// The lock's condition variable in tests: waiters queue in order and wake only when a
+    /// notification reaches them, never spuriously, so `notify_one` wakes exactly one waiter
+    /// whatever the interleaving (std's futex condition variable can also return a waiter that
+    /// was between releasing the mutex and blocking).
+    pub(crate) struct ExactCondvar {
+        queue: Mutex<VecDeque<Arc<Token>>>,
+    }
+
+    #[derive(Default)]
+    struct Token {
+        woken: Mutex<bool>,
+        cv: Condvar,
+    }
+
+    fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    impl ExactCondvar {
+        pub(crate) const fn new() -> ExactCondvar {
+            ExactCondvar {
+                queue: Mutex::new(VecDeque::new()),
+            }
+        }
+
+        /// Queues this thread while `held` is still locked (a release flips the flag under it,
+        /// so no notification is missed), releases it, and blocks until notified or
+        /// `timeout`; then locks again through `relock`. `true`: timed out.
+        pub(crate) fn wait<'a>(
+            &self,
+            held: MutexGuard<'a, bool>,
+            timeout: Option<Duration>,
+            relock: impl FnOnce() -> MutexGuard<'a, bool>,
+        ) -> (MutexGuard<'a, bool>, bool) {
+            let token = Arc::new(Token::default());
+            lock(&self.queue).push_back(token.clone());
+            drop(held);
+            let end = timeout.map(|t| Instant::now() + t);
+            let mut woken = lock(&token.woken);
+            while !*woken {
+                match end {
+                    None => woken = token.cv.wait(woken).unwrap_or_else(PoisonError::into_inner),
+                    Some(end) => {
+                        let left = end.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        woken = token
+                            .cv
+                            .wait_timeout(woken, left)
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .0;
+                    }
+                }
+            }
+            let mut timed_out = !*woken;
+            drop(woken);
+            if timed_out {
+                let mut q = lock(&self.queue);
+                match q.iter().position(|t| Arc::ptr_eq(t, &token)) {
+                    Some(i) => {
+                        q.remove(i);
+                    }
+                    // A notification took it off the queue in the meantime: it was woken.
+                    None => timed_out = false,
+                }
+            }
+            (relock(), timed_out)
+        }
+
+        fn wake(token: &Token) {
+            *lock(&token.woken) = true;
+            token.cv.notify_one();
+        }
+
+        pub(crate) fn notify_all(&self) {
+            for t in lock(&self.queue).drain(..) {
+                Self::wake(&t);
+            }
+        }
+
+        #[allow(
+            dead_code,
+            reason = "the single-waiter wake, for comparison in reviews"
+        )]
+        pub(crate) fn notify_one(&self) {
+            if let Some(t) = lock(&self.queue).pop_front() {
+                Self::wake(&t);
+            }
+        }
+    }
 
     /// How many threads wait on the condition variable.
     pub(crate) static WAITING: AtomicUsize = AtomicUsize::new(0);

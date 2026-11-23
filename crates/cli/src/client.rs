@@ -542,29 +542,43 @@ mod tests {
         assert_eq!(got, StopSent::DeadlinePassed);
     }
 
-    /// PR8-CL-15 (Windows): an `OpenEventW` in flight when the deadline passes (delayed before
-    /// the call), finding no event: `DeadlinePassed`, not `NoListener`.
+    /// PR8-CL-15 (Windows): an `OpenEventW` of an existing event, in flight when the deadline
+    /// passes (delayed before the call): `DeadlinePassed`, the delivery stage never reached and
+    /// the listener not woken.
     #[cfg(windows)]
     #[test]
     fn open_across_the_deadline_is_the_deadline() {
         use std::time::{Duration, Instant};
         let me = host::current_identity().unwrap();
+        let inst = instance();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _l = host::listen_for_stop(&inst, Box::new(move || tx.send(()).unwrap())).unwrap();
         let target = StopTarget {
             pid: me.pid,
             start_time: me.start_time,
-            instance: instance(),
+            instance: inst,
         };
         let end = Instant::now() + Duration::from_millis(300);
         let delay = || std::thread::sleep(end.saturating_duration_since(Instant::now()));
+        let reached = std::cell::Cell::new(false);
+        let delivery = || reached.set(true);
         let seams = host::StopSeams {
             identity: &host::process_identity,
             before_open: &delay,
-            before_delivery: &|| {},
+            before_delivery: &delivery,
             deliver: None,
         };
         assert_eq!(
             host::send_stop_with(&target, end, &seams).unwrap(),
             StopSent::DeadlinePassed
+        );
+        assert!(
+            !reached.get(),
+            "an open first seen at the deadline went on to the delivery"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the event was set after the deadline"
         );
     }
 

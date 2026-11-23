@@ -1430,8 +1430,8 @@ mod tests {
 
     /// The Windows stop flow on every OS (no identity check before the delivery): an open, or
     /// the identity lookup after an open that finds no event, first observed at the deadline
-    /// is `DeadlinePassed`, whatever it found; with time left the same steps give
-    /// `NoListener` and `AccessDenied`.
+    /// is `DeadlinePassed`, whatever it found, and a late successful open never reaches the
+    /// delivery stage; with time left the same steps give `NoListener` and `AccessDenied`.
     #[test]
     fn late_stop_observations_are_the_deadline() {
         use super::{ProcessIdentity, StopPlatform, StopSent, StopTarget, stop_flow};
@@ -1476,6 +1476,24 @@ mod tests {
             denied()
         };
         assert_eq!(run(end, &live, &late_open), StopSent::DeadlinePassed);
+        // An open that succeeds only at the deadline never reaches the delivery stage.
+        let end = Instant::now() + Duration::from_millis(200);
+        let reached = std::cell::Cell::new(false);
+        let got = stop_flow(
+            &target,
+            end,
+            windows,
+            &live,
+            || {
+                std::thread::sleep(end.saturating_duration_since(Instant::now()));
+                Ok(())
+            },
+            &|| reached.set(true),
+            |(): &()| -> io::Result<()> { panic!("fired after the deadline") },
+        )
+        .unwrap();
+        assert_eq!(got, StopSent::DeadlinePassed);
+        assert!(!reached.get(), "a late open went on to the delivery stage");
         let soon = Instant::now() + Duration::from_secs(5);
         assert_eq!(run(soon, &live, &no_event), StopSent::NoListener);
         assert_eq!(run(soon, &live, &denied), StopSent::AccessDenied);
