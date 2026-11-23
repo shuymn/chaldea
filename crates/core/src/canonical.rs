@@ -7,7 +7,9 @@
 //! from the order a type or a map serializes its members in: a struct's declaration order,
 //! a `HashMap`'s hasher, and a `serde_json::Map` built with the `preserve_order` feature
 //! would each give another order. Scalars are written as `serde_json` writes them, so a
-//! float keeps its `serde_json` spelling (`1.0`) and strings use its escapes.
+//! float keeps its `serde_json` spelling (`1.0`, with `-0.0` written as `0.0`) and strings
+//! use its escapes. Raw JSON text (`RawValue`) is refused: its members would keep their
+//! sender's order.
 
 use std::fmt;
 
@@ -23,7 +25,9 @@ impl CanonicalJson {
     /// # Errors
     ///
     /// When `value` has a non-finite float, a map key that is not a string, integer, `bool`,
-    /// or unit variant, an object with two members of one key, or its `Serialize` fails.
+    /// or unit variant, an object with two members of one key, raw JSON text (a
+    /// `serde_json::value::RawValue`, which the caller converts to a typed value first), or
+    /// its `Serialize` fails.
     pub fn of<T: Serialize + ?Sized>(value: &T) -> Result<CanonicalJson, CanonicalError> {
         let node = value.serialize(NodeSerializer)?;
         let mut out = String::new();
@@ -113,13 +117,19 @@ fn number(n: &impl ToString) -> Result<Node, CanonicalError> {
     Ok(Node::Number(n.to_string()))
 }
 
+/// A float as `serde_json` writes it; `-0.0` is written as `0.0`, the value JSON gives both.
 fn float(f: f64) -> Result<Node, CanonicalError> {
     if !f.is_finite() {
         return Err(CanonicalError(format!("{f} is not a JSON number")));
     }
+    let f = if f == 0.0 { 0.0 } else { f };
     let s = serde_json::to_string(&f).map_err(|e| CanonicalError(e.to_string()))?;
     Ok(Node::Number(s))
 }
+
+/// The struct names `serde_json` uses to pass raw JSON text through a serializer
+/// (`RawValue`, and `Number` with `arbitrary_precision`): text this module cannot order.
+const RAW_PREFIX: &str = "$serde_json::private::";
 
 /// Serializes into a [`Node`], with `serde_json`'s data model (enums externally tagged).
 struct NodeSerializer;
@@ -172,6 +182,7 @@ impl ser::Serializer for NodeSerializer {
         if !v.is_finite() {
             return Err(CanonicalError(format!("{v} is not a JSON number")));
         }
+        let v = if v == 0.0 { 0.0 } else { v };
         let s = serde_json::to_string(&v).map_err(|e| CanonicalError(e.to_string()))?;
         Ok(Node::Number(s))
     }
@@ -256,7 +267,12 @@ impl ser::Serializer for NodeSerializer {
             key: None,
         })
     }
-    fn serialize_struct(self, _name: &'static str, len: usize) -> Result<MapNode, CanonicalError> {
+    fn serialize_struct(self, name: &'static str, len: usize) -> Result<MapNode, CanonicalError> {
+        if name.starts_with(RAW_PREFIX) {
+            return Err(CanonicalError(
+                "raw JSON text has no canonical form; convert it to a typed value".into(),
+            ));
+        }
         Ok(MapNode {
             members: Vec::with_capacity(len),
             key: None,
@@ -652,5 +668,31 @@ mod tests {
             }
         }
         assert!(CanonicalJson::of(&FloatKeys(by_float)).is_err());
+    }
+
+    #[test]
+    fn negative_zero_is_zero() {
+        assert_eq!(canon(&-0.0_f64), "0.0");
+        assert_eq!(canon(&-0.0_f32), "0.0");
+        let parsed: f64 = serde_json::from_str("-0.0").unwrap();
+        assert_eq!(canon(&parsed), canon(&0.0_f64));
+    }
+
+    /// A `RawValue` carries JSON text that the canonical form cannot order: refused, at the
+    /// top and inside a typed value.
+    #[test]
+    fn raw_value_is_refused() {
+        #[derive(Serialize)]
+        struct Args {
+            n: u8,
+            inner: Box<serde_json::value::RawValue>,
+        }
+        let raw = |s: &str| serde_json::value::RawValue::from_string(s.to_owned()).unwrap();
+        assert!(CanonicalJson::of(raw(r#"{"b":2,"a":1}"#).as_ref()).is_err());
+        let typed = Args {
+            n: 1,
+            inner: raw(r#"{"b":2,"a":1}"#),
+        };
+        assert!(CanonicalJson::of(&typed).is_err());
     }
 }
