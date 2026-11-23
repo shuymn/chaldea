@@ -116,13 +116,14 @@ async fn observe(
     let idle_w = idle.clone();
     let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let sent_w = sent.clone();
-    // A failed write completes only once the reader has seen the connection end, so the
-    // send error always comes in after the end, as it can when the server closes.
-    let (ended, mut ended_w) = tokio::sync::watch::channel(false);
+    // A failed write completes only once the collector below has started its bounded wait
+    // for the writer, so the send error always comes in after the end was seen, as it can
+    // when the server closes, and only a collector that waits gets it.
+    let (joining, mut joining_w) = tokio::sync::watch::channel(false);
     let writer = tokio::spawn(async move {
         let record = |n: usize| sent_w.fetch_add(n, std::sync::atomic::Ordering::SeqCst);
         let mut failed = async |e: io::Error| {
-            let _ = ended_w.wait_for(|e| *e).await;
+            let _ = joining_w.wait_for(|j| *j).await;
             Some(e.kind())
         };
         match body {
@@ -175,7 +176,6 @@ async fn observe(
             Ok(Err(e)) => break End::Reset(e.kind()),
         }
     };
-    let _ = ended.send(true);
     let elapsed = replied_at.unwrap_or_else(|| first.elapsed());
     // A writer still sending once the connection ended gets its error soon: wait for it
     // (at most 1 s), then abort a writer still pending (a dropped pending write).
@@ -183,6 +183,7 @@ async fn observe(
     let ended = matches!(end, End::Eof | End::Reset(_));
     let sending = !idle.load(std::sync::atomic::Ordering::SeqCst);
     let waited = if sending && ended {
+        let _ = joining.send(true);
         tokio::time::timeout(Duration::from_secs(1), &mut writer)
             .await
             .ok()
