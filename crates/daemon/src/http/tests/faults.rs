@@ -100,6 +100,18 @@ async fn pass(slot: &Mutex<Option<Gate>>) -> bool {
     true
 }
 
+/// Passes a gate as [`pass`], but waits until the release is used or dropped, never on a
+/// timer: for gates whose test result depends on the waiter not going on by itself.
+async fn pass_held(slot: &Mutex<Option<Gate>>) -> bool {
+    let gate = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+    let Some((reached, release)) = gate else {
+        return false;
+    };
+    let _ = reached.send(());
+    let _ = release.await;
+    true
+}
+
 /// The armed hook if its skip count is used up; otherwise counts one skip.
 fn take(slot: &Mutex<Option<(usize, Hook)>>) -> Option<Hook> {
     let mut s = slot.lock().unwrap_or_else(PoisonError::into_inner);
@@ -180,13 +192,14 @@ impl Points {
             .clone()
     }
 
-    /// Arms the submit gate, as [`Points::arm_removal_gate`].
+    /// Arms the submit gate, as [`Points::arm_removal_gate`], except that the submission
+    /// goes on only when the returned sender is used or dropped (no 20 s release).
     pub(crate) fn arm_submit_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         arm(&self.submit_gate)
     }
 
     pub(crate) async fn before_submit(&self) {
-        pass(&self.submit_gate).await;
+        pass_held(&self.submit_gate).await;
     }
 
     pub(crate) fn submits(&self) -> usize {
