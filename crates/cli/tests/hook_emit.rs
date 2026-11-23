@@ -98,9 +98,22 @@ struct Stub {
     port: u16,
     reqs: Arc<Mutex<Vec<Req>>>,
     accepted: Arc<AtomicUsize>,
+    /// Connections whose handler finished (a request read, held, or none).
+    handled: Arc<AtomicUsize>,
+    /// Accept passes that found the backlog empty.
+    idle: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     held: Arc<Mutex<Vec<TcpStream>>>,
     accept: Option<JoinHandle<()>>,
+}
+
+/// Counts its connection as handled when `serve` ends, whatever the path.
+struct Handled(Arc<AtomicUsize>);
+
+impl Drop for Handled {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl Stub {
@@ -115,25 +128,40 @@ impl Stub {
         let port = listener.local_addr().unwrap().port();
         let reqs = Arc::new(Mutex::new(Vec::new()));
         let accepted = Arc::new(AtomicUsize::new(0));
+        let handled = Arc::new(AtomicUsize::new(0));
+        let idle = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let held = Arc::new(Mutex::new(Vec::new()));
         let script = script.to_vec();
         let t0 = Instant::now();
         let accept = {
-            let (reqs, accepted, stop, held) =
-                (reqs.clone(), accepted.clone(), stop.clone(), held.clone());
+            let (reqs, accepted, handled, idle, stop, held) = (
+                reqs.clone(),
+                accepted.clone(),
+                handled.clone(),
+                idle.clone(),
+                stop.clone(),
+                held.clone(),
+            );
             std::thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((s, _)) => {
+                            // Stamped at the accept, not in the handler.
+                            let at = t0.elapsed();
                             let i = accepted.fetch_add(1, Ordering::SeqCst);
                             let reply = script[i.min(script.len() - 1)];
                             let (reqs, held) = (reqs.clone(), held.clone());
+                            let done = Handled(handled.clone());
                             std::thread::spawn(move || {
-                                serve(s, reply, t0.elapsed(), walk, &reqs, &held);
+                                let _done = done;
+                                serve(s, reply, at, walk, &reqs, &held);
                             });
                         }
-                        Err(_) => std::thread::sleep(POLL),
+                        Err(_) => {
+                            idle.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(POLL);
+                        }
                     }
                 }
             })
@@ -142,6 +170,8 @@ impl Stub {
             port,
             reqs,
             accepted,
+            handled,
+            idle,
             stop,
             held,
             accept: Some(accept),
@@ -169,19 +199,37 @@ impl Stub {
         }
     }
 
-    /// The requests read once every accepted connection was handled (bounded).
-    fn settled(&self) -> Vec<Req> {
+    /// Waits (bounded) until the accept loop has found the backlog empty in a full pass that
+    /// started after this call, so every connection made before it was accepted.
+    fn drain(&self) {
+        let from = self.idle.load(Ordering::SeqCst);
         let end = Instant::now() + WAIT;
-        loop {
-            let held = self.held.lock().unwrap().len();
-            let r = self.reqs();
-            let n = self.accepted.load(Ordering::SeqCst);
-            // A connection is handled once it is a request or held unread.
-            if r.len() + held >= n || Instant::now() >= end {
-                return r;
-            }
+        while self.idle.load(Ordering::SeqCst) < from + 2 {
+            assert!(Instant::now() < end, "the accept loop did not drain");
             std::thread::sleep(POLL);
         }
+    }
+
+    /// The connections accepted, after draining the backlog.
+    fn accepted(&self) -> usize {
+        self.drain();
+        self.accepted.load(Ordering::SeqCst)
+    }
+
+    /// The requests read once the backlog is drained and every accepted connection was
+    /// handled (bounded).
+    fn settled(&self) -> Vec<Req> {
+        self.drain();
+        let end = Instant::now() + WAIT;
+        while self.handled.load(Ordering::SeqCst) < self.accepted.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < end,
+                "connections not handled: {:?}",
+                self.reqs()
+            );
+            std::thread::sleep(POLL);
+        }
+        self.reqs()
     }
 }
 
@@ -283,6 +331,40 @@ fn read_request(s: &mut TcpStream, at: Duration) -> Option<Req> {
         body,
         ancestry: None,
     })
+}
+
+/// The fixture's own accounting: `settled` returns only once every accepted connection was
+/// handled, a request still being read and a connection closed without one included.
+#[test]
+fn stub_settles_after_every_connection_is_handled() {
+    let stub = Stub::start(&[Reply::Silent]);
+    let req = b"POST /hook HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}";
+    let mut first = TcpStream::connect(("127.0.0.1", stub.port)).unwrap();
+    first.write_all(req).unwrap();
+    stub.wait_reqs(1);
+    let second = TcpStream::connect(("127.0.0.1", stub.port)).unwrap();
+    // The second request is written after a delay, so `settled` is called while it is
+    // still being read.
+    let writer = std::thread::spawn(move || {
+        let mut second = second;
+        std::thread::sleep(Duration::from_millis(200));
+        second.write_all(req).unwrap();
+        second
+    });
+    let end = Instant::now() + WAIT;
+    while stub.accepted.load(Ordering::SeqCst) < 2 {
+        assert!(Instant::now() < end);
+        std::thread::sleep(POLL);
+    }
+    assert_eq!(stub.settled().len(), 2);
+    let _second = writer.join().unwrap();
+    // A connection closed without a request is handled too: `settled` does not wait out
+    // its bound.
+    drop(TcpStream::connect(("127.0.0.1", stub.port)).unwrap());
+    let t = Instant::now();
+    assert_eq!(stub.settled().len(), 2);
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    drop(first);
 }
 
 // ---- Running a child ----
@@ -534,7 +616,7 @@ fn slow_write() {
     let stub = Stub::start(&[Reply::NoRead]);
     let r = emit_to(&stub.url(), Stdin::Bytes(vec![b'x'; MIB4]));
     assert_quiet(&r);
-    assert!(stub.accepted.load(Ordering::SeqCst) >= 1);
+    assert!(stub.accepted() >= 1);
 }
 
 #[test]
@@ -562,7 +644,7 @@ fn at_most_three_attempts() {
     assert_quiet(&emit_to(&stub.url(), Stdin::Bytes(PAYLOAD.to_vec())));
     let reqs = stub.settled();
     assert_eq!(one_id_attempts(&reqs), ["1", "2", "3"]);
-    assert_eq!(stub.accepted.load(Ordering::SeqCst), 3);
+    assert_eq!(stub.accepted(), 3);
 }
 
 /// PR9-CL-23 `rejecting`: a final status ends the run.
@@ -572,7 +654,7 @@ fn no_retry_on_401() {
         let stub = Stub::start(&[Reply::Status(code), Reply::Status(200)]);
         assert_quiet(&emit_to(&stub.url(), Stdin::Bytes(PAYLOAD.to_vec())));
         assert_eq!(stub.settled().len(), 1, "{code}");
-        assert_eq!(stub.accepted.load(Ordering::SeqCst), 1, "{code}");
+        assert_eq!(stub.accepted(), 1, "{code}");
     }
 }
 
@@ -600,12 +682,7 @@ fn late_stdin_sends_nothing() {
     );
     assert_quiet(&r);
     assert!(r.elapsed >= Duration::from_millis(1500), "{:?}", r.elapsed);
-    assert_eq!(
-        stub.accepted.load(Ordering::SeqCst),
-        0,
-        "{:?}",
-        stub.settled()
-    );
+    assert_eq!(stub.accepted(), 0, "{:?}", stub.settled());
 }
 
 #[test]
@@ -618,7 +695,7 @@ fn no_request_with_open_stdin() {
         "{:?}",
         r.elapsed
     );
-    assert_eq!(stub.accepted.load(Ordering::SeqCst), 0);
+    assert_eq!(stub.accepted(), 0);
 }
 
 /// Without the exact URL and token the emitter exits at once, before reading stdin (held
@@ -668,7 +745,7 @@ fn no_request_without_env() {
             r.elapsed
         );
     }
-    assert_eq!(stub.accepted.load(Ordering::SeqCst), 0);
+    assert_eq!(stub.accepted(), 0);
     // The control: the same stub with the full environment gets the request.
     assert_quiet(&emit_to(&url, Stdin::Bytes(PAYLOAD.to_vec())));
     assert_eq!(stub.settled().len(), 1);
@@ -1019,5 +1096,5 @@ fn fake_cli_hooks_refuses_a_bad_script() {
     let r = run(&mut cmd, Stdin::Bytes(Vec::new()));
     assert_eq!(r.code, Some(2));
     assert_eq!(reports.wait("script_error", 1).len(), 1);
-    assert_eq!(stub.accepted.load(Ordering::SeqCst), 0);
+    assert_eq!(stub.accepted(), 0);
 }
