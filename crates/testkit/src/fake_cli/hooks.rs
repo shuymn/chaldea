@@ -58,12 +58,14 @@ pub(crate) fn run(o: &Opts) -> i32 {
 
 /// Runs one step; false when the step is not one of the table's.
 fn run_step(o: &Opts, emitter: &str, rep: &Reporter, i: usize, step: &Value) -> bool {
-    if let Some(p) = step.get("emit") {
-        for r in emit_all(emitter, &o.agent, std::slice::from_ref(p)) {
-            report_emitted(rep, &json!(i), r.as_ref());
-        }
-    } else if let Some(Value::Array(ps)) = step.get("concurrent") {
-        for r in emit_all(emitter, &o.agent, ps) {
+    // `emit` (whatever its value) wins over `concurrent`, which counts only as an array.
+    let payloads = match (step.get("emit"), step.get("concurrent")) {
+        (Some(p), _) => Some(std::slice::from_ref(p)),
+        (None, Some(Value::Array(ps))) => Some(ps.as_slice()),
+        _ => None,
+    };
+    if let Some(payloads) = payloads {
+        for r in emit_all(emitter, &o.agent, payloads) {
             report_emitted(rep, &json!(i), r.as_ref());
         }
     } else if let Some(steps @ Value::Array(_)) = step.get("nested") {
