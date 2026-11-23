@@ -27,10 +27,10 @@ use super::append::{EVENT_COLUMNS, RawRow};
 use super::error::{ReadError, StoreError};
 use super::lock;
 use super::rows::{
-    ApprovalRow, BlobBody, BufferedDelivery, BufferedHook, HookDelivery, HookReply, InputRow,
-    LaunchRow, Routing, SchemaInfo, SurfaceRow, ThreadRow, TokenKind, TokenRow, TranscriptCursor,
-    WorktreeRow, command_result, enum_text, opt_u64, opt_uuid, parse_enum, parse_json, parse_uuid,
-    to_u64,
+    ApprovalRow, BlobBody, BufferedDelivery, BufferedHook, BufferedSummary, HookDelivery,
+    HookReply, InputRow, LaunchRow, Routing, SchemaInfo, SurfaceRow, ThreadRow, TokenKind,
+    TokenRow, TranscriptCursor, WorktreeRow, command_result, enum_text, opt_u64, opt_uuid,
+    parse_enum, parse_json, parse_uuid, to_u64,
 };
 
 /// One page of a stream, as `core::sync::EventsResponse::Replay` carries it.
@@ -1247,6 +1247,67 @@ impl<'a> ReadTx<'a> {
                     })
                 })
                 .collect()
+        })
+    }
+
+    /// The launch's buffered deliveries: their count, the summed length of their bodies, and
+    /// the earliest `received_at` (no body is read).
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub fn buffered_summary(&self, l: LaunchId) -> Result<BufferedSummary, StoreError> {
+        self.guard(|| {
+            let (count, bytes, earliest): (i64, i64, Option<String>) = sql(self.conn.query_row(
+                "SELECT count(*), coalesce(sum(length(pending_body)), 0), min(received_at)
+                 FROM hook_deliveries WHERE launch_id = ?1 AND routing = 'buffered'",
+                [l.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ))?;
+            Ok(BufferedSummary {
+                count: to_u64(count)?,
+                body_bytes: to_u64(bytes)?,
+                earliest_received_at: earliest.map(Timestamp),
+            })
+        })
+    }
+
+    /// The largest `receipt_ordinal` of the launch's deliveries; 0 when it has none.
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub fn max_receipt_ordinal(&self, l: LaunchId) -> Result<u64, StoreError> {
+        self.guard(|| {
+            let max: i64 = sql(self.conn.query_row(
+                "SELECT coalesce(max(receipt_ordinal), 0) FROM hook_deliveries WHERE launch_id = ?1",
+                [l.to_string()],
+                |r| r.get(0),
+            ))?;
+            to_u64(max)
+        })
+    }
+
+    /// The `receipt_ordinal` of the delivery whose primary event is the launch's
+    /// `session_bound`; `None` when the launch is unbound or was bound by another writer.
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub fn binding_receipt_ordinal(&self, l: LaunchId) -> Result<Option<u64>, StoreError> {
+        self.guard(|| {
+            let ordinal: Option<i64> = sql(self
+                .conn
+                .query_row(
+                    "SELECT d.receipt_ordinal FROM hook_deliveries d
+                     JOIN events e ON e.stream_id = d.stream_id AND e.seq = d.seq
+                     WHERE d.launch_id = ?1 AND d.routing = 'appended'
+                       AND e.kind = 'session_bound' AND e.launch_id = ?1",
+                    [l.to_string()],
+                    |r| r.get(0),
+                )
+                .optional())?;
+            ordinal.map(to_u64).transpose()
         })
     }
 

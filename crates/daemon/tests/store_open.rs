@@ -103,7 +103,7 @@ fn refuses_newer_schema() {
             r,
             Err(OpenError::NewerSchema {
                 found: 99,
-                supported: 1
+                supported: 2
             })
         ),
         "{:?}",
@@ -121,7 +121,7 @@ fn refuses_altered_schema() {
         .execute_batch("DROP TRIGGER events_no_update")
         .unwrap();
     match open(&s.path()) {
-        Err(OpenError::SchemaMismatch { version: 1, names }) => {
+        Err(OpenError::SchemaMismatch { version: 2, names }) => {
             assert!(names.contains(&"events_no_update".to_owned()), "{names:?}");
         }
         other => panic!("{:?}", other.err()),
@@ -173,7 +173,7 @@ fn sqlite_version_is_bundled() {
     )]
     let info = s.read(|r| r.schema_info());
     assert_eq!(info.sqlite_version, "3.54.1");
-    assert_eq!(info.user_version, 1);
+    assert_eq!(info.user_version, 2);
     assert_eq!(info.application_id, 0x4348_4C44);
 }
 
@@ -493,4 +493,71 @@ fn shutdown_closes_commit_notifications_with_a_live_clone() {
         notifications.try_recv(),
         Err(TryRecvError::Closed)
     ));
+}
+
+/// A v1 store (a v2 store without the v2 trigger, at `user_version` 1, which the v1
+/// fingerprint accepts) opens as v2 with every row unchanged, consistent projections, and
+/// the trigger in force (`docs/design/hook-ingest.md` §2.12).
+#[test]
+fn v1_upgrades_to_v2() {
+    use chaldea_core::payload::Content;
+    use chaldea_daemon::store::{
+        BufferedHook, HookReply, NewHookDelivery, NewRouting, StoreError, WriteError,
+    };
+    use support::{bound, bound_thread, launch, raw_unknown, reserved};
+
+    let mut s = TestStore::new();
+    let (t1, l1) = (thread(1), launch(1));
+    let (t2, l2) = (thread(2), launch(2));
+    bound_thread(&s, t1, l1, Some("/work/t/a.jsonl"));
+    s.append(vec![registered(t2, false)]).unwrap();
+    s.append(vec![reserved(t2, l2)]).unwrap();
+    let reply = |b: &str| HookReply {
+        http_status: 200,
+        body: b.into(),
+    };
+    let deliveries = vec![
+        NewHookDelivery {
+            launch_id: l1,
+            emit_id: uuid::Uuid::from_u128(1),
+            receipt_ordinal: 1,
+            first_reply: reply(""),
+            routing: NewRouting::Appended(vec![raw_unknown(
+                StreamId::Thread(t1),
+                "hook:1",
+                Content::text("one"),
+            )]),
+        },
+        NewHookDelivery {
+            launch_id: l2,
+            emit_id: uuid::Uuid::from_u128(2),
+            receipt_ordinal: 1,
+            first_reply: reply(""),
+            routing: NewRouting::Buffered(BufferedHook {
+                body: b"{\"hook_event_name\":\"Stop\"}".to_vec(),
+                meta: "{\"v\":1}".into(),
+            }),
+        },
+    ];
+    for d in deliveries {
+        s.run(move |tx| Ok(tx.hook_delivery_record(d)?)).unwrap();
+    }
+    s.shutdown();
+    Connection::open(s.path())
+        .unwrap()
+        .execute_batch("DROP TRIGGER events_session_bound_once; PRAGMA user_version = 1")
+        .unwrap();
+    let before = support::http::dump(&s.path());
+
+    s.reopen();
+    assert_eq!(support::http::dump(&s.path()), before, "a v1 row changed");
+    assert_eq!(s.read(|r| Ok(r.schema_info()?.user_version)), 2);
+    let diff = s.run(|tx| Ok(tx.verify_projections()?)).unwrap();
+    assert!(diff.is_empty(), "{diff:?}");
+    // The v2 trigger is in force: a second binding of l1 is refused.
+    let r = s.append(vec![bound(t1, l1, "s2", None)]);
+    assert!(
+        matches!(&r, Err(WriteError::RolledBack(StoreError::Constraint(m))) if m.contains("session_bound")),
+        "{r:?}"
+    );
 }

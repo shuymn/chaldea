@@ -22,6 +22,51 @@ fn golden_json() {
         serde_json::from_str::<EventAnnex>(json).unwrap(),
         transcript
     );
+    let hook = EventAnnex::Hook { truncated: true };
+    let json = r#"{"hook":{"truncated":true}}"#;
+    assert_eq!(serde_json::to_string(&hook).unwrap(), json);
+    assert_eq!(serde_json::from_str::<EventAnnex>(json).unwrap(), hook);
+}
+
+/// The hook annex is accepted only on a `raw_unknown` whose source kind is `hook`.
+#[test]
+fn hook_annex_only_on_a_hook_raw_unknown() {
+    use chaldea_core::ids::StreamId;
+    use chaldea_core::payload::{Content, Encoding, SourceKind};
+
+    use super::support::{TestStore, raw_unknown, registered, source, thread};
+    use crate::store::{AnnexError, StoreError, WriteError};
+
+    let s = TestStore::new();
+    let t = thread(1);
+    s.append(vec![registered(t, false)]).unwrap();
+    let raw = || Content::Inline {
+        inline: "x".into(),
+        encoding: Encoding::Utf8,
+    };
+    let mut ok = raw_unknown(StreamId::Thread(t), "hook:1", raw());
+    ok.source = source(SourceKind::Hook);
+    ok.annex = Some(EventAnnex::Hook { truncated: true });
+    s.append(vec![ok])
+        .expect("a hook raw_unknown takes the annex");
+    let unexpected = |r: Result<_, WriteError>, what: &str| {
+        assert!(
+            matches!(
+                r,
+                Err(WriteError::RolledBack(StoreError::Annex(
+                    AnnexError::Unexpected(_)
+                )))
+            ),
+            "{what}: {r:?}"
+        );
+    };
+    let mut daemon = raw_unknown(StreamId::Thread(t), "hook:2", raw());
+    daemon.annex = Some(EventAnnex::Hook { truncated: true });
+    unexpected(s.append(vec![daemon]), "a daemon-sourced raw_unknown");
+    let mut other = registered(thread(2), false);
+    other.source = source(SourceKind::Hook);
+    other.annex = Some(EventAnnex::Hook { truncated: false });
+    unexpected(s.append(vec![other]), "another kind");
 }
 
 /// A counted set has one spelling: the fixed order, no repeats, known classes only.

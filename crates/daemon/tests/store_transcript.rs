@@ -137,12 +137,20 @@ fn same_path_swapped_file() {
     );
 }
 
-/// A batch read before the launch rebound to another path is refused (StaleBinding).
+/// A batch read before the thread bound its next launch to another path is refused
+/// (StaleBinding).
 #[test]
 fn old_batch_after_rebind_is_refused() {
     let s = TestStore::new();
     let (t, l) = with_lines(&s);
-    s.append(vec![bound(t, l, "s2", Some(B))]).unwrap();
+    let l2 = launch(2);
+    s.append(vec![
+        exited(t, l),
+        reserved(t, l2),
+        started(t, l2),
+        bound(t, l2, "s2", Some(B)),
+    ])
+    .unwrap();
     let n = head(&s, t);
     let mut b = batch(t, l, A, Some(pos(1, A, "f1", 20)));
     b.lines = vec![line(20, 30, "late")];

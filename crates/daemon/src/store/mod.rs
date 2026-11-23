@@ -64,7 +64,7 @@ pub use content::{ContentError, MAX_BLOB_BYTES, Prepared, prepare_content};
 pub use error::{OpenError, ProjectionError, ReadError, StoreError};
 pub use readers::{Page, ReadTx};
 pub use rows::{
-    ApprovalRow, Binding, BlobBody, BufferedDelivery, BufferedHook, HookDelivery,
+    ApprovalRow, Binding, BlobBody, BufferedDelivery, BufferedHook, BufferedSummary, HookDelivery,
     HookDeliveryLookup, HookReply, InputRow, LaunchRow, ProjectionDiff, RebuildReport, Routing,
     SchemaInfo, SurfaceRow, ThreadRow, TokenKind, TokenRow, TranscriptCursor, WorktreeRow,
 };
