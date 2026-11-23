@@ -1,0 +1,883 @@
+# Design: Daemon Lifecycle (MVP PR 8)
+
+Status: design. Scope is the PR 8 row of `docs/mvp-design.md` §4 (cited as "mvp §N"): `chaldea daemon run`, `daemon start` (detached: a launchd job on a macOS GUI host, `setsid` without a GUI domain, `DETACHED_PROCESS` on Windows), `daemon stop`, the parent kill-on-close job check on Windows, and the obligations handed to PR 8 by mvp §4 "PR 8", `docs/design/event-store.md` (cited as "store §N") §2.4, §4, §5, `docs/design/http-surface.md` (cited as "http §N") §2.2, §2.4, §2.10, §2.11, §4, and `docs/design/formal-specs.md` §7.4 "PR 8". It also adds `chaldea open` (mvp §2.5 "Secrets", http §8 D12), the first client of the files this PR defines.
+
+**What PR 8 decides and what it leaves.** PR 8 owns the process: its CLI entry, the state directory and the files in it, the single-instance lock, discovery, the port, the owner token file, startup order, the one shutdown decision and its budget, detaching and the readiness handshake, the Windows parent job check, the process-wide signal state, logging, and the panic hook. It does not decide hook ingest (PR 9), launches, the supervisor, or the restart scan of launches and inputs (PR 10), attach (PR 11), the PWA (PR 18), or the doctor (PR 21); for each it provides the seam of §2.14 and §4. No public type of `crates/core` changes, and no public contract of mvp changes; the public names this PR adds are §8 D14.
+
+**Commitments from PR 6 and PR 7 this design keeps.**
+
+1. `Store::shutdown` blocks its thread; the daemon calls it off the executor's worker threads, once, inside the one shutdown budget, after `ServeHandle::shutdown` (store §4 row 8; http §4 row 8).
+2. The single-instance lock is released in-process only when the store's report says both `readers_returned` and `writer_exited` (an abandoned reader still holds a SQLite connection and its snapshot); otherwise the process exits holding it, and the OS releases it (store §5 "Normal shutdown").
+3. The DB files are touched in-process only when both `readers_returned` and `writer_exited` hold; PR 8 touches them in no case after shutdown (no delete, copy, or checkpoint of its own).
+4. `receipts_mark_unknown_after_crash` runs before the HTTP server serves (mvp §2.4 "Restart"; formal-specs §7.4 "PR 8").
+5. Every `LifecycleSink::store_fatal` (`CommitUnknown`, `WriterGone`, `Failed`, `ReceiptUncompleted`) stops the daemon (http §2.2).
+6. Every diagnostic the process writes goes through `trace::redact_secrets`, and the panic hook omits the panic payload (http §2.10).
+
+Sources read for this document (paths are relative to each root):
+
+| Source | Revision | Read for |
+|---|---|---|
+| This repository | `3df7c70` | `docs/architecture.md`, `docs/mvp-design.md`, `docs/prior-art.md` rows 1a–1c, 8, 9, `docs/design/{event-store,http-surface,formal-specs,pty-runtime,pty-unix,pty-windows}.md`, `docs/spikes/pty-hooks-spike.md` (C-5), `spikes/pty-hooks/src/os/windows.rs`, `crates/daemon/src/{lib.rs,http/{mod,auth,routes,trace,registry,ctx}.rs,store/{mod,error,open,writer,write_tx}.rs}`, `crates/pty-runtime/src/{lib,spawn,fake}.rs`, `src/{unix,windows}/sys.rs`, `Cargo.toml`, `Cargo.lock`, `.github/workflows/ci.yml` |
+| Rust std | 1.96.0 `rust-src` | `fs.rs` (file locks, `hard_link`), `sys/fs/{unix,windows}.rs`, `sys/net/connection/socket/mod.rs`, `os/unix/process.rs`, `env.rs` |
+| `tokio` | crate 1.54.1 | `Cargo.toml` (`signal` feature), `src/signal/unix.rs`, `src/signal/windows/sys.rs` |
+| `tracing-subscriber` | crate 0.3.23 | `src/fmt/fmt_layer.rs` |
+| `rustix` | crate 1.1.6 | `src/process/{id,kill}.rs` |
+| `clap` | crate 4.6.8 (`clap_builder` 4.6.7) | `Cargo.toml` (pins, features, rust-version), `src/error/mod.rs` |
+| `windows-sys` | crate 0.61.2 | `Win32/{UI/Shell,System/{Threading,Console,JobObjects},Security,Security/Authorization,Storage/FileSystem}/mod.rs` |
+| macOS SDK | Command Line Tools SDK | `usr/include/sys/{acl,un}.h` |
+| herdr (`herdrdev/herdr`) | `e8d7d97` | `src/platform/windows.rs`, `src/platform/macos/launchd_spawn.rs`, `src/server/{autodetect,shutdown}.rs` |
+| T3 Code (`pingdotgg/t3code`, sparse `apps/server/src`) | `dc2f73a` | `serverOwnership.ts`, `serverRuntimeState.ts`, `config.ts`, `server.ts` |
+| Microsoft Learn | 2026-11-23 | "Nested Jobs", "QueryInformationJobObject", "Process Creation Flags", "LockFileEx", "HandlerRoutine", "SetConsoleCtrlHandler", "GenerateConsoleCtrlEvent", "Kernel object namespaces", "Mandatory Integrity Control", "ACE inheritance rules" |
+
+**Facts this design relies on.** T-facts are exercised by named tests of §7; D-facts rest on the cited source and are not re-proven here.
+
+| # | Fact | Where | Kind |
+|---|---|---|---|
+| L1 | `File::try_lock` (stable since 1.89) is `flock(LOCK_EX \| LOCK_NB)` on Apple targets and `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK \| LOCKFILE_FAIL_IMMEDIATELY)` over the whole range on Windows; a held lock is `TryLockError::WouldBlock`; `unlock` releases it; it is also released when the file and every handle duplicated or inherited from it is closed. std opens files close-on-exec on Unix and non-inheritable on Windows. | std `fs.rs:940-985`, `:1084`; `sys/fs/unix.rs:1542-1553`; `sys/fs/windows.rs:458-478` | T (PR8-CL-3) |
+| L2 | A Windows byte-range lock blocks reads of the locked range by other handles; the OS releases a terminated process's locks, "the time it takes … depends upon available system resources", with no stated bound. | Microsoft, "LockFileEx" remarks | D (why the lock file holds no data and acquisition retries, §2.5) |
+| L3 | `std::net::TcpListener::bind` sets `SO_REUSEADDR` on Unix and deliberately not on Windows (socket hijacking). | std `sys/net/connection/socket/mod.rs:545-556` | D |
+| L4 | std on Windows opens files with `FILE_SHARE_READ \| WRITE \| DELETE` by default; `fs::rename` is `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` and, on `ERROR_ACCESS_DENIED`, retries through `SetFileInformationByHandle(FileRenameInfoEx)` on a handle opened with `FILE_FLAG_OPEN_REPARSE_POINT`. `fs::hard_link` is `linkat(…, 0)` on macOS and `CreateHardLinkW` on Windows; both fail when the new name exists. | std `sys/fs/windows.rs:206`, `:1311-1330`, `:1451`; `sys/fs/unix.rs:2137-2160` | T (PR8-CL-2, CL-1's marker case) |
+| L5 | `CommandExt::setsid` is unstable; `rustix::process::{setsid, getsid, geteuid, kill_process}` are safe; `CommandExt::process_group` is stable. | std `os/unix/process.rs:206`, `:220-221`; rustix `process/id.rs:53`, `:215`, `:234`, `process/kill.rs:16` | D |
+| L6 | tokio's Unix signal handler records the event and writes one byte to a nonblocking pipe (`signal/unix.rs:252-259`), registered through `signal-hook-registry` (`:286`). Its Windows handler returns at once for Ctrl-C and Ctrl-Break and never returns for close, logoff, and shutdown events, so the process lives until it exits or the system's timeout (`signal/windows/sys.rs`, `SignalKind::terminates`, `handler`). The `signal` feature adds `signal-hook-registry` (already in the lock) and `windows-sys/Win32_System_Console` (`Cargo.toml:122-130`). | tokio 1.54.1 | T (PR8-CL-9) for the Unix signals, Ctrl-C, and Ctrl-Break; D for the close, logoff, and shutdown handler (CL-10 injects the console end, since `GenerateConsoleCtrlEvent` sends only Ctrl-C and Ctrl-Break) |
+| L7 | Windows terminates a process whose handler has not returned for `CTRL_CLOSE_EVENT` after a timeout (about 5 s); logoff and shutdown events reach console applications only in some configurations, so their delivery is best effort. The Ctrl-C ignore attribute set by `SetConsoleCtrlHandler(NULL, TRUE)` is inherited by child processes. | Microsoft, "HandlerRoutine", "SetConsoleCtrlHandler" | D (why a console end is a crash exit, §2.8) |
+| L8 | `tracing-subscriber`'s fmt layer formats one event into a buffer and writes it with one `write_all` to a writer made for that event. | `fmt/fmt_layer.rs:1019-1050` | T (PR8-CL-20) |
+| L9 | herdr checks `IsProcessInJob` plus `QueryInformationJobObject(NULL, JobObjectExtendedLimitInformation)` for `KILL_ON_JOB_CLOSE` (`platform/windows.rs:1665-1685`), launches its server through WMI `Win32_Process.Create` when that holds and otherwise with `DETACHED_PROCESS` (`:1515-1521`, `:1687-1691`), and counts a server as detached when it has no console window and is not in a kill-on-close job (`:1693-1700`). Its starter polls for readiness every 50 ms for up to 15 s (`server/autodetect.rs:20-23`, `:262-293`). | herdr | D |
+| L10 | On macOS a process started from a terminal app stays in that app's launchd job and resource coalition after `setsid`, and quitting the app kills it (herdr#4920). herdr submits its server as a one-shot job in the user's GUI launchd domain (`launchctl bootstrap gui/<uid> <plist>` from a private directory); the job process forks the real server into its own session and exits, so the server has a coalition of its own and is not a running GUI job; it uses a direct spawn over SSH or without a GUI domain, rejects values a plist would alter, and removes only its own finished jobs, leaving recent ones out of its scavenging. | herdr `platform/macos/launchd_spawn.rs:1-59`, `:61-88`, `:151-186`, `:197-300` | D (coalition and app-quit survival are real-host checks, §7) |
+| L11 | T3 Code's ownership lock is an exclusive transaction on a file that is never unlinked, released by the OS when the process exits (`serverOwnership.ts:174-208`); its runtime record carries a random `ownerId` and is cleared only when it still names the clearing server (`:237-264`); the record is written atomically (`serverRuntimeState.ts:87-103`); readers drop a record whose pid is dead before sending credentials (`:195-207`); a stop request makes the server stop as a `SIGTERM` would (`server.ts:722-723`). | T3 Code | D |
+| L12 | The spike's detached launch uses `DETACHED_PROCESS \| CREATE_BREAKAWAY_FROM_JOB \| CREATE_NEW_PROCESS_GROUP` and retries without breakaway on `ERROR_ACCESS_DENIED` (`spikes/pty-hooks/src/os/windows.rs:696-708`); its C-5 terminal-close survival passed on one host (spike §3, `59bc61b8`). | spike | D |
+| L13 | `IsProcessInJob(process, NULL)` reports membership in any job; with a `NULL` job handle `QueryInformationJobObject` reports only the immediate job when jobs are nested, and no API names the parent job. `CREATE_BREAKAWAY_FROM_JOB` requires `JOB_OBJECT_LIMIT_BREAKAWAY_OK` on the job; with `SILENT_BREAKAWAY_OK` children break away without the flag. A child that breaks away leaves every job up the chain until one that does not allow breakaway, and stays in that one. | Microsoft, "QueryInformationJobObject", "Process Creation Flags", "Nested Jobs" | T (PR8-CL-11, CL-12) |
+| L14 | Inside a kill-on-close job without breakaway, a PTY spawn takes the job-list branch nested under it; a parent job with UI limits also nested on `windows-latest` (A13 falsified); refusal of nesting is reachable only by injection, and makes spawns fail without an uncontained child. | `docs/design/pty-windows.md` §2.5 "Daemon inside a job", A13, PR4-CL-27 | T (PR 4) |
+| L15 | Ignored signal dispositions and the signal mask survive `execve`, so a daemon started by a parent that ignores `SIGCHLD` or blocks `SIGTERM` inherits that. | POSIX `execve` | T (PR8-CL-17) |
+| L16 | The merged PR 6 / PR 7 seams: `StoreConfig`, `ShutdownReport { readers_returned, readers_abandoned, writer_exited, jobs_run, jobs_expired, checkpoint }`, `Store::open`, `Store::shutdown(deadline)` (its timed waits end by the deadline and the owner detaches the writer thread; synchronous work around them can outlive it, so a caller caps its own wait), `WriteTx::receipts_mark_unknown_after_crash`, the commit fault `CommitFault::IoErrAfterCommit`; `HttpConfig::new(port)`, `LifecycleSink`, `StoreFatal`, `HttpServer::new(cfg, store, sink, mounts)` (four arguments; 7c adds the `CommandRegistry`, http §2.2), `serve`, `tokens`, `ServeHandle::shutdown(deadline)` (waits until the deadline, then requests abort of the remaining tasks and returns), `HttpShutdownReport { exited, abort_requested }`, `TokenService` (`Clone`), `TokenService::issue_owner`, `http::verify_secret_in` and `AuthFailure::{Invalid, Store}`, `trace::redact_secrets`, `Mounts::{mvp, with}`. `Store`'s `Drop` without `shutdown` lets the writer finish on its own. | `crates/daemon/src/store/mod.rs:72`, `:261`, `:430`, `:508-560`, `:599-610`; `store/writer.rs:136`, `:416`; `store/write_tx.rs:846`; `http/mod.rs:159`, `:182-197`, `:259`, `:290`, `:329-350`; `http/auth.rs:133-136`, `:186`, `:225`, `:276`; `http/trace.rs:51`; `http/routes.rs:439`, `:484` | D |
+| L17 | `pty-runtime` already looks up process identities on both OSes (`fake::identify`, `fake.rs:705`, `:748`; macOS `proc_pidinfo`, `unix/sys.rs:198-230`) and calls `IsProcessInJob` and `QueryInformationJobObject` (`windows/sys.rs:25-28`, `:188-256`); `unsafe` is allowed only in its `unix::sys` and `windows::sys` (`docs/design/pty-unix.md` §2.7). | this repository | D |
+| L18 | clap 4.6.8 pins `clap_builder =4.6.7` and `clap_derive =4.6.8` and needs Rust 1.85; its `default` features are `std, color, help, usage, error-context, suggestions`. `Parser::try_parse` returns a `clap::Error` whose `render()` gives the message and whose `exit_code()` gives the status, without printing. | clap `Cargo.toml:14`, `:108-131`, `:512-517`; `clap_builder` `error/mod.rs:233`, `:300` | D; T for the redaction of parse errors (PR8-CL-20) |
+| L19 | Creating a named event in `Global\` needs no privilege (only file mappings and symbolic links need `SeCreateGlobalPrivilege`), and `Global\` is shared by every session, while `Local\` is per session. Mandatory Integrity Control's default `NO_WRITE_UP` denies a medium-integrity process write access (such as `EVENT_MODIFY_STATE`) to an object created by an elevated process, whatever its DACL. | Microsoft, "Kernel object namespaces", "Mandatory Integrity Control" | D (cross-session reach is a real-host check, §7) |
+| L20 | `acl_get_link_np(path, ACL_TYPE_EXTENDED)` reads a file's extended ACL without following a final symlink, and `acl_get_fd_np` reads an open file's. A Unix socket path on Darwin fits in `sun_path[104]`, including its terminating NUL. | `sys/acl.h:102`, `:199`; `sys/un.h:79` | D |
+| L21 | `ShellExecuteExW` with `lpVerb = "open"` hands a URL to its registered handler (the default browser for `http`); the structure needs the `Win32_System_Registry` feature. | windows-sys `UI/Shell/mod.rs:756`, `:5129`, `:5714-5735` | D (browser delivery and the fragment are real-host checks, §7) |
+| L22 | A protected DACL (`SE_DACL_PROTECTED`, the `P` flag in SDDL) blocks inheritable ACEs of the parent from flowing into the object, so an object created with `SECURITY_ATTRIBUTES` whose DACL is protected has exactly that DACL; an unprotected explicit DACL would still receive inherited ACEs. | Microsoft, "ACE inheritance rules" | T (PR8-CL-1, CL-2, CL-21 read back the descriptor) |
+| L23 | `launchctl print gui/<uid>` exits 0 when the user's GUI domain exists, and exits 112 with "Could not find domain for user gui: <uid>" when it does not. | observed on macOS (Darwin 25.6) with an existing and a non-existent uid | D, with the classifier unit-tested over both outputs (PR8-CL-13) |
+
+## 1. Goal and Dependencies
+
+**Goal.** A `chaldea` binary whose `daemon run` holds one state directory exclusively, reconciles the store before anything can reach it, serves PR 7's HTTP surface on `127.0.0.1:<port>`, publishes where it listens and an owner token for the user's CLI, and ends on every trigger through one shutdown with one budget, releasing the lock only after the store's writer and readers have finished; `daemon start` runs it detached from the launching terminal (macOS GUI host: outside the terminal app's launchd job and session; macOS without a GUI domain: in its own session; Windows: outside its console and every job) and reports readiness or the reason it failed within a deadline; `daemon stop` stops it, during startup too, through an OS mechanism. Every claim of §6 has a test on `macos-latest` and `windows-latest`, or names why it is single-OS or a real-host check.
+
+**Files.**
+
+```
+crates/cli/Cargo.toml                       # chaldea-cli, [[bin]] name = "chaldea"; [lints] workspace = true (forbid unsafe)
+crates/cli/clippy.toml                      # disallowed-methods: Command::{spawn, output, status} (§2.11)
+crates/cli/src/main.rs                      # internal entries, process setup once (§2.3), argv parsing, exit
+crates/cli/src/args.rs                      # clap derive: global --state-dir; daemon {run,start,stop}; open
+crates/cli/src/daemon_cmd.rs                # run, start (detach + handshake), stop
+crates/cli/src/open.rs                      # chaldea open, with its launcher seam
+crates/cli/src/client.rs                    # discovery read + liveness, owner token read, one-request HTTP/1.1 client (std)
+crates/cli/src/spawn.rs                     # spawn_locked: the one place the CLI creates a child
+crates/cli/tests/daemon_{run,start,stop,signals,panic,open,files}.rs   # the real binary (CARGO_BIN_EXE_chaldea)
+crates/cli/tests/daemon_windows.rs          # cfg(windows): parent jobs, console events, DACLs, stop event
+crates/cli/tests/daemon_macos.rs            # cfg(target_os = "macos"): launchd job, sessions, ACLs, signal state
+crates/cli/tests/lints.rs                   # clippy.toml entries of cli and daemon (§2.11)
+crates/daemon/clippy.toml                   # + Command::{spawn, output, status}
+crates/daemon/src/lifecycle/mod.rs          # DaemonConfig, Components, run, ExitReport, ExitCode, FailReason
+crates/daemon/src/lifecycle/process.rs      # prepare_process (once per process, §2.3)
+crates/daemon/src/lifecycle/state_dir.rs    # resolve, create or adopt, privacy check, marker
+crates/daemon/src/lifecycle/files.rs        # InstanceLock, probe, DiscoveryRecord, write_replace, port and token files
+crates/daemon/src/lifecycle/gate.rs         # ShutdownGate, StopCause, GateSink, the active-gate slot
+crates/daemon/src/lifecycle/startup.rs      # the startup task and its Started value (§2.7)
+crates/daemon/src/lifecycle/shutdown.rs     # the coordinator and the shutdown sequence (§2.8)
+crates/daemon/src/lifecycle/signals.rs      # tokio signal listeners and the stop listener → gate
+crates/daemon/src/lifecycle/log.rs          # subscriber, log thread, LogTarget, diag(), rotation
+crates/daemon/src/lifecycle/panic.rs        # panic hook, task-kind context
+crates/daemon/src/lifecycle/ready.rs        # readiness verdict (child side)
+crates/daemon/src/lifecycle/tests/          # unit tests with fault points (§7)
+crates/daemon/src/http/registry.rs          # + task-kind context around each poll (§2.13)
+crates/pty-runtime/src/host/{mod,unix,windows}.rs   # process-level OS primitives (§2.2); unsafe only in unix::sys / windows::sys
+crates/pty-runtime/src/fake.rs              # + test helpers (fake feature): TestJob, ctrl events, signal state, ACL grants, links
+```
+
+**Dependencies.** Root `[workspace.dependencies]`, exact pins in the existing style:
+
+```toml
+# The `chaldea` CLI's argument parsing (docs/design/daemon-lifecycle.md §1); no color, no suggestions.
+clap = { version = "=4.6.8", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+```
+
+and these changes to existing entries:
+
+- `tokio`: `crates/daemon` adds `rt-multi-thread` and `signal` to its normal features (`sync`, `rt`, `net`, `time`, `macros` stay). `process` stays off (§2.11).
+- `tracing-subscriber =0.3.23` (`fmt`, `std`; already locked as a daemon dev-dependency) becomes a normal dependency of `crates/daemon`.
+- `windows-sys` gains `Win32_UI_Shell` (`SHGetKnownFolderPath`, `ShellExecuteExW`), `Win32_System_Com` (`CoTaskMemFree` for the known-folder path), `Win32_System_Registry` (needed by `SHELLEXECUTEINFOW`, L21), `Win32_Security_Authorization` (`GetSecurityInfo`, `ConvertStringSecurityDescriptorToSecurityDescriptorW`, `ConvertSidToStringSidW`), and `Win32_Storage_FileSystem` (`CreateDirectoryW`, `CreateFileW`, `GetFileInformationByHandleEx`); events (`CreateEventW`, `OpenEventW`, `SetEvent`) are in `Win32_System_Threading`, `GetAce`, `GetTokenInformation`, `EqualSid` in `Win32_Security`, and `GenerateConsoleCtrlEvent`, `GetConsoleWindow`, `GetConsoleProcessList` in `Win32_System_Console`, all already enabled. Features add declarations only; the lock gains no package.
+- macOS: `pty-runtime`'s `unix::sys` declares `acl_get_link_np`, `acl_get_fd_np`, `acl_get_entry`, `acl_get_tag_type`, `acl_free` (libSystem; `libc` has no Apple ACL bindings).
+- `crates/daemon` depends on `chaldea-pty-runtime` (mvp §3's direction `core ← pty-runtime ← daemon ← cli`).
+- `crates/cli`: `chaldea-core`, `chaldea-daemon`, `chaldea-pty-runtime`, `clap`, `serde`, `serde_json`, `uuid`; dev: `tempfile`, `chaldea-pty-runtime` with `fake`, and on Unix `rustix` (`process`) for test signals.
+
+`clap` is new to the lock; it brings `clap_builder 4.6.7`, `clap_derive 4.6.8`, `clap_lex`, `anstyle`, and `heck` (L18); the PR records the resolved versions in its description. No new `unsafe` outside `pty-runtime`'s two `sys` modules: `crates/cli` and `crates/daemon` stay `unsafe_code = "forbid"`.
+
+**Workspace and CI.** `members` gains `crates/cli`. `cargo test --workspace --locked --no-fail-fast` runs the lifecycle unit tests, the binary tests, and the `host` tests on both runners. Changes to `.github/workflows/ci.yml`:
+
+- The Windows sentinel step lists `cargo test -p chaldea-cli --test daemon_windows --locked -- --list`, which must contain `start_breaks_away_from_a_kill_on_close_job_with_breakaway`, and adds `host::windows::tests::job_state_reads_the_immediate_job` to the `chaldea-pty-runtime --lib` list.
+- A Windows preflight step runs before the workspace tests: `out="$(cargo test -p chaldea-pty-runtime --lib --locked -- host::windows::tests::runner_can_break_away --exact)" && grep -q '^test result: ok\. 1 passed' <<<"$out"` (A-W1, §2.12): the test must have run and passed exactly once, so a renamed or compiled-out test fails the step instead of passing with zero tests; its failure fails the job before any detach test runs.
+- A dependency check keeps tokio's `process` feature out of the daemon, in the file's captured-output form (a negated pipeline can pass on `SIGPIPE` under `pipefail`, as the file's own comment at `ci.yml:84-85` warns): `feats="$(cargo tree -p chaldea-daemon -e features --prefix none -i tokio)" && ! grep -q '^tokio feature "process"' <<<"$feats"`.
+
+`lefthook.yml` mirrors the new check.
+
+## 2. Types and Functions
+
+Names may change in review; shapes may not.
+
+### 2.1 Threat Model and Rules
+
+**Threat model.** The MVP assumes a host used by **one OS account**. Processes of that account are trusted: they can already read `owner.token`, signal the daemon, and attach a debugger to it. Other OS accounts on the same host are outside the model. Consequences, stated as known limits (§6.2) with the reopen condition "Chaldea runs on a host shared with other OS accounts":
+
+- The CLI does not authenticate the server: Host validation protects requests that arrive at Chaldea, but a process of another account that holds the saved port while Chaldea is stopped, or after the CLI's liveness check, can receive the CLI's Bearer token, and can serve a page at the PWA's origin that reads the origin's IndexedDB owner token on reload. A server-authentication handshake for the CLI and a revised browser credential are the additions that close this; both are reversible additions. **PR 18 must not treat the stable origin (§2.6) as an authenticated server**; its design states its browser-credential assumption against this section.
+- The pair code may appear in the browser launcher's process arguments while `chaldea open` runs (§2.13). Only the account's own processes see them in the model, and those can already read `owner.token`, so the model accepts it for the same reason it accepts the token file.
+
+Measures that need no protocol are taken anyway: the state directory and its secret files are private to the account and verified so (§2.4), and files are adopted only on evidence and never through links (§2.4).
+
+**Rules.**
+
+1. **The OS decides exclusivity and liveness.** One daemon per state directory is an OS file lock (L1), released by the OS at process exit whatever happened; a published record is used only while the lock is held and its process is alive. Stopping is an OS signal (Unix) or an event in the account's global namespace (Windows), never a request the HTTP stack must still be able to serve.
+2. **One coordinator decides the shutdown.** Every trigger (signal, stop request, fatal store outcome, panic, a failed startup step) calls `ShutdownGate::request`; the first call fixes the cause and the cutoff together, and nothing moves the cutoff afterwards (§2.8). A Windows console end is not a shutdown but a crash exit (§2.8). One task, the coordinator, runs the shutdown; it never interrupts the startup task, which stops at its next step boundary (§2.7).
+3. **Order is code, not discipline.** Startup is one task whose steps run in a fixed order; the listener does not exist before reconciliation committed (§2.7). Shutdown is one function: startup join, HTTP, participants, store, lock (§2.8).
+4. **Nothing is adopted, removed, or overwritten without proof** (§2.4): the state directory is ours only when we created it, adopted it empty, or it carries our marker, and it must be private; inside it, names are opened without following links; a file is replaced only by an atomic rename of a temporary this run created; the discovery record is removed only when it still names this instance. The lock file is never removed, truncated, or written.
+5. **Lifecycle resources outlive every unwind.** `InstanceLock`'s `Drop` never releases the lock (the handle is leaked; only the OS releases it at exit); the startup task owns what it creates and hands it to the coordinator only by returning it; the runtime is never dropped while work may remain (`shutdown_background`); every panic on the startup, coordinator, or main path is caught (§2.9). The only in-process release is `InstanceLock::release`, called once by the coordinator when §2.8 step 6's conditions hold.
+6. **Every wait has a deadline** (§5 "Waits"), and every ending ends the process: `main`'s last act is `std::process::exit`. One call has no bound of ours: `ShellExecuteExW` in `chaldea open` returns when the shell has handed the URL over; `open` is a foreground command the user can interrupt, and the daemon never makes this call.
+
+### 2.2 Process Layout, CLI, and `pty-runtime::host`
+
+**Binary.** `crates/cli` builds `chaldea`. `main`, in this order, before any thread exists:
+
+1. `argv[1] == "hook-emit"` → PR 9's emitter (mvp §3 "Single binary"; no daemon setup).
+2. macOS: when `argv[1..4]` is exactly `["daemon", "run", "--from-launchd"]` (the shape the starter writes into the job's `ProgramArguments`, §2.10), `host::leave_launchd_job()`, whose fork needs a single-threaded process.
+3. `lifecycle::prepare_process` (§2.3).
+4. `Cli::try_parse()`; a `clap::Error` is rendered with `render()`, passed through `log::diag` (§2.13), printed to stderr, and the process exits with `exit_code()` (2 for usage errors, 0 for `--help`). clap never prints on its own.
+
+```
+chaldea [--state-dir <path>] daemon run   [--port <n>]
+chaldea [--state-dir <path>] daemon start [--port <n>]
+chaldea [--state-dir <path>] daemon stop
+chaldea [--state-dir <path>] open [--print-url]
+```
+
+`--state-dir` falls back to `CHALDEA_STATE_DIR`, then to the default (§2.4), and is made absolute against the caller's working directory (`std::path::absolute`) before any use, so the starter and the detached child name the same directory. `daemon run` takes hidden flags only `daemon start` passes: `--from-launchd` (macOS, first after `run`), `--detached-child`, `--ready <channel>`. Exit codes are `ExitCode` (§2.8).
+
+**Library entry** (`crates/daemon/src/lifecycle/mod.rs`):
+
+```rust
+pub struct DaemonConfig {
+    pub state_dir: PathBuf,                 // absolute; checked by run (§2.4)
+    pub port: Option<u16>,                  // --port; None: the saved port, else a new one (§2.6)
+    pub mode: RunMode,                      // Foreground | DetachedChild { ready: ReadyArg, via: DetachVia }
+    pub budgets: Budgets,                   // Budgets::DEFAULT (§2.8)
+}
+/// What later PRs plug in, called at fixed steps (§2.14). PR 8's `MvpComponents`: the receipts reconciler and
+/// `Mounts::mvp()`.
+pub trait Components: Send + 'static {
+    /// Step 9, before the listener exists.
+    fn reconcilers(&mut self, store: &Store) -> Vec<Reconciler>;
+    /// Step 11, after bind: everything the components need to exist.
+    fn build(&mut self, ctx: &BuildCtx) -> Built;
+    /// Step 12, after HttpServer::new, before serve: the token service (TokenService is Clone, L16).
+    fn attach(&mut self, server: &HttpServer) {}
+}
+pub struct BuildCtx { pub store: Store, pub gate: GateHandle, pub sink: Arc<dyn LifecycleSink>, pub port: u16, pub state_dir: PathBuf }
+pub struct Built { pub mounts: Mounts, pub participants: Vec<Box<dyn ShutdownParticipant>> }  // + commands with 7c (§2.14)
+/// The process entry: registers the active gate and the process log target (§2.3), runs one daemon to its
+/// end, and returns what `main` passes to `std::process::exit` (§2.9). Assumes `prepare_process` ran.
+pub fn run(cfg: DaemonConfig, components: Box<dyn Components>) -> ExitReport;
+/// cfg(test): the same startup and coordinator with no process-wide registration: no active gate,
+/// diagnostics into the given sink.
+#[cfg(test)] pub(crate) fn run_isolated(cfg: DaemonConfig, components: Box<dyn Components>, log: TestLog) -> ExitReport;
+pub struct ExitReport { pub code: ExitCode, pub reason: Option<FailReason>, pub lock: LockDisposition }
+pub enum LockDisposition { NeverTaken, Released, HeldUntilExit }
+```
+
+`run` returns instead of exiting so tests can inspect the report; it builds its own runtime per call.
+
+**`pty-runtime::host`.** Process-level OS primitives, kept in `pty-runtime` because it isolates OS differences and is the only crate allowed `unsafe` (AGENTS.md "Platform & Development Policy"; L17). Every function is safe; the `unsafe` calls are new functions in `unix::sys` and `windows::sys`.
+
+```rust
+pub mod host {
+    // Identity
+    pub fn process_identity(pid: u32) -> io::Result<Option<ProcessIdentity>>;   // promotes fake::identify (PR3 D7)
+    pub fn current_identity() -> io::Result<ProcessIdentity>;
+    // Process-wide signal state (Unix; Windows: Ok)
+    pub fn reset_process_signals() -> io::Result<()>;      // SIGCHLD → SIG_DFL, no flags; unblock TERM, INT, HUP, CHLD
+    pub fn signal_state() -> io::Result<SignalState>;      // SIGCHLD disposition and flags, blocked TERM/INT/HUP/CHLD
+    // Detaching
+    pub fn detach_session() -> io::Result<()>;             // Unix: setsid; Windows: Ok
+    pub fn leave_launchd_job() -> io::Result<()>;          // macOS: fork; the parent _exit(0)s, the child returns
+    pub fn gui_domain(deadline: Instant) -> GuiDomain;     // macOS: Available | Absent { why } | ProbeFailed { why } (§2.10)
+    pub fn launchctl(args: &[&OsStr], deadline: Instant) -> io::Result<LaunchctlOutput>;  // /bin/launchctl, with_spawn_lock
+    pub fn configure_detached(cmd: &mut Command, breakaway: Breakaway);  // Windows creation flags (§2.12); Unix nothing
+    // Readiness channel (§2.10)
+    pub fn ready_channel() -> io::Result<(ReadyReader, ReadyArg)>;  // macOS: a Unix socket in a short private dir; Windows: stdout pipe
+    pub fn ready_writer(arg: &ReadyArg) -> io::Result<ReadyWriter>; // the child's end; `close` closes it explicitly
+    // Files and privacy (§2.4)
+    pub fn default_state_base() -> io::Result<PathBuf>;     // Unix $HOME; Windows FOLDERID_LocalAppData
+    pub fn create_private_dir(path: &Path) -> io::Result<()>; // Unix mode 0700; Windows explicit protected DACL
+    pub fn privacy(path: &Path, kind: EntryKind) -> io::Result<Privacy>;   // never follows a final link
+    pub fn handle_privacy(file: &File) -> io::Result<Privacy>;              // the same checks on an open handle
+    pub enum Privacy { Private, Link, NotOwned, ModeTooOpen { mode: u32 }, AclGrantsOthers, NotOfKind }
+    pub fn open_no_follow(path: &Path, access: Access) -> io::Result<File>;  // O_NOFOLLOW; Windows FILE_FLAG_OPEN_REPARSE_POINT + refuse a reparse point
+    pub fn create_private_file(path: &Path) -> io::Result<File>;   // create_new, explicit owner-only descriptor, handle verified
+    pub fn is_plain_file_or_absent(path: &Path) -> io::Result<bool>; // not a link, not a reparse point, a regular file or nothing
+    // Windows parent job (§2.12)
+    pub fn job_state() -> io::Result<JobState>;            // Unix: JobState::NONE
+    pub struct JobState { pub in_job: bool, pub immediate: Option<JobLimits> }
+    pub struct JobLimits { pub kill_on_close: bool, pub breakaway_ok: bool, pub silent_breakaway_ok: bool }
+    pub fn has_console() -> Option<bool>;                  // Windows GetConsoleWindow; Unix None
+    // Stop channel (§2.10)
+    pub fn listen_for_stop(instance: Uuid, on_stop: Box<dyn FnOnce() + Send>) -> io::Result<StopListener>;  // StopListener::name()
+    pub fn send_stop(target: &StopTarget) -> io::Result<StopSent>;
+    pub struct StopTarget { pub pid: u32, pub start_time: String, pub instance: Uuid }
+    pub enum StopSent { Sent, Exited, IdentityMismatch, AccessDenied, NoListener }
+    // Browser (§2.13)
+    pub fn open_url(url: &str) -> io::Result<()>;          // macOS /usr/bin/open; Windows ShellExecuteExW
+}
+```
+
+`fake` gains test helpers (the `fake` feature, never in a default build, PR2 D6): `TestJob::new(limits)` with `assign`, `contains`, `close`, and `nest_in(&TestJob)` (Windows); `send_ctrl_event(kind, group)` (Ctrl-C or Ctrl-Break, the only events `GenerateConsoleCtrlEvent` sends), `ignore_ctrl_c()`, and `console_processes()` (Windows); `ignore_sigchld()`, `block_signals(&[..])` (Unix); `grant_users_read(path)` (Windows: adds an allow ACE for `BUILTIN\Users`); `grant_everyone_read_acl(path)` (macOS: adds an extended allow entry); `make_link(link, target)` (macOS a symlink; Windows a directory junction, which needs no privilege).
+
+### 2.3 Process Setup and Per-Run State
+
+**Once per process** (`lifecycle::prepare_process`, called by `main` before argument parsing (§2.2), and first in every test helper process; never in an in-process unit test):
+
+1. `host::reset_process_signals()` before any thread exists (§2.11).
+2. The panic hook (§2.13), installed with `std::panic::set_hook`.
+3. The log subsystem: the global `tracing` subscriber and the `daemon-log` thread (§2.13).
+
+Each is guarded by one `std::sync::Once`, so a second call does nothing.
+
+**Per run.** `run` creates its gate and registers it in the process's active-gate slot (`static ACTIVE_GATE: Mutex<Option<Weak<ShutdownGate>>>`), which the panic hook reads; it also owns the process log target (stderr in the foreground, the run's `daemon.log` when detached, §2.13). `run` is called once per process: by `main`, or by a helper process in tests. Unit tests use `run_isolated`, which registers nothing process-wide, so any number of them run in parallel in one test process. Tests that touch process-wide state (the hook, the subscriber, signal state, signals, consoles, jobs) or that leave a never-returning task or a leaked lock behind run in helper processes (§7).
+
+### 2.4 State Directory and Its Files
+
+**Location.** `--state-dir`, else `CHALDEA_STATE_DIR`, else the default: `$HOME/.chaldea` on macOS and `<FOLDERID_LocalAppData>\Chaldea` on Windows (§8 D11). `state_dir::resolve` is used by every subcommand, so a client and the daemon agree.
+
+**Private trustees.** One definition, used by every privacy check and by P-8: on macOS, the effective uid (root is not checked: it can read anything); on Windows, the user's SID, `SYSTEM`, and `BUILTIN\Administrators`, plus, on directories only, `CREATOR OWNER` (inherit-only) and `OWNER RIGHTS`. "Private" means owned by the user and granting nothing to anyone outside this set.
+
+**Creation and adoption** (`state_dir::prepare`, daemon only; clients never create it):
+
+1. On the absolute path, `symlink_metadata` of the final component: a symlink or a Windows reparse point is refused (`FailReason::StateDir`); links in ancestors (such as macOS `/var` → `/private/var`) are allowed.
+2. Absent: `host::create_private_dir` (Unix `mkdir` with mode `0700`; Windows `CreateDirectoryW` with an explicit protected DACL `D:P(A;OICI;FA;;;<user SID>)(A;OICI;FA;;;SY)`), then the marker (step 4). Only the last component is created; its parent must exist. `AlreadyExists` (a concurrent first start) continues with step 3 on what is there.
+3. Present: `host::privacy(dir, Directory)` must be `Private`:
+   - **macOS:** owned by the effective uid (checked first, so an ownership failure reports `NotOwned`), no group or other mode bits, and no extended ACL entry of type allow (`acl_get_link_np`, L20; deny-only entries such as the home directory's "everyone deny delete" pass).
+   - **Windows:** owner is the user's SID; the DACL is present, and every allow ACE names a private trustee; any other allow ACE (`Users`, `Everyone`, another account) refuses. The default profile ACL and the DACL of step 2 both pass.
+   Anything else refuses with a message naming the check (e.g. "run `chmod 700 <dir>` and remove its ACL entries") and nothing is changed: an existing directory is never chmodded or re-ACLed.
+4. **Marker:** `<dir>/CHALDEA_STATE` holding `{"chaldea_state_dir":1}`. A directory is adopted only if (a) step 2 created it, (b) it is empty, ignoring unfinished marker temporaries `.CHALDEA_STATE.tmp-*`, or (c) it carries a marker that is a regular file with that content. For (a) and (b) the marker is published without replacing anything: write `.CHALDEA_STATE.tmp-<instance>` with `create_private_file` and `sync_all`, then `fs::hard_link` it to `CHALDEA_STATE`, which fails if the name exists (L4), then remove the temporary (this call created it). `AlreadyExists` from a concurrent start means a complete marker is there: it is read and validated as in (c). A crash leaves at most a temporary, which never makes a directory unadoptable. A non-empty directory without a valid marker is refused ("not a Chaldea state directory"), so a mistyped `--state-dir ~/Documents` never adopts unrelated files.
+
+The canonical path is taken after these checks. From here every file operation names a child of the verified directory; because the directory is private, only the account's own processes can create entries in it after the check, and they are trusted (§2.1).
+
+**Files** (directly in the state directory):
+
+| Name | Content | Written by | Replaced | Removed |
+|---|---|---|---|---|
+| `CHALDEA_STATE` | the marker | `prepare` | never | never |
+| `.CHALDEA_STATE.tmp-<instance>` | the marker's temporary | `prepare` | — | by `prepare` after the link; a crash leaves it |
+| `daemon.lock` | empty | created if missing by `InstanceLock::acquire` (`open_no_follow`, mode `0600`), never truncated or written | never | never |
+| `daemon.json` | discovery record (§2.6) | the lock holder only | atomically, at `starting` and at `serving` | by the lock holder at shutdown, only when its `instance` is this run's |
+| `port` | the saved port in decimal + `\n` | the lock holder only, once it serves (§2.6) | atomically | never |
+| `owner.token` | the CLI's owner token (`chd_…` + `\n`) | the lock holder only, before serving | atomically, when absent or invalid (§2.13) | never |
+| `daemon.log`, `daemon.log.1` | log and panic lines of a detached daemon | the detached daemon, after it holds the lock | `daemon.log` is renamed to `daemon.log.1` (replacing it) at 8 MiB (§2.13) | never |
+| `chaldea.db`, `-wal`, `-shm`, `-journal` | the store | `Store::open`, SQLite | — | never (store §5) |
+| `.<name>.tmp-<instance>` | a temporary | `write_replace` | — | by `write_replace` on its own failure; a crash leaves it (never removed by a later run) |
+
+**Opening.** Every open of a file in the state directory uses `host::open_no_follow` (or `create_private_file`), and every reader checks the opened handle is a regular file: the lock, the discovery record (daemon and clients), the port file, the owner token, the log, and the marker. The database is opened by SQLite by path, so before `Store::open` the daemon requires `host::is_plain_file_or_absent` for `chaldea.db` and its `-wal`, `-shm`, and `-journal` sidecars (refused otherwise, `FailReason::StoreOpen`, "a link where the database should be").
+
+**Secret files.** `create_private_file` creates with an explicit owner-only descriptor, never inheritance (L22): macOS `O_CREAT | O_EXCL | O_NOFOLLOW` with mode `0600`; Windows `CreateFileW(CREATE_NEW)` with `SECURITY_ATTRIBUTES` holding `D:P(A;;FA;;;<user SID>)(A;;FA;;;SY)`. It then checks the opened handle with `host::handle_privacy` (macOS `fstat` owner and mode plus `acl_get_fd_np`; Windows `GetSecurityInfo` owner and DACL) before returning it, so no secret is written into a file whose effective access was not verified. Every temporary of `write_replace` is created this way, so `owner.token` carries this descriptor after its rename (a rename keeps the file's descriptor).
+
+**Existing secret file.** `owner.token` is checked at step 6 (§2.7), before any mutation other than the marker and an empty `daemon.lock`: `host::privacy(path, File)` must be `Private`, else the start is refused (`FailReason::TokenFile`, "owner.token is readable by others; its token may be exposed. Removing the file does not revoke the token: revoke it, then remove the file") without reading it. The other files carry no secret; within a marked private directory a file of a known name is ours, and it is still parsed before use (§2.6, §2.13).
+
+**`write_replace(dir, name, bytes)`** — the one way a file other than the lock, the marker, and the log is written:
+
+1. `symlink_metadata(dir/name)`: absent, or a regular file → continue; a link, reparse point, directory, or anything else → refuse (`FileRefused { name }`), nothing written.
+2. Create `.<name>.tmp-<instance>` with `host::create_private_file`, write, `sync_all`. A failure here removes the temporary (this call created it) and returns the error; `name` is unchanged.
+3. `fs::rename` onto `name` (L4: a std reader holding it open does not block it); a failure is retried every 50 ms for up to 500 ms, then the temporary is removed and the error returned; `name` is unchanged.
+4. **The rename is the commit.** Unix: `sync_all` on the directory; a failure is logged as a durability warning ("`<name>` was replaced but may not survive a power loss") and does not fail the call, because the new content is already visible.
+
+### 2.5 Single-Instance Lock
+
+```rust
+pub struct InstanceLock { file: ManuallyDrop<File> }   // no Clone; Drop does nothing (the handle is leaked)
+impl InstanceLock {
+    /// open_no_follow(daemon.lock, read+write, create, mode 0600), then try_lock, retried every 50 ms
+    /// within `retry` (2 s) on WouldBlock only.
+    pub fn acquire(dir: &Path, retry: Duration) -> Result<InstanceLock, LockError>;   // Held | Io(io::Error)
+    /// unlock(), then close. Only the coordinator calls it (§2.8 step 6).
+    pub(crate) fn release(self);
+}
+/// Clients: open_no_follow read-only (never create), try_lock_shared: WouldBlock → Held; Ok → Free (unlock at once).
+pub fn probe(dir: &Path) -> io::Result<LockProbe>;   // Held | Free | Missing
+```
+
+- **Mechanism.** `flock` on macOS, `LockFileEx` on Windows (L1), on a file that holds no data, because a Windows lock also blocks reads of the range (L2). The lock is per open file description / handle, so a second `acquire` in the same process also gets `WouldBlock` (the tests rely on it). std opens it close-on-exec / non-inheritable, and PR 3's `pre_exec` closes every inherited descriptor anyway, so no child keeps it alive after the daemon exits.
+- **Never released by a drop.** `Drop` leaks the handle, so an unwind, an early return, or a forgotten value never releases the lock in-process; only `release` or process exit does.
+- **Contention vs I/O.** `WouldBlock` is contention (`Held`, retried for 2 s); any other error (`EACCES`, `ENOSPC`, `EIO`) is `Io`, not retried, and fails the start with `FailReason::LockIo` and the error, distinct from "already running".
+- **Retry.** The 2 s is the CLI's allowance for a client's momentary shared probe and for Windows releasing a crashed process's lock (L2 gives no upper bound; a release slower than 2 s reports "already running" and the user retries). It is not a wait for a live daemon.
+- **A second `daemon run`** gets `Held` after the retry, reads `daemon.json` (§2.6 liveness rule), and exits `AlreadyRunning` (3) with "a daemon already holds `<dir>` (pid …, `http://127.0.0.1:<port>`)", or "(starting)". It created nothing but possibly an empty `daemon.lock`.
+- **The store's own guard.** A second process opening the database directly (an older binary, a doctor) is serialized by SQLite's locks, and a projection version mismatch is refused per job (store §2.4); the instance lock is about daemons.
+
+### 2.6 Discovery: Record, Port, Liveness
+
+**Record** (`daemon.json`, internal: read by the same binary and by the doctor, not a public contract):
+
+```json
+{ "version": 1, "instance": "<uuid v4>", "pid": 4242, "start_time": "<ProcessIdentity.start_time>",
+  "state": "starting" | "serving", "port": 7373 | null, "url": "http://127.0.0.1:7373" | null,
+  "started_at": "<RFC 3339>", "detached": "launchd" | "setsid" | "windows" | null,
+  "evidence": { "job": { "in_job": false, "immediate": null } | null, "console": false | null } }
+```
+
+`instance` is a fresh random UUID per run, created by `run` before startup. `pid` is the daemon's own (on macOS's launchd path, the forked daemon's, never the job process's). The record is written with `write_replace` at `starting` (step 7, after the stop listener exists) and at `serving` (step 13). It never contains a secret.
+
+**Port.** The PWA's origin is `http://127.0.0.1:<port>` and its owner token lives in that origin's IndexedDB (mvp §2.5 "Secrets"), so a changed port loses the pairing and P-19's reconnect (§2.1 bounds what the stable origin proves):
+
+1. The `port` file, if present, is validated at step 6, before the store opens: one decimal number in 1–65535 and a newline. A malformed file fails the start (`FailReason::PortFile`, "`<dir>/port` is not a port number; move it away and start again to choose a new port").
+2. **Choice at step 10:** `--port <n>` if given; else the saved port; else (first start) the first port of `7373..=7472` that binds. That range lies below the dynamic port range of macOS and Windows (49152–65535 by default), so the OS does not hand a first-start port to outgoing connections later; a taken or excluded port is skipped.
+3. **Bind failure is reported, never moved around:** `FailReason::PortUnavailable` with the OS error. For the saved port: "port <n> (saved for `<dir>`) is unavailable: <error>; `--port <m>` starts on another port, which changes the pairing origin (re-run `chaldea open` after it)". When no port of the range binds: "no free port in 7373–7472 on 127.0.0.1 (last error: <error>); pass `--port <n>`". In every case `port` is unchanged.
+4. **Publication point:** at step 13, after `serve` and before the `serving` record, `write_replace("port")` if the port differs from the saved one. A failure before its rename fails the start with `port` unchanged; once the rename happened, the port is committed (§2.4 `write_replace` step 4) and a later failure of the start does not undo it: the daemon did serve on it. Any startup that does not end `Ok` after that rename, whether it failed or was stopped, says so: `Started` records `port_saved: Some(n)`, the coordinator puts it into the readiness `fail` line as a `port_saved=<n>` field before the message (for `fail stopped` too), and the message, and the starter repeats it in every unsuccessful branch: "port <n> was saved for `<dir>` before the start ended; the next start uses it, so re-pair with `chaldea open`". No record says `serving` before the port is saved.
+
+The listener is `std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))` (L3), set nonblocking, and converted with `tokio::net::TcpListener::from_std` inside the runtime. `localhost` and `127.0.0.1` both satisfy the Host check (http §2.2 step 1); the record's `url` uses `127.0.0.1`.
+
+**Liveness rule** (`client::Discovery::read`, every client): a record is used only when (a) `probe` says `Held`, (b) the record, opened without following links, parses with `version: 1`, and (c) `host::process_identity(pid)` equals `(pid, start_time)`. `Free` or `Missing` → `NotRunning` (a leftover record is ignored, never removed by a client); `Held` and (b)–(c) hold → `Starting(record)` or `Serving(record)`; `Held` and (b) or (c) fails → `Unknown` (the holder has not yet replaced an old record; it does so as its first act after the stop listener). A client sends a credential only to a `Serving` record (T3 Code drops dead-pid records before sending credentials, L11); what that does not prove is §2.1's.
+
+### 2.7 Startup Sequence
+
+`run` builds the runtime (`ManuallyDrop<Runtime>`, multi-thread), creates the gate and the `instance`, starts the signal listeners and the coordinator (§2.8), and spawns the **startup task**, whose steps run in order. The startup task owns everything it creates in one `Started` value (`lock`, `store`, `server`, `serve`, `participants`, `ready`, `record_written`, `port_saved`, `log_file`) and returns it with its outcome: `Ok` (serving), `Failed(FailReason)`, or `Stopped`. It is never aborted:
+
+- Before each step after step 1 (so a detached child always holds its readiness writer), and once more before the readiness line of step 14, it checks `gate.fired()`; if the gate fired, it returns `Stopped` with what it has. A step in progress (a long `Store::open`, an admitted reconciler) runs to its end first.
+- A failing step returns `Failed(reason)` at once; a step never decides a shutdown itself, the coordinator does (§2.8).
+
+| # | Step | Publishes | On failure: reason; disk outcome |
+|---|---|---|---|
+| 1 | `DetachedChild`: open the readiness writer (§2.10); on macOS the launchd path already forked in `main` (§2.2), and both macOS paths call `host::detach_session()` here | — | `Internal`; nothing. A failed `setsid` is reported through the readiness writer opened first |
+| 2 | Windows parent job check (§2.12): `DetachedChild` requires `in_job == false`; `Foreground` warns | — | `ParentJob`; nothing |
+| 3 | (done by `run` before the task starts, listed for the failure column) runtime, gate, signal listeners, coordinator | — | `Internal`; nothing |
+| 4 | `state_dir::prepare` (§2.4) | the directory and marker, if new | `StateDir`; a created directory and marker stay (empty, private, ours) |
+| 5 | `InstanceLock::acquire(dir, 2 s)` | `daemon.lock` if new | `AlreadyRunning` or `LockIo`; at most an empty `daemon.lock` |
+| 6 | Checks before any further mutation: `owner.token` privacy and format (§2.4, §2.13), the `port` file and `--port` (§2.6), the database paths (§2.4). Then `DetachedChild`: open `daemon.log` and switch the log target (§2.13) | `daemon.log` | `TokenFile`, `PortFile`, `StoreOpen`; nothing beyond step 5; lock released |
+| 7 | `host::listen_for_stop(instance, gate.request(StopRequest))`; `write_replace("daemon.json", starting)` | the stop listener, then the record | `Internal` (including an existing event name); the record unchanged or ours (removed at shutdown); lock released |
+| 8 | `Store::open(StoreConfig { path: dir/chaldea.db, readers: 4, writer_queue: 256, busy_timeout: 5 s, SystemClock, RandomIds })` in `spawn_blocking`, awaited to its return (an open can rebuild projections; no deadline, store §2.8) | — | `StoreOpen` with the `OpenError` variant; a failed open can leave an empty or initialized database (store §2.8); lock released |
+| 9 | `components.reconcilers(&store)`, in order, each one write job with `not_after = now + 30 s`, awaited to its reply: PR 8's `receipts_mark_unknown_after_crash` (count logged), then PR 10's, then PR 9's (§2.14) | the reconciled rows (committed, idempotent) | a `WriteError` → `StoreOpen`; `CommitUnknown`, `WriterGone`, `Failed`, or `SubmitError::Failed` → `StoreFatal`; committed reconcilers stay committed |
+| 10 | choose and bind the port (§2.6) | — | `PortUnavailable`; reconciliation stays, `port` unchanged |
+| 11 | `components.build(&BuildCtx { store, gate, sink: GateSink, port, state_dir })`; `HttpServer::new(HttpConfig::new(port), store.clone(), sink, built.mounts)` (plus the `CommandRegistry` once 7c is merged, §2.14) | — | a panic (a mount mismatch, http §2.2) → `Panic` (§2.9); `port` unchanged |
+| 12 | `components.attach(&server)`; owner token verify or issue (§2.13) | `owner.token` if issued | `TokenFile`, `StoreOpen`, or `StoreFatal`; an issued token whose file write failed stays a valid unheld row (harmless, revocable, http §2.4) |
+| 13 | `serve(listener)` → `ServeHandle`; `write_replace("port")` if changed (§2.6); `write_replace("daemon.json", serving)` | the listener, the port, the record | `Internal`; a port write that failed before its rename leaves `port` unchanged; a failure after it leaves the new port saved and the message says so (§2.6) |
+| 14 | if the gate has not fired: `DetachedChild` writes `ready <port> <pid>` and closes the channel (§2.10); `Foreground` logs `listening on http://127.0.0.1:<port>` | the verdict | a write error is ignored (§2.10) |
+
+Every outcome other than `Ok` ends in the coordinator's shutdown sequence (§2.8), which shuts down what `Started` holds, removes our record, decides the lock, and only then sends the verdict.
+
+**Why this order.**
+
+- **Reconciliation before the listener exists** (mvp §4 PR 8; formal-specs §7.4): step 9 commits before step 10 binds, so no connection can reach any route while a receipt from a crashed run is still `in_progress`. The listener is the gate: there is no socket to connect to.
+- **Every refusal before the first mutation it could leave behind**: the privacy, format, and link checks of step 6 run before the log, the record, the store, and reconciliation, so a refused start leaves at most the marker and an empty `daemon.lock`.
+- **The stop listener before the record**, so a client that sees a `starting` record can always stop it (§2.10).
+- **The owner token before `serve`**: a client that reads `owner.token` only ever sees a token valid in the store it will reach.
+- **The lock before any state write except the directory and marker**, and the log after the lock, so a losing concurrent start writes no log.
+- **The port saved once the daemon serves, before the `serving` record**: a start that never served leaves the previous origin, and discovery never reports `serving` on an unsaved port.
+- **Job check before the state directory**: a refused detached start leaves the state directory untouched.
+
+### 2.8 The Gate, the Coordinator, and the Shutdown Sequence
+
+```rust
+pub enum StopCause {
+    Signal(SignalName),                  // TERM, INT, HUP (Unix); CtrlC, CtrlBreak (Windows)
+    StopRequest,                         // Windows stop event; Unix `daemon stop` arrives as Signal(TERM)
+    StoreFatal(StoreFatal),              // from GateSink or a startup write
+    Panic,
+    StartupFailed(FailReason),
+}
+pub struct Stopping { pub cause: StopCause, pub cutoff: Instant }   // published together, once
+pub struct ShutdownGate {
+    first: OnceLock<Stopping>,           // the cause and the cutoff: set once, never changed
+    worst: AtomicU8,                     // most severe later outcome: 0 none, 1 store_fatal, 2 panic (fetch_max)
+    crash: OnceLock<ConsoleEvent>,       // Windows console end (below)
+    wake: tokio::sync::Notify,           // notify_one after any of the above
+}
+impl ShutdownGate {
+    /// Non-blocking and callable from any thread, a panic hook, or a LifecycleSink. Publishes first
+    /// (Stopping or `worst`, then `wake`), then queues its diagnostic. Returns whether this call was the first.
+    pub fn request(&self, cause: StopCause) -> bool;
+    /// Windows console end: records the event and wakes the coordinator, which exits at once (below).
+    pub fn crash_exit(&self, event: ConsoleEvent);
+    pub fn fired(&self) -> bool;
+}
+pub struct Budgets {          // Budgets::DEFAULT; every end is measured back from the cutoff C = first request + total
+    pub total: Duration,              // 10 s
+    pub startup_join_before: Duration,// 6 s: the startup task has until C − 6 s to reach a step boundary
+    pub http_before: Duration,        // 5 s: HTTP drains until C − 5 s
+    pub store_before: Duration,       // 3 s: participants run until C − 3 s; the store has the last 3 s
+    pub report_grace: Duration,       // 250 ms past C for the store report
+    pub log_flush: Duration,          // 100 ms
+}
+```
+
+`OnceLock::set` publishes the cause and its cutoff as one value, so no reader sees one without the other; a later `StoreFatal` or `Panic` raises `worst`, which only selects the exit reason (below). `GateSink(Arc<ShutdownGate>)` implements `LifecycleSink`: `store_fatal(f)` calls `request(StoreFatal(f))`, then logs `store fatal: <variant>` (a `ReceiptUncompleted` with its `command_id`, which is not a secret). Diagnostics go through the non-blocking log queue (§2.13), so a stalled stderr or disk cannot delay a request or the coordinator.
+
+**Signal listeners** (`signals.rs`, tasks on the runtime, not registered in PR 7's registry, ended by process exit): Unix `tokio::signal::unix::signal` for `SIGTERM`, `SIGINT`, `SIGHUP`; Windows `tokio::signal::windows::{ctrl_c, ctrl_break}` call `gate.request`, and `{ctrl_close, ctrl_logoff, ctrl_shutdown}` call `gate.crash_exit`. A later signal is logged as "already stopping (<first cause>)". A detached Windows daemon has no console and receives only the stop event; at logoff or system shutdown the system ends it.
+
+**Console end is a crash exit.** Windows kills the process about 5 s after a close event and delivers logoff and shutdown only sometimes (L7), so no graceful sequence could be guaranteed to finish. Once `crash` is observed, during startup, while serving, or in the middle of a shutdown, the coordinator starts no further step and returns with `ExitReport { code: Failed, reason: ConsoleEnd, lock }`, where `lock` is `HeldUntilExit` unless step 6 already released it; the log queue is flushed for at most `log_flush`. A step already started is not undone or awaited: the record may already be removed, and a `Store::shutdown` already submitted keeps running on its blocking thread until the exit ends it. Recovery is crash-only (AGENTS.md "PTY Seam"): an uncommitted transaction is rolled back by WAL recovery, a committed one survives without a checkpoint (store §2.9), and the next start acquires the lock once the OS released it (within the 2 s retry, §2.5, else "already running"), replaces the stale record, and reconciles receipts.
+
+**The coordinator** (`shutdown::run`, one task, the only caller of `ServeHandle::shutdown`, `Store::shutdown`, and `InstanceLock::release`) awaits `wake`, selecting on `crash` throughout. When the startup task returns `Ok`, it keeps waiting; when it returns `Failed(r)`, the coordinator calls `request(StartupFailed(r))`. Once `first` is set, with `C` its cutoff:
+
+1. **Join the startup task** until `C − startup_join_before`. It ends at its next step boundary and returns `Started` (a panic in it is a `JoinError`, §2.9). **A missed join is a bare exit:** if it has not returned by then, the task may still own the lock, the store, the readiness writer, or a write in progress, so the coordinator returns at once with `ExitReport { code: Failed, reason: StartupUnjoined, lock: HeldUntilExit }`: no filesystem cleanup (the record stays), no verdict (a detached starter sees EOF and reports it, §2.10), no store call; only the log queue is flushed for at most `log_flush`. The next start waits for the OS to release the lock (the 2 s retry, §2.5), replaces the stale record, and recovers the WAL.
+2. If `Started.serve` exists: `ServeHandle::shutdown(C − http_before)`, awaited to its return (it returns by its deadline after requesting abort of what remains, L16; the coordinator never drops it). The `HttpShutdownReport` is logged.
+3. Each `ShutdownParticipant` in order, until `C − store_before`; the participants share the time between the HTTP end and the store's share, so a later PR is never left with nothing (PR 8 has none).
+4. If `Started.store` exists: `spawn_blocking(move || store.shutdown(C))`. `Store::shutdown` ends its timed waits by `C` (L16), but synchronous work around them is not bounded, so the coordinator caps its own wait: it observes the call until `C + report_grace`, and a report not seen by then counts as `writer_exited: false`, `readers_returned: false` (the call keeps running on its blocking thread until the process exits).
+5. Remove `daemon.json` if it parses and names this `instance` (L11); never otherwise.
+6. **Lock rule:** `InstanceLock::release` → `Released` only if all hold: the startup task returned (step 1), the HTTP report has no `abort_requested` task (or nothing served), no store was opened or the report has both `readers_returned` and `writer_exited` (an abandoned reader keeps a SQLite connection and its snapshot open, even after the writer retired), and the log thread acknowledged switching away from `daemon.log` within `log_flush` (a detached daemon; so no rotation of ours runs after a successor opens the log). Otherwise log "exiting with the instance lock held (<which condition>)" → `HeldUntilExit` (the handle stays leaked until exit). Nothing in this process touches the DB files after step 4.
+7. **Verdict:** compute the outcome (below) and, for a `DetachedChild` whose startup outcome was not `Ok` (so it never sent `ready`), send `fail <verdict reason> <message>` on the writer `Started` returned (§2.10); a startup task that panicked took its writer with it, and the starter sees EOF. Then log `exiting: code <n> (<reason>)`, flush the log queue for at most `log_flush`, and return.
+
+Readers in flight get the time between the HTTP drain and `C` to return; the store then abandons and reports them (store §5); notification receivers are not drained (store §4 row 8); committed transactions survive a skipped checkpoint (store §2.9).
+
+**Outcome and reason.** Two results are computed, each from what the coordinator observed:
+
+- **The daemon's exit reason** (`ExitReport::reason`), by precedence: `panic` (if `worst` or the cause says so) > `store_fatal` > the startup failure's reason (`state_dir`, `lock_io`, `already_running`, `parent_job`, `token_file`, `port_file`, `port_unavailable`, `store_open`, `internal`) > `lock_held_at_exit` (an otherwise clean stop that retains the lock, `HeldUntilExit`) > none. A signal or stop request is not a failure, whether it came before or after startup completed: a clean stop exits 0. `console_end` and `startup_unjoined` are set only by their own paths above. `FailReason` is exactly these tokens.
+- **The detached verdict reason**, sent only when `Started`'s startup outcome was not `Ok`: the exit reason if there is one, else `stopped` ("stopped before it became ready"). Either carries `port_saved=<n>` when step 13 had already committed a new port (§2.6). `stopped` is a verdict token only; the starter turns it into its own exit 1, while the daemon itself may exit 0.
+
+**Exit codes** (`ExitCode`, published; §8 D14). Only distinctions a caller acts on are codes; the reason is in the log and in the readiness line:
+
+| Code | Name | When |
+|---|---|---|
+| 0 | `Ok` | `run`: a **clean stop**: stopped by a signal or stop request (before or after startup completed) with no exit reason and no retained lock, that is `NeverTaken` (stopped before step 5) or `Released`; `start`: a daemon serves the state directory; `stop`: the daemon stopped, or none was running; `open`: the URL was handed over or printed; any command's `--help` |
+| 1 | `Failed` | anything else that ended a command: a startup failure, a fatal store outcome or panic, a console end, an unjoined startup, a shutdown that exited holding the lock, a daemon stopped before it was ready (`start`), a conflicting `--port`, a stop that could not be delivered |
+| 2 | `Usage` | clap |
+| 3 | `AlreadyRunning` | `run`: another daemon holds the state directory |
+| 4 | `Timeout` | `start`: no verdict within 15 s, or a launchd submission whose outcome could not be resolved (the daemon may still be starting); `stop`: the daemon was still running 15 s after the stop began |
+
+### 2.9 Panics and Unwinding
+
+- **Startup task panics** end the task with a `JoinError`, which the coordinator maps to `request(Panic)`. What the task owned unwinds with it: `InstanceLock` leaks its handle, a `Store` dropped without `shutdown` lets its writer finish on its own (L16), so the lock outcome is `HeldUntilExit` whenever step 5 may have succeeded. The readiness writer unwinds too, so a detached starter sees EOF; the record, which the coordinator still removes (the task has ended, so nothing else writes it), is the only cleanup.
+- **The coordinator** runs inside `runtime.block_on(AssertUnwindSafe(coordinator).catch_unwind())`; a panic there returns `ExitReport { code: Failed, reason: Panic, lock: HeldUntilExit }` at once.
+- **Panics in `run` before the runtime exists** are caught by `run` with `catch_unwind` and reported the same way (`NeverTaken`).
+- **Panics in other tasks and threads** (PR 7's registered tasks, `spawn_blocking`, the store writer) are caught by tokio or by the store, and the panic hook requests `Panic` through the active gate (§2.13).
+- **The runtime** is a `ManuallyDrop` that `run` ends with `shutdown_background()`: blocking tasks (an abandoned `Store::shutdown` or `Store::open`) are left running and end with the process, so neither a return nor an unwind waits for them.
+- **`main`** calls `run` inside `catch_unwind` as the last guard, maps an escaped panic to exit 1, and then calls `std::process::exit`. The exit code for any panic is 1 (`Failed`, reason `panic`), never Rust's 101.
+
+### 2.10 `daemon start`, Readiness, `daemon stop`
+
+**Readiness channel** (`host::ready_channel`). macOS: the starter creates a private directory `chd-<16 hex>` (`mkdir` mode `0700`, a fresh name on `EEXIST`, owner and mode verified) in `std::env::temp_dir()`, or in `/tmp` when `<temp_dir>/chd-<16 hex>/r` would exceed 100 bytes (Darwin's `sun_path` holds 104 bytes with its NUL, L20), and binds a `std::os::unix::net::UnixListener` at `r` in it; `ReadyArg` is that path. Windows: the child's stdout pipe (`ReadyArg::Stdout`). The starter removes the directory it created when it is done. A child that connects after the starter removed it, or writes after the starter left, gets an error it ignores and keeps running (a serving daemon whose verdict nobody reads).
+
+**The child's verdict** (`ready.rs`): exactly one line, then `ReadyWriter::close` (macOS: shut down and close the socket; Windows: close the stdout handle explicitly through `host`, since dropping Rust's `Stdout` does not close it):
+
+- `ready <port> <pid>\n` at step 14, only after the port is saved and the `serving` record written, and only if the gate has not fired at that check (a stop arriving later is an ordinary stop of a serving daemon);
+- `fail <reason> [port_saved=<n>] <message>\n` from the coordinator's step 7, after the lock was released or the hold decided, the record removed, and the reason chosen by §2.8's precedence. `<message>` goes through `log::diag` (redacted, control characters replaced by spaces) and is cut to 512 bytes at a character boundary.
+
+A write error (a starter that stopped reading) is ignored: Rust ignores `SIGPIPE`, so a broken pipe is an error value, never a signal.
+
+**Start** (`daemon_cmd::start`, in the CLI process), one deadline of **15 s** from its start (`READY_TIMEOUT`, herdr's bound, L9) that every step below shares:
+
+1. Resolve the state directory to an absolute path. On Windows read `host::job_state()` and decide the breakaway (§2.12); a refusal exits 1 with the message before any spawn.
+2. `host::ready_channel()`.
+3. **Launch** (in every case the working directory is the temp directory, so the daemon never holds the user's working directory open):
+   - **Choosing the macOS path.** `host::gui_domain(deadline)`, with at most 3 s of the deadline: `Absent` when `SSH_CONNECTION` or `SSH_TTY` is set (the deliberate SSH path, no probe), or when `launchctl print gui/<uid>` completed and reported that the domain does not exist (exit 112, "Could not find domain", L23); `Available` when it exits 0; `ProbeFailed` for anything else (a timeout, a spawn error, another exit). `ProbeFailed` fails the start, exit 1: "could not determine whether a GUI session exists (<why>); run `chaldea daemon run` in a terminal you keep open". Only `Absent` takes the `setsid` path.
+   - **macOS with a GUI domain** (`Available`). The launch is a one-shot launchd job and nothing else:
+     1. Label `dev.chaldea.daemon.<unix-ms>-<uuid>`. Program arguments `current_exe() daemon run --from-launchd --detached-child --ready <path> --state-dir <abs> [--port <n>]`; `EnvironmentVariables` the starter's environment; `WorkingDirectory` the temp directory; the starter's umask; stdout and stderr `/dev/null`; `RunAtLoad` true, `KeepAlive` false, `AbandonProcessGroup` true. A value a plist cannot represent unchanged (a non-UTF-8 argument or variable) fails the start: "this environment cannot be passed to launchd (<name>); run `chaldea daemon run` in a terminal you keep open".
+     2. The plist is written with `create_private_file` into the readiness directory; `launchctl bootstrap gui/<uid> <plist>` runs through `host::launchctl` with the remaining deadline minus 3 s, which stay reserved for resolving the label. Exit 0 → submitted. Otherwise the attempt's unique label is looked up with `launchctl print gui/<uid>/<label>` within the reserve:
+        - **`bootstrap` completed with a non-zero exit:** the command has finished, so nothing of this attempt is still in flight. Label present → submitted; absent → non-submission is established: the start fails, exit 1, with launchctl's message and "run `chaldea daemon run` in a terminal you keep open".
+        - **`bootstrap` timed out:** the submission may still complete after any lookup, so one absent answer proves nothing. The label is polled every 250 ms for the whole reserve: present → submitted; still absent, or the lookups fail → indeterminate.
+        - **Indeterminate** → exit 4 with "the launch may still be pending as `<label>`: `launchctl print gui/<uid>/<label>` shows it; until the daemon forks, `launchctl bootout gui/<uid>/<label>` cancels it; once it has published its record, use `chaldea daemon stop`". There is no retry and no other launch path on a GUI host, so a start never reports a daemon that dies when the terminal app quits.
+     3. **Job process.** `main` sees `daemon run --from-launchd` (§2.2) and calls `host::leave_launchd_job()` before any thread exists: `fork`; the parent calls `_exit(0)` (no destructors or stdio flushing in the job's process), so launchd sees a finished one-shot job and does not restart it; the child continues, calls `setsid` at step 1, and becomes the daemon, outside the terminal app's launchd job and coalition (L10). A failed `fork` is reported by the job process itself: it opens the readiness writer, sends `fail internal fork failed: <error>`, and exits 1.
+     4. **Cleanup.** After a verdict (which only the forked daemon sends, so the handoff happened), the starter removes its own label with `launchctl bootout gui/<uid>/<label>` within the remaining deadline. On EOF, a timeout, or a `bootout` that fails or runs out of time, it leaves the label to a later start's scavenging. Before bootstrapping, it removes labels proven stale: a `dev.chaldea.daemon.*` job that `launchctl print` shows not running and whose label's timestamp is more than 60 s old (beyond any attempt's 15 s deadline). Nothing else is removed.
+   - **macOS without a GUI domain** (`Absent`): `Command::new(current_exe())` with the same arguments minus `--from-launchd`, stdin, stdout, and stderr null, through `spawn_locked`; the child calls `setsid` at step 1, so it is in its own session and survives the SSH connection's end. There is no terminal app to quit on this path.
+   - **Windows:** the same arguments with `--ready stdout`, stdin and stderr null, stdout piped, `host::configure_detached(&mut cmd, breakaway)`, through `spawn_locked`.
+4. **Wait for the verdict** until the deadline:
+   - `ready <port> <pid>` → if `--port <n>` was given and differs → exit 1 ("a daemon serves `<dir>` on port <port>, not <n>"); else print `daemon started: http://127.0.0.1:<port> (pid <pid>)` and exit 0.
+   - `fail already_running …` → poll `Discovery::read` every 50 ms: `Serving` → the port check above, then exit 0; `NotRunning` (the winner exited during its startup) → exit 1 ("the daemon starting for `<dir>` exited; see `<dir>/daemon.log`"); the deadline → exit 4.
+   - `fail stopped …` → "the daemon was stopped before it became ready", exit 1.
+   - Any `fail` line with `port_saved=<n>` → the starter also prints the re-pairing notice of §2.6, whatever the reason.
+   - `fail <other> <message>` → print the message, exit 1.
+   - EOF without a verdict → the child or job exited before deciding: on Windows wait for the child's exit status, on macOS poll the lock, for at most 2 s and never past the deadline; print what was observed and the log path; exit 1.
+   - the deadline → "the daemon did not report readiness within 15 s; it may still be starting", exit 4, with what the owner can do: once it has published its record, `chaldea daemon stop` reaches it; before that, the pending launch is the child pid <pid> (direct spawn) or the launchd label `<label>` (`launchctl bootout gui/<uid>/<label>` cancels a launch that has not forked yet). The child is not killed: it may be rebuilding projections.
+
+**Windows detach.** `DETACHED_PROCESS` (no console; `CREATE_NO_WINDOW` would be ignored with it), `CREATE_NEW_PROCESS_GROUP`, and the breakaway of §2.12 (the spike's flags, L12). Console events never reach it.
+
+**Stop** (`daemon_cmd::stop`), one deadline of **15 s** from its start (`STOP_WAIT` = the 10 s shutdown budget + 5 s for process exit). It targets a **published** daemon: the process a `starting` or `serving` record names (on macOS's launchd path, the forked daemon; the launchd job is never touched). A launch that a timed-out `start` submitted is invisible until it publishes: while it has not taken the lock, `Discovery::read` gives `NotRunning` and `stop` reports "not running"; once it holds the lock but has not yet written its record (steps 5–7), `Discovery::read` gives `Unknown` and `stop` waits for the record (step 1 below). The starter's timeout message names the pending launch.
+
+1. `Discovery::read`: `NotRunning` → print "not running", exit 0. `Unknown` → poll until `Starting`, `Serving`, `NotRunning`, or the deadline (exit 4: "a daemon holds `<dir>` but has not published its identity").
+2. `Starting` or `Serving`: `host::send_stop(&StopTarget { pid, start_time, instance })`:
+   - **Unix:** `host::process_identity(pid)` must equal `(pid, start_time)` (a zombie does not match: it has exited), then `kill(pid, SIGTERM)`; `ESRCH` → `Exited` (the target exited after the check); `EPERM` → `AccessDenied`. The window between the identity check and the signal is the PID race pty-unix §2.5 describes: if the daemon exited and its pid was reused by another of the account's processes in between, that process gets `SIGTERM` (§6.2).
+   - **Windows:** `OpenEventW(EVENT_MODIFY_STATE, "Global\chaldea-stop-<instance>")` then `SetEvent`. The daemon creates that event at step 7 with `CreateEventW` and an explicit security descriptor `D:P(A;;0x1F0003;;;<user SID>)` (all event rights for the account only); `Global\` needs no privilege for events and is shared by every session (L19), so a stop from an SSH or second desktop session of the same account reaches it; an existing name fails the daemon's step 7 (`ERROR_ALREADY_EXISTS`). The instance UUID in the name ties the request to the selected instance. `ERROR_ACCESS_DENIED` → `AccessDenied`.
+   - **When the request did not land** (`OpenEventW` finds no event, or the Unix identity check fails), `send_stop` re-checks the selected identity: gone → `Exited`; the pid alive with another `start_time` → `IdentityMismatch` (nothing was signalled; the selected identity no longer exists); alive and matching with no event → `NoListener`.
+   - `Sent`, `Exited`, or `IdentityMismatch` → step 3 (the last two print "the daemon had already exited"). `AccessDenied` → exit 1: "access denied; the daemon may run elevated: run `chaldea daemon stop` from an elevated terminal" (Windows, L19) or "…as the daemon's user" (Unix). `NoListener` → exit 1 ("the daemon (pid …) is running without a stop listener; see `<dir>/daemon.log`").
+3. **Completion is generation-aware:** poll every 50 ms until the target `(pid, start_time)` is gone, then print "stopped" and exit 0 — whether or not a new daemon has since taken the lock (that one is reported: "a new daemon (pid …) now holds `<dir>`"). At the deadline → exit 4 ("still running after 15 s (pid …)").
+
+`stop` sends one request and never kills; the daemon ends by itself, because its shutdown is bounded by its budget and ends in `std::process::exit`.
+
+### 2.11 Process Rules (mvp §4 PR 8, kept by PR 10)
+
+**Spawn lock.** Every child the daemon or the CLI creates is created through one function per crate, `spawn_locked(cmd: &mut Command) -> io::Result<Child>` = `chaldea_pty_runtime::with_spawn_lock(|| cmd.spawn())`. `crates/daemon/clippy.toml` and `crates/cli/clippy.toml` list `std::process::Command::spawn`, `output`, and `status` under `disallowed-methods`; `spawn_locked` carries the only `#[allow(clippy::disallowed_methods)]`. `host`'s own children (`/bin/launchctl`, `/usr/bin/open`, by absolute path) are created under `with_spawn_lock` inside `pty-runtime`. tokio's `process` feature stays off (CI check, §1), so `tokio::process` cannot be used; the PR records `cargo tree -p chaldea-daemon -e normal` in its description, and a dependency that spawns would need review against this rule. `tests/lints.rs` in `crates/cli` checks both `clippy.toml` files keep these entries. PR 8's children: `launchctl`, `open`, the detached daemon; none in the daemon process itself.
+
+**Wait ownership (macOS).** `prepare_process` calls `host::reset_process_signals()` before any thread exists: `SIGCHLD` is set to `SIG_DFL` with no flags, because an inherited `SIG_IGN` (L15) would let the kernel reap every child and break PR 3's ownership rule; `SIGTERM`, `SIGINT`, `SIGHUP`, and `SIGCHLD` are unblocked so the listeners receive them. Neither crate calls a wildcard wait: the only waits are `std::process::Child::wait` / `try_wait` (exact pid) in the CLI and `host`, and PR 3's backend in the daemon. No code sets `SIGCHLD` to `SIG_IGN` or uses `SA_NOCLDWAIT`; PR 8 never registers a `SIGCHLD` handler.
+
+**Signal handlers.** The only handlers the process installs are tokio's for `SIGTERM`, `SIGINT`, and `SIGHUP` (L6): an atomic store and a nonblocking pipe write, both async-signal-safe and non-blocking (a source fact about tokio, not something a test of PR 8 proves). A handler that runs in a forked child before PR 3's `pre_exec` resets dispositions writes one byte to the child's copy of the pipe, which only wakes the daemon's driver without an event. The panic hook is not a signal handler.
+
+**Windows.** `CreatePseudoConsole` and `CreateProcessW` run under the lock inside the backend (PR 4); the CLI's spawns use std under the same lock. The daemon and the CLI close no handle they did not open: both crates forbid `unsafe`, so a raw `CloseHandle` is impossible outside `pty-runtime`'s `sys` modules. A parent job that refuses nesting makes PTY spawns fail with no uncontained running child (PR 4, L14); PR 8 adds no check for it.
+
+### 2.12 Windows Parent Job
+
+**What the hazard is.** A daemon inside a job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` dies, with every PTY session it owns, when the job's last handle closes, typically when the launching terminal exits (prior-art row 8). Nesting is not the issue: PTY spawns nest under such a job, including one with UI limits (L14, A13); a parent that refused nesting would make spawns fail without an uncontained child (PR 4), which the doctor reports (PR 21). The check is about the daemon's **lifetime**.
+
+**What can be proven.** Only the immediate job's limits are visible, and no API names a parent job (L13), so "outside every kill-on-close job" can be proven only as **in no job at all**: `IsProcessInJob(self, NULL) == false`.
+
+**Starter** (`daemon start`, from `host::job_state()` of the CLI process):
+
+| CLI process | Launch | Then |
+|---|---|---|
+| not in a job | `DETACHED_PROCESS \| CREATE_NEW_PROCESS_GROUP` | child in no job |
+| immediate job has `BREAKAWAY_OK` | + `CREATE_BREAKAWAY_FROM_JOB` | child leaves the chain up to the first job without breakaway (L13) |
+| immediate job has `SILENT_BREAKAWAY_OK` only | no breakaway flag (the explicit flag requires `BREAKAWAY_OK`, L13) | the child breaks away implicitly as above |
+| immediate job allows neither | — | refused before spawning, exit 1: "this terminal runs inside a job that Chaldea cannot leave, so a detached daemon could be killed when the terminal closes; run `chaldea daemon run` in a window you keep open, or start Chaldea from a terminal outside such a job" |
+
+A spawn with `CREATE_BREAKAWAY_FROM_JOB` that fails with `ERROR_ACCESS_DENIED` is not retried without the flag (the spike's retry, L12, could start a daemon tied to the terminal): it is refused with the same message.
+
+**The child decides.** Step 2 reads `host::job_state()` in the daemon itself and records it in `daemon.json`'s `evidence.job` (with `evidence.console` from `host::has_console()`). In `DetachedChild` mode it requires `in_job == false`; otherwise it fails with `parent_job` (an outer job that refused the breakaway, nested or not). In `Foreground` mode a job is logged as a warning ("this daemon runs inside a job and may be killed with it, with its sessions") and the daemon runs: a foreground daemon's lifetime is the window's by the user's choice, and its sessions are recovered at the next start like after any crash.
+
+**CI assumption (A-W1).** The Windows tests of PR8-CL-11 and CL-12's starter cases need the test process to be in no job or in jobs that let a child leave them. The CI job's preflight step (§1) runs `host::windows::tests::runner_can_break_away` before any other test, as a real smoke test: it records `job_state()`, launches a helper with the flags the starter would choose, and asserts the helper reports `IsProcessInJob(self, NULL) == false`. The detach tests depend on that precondition and fail with the recorded state in their message (never skip). WMI `Win32_Process.Create` (herdr, L9) is the alternative if a supported terminal or the runner turns out to run inside a job without breakaway (§3, §8 D5).
+
+### 2.13 Logging, the Panic Hook, Owner Token, `chaldea open`
+
+**Log subsystem** (installed once by `prepare_process`):
+
+- **Queue and thread.** Every diagnostic is a line pushed with `try_send` onto a bounded `std::sync::mpsc::sync_channel` (1024 lines) drained by the `daemon-log` thread; a full queue drops the line and counts it (the count is logged when space returns). The thread writes each line to the current `LogTarget` with one `write_all`, ignoring errors. A stalled stderr or disk therefore blocks only the log thread, never a request, the gate, or the coordinator.
+- **Target.** Per run: stderr in `Foreground`; in `DetachedChild` mode nothing until step 6, then `daemon.log` opened after the lock (`open_no_follow`, append, create `0600`). The coordinator switches the target away from `daemon.log` at shutdown step 6 and waits up to `log_flush` for the thread's acknowledgement (§2.8).
+- **Rotation.** When `daemon.log` reaches its cap (8 MiB; a `cfg(test)` override sets a smaller one), the log thread checks `daemon.log.1` is absent or a regular file, renames `daemon.log` onto it, and creates a new `daemon.log`. If the check or the rename fails (a held destination on Windows, a filesystem error), the thread stops writing to the file, counts the dropped lines, and retries the rotation every 60 s; it never writes past 8 MiB. A detached daemon therefore keeps at most 16 MiB plus one line of logs.
+- **Subscriber.** `tracing_subscriber::fmt()` with `with_writer(QueueWriter)`, `with_ansi(false)`, level `INFO`, as the global default. `QueueWriter::make_writer` returns a `LineBuf` that collects one event's bytes (L8) and, on drop, converts them lossily to UTF-8, applies `http::trace::redact_secrets` to the whole formatted line (message, fields, and span fields alike), and pushes it.
+- **Other diagnostics.** Text that reaches the user outside `tracing` (clap's rendered errors, a refusal printed by the CLI, the readiness `fail` message, the starter's own output) goes through one function, `log::diag(&str) -> String`, that applies `redact_secrets` and replaces control characters; nothing else prints a diagnostic.
+
+**Panic hook** (installed once by `prepare_process`, replacing the default hook, which would print the payload):
+
+- Requests `Panic` on the active gate (§2.3) first, if one is registered.
+- Then pushes one line: `chaldea: panic in <kind> at <file>:<line>:<column> (payload omitted)`, passed through `redact_secrets`. `<kind>` is a fixed label: the task kind of the registered task being polled on this thread (`accept`, `connection`, `socket`, `write`, `runner`), else one of the daemon's own thread names (`store-writer`, `daemon-log`, `daemon-stop`, `main`), else `runtime` for a tokio thread or `thread` for any other; a thread's name itself is never printed. The payload, its message, and a backtrace are never formatted.
+- **Lock discipline.** The hook uses no `tracing`. It takes exactly two locks, each only for a fixed sequence of std operations that call no user code and cannot panic: the `ACTIVE_GATE` mutex, held only to upgrade the `Weak` (a poisoned mutex is read through `into_inner`), and tokio `Notify`'s internal mutex inside `notify_one`. `OnceLock::set` and `AtomicU8::fetch_max` take none, and `try_send` never blocks. A panic raised while one of those locks is held cannot happen, so the hook cannot deadlock on a lock its own thread holds.
+
+The task kind comes from a thread-local that PR 7's registry wrapper sets for the duration of each `poll` of a registered task (a `Cell<Option<TaskKind>>` with a guard that restores the previous value), an internal change to `http/registry.rs`.
+
+**Every panic stops the daemon.** A panicking runner leaves its receipt `in_progress` (like `ReceiptUncompleted`), and the hook cannot tell a harmless panic from that one, so the first panic starts the shutdown (cause `Panic`), later ones raise `worst`; exit 1 with reason `panic`. A writer job's panic is still rolled back by the store (`Panicked`, store §2.2) and the shutdown then drains normally.
+
+**Owner token.** Step 6 checks an existing `owner.token`'s privacy (§2.4) and format, reading it through `open_no_follow` (at most 128 bytes): not of the form `chd_[A-Za-z0-9_-]{43}\n` → refuse (`TokenFile`, "owner.token is not a Chaldea token file; move it away"), nothing written. Step 12, before `serve`:
+
+1. `owner.token` absent → issue.
+2. Present (and checked at step 6): verify it in one store read run in `spawn_blocking`: `http::verify_secret_in(tx, secret)` with kind `owner`. `Ok` → keep the file unchanged. `AuthFailure::Invalid` (revoked, unknown in this database) → issue. `AuthFailure::Store(_)` or a read error → fail the start (`StoreOpen`): a store error is never taken as "invalid", so a transient failure never replaces a valid token.
+3. **Issue:** `server.tokens().issue_owner(None, now + 5 s)` (one write job: `token_insert` of an `owner` token; http §2.4), then `write_replace("owner.token", secret + "\n")` (its temporary is created by `create_private_file`, §2.4).
+
+The file's token lives until it is revoked (mvp §2.5: owner tokens last "until revoked"); a revoked or unknown token is replaced at the next start, and a missing file is reissued. The daemon never revokes a token on its own, so a paired PWA and every CLI holding the token keep working across restarts (§8 D8).
+
+**`chaldea open [--print-url]`** (http §8 D12):
+
+1. `Discovery::read` → `Serving`, else exit 1 ("daemon not running; run `chaldea daemon start`").
+2. Read `owner.token` with the checks above.
+3. One HTTP/1.1 request on a new connection: `POST /api/pair-codes`, `Host: 127.0.0.1:<port>`, `Authorization: Bearer <token>`, `Content-Length: 0`, no `Origin`, `Connection: close`, 5 s deadline; `200` with `PairCodeResponse { code, expires_in }`, else print the `ErrorBody` code and exit 1.
+4. URL `http://127.0.0.1:<port>/#pair=<code>`. `--print-url` prints it to stdout and exits 0. Otherwise `open::run` hands it to its launcher, `host::open_url` in the binary:
+   - **macOS:** `/usr/bin/open <url>` through `with_spawn_lock`, waited for up to 5 s; Launch Services passes the URL to the default browser.
+   - **Windows:** `ShellExecuteExW` with `lpVerb = "open"`, `lpFile = <url>`, `SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI` (L21): a system API with no `PATH` lookup.
+   The URL, and so the code, may appear in a launcher's or the browser's arguments (§2.1). A launcher error or a non-zero `open` exit → print the URL with "could not open a browser; open this URL yourself" and exit 0. The code is never logged. Until PR 18 mounts the PWA, `/` answers 501.
+
+`open::run` takes the launcher as a parameter (`&dyn Fn(&str) -> io::Result<()>`), so tests observe the URL handed over without launching a browser.
+
+`client.rs`'s HTTP client is std-only (one request per connection, as http §2.2 requires of clients), reads the status line, headers, and a `Content-Length` body of at most 1 MiB, each read bounded by the remaining deadline (`set_read_timeout`, `connect_timeout`).
+
+### 2.14 What Later PRs Plug In
+
+| Seam | Type | Used by |
+|---|---|---|
+| Restart reconciliation before the listener | `Components::reconcilers(&Store) -> Vec<Reconciler>`, `Reconciler { name, job: Box<dyn FnOnce(&mut WriteTx<'_>) -> Result<u64, JobError> + Send> }`, each its own job, in order | PR 8 (receipts), then PR 10 (open launches → `launch_exited` `daemon_restart` / `unknown_after_crash`, inputs, token revocation; mvp §2.9 "Daemon restart"), then PR 9 (buffered deliveries of launches that can no longer bind → `raw_unknown`). **Order:** PR 10's runs before PR 9's, because PR 10 decides which launches can no longer bind and PR 9 finalizes their buffered deliveries from that |
+| Building components | `Components::build(&BuildCtx { store, gate, sink, port, state_dir }) -> Built { mounts, participants }` at step 11; `Components::attach(&HttpServer)` at step 12 for the token service | PR 9 (`POST /hook`), PR 10 (supervisor, `/api/adapters`, launch tokens), PR 11, PR 18, PR 20, PR 21 |
+| Commands | the merged `HttpServer::new` takes four arguments (L16). 7c adds `CommandRegistry` (http §2.2): **whichever of PR 8 and 7c merges later** adds `commands: CommandRegistry` to `Built` and passes it to `HttpServer::new` at step 11 | PR 10, 16, 20, 21 |
+| Shutdown participants | `pub trait ShutdownParticipant: Send + Sync { fn name(&self) -> &'static str; fn shutdown(&self, end: Instant) -> BoxFuture<'_, ()>; }`, run after HTTP, before the store, sharing the 2 s between `C − 5 s` and `C − 3 s` | PR 10 (supervisor: stop accepting spawns; sessions per its design) |
+| Fatal outcomes from later code | `BuildCtx::gate` (`GateHandle::request`) and `BuildCtx::sink` | PR 10 |
+| Spawning children | `spawn_locked` (CLI), `with_spawn_lock` (daemon, backend) | PR 10, 16 (git), 20 (one-shot hooks) |
+| Discovery and token for clients | `cli::client::{Discovery::read, read_owner_token, request}` | PR 10 (CLI commands), PR 11 (attach), PR 21 (doctor) |
+| Evidence for the doctor | `daemon.json` (`detached`, `evidence`), `probe`, `daemon.log` | PR 21 |
+| Browser credential | §2.1's threat model and its reopen condition | PR 18 |
+
+### 2.15 Single Deciding Points
+
+| Operation that can happen concurrently | Decided by | Why a second actor cannot act |
+|---|---|---|
+| Which process owns a state directory | the OS file lock (`try_lock`) | the OS grants it to one handle; a second gets `WouldBlock` |
+| Whether an existing directory is adopted | `state_dir::prepare` (privacy + marker) | the marker is published with a no-replace `hard_link`; a concurrent start that loses reads the complete winner's |
+| Shutdown start, cause, and cutoff | `ShutdownGate::first` (`OnceLock::set` of `Stopping`) | only the first `set` succeeds; later requests log and raise `worst` |
+| Crash exit on a console end | `ShutdownGate::crash` → the coordinator returns | no further shutdown step starts after it is observed |
+| Bare exit on a missed join | the coordinator at `C − 6 s` | it touches nothing the unjoined task may still own |
+| Ownership of what startup created | the startup task, until it returns `Started` to the coordinator | the task is never aborted; the coordinator acts only on what it returned |
+| Calling `ServeHandle::shutdown`, `Store::shutdown`, releasing the lock | the coordinator | no other code holds the `ServeHandle` or calls `Store::shutdown`; `release` is crate-private and called only there |
+| Lock release vs exit with the lock | §2.8 step 6's conditions, read once | released only then; `Drop` never releases |
+| Writing `daemon.json`, `port`, `owner.token` | the lock holder, in its startup steps | only the holder writes; replacement is `write_replace` |
+| Removing `daemon.json` | the coordinator with an `instance` match | a record of another instance is never removed |
+| Serving vs unreconciled receipts | startup order: step 9 before step 10 | no listener exists before reconciliation commits |
+| Detached verdict | the startup task's `ready`, or the coordinator's `fail` after the lock decision | one owner of the writer at a time; the starter only reads it, EOF, or times out |
+| Parent job verdict | the child's step 2 | the starter's check only chooses the launch and refuses early |
+| Stop delivery | the OS (signal, event) → the gate | the gate is the only effect a stop request has |
+| Stop completion | the target identity's disappearance | a new daemon's lock does not count as the old one's |
+| Panics | the panic hook → the gate; startup and coordinator panics caught by `run` | as above |
+
+## 3. Structure Options
+
+| Fork | Option | Precedent | Verdict |
+|---|---|---|---|
+| **Crate layout** | A. Everything in the `chaldea` binary crate | herdr's single crate | Rejected: the lifecycle could not be unit-tested with the store's and HTTP's test faults, which are `cfg(test)` in `chaldea-daemon`. |
+| | B. `lifecycle` module in `chaldea-daemon` + thin `crates/cli` binary | mvp §3 (`crates/cli` = binary, `daemon run`) | **Adopted.** `run` returns an `ExitReport`; `main` exits. |
+| | C. A separate daemon binary | — | Rejected: mvp §3 "Single binary". |
+| **Argument parsing** | A. Hand-written / `lexopt` | the spike's `cli.rs` | Rejected: about twenty subcommands with flags (mvp D2). |
+| | B. `clap` derive without color and suggestions, errors rendered through `diag` | Codex CLI, herdr | **Adopted** (`=4.6.8`, L18); `hook-emit` dispatches before clap. |
+| **Where OS code lives** | A. `cfg` blocks in `daemon` and `cli` | — | Rejected: AGENTS.md isolates OS code in `pty-runtime`, and the calls need `unsafe`, forbidden in both crates. |
+| | B. A new `crates/os` crate with its own `unsafe` carve-out | — | Rejected for the MVP: a second carve-out and lints table; can split out later without API change. |
+| | C. `pty-runtime::host` with `unsafe` only in the existing `sys` modules | PR 3 / PR 4 carve-out | **Adopted.** |
+| **Single-instance lock** | A. A pid file checked for liveness | many daemons | Rejected: pid reuse; a crash leaves it; deleting it needs proof. |
+| | B. A SQLite exclusive transaction on a dedicated file | T3 Code (L11) | Rejected: the same OS mechanism as std's file lock with a second SQLite connection. |
+| | C. A named mutex / Unix socket | herdr (socket) | Rejected: no named mutex on macOS; a socket file needs unlinking. |
+| | D. `File::try_lock` on a data-less `daemon.lock`, never removed, never released by a drop | std (L1), T3 Code's never-unlink rule | **Adopted.** |
+| **Stop path** | A. An HTTP route `POST /api/daemon/stop` | herdr `server.stop` over its socket | Rejected: a public route (mvp §2.5), and a wedged or saturated HTTP stack, or a daemon still starting, could not be stopped. |
+| | B. A private control socket or pipe per instance | — | Rejected for the MVP: removes the Unix PID race (§2.10) but adds a socket file to remove (Unix) and a pipe server; the race is within the account (§2.1). |
+| | C. Unix `SIGTERM` to a verified identity; Windows a `Global\` event per instance with an account-only DACL | T3 Code stops as a `SIGTERM` would (L11) | **Adopted.** Works during startup and when HTTP is stuck; reaches every session of the account on Windows. |
+| **Stop during startup** | A. Abort the startup task and shut down what it published | — | Rejected: cancellation cannot interrupt a step's synchronous part, so a resumed step could publish after the lock was released, and partial state would need a shared handoff. |
+| | B. The task stops at its next step boundary and returns what it owns; the coordinator joins it within the budget, else exits holding the lock | — | **Adopted** (§2.7, §2.8). |
+| **Port** | A. A fixed default port | T3 Code `DEFAULT_PORT = 3773` (`config.ts:30`) | Rejected: two state directories (or test runs) on one host collide. |
+| | B. Ephemeral each start | — | Rejected: the PWA origin changes. |
+| | C. An OS-ephemeral port once, saved | — | Rejected: the dynamic range is handed to outgoing connections, so the saved port is often taken later. |
+| | D. The first free port of `7373..=7472`, saved once the daemon serves; `--port` overrides | — | **Adopted** (§2.6). |
+| **Detach on Windows** | A. `DETACHED_PROCESS` + breakaway when allowed; the child proves it is in no job | spike C-5 (L12), herdr's readiness rule (L9) | **Adopted.** |
+| | B. WMI `Win32_Process.Create` | herdr (L9) | Rejected for the MVP: COM and the WMI service; reopen condition in §8 D5. |
+| | C. Task Scheduler / service | — | Rejected: installation state outside the state directory. |
+| **Detach on macOS** | A. `setsid` only | herdr before #4920 | Rejected on GUI hosts: quitting the terminal app kills the daemon and its sessions, an ordinary action for a host reached from the PWA (L10). Kept where no GUI domain exists (SSH), where no terminal app is involved. |
+| | B. A one-shot launchd job in `gui/<uid>` that forks the daemon; a failed submission fails the start | herdr `launchd_spawn.rs` (L10) | **Adopted** for GUI hosts. herdr also falls back to a direct spawn on some failures; Chaldea does not, because the fallback would report success for a daemon that dies with the terminal app. |
+| | C. A persistent LaunchAgent | — | Rejected: installation state, and launchd would own restarts. |
+| **Readiness handshake** | A. Poll the discovery record | herdr polls its socket (L9) | Rejected: a failure is seen only as a timeout. |
+| | B. One verdict line over a channel (stdout pipe on Windows; a Unix socket on macOS, which also works for a launchd job) | — | **Adopted.** |
+| **Shutdown budget** | A. Separate budgets for HTTP and the store | — | Rejected: the obligation is one budget. |
+| | B. One cutoff fixed at the first cause, with ends for startup join, HTTP, participants, and the store | store §4 row 8; http §4 row 8 | **Adopted.** |
+| | C. A Windows console end tightens the cutoff | — | Rejected: `ServeHandle::shutdown` requests aborts only after its wait and `Store::shutdown` keeps its first deadline, so tightening could skip aborts or outlive the new cutoff; within about 5 s (L7) a crash exit with crash-only recovery is the honest outcome. |
+| **Second trigger** | A. A second Ctrl-C forces exit | many CLIs | Rejected: two deciding points; the budget already bounds the shutdown. |
+| | B. Later triggers only log or raise the reason's severity | herdr "first stop reason wins" (`server/shutdown.rs`) | **Adopted.** |
+| **Panics** | A. Stop only for runner panics | — | Rejected: the hook cannot classify reliably. |
+| | B. `panic = "abort"` | — | Rejected: the store's writer catches job panics to roll back (store §2.2). |
+| | C. Every panic stops the daemon through the gate; startup and coordinator panics caught by `run` | — | **Adopted.** |
+| **Owner token file** | A. Rotate every start | — | Rejected: every client holding the old token fails after any restart. |
+| | B. Keep while valid and private; reissue when missing or invalid | mvp §2.5 "until revoked" | **Adopted.** |
+| **State directory privacy** | A. Location under the profile (Windows), mode bits (macOS) | store §5 "Permissions" | Rejected: a directory under the profile can grant other accounts access, and a macOS ACL can grant beyond the mode. |
+| | B. Explicit owner-only descriptors at creation, verified on the handle; existing directories and the token checked against one private-trustee set and never modified | — | **Adopted.** |
+| **Pair code to the browser** | A. The OS launcher with the URL as its argument (`/usr/bin/open`, `ShellExecuteExW`) | http D12 | **Adopted** under §2.1: arguments are visible only to the account's own processes. |
+| | B. An account-private redirect page that the browser opens by path | — | Rejected: protects nothing inside §2.1's model, and the page must outlive a cold browser start yet be removed after a killed CLI. |
+| | C. Print only | — | Kept as `--print-url` and as the fallback. |
+
+## 4. Same-Class Inventory
+
+Every later PR that starts children, adds a shutdown participant or reconciler, or reads the discovery files, and the seam it uses (§2.14). None needs a change to PR 8's types; 7c's `CommandRegistry` is the one addition, made by whichever of PR 8 and 7c merges later.
+
+| PR | What | Seam | What PR 8 provides |
+|---|---|---|---|
+| 7c commands | `CommandRegistry` passed to `HttpServer::new` | `Built::commands` (added by the later merge) | step 11 |
+| 9 hooks | `POST /hook`; restart: buffered deliveries of launches that can no longer bind → `raw_unknown` | `build` (mounts), a reconciler after PR 10's | reconcilers before the listener; the emitter reads `CHALDEA_HOOK_URL` from its env, not the discovery files |
+| 10 supervisor | commands, launch tokens, restart scan, PTY children, sessions at shutdown | `reconcilers`, `build` (store, gate, sink, port), `attach` (tokens), `ShutdownParticipant`, `spawn_locked` / `with_spawn_lock` | the process rules of §2.11; order HTTP → supervisor → store |
+| 10 CLI commands | `spawn`, `send`, `wait`, … | `client::{Discovery::read, read_owner_token, request}` | the liveness rule (§2.6); one request per connection |
+| 11 attach | attach client | `client`, `Mount::upgrade` (http) | discovery and owner token; sockets end with the HTTP shutdown |
+| 16 worktrees | git children | `with_spawn_lock` | spawn rule |
+| 18 PWA | `/`, `/assets/*`; pairing page | `build` (mounts) | a stable origin per state directory (§2.6) and §2.1's statement of what it does not prove; `chaldea open` |
+| 20 extensions | one-shot hook children | `with_spawn_lock` | spawn rule |
+| 21 doctor | lock state, record evidence, parent job, log, DB check | `probe`, `daemon.json`, `host::job_state` | evidence recorded at startup, labelled with what was observed |
+
+## 5. Resource Paths
+
+| Resource | Created by | Bound | Ends on |
+|---|---|---|---|
+| `daemon.lock` handle and lock | step 5 | one | `InstanceLock::release` under §2.8 step 6; else process exit (OS release; on Windows possibly delayed, L2) |
+| State directory and marker | step 4 (only if missing or empty) | one | never removed |
+| Marker temporary | step 4 | one | removed after the link; a crash leaves it (counts as empty) |
+| `daemon.json` | steps 7, 13 | one | removed by the coordinator if it names this instance; a crash or console end leaves it (ignored by clients while the lock is free; replaced by the next holder) |
+| `port`, `owner.token` | steps 13, 12 | one each | never removed |
+| Temporaries | `write_replace` | one per call | renamed, or removed on that call's failure; a crash leaves one named by the dead instance |
+| `daemon.log`, `daemon.log.1` | the detached daemon, step 6 | 8 MiB each | rotated; never removed |
+| Log queue and `daemon-log` thread | `prepare_process` | 1024 lines | process exit (flushed for at most 100 ms by the coordinator) |
+| Runtime and its blocking pool | `run` | default workers | `shutdown_background()` at the end of `run`; blocking tasks end with the process |
+| Signal listeners | `run` | 3 (Unix) or 5 (Windows) tasks | with the runtime |
+| Stop listener (Windows event and thread) | step 7 | one | process exit |
+| Startup task | `run` | one | its return at a step boundary or its last step; joined by the coordinator, or left running until process exit if not joined by `C − 6 s` |
+| Store (writer thread, readers, files) | step 8 | store §5 | `Store::shutdown(C)` by the coordinator; an open still running when the process exits ends with it |
+| Reconciler jobs | step 9 | one job each, `not_after` 30 s | their reply (the writer replies to every accepted job) |
+| Listener and HTTP tasks | steps 10, 13 | http §5 | `ServeHandle::shutdown`, awaited to its return |
+| Readiness channel (child end) | step 1 | one | closed after the one line, or at exit |
+| Readiness directory, socket, and plist (starter) | `daemon start` | one each | removed by the starter after the verdict, EOF, or the deadline |
+| launchd job definition | `daemon start` (macOS GUI host) | one | removed by the starter after a verdict; otherwise by a later `start` once proven stale (not running, older than 60 s) |
+| Detached daemon | `daemon start` | one | runs until stopped; never killed by the starter |
+| `/usr/bin/open` child (macOS) | `open` | one | waited for up to 5 s |
+
+**Endings.** Every ending ends the process; "shutdown" means §2.8's sequence. Codes are §2.8's (D14); an OS-forced termination (a kill, Windows ending a process after a console event) has no D14 code: its status is whatever the OS reports.
+
+| Ending | Gate | What happens | Lock | `run` exit |
+|---|---|---|---|---|
+| `SIGTERM` (incl. `daemon stop` on Unix), `SIGINT`, `SIGHUP` | `Signal` | shutdown, cutoff now + 10 s | released iff §2.8 step 6 holds | 0, or 1 (`lock_held_at_exit`) |
+| Ctrl-C, Ctrl-Break (Windows console) | `Signal` | as above | as above | 0 or 1 |
+| `daemon stop` (Windows) | `StopRequest` | shutdown, 10 s | as above | 0 or 1 |
+| Console close; logoff and system shutdown when delivered (Windows, foreground) | `crash` | no further step starts; exit; next start recovers | held unless step 6 already released it | 1 (`console_end`), or killed |
+| Any stop during startup | the trigger's | the startup task stops at its next step boundary; the coordinator joins it until `C − 6 s`, then shuts down what it returned; a detached starter gets `fail stopped` | `NeverTaken` if stopped before step 5, else as above | 0 (clean: `NeverTaken` or `Released`) or 1 |
+| Startup not joined by `C − 6 s` | — | bare exit: no cleanup, no verdict (the starter sees EOF); the record stays | held until exit | 1 (`startup_unjoined`) |
+| `StoreFatal` from `GateSink` or step 9 | `StoreFatal` | shutdown, 10 s; the unknown outcome stays for restart (store §2.2) | as above | 1 |
+| Panic in any task or thread | `Panic` | hook line; shutdown, 10 s | as above | 1 |
+| Panic in the startup task | `Panic` (from its `JoinError`) | shutdown of nothing (its resources unwound) | held until exit if step 5 may have run | 1 |
+| Panic in the coordinator | — | `run` returns at once | held until exit | 1 |
+| Parent job refusal (detached, Windows) | — (step 2) | `fail parent_job` | never taken | 1 |
+| State directory refused, lock I/O error | `StartupFailed` | nothing else touched | never taken | 1 |
+| Lock held by another daemon | `StartupFailed` | nothing else touched | not ours | 3 |
+| Token file, port file, or database path refused | `StartupFailed` | before the log and the store | released | 1 |
+| Store open fails | `StartupFailed` | §2.7 row 8 | released | 1 |
+| Reconciliation fails | `StartupFailed` / `StoreFatal` | store shut down | iff §2.8 step 6 holds | 1 |
+| Port bind fails | `StartupFailed` | store shut down; `port` unchanged | as above | 1 |
+| Owner token verify, issue, or write fails | `StartupFailed` / `StoreFatal` | store shut down | as above | 1 |
+| Port or record write fails at step 13 | `StartupFailed` | full shutdown; `port` unchanged if before its rename | as above | 1 |
+| Kill (`SIGKILL`, `TerminateProcess`), a foreground daemon's job closing, logoff of a detached Windows daemon | — | no shutdown; the OS closes handles and releases the lock; the next start recovers the WAL and runs the reconcilers | OS | killed |
+| Readiness deadline (starter) | — | the child keeps starting; the starter exits 4 | child's | — |
+
+**Waits.**
+
+| Wait | Bound |
+|---|---|
+| Lock acquisition | 2 s of retries on contention, polled every 50 ms (a CLI allowance; L2 has no OS bound) |
+| `Store::open` (including a projection rebuild) | none of its own (store §2.8); a stop during it is bounded by the startup join (`C − 6 s`), after which the process exits holding the lock |
+| Each reconciler job | admission `not_after` 30 s; the reply is guaranteed by the writer (store §5); bounded by the startup join as above |
+| Owner token issue | `issue_owner` deadline 5 s + PR 7's reply grace |
+| `write_replace` rename retries | 500 ms |
+| Startup join | until `C − 6 s` |
+| HTTP drain | `ServeHandle::shutdown(C − 5 s)`, which returns by its deadline |
+| Participants | until `C − 3 s` |
+| `Store::shutdown` | `C` (its own bound), observed until `C + 250 ms` |
+| Log target switch and flush at exit | 100 ms each |
+| Readiness (starter) | 15 s from the start, covering the GUI-domain probe (at most 3 s), `bootstrap` (all but the last 3 s), the label `print` (the reserved 3 s), `bootout`, and the verdict; EOF follow-up at most 2 s within it |
+| `daemon stop` | 15 s from the start |
+| `open`: request 5 s; `/usr/bin/open` 5 s; `ShellExecuteExW` | as listed; `ShellExecuteExW` has no bound of ours (§2.1 rule 6) |
+| Signal listeners, stop listener thread, log thread | unbounded by design: they end with the process |
+
+**Windows and macOS differences.** Lock: `flock` vs `LockFileEx` (released lazily after a crash on Windows). Detach: launchd job + fork + `setsid` on a GUI host (`setsid` alone without a GUI domain) vs `DETACHED_PROCESS` + breakaway. Readiness: Unix socket vs stdout pipe. Stop: `SIGTERM` to a verified identity vs a `Global\` event per instance. Console end: Windows only, a crash exit (Unix has `SIGHUP`, a graceful stop). Parent job: Windows only. Privacy: owner, mode, and ACL vs owner and DACL. Browser: `/usr/bin/open` vs `ShellExecuteExW`. Wait ownership: macOS only (Windows has no reaping, PR 4 §2.1).
+
+## 6. Purpose Layer and Plan Layer
+
+### 6.1 Purpose Layer: Acceptance Criteria
+
+Checked on a real `chaldea` binary on a developer machine of each OS. `$D` is a fresh state directory; requests carry the owner token from stdin, never in an argument: `printf 'Authorization: Bearer %s\n' "$(cat $D/owner.token)" | curl -s -H @- …` (`printf` is a shell builtin).
+
+| ID | Criterion (EARS) | Source | How to observe |
+|---|---|---|---|
+| PR8-P-1 | When a user runs `chaldea --state-dir $D daemon start` from a terminal application on a healthy GUI host, the daemon shall be serving within 15 s, survive the closing of the terminal window and the quitting of that application, and stop with `chaldea daemon stop`. | mvp §4 PR 8; arch §5 open item; L10 | Two separate checks, each on a fresh instance launched from the application under test: (a) start, note `instance` and `pid` from `$D/daemon.json`, close the window, from another terminal `GET /api/threads` → 200 with the same `instance`; (b) stop, start again from the application, note the new `instance`, quit it (`Cmd-Q` on macOS), request again → 200 with that `instance`. Then `daemon stop` → "stopped", exit 0. |
+| PR8-P-2 | While a daemon serves `$D`, a second `daemon run` on `$D` shall exit 3 without changing anything, and `daemon start` shall report the running daemon. | mvp §4 PR 8 | `daemon run` → exit 3 with the URL; `ls -l $D` unchanged; `daemon start` → the same URL, exit 0. |
+| PR8-P-3a | When the daemon is killed while a command receipt is `in_progress` and is started again, the receipt shall be `unknown_after_crash` before any request is served, and the origin shall be unchanged. | mvp §2.4 "Restart", P-18, P-19 | Kill by pid with an `in_progress` receipt (a 7c test command, or one written through the store API); `daemon start`; same port; the doctor's or a test's store read shows `unknown_after_crash`. |
+| PR8-P-3b | When a client retries that command with its `command_id`, the daemon shall answer 409 `unknown_after_crash`. | mvp §2.4 | With 7c and PR 10's first long command: the retry → 409 `unknown_after_crash`. |
+| PR8-P-4 | When `chaldea open` runs, the default browser shall open the daemon's pairing URL with its fragment, and the code shall work once within 60 s. | mvp §2.5 "Secrets"; http D12 | Real browser after PR 18, launched both cold (not running) and warm; before PR 18, `--print-url` and a `POST /api/pair` with a matching `Origin` → 200, again → 401. |
+| PR8-P-5 | When the daemon logs, fails to start, or panics, or the CLI rejects its arguments, no token, ticket, pair code, or request body shall appear in its output. | http §2.10 | `grep -E 'chd[tp]?_[A-Za-z0-9_-]{20}' $D/daemon.log` → nothing after a session with pairing and commands; PR8-CL-19, CL-20 cover arbitrary body text with markers. |
+| PR8-P-6 | If a Windows user starts the daemon from a terminal inside a job it cannot leave, then `daemon start` shall refuse with a message instead of starting a daemon that dies with the terminal. | arch §5 "Daemon parent job check" | Windows host; a terminal inside such a job (the CI test's helper is the reproducible form). |
+| PR8-P-7 | When the store reports a fatal outcome, the daemon shall stop, and the next start shall reconcile. | mvp §4 PR 8 | Not provokable on a healthy machine; PR8-CL-8 with fault injection. |
+| PR8-P-8 | When the state directory or `owner.token` grants access to anyone outside the private trustees (§2.4), the daemon shall refuse to start; a refused directory shall be unchanged, and a refused token shall leave at most an empty `daemon.lock` created. | §2.1, §2.4 | `chmod 755 $D` (macOS) or an added `Users` ACE (Windows) → refusal message, listing unchanged; `chmod 644 $D/owner.token` → refusal naming revocation, listing unchanged but for `daemon.lock`. |
+
+### 6.2 Plan Layer: Claims
+
+| ID | Claim (EARS) | Source | Falsifying test |
+|---|---|---|---|
+| PR8-CL-1 | The daemon shall create a missing state directory private to the account (macOS mode `0700`; Windows an explicit protected DACL for the user and `SYSTEM`) with a complete marker, and shall refuse, changing nothing, a directory whose final component is a link, that is not owned by the user, that grants group or other mode bits or an allow ACL entry outside the private trustees, or that is non-empty without a valid marker; an unfinished marker temporary shall not prevent adoption. | §2.4; store §5 "Permissions"; mvp §4 PR 8 | unit (helper process) `state_dir::creates_private` (mode or DACL read back), `state_dir::refuses_a_linked_final_component`, `state_dir::adopts_empty_and_marked`, `state_dir::adopts_with_only_a_marker_temp`, `state_dir::marker_link_does_not_replace` (an existing marker with other content: `hard_link` fails, the existing file unchanged, validated and refused), `state_dir::refuses_unmarked_nonempty` (a directory holding a file `port` with `7373\n`: refused, file unchanged); macOS `state_dir::refuses_not_owned_first` (`/usr`: `NotOwned` reported before any mode check), `state_dir::refuses_group_readable` (0750), `state_dir::refuses_acl_allow_entry` (`fake::grant_everyone_read_acl` on a 0700 directory); Windows `state_dir::refuses_users_ace_under_profile` (a directory under `FOLDERID_LocalAppData` with `fake::grant_users_read`), `state_dir::refuses_existing_public_dir` (the existing Public folder, `FOLDERID_Public`, resolved through `SHGetKnownFolderPath`; not created by the test) |
+| PR8-CL-2 | `write_replace` shall replace only an absent entry or a regular file, through a temporary created with an explicit owner-only descriptor and a rename, never write through a link, leave the target unchanged and no temporary when it fails before the rename, and count the rename as the commit; the daemon shall refuse a database or sidecar path that is a link. | §2.4 rule 4 | unit `files::replaces_regular_file`, `files::refuses_symlink` (macOS: link to a file outside: refused, target unchanged), `files::write_failure_removes_the_temp`, `files::rename_failure_keeps_the_target`, `files::dir_sync_failure_is_a_warning` (fault after the rename: `Ok`, new content, a warning line); `files::temp_descriptor_is_owner_only` (mode or DACL of the temporary read from its handle before writing); `startup::refuses_linked_database_and_sidecars` (four cases, `chaldea.db`, `-wal`, `-shm`, `-journal` made with `fake::make_link`: `StoreOpen`, nothing opened, the link target unchanged); Windows `files::replaces_while_a_reader_holds_it` (L4), `files::refuses_reparse_point` (a junction, integration), and `host::windows::tests::classify_entry` (the pure classifier over attribute and reparse-tag inputs: a non-directory with `FILE_ATTRIBUTE_REPARSE_POINT` and `IO_REPARSE_TAG_SYMLINK` is `Link`, not `NotOfKind`, so the file case is covered without a symlink privilege) |
+| PR8-CL-3 | While a daemon holds `daemon.lock`, another acquisition shall fail with `Held` while an I/O failure shall fail with `LockIo`; the lock shall be free after `release`, after the holder's exit, and after its kill. | §2.5; L1 | unit `lock::second_handle_is_held`, `lock::release_then_reacquire`, `lock::io_error_is_not_contention` (a lock path that is a directory); helper process `lock::drop_does_not_release` (the parent probes `Held` after the helper dropped its `InstanceLock`, until the helper exits); binary `daemon_run::second_run_exits_3_and_touches_nothing` (listing and mtimes before and after), `daemon_run::reacquire_after_kill` (kill by pid; `daemon run` again succeeds within the 2 s allowance or reports `already running`, and succeeds once the probe says `Free`) |
+| PR8-CL-4 | The lock shall be released in-process only when the startup task returned, HTTP reported no aborted task, the store reported both `readers_returned` and `writer_exited`, and the log target switch was acknowledged; otherwise `run` shall return `HeldUntilExit` within its cutoff plus 1 s, and another process shall not acquire the lock until the first process exits. | mvp §4 PR 8; store §5 | helper processes, each under a parent timeout of 30 s, each pausing 2 s after `run` returns while the parent's probe sees `Held`, then `Free` after its exit: `shutdown::blocked_writer_keeps_the_lock` (a writer job held past the cutoff: `writer_exited: false`, `run` returns within 10 s + 1 s wall clock), `shutdown::live_reader_keeps_the_lock` (a `CommitUnknown` retires the writer first, then a real reader is held past the cutoff: the report has `writer_exited: true`, `readers_returned: false`, and the lock is held), `shutdown::aborted_http_task_keeps_the_lock`, `shutdown::unacknowledged_log_switch_keeps_the_lock` (a fault withholds the log thread's acknowledgement); unit `shutdown::exited_writer_releases` |
+| PR8-CL-5 | Shutdown shall run the startup join, HTTP, participants, then `Store::shutdown` with the coordinator's cutoff, the store call on a blocking thread so that no worker thread is occupied and the coordinator itself stays responsive while it blocks. | mvp §4 PR 8; http §4 row 8 | unit `shutdown::order_and_ends` (recording participant and a real server and store: order and the ends passed); helper process under a parent watchdog of 30 s `shutdown::store_shutdown_runs_off_the_workers` (a reader held until 1 s before the cutoff makes the real `Store::shutdown` block; meanwhile `worker_threads` tasks each record their thread id and wait on one `std::sync::Barrier` of that size, which they cross only if every worker is free; the thread id recorded inside the `spawn_blocking` closure is none of theirs; and a `cfg(test)` probe that only the coordinator's `select!` loop answers replies within 100 ms) |
+| PR8-CL-6 | The listener shall not exist until every reconciler committed, and every `in_progress` receipt shall be `unknown_after_crash` before the first request is served. | mvp §4 PR 8; formal-specs §7.4 | unit `startup::no_listener_during_reconciliation` (a fault parks step 9; a connect to the chosen port is refused; released → serving); binary `daemon_run::in_progress_receipt_becomes_unknown` (a database with an `in_progress` receipt written through the store API; start; stop; a store read shows `unknown_after_crash`) |
+| PR8-CL-7 | Each `StoreFatal` variant passed to `GateSink`, and `SubmitError::Failed` at step 9, shall start the shutdown and make the exit 1 with reason `store_fatal`, also when it arrives after another cause; a panic after a store fatal shall make the reason `panic`. | mvp §4 PR 8; http §2.2 | unit `gate::each_fatal_variant_stops` (four cases), `gate::late_fatal_sets_the_reason` (Signal first, `WriterGone` second: cause Signal, cutoff unchanged, reason `store_fatal`), `gate::reason_precedence` (Signal, `WriterGone`, then a panic request: `panic`), `startup::submit_failed_is_fatal` |
+| PR8-CL-8 | When an intent job commits and then meets `CommitUnknown` while serving, the daemon shall stop, the receipt shall be durably `in_progress` after the stop, and the next start shall make it `unknown_after_crash`. | mvp §4 PR 8; store §2.2 | unit `startup::commit_unknown_stops_and_restart_reconciles` (the merged `CommitFault::IoErrAfterCommit` on a test command's intent job; `run_isolated` returns 1 `store_fatal`; a fresh `Store::open` shows the receipt `in_progress`; a second `run_isolated` on the same directory; then `unknown_after_crash`) |
+| PR8-CL-9 | `SIGTERM`, `SIGINT`, and `SIGHUP` (Unix), and Ctrl-C and Ctrl-Break (Windows), shall each stop a serving daemon with exit 0 and a free lock. | §2.8; L6 | binary `daemon_signals::term_int_hup` (macOS, three runs, `rustix::process::kill_process`); Windows `daemon_windows::ctrl_c_and_ctrl_break_stop` (the test starts a helper with `CREATE_NEW_CONSOLE`; the helper starts a foreground daemon on that console (Ctrl-C case: same process group; Ctrl-Break: `CREATE_NEW_PROCESS_GROUP`), and only after creating it calls `fake::ignore_ctrl_c()` for itself, so the daemon does not inherit the ignore (L7); it asserts `fake::console_processes()` contains the daemon's pid, sends the event, and reports the exit code and the lock state) |
+| PR8-CL-10 | When a Windows console end is observed, during startup, while serving, or during a shutdown, the process shall start no further shutdown step and exit holding whatever lock it still holds, and the next start shall roll back an uncommitted transaction, keep a committed one, and reconcile its receipts. | §2.8; L6, L7 | unit `shutdown::console_end_exits_without_store_shutdown` (a recording store wrapper: `crash_exit` while serving, and again after a `Signal` while HTTP drains: `run_isolated` returns `HeldUntilExit`, `console_end`, within 200 ms, and `Store::shutdown` was never called), `shutdown::console_end_during_store_shutdown` (a real `Store::shutdown` blocked on a held reader, then `crash_exit`: `run_isolated` returns `HeldUntilExit`, `console_end` within 200 ms instead of waiting for `C + 250 ms`, and the lock is not released); helper process `shutdown::console_end_recovers_on_restart` (the helper runs `prepare_process` and `run` and exits through `main`'s path; a `cfg(test)` trigger calls `gate.crash_exit(ConsoleEvent::Close)`, since `GenerateConsoleCtrlEvent` cannot send a close event, while one write job is parked inside its transaction before commit and one intent has committed `in_progress`; the parent sees exit 1 and `daemon.json` still present, then runs a second daemon on the directory: the parked job's rows are absent and the receipt is `unknown_after_crash`). Real delivery by closing a window: PR 23. |
+| PR8-CL-11 | When `daemon start` runs inside a kill-on-close job that allows breakaway, explicitly or silently, the daemon shall run in no job and keep serving after the job is closed. | §2.12; L13 | Windows `daemon_windows::start_breaks_away_from_a_kill_on_close_job_with_breakaway`, `…_with_silent_breakaway` (the test owns a `fake::TestJob`; a helper assigned to it runs `chaldea daemon start`; `TestJob::contains(daemon pid)` is false and `evidence.job.in_job` is false; the test closes the job; an authenticated `GET /api/threads` to the same daemon's `serving` record (same `instance`) → 200; then `daemon stop`) |
+| PR8-CL-12 | When `daemon start` runs inside a job it cannot leave, it shall exit 1 with the message and leave no daemon or lock; a detached child that finds itself in any job shall fail with `parent_job`; a foreground `daemon run` in a job shall warn and serve. | §2.12 | Windows `daemon_windows::start_refuses_a_job_without_breakaway`; `daemon_windows::child_rejects_any_job` (the test launches `chaldea daemon run --detached-child --ready stdout` directly into a `TestJob` without the starter: verdict `fail parent_job`, exit 1, `probe` not `Held` afterwards), `daemon_windows::nested_outer_job_refuses` (outer `TestJob` kill-on-close without breakaway, inner with `BREAKAWAY_OK`, helper in the inner one runs `daemon start`: exit 1 with `parent_job` or the starter's refusal, never a daemon in a job), `daemon_windows::foreground_in_a_job_warns` |
+| PR8-CL-13 | A detached daemon shall be in its own session (macOS); on a GUI host it shall have been launched through its own launchd job, and a probe failure or a refused or unresolved submission shall fail `start` instead of falling back to `setsid`; on Windows it shall have no console. | §2.10; L10, L23 | macOS `daemon_macos::detached_child_has_its_own_session` (`getsid(pid) == pid`; the starter runs in an isolated process group (`process_group(0)`), which the test kills with `killpg`; the daemon keeps serving), `daemon_macos::gui_host_uses_launchd` (when `host::gui_domain` is `Available`: `detached == "launchd"`, `getsid(pid) == pid`, and, the starter having logged a successful `bootout`, `launchctl print gui/<uid>/<label>` fails after `start` returned; when `Absent`: `detached == "setsid"`, asserted, with the reason printed), `daemon_macos::failed_domain_probe_fails_the_start` (a fault makes the probe time out: exit 1 with the `daemon run` suggestion, no daemon, no `setsid` child), `daemon_macos::refused_submission_fails_the_start` (a fault makes `bootstrap` fail with the label absent: exit 1, no daemon), `daemon_macos::timed_out_bootstrap_is_resolved_by_label` (a fault delays `bootstrap` past its share while it registers the job: the reserved 3 s resolve the label, the start proceeds to a verdict, one daemon), `daemon_macos::timeout_then_absent_then_present` (a fault makes `bootstrap` time out and register the label only 1 s into the reserve: the first lookups answer absent, a later one present, and the start proceeds to a verdict instead of exiting 1), `daemon_macos::completed_bootstrap_failure_is_final` (a non-zero `bootstrap` exit with the label absent: exit 1), `daemon_macos::indeterminate_submission_times_out` (both `bootstrap` and the label `print` time out: exit 4 naming the label and `bootout`), `daemon_macos::stale_labels_only` (a not-running label 2 minutes old is removed; one 5 s old is kept); unit `host::macos::tests::classify_gui_probe` (exit 0, exit 112 with "Could not find domain", and other outputs → `Available`, `Absent`, `ProbeFailed`); Windows `daemon_windows::detached_child_has_no_console`. Survival of a terminal-app quit: PR 23. |
+| PR8-CL-14 | `daemon start` shall print the verdict after the child's lock decision, report each `fail` reason distinctly (including `already_running` and `stopped`), bound its EOF follow-up by its deadline, report a conflicting `--port`, never kill the child on timeout, and leave a late child unharmed. | §2.10 | binary `daemon_start::reports_ready_url`, `daemon_start::fail_arrives_after_the_lock_decision` (the test binds the port first; when the starter exits 1, `probe` is already `Free` and `daemon.json` absent), `daemon_start::stopped_before_ready` (a fault parks step 9; `daemon stop` meanwhile: the starter prints the stopped message and exits 1, and the daemon's own exit status, read from its log line, is 0), `daemon_start::concurrent_starts` (two starters; one serves; the other exits 0 with the same URL), `daemon_start::concurrent_first_start_at_marker` (a fault parks the first starter's child between the marker temporary and its link; the second start publishes the marker and serves; the first resumes, validates the marker, and reports `already_running` → exit 0 with the same URL), `daemon_start::loser_sees_winner_exit` (the winner fails at bind after a parked reconciler; the loser exits 1 before its deadline), `daemon_start::explicit_port_conflict` (exit 1), `daemon_start::eof_follow_up_within_deadline` (a child that closes the channel without a line 14 s in: the starter exits by 15 s); unit `ready::timeout_after_15_s_leaves_child` (a child that never writes; literal 15 s; afterwards the child is released, its connect or write fails, and it keeps serving until `daemon stop`), `ready::message_is_one_redacted_line` (a message with `\n`, a control character, a `chd_` token, and 600 bytes), `ready::long_tmpdir_uses_tmp` (macOS: `TMPDIR` of 120 bytes: the socket path is under `/tmp` and at most 100 bytes) |
+| PR8-CL-15 | `daemon stop` shall stop a published (`starting` or `serving`) daemon within one 15 s deadline, signal only the recorded identity (Unix; the remaining PID race between check and signal is §6.2's) or the instance's event (Windows), treat a target that exited before or during the request (including `ESRCH`) as gone, distinguish denied access and a live target without a listener, and report completion only when the target identity is gone. | §2.10 | binary `daemon_stop::stops_and_waits_for_the_target`, `daemon_stop::not_running_is_success`, `daemon_stop::replacement_does_not_confuse_completion` (a new daemon takes the lock right after the target exits: "stopped" plus the new daemon reported, exit 0), `daemon_stop::identity_mismatch_signals_nothing` (the test holds the lock and writes a valid record naming a live unrelated process with a wrong `start_time`: `Discovery::read` → `Unknown`; the unit test `client::send_stop_mismatch` calls `host::send_stop` with that target: `IdentityMismatch`, the process alive and unsignalled), `client::send_stop_exited` (a target that exited before the check: `Exited`), `client::send_stop_esrch_is_exited` (Unix: a fault makes `kill` return `ESRCH` after a matching check: `Exited`); Windows `daemon_windows::stop_event_is_global` (one CI session, so by name: `StopListener::name()` starts with `Global\`, the test's `OpenEventW` on that exact name succeeds, and the DACL read back names only the user; reaching another session is a PR 23 check), `daemon_windows::no_listener_is_reported` (a helper holds the lock with a valid record of itself and no event: `NoListener`, exit 1) |
+| PR8-CL-16 | Every child the CLI or the daemon creates shall be created through `spawn_locked` or `with_spawn_lock`, and tokio's `process` feature shall stay off. | mvp §4 PR 8 rule (1); pty-unix §2.1 | clippy `disallowed-methods` in both crates (a direct `Command::spawn` fails `cargo clippy -D warnings`); `cli/tests/lints.rs::clippy_tomls_disallow_spawn`; the CI `cargo tree` check of §1 |
+| PR8-CL-17 | When the process starts with `SIGCHLD` ignored and `SIGTERM`, `SIGINT`, `SIGHUP`, `SIGCHLD` blocked by its parent, `prepare_process` shall restore `SIGCHLD` to `SIG_DFL` without `SA_NOCLDWAIT` and unblock those signals, so children stay waitable by exact pid. | mvp §4 PR 8 rule (2); L15 | macOS `daemon_macos::inherited_signal_state_is_reset` (a helper calls `fake::ignore_sigchld` and `fake::block_signals`, execs the test binary in a second helper mode that calls `prepare_process`, then asserts `host::signal_state()` (disposition, flags, mask) and that `Child::wait` on `/usr/bin/true` spawned through `spawn_locked` returns its status; without `prepare_process` the wait fails `ECHILD`) |
+| PR8-CL-18 | While serving, the daemon's `SIGCHLD` disposition shall stay `SIG_DFL` without `SA_NOCLDWAIT`. | mvp §4 PR 8 rule (2) | macOS `daemon_macos::sigchld_default_while_serving` (a helper with `SIGCHLD` ignored runs `prepare_process` and `run` with a test participant that reads `host::signal_state()` during shutdown, after serving: `SIG_DFL`, no flags). The async-signal safety of the handlers (rule (3)) is a source audit of `signals.rs` (three `tokio::signal::unix::signal` calls) and of tokio (L6), kept separate from this test. |
+| PR8-CL-19 | The panic hook shall write the location and a fixed task or thread kind, omit the payload and the thread's name, and stop the daemon with exit 1; a panic in the startup task shall keep the lock until exit; a coordinator panic shall return at once. | mvp §4 PR 8; http §2.10; §2.9 | helper processes (running `prepare_process` and `run`, under a parent timeout of 30 s): `daemon_panic::payload_is_omitted` (`Mounts::mvp().with(Mount::write(POST /events, h))` where `h` panics with the request body `BODY-MARKER-<uuid> chd_<43 chars>`; the test posts it with the owner token; stderr contains `panic in connection` (the handler runs in the connection task) and a source location, and neither marker nor the token; exit 1; lock free), `daemon_panic::thread_name_is_omitted` (the handler spawns a `std::thread::Builder::new().name("THREAD-MARKER-chd_<43 chars>")` thread that panics: `panic in thread`, neither the name nor the token), `daemon_panic::startup_panic_keeps_the_lock` (a component's `build` panics: exit 1, the parent probes `Held` while the helper pauses 2 s before exit), `shutdown::coordinator_panic_returns` (a participant panicking inside the coordinator: `run` returns `HeldUntilExit` within 1 s; the parent probes `Held` during the helper's pause) |
+| PR8-CL-20 | Every diagnostic the process writes (log lines in the foreground and in `daemon.log`, startup refusals, readiness `fail` messages, clap's errors) shall have `chd_`, `chdt_`, and `chdp_` secrets replaced. | http §2.10 | unit `log::redacts_message_fields_and_spans` (an event with distinct tokens in the message, a field, and a span field through the real `QueueWriter` into a captured target); binary `daemon_run::foreground_stderr_is_redacted`, `daemon_start::detached_log_is_redacted` (the same markers through a test mount's `tracing` calls), `daemon_start::startup_failure_output_is_redacted` (`--state-dir <tmp>/chd_<43 chars>` that is refused: neither the starter's output nor the `fail` line contains the token), `daemon_run::usage_error_is_redacted` (`daemon run --port chd_<43 chars>`: exit 2, stderr without the token) |
+| PR8-CL-21 | The owner token file shall be issued when missing or invalid, kept when valid, created owner-only, never replaced on a store error, and a file not private or not in the token format shall refuse the start before the log or the store is touched. | §2.13; mvp §2.5 | binary `daemon_run::issues_owner_token` (descriptor read back: private; reads `/api/threads` → 200), `daemon_run::keeps_a_valid_token_across_restart`, `daemon_run::reissues_a_revoked_token`, `daemon_run::refuses_a_foreign_token_file`, `daemon_run::refuses_a_valid_token_with_wrong_permissions` (macOS `0644`; Windows a `Users` ACE: refused with the revocation message, no `daemon.log`, no `chaldea.db` created, the file unchanged); unit `startup::token_store_error_does_not_reissue` (a read fault: start fails, file unchanged) |
+| PR8-CL-22 | The daemon shall listen only on `127.0.0.1`, choose its first port from `7373..=7472` skipping taken ones, keep the saved port across restarts and starts that failed before saving it, say so when a failed start already saved a new port, and report rather than move when a port is taken or the range is exhausted. | §2.6; mvp §2.5; P-19 | binary `daemon_run::first_port_from_the_range`, `daemon_run::taken_first_port_is_skipped` (the test holds 7373 when free: the daemon serves on a later port of the range), `daemon_run::same_port_after_restart`, `daemon_run::failed_override_keeps_the_saved_port` (`--port` taken: exit 1; the `port` file unchanged), `daemon_run::taken_saved_port_is_reported` (the message names the OS error and re-pairing), `daemon_run::malformed_port_file_fails_before_the_store` (no `chaldea.db` created), `daemon_run::not_reachable_on_other_addresses` (`local_addr` is `127.0.0.1`; a `TcpStream::connect_timeout` of 2 s to a non-loopback address of the host on that port fails, where one exists); unit `startup::range_exhaustion` (a bind fault for every port of the range: `PortUnavailable` naming the range and `--port`, `port` unchanged), `startup::port_write_failure_before_rename` (`port` unchanged, start fails), `startup::port_committed_after_rename` (a dir-sync fault: start succeeds with a warning; the next start uses the new port), `startup::record_failure_after_port_rename` (saved port A, `--port B`, a fault fails the `serving` record write after the port rename: the failure message says B was saved and re-pairing is required; the next start without `--port` serves on B) |
+| PR8-CL-23 | Every subcommand shall resolve the same state directory (`--state-dir`, else `CHALDEA_STATE_DIR`, else the default, made absolute); a client shall use a discovery record only while the lock is held and the recorded identity is alive, never remove a record, and the daemon shall remove only its own. | §2.6 | unit `client::stale_record_with_free_lock_is_not_running`, `client::held_lock_with_dead_pid_is_unknown`, `client::linked_record_is_refused`, `shutdown::removes_only_its_own_record`; binary `daemon_run::flag_overrides_env` (`--state-dir A` with `CHALDEA_STATE_DIR=B`: the daemon serves A and B is untouched), `daemon_run::env_only_selects_the_dir` (`CHALDEA_STATE_DIR=B` alone: the daemon serves B), and `daemon_start::child_receives_the_resolved_dir` (a relative `--state-dir` from another working directory: the record's directory is the absolute path) |
+| PR8-CL-24 | `chaldea open` shall obtain a code with the owner token and no `Origin`, hand `http://127.0.0.1:<port>/#pair=<code>` to its launcher, and print the URL with `--print-url` or when the launcher fails. | mvp §2.5; http D12 | binary `daemon_open::print_url_pairs_once`; unit `open::hands_the_url_to_the_launcher` (a recording launcher, no browser: the exact URL, once), `open::launcher_failure_prints_the_url` (a failing launcher: the URL on stdout, exit 0). Browser delivery, cold and warm, with the fragment: PR 23. |
+| PR8-CL-25 | Every startup failure and every stop during startup shall stop at a step boundary, run the coordinator's shutdown for what the startup task returned, decide the lock, leave the disk outcome §2.7 states, and send the verdict afterwards; a startup task not joined by `C − 6 s` shall end in a bare exit holding the lock; a clean stop shall exit 0 whether it came before or after startup completed. | §2.7, §2.8 | unit `startup::failure_at_each_step` (faults at steps 6, 7, 8, 9, 10, 11, 12, 13, 14: each `ExitReport` reason, the store report produced when a store existed, the record absent, `port` as §2.6 states, and the order "lock decision, then verdict" from a recording readiness writer), `startup::stop_before_and_after_ready` (a stop at step 9 and one after step 14, in `Foreground` and `DetachedChild` modes: `run_isolated` returns 0 in all four; the recording writer holds `fail stopped …` for the first and `ready …` for the second), `startup::stop_before_the_lock` (a stop while step 4 is parked: `run_isolated` returns 0 with `NeverTaken`, no `daemon.lock` created, and the detached verdict `fail stopped`), `startup::stop_after_port_rename` (saved port A, `--port B`, a stop while parked between the port rename and step 14: `run_isolated` returns 0, the verdict is `fail stopped port_saved=B …` with the re-pairing notice, and the next start serves on B); helper processes under a parent timeout of 30 s: `startup::stop_inside_step` (barriers inside steps 8, 13, and 14; a stop arrives while parked; a second `daemon run` on the same directory meanwhile exits 3; released: the task finishes the step, publishes nothing after it (no `serving` record or `port` change after step 8; no `ready` after 13), and the lock is released only after the join), `startup::unjoined_startup_is_a_bare_exit` (step 8 parked past the join end: `run` returns `startup_unjoined`, `HeldUntilExit` between 4 s and 4.5 s after the stop (a coordinator that waited until `C` would take 10 s), `daemon.json` still present, the starter saw EOF; the helper pauses 2 s before exit while the parent's probe sees `Held`, then `Free`) |
+| PR8-CL-26 | The process shall never drop its runtime while work may remain, its process-wide setup shall run once and be registered by one run, and a detached daemon's log shall never exceed its cap per file (two files), rotating at the cap and dropping lines while rotation fails. | §2.3, §2.9 | CL-4's and CL-25's wall-clock bounds; helper process `run::blocking_task_past_the_deadline` (a component's `spawn_blocking` task that never returns: `run` returns within its cutoff + 1 s; parent timeout 30 s); helper process `process::prepare_is_idempotent` (two calls, one hook, one subscriber); unit `run::isolated_runs_register_nothing` (two parallel `run_isolated` calls: `ACTIVE_GATE` stays empty, each run's diagnostics in its own sink); unit `log::rotates_at_the_cap` (a 64 KiB test cap: past it, `daemon.log.1` holds the old lines and a fresh `daemon.log` the new ones), `log::rotation_failure_stops_writing` (`daemon.log.1` a directory: the rename fails, `daemon.log` never exceeds the cap plus one line, dropped lines are counted) |
+
+**Mapping.** mvp §4 PR 8: parent job → CL-11, CL-12, CL-13; lock after `writer_exited` → CL-3, CL-4; receipts before serving → CL-6; shutdown order and one budget → CL-5, CL-25; `LifecycleSink` stops → CL-7, CL-8; panic hook → CL-19; store shutdown rules (blocking call off the executor, one budget, readers then store, file access only when both flags, `Failed`/`WriterGone`/`CommitUnknown`) → CL-4, CL-5, CL-7, CL-8; state directory ACL → CL-1, CL-21; process rules (1) → CL-16, (2) → CL-17, CL-18, (3) → §2.11's audit, Windows rules → §2.11 (forbid `unsafe`) and PR 4's tests. store §2.4 `receipts_mark_unknown_after_crash` → CL-6. http §2.11 / §4 row 8: `HttpServer::new` and `serve` on `127.0.0.1` → CL-22; `ServeHandle::shutdown` → CL-5; `LifecycleSink` → CL-7; `issue_owner` and the token file → CL-21; redaction → CL-20; panic hook → CL-19; `chaldea open` → CL-24. formal-specs §7.4 PR 8 → CL-6. §2.1 rules: files → CL-1, CL-2, CL-23; endings → CL-10, CL-25; unwinding → CL-4, CL-19, CL-26.
+
+**Known limits** (no test, by design):
+
+- **Other OS accounts** (§2.1): the CLI does not authenticate the server, so a process of another account that holds the port can receive the CLI's Bearer token or serve the PWA origin; the pair code may appear in a launcher's arguments. Reopen when Chaldea runs on a host shared with other OS accounts.
+- **Unix stop PID race**: between `daemon stop`'s identity check and its `SIGTERM`, the daemon can exit and its pid be reused by another process of the account, which then gets `SIGTERM` (pty-unix §2.5 describes the same window). A private control socket per instance (§3) closes it.
+- **Elevation on Windows**: a daemon started elevated cannot be stopped from a non-elevated terminal of the same account (L19); `daemon stop` reports access denied.
+- **Windows jobs**: a daemon inside any job is refused when detached, even if no kill-on-close job is in its chain, because the chain is not visible (L13); logoff and system shutdown end a detached daemon without a shutdown (crash-only recovery applies).
+- **Console end**: a foreground Windows daemon whose console closes exits without a graceful shutdown; the next start recovers.
+- **Pending launch**: `daemon stop` sees only a published daemon; a launch that a timed-out `start` submitted and that has not yet published its record is invisible to it until it does (the starter's timeout message names the pending pid or launchd label).
+- **Slow startup step at a stop**: a stop while a step runs longer than 4 s (a projection rebuild in `Store::open`) ends in a bare exit holding the lock; the next start recovers.
+- **Discovery race** (§2.6): between a daemon's death and a new holder's first record write, a client that checked the old identity just before the death can send one request to a port nobody or a new process holds.
+- **Lock release after a Windows crash** can take longer than the 2 s allowance (L2); `daemon run` then reports "already running" and succeeds once the OS released it.
+- **A stalled log target** loses lines once the 1024-line queue is full; the drop count is logged when space returns.
+- **Same-account processes** can plant links in the private state directory between the checks and the opens; they are trusted (§2.1).
+
+## 7. Tests and Completion Commands
+
+**Kinds of tests.**
+
+- **Unit tests** in `crates/daemon/src/lifecycle/tests/` call `run_isolated` and the lifecycle's parts in-process with `cfg(test)` fault points (a parked step, a barrier inside a step, a writer job held past the cutoff, the merged `IoErrAfterCommit`, a rename, write, or directory-sync failure, a bind failure, a panicking component), the test's own state directory, and the gate triggered directly. They never call `prepare_process` or `run`, register nothing process-wide, and leave no task running after they return.
+- **Helper-process tests.** Everything that touches process-wide state (the panic hook, the global subscriber, signal dispositions and masks, signals, consoles, jobs), leaks a lock, or leaves a never-returning task runs in a helper: the test binary re-executes itself with an environment variable selecting the helper (the pattern of PR4-CL-27), the helper calls `prepare_process` and `run` exactly as `main` does and exits through the same `std::process::exit` call, and the parent observes exit codes, output, files, and the lock, and kills the helper by pid if it outlives the test's timeout (30 s unless stated).
+- **Binary tests** in `crates/cli/tests/` run `env!("CARGO_BIN_EXE_chaldea")` with `--state-dir <tempdir>`. macOS: a fresh directory under the OS temp directory. Windows: a fresh directory under `SHGetKnownFolderPath(FOLDERID_LocalAppData)` (not `%TEMP%`, which can be redirected), whose privacy the first Windows test asserts with `host::privacy`. Every test stops its daemon (`daemon stop`, or a kill plus a wait for `Free`) before the temp directory drops.
+- **`host` tests** in `crates/pty-runtime/src/host/` on each OS: identities, signal state, privacy cases, `create_private_file`'s descriptor on the handle, `job_state` (Windows sentinel `job_state_reads_the_immediate_job`; `runner_can_break_away` runs as the A-W1 preflight, §1), the stop event (creation, duplicate name refused, DACL), `send_stop` against a listener, a missing name, and an exited target, the launchd plist (escaping, unrepresentable values refused; macOS), the readiness socket path length.
+
+**Windows-only tests:** CL-9 (Ctrl-C, Ctrl-Break), CL-11, CL-12, CL-13's console, CL-1's DACL cases, CL-2's reader and reparse cases, CL-15's event cases, CL-21's ACE case, the `host::windows` tests. **macOS-only tests:** CL-1's owner, mode, and ACL cases, CL-2's symlink case, CL-9's Unix signals, CL-13's session and launchd cases, CL-14's long `TMPDIR`, CL-17, CL-18, the `host::macos` tests.
+
+**Real-host checks (PR 23)**, not provable in CI: console close delivery by closing a window; terminal-application quit on macOS (launchd path) and window close (session isolation) as separate checks on fresh instances, as P-1 describes; job survival with a real terminal; `chaldea open` delivering the URL with its fragment to a cold and a warm browser on each OS; the Windows stop event reaching the daemon from a second session.
+
+Literals in tests are the design's: 2 s lock retry; 15 s readiness and stop deadlines; 10 s budget with ends at `C − 6 s`, `C − 5 s`, `C − 3 s`, and `C`; 250 ms report grace; 100 ms log switch and flush; 30 s reconciler admission; 5 s token issue, `open` request, and `/usr/bin/open`; 3 s GUI-domain probe and label-resolution reserve; 60 s launchd label staleness and log rotation retry; 8 MiB log rotation; 1024-line queue; 100-byte socket path limit; ports `7373..=7472`; modes `0700` / `0600`; exit codes 0–4.
+
+**Completion commands** (mvp §5, extended):
+
+```
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked --no-fail-fast
+deps="$(cargo tree -p chaldea-core -e normal --prefix none)" && ! grep -Eq '^(tokio|rusqlite|axum|hyper|tower|getrandom) ' <<<"$deps"
+deps="$(cargo tree -p chaldea-pty-runtime -e normal --prefix none)" && ! grep -Eq '^tokio ' <<<"$deps"
+feats="$(cargo tree -p chaldea-daemon -e features --prefix none -i tokio)" && ! grep -q '^tokio feature "process"' <<<"$feats"
+```
+
+plus the `workspace` job green on `macos-latest` and `windows-latest` (clippy runs on both) with the sentinel additions of §1, and the `pty-hooks` and `specs` jobs unchanged.
+
+## 8. Decisions
+
+**D1. `crates/cli` is the binary; the lifecycle is `chaldea_daemon::lifecycle`.** `main` dispatches the internal entries, runs `prepare_process` once, parses with `try_parse`, then calls `run`, which returns an `ExitReport`; unit tests use `run_isolated`. Dependencies: `clap =4.6.8` (no color, no suggestions); `tokio` gains `rt-multi-thread` and `signal`; `tracing-subscriber =0.3.23` becomes a normal daemon dependency; `windows-sys` gains the features of §1; `daemon` depends on `pty-runtime`. PR 8 builds against the merged four-argument `HttpServer::new`; the `CommandRegistry` is wired by whichever of PR 8 and 7c merges later.
+
+**D2. OS primitives go in `pty-runtime::host`**, safe functions over new `unix::sys` / `windows::sys` entries, including the launchd calls, the readiness channel, privacy checks and private file creation, the stop event, and the browser launch; `daemon` and `cli` keep `forbid(unsafe_code)`. `host::process_identity` is the public identity lookup PR3 D7 deferred to its first consumer.
+
+**D3. One daemon per state directory is `File::try_lock` on a data-less `daemon.lock` that is never removed and never released by a drop**, retried for 2 s on contention, released in-process only under §2.8 step 6's conditions (the startup task joined, no aborted HTTP task, `readers_returned` and `writer_exited`, the log target switched).
+
+**D4. Stop goes through the OS**: `SIGTERM` to a verified identity on Unix (with the stated PID race), a `Global\` event per instance with an account-only DACL on Windows; it works during startup; `daemon stop` has one 15 s deadline, completes when the target identity is gone, reports exited, denied, and listener-less targets distinctly, and never kills.
+
+**D5. On Windows a detached daemon must be in no job.** The starter breaks away explicitly with `BREAKAWAY_OK`, implicitly with `SILENT_BREAKAWAY_OK`, and refuses otherwise; the child verifies `IsProcessInJob(self, NULL) == false`; a foreground run warns. Reconciled with PR 4's A13: nesting works under any job tested, so the check guards the daemon's lifetime only. Reopen (WMI `Win32_Process.Create`, herdr's route) if a supported terminal or the CI runner runs inside a job without breakaway.
+
+**D6. On a macOS GUI host, `daemon start` submits a one-shot launchd job in the user's GUI domain whose process forks the daemon and exits**, so quitting the terminal app does not kill the daemon (the daemon is a persistent agent host reached from the PWA, and quitting a terminal app is ordinary use). A GUI-domain probe failure or a refused submission fails the start with a pointer to `daemon run`, and a submission that cannot be resolved by its label is a timeout naming the label; there is no silent fallback. Only a confirmed absent GUI domain or an SSH session uses a direct child that calls `setsid`. The record says which path ran.
+
+**D7. One coordinator, one budget.** The first trigger fixes the cause and the cutoff (10 s) together; the startup task is never aborted and is joined until `C − 6 s`, after which the process exits bare, holding the lock; HTTP, participants, and the store end at `C − 5 s`, `C − 3 s`, and `C`, and neither HTTP's nor the store's shutdown is cut short; a Windows console end starts no further step and exits holding whatever lock is still held; a clean stop exits 0 whether it came before or after startup completed; every panic stops the daemon, and startup and coordinator panics are caught.
+
+**D8. The owner token file holds one owner token that lives until revoked**, kept only while private, reissued at start when missing or `Invalid` (never on a store error); no automatic rotation.
+
+**D9. The state directory and secret files are private by mechanism**: created with explicit owner-only descriptors (mode `0700` / `0600`; protected DACLs) verified on the handle, existing ones checked against one private-trustee set and never modified; directories adopted only when created, empty, or marked, with the marker published without replacement.
+
+**D10. Readiness is one verdict line** (stdout pipe on Windows, a Unix socket in a short private directory on macOS) within 15 s, sent after the lock decision with one reason chosen by precedence (`stopped` when a clean stop came before readiness, a verdict token separate from the daemon's exit status); a timeout never kills the child, and a late child ignores a missing channel.
+
+**D11. The default state directory is `$HOME/.chaldea` (macOS) and `%LOCALAPPDATA%\Chaldea` (Windows).** Short, non-roaming paths: mvp §2.6's `worktree_base` defaults to `<state_dir>/wt` (MSVC's 260-character limit, arch §5), and SQLite WAL needs a local, non-synced filesystem (store S7). Moving it later needs a migration of the database and worktrees.
+
+**D12. The first port is the first free one of `7373..=7472`, saved once the daemon serves (the rename is the commit), kept across starts that never served; a taken saved port or an exhausted range is reported, never moved.** Below the OS dynamic range, so it is not handed to outgoing connections; an override changes the pairing origin and says so.
+
+**D13. Other OS accounts are outside the threat model** (§2.1): the CLI does not authenticate the server, the PWA origin is not an authenticated server, and the pair code may appear in a launcher's arguments; reversible by a server-authentication handshake or a revised browser credential, reopened when Chaldea runs on a host shared with other accounts. Private state and the adoption rules are kept regardless.
+
+**D14. The public CLI names PR 8 adds.** `--state-dir` (global) with `CHALDEA_STATE_DIR`; `daemon run [--port]`, `daemon start [--port]`, `daemon stop`; `open [--print-url]`; exit codes 0 `Ok`, 1 `Failed`, 2 `Usage`, 3 `AlreadyRunning`, 4 `Timeout`, with the failure reason in the output instead of the code. Reason: scripts can tell "already running" and "still starting" from failure, tests run isolated daemons through the flag or the variable, and the surface stays small. Alternatives: no environment variable (avoids a `CHALDEA_*` variable, which is scrubbed from children anyway, mvp §2.5, but lengthens every non-default invocation); one code per failure reason (more precise, but a wider contract with no named consumer). Adding codes or flags later is additive; renaming or removing these breaks scripts.
+
+## Related Text in Other Documents
+
+- `docs/architecture.md` §5 "Open items for the MVP", **Daemon parent job check**: resolved by §2.12 and D5 (a detached daemon must be in no job; nesting is not the hazard, per `docs/design/pty-windows.md` A13). Proposed arch §5 entries once PR 8 merges: that resolution, and a macOS quirk for the terminal-app coalition with D6's launchd answer (L10).
+- `docs/prior-art.md` row 8: herdr escapes a kill-on-close job through WMI; Chaldea refuses instead (D5). Rows for single-instance locks (T3 Code's never-unlinked lock, std file locks) and macOS detaching (herdr's launchd job, without its fallback) are proposed.
+- `docs/mvp-design.md` §2.5 "Token kinds", `owner` holder "the user's CLI (token file, 0600 / user-only ACL)": the file is `<state_dir>/owner.token`, created owner-only and verified private (§2.4, §2.13, D9); "Secrets": `chaldea open` hands the pairing URL to the OS launcher, accepted under D13.
+- `docs/mvp-design.md` §6.1 P-19 ("Stop and start the daemon"): relies on the saved port (D12); §1 / §2.5: the single-account threat model (D13) is the assumption under the localhost Bearer design.
+- `docs/mvp-design.md` §8 D2 lists `open` and `daemon run/start/stop`; their flags and exit codes are D14.
+- `docs/design/http-surface.md` §2.2: `HttpServer::new` gains the `CommandRegistry` with 7c (D1); `http/registry.rs` gains the task-kind thread-local for the panic hook (§2.13), an internal change. §8 D12: the browser is opened by the OS launcher (§2.13).
+- `docs/design/event-store.md` §5 "Permissions": Windows privacy is explicit owner-only descriptors and the private-trustee check, not the location under the profile (D9). §5 "Paths": if `store_open::long_multibyte_path` ever fails on Windows, the "state directory path under 200 characters" check belongs to §2.4's `prepare`.
