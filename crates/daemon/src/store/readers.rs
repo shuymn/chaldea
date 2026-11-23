@@ -33,6 +33,14 @@ use super::rows::{
     parse_enum, parse_json, parse_uuid, to_u64,
 };
 
+/// [`ReadTx::binding_receipt_ordinal`]'s query: the binding is searched within the thread's
+/// stream through `events_kind` (newest first), then its delivery by the launch's key.
+pub(super) const BINDING_ORDINAL_SQL: &str = "SELECT d.receipt_ordinal FROM events e
+     LEFT JOIN hook_deliveries d ON d.launch_id = e.launch_id AND d.stream_id = e.stream_id
+       AND d.seq = e.seq AND d.routing = 'appended'
+     WHERE e.stream_id = ?1 AND e.kind = 'session_bound' AND e.launch_id = ?2
+     ORDER BY e.seq DESC LIMIT 1";
+
 /// One page of a stream, as `core::sync::EventsResponse::Replay` carries it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Page {
@@ -1288,24 +1296,24 @@ impl<'a> ReadTx<'a> {
         })
     }
 
-    /// The `receipt_ordinal` of the delivery whose primary event is the launch's latest
-    /// `session_bound` (by stream sequence); `None` when the launch is unbound or that event
-    /// was not recorded by a hook delivery.
+    /// The `receipt_ordinal` of the delivery whose primary event is launch `l`'s latest
+    /// `session_bound` in thread `t`'s stream (by stream sequence); `None` when the launch is
+    /// unbound or that event was not recorded by a hook delivery.
     ///
     /// # Errors
     ///
     /// A store error.
-    pub fn binding_receipt_ordinal(&self, l: LaunchId) -> Result<Option<u64>, StoreError> {
+    pub fn binding_receipt_ordinal(
+        &self,
+        t: ThreadId,
+        l: LaunchId,
+    ) -> Result<Option<u64>, StoreError> {
         self.guard(|| {
             let ordinal: Option<Option<i64>> = sql(self
                 .conn
                 .query_row(
-                    "SELECT d.receipt_ordinal FROM events e
-                     LEFT JOIN hook_deliveries d ON d.stream_id = e.stream_id AND d.seq = e.seq
-                       AND d.launch_id = e.launch_id AND d.routing = 'appended'
-                     WHERE e.launch_id = ?1 AND e.kind = 'session_bound'
-                     ORDER BY e.seq DESC LIMIT 1",
-                    [l.to_string()],
+                    BINDING_ORDINAL_SQL,
+                    [StreamId::Thread(t).to_string(), l.to_string()],
                     |r| r.get(0),
                 )
                 .optional())?;

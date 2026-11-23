@@ -256,7 +256,7 @@ fn binding_ordinal_is_the_latest_binding() {
         };
         record(&s, d).unwrap();
     }
-    let ordinal = || s.read(move |r| r.binding_receipt_ordinal(l));
+    let ordinal = || s.read(move |r| r.binding_receipt_ordinal(t, l));
     assert_eq!(ordinal(), Some(2));
     s.append(vec![support::bound(t, l, "s3", None)]).unwrap();
     assert_eq!(ordinal(), None);

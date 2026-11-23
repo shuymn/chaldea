@@ -258,7 +258,10 @@ pub(crate) fn run(
             let Head::Hook(h) = &d.head else {
                 return Err(super::refused_internal());
             };
-            let binding_ordinal = tx.read().binding_receipt_ordinal(launch)?.unwrap_or(0);
+            let binding_ordinal = tx
+                .read()
+                .binding_receipt_ordinal(thread, launch)?
+                .unwrap_or(0);
             let json = json.as_ref().ok_or_else(super::refused_internal)?;
             let hook = accepted(d, thread, &l, h, json, binding_ordinal);
             let interpretation = d.adapter.interpret(&tx.read(), &hook)?;
