@@ -1330,8 +1330,9 @@ impl<'a> ReadTx<'a> {
     pub fn hook_emit_in_thread(&self, t: ThreadId, emit: Uuid) -> Result<bool, StoreError> {
         self.guard(|| {
             sql(self.conn.query_row(
-                "SELECT EXISTS (SELECT 1 FROM hook_deliveries WHERE emit_id = ?2 AND launch_id IN
-                   (SELECT launch_id FROM events WHERE stream_id = ?1 AND kind = 'launch_reserved'))",
+                "SELECT EXISTS (SELECT 1 FROM events e JOIN hook_deliveries d
+                   ON d.launch_id = e.launch_id AND d.emit_id = ?2
+                   WHERE e.stream_id = ?1 AND e.kind = 'launch_reserved')",
                 [StreamId::Thread(t).to_string(), emit.to_string()],
                 |r| r.get(0),
             ))
