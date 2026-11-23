@@ -169,22 +169,59 @@ async fn expired_observed_is_408() {
     srv.stop().await;
 }
 
-/// The waiter is held at the top of its loop, before it reads the progress, while the
-/// intent job waits behind the writer past `deadline + write_reply_grace`; the writer then
-/// replies `Expired` and the runner publishes it. Released, the waiter reads that reply
-/// after the reply time: 503 `outcome_unknown`, not 408, whatever the clock read before
-/// the gate.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// A clock that, once armed, holds the next reader right after it took its reading (the
+/// reading is from before the hold).
+#[derive(Default)]
+struct HeldClock {
+    hold: std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+}
+
+impl HeldClock {
+    /// The returned receiver gets a message when the next reading is taken, which returns
+    /// once the returned sender is used or dropped (at most 20 s).
+    fn arm(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.hold.lock().unwrap() = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+}
+
+impl MonotonicClock for HeldClock {
+    fn now(&self) -> Instant {
+        let at = Instant::now();
+        let held = self.hold.lock().unwrap().take();
+        if let Some((reached, release)) = held {
+            let _ = reached.send(());
+            let _ = release.recv_timeout(Duration::from_secs(20));
+        }
+        at
+    }
+
+    fn real(&self, at: Instant) -> Instant {
+        at
+    }
+}
+
+/// The waiter's first reading of the clock in its loop is taken before the reply time and
+/// held there while the intent job, behind the writer past `deadline + write_reply_grace`,
+/// is answered `Expired` and the runner publishes it. Released, the waiter must not send
+/// that reply with the early reading: 503 `outcome_unknown`, not 408. (With the clock read
+/// before the progress, the held reading would pair with the late `Done(Expired)`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn progress_taken_after_the_grace_is_outcome_unknown() {
-    let (srv, probe) = TestServer::with_commands(|c| {
-        c.write_reply_grace = Duration::from_millis(100);
+    let clock = Arc::new(HeldClock::default());
+    let c = clock.clone();
+    let (srv, probe) = TestServer::with_commands(move |cfg| {
+        cfg.write_reply_grace = Duration::from_millis(100);
+        cfg.clock = c;
     })
     .await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let s = shared(&srv);
     let base = srv.server.tasks();
     let writer = srv.hold_writer().await;
-    let (gate_reached, release) = s.faults.arm_progress_gate();
+    let (gate_reached, gate_release) = s.faults.arm_progress_gate();
     let before = s.faults.submits();
     let deadline = s.cfg.clock.now() + Duration::from_millis(300);
     let cmd = admitted(&s, "test_counter", &owner, cid(1), r#"{"n":1}"#);
@@ -195,6 +232,10 @@ async fn progress_taken_after_the_grace_is_outcome_unknown() {
         s.faults.submits() == before + 1
     })
     .await;
+    // The waiter's next reading is the one its loop takes; it is held right after.
+    let (clock_reached, clock_release) = clock.arm();
+    gate_release.send(()).unwrap();
+    reached_sync(clock_reached).await;
     // Lower bounds: the reply time and the job's `not_after` have passed.
     tokio::time::sleep_until(tokio::time::Instant::from_std(
         deadline + Duration::from_millis(150),
@@ -206,7 +247,7 @@ async fn progress_taken_after_the_grace_is_outcome_unknown() {
         srv.server.tasks() == base
     })
     .await;
-    release.send(()).unwrap();
+    clock_release.send(()).unwrap();
     let r = joined(waiter).await;
     assert_eq!(r.err(), Some(ApiError::outcome_unknown()));
     assert_eq!(srv.receipt(cid(1)), None);
@@ -480,38 +521,78 @@ async fn completion_budget_ends_admission() {
     x.stop().await;
 }
 
-/// The pauses between completion attempts: 10 ms, doubling to 1 s, the last cut at the
-/// budget's end (the attempt after the 66th would start past it). A tokio timer wakes on
-/// the millisecond tick after its deadline, so each pause may be 1 ms longer.
+/// The pauses between completion attempts, as scheduled: 10 ms, doubling to 1 s, and the
+/// 66th cut to end exactly at the budget's end (60 s after the first attempt), after which
+/// no attempt starts. A tokio timer wakes on the millisecond tick at or after its
+/// deadline, so an attempt may start up to 1 ms after its scheduled wake; nothing else is
+/// tolerated.
 #[tokio::test]
 async fn completion_backoff_schedule() {
     let x = exhaust_the_budget().await;
     let s = shared(&x.srv);
     let attempts = s.faults.completion_attempts();
-    let gaps: Vec<u128> = attempts
-        .windows(2)
-        .map(|w| (w[1] - w[0]).as_millis())
+    let pauses = s.faults.completion_pauses();
+    let budget_end = x.first + Duration::from_secs(60);
+    let mut want: Vec<Duration> = [10, 20, 40, 80, 160, 320, 640]
+        .into_iter()
+        .map(Duration::from_millis)
         .collect();
-    let mut want = vec![10, 20, 40, 80, 160, 320, 640];
-    want.extend([1000; 58]);
-    assert_eq!(gaps.len(), want.len(), "{gaps:?}");
-    assert!(
-        gaps.iter()
-            .zip(&want)
-            .all(|(g, w)| *g == *w || *g == *w + 1),
-        "{gaps:?}"
-    );
+    want.extend([Duration::from_secs(1); 58]);
+    assert_eq!(attempts.len(), 66);
+    assert_eq!(pauses.len(), 66);
+    let scheduled: Vec<Duration> = pauses.iter().map(|(from, wake)| *wake - *from).collect();
+    assert_eq!(scheduled[..65], want[..], "{scheduled:?}");
+    let (last_from, last_wake) = pauses[65];
     assert_eq!(
-        x.reported,
-        (false, true),
-        "the last pause is cut at the end"
+        last_wake, budget_end,
+        "the last pause ends at the budget's end"
+    );
+    assert!(last_wake - last_from < Duration::from_secs(1));
+    for (i, (from, wake)) in pauses.iter().enumerate() {
+        assert_eq!(*from, attempts[i], "pause {i} is scheduled at its attempt");
+        if let Some(next) = attempts.get(i + 1) {
+            let late = *next - *wake;
+            assert!(
+                late <= Duration::from_millis(1),
+                "attempt {} started {late:?} late",
+                i + 1
+            );
+        }
+    }
+    assert_eq!(x.reported, (false, true), "no attempt after the last pause");
+    x.stop().await;
+}
+
+/// Each completion attempt's `not_after` is 5 s after its admission, cut at the budget's
+/// end: the attempts of the last 5 s get the budget's end.
+#[tokio::test]
+async fn completion_attempt_not_after() {
+    let x = exhaust_the_budget().await;
+    let s = shared(&x.srv);
+    let budget_end = x.first + Duration::from_secs(60);
+    let attempts = s.faults.completion_attempts_with_not_after();
+    let mut cut = 0;
+    for (at, not_after) in &attempts {
+        if *at + Duration::from_secs(5) < budget_end {
+            assert_eq!(*not_after, *at + Duration::from_secs(5));
+        } else {
+            assert_eq!(*not_after, budget_end);
+            cut += 1;
+        }
+    }
+    assert!(
+        cut > 0 && cut < attempts.len(),
+        "{cut} of {} cut",
+        attempts.len()
     );
     x.stop().await;
 }
 
 /// A completion attempt admitted before the 60 s budget ends and held in the writer past
-/// it, on the server's clock and on tokio's timers alike (paused time advanced 61 s), is
-/// awaited: it commits, nothing is reported, and the result replays.
+/// it, on the server's clock and on tokio's timers alike (paused time slept through to 61 s
+/// after the first attempt, so every timer due by then has fired and been handled), is
+/// awaited: nothing is reported while it is held; released, it commits, and the result
+/// replays.
 #[tokio::test]
 async fn last_admitted_attempt_is_awaited() {
     let (srv, probe) = TestServer::with_commands(|c| c.clock = Arc::new(TokioClock)).await;
@@ -529,8 +610,16 @@ async fn last_admitted_attempt_is_awaited() {
     reached_sync(hold_reached).await;
     let first = s.faults.completion_attempts()[0];
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        first + Duration::from_secs(61),
+    ))
+    .await;
     assert!(s.cfg.clock.now() > first + Duration::from_secs(60));
+    assert!(srv.sink.0.lock().unwrap().is_empty(), "reported while held");
+    assert_eq!(
+        srv.receipt(cid(1)).unwrap().status,
+        ReceiptStatus::InProgress
+    );
     tokio::time::resume();
     hold_release.send(()).unwrap();
     eventually(Duration::from_secs(10), "the receipt completes", || {
@@ -556,9 +645,11 @@ async fn last_admitted_attempt_is_awaited() {
 }
 
 /// A command's own budget (`test_long_deadline`: 30 s) governs its request, not the server's
-/// short deadline (2 s), measured from the request's origin: with the body incomplete, the
-/// server's clock moves 20 s on, and the body completed then runs the command; moved 31 s
-/// on, it is 408 with nothing submitted and no receipt.
+/// short deadline (2 s), measured from the connection's first head byte: the first byte is
+/// read, the server's clock moves 20 s on, and the rest of the head and all but the last
+/// body byte follow. The body completed then runs the command; with the clock moved 31 s
+/// on first, it is 408 with nothing submitted and no receipt (measured from the head's
+/// end, it would have run).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn command_budget_is_its_own() {
     let (srv, _probe) = TestServer::with_commands(|_| {}).await;
@@ -572,10 +663,18 @@ async fn command_budget_is_its_own() {
         let bytes = srv
             .command("test_long_deadline", &owner, cid(n), "{}")
             .bytes();
-        let (head, last) = bytes.split_at(bytes.len() - 1);
-        let (polls, submits) = (s.faults.polls(), s.faults.submits());
+        let (first, rest) = bytes.split_at(1);
+        let (rest, last) = rest.split_at(rest.len() - 1);
+        let (firsts, polls, submits) =
+            (s.faults.first_bytes(), s.faults.polls(), s.faults.submits());
         let mut c = connect(srv.port).await;
-        write(&mut c, head).await;
+        write(&mut c, first).await;
+        eventually(Duration::from_secs(10), "the first byte is read", || {
+            s.faults.first_bytes() > firsts
+        })
+        .await;
+        srv.clock.skew(Duration::from_secs(20));
+        write(&mut c, rest).await;
         eventually(Duration::from_secs(10), "the body is polled", || {
             s.faults.polls() > polls
         })

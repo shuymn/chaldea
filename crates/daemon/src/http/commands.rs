@@ -21,7 +21,7 @@ use axum::response::{IntoResponse, Response};
 use chaldea_core::auth::{CommandSpec, MVP_COMMANDS};
 use chaldea_core::canonical::CanonicalJson;
 use chaldea_core::command::{CommandResult, ReceiptLookup, request_identity};
-use chaldea_core::http::CommandRequest;
+use chaldea_core::http::{CommandRequest, ErrorCode};
 use chaldea_core::ids::CommandId;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
@@ -79,37 +79,51 @@ pub trait CommandHandler: Send + Sync + 'static {
 
 /// A command's effect, run once by the runner after its intent committed.
 pub trait CommandEffect: Send + Sync {
-    /// Resolves to the command's terminal result, whose status is in the result set
-    /// (design §2.8 "Statuses": 2xx, 4xx except 408, 500, 504; outside it, the runner
-    /// stores and answers 500 `internal`). The owning PR guarantees that it resolves within a bound it states, and
-    /// that a result it returns for work that did not happen (a refusal, or work that ran
-    /// out of its time) means the work can no longer happen later. Work that ran out of its
-    /// time is 504 with a code of the owning PR, never 408: 408 says the request's deadline
-    /// kept its intent from committing. The runner adds no timeout of its own.
+    /// Resolves to the command's terminal result, a handler reply (design §2.8 "Handler
+    /// replies": a status of 2xx except 204 and 205, 4xx except 408, 500, or 504, and no
+    /// reserved code; otherwise the runner stores and answers 500 `internal`). The owning
+    /// PR guarantees that it resolves within a bound it states, and that a result it
+    /// returns for work that did not happen (a refusal, or work that ran out of its time)
+    /// means the work can no longer happen later. Work that ran out of its time is 504 with
+    /// a code of the owning PR, never 408: 408 says the request's deadline kept its intent
+    /// from committing. The runner adds no timeout of its own.
     fn run(&self, run: EffectRun) -> BoxFuture<'static, CommandResult>;
 }
 
-/// The statuses a command result may have, from a completed intent or an effect: 2xx,
-/// 4xx except 408, 500, and 504. Each is stored and replayed byte for byte; 408 is the
-/// runner's own (the deadline kept the intent from committing), and 503 and the other
-/// codes would tell a client to retry a result that replays unchanged.
+/// The codes reserved to the runner and the request path: the request's own deadline,
+/// the receipt's state, and an outcome not known. No handler reply carries one.
+const RESERVED_CODES: [ErrorCode; 5] = [
+    ErrorCode::RequestTimeout,
+    ErrorCode::OutcomeUnknown,
+    ErrorCode::InProgress,
+    ErrorCode::UnknownAfterCrash,
+    ErrorCode::Conflict,
+];
+
+/// The statuses a command result may have, from a completed intent or an effect: 2xx
+/// except 204 and 205 (sent without the stored body), 4xx except 408, 500, and 504. Each
+/// is stored and replayed byte for byte; 408 is the runner's own (the deadline kept the
+/// intent from committing), and 503 and the other codes would tell a client to retry a
+/// result that replays unchanged.
 fn result_status_allowed(status: u16) -> bool {
-    matches!(status, 200..=299 | 400..=407 | 409..=499 | 500 | 504)
+    matches!(status, 200..=203 | 206..=299 | 400..=407 | 409..=499 | 500 | 504)
 }
 
-/// The statuses a command's refusal may have (the intent job rolls back with it): 4xx
-/// except 408, and 5xx.
-fn refusal_status_allowed(status: StatusCode) -> bool {
-    (status.is_client_error() || status.is_server_error()) && status != StatusCode::REQUEST_TIMEOUT
+/// Whether a result body names a reserved code (`{"code": …}` at its top level).
+fn result_code_reserved(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| serde_json::from_value::<ErrorCode>(v.get("code")?.clone()).ok())
+        .is_some_and(|c| RESERVED_CODES.contains(&c))
 }
 
-/// `r`, or 500 `internal` when its status is outside the result set (a programming error
-/// of its handler).
+/// `r`, or 500 `internal` when its status is outside the result set or its body names a
+/// reserved code (a programming error of its handler).
 fn checked_result(command_id: CommandId, r: CommandResult) -> CommandResult {
-    if result_status_allowed(r.http_status) {
+    if result_status_allowed(r.http_status) && !result_code_reserved(&r.body) {
         return r;
     }
-    tracing::error!(%command_id, status = r.http_status, "command result status outside the result set");
+    tracing::error!(%command_id, status = r.http_status, "command result outside the handler replies");
     let body = serde_json::to_string(&ApiError::internal().body()).unwrap_or_default();
     CommandResult {
         http_status: 500,
@@ -117,19 +131,33 @@ fn checked_result(command_id: CommandId, r: CommandResult) -> CommandResult {
     }
 }
 
-/// An intent's refusal as the job's refusal: one outside the refusal set, or not an
-/// [`ApiError`], is 500 `internal`.
+/// A handler's refusal (from `prepare`, or an intent's, which the job rolls back) as
+/// answered: 4xx except 408, or 5xx, with no reserved code; any other is 500 `internal`.
+/// A transient refusal keeps a code that says nothing happened (such as `busy`).
+fn checked_error(e: ApiError) -> ApiError {
+    let status = e.status();
+    let allowed = (status.is_client_error() || status.is_server_error())
+        && status != StatusCode::REQUEST_TIMEOUT
+        && !RESERVED_CODES.contains(&e.code());
+    if allowed {
+        return e;
+    }
+    tracing::error!(status = status.as_u16(), code = ?e.code(), "command refusal outside the handler replies");
+    ApiError::internal()
+}
+
+/// An intent's refusal as the job's refusal: checked by [`checked_error`]; one that is not
+/// an [`ApiError`] is 500 `internal`.
 fn checked_refusal(command_id: CommandId, e: JobError) -> JobError {
     let JobError::Refused(r) = e else {
         return e;
     };
     match r.downcast::<ApiError>() {
-        Ok(api) if refusal_status_allowed(api.status()) => refused(*api),
-        Ok(api) => {
-            tracing::error!(%command_id, status = api.status().as_u16(), "command refusal status outside the refusal set");
+        Ok(api) => refused(checked_error(*api)),
+        Err(_) => {
+            tracing::error!(%command_id, "command refusal that is not an ApiError");
             refused(ApiError::internal())
         }
-        Err(_) => refused(ApiError::internal()),
     }
 }
 
@@ -366,7 +394,7 @@ pub(crate) fn prepare_args(
     args: &RawValue,
 ) -> Result<(Prepared, [u8; 32]), ApiError> {
     scan_duplicates(args.get()).map_err(|_| ApiError::bad_args())?;
-    let prepared = handler.prepare(args)?;
+    let prepared = handler.prepare(args).map_err(checked_error)?;
     let identity = request_identity(name, &prepared.normalized);
     Ok((prepared, identity))
 }
@@ -649,7 +677,7 @@ async fn complete(shared: &Shared, command_id: CommandId, result: &CommandResult
         }
         let not_after = (now + COMPLETION_ATTEMPT).min(budget_end);
         #[cfg(test)]
-        shared.faults.completion_attempt(now);
+        shared.faults.completion_attempt(now, not_after);
         let r = result.clone();
         #[cfg(test)]
         let hold = shared.faults.take_completion_hold();
@@ -665,7 +693,10 @@ async fn complete(shared: &Shared, command_id: CommandId, result: &CommandResult
             Err(f) if retryable(&f) => {}
             Err(_) => return false,
         }
-        let wake = (shared.cfg.clock.now() + backoff).min(budget_end);
+        let from = shared.cfg.clock.now();
+        let wake = (from + backoff).min(budget_end);
+        #[cfg(test)]
+        shared.faults.completion_pause(from, wake);
         tokio::time::sleep_until(shared.timer(wake)).await;
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }

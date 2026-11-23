@@ -710,15 +710,16 @@ async fn committed_effect_cannot_answer_408() {
     srv.stop().await;
 }
 
-/// A completed intent's or an effect's status outside the result set (408, 503, 302, 42) is
-/// stored and answered as 500 `internal`, and replays as such; a refusal outside the
-/// refusal set (408, 200) is 500 `internal` with no receipt.
+/// A completed intent's or an effect's status outside the result set (408, 503, 302, 42,
+/// and 204 and 205, which carry no body) is stored and answered as 500 `internal`, and
+/// replays as such; a refusal outside the refusal set (408, 200) is 500 `internal` with no
+/// receipt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn statuses_outside_the_sets_are_500() {
     let (srv, probe) = TestServer::with_commands(|_| {}).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let mut stored = Vec::new();
-    for (i, status) in [408, 503, 302, 42].into_iter().enumerate() {
+    for (i, status) in [408, 503, 302, 42, 204, 205].into_iter().enumerate() {
         let args = format!(r#"{{"text":"s","status":{status}}}"#);
         stored.push((cid(i as u128), "test_completed", args));
     }
@@ -783,16 +784,18 @@ async fn panicking_effect_is_reconciled() {
     );
     // The restart: the store reopens and marks what was in progress.
     let (_, mut store) = srv.into_store(Duration::from_secs(10)).await;
-    let store = tokio::task::spawn_blocking(move || {
+    let restart = tokio::task::spawn_blocking(move || {
         store.reopen();
         let marked = store
             .run(|tx| Ok(tx.receipts_mark_unknown_after_crash()?))
             .unwrap();
         assert_eq!(marked, 1);
         store
-    })
-    .await
-    .unwrap();
+    });
+    let store = tokio::time::timeout(Duration::from_secs(20), restart)
+        .await
+        .expect("the restart within 20 s")
+        .unwrap();
     let (srv, probe2) = TestServer::with_commands_on(store, |_| {}).await;
     let r = srv
         .send(&srv.command("test_slow_effect", &owner, id, args))
@@ -802,5 +805,79 @@ async fn panicking_effect_is_reconciled() {
         (probe.effects(), probe2.intents(), probe2.effects()),
         (1, 0, 0)
     );
+    srv.stop().await;
+}
+
+/// Replies reserved to the runner and the request path (408, and the codes
+/// `request_timeout`, `outcome_unknown`, `in_progress`, `unknown_after_crash`, `conflict`)
+/// are 500 `internal` from a handler: a `prepare` error and an intent's refusal with no
+/// receipt, a completed result stored as such and replayed. A transient refusal whose
+/// outcome is known (503 `busy`) is answered as is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reserved_handler_replies_are_500() {
+    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    for (id, name, args) in [
+        (cid(1), "test_completed", r#"{"text":"prepare_timeout"}"#),
+        (cid(2), "test_refuse", r#"{"how":"outcome_unknown"}"#),
+    ] {
+        let r = srv.send(&srv.command(name, &owner, id, args)).await;
+        assert_eq!(srv.receipt(id), None, "{name} {args}");
+        assert_eq!(
+            (r.status, r.body.as_slice()),
+            (500, INTERNAL),
+            "{name} {args}"
+        );
+    }
+    for (i, code) in [
+        "in_progress",
+        "outcome_unknown",
+        "request_timeout",
+        "conflict",
+        "unknown_after_crash",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = cid(10 + i as u128);
+        let args = format!(r#"{{"text":"r","status":409,"code":"{code}"}}"#);
+        let req = srv.command("test_completed", &owner, id, &args);
+        let first = srv.send(&req).await;
+        assert_eq!(
+            (first.status, first.body.as_slice()),
+            (500, INTERNAL),
+            "{code}"
+        );
+        assert_eq!(
+            srv.receipt(id).unwrap().status,
+            ReceiptStatus::Completed(completed(&first)),
+            "{code}"
+        );
+        let replay = srv.send(&req).await;
+        assert_eq!(
+            (replay.status, &replay.body),
+            (first.status, &first.body),
+            "{code}"
+        );
+    }
+    // A handler's own code on the same status is its own.
+    let r = srv
+        .send(&srv.command(
+            "test_completed",
+            &owner,
+            cid(20),
+            r#"{"text":"r","status":409,"code":"card_closed"}"#,
+        ))
+        .await;
+    assert_eq!(
+        (r.status, r.body.as_slice()),
+        (409, br#"{"code":"card_closed"}"#.as_slice())
+    );
+    let r = srv
+        .send(&srv.command("test_refuse", &owner, cid(21), r#"{"how":"busy"}"#))
+        .await;
+    assert_eq!(r.outcome(), (503, code("busy")));
+    assert_eq!(srv.receipt(cid(21)), None);
+    assert_eq!(probe.intents(), 0);
     srv.stop().await;
 }

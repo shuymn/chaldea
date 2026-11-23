@@ -43,8 +43,14 @@ pub(crate) struct Points {
     /// Held once by a command's reply wait at the top of its loop, before it reads the
     /// runner's progress.
     pub(crate) progress_gate: Mutex<Option<Gate>>,
-    /// The server's clock at each receipt completion attempt, in order.
-    pub(crate) completion_attempts: Mutex<Vec<std::time::Instant>>,
+    /// Each receipt completion attempt, in order: the server's clock at its admission and
+    /// its `not_after`.
+    pub(crate) completion_attempts: Mutex<Vec<(std::time::Instant, std::time::Instant)>>,
+    /// Each pause between completion attempts, in order: the server's clock when it was
+    /// scheduled and the instant it wakes at.
+    pub(crate) completion_pauses: Mutex<Vec<(std::time::Instant, std::time::Instant)>>,
+    /// Connections whose first byte was read (the request origin recorded).
+    pub(crate) first_bytes: AtomicUsize,
     /// Taken by the next receipt completion attempt, which holds it inside its job on the
     /// writer thread.
     pub(crate) completion_hold: Mutex<Option<WriterHold>>,
@@ -216,18 +222,50 @@ impl Points {
         pass(&self.progress_gate).await;
     }
 
-    pub(crate) fn completion_attempt(&self, at: std::time::Instant) {
+    pub(crate) fn completion_attempt(&self, at: std::time::Instant, not_after: std::time::Instant) {
         self.completion_attempts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(at);
+            .push((at, not_after));
     }
 
+    /// The server's clock at each completion attempt.
     pub(crate) fn completion_attempts(&self) -> Vec<std::time::Instant> {
+        self.completion_attempts_with_not_after()
+            .into_iter()
+            .map(|(at, _)| at)
+            .collect()
+    }
+
+    pub(crate) fn completion_attempts_with_not_after(
+        &self,
+    ) -> Vec<(std::time::Instant, std::time::Instant)> {
         self.completion_attempts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    pub(crate) fn completion_pause(&self, from: std::time::Instant, wake: std::time::Instant) {
+        self.completion_pauses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((from, wake));
+    }
+
+    pub(crate) fn completion_pauses(&self) -> Vec<(std::time::Instant, std::time::Instant)> {
+        self.completion_pauses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn first_byte_read(&self) {
+        self.first_bytes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn first_bytes(&self) -> usize {
+        self.first_bytes.load(Ordering::SeqCst)
     }
 
     /// Arms the completion hold: the returned receiver gets a message when the next

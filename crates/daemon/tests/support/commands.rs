@@ -5,12 +5,13 @@
 //!
 //! - `test_counter`: completed in its intent job, which appends one event and counts the
 //!   intents run; an optional `target` thread is checked against the `task set` grant.
-//! - `test_completed`: completed in its intent job with a fixed body and a status (201
-//!   unless the arguments name one).
+//! - `test_completed`: completed in its intent job with a fixed body (or an error body with
+//!   the `code` the arguments name) and a status (201 unless the arguments name one); its
+//!   `prepare` refuses the text `prepare_timeout` with 408.
 //! - `test_slow_effect`: a pending intent whose effect waits for the test's release when
 //!   armed, can revoke the caller's token, and answers a status or panics by its tag.
-//! - `test_refuse`: an intent that refuses (with a status in the refusal set or outside
-//!   it), panics, or writes and returns `Pending` without an effect.
+//! - `test_refuse`: an intent that refuses (with a reply a handler may give or one reserved
+//!   to the runner), panics, or writes and returns `Pending` without an effect.
 //! - `test_worktree_remove`: the `OwnWorktree` object check.
 //! - `test_long_deadline`: completed in its intent job, with a budget of its own
 //!   ([`LONG_DEADLINE`]).
@@ -244,6 +245,9 @@ struct TextArgs {
     /// The status to answer; 201 when absent.
     #[serde(default)]
     status: Option<u16>,
+    /// When present, the body is `{"code": code}` instead of [`completed_body`].
+    #[serde(default)]
+    code: Option<String>,
 }
 
 /// The body `test_completed` answers for `text`: status 201, non-ASCII bytes included.
@@ -264,12 +268,19 @@ impl CommandHandler for Completed {
 
     fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError> {
         let (a, normalized): (TextArgs, _) = parse(args)?;
+        if a.text == "prepare_timeout" {
+            return Err(ApiError::request_timeout());
+        }
         Ok(Prepared {
             normalized,
             intent: Box::new(move |_tx, _auth, _ctx| {
+                let body = match &a.code {
+                    Some(code) => serde_json::json!({ "code": code }).to_string(),
+                    None => completed_body(&a.text),
+                };
                 Ok(Intent::Completed(CommandResult {
                     http_status: a.status.unwrap_or(201),
-                    body: completed_body(&a.text),
+                    body,
                 }))
             }),
         })
@@ -348,12 +359,14 @@ impl CommandEffect for SlowEffect {
             }
             if run.revoke_self {
                 let id = run.token_id;
-                store
+                let ticket = store
                     .submit(soon(), move |tx| {
                         Ok(tx.token_revoke(TokenSelector::Token(id))?)
                     })
-                    .unwrap()
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(10), ticket)
                     .await
+                    .expect("the revocation within 10 s")
                     .unwrap();
             }
             // Tags that answer a status outside the result set, or panic.
@@ -382,6 +395,10 @@ enum How {
     Timeout,
     /// Refused with 200, outside the refusal set.
     Success,
+    /// Refused with 503 `outcome_unknown`, a reply reserved to the runner.
+    OutcomeUnknown,
+    /// Refused with 503 `busy`: a transient refusal whose outcome is known.
+    Busy,
     /// Appends one event, then returns `Intent::Pending` from a handler without an effect.
     Pending,
     /// The intent panics.
@@ -409,6 +426,8 @@ impl CommandHandler for Refuse {
                 How::Forbidden => Err(refuse(ApiError::forbidden())),
                 How::Timeout => Err(refuse(ApiError::request_timeout())),
                 How::Success => Err(refuse(ApiError::new(StatusCode::OK, ErrorCode::Internal))),
+                How::OutcomeUnknown => Err(refuse(ApiError::outcome_unknown())),
+                How::Busy => Err(refuse(ApiError::busy())),
                 How::Pending => {
                     let id = ctx.command_id();
                     let mut e = registered(ThreadId(id.0), false);
