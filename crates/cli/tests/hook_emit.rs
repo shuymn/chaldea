@@ -429,6 +429,37 @@ fn reports_fail_on_a_malformed_tail_after_the_last_expected_event() {
     drop(reports);
 }
 
+/// A reader that times out on an open connection is a fault, not the stream's end.
+#[test]
+#[should_panic(expected = "report reader failed")]
+fn reports_fail_when_a_reader_times_out() {
+    let reports = Reports::start_with(Duration::from_millis(200));
+    let mut s = TcpStream::connect(&reports.addr).unwrap();
+    s.write_all(b"{\"event\":\"a\"}\n").unwrap();
+    assert_eq!(reports.wait("a", 1).len(), 1);
+    // The connection stays open past the reader's timeout.
+    let _held = s;
+    reports.final_of("a");
+}
+
+/// A drop that fails still closes the listener.
+#[test]
+fn reports_close_their_listener_when_a_drop_fails() {
+    let mut addr = String::new();
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let reports = Reports::start();
+        addr.clone_from(&reports.addr);
+        let mut s = TcpStream::connect(&reports.addr).unwrap();
+        s.write_all(b"{bad}\n").unwrap();
+        drop(s);
+        drop(reports);
+    }));
+    let msg = failed.expect_err("the drop reports the malformed frame");
+    let msg = msg.downcast_ref::<String>().map_or("", String::as_str);
+    assert!(msg.contains("malformed report frame"), "{msg}");
+    assert!(TcpStream::connect(&addr).is_err(), "listener still open");
+}
+
 // ---- Running a child ----
 
 /// What a child gets on stdin.
@@ -910,15 +941,33 @@ fn hook_emit_runs_before_process_setup() {
 // ---- FakeCli hook emission (§2.14) ----
 
 impl Drop for Reports {
-    /// Drains the readers and fails on a malformed frame read after the test's last look,
-    /// unless the test is already failing.
+    /// Drains the readers, closes the listener, and then fails on a reader fault seen after
+    /// the test's last look, unless the test is already failing. The listener is closed on
+    /// every path, the failing ones included.
     fn drop(&mut self) {
-        if !std::thread::panicking() {
-            let _ = self.final_of("");
-        }
+        let fault = if std::thread::panicking() {
+            None
+        } else {
+            self.try_drain().err().or_else(|| self.fault())
+        };
         self.stop.store(true, Ordering::SeqCst);
         if let Some(a) = self.accept.take() {
-            let _ = a.join();
+            // The accept loop checks `stop` once per POLL; past WAIT it is left detached.
+            let end = Instant::now() + WAIT;
+            while !a.is_finished() && Instant::now() < end {
+                std::thread::sleep(POLL);
+            }
+            let stopped = a.is_finished();
+            if stopped {
+                let _ = a.join();
+            }
+            assert!(
+                fault.is_some() || stopped || std::thread::panicking(),
+                "report accept loop did not stop"
+            );
+        }
+        if let Some(fault) = fault {
+            panic!("{fault}");
         }
     }
 }
@@ -938,10 +987,12 @@ fn fake_cli() -> PathBuf {
 }
 
 /// A report listener: every line of every FakeCli process, as JSON. A connection is read
-/// until its EOF or [`WAIT`] without a line; the accept loop ends when this is dropped.
+/// until its EOF or a reset; going [`WAIT`] without a line, a read error, or a failed socket
+/// setup is a fault. The accept loop ends when this is dropped.
 struct Reports {
     addr: String,
-    /// The events, and the first complete frame that was not JSON.
+    /// The events, and the first fault: a complete frame that was not JSON, or a reader
+    /// that ended other than at its stream's end.
     events: Arc<Mutex<(Vec<Value>, Option<String>)>>,
     /// Reader threads still running.
     open: Arc<AtomicUsize>,
@@ -960,8 +1011,21 @@ impl Drop for Reader {
     }
 }
 
+/// The end of a peer killed while connected (Windows reports it as a reset).
+fn is_reset(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+    )
+}
+
 impl Reports {
     fn start() -> Reports {
+        Reports::start_with(WAIT)
+    }
+
+    /// A listener whose readers give up after `read_timeout` without a line.
+    fn start_with(read_timeout: Duration) -> Reports {
         let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         l.set_nonblocking(true).unwrap();
         let addr = l.local_addr().unwrap().to_string();
@@ -987,8 +1051,15 @@ impl Reports {
                 let reader = Reader(readers.clone());
                 std::thread::spawn(move || {
                     let _reader = reader;
-                    s.set_nonblocking(false).unwrap();
-                    s.set_read_timeout(Some(WAIT)).unwrap();
+                    let fault = |f: String| {
+                        ev.lock().unwrap().1.get_or_insert(f);
+                    };
+                    let setup = s
+                        .set_nonblocking(false)
+                        .and_then(|()| s.set_read_timeout(Some(read_timeout)));
+                    if let Err(e) = setup {
+                        return fault(format!("report reader setup failed: {e}"));
+                    }
                     // Complete frames only: an unterminated last one (a process killed while
                     // reporting) is discarded.
                     let mut r = BufReader::new(s);
@@ -996,16 +1067,16 @@ impl Reports {
                         let mut line = Vec::new();
                         match r.read_until(b'\n', &mut line) {
                             Ok(_) if line.ends_with(b"\n") => {}
-                            _ => return,
+                            Ok(_) => return,
+                            Err(e) if is_reset(&e) => return,
+                            Err(e) => return fault(format!("report reader failed: {e}")),
                         }
                         let mut ev = ev.lock().unwrap();
-                        match serde_json::from_slice(&line) {
-                            Ok(v) => ev.0.push(v),
-                            Err(_) => {
-                                let frame = String::from_utf8_lossy(&line).into_owned();
-                                ev.1.get_or_insert(frame);
-                                return;
-                            }
+                        if let Err(e) = serde_json::from_slice::<Value>(&line).map(|v| ev.0.push(v))
+                        {
+                            let frame = String::from_utf8_lossy(&line);
+                            ev.1.get_or_insert(format!("malformed report frame: {frame:?} ({e})"));
+                            return;
                         }
                     }
                 });
@@ -1022,28 +1093,38 @@ impl Reports {
     }
 
     /// Waits (bounded) until every connection made so far was accepted and every reader has
-    /// reached its stream's end, so no frame is still unread; panics past the bound.
-    fn drain(&self) {
+    /// ended, so no frame is still unread.
+    fn try_drain(&self) -> Result<(), String> {
         let from = self.idle.load(Ordering::SeqCst);
         let end = Instant::now() + WAIT;
         while self.idle.load(Ordering::SeqCst) < from + 2 || self.open.load(Ordering::SeqCst) > 0 {
-            assert!(Instant::now() < end, "report readers did not drain");
+            if Instant::now() >= end {
+                return Err("report readers did not drain".into());
+            }
             std::thread::sleep(POLL);
         }
+        Ok(())
+    }
+
+    /// The first reader fault, if any.
+    fn fault(&self) -> Option<String> {
+        self.events.lock().unwrap().1.clone()
     }
 
     /// The events named `event` once every reader has drained (the final count); panics
-    /// once a malformed frame was read.
+    /// past the drain's bound or once a reader fault was recorded.
     fn final_of(&self, event: &str) -> Vec<Value> {
-        self.drain();
+        if let Err(e) = self.try_drain() {
+            panic!("{e}");
+        }
         self.of(event)
     }
 
-    /// The events named `event` so far; panics once a malformed frame was read.
+    /// The events named `event` so far; panics once a reader fault was recorded.
     fn of(&self, event: &str) -> Vec<Value> {
         let ev = self.events.lock().unwrap();
-        if let Some(frame) = &ev.1 {
-            panic!("malformed report frame: {frame:?}");
+        if let Some(fault) = &ev.1 {
+            panic!("{fault}");
         }
         ev.0.iter()
             .filter(|e| e["event"] == event)
