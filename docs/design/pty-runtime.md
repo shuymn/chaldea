@@ -82,8 +82,8 @@ pub struct SpawnedPty {                      // fields private; only backends bu
 pub trait PtyChild: Send + Sync {
     fn identity(&self) -> &ProcessIdentity;
     fn wait_timeout(&self, timeout: Duration) -> io::Result<Option<ChildExit>>;
-    /// Kills the whole tree plus the recorded descendants in `extra` (the daemon learns
-    /// them from hook emitters); idempotent; returns by `deadline`. The caller passes its
+    /// Kills the whole tree plus the recorded descendants in `extra` (identities the daemon
+    /// proves belong to the launch, never hook-emitter ancestry); idempotent; returns by `deadline`. The caller passes its
     /// full list of recorded descendants on every call, retries included; the report's
     /// survivors are diagnostic, never a list to resubmit.
     fn kill_tree(&self, extra: &[ProcessIdentity], deadline: Instant) -> KillReport;
