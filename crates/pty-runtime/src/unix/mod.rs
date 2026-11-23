@@ -6,7 +6,7 @@ mod child;
 mod io;
 mod kill;
 #[allow(unsafe_code)]
-mod sys;
+pub(crate) mod sys;
 mod table;
 #[cfg(test)]
 mod tests;
@@ -41,7 +41,23 @@ pub fn native() -> Arc<dyn PtyRuntime> {
     Arc::new(UnixPty::default())
 }
 
-/// Process identity by pid, for tests (`fake::identify`).
+/// The identity of a live process by pid (`host::process_identity`); a zombie has exited and
+/// is `None`.
+pub(crate) fn identify_live(pid: u32) -> std::io::Result<Option<crate::ProcessIdentity>> {
+    use self::table::Lookup;
+    match table::lookup(pid) {
+        Lookup::Live(p) => Ok(Some(crate::ProcessIdentity {
+            pid,
+            start_time: p.start.to_string(),
+            group: p.pgid.to_string(),
+        })),
+        Lookup::Zombie(_) | Lookup::Gone => Ok(None),
+        Lookup::Unreadable => Err(Error::from(ErrorKind::PermissionDenied)),
+    }
+}
+
+/// Process identity by pid, for tests (`fake::identify`); a zombie keeps its start stamp
+/// with an empty group.
 #[cfg(feature = "fake")]
 pub(crate) fn identify(pid: u32) -> std::io::Result<Option<crate::ProcessIdentity>> {
     use self::table::Lookup;

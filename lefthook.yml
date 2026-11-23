@@ -35,6 +35,14 @@ pre-commit:
         - "crates/**/Cargo.toml"
         - "Cargo.{toml,lock}"
       run: deps="$(cargo tree -p chaldea-pty-runtime -e normal --prefix none)" && ! printf '%s\n' "$deps" | grep -Eq '^tokio '
+    # tokio's `process` feature stays off in the daemon (every child goes through the spawn
+    # lock). Without pipefail the pipeline's status is grep's, so an early grep exit cannot
+    # pass it.
+    daemon-tokio-features:
+      glob:
+        - "crates/**/Cargo.toml"
+        - "Cargo.{toml,lock}"
+      run: feats="$(cargo tree -p chaldea-daemon -e features --prefix none -i tokio)" && ! printf '%s\n' "$feats" | grep -q '^tokio feature "process"'
     # The daemon's own build parses decimals with serde_json's `float_roundtrip`, which
     # command request identity relies on.
     serde-json-features:

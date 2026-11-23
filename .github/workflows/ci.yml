@@ -71,13 +71,25 @@ jobs:
           list="$(cargo test -p chaldea-pty-runtime --lib --locked -- --list)"
           require "$list" \
             windows::tests::dropping_the_child_kills_through_the_job \
-            windows::kill::tests::job_empty_and_handles_signalled_proves_death
+            windows::kill::tests::job_empty_and_handles_signalled_proves_death \
+            host::windows::tests::created_entries_read_back_private \
+            host::windows::tests::stop_event_round_trip
           list="$(cargo test -p chaldea-pty-runtime --test windows_spawn --locked -- --list)"
           require "$list" env_is_exactly_the_spec
           list="$(cargo test -p chaldea-testkit --test pty_windows --locked -- --list)"
           require "$list" spawn_tree_dies_and_unrelated_survives
           list="$(cargo test -p chaldea-daemon --test store_open --locked -- --list)"
           require "$list" long_path_vfs_is_selected
+          list="$(cargo test -p chaldea-daemon --lib --locked -- --list)"
+          require "$list" \
+            lifecycle::tests::state_dir::refuses_users_ace_under_profile \
+            lifecycle::tests::state_dir::creates_a_state_dir_beyond_max_path \
+            lifecycle::tests::state_dir::refuses_verbatim_path_with_parent_component \
+            lifecycle::tests::files::refuses_reparse_point \
+            lifecycle::tests::shutdown::record_removal_failure_is_reported
+          list="$(cargo test -p chaldea-cli --test daemon_windows --locked -- --list)"
+          require "$list" ctrl_c_and_ctrl_break_stop stop_event_is_global \
+            setup_without_console_can_start_and_stop
 
       # core is Sans-IO: no async runtime, store, HTTP stack, or random source in its
       # dependency tree (core::auth and core::http are pure policy and wire types).
@@ -93,6 +105,13 @@ jobs:
         run: |
           deps="$(cargo tree -p chaldea-pty-runtime -e normal --prefix none)"
           ! grep -Eq '^tokio ' <<<"$deps"
+
+      # Every child goes through the spawn lock: tokio's `process` feature stays off in the
+      # daemon (docs/design/daemon-lifecycle.md §2.11).
+      - name: Check the daemon's tokio features
+        run: |
+          feats="$(cargo tree -p chaldea-daemon -e features --prefix none -i tokio)"
+          ! grep -q '^tokio feature "process"' <<<"$feats"
 
       # The daemon's own build (no dev-dependencies) parses decimals with serde_json's
       # `float_roundtrip`, which command request identity relies on (http-surface §2.8).

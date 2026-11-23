@@ -63,6 +63,8 @@ pub use tickets::TicketPurpose;
 pub use trace::redact_secrets;
 pub use upgrade::{ShutdownSignal, UpgradeGrant, UpgradedSocket};
 
+pub(crate) use auth::{TOKEN_PREFIX, has_secret_form};
+
 /// The server's monotonic clock (design §2.3): request origins, deadlines, the cutoff
 /// checks, and ticket expiry are all read on it; tests inject one.
 pub trait MonotonicClock: Send + Sync + 'static {
@@ -301,6 +303,15 @@ impl HttpServer {
         let accept = listener::accept_loop(self.shared.clone(), listener, self.router.clone());
         // Refused only once the registry is closing: the listener is dropped with it.
         let _ = self.shared.registry.spawn(TaskKind::Accept, accept);
+        ServeHandle {
+            shared: self.shared.clone(),
+        }
+    }
+
+    /// A handle that drains the registry without serving: for a server whose startup ended
+    /// before `serve` but may have registered work (a token write's observer).
+    #[must_use]
+    pub fn shutdown_handle(&self) -> ServeHandle {
         ServeHandle {
             shared: self.shared.clone(),
         }

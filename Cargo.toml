@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/daemon", "crates/pty-runtime", "crates/testkit"]
+members = ["crates/cli", "crates/core", "crates/daemon", "crates/pty-runtime", "crates/testkit"]
 resolver = "3"
 
 [workspace.package]
@@ -45,6 +45,10 @@ windows-sys = { version = "=0.61.2", features = [
   "Win32_System_LibraryLoader", # GetModuleHandleW, GetModuleFileNameW (the conpty_module evidence)
   "Win32_System_Pipes",         # PeekNamedPipe (test helper for CL-21)
   "Win32_Globalization",        # CompareStringOrdinal (environment key order and equality)
+  "Win32_UI_Shell",             # SHGetKnownFolderPath (the default state directory, docs/design/daemon-lifecycle.md §2.4)
+  "Win32_System_Com",           # CoTaskMemFree for the known-folder path
+  "Win32_Security_Authorization", # GetSecurityInfo, SDDL conversions (state-directory privacy)
+  "Win32_Storage_FileSystem",   # CreateDirectoryW, CreateFileW with an explicit descriptor
 ] }
 # testkit's FakeCli on Windows: console mode and size without `unsafe` (already in the lock).
 winapi-util = "=0.1.11"
@@ -84,8 +88,11 @@ futures-util = { version = "=0.3.34", default-features = false, features = ["sin
 tungstenite = { version = "=0.29.0", default-features = false }
 # Dev only: the WebSocket test client (the version axum's `ws` feature locks).
 tokio-tungstenite = "=0.29.0"
-# Dev only: the capturing log subscriber of the secret-redaction tests.
+# The daemon's log subscriber (docs/design/daemon-lifecycle.md §2.13); also the capturing
+# subscriber of the secret-redaction tests.
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
+# The `chaldea` CLI's argument parsing (docs/design/daemon-lifecycle.md §1); no color, no suggestions.
+clap = { version = "=4.6.8", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

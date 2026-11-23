@@ -163,6 +163,7 @@ pub struct HttpServer { /* Arc<AppState>: store, config, TokenService, TicketSto
 impl HttpServer {
     pub fn new(cfg: HttpConfig, store: Store, registry: CommandRegistry, sink: Arc<dyn LifecycleSink>, mounts: Mounts) -> HttpServer;
     pub fn serve(&self, listener: tokio::net::TcpListener) -> ServeHandle;   // the listener is PR 8's, bound to 127.0.0.1
+    pub fn shutdown_handle(&self) -> ServeHandle;   // drains the registry of a server that may never serve (PR 8's start)
     pub fn tokens(&self) -> &TokenService;     // PR 8 (owner token file), PR 10 (launch tokens), PR 20
     pub fn nudge_revocation(&self);            // re-check every WebSocket's token now (§2.6)
 }

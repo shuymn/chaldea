@@ -33,6 +33,7 @@
 
 mod backend;
 mod drain;
+pub mod host;
 mod limits;
 mod origin;
 mod session;

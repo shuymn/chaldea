@@ -1,6 +1,10 @@
 # The router is built in one place, from the route table (docs/design/http-surface.md §2.2):
 # `routes::build_router` carries the one `allow`. Any other route, nest, merge, or fallback
 # would serve a path the guard and the route inventory do not know.
+#
+# Every child the daemon creates goes through `lifecycle::spawn_locked`, under the spawn lock
+# shared with the PTY backends (docs/design/daemon-lifecycle.md §2.11), which carries the one
+# `allow`; tokio's `process` feature stays off (CI checks it).
 
 disallowed-methods = [
   { path = "axum::routing::Router::route", reason = "routes come only from http::ROUTES through build_router" },
@@ -10,4 +14,7 @@ disallowed-methods = [
   { path = "axum::routing::Router::merge", reason = "routes come only from http::ROUTES through build_router" },
   { path = "axum::routing::Router::fallback", reason = "the fallback is build_router's" },
   { path = "axum::routing::Router::fallback_service", reason = "the fallback is build_router's" },
+  { path = "std::process::Command::spawn", reason = "spawn through lifecycle::spawn_locked (the spawn lock)" },
+  { path = "std::process::Command::output", reason = "spawn through lifecycle::spawn_locked (the spawn lock)" },
+  { path = "std::process::Command::status", reason = "spawn through lifecycle::spawn_locked (the spawn lock)" },
 ]

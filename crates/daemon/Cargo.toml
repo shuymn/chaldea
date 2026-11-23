@@ -10,10 +10,13 @@ publish.workspace = true
 
 [dependencies]
 chaldea-core = { path = "../core" }
+# Process-level OS primitives (`host`) and the spawn lock (docs/design/daemon-lifecycle.md §2.2).
+chaldea-pty-runtime = { path = "../pty-runtime" }
 rusqlite.workspace = true
 sha2.workspace = true
-# The writer's reply channel (`sync`) and the HTTP server's runtime, sockets, and timers.
-tokio = { workspace = true, features = ["rt", "net", "time", "macros"] }
+# The writer's reply channel (`sync`), the HTTP server's runtime, sockets, and timers, and the
+# daemon's multi-thread runtime and signal listeners. Never `process` (CI checks it).
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time", "macros", "signal"] }
 base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -30,13 +33,17 @@ tracing.workspace = true
 http-body-util.workspace = true
 futures-util.workspace = true
 tungstenite.workspace = true
+# The global log subscriber (docs/design/daemon-lifecycle.md §2.13).
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# The `host` test helpers (links, ACL grants, signal state).
+chaldea-pty-runtime = { path = "../pty-runtime", features = ["fake"] }
 proptest.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+# Paused-clock tests (the runtime features are normal dependencies above).
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
-tracing-subscriber.workspace = true
 # The contract fixtures validate captured bodies against packages/contracts/schema.
 jsonschema.workspace = true
 

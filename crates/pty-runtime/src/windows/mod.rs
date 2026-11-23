@@ -11,7 +11,7 @@ mod control;
 pub(crate) mod hooks;
 mod kill;
 #[allow(unsafe_code)]
-mod sys;
+pub(crate) mod sys;
 #[cfg(test)]
 mod tests;
 mod wait;

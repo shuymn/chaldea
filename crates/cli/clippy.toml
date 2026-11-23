@@ -1,0 +1,8 @@
+# Every child the CLI creates goes through a spawn-lock wrapper (`spawn_locked`,
+# docs/design/daemon-lifecycle.md §2.11), which carries the one `allow`.
+
+disallowed-methods = [
+  { path = "std::process::Command::spawn", reason = "spawn through spawn_locked (the spawn lock)" },
+  { path = "std::process::Command::output", reason = "spawn through spawn_locked (the spawn lock)" },
+  { path = "std::process::Command::status", reason = "spawn through spawn_locked (the spawn lock)" },
+]

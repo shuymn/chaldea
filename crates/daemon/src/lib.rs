@@ -1,4 +1,5 @@
-//! The Chaldea daemon. In this PR it holds only the event store (`docs/design/event-store.md`).
+//! The Chaldea daemon: the event store (`docs/design/event-store.md`), the HTTP server
+//! (`docs/design/http-surface.md`), and the process lifecycle (`docs/design/daemon-lifecycle.md`).
 //!
 //! The store's rules (§2.1 of that design):
 //!
@@ -19,4 +20,5 @@
 extern crate self as chaldea_daemon;
 
 pub mod http;
+pub mod lifecycle;
 pub mod store;

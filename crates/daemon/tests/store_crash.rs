@@ -10,6 +10,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use chaldea_core::ids::{IdempotencyKey, StreamId};
+use chaldea_daemon::lifecycle::spawn_locked;
 use chaldea_daemon::store::{NewEvent, Store, prepare_content};
 use support::{FixedClock, T0, config, raw_unknown, registered, soon, thread};
 
@@ -85,14 +86,15 @@ fn crash_child() {
 /// large job's events are there after reopening.
 fn crash(mode: &str) -> (u64, usize) {
     let dir = tempfile::tempdir().unwrap();
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "crash_child", "--nocapture", "--test-threads=1"])
-        .env(DIR_VAR, dir.path())
-        .env(MODE_VAR, mode)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
+    let mut child = spawn_locked(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "crash_child", "--nocapture", "--test-threads=1"])
+            .env(DIR_VAR, dir.path())
+            .env(MODE_VAR, mode)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit()),
+    )
+    .unwrap();
     let stdout = child.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {

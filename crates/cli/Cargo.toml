@@ -1,0 +1,33 @@
+[package]
+name = "chaldea-cli"
+description = "The `chaldea` binary: the daemon's process entry and the CLI (docs/design/daemon-lifecycle.md)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "chaldea"
+path = "src/main.rs"
+
+[dependencies]
+chaldea-daemon = { path = "../daemon" }
+clap.workspace = true
+
+[dev-dependencies]
+chaldea-daemon = { path = "../daemon" }
+# Receipt and token ids for the store fixtures.
+chaldea-core = { path = "../core" }
+# The `host` test helpers (signal state, links, ACL grants, console events, the stop event).
+chaldea-pty-runtime = { path = "../pty-runtime", features = ["fake"] }
+serde_json.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+# Test signals by pid.
+rustix = { workspace = true }
+
+[lints]
+workspace = true

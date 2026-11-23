@@ -1,5 +1,6 @@
 //! The only module allowed `unsafe` (`docs/design/pty-unix.md` §2.7). Every function here
-//! is safe to call: the `pre_exec` body of the spawn, the fd ceiling, and libproc.
+//! is safe to call: the `pre_exec` body of the spawn, the fd ceiling, libproc, and the
+//! process-level calls of `host` (signal state, extended ACLs).
 
 use std::ffi::c_int;
 use std::io;
@@ -312,6 +313,172 @@ pub(crate) fn open_fds(pid: u32) -> io::Result<Vec<i32>> {
     let mut list: Vec<i32> = fds.iter().map(|f| f.proc_fd).collect();
     list.sort_unstable();
     Ok(list)
+}
+
+// ---- Process-level primitives of `host` (docs/design/daemon-lifecycle.md §2.2) ----
+
+/// `sys/acl.h`: the extended ACL type, the entry iteration ids, and the allow tag.
+const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+const ACL_FIRST_ENTRY: c_int = 0;
+const ACL_NEXT_ENTRY: c_int = -1;
+const ACL_EXTENDED_ALLOW: c_int = 1;
+
+unsafe extern "C" {
+    /// `sys/acl.h` (libSystem); libc 0.2.191 has no Apple ACL bindings.
+    fn acl_get_link_np(path: *const std::ffi::c_char, ty: c_int) -> *mut std::ffi::c_void;
+    fn acl_get_fd_np(fd: c_int, ty: c_int) -> *mut std::ffi::c_void;
+    fn acl_get_entry(
+        acl: *mut std::ffi::c_void,
+        entry_id: c_int,
+        entry: *mut *mut std::ffi::c_void,
+    ) -> c_int;
+    fn acl_get_tag_type(entry: *mut std::ffi::c_void, tag: *mut c_int) -> c_int;
+    fn acl_free(obj: *mut std::ffi::c_void) -> c_int;
+}
+
+/// An ACL `acl_get_*_np` returned; freed once on drop.
+struct Acl(*mut std::ffi::c_void);
+
+impl Drop for Acl {
+    fn drop(&mut self) {
+        // SAFETY: the pointer is an ACL the library allocated and nothing else frees.
+        let _ = unsafe { acl_free(self.0) };
+    }
+}
+
+/// Whether an ACL pointer (or the error of its lookup) has an entry of type allow; a null
+/// pointer with `ENOENT` is no extended ACL.
+fn acl_has_allow(acl: *mut std::ffi::c_void) -> io::Result<bool> {
+    if acl.is_null() {
+        let e = io::Error::last_os_error();
+        return if e.raw_os_error() == Some(libc::ENOENT) {
+            Ok(false)
+        } else {
+            Err(e)
+        };
+    }
+    let acl = Acl(acl);
+    let mut id = ACL_FIRST_ENTRY;
+    loop {
+        let mut entry = std::ptr::null_mut();
+        // SAFETY: `acl.0` is a live ACL; `entry` is a local out-pointer.
+        if unsafe { acl_get_entry(acl.0, id, &raw mut entry) } != 0 {
+            return Ok(false);
+        }
+        let mut tag: c_int = 0;
+        // SAFETY: `entry` was just returned for this live ACL; `tag` is a local.
+        if unsafe { acl_get_tag_type(entry, &raw mut tag) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if tag == ACL_EXTENDED_ALLOW {
+            return Ok(true);
+        }
+        id = ACL_NEXT_ENTRY;
+    }
+}
+
+/// Whether the extended ACL of `path` (not following a final symlink) has an allow entry.
+pub(crate) fn acl_allows_link(path: &std::ffi::CStr) -> io::Result<bool> {
+    // SAFETY: `path` is a NUL-terminated string that outlives the call.
+    let acl = unsafe { acl_get_link_np(path.as_ptr(), ACL_TYPE_EXTENDED) };
+    acl_has_allow(acl)
+}
+
+/// Whether the extended ACL of the open file `fd` has an allow entry.
+pub(crate) fn acl_allows_fd(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `fd` is a borrowed, open descriptor for the duration of the call.
+    let acl = unsafe { acl_get_fd_np(fd.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    acl_has_allow(acl)
+}
+
+fn sig_bit(sig: c_int) -> libc::sigset_t {
+    // Darwin's `sigaddset`: bit `sig - 1` of a 32-bit set.
+    1u32 << (sig - 1)
+}
+
+/// The signals `prepare_process` unblocks.
+const RESET_SIGNALS: [c_int; 4] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGCHLD];
+
+/// `SIGCHLD` to `SIG_DFL` with no flags, then `TERM`, `INT`, `HUP`, `CHLD` unblocked in the
+/// calling thread's mask (inherited by threads created later).
+pub(crate) fn reset_process_signals() -> io::Result<()> {
+    let default_action = libc::sigaction {
+        sa_sigaction: libc::SIG_DFL,
+        sa_mask: 0,
+        sa_flags: 0,
+    };
+    // SAFETY: `default_action` is a valid action; the old action is not requested.
+    if unsafe {
+        libc::sigaction(
+            libc::SIGCHLD,
+            &raw const default_action,
+            std::ptr::null_mut(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let set = RESET_SIGNALS.iter().fold(0, |m, s| m | sig_bit(*s));
+    // SAFETY: `set` is a valid set; the old mask is not requested.
+    let rc =
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut()) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    Ok(())
+}
+
+/// The `SIGCHLD` handler value and flags, and the calling thread's blocked set.
+pub(crate) fn signal_state() -> io::Result<(usize, c_int, libc::sigset_t)> {
+    let mut old = MaybeUninit::<libc::sigaction>::zeroed();
+    // SAFETY: a null new action only reads; `old` is a writable `sigaction`.
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), old.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `sigaction` holds only integers, so the zeroed value is valid, and the call
+    // filled it.
+    let old = unsafe { old.assume_init() };
+    let mut mask: libc::sigset_t = 0;
+    // SAFETY: a null new set only reads; `mask` is a writable set.
+    let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &raw mut mask) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    Ok((old.sa_sigaction, old.sa_flags, mask))
+}
+
+/// Whether `sig` is in `mask`.
+pub(crate) fn in_set(mask: libc::sigset_t, sig: c_int) -> bool {
+    mask & sig_bit(sig) != 0
+}
+
+/// Test helper: `SIGCHLD` ignored (the state a careless parent can leave).
+#[cfg(feature = "fake")]
+pub(crate) fn ignore_sigchld() -> io::Result<()> {
+    let ignore = libc::sigaction {
+        sa_sigaction: libc::SIG_IGN,
+        sa_mask: 0,
+        sa_flags: 0,
+    };
+    // SAFETY: `ignore` is a valid action; the old action is not requested.
+    if unsafe { libc::sigaction(libc::SIGCHLD, &raw const ignore, std::ptr::null_mut()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Test helper: blocks `signals` in the calling thread's mask.
+#[cfg(feature = "fake")]
+pub(crate) fn block_signals(signals: &[c_int]) -> io::Result<()> {
+    let set = signals.iter().fold(0, |m, s| m | sig_bit(*s));
+    // SAFETY: `set` is a valid set; the old mask is not requested.
+    let rc =
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut()) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

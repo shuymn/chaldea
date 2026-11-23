@@ -290,7 +290,7 @@ impl OutputProbe {                                                 // the test's
 
 ### 2.7 The `unsafe` Carve-Out
 
-The crate's `[lints]` table is PR3 §2.7's. A second module is allowed `unsafe`: `#[allow(unsafe_code)] mod sys;` in `src/windows/mod.rs`. Everything else is safe code over `sys`, std, and `OwnedHandle`. Each `unsafe` block holds one operation and a `SAFETY` comment (`multiple_unsafe_ops_per_block`, `undocumented_unsafe_blocks` denied). `sys` exposes safe functions only:
+The crate's `[lints]` table is PR3 §2.7's. A second module is allowed `unsafe`: `#[allow(unsafe_code)] pub(crate) mod sys;` in `src/windows/mod.rs` (crate-visible for `host`, as in pty-unix §2.7). Everything else is safe code over `sys`, std, and `OwnedHandle`. Each `unsafe` block holds one operation and a `SAFETY` comment (`multiple_unsafe_ops_per_block`, `undocumented_unsafe_blocks` denied). `sys` exposes safe functions only:
 
 | Safe function | `unsafe` operations inside | Safety argument |
 |---|---|---|
