@@ -77,8 +77,10 @@ $PassedVariables = @(
 )
 # The cli test fixture creates every test directory under this run-owned root when it is set.
 $TestRootVariable = 'CHALDEA_TEST_ROOT'
-# How long the whole cleanup may take.
+# How long the whole cleanup may take, and the part of it kept for listing the survivors: the
+# wrapper's stop and the daemon stops end that long before the cleanup's deadline.
 $CleanupSeconds = 120
+$SurvivorReserveSeconds = 30
 
 function Invoke-CargoLane {
     # The owner the token gives new objects (an elevated administrator's: Administrators).
@@ -150,7 +152,7 @@ function Open-Row($Row) {
 # timeout is in whole seconds); $null with an error recorded when less is left.
 function Get-Snapshot([int] $Ms, [string] $What, $Report) {
     if ($Ms -lt 1000) {
-        $Report.errors += "the cleanup deadline passed before $What"
+        $Report.errors += "no time was left for $What"
         return $null
     }
     try { , @(Get-CimInstance Win32_Process -OperationTimeoutSec ([int][Math]::Floor($Ms / 1000))) }
@@ -161,7 +163,8 @@ function Get-Snapshot([int] $Ms, [string] $What, $Report) {
 }
 
 # The cleanup, on every ending of the lane, within one deadline: every wait, output included,
-# gets the time left. It terminates nothing but the wrapper, in this order:
+# gets the time left, and a and b end early enough to leave c its reserve. It terminates
+# nothing but the wrapper, in this order:
 #   a. the wrapper, found in a snapshot by its unique argument and opened as Open-Row does, is
 #      terminated (not its descendants) and waited for;
 #   b. `chaldea daemon stop` runs for every state directory under the run root;
@@ -171,9 +174,11 @@ function Get-Snapshot([int] $Ms, [string] $What, $Report) {
 function Invoke-Cleanup([string] $WrapperArg, [string] $RunDir, [string] $RunRoot, [string] $Chaldea) {
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $left = { [int][Math]::Max(0, $CleanupSeconds * 1000 - $clock.ElapsedMilliseconds) }
+    # The time left to a and b, which end before the survivor reserve.
+    $leftBefore = { [int][Math]::Max(0, ($CleanupSeconds - $SurvivorReserveSeconds) * 1000 - $clock.ElapsedMilliseconds) }
     $report = [ordered]@{ wrapper = @(); daemon_stop = @(); survivors = @(); run_root = ''; errors = @() }
 
-    $rows = Get-Snapshot (& $left) 'the wrapper search' $report
+    $rows = Get-Snapshot (& $leftBefore) 'the wrapper search' $report
     if ($null -ne $rows) {
         $found = @($rows | Where-Object { Test-Names $_.CommandLine $WrapperArg })
         if ($found.Count -eq 0) { $report.wrapper += 'not running' }
@@ -189,8 +194,8 @@ function Invoke-Cleanup([string] $WrapperArg, [string] $RunDir, [string] $RunRoo
                     $p.Kill()
                     $what = 'terminated'
                 }
-                if ($p.WaitForExit((& $left))) { $report.wrapper += "pid $($p.Id): $what; exit observed" }
-                else { $report.errors += "the wrapper (pid $($p.Id)) did not exit before the cleanup deadline" }
+                if ($p.WaitForExit((& $leftBefore))) { $report.wrapper += "pid $($p.Id): $what; exit observed" }
+                else { $report.errors += "the wrapper (pid $($p.Id)) did not exit before the survivor reserve" }
             }
             catch { $report.errors += "terminate the wrapper (pid $($p.Id)): $_" }
             finally { $p.Dispose() }
@@ -204,8 +209,8 @@ function Invoke-Cleanup([string] $WrapperArg, [string] $RunDir, [string] $RunRoo
             ForEach-Object { $_.FullName })
     }
     foreach ($d in $dirs) {
-        if ((& $left) -eq 0) {
-            $report.errors += "the cleanup deadline passed before daemon stop for $d"
+        if ((& $leftBefore) -eq 0) {
+            $report.errors += "no time was left before the survivor reserve for daemon stop for $d"
             break
         }
         try {
@@ -217,21 +222,22 @@ function Invoke-Cleanup([string] $WrapperArg, [string] $RunDir, [string] $RunRoo
             $stop = [Diagnostics.Process]::Start($psi)
             $out = $stop.StandardOutput.ReadToEndAsync()
             $err = $stop.StandardError.ReadToEndAsync()
-            if (-not $stop.WaitForExit((& $left))) {
-                $report.errors += "daemon stop for $d did not finish before the cleanup deadline"
+            if (-not $stop.WaitForExit((& $leftBefore))) {
+                $report.errors += "daemon stop for $d did not finish before the survivor reserve"
                 continue
             }
             $entry = [ordered]@{ dir = $d; exit = $stop.ExitCode; stdout = $null; stderr = $null }
             # A result is read only once its task completed; output still open at the deadline
             # is reported as such.
-            if ($out.Wait((& $left))) { $entry.stdout = $out.Result.Trim() } else { $entry.stdout = '(still open at the cleanup deadline)' }
-            if ($err.Wait((& $left))) { $entry.stderr = $err.Result.Trim() } else { $entry.stderr = '(still open at the cleanup deadline)' }
+            if ($out.Wait((& $leftBefore))) { $entry.stdout = $out.Result.Trim() } else { $entry.stdout = '(still open at the survivor reserve)' }
+            if ($err.Wait((& $leftBefore))) { $entry.stderr = $err.Result.Trim() } else { $entry.stderr = '(still open at the survivor reserve)' }
             $report.daemon_stop += $entry
         }
         catch { $report.errors += "daemon stop for ${d}: $_" }
     }
 
     $rows = Get-Snapshot (& $left) 'the survivor snapshot' $report
+    if ($null -eq $rows) { $report.errors += 'the survivors were not listed' }
     if ($null -ne $rows) {
         foreach ($row in $rows) {
             $line = [string]$row.CommandLine
@@ -318,6 +324,7 @@ function Invoke-WmiLane {
 
     $wrapper = $null
     $cleanup = $null
+    $status = $null
     try {
         # Submission, bounded by the CIM operation timeout; the execution cutoff counts from it.
         $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -333,23 +340,29 @@ function Invoke-WmiLane {
         if ($row) { $wrapper = Open-Row $row }
         Write-Host "wrapper: pid $wrapperId (opened: $([bool]$wrapper)), run directory $run, run root $runRoot"
 
-        # Execution, against the cutoff: the wrapper's end counts only when it is seen before
-        # the cutoff, through its exit when it was opened, otherwise through its final status.
+        # Execution, against the cutoff: the wrapper's final status counts only when it is read
+        # before the cutoff, after its exit when it was opened, otherwise as soon as `done`
+        # exists (the wrapper publishes it complete, by a rename).
         $done = Join-Path $run 'done'
-        $ended = $false
+        $readDone = { if (Test-Path -LiteralPath $done) { [IO.File]::ReadAllText($done) } else { $null } }
         if ($wrapper) {
             $left = $cutoff - $clock.Elapsed
-            $ended = $left -gt [TimeSpan]::Zero -and $wrapper.WaitForExit([int][Math]::Min([int]::MaxValue, $left.TotalMilliseconds))
+            if ($left -gt [TimeSpan]::Zero -and $wrapper.WaitForExit([int][Math]::Min([int]::MaxValue, $left.TotalMilliseconds))) {
+                $status = & $readDone
+            }
         }
         else {
-            while (-not $ended -and $clock.Elapsed -lt $cutoff) {
-                $ended = Test-Path -LiteralPath $done
-                if (-not $ended) {
+            while ($null -eq $status -and $clock.Elapsed -lt $cutoff) {
+                $status = & $readDone
+                if ($null -eq $status) {
                     Start-Sleep -Milliseconds ([int][Math]::Max(0, [Math]::Min(1000, ($cutoff - $clock.Elapsed).TotalMilliseconds)))
                 }
             }
         }
-        if (-not $ended -or $clock.Elapsed -ge $cutoff) { $problems += "the wrapper did not finish within $TimeoutMinutes min" }
+        if ($null -eq $status -or $clock.Elapsed -ge $cutoff) {
+            $status = $null
+            $problems += "the wrapper's final status was not read within $TimeoutMinutes min"
+        }
     }
     catch { $problems += "the lane failed: $_" }
     finally {
@@ -406,13 +419,11 @@ function Invoke-WmiLane {
     }
     if ($cleanup.errors.Count -gt 0) { $problems += "cleanup errors: $($cleanup.errors -join '; ')" }
 
-    $done = Join-Path $run 'done'
-    if (Test-Path -LiteralPath $done) {
-        $status = Get-Content -LiteralPath $done -Raw
+    # The final status read before the cutoff (a timeout is already a problem).
+    if ($null -ne $status) {
         Write-Host "== done: $status"
         if ($status -cne 'finished') { $problems += "the final status is '$status', not 'finished'" }
     }
-    else { $problems += 'the final status file is missing' }
 
     if ($problems.Count -gt 0) { throw "the WMI lane failed:`n$($problems -join "`n")" }
 }
@@ -446,7 +457,14 @@ function Invoke-Step($Step, [string] $Cwd) {
 # The wrapper: records its identity and job state, then runs the plan's steps; `done` last.
 function Invoke-Wrapper {
     $plan = Get-Content -LiteralPath (Join-Path $RunDir 'plan.json') -Raw | ConvertFrom-Json
-    $finish = { param($s) [IO.File]::WriteAllText((Join-Path $RunDir 'done'), $s) }
+    # The final status, published complete: written to a temporary file in the run directory,
+    # then renamed to `done`.
+    $finish = {
+        param($s)
+        $tmp = Join-Path $RunDir 'done.tmp'
+        [IO.File]::WriteAllText($tmp, $s)
+        [IO.File]::Move($tmp, (Join-Path $RunDir 'done'))
+    }
     try {
         Add-Type -TypeDefinition @'
 using System;
