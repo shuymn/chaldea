@@ -25,6 +25,8 @@ pub(crate) struct Points {
     pub(crate) accept_errors: Mutex<VecDeque<io::ErrorKind>>,
     /// Write jobs `run_write` submitted to the store.
     pub(crate) submits: AtomicUsize,
+    /// The `not_after` of each job `run_write` submitted, in order.
+    pub(crate) submitted_not_afters: Mutex<Vec<std::time::Instant>>,
     /// Held once by an upgrade admission between its final read and the ticket removal.
     pub(crate) removal_gate: Mutex<Option<Gate>>,
     /// Held once by a read's or a write reply's waiter before it first polls its result
@@ -43,9 +45,8 @@ pub(crate) struct Points {
     /// Held once by a command's reply wait at the top of its loop, before it reads the
     /// runner's progress.
     pub(crate) progress_gate: Mutex<Option<Gate>>,
-    /// Each receipt completion attempt, in order: the server's clock at its admission and
-    /// its `not_after`.
-    pub(crate) completion_attempts: Mutex<Vec<(std::time::Instant, std::time::Instant)>>,
+    /// The server's clock at each receipt completion attempt's admission, in order.
+    pub(crate) completion_attempts: Mutex<Vec<std::time::Instant>>,
     /// Each pause between completion attempts, in order: the server's clock when it was
     /// scheduled and the instant it wakes at.
     pub(crate) completion_pauses: Mutex<Vec<(std::time::Instant, std::time::Instant)>>,
@@ -157,8 +158,19 @@ impl Points {
             .map(io::Error::from)
     }
 
-    pub(crate) fn write_submitted(&self) {
+    pub(crate) fn write_submitted(&self, not_after: std::time::Instant) {
         self.submits.fetch_add(1, Ordering::SeqCst);
+        self.submitted_not_afters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(not_after);
+    }
+
+    pub(crate) fn submitted_not_afters(&self) -> Vec<std::time::Instant> {
+        self.submitted_not_afters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn submits(&self) -> usize {
@@ -222,24 +234,14 @@ impl Points {
         pass(&self.progress_gate).await;
     }
 
-    pub(crate) fn completion_attempt(&self, at: std::time::Instant, not_after: std::time::Instant) {
+    pub(crate) fn completion_attempt(&self, at: std::time::Instant) {
         self.completion_attempts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push((at, not_after));
+            .push(at);
     }
 
-    /// The server's clock at each completion attempt.
     pub(crate) fn completion_attempts(&self) -> Vec<std::time::Instant> {
-        self.completion_attempts_with_not_after()
-            .into_iter()
-            .map(|(at, _)| at)
-            .collect()
-    }
-
-    pub(crate) fn completion_attempts_with_not_after(
-        &self,
-    ) -> Vec<(std::time::Instant, std::time::Instant)> {
         self.completion_attempts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

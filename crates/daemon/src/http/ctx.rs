@@ -149,7 +149,7 @@ pub(crate) async fn run_write<R: Send + 'static>(
     after_ok: Option<AfterOk>,
 ) -> Result<R, WriteFailure> {
     #[cfg(test)]
-    shared.faults.write_submitted();
+    shared.faults.write_submitted(not_after);
     let ticket = match shared.store.submit(shared.real(not_after), job) {
         Ok(t) => t,
         Err(e) => {

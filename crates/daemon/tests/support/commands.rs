@@ -6,7 +6,8 @@
 //! - `test_counter`: completed in its intent job, which appends one event and counts the
 //!   intents run; an optional `target` thread is checked against the `task set` grant.
 //! - `test_completed`: completed in its intent job with a fixed body (or an error body with
-//!   the `code` the arguments name) and a status (201 unless the arguments name one); its
+//!   the `code` the arguments name, or by its text a body that is not JSON or one that
+//!   `serde_json::Value` cannot hold) and a status (201 unless the arguments name one); its
 //!   `prepare` refuses the text `prepare_timeout` with 408.
 //! - `test_slow_effect`: a pending intent whose effect waits for the test's release when
 //!   armed, can revoke the caller's token, and answers a status or panics by its tag.
@@ -274,9 +275,13 @@ impl CommandHandler for Completed {
         Ok(Prepared {
             normalized,
             intent: Box::new(move |_tx, _auth, _ctx| {
-                let body = match &a.code {
-                    Some(code) => serde_json::json!({ "code": code }).to_string(),
-                    None => completed_body(&a.text),
+                let body = match (a.text.as_str(), &a.code) {
+                    ("not_json", _) => "not json".to_owned(),
+                    ("large_number", _) => {
+                        r#"{"code":"in_progress","retry_after":1,"details":1e400}"#.to_owned()
+                    }
+                    (_, Some(code)) => serde_json::json!({ "code": code }).to_string(),
+                    (_, None) => completed_body(&a.text),
                 };
                 Ok(Intent::Completed(CommandResult {
                     http_status: a.status.unwrap_or(201),
@@ -399,6 +404,8 @@ enum How {
     OutcomeUnknown,
     /// Refused with 503 `busy`: a transient refusal whose outcome is known.
     Busy,
+    /// Refused with the `code` and `status` of the arguments.
+    Code,
     /// Appends one event, then returns `Intent::Pending` from a handler without an effect.
     Pending,
     /// The intent panics.
@@ -409,6 +416,11 @@ enum How {
 #[serde(deny_unknown_fields)]
 struct RefuseArgs {
     how: How,
+    /// For `How::Code`: the refusal's code and status.
+    #[serde(default)]
+    code: Option<ErrorCode>,
+    #[serde(default)]
+    status: Option<u16>,
 }
 
 struct Refuse;
@@ -428,6 +440,13 @@ impl CommandHandler for Refuse {
                 How::Success => Err(refuse(ApiError::new(StatusCode::OK, ErrorCode::Internal))),
                 How::OutcomeUnknown => Err(refuse(ApiError::outcome_unknown())),
                 How::Busy => Err(refuse(ApiError::busy())),
+                How::Code => {
+                    let status = StatusCode::from_u16(a.status.unwrap_or(400)).unwrap();
+                    Err(refuse(ApiError::new(
+                        status,
+                        a.code.unwrap_or(ErrorCode::Internal),
+                    )))
+                }
                 How::Pending => {
                     let id = ctx.command_id();
                     let mut e = registered(ThreadId(id.0), false);

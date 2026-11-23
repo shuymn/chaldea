@@ -169,32 +169,45 @@ async fn expired_observed_is_408() {
     srv.stop().await;
 }
 
-/// A clock that, once armed, holds the next reader right after it took its reading (the
-/// reading is from before the hold).
+/// A clock on real time that, once armed, gives the next reader a chosen reading and holds
+/// it right after; the reached receiver gets that reading.
 #[derive(Default)]
 struct HeldClock {
-    hold: std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    hold: std::sync::Mutex<Option<ClockHold>>,
 }
 
+/// The reading to give, where to report it, and the release to wait for.
+type ClockHold = (
+    Instant,
+    std::sync::mpsc::Sender<Instant>,
+    std::sync::mpsc::Receiver<()>,
+);
+
 impl HeldClock {
-    /// The returned receiver gets a message when the next reading is taken, which returns
-    /// once the returned sender is used or dropped (at most 20 s).
-    fn arm(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    /// The next reading is `at`; the returned receiver gets it when it is taken, and the
+    /// reader goes on once the returned sender is used or dropped (at most 20 s).
+    fn arm(
+        &self,
+        at: Instant,
+    ) -> (
+        std::sync::mpsc::Receiver<Instant>,
+        std::sync::mpsc::Sender<()>,
+    ) {
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        *self.hold.lock().unwrap() = Some((reached_tx, release_rx));
+        *self.hold.lock().unwrap() = Some((at, reached_tx, release_rx));
         (reached_rx, release_tx)
     }
 }
 
 impl MonotonicClock for HeldClock {
     fn now(&self) -> Instant {
-        let at = Instant::now();
         let held = self.hold.lock().unwrap().take();
-        if let Some((reached, release)) = held {
-            let _ = reached.send(());
-            let _ = release.recv_timeout(Duration::from_secs(20));
-        }
+        let Some((at, reached, release)) = held else {
+            return Instant::now();
+        };
+        let _ = reached.send(at);
+        let _ = release.recv_timeout(Duration::from_secs(20));
         at
     }
 
@@ -203,11 +216,12 @@ impl MonotonicClock for HeldClock {
     }
 }
 
-/// The waiter's first reading of the clock in its loop is taken before the reply time and
-/// held there while the intent job, behind the writer past `deadline + write_reply_grace`,
-/// is answered `Expired` and the runner publishes it. Released, the waiter must not send
-/// that reply with the early reading: 503 `outcome_unknown`, not 408. (With the clock read
-/// before the progress, the held reading would pair with the late `Done(Expired)`.)
+/// The waiter's first reading of the clock in its loop is the deadline (before the reply
+/// time, whenever the waiter takes it) and is held there while the intent job, behind the
+/// writer past `deadline + write_reply_grace`, is answered `Expired` and the runner
+/// publishes it. Released, the waiter must not send that reply with the early reading: 503
+/// `outcome_unknown`, not 408. (With the clock read before the progress, the held reading
+/// would pair with the late `Done(Expired)`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn progress_taken_after_the_grace_is_outcome_unknown() {
     let clock = Arc::new(HeldClock::default());
@@ -224,6 +238,7 @@ async fn progress_taken_after_the_grace_is_outcome_unknown() {
     let (gate_reached, gate_release) = s.faults.arm_progress_gate();
     let before = s.faults.submits();
     let deadline = s.cfg.clock.now() + Duration::from_millis(300);
+    let reply_by = deadline + Duration::from_millis(100);
     let cmd = admitted(&s, "test_counter", &owner, cid(1), r#"{"n":1}"#);
     let w = s.clone();
     let waiter = tokio::spawn(async move { run(&w, deadline, cmd).await });
@@ -232,10 +247,18 @@ async fn progress_taken_after_the_grace_is_outcome_unknown() {
         s.faults.submits() == before + 1
     })
     .await;
-    // The waiter's next reading is the one its loop takes; it is held right after.
-    let (clock_reached, clock_release) = clock.arm();
+    // The waiter's next reading is the one its loop takes; it is the deadline, held.
+    let (clock_reached, clock_release) = clock.arm(deadline);
     gate_release.send(()).unwrap();
-    reached_sync(clock_reached).await;
+    let sample =
+        tokio::task::spawn_blocking(move || clock_reached.recv_timeout(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .expect("the waiter read the clock within 10 s");
+    assert!(
+        sample < reply_by,
+        "the held reading is before the reply time"
+    );
     // Lower bounds: the reply time and the job's `not_after` have passed.
     tokio::time::sleep_until(tokio::time::Instant::from_std(
         deadline + Duration::from_millis(150),
@@ -551,11 +574,12 @@ async fn completion_backoff_schedule() {
     for (i, (from, wake)) in pauses.iter().enumerate() {
         assert_eq!(*from, attempts[i], "pause {i} is scheduled at its attempt");
         if let Some(next) = attempts.get(i + 1) {
-            let late = *next - *wake;
+            let late = next.checked_duration_since(*wake);
             assert!(
-                late <= Duration::from_millis(1),
-                "attempt {} started {late:?} late",
-                i + 1
+                late.is_some_and(|l| l <= Duration::from_millis(1)),
+                "attempt {} started {late:?} after its wake ({:?} before it if None)",
+                i + 1,
+                wake.checked_duration_since(*next)
             );
         }
     }
@@ -563,14 +587,22 @@ async fn completion_backoff_schedule() {
     x.stop().await;
 }
 
-/// Each completion attempt's `not_after` is 5 s after its admission, cut at the budget's
-/// end: the attempts of the last 5 s get the budget's end.
+/// Each completion attempt's `not_after`, as `run_write` received it, is 5 s after its
+/// admission, cut at the budget's end: the attempts of the last 5 s get the budget's end.
 #[tokio::test]
 async fn completion_attempt_not_after() {
     let x = exhaust_the_budget().await;
     let s = shared(&x.srv);
     let budget_end = x.first + Duration::from_secs(60);
-    let attempts = s.faults.completion_attempts_with_not_after();
+    let admitted_at = s.faults.completion_attempts();
+    // The completion attempts are the last jobs `run_write` submitted.
+    let submitted = s.faults.submitted_not_afters();
+    let passed = &submitted[submitted.len() - admitted_at.len()..];
+    let attempts: Vec<(Instant, Instant)> = admitted_at
+        .iter()
+        .copied()
+        .zip(passed.iter().copied())
+        .collect();
     let mut cut = 0;
     for (at, not_after) in &attempts {
         if *at + Duration::from_secs(5) < budget_end {

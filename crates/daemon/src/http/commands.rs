@@ -21,7 +21,7 @@ use axum::response::{IntoResponse, Response};
 use chaldea_core::auth::{CommandSpec, MVP_COMMANDS};
 use chaldea_core::canonical::CanonicalJson;
 use chaldea_core::command::{CommandResult, ReceiptLookup, request_identity};
-use chaldea_core::http::{CommandRequest, ErrorCode};
+use chaldea_core::http::{CommandRequest, ErrorBody, ErrorCode};
 use chaldea_core::ids::CommandId;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
@@ -80,47 +80,79 @@ pub trait CommandHandler: Send + Sync + 'static {
 /// A command's effect, run once by the runner after its intent committed.
 pub trait CommandEffect: Send + Sync {
     /// Resolves to the command's terminal result, a handler reply (design §2.8 "Handler
-    /// replies": a status of 2xx except 204 and 205, 4xx except 408, 500, or 504, and no
-    /// reserved code; otherwise the runner stores and answers 500 `internal`). The owning
-    /// PR guarantees that it resolves within a bound it states, and that a result it
-    /// returns for work that did not happen (a refusal, or work that ran out of its time)
-    /// means the work can no longer happen later. Work that ran out of its time is 504 with
-    /// a code of the owning PR, never 408: 408 says the request's deadline kept its intent
-    /// from committing. The runner adds no timeout of its own.
+    /// replies": a JSON success other than 204 and 205, or an `ErrorBody` whose code a
+    /// handler may use, at that code's status; otherwise the runner stores and answers 500
+    /// `internal`). The owning PR guarantees that it resolves within a bound it states, and
+    /// that a result it returns for work that did not happen (a refusal, or work that ran
+    /// out of its time) means the work can no longer happen later. Work that ran out of its
+    /// time is 504 with a code the owning PR adds for it, never 408: 408 says the request's
+    /// deadline kept its intent from committing. The runner adds no timeout of its own.
     fn run(&self, run: EffectRun) -> BoxFuture<'static, CommandResult>;
 }
 
-/// The codes reserved to the runner and the request path: the request's own deadline,
-/// the receipt's state, and an outcome not known. No handler reply carries one.
-const RESERVED_CODES: [ErrorCode; 5] = [
-    ErrorCode::RequestTimeout,
-    ErrorCode::OutcomeUnknown,
-    ErrorCode::InProgress,
-    ErrorCode::UnknownAfterCrash,
-    ErrorCode::Conflict,
-];
-
-/// The statuses a command result may have, from a completed intent or an effect: 2xx
-/// except 204 and 205 (sent without the stored body), 4xx except 408, 500, and 504. Each
-/// is stored and replayed byte for byte; 408 is the runner's own (the deadline kept the
-/// intent from committing), and 503 and the other codes would tell a client to retry a
-/// result that replays unchanged.
-fn result_status_allowed(status: u16) -> bool {
-    matches!(status, 200..=203 | 206..=299 | 400..=407 | 409..=499 | 500 | 504)
+/// The status a handler may reply with `code` at (design §2.8 "Handler replies"), or
+/// `None` for a code only the runner, the guard, or the store gives. One arm per code and
+/// no wildcard: a new `ErrorCode` does not compile until it is classified here.
+fn handler_status(code: ErrorCode) -> Option<StatusCode> {
+    match code {
+        // A command's own outcome, or a refusal that says nothing happened.
+        ErrorCode::BadArgs => Some(StatusCode::BAD_REQUEST),
+        ErrorCode::Forbidden => Some(StatusCode::FORBIDDEN),
+        ErrorCode::NotFound => Some(StatusCode::NOT_FOUND),
+        ErrorCode::Busy | ErrorCode::ShuttingDown => Some(StatusCode::SERVICE_UNAVAILABLE),
+        ErrorCode::Internal => Some(StatusCode::INTERNAL_SERVER_ERROR),
+        // Routing, framing, method, and authentication: the outer layer and the guard.
+        ErrorCode::MisdirectedRequest
+        | ErrorCode::OriginRejected
+        | ErrorCode::Unauthorized
+        | ErrorCode::MethodNotAllowed
+        | ErrorCode::LengthRequired
+        | ErrorCode::PayloadTooLarge
+        | ErrorCode::BadRequest
+        | ErrorCode::BadQuery
+        | ErrorCode::NotImplemented
+        // The request's deadline, the receipt, and an outcome not known: the runner.
+        | ErrorCode::RequestTimeout
+        | ErrorCode::InProgress
+        | ErrorCode::Conflict
+        | ErrorCode::UnknownAfterCrash
+        | ErrorCode::OutcomeUnknown
+        // The store's own state.
+        | ErrorCode::DiskFull
+        | ErrorCode::StoreFailed => None,
+    }
 }
 
-/// Whether a result body names a reserved code (`{"code": …}` at its top level).
-fn result_code_reserved(body: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| serde_json::from_value::<ErrorCode>(v.get("code")?.clone()).ok())
-        .is_some_and(|c| RESERVED_CODES.contains(&c))
+/// Whether a command result may be stored and replayed as it is. A success (2xx except 204
+/// and 205, which hyper or HTTP send without the stored body) has a JSON body. Any other
+/// status has an `ErrorBody` (only `code` and `retry_after`, one of each) whose code a
+/// handler may use at exactly that status, and not 503 (a replayed result would tell a
+/// client to retry it forever). Anything that does not parse is refused.
+fn result_allowed(r: &CommandResult) -> bool {
+    let Ok(status) = StatusCode::from_u16(r.http_status) else {
+        return false;
+    };
+    if status.is_success() {
+        return status != StatusCode::NO_CONTENT
+            && status != StatusCode::RESET_CONTENT
+            && serde_json::from_str::<&RawValue>(&r.body).is_ok();
+    }
+    let Ok(body) = serde_json::from_str::<ErrorBody>(&r.body) else {
+        return false;
+    };
+    let Ok(members) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&r.body)
+    else {
+        return false;
+    };
+    members.keys().all(|k| k == "code" || k == "retry_after")
+        && status != StatusCode::SERVICE_UNAVAILABLE
+        && handler_status(body.code) == Some(status)
 }
 
-/// `r`, or 500 `internal` when its status is outside the result set or its body names a
-/// reserved code (a programming error of its handler).
+/// `r`, or 500 `internal` when a handler may not reply with it (a programming error of its
+/// handler).
 fn checked_result(command_id: CommandId, r: CommandResult) -> CommandResult {
-    if result_status_allowed(r.http_status) && !result_code_reserved(&r.body) {
+    if result_allowed(&r) {
         return r;
     }
     tracing::error!(%command_id, status = r.http_status, "command result outside the handler replies");
@@ -131,18 +163,15 @@ fn checked_result(command_id: CommandId, r: CommandResult) -> CommandResult {
     }
 }
 
-/// A handler's refusal (from `prepare`, or an intent's, which the job rolls back) as
-/// answered: 4xx except 408, or 5xx, with no reserved code; any other is 500 `internal`.
-/// A transient refusal keeps a code that says nothing happened (such as `busy`).
+/// A handler's refusal (a `prepare` error, or an intent's, which the job rolls back) as
+/// answered: its code must be one a handler may use, at that code's status; any other is
+/// 500 `internal`. A transient refusal keeps a code that says nothing happened (`busy`,
+/// `shutting_down`).
 fn checked_error(e: ApiError) -> ApiError {
-    let status = e.status();
-    let allowed = (status.is_client_error() || status.is_server_error())
-        && status != StatusCode::REQUEST_TIMEOUT
-        && !RESERVED_CODES.contains(&e.code());
-    if allowed {
+    if handler_status(e.code()) == Some(e.status()) {
         return e;
     }
-    tracing::error!(status = status.as_u16(), code = ?e.code(), "command refusal outside the handler replies");
+    tracing::error!(status = e.status().as_u16(), code = ?e.code(), "command refusal outside the handler replies");
     ApiError::internal()
 }
 
@@ -488,7 +517,8 @@ pub(crate) async fn run(
 /// read while the clock is before `reply_by` is the reply. Otherwise the reply time has
 /// been reached (the clock read after the progress at or past `reply_by`, or the timer
 /// fired), and the progress read then decides: an intent committed is 409 `in_progress`
-/// (the receipt exists and is `in_progress` when read), anything else 503
+/// (the receipt exists, and the runner had not yet published its completion when read;
+/// the completion may already have committed), anything else 503
 /// `outcome_unknown` (a `Done` read at or after `reply_by` included, so a late `Expired`
 /// is never 408). A runner gone without a final reply (aborted at the drain deadline) is
 /// the same.
@@ -677,7 +707,7 @@ async fn complete(shared: &Shared, command_id: CommandId, result: &CommandResult
         }
         let not_after = (now + COMPLETION_ATTEMPT).min(budget_end);
         #[cfg(test)]
-        shared.faults.completion_attempt(now, not_after);
+        shared.faults.completion_attempt(now);
         let r = result.clone();
         #[cfg(test)]
         let hold = shared.faults.take_completion_hold();

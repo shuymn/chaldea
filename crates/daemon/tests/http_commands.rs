@@ -110,11 +110,11 @@ async fn replay_is_byte_equal() {
         "test_completed",
         &owner,
         cid(3),
-        r#"{"text":"no","status":409}"#,
+        r#"{"text":"no","status":404,"code":"not_found"}"#,
     );
     let first = srv.send(&refusal).await;
-    assert_eq!(first.status, 409, "{first:?}");
-    assert_eq!(first.body, completed_body("no").as_bytes());
+    assert_eq!(first.status, 404, "{first:?}");
+    assert_eq!(first.body, br#"{"code":"not_found"}"#);
     let again = srv.send(&refusal).await;
     assert_eq!((again.status, &again.body), (first.status, &first.body));
     srv.stop().await;
@@ -784,18 +784,22 @@ async fn panicking_effect_is_reconciled() {
     );
     // The restart: the store reopens and marks what was in progress.
     let (_, mut store) = srv.into_store(Duration::from_secs(10)).await;
-    let restart = tokio::task::spawn_blocking(move || {
+    let reopened = tokio::task::spawn_blocking(move || {
         store.reopen();
-        let marked = store
-            .run(|tx| Ok(tx.receipts_mark_unknown_after_crash()?))
-            .unwrap();
-        assert_eq!(marked, 1);
         store
     });
-    let store = tokio::time::timeout(Duration::from_secs(20), restart)
+    let store = tokio::time::timeout(Duration::from_secs(20), reopened)
         .await
-        .expect("the restart within 20 s")
+        .expect("the store reopens within 20 s")
         .unwrap();
+    let marked = store
+        .store()
+        .submit(soon(), |tx| Ok(tx.receipts_mark_unknown_after_crash()?))
+        .map(settled)
+        .unwrap()
+        .await
+        .unwrap();
+    assert_eq!(marked, 1);
     let (srv, probe2) = TestServer::with_commands_on(store, |_| {}).await;
     let r = srv
         .send(&srv.command("test_slow_effect", &owner, id, args))
@@ -860,7 +864,7 @@ async fn reserved_handler_replies_are_500() {
             "{code}"
         );
     }
-    // A handler's own code on the same status is its own.
+    // A code that is not an `ErrorCode` (an owning PR adds its codes there first).
     let r = srv
         .send(&srv.command(
             "test_completed",
@@ -869,15 +873,183 @@ async fn reserved_handler_replies_are_500() {
             r#"{"text":"r","status":409,"code":"card_closed"}"#,
         ))
         .await;
-    assert_eq!(
-        (r.status, r.body.as_slice()),
-        (409, br#"{"code":"card_closed"}"#.as_slice())
-    );
+    assert_eq!((r.status, r.body.as_slice()), (500, INTERNAL));
     let r = srv
         .send(&srv.command("test_refuse", &owner, cid(21), r#"{"how":"busy"}"#))
         .await;
     assert_eq!(r.outcome(), (503, code("busy")));
     assert_eq!(srv.receipt(cid(21)), None);
     assert_eq!(probe.intents(), 0);
+    srv.stop().await;
+}
+
+/// Every `ErrorCode` with the status it is sent with, written out from §2.9.
+const CODES: [(&str, u16); 22] = [
+    ("misdirected_request", 421),
+    ("origin_rejected", 403),
+    ("unauthorized", 401),
+    ("forbidden", 403),
+    ("not_found", 404),
+    ("method_not_allowed", 405),
+    ("request_timeout", 408),
+    ("length_required", 411),
+    ("payload_too_large", 413),
+    ("bad_request", 400),
+    ("bad_query", 400),
+    ("bad_args", 400),
+    ("in_progress", 409),
+    ("conflict", 409),
+    ("unknown_after_crash", 409),
+    ("not_implemented", 501),
+    ("busy", 503),
+    ("disk_full", 503),
+    ("shutting_down", 503),
+    ("store_failed", 503),
+    ("outcome_unknown", 503),
+    ("internal", 500),
+];
+
+/// The codes a handler may reply with (§2.8 "Handler replies"); every other code belongs to
+/// the runner, the guard, or the store.
+const HANDLER_CODES: [&str; 6] = [
+    "bad_args",
+    "forbidden",
+    "not_found",
+    "busy",
+    "shutting_down",
+    "internal",
+];
+
+/// The code table over every `ErrorCode`, as a refusal and as a stored result: a code a
+/// handler may use, at its status, is answered as it is (a result only with a status of
+/// the result set, so not 503); any other code, or a handler code at another status, is 500
+/// `internal`: a refusal with no receipt, a result stored as 500 and replayed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_replies_follow_the_code_table() {
+    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let mut n = 100;
+    let mut mismatched = Vec::new();
+    let mut cases: Vec<(&str, u16)> = CODES.to_vec();
+    // A handler code at another status.
+    cases.extend([("not_found", 400), ("forbidden", 404), ("internal", 503)]);
+    for (code, status) in cases {
+        let usable = HANDLER_CODES.contains(&code) && CODES.contains(&(code, status));
+        let body = format!(r#"{{"code":"{code}"}}"#);
+        n += 1;
+        let id = cid(n);
+        let args = format!(r#"{{"how":"code","code":"{code}","status":{status}}}"#);
+        let r = srv
+            .send(&srv.command("test_refuse", &owner, id, &args))
+            .await;
+        let want = if usable {
+            (status, body.as_bytes())
+        } else {
+            (500, INTERNAL)
+        };
+        if (r.status, r.body.as_slice()) != want {
+            mismatched.push(format!(
+                "refusal {code} {status}: got {} {}",
+                r.status,
+                String::from_utf8_lossy(&r.body)
+            ));
+        }
+        assert_eq!(srv.receipt(id), None, "refusal {code} {status}");
+        n += 1;
+        let id = cid(n);
+        let args = format!(r#"{{"text":"t","status":{status},"code":"{code}"}}"#);
+        let req = srv.command("test_completed", &owner, id, &args);
+        let first = srv.send(&req).await;
+        let want = if usable && status != 503 {
+            (status, body.as_bytes())
+        } else {
+            (500, INTERNAL)
+        };
+        if (first.status, first.body.as_slice()) != want {
+            mismatched.push(format!(
+                "result {code} {status}: got {} {}",
+                first.status,
+                String::from_utf8_lossy(&first.body)
+            ));
+        }
+        let replay = srv.send(&req).await;
+        assert_eq!(
+            (replay.status, &replay.body),
+            (first.status, &first.body),
+            "result {code} {status}"
+        );
+        assert_eq!(
+            srv.receipt(id).unwrap().status,
+            ReceiptStatus::Completed(completed(&first)),
+            "result {code} {status}"
+        );
+    }
+    assert!(mismatched.is_empty(), "{mismatched:#?}");
+    assert_eq!(probe.intents(), 0);
+    srv.stop().await;
+}
+
+/// A result body that does not parse is 500 `internal`, stored and replayed: an error body
+/// that `serde_json::Value` cannot hold (a number out of range beside a runner code), and a
+/// success body that is not JSON.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unparsable_result_bodies_are_500() {
+    let (srv, _probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    for (i, args) in [
+        r#"{"text":"large_number","status":409}"#,
+        r#"{"text":"not_json","status":200}"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = cid(i as u128);
+        let req = srv.command("test_completed", &owner, id, args);
+        let first = srv.send(&req).await;
+        let replay = srv.send(&req).await;
+        assert_eq!(
+            (first.status, first.body.as_slice()),
+            (500, INTERNAL),
+            "{args}"
+        );
+        assert_eq!(
+            (replay.status, &replay.body),
+            (first.status, &first.body),
+            "{args}"
+        );
+        assert_eq!(
+            srv.receipt(id).unwrap().status,
+            ReceiptStatus::Completed(completed(&first)),
+            "{args}"
+        );
+    }
+    srv.stop().await;
+}
+
+/// A handler's 405 `method_not_allowed` (which needs an `Allow` the runner does not send) is
+/// 500 `internal`, as a result and as a refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn command_method_rejection_is_500() {
+    let (srv, _probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let req = srv.command(
+        "test_completed",
+        &owner,
+        cid(1),
+        r#"{"text":"x","status":405,"code":"method_not_allowed"}"#,
+    );
+    for _ in 0..2 {
+        let r = srv.send(&req).await;
+        assert_eq!((r.status, r.body.as_slice()), (500, INTERNAL), "{r:?}");
+    }
+    let r = srv
+        .send(&srv.command(
+            "test_refuse",
+            &owner,
+            cid(2),
+            r#"{"how":"code","code":"method_not_allowed","status":405}"#,
+        ))
+        .await;
+    assert_eq!((r.status, r.body.as_slice()), (500, INTERNAL), "{r:?}");
     srv.stop().await;
 }
