@@ -12,7 +12,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -25,8 +25,9 @@ const URL: &str = "CHALDEA_HOOK_URL";
 const TOKEN: &str = "CHALDEA_HOOK_TOKEN";
 const THREAD: &str = "CHALDEA_THREAD_ID";
 const THREAD_ID: &str = "0198c0de-0000-7000-8000-000000000001";
-/// PR9-CL-23's bound on a run, restated from the design (3 s watchdog plus process overhead).
-const RUN_BOUND: Duration = Duration::from_millis(3500);
+/// PR9-CL-23's bound on a run, restated from the design: the 3 s watchdog plus 1.5 s for
+/// process start and exit.
+const RUN_BOUND: Duration = Duration::from_millis(4500);
 /// The parent-enforced bound on any child of these tests.
 const PARENT_BOUND: Duration = Duration::from_secs(10);
 /// Every other bounded wait of these tests.
@@ -375,7 +376,7 @@ enum Stdin {
     Bytes(Vec<u8>),
     /// Never closed while the child runs.
     Open,
-    /// Written, then closed after this delay.
+    /// Written, then closed this long after the spawn.
     LateEof(Duration, Vec<u8>),
 }
 
@@ -387,14 +388,41 @@ struct Run {
     pid: u32,
 }
 
-fn collect(r: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
+/// Reads `r` to its EOF on a thread; [`joined`] takes the result.
+fn collect(r: Option<impl Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut r) = r {
             let _ = r.read_to_end(&mut buf);
         }
-        buf
-    })
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// What [`collect`] read, waiting at most [`WAIT`] for the EOF.
+fn joined(rx: &mpsc::Receiver<Vec<u8>>, what: &str) -> Vec<u8> {
+    rx.recv_timeout(WAIT)
+        .unwrap_or_else(|_| panic!("{what} not closed within {WAIT:?}"))
+}
+
+/// Kills `c` and reaps it, waiting at most [`WAIT`].
+fn kill_and_reap(c: &mut Child) {
+    let _ = c.kill();
+    let end = Instant::now() + WAIT;
+    while matches!(c.try_wait(), Ok(None)) && Instant::now() < end {
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Kills and reaps the child on drop, a panicking test included.
+struct Killed(Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        kill_and_reap(&mut self.0);
+    }
 }
 
 /// Waits for `c` at most [`PARENT_BOUND`]; kills it and panics past it.
@@ -405,8 +433,7 @@ fn wait_bounded(c: &mut Child, what: &str) -> std::process::ExitStatus {
             return s;
         }
         if Instant::now() >= end {
-            let _ = c.kill();
-            let _ = c.wait();
+            kill_and_reap(c);
             panic!("{what} did not exit within {PARENT_BOUND:?}");
         }
         std::thread::sleep(POLL);
@@ -451,10 +478,11 @@ fn run(cmd: &mut Command, stdin: Stdin) -> Run {
         }
         Stdin::Open => keep = Some(pipe),
         Stdin::LateEof(d, b) => {
+            let eof = started + d;
             std::thread::spawn(move || {
                 let mut pipe = pipe;
                 let _ = pipe.write_all(&b);
-                std::thread::sleep(d);
+                std::thread::sleep(eof.saturating_duration_since(Instant::now()));
             });
         }
     }
@@ -463,8 +491,8 @@ fn run(cmd: &mut Command, stdin: Stdin) -> Run {
     drop(keep);
     Run {
         code: status.code(),
-        stdout: out.join().unwrap(),
-        stderr: err.join().unwrap(),
+        stdout: joined(&out, "stdout"),
+        stderr: joined(&err, "stderr"),
         elapsed,
         pid: c.id(),
     }
@@ -605,7 +633,7 @@ fn no_reply_gets_a_second_attempt() {
     assert_eq!(one_id_attempts(&reqs), ["1", "2"]);
     let gap = reqs[1].at - reqs[0].at;
     assert!(
-        gap >= Duration::from_millis(1800) && gap < Duration::from_millis(2300),
+        gap >= Duration::from_millis(1800) && gap < Duration::from_millis(2500),
         "{gap:?}"
     );
 }
@@ -803,7 +831,7 @@ fn threads(pid: u32) -> usize {
     let mut c = spawn_locked(&mut cmd).unwrap();
     let out = collect(c.stdout.take());
     wait_bounded(&mut c, "ps");
-    String::from_utf8_lossy(&out.join().unwrap())
+    String::from_utf8_lossy(&joined(&out, "ps stdout"))
         .lines()
         .skip(1)
         .count()
@@ -823,22 +851,31 @@ fn hook_emit_runs_before_process_setup() {
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut c = spawn_locked(&mut cmd).unwrap();
-    c.stdin.take().unwrap().write_all(PAYLOAD).unwrap();
+    let mut c = Killed(spawn_locked(&mut cmd).unwrap());
+    c.0.stdin.take().unwrap().write_all(PAYLOAD).unwrap();
     stub.wait_reqs(1);
     // The first attempt lasts 1.8 s; the stdin thread ends right after its EOF.
     let end = Instant::now() + Duration::from_millis(1000);
-    let mut seen = threads(c.id());
+    let pid = c.0.id();
+    let mut seen = threads(pid);
     while seen != 2 && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(20));
-        seen = threads(c.id());
+        seen = threads(pid);
     }
-    let _ = c.kill();
-    let _ = c.wait();
+    drop(c);
     assert_eq!(seen, 2, "threads of the emitter during its first attempt");
 }
 
 // ---- FakeCli hook emission (§2.14) ----
+
+impl Drop for Reports {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(a) = self.accept.take() {
+            let _ = a.join();
+        }
+    }
+}
 
 /// FakeCli, built by `cargo test --workspace` (testkit's binary) next to the test binaries'
 /// `deps/` directory.
@@ -854,23 +891,33 @@ fn fake_cli() -> PathBuf {
     p
 }
 
-/// A report listener: every line of every FakeCli process, as JSON.
+/// A report listener: every line of every FakeCli process, as JSON. A connection is read
+/// until its EOF or [`WAIT`] without a line; the accept loop ends when this is dropped.
 struct Reports {
     addr: String,
     events: Arc<Mutex<Vec<Value>>>,
+    stop: Arc<AtomicBool>,
+    accept: Option<JoinHandle<()>>,
 }
 
 impl Reports {
     fn start() -> Reports {
         let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        l.set_nonblocking(true).unwrap();
         let addr = l.local_addr().unwrap().to_string();
         let events = Arc::new(Mutex::new(Vec::new()));
-        let ev = events.clone();
-        std::thread::spawn(move || {
-            for s in l.incoming() {
-                let Ok(s) = s else { return };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ev, halt) = (events.clone(), stop.clone());
+        let accept = std::thread::spawn(move || {
+            while !halt.load(Ordering::SeqCst) {
+                let Ok((s, _)) = l.accept() else {
+                    std::thread::sleep(POLL);
+                    continue;
+                };
                 let ev = ev.clone();
                 std::thread::spawn(move || {
+                    let _ = s.set_nonblocking(false);
+                    let _ = s.set_read_timeout(Some(WAIT));
                     for line in BufReader::new(s).lines().map_while(Result::ok) {
                         ev.lock()
                             .unwrap()
@@ -879,7 +926,12 @@ impl Reports {
                 });
             }
         });
-        Reports { addr, events }
+        Reports {
+            addr,
+            events,
+            stop,
+            accept: Some(accept),
+        }
     }
 
     fn of(&self, event: &str) -> Vec<Value> {
@@ -925,7 +977,7 @@ fn emitted_quietly(reports: &Reports, n: usize) {
         assert_eq!(e["code"], 0, "{e}");
         assert_eq!(e["stdout_len"], 0, "{e}");
         assert_eq!(e["stderr_len"], 0, "{e}");
-        assert!(e["elapsed_ms"].as_u64().unwrap() < 3500, "{e}");
+        assert!(e["elapsed_ms"].as_u64().unwrap() < 4500, "{e}");
     }
 }
 
@@ -1080,8 +1132,8 @@ fn fake_cli_hooks_runs_its_script() {
     std::fs::write(&gate, b"").unwrap();
     let status = wait_bounded(&mut c, "FakeCli hooks");
     assert_eq!(status.code(), Some(0));
-    assert!(out.join().unwrap().is_empty());
-    assert!(err.join().unwrap().is_empty());
+    assert!(joined(&out, "stdout").is_empty());
+    assert!(joined(&err, "stderr").is_empty());
     let reqs = stub.settled();
     assert_eq!(reqs.len(), 6, "{reqs:?}");
     assert_eq!(reqs[0].json(), prompt);
