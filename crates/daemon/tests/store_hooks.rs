@@ -234,3 +234,30 @@ fn empty_promotion_is_refused() {
         Err(WriteError::RolledBack(StoreError::BadRouting(_)))
     ));
 }
+
+/// `binding_receipt_ordinal` names the delivery of the launch's latest `session_bound` by
+/// stream sequence, and is `None` when that event came from no hook delivery. Two bindings
+/// of one launch need the v2 trigger dropped (they predate it in a migrated v1 history).
+#[test]
+fn binding_ordinal_is_the_latest_binding() {
+    let (s, t, l) = setup();
+    s.append(vec![support::started(t, l)]).unwrap();
+    rusqlite::Connection::open(s.path())
+        .unwrap()
+        .execute_batch("DROP TRIGGER events_session_bound_once")
+        .unwrap();
+    for (ordinal, session) in [(1, "s1"), (2, "s2")] {
+        let d = NewHookDelivery {
+            launch_id: l,
+            emit_id: emit(u128::from(ordinal)),
+            receipt_ordinal: ordinal,
+            first_reply: reply(""),
+            routing: NewRouting::Appended(vec![support::bound(t, l, session, None)]),
+        };
+        record(&s, d).unwrap();
+    }
+    let ordinal = || s.read(move |r| r.binding_receipt_ordinal(l));
+    assert_eq!(ordinal(), Some(2));
+    s.append(vec![support::bound(t, l, "s3", None)]).unwrap();
+    assert_eq!(ordinal(), None);
+}

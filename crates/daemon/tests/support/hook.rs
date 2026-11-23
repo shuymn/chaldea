@@ -255,11 +255,12 @@ impl ProcessProbe for Chains {
     }
 }
 
-/// Intake facts `{"n": k, "position": k}`, `k` counting calls from 1; records each call's
-/// launch and `k` in call order.
+/// Intake facts `{"n": k, "position": k}` (or JSON `null` while `null` is set), `k`
+/// counting calls from 1; records each call's launch and `k` in call order.
 #[derive(Default)]
 pub struct Facts {
     n: AtomicU64,
+    pub null: std::sync::atomic::AtomicBool,
     pub calls: Mutex<Vec<(LaunchId, u64)>>,
 }
 
@@ -267,6 +268,9 @@ impl IntakeProbe for Facts {
     fn facts(&self, launch: LaunchId) -> Option<IntakeFacts> {
         let k = self.n.fetch_add(1, Ordering::SeqCst) + 1;
         self.calls.lock().unwrap().push((launch, k));
+        if self.null.load(Ordering::SeqCst) {
+            return Some(IntakeFacts(serde_json::Value::Null));
+        }
         Some(IntakeFacts(serde_json::json!({ "n": k, "position": k })))
     }
 }

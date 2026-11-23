@@ -214,11 +214,13 @@ pub(crate) fn run(
     if let Some(existing) = tx.read().hook_delivery(launch, emit)? {
         return Ok(existing.first_reply);
     }
-    // 2. `emit_id` reuse by another launch of the thread.
-    if tx
-        .read()
-        .event_by_key(StreamId::Thread(thread), &hook_key(emit))?
-        .is_some()
+    // 2. `emit_id` reuse by another launch of the thread: its delivery, buffered ones
+    // included, or an event under its key.
+    if tx.read().hook_emit_in_thread(thread, emit)?
+        || tx
+            .read()
+            .event_by_key(StreamId::Thread(thread), &hook_key(emit))?
+            .is_some()
     {
         return Err(crate::http::refused(ApiError::bad_request()));
     }
@@ -235,6 +237,7 @@ pub(crate) fn run(
         _ => None,
     };
     let decision = decide(d, tx, &l, &t, thread, json.is_some())?;
+    let overflow = matches!(decision, Decision::Overflow);
     let body = || d.body.to_vec();
     // 5. Record.
     let routing = match decision {
@@ -324,7 +327,9 @@ pub(crate) fn run(
             NewRouting::Buffered(BufferedHook { body: body(), meta })
         }
         Decision::Overflow => {
-            buffer::drain_unbound(tx, launch)?;
+            // Receipt order: the buffered deliveries received before this one first, the
+            // later ones after it is recorded.
+            buffer::drain_unbound(tx, launch, |o| o < d.ordinal)?;
             NewRouting::RawUnknown(raw_event(
                 thread,
                 &l,
@@ -350,6 +355,9 @@ pub(crate) fn run(
         HookDeliveryLookup::New(HookDelivery { first_reply, .. })
         | HookDeliveryLookup::Replay(HookDelivery { first_reply, .. }) => first_reply,
     };
+    if overflow {
+        buffer::drain_unbound(tx, launch, |_| true)?;
+    }
     // 6. Bind.
     if bind {
         bind_and_promote(d, tx, thread, launch, json.as_ref())?;

@@ -107,6 +107,62 @@ async fn reply_waits_for_commit() {
     h.stop().await;
 }
 
+/// Both replay paths answer the stored first reply, whatever it is: the pre-read's (a
+/// delivery already stored) and the job's (stored after the pre-read, while the walk ran).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replays_answer_the_stored_reply() {
+    use chaldea_daemon::store::{BufferedHook, HookReply, NewHookDelivery, NewRouting};
+    let h = HookServer::start().await;
+    let l = h.codex(1).await;
+    bind_codex(&h, &l, "s").await;
+    let store = |emit: Uuid, ordinal: u64, body: &'static str| {
+        let lid = l.launch;
+        h.run(move |tx| {
+            tx.hook_delivery_record(NewHookDelivery {
+                launch_id: lid,
+                emit_id: emit,
+                receipt_ordinal: ordinal,
+                first_reply: HookReply {
+                    http_status: 202,
+                    body: body.into(),
+                },
+                routing: NewRouting::Buffered(BufferedHook {
+                    body: b"{}".to_vec(),
+                    meta: "{}".into(),
+                }),
+            })?;
+            Ok(())
+        })
+    };
+    // The pre-read's replay.
+    let pre = Hook::of(&l, "Stop", "s");
+    store(pre.emit, 100, "{\"stored\":1}").await;
+    let r = h.post(&pre).await;
+    assert_eq!(
+        (r.status, r.body.as_slice()),
+        (202, &b"{\"stored\":1}"[..]),
+        "{r:?}"
+    );
+    // The job's replay: the delivery is stored while the request walks.
+    h.chains.set(7001, direct(7001, "codex"));
+    let (walking, release) = h.chains.hold(7001);
+    let job = Hook::of(&l, "Stop", "s").pid(Some(7001));
+    let reply = h.spawn_post(&job);
+    tokio::task::spawn_blocking(move || walking.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .unwrap();
+    store(job.emit, 101, "{\"stored\":2}").await;
+    release.send(()).unwrap();
+    let r = reply.await.unwrap();
+    assert_eq!(
+        (r.status, r.body.as_slice()),
+        (202, &b"{\"stored\":2}"[..]),
+        "{r:?}"
+    );
+    h.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_after_binding_keeps_first_reply() {
     let h = HookServer::start().await;
@@ -727,6 +783,53 @@ async fn promotion_carries_intake_facts() {
     h.stop().await;
 }
 
+/// Facts the probe returned as JSON `null` are present facts: the promoted hook gets
+/// `Some(null)`, as a direct delivery after the binding does, not `None`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promotion_keeps_present_null_facts() {
+    let h = HookServer::start().await;
+    let l = h.codex(1).await;
+    h.facts
+        .null
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let early = Hook::of(&l, "UserPromptSubmit", "s");
+    ok(&h.post(&early).await);
+    bind_codex(&h, &l, "s").await;
+    let direct_hook = Hook::of(&l, "UserPromptSubmit", "s");
+    ok(&h.post(&direct_hook).await);
+    let calls = h.adapter.calls();
+    let facts = |emit| {
+        calls
+            .iter()
+            .find(|c| c.emit_id == emit)
+            .unwrap()
+            .intake
+            .clone()
+    };
+    let null = Some(chaldea_daemon::hook::IntakeFacts(serde_json::Value::Null));
+    assert_eq!(facts(early.emit), null, "promoted");
+    assert_eq!(facts(direct_hook.emit), null, "direct");
+    h.stop().await;
+}
+
+/// A buffered hook of another session than the one bound is `foreign_session` at
+/// promotion, never interpreted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promotion_refuses_another_session() {
+    let h = HookServer::start().await;
+    let l = h.codex(1).await;
+    let other = Hook::of(&l, "UserPromptSubmit", "other");
+    ok(&h.post(&other).await);
+    assert_eq!(
+        h.delivery(l.launch, other.emit).unwrap().routing,
+        Routing::Buffered
+    );
+    bind_codex(&h, &l, "s").await;
+    h.assert_raw(&l, other.emit, R::ForeignSession);
+    assert!(h.adapter.calls().iter().all(|c| c.emit_id != other.emit));
+    h.stop().await;
+}
+
 /// Writes a buffered delivery directly, with `meta` and `body`.
 async fn buffer_directly(
     h: &HookServer,
@@ -765,8 +868,7 @@ fn meta(l: &Launch, start: &str) -> String {
             {"pid": 7001, "start_time": "3000", "name": "chaldea"},
             {"pid": L_PID, "start_time": start, "name": "codex"}
         ],
-        "chain_end": "root",
-        "intake": null
+        "chain_end": "root"
     })
     .to_string()
 }
@@ -1057,6 +1159,43 @@ async fn concurrent_overflow() {
     h.stop().await;
 }
 
+/// An overflow drains in receipt order: receipt 1, held in its walk while receipts 2–33
+/// fill the buffer, overflows on release, and the 33 `raw_unknown` events follow receipt
+/// order, receipt 1 first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overflow_keeps_receipt_order() {
+    let h = HookServer::start_with(HookConfig::default(), |c| {
+        c.short_deadline = Duration::from_secs(10);
+    })
+    .await;
+    let l = h.codex(1).await;
+    h.chains.set(7001, direct(7001, "codex"));
+    let (walking, release) = h.chains.hold(7001);
+    let first = Hook::of(&l, "Stop", "s").pid(Some(7001));
+    let first_reply = h.spawn_post(&first);
+    tokio::task::spawn_blocking(move || walking.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut later = Vec::new();
+    for _ in 0..32 {
+        let x = Hook::of(&l, "Stop", "s");
+        ok(&h.post(&x).await);
+        later.push(x.emit);
+    }
+    release.send(()).unwrap();
+    ok(&first_reply.await.unwrap());
+    let mut want = vec![format!("hook:{}", first.emit)];
+    want.extend(later.iter().map(|e| format!("hook:{e}")));
+    let got: Vec<String> = h
+        .hook_events(l.thread)
+        .into_iter()
+        .map(|(_, k)| k)
+        .collect();
+    assert_eq!(got, want);
+    h.stop().await;
+}
+
 // ---- PR9-CL-14: unbound launches ---------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1319,6 +1458,77 @@ async fn emit_id_reused_by_another_launch() {
     );
     assert_eq!(h.snapshot(&next), before);
     assert!(h.delivery(l2, first.emit).is_none());
+    h.stop().await;
+}
+
+/// `l`'s thread gets launch `n` (Codex, started) after `l` exits; `l`'s token stays valid.
+async fn next_launch(h: &HookServer, l: &Launch, n: u128) -> Launch {
+    let t = l.thread;
+    h.srv
+        .append(exit(t, l.launch, &h.thread_row(t).state))
+        .await;
+    let state = h.thread_row(t).state;
+    h.srv
+        .append(reserve_and_start(
+            t,
+            launch(n),
+            Agent::Codex,
+            &state,
+            true,
+            true,
+        ))
+        .await;
+    let token = h
+        .srv
+        .token(
+            chaldea_core::auth::TokenKind::Hook,
+            Some(t),
+            Some(launch(n)),
+        )
+        .await;
+    Launch {
+        launch: launch(n),
+        token,
+        ..l.clone()
+    }
+}
+
+/// An emit id buffered by the thread's current launch (no event under its key yet) is
+/// still taken: the earlier launch reusing it gets 400 and stores nothing, and the current
+/// launch's buffer then binds, or resolves at its exit, without a key conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn emit_id_reused_while_other_launch_buffered() {
+    let h = HookServer::start().await;
+    for (n, resolve) in [(1, false), (3, true)] {
+        let l1 = h.codex(n).await;
+        let l2 = next_launch(&h, &l1, n + 1).await;
+        let buffered = Hook::of(&l2, "UserPromptSubmit", "s");
+        ok(&h.post(&buffered).await);
+        assert_eq!(
+            h.delivery(l2.launch, buffered.emit).unwrap().routing,
+            Routing::Buffered
+        );
+        let before = h.snapshot(&l1);
+        let reuse = Hook::of(&l1, "Stop", "s").emit(buffered.emit);
+        assert_eq!(
+            h.post(&reuse).await.outcome(),
+            (400, Some("bad_request".into()))
+        );
+        assert_eq!(h.snapshot(&l1), before);
+        assert!(h.delivery(l1.launch, buffered.emit).is_none());
+        if resolve {
+            let lid = l2.launch;
+            let n = h.run(move |tx| Ok(resolve_unbindable(tx, lid)?)).await;
+            assert_eq!(n, 1);
+            h.assert_raw(&l2, buffered.emit, R::Unbound);
+        } else {
+            bind_codex(&h, &l2, "s").await;
+            assert!(matches!(
+                h.delivery(l2.launch, buffered.emit).unwrap().routing,
+                Routing::Appended { .. } | Routing::RawUnknown { .. }
+            ));
+        }
+    }
     h.stop().await;
 }
 

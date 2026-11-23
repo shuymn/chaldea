@@ -23,7 +23,19 @@ pub(crate) struct Meta {
     pub(crate) attempt: Option<u8>,
     pub(crate) chain: Vec<Link>,
     pub(crate) chain_end: String,
+    /// Present exactly when the probe returned facts, whatever their JSON (`null`
+    /// included); absent for `None`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
     pub(crate) intake: Option<IntakeFacts>,
+}
+
+/// A present `intake` field is `Some`, whatever its value.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<IntakeFacts>, D::Error> {
+    IntakeFacts::deserialize(d).map(Some)
 }
 
 impl Meta {
@@ -44,13 +56,22 @@ pub(crate) fn fits(s: &BufferedSummary, len: u64, cfg: &HookConfig) -> bool {
     count_ok && s.body_bytes.saturating_add(len) <= cfg.buffer_max_bytes
 }
 
-/// Promotes every buffered delivery of `launch` to `raw_unknown` `unbound`, in receipt
-/// order. Returns how many.
-pub(crate) fn drain_unbound(tx: &mut WriteTx<'_>, launch: LaunchId) -> Result<usize, StoreError> {
+/// Promotes the buffered deliveries of `launch` whose receipt ordinal `take` accepts to
+/// `raw_unknown` `unbound`, in receipt order. Returns how many.
+pub(crate) fn drain_unbound(
+    tx: &mut WriteTx<'_>,
+    launch: LaunchId,
+    take: impl Fn(u64) -> bool,
+) -> Result<usize, StoreError> {
     let Some(l) = tx.read().launch(launch)? else {
         return Ok(0);
     };
-    let rows = tx.read().buffered_deliveries(launch)?;
+    let rows: Vec<_> = tx
+        .read()
+        .buffered_deliveries(launch)?
+        .into_iter()
+        .filter(|b| take(b.receipt_ordinal))
+        .collect();
     let n = rows.len();
     for b in rows {
         let e = raw_event(
@@ -89,7 +110,7 @@ pub fn expire(
     };
     let ttl = i64::try_from(cfg.buffer_ttl.as_millis()).unwrap_or(i64::MAX);
     if now.saturating_sub(oldest) > ttl {
-        drain_unbound(tx, launch)
+        drain_unbound(tx, launch, |_| true)
     } else {
         Ok(0)
     }
@@ -104,7 +125,7 @@ pub fn expire(
 ///
 /// A store error.
 pub fn resolve_unbindable(tx: &mut WriteTx<'_>, launch: LaunchId) -> Result<usize, StoreError> {
-    drain_unbound(tx, launch)
+    drain_unbound(tx, launch, |_| true)
 }
 
 /// Milliseconds since the Unix epoch of a store stamp `YYYY-MM-DDTHH:MM:SS.mmmZ`
@@ -165,6 +186,27 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Facts the probe returned as JSON `null` stay present through the stored meta;
+    /// absent facts stay absent.
+    #[test]
+    fn present_null_intake_survives_buffering() {
+        let mut original = Meta {
+            v: Meta::VERSION,
+            thread_header: None,
+            agent_header: "codex".into(),
+            emitter_version: "test".into(),
+            attempt: Some(1),
+            chain: vec![],
+            chain_end: "no_pid".into(),
+            intake: Some(IntakeFacts(serde_json::Value::Null)),
+        };
+        let stored = serde_json::to_string(&original).unwrap();
+        assert_eq!(Meta::parse(&stored).unwrap().intake, original.intake);
+        original.intake = None;
+        let stored = serde_json::to_string(&original).unwrap();
+        assert_eq!(Meta::parse(&stored).unwrap().intake, None);
+    }
 
     /// The stamp format and its boundaries.
     #[test]

@@ -1288,26 +1288,45 @@ impl<'a> ReadTx<'a> {
         })
     }
 
-    /// The `receipt_ordinal` of the delivery whose primary event is the launch's
-    /// `session_bound`; `None` when the launch is unbound or was bound by another writer.
+    /// The `receipt_ordinal` of the delivery whose primary event is the launch's latest
+    /// `session_bound` (by stream sequence); `None` when the launch is unbound or that event
+    /// was not recorded by a hook delivery.
     ///
     /// # Errors
     ///
     /// A store error.
     pub fn binding_receipt_ordinal(&self, l: LaunchId) -> Result<Option<u64>, StoreError> {
         self.guard(|| {
-            let ordinal: Option<i64> = sql(self
+            let ordinal: Option<Option<i64>> = sql(self
                 .conn
                 .query_row(
-                    "SELECT d.receipt_ordinal FROM hook_deliveries d
-                     JOIN events e ON e.stream_id = d.stream_id AND e.seq = d.seq
-                     WHERE d.launch_id = ?1 AND d.routing = 'appended'
-                       AND e.kind = 'session_bound' AND e.launch_id = ?1",
+                    "SELECT d.receipt_ordinal FROM events e
+                     LEFT JOIN hook_deliveries d ON d.stream_id = e.stream_id AND d.seq = e.seq
+                       AND d.launch_id = e.launch_id AND d.routing = 'appended'
+                     WHERE e.launch_id = ?1 AND e.kind = 'session_bound'
+                     ORDER BY e.seq DESC LIMIT 1",
                     [l.to_string()],
                     |r| r.get(0),
                 )
                 .optional())?;
-            ordinal.map(to_u64).transpose()
+            ordinal.flatten().map(to_u64).transpose()
+        })
+    }
+
+    /// Whether a delivery of any launch reserved in thread `t`'s stream already took
+    /// `emit` (buffered deliveries included).
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub fn hook_emit_in_thread(&self, t: ThreadId, emit: Uuid) -> Result<bool, StoreError> {
+        self.guard(|| {
+            sql(self.conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM hook_deliveries WHERE emit_id = ?2 AND launch_id IN
+                   (SELECT launch_id FROM events WHERE stream_id = ?1 AND kind = 'launch_reserved'))",
+                [StreamId::Thread(t).to_string(), emit.to_string()],
+                |r| r.get(0),
+            ))
         })
     }
 
