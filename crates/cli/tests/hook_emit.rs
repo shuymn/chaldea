@@ -377,6 +377,31 @@ fn stub_settles_after_every_connection_is_handled() {
     drop((first, second));
 }
 
+/// The report fixture keeps complete lines only: a process killed mid-line leaves an
+/// unterminated last frame, which is discarded.
+#[test]
+fn reports_discard_an_unterminated_last_frame() {
+    let reports = Reports::start();
+    let mut s = TcpStream::connect(&reports.addr).unwrap();
+    s.write_all(b"{\"event\":\"a\"}\n{\"ev").unwrap();
+    drop(s);
+    assert_eq!(reports.wait("a", 1).len(), 1);
+    // The reader has ended on the cut frame without failing.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(reports.of("a").len(), 1);
+}
+
+/// A complete frame that is not JSON is a fixture failure.
+#[test]
+#[should_panic(expected = "malformed report frame")]
+fn reports_fail_on_a_malformed_frame() {
+    let reports = Reports::start();
+    let mut s = TcpStream::connect(&reports.addr).unwrap();
+    s.write_all(b"{bad}\n{\"event\":\"a\"}\n").unwrap();
+    drop(s);
+    reports.wait("a", 1);
+}
+
 // ---- Running a child ----
 
 /// What a child gets on stdin.
@@ -906,7 +931,8 @@ fn fake_cli() -> PathBuf {
 /// until its EOF or [`WAIT`] without a line; the accept loop ends when this is dropped.
 struct Reports {
     addr: String,
-    events: Arc<Mutex<Vec<Value>>>,
+    /// The events, and the first complete frame that was not JSON.
+    events: Arc<Mutex<(Vec<Value>, Option<String>)>>,
     stop: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
 }
@@ -916,7 +942,7 @@ impl Reports {
         let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         l.set_nonblocking(true).unwrap();
         let addr = l.local_addr().unwrap().to_string();
-        let events = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new((Vec::new(), None)));
         let stop = Arc::new(AtomicBool::new(false));
         let (ev, halt) = (events.clone(), stop.clone());
         let accept = std::thread::spawn(move || {
@@ -933,10 +959,24 @@ impl Reports {
                 std::thread::spawn(move || {
                     s.set_nonblocking(false).unwrap();
                     s.set_read_timeout(Some(WAIT)).unwrap();
-                    for line in BufReader::new(s).lines().map_while(Result::ok) {
-                        ev.lock()
-                            .unwrap()
-                            .push(serde_json::from_str(&line).unwrap());
+                    // Complete frames only: an unterminated last one (a process killed while
+                    // reporting) is discarded.
+                    let mut r = BufReader::new(s);
+                    loop {
+                        let mut line = Vec::new();
+                        match r.read_until(b'\n', &mut line) {
+                            Ok(_) if line.ends_with(b"\n") => {}
+                            _ => return,
+                        }
+                        let mut ev = ev.lock().unwrap();
+                        match serde_json::from_slice(&line) {
+                            Ok(v) => ev.0.push(v),
+                            Err(_) => {
+                                let frame = String::from_utf8_lossy(&line).into_owned();
+                                ev.1.get_or_insert(frame);
+                                return;
+                            }
+                        }
                     }
                 });
             }
@@ -949,11 +989,13 @@ impl Reports {
         }
     }
 
+    /// The events named `event` so far; panics once a malformed frame was read.
     fn of(&self, event: &str) -> Vec<Value> {
-        self.events
-            .lock()
-            .unwrap()
-            .iter()
+        let ev = self.events.lock().unwrap();
+        if let Some(frame) = &ev.1 {
+            panic!("malformed report frame: {frame:?}");
+        }
+        ev.0.iter()
             .filter(|e| e["event"] == event)
             .cloned()
             .collect()
