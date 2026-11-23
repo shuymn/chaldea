@@ -279,6 +279,14 @@ impl WriteCtx {
     /// One non-command write through `observe_write`, its result awaited until `deadline + write_reply_grace`.
     pub async fn write<R: Send + 'static>(&self, job: impl FnOnce(&mut WriteTx<'_>, Option<&Authorized>) -> Result<R, JobError> + Send + 'static)
         -> Result<R, ApiError>;     // no reply by then → 503 `outcome_unknown` (never `in_progress`: no receipt)
+    /// `write` whose observer drops `release` as soon as `Store::submit` returns (or with the observer, refused
+    /// or aborted before it submitted); a client that disconnects after registration no longer holds it.
+    pub(crate) async fn write_then<R: Send + 'static>(&self, job: impl FnOnce(&mut WriteTx<'_>, Option<&Authorized>)
+        -> Result<R, JobError> + Send + 'static, release: Box<dyn Any + Send>) -> Result<R, ApiError>;
+    /// One read cut off at `by` instead of the request deadline, with the same one-cutoff rule.
+    pub(crate) async fn read_by<R: Send + 'static>(&self, by: Instant, f: impl FnOnce(&ReadTx<'_>)
+        -> Result<R, StoreError> + Send + 'static) -> Result<R, ApiError>;
+    pub(crate) fn commits(&self) -> broadcast::Receiver<Committed>;   // the store's commit notifications from now on
 }
 /// The one submit-and-observe path: submits, owns and awaits the ticket (the writer answers every accepted
 /// job, store §5), reports a fatal outcome to `LifecycleSink`, and runs `after_ok` on success (e.g. the
@@ -291,7 +299,7 @@ pub(crate) fn observe_write<R: Send + 'static>(app: &AppState, not_after: Instan
     -> Result<oneshot::Receiver<Result<R, WriteFailure>>, Closing>;
 ```
 
-**Typed failures survive the wrappers.** `Store::read`'s closure returns `Result<R, StoreError>`: a `StoreError` from the read itself or from the token lookup maps through §2.9 automatically. `ReadCtx` passes it a closure that returns `Ok(f(tx, &auth))`, and `f` returns `Result<R, ApiError>`, so `f` decides how its own store calls map (normally through §2.9) and an authorization or validation failure stays the `ApiError` `f` chose. `verify_hash_in` returns `AuthFailure::{Invalid, Store(StoreError)}`: `Invalid` (missing, revoked, malformed, agent launch not current) is 401, `Store` maps through §2.9; a failed lookup is never a 401. Write jobs return `JobError::Refused(ApiError)` for refusals and `JobError::Store` for store errors.
+**Typed failures survive the wrappers.** `Store::read`'s closure returns `Result<R, StoreError>`: a `StoreError` from the read itself or from the token lookup maps through §2.9 automatically. `ReadCtx` passes it a closure that returns `Ok(f(tx, &auth))`, and `f` returns `Result<R, ApiError>`, so `f` decides how its own store calls map (normally through §2.9) and an authorization or validation failure stays the `ApiError` `f` chose. `verify_hash_in` returns `AuthFailure::{Invalid, Store(StoreError)}`: `Invalid` (missing, revoked, malformed, agent launch not current, hook token without its launch of its thread) is 401, `Store` maps through §2.9; a failed lookup is never a 401. Write jobs return `JobError::Refused(ApiError)` for refusals and `JobError::Store` for store errors.
 
 **Read outcomes: one cutoff.** Every read (the step-4 lookup, `ReadCtx::read`, a socket's read) is awaited until its deadline and no longer. A store outcome returned before the cutoff maps through §2.9 (`ReadError::Closed` → 503 `shutting_down`, `ReadError::Store(Busy)` → 503 `busy`); a read that has not returned by the cutoff answers 408, whether it was still waiting for a reader or running. A result is accepted only if the clock, read when the result is taken, is before the deadline; otherwise it is discarded and the request answers 408, whether it was a success or a store error. This matters because a reader can return after the cutoff and `timeout_at` polls the result before its timer, so both can be ready when the task resumes (H16); the check is the same for the step-4 lookup, `ReadCtx::read`, the final ticket admission read (§2.4), and a socket's reads (a late result drops the socket). The one exception is reader-pool exhaustion: the pool's own wait ends at the same instant (`wait_until = deadline`), so a reader pool exhausted through the cutoff answers 408 or 503 `busy` depending on which is observed first; both mean "nothing happened, retry", and no claim depends on which. The same rule holds for the other waits at the deadline: a read mount's handler is not invoked once the deadline has passed and its result taken at or after it is 408, and `body_within` answers 408 for a body completed at or after the deadline even when it was ready at once, so no write is submitted after a body missed the cutoff. A read cut off this way has no effect and finishes on its own.
 
@@ -318,7 +326,7 @@ impl TokenService {
 }
 ```
 
-**`verify_hash_in`** (the one token check; step 4 and every read, write, and socket check run it): `token_by_hash`, constant-time equality, `revoked_at IS NULL`; for `agent`, also: the token's launch is its thread's `current_launch_id` and that launch has no `exit_reason` (mvp §2.5 "one launch" holds at use time even before PR 10 revokes); for `hook`, only revocation (PR 9 adds its launch and binding checks). `rescue` and `owner`: until revoked. `extension`: until revoked; its one-run lifetime is PR 20's revocation after the run. No `token_by_id` is needed: every later check has the hash.
+**`verify_hash_in`** (the one token check; step 4 and every read, write, and socket check run it): `token_by_hash`, constant-time equality, `revoked_at IS NULL`; for `agent`, also: the token's launch is its thread's `current_launch_id` and that launch has no `exit_reason` (mvp §2.5 "one launch" holds at use time even before PR 10 revokes); for `hook`, the token names a thread and a launch, and that launch is of that thread (hook-ingest §2.8); it need not be current, live, or bound, so late hooks are kept, and revocation ends it. `rescue` and `owner`: until revoked. `extension`: until revoked; its one-run lifetime is PR 20's revocation after the run. No `token_by_id` is needed: every later check has the hash.
 
 **Revocation nudges come from the observer.** `TokenService::revoke` passes the nudge as `after_ok` to `observe_write`, so it fires from the task that observes the commit, also when the request that asked for the revocation has gone. PR 10 and PR 16 pass the same `after_ok` to `run_write` for their own revoking jobs.
 
@@ -597,7 +605,7 @@ The request waits on the `watch` until `deadline + write_reply_grace` and replie
 | Listener and lifecycle | `HttpServer::new`, `serve(TcpListener)`, `ServeHandle::shutdown(deadline)`, `LifecycleSink` | PR 8 |
 | Token issuance and revocation | `TokenService::{mint, new_token, issue_owner, revoke}`, `nudge_revocation`, the `after_ok` of `run_write` / `observe_write` | PR 8 (owner token file), PR 10 (launch tokens), PR 16, PR 20 |
 | Commands | `CommandHandler`, `CommandEffect` (with its bounded-result obligation), `CommandRegistry::register`, `Prepared`, `Authorized`, `deny_for`, `ObjectScope` | PR 10, 16, 20, 21 |
-| Hook route | `Mount::write` for `POST /hook` (spec in `ROUTES`), `WriteCtx` | PR 9 |
+| Hook route | `Mount::write` for `POST /hook` (spec in `ROUTES`), `WriteCtx` (`write_then`, `read_by`, `commits`); `Mounts::mvp` mounts it with `HookSeams::mvp` | PR 9; PR 10, 13, 14 replace the seams |
 | Attach | `Mount::upgrade` for `GET /api/attach/{thread}`; the handler gets `AttachGrant { thread, token_id, token_sha256 }` and runs in a registered socket task | PR 11 |
 | Read routes | `Mount::read` for `/api/adapters`, `/api/doctor`, `/`, `/assets/*` with `ReadCtx` | PR 10, 21, 18 |
 | `POST /events` | `Mount::write`, `ObjectScope::stored_surface` | PR 20 |

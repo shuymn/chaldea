@@ -640,5 +640,4 @@ Not applied here; proposals for `docs/architecture.md`, `docs/prior-art.md`, `AG
 - **arch §4.4**: Rescue acts on PTYs through human-clicked `surface_action`s only; `attention` is an outbound hook on raise and clear.
 - **arch §2 / AGENTS.md invariant 5**: the token kinds (`owner`, `agent`, `hook`, `rescue`, `extension`) next to "regular vs Rescue".
 - **arch §2 / §4.1 (Phase 2 relay)**: the daemon serves one request per connection; a relay or proxy that folds `Connection` headers forwards a `101` with `Connection: Upgrade` alone.
-- **arch §5 open items**: the Windows hook receiver item concerns the axum receiver; keep `deadline_slow_head` (EOF, no side effect) and `non_numeric_content_length` (400) as checks to run on CI and the real host.
 - **prior-art**: rows for event store and replay (T3 Code v1/v2, `decideThreadResume`), command receipts, scoped auth and pairing (T3 Code), thread/turn status and schema fixtures (Codex app-server), worktree removal checks (T3 Code vs herdr), herdr's Codex-on-Windows paste-boundary key (`src/app/api/agents.rs:14-33`), `PermissionRequest` without a tool id in both CLIs, and Codex's trust hash covering the hook timeout.
