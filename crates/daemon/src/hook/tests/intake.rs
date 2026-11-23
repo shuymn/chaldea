@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chaldea_core::ids::LaunchId;
+use chaldea_core::payload::RawUnknownReason;
 
 use super::support::hook::{Hook, HookServer};
 use super::support::http::{TestServer, connect, write};
@@ -141,6 +142,33 @@ async fn release_points() {
         "kept after a refused registration"
     );
     srv.store.shutdown();
+}
+
+/// Of two eligible `SessionStart`s of different sessions, the one received first binds
+/// (PR9-CL-6): with the first held before its job, the second is seen waiting on the
+/// pending lower ordinal; released, the first binds and the second is `foreign_session`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn later_session_start_waits_before_the_first_submits() {
+    let h = HookServer::start().await;
+    h.srv.clock.stop();
+    let l = h.codex(1).await;
+    let first = Hook::of(&l, "SessionStart", "first");
+    let second = Hook::of(&l, "SessionStart", "second");
+    let (at_job, release_first) = h.ingest.points.arm_job(1);
+    let first_reply = h.spawn_post(&first);
+    reached(at_job).await;
+    let (waiting, at_wait) = tokio::sync::oneshot::channel();
+    *h.ingest.order.between_check_and_await.lock().unwrap() =
+        Some(Box::new(move || waiting.send(()).unwrap()));
+    let second_reply = h.spawn_post(&second);
+    reached(at_wait).await;
+    assert!(h.launch_row(l.launch).session_id.is_none());
+    release_first.send(()).unwrap();
+    ok(&first_reply.await.unwrap());
+    ok(&second_reply.await.unwrap());
+    assert_eq!(h.launch_row(l.launch).session_id.as_deref(), Some("first"));
+    h.assert_raw(&l, second.emit, RawUnknownReason::ForeignSession);
+    h.stop().await;
 }
 
 /// A queued earlier job releases its ordinal at submission: hook 1 passes `Store::submit`

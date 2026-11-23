@@ -47,6 +47,11 @@ async fn stopped_clock_converts_a_cutoff_once() {
     assert!(clock.real(f - Duration::from_millis(1)) < clock.real(f));
     assert!(clock.real(f) <= std::time::Instant::now());
     assert_eq!(clock.real(cutoff), real_cutoff);
+    // A day past the real stop instant, the stopped clock's reading's own real instant.
+    assert_eq!(
+        real_cutoff,
+        clock.real(f) + Duration::from_secs(24 * 60 * 60)
+    );
 }
 
 fn ok(r: &support::http::Reply) {
@@ -117,23 +122,6 @@ async fn concurrent_retries_dedup_in_the_job() {
     ok(&b.await.unwrap());
     assert_eq!(h.stream(l.thread).len(), events + 1, "one event");
     assert_eq!(h.adapter.calls().len(), calls + 1, "one adapter call");
-    assert!(h.delivery(l.launch, hook.emit).is_some());
-    h.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reply_waits_for_commit() {
-    let h = server().await;
-    let l = h.codex(1).await;
-    bind_codex(&h, &l, "s").await;
-    let hook = Hook::of(&l, "Stop", "s");
-    let release = h.srv.hold_writer().await;
-    let reply = h.spawn_post(&hook);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(!reply.is_finished(), "a reply before the job committed");
-    assert!(h.delivery(l.launch, hook.emit).is_none());
-    release.send(()).unwrap();
-    ok(&reply.await.unwrap());
     assert!(h.delivery(l.launch, hook.emit).is_some());
     h.stop().await;
 }
@@ -228,27 +216,6 @@ async fn identical_bodies_are_two_deliveries() {
     assert!(h.delivery(l.launch, a.emit).is_some());
     assert!(h.delivery(l.launch, b.emit).is_some());
     assert_eq!(h.stream(l.thread).len(), events + 2);
-    h.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn buffered_durable_before_200() {
-    let h = server().await;
-    let l = h.codex(1).await;
-    let hook = Hook::of(&l, "UserPromptSubmit", "s");
-    let release = h.srv.hold_writer().await;
-    let reply = h.spawn_post(&hook);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(
-        !reply.is_finished(),
-        "200 before the buffered row committed"
-    );
-    release.send(()).unwrap();
-    ok(&reply.await.unwrap());
-    assert_eq!(
-        h.delivery(l.launch, hook.emit).unwrap().routing,
-        Routing::Buffered
-    );
     h.stop().await;
 }
 
@@ -368,33 +335,6 @@ async fn binding_waits_for_earlier_hook() {
         ],
         "session_bound, the binding's raw, UserPromptSubmit 1, Stop 3"
     );
-    h.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn earlier_session_start_wins() {
-    let h = server().await;
-    let l = h.codex(1).await;
-    h.chains.set(7001, direct(7001, "codex"));
-    let (walking, release) = h.chains.hold(7001);
-    let earlier = Hook::of(&l, "SessionStart", "first").pid(Some(7001));
-    let earlier_reply = h.spawn_post(&earlier);
-    tokio::task::spawn_blocking(move || walking.recv_timeout(Duration::from_secs(10)))
-        .await
-        .unwrap()
-        .unwrap();
-    let later = Hook::of(&l, "SessionStart", "second");
-    let later_reply = h.spawn_post(&later);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        !later_reply.is_finished(),
-        "the later SessionStart overtook"
-    );
-    release.send(()).unwrap();
-    ok(&earlier_reply.await.unwrap());
-    ok(&later_reply.await.unwrap());
-    assert_eq!(h.launch_row(l.launch).session_id.as_deref(), Some("first"));
-    h.assert_raw(&l, later.emit, R::ForeignSession);
     h.stop().await;
 }
 

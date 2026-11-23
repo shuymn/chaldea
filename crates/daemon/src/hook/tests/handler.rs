@@ -409,6 +409,89 @@ async fn store_outcomes_map() {
     store.store = None;
 }
 
+/// Posts `hook` (receipt `ordinal`) on a stopped clock with the writer held, and returns
+/// once the request waits for its reply (the HTTP faults' cutoff gate, armed after the
+/// pre-read so that only the reply wait meets it) and its job has passed `Store::submit`:
+/// the client task, the writer's release, and the gate's opener.
+async fn held_at_reply_wait(
+    h: &HookServer,
+    l: &Launch,
+    hook: &Hook,
+    ordinal: u64,
+) -> (
+    tokio::task::JoinHandle<super::support::http::Reply>,
+    std::sync::mpsc::Sender<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let s = shared(&h.srv);
+    let release = h.srv.hold_writer().await;
+    let (at_job, go) = h.ingest.points.arm_job(ordinal);
+    let before = s.faults.submits();
+    let reply = h.spawn_post(hook);
+    reached(at_job).await;
+    let (at_wait, open) = s.faults.arm_cutoff_gate();
+    go.send(()).unwrap();
+    reached(at_wait).await;
+    eventually(WAIT, "the job passed Store::submit", || {
+        s.faults.submits() > before && !h.ingest.order.is_pending(l.launch, ordinal)
+    })
+    .await;
+    (reply, release, open)
+}
+
+/// The reply waits for the job's commit (PR9-CL-1): the request reaches its reply wait
+/// with its job queued behind a held writer and no row; released, the row commits while the
+/// request is still held there and no reply has left; the wait let go, 200.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_waits_for_commit() {
+    let h = HookServer::start().await;
+    h.srv.clock.stop();
+    let l = h.codex(1).await;
+    bind(&h, &l, "s").await;
+    let hook = Hook::of(&l, "Stop", "s");
+    let (reply, release, open) = held_at_reply_wait(&h, &l, &hook, 2).await;
+    assert!(h.delivery(l.launch, hook.emit).is_none());
+    // The job commits while the request is still held at its reply wait: no reply has
+    // left by another way.
+    release.send(()).unwrap();
+    eventually(WAIT, "the row committed", || {
+        h.delivery(l.launch, hook.emit).is_some()
+    })
+    .await;
+    assert!(
+        !reply.is_finished(),
+        "a reply that did not wait for the job"
+    );
+    open.send(()).unwrap();
+    ok(&reply.await.unwrap());
+    h.stop().await;
+}
+
+/// A buffered hook is durable before 200 (PR9-CL-4), as [`reply_waits_for_commit`] for an
+/// unbound launch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn buffered_durable_before_200() {
+    let h = HookServer::start().await;
+    h.srv.clock.stop();
+    let l = h.codex(1).await;
+    let hook = Hook::of(&l, "UserPromptSubmit", "s");
+    let (reply, release, open) = held_at_reply_wait(&h, &l, &hook, 1).await;
+    assert!(h.delivery(l.launch, hook.emit).is_none());
+    release.send(()).unwrap();
+    eventually(WAIT, "the buffered row committed", || {
+        h.delivery(l.launch, hook.emit)
+            .is_some_and(|d| d.routing == Routing::Buffered)
+    })
+    .await;
+    assert!(
+        !reply.is_finished(),
+        "200 that did not wait for the buffered row"
+    );
+    open.send(()).unwrap();
+    ok(&reply.await.unwrap());
+    h.stop().await;
+}
+
 /// The stopped clock `hook_ingest` runs on (`SkewClock::stop`): a hook whose job has passed
 /// `Store::submit` behind a held writer is held there past the request deadline (2 s, the
 /// test server's) and the reply grace (100 ms), and the job still answers 200.
