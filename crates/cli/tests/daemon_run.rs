@@ -521,7 +521,10 @@ fn restarts_keep_a_usable_saved_endpoint() {
         let before = serving_record(&dir.path);
         let token = token_of(&dir.path);
         assert_eq!(saved_port(&dir.path), format!("{port}\n"));
-        assert_eq!(support::get_complete(port, "/api/threads", &token).0, 200);
+        assert_eq!(
+            support::request_complete(port, "GET", "/api/threads", &token, None).0,
+            200
+        );
         if killed {
             support::kill_and_reap(&mut first.child);
             let stale = chaldea_daemon::lifecycle::read_record(&dir.path)
@@ -545,7 +548,36 @@ fn restarts_keep_a_usable_saved_endpoint() {
         );
         assert_eq!(saved_port(&dir.path), format!("{port}\n"));
         assert_eq!(token_of(&dir.path), token);
-        assert_eq!(support::get_complete(port, "/api/threads", &token).0, 200);
+        assert_eq!(
+            support::request_complete(port, "GET", "/api/threads", &token, None).0,
+            200
+        );
         assert_eq!(next.stop_and_wait(&dir.path), 0, "{}", next.stderr());
     }
+}
+
+/// The daemon serves the MVP command table: an MVP command no PR has implemented yet answers
+/// 501 `not_implemented` and leaves no receipt.
+#[test]
+fn mvp_command_is_501_without_receipt() {
+    let dir = state();
+    let (mut d, port) = serve(&dir.path);
+    let token = token_of(&dir.path);
+    let cmd = CommandId::from_u128(0x5000_0000_0000_0000_0000_0000_0000_00c1);
+    let (status, body) = support::request_complete(
+        port,
+        "POST",
+        "/api/commands/spawn",
+        &token,
+        Some(&format!(r#"{{"command_id":"{cmd}","args":{{}}}}"#)),
+    );
+    assert_eq!(status, 501, "{body}");
+    assert!(body.contains("not_implemented"), "{body}");
+    assert_eq!(d.stop_and_wait(&dir.path), 0, "{}", d.stderr());
+    let store = open_store(&dir.path);
+    let receipt = store
+        .read(Instant::now() + support::WAIT, move |tx| tx.receipt(cmd))
+        .unwrap();
+    close_store(&store);
+    assert!(receipt.is_none(), "{receipt:?}");
 }

@@ -361,14 +361,27 @@ pub fn get_status(port: u16, path: &str, token: Option<&str>) -> u16 {
     std::str::from_utf8(&head[9..12]).unwrap().parse().unwrap()
 }
 
-/// One GET on a new connection, read through EOF (the server closes it): the status and the
-/// body, whose length matches its `Content-Length`.
-pub fn get_complete(port: u16, path: &str, token: &str) -> (u16, String) {
+/// One request on a new connection, read through EOF (the server closes it): the status and
+/// the body, whose length matches its `Content-Length`. A body is sent as JSON.
+pub fn request_complete(
+    port: u16,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<&str>,
+) -> (u16, String) {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(WAIT)).unwrap();
+    let content = body.map_or_else(String::new, |b| {
+        format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            b.len()
+        )
+    });
     write!(
         s,
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n{content}Connection: close\r\n\r\n{}",
+        body.unwrap_or("")
     )
     .unwrap();
     let mut raw = Vec::new();
