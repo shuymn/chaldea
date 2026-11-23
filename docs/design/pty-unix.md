@@ -545,7 +545,7 @@ Checked on a real macOS host (and `macos-latest` CI) by `cargo test -p chaldea-t
 
 **D6. `unsafe` lives in one module, `unix::sys`, under a crate-local `deny`**, with `undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block` denied and the restated clippy table checked by a test.
 
-**D7. The public additions are `native()` and `with_spawn_lock()`.** The lock takes a closure, not a `&mut std::process::Command`, so `tokio::process` and process-wrap spawns run under it too. Process identity lookup stays internal, reachable by tests through the `fake` feature; the PR that first builds `extra` in the daemon adds the public lookup.
+**D7. The public additions are `native()` and `with_spawn_lock()`.** The lock takes a closure, not a `&mut std::process::Command`, so `tokio::process` and process-wrap spawns run under it too. Process identity lookup stays internal, reachable by tests through the `fake` feature; PR 9 adds the public lookup for hook binding, its first consumer (`docs/design/hook-ingest.md` §2.5).
 
 **D8. FakeCli is library code with a thin binary, reports over loopback TCP with `ping`/`pong`, and lifts a mode only with the PR that first tests it.** Its real-PTY tests are testkit integration tests, so Cargo locates the binary. `stall`, `banner`, hooks, the `mcp` role, and attach input parsing are still to come (§2.8).
 
