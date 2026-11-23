@@ -12,6 +12,10 @@ mod shutdown;
 mod startup;
 mod state_dir;
 
+#[path = "../../../tests/support/lifecycle.rs"]
+mod fixtures;
+pub(super) use fixtures::{free_port, kill_and_reap, open_store, token_of};
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::path::{Path, PathBuf};
@@ -60,15 +64,6 @@ pub(super) fn state() -> Dir {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("state");
     Dir { _tmp: tmp, path }
-}
-
-/// A port nothing listens on right now (bound to `127.0.0.1:0`, then released).
-pub(super) fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 /// Test components: the receipts reconciler unless told otherwise, extra reconcilers, test
@@ -331,13 +326,6 @@ pub(super) fn get_status(port: u16, path: &str, token: Option<&str>) -> std::io:
     request(port, "GET", path, token, None).map(|(c, _)| c)
 }
 
-pub(super) fn token_of(dir: &Path) -> String {
-    std::fs::read_to_string(dir.join(super::names::OWNER_TOKEN))
-        .unwrap()
-        .trim_end()
-        .to_owned()
-}
-
 // ---- Helper processes ----
 
 /// Selects the helper body in a re-executed test binary.
@@ -373,20 +361,6 @@ pub(super) fn helper_exit(r: &ExitReport, pause: Duration) -> ! {
     std::thread::sleep(pause);
     super::flush_process_log(Duration::from_millis(100));
     std::process::exit(r.code.code());
-}
-
-/// Kills `child` and reaps it within 10 s (a process that cannot be reaped is reported, not
-/// waited for).
-pub(super) fn kill_and_reap(child: &mut Child) {
-    let _ = child.kill();
-    let end = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < end {
-        if !matches!(child.try_wait(), Ok(None)) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    eprintln!("pid {} was not reaped within 10 s of its kill", child.id());
 }
 
 /// A helper process: this test binary re-executed with `--exact <test>`.

@@ -17,26 +17,14 @@ use super::super::faults::{Faults, Point};
 use super::super::files::{LockProbe, ReplaceStage};
 use super::super::{FailReason, LockDisposition, PORT_RANGE, Reconciler, names};
 use super::{
-    RecordingReady, TestComponents, WAIT, detached, foreground, free_port, get_status, request,
-    start, state, token_of,
+    RecordingReady, TestComponents, WAIT, detached, foreground, free_port, get_status, open_store,
+    request, start, state, token_of,
 };
 use crate::http::{ApiError, Mount, Mounts, WriteCtx, spec};
 use crate::store::test_faults::{CommitFault, Faults as StoreFaults};
-use crate::store::{JobError, RandomIds, Store, StoreConfig, SystemClock};
+use crate::store::{JobError, Store};
 
 const CMD: CommandId = CommandId::from_u128(0x8a);
-
-pub(super) fn open_store(dir: &Path) -> Store {
-    Store::open(StoreConfig {
-        path: dir.join(names::DB),
-        readers: 2,
-        writer_queue: 16,
-        busy_timeout: Duration::from_secs(5),
-        clock: Arc::new(SystemClock),
-        ids: Arc::new(RandomIds),
-    })
-    .unwrap()
-}
 
 pub(super) fn close(store: &Store) {
     let r = store.shutdown(Instant::now() + Duration::from_secs(10));

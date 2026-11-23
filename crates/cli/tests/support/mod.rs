@@ -22,6 +22,11 @@ use chaldea_daemon::lifecycle::{
 };
 use tempfile::TempDir;
 
+#[path = "../../../daemon/tests/support/lifecycle.rs"]
+mod lifecycle;
+#[allow(unused_imports, reason = "each test file uses part of these helpers")]
+pub use lifecycle::{free_port, kill_and_reap, open_store, token_of};
+
 /// Every bounded wait of these tests.
 pub const WAIT: Duration = Duration::from_secs(30);
 
@@ -69,16 +74,6 @@ pub fn state() -> Dir {
     let tmp = temp_parent();
     let path = tmp.path().join("state");
     Dir { tmp, path }
-}
-
-/// A port nothing listens on right now (bound to `127.0.0.1:0`, then released).
-#[must_use]
-pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 /// `chaldea <args>` with `CHALDEA_STATE_DIR` removed unless `env` sets it.
@@ -147,19 +142,6 @@ impl Drop for Done {
     fn drop(&mut self) {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-}
-
-/// Kills `child` (a process this test started) and reaps it within 10 s.
-pub fn kill_and_reap(child: &mut Child) {
-    let _ = child.kill();
-    let end = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < end {
-        if !matches!(child.try_wait(), Ok(None)) {
-            return;
-        }
-        std::thread::sleep(POLL);
-    }
-    eprintln!("pid {} was not reaped within 10 s of its kill", child.id());
 }
 
 impl Proc {
@@ -336,15 +318,6 @@ pub fn lock_state(dir: &Path) -> LockProbe {
     probe(dir).unwrap()
 }
 
-/// The saved owner token (without its newline).
-#[must_use]
-pub fn token_of(dir: &Path) -> String {
-    std::fs::read_to_string(dir.join(names::OWNER_TOKEN))
-        .unwrap()
-        .trim_end()
-        .to_owned()
-}
-
 /// `GET <path>` on `127.0.0.1:<port>` with `token` (or none); the status code.
 #[must_use]
 pub fn get_status(port: u16, path: &str, token: Option<&str>) -> u16 {
@@ -449,21 +422,6 @@ pub fn write_private(path: &Path, bytes: &[u8]) {
     let mut f = chaldea_pty_runtime::host::create_private_file(path).unwrap();
     f.write_all(bytes).unwrap();
     f.sync_all().unwrap();
-}
-
-/// Opens the daemon's database directly (the daemon must not be running).
-#[must_use]
-pub fn open_store(dir: &Path) -> chaldea_daemon::store::Store {
-    use chaldea_daemon::store::{RandomIds, Store, StoreConfig, SystemClock};
-    Store::open(StoreConfig {
-        path: dir.join(names::DB),
-        readers: 2,
-        writer_queue: 16,
-        busy_timeout: Duration::from_secs(5),
-        clock: Arc::new(SystemClock),
-        ids: Arc::new(RandomIds),
-    })
-    .unwrap()
 }
 
 /// Shuts the store down and asserts it closed.

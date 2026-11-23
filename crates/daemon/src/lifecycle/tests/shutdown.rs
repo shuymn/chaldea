@@ -532,7 +532,7 @@ fn built_commands_are_served_and_drained() {
     let marks: Vec<String> = faults.marks().into_iter().map(|m| m.0).collect();
     let at = |w: &str| marks.iter().position(|m| m == w).unwrap();
     assert!(at("http") < at("store"), "{marks:?}");
-    let store = super::startup::open_store(&dir.path);
+    let store = super::open_store(&dir.path);
     let receipt = store
         .read(Instant::now() + WAIT, move |tx| tx.receipt(cmd))
         .unwrap()

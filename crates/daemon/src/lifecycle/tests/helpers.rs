@@ -489,7 +489,7 @@ fn console_end_recovers_on_restart() {
     run.serving();
     run.stop();
     assert_eq!(run.join().code.code(), 0);
-    let store = super::startup::open_store(&dir.path);
+    let store = super::open_store(&dir.path);
     let parked = store
         .read(Instant::now() + WAIT, |r| r.token_by_hash(&[2; 32]))
         .unwrap();
@@ -1060,7 +1060,7 @@ fn console_end_during_startup() {
     // daemon (no port to race for).
     let dir = state();
     super::super::state_dir::prepare(&dir.path, "00000000-0000-4000-8000-0000000000aa").unwrap();
-    let store = super::startup::open_store(&dir.path);
+    let store = super::open_store(&dir.path);
     super::settle(
         store
             .submit(Instant::now() + WAIT, |tx| {
