@@ -766,11 +766,8 @@ fn stopping_worker_paused_past_its_cutoff_creates_nothing() {
     let pause = || std::thread::sleep(end.saturating_duration_since(Instant::now()));
     let r = super::super::shutdown::mark_stopping(d.path(), "i", end, &pause, &hook);
     assert!(r.is_err());
-    assert!(
-        seen.lock().unwrap().is_empty(),
-        "{:?}",
-        seen.lock().unwrap()
-    );
+    let stages = seen.lock().unwrap().clone();
+    assert!(stages.is_empty(), "{stages:?}");
     let temps: Vec<_> = std::fs::read_dir(d.path())
         .unwrap()
         .map(|e| e.unwrap().file_name())
@@ -784,4 +781,28 @@ fn stopping_worker_paused_past_its_cutoff_creates_nothing() {
         super::super::files::read_record(d.path()),
         Ok(Some(r)) if r.state == super::super::files::RecordState::Stopping
     ));
+}
+
+/// The `stopping` rewrite's failing rename is retried only before the rewrite's cutoff, never
+/// for a fresh retry window.
+#[test]
+fn stopping_rename_is_not_retried_past_its_cutoff() {
+    use super::super::files::ReplaceStage;
+    let d = tempfile::tempdir().unwrap();
+    let before = serving_record(d.path(), "i");
+    let renames = Mutex::new(Vec::new());
+    let hook = |_: &str, stage| {
+        if stage == ReplaceStage::Rename {
+            renames.lock().unwrap().push(Instant::now());
+            return Err(std::io::Error::other("injected"));
+        }
+        Ok(())
+    };
+    let end = Instant::now() + Duration::from_millis(150);
+    let r = super::super::shutdown::mark_stopping(d.path(), "i", end, &|| {}, &hook);
+    assert!(r.is_err());
+    let renames = renames.into_inner().unwrap();
+    assert!(!renames.is_empty());
+    assert!(renames.iter().all(|&t| t < end), "{renames:?} {end:?}");
+    assert_eq!(std::fs::read(d.path().join(names::RECORD)).unwrap(), before);
 }

@@ -302,14 +302,15 @@ pub(crate) struct Replaced {
 
 /// Replaces `dir/name` with `bytes`: only an absent entry or a regular file, through a
 /// temporary `.<name>.tmp-<instance>` created owner-only and a rename, which is the commit.
-/// A failed rename is retried every 50 ms until `retry_until`, or for 500 ms from the first
-/// attempt when it is `None`.
+/// With `rename_until`, no rename is attempted at or after it, and a failed one is retried
+/// every 50 ms until it; without, a failed rename is retried every 50 ms for 500 ms from the
+/// first attempt.
 pub(crate) fn write_replace(
     dir: &Path,
     name: &str,
     bytes: &[u8],
     instance: &str,
-    retry_until: Option<Instant>,
+    rename_until: Option<Instant>,
     hook: ReplaceHook<'_>,
 ) -> Result<Replaced, ReplaceError> {
     let target = dir.join(name);
@@ -338,8 +339,15 @@ pub(crate) fn write_replace(
         }
         return Err(ReplaceError::Io(e));
     }
-    let end = retry_until.unwrap_or_else(|| Instant::now() + RENAME_RETRY_FOR);
+    let end = rename_until.unwrap_or_else(|| Instant::now() + RENAME_RETRY_FOR);
     loop {
+        if rename_until.is_some_and(|until| Instant::now() >= until) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(ReplaceError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "its cutoff passed before the rename",
+            )));
+        }
         let renamed =
             hook(name, ReplaceStage::Rename).and_then(|()| std::fs::rename(&tmp, &target));
         match renamed {

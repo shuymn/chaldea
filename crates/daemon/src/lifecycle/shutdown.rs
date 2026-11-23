@@ -829,23 +829,7 @@ pub(super) fn mark_stopping(
         return Err(late());
     }
     r.state = files::RecordState::Stopping;
-    let hook = |n: &str, s: files::ReplaceStage| {
-        if s == files::ReplaceStage::Rename && Instant::now() >= end {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "its budget ended before the rename",
-            ));
-        }
-        hook(n, s)
-    };
-    files::write_replace(
-        dir,
-        names::RECORD,
-        &r.to_bytes(),
-        instance,
-        Some(end),
-        &hook,
-    )
-    .map(drop)
-    .map_err(|e| format!("the discovery record could not be marked stopping: {e}"))
+    files::write_replace(dir, names::RECORD, &r.to_bytes(), instance, Some(end), hook)
+        .map(drop)
+        .map_err(|e| format!("the discovery record could not be marked stopping: {e}"))
 }

@@ -110,24 +110,29 @@ fn rename_failure_keeps_the_target() {
     assert!(temps(d.path()).is_empty());
 }
 
-/// A rename failing at its retry cutoff is not retried: one attempt, then the error, the
-/// target unchanged and no temporary left.
+/// With a rename cutoff, a failing rename is retried only before it: no attempt at or after
+/// the cutoff, then the error, the target unchanged and no temporary left.
 #[test]
-fn rename_is_not_retried_past_its_cutoff() {
+fn no_rename_at_or_after_its_cutoff() {
     let d = dir();
     std::fs::write(d.path().join("port"), "1\n").unwrap();
-    let attempts = std::sync::atomic::AtomicU32::new(0);
+    let attempts = std::sync::Mutex::new(Vec::new());
     let fail = |_: &str, s: ReplaceStage| {
         if s == ReplaceStage::Rename {
-            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            attempts.lock().unwrap().push(std::time::Instant::now());
             Err(io::Error::other("injected"))
         } else {
             Ok(())
         }
     };
-    let now = Some(std::time::Instant::now());
-    assert!(write_replace(d.path(), "port", b"7373\n", INSTANCE, now, &fail).is_err());
-    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let until = std::time::Instant::now() + Duration::from_millis(120);
+    assert!(write_replace(d.path(), "port", b"7373\n", INSTANCE, Some(until), &fail).is_err());
+    let attempts = attempts.into_inner().unwrap();
+    assert!(!attempts.is_empty());
+    assert!(
+        attempts.iter().all(|&t| t < until),
+        "{attempts:?} {until:?}"
+    );
     assert_eq!(std::fs::read(d.path().join("port")).unwrap(), b"1\n");
     assert!(temps(d.path()).is_empty());
 }
