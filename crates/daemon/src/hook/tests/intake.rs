@@ -143,6 +143,51 @@ async fn release_points() {
     srv.store.shutdown();
 }
 
+/// A queued earlier job releases its ordinal at submission: hook 1 passes `Store::submit`
+/// behind a held writer and its client disconnects; the binding `SessionStart` 2 is then
+/// submitted while hook 1 is still queued; released, hook 1 commits, then the binding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_earlier_job_releases_at_submit() {
+    let h = HookServer::start().await;
+    h.srv.clock.stop();
+    let l = h.codex(1).await;
+    let release = h.srv.hold_writer().await;
+    let s = shared(&h.srv);
+    let order = h.ingest.order.clone();
+    let before = s.faults.submits();
+    let first = Hook::of(&l, "UserPromptSubmit", "s");
+    let mut conn = connect(h.srv.port).await;
+    write(&mut conn, &first.req(&h.srv).bytes()).await;
+    super::support::http::eventually(WAIT, "hook 1 passed Store::submit", || {
+        s.faults.submits() > before && !order.is_pending(l.launch, 1)
+    })
+    .await;
+    drop(conn);
+    let start = Hook::of(&l, "SessionStart", "s");
+    let start_reply = h.spawn_post(&start);
+    super::support::http::eventually(WAIT, "the binding passed Store::submit", || {
+        s.faults.submits() > before + 1 && !order.is_pending(l.launch, 2)
+    })
+    .await;
+    assert!(
+        h.delivery(l.launch, first.emit).is_none(),
+        "hook 1 ran before the writer was free"
+    );
+    release.send(()).unwrap();
+    ok(&start_reply.await.unwrap());
+    let d1 = h.delivery(l.launch, first.emit).expect("hook 1 committed");
+    let d2 = h.delivery(l.launch, start.emit).unwrap();
+    assert!(
+        d1.commit_ordinal < d2.commit_ordinal,
+        "hook 1 then the binding"
+    );
+    assert!(
+        matches!(d1.routing, Routing::Appended { .. }),
+        "promoted: {d1:?}"
+    );
+    h.stop().await;
+}
+
 /// A client that disconnects after its observer registered no longer holds its ticket:
 /// the observer submits the job and releases the ordinal then, and a waiting binding job
 /// commits after it.

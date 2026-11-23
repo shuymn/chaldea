@@ -426,43 +426,6 @@ async fn released_gap_does_not_block() {
     h.stop().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn queued_earlier_job_releases_at_submit() {
-    let h = server().await;
-    let l = h.codex(1).await;
-    let release = h.srv.hold_writer().await;
-    // Hook 1 is submitted behind the held writer; its client then disconnects.
-    let first = Hook::of(&l, "UserPromptSubmit", "s");
-    let mut conn = support::http::connect(h.srv.port).await;
-    support::http::write(&mut conn, &first.req(&h.srv).bytes()).await;
-    support::http::eventually(Duration::from_secs(10), "hook 1 walked", || {
-        h.chains.walked() > 0
-    })
-    .await;
-    // The binding SessionStart 2 is submitted too: hook 1's ordinal was released when
-    // its job was queued, not when it ran.
-    let start = Hook::of(&l, "SessionStart", "s");
-    let start_reply = h.spawn_post(&start);
-    support::http::eventually(Duration::from_secs(10), "the binding walked", || {
-        h.chains.walked() >= 2
-    })
-    .await;
-    drop(conn);
-    release.send(()).unwrap();
-    ok(&start_reply.await.unwrap());
-    let d1 = h.delivery(l.launch, first.emit).expect("hook 1 committed");
-    let d2 = h.delivery(l.launch, start.emit).unwrap();
-    assert!(
-        d1.commit_ordinal < d2.commit_ordinal,
-        "hook 1 then the binding"
-    );
-    assert!(
-        matches!(d1.routing, Routing::Appended { .. }),
-        "promoted: {d1:?}"
-    );
-    h.stop().await;
-}
-
 // ---- PR9-CL-7 to CL-10: binding rules and selection --------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
