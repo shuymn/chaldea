@@ -72,6 +72,7 @@ fn helper_role() {
             life_bound();
             until_stdin_closes();
         }
+        Ok("exit_now") => host::exit_now(7),
         _ => {}
     }
 }
@@ -168,6 +169,22 @@ fn an_exited_process_is_gone_before_its_reap() {
     assert!(a.links.is_empty(), "{a:?}");
     assert_eq!(a.end, process::AncestryEnd::Gone(pid));
     drop(c);
+}
+
+/// `host::exit_now` ends the process with the given code.
+#[test]
+fn exit_now_ends_with_its_code() {
+    let mut c = Reaped(spawn(&mut helper("exit_now")));
+    drop(c.0.stdin.take());
+    let end = Instant::now() + WAIT;
+    let status = loop {
+        if let Some(s) = c.0.try_wait().unwrap() {
+            break s;
+        }
+        assert!(Instant::now() < end, "the helper did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(7));
 }
 
 /// FakeCli, built by `cargo test --workspace` (testkit's binary) next to the test binaries'

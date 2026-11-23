@@ -587,6 +587,16 @@ pub(crate) fn compare_ordinal_ignore_case(a: &[u16], b: &[u16]) -> Ordering {
     }
 }
 
+/// `TerminateProcess(GetCurrentProcess(), code)`: ends this process without exit handlers or
+/// DLL detach; it returns only when refused.
+pub(crate) fn terminate_current(code: u32) -> io::Result<()> {
+    // SAFETY: the pseudo-handle of the current process is always valid.
+    if unsafe { TerminateProcess(current_process(), code) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// The current-process pseudo-handle (needs no close).
 fn current_process() -> HANDLE {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;

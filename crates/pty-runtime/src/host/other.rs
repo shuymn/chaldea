@@ -14,6 +14,10 @@ fn unsupported<T>() -> io::Result<T> {
     ))
 }
 
+pub(super) fn exit_now(code: i32) -> ! {
+    std::process::exit(code)
+}
+
 pub(super) fn process_identity(_pid: u32) -> io::Result<Option<ProcessIdentity>> {
     unsupported()
 }

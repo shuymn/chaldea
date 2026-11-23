@@ -151,6 +151,13 @@ pub(crate) fn fd_ceiling() -> io::Result<c_int> {
     Ok(table.max(highest.saturating_add(1)))
 }
 
+/// `_exit(code)`: ends the process now; no `atexit` handler runs and no stdio stream is
+/// flushed.
+pub(crate) fn exit_now(code: c_int) -> ! {
+    // SAFETY: `_exit` accepts any status and does not return.
+    unsafe { libc::_exit(code) }
+}
+
 /// `proc_listallpids` with a null buffer: an estimate of the number of processes.
 pub(crate) fn pid_count() -> io::Result<usize> {
     // SAFETY: a size query: a null buffer of length 0.
@@ -551,6 +558,65 @@ mod tests {
         };
         assert!(status.success(), "helper {name}: {status}");
         false
+    }
+
+    extern "C" fn exit_marker() {
+        let msg = b"EXIT-HANDLER-RAN\n";
+        // SAFETY: writes a static buffer of `msg.len()` bytes to fd 2.
+        let _ = unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
+    }
+
+    /// `exit_now` ends the process with its code and runs no `atexit` handler;
+    /// `std::process::exit`, the control, runs it.
+    #[test]
+    fn exit_now_skips_exit_handlers() {
+        const MODE: &str = "CHALDEA_EXIT_NOW_MODE";
+        if let Ok(mode) = std::env::var(MODE) {
+            // SAFETY: registers a handler that only writes to fd 2.
+            assert_eq!(unsafe { libc::atexit(exit_marker) }, 0);
+            if mode == "now" {
+                exit_now(7);
+            }
+            std::process::exit(7);
+        }
+        for (mode, ran) in [("now", false), ("std", true)] {
+            let exe = std::env::current_exe().unwrap();
+            let mut child = with_spawn_lock(|| {
+                Command::new(exe)
+                    .args([
+                        "--exact",
+                        "unix::sys::tests::exit_now_skips_exit_handlers",
+                        "--nocapture",
+                    ])
+                    .env(MODE, mode)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+            })
+            .unwrap();
+            let mut err = child.stderr.take().unwrap();
+            let reader = std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = std::io::Read::read_to_string(&mut err, &mut s);
+                s
+            });
+            let end = Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                if let Some(s) = child.try_wait().unwrap() {
+                    break s;
+                }
+                if Instant::now() >= end {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{mode}: the helper did not exit");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let err = reader.join().unwrap();
+            assert_eq!(status.code(), Some(7), "{mode}: {err}");
+            assert_eq!(err.contains("EXIT-HANDLER-RAN"), ran, "{mode}: {err}");
+        }
     }
 
     fn spec(argv: &[&str], dir: &TempDir) -> SpawnSpec {

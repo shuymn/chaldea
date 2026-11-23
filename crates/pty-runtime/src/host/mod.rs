@@ -26,6 +26,16 @@ use other as imp;
 #[cfg(windows)]
 use windows as imp;
 
+// ---- Exit ----
+
+/// Ends this process at once with `code`: no exit handler, static destructor, stdio flush,
+/// or DLL detach runs (`_exit` on macOS; `TerminateProcess` of the current process on
+/// Windows). For a process with nothing to flush whose exit must not wait on anything
+/// (`chaldea hook-emit`, docs/design/hook-ingest.md §2.13).
+pub fn exit_now(code: i32) -> ! {
+    imp::exit_now(code)
+}
+
 // ---- Identity ----
 
 /// The identity of a live process by pid; `None` when no process has that pid or it has

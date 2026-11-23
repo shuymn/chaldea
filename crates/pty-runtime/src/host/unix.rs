@@ -14,6 +14,10 @@ use super::{
 };
 use crate::unix::sys;
 
+pub(super) fn exit_now(code: i32) -> ! {
+    sys::exit_now(code)
+}
+
 pub(super) fn process_identity(pid: u32) -> io::Result<Option<ProcessIdentity>> {
     crate::unix::identify_live(pid)
 }

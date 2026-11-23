@@ -25,6 +25,17 @@ const ADMINISTRATORS: &str = "S-1-5-32-544";
 const CREATOR_OWNER: &str = "S-1-3-0";
 const OWNER_RIGHTS: &str = "S-1-3-4";
 
+pub(super) fn exit_now(code: i32) -> ! {
+    // Termination of the current process does not return once it began; the wait covers an
+    // asynchronous start. Only a refused call falls back to the normal exit.
+    if sys::terminate_current(code.cast_unsigned()).is_ok() {
+        loop {
+            std::thread::park();
+        }
+    }
+    std::process::exit(code)
+}
+
 pub(super) fn process_identity(pid: u32) -> io::Result<Option<ProcessIdentity>> {
     let h = match sys::open_process(pid, crate::windows::QUERY_SYNC) {
         Ok(h) => h,
