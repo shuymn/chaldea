@@ -539,13 +539,13 @@ fn kevent_change(ident: usize, filter: i16, fflags: u32) -> libc::kevent {
 ///
 /// # Errors
 ///
-/// The kqueue cannot be created or waited on.
+/// The kqueue cannot be created or waited on, or a registration failed for another reason.
 pub(crate) fn wait_readable_or_exit(
     fd: Option<std::os::fd::BorrowedFd<'_>>,
     pid: Option<u32>,
     timeout: std::time::Duration,
 ) -> io::Result<()> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::AsRawFd;
     let mut changes = Vec::with_capacity(2);
     if let Some(fd) = fd {
         let ident = usize::try_from(fd.as_raw_fd()).map_err(io::Error::other)?;
@@ -555,6 +555,14 @@ pub(crate) fn wait_readable_or_exit(
         let ident = usize::try_from(pid).map_err(io::Error::other)?;
         changes.push(kevent_change(ident, libc::EVFILT_PROC, libc::NOTE_EXIT));
     }
+    kevent_wait(&changes, timeout)
+}
+
+/// [`wait_readable_or_exit`] on `changes` (at most two). A registration that fails is
+/// returned as an event with `EV_ERROR` and its errno in `data`: `ESRCH` for a process is its
+/// exit, any other is an error.
+fn kevent_wait(changes: &[libc::kevent], timeout: std::time::Duration) -> io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     // SAFETY: `kqueue` takes no arguments.
     let kq = unsafe { libc::kqueue() };
     if kq < 0 {
@@ -587,6 +595,16 @@ pub(crate) fn wait_readable_or_exit(
             return Ok(());
         }
         return Err(e);
+    }
+    let n = usize::try_from(n).map_err(io::Error::other)?;
+    for ev in &events[..n.min(events.len())] {
+        if ev.flags & libc::EV_ERROR == 0 || ev.data == 0 {
+            continue;
+        }
+        let errno = i32::try_from(ev.data).map_err(io::Error::other)?;
+        if !(ev.filter == libc::EVFILT_PROC && errno == libc::ESRCH) {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
     }
     Ok(())
 }
@@ -1068,5 +1086,19 @@ mod tests {
         );
         assert!(!spawn_lock_held());
         let _ = p.teardown();
+    }
+
+    /// A registration error comes back as an `EV_ERROR` event: `ESRCH` for a process that does
+    /// not exist (macOS pids stay below 100000) is its exit; another error (`EBADF` for a
+    /// descriptor that is not open) is returned, not taken for a wake-up.
+    #[test]
+    fn kevent_registration_errors() {
+        use std::time::Duration;
+        let gone = super::kevent_change(4_000_000, libc::EVFILT_PROC, libc::NOTE_EXIT);
+        super::kevent_wait(&[gone], Duration::from_secs(5)).unwrap();
+        let ident = usize::try_from(i32::MAX).unwrap();
+        let bad = super::kevent_change(ident, libc::EVFILT_READ, 0);
+        let e = super::kevent_wait(&[bad], Duration::from_secs(5)).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EBADF), "{e}");
     }
 }

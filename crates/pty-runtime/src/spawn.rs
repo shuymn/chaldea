@@ -46,11 +46,15 @@ pub fn with_spawn_lock<R>(f: impl FnOnce() -> R) -> R {
 /// Proof that the process-wide spawn lock is held: only [`spawn_lock`] and
 /// [`spawn_lock_before`] build one, so a function taking `&SpawnGuard` cannot be called under
 /// some other mutex.
+///
+/// It is `!Send`: the thread that acquired the lock releases it, and the Windows test marker
+/// of that thread clears with it.
 pub(crate) struct SpawnGuard {
     // Declared first, so the flag clears before the lock is released.
     #[cfg(all(windows, any(test, feature = "fake")))]
     _mark: held_here::Mark,
     _held: Held,
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 /// Releases the lock when dropped (also while unwinding).
@@ -68,6 +72,7 @@ fn guard() -> SpawnGuard {
         #[cfg(all(windows, any(test, feature = "fake")))]
         _mark: held_here::Mark::new(),
         _held: Held,
+        _not_send: std::marker::PhantomData,
     }
 }
 
@@ -84,14 +89,17 @@ pub(crate) fn spawn_lock() -> SpawnGuard {
     guard()
 }
 
-/// The lock, if it is acquired before `deadline`; `None` once the deadline has passed (the
-/// caller then creates nothing).
+/// The lock, if it is acquired before `deadline`; `None` once the deadline has passed, even
+/// with the lock free (the caller then creates nothing).
 pub(crate) fn spawn_lock_before(deadline: Instant) -> Option<SpawnGuard> {
     let mut held = SPAWN_LOCK.flag();
-    while *held {
+    loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return None;
+        }
+        if !*held {
+            break;
         }
         held = SPAWN_LOCK
             .freed
@@ -103,6 +111,18 @@ pub(crate) fn spawn_lock_before(deadline: Instant) -> Option<SpawnGuard> {
     drop(held);
     Some(guard())
 }
+
+// `SpawnGuard` is not `Send`: were it, both impls below would apply and the call would be
+// ambiguous, which fails the build.
+#[cfg(test)]
+const _: fn() = || {
+    trait AmbiguousIfSend<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+    let _ = <SpawnGuard as AmbiguousIfSend<_>>::some_item;
+};
 
 /// Whether some thread holds the lock (tests only).
 #[cfg(all(test, any(target_os = "macos", windows)))]

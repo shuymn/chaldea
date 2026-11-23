@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use super::{
     Access, Breakaway, EntryKind, JobState, LaunchctlOutput, Privacy, ProcessIdentity, ReadyArg,
-    ReadyRead, Received, SigchldDisposition, SignalState, StopTarget, UnixSignal, receive_before,
+    ReadyRead, Received, SigchldDisposition, SignalState, StopTarget, UnixSignal, decided_before,
     recv_before, spawn_before, timed_out,
 };
 use crate::unix::sys;
@@ -227,16 +227,12 @@ fn abandon(mut child: Child) {
     }
 }
 
-/// `child`'s exit when it comes before `deadline`, through [`receive_before`] woken by the
+/// `child`'s exit when it comes before `deadline`, through [`decided_before`] woken by the
 /// exit itself (kqueue); `None` at the deadline.
 fn exit_before(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
     let pid = child.id();
-    receive_before(deadline, |left| {
-        if let Some(s) = child.try_wait()? {
-            return Ok(Some(s));
-        }
-        sys::wait_readable_or_exit(None, Some(pid), left)?;
-        child.try_wait()
+    decided_before(deadline, child, Child::try_wait, |_, left| {
+        sys::wait_readable_or_exit(None, Some(pid), left)
     })
 }
 
@@ -452,18 +448,20 @@ pub(super) fn ready_read(
     deadline: Instant,
     mut child: Option<&mut DetachedInner>,
 ) -> io::Result<ReadyRead> {
-    let got = receive_before(deadline, |left| {
-        if let Some(r) = ready_step(inner, child.as_deref_mut())? {
-            return Ok(Some(r));
-        }
-        // Woken by a connection, data, the peer's end, or the direct child's exit.
-        let fd = match &inner.stream {
-            Some(s) => s.as_fd(),
-            None => inner.listener.as_fd(),
-        };
-        sys::wait_readable_or_exit(Some(fd), child.as_deref().map(|c| c.0.id()), left)?;
-        ready_step(inner, child.as_deref_mut())
-    })?;
+    let pid = child.as_deref().map(|c| c.0.id());
+    let got = decided_before(
+        deadline,
+        inner,
+        |inner| ready_step(inner, child.as_deref_mut()),
+        |inner, left| {
+            // Woken by a connection, data, the peer's end, or the direct child's exit.
+            let fd = match &inner.stream {
+                Some(s) => s.as_fd(),
+                None => inner.listener.as_fd(),
+            };
+            sys::wait_readable_or_exit(Some(fd), pid, left)
+        },
+    )?;
     Ok(got.unwrap_or(ReadyRead::TimedOut))
 }
 

@@ -630,6 +630,45 @@ pub(crate) fn receive_before<T>(
     }
 }
 
+/// Waits until `deadline` for `step` to decide, blocking in `block` between steps. `step`
+/// looks without blocking (`None`: nothing decided yet); `block(state, left)` blocks for at
+/// most `left` until something may have changed (an event, a signal, a spurious wake-up). Each
+/// step is classified like [`observed_before`], and `left` is read immediately before `block`,
+/// so a pause after a step shortens the wait instead of carrying it past the deadline. Nothing
+/// is waited for once the deadline has passed. `None`: timed out.
+///
+/// # Errors
+///
+/// `step`'s or `block`'s error, returned before the deadline.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "only macOS's kqueue waits look before they block")
+)]
+pub(crate) fn decided_before<S: ?Sized, T>(
+    deadline: Instant,
+    state: &mut S,
+    mut step: impl FnMut(&mut S) -> io::Result<Option<T>>,
+    mut block: impl FnMut(&mut S, Duration) -> io::Result<()>,
+) -> io::Result<Option<T>> {
+    loop {
+        let Some(got) = observed_before(deadline, || step(state)) else {
+            return Ok(None);
+        };
+        if let Some(t) = got? {
+            return Ok(Some(t));
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        let blocked = block(state, left);
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        blocked?;
+    }
+}
+
 /// [`receive_before`] on a channel: its message, or [`Received::Closed`] when every sender is
 /// gone, each only when received before `deadline`.
 pub(crate) fn recv_before<T>(rx: &std::sync::mpsc::Receiver<T>, deadline: Instant) -> Received<T> {
@@ -899,7 +938,8 @@ pub enum StopSent {
 /// # Errors
 ///
 /// The identity lookup failed, or the delivery failed for another reason than the target's
-/// absence or denied access.
+/// absence or denied access; a lookup or open that fails at or after the deadline is
+/// [`StopSent::DeadlinePassed`] instead.
 pub fn send_stop(target: &StopTarget, deadline: Instant) -> io::Result<StopSent> {
     send_stop_with(
         target,
@@ -941,11 +981,21 @@ pub fn send_stop_with(
     let identity_matches = || -> io::Result<Option<bool>> {
         Ok((seams.identity)(target.pid)?.map(|id| id.start_time == target.start_time))
     };
+    // A lookup or open that fails at or after the deadline is the deadline's: nothing was
+    // signalled, and its error says nothing about the target.
+    let failed = |e: io::Error| {
+        if Instant::now() >= deadline {
+            Ok(StopSent::DeadlinePassed)
+        } else {
+            Err(e)
+        }
+    };
     if imp::CHECK_BEFORE_DELIVERY {
-        match identity_matches()? {
-            Some(true) => {}
-            Some(false) => return Ok(StopSent::IdentityMismatch),
-            None => return Ok(StopSent::Exited),
+        match identity_matches() {
+            Ok(Some(true)) => {}
+            Ok(Some(false)) => return Ok(StopSent::IdentityMismatch),
+            Ok(None) => return Ok(StopSent::Exited),
+            Err(e) => return failed(e),
         }
     }
     let delivered = match seams.deliver {
@@ -954,6 +1004,8 @@ pub fn send_stop_with(
             act_before(deadline, || deliver(target))
         }
         None => match imp::open_stop(target) {
+            // An event not found at or after the deadline is not looked into further.
+            Err(_) if Instant::now() >= deadline => return Ok(StopSent::DeadlinePassed),
             Err(e) => Some(Err(e)),
             Ok(open) => {
                 (seams.before_delivery)();
@@ -972,11 +1024,12 @@ pub fn send_stop_with(
                 return Ok(StopSent::Exited);
             }
             // No event: tell an exited target from a live one without a listener.
-            Ok(match identity_matches()? {
-                None => StopSent::Exited,
-                Some(false) => StopSent::IdentityMismatch,
-                Some(true) => StopSent::NoListener,
-            })
+            match identity_matches() {
+                Ok(None) => Ok(StopSent::Exited),
+                Ok(Some(false)) => Ok(StopSent::IdentityMismatch),
+                Ok(Some(true)) => Ok(StopSent::NoListener),
+                Err(e) => failed(e),
+            }
         }
         Err(e)
             if e.kind() == io::ErrorKind::PermissionDenied
@@ -1172,6 +1225,111 @@ mod tests {
         let _ = got;
     }
 
+    /// The spawn lock is refused once the deadline has passed, even while it is free. A
+    /// helper process (this test re-run alone) holds the only thread that could take it.
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn spawn_lock_is_refused_after_the_deadline() {
+        const HELPER: &str = "CHALDEA_HOST_LOCK_AFTER_DEADLINE";
+        if std::env::var_os(HELPER).is_some() {
+            assert!(!crate::spawn::spawn_lock_held());
+            let past = Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .unwrap();
+            assert!(crate::spawn::spawn_lock_before(past).is_none(), "granted");
+            assert!(!crate::spawn::spawn_lock_held());
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        let _s = serial();
+        let out = crate::with_spawn_lock(|| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "host::tests::spawn_lock_is_refused_after_the_deadline",
+                    "--exact",
+                    "--test-threads=1",
+                ])
+                .env(HELPER, "1")
+                .stdin(std::process::Stdio::null())
+                .output()
+        })
+        .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && text.contains("1 passed"),
+            "{text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The time left is read immediately before the blocking call: a step that ends close to
+    /// the deadline leaves only the rest of the budget to the wait.
+    #[test]
+    fn the_wait_gets_the_time_left_after_the_step() {
+        let start = Instant::now();
+        let end = start + Duration::from_secs(2);
+        let mut steps = 0;
+        let mut lefts = Vec::new();
+        let got = super::decided_before(
+            end,
+            &mut steps,
+            |steps| {
+                *steps += 1;
+                if *steps == 1 {
+                    std::thread::sleep(Duration::from_millis(1500));
+                    return Ok(None);
+                }
+                Ok(Some(()))
+            },
+            |_, left| {
+                lefts.push(left);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(got, Some(()));
+        assert_eq!(lefts.len(), 1, "{lefts:?}");
+        assert!(lefts[0] <= Duration::from_millis(500), "{lefts:?}");
+    }
+
+    /// A step's result or a wait's error at or after the deadline is a timeout; once the
+    /// deadline has passed, nothing is stepped or waited for.
+    #[test]
+    fn decided_at_the_deadline_is_a_timeout() {
+        let end = Instant::now() + Duration::from_millis(100);
+        let late = super::decided_before(
+            end,
+            &mut (),
+            |()| {
+                std::thread::sleep(end.saturating_duration_since(Instant::now()));
+                Ok(Some(()))
+            },
+            |(), _| Ok(()),
+        );
+        assert_eq!(late.unwrap(), None);
+        let end = Instant::now() + Duration::from_millis(100);
+        let late = super::decided_before(
+            end,
+            &mut (),
+            |()| Ok(None::<()>),
+            |(), left| {
+                std::thread::sleep(left);
+                Err(io::Error::other("late"))
+            },
+        );
+        assert_eq!(late.unwrap(), None);
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let none = super::decided_before(
+            past,
+            &mut (),
+            |()| -> io::Result<Option<()>> { panic!("stepped after the deadline") },
+            |(), _| panic!("waited after the deadline"),
+        );
+        assert_eq!(none.unwrap(), None);
+    }
+
     /// A message delivered while the wait blocks is received at once: the wait is handed the
     /// whole remaining budget in one call, with no interval in which a message could wait
     /// unseen until the deadline.
@@ -1236,6 +1394,8 @@ mod tests {
     #[test]
     fn nothing_is_launched_after_the_deadline() {
         use super::{Breakaway, ready_channel_in, spawn_detached};
+        #[cfg(target_os = "macos")]
+        let _s = serial();
         let temp = std::path::absolute(std::env::temp_dir()).unwrap();
         let exe = std::path::Path::new("/nonexistent/chaldea-test");
         let (mut r, _) = ready_channel_in(&temp).unwrap();

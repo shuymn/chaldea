@@ -455,6 +455,59 @@ mod tests {
         assert_eq!(host::send_stop(&t, soon()).unwrap(), StopSent::Sent);
     }
 
+    /// PR8-CL-15 (Unix): an identity lookup that fails at or after the deadline is
+    /// `DeadlinePassed`, not its error; one that fails before it is the error.
+    #[cfg(unix)]
+    #[test]
+    fn late_identity_error_is_the_deadline() {
+        use std::time::{Duration, Instant};
+        let t = StopTarget {
+            pid: std::process::id(),
+            start_time: "1".to_owned(),
+            instance: instance(),
+        };
+        let end = Instant::now() + Duration::from_millis(100);
+        let late_failure = |_: u32| {
+            std::thread::sleep(end.saturating_duration_since(Instant::now()));
+            Err(std::io::Error::other("lookup failed"))
+        };
+        let seams = host::StopSeams {
+            identity: &late_failure,
+            before_delivery: &|| {},
+            deliver: None,
+        };
+        assert_eq!(
+            host::send_stop_with(&t, end, &seams).unwrap(),
+            StopSent::DeadlinePassed
+        );
+        let failure = |_: u32| Err(std::io::Error::other("lookup failed"));
+        let seams = host::StopSeams {
+            identity: &failure,
+            before_delivery: &|| {},
+            deliver: None,
+        };
+        assert!(host::send_stop_with(&t, soon(), &seams).is_err());
+    }
+
+    /// PR8-CL-15 (Windows): an event not found at or after the deadline is `DeadlinePassed`;
+    /// the identity is not looked up to call it `NoListener`.
+    #[cfg(windows)]
+    #[test]
+    fn late_missing_event_is_the_deadline() {
+        use std::time::{Duration, Instant};
+        let me = host::current_identity().unwrap();
+        let t = StopTarget {
+            pid: me.pid,
+            start_time: me.start_time,
+            instance: instance(),
+        };
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(host::send_stop(&t, past).unwrap(), StopSent::DeadlinePassed);
+        assert_eq!(host::send_stop(&t, soon()).unwrap(), StopSent::NoListener);
+    }
+
     /// PR8-CL-15 (Windows): a pause between `OpenEventW` and `SetEvent` that crosses the
     /// deadline sets nothing; with time left, the event is set.
     #[cfg(windows)]

@@ -15,7 +15,7 @@ pub(crate) mod process;
 pub(crate) mod sys;
 #[cfg(test)]
 mod tests;
-mod wait;
+pub(crate) mod wait;
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, ErrorKind, Write};

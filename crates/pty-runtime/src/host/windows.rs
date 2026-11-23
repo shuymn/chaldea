@@ -375,8 +375,7 @@ pub(super) fn detached_exit_before(
     deadline: Instant,
 ) -> io::Result<Option<String>> {
     super::receive_before(deadline, |left| {
-        // Rounded up, so a wait shorter than a millisecond still blocks.
-        let ms = u32::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(u32::MAX);
+        let ms = crate::windows::wait::chunk_ms(left);
         if sys::wait(inner.process.as_handle(), ms)? {
             Ok(Some(format!(
                 "exit code: {}",
