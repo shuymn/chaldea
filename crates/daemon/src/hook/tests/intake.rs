@@ -275,34 +275,3 @@ async fn queued_earlier_job_releases_at_submit() {
     );
     h.stop().await;
 }
-
-/// A client that disconnects after its observer registered no longer holds its ticket:
-/// the observer submits the job and releases the ordinal then, and a waiting binding job
-/// commits after it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn disconnect_after_registration() {
-    let h = HookServer::start().await;
-    let l = h.codex(1).await;
-    let (gate, open) = shared(&h.srv).faults.arm_submit_gate();
-    let first = Hook::of(&l, "UserPromptSubmit", "s");
-    let mut conn = connect(h.srv.port).await;
-    write(&mut conn, &first.req(&h.srv).bytes()).await;
-    reached(gate).await;
-    drop(conn);
-    let start = Hook::of(&l, "SessionStart", "s");
-    let start_reply = h.spawn_post(&start);
-    // The binding waits on ordinal 1, held by the registered observer.
-    let order = h.ingest.order.clone();
-    super::support::http::eventually(WAIT, "ordinal 2 taken", || order.is_pending(l.launch, 2))
-        .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!start_reply.is_finished(), "the binding overtook ordinal 1");
-    assert!(order.is_pending(l.launch, 1));
-    open.send(()).unwrap();
-    ok(&start_reply.await.unwrap());
-    let d1 = h.delivery(l.launch, first.emit).expect("hook 1 committed");
-    let d2 = h.delivery(l.launch, start.emit).unwrap();
-    assert!(d1.commit_ordinal < d2.commit_ordinal);
-    assert!(matches!(d1.routing, Routing::Appended { .. }), "{d1:?}");
-    h.stop().await;
-}

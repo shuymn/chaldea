@@ -223,11 +223,13 @@ async fn faulty() -> (HookServer, std::sync::Arc<Faults>) {
 /// commit whose outcome is unknown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn store_outcomes_map() {
-    // J1: expired before the job held the lock.
-    let h = HookServer::start_with(HookConfig::default(), |c| {
-        c.write_reply_grace = Duration::from_secs(1);
-    })
-    .await;
+    use crate::http::MonotonicClock;
+
+    // J1: expired before the job held the lock. The server's clock stands still, so no
+    // reply cutoff fires; the store's clock is put past the queued job's `not_after`
+    // before the writer takes it.
+    let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     bind(&h, &l, "s").await;
     let s = shared(&h.srv);
@@ -236,21 +238,24 @@ async fn store_outcomes_map() {
     let before = s.faults.submits();
     let reply = h.spawn_post(&x);
     eventually(WAIT, "the hook job is submitted", || {
-        s.faults.submits() > before
+        s.faults.submits() > before && !h.ingest.order.is_pending(l.launch, 2)
     })
     .await;
-    // Released just after the job's `not_after`, inside the 1 s reply grace: the writer
-    // answers `Expired`.
-    let not_after = *s.faults.submitted_not_afters().last().unwrap();
-    tokio::time::sleep_until(tokio::time::Instant::from_std(
-        not_after + Duration::from_millis(100),
-    ))
-    .await;
+    // The job's `not_after` as the writer has it: the real instant of the request deadline.
+    let not_after = h
+        .srv
+        .clock
+        .real(*s.faults.submitted_not_afters().last().unwrap());
+    h.srv
+        .store
+        .clock
+        .lead(not_after.saturating_duration_since(Instant::now()) + Duration::from_millis(1));
     release.send(()).unwrap();
     assert_eq!(
         outcome(&reply.await.unwrap()),
         (408, Some("request_timeout".into()))
     );
+    h.srv.store.clock.lead(Duration::ZERO);
     assert!(h.delivery(l.launch, x.emit).is_none());
     h.stop().await;
 
@@ -409,6 +414,24 @@ async fn store_outcomes_map() {
     store.store = None;
 }
 
+/// The handler's context for a request of `l`'s hook token, as the guard builds it: the
+/// principal and the test deadline from the server's clock.
+fn write_ctx(h: &HookServer, l: &Launch) -> crate::http::WriteCtx {
+    use crate::http::{MonotonicClock, Principal, WriteCtx};
+
+    let token = h.srv.token_row(&l.token).unwrap();
+    WriteCtx::new(
+        Some(Principal {
+            token_id: token.token_id,
+            token_sha256: token.sha256,
+            kind: token.kind,
+            thread: token.thread_id,
+        }),
+        h.srv.clock.now() + super::support::http::DEADLINE,
+        shared(&h.srv),
+    )
+}
+
 /// `hook`'s request as the guard hands it to the handler.
 fn request(hook: &Hook) -> axum::http::Request<axum::body::Body> {
     let mut r = axum::http::Request::post("/hook")
@@ -429,6 +452,72 @@ fn request(hook: &Hook) -> axum::http::Request<axum::body::Body> {
     r.body(axum::body::Body::from(hook.body.clone())).unwrap()
 }
 
+/// A commit that fails never answers 200, appended or buffered: `BusyBeforeCommit` rolls
+/// the job back, the reply is 503 `busy`, and nothing is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_commit_never_replies_ok() {
+    for (event, bound) in [("Stop", true), ("UserPromptSubmit", false)] {
+        let (h, faults) = faulty().await;
+        h.srv.clock.stop();
+        let l = h.codex(1).await;
+        if bound {
+            bind(&h, &l, "s").await;
+        }
+        let hook = Hook::of(&l, event, "s");
+        *faults.commit.lock().unwrap() = Some(CommitFault::BusyBeforeCommit);
+        assert_eq!(
+            outcome(&h.post(&hook).await),
+            (503, Some("busy".into())),
+            "{event}"
+        );
+        assert!(h.delivery(l.launch, hook.emit).is_none(), "{event}");
+        h.stop().await;
+    }
+}
+
+/// A handler dropped after its write observer registered no longer holds its ticket: the
+/// observer, held at the submit gate, still owns ordinal 1 and the job; a binding
+/// `SessionStart` 2 is seen waiting on it; released, the observer submits the job, the
+/// ordinal is released at submit, and the binding commits after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_handler_after_registration_preserves_the_job() {
+    let h = HookServer::start().await;
+    h.srv.clock.stop();
+    let l = h.codex(1).await;
+    let first = Hook::of(&l, "UserPromptSubmit", "s");
+    let (registered, open) = shared(&h.srv).faults.arm_submit_gate();
+    let mut handler = Box::pin(h.ingest.clone().handle(write_ctx(&h, &l), request(&first)));
+    tokio::select! {
+        biased;
+        _ = &mut handler => panic!("the handler answered before its job was submitted"),
+        () = reached(registered) => {}
+    }
+    drop(handler);
+    assert!(
+        h.ingest.order.is_pending(l.launch, 1),
+        "released with the handler"
+    );
+    assert!(h.delivery(l.launch, first.emit).is_none());
+    let (waiting, at_wait) = tokio::sync::oneshot::channel();
+    *h.ingest.order.between_check_and_await.lock().unwrap() =
+        Some(Box::new(move || waiting.send(()).unwrap()));
+    let start = Hook::of(&l, "SessionStart", "s");
+    let start_reply = h.spawn_post(&start);
+    reached(at_wait).await;
+    open.send(()).unwrap();
+    ok(&start_reply.await.unwrap());
+    let d1 = h
+        .delivery(l.launch, first.emit)
+        .expect("the observer committed hook 1");
+    let d2 = h.delivery(l.launch, start.emit).unwrap();
+    assert!(
+        d1.commit_ordinal < d2.commit_ordinal,
+        "hook 1 then the binding"
+    );
+    assert!(matches!(d1.routing, Routing::Appended { .. }), "{d1:?}");
+    h.stop().await;
+}
+
 /// The reply waits for the job's commit, appended (PR9-CL-1) and buffered (PR9-CL-4): the
 /// handler, polled directly with no test gate, is still pending once its write observer
 /// waits for the job's answer behind a held writer (the HTTP faults' ticket park), and
@@ -438,8 +527,6 @@ async fn submitted_hook_cannot_reply_before_commit() {
     use std::future::Future;
     use std::task::{Context, Waker};
 
-    use crate::http::{MonotonicClock, Principal, WriteCtx};
-
     for (event, ordinal) in [("Stop", 2), ("UserPromptSubmit", 1)] {
         let h = HookServer::start().await;
         h.srv.clock.stop();
@@ -448,18 +535,8 @@ async fn submitted_hook_cannot_reply_before_commit() {
             bind(&h, &l, "s").await;
         }
         let hook = Hook::of(&l, event, "s");
-        let token = h.srv.token_row(&l.token).unwrap();
         let s = shared(&h.srv);
-        let ctx = WriteCtx::new(
-            Some(Principal {
-                token_id: token.token_id,
-                token_sha256: token.sha256,
-                kind: token.kind,
-                thread: token.thread_id,
-            }),
-            h.srv.clock.now() + super::support::http::DEADLINE,
-            s.clone(),
-        );
+        let ctx = write_ctx(&h, &l);
         let release = h.srv.hold_writer().await;
         let parked = s.faults.arm_ticket_park();
         let response = tokio::task::unconstrained(h.ingest.clone().handle(ctx, request(&hook)));
@@ -733,6 +810,7 @@ async fn handler_rejections() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn body_permit_lifetime() {
     let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     bind(&h, &l, "s").await;
     let total = 32 * 1024;
@@ -745,15 +823,18 @@ async fn body_permit_lifetime() {
     let x = Hook::new(&l, &body);
     let s = shared(&h.srv);
     let before = s.faults.submits();
-    let mut conn = connect(h.srv.port).await;
-    write(&mut conn, &x.req(&h.srv).bytes()).await;
-    eventually(WAIT, "the hook job is submitted", || {
-        s.faults.submits() > before
-    })
-    .await;
-    drop(conn);
+    // The handler, driven here, is dropped once its job passed `Store::submit`: the client
+    // is gone and the handler with it.
+    let mut handler = Box::pin(h.ingest.clone().handle(write_ctx(&h, &l), request(&x)));
+    tokio::select! {
+        biased;
+        _ = &mut handler => panic!("the handler answered while the writer was held"),
+        () = eventually(WAIT, "the hook job is submitted", || {
+            s.faults.submits() > before && !h.ingest.order.is_pending(l.launch, 2)
+        }) => {}
+    }
+    drop(handler);
     let permits = u32::try_from(body.len().div_ceil(1024)).unwrap() as usize;
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
         h.ingest.free_permits(),
         total - permits,
