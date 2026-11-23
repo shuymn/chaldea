@@ -835,3 +835,66 @@ fn port_zero_is_refused() {
     assert!(log.text().contains("port 0"), "{}", log.text());
     assert!(!dir.path.join(names::PORT).exists());
 }
+
+/// The job state a kill-on-close job without breakaway reports.
+fn in_a_job() -> chaldea_pty_runtime::host::JobState {
+    chaldea_pty_runtime::host::JobState {
+        in_job: true,
+        immediate: Some(chaldea_pty_runtime::host::JobLimits {
+            kill_on_close: true,
+            breakaway_ok: false,
+            silent_breakaway_ok: false,
+        }),
+    }
+}
+
+/// PR8-CL-12 (step 2, the child decides): a detached child in any job fails with `parent_job`
+/// before the state directory, the lock, or anything else; its verdict says so.
+#[test]
+fn detached_child_in_a_job_fails_parent_job() {
+    let dir = state();
+    let ready = RecordingReady::new(&dir.path);
+    let faults = Arc::new(Faults::default());
+    *faults.job_state.lock().unwrap() = Some(in_a_job());
+    let r = start(
+        detached(&dir.path, None, &ready),
+        TestComponents::default(),
+        faults,
+    )
+    .join();
+    assert_eq!(
+        (r.code.code(), r.reason, r.lock),
+        (1, Some(FailReason::ParentJob), LockDisposition::NeverTaken)
+    );
+    assert!(!dir.path.exists(), "the state directory was created");
+    let lines = ready.lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].line.starts_with("fail parent_job "), "{lines:?}");
+    assert!(lines[0].line.contains("kill_on_close=true"), "{lines:?}");
+}
+
+/// PR8-CL-12: a foreground daemon in a job warns, records the job in `daemon.json`'s
+/// evidence, and serves.
+#[test]
+fn foreground_in_a_job_warns_and_serves() {
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    *faults.job_state.lock().unwrap() = Some(in_a_job());
+    let run = start(
+        foreground(&dir.path, None),
+        TestComponents::default(),
+        faults,
+    );
+    run.serving();
+    assert!(
+        run.log.text().contains("runs inside a job"),
+        "{}",
+        run.log.text()
+    );
+    let record = crate::lifecycle::read_record(&dir.path).unwrap().unwrap();
+    let job = record.evidence.job.expect("job evidence");
+    assert_eq!(job["in_job"], true, "{job}");
+    assert_eq!(job["immediate"]["kill_on_close"], true, "{job}");
+    run.stop();
+    assert_eq!(run.join().code.code(), 0);
+}

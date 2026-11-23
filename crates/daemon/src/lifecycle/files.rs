@@ -129,8 +129,9 @@ pub enum RecordState {
     Serving,
 }
 
-/// What the doctor reads about how the daemon was started (Windows job evidence arrives with
-/// the detach path).
+/// What the doctor reads about how the daemon was started: step 2's job state (`in_job` and
+/// the immediate job's limits; recorded on Windows, `null` elsewhere) and whether it has a
+/// console window (`null` off Windows).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Evidence {
     pub job: Option<serde_json::Value>,
@@ -404,4 +405,34 @@ pub(crate) fn check_token_file(dir: &Path) -> Result<TokenFile, TokenFileError> 
     token_file_form(&bytes)
         .map(TokenFile::Present)
         .ok_or(TokenFileError::BadForm)
+}
+
+/// The owner token for a client (design §2.13 `chaldea open`, §2.14): the same checks as the
+/// daemon's step 6 (private, regular, not a link, of the token form), the secret without its
+/// newline.
+///
+/// # Errors
+///
+/// What is wrong with the file, as a message without the token.
+pub fn read_owner_token(dir: &Path) -> Result<String, String> {
+    match check_token_file(dir) {
+        Ok(TokenFile::Present(t)) => Ok(t),
+        Ok(TokenFile::Absent) => Err(format!(
+            "{} is missing; start the daemon to issue it",
+            dir.join(names::OWNER_TOKEN).display()
+        )),
+        Err(TokenFileError::NotPrivate(p)) => Err(format!(
+            "{} is not private ({}); its token may be exposed",
+            dir.join(names::OWNER_TOKEN).display(),
+            p.describe()
+        )),
+        Err(TokenFileError::BadForm) => Err(format!(
+            "{} is not a Chaldea token file",
+            dir.join(names::OWNER_TOKEN).display()
+        )),
+        Err(TokenFileError::Io(e)) => Err(format!(
+            "{} cannot be read: {e}",
+            dir.join(names::OWNER_TOKEN).display()
+        )),
+    }
 }

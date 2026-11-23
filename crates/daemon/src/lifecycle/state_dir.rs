@@ -193,6 +193,17 @@ fn validate_marker(dir: &Path) -> io::Result<bool> {
     Ok(buf == MARKER_CONTENT)
 }
 
+/// A test pause between the marker's temporary and its link (`daemon_start` holds a child
+/// there while a concurrent start publishes its own marker); never set in production.
+static MARKER_PAUSE: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
+/// Sets the pause between the marker's temporary and its link, once per process (tests of the
+/// concurrent first start).
+#[doc(hidden)]
+pub fn set_marker_pause(pause: Box<dyn Fn() + Send + Sync>) {
+    let _ = MARKER_PAUSE.set(pause);
+}
+
 /// Publishes the marker without replacing anything: a private temporary, linked to
 /// `CHALDEA_STATE` (which fails if the name exists), then the temporary removed. A concurrent
 /// start that won leaves a complete marker, which is validated instead.
@@ -211,6 +222,9 @@ pub(crate) fn publish_marker(dir: &Path, instance: &str) -> Result<(), String> {
             let _ = std::fs::remove_file(&tmp);
         }
         return Err(format!("its marker cannot be written: {e}"));
+    }
+    if let Some(pause) = MARKER_PAUSE.get() {
+        pause();
     }
     let linked = std::fs::hard_link(&tmp, dir.join(names::MARKER));
     let _ = std::fs::remove_file(&tmp);

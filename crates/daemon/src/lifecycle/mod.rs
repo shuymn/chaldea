@@ -47,14 +47,14 @@ use crate::http::{CommandRegistry, HttpServer, LifecycleSink, Mounts};
 use crate::store::{JobError, Store, WriteTx};
 
 pub use files::{
-    Discovery, DiscoveryRecord, InstanceLock, LockError, LockProbe, RecordState, discover, probe,
-    read_record,
+    Discovery, DiscoveryRecord, Evidence, InstanceLock, LockError, LockProbe, RecordState,
+    discover, probe, read_owner_token, read_record,
 };
 pub use gate::{ConsoleEvent, GateHandle, ShutdownGate, SignalName, StopCause, Stopping};
 pub use log::diag;
 pub use process::prepare_process;
-pub use ready::{ReadyOpener, ReadyWriter};
-pub use state_dir::{STATE_DIR_ENV, resolve as resolve_state_dir};
+pub use ready::{ReadyOpener, ReadyWriter, early_fail_line, host_ready_opener};
+pub use state_dir::{STATE_DIR_ENV, resolve as resolve_state_dir, set_marker_pause};
 
 pub(crate) use panic::TaskKindGuard;
 
@@ -88,8 +88,9 @@ pub const LOG_CAP: u64 = 8 * 1024 * 1024;
 pub enum RunMode {
     /// `chaldea daemon run` in a terminal: logs to stderr.
     Foreground,
-    /// The child `daemon start` launched (8b): its readiness verdict goes to `ready`, its log
-    /// to `daemon.log` from step 6.
+    /// The child `daemon start` launched: its readiness verdict goes to `ready`, its log to
+    /// `daemon.log` from step 6; on macOS it leaves its session at step 1, and it requires to
+    /// be in no job at step 2 (design §2.7, §2.12).
     DetachedChild { ready: ReadyOpener, via: DetachVia },
 }
 

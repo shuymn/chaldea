@@ -137,6 +137,9 @@ pub(crate) struct Faults {
     pub(crate) log_cap: Mutex<Option<u64>>,
     /// The store is opened with these fault points.
     pub(crate) store_faults: Mutex<Option<Arc<test_faults::Faults>>>,
+    /// Step 2 reads this job state instead of the process's (an isolated run reads
+    /// `JobState::NONE` when unset).
+    pub(crate) job_state: Mutex<Option<chaldea_pty_runtime::host::JobState>>,
     // Published by the run.
     pub(crate) gate: OnceLock<Arc<ShutdownGate>>,
     pub(crate) store: OnceLock<Store>,

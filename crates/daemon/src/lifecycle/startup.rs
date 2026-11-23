@@ -114,6 +114,11 @@ pub(crate) struct StartupCtx {
     pub(crate) instance: String,
     pub(crate) log: Logger,
     pub(crate) shared: Arc<Shared>,
+    /// Step 2's evidence, recorded in `daemon.json`.
+    pub(crate) evidence: std::sync::Mutex<Evidence>,
+    /// A process run (`run`, a helper's `run_process_with`): step 1 may leave the session and
+    /// step 2 reads the process's job; an isolated run does neither.
+    pub(crate) process: bool,
     #[cfg(test)]
     pub(crate) faults: Arc<super::faults::Faults>,
 }
@@ -185,8 +190,44 @@ impl StartupCtx {
             url: port.map(url),
             started_at: SystemClock.now().1.0,
             detached,
-            evidence: Evidence::default(),
+            evidence: self.evidence.lock().map(|e| e.clone()).unwrap_or_default(),
         })
+    }
+}
+
+/// Step 2's job state: the process's for a process run; a test's override, else in no job,
+/// for an isolated run.
+fn job_state(cx: &StartupCtx) -> std::io::Result<host::JobState> {
+    #[cfg(test)]
+    if let Some(j) = cx.faults.job_state.lock().ok().and_then(|j| *j) {
+        return Ok(j);
+    }
+    if cx.process {
+        host::job_state()
+    } else {
+        Ok(host::JobState::NONE)
+    }
+}
+
+/// `evidence.job` of `daemon.json`.
+fn job_evidence(job: &host::JobState) -> serde_json::Value {
+    serde_json::json!({
+        "in_job": job.in_job,
+        "immediate": job.immediate.map(|l| serde_json::json!({
+            "kill_on_close": l.kill_on_close,
+            "breakaway_ok": l.breakaway_ok,
+            "silent_breakaway_ok": l.silent_breakaway_ok,
+        })),
+    })
+}
+
+fn job_text(job: &host::JobState) -> String {
+    match job.immediate {
+        Some(l) => format!(
+            "immediate job: kill_on_close={}, breakaway_ok={}, silent_breakaway_ok={}",
+            l.kill_on_close, l.breakaway_ok, l.silent_breakaway_ok
+        ),
+        None => "its limits are not visible".to_owned(),
     }
 }
 
@@ -291,8 +332,54 @@ pub(crate) async fn run(mut cx: StartupCtx) -> Started {
             ready: Box::new(|| Err(std::io::Error::other("already opened"))),
             via,
         };
+        // Both macOS paths leave the starter's (or the job's) session here, after the
+        // readiness writer exists to report a failure.
+        if cfg!(target_os = "macos")
+            && cx.process
+            && let Err(e) = host::detach_session()
+        {
+            return st.failed(
+                FailReason::Internal,
+                format!("the daemon cannot leave the terminal's session (setsid): {e}"),
+            );
+        }
     }
-    // Step 2 (the Windows parent job check) arrives with the detach path.
+
+    // Step 2: the parent job (Windows, design §2.12). The child decides: a detached daemon
+    // must be in no job; a foreground one in a job warns and serves.
+    boundary!(cx, st, 2);
+    match job_state(&cx) {
+        Ok(job) => {
+            if let Ok(mut e) = cx.evidence.lock() {
+                if cfg!(windows) || job.in_job {
+                    e.job = Some(job_evidence(&job));
+                }
+                e.console = host::has_console();
+            }
+            if job.in_job {
+                if detached {
+                    return st.failed(
+                        FailReason::ParentJob,
+                        format!(
+                            "this daemon runs inside a job ({}), which could kill it when the job closes; run `chaldea daemon run` in a window you keep open, or start Chaldea from a terminal outside such a job",
+                            job_text(&job)
+                        ),
+                    );
+                }
+                cx.log.warn(&format!(
+                    "this daemon runs inside a job ({}) and may be killed with it, with its sessions",
+                    job_text(&job)
+                ));
+            }
+        }
+        Err(e) if detached => {
+            return st.failed(
+                FailReason::ParentJob,
+                format!("the daemon's job state cannot be read, so it cannot prove it runs in no job: {e}"),
+            );
+        }
+        Err(e) => cx.log.warn(&format!("the job state cannot be read: {e}")),
+    }
 
     // Step 4: the state directory.
     boundary!(cx, st, 4);
