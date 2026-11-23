@@ -685,37 +685,50 @@ fn truncates_over_4_mib() {
     assert_eq!(reqs[0].body.len(), MIB4);
 }
 
-/// `hook-emit` is dispatched before process setup (hook-ingest §2.13): an inherited ignored
-/// `SIGHUP` (from `nohup`) stays ignored in the emitter, where `prepare_process` would reset
-/// it to the default action, which ends the process.
+/// The threads of `pid`, from `ps -M` (one line per thread after the header).
+#[cfg(target_os = "macos")]
+fn threads(pid: u32) -> usize {
+    let mut cmd = Command::new("/bin/ps");
+    cmd.args(["-M", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut c = spawn_locked(&mut cmd).unwrap();
+    let out = collect(c.stdout.take());
+    wait_bounded(&mut c, "ps");
+    String::from_utf8_lossy(&out.join().unwrap())
+        .lines()
+        .skip(1)
+        .count()
+}
+
+/// `hook-emit` is dispatched before process setup (hook-ingest §2.13): while its first
+/// attempt waits for a reply, the emitter runs only its main thread and the watchdog (the
+/// stdin reader has ended). `prepare_process` would add the daemon's log thread.
 #[cfg(target_os = "macos")]
 #[test]
 fn hook_emit_runs_before_process_setup() {
     warm();
     let stub = Stub::start(&[Reply::Silent]);
     let env = full_env(&stub.url());
-    let mut cmd = Command::new("/usr/bin/nohup");
-    cmd.arg(EMITTER)
-        .args(["hook-emit", "codex"])
-        .env_remove(URL)
-        .env_remove(TOKEN)
-        .env_remove(THREAD)
-        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut cmd = emitter(&env);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut c = spawn_locked(&mut cmd).unwrap();
-    let out = collect(c.stdout.take());
-    let err = collect(c.stderr.take());
     c.stdin.take().unwrap().write_all(PAYLOAD).unwrap();
-    // The emitter is past dispatch once its request arrives.
     stub.wait_reqs(1);
-    let pid = rustix::process::Pid::from_raw(i32::try_from(c.id()).unwrap()).unwrap();
-    rustix::process::kill_process(pid, rustix::process::Signal::HUP).unwrap();
-    let status = wait_bounded(&mut c, "nohup chaldea hook-emit");
-    assert_eq!(status.code(), Some(0), "{status:?}");
-    assert!(out.join().unwrap().is_empty());
-    assert!(err.join().unwrap().is_empty());
+    // The first attempt lasts 1.8 s; the stdin thread ends right after its EOF.
+    let end = Instant::now() + Duration::from_millis(1000);
+    let mut seen = threads(c.id());
+    while seen != 2 && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+        seen = threads(c.id());
+    }
+    let _ = c.kill();
+    let _ = c.wait();
+    assert_eq!(seen, 2, "threads of the emitter during its first attempt");
 }
 
 // ---- FakeCli hook emission (§2.14) ----

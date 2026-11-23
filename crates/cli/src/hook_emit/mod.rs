@@ -250,6 +250,7 @@ mod tests {
     struct TestClock {
         now: Cell<Instant>,
         jump: Cell<Duration>,
+        slept: RefCell<Vec<Duration>>,
     }
 
     impl TestClock {
@@ -257,6 +258,7 @@ mod tests {
             TestClock {
                 now: Cell::new(t),
                 jump: Cell::new(Duration::ZERO),
+                slept: RefCell::new(Vec::new()),
             }
         }
         fn advance(&self, d: Duration) {
@@ -269,6 +271,7 @@ mod tests {
             self.now.get()
         }
         fn sleep(&self, d: Duration) {
+            self.slept.borrow_mut().push(d);
             self.advance(d + self.jump.replace(Duration::ZERO));
         }
     }
@@ -353,6 +356,21 @@ mod tests {
         assert_eq!(script(&clock, t0, &[0, 0, 0], &[Next::Retry; 3]).len(), 1);
         let clock = TestClock::at(t0 + ms(2601));
         assert!(script(&clock, t0, &[0, 0, 0], &[Next::Retry; 3]).is_empty());
+    }
+
+    #[test]
+    fn no_backoff_when_the_next_attempt_cannot_fit() {
+        // After attempt 1, 2560 + 50 + 300 > 2900: no sleep and no attempt 2.
+        let t0 = Instant::now();
+        let clock = TestClock::at(t0 + ms(2500));
+        let seen = script(&clock, t0, &[60, 0, 0], &[Next::Retry; 3]);
+        assert_eq!(seen, [(1, ms(2500), ms(2900))]);
+        assert!(clock.slept.borrow().is_empty());
+        // At 2550 the backoff fits (2550 + 50 + 300 = 2900).
+        let clock = TestClock::at(t0 + ms(2500));
+        let seen = script(&clock, t0, &[50, 0, 0], &[Next::Retry; 3]);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(*clock.slept.borrow(), [ms(50)]);
     }
 
     #[test]
