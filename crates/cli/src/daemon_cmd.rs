@@ -1053,8 +1053,9 @@ pub(crate) fn stop(dir: &Path, seams: &mut Seams) -> ExitCode {
     match wait_gone(&target, deadline) {
         Gone::Yes => {
             print_out("stopped");
-            if let Discovery::Starting(r) | Discovery::Serving(r) | Discovery::Stopping(r) =
-                client::discover(dir)
+            // A note about another holder, only when seen before the deadline.
+            if let Some(Discovery::Starting(r) | Discovery::Serving(r) | Discovery::Stopping(r)) =
+                host::observed_before(deadline, || client::discover(dir))
                 && r.instance != target.instance
             {
                 print_out(&format!(
