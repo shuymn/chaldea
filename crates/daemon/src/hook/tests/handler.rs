@@ -409,6 +409,36 @@ async fn store_outcomes_map() {
     store.store = None;
 }
 
+/// The stopped clock `hook_ingest` runs on (`SkewClock::stop`): a hook whose job has passed
+/// `Store::submit` behind a held writer is held there past the request deadline (2 s, the
+/// test server's) and the reply grace (100 ms), and the job still answers 200.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopped_clock_keeps_a_queued_hook_past_reply_grace() {
+    let h = HookServer::start().await;
+    h.srv.clock.stop();
+    let l = h.codex(1).await;
+    let hook = Hook::of(&l, "Stop", "s");
+    let release = h.srv.hold_writer().await;
+    let s = shared(&h.srv);
+    let before = s.faults.submits();
+    let reply = h.spawn_post(&hook);
+    // Ordinal 1's ticket is released when `Store::submit` returns.
+    eventually(WAIT, "the hook passed Store::submit", || {
+        s.faults.submits() > before && !h.ingest.order.is_pending(l.launch, 1)
+    })
+    .await;
+    // Measured from the submission, which follows the request's first head byte.
+    tokio::time::sleep(Duration::from_millis(2000 + 100 + 400)).await;
+    assert!(
+        !reply.is_finished(),
+        "a cutoff answered while the job was queued"
+    );
+    release.send(()).unwrap();
+    ok(&reply.await.unwrap());
+    assert!(h.delivery(l.launch, hook.emit).is_some());
+    h.stop().await;
+}
+
 /// The job held inside the writer past the reply grace: 503 `outcome_unknown`, no row yet;
 /// released, the row commits; a retry with the same emit id replays it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

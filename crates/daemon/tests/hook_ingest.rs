@@ -31,6 +31,24 @@ fn stopped(h: HookServer) -> HookServer {
     h
 }
 
+/// A stopped clock converts one cutoff to the same real instant every time, and keeps
+/// earlier readings in the past.
+#[tokio::test]
+async fn stopped_clock_converts_a_cutoff_once() {
+    use chaldea_daemon::http::MonotonicClock;
+
+    let clock = support::http::SkewClock::default();
+    clock.stop();
+    let f = clock.now();
+    let cutoff = f + support::http::DEADLINE;
+    let real_cutoff = clock.real(cutoff);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(clock.now(), f);
+    assert!(clock.real(f - Duration::from_millis(1)) < clock.real(f));
+    assert!(clock.real(f) <= std::time::Instant::now());
+    assert_eq!(clock.real(cutoff), real_cutoff);
+}
+
 fn ok(r: &support::http::Reply) {
     assert_eq!(r.status, 200, "{r:?}");
     assert!(r.body.is_empty(), "{r:?}");
@@ -114,23 +132,6 @@ async fn reply_waits_for_commit() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!reply.is_finished(), "a reply before the job committed");
     assert!(h.delivery(l.launch, hook.emit).is_none());
-    release.send(()).unwrap();
-    ok(&reply.await.unwrap());
-    assert!(h.delivery(l.launch, hook.emit).is_some());
-    h.stop().await;
-}
-
-/// The stopped clock of [`server`]: a hook whose job waits in the writer's queue past the
-/// test deadline and its 100 ms reply grace is still answered by the job.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stopped_clock_cuts_no_request() {
-    let h = server().await;
-    let l = h.codex(1).await;
-    let hook = Hook::of(&l, "Stop", "s");
-    let release = h.srv.hold_writer().await;
-    let reply = h.spawn_post(&hook);
-    tokio::time::sleep(support::http::DEADLINE + Duration::from_millis(500)).await;
-    assert!(!reply.is_finished(), "a reply while the writer was held");
     release.send(()).unwrap();
     ok(&reply.await.unwrap());
     assert!(h.delivery(l.launch, hook.emit).is_some());
@@ -402,7 +403,7 @@ async fn released_gap_does_not_block() {
     let h = server().await;
     let l = h.codex(1).await;
     h.chains.set(7001, direct(7001, "codex"));
-    let (walking, _release) = h.chains.hold(7001);
+    let (walking, release) = h.chains.hold(7001);
     // Ordinal 1: its client disconnects during the walk.
     let first = Hook::of(&l, "UserPromptSubmit", "s").pid(Some(7001));
     let mut conn = support::http::connect(h.srv.port).await;
@@ -412,9 +413,16 @@ async fn released_gap_does_not_block() {
         .unwrap()
         .unwrap();
     drop(conn);
-    // Ordinal 2 binds. Ordinal 1's walk stays held and its deadline never passes on the
-    // stopped clock, so only the disconnect can have released it.
+    // Ordinal 2 binds while ordinal 1's walk is still held and its deadline never passes
+    // on the stopped clock: only the disconnect can have released ordinal 1.
     bind_codex(&h, &l, "s").await;
+    assert!(
+        h.delivery(l.launch, first.emit).is_none(),
+        "the disconnected hook submitted a job"
+    );
+    release
+        .send(())
+        .expect("the first walk was still held when the binding succeeded");
     h.stop().await;
 }
 
