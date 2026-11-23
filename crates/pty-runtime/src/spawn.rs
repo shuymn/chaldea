@@ -11,46 +11,103 @@
 //! child creation in the process therefore runs under one lock: the native backend's spawn
 //! and every closure passed to [`with_spawn_lock`].
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
-static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+/// The lock: whether a thread holds it, and the wake-up of its waiters. The inner mutex is
+/// held only to read or flip the flag, so a waiter can give up at a deadline.
+struct SpawnLock {
+    held: Mutex<bool>,
+    freed: Condvar,
+}
+
+static SPAWN_LOCK: SpawnLock = SpawnLock {
+    held: Mutex::new(false),
+    freed: Condvar::new(),
+};
+
+impl SpawnLock {
+    fn flag(&self) -> MutexGuard<'_, bool> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// Runs `f` while holding the process-wide spawn lock. Every child the daemon creates
 /// (`std::process::Command::spawn`, `tokio::process::Command::spawn`, process-wrap) must be
 /// created inside such a closure; the native backend's own spawn takes the same lock.
 ///
 /// `f` must not call `with_spawn_lock` or spawn a PTY session itself: the lock is not
-/// reentrant. A poisoned lock is taken over.
+/// reentrant. A thread that panics while holding it releases it.
 pub fn with_spawn_lock<R>(f: impl FnOnce() -> R) -> R {
     let _guard = spawn_lock();
     f()
 }
 
-/// Proof that the process-wide spawn lock is held: only [`spawn_lock`] builds one, so a
-/// function taking `&SpawnGuard` cannot be called under some other mutex.
+/// Proof that the process-wide spawn lock is held: only [`spawn_lock`] and
+/// [`spawn_lock_before`] build one, so a function taking `&SpawnGuard` cannot be called under
+/// some other mutex.
 pub(crate) struct SpawnGuard {
     // Declared first, so the flag clears before the lock is released.
     #[cfg(all(windows, any(test, feature = "fake")))]
     _mark: held_here::Mark,
-    _guard: MutexGuard<'static, ()>,
+    _held: Held,
 }
 
-pub(crate) fn spawn_lock() -> SpawnGuard {
-    let guard = SPAWN_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    SpawnGuard {
-        #[cfg(all(windows, any(test, feature = "fake")))]
-        _mark: held_here::Mark::new(),
-        _guard: guard,
+/// Releases the lock when dropped (also while unwinding).
+struct Held;
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        *SPAWN_LOCK.flag() = false;
+        SPAWN_LOCK.freed.notify_one();
     }
 }
 
-/// Whether some thread holds the lock (tests only): `try_lock` returned `WouldBlock`.
+fn guard() -> SpawnGuard {
+    SpawnGuard {
+        #[cfg(all(windows, any(test, feature = "fake")))]
+        _mark: held_here::Mark::new(),
+        _held: Held,
+    }
+}
+
+pub(crate) fn spawn_lock() -> SpawnGuard {
+    let mut held = SPAWN_LOCK.flag();
+    while *held {
+        held = SPAWN_LOCK
+            .freed
+            .wait(held)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+    *held = true;
+    drop(held);
+    guard()
+}
+
+/// The lock, if it is acquired before `deadline`; `None` once the deadline has passed (the
+/// caller then creates nothing).
+pub(crate) fn spawn_lock_before(deadline: Instant) -> Option<SpawnGuard> {
+    let mut held = SPAWN_LOCK.flag();
+    while *held {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        held = SPAWN_LOCK
+            .freed
+            .wait_timeout(held, left)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
+    *held = true;
+    drop(held);
+    Some(guard())
+}
+
+/// Whether some thread holds the lock (tests only).
 #[cfg(all(test, any(target_os = "macos", windows)))]
 pub(crate) fn spawn_lock_held() -> bool {
-    matches!(
-        SPAWN_LOCK.try_lock(),
-        Err(std::sync::TryLockError::WouldBlock)
-    )
+    *SPAWN_LOCK.flag()
 }
 
 /// Whether the calling thread holds the lock (the Windows call trace records it).

@@ -504,13 +504,14 @@ impl DetachedChild {
         imp::detached_id(&self.inner)
     }
 
-    /// Its exit, described, once it exited; `None` while it runs.
+    /// Its exit, described, when it exits before `deadline`, woken by the exit and classified
+    /// as [`receive_before`] does; `None` when it still runs at the deadline.
     ///
     /// # Errors
     ///
     /// Its status cannot be read.
-    pub fn try_wait(&mut self) -> io::Result<Option<String>> {
-        imp::detached_try_wait(&mut self.inner)
+    pub fn exit_before(&mut self, deadline: Instant) -> io::Result<Option<String>> {
+        imp::detached_exit_before(&mut self.inner, deadline)
     }
 }
 
@@ -522,33 +523,37 @@ impl std::fmt::Debug for DetachedChild {
     }
 }
 
-/// Starts `exe args` in `cwd` under the spawn lock, with this process's environment and stdin
-/// and stderr the null device. macOS: stdout the null device (the child calls `setsid`
-/// itself). Windows: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`, plus
-/// `CREATE_BREAKAWAY_FROM_JOB` for [`Breakaway::Explicit`]; stdout a pipe whose read end
-/// `ready` takes; and only those three handles inherited (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`),
-/// so the child holds nothing else of this process's caller.
+/// Starts `exe args` in `cwd` through [`spawn_before`] (nothing is created at or after
+/// `deadline`), with this process's environment and stdin and stderr the null device. macOS:
+/// stdout the null device (the child calls `setsid` itself). Windows: `DETACHED_PROCESS |
+/// CREATE_NEW_PROCESS_GROUP`, plus `CREATE_BREAKAWAY_FROM_JOB` for [`Breakaway::Explicit`];
+/// the working directory without a verbatim prefix when that names the same directory
+/// (`docs/design/pty-windows.md`); stdout a pipe whose read end `ready` takes; and only those
+/// three handles inherited (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`), so the child holds nothing
+/// else of this process's caller.
 ///
 /// # Errors
 ///
-/// The spawn error (Windows `ERROR_ACCESS_DENIED` when the job refused the breakaway).
+/// `TimedOut` when the deadline ended the launch; the spawn error (Windows
+/// `ERROR_ACCESS_DENIED` when the job refused the breakaway).
 pub fn spawn_detached(
     exe: &Path,
     args: &[OsString],
     cwd: &Path,
     breakaway: Breakaway,
     ready: &mut ReadyReader,
+    deadline: Instant,
 ) -> io::Result<DetachedChild> {
     Ok(DetachedChild {
-        inner: imp::spawn_detached(exe, args, cwd, breakaway, &mut ready.inner)?,
+        inner: imp::spawn_detached(exe, args, cwd, breakaway, &mut ready.inner, deadline)?,
     })
 }
 
-// ---- Deadlines ----
+// ---- Deadlines (docs/design/daemon-lifecycle.md §2.10 "Deadlines") ----
 
 /// `observe`'s result when it was observed before `deadline`. The deadline is checked before
 /// observing and again after, so a result first seen at or after the deadline loses to it and
-/// nothing is observed once it has passed.
+/// nothing is observed once it has passed. For polls of state that cannot wake a waiter.
 pub fn observed_before<T>(deadline: Instant, observe: impl FnOnce() -> T) -> Option<T> {
     if Instant::now() >= deadline {
         return None;
@@ -560,24 +565,92 @@ pub fn observed_before<T>(deadline: Instant, observe: impl FnOnce() -> T) -> Opt
     Some(seen)
 }
 
-/// How often the readiness channel is polled.
-const READY_POLL: Duration = Duration::from_millis(20);
+/// Runs the OS action `act` only if `deadline` has not passed: the check is the last step
+/// before the action, so nothing a caller did before (a lookup, a lock wait) can carry the
+/// action past the deadline. `None` when it was not run.
+pub fn act_before<T>(deadline: Instant, act: impl FnOnce() -> T) -> Option<T> {
+    (Instant::now() < deadline).then(act)
+}
 
-/// Polls `step` every 20 ms until it decides, each step through [`observed_before`]: a
-/// verdict, end, or error first seen at or after `deadline` is `TimedOut`.
-fn ready_poll(
+/// Runs `act`, which creates a child, under the process-wide spawn lock acquired before
+/// `deadline`, and then through [`act_before`]: a lock not acquired by the deadline, or acquired
+/// only at it, creates nothing. `None` when nothing was run.
+pub(crate) fn spawn_before<T>(
     deadline: Instant,
-    mut step: impl FnMut() -> io::Result<Option<ReadyRead>>,
-) -> io::Result<ReadyRead> {
+    act: impl FnOnce(&crate::spawn::SpawnGuard) -> T,
+) -> Option<T> {
+    spawn_before_paused(deadline, || {}, act)
+}
+
+/// [`spawn_before`] with `acquired` run once the lock is held, before the deadline check (a
+/// test's pause).
+fn spawn_before_paused<T>(
+    deadline: Instant,
+    acquired: impl FnOnce(),
+    act: impl FnOnce(&crate::spawn::SpawnGuard) -> T,
+) -> Option<T> {
+    let held = crate::spawn::spawn_lock_before(deadline)?;
+    acquired();
+    act_before(deadline, || act(&held))
+}
+
+/// The error of an action or wait that the deadline ended.
+fn timed_out(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("{what} did not finish in time"),
+    )
+}
+
+/// Waits until `deadline` for `wait` to decide. `wait(left)` blocks for at most `left` and
+/// returns as soon as its result arrives (a message, readable data, a process exit), or `None`
+/// when nothing did. Each return is classified with one clock sample: before the deadline its
+/// result counts; at or after it, the wait timed out, whatever it returned. Nothing is waited
+/// for once the deadline has passed. `None`: timed out.
+///
+/// # Errors
+///
+/// `wait`'s error, returned before the deadline.
+pub(crate) fn receive_before<T>(
+    deadline: Instant,
+    mut wait: impl FnMut(Duration) -> io::Result<Option<T>>,
+) -> io::Result<Option<T>> {
     loop {
-        match observed_before(deadline, &mut step) {
-            None => return Ok(ReadyRead::TimedOut),
-            Some(Err(e)) => return Err(e),
-            Some(Ok(Some(r))) => return Ok(r),
-            Some(Ok(None)) => {}
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(None);
         }
-        std::thread::sleep(READY_POLL.min(deadline.saturating_duration_since(Instant::now())));
+        let got = wait(left);
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        if let Some(t) = got? {
+            return Ok(Some(t));
+        }
     }
+}
+
+/// [`receive_before`] on a channel: its message, or [`Received::Closed`] when every sender is
+/// gone, each only when received before `deadline`.
+pub(crate) fn recv_before<T>(rx: &std::sync::mpsc::Receiver<T>, deadline: Instant) -> Received<T> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let got = receive_before(deadline, |left| match rx.recv_timeout(left) {
+        Ok(t) => Ok(Some(Received::Got(t))),
+        Err(RecvTimeoutError::Disconnected) => Ok(Some(Received::Closed)),
+        Err(RecvTimeoutError::Timeout) => Ok(None),
+    });
+    match got {
+        Ok(Some(r)) => r,
+        Ok(None) | Err(_) => Received::TimedOut,
+    }
+}
+
+/// What [`recv_before`] received.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Received<T> {
+    Got(T),
+    Closed,
+    TimedOut,
 }
 
 // ---- Readiness channel (docs/design/daemon-lifecycle.md §2.10) ----
@@ -636,7 +709,8 @@ pub enum ReadyRead {
 }
 
 /// The starter's end of the readiness channel. Dropping it removes what it created (macOS:
-/// the socket, the launchd plist [`READY_PLIST`], then the directory if that left it empty).
+/// the socket, the launchd plist if [`ReadyReader::write_plist`] created it, then the
+/// directory if that left it empty).
 pub struct ReadyReader {
     inner: imp::ReadyInner,
 }
@@ -648,9 +722,21 @@ impl ReadyReader {
         imp::ready_dir(&self.inner)
     }
 
-    /// Waits until `deadline` for one line, polling every 20 ms; anything first observed at
-    /// or after `deadline` is `TimedOut`. `child`, when given, is the directly spawned child:
-    /// its exit before it connected counts as `Eof` (macOS).
+    /// Creates the launchd plist [`READY_PLIST`] in [`ReadyReader::dir`] as a new private file
+    /// ([`create_private_file`]) holding `contents`, and returns its path; dropping the reader
+    /// removes it, and removes no plist it did not create (macOS).
+    ///
+    /// # Errors
+    ///
+    /// The file exists or cannot be written; `Unsupported` off macOS.
+    pub fn write_plist(&mut self, contents: &[u8]) -> io::Result<PathBuf> {
+        imp::ready_write_plist(&mut self.inner, contents)
+    }
+
+    /// Waits until `deadline` for one line through [`receive_before`]: woken by the line, the
+    /// channel's end, or (macOS) the exit of `child`, the directly spawned child, before it
+    /// connected, which counts as `Eof`; anything received at or after `deadline` is
+    /// `TimedOut`.
     ///
     /// # Errors
     ///
@@ -801,22 +887,47 @@ pub enum StopSent {
     AccessDenied,
     /// The target is alive and matching but has no stop event (Windows).
     NoListener,
+    /// The deadline passed before the delivery: nothing was signalled.
+    DeadlinePassed,
 }
 
-/// Sends a stop to `target`: Unix `SIGTERM` after checking `(pid, start_time)` (the window
-/// between check and signal is the PID race of design §6.2); Windows sets
-/// `Global\chaldea-stop-<instance>`.
+/// Sends a stop to `target` before `deadline`: Unix `SIGTERM` after checking `(pid,
+/// start_time)` (the window between check and signal is the PID race of design §6.2); Windows
+/// sets `Global\chaldea-stop-<instance>`. The signal or the event's set goes through
+/// [`act_before`], after the identity check and the event's open.
 ///
 /// # Errors
 ///
 /// The identity lookup failed, or the delivery failed for another reason than the target's
 /// absence or denied access.
-pub fn send_stop(target: &StopTarget) -> io::Result<StopSent> {
-    send_stop_with(target, &imp::deliver_stop)
+pub fn send_stop(target: &StopTarget, deadline: Instant) -> io::Result<StopSent> {
+    send_stop_with(
+        target,
+        deadline,
+        &StopSeams {
+            identity: &process_identity,
+            before_delivery: &|| {},
+            deliver: None,
+        },
+    )
 }
 
-/// [`send_stop`] with the delivery (`kill`, or the event's open and set) replaced, for fault
-/// tests.
+/// A stop's delivery to its target.
+#[doc(hidden)]
+pub type Deliver<'a> = &'a dyn Fn(&StopTarget) -> io::Result<()>;
+
+/// The replaceable steps of [`send_stop_with`], for fault tests.
+#[doc(hidden)]
+pub struct StopSeams<'a> {
+    /// The identity lookup ([`process_identity`]).
+    pub identity: &'a dyn Fn(u32) -> io::Result<Option<ProcessIdentity>>,
+    /// Runs after the identity check and the event's open, before the deadline check.
+    pub before_delivery: &'a dyn Fn(),
+    /// Replaces the delivery (`kill`; the event's open and set) when given.
+    pub deliver: Option<Deliver<'a>>,
+}
+
+/// [`send_stop`] with [`StopSeams`].
 ///
 /// # Errors
 ///
@@ -824,16 +935,36 @@ pub fn send_stop(target: &StopTarget) -> io::Result<StopSent> {
 #[doc(hidden)]
 pub fn send_stop_with(
     target: &StopTarget,
-    deliver: &dyn Fn(&StopTarget) -> io::Result<()>,
+    deadline: Instant,
+    seams: &StopSeams<'_>,
 ) -> io::Result<StopSent> {
+    let identity_matches = || -> io::Result<Option<bool>> {
+        Ok((seams.identity)(target.pid)?.map(|id| id.start_time == target.start_time))
+    };
     if imp::CHECK_BEFORE_DELIVERY {
-        match identity_matches(target)? {
+        match identity_matches()? {
             Some(true) => {}
             Some(false) => return Ok(StopSent::IdentityMismatch),
             None => return Ok(StopSent::Exited),
         }
     }
-    match deliver(target) {
+    let delivered = match seams.deliver {
+        Some(deliver) => {
+            (seams.before_delivery)();
+            act_before(deadline, || deliver(target))
+        }
+        None => match imp::open_stop(target) {
+            Err(e) => Some(Err(e)),
+            Ok(open) => {
+                (seams.before_delivery)();
+                act_before(deadline, || imp::fire_stop(&open))
+            }
+        },
+    };
+    let Some(delivered) = delivered else {
+        return Ok(StopSent::DeadlinePassed);
+    };
+    match delivered {
         Ok(()) => Ok(StopSent::Sent),
         Err(e) if e.raw_os_error() == Some(imp::DELIVERY_GONE) => {
             if imp::CHECK_BEFORE_DELIVERY {
@@ -841,7 +972,7 @@ pub fn send_stop_with(
                 return Ok(StopSent::Exited);
             }
             // No event: tell an exited target from a live one without a listener.
-            Ok(match identity_matches(target)? {
+            Ok(match identity_matches()? {
                 None => StopSent::Exited,
                 Some(false) => StopSent::IdentityMismatch,
                 Some(true) => StopSent::NoListener,
@@ -855,11 +986,6 @@ pub fn send_stop_with(
         }
         Err(e) => Err(e),
     }
-}
-
-/// `None`: no live process has the pid; `Some(true)`: it has the recorded start time.
-fn identity_matches(target: &StopTarget) -> io::Result<Option<bool>> {
-    Ok(process_identity(target.pid)?.map(|id| id.start_time == target.start_time))
 }
 
 // ---- Browser (docs/design/daemon-lifecycle.md §2.13) ----
@@ -968,36 +1094,170 @@ mod tests {
         );
     }
 
-    /// The readiness poll: a verdict first observed at or after the deadline is `TimedOut`,
-    /// as is one that a step found only at the deadline.
-    #[test]
-    fn readiness_poll_crossing_the_deadline_times_out() {
-        use super::{ReadyRead, ready_poll};
-        let end = Instant::now() + Duration::from_millis(100);
-        let got = ready_poll(end, || {
-            std::thread::sleep(end.saturating_duration_since(Instant::now()));
-            Ok(Some(ReadyRead::Line("ready 1 2".to_owned())))
-        })
-        .unwrap();
-        assert_eq!(got, ReadyRead::TimedOut);
-        let mut n = 0;
-        let got = ready_poll(Instant::now() + Duration::from_secs(5), || {
-            n += 1;
-            Ok((n == 3).then_some(ReadyRead::Eof))
-        })
-        .unwrap();
-        assert_eq!((got, n), (ReadyRead::Eof, 3));
+    /// The tests that create children hold the lock of the backend's real-process tests,
+    /// which count this process's children (macOS).
+    #[cfg(target_os = "macos")]
+    pub(super) fn serial() -> std::sync::MutexGuard<'static, ()> {
+        crate::unix::tests::serial()
     }
 
-    /// Dropping the reader removes only what it created (macOS): the socket and the plist by
-    /// name, then the directory, which another file in it keeps.
+    /// Waits (bounded) until this process has no child left, so a reaper thread's child is
+    /// gone before the serial lock is released (macOS).
+    #[cfg(target_os = "macos")]
+    pub(super) fn no_children_left() {
+        let end = Instant::now() + Duration::from_secs(10);
+        while !crate::unix::sys::child_pids().is_empty() {
+            assert!(
+                Instant::now() < end,
+                "children left: {:?}",
+                crate::unix::sys::child_pids()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// `act_before` runs its action only before the deadline.
+    #[test]
+    fn actions_run_only_before_the_deadline() {
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(
+            super::act_before(past, || panic!("acted after the deadline")),
+            None::<()>
+        );
+        assert_eq!(
+            super::act_before(Instant::now() + Duration::from_secs(5), || 7),
+            Some(7)
+        );
+    }
+
+    /// A spawn lock another thread holds past the deadline creates nothing: the waiter gives
+    /// up at the deadline instead of acting once the lock is released.
+    #[test]
+    fn spawn_lock_held_past_the_deadline_creates_nothing() {
+        let held = crate::spawn::spawn_lock();
+        let end = Instant::now() + Duration::from_millis(200);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let acted = super::spawn_before(end, |_| ()).is_some();
+            tx.send((acted, Instant::now())).unwrap();
+        });
+        let got = rx.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        waiter.join().unwrap();
+        let (acted, at) = got.expect("the waiter did not give up at the deadline");
+        assert!(!acted, "created after the deadline");
+        assert!(at >= end);
+    }
+
+    /// A lock acquired, then a pause until the deadline before the action: the check under the
+    /// lock creates nothing. With time left, the action runs under the lock.
+    #[test]
+    fn deadline_reached_under_the_spawn_lock_creates_nothing() {
+        let end = Instant::now() + Duration::from_millis(100);
+        let acted = std::cell::Cell::new(false);
+        let got = super::spawn_before_paused(
+            end,
+            || std::thread::sleep(end.saturating_duration_since(Instant::now())),
+            |_| acted.set(true),
+        );
+        assert!(got.is_none() && !acted.get(), "created after the deadline");
+        let got = super::spawn_before(Instant::now() + Duration::from_secs(5), |_| {
+            crate::spawn::spawn_lock_held()
+        });
+        #[cfg(any(target_os = "macos", windows))]
+        assert_eq!(got, Some(true));
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let _ = got;
+    }
+
+    /// A message delivered while the wait blocks is received at once: the wait is handed the
+    /// whole remaining budget in one call, with no interval in which a message could wait
+    /// unseen until the deadline.
+    #[test]
+    fn a_message_during_the_wait_is_received() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        let (waiting_tx, waiting_rx) = channel();
+        let (tx, rx) = channel();
+        let sender = std::thread::spawn(move || {
+            waiting_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            tx.send("ready 1 2").unwrap();
+        });
+        let budget = Duration::from_secs(5);
+        let mut lefts = Vec::new();
+        let got = super::receive_before(Instant::now() + budget, |left| {
+            lefts.push(left);
+            let _ = waiting_tx.send(());
+            match rx.recv_timeout(left) {
+                Ok(m) => Ok(Some(m)),
+                Err(RecvTimeoutError::Timeout) => Ok(None),
+                Err(RecvTimeoutError::Disconnected) => Err(io::Error::other("no sender")),
+            }
+        })
+        .unwrap();
+        sender.join().unwrap();
+        assert_eq!(got, Some("ready 1 2"));
+        assert_eq!(lefts.len(), 1, "{lefts:?}");
+        assert!(lefts[0] > budget - Duration::from_secs(1), "{lefts:?}");
+    }
+
+    /// A result the wait returns at or after the deadline is a timeout; once the deadline has
+    /// passed, nothing is waited for; a channel's message before it is received.
+    #[test]
+    fn received_at_the_deadline_is_a_timeout() {
+        let end = Instant::now() + Duration::from_millis(100);
+        let late = super::receive_before(end, |left| {
+            std::thread::sleep(left);
+            Ok(Some(()))
+        });
+        assert_eq!(late.unwrap(), None);
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let none = super::receive_before(past, |_| -> io::Result<Option<()>> {
+            panic!("waited after the deadline")
+        });
+        assert_eq!(none.unwrap(), None);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            tx.send(1).unwrap();
+        });
+        let soon = Instant::now() + Duration::from_secs(5);
+        assert_eq!(super::recv_before(&rx, soon), super::Received::Got(1));
+        sender.join().unwrap();
+        assert_eq!(super::recv_before(&rx, soon), super::Received::Closed);
+    }
+
+    /// Nothing is launched once the deadline has passed: a program that does not exist gives
+    /// the timeout, not the spawn error a spawn attempt would.
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn nothing_is_launched_after_the_deadline() {
+        use super::{Breakaway, ready_channel_in, spawn_detached};
+        let temp = std::path::absolute(std::env::temp_dir()).unwrap();
+        let exe = std::path::Path::new("/nonexistent/chaldea-test");
+        let (mut r, _) = ready_channel_in(&temp).unwrap();
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let e = spawn_detached(exe, &[], &temp, Breakaway::NotRequested, &mut r, past).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+        let soon = Instant::now() + Duration::from_secs(5);
+        let e = spawn_detached(exe, &[], &temp, Breakaway::NotRequested, &mut r, soon).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
+    }
+
+    /// Dropping the reader removes only what it created (macOS): the socket and the plist it
+    /// wrote, then the directory, which another file in it keeps.
     #[cfg(target_os = "macos")]
     #[test]
     fn reader_removes_only_its_own_files() {
         use super::{READY_PLIST, ready_channel_in};
-        let (r, _) = ready_channel_in(&std::env::temp_dir()).unwrap();
+        let (mut r, _) = ready_channel_in(&std::env::temp_dir()).unwrap();
         let dir = r.dir().unwrap().to_path_buf();
-        std::fs::write(dir.join(READY_PLIST), b"plist").unwrap();
+        assert_eq!(r.write_plist(b"plist").unwrap(), dir.join(READY_PLIST));
         std::fs::write(dir.join("other"), b"x").unwrap();
         drop(r);
         let mut left: Vec<_> = std::fs::read_dir(&dir)
@@ -1011,6 +1271,23 @@ mod tests {
         let dir = r.dir().unwrap().to_path_buf();
         drop(r);
         assert!(!dir.exists());
+    }
+
+    /// A plist the reader did not create stays (macOS): one written by someone else, which the
+    /// reader's own exclusive creation then refuses.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reader_keeps_a_plist_it_never_created() {
+        let (mut r, _) = super::ready_channel_in(&std::env::temp_dir()).unwrap();
+        let dir = r.dir().unwrap().to_path_buf();
+        let path = dir.join(super::READY_PLIST);
+        std::fs::write(&path, b"someone else's file").unwrap();
+        let e = r.write_plist(b"plist").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
+        drop(r);
+        assert_eq!(std::fs::read(&path).unwrap(), b"someone else's file");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     /// A relative temp directory is made absolute against the working directory (macOS), so
@@ -1031,6 +1308,7 @@ mod tests {
             drop(r);
             return;
         }
+        let _s = serial();
         let base = std::env::temp_dir().join(format!("chaldea-rel-{}", std::process::id()));
         std::fs::create_dir_all(base.join("rel")).unwrap();
         let out = crate::with_spawn_lock(|| {

@@ -626,6 +626,23 @@ fn invalid(msg: &str) -> SpawnError {
     setup(io::Error::new(ErrorKind::InvalidInput, msg.to_owned()))
 }
 
+/// The NUL-terminated current directory passed to `CreateProcessW` for `cwd`: without its
+/// verbatim prefix when that names the same directory (`cmdline::verbatim_cwd`); `None` when
+/// the stripped form would name another one.
+pub(crate) fn process_cwd(cwd: &std::path::Path) -> Option<Vec<u16>> {
+    let given = cmdline::wide(cwd.as_os_str());
+    let absolute = |u: &[u16]| -> io::Result<Vec<u16>> {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let a = std::path::absolute(std::path::PathBuf::from(OsString::from_wide(u)))?;
+        Ok(a.as_os_str().encode_wide().collect())
+    };
+    match cmdline::verbatim_cwd(&given, absolute) {
+        Cwd::AsGiven => Some(nul_terminated(given)),
+        Cwd::Stripped(s) => Some(nul_terminated(s)),
+        Cwd::Refused => None,
+    }
+}
+
 fn nul_terminated(mut units: Vec<u16>) -> Vec<u16> {
     units.push(0);
     units
@@ -691,20 +708,10 @@ fn validate(spec: &SpawnSpec) -> Result<Buffers, SpawnError> {
         }
         Err(e) => return Err(setup(e)),
     }
-    let given = cmdline::wide(spec.cwd.as_os_str());
-    let absolute = |u: &[u16]| -> io::Result<Vec<u16>> {
-        use std::os::windows::ffi::{OsStrExt, OsStringExt};
-        let a = std::path::absolute(std::path::PathBuf::from(OsString::from_wide(u)))?;
-        Ok(a.as_os_str().encode_wide().collect())
-    };
-    let cwd = match cmdline::verbatim_cwd(&given, absolute) {
-        Cwd::AsGiven => nul_terminated(given),
-        Cwd::Stripped(s) => nul_terminated(s),
-        Cwd::Refused => {
-            return Err(invalid(
-                "verbatim cwd names another directory without its prefix",
-            ));
-        }
+    let Some(cwd) = process_cwd(&spec.cwd) else {
+        return Err(invalid(
+            "verbatim cwd names another directory without its prefix",
+        ));
     };
     let env = match cmdline::env_block(&spec.env, sys::compare_ordinal_ignore_case) {
         Ok(env) => env,

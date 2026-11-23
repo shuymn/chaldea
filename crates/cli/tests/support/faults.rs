@@ -44,6 +44,9 @@ pub const EOF_CHILD_MS: &str = "CHALDEA_TEST_EOF_CHILD_MS";
 pub const READY_PAUSE: &str = "CHALDEA_TEST_READY_PAUSE";
 /// A gate directory: `daemon start` waits at it once it read a verdict line.
 pub const VERDICT_PAUSE: &str = "CHALDEA_TEST_VERDICT_PAUSE";
+/// A gate directory: `daemon start` waits at it once its serving check got its 200, before
+/// its last discovery.
+pub const SERVE_PAUSE: &str = "CHALDEA_TEST_SERVE_PAUSE";
 /// A directory: a detached child writes its exit code to `<dir>/daemon-exit` just before it
 /// exits.
 pub const EXIT_RECORD: &str = "CHALDEA_TEST_EXIT_RECORD";
@@ -165,6 +168,9 @@ pub fn enter_if_chaldea() {
     }
     if let Some(dir) = env_path(VERDICT_PAUSE) {
         seams.after_verdict = Some(Box::new(move || wait_at(&dir)));
+    }
+    if let Some(dir) = env_path(SERVE_PAUSE) {
+        seams.after_answer = Some(Box::new(move || wait_at(&dir)));
     }
     if detached_child && let Some(dir) = env_path(EXIT_RECORD) {
         seams.on_exit = Some(Box::new(move |code| {

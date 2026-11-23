@@ -243,6 +243,7 @@ fn already_running_message(dir: &Path) -> String {
             r.url.unwrap_or_else(|| "starting".to_owned())
         ),
         Discovery::Starting(r) => format!("pid {}, starting", r.pid),
+        Discovery::Stopping(r) => format!("pid {}, stopping", r.pid),
         Discovery::NotRunning | Discovery::Unknown => "starting".to_owned(),
     };
     format!("a daemon already holds {} ({who})", dir.display())

@@ -538,6 +538,62 @@ fn built_commands_are_served_and_drained() {
     );
 }
 
+/// PR8-CL-23: a removal whose re-read returned before the 500 ms budget but reaches the unlink
+/// only after it (paused there) issues no deletion: the budget is checked again just before
+/// the unlink.
+#[test]
+fn no_unlink_after_the_record_budget() {
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    let park = faults.park(Point::AfterRecordVerify);
+    let run = start(
+        foreground(&dir.path, Some(free_port())),
+        TestComponents::default(),
+        faults.clone(),
+    );
+    run.serving();
+    run.stop();
+    assert!(park.wait_reached(WAIT));
+    // The budget began before the pause was reached.
+    std::thread::sleep(Duration::from_millis(600));
+    park.release();
+    let log = run.log.clone();
+    let r = run.join();
+    assert_eq!(r.code.code(), 0, "{}", log.text());
+    assert!(dir.path.join(names::RECORD).exists(), "{}", log.text());
+    assert!(log.text().contains("was left in place"), "{}", log.text());
+}
+
+/// PR8-CL-23: the record says `stopping` before HTTP shuts down: a discovery made once HTTP's
+/// shutdown returned (paused there) sees this run stopping, not serving.
+#[test]
+fn record_says_stopping_before_http_shuts_down() {
+    use super::super::files::{Discovery, discover};
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    let park = faults.park(Point::AfterHttp);
+    let run = start(
+        foreground(&dir.path, Some(free_port())),
+        TestComponents::default(),
+        faults.clone(),
+    );
+    run.serving();
+    let Discovery::Serving(serving) = discover(&dir.path) else {
+        panic!("not serving: {:?}", discover(&dir.path))
+    };
+    run.stop();
+    assert!(park.wait_reached(WAIT));
+    let seen = discover(&dir.path);
+    park.release();
+    let log = run.log.clone();
+    let r = run.join();
+    assert_eq!(r.code.code(), 0, "{}", log.text());
+    assert!(
+        matches!(&seen, Discovery::Stopping(s) if s.instance == serving.instance),
+        "{seen:?}"
+    );
+}
+
 /// A re-read that would first succeed after the 500 ms budget issues no deletion: the wait
 /// is capped at what remains and the deadline is checked before each attempt.
 #[test]

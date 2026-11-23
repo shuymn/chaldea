@@ -104,6 +104,7 @@ pub(super) fn spawn_detached(
     _cwd: &Path,
     _breakaway: Breakaway,
     _ready: &mut ReadyInner,
+    _deadline: Instant,
 ) -> io::Result<DetachedInner> {
     unsupported()
 }
@@ -112,7 +113,10 @@ pub(super) fn detached_id(_inner: &DetachedInner) -> u32 {
     0
 }
 
-pub(super) fn detached_try_wait(_inner: &mut DetachedInner) -> io::Result<Option<String>> {
+pub(super) fn detached_exit_before(
+    _inner: &mut DetachedInner,
+    _deadline: Instant,
+) -> io::Result<Option<String>> {
     unsupported()
 }
 
@@ -120,6 +124,13 @@ pub(super) struct ReadyInner;
 
 pub(super) fn ready_dir(_inner: &ReadyInner) -> Option<&Path> {
     None
+}
+
+pub(super) fn ready_write_plist(
+    _inner: &mut ReadyInner,
+    _contents: &[u8],
+) -> io::Result<std::path::PathBuf> {
+    unsupported()
 }
 
 pub(super) fn ready_channel_in(_temp: &Path) -> io::Result<(ReadyInner, ReadyArg)> {
@@ -158,7 +169,13 @@ pub(super) const CHECK_BEFORE_DELIVERY: bool = true;
 pub(super) const DELIVERY_GONE: i32 = -1;
 pub(super) const DELIVERY_DENIED: i32 = -1;
 
-pub(super) fn deliver_stop(_target: &StopTarget) -> io::Result<()> {
+pub(super) struct StopDelivery;
+
+pub(super) fn open_stop(_target: &StopTarget) -> io::Result<StopDelivery> {
+    unsupported()
+}
+
+pub(super) fn fire_stop(_d: &StopDelivery) -> io::Result<()> {
     unsupported()
 }
 

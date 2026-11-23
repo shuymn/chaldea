@@ -282,6 +282,23 @@ fn held_lock_with_dead_pid_is_unknown() {
     l.release();
 }
 
+/// A lock released after the record was read (its daemon removed the record and exited) is
+/// not running: discovery checks the lock again after the read.
+#[test]
+fn lock_released_after_the_read_is_not_running() {
+    let d = dir();
+    let l = InstanceLock::acquire(d.path(), Duration::ZERO).unwrap();
+    let me = host::current_identity().unwrap();
+    write_record(d.path(), &record(me.pid, &me.start_time));
+    let l = std::cell::Cell::new(Some(l));
+    let got = super::super::files::discover_paused(d.path(), || {
+        if let Some(l) = l.take() {
+            l.release();
+        }
+    });
+    assert_eq!(got, Discovery::NotRunning);
+}
+
 /// A record reached through a link is never used.
 #[test]
 fn linked_record_is_refused() {

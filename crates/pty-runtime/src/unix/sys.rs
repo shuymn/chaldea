@@ -520,6 +520,77 @@ pub(crate) fn fork() -> io::Result<Forked> {
     }
 }
 
+/// One `kevent` change: `filter` on `ident`, added for this wait only.
+fn kevent_change(ident: usize, filter: i16, fflags: u32) -> libc::kevent {
+    libc::kevent {
+        ident,
+        filter,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    }
+}
+
+/// Blocks for at most `timeout` until `fd` is readable or the process `pid` exits, with a
+/// kqueue of its own. Returns early, without an error, when the process is already gone
+/// (its registration fails with `ESRCH`) or a signal interrupts the wait; the caller looks
+/// again either way.
+///
+/// # Errors
+///
+/// The kqueue cannot be created or waited on.
+pub(crate) fn wait_readable_or_exit(
+    fd: Option<std::os::fd::BorrowedFd<'_>>,
+    pid: Option<u32>,
+    timeout: std::time::Duration,
+) -> io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let mut changes = Vec::with_capacity(2);
+    if let Some(fd) = fd {
+        let ident = usize::try_from(fd.as_raw_fd()).map_err(io::Error::other)?;
+        changes.push(kevent_change(ident, libc::EVFILT_READ, 0));
+    }
+    if let Some(pid) = pid {
+        let ident = usize::try_from(pid).map_err(io::Error::other)?;
+        changes.push(kevent_change(ident, libc::EVFILT_PROC, libc::NOTE_EXIT));
+    }
+    // SAFETY: `kqueue` takes no arguments.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `kq` is a new descriptor that nothing else owns.
+    let kq = unsafe { OwnedFd::from_raw_fd(kq) };
+    let mut events = [kevent_change(0, 0, 0); 2];
+    let ts = libc::timespec {
+        tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
+        tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
+    };
+    let n_changes = c_int::try_from(changes.len()).map_err(io::Error::other)?;
+    let n_events = c_int::try_from(events.len()).map_err(io::Error::other)?;
+    // SAFETY: `changes` holds `n_changes` initialized entries and `events` room for
+    // `n_events`; both outlive the call, `ts` is a valid timespec, and `kq` is open.
+    let n = unsafe {
+        libc::kevent(
+            kq.as_raw_fd(),
+            changes.as_ptr(),
+            n_changes,
+            events.as_mut_ptr(),
+            n_events,
+            &raw const ts,
+        )
+    };
+    if n < 0 {
+        let e = io::Error::last_os_error();
+        if matches!(e.raw_os_error(), Some(libc::EINTR | libc::ESRCH)) {
+            return Ok(());
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     //! Spawn hygiene, the spawn lock, and `bsd_info`. Tests that change process-wide state

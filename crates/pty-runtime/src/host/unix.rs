@@ -12,11 +12,12 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::{
     Access, Breakaway, EntryKind, JobState, LaunchctlOutput, Privacy, ProcessIdentity, ReadyArg,
-    ReadyRead, SigchldDisposition, SignalState, StopTarget, UnixSignal, observed_before,
+    ReadyRead, Received, SigchldDisposition, SignalState, StopTarget, UnixSignal, receive_before,
+    recv_before, spawn_before, timed_out,
 };
 use crate::unix::sys;
 
@@ -205,9 +206,6 @@ pub(super) fn current_umask() -> u32 {
     u32::from(old.bits())
 }
 
-/// How often a child's exit is polled.
-const CHILD_POLL: Duration = Duration::from_millis(10);
-
 /// Reads `r` to its end on a thread; the bytes arrive on the returned channel.
 fn drain(mut r: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
@@ -217,13 +215,6 @@ fn drain(mut r: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
         let _ = tx.send(buf);
     });
     rx
-}
-
-fn timed_out(what: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::TimedOut,
-        format!("{what} did not finish in time"),
-    )
 }
 
 /// Kills `child` and leaves its reaping to a thread, so no wait outlives the caller's deadline.
@@ -236,47 +227,52 @@ fn abandon(mut child: Child) {
     }
 }
 
-/// Spawns `cmd` under the spawn lock unless `deadline` has passed, hands the child to
-/// `spawned`, and waits for its exit until `deadline`, polling every 10 ms: an exit first
-/// observed at or after the deadline is a timeout, and past the deadline the child is killed and
-/// handed to a reaper thread.
+/// `child`'s exit when it comes before `deadline`, through [`receive_before`] woken by the
+/// exit itself (kqueue); `None` at the deadline.
+fn exit_before(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+    let pid = child.id();
+    receive_before(deadline, |left| {
+        if let Some(s) = child.try_wait()? {
+            return Ok(Some(s));
+        }
+        sys::wait_readable_or_exit(None, Some(pid), left)?;
+        child.try_wait()
+    })
+}
+
+/// Spawns `cmd` through [`spawn_before`], hands the child to `spawned`, and waits for its exit
+/// through [`exit_before`]; past the deadline the child is killed and handed to a reaper
+/// thread.
 fn run_until(
     cmd: &mut Command,
     deadline: Instant,
     what: &str,
     spawned: impl FnOnce(&mut Child),
 ) -> io::Result<ExitStatus> {
-    if Instant::now() >= deadline {
-        return Err(timed_out(what));
-    }
-    let mut child = crate::with_spawn_lock(|| cmd.spawn())?;
+    let mut child = spawn_before(deadline, |_| cmd.spawn()).ok_or_else(|| timed_out(what))??;
     spawned(&mut child);
-    loop {
-        match observed_before(deadline, || child.try_wait()) {
-            None => {
-                abandon(child);
-                return Err(timed_out(what));
-            }
-            Some(Ok(Some(s))) => return Ok(s),
-            Some(Ok(None)) => {}
-            Some(Err(e)) => {
-                abandon(child);
-                return Err(e);
-            }
+    match exit_before(&mut child, deadline) {
+        Ok(Some(s)) => Ok(s),
+        Ok(None) => {
+            abandon(child);
+            Err(timed_out(what))
         }
-        std::thread::sleep(CHILD_POLL.min(deadline.saturating_duration_since(Instant::now())));
+        Err(e) => {
+            abandon(child);
+            Err(e)
+        }
     }
 }
 
-/// The drained output, if it arrived before `deadline`.
+/// The drained output, if it arrived before `deadline` ([`recv_before`]).
 fn output_before(rx: Option<mpsc::Receiver<Vec<u8>>>, deadline: Instant) -> Option<String> {
     let Some(rx) = rx else {
         return Some(String::new());
     };
-    let left = deadline.saturating_duration_since(Instant::now());
-    observed_before(deadline, || rx.recv_timeout(left).ok())
-        .flatten()
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
+    match recv_before(&rx, deadline) {
+        Received::Got(b) => Some(String::from_utf8_lossy(&b).into_owned()),
+        Received::Closed | Received::TimedOut => None,
+    }
 }
 
 /// `cmd`'s exit and output, all observed before `deadline` ([`run_until`]); output not read to
@@ -318,6 +314,7 @@ pub(super) fn spawn_detached(
     cwd: &Path,
     _breakaway: Breakaway,
     _ready: &mut ReadyInner,
+    deadline: Instant,
 ) -> io::Result<DetachedInner> {
     let mut cmd = Command::new(exe);
     cmd.args(args)
@@ -325,15 +322,20 @@ pub(super) fn spawn_detached(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    Ok(DetachedInner(crate::with_spawn_lock(|| cmd.spawn())?))
+    let child = spawn_before(deadline, |_| cmd.spawn())
+        .ok_or_else(|| timed_out("the daemon's launch"))??;
+    Ok(DetachedInner(child))
 }
 
 pub(super) fn detached_id(inner: &DetachedInner) -> u32 {
     inner.0.id()
 }
 
-pub(super) fn detached_try_wait(inner: &mut DetachedInner) -> io::Result<Option<String>> {
-    Ok(inner.0.try_wait()?.map(|s| s.to_string()))
+pub(super) fn detached_exit_before(
+    inner: &mut DetachedInner,
+    deadline: Instant,
+) -> io::Result<Option<String>> {
+    Ok(exit_before(&mut inner.0, deadline)?.map(|s| s.to_string()))
 }
 
 // ---- Readiness channel ----
@@ -343,16 +345,29 @@ pub(super) struct ReadyInner {
     listener: UnixListener,
     stream: Option<UnixStream>,
     buf: Vec<u8>,
+    /// This reader created the plist.
+    plist: bool,
 }
 
 impl Drop for ReadyInner {
     fn drop(&mut self) {
-        // What this starter created, by name: the socket, the plist, then the directory,
-        // which anything else in it keeps.
+        // Only what this reader created: the socket (bound by it), the plist if it created
+        // it, then the directory, which anything else in it keeps.
         let _ = std::fs::remove_file(self.dir.join(SOCKET));
-        let _ = std::fs::remove_file(self.dir.join(super::READY_PLIST));
+        if self.plist {
+            let _ = std::fs::remove_file(self.dir.join(super::READY_PLIST));
+        }
         let _ = std::fs::remove_dir(&self.dir);
     }
+}
+
+pub(super) fn ready_write_plist(inner: &mut ReadyInner, contents: &[u8]) -> io::Result<PathBuf> {
+    let path = inner.dir.join(super::READY_PLIST);
+    let mut f = super::create_private_file(&path)?;
+    inner.plist = true;
+    f.write_all(contents)?;
+    f.sync_all()?;
+    Ok(path)
 }
 
 /// The socket's name in the readiness directory.
@@ -409,26 +424,24 @@ pub(super) fn ready_channel_in(temp: &Path) -> io::Result<(ReadyInner, ReadyArg)
         }
     }
     let path = dir.join(SOCKET);
-    let listener = match UnixListener::bind(&path).and_then(|l| {
-        l.set_nonblocking(true)?;
-        Ok(l)
-    }) {
+    let listener = match UnixListener::bind(&path) {
         Ok(l) => l,
         Err(e) => {
-            let _ = std::fs::remove_file(&path);
+            // Nothing was bound: only the directory is this attempt's.
             let _ = std::fs::remove_dir(&dir);
             return Err(e);
         }
     };
-    Ok((
-        ReadyInner {
-            dir,
-            listener,
-            stream: None,
-            buf: Vec::new(),
-        },
-        ReadyArg::Socket(path),
-    ))
+    let inner = ReadyInner {
+        dir,
+        listener,
+        stream: None,
+        buf: Vec::new(),
+        plist: false,
+    };
+    // From here dropping `inner` removes the socket and the directory.
+    inner.listener.set_nonblocking(true)?;
+    Ok((inner, ReadyArg::Socket(path)))
 }
 
 /// The longest verdict line the starter accepts.
@@ -439,7 +452,19 @@ pub(super) fn ready_read(
     deadline: Instant,
     mut child: Option<&mut DetachedInner>,
 ) -> io::Result<ReadyRead> {
-    super::ready_poll(deadline, || ready_step(inner, child.as_deref_mut()))
+    let got = receive_before(deadline, |left| {
+        if let Some(r) = ready_step(inner, child.as_deref_mut())? {
+            return Ok(Some(r));
+        }
+        // Woken by a connection, data, the peer's end, or the direct child's exit.
+        let fd = match &inner.stream {
+            Some(s) => s.as_fd(),
+            None => inner.listener.as_fd(),
+        };
+        sys::wait_readable_or_exit(Some(fd), child.as_deref().map(|c| c.0.id()), left)?;
+        ready_step(inner, child.as_deref_mut())
+    })?;
+    Ok(got.unwrap_or(ReadyRead::TimedOut))
 }
 
 /// One look at the channel: a connection accepted and read until it would block; `None` while
@@ -535,12 +560,19 @@ pub(super) const CHECK_BEFORE_DELIVERY: bool = true;
 pub(super) const DELIVERY_GONE: i32 = libc::ESRCH;
 pub(super) const DELIVERY_DENIED: i32 = libc::EPERM;
 
-pub(super) fn deliver_stop(target: &StopTarget) -> io::Result<()> {
-    let pid = i32::try_from(target.pid)
+/// The process a stop signals.
+pub(super) struct StopDelivery(rustix::process::Pid);
+
+pub(super) fn open_stop(target: &StopTarget) -> io::Result<StopDelivery> {
+    i32::try_from(target.pid)
         .ok()
         .and_then(rustix::process::Pid::from_raw)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a pid"))?;
-    rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+        .map(StopDelivery)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a pid"))
+}
+
+pub(super) fn fire_stop(d: &StopDelivery) -> io::Result<()> {
+    rustix::process::kill_process(d.0, rustix::process::Signal::TERM)?;
     Ok(())
 }
 
@@ -581,6 +613,7 @@ mod tests {
     /// the timeout, not the spawn error a spawn attempt would.
     #[test]
     fn nothing_runs_after_the_deadline() {
+        let _s = super::super::tests::serial();
         let past = Instant::now()
             .checked_sub(Duration::from_millis(1))
             .unwrap();
@@ -598,6 +631,7 @@ mod tests {
     /// timeout returned at the deadline, not after the command or the grandchild ends.
     #[test]
     fn a_command_past_its_deadline_returns_at_the_deadline() {
+        let _s = super::super::tests::serial();
         for script in ["sleep 3", "sleep 3 & echo started"] {
             let t = Instant::now();
             let got = output_until(&mut sh(script), t + Duration::from_millis(300), "test");
@@ -622,5 +656,6 @@ mod tests {
             (got.code, got.stdout.as_str(), got.stderr.as_str()),
             (Some(3), "out\n", "err\n")
         );
+        super::super::tests::no_children_left();
     }
 }

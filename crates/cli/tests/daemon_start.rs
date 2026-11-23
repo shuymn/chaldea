@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use chaldea_daemon::lifecycle::{Discovery, LockProbe, discover, names};
 use support::faults::{
     self, EOF_CHILD_MS, EXIT_RECORD, Gate, HOLD_READER_MS, LOG_MARKERS, Labels, MARKER_PAUSE,
-    PARK_RECONCILER, READY_PAUSE, SLOW_SHUTDOWN_MS, TOKEN_FIELD, TOKEN_MSG, TOKEN_SPAN,
-    VERDICT_PAUSE,
+    PARK_RECONCILER, READY_PAUSE, SERVE_PAUSE, SLOW_SHUTDOWN_MS, TOKEN_FIELD, TOKEN_MSG,
+    TOKEN_SPAN, VERDICT_PAUSE,
 };
 use support::runner::{Case, main as run_cases};
 use support::{Dir, Proc, WAIT, get_status, lock_state, state, token_of, wait_for};
@@ -69,6 +69,10 @@ fn main() {
         Case {
             name: "stopping_winner_is_not_reported_running",
             run: stopping_winner_is_not_reported_running,
+        },
+        Case {
+            name: "stopping_after_the_answer_is_not_reported_started",
+            run: stopping_after_the_answer_is_not_reported_started,
         },
         Case {
             name: "detached_log_is_redacted",
@@ -574,6 +578,54 @@ fn stopping_winner_is_not_reported_running() {
         stopper.stderr()
     );
     assert_eq!(discover(&d.path), Discovery::NotRunning);
+}
+
+/// PR8-CL-14: the daemon whose serving check answered 200 begins its shutdown before the
+/// start's last discovery (paused between them; a 6 s shutdown participant keeps the lock and
+/// the record): the record says `stopping`, so the start reports the stop (exit 1), never the
+/// URL.
+fn stopping_after_the_answer_is_not_reported_started() {
+    let labels = Labels::new();
+    let d = state();
+    let _stop = StopOnDrop(&labels, &d.path);
+    let gate = Gate::new();
+    let mut starter = Gated {
+        gate: &gate,
+        p: Proc::spawn(&mut cmd(
+            &labels,
+            &d.path,
+            &["daemon", "start"],
+            &[
+                (SERVE_PAUSE, gate.path().as_os_str()),
+                (SLOW_SHUTDOWN_MS, OsStr::new("6000")),
+            ],
+        )),
+    };
+    assert!(gate.reached(WAIT), "the serving check never answered");
+    let mut stopper = Proc::spawn(&mut cmd(&labels, &d.path, &["daemon", "stop"], &[]));
+    let log = d.path.join(names::LOG);
+    assert!(
+        wait_for(|| std::fs::read_to_string(&log).is_ok_and(|l| l.contains("http shutdown:"))),
+        "the HTTP surface did not shut down"
+    );
+    let seen = discover(&d.path);
+    assert!(matches!(seen, Discovery::Stopping(_)), "{seen:?}");
+    gate.release();
+    let p = &mut starter.p;
+    assert_eq!(p.code(), 1, "{}{}", p.stdout(), p.stderr());
+    assert!(!p.stdout().contains("daemon started"), "{}", p.stdout());
+    assert!(
+        p.stderr().contains("stopped before the start finished"),
+        "{}",
+        p.stderr()
+    );
+    assert_eq!(
+        stopper.code(),
+        0,
+        "{}{}",
+        stopper.stdout(),
+        stopper.stderr()
+    );
 }
 
 /// PR8-CL-20: `chd_`, `chdt_`, `chdp_` secrets in a message, a field, and a span field of a

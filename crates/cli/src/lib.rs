@@ -48,6 +48,8 @@ pub struct Seams {
     /// Runs once `daemon start` read a verdict line (after the launchd job's removal), before
     /// it acts on it.
     pub after_verdict: Option<Box<dyn Fn()>>,
+    /// Runs once `daemon start`'s serving check got its 200, before its last discovery.
+    pub after_answer: Option<Box<dyn Fn()>>,
     /// Receives the exit code just before the process exits.
     pub on_exit: Option<Box<dyn FnOnce(i32)>>,
 }
@@ -70,8 +72,8 @@ pub fn dispatch_with(args: &[OsString], stall: Stall, mut seams: Seams) -> ! {
         hook_emit::main(args, stall);
     }
     // The launchd job's process forks the daemon while it has one thread (design §2.2), and
-    // only for arguments that parse: an invalid invocation exits 2 from this process.
-    let fork_error = if from_launchd(args) && parse(args).is_ok() {
+    // only for a usable invocation: an invalid one exits 2 from this process.
+    let fork_error = if from_launchd(args) && parse(args).is_ok_and(|cli| usable(&cli)) {
         host::leave_launchd_job().err()
     } else {
         None
@@ -97,6 +99,21 @@ pub fn dispatch_with(args: &[OsString], stall: Stall, mut seams: Seams) -> ! {
 /// `argv[1..4]` is exactly `daemon run --from-launchd`, the shape the starter writes.
 fn from_launchd(args: &[OsString]) -> bool {
     args.len() >= 4 && args[1] == "daemon" && args[2] == "run" && args[3] == "--from-launchd"
+}
+
+/// Whether `cli` passes the checks `daemon run` makes before it starts (its readiness channel).
+fn usable(cli: &Cli) -> bool {
+    match &cli.command {
+        Command::Daemon {
+            command:
+                DaemonCommand::Run {
+                    detached_child,
+                    ready,
+                    ..
+                },
+        } => daemon_cmd::ready_channel_arg(*detached_child, ready.as_deref()).is_ok(),
+        _ => true,
+    }
 }
 
 /// The job's process could not fork: it reports on the readiness channel itself.

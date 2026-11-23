@@ -323,26 +323,27 @@ pub(super) fn spawn_detached(
     cwd: &Path,
     breakaway: Breakaway,
     ready: &mut ReadyInner,
+    deadline: Instant,
 ) -> io::Result<DetachedInner> {
     use crate::windows::cmdline;
+    let dir = detached_cwd(cwd)?;
     let (reader, writer) = std::io::pipe()?;
     let null = OpenOptions::new().read(true).write(true).open("NUL")?;
     let mut argv = vec![exe.as_os_str().to_owned()];
     argv.extend(args.iter().cloned());
     let app = cmdline::wide_nul(exe.as_os_str());
     let mut line = cmdline::command_line(&argv);
-    let dir = cmdline::wide_nul(cwd.as_os_str());
-    let created = {
-        let held = crate::spawn::spawn_lock();
+    let created = super::spawn_before(deadline, |held| {
         sys::create_detached(
-            &held,
+            held,
             &app,
             &mut line,
             &dir,
             detached_flags(breakaway),
             [null.as_handle(), writer.as_handle(), null.as_handle()],
-        )?
-    };
+        )
+    })
+    .ok_or_else(|| super::timed_out("the daemon's launch"))??;
     // This process's copies of the child's ends close here; the child holds its own.
     drop(writer);
     drop(null);
@@ -353,19 +354,38 @@ pub(super) fn spawn_detached(
     })
 }
 
+/// The child's working directory as `CreateProcessW` takes it: without a verbatim prefix
+/// when that names the same directory, as the PTY backend passes it
+/// (`docs/design/pty-windows.md`).
+fn detached_cwd(cwd: &Path) -> io::Result<Vec<u16>> {
+    crate::windows::process_cwd(cwd).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the verbatim working directory names another directory without its prefix",
+        )
+    })
+}
+
 pub(super) fn detached_id(inner: &DetachedInner) -> u32 {
     inner.pid
 }
 
-pub(super) fn detached_try_wait(inner: &mut DetachedInner) -> io::Result<Option<String>> {
-    if sys::wait(inner.process.as_handle(), 0)? {
-        Ok(Some(format!(
-            "exit code: {}",
-            sys::exit_code(&inner.process)?
-        )))
-    } else {
-        Ok(None)
-    }
+pub(super) fn detached_exit_before(
+    inner: &mut DetachedInner,
+    deadline: Instant,
+) -> io::Result<Option<String>> {
+    super::receive_before(deadline, |left| {
+        // Rounded up, so a wait shorter than a millisecond still blocks.
+        let ms = u32::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(u32::MAX);
+        if sys::wait(inner.process.as_handle(), ms)? {
+            Ok(Some(format!(
+                "exit code: {}",
+                sys::exit_code(&inner.process)?
+            )))
+        } else {
+            Ok(None)
+        }
+    })
 }
 
 // ---- Readiness channel: the child's stdout pipe ----
@@ -417,22 +437,27 @@ pub(super) fn ready_read(
     deadline: Instant,
     _child: Option<&mut DetachedInner>,
 ) -> io::Result<ReadyRead> {
-    if inner.rx.is_none() {
+    let Some(rx) = &inner.rx else {
         return Err(io::Error::other("the child's stdout was not attached"));
-    }
-    super::ready_poll(deadline, || {
-        let Some(rx) = &inner.rx else {
-            return Ok(Some(ReadyRead::Eof));
-        };
-        match rx.try_recv() {
-            Ok(r) => {
-                inner.rx = None;
-                r.map(Some)
-            }
-            Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => Ok(Some(ReadyRead::Eof)),
+    };
+    match super::recv_before(rx, deadline) {
+        super::Received::Got(r) => {
+            inner.rx = None;
+            r
         }
-    })
+        super::Received::Closed => {
+            inner.rx = None;
+            Ok(ReadyRead::Eof)
+        }
+        super::Received::TimedOut => Ok(ReadyRead::TimedOut),
+    }
+}
+
+pub(super) fn ready_write_plist(_inner: &mut ReadyInner, _contents: &[u8]) -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the launchd plist is macOS only",
+    ))
 }
 
 pub(super) struct ReadyWriterInner(File);
@@ -496,9 +521,17 @@ pub(super) const DELIVERY_GONE: i32 = 2;
 /// `ERROR_ACCESS_DENIED`.
 pub(super) const DELIVERY_DENIED: i32 = 5;
 
-pub(super) fn deliver_stop(target: &StopTarget) -> io::Result<()> {
-    let h = sys::open_event_modify(&super::stop_event_name(&target.instance))?;
-    sys::set_event(&h)
+/// The opened stop event.
+pub(super) struct StopDelivery(OwnedHandle);
+
+pub(super) fn open_stop(target: &StopTarget) -> io::Result<StopDelivery> {
+    Ok(StopDelivery(sys::open_event_modify(
+        &super::stop_event_name(&target.instance),
+    )?))
+}
+
+pub(super) fn fire_stop(d: &StopDelivery) -> io::Result<()> {
+    sys::set_event(&d.0)
 }
 
 // ---- Browser ----
@@ -768,6 +801,7 @@ mod tests {
             panic!("A-W1 does not hold: the immediate job allows no breakaway: {state:?}")
         });
         let flags = detached_flags(breakaway);
+        eprintln!("A-W1: launching the helper with flags {flags:#x} ({breakaway:?})");
         let (status, out) = helper_run(
             "host::windows::tests::runner_can_break_away",
             "probe",
@@ -782,6 +816,17 @@ mod tests {
             status.success() && report.as_deref() == Some("in_job=false"),
             "A-W1 does not hold: job state {state:?}, breakaway {breakaway:?}, flags {flags:#x}, helper exited {status:?}, report {report:?}\n{out}"
         );
+    }
+
+    /// The detached child's working directory loses a verbatim prefix that names the same
+    /// directory, and keeps an ordinary path as given.
+    #[test]
+    fn detached_cwd_strips_a_verbatim_prefix() {
+        use crate::windows::cmdline::wide_nul;
+        let root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let verbatim = PathBuf::from(format!(r"\\?\{}", root.display()));
+        assert_eq!(detached_cwd(&verbatim).unwrap(), wide_nul(root.as_os_str()));
+        assert_eq!(detached_cwd(&root).unwrap(), wide_nul(root.as_os_str()));
     }
 
     fn uuid_like() -> String {

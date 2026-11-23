@@ -38,7 +38,7 @@ mod macos {
     use super::support::runner::Case;
     use super::support::{Proc, get_status, report, run_helper, state, token_of};
 
-    pub(super) const CASES: [Case; 11] = [
+    pub(super) const CASES: [Case; 12] = [
         Case {
             name: "inherited_signal_state_is_reset",
             run: inherited_signal_state_is_reset,
@@ -78,6 +78,10 @@ mod macos {
         Case {
             name: "stale_labels_only",
             run: stale_labels_only,
+        },
+        Case {
+            name: "relative_tmpdir_reaches_the_job",
+            run: relative_tmpdir_reaches_the_job,
         },
         Case {
             name: "invalid_launchd_invocation_exits_2",
@@ -539,19 +543,48 @@ mod macos {
         stop(&labels, &d.path);
     }
 
-    /// `daemon run --from-launchd` with arguments that do not parse exits 2 from the job's
-    /// process itself, before any fork (a fork's parent would exit 0).
+    /// PR8-CL-13: a relative `TMPDIR` is resolved once against the starter's directory, so the
+    /// readiness socket and the launchd job's working directory name the same existing
+    /// directory, and the start through launchd succeeds.
+    fn relative_tmpdir_reaches_the_job() {
+        require_gui();
+        let labels = Labels::new();
+        let d = state();
+        let _stop = StopOnDrop(&labels, &d.path);
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.path().join("rel")).unwrap();
+        let mut c = start_cmd(&labels, &d.path, &[("TMPDIR", OsStr::new("rel"))]);
+        c.current_dir(base.path());
+        let mut p = Proc::spawn(&mut c);
+        assert_eq!(p.code(), 0, "{}{}", p.stdout(), p.stderr());
+        assert!(
+            p.stderr().contains("detaching through launchd"),
+            "{}",
+            p.stderr()
+        );
+        stop(&labels, &d.path);
+    }
+
+    /// `daemon run --from-launchd` with arguments that do not parse, or a readiness channel
+    /// `daemon run` refuses, exits 2 from the job's process itself, before any fork (a fork's
+    /// parent would exit 0).
     fn invalid_launchd_invocation_exits_2() {
         let labels = Labels::new();
         let d = state();
-        // The shape the starter writes: `daemon run --from-launchd` first.
-        let mut c = faults::chaldea(&labels, &[]);
-        c.args(["daemon", "run", "--from-launchd", "--port", "not-a-port"])
-            .arg("--state-dir")
-            .arg(&d.path);
-        let mut p = Proc::spawn(&mut c);
-        assert_eq!(p.code(), 2, "{}{}", p.stdout(), p.stderr());
-        assert!(p.stderr().contains("not-a-port"), "{}", p.stderr());
-        assert_no_daemon(&d.path);
+        for (args, named) in [
+            (&["--port", "not-a-port"][..], "not-a-port"),
+            (&["--detached-child", "--ready", "relative"][..], "--ready"),
+        ] {
+            // The shape the starter writes: `daemon run --from-launchd` first.
+            let mut c = faults::chaldea(&labels, &[]);
+            c.args(["daemon", "run", "--from-launchd"])
+                .args(args)
+                .arg("--state-dir")
+                .arg(&d.path);
+            let mut p = Proc::spawn(&mut c);
+            assert_eq!(p.code(), 2, "{args:?}: {}{}", p.stdout(), p.stderr());
+            assert!(p.stderr().contains(named), "{args:?}: {}", p.stderr());
+            assert_no_daemon(&d.path);
+        }
     }
 }

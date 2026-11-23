@@ -121,12 +121,14 @@ pub fn probe(dir: &Path) -> io::Result<LockProbe> {
 
 // ---- Discovery (design §2.6) ----
 
-/// The daemon's published state.
+/// The daemon's published state (design §2.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordState {
     Starting,
     Serving,
+    /// The shutdown began; written before HTTP shuts down, so it never serves again.
+    Stopping,
 }
 
 /// What the doctor reads about how the daemon was started: step 2's job state (`in_job` and
@@ -202,27 +204,51 @@ pub enum Discovery {
     Unknown,
     Starting(DiscoveryRecord),
     Serving(DiscoveryRecord),
+    Stopping(DiscoveryRecord),
 }
 
 /// Applies the liveness rule: a record is used only when the lock is held, the record parses
-/// (read without following links), and its `(pid, start_time)` is a live process. Never
-/// removes anything.
+/// (read without following links), its `(pid, start_time)` is a live process, and the lock is
+/// still held after the record was read, so a record its daemon removed before releasing the
+/// lock is never returned once the lock is free. Never removes anything.
 #[must_use]
 pub fn discover(dir: &Path) -> Discovery {
-    match probe(dir) {
-        Ok(LockProbe::Held) => {}
-        Ok(LockProbe::Free | LockProbe::Missing) => return Discovery::NotRunning,
-        Err(_) => return Discovery::Unknown,
+    discover_paused(dir, || {})
+}
+
+/// [`discover`] with `read` run after the record and its identity were read, before the lock
+/// is checked again (a test's pause).
+pub(crate) fn discover_paused(dir: &Path, read: impl FnOnce()) -> Discovery {
+    let held = || match probe(dir) {
+        Ok(LockProbe::Held) => Some(true),
+        Ok(LockProbe::Free | LockProbe::Missing) => Some(false),
+        Err(_) => None,
+    };
+    match held() {
+        Some(true) => {}
+        Some(false) => return Discovery::NotRunning,
+        None => return Discovery::Unknown,
     }
     let Ok(Some(r)) = read_record(dir) else {
         return Discovery::Unknown;
     };
-    match host::process_identity(r.pid) {
-        Ok(Some(id)) if id.start_time == r.start_time => match r.state {
-            RecordState::Starting => Discovery::Starting(r),
-            RecordState::Serving => Discovery::Serving(r),
-        },
-        _ => Discovery::Unknown,
+    let alive = matches!(
+        host::process_identity(r.pid),
+        Ok(Some(id)) if id.start_time == r.start_time
+    );
+    read();
+    match held() {
+        Some(true) => {}
+        Some(false) => return Discovery::NotRunning,
+        None => return Discovery::Unknown,
+    }
+    if !alive {
+        return Discovery::Unknown;
+    }
+    match r.state {
+        RecordState::Starting => Discovery::Starting(r),
+        RecordState::Serving => Discovery::Serving(r),
+        RecordState::Stopping => Discovery::Stopping(r),
     }
 }
 

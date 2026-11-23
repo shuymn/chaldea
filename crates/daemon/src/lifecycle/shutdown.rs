@@ -334,9 +334,18 @@ impl Coordinator {
             if let Some(p) = self.faults.parked(super::faults::Point::AfterRecordVerify) {
                 p.hold().await;
             }
-            // The last boundary: a console end observed by now issues no deletion.
+            // The last boundary: a console end observed by now issues no deletion, nor does
+            // the end of the budget.
             if self.gate.crashed().is_some() {
                 return Err(Crashed);
+            }
+            if Instant::now() >= end {
+                self.log.warn(&format!(
+                    "the discovery record {} was left in place: its removal did not start within {} ms",
+                    path.display(),
+                    RECORD_REMOVAL.as_millis()
+                ));
+                return Ok(());
             }
             #[cfg(test)]
             let removed = self
@@ -360,6 +369,41 @@ impl Coordinator {
                     self.guarded(self.record_wait(end)).await?;
                 }
             }
+        }
+    }
+
+    /// Rewrites our record with the `stopping` state; a record that is missing, unreadable,
+    /// or another instance's is left alone, and a failed rewrite is logged.
+    fn publish_stopping(&self, dir: &std::path::Path) {
+        let mut r = match files::read_record(dir) {
+            Ok(Some(r)) if r.instance == self.instance => r,
+            Ok(_) => return,
+            Err(e) => {
+                self.log.warn(&format!(
+                    "the discovery record could not be read to mark it stopping: {e}"
+                ));
+                return;
+            }
+        };
+        r.state = files::RecordState::Stopping;
+        #[cfg(test)]
+        let faults = self.faults.clone();
+        let hook = move |n: &str, s: files::ReplaceStage| -> std::io::Result<()> {
+            #[cfg(test)]
+            {
+                faults.replace_hook(n, s)
+            }
+            #[cfg(not(test))]
+            {
+                files::no_hook(n, s)
+            }
+        };
+        if let Err(e) =
+            files::write_replace(dir, names::RECORD, &r.to_bytes(), &self.instance, &hook)
+        {
+            self.log.warn(&format!(
+                "the discovery record could not be marked stopping: {e}"
+            ));
         }
     }
 
@@ -502,8 +546,15 @@ impl Coordinator {
             }
         };
 
-        // 2. HTTP until C − 5 s, awaited to its return; also a server that never served, whose
-        // registry can hold startup's own writes (the owner token's observer).
+        // 2. The record says `stopping` before HTTP shuts down, so no client takes this run
+        // for one that serves once its surface may be gone. Then HTTP until C − 5 s, awaited
+        // to its return; also a server that never served, whose registry can hold startup's
+        // own writes (the owner token's observer).
+        if self.shared.record_published.load(Ordering::SeqCst)
+            && let Some(dir) = self.shared.dir.get().cloned()
+        {
+            self.publish_stopping(&dir);
+        }
         let mut http_aborted = false;
         if let Some(serve) = st.serve.take() {
             let end = cutoff - b.http_before;
