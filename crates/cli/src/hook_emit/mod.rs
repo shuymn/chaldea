@@ -16,6 +16,8 @@ use std::io::Read;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use chaldea_pty_runtime::host;
+
 use self::client::{Tcp, Transport};
 use self::env::Env;
 
@@ -27,6 +29,8 @@ pub enum Stall {
     Off,
     /// Blocks the main thread forever once stdin is read, so only the watchdog ends the run.
     AfterStdin,
+    /// Panics on the main thread once stdin is read, so only the panic hook ends the run.
+    PanicAfterStdin,
 }
 
 /// The body cap (mvp §2.5): a longer stdin is sent as its first 4 MiB, marked truncated.
@@ -50,7 +54,28 @@ pub(crate) trait Clock {
     fn sleep(&self, d: Duration);
 }
 
-struct SystemClock;
+pub(crate) struct SystemClock;
+
+/// The fixed instants of one run, from its start `T0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Budget {
+    /// `I`: stdin must have completed before it.
+    pub(crate) stdin_end: Instant,
+    /// `E`: no attempt runs past it.
+    pub(crate) work_end: Instant,
+    /// `W`: the watchdog exits at it.
+    pub(crate) watchdog: Instant,
+}
+
+impl Budget {
+    pub(crate) fn from(t0: Instant) -> Budget {
+        Budget {
+            stdin_end: t0 + STDIN_END,
+            work_end: t0 + WORK_END,
+            watchdog: t0 + WATCHDOG,
+        }
+    }
+}
 
 impl Clock for SystemClock {
     fn now(&self) -> Instant {
@@ -64,16 +89,21 @@ impl Clock for SystemClock {
 /// The run of §2.13; never returns, and exits 0 on every path.
 pub(crate) fn main(args: &[OsString], stall: Stall) -> ! {
     let t0 = Instant::now();
-    watchdog::start(t0 + WATCHDOG);
+    let budget = Budget::from(t0);
+    watchdog::start(budget.watchdog);
     let Some(env) = env::read() else {
-        std::process::exit(0)
+        host::exit_now(0)
     };
-    let Some(body) = read_stdin(t0 + STDIN_END) else {
-        std::process::exit(0)
+    let Some(body) = read_stdin(budget.stdin_end) else {
+        host::exit_now(0)
     };
-    if stall == Stall::AfterStdin {
-        let (_never_sent, rx) = mpsc::channel::<()>();
-        let _ = rx.recv();
+    match stall {
+        Stall::Off => {}
+        Stall::AfterStdin => {
+            let (_never_sent, rx) = mpsc::channel::<()>();
+            let _ = rx.recv();
+        }
+        Stall::PanicAfterStdin => panic!("injected hook-emit panic"),
     }
     let agent = args
         .get(2)
@@ -97,7 +127,7 @@ pub(crate) fn main(args: &[OsString], stall: Stall) -> ! {
             deadline,
         ))
     });
-    std::process::exit(0)
+    host::exit_now(0)
 }
 
 /// Stdin as it is sent.
@@ -196,7 +226,7 @@ pub(crate) fn run(
     t0: Instant,
     mut attempt: impl FnMut(u8, Instant) -> Next,
 ) -> Vec<Instant> {
-    let end = t0 + WORK_END;
+    let end = Budget::from(t0).work_end;
     let mut starts = Vec::new();
     for (k, backoff) in (1u8..).zip(BACKOFF) {
         if clock.now() + backoff + MIN_ATTEMPT > end {
@@ -464,6 +494,16 @@ mod tests {
         assert_eq!(input.position(), (MAX_BODY + 4096) as u64, "drained to EOF");
         let mut short = std::io::Cursor::new(b"{}".to_vec());
         assert_eq!(read_capped(&mut short).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn budget_instants() {
+        // Restated from the design: I = T0 + 1500 ms, E = T0 + 2900 ms, W = T0 + 3000 ms.
+        let t0 = Instant::now();
+        let b = Budget::from(t0);
+        assert_eq!(b.stdin_end - t0, ms(1500));
+        assert_eq!(b.work_end - t0, ms(2900));
+        assert_eq!(b.watchdog - t0, ms(3000));
     }
 
     #[test]

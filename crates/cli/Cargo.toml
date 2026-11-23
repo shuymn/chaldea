@@ -21,6 +21,8 @@ harness = false
 [dependencies]
 chaldea-daemon = { path = "../daemon" }
 clap.workspace = true
+# The emitter's exit without exit handlers (`host::exit_now`, hook-ingest §2.13).
+chaldea-pty-runtime = { path = "../pty-runtime" }
 # The emitter's `emit_id` (hook-ingest §2.13).
 uuid = { workspace = true, features = ["v4"] }
 
