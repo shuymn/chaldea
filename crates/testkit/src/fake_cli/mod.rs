@@ -1,18 +1,24 @@
 //! `chaldea-fake-cli` (`docs/design/pty-unix.md` §2.8):
 //!
 //! ```text
-//! chaldea-fake-cli --mode <echo|queries|attachable|spawn-tree|sleeper|report-process>
+//! chaldea-fake-cli --mode <echo|queries|attachable|spawn-tree|sleeper|report-process|hooks>
 //!                  [--report <127.0.0.1:port>] [--role <role>] [--roles <list>]
 //!                  [--max-life-secs <n>] [--reply-timeout-ms <n>] [--raw] [--setsid]
 //!                  [--escape-orphan] [--orphan-keeps-tty] [--out <path>] [--emit-output]
-//!                  [--validate-input <n>] [-- <ignored argument>...]
+//!                  [--validate-input <n>] [--emitter <path>] [--agent <claude|codex>]
+//!                  [--session-id <id>] [--nested] [--nested-child] [--script <json>]
+//!                  [-- <ignored argument>...]
 //! ```
+//!
+//! `--emitter`, `--agent`, `--session-id`, `--nested`, `--nested-child`, and `--script` are
+//! the hook emission of `docs/design/hook-ingest.md` §2.14 (`echo` and `hooks`).
 //!
 //! An unknown mode or flag exits 2. Arguments after `--` are ignored (`report-process`
 //! records them with the rest of its argv; `docs/design/pty-windows.md` §2.8).
 
 mod attachable;
 mod echo;
+mod hooks;
 mod queries;
 mod report_process;
 mod sleeper;
@@ -34,6 +40,7 @@ pub(crate) enum Mode {
     SpawnTree,
     Sleeper,
     ReportProcess,
+    Hooks,
 }
 
 impl Mode {
@@ -45,6 +52,7 @@ impl Mode {
             Mode::SpawnTree => "spawn-tree",
             Mode::Sleeper => "sleeper",
             Mode::ReportProcess => "report-process",
+            Mode::Hooks => "hooks",
         }
     }
 }
@@ -67,6 +75,18 @@ pub(crate) struct Opts {
     pub(crate) emit_output: bool,
     /// `echo`: read exactly this many bytes and check the `a`–`z` pattern.
     pub(crate) validate_input: Option<usize>,
+    /// `echo`, `hooks`: the emitter binary, run as `<emitter> hook-emit <agent>`.
+    pub(crate) emitter: Option<String>,
+    /// The emitter's agent argument (`codex` by default).
+    pub(crate) agent: String,
+    /// `echo --emitter`: the session id of its hooks (a random UUID by default).
+    pub(crate) session_id: Option<String>,
+    /// `echo --emitter`: also start a nested FakeCli that emits another session's hooks.
+    pub(crate) nested: bool,
+    /// `echo`: run as that nested FakeCli.
+    pub(crate) nested_child: bool,
+    /// `hooks`: the steps, a JSON array.
+    pub(crate) script: Option<String>,
 }
 
 fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
@@ -89,6 +109,12 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
         out: None,
         emit_output: false,
         validate_input: None,
+        emitter: None,
+        agent: "codex".to_owned(),
+        session_id: None,
+        nested: false,
+        nested_child: false,
+        script: None,
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -101,6 +127,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
                     "spawn-tree" => Mode::SpawnTree,
                     "sleeper" => Mode::Sleeper,
                     "report-process" => Mode::ReportProcess,
+                    "hooks" => Mode::Hooks,
                     m => return Err(format!("unknown mode {m}")),
                 });
             }
@@ -130,6 +157,12 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
             "--validate-input" => {
                 o.validate_input = Some(value()?.parse().map_err(|e| format!("{flag}: {e}"))?);
             }
+            "--emitter" => o.emitter = Some(value()?),
+            "--agent" => o.agent = value()?,
+            "--session-id" => o.session_id = Some(value()?),
+            "--nested" => o.nested = true,
+            "--nested-child" => o.nested_child = true,
+            "--script" => o.script = Some(value()?),
             "--" => break,
             f => return Err(format!("unknown flag {f}")),
         }
@@ -161,6 +194,7 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> i32 {
         Mode::SpawnTree => spawn_tree::run(&o),
         Mode::Sleeper => sleeper::run(&o),
         Mode::ReportProcess => report_process::run(&o),
+        Mode::Hooks => hooks::run(&o),
     };
     crate::report::end();
     code
