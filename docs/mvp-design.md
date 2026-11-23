@@ -424,7 +424,7 @@ Each PR keeps `core` + `FakePty` tests green on macOS and Windows CI; macOS firs
 
 **Why the first tests run in PR 15.** Both are end to end (arch §5, issue #2) and need the Windows backend, the encoder, hook ingest, attach, and the Codex launch path. A failure changes only the encoder, the capability table, and the attach paste path, not a contract. PR 5 tests the encoder on both OSes from the start and PR 14 runs FakeCli attach paste tests on `windows-latest`.
 
-**Open items of arch §5.** Codex keyed input: PR 15 (unit tests in 5). Human paste through attach: PR 15 (contract in 11, FakeCli in 14). Codex hook trust renewal: PR 14, 21. Windows hook receiver: PR 9, 23, with the expectations of §2.5. Daemon parent job check: PR 8 (prior-art row 8). Windows build coverage: PR 23; real-CLI runs on more builds need more hosts and stay open until then. prior-art "Not Verified" items that affect behaviour (inbox conhost on other builds, BMP characters delivered only on Alt release) are covered by PR 15 and 23; the rest do not affect the MVP and stay unverified.
+**Open items of arch §5.** Codex keyed input: PR 15 (unit tests in 5). Human paste through attach: PR 15 (contract in 11, FakeCli in 14). Codex hook trust renewal: PR 14, 21. Windows hook receiver: PR 9, 23, with the expectations of §2.5. Windows build coverage: PR 23; real-CLI runs on more builds need more hosts and stay open until then. prior-art "Not Verified" items that affect behaviour (inbox conhost on other builds, BMP characters delivered only on Alt release) are covered by PR 15 and 23; the rest do not affect the MVP and stay unverified.
 
 **Design obligations.** One line per scenario that the PR's own design and tests must cover; the PR's document decides how.
 
