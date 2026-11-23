@@ -252,9 +252,12 @@ impl Broken {
     }
 }
 
-/// The LF- or CRLF-terminated lines of `r`, without their terminator, read on a thread; the
-/// channel closes at EOF or a read error, and an unterminated last line is not sent.
-fn lines_of(r: Option<impl Read + Send + 'static>) -> Receiver<String> {
+/// A complete handshake line, without its terminator, and when its read completed.
+type Frame = (String, Instant);
+
+/// The LF- or CRLF-terminated lines of `r`, read on a thread and stamped as each completes;
+/// the channel closes at EOF or a read error, and an unterminated last line is not sent.
+fn lines_of(r: Option<impl Read + Send + 'static>) -> Receiver<Frame> {
     let (tx, rx) = mpsc::channel();
     if let Some(r) = r {
         std::thread::spawn(move || {
@@ -269,10 +272,8 @@ fn lines_of(r: Option<impl Read + Send + 'static>) -> Receiver<String> {
                 if line.ends_with(b"\r") {
                     line.pop();
                 }
-                if tx
-                    .send(String::from_utf8_lossy(&line).into_owned())
-                    .is_err()
-                {
+                let frame = (String::from_utf8_lossy(&line).into_owned(), Instant::now());
+                if tx.send(frame).is_err() {
                     return;
                 }
             }
@@ -281,10 +282,12 @@ fn lines_of(r: Option<impl Read + Send + 'static>) -> Receiver<String> {
     rx
 }
 
-/// Takes the next line of `lines`, which must be exactly `want` and arrive by `until`.
-fn expect_line(lines: &Receiver<String>, want: &str, until: Instant) -> Result<(), Broken> {
+/// Takes the next line of `lines`, which must be exactly `want` and have completed before
+/// `until` (a line stamped at or after it is late, even when it is already queued).
+fn expect_line(lines: &Receiver<Frame>, want: &str, until: Instant) -> Result<(), Broken> {
     match lines.recv_timeout(until.saturating_duration_since(Instant::now())) {
-        Ok(l) if l == want => Ok(()),
+        Ok((_, at)) if at >= until => Err(Broken::Timeout),
+        Ok((l, _)) if l == want => Ok(()),
         Ok(_) => Err(Broken::Unexpected),
         Err(RecvTimeoutError::Disconnected) => Err(Broken::Eof),
         Err(RecvTimeoutError::Timeout) => Err(Broken::Timeout),
@@ -328,11 +331,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_handshake_token_queued_after_its_deadline_is_rejected() {
+        let (tx, rx) = mpsc::channel();
+        let deadline = Instant::now() - Duration::from_millis(1);
+        tx.send(("go".to_owned(), Instant::now())).unwrap();
+
+        assert_eq!(expect_line(&rx, "go", deadline), Err(Broken::Timeout));
+        // Completed before the deadline and read after it: in time.
+        let deadline = Instant::now();
+        tx.send(("go".to_owned(), deadline - Duration::from_millis(1)))
+            .unwrap();
+        assert_eq!(expect_line(&rx, "go", deadline), Ok(()));
+    }
+
+    #[test]
     fn a_handshake_line_must_be_exact_and_in_time() {
         let until = || Instant::now() + Duration::from_secs(5);
         let (tx, rx) = mpsc::channel();
         for l in ["go", "gone", "go ", ""] {
-            tx.send(l.to_owned()).unwrap();
+            tx.send((l.to_owned(), Instant::now())).unwrap();
         }
         assert_eq!(expect_line(&rx, "go", until()), Ok(()));
         for _ in 0..3 {
