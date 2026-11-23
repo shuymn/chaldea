@@ -246,9 +246,12 @@ struct TextArgs {
     /// The status to answer; 201 when absent.
     #[serde(default)]
     status: Option<u16>,
-    /// When present, the body is `{"code": code}` instead of [`completed_body`].
+    /// When present, the body is `{"code": code}` (with `retry_after` when given) instead
+    /// of [`completed_body`].
     #[serde(default)]
     code: Option<String>,
+    #[serde(default)]
+    retry_after: Option<u32>,
 }
 
 /// The body `test_completed` answers for `text`: status 201, non-ASCII bytes included.
@@ -280,7 +283,16 @@ impl CommandHandler for Completed {
                     ("large_number", _) => {
                         r#"{"code":"in_progress","retry_after":1,"details":1e400}"#.to_owned()
                     }
-                    (_, Some(code)) => serde_json::json!({ "code": code }).to_string(),
+                    ("null_retry_after", _) => {
+                        r#"{"code":"forbidden","retry_after":null}"#.to_owned()
+                    }
+                    ("extra_member", _) => r#"{"code":"forbidden","extra":1}"#.to_owned(),
+                    (_, Some(code)) => match a.retry_after {
+                        Some(secs) => {
+                            serde_json::json!({ "code": code, "retry_after": secs }).to_string()
+                        }
+                        None => serde_json::json!({ "code": code }).to_string(),
+                    },
                     (_, None) => completed_body(&a.text),
                 };
                 Ok(Intent::Completed(CommandResult {
@@ -416,11 +428,13 @@ enum How {
 #[serde(deny_unknown_fields)]
 struct RefuseArgs {
     how: How,
-    /// For `How::Code`: the refusal's code and status.
+    /// For `How::Code`: the refusal's code, status, and `retry_after`.
     #[serde(default)]
     code: Option<ErrorCode>,
     #[serde(default)]
     status: Option<u16>,
+    #[serde(default)]
+    retry_after: Option<u32>,
 }
 
 struct Refuse;
@@ -442,10 +456,11 @@ impl CommandHandler for Refuse {
                 How::Busy => Err(refuse(ApiError::busy())),
                 How::Code => {
                     let status = StatusCode::from_u16(a.status.unwrap_or(400)).unwrap();
-                    Err(refuse(ApiError::new(
-                        status,
-                        a.code.unwrap_or(ErrorCode::Internal),
-                    )))
+                    let e = ApiError::new(status, a.code.unwrap_or(ErrorCode::Internal));
+                    Err(refuse(match a.retry_after {
+                        Some(secs) => e.with_retry_after(secs),
+                        None => e,
+                    }))
                 }
                 How::Pending => {
                     let id = ctx.command_id();

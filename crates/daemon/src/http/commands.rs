@@ -85,22 +85,41 @@ pub trait CommandEffect: Send + Sync {
     /// `internal`). The owning PR guarantees that it resolves within a bound it states, and
     /// that a result it returns for work that did not happen (a refusal, or work that ran
     /// out of its time) means the work can no longer happen later. Work that ran out of its
-    /// time is 504 with a code the owning PR adds for it, never 408: 408 says the request's
-    /// deadline kept its intent from committing. The runner adds no timeout of its own.
+    /// time is 504 with a code the owning PR adds to `ErrorCode` and classifies in
+    /// `handler_code`, never 408: 408 says the request's deadline kept its intent from
+    /// committing. The runner adds no timeout of its own.
     fn run(&self, run: EffectRun) -> BoxFuture<'static, CommandResult>;
 }
 
-/// The status a handler may reply with `code` at (design §2.8 "Handler replies"), or
-/// `None` for a code only the runner, the guard, or the store gives. One arm per code and
-/// no wildcard: a new `ErrorCode` does not compile until it is classified here.
-fn handler_status(code: ErrorCode) -> Option<StatusCode> {
+/// How a handler may reply with a code: at `status`, with `retry_after` exactly when
+/// `retry_after` is true (omitted otherwise, never `null`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HandlerCode {
+    status: StatusCode,
+    retry_after: bool,
+}
+
+/// How a handler may reply with `code` (design §2.8 "Handler replies"), or `None` for a
+/// code only the runner, the guard, or the store gives. One arm per code and no wildcard:
+/// a new `ErrorCode` does not compile until it is classified here.
+fn handler_code(code: ErrorCode) -> Option<HandlerCode> {
+    let at = |status| {
+        Some(HandlerCode {
+            status,
+            retry_after: false,
+        })
+    };
     match code {
         // A command's own outcome, or a refusal that says nothing happened.
-        ErrorCode::BadArgs => Some(StatusCode::BAD_REQUEST),
-        ErrorCode::Forbidden => Some(StatusCode::FORBIDDEN),
-        ErrorCode::NotFound => Some(StatusCode::NOT_FOUND),
-        ErrorCode::Busy | ErrorCode::ShuttingDown => Some(StatusCode::SERVICE_UNAVAILABLE),
-        ErrorCode::Internal => Some(StatusCode::INTERNAL_SERVER_ERROR),
+        ErrorCode::BadArgs => at(StatusCode::BAD_REQUEST),
+        ErrorCode::Forbidden => at(StatusCode::FORBIDDEN),
+        ErrorCode::NotFound => at(StatusCode::NOT_FOUND),
+        // Transient: the client retries after `retry_after`.
+        ErrorCode::Busy | ErrorCode::ShuttingDown => Some(HandlerCode {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            retry_after: true,
+        }),
+        ErrorCode::Internal => at(StatusCode::INTERNAL_SERVER_ERROR),
         // Routing, framing, method, and authentication: the outer layer and the guard.
         ErrorCode::MisdirectedRequest
         | ErrorCode::OriginRejected
@@ -126,8 +145,9 @@ fn handler_status(code: ErrorCode) -> Option<StatusCode> {
 /// Whether a command result may be stored and replayed as it is. A success (2xx except 204
 /// and 205, which hyper or HTTP send without the stored body) has a JSON body. Any other
 /// status has an `ErrorBody` (only `code` and `retry_after`, one of each) whose code a
-/// handler may use at exactly that status, and not 503 (a replayed result would tell a
-/// client to retry it forever). Anything that does not parse is refused.
+/// handler may use at exactly that status, with `retry_after` present exactly when the code
+/// calls for it, and not 503 (a replayed result would tell a client to retry it forever).
+/// Anything that does not parse is refused.
 fn result_allowed(r: &CommandResult) -> bool {
     let Ok(status) = StatusCode::from_u16(r.http_status) else {
         return false;
@@ -146,7 +166,11 @@ fn result_allowed(r: &CommandResult) -> bool {
     };
     members.keys().all(|k| k == "code" || k == "retry_after")
         && status != StatusCode::SERVICE_UNAVAILABLE
-        && handler_status(body.code) == Some(status)
+        && handler_code(body.code)
+            == Some(HandlerCode {
+                status,
+                retry_after: members.contains_key("retry_after"),
+            })
 }
 
 /// `r`, or 500 `internal` when a handler may not reply with it (a programming error of its
@@ -164,11 +188,16 @@ fn checked_result(command_id: CommandId, r: CommandResult) -> CommandResult {
 }
 
 /// A handler's refusal (a `prepare` error, or an intent's, which the job rolls back) as
-/// answered: its code must be one a handler may use, at that code's status; any other is
-/// 500 `internal`. A transient refusal keeps a code that says nothing happened (`busy`,
-/// `shutting_down`).
+/// answered: its code must be one a handler may use, at that code's status, with
+/// `retry_after` exactly when the code calls for it; any other is 500 `internal`. A
+/// transient refusal keeps a code that says nothing happened (`busy`, `shutting_down`) and
+/// tells the client when to retry.
 fn checked_error(e: ApiError) -> ApiError {
-    if handler_status(e.code()) == Some(e.status()) {
+    let reply = HandlerCode {
+        status: e.status(),
+        retry_after: e.retry_after().is_some(),
+    };
+    if handler_code(e.code()) == Some(reply) {
         return e;
     }
     tracing::error!(status = e.status().as_u16(), code = ?e.code(), "command refusal outside the handler replies");
@@ -486,7 +515,9 @@ pub(crate) struct Admitted {
 pub(crate) enum Progress {
     /// The intent job was handed to the writer, which has not replied.
     Submitted,
-    /// The intent committed; its effect or completion is still running.
+    /// The intent committed, and the runner has not published its completion: the effect
+    /// or the completion may still be running, or the completion may already have
+    /// committed.
     IntentCommitted,
     /// The command's reply.
     Done(Result<CommandResult, ApiError>),

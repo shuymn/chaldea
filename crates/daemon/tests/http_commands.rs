@@ -920,25 +920,46 @@ const HANDLER_CODES: [&str; 6] = [
     "internal",
 ];
 
+/// The handler codes whose reply carries `retry_after` (every other one omits it).
+const RETRY_CODES: [&str; 2] = ["busy", "shutting_down"];
+
 /// The code table over every `ErrorCode`, as a refusal and as a stored result: a code a
-/// handler may use, at its status, is answered as it is (a result only with a status of
-/// the result set, so not 503); any other code, or a handler code at another status, is 500
-/// `internal`: a refusal with no receipt, a result stored as 500 and replayed.
+/// handler may use, at its status, with `retry_after` exactly when the code calls for it, is
+/// answered as it is (a result only with a status of the result set, so not 503); any other
+/// reply is 500 `internal`: a refusal with no receipt, a result stored as 500 and replayed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn handler_replies_follow_the_code_table() {
     let (srv, probe) = TestServer::with_commands(|_| {}).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let mut n = 100;
     let mut mismatched = Vec::new();
-    let mut cases: Vec<(&str, u16)> = CODES.to_vec();
-    // A handler code at another status.
-    cases.extend([("not_found", 400), ("forbidden", 404), ("internal", 503)]);
-    for (code, status) in cases {
-        let usable = HANDLER_CODES.contains(&code) && CODES.contains(&(code, status));
-        let body = format!(r#"{{"code":"{code}"}}"#);
+    let mut cases: Vec<(&str, u16, Option<u32>)> =
+        CODES.iter().map(|(c, s)| (*c, *s, None)).collect();
+    cases.extend([
+        // A handler code at another status.
+        ("not_found", 400, None),
+        ("forbidden", 404, None),
+        ("internal", 503, None),
+        // `retry_after` where the code calls for it, and where it does not.
+        ("busy", 503, Some(1)),
+        ("shutting_down", 503, Some(1)),
+        ("forbidden", 403, Some(1)),
+    ]);
+    for (code, status, retry_after) in cases {
+        let usable = HANDLER_CODES.contains(&code)
+            && CODES.contains(&(code, status))
+            && retry_after.is_some() == RETRY_CODES.contains(&code);
+        let (body, retry) = match retry_after {
+            Some(secs) => (
+                format!(r#"{{"code":"{code}","retry_after":{secs}}}"#),
+                format!(r#","retry_after":{secs}"#),
+            ),
+            None => (format!(r#"{{"code":"{code}"}}"#), String::new()),
+        };
+        let case = format!("{code} {status} {retry_after:?}");
         n += 1;
         let id = cid(n);
-        let args = format!(r#"{{"how":"code","code":"{code}","status":{status}}}"#);
+        let args = format!(r#"{{"how":"code","code":"{code}","status":{status}{retry}}}"#);
         let r = srv
             .send(&srv.command("test_refuse", &owner, id, &args))
             .await;
@@ -949,15 +970,15 @@ async fn handler_replies_follow_the_code_table() {
         };
         if (r.status, r.body.as_slice()) != want {
             mismatched.push(format!(
-                "refusal {code} {status}: got {} {}",
+                "refusal {case}: got {} {}",
                 r.status,
                 String::from_utf8_lossy(&r.body)
             ));
         }
-        assert_eq!(srv.receipt(id), None, "refusal {code} {status}");
+        assert_eq!(srv.receipt(id), None, "refusal {case}");
         n += 1;
         let id = cid(n);
-        let args = format!(r#"{{"text":"t","status":{status},"code":"{code}"}}"#);
+        let args = format!(r#"{{"text":"t","status":{status},"code":"{code}"{retry}}}"#);
         let req = srv.command("test_completed", &owner, id, &args);
         let first = srv.send(&req).await;
         let want = if usable && status != 503 {
@@ -967,7 +988,7 @@ async fn handler_replies_follow_the_code_table() {
         };
         if (first.status, first.body.as_slice()) != want {
             mismatched.push(format!(
-                "result {code} {status}: got {} {}",
+                "result {case}: got {} {}",
                 first.status,
                 String::from_utf8_lossy(&first.body)
             ));
@@ -976,12 +997,12 @@ async fn handler_replies_follow_the_code_table() {
         assert_eq!(
             (replay.status, &replay.body),
             (first.status, &first.body),
-            "result {code} {status}"
+            "result {case}"
         );
         assert_eq!(
             srv.receipt(id).unwrap().status,
             ReceiptStatus::Completed(completed(&first)),
-            "result {code} {status}"
+            "result {case}"
         );
     }
     assert!(mismatched.is_empty(), "{mismatched:#?}");
@@ -989,9 +1010,39 @@ async fn handler_replies_follow_the_code_table() {
     srv.stop().await;
 }
 
-/// A result body that does not parse is 500 `internal`, stored and replayed: an error body
-/// that `serde_json::Value` cannot hold (a number out of range beside a runner code), and a
-/// success body that is not JSON.
+/// A `busy` or `shutting_down` refusal tells the client when to retry: without
+/// `retry_after` it is 500 `internal`, with it 503 as it is; no receipt either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn busy_refusal_has_retry_delay() {
+    let (srv, _probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let mut n = 0;
+    for code in ["busy", "shutting_down"] {
+        for (retry, want_status, want_body) in [
+            (String::new(), 500, INTERNAL.to_vec()),
+            (
+                r#","retry_after":1"#.to_owned(),
+                503,
+                format!(r#"{{"code":"{code}","retry_after":1}}"#).into_bytes(),
+            ),
+        ] {
+            n += 1;
+            let args = format!(r#"{{"how":"code","code":"{code}","status":503{retry}}}"#);
+            let r = srv
+                .send(&srv.command("test_refuse", &owner, cid(n), &args))
+                .await;
+            assert_eq!((r.status, &r.body), (want_status, &want_body), "{args}");
+            assert_eq!(srv.receipt(cid(n)), None, "{args}");
+        }
+    }
+    srv.stop().await;
+}
+
+/// A result body that is not one a handler may store is 500 `internal`, stored and
+/// replayed: an error body that `serde_json::Value` cannot hold (a number out of range
+/// beside a runner code), a success body that is not JSON, and error bodies with a handler
+/// code at its status but `"retry_after": null` (absent is omitted, never `null`) or a
+/// member other than `code` and `retry_after`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unparsable_result_bodies_are_500() {
     let (srv, _probe) = TestServer::with_commands(|_| {}).await;
@@ -999,6 +1050,8 @@ async fn unparsable_result_bodies_are_500() {
     for (i, args) in [
         r#"{"text":"large_number","status":409}"#,
         r#"{"text":"not_json","status":200}"#,
+        r#"{"text":"null_retry_after","status":403}"#,
+        r#"{"text":"extra_member","status":403}"#,
     ]
     .into_iter()
     .enumerate()
