@@ -28,6 +28,20 @@ async fn resolves(
         .is_ok()
 }
 
+/// The intake instant is sampled with the intake lock held, in the critical section that
+/// takes the ordinal and the facts.
+#[test]
+fn intake_samples_under_the_lock() {
+    let order = Arc::new(IntakeOrder::default());
+    let o = order.clone();
+    let (_, _, at) = order.intake(l(), 0, &NoIntakeFacts, || {
+        assert!(o.locked(), "the clock was sampled outside the intake lock");
+        Instant::now()
+    });
+    assert!(at <= Instant::now());
+    assert!(!order.locked());
+}
+
 /// Ordinals continue from the stored maximum; a waiter resolves once every lower ordinal
 /// is released, whatever the order of the releases; a release between the waiter's check
 /// and its await wakes it.

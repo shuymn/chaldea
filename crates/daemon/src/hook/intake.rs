@@ -132,6 +132,15 @@ impl IntakeOrder {
         )
     }
 
+    /// Whether some thread holds the intake lock now (tests only).
+    #[cfg(test)]
+    pub(crate) fn locked(&self) -> bool {
+        matches!(
+            self.launches.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+
     /// Resolves once no ordinal lower than `t`'s is pending for its launch. The
     /// `Notified` future is created and enabled before `pending` is checked, so a release
     /// between the check and the await wakes it.
