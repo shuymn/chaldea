@@ -372,26 +372,13 @@ pub(crate) fn budget(shared: &Shared, path: &str) -> Duration {
         .unwrap_or(shared.cfg.short_deadline)
 }
 
-/// Why the duplicate scan stopped.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ArgsError {
-    /// An object has two members of one key (after JSON unescaping).
-    Duplicate,
-    /// Not JSON.
-    Malformed,
-}
-
-/// Scans the raw `args` for an object with two members of one key, at every depth.
-pub(crate) fn scan_duplicates(raw: &str) -> Result<(), ArgsError> {
+/// Scans the raw `args` for an object with two members of one key (after JSON unescaping),
+/// at every depth; text that is not JSON fails too.
+pub(crate) fn scan_duplicates(raw: &str) -> Result<(), serde_json::Error> {
     let mut de = serde_json::Deserializer::from_str(raw);
-    match Scan.deserialize(&mut de).and_then(|()| de.end()) {
-        Ok(()) => Ok(()),
-        Err(e) if e.to_string().starts_with(DUPLICATE) => Err(ArgsError::Duplicate),
-        Err(_) => Err(ArgsError::Malformed),
-    }
+    Scan.deserialize(&mut de)?;
+    de.end()
 }
-
-const DUPLICATE: &str = "duplicate member";
 
 /// A seed that walks one JSON value and refuses an object with a repeated key.
 #[derive(Clone, Copy)]
@@ -439,7 +426,7 @@ impl<'de> Visitor<'de> for Scan {
         let mut keys = std::collections::HashSet::new();
         while let Some(key) = map.next_key::<String>()? {
             if !keys.insert(key) {
-                return Err(de::Error::custom(DUPLICATE));
+                return Err(de::Error::custom("duplicate member"));
             }
             map.next_value_seed(self)?;
         }
