@@ -18,18 +18,46 @@ use support::hook::{
 use support::{launch, soon, thread};
 use uuid::Uuid;
 
+/// A hook server on a stopped clock ([`support::http::SkewClock::stop`]): no request
+/// deadline passes, so a reply here depends on the server's work and not on how fast the
+/// host runs it. None of these tests is about a deadline (`hook_b8` and the unit tests
+/// cover those).
+async fn server() -> HookServer {
+    stopped(HookServer::start().await)
+}
+
+fn stopped(h: HookServer) -> HookServer {
+    h.srv.clock.stop();
+    h
+}
+
+/// A stopped clock converts one cutoff to the same real instant every time, and keeps
+/// earlier readings in the past.
+#[tokio::test]
+async fn stopped_clock_converts_a_cutoff_once() {
+    use chaldea_daemon::http::MonotonicClock;
+
+    let clock = support::http::SkewClock::default();
+    clock.stop();
+    let f = clock.now();
+    let cutoff = f + support::http::DEADLINE;
+    let real_cutoff = clock.real(cutoff);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(clock.now(), f);
+    assert!(clock.real(f - Duration::from_millis(1)) < clock.real(f));
+    assert!(clock.real(f) <= std::time::Instant::now());
+    assert_eq!(clock.real(cutoff), real_cutoff);
+    // A day past the real stop instant, the stopped clock's reading's own real instant.
+    assert_eq!(
+        real_cutoff,
+        clock.real(f) + Duration::from_secs(24 * 60 * 60)
+    );
+}
+
 fn ok(r: &support::http::Reply) {
     assert_eq!(r.status, 200, "{r:?}");
     assert!(r.body.is_empty(), "{r:?}");
     assert_eq!(r.header("content-length"), Some("0"), "{r:?}");
-}
-
-/// The kinds of the hook-sourced events of `l`'s thread.
-fn kinds(h: &HookServer, l: &Launch) -> Vec<String> {
-    h.hook_events(l.thread)
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect()
 }
 
 fn session_of(l: &Launch) -> String {
@@ -47,7 +75,7 @@ async fn bind_codex(h: &HookServer, l: &Launch, session: &str) -> Uuid {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_replays_first_reply() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     bind_codex(&h, &l, "s").await;
     let hook = Hook::of(&l, "Stop", "s");
@@ -64,7 +92,7 @@ async fn retry_replays_first_reply() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_retries_dedup_in_the_job() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     bind_codex(&h, &l, "s").await;
     let events = h.stream(l.thread).len();
@@ -90,29 +118,12 @@ async fn concurrent_retries_dedup_in_the_job() {
     h.stop().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reply_waits_for_commit() {
-    let h = HookServer::start().await;
-    let l = h.codex(1).await;
-    bind_codex(&h, &l, "s").await;
-    let hook = Hook::of(&l, "Stop", "s");
-    let release = h.srv.hold_writer().await;
-    let reply = h.spawn_post(&hook);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(!reply.is_finished(), "a reply before the job committed");
-    assert!(h.delivery(l.launch, hook.emit).is_none());
-    release.send(()).unwrap();
-    ok(&reply.await.unwrap());
-    assert!(h.delivery(l.launch, hook.emit).is_some());
-    h.stop().await;
-}
-
 /// Both replay paths answer the stored first reply, whatever it is: the pre-read's (a
 /// delivery already stored) and the job's (stored after the pre-read, while the walk ran).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replays_answer_the_stored_reply() {
     use chaldea_daemon::store::{BufferedHook, HookReply, NewHookDelivery, NewRouting};
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     bind_codex(&h, &l, "s").await;
     let store = |emit: Uuid, ordinal: u64, body: &'static str| {
@@ -165,7 +176,7 @@ async fn replays_answer_the_stored_reply() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_after_binding_keeps_first_reply() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     let early = Hook::of(&l, "UserPromptSubmit", "s");
     ok(&h.post(&early).await);
@@ -186,7 +197,7 @@ async fn retry_after_binding_keeps_first_reply() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn identical_bodies_are_two_deliveries() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     bind_codex(&h, &l, "s").await;
     let events = h.stream(l.thread).len();
@@ -200,40 +211,20 @@ async fn identical_bodies_are_two_deliveries() {
     h.stop().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn buffered_durable_before_200() {
-    let h = HookServer::start().await;
-    let l = h.codex(1).await;
-    let hook = Hook::of(&l, "UserPromptSubmit", "s");
-    let release = h.srv.hold_writer().await;
-    let reply = h.spawn_post(&hook);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(
-        !reply.is_finished(),
-        "200 before the buffered row committed"
-    );
-    release.send(()).unwrap();
-    ok(&reply.await.unwrap());
-    assert_eq!(
-        h.delivery(l.launch, hook.emit).unwrap().routing,
-        Routing::Buffered
-    );
-    h.stop().await;
-}
-
 // ---- PR9-CL-5: ordinals -----------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_ordinals_unique() {
-    let h = HookServer::start_with(
-        HookConfig {
-            buffer_max_count: 100,
-            ..HookConfig::default()
-        },
-        // 64 requests at once on a debug build: the 5 s product deadline.
-        |c| c.short_deadline = Duration::from_secs(5),
-    )
-    .await;
+    let h = stopped(
+        HookServer::start_with(
+            HookConfig {
+                buffer_max_count: 100,
+                ..HookConfig::default()
+            },
+            |_| {},
+        )
+        .await,
+    );
     let l = h.codex(1).await;
     bind_codex(&h, &l, "s").await;
     let hooks: Vec<Hook> = (0..64).map(|_| Hook::of(&l, "Stop", "s")).collect();
@@ -269,7 +260,7 @@ async fn concurrent_ordinals_unique() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ordinals_continue_after_restart() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     bind_codex(&h, &l, "s").await;
     for _ in 0..2 {
@@ -277,7 +268,7 @@ async fn ordinals_continue_after_restart() {
     }
     let HookServer { srv, .. } = h;
     let (_, store) = srv.into_store(Duration::from_secs(10)).await;
-    let h = HookServer::start_on(store, HookConfig::default(), |_| {}).await;
+    let h = stopped(HookServer::start_on(store, HookConfig::default(), |_| {}).await);
     h.chains.set(EMITTER_PID, direct(EMITTER_PID, "codex"));
     let next = Hook::of(&l, "Stop", "s");
     ok(&h.post(&next).await);
@@ -288,90 +279,11 @@ async fn ordinals_continue_after_restart() {
 // ---- PR9-CL-6: binding order -------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn binding_waits_for_earlier_hook() {
-    let h = HookServer::start().await;
-    let l = h.codex(1).await;
-    // Hook 1 walks a chain of its own pid, held.
-    h.chains.set(7001, direct(7001, "codex"));
-    let (walking, release) = h.chains.hold(7001);
-    let first = Hook::of(&l, "UserPromptSubmit", "s").pid(Some(7001));
-    let first_reply = h.spawn_post(&first);
-    tokio::task::spawn_blocking(move || walking.recv_timeout(Duration::from_secs(10)))
-        .await
-        .unwrap()
-        .unwrap();
-    let start = Hook::of(&l, "SessionStart", "s");
-    let start_reply = h.spawn_post(&start);
-    let stop = Hook::of(&l, "Stop", "s");
-    let stop_reply = h.spawn_post(&stop);
-    // Stop 3 is buffered (the launch is unbound); the SessionStart waits for ordinal 1.
-    ok(&stop_reply.await.unwrap());
-    assert_eq!(
-        h.launch_row(l.launch).session_id,
-        None,
-        "bound before hook 1"
-    );
-    release.send(()).unwrap();
-    ok(&first_reply.await.unwrap());
-    ok(&start_reply.await.unwrap());
-    let order: Vec<Uuid> = h
-        .adapter
-        .calls()
-        .into_iter()
-        .filter(|c| c.promoted || c.event_name != "SessionStart")
-        .map(|c| c.emit_id)
-        .collect();
-    assert_eq!(
-        order,
-        vec![first.emit, stop.emit],
-        "promotion in receipt order"
-    );
-    assert_eq!(
-        kinds(&h, &l),
-        vec![
-            "session_bound",
-            "raw_unknown",
-            "user_message",
-            "assistant_message"
-        ],
-        "session_bound, the binding's raw, UserPromptSubmit 1, Stop 3"
-    );
-    h.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn earlier_session_start_wins() {
-    let h = HookServer::start().await;
-    let l = h.codex(1).await;
-    h.chains.set(7001, direct(7001, "codex"));
-    let (walking, release) = h.chains.hold(7001);
-    let earlier = Hook::of(&l, "SessionStart", "first").pid(Some(7001));
-    let earlier_reply = h.spawn_post(&earlier);
-    tokio::task::spawn_blocking(move || walking.recv_timeout(Duration::from_secs(10)))
-        .await
-        .unwrap()
-        .unwrap();
-    let later = Hook::of(&l, "SessionStart", "second");
-    let later_reply = h.spawn_post(&later);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        !later_reply.is_finished(),
-        "the later SessionStart overtook"
-    );
-    release.send(()).unwrap();
-    ok(&earlier_reply.await.unwrap());
-    ok(&later_reply.await.unwrap());
-    assert_eq!(h.launch_row(l.launch).session_id.as_deref(), Some("first"));
-    h.assert_raw(&l, later.emit, R::ForeignSession);
-    h.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn released_gap_does_not_block() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     h.chains.set(7001, direct(7001, "codex"));
-    let (walking, _release) = h.chains.hold(7001);
+    let (walking, release) = h.chains.hold(7001);
     // Ordinal 1: its client disconnects during the walk.
     let first = Hook::of(&l, "UserPromptSubmit", "s").pid(Some(7001));
     let mut conn = support::http::connect(h.srv.port).await;
@@ -381,51 +293,16 @@ async fn released_gap_does_not_block() {
         .unwrap()
         .unwrap();
     drop(conn);
-    // Ordinal 2 binds at once, long before ordinal 1's deadline.
-    let started = std::time::Instant::now();
+    // Ordinal 2 binds while ordinal 1's walk is still held and its deadline never passes
+    // on the stopped clock: only the disconnect can have released ordinal 1.
     bind_codex(&h, &l, "s").await;
     assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "the binding waited {:?} for a released ordinal",
-        started.elapsed()
+        h.delivery(l.launch, first.emit).is_none(),
+        "the disconnected hook submitted a job"
     );
-    h.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn queued_earlier_job_releases_at_submit() {
-    let h = HookServer::start().await;
-    let l = h.codex(1).await;
-    let release = h.srv.hold_writer().await;
-    // Hook 1 is submitted behind the held writer; its client then disconnects.
-    let first = Hook::of(&l, "UserPromptSubmit", "s");
-    let mut conn = support::http::connect(h.srv.port).await;
-    support::http::write(&mut conn, &first.req(&h.srv).bytes()).await;
-    support::http::eventually(Duration::from_secs(10), "hook 1 walked", || {
-        h.chains.walked() > 0
-    })
-    .await;
-    // The binding SessionStart 2 is submitted too: hook 1's ordinal was released when
-    // its job was queued, not when it ran.
-    let start = Hook::of(&l, "SessionStart", "s");
-    let start_reply = h.spawn_post(&start);
-    support::http::eventually(Duration::from_secs(10), "the binding walked", || {
-        h.chains.walked() >= 2
-    })
-    .await;
-    drop(conn);
-    release.send(()).unwrap();
-    ok(&start_reply.await.unwrap());
-    let d1 = h.delivery(l.launch, first.emit).expect("hook 1 committed");
-    let d2 = h.delivery(l.launch, start.emit).unwrap();
-    assert!(
-        d1.commit_ordinal < d2.commit_ordinal,
-        "hook 1 then the binding"
-    );
-    assert!(
-        matches!(d1.routing, Routing::Appended { .. }),
-        "promoted: {d1:?}"
-    );
+    release
+        .send(())
+        .expect("the first walk was still held when the binding succeeded");
     h.stop().await;
 }
 
@@ -433,7 +310,7 @@ async fn queued_earlier_job_releases_at_submit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claude_binds_by_expected_session() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.claude(1).await;
     // Another session: foreign, no binding. Claude ignores the chain (pid absent).
     let other = Hook::of(&l, "SessionStart", "other").pid(None);
@@ -451,7 +328,7 @@ async fn claude_binds_by_expected_session() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_binds_by_ancestry() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     // No chain: foreign.
     let none = Hook::of(&l, "SessionStart", "s").pid(None);
@@ -463,7 +340,7 @@ async fn codex_binds_by_ancestry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn escaped_windows_transcript_path() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     let body = br#"{"hook_event_name":"SessionStart","session_id":"s","transcript_path":"C:\\work\\t.jsonl"}"#;
     ok(&h.post(&Hook::new(&l, body)).await);
@@ -476,7 +353,7 @@ async fn escaped_windows_transcript_path() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nested_chain_does_not_bind() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     h.chains.set(
         7001,
@@ -499,7 +376,7 @@ async fn nested_chain_does_not_bind() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn non_emitter_first_link_is_not_eligible() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     h.chains.set(
         7001,
@@ -517,7 +394,7 @@ async fn non_emitter_first_link_is_not_eligible() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nested_claude_new_session_is_foreign() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.claude(1).await;
     ok(&h.post(&Hook::of(&l, "SessionStart", &session_of(&l))).await);
     let nested = Hook::of(&l, "SessionStart", "nested-session");
@@ -531,7 +408,7 @@ async fn nested_claude_new_session_is_foreign() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nested_claude_same_session_is_selected() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.claude(1).await;
     ok(&h.post(&Hook::of(&l, "SessionStart", &session_of(&l))).await);
     // A nested Claude resuming the launch's session id, with another chain entirely:
@@ -545,7 +422,7 @@ async fn nested_claude_same_session_is_selected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn differently_named_nested_codex_binds_first() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     h.chains.set(
         7001,
@@ -569,7 +446,7 @@ async fn differently_named_nested_codex_binds_first() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nested_link_missing_from_prefix_is_eligible() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     // A nested `codex` created the emitter, but its link reads as L directly.
     h.chains.set(7001, direct(7001, "codex"));
@@ -581,7 +458,7 @@ async fn nested_link_missing_from_prefix_is_eligible() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unrecognised_link_below_another_cli_is_not_eligible() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     h.chains.set(
         7001,
@@ -604,7 +481,7 @@ async fn unrecognised_link_below_another_cli_is_not_eligible() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chain_cut_before_l_stays_unbound() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     for (pid, end) in [
         (7001, AncestryEnd::Limit),
@@ -625,7 +502,7 @@ async fn chain_cut_before_l_stays_unbound() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn later_hooks_revalidate_ancestry() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     bind_codex(&h, &l, "s").await;
     h.chains.set(
@@ -652,7 +529,7 @@ async fn later_hooks_revalidate_ancestry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conflicting_session_start_is_foreign() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     bind_codex(&h, &l, "s").await;
     let other = Hook::of(&l, "SessionStart", "other");
@@ -664,7 +541,7 @@ async fn conflicting_session_start_is_foreign() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn foreign_session_never_interpreted() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     // Unbound: an ineligible chain.
     let unbound = Hook::of(&l, "Stop", "s").pid(None);
@@ -701,7 +578,7 @@ async fn foreign_session_never_interpreted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unbound_intake_changes_nothing() {
-    let h = HookServer::start().await;
+    let h = server().await;
     h.adapter.set_mode(Mode::Readiness);
     let l = h.codex(1).await;
     let before = h.snapshot(&l);
@@ -726,7 +603,7 @@ async fn unbound_intake_changes_nothing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn promotion_in_receipt_order() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     // Ordinal 1 walks held, so ordinal 2 commits first.
     h.chains.set(7001, direct(7001, "codex"));
@@ -761,7 +638,7 @@ async fn promotion_in_receipt_order() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn promotion_carries_intake_facts() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     let early = Hook::of(&l, "UserPromptSubmit", "s").attempt(Some("2"));
     ok(&h.post(&early).await);
@@ -787,7 +664,7 @@ async fn promotion_carries_intake_facts() {
 /// `Some(null)`, as a direct delivery after the binding does, not `None`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn promotion_keeps_present_null_facts() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     h.facts
         .null
@@ -816,7 +693,7 @@ async fn promotion_keeps_present_null_facts() {
 /// promotion, never interpreted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn promotion_refuses_another_session() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     let other = Hook::of(&l, "UserPromptSubmit", "other");
     ok(&h.post(&other).await);
@@ -875,7 +752,7 @@ fn meta(l: &Launch, start: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn promotion_rechecks_ancestry() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     let wrong = buffer_directly(&h, &l, 100, payload("Stop", "s"), meta(&l, "999")).await;
     let right = buffer_directly(&h, &l, 101, payload("Stop", "s"), meta(&l, L_START)).await;
@@ -888,7 +765,7 @@ async fn promotion_rechecks_ancestry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn binding_ordinal_on_promoted_and_direct() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     ok(&h.post(&Hook::of(&l, "UserPromptSubmit", "s")).await);
     let start = Hook::of(&l, "SessionStart", "s");
@@ -906,7 +783,7 @@ async fn binding_ordinal_on_promoted_and_direct() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn binding_interpret_sees_bound_state() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     bind_codex(&h, &l, "s").await;
     let c = &h.adapter.calls()[0];
@@ -920,7 +797,7 @@ async fn binding_interpret_sees_bound_state() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_promotion_rolls_back_binding() {
     for mode in [Mode::RepeatName, Mode::ReservedName] {
-        let h = HookServer::start().await;
+        let h = server().await;
         let l = h.codex(1).await;
         let early = Hook::of(&l, "UserPromptSubmit", "s");
         ok(&h.post(&early).await);
@@ -955,6 +832,7 @@ async fn binding_raw_is_kept() {
         ),
     ))
     .await;
+    srv.clock.stop();
     let (t, lid) = (thread(1), launch(1));
     srv.append(vec![support::hook::register(t, Agent::Codex)])
         .await;
@@ -1010,7 +888,7 @@ async fn buffered(h: &HookServer, l: &Launch, n: usize) -> Vec<Uuid> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn buffer_count_overflow() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     let first = buffered(&h, &l, 32).await;
     for e in &first {
@@ -1037,7 +915,7 @@ async fn buffer_count_overflow() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn buffer_bytes_overflow() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     // Bodies padded to exactly 4 MiB: two fill the 8 MiB exactly; a third byte over.
     let body = |len: usize| {
@@ -1075,7 +953,7 @@ fn set_clock(h: &HookServer, at: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn buffer_ttl_expires() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     set_clock(&h, "2026-11-22T00:00:00.000Z");
     let old = buffered(&h, &l, 1).await[0];
@@ -1099,7 +977,7 @@ async fn buffer_ttl_expires() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ttl_uses_earliest_received_at() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     // Ordinal 1 commits after ordinal 2, with a later stamp.
     h.chains.set(7001, direct(7001, "codex"));
@@ -1125,7 +1003,7 @@ async fn ttl_uses_earliest_received_at() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clock_back_expires_nothing() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     set_clock(&h, "2026-11-22T01:00:00.000Z");
     let e = buffered(&h, &l, 1).await[0];
@@ -1137,7 +1015,7 @@ async fn clock_back_expires_nothing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_overflow() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     let hooks: Vec<Hook> = (0..33).map(|_| Hook::of(&l, "Stop", "s")).collect();
     let tasks: Vec<_> = hooks.iter().map(|x| h.spawn_post(x)).collect();
@@ -1164,10 +1042,7 @@ async fn concurrent_overflow() {
 /// order, receipt 1 first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn overflow_keeps_receipt_order() {
-    let h = HookServer::start_with(HookConfig::default(), |c| {
-        c.short_deadline = Duration::from_secs(10);
-    })
-    .await;
+    let h = server().await;
     let l = h.codex(1).await;
     h.chains.set(7001, direct(7001, "codex"));
     let (walking, release) = h.chains.hold(7001);
@@ -1200,7 +1075,7 @@ async fn overflow_keeps_receipt_order() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn not_current_launch_is_unbound() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     let state = h.thread_row(l.thread).state;
     h.srv.append(exit(l.thread, l.launch, &state)).await;
@@ -1224,7 +1099,7 @@ async fn not_current_launch_is_unbound() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exit_before_bind_then_after_bind() {
     // Exit first: the buffer is resolved, a later SessionStart is unbound.
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     let early = buffered(&h, &l, 1).await[0];
     let (t, lid) = (l.thread, l.launch);
@@ -1261,7 +1136,7 @@ async fn exit_before_bind_then_after_bind() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolve_unbindable_clears_buffer() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     let ids = buffered(&h, &l, 3).await;
     let lid = l.launch;
@@ -1283,7 +1158,7 @@ async fn resolve_unbindable_clears_buffer() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unparseable_kept_verbatim() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     let text = Hook::new(&l, b"not json");
     ok(&h.post(&text).await);
@@ -1311,7 +1186,7 @@ async fn unparseable_kept_verbatim() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn schema_mismatch_kept_verbatim() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     let x = Hook::new(&l, br#"{"x":1}"#);
     ok(&h.post(&x).await);
@@ -1329,7 +1204,7 @@ async fn schema_mismatch_kept_verbatim() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn large_raw_is_a_blob() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     let body = vec![b'z'; 200 * 1024];
     let x = Hook::new(&l, &body);
@@ -1347,7 +1222,7 @@ async fn large_raw_is_a_blob() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lone_surrogate_is_unparseable() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     let body = br#"{"hook_event_name":"Stop","session_id":"s","x":"\uD800"}"#;
     let unbound = Hook::new(&l, body);
@@ -1362,7 +1237,7 @@ async fn lone_surrogate_is_unparseable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invalid_buffer_then_valid_bind() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     let bad_body = buffer_directly(
         &h,
@@ -1388,7 +1263,7 @@ async fn invalid_buffer_then_valid_bind() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hook_token_checks() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     let other = h.codex(2).await;
     let srv = &h.srv;
@@ -1427,7 +1302,7 @@ async fn hook_token_checks() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn emit_id_reused_by_another_launch() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     // An unparseable body: an event under `hook:<emit>` in the thread at once.
     let first = Hook::new(&l, b"not json");
@@ -1498,7 +1373,7 @@ async fn next_launch(h: &HookServer, l: &Launch, n: u128) -> Launch {
 /// launch's buffer then binds, or resolves at its exit, without a key conflict.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn emit_id_reused_while_other_launch_buffered() {
-    let h = HookServer::start().await;
+    let h = server().await;
     for (n, resolve) in [(1, false), (3, true)] {
         let l1 = h.codex(n).await;
         let l2 = next_launch(&h, &l1, n + 1).await;
@@ -1536,7 +1411,7 @@ async fn emit_id_reused_while_other_launch_buffered() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_after_uncommitted_first_is_unreliable() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     bind_codex(&h, &l, "s").await;
     // Attempt 1 is cut before its job: its client leaves during a held walk.
@@ -1569,7 +1444,7 @@ async fn retry_after_uncommitted_first_is_unreliable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_after_lost_reply_replays() {
-    let h = HookServer::start().await;
+    let h = server().await;
     let l = h.codex(1).await;
     bind_codex(&h, &l, "s").await;
     let first = Hook::of(&l, "Stop", "s");

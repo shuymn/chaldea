@@ -37,6 +37,8 @@ pub(crate) struct Points {
     pub(crate) sample_gate: Mutex<Option<Gate>>,
     /// Told the first time the next registered socket task parks.
     pub(crate) first_park: Mutex<Option<oneshot::Sender<()>>>,
+    /// Told the first time the next write observer's wait for its ticket parks.
+    pub(crate) ticket_park: Mutex<Option<oneshot::Sender<()>>>,
     /// The upgrade steps recorded, in order.
     pub(crate) steps: Mutex<Vec<&'static str>>,
     /// Held once by a socket's next send before it writes.
@@ -95,6 +97,18 @@ async fn pass(slot: &Mutex<Option<Gate>>) -> bool {
     };
     let _ = reached.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(20), release).await;
+    true
+}
+
+/// Passes a gate as [`pass`], but waits until the release is used or dropped, never on a
+/// timer: for gates whose test result depends on the waiter not going on by itself.
+async fn pass_held(slot: &Mutex<Option<Gate>>) -> bool {
+    let gate = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+    let Some((reached, release)) = gate else {
+        return false;
+    };
+    let _ = reached.send(());
+    let _ = release.await;
     true
 }
 
@@ -178,13 +192,14 @@ impl Points {
             .clone()
     }
 
-    /// Arms the submit gate, as [`Points::arm_removal_gate`].
+    /// Arms the submit gate, as [`Points::arm_removal_gate`], except that the submission
+    /// goes on only when the returned sender is used or dropped (no 20 s release).
     pub(crate) fn arm_submit_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         arm(&self.submit_gate)
     }
 
     pub(crate) async fn before_submit(&self) {
-        pass(&self.submit_gate).await;
+        pass_held(&self.submit_gate).await;
     }
 
     pub(crate) fn submits(&self) -> usize {
@@ -338,6 +353,36 @@ impl Points {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// The returned receiver fires the first time the next write observer's wait for its
+    /// ticket parks (`run_write`): its job was submitted and has not answered yet.
+    pub(crate) fn arm_ticket_park(&self) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        *self
+            .ticket_park
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(tx);
+        rx
+    }
+
+    pub(crate) async fn signal_ticket_park<F: Future>(&self, fut: F) -> F::Output {
+        let mut signal = self
+            .ticket_park
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let mut fut = std::pin::pin!(fut);
+        std::future::poll_fn(move |cx| {
+            let r = fut.as_mut().poll(cx);
+            if r.is_pending()
+                && let Some(s) = signal.take()
+            {
+                let _ = s.send(());
+            }
+            r
+        })
+        .await
     }
 
     /// The returned receiver fires the first time the next registered socket task parks.

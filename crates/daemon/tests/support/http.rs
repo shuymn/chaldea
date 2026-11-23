@@ -47,13 +47,28 @@ impl LifecycleSink for RecordingSink {
     }
 }
 
-/// The real monotonic clock plus a settable offset, or frozen at one instant.
+/// The real monotonic clock plus a settable offset, frozen at one instant, or stopped.
 #[derive(Default)]
 pub struct SkewClock {
     offset_ms: AtomicU64,
-    /// While set: the instant `now` returns, and the real instant it was set at.
-    frozen: Mutex<Option<(Instant, Instant)>>,
+    /// While set, the clock stands still.
+    held: Mutex<Option<Held>>,
 }
+
+/// A clock that stands still: frozen (real time keeps running for later readings) or
+/// stopped (no later reading arrives).
+#[derive(Clone, Copy)]
+struct Held {
+    /// The instant `now` returns.
+    at: Instant,
+    /// The real instant it was set at.
+    real: Instant,
+    stopped: bool,
+}
+
+/// How far past the real stop instant a stopped clock puts every later reading: beyond
+/// every bound a test waits for.
+const NEVER: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl SkewClock {
     pub fn skew(&self, by: Duration) {
@@ -63,7 +78,25 @@ impl SkewClock {
 
     /// Stops the clock at `at`; real time keeps running for timers.
     pub fn freeze(&self, at: Instant) {
-        *self.frozen.lock().unwrap() = Some((at, Instant::now()));
+        *self.held.lock().unwrap() = Some(Held {
+            at,
+            real: Instant::now(),
+            stopped: false,
+        });
+    }
+
+    /// Stops the clock at its current reading for good: no later reading arrives, so a
+    /// deadline taken from this clock never passes and its timers do not fire while the
+    /// test runs. Timers of their own (hyper's header read, the write stall, the raw
+    /// client's waits) still run.
+    pub fn stop(&self) {
+        let mut held = self.held.lock().unwrap();
+        let at = held.map_or_else(|| Instant::now() + self.offset(), |h| h.at);
+        *held = Some(Held {
+            at,
+            real: Instant::now(),
+            stopped: true,
+        });
     }
 
     fn offset(&self) -> Duration {
@@ -73,19 +106,22 @@ impl SkewClock {
 
 impl MonotonicClock for SkewClock {
     fn now(&self) -> Instant {
-        match *self.frozen.lock().unwrap() {
-            Some((at, _)) => at,
+        match *self.held.lock().unwrap() {
+            Some(h) => h.at,
             None => Instant::now() + self.offset(),
         }
     }
 
-    /// `at` less the current offset (or, frozen, the real instant as far from the freeze
-    /// as `at` is from the frozen reading); when that is before the platform's earliest
-    /// instant it is long past, and the fixture reads `Instant::now()` instead.
+    /// `at` less the current offset; held, the real instant as far from the real set
+    /// instant as `at` is from the held reading, except that a stopped clock puts every
+    /// later `at` at [`NEVER`] past its real stop instant. When that is before the
+    /// platform's earliest instant it is long past, and the fixture reads `Instant::now()`
+    /// instead.
     fn real(&self, at: Instant) -> Instant {
-        match *self.frozen.lock().unwrap() {
-            Some((f, r)) if at >= f => r + (at - f),
-            Some((f, r)) => r.checked_sub(f - at).unwrap_or_else(Instant::now),
+        match *self.held.lock().unwrap() {
+            Some(h) if h.stopped && at > h.at => h.real + NEVER,
+            Some(h) if at >= h.at => h.real + (at - h.at),
+            Some(h) => h.real.checked_sub(h.at - at).unwrap_or_else(Instant::now),
             None => at.checked_sub(self.offset()).unwrap_or_else(Instant::now),
         }
     }
@@ -303,7 +339,7 @@ impl TestServer {
             .store()
             .submit(soon(), move |_tx| {
                 let _ = entered_tx.send(());
-                let _ = wait.recv_timeout(Duration::from_secs(20));
+                let _ = wait.recv();
                 Ok(())
             })
             .unwrap();
