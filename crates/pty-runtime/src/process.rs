@@ -138,12 +138,12 @@ fn newer(parent: &ProcessEntry, child: &ProcessEntry) -> bool {
 
 /// An image name as [`ProcessEntry::name`] holds it: ASCII-lowercased, a trailing `.exe`
 /// removed.
-pub(crate) fn normalize(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    match lower.strip_suffix(".exe") {
-        Some(stem) => stem.to_owned(),
-        None => lower,
+pub(crate) fn normalize(mut name: String) -> String {
+    name.make_ascii_lowercase();
+    if name.ends_with(".exe") {
+        name.truncate(name.len() - ".exe".len());
     }
+    name
 }
 
 /// A macOS process record (`unix::table::Lookup`) in a form every OS can build, so the
@@ -186,7 +186,7 @@ pub(crate) fn from_unix(r: UnixRecord) -> Lookup {
                 group: pgid.to_string(),
             },
             ppid,
-            name: normalize(&name),
+            name: normalize(name),
         }),
         UnixRecord::Zombie | UnixRecord::Gone => Lookup::Gone,
         UnixRecord::Unreadable => Lookup::Unreadable,
@@ -434,10 +434,13 @@ mod tests {
 
     #[test]
     fn names_are_normalized() {
-        assert_eq!(normalize("Chaldea.EXE"), "chaldea");
-        assert_eq!(normalize("chaldea-fake-cli.exe"), "chaldea-fake-cli");
-        assert_eq!(normalize("codex"), "codex");
-        assert_eq!(normalize("a.exe.exe"), "a.exe");
-        assert_eq!(normalize("Ä.exe"), "Ä");
+        assert_eq!(normalize("Chaldea.EXE".to_owned()), "chaldea");
+        assert_eq!(
+            normalize("chaldea-fake-cli.exe".to_owned()),
+            "chaldea-fake-cli"
+        );
+        assert_eq!(normalize("codex".to_owned()), "codex");
+        assert_eq!(normalize("a.exe.exe".to_owned()), "a.exe");
+        assert_eq!(normalize("Ä.exe".to_owned()), "Ä");
     }
 }

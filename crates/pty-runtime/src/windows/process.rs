@@ -117,7 +117,7 @@ pub(crate) fn filetime_now() -> u64 {
 pub(crate) fn rows(entries: impl IntoIterator<Item = (u32, u32, String)>) -> HashMap<u32, Row> {
     entries
         .into_iter()
-        .map(|(pid, ppid, exe)| (pid, (ppid, normalize(&exe))))
+        .map(|(pid, ppid, exe)| (pid, (ppid, normalize(exe))))
         .collect()
 }
 
