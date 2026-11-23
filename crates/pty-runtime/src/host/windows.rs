@@ -42,8 +42,10 @@ pub(super) fn process_identity(pid: u32) -> io::Result<Option<ProcessIdentity>> 
     }))
 }
 
+/// Windows has no inherited signal mask; the one inherited state that keeps a console
+/// program from stopping is an "ignore Ctrl-C" attribute (for example from `start /b`).
 pub(super) fn reset_process_signals() -> io::Result<()> {
-    Ok(())
+    sys::enable_ctrl_c_if_console()
 }
 
 pub(super) fn signal_state() -> io::Result<SignalState> {
@@ -104,11 +106,19 @@ pub struct AceView {
     pub sid: Option<String>,
 }
 
-fn private_trustee(sid: &str, user: &str, kind: EntryKind) -> bool {
+/// `INHERIT_ONLY_ACE` (`winnt.h`): the ACE applies only to what the directory's children
+/// inherit.
+const INHERIT_ONLY_ACE: u8 = 0x08;
+
+/// A private trustee of an allow ACE: the user, `SYSTEM`, `Administrators`; on a directory also
+/// `OWNER RIGHTS`, and `CREATOR OWNER` on an inherit-only ACE (it names the owner of what is
+/// created inside).
+fn private_trustee(sid: &str, flags: u8, user: &str, kind: EntryKind) -> bool {
     sid == user
         || sid == SYSTEM
         || sid == ADMINISTRATORS
-        || (kind == EntryKind::Directory && (sid == CREATOR_OWNER || sid == OWNER_RIGHTS))
+        || (kind == EntryKind::Directory
+            && (sid == OWNER_RIGHTS || (sid == CREATOR_OWNER && flags & INHERIT_ONLY_ACE != 0)))
 }
 
 /// The privacy judgement of an owner and DACL (`None`: a NULL DACL): owned by `user`, and
@@ -132,7 +142,7 @@ pub fn judge_descriptor(
             ACE_DENIED => {}
             ACE_ALLOWED => {
                 let sid = ace.sid.as_deref().unwrap_or("");
-                if !private_trustee(sid, user, kind) {
+                if !private_trustee(sid, ace.flags, user, kind) {
                     return Privacy::AclGrantsOthers;
                 }
             }
@@ -212,6 +222,11 @@ pub(super) fn open_no_follow(path: &Path, access: Access) -> io::Result<File> {
         ));
     }
     Ok(f)
+}
+
+pub(super) fn hard_links(path: &Path) -> io::Result<u64> {
+    let f = open_entry(path)?;
+    Ok(u64::from(sys::file_links(f.as_handle())?))
 }
 
 pub(super) fn is_reparse(m: &Metadata) -> bool {
@@ -310,10 +325,25 @@ mod tests {
             judge_descriptor(USER, Some(&users), USER, EntryKind::Directory),
             Privacy::AclGrantsOthers
         );
-        let creator = [allow(USER), allow(CREATOR_OWNER), allow(OWNER_RIGHTS)];
+        let inherit_only = |sid: &str| AceView {
+            ace_type: ACE_ALLOWED,
+            flags: INHERIT_ONLY_ACE,
+            sid: Some(sid.to_owned()),
+        };
+        let creator = [
+            allow(USER),
+            inherit_only(CREATOR_OWNER),
+            allow(OWNER_RIGHTS),
+        ];
         assert_eq!(
             judge_descriptor(USER, Some(&creator), USER, EntryKind::Directory),
             Privacy::Private
+        );
+        // `CREATOR OWNER` on an ACE that applies to the directory itself is not private.
+        let effective = [allow(USER), allow(CREATOR_OWNER)];
+        assert_eq!(
+            judge_descriptor(USER, Some(&effective), USER, EntryKind::Directory),
+            Privacy::AclGrantsOthers
         );
         assert_eq!(
             judge_descriptor(USER, Some(&creator), USER, EntryKind::File),

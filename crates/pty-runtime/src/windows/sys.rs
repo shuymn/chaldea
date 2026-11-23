@@ -632,9 +632,25 @@ fn wide_str(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
 }
 
-fn wide_path(p: &std::path::Path) -> Vec<u16> {
+/// `p` made absolute (normalized by `GetFullPathNameW`) in the `\\?\` form, so a create
+/// accepts paths longer than `MAX_PATH` as std's own opens do; NUL-terminated.
+fn long_path(p: &std::path::Path) -> io::Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
-    p.as_os_str().encode_wide().chain([0]).collect()
+    let abs: Vec<u16> = std::path::absolute(p)?.as_os_str().encode_wide().collect();
+    let units = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+    let mut out = if abs.starts_with(&units(r"\\?\")) || abs.starts_with(&units(r"\\.\")) {
+        abs
+    } else if abs.starts_with(&units(r"\\")) {
+        let mut v = units(r"\\?\UNC\");
+        v.extend_from_slice(&abs[2..]);
+        v
+    } else {
+        let mut v = units(r"\\?\");
+        v.extend_from_slice(&abs);
+        v
+    };
+    out.push(0);
+    Ok(out)
 }
 
 /// The units of a NUL-terminated UTF-16 string an API returned.
@@ -741,7 +757,7 @@ pub(crate) fn create_dir_with(path: &std::path::Path, sddl: &str) -> io::Result<
     use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
     let sd = descriptor(sddl)?;
     let sa = attributes(&sd);
-    let w = wide_path(path);
+    let w = long_path(path)?;
     // SAFETY: `w` is NUL-terminated; `sa` and the descriptor it points to outlive the call.
     if unsafe { CreateDirectoryW(w.as_ptr(), &raw const sa) } == 0 {
         return Err(io::Error::last_os_error());
@@ -762,7 +778,7 @@ pub(crate) fn create_new_file_with(
     };
     let sd = descriptor(sddl)?;
     let sa = attributes(&sd);
-    let w = wide_path(path);
+    let w = long_path(path)?;
     // SAFETY: `w` is NUL-terminated; `sa` and its descriptor outlive the call; no template.
     let h = unsafe {
         CreateFileW(
@@ -1003,6 +1019,36 @@ pub(crate) fn ignore_ctrl_c() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Clears an inherited "ignore Ctrl-C" attribute (`SetConsoleCtrlHandler(NULL, FALSE)`) when
+/// the process has a console; without one there is nothing to deliver.
+pub(crate) fn enable_ctrl_c_if_console() -> io::Result<()> {
+    use windows_sys::Win32::System::Console::{GetConsoleProcessList, SetConsoleCtrlHandler};
+    let mut one = [0u32; 1];
+    // SAFETY: the buffer holds one entry, which is passed; a count of 0 means no console.
+    if unsafe { GetConsoleProcessList(one.as_mut_ptr(), 1) } == 0 {
+        return Ok(());
+    }
+    // SAFETY: a null handler with FALSE clears the process's ignore attribute.
+    if unsafe { SetConsoleCtrlHandler(None, 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The number of hard links of the file open as `h` (`GetFileInformationByHandle`).
+pub(crate) fn file_links(h: BorrowedHandle<'_>) -> io::Result<u32> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    // SAFETY: a plain-data struct the call fills.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is borrowed and valid; `info` is a local.
+    if unsafe { GetFileInformationByHandle(raw(&h), &raw mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.nNumberOfLinks)
 }
 
 /// The pids attached to this process's console (tests).

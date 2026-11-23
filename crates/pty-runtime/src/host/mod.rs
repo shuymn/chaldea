@@ -255,6 +255,16 @@ pub fn is_plain_file_or_absent(path: &Path) -> io::Result<bool> {
     }
 }
 
+/// How many hard links name the entry at `path` (never following a final link): above 1,
+/// another path shares the file.
+///
+/// # Errors
+///
+/// The entry cannot be inspected (`NotFound` when absent).
+pub fn hard_links(path: &Path) -> io::Result<u64> {
+    imp::hard_links(path)
+}
+
 // ---- Stop channel (docs/design/daemon-lifecycle.md §2.10) ----
 
 /// The daemon's stop listener: on Windows a `Global\chaldea-stop-<instance>` event with an

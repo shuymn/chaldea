@@ -50,6 +50,10 @@ pub(super) fn open_no_follow(_path: &Path, _access: Access) -> io::Result<File> 
     unsupported()
 }
 
+pub(super) fn hard_links(_path: &Path) -> io::Result<u64> {
+    unsupported()
+}
+
 pub(super) fn is_reparse(_m: &Metadata) -> bool {
     false
 }

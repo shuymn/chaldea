@@ -125,7 +125,9 @@ pub(super) fn open_no_follow(path: &Path, access: Access) -> io::Result<File> {
             o.append(true).create(true).mode(0o600);
         }
     }
-    o.custom_flags(libc::O_NOFOLLOW);
+    // Non-blocking, so a FIFO or device fails the type check below instead of blocking the
+    // open; for a regular file the flag changes nothing.
+    o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let f = o.open(path).map_err(|e| {
         if e.raw_os_error() == Some(libc::ELOOP) {
             io::Error::new(io::ErrorKind::InvalidInput, "a link")
@@ -147,6 +149,10 @@ pub(super) fn create_new_private(path: &Path) -> io::Result<File> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
+}
+
+pub(super) fn hard_links(path: &Path) -> io::Result<u64> {
+    Ok(std::fs::symlink_metadata(path)?.nlink())
 }
 
 pub(super) fn is_reparse(_m: &Metadata) -> bool {
