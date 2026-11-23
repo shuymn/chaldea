@@ -11,28 +11,26 @@
 //! | `{ "nested": [<step>, …] }` | a nested FakeCli `hooks` with those steps, inheriting the environment; waits for it |
 //! | `{ "wait_file": "<path>" }` | waits until the file exists, at most [`WAIT_FILE`] |
 //!
-//! Reports: `emitted` per emitter run (`step`, `code` or null when it was killed,
-//! `elapsed_ms`, `stdout_len`, `stderr_len`, each null when the pipe was still open at the
-//! run's end); `nested` per nested run (`step`, `code`); `wait_file` (`step`, `found`);
-//! `script_error` for a script that does not parse.
+//! Reports: `emitted` per emitter run (`step`, `code` or null when it did not exit by its
+//! deadline, `elapsed_ms`, `stdout_len`, `stderr_len`, each null when that pipe did not close
+//! by the deadline plus the reap); `nested` per nested run (`step`, `code`); `wait_file`
+//! (`step`, `found`); `script_error` for a script that does not parse.
 //!
-//! Every child's bounds are measured from its own launch: an emitter is killed at
-//! [`EMITTER_WAIT`], and its output pipes and reap are awaited until [`REAP`] after that.
+//! Every child's deadline is measured from its own launch and enforced by
+//! [`watch::settle`]: an emitter is killed [`EMITTER_WAIT`] after its launch.
 
-use std::io::{Read, Write};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use super::Opts;
+use super::watch::{self, Watched};
 use crate::report::Reporter;
 
 /// The longest an emitter run is awaited from its launch (its own watchdog ends it at 3 s).
 pub(crate) const EMITTER_WAIT: Duration = Duration::from_secs(10);
-/// How long past a child's exit bound its output pipes and its reap are awaited.
-pub(crate) const REAP: Duration = Duration::from_secs(1);
 /// The longest a nested FakeCli is awaited from its launch.
 const NESTED_WAIT: Duration = Duration::from_secs(60);
 /// The longest a `wait_file` step waits.
@@ -61,12 +59,12 @@ pub(crate) fn run(o: &Opts) -> i32 {
 /// Runs one step; false when the step is not one of the table's.
 fn run_step(o: &Opts, emitter: &str, rep: &Reporter, i: usize, step: &Value) -> bool {
     if let Some(p) = step.get("emit") {
-        let r = start(emitter, &o.agent, p).map(Running::finish);
-        report_emitted(rep, &json!(i), r);
+        for r in emit_all(emitter, &o.agent, std::slice::from_ref(p)) {
+            report_emitted(rep, &json!(i), r.as_ref());
+        }
     } else if let Some(Value::Array(ps)) = step.get("concurrent") {
-        let started: Vec<_> = ps.iter().map(|p| start(emitter, &o.agent, p)).collect();
-        for r in started {
-            report_emitted(rep, &json!(i), r.map(Running::finish));
+        for r in emit_all(emitter, &o.agent, ps) {
+            report_emitted(rep, &json!(i), r.as_ref());
         }
     } else if let Some(steps @ Value::Array(_)) = step.get("nested") {
         let mut cmd = Command::new(std::env::current_exe().unwrap_or_default());
@@ -77,10 +75,10 @@ fn run_step(o: &Opts, emitter: &str, rep: &Reporter, i: usize, step: &Value) -> 
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let launched = Instant::now();
-        let code = cmd
-            .spawn()
-            .ok()
-            .and_then(|mut c| wait_until(&mut c, launched + NESTED_WAIT));
+        let code = cmd.spawn().ok().and_then(|c| {
+            let w = Watched::new(c, launched, NESTED_WAIT);
+            watch::settle(vec![w]).remove(0).code
+        });
         rep.send(&json!({"event": "nested", "step": i, "code": code}));
     } else if let Some(Value::String(path)) = step.get("wait_file") {
         let end = Instant::now() + WAIT_FILE;
@@ -96,103 +94,68 @@ fn run_step(o: &Opts, emitter: &str, rep: &Reporter, i: usize, step: &Value) -> 
     true
 }
 
-/// One emitter run: the process, its launch and exit bound, and the threads counting its
-/// outputs.
-pub(crate) struct Running {
-    child: Child,
-    started: Instant,
-    /// The exit is awaited until it; past it the child is killed.
-    deadline: Instant,
-    stdout: Receiver<usize>,
-    stderr: Receiver<usize>,
-}
-
 /// The result of one emitter run.
 pub(crate) struct Emitted {
-    /// `None`: killed at its deadline, or exited by a signal.
+    /// `None`: it did not exit by its deadline (killed), or it ended by a signal.
     pub(crate) code: Option<i32>,
     pub(crate) elapsed: Duration,
-    /// `None`: the pipe was still open [`REAP`] after the deadline (a descendant holds it).
+    /// `None`: the pipe did not close by the deadline plus the reap (a descendant holds it).
     pub(crate) stdout_len: Option<usize>,
     pub(crate) stderr_len: Option<usize>,
 }
 
-/// Starts `<emitter> hook-emit <agent>`, writes `payload` (a JSON value; a string is sent as
-/// its raw text) to its stdin, and closes it.
-pub(crate) fn start(emitter: &str, agent: &str, payload: &Value) -> Option<Running> {
+/// Runs one emitter per payload, all launched before any is awaited and settled together,
+/// and returns their results in payload order; `None` for an emitter that did not start.
+pub(crate) fn emit_all(emitter: &str, agent: &str, payloads: &[Value]) -> Vec<Option<Emitted>> {
+    let started: Vec<Option<Watched>> = payloads.iter().map(|p| start(emitter, agent, p)).collect();
+    let ok: Vec<bool> = started.iter().map(Option::is_some).collect();
+    let mut settled = watch::settle(started.into_iter().flatten().collect()).into_iter();
+    ok.into_iter()
+        .map(|ok| {
+            let s = if ok { settled.next() } else { None }?;
+            Some(Emitted {
+                code: s.code,
+                elapsed: s.elapsed,
+                stdout_len: s.outputs[0],
+                stderr_len: s.outputs[1],
+            })
+        })
+        .collect()
+}
+
+/// Starts `<emitter> hook-emit <agent>` with both outputs counted, writes `payload` (a JSON
+/// value; a string is sent as its raw text) to its stdin, and closes it.
+fn start(emitter: &str, agent: &str, payload: &Value) -> Option<Watched> {
     let bytes = match payload {
         Value::String(s) => s.clone().into_bytes(),
         v => v.to_string().into_bytes(),
     };
-    let mut cmd = Command::new(emitter);
-    cmd.args(["hook-emit", agent]);
-    Running::launch(&mut cmd, bytes, EMITTER_WAIT)
-}
-
-/// Counts the bytes of `r` until its EOF, on a thread; the count arrives on the channel.
-fn count(r: Option<impl Read + Send + 'static>) -> Receiver<usize> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut r) = r {
-            let _ = r.read_to_end(&mut buf);
-        }
-        let _ = tx.send(buf.len());
-    });
-    rx
-}
-
-impl Running {
-    /// Starts `cmd` with piped stdio, writes `input` to its stdin and closes it; the exit is
-    /// awaited until `wait` after this launch.
-    pub(crate) fn launch(cmd: &mut Command, input: Vec<u8>, wait: Duration) -> Option<Running> {
-        let started = Instant::now();
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .ok()?;
-        let stdout = count(child.stdout.take());
-        let stderr = count(child.stderr.take());
-        if let Some(mut stdin) = child.stdin.take() {
-            // The emitter may exit without reading (a missing environment): a broken pipe
-            // here is expected.
-            std::thread::spawn(move || {
-                let _ = stdin.write_all(&input);
-            });
-        }
-        Some(Running {
-            child,
-            started,
-            deadline: started + wait,
-            stdout,
-            stderr,
-        })
+    let launched = Instant::now();
+    let mut child = Command::new(emitter)
+        .args(["hook-emit", agent])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let (stdout, stderr, stdin) = (child.stdout.take(), child.stderr.take(), child.stdin.take());
+    let mut w = Watched::new(child, launched, EMITTER_WAIT);
+    w.count(stdout);
+    w.count(stderr);
+    if let Some(mut stdin) = stdin {
+        // The emitter may exit without reading (a missing environment): a broken pipe here
+        // is expected.
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        });
     }
-
-    /// Waits for the exit until the deadline (then kills it), and for its outputs and reap
-    /// until [`REAP`] after the deadline.
-    pub(crate) fn finish(mut self) -> Emitted {
-        let code = wait_until(&mut self.child, self.deadline);
-        let elapsed = self.started.elapsed();
-        let end = self.deadline + REAP;
-        let len = |rx: &Receiver<usize>| {
-            rx.recv_timeout(end.saturating_duration_since(Instant::now()))
-                .ok()
-        };
-        Emitted {
-            code,
-            elapsed,
-            stdout_len: len(&self.stdout),
-            stderr_len: len(&self.stderr),
-        }
-    }
+    Some(w)
 }
 
-/// Reports one emitter run; `step` is the step index (`hooks`) or the hook's name (`echo`).
-pub(crate) fn report_emitted(rep: &Reporter, step: &Value, r: Option<Emitted>) {
-    let v = match r {
+/// The `emitted` event of one emitter run; `step` is the step index (`hooks`) or the hook's
+/// name (`echo`).
+pub(crate) fn emitted_event(step: &Value, r: Option<&Emitted>) -> Value {
+    match r {
         Some(e) => json!({
             "event": "emitted",
             "step": step,
@@ -202,26 +165,12 @@ pub(crate) fn report_emitted(rep: &Reporter, step: &Value, r: Option<Emitted>) {
             "stderr_len": e.stderr_len,
         }),
         None => json!({"event": "emitted", "step": step, "code": null, "spawn_failed": true}),
-    };
-    rep.send(&v);
+    }
 }
 
-/// The exit code by `deadline`, else kills the child and reaps it until [`REAP`] after the
-/// deadline: `None`.
-pub(crate) fn wait_until(c: &mut Child, deadline: Instant) -> Option<i32> {
-    loop {
-        match c.try_wait() {
-            Ok(Some(s)) => return s.code(),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL),
-            _ => break,
-        }
-    }
-    let _ = c.kill();
-    let end = deadline + REAP;
-    while matches!(c.try_wait(), Ok(None)) && Instant::now() < end {
-        std::thread::sleep(POLL);
-    }
-    None
+/// Reports one emitter run (see [`emitted_event`]).
+pub(crate) fn report_emitted(rep: &Reporter, step: &Value, r: Option<&Emitted>) {
+    rep.send(&emitted_event(step, r));
 }
 
 /// A random version-4 UUID in hyphenated form, from the standard library's per-process hash
@@ -256,73 +205,6 @@ pub(crate) fn random_uuid() -> String {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
-    fn sh(script: &str) -> Command {
-        let mut c = Command::new("/bin/sh");
-        c.args(["-c", script]);
-        c
-    }
-
-    /// Three runs that never exit, all launched before the first is finished: each is
-    /// killed at its own launch's bound, so the three end together.
-    #[cfg(unix)]
-    #[test]
-    fn each_run_is_bounded_from_its_launch() {
-        let wait = Duration::from_millis(300);
-        let t = Instant::now();
-        let runs: Vec<Running> = (0..3)
-            .map(|_| Running::launch(&mut sh("exec sleep 30"), Vec::new(), wait).unwrap())
-            .collect();
-        for r in runs {
-            let e = r.finish();
-            assert_eq!(e.code, None);
-            assert!(e.elapsed >= wait, "{:?}", e.elapsed);
-            assert_eq!((e.stdout_len, e.stderr_len), (Some(0), Some(0)));
-        }
-        // Restated: 300 ms each; serial bounds would end the last at 900 ms.
-        assert!(
-            t.elapsed() < Duration::from_millis(600),
-            "{:?}",
-            t.elapsed()
-        );
-    }
-
-    /// A run that exits while a descendant holds its stdout: the count is given up at the
-    /// run's end, and the descendant (its pid written to a file) is killed here.
-    #[cfg(unix)]
-    #[test]
-    fn an_output_held_open_is_bounded() {
-        let dir = std::env::temp_dir().join(format!("chaldea-hooks-{}", random_uuid()));
-        std::fs::create_dir(&dir).unwrap();
-        let pidfile = dir.join("pid");
-        let script = format!(
-            "sleep 30 2>/dev/null & echo $! > '{}'; exit 0",
-            pidfile.display()
-        );
-        let wait = Duration::from_millis(300);
-        let t = Instant::now();
-        let e = Running::launch(&mut sh(&script), Vec::new(), wait)
-            .unwrap()
-            .finish();
-        let took = t.elapsed();
-        let pid: i32 = std::fs::read_to_string(&pidfile)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let _ = rustix::process::kill_process(
-            rustix::process::Pid::from_raw(pid).unwrap(),
-            rustix::process::Signal::KILL,
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(e.code, Some(0));
-        assert_eq!(e.stdout_len, None, "stdout is held by the descendant");
-        assert_eq!(e.stderr_len, Some(0));
-        // Restated: the 300 ms bound plus the 1 s reap.
-        assert!(took < Duration::from_millis(2000), "{took:?}");
-        assert!(took >= Duration::from_millis(1300), "{took:?}");
-    }
-
     #[test]
     fn random_uuid_is_v4() {
         let a = random_uuid();
@@ -334,5 +216,30 @@ mod tests {
             assert!(matches!(&u[19..20], "8" | "9" | "a" | "b"), "{u}");
             assert_eq!(u.matches('-').count(), 4, "{u}");
         }
+    }
+
+    /// The report's wire form: a count given up is JSON `null`, a counted one a number.
+    #[test]
+    fn a_held_pipe_is_reported_as_null() {
+        let e = Emitted {
+            code: Some(0),
+            elapsed: Duration::from_millis(5),
+            stdout_len: None,
+            stderr_len: Some(0),
+        };
+        let line = emitted_event(&json!(0), Some(&e)).to_string();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["stdout_len"], Value::Null, "{line}");
+        assert_eq!(v["stderr_len"], 0, "{line}");
+        assert_eq!(v["code"], 0, "{line}");
+        let spawn_failed: Value =
+            serde_json::from_str(&emitted_event(&json!(1), None).to_string()).unwrap();
+        assert_eq!(
+            (
+                spawn_failed["code"].clone(),
+                spawn_failed["spawn_failed"].clone()
+            ),
+            (Value::Null, json!(true))
+        );
     }
 }

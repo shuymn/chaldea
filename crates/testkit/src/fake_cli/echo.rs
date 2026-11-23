@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::Opts;
-use super::hooks::{self, Running};
+use super::hooks;
+use super::watch::{self, Watched};
 use crate::report::Reporter;
 
 /// How long either side of the nested handshake waits for the other's line (one emitter run,
@@ -101,8 +102,8 @@ impl<'a> Prompts<'a> {
 
     fn emit(&self, payload: &Value, rep: &Reporter) {
         let name = payload["hook_event_name"].clone();
-        let r = hooks::start(self.emitter, self.agent, payload).map(Running::finish);
-        hooks::report_emitted(rep, &name, r);
+        let r = hooks::emit_all(self.emitter, self.agent, std::slice::from_ref(payload)).pop();
+        hooks::report_emitted(rep, &name, r.flatten().as_ref());
     }
 
     /// The nested sequence (B-11): the nested FakeCli emits its `SessionStart`, this process
@@ -121,19 +122,31 @@ impl<'a> Prompts<'a> {
             return false;
         };
         let lines = lines_of(child.stdout.take());
-        if let Err(b) = expect_line(&lines, "sent", launched + HANDSHAKE) {
-            rep.send(&json!({"event": "handshake_failed", "side": "parent", "reason": b.name()}));
-            let code = hooks::wait_until(&mut child, Instant::now());
-            rep.send(&json!({"event": "nested", "code": code}));
-            return false;
+        let stdin = child.stdin.take();
+        let mut w = Watched::new(child, launched, NESTED_LIFE);
+        let ok = match expect_line(&lines, "sent", launched + HANDSHAKE) {
+            Err(b) => {
+                rep.send(
+                    &json!({"event": "handshake_failed", "side": "parent", "reason": b.name()}),
+                );
+                false
+            }
+            Ok(()) => {
+                self.emit(&session_start(&self.session), rep);
+                true
+            }
+        };
+        if ok {
+            if let Some(mut stdin) = stdin {
+                let _ = stdin.write_all(b"go\n");
+            }
+        } else {
+            drop(stdin);
+            w.end_now();
         }
-        self.emit(&session_start(&self.session), rep);
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(b"go\n");
-        }
-        let code = hooks::wait_until(&mut child, launched + NESTED_LIFE);
+        let code = watch::settle(vec![w]).remove(0).code;
         rep.send(&json!({"event": "nested", "code": code}));
-        code == Some(0)
+        ok && code == Some(0)
     }
 
     /// Emits a `UserPromptSubmit` for every complete line in `bytes`.

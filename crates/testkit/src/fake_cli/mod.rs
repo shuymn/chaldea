@@ -24,6 +24,7 @@ mod report_process;
 mod sleeper;
 mod spawn_tree;
 mod term;
+mod watch;
 
 use std::ffi::OsString;
 use std::time::Duration;
