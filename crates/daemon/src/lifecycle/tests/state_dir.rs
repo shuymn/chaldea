@@ -202,8 +202,6 @@ fn refuses_existing_public_dir() {
     assert!(!public.join(names::MARKER).exists());
 }
 
-// ---- Review round 1 ----
-
 /// A trailing separator does not make a linked final component look like its target: still
 /// refused, the target untouched.
 #[test]
@@ -277,8 +275,6 @@ fn creates_a_state_dir_beyond_max_path() {
         MARKER_CONTENT
     );
 }
-
-// ---- Review round 2 ----
 
 /// Only trailing separators go: a root keeps its own, every other component stays as given.
 #[test]

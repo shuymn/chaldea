@@ -155,8 +155,6 @@ fn isolated_runs_register_nothing() {
     assert!(lb.text().contains(&format!("127.0.0.1:{pb}")));
 }
 
-// ---- Review round 1 ----
-
 /// A console end after the lock decision of a run that never took the lock reports
 /// `NeverTaken`, not a held lock.
 #[test]
@@ -301,8 +299,6 @@ fn record_removal_failure_is_reported() {
     );
 }
 
-// ---- Review round 2 ----
-
 /// Another instance's record that replaces ours while a removal is retried survives: each
 /// attempt removes only a record that still names this run.
 #[test]
@@ -375,8 +371,6 @@ fn record_removal_is_retried() {
         }
     }
 }
-
-// ---- Review round 3 ----
 
 /// A re-read of the record that fails (a Windows sharing violation) is retried within the
 /// removal's deadline; one that keeps failing is named in a warning.

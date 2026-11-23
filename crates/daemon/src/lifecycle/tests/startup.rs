@@ -669,8 +669,6 @@ fn stop_after_port_rename() {
     run.join();
 }
 
-// ---- Review round 1 ----
-
 /// A private directory with a complete marker and nothing else.
 pub(super) fn marked(dir: &Path) {
     chaldea_pty_runtime::host::create_private_dir(dir).unwrap();

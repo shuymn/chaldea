@@ -893,8 +893,6 @@ fn foreground_stderr_is_redacted() {
     assert!(!err.contains(&owner), "{err}");
 }
 
-// ---- Review round 1 ----
-
 /// PR8-CL-4: the switch to `daemon.log` at step 6 handed to the log thread but not
 /// acknowledged in time fails the start; the file target may still be active, so the lock is
 /// kept until the exit.
@@ -1190,7 +1188,7 @@ fn failed_signal_reset_fails_the_start() {
     assert!(!dir.path.exists());
 }
 
-// ---- Console ends and panics that keep the lock, moved out of the in-process tests ----
+// ---- Console ends and panics that keep the lock ----
 
 /// PR8-CL-10: a console end while serving, and one while HTTP drains after a signal, returns
 /// within 200 ms holding the lock, without calling `Store::shutdown`.
@@ -1321,8 +1319,6 @@ fn panic_at_step_11() {
     assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
     held_then_free(&mut h, &dir.path);
 }
-
-// ---- Review round 2 ----
 
 /// PR8-CL-25: the startup task returning after the join's end while the coordinator still
 /// waits for the first request (both ready when it resumes) is a bare exit, as in the join;

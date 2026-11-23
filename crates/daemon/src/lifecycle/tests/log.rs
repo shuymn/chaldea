@@ -99,8 +99,6 @@ fn rotation_failure_stops_writing() {
     assert!(d.path().join(names::LOG_OLD).is_dir());
 }
 
-// ---- Review round 1 ----
-
 /// A rotation whose rename committed but whose new `daemon.log` could not be created recovers
 /// on the next attempt by creating it, without renaming again.
 #[test]

@@ -307,8 +307,6 @@ fn linked_record_is_refused() {
     l.release();
 }
 
-// ---- Review round 1 ----
-
 /// An `AlreadyExists` after this call created its temporary (here injected at the write) still
 /// removes the temporary: cleanup follows what the call created, not the error's kind.
 #[test]

@@ -450,8 +450,6 @@ fn env_only_selects_the_dir() {
     assert_eq!(d.stop_and_wait(&b.path), 0);
 }
 
-// ---- Review round 1 ----
-
 /// `--help` goes to stdout, with nothing on stderr, and exits 0.
 #[test]
 fn help_goes_to_stdout() {
