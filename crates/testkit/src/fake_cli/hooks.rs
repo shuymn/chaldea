@@ -229,8 +229,16 @@ mod tests {
         };
         let line = emitted_event(&json!(0), Some(&e)).to_string();
         let v: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(v["stdout_len"], Value::Null, "{line}");
-        assert_eq!(v["stderr_len"], 0, "{line}");
+        assert_eq!(v.get("stdout_len"), Some(&Value::Null), "{line}");
+        assert_eq!(v.get("stderr_len"), Some(&json!(0)), "{line}");
+        let e = Emitted {
+            stdout_len: Some(3),
+            stderr_len: None,
+            ..e
+        };
+        let v = emitted_event(&json!(0), Some(&e));
+        assert_eq!(v.get("stdout_len"), Some(&json!(3)), "{v}");
+        assert_eq!(v.get("stderr_len"), Some(&Value::Null), "{v}");
         assert_eq!(v["code"], 0, "{line}");
         let spawn_failed: Value =
             serde_json::from_str(&emitted_event(&json!(1), None).to_string()).unwrap();
