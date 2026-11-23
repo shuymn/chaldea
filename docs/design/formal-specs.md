@@ -144,6 +144,8 @@ All are checked by `pnpm run simulate` (§5). Each reads facts recorded where th
 
 **A conservative consequence.** `trace_finding_positional_vt_reply`: a VT reply after `launch_started` is a counted write after the positional prompt's anchor, so under the default counted classes its ack is never attributable (mvp §2.3:182; docs/design/pty-runtime.md §2.3 "Basis"). Startup replies wait in the reply lane from the first output byte and can start before `launch_started` is recorded (docs/design/pty-runtime.md §2.2 "Start"), so PR 10 states where the anchor is taken and which writes around it count, with examples.
 
+**A condition PR 10 adds to the model.** `attributable` in `specs/thread_input.qnt` checks the launch, the dispatch, the text, and the counted writes after the dispatch, but not mvp §2.3's competing-submission condition. A human submits `P` and its hook is delayed; the owner asserts readiness, and a separate dispatch of `P` reaches the PTY but the CLI never submits it; the delayed hook reaches intake after that dispatch with no counted write after it, so the model's `attributable` holds and `applyPrompt` acks the input. PR 10 adds the condition to `attributable` (an earlier submission of indistinguishable text, unknown history included, keeps the input `unconfirmed`), with a trace for the delayed human hook (`unconfirmed`) and one for a clean ordinary send (`acked`), and re-exports the traces.
+
 **Races the contract refuses** (named `trace_refused_*`):
 
 - evidence of the same turn as a `key` write arriving after the gate opened (`EvidenceOfSameTurn` at the recheck);
@@ -187,7 +189,7 @@ The `specs` job of `ci.yml` (`ubuntu-latest`, mise pinned in `mise-action`) inst
 ## 6. Extending
 
 - **PR 9** implements the buffering and promotion the model's `buffer*` actions and `bind` state (hole d).
-- **PR 10** makes the supervisor layer real: each guard here is a checklist item, it decides holes a–c and the recheck-attempt choice of §3, and it grows the model where §1 says. A changed guard changes the spec and its traces in the same PR.
+- **PR 10** makes the supervisor layer real: each guard here is a checklist item, it decides holes a–c and the recheck-attempt choice of §3, adds §3's competing-submission condition, and grows the model where §1 says. A changed guard changes the spec and its traces in the same PR.
 - **PR 13–14** correlate card resolutions and card keys by `approval_id` (the card finding).
 - **PR 7b, 7c, 8, 18** implement what Q-B states; §7.4 lists the obligations it hands them.
 - **PR 17**'s `stateright` model checks the Rust sync code; Q-B checks the contract it implements (§7.7).
