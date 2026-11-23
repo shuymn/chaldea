@@ -194,6 +194,19 @@ pub(crate) struct BsdInfo {
     pub(crate) zombie: bool,
     /// Microseconds since the Unix epoch.
     pub(crate) start: u64,
+    /// The image name, NUL-padded: `pbi_name` (at most 31 bytes), else `pbi_comm` (at most
+    /// 15) when `pbi_name` is empty.
+    pub(crate) name: [u8; 32],
+}
+
+/// `pbi_name` when it is not empty, else `pbi_comm`, as bytes padded with NULs.
+fn image_name(name: &[libc::c_char; 32], comm: &[libc::c_char; 16]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let src: &[libc::c_char] = if name[0] == 0 { comm } else { name };
+    for (o, c) in out.iter_mut().zip(src) {
+        *o = c.cast_unsigned();
+    }
+    out
 }
 
 /// `proc_pidinfo(pid, PROC_PIDTBSDINFO, 1)`, which also reads zombies; the errno on
@@ -236,6 +249,7 @@ pub(crate) fn bsd_info(pid: u32) -> Result<BsdInfo, i32> {
             .pbi_start_tvsec
             .saturating_mul(1_000_000)
             .saturating_add(info.pbi_start_tvusec),
+        name: image_name(&info.pbi_name, &info.pbi_comm),
     })
 }
 

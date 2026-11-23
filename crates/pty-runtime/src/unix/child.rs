@@ -360,6 +360,7 @@ mod tests {
             ppid: 1,
             pgid: L,
             start,
+            name: [0; 32],
         })
     }
 

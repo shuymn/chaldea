@@ -22,6 +22,9 @@ use windows_sys::Win32::Globalization::{
 use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
 };
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
@@ -499,6 +502,52 @@ pub(crate) fn open_process(pid: u32, access: u32) -> io::Result<OwnedHandle> {
     // SAFETY: plain call; `bInheritHandle` is FALSE; the result is checked before wrapping.
     let h = unsafe { OpenProcess(access, 0, pid) };
     owned(h)
+}
+
+/// One entry of a Toolhelp process snapshot.
+pub(crate) struct SnapshotEntry {
+    pub(crate) pid: u32,
+    /// `th32ParentProcessID`: the creator's pid, never updated after the creator exits.
+    pub(crate) ppid: u32,
+    /// `szExeFile`: the image file name, lossily decoded.
+    pub(crate) exe: String,
+}
+
+/// `ERROR_NO_MORE_FILES`: the end of a Toolhelp enumeration.
+const ERROR_NO_MORE_FILES: i32 = 18;
+
+/// Every process of one `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)`, through
+/// `Process32FirstW` / `Process32NextW`; the snapshot handle is closed on return.
+pub(crate) fn process_snapshot() -> io::Result<Vec<SnapshotEntry>> {
+    // SAFETY: plain call; the result is checked (INVALID_HANDLE_VALUE) before wrapping.
+    let snap = owned(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })?;
+    let mut e = PROCESSENTRY32W {
+        dwSize: len_u32(size_of::<PROCESSENTRY32W>()),
+        ..PROCESSENTRY32W::default()
+    };
+    let mut out = Vec::new();
+    // SAFETY: the snapshot handle is borrowed and valid; `e` is a local with `dwSize` set.
+    let mut ok = unsafe { Process32FirstW(raw(&snap), &raw mut e) };
+    while ok != 0 {
+        let len = e
+            .szExeFile
+            .iter()
+            .position(|c| *c == 0)
+            .unwrap_or(e.szExeFile.len());
+        out.push(SnapshotEntry {
+            pid: e.th32ProcessID,
+            ppid: e.th32ParentProcessID,
+            exe: String::from_utf16_lossy(&e.szExeFile[..len]),
+        });
+        // SAFETY: as for `Process32FirstW`.
+        ok = unsafe { Process32NextW(raw(&snap), &raw mut e) };
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(ERROR_NO_MORE_FILES) {
+        Ok(out)
+    } else {
+        Err(err)
+    }
 }
 
 // ---- Evidence and helpers ----

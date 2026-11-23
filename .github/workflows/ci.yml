@@ -73,9 +73,12 @@ jobs:
             windows::tests::dropping_the_child_kills_through_the_job \
             windows::kill::tests::job_empty_and_handles_signalled_proves_death \
             host::windows::tests::created_entries_read_back_private \
-            host::windows::tests::stop_event_round_trip
+            host::windows::tests::stop_event_round_trip \
+            windows::process::tests::wait_result_mapping
           list="$(cargo test -p chaldea-pty-runtime --test windows_spawn --locked -- --list)"
           require "$list" env_is_exactly_the_spec
+          list="$(cargo test -p chaldea-pty-runtime --test process_native --locked -- --list)"
+          require "$list" ancestry_of_a_grandchild_reaches_this_process
           list="$(cargo test -p chaldea-testkit --test pty_windows --locked -- --list)"
           require "$list" spawn_tree_dies_and_unrelated_survives
           list="$(cargo test -p chaldea-daemon --test store_open --locked -- --list)"

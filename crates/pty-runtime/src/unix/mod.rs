@@ -7,7 +7,7 @@ mod io;
 mod kill;
 #[allow(unsafe_code)]
 pub(crate) mod sys;
-mod table;
+pub(crate) mod table;
 #[cfg(test)]
 mod tests;
 
