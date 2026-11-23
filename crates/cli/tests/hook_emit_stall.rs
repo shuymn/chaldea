@@ -1,9 +1,10 @@
 //! PR9-CL-23's exits (hook-ingest §2.13 "Test stall", §7.4): this binary (`harness = false`)
 //! re-executes itself as `hook-emit codex`, with the emitter's environment and the case's
 //! role set only on that child, and the child calls the library's `dispatch` with the role's
-//! `Stall`. On macOS the child first registers a C `atexit` handler that writes to stderr, so
-//! every case's empty stderr also shows that the emitter ended through `host::exit_now`, not
-//! the C exit path. One case per exit of the emitter:
+//! `Stall`. The child first leaves an unterminated line in Rust's stdout buffer, which the
+//! normal exit (`std::process::exit`) flushes and `host::exit_now` does not, so every case's
+//! empty stdout also shows that the emitter ended through `exit_now`, on every OS. One case
+//! per exit of the emitter:
 //!
 //! - `Stall::AfterStdin` blocks the main thread once stdin is read: the child must still exit
 //!   0 between 2.9 s and 4.5 s, silently, with no request; only the watchdog that `dispatch`
@@ -34,6 +35,8 @@ use chaldea_daemon::lifecycle::spawn_locked;
 const ROLE: &str = "CHALDEA_TEST_HOOK_EMIT_STALL";
 const PARENT_BOUND: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(5);
+/// Left in the child's stdout buffer before `dispatch`.
+const EXIT_PROBE: &[u8] = b"RUST-EXIT-PROBE";
 const PAYLOAD: &[u8] = br#"{"hook_event_name":"Stop","session_id":"s"}"#;
 
 struct Case {
@@ -105,8 +108,9 @@ fn main() {
             Ok("panic-after-stdin") => Stall::PanicAfterStdin,
             _ => Stall::Off,
         };
-        #[cfg(target_os = "macos")]
-        chaldea_pty_runtime::host::mark_exit_handlers().unwrap();
+        // Unterminated, so it stays in Rust's stdout buffer: the normal exit
+        // (`std::process::exit`) flushes it, `exit_now` does not.
+        std::io::stdout().write_all(EXIT_PROBE).unwrap();
         chaldea_cli::dispatch(&args, stall);
     }
     // libtest's protocol, as far as `cargo test` uses it.
@@ -157,6 +161,7 @@ impl Listener {
                         count.fetch_add(1, Ordering::SeqCst);
                         s.set_nonblocking(false).unwrap();
                         s.set_read_timeout(Some(PARENT_BOUND)).unwrap();
+                        s.set_write_timeout(Some(PARENT_BOUND)).unwrap();
                         let mut buf = [0u8; 4096];
                         let _ = s.read(&mut buf);
                         let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");

@@ -158,29 +158,6 @@ pub(crate) fn exit_now(code: c_int) -> ! {
     unsafe { libc::_exit(code) }
 }
 
-/// What [`mark_exit_handlers`]'s handler writes to fd 2.
-#[cfg(any(test, feature = "fake"))]
-pub(crate) const EXIT_MARK: &str = "EXIT-HANDLER-RAN\n";
-
-#[cfg(any(test, feature = "fake"))]
-extern "C" fn exit_marker() {
-    let msg = EXIT_MARK.as_bytes();
-    // SAFETY: writes a static buffer of `msg.len()` bytes to fd 2.
-    let _ = unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
-}
-
-/// Registers an `atexit` handler that writes [`EXIT_MARK`] to fd 2, so a test sees whether
-/// a process ended through the C exit path.
-#[cfg(any(test, feature = "fake"))]
-pub(crate) fn mark_exit_handlers() -> io::Result<()> {
-    // SAFETY: registers a handler that only writes a static buffer to fd 2.
-    if unsafe { libc::atexit(exit_marker) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::other("atexit refused the handler"))
-    }
-}
-
 /// `proc_listallpids` with a null buffer: an estimate of the number of processes.
 pub(crate) fn pid_count() -> io::Result<usize> {
     // SAFETY: a size query: a null buffer of length 0.
@@ -583,6 +560,26 @@ mod tests {
         false
     }
 
+    /// What [`mark_exit_handlers`]'s handler writes to fd 2.
+    const EXIT_MARK: &str = "EXIT-HANDLER-RAN\n";
+
+    extern "C" fn exit_marker() {
+        let msg = EXIT_MARK.as_bytes();
+        // SAFETY: writes a static buffer of `msg.len()` bytes to fd 2.
+        let _ = unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
+    }
+
+    /// Registers an `atexit` handler that writes [`EXIT_MARK`] to fd 2, so a test sees whether
+    /// a process ended through the C exit path.
+    fn mark_exit_handlers() -> io::Result<()> {
+        // SAFETY: registers a handler that only writes a static buffer to fd 2.
+        if unsafe { libc::atexit(exit_marker) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::other("atexit refused the handler"))
+        }
+    }
+
     /// `exit_now` ends the process with its code and runs no `atexit` handler;
     /// `std::process::exit`, the control, runs it.
     #[test]
@@ -612,10 +609,11 @@ mod tests {
             })
             .unwrap();
             let mut err = child.stderr.take().unwrap();
-            let reader = std::thread::spawn(move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
                 let mut s = String::new();
                 let _ = std::io::Read::read_to_string(&mut err, &mut s);
-                s
+                let _ = tx.send(s);
             });
             let end = Instant::now() + Duration::from_secs(30);
             let status = loop {
@@ -632,7 +630,9 @@ mod tests {
                 }
                 std::thread::sleep(Duration::from_millis(10));
             };
-            let err = reader.join().unwrap();
+            let err = rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the helper's stderr did not close");
             assert_eq!(status.code(), Some(7), "{mode}: {err}");
             assert_eq!(err.contains(EXIT_MARK), ran, "{mode}: {err}");
         }
