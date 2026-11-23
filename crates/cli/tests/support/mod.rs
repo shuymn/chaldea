@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 use chaldea_daemon::lifecycle::{
     Discovery, DiscoveryRecord, LockProbe, STATE_DIR_ENV, discover, names, probe, spawn_locked,
 };
-use tempfile::TempDir;
 
 pub mod faults;
 #[path = "../../../daemon/tests/support/lifecycle.rs"]
@@ -47,28 +46,48 @@ const POLL: Duration = Duration::from_millis(20);
 
 /// A fresh state directory path (absent) under a private temp directory.
 pub struct Dir {
-    pub tmp: TempDir,
+    pub tmp: TempParent,
     pub path: PathBuf,
 }
 
-/// The parent of every test directory: the OS temp directory on macOS; on Windows
-/// `FOLDERID_LocalAppData` (not `%TEMP%`, which can be redirected), asserted private.
-#[must_use]
-pub fn temp_parent() -> TempDir {
-    #[cfg(windows)]
-    {
-        use chaldea_pty_runtime::host::{self, EntryKind, Privacy};
-        let tmp = tempfile::tempdir_in(host::default_state_base().unwrap()).unwrap();
-        assert_eq!(
-            host::privacy(tmp.path(), EntryKind::Directory).unwrap(),
-            Privacy::Private,
-            "{}",
-            tmp.path().display()
-        );
-        tmp
+/// A test's private directory, removed with its contents when dropped.
+pub struct TempParent(PathBuf);
+
+impl TempParent {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.0
     }
+}
+
+impl Drop for TempParent {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The parent of every test directory: on macOS under the OS temp directory; on Windows under
+/// `FOLDERID_LocalAppData` (not `%TEMP%`, which can be redirected). Created with
+/// `host::create_private_dir`, as the daemon creates its state directory, so its owner is this
+/// account whatever owner the process's token gives new objects (an elevated administrator's
+/// token gives them `Administrators`); asserted private.
+#[must_use]
+pub fn temp_parent() -> TempParent {
+    use chaldea_pty_runtime::host::{self, EntryKind, Privacy};
+    #[cfg(windows)]
+    let base = host::default_state_base().unwrap();
     #[cfg(not(windows))]
-    tempfile::tempdir().unwrap()
+    let base = std::env::temp_dir();
+    let path = base.join(format!(".chaldea-test-{}", uuid::Uuid::new_v4().simple()));
+    host::create_private_dir(&path).unwrap();
+    let tmp = TempParent(path);
+    assert_eq!(
+        host::privacy(tmp.path(), EntryKind::Directory).unwrap(),
+        Privacy::Private,
+        "{}",
+        tmp.path().display()
+    );
+    tmp
 }
 
 #[must_use]

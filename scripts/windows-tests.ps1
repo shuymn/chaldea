@@ -50,6 +50,8 @@ $PassedVariables = @(
 )
 
 function Invoke-CargoLane {
+    # The owner the token gives new objects (an elevated administrator's: Administrators).
+    Write-Host "token default owner: $([Security.Principal.WindowsIdentity]::GetCurrent().Owner.Value)"
     $failed = @()
     # `'--'` is quoted so that PowerShell passes it to cargo.
     cargo test --workspace --exclude chaldea-cli --locked --no-fail-fast '--' --exact --skip $AW1
@@ -297,6 +299,7 @@ public static class ChaldeaJob {
         [ordered]@{
             user = $me.Name
             sid = $me.User.Value
+            default_owner = $me.Owner.Value
             integrity = $label.'Group Name'
             integrity_sid = $label.SID
             session = (Get-Process -Id $PID).SessionId
