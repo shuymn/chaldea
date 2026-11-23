@@ -18,7 +18,12 @@ use std::time::{Duration, Instant};
 
 use chaldea_daemon::lifecycle::spawn_locked;
 use chaldea_pty_runtime::process::{self, Ancestry};
+#[cfg(target_os = "macos")]
+use child::kill_and_reap;
+use child::{collect, wait_until};
 use serde_json::{Value, json};
+
+mod child;
 
 const EMITTER: &str = env!("CARGO_BIN_EXE_chaldea");
 const URL: &str = "CHALDEA_HOOK_URL";
@@ -449,58 +454,28 @@ struct Run {
     pid: u32,
 }
 
-/// Reads `r` to its EOF on a thread; [`joined`] takes the result.
-fn collect(r: Option<impl Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut r) = r {
-            let _ = r.read_to_end(&mut buf);
-        }
-        let _ = tx.send(buf);
-    });
-    rx
-}
-
 /// What [`collect`] read, waiting at most [`WAIT`] for the EOF.
 fn joined(rx: &mpsc::Receiver<Vec<u8>>, what: &str) -> Vec<u8> {
     rx.recv_timeout(WAIT)
         .unwrap_or_else(|_| panic!("{what} not closed within {WAIT:?}"))
 }
 
-/// Kills `c` and reaps it, waiting at most [`WAIT`].
-fn kill_and_reap(c: &mut Child) {
-    let _ = c.kill();
-    let end = Instant::now() + WAIT;
-    while matches!(c.try_wait(), Ok(None)) && Instant::now() < end {
-        std::thread::sleep(POLL);
-    }
-}
-
-/// Kills and reaps the child on drop, a panicking test included.
+/// Kills and reaps the child on drop (waiting at most [`WAIT`]), a panicking test included.
 #[cfg(target_os = "macos")]
 struct Killed(Child);
 
 #[cfg(target_os = "macos")]
 impl Drop for Killed {
     fn drop(&mut self) {
-        kill_and_reap(&mut self.0);
+        kill_and_reap(&mut self.0, WAIT);
     }
 }
 
-/// Waits for `c` at most [`PARENT_BOUND`]; kills it and panics past it.
+/// Waits for `c` at most [`PARENT_BOUND`]; past it, kills and reaps it (waiting at most
+/// [`WAIT`]) and panics.
 fn wait_bounded(c: &mut Child, what: &str) -> std::process::ExitStatus {
-    let end = Instant::now() + PARENT_BOUND;
-    loop {
-        if let Some(s) = c.try_wait().unwrap() {
-            return s;
-        }
-        if Instant::now() >= end {
-            kill_and_reap(c);
-            panic!("{what} did not exit within {PARENT_BOUND:?}");
-        }
-        std::thread::sleep(POLL);
-    }
+    wait_until(c, Instant::now() + PARENT_BOUND, WAIT)
+        .unwrap_or_else(|| panic!("{what} did not exit within {PARENT_BOUND:?}"))
 }
 
 /// Runs the emitter binary once before any measured run, so the OS's first-execution checks

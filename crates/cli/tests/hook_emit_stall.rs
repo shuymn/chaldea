@@ -20,15 +20,17 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use chaldea_cli::Stall;
 use chaldea_daemon::lifecycle::spawn_locked;
+use child::{collect, wait_until};
+
+mod child;
 
 /// The child's role, set only in the child's environment and read by this binary's `main`,
 /// never by the emitter.
@@ -191,28 +193,6 @@ impl Drop for Listener {
     }
 }
 
-/// Collects `r` on a thread; the result arrives on the returned channel.
-fn collect(r: Option<impl Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut r) = r {
-            let _ = r.read_to_end(&mut buf);
-        }
-        let _ = tx.send(buf);
-    });
-    rx
-}
-
-/// Kills `child` and reaps it, waiting at most [`PARENT_BOUND`].
-fn kill_and_reap(child: &mut Child) {
-    let _ = child.kill();
-    let end = Instant::now() + PARENT_BOUND;
-    while matches!(child.try_wait(), Ok(None)) && Instant::now() < end {
-        std::thread::sleep(POLL);
-    }
-}
-
 fn run_case(c: &Case) {
     let listener = Listener::start();
     let mut cmd = Command::new(std::env::current_exe().unwrap());
@@ -245,16 +225,9 @@ fn run_case(c: &Case) {
         drop(stdin);
         None
     };
-    let status = loop {
-        if let Some(s) = child.try_wait().unwrap() {
-            break s;
-        }
-        if started.elapsed() >= PARENT_BOUND {
-            kill_and_reap(&mut child);
-            panic!("{}: the child did not exit within {PARENT_BOUND:?}", c.name);
-        }
-        std::thread::sleep(POLL);
-    };
+    // Past the bound, the child is killed and reaped within the same bound.
+    let status = wait_until(&mut child, started + PARENT_BOUND, PARENT_BOUND)
+        .unwrap_or_else(|| panic!("{}: the child did not exit within {PARENT_BOUND:?}", c.name));
     let (elapsed, spanned) = (started.elapsed(), before.elapsed());
     drop(held);
     let out = out.recv_timeout(PARENT_BOUND).expect("stdout not closed");
