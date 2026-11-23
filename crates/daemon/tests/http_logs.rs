@@ -78,7 +78,7 @@ async fn secrets_absent() {
     let srv = TestServer::start(Mounts::mvp()).await;
     let p = srv.port;
     let owner = srv.token(TokenKind::Owner, None, None).await;
-    let hook = srv.token(TokenKind::Hook, None, None).await;
+    let hook = srv.token_of(TokenKind::Hook, 1).await;
     let origin = format!("http://127.0.0.1:{p}");
 
     // Positive control first: one record per request, with its route and status.
@@ -99,7 +99,7 @@ async fn secrets_absent() {
         ("/api/threads", 200),
         ("/api/ws", 401),
         ("/api/pair", 401),
-        ("/hook", 501),
+        ("/hook", 400),
         ("unmatched", 404),
     ] {
         assert!(

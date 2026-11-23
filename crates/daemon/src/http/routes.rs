@@ -432,7 +432,8 @@ pub struct Mounts(Vec<Mount>);
 impl Mounts {
     /// Every route of [`ROUTES`]: PR 7's sync reads, blobs, tickets, pairing, the WebSocket
     /// loop, and the command dispatcher (each command 501 until its handler is registered),
-    /// and a 501 handler for every route whose PR has not mounted one.
+    /// PR 9's `/hook` with [`crate::hook::HookSeams::mvp`], and a 501 handler for every
+    /// route whose PR has not mounted one.
     ///
     /// # Panics
     ///
@@ -476,6 +477,10 @@ impl Mounts {
             .with(Mount::write(
                 at(Method::POST, commands::COMMAND_PATH),
                 commands::dispatch,
+            ))
+            .with(crate::hook::mount(
+                crate::hook::HookConfig::default(),
+                crate::hook::HookSeams::mvp(),
             ))
     }
 

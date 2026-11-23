@@ -55,6 +55,8 @@ pub(crate) struct Points {
     /// Taken by the next receipt completion attempt, which holds it inside its job on the
     /// writer thread.
     pub(crate) completion_hold: Mutex<Option<WriterHold>>,
+    /// Held once by a registered write observer before it submits its job.
+    pub(crate) submit_gate: Mutex<Option<Gate>>,
 }
 
 /// A hold inside a write job, on the writer thread: tells the test it was reached, then
@@ -171,6 +173,15 @@ impl Points {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Arms the submit gate, as [`Points::arm_removal_gate`].
+    pub(crate) fn arm_submit_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        arm(&self.submit_gate)
+    }
+
+    pub(crate) async fn before_submit(&self) {
+        pass(&self.submit_gate).await;
     }
 
     pub(crate) fn submits(&self) -> usize {

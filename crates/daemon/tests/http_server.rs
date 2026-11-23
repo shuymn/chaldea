@@ -78,9 +78,7 @@ async fn shutdown_returns_by_its_deadline() {
         },
     ));
     let mut srv = TestServer::start(mounts).await;
-    let hook = srv
-        .token(chaldea_core::auth::TokenKind::Hook, None, None)
-        .await;
+    let hook = srv.token_of(chaldea_core::auth::TokenKind::Hook, 1).await;
     let mut held = connect(srv.port).await;
     held.write_all(&srv.req("POST", "/hook").bearer(&hook).body(b"{}").bytes())
         .await

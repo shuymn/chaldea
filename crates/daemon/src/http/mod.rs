@@ -34,7 +34,7 @@ mod upgrade;
 mod ws;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -64,6 +64,8 @@ pub use trace::redact_secrets;
 pub use upgrade::{ShutdownSignal, UpgradeGrant, UpgradedSocket};
 
 pub(crate) use auth::{TOKEN_PREFIX, has_secret_form};
+pub(crate) use ctx::until_deadline;
+pub(crate) use error::refused;
 
 /// The server's monotonic clock (design §2.3): request origins, deadlines, the cutoff
 /// checks, and ticket expiry are all read on it; tests inject one.
