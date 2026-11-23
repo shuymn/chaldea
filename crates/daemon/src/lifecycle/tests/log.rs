@@ -112,6 +112,7 @@ fn rotation_resumes_after_a_failed_reopen() {
     f.fail_reopen = 1;
     let mut i = 0;
     while !d.path().join(names::LOG_OLD).exists() {
+        assert!(i < 10_000, "no rotation after {i} lines");
         f.write(&line(i));
         i += 1;
     }
@@ -144,6 +145,7 @@ fn partial_write_counts_toward_the_cap() {
     f.partial_write = Some(one - 1);
     let mut i = 0;
     while !d.path().join(names::LOG_OLD).exists() {
+        assert!(i < 10_000, "no rotation after {i} lines");
         f.write(&line(i));
         i += 1;
     }

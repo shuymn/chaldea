@@ -1023,10 +1023,15 @@ pub(crate) fn ignore_ctrl_c() -> io::Result<()> {
 
 /// Clears an inherited "ignore Ctrl-C" attribute (`SetConsoleCtrlHandler(NULL, FALSE)`) when
 /// the process has a console; without one there is nothing to deliver.
+///
+/// `GetConsoleProcessList` returns 0 both when the process has no console and when the call
+/// itself fails; the two are not told apart here. Either way the reset is skipped: a process
+/// with a console that the probe failed for keeps an inherited ignore, and still stops on
+/// Ctrl-Break and on the stop event.
 pub(crate) fn enable_ctrl_c_if_console() -> io::Result<()> {
     use windows_sys::Win32::System::Console::{GetConsoleProcessList, SetConsoleCtrlHandler};
     let mut one = [0u32; 1];
-    // SAFETY: the buffer holds one entry, which is passed; a count of 0 means no console.
+    // SAFETY: the buffer holds one entry, which is passed.
     if unsafe { GetConsoleProcessList(one.as_mut_ptr(), 1) } == 0 {
         return Ok(());
     }

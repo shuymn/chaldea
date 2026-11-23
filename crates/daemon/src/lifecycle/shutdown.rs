@@ -221,7 +221,29 @@ impl Coordinator {
     }
 
     fn crash_exit(&self, lock: LockDisposition) -> ExitReport {
+        #[cfg(test)]
+        if let Some(p) = self.faults.parked(super::faults::Point::CrashExit) {
+            p.hold_blocking();
+        }
         self.finish(ExitReport::failed(FailReason::ConsoleEnd, lock))
+    }
+
+    /// Whether the startup join's end (`C − startup_join_before`) has passed.
+    fn join_ended(&self) -> bool {
+        self.gate
+            .stopping()
+            .is_some_and(|s| Instant::now() >= s.cutoff - self.budgets.startup_join_before)
+    }
+
+    /// The bare exit of a startup task not joined by its end (design §2.8 step 1).
+    fn unjoined(&self) -> ExitReport {
+        self.log.error(
+            "the startup did not reach a step boundary in time: exiting with the instance lock held",
+        );
+        self.finish(ExitReport::failed(
+            FailReason::StartupUnjoined,
+            LockDisposition::HeldUntilExit,
+        ))
     }
 
     /// The lock as a crash exit before the lock decision leaves it: held when startup tried
@@ -236,21 +258,44 @@ impl Coordinator {
 
     /// Removes our record, retrying for a bounded time (Windows refuses the removal while
     /// another process holds the file without delete sharing); a record left behind is named
-    /// in the log.
-    fn remove_record(&self, path: &std::path::Path) {
+    /// in the log. Every attempt first re-reads the record and removes it only while it still
+    /// names this run; a console end ends the retries at once.
+    async fn remove_record(&mut self, dir: &std::path::Path) -> Result<(), Crashed> {
+        let path = dir.join(names::RECORD);
+        let path = path.as_path();
         let end = Instant::now() + RECORD_REMOVAL;
         loop {
-            match std::fs::remove_file(path) {
-                Ok(()) => return,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            if self.gate.crashed().is_some() {
+                return Err(Crashed);
+            }
+            match files::read_record(dir) {
+                Ok(Some(r)) if r.instance == self.instance => {}
+                _ => return Ok(()),
+            }
+            #[cfg(test)]
+            let removed = self
+                .faults
+                .record_remove()
+                .and_then(|()| std::fs::remove_file(path));
+            #[cfg(not(test))]
+            let removed = std::fs::remove_file(path);
+            match removed {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(e) if Instant::now() >= end => {
                     self.log.warn(&format!(
                         "the discovery record {} could not be removed: {e}",
                         path.display()
                     ));
-                    return;
+                    return Ok(());
                 }
-                Err(_) => std::thread::sleep(RECORD_RETRY),
+                Err(_) => {
+                    #[cfg(test)]
+                    if let Some(p) = self.faults.parked(super::faults::Point::RecordRetry) {
+                        p.hold().await;
+                    }
+                    self.guarded(tokio::time::sleep(RECORD_RETRY)).await?;
+                }
             }
         }
     }
@@ -327,9 +372,19 @@ impl Coordinator {
             let gate = self.gate.clone();
             match task.as_mut() {
                 Some(t) => {
+                    #[cfg(test)]
+                    if let Some(p) = self.faults.parked(super::faults::Point::CoordinatorWaiting) {
+                        p.hold_blocking();
+                    }
                     tokio::select! {
+                        biased;
                         r = t => {
                             task = None;
+                            // Consumed only before the join's end, as in step 1: a stop may
+                            // have fired while this loop was not polled.
+                            if self.join_ended() {
+                                return self.unjoined();
+                            }
                             seen.take(&gate, r);
                         }
                         () = gate.woken() => {}
@@ -357,15 +412,7 @@ impl Coordinator {
             }
             match self.guarded(deadline_first(end, t)).await {
                 Err(Crashed) => return self.crash_exit(self.unreleased()),
-                Ok(Err(Elapsed)) => {
-                    self.log.error(
-                        "the startup did not reach a step boundary in time: exiting with the instance lock held",
-                    );
-                    return self.finish(ExitReport::failed(
-                        FailReason::StartupUnjoined,
-                        LockDisposition::HeldUntilExit,
-                    ));
-                }
+                Ok(Err(Elapsed)) => return self.unjoined(),
                 Ok(Ok(r)) => seen.take(&self.gate, r),
             }
         }
@@ -474,11 +521,10 @@ impl Coordinator {
 
         // 5. Remove our record, never another instance's, and only when this run published one.
         if self.shared.record_published.load(Ordering::SeqCst)
-            && let Some(dir) = self.shared.dir.get()
-            && let Ok(Some(r)) = files::read_record(dir)
-            && r.instance == self.instance
+            && let Some(dir) = self.shared.dir.get().cloned()
+            && self.remove_record(&dir).await.is_err()
         {
-            self.remove_record(&dir.join(names::RECORD));
+            return self.crash_exit(held_now(&st));
         }
 
         // 6. The lock rule, read once.
@@ -497,6 +543,16 @@ impl Coordinator {
                     why.push("the store did not report its readers returned and its writer exited");
                 }
                 if st.log_file {
+                    #[cfg(test)]
+                    if let Some(p) = self.faults.parked(super::faults::Point::BeforeLogSwitch) {
+                        p.hold().await;
+                    }
+                    if self.gate.crashed().is_some() {
+                        drop(l);
+                        return self.crash_exit(LockDisposition::HeldUntilExit);
+                    }
+                    #[cfg(test)]
+                    self.faults.log_switch_queued.store(true, Ordering::SeqCst);
                     #[cfg(test)]
                     let after = env
                         .test_log

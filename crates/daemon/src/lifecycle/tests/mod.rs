@@ -369,11 +369,27 @@ pub(super) fn helper_exit(r: &ExitReport, pause: Duration) -> ! {
     std::process::exit(r.code.code());
 }
 
+/// Kills `child` and reaps it within 10 s (a process that cannot be reaped is reported, not
+/// waited for).
+pub(super) fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let end = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < end {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    eprintln!("pid {} was not reaped within 10 s of its kill", child.id());
+}
+
 /// A helper process: this test binary re-executed with `--exact <test>`.
 pub(super) struct Helper {
     child: Child,
     lines: Receiver<String>,
     stderr: Arc<Mutex<String>>,
+    /// The stderr collector reached the end of the stream.
+    stderr_done: Arc<std::sync::atomic::AtomicBool>,
     pub(super) seen: Vec<String>,
 }
 
@@ -406,6 +422,8 @@ impl Helper {
         let stderr = Arc::new(Mutex::new(String::new()));
         let err = child.stderr.take().unwrap();
         let sink = stderr.clone();
+        let stderr_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = stderr_done.clone();
         std::thread::spawn(move || {
             let mut buf = String::new();
             let mut r = BufReader::new(err);
@@ -413,11 +431,13 @@ impl Helper {
                 sink.lock().unwrap().push_str(&buf);
                 buf.clear();
             }
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         Helper {
             child,
             lines: rx,
             stderr,
+            stderr_done,
             seen: Vec::new(),
         }
     }
@@ -440,8 +460,7 @@ impl Helper {
                     }
                 }
                 Err(e) => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
+                    kill_and_reap(&mut self.child);
                     panic!(
                         "no `{prefix}` from the helper ({e}); seen {:?}; stderr:\n{}",
                         self.seen,
@@ -452,16 +471,20 @@ impl Helper {
         }
     }
 
-    /// Waits for the helper's exit within `within` (killed otherwise); its exit code.
+    /// Waits for the helper's exit within `within` (killed otherwise), then for its stderr to
+    /// be collected (10 s); its exit code.
     pub(super) fn wait(&mut self, within: Duration) -> Option<i32> {
         let end = Instant::now() + within;
         loop {
             if let Some(s) = self.child.try_wait().unwrap() {
+                let collected = wait_for(Duration::from_secs(10), || {
+                    self.stderr_done.load(std::sync::atomic::Ordering::SeqCst)
+                });
+                assert!(collected, "the helper's stderr was not collected");
                 return s.code();
             }
             if Instant::now() >= end {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                kill_and_reap(&mut self.child);
                 panic!("the helper did not exit; stderr:\n{}", self.stderr());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -472,8 +495,7 @@ impl Helper {
 impl Drop for Helper {
     fn drop(&mut self) {
         if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            kill_and_reap(&mut self.child);
         }
     }
 }

@@ -366,7 +366,7 @@ pub(crate) async fn run(mut cx: StartupCtx) -> Started {
                     return st.failed(
                         FailReason::StoreOpen,
                         format!(
-                            "{} has {n} hard links; the database must have one: copy it to a new file and move that into place",
+                            "{} has {n} hard links; the database must have one: with every writer of it stopped, make a consistent copy with SQLite's backup (`sqlite3 <db> \".backup <new>\"`), then move the copy into place as `chaldea.db` and remove the old names",
                             dir.join(f).display()
                         ),
                     );
@@ -660,7 +660,7 @@ pub(crate) async fn run(mut cx: StartupCtx) -> Started {
     if let Some(p) = cx.faults.parked(super::faults::Point::Inside(14)) {
         p.hold().await;
     }
-    if cx.gate.fired() {
+    if cx.gate.fired() || cx.gate.crashed().is_some() {
         st.outcome = Outcome::Stopped;
         return st;
     }

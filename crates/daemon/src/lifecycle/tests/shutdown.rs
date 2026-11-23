@@ -283,6 +283,7 @@ fn record_removal_failure_is_reported() {
         .unwrap();
     run.stop();
     let log = run.log.clone();
+    let faults = run.faults.clone();
     let r = run.join();
     drop(held);
     assert_eq!(r.code.code(), 0, "{}", log.text());
@@ -291,4 +292,86 @@ fn record_removal_failure_is_reported() {
         "{}",
         log.text()
     );
+    // The warning comes after retries, not after the first refusal.
+    assert!(
+        faults
+            .record_remove_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 1
+    );
+}
+
+// ---- Review round 2 ----
+
+/// Another instance's record that replaces ours while a removal is retried survives: each
+/// attempt removes only a record that still names this run.
+#[test]
+fn record_retry_spares_a_replacement() {
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    faults
+        .record_remove_fails
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let park = faults.park(Point::RecordRetry);
+    let run = start(
+        foreground(&dir.path, Some(free_port())),
+        TestComponents::default(),
+        faults,
+    );
+    run.serving();
+    let path = dir.path.join(names::RECORD);
+    run.stop();
+    assert!(park.wait_reached(WAIT));
+    let ours = std::fs::read_to_string(&path).unwrap();
+    let theirs = ours.replace(
+        serde_json::from_str::<serde_json::Value>(&ours).unwrap()["instance"]
+            .as_str()
+            .unwrap(),
+        "00000000-0000-4000-8000-0000000000fe",
+    );
+    std::fs::write(&path, &theirs).unwrap();
+    park.release();
+    run.join();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs);
+}
+
+/// A removal refused twice succeeds on its third attempt, without a warning; one refused on
+/// every attempt is retried, then named in a warning.
+#[test]
+fn record_removal_is_retried() {
+    use std::sync::atomic::Ordering;
+    for (fails, removed) in [(2, true), (u32::MAX, false)] {
+        let dir = state();
+        let faults = Arc::new(Faults::default());
+        faults.record_remove_fails.store(fails, Ordering::SeqCst);
+        let run = start(
+            foreground(&dir.path, Some(free_port())),
+            TestComponents::default(),
+            faults.clone(),
+        );
+        run.serving();
+        run.stop();
+        let log = run.log.clone();
+        let r = run.join();
+        assert_eq!(r.code.code(), 0, "{}", log.text());
+        let attempts = faults.record_remove_attempts.load(Ordering::SeqCst);
+        let path = dir.path.join(names::RECORD);
+        if removed {
+            assert_eq!(attempts, 3);
+            assert!(!path.exists());
+            assert!(
+                !log.text().contains("could not be removed"),
+                "{}",
+                log.text()
+            );
+        } else {
+            assert!(attempts > 1, "{attempts}");
+            assert!(path.exists());
+            assert!(
+                log.text().contains("daemon.json") && log.text().contains("could not be removed"),
+                "{}",
+                log.text()
+            );
+        }
+    }
 }

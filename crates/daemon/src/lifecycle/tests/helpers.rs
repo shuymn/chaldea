@@ -983,8 +983,9 @@ fn console_end_before_the_store_submit() {
                 park.release();
                 assert!(returned());
                 report(&format!(
-                    "checks store_shutdown={}",
-                    sf.marks.lock().unwrap().contains(&"owner_claimed")
+                    "checks store_shutdown={} submitted={}",
+                    sf.marks.lock().unwrap().contains(&"owner_claimed"),
+                    c.faults.marks().iter().any(|m| m.0 == "store")
                 ));
             },
         );
@@ -992,6 +993,8 @@ fn console_end_before_the_store_submit() {
     let (mut h, dir) = parent("console_end_before_the_store_submit", &[]);
     let c = h.expect("checks", WAIT);
     assert_eq!(field(&c, "store_shutdown"), "false", "{c}");
+    // The coordinator never submitted it (a submitted call might not have run yet).
+    assert_eq!(field(&c, "submitted"), "false", "{c}");
     let r = h.expect("returned", WAIT);
     assert_eq!(field(&r, "reason"), "console_end", "{r}");
     held_then_free(&mut h, &dir.path);
@@ -1034,6 +1037,7 @@ fn console_end_during_startup() {
     if in_helper() {
         let faults = Arc::new(Faults::default());
         let park = faults.park(Point::Before(9));
+        let exiting = faults.park(Point::CrashExit);
         helper(
             fg(),
             TestComponents::default(),
@@ -1041,8 +1045,14 @@ fn console_end_during_startup() {
             Duration::from_secs(2),
             move |c| {
                 assert!(park.wait_reached(WAIT));
+                let at = Instant::now();
                 c.crash();
+                assert!(exiting.wait_reached(WAIT));
+                report(&format!("checks exit_ms={}", at.elapsed().as_millis()));
+                // The runtime stays up until the startup task has passed the boundary.
                 park.release();
+                assert!(wait_for(WAIT, || c.faults.startup_returned.get().is_some()));
+                exiting.release();
             },
         );
     }
@@ -1071,8 +1081,8 @@ fn console_end_during_startup() {
         &dir.path,
         &[],
     );
-    let since = h.expect("since_crash_ms", WAIT);
-    let ms: u64 = field(&since, "since_crash_ms").parse().unwrap();
+    let c = h.expect("checks", WAIT);
+    let ms: u64 = field(&c, "exit_ms").parse().unwrap();
     assert!(ms < 200, "{ms} ms");
     let r = h.expect("returned", WAIT);
     assert_eq!(field(&r, "reason"), "console_end", "{r}");
@@ -1315,4 +1325,142 @@ fn panic_at_step_11() {
     assert_eq!(field(&r, "reason"), "panic", "{r}");
     assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
     held_then_free(&mut h, &dir.path);
+}
+
+// ---- Review round 2 ----
+
+/// PR8-CL-25: the startup task returning after the join's end while the coordinator still
+/// waits for the first request (both ready when it resumes) is a bare exit, as in the join.
+#[test]
+fn late_startup_in_the_first_wait_is_a_bare_exit() {
+    if in_helper() {
+        let faults = Arc::new(Faults::default());
+        let inside = faults.park(Point::Inside(8));
+        let waiting = faults.park(Point::CoordinatorWaiting);
+        helper(
+            fg(),
+            TestComponents::default(),
+            faults,
+            Duration::from_secs(2),
+            move |c| {
+                assert!(inside.wait_reached(WAIT));
+                assert!(waiting.wait_reached(WAIT));
+                c.stop();
+                let end = c.gate().stopping().unwrap().cutoff - Duration::from_secs(6);
+                assert!(wait_for(WAIT, || Instant::now() > end + Duration::from_millis(200)));
+                inside.release();
+                assert!(wait_for(WAIT, || c.faults.startup_returned.get().is_some()));
+                waiting.release();
+            },
+        );
+    }
+    let (mut h, dir) = parent("late_startup_in_the_first_wait_is_a_bare_exit", &[]);
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "reason"), "startup_unjoined", "{r}");
+    assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
+    held_then_free(&mut h, &dir.path);
+}
+
+/// PR8-CL-10: a console end while the record's removal is retried ends the retries at once.
+#[test]
+fn console_end_during_the_record_retry() {
+    if in_helper() {
+        let faults = Arc::new(Faults::default());
+        faults.record_remove_fails.store(u32::MAX, Ordering::SeqCst);
+        let park = faults.park(Point::RecordRetry);
+        helper(
+            fg(),
+            TestComponents::default(),
+            faults,
+            Duration::from_secs(2),
+            move |c| {
+                c.serving();
+                c.stop();
+                assert!(park.wait_reached(WAIT));
+                c.crash();
+                park.release();
+                assert!(wait_for(WAIT, returned));
+                report(&format!(
+                    "checks attempts={}",
+                    c.faults.record_remove_attempts.load(Ordering::SeqCst)
+                ));
+            },
+        );
+    }
+    let (mut h, dir) = parent("console_end_during_the_record_retry", &[]);
+    let c = h.expect("checks", WAIT);
+    assert_eq!(field(&c, "attempts"), "1", "{c}");
+    let since = h.expect("since_crash_ms", WAIT);
+    let ms: u64 = field(&since, "since_crash_ms").parse().unwrap();
+    assert!(ms < 200, "{ms} ms");
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "reason"), "console_end", "{r}");
+    assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
+    held_then_free(&mut h, &dir.path);
+}
+
+/// PR8-CL-10: a console end before the switch away from `daemon.log` queues no switch.
+#[test]
+fn console_end_before_the_log_switch() {
+    if in_helper() {
+        let dir = helper_dir();
+        let ready = RecordingReady::new(&dir);
+        let faults = Arc::new(Faults::default());
+        let park = faults.park(Point::BeforeLogSwitch);
+        helper(
+            detached(&dir, Some(free_port()), &ready),
+            TestComponents::default(),
+            faults,
+            Duration::from_secs(2),
+            move |c| {
+                c.serving();
+                c.stop();
+                assert!(park.wait_reached(WAIT));
+                c.crash();
+                park.release();
+                assert!(wait_for(WAIT, returned));
+                report(&format!(
+                    "checks queued={}",
+                    c.faults.log_switch_queued.load(Ordering::SeqCst)
+                ));
+            },
+        );
+    }
+    let (mut h, dir) = parent("console_end_before_the_log_switch", &[]);
+    let c = h.expect("checks", WAIT);
+    assert_eq!(field(&c, "queued"), "false", "{c}");
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "reason"), "console_end", "{r}");
+    assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
+    held_then_free(&mut h, &dir.path);
+}
+
+/// PR8-CL-10: a console end after step 14's boundary and before its last check sends no
+/// verdict (the foreground's `listening` line).
+#[test]
+fn console_end_at_the_startup_verdict() {
+    if in_helper() {
+        let faults = Arc::new(Faults::default());
+        let inside = faults.park(Point::Inside(14));
+        let exiting = faults.park(Point::CrashExit);
+        helper(
+            fg(),
+            TestComponents::default(),
+            faults,
+            Duration::from_secs(2),
+            move |c| {
+                assert!(inside.wait_reached(WAIT));
+                c.crash();
+                assert!(exiting.wait_reached(WAIT));
+                inside.release();
+                assert!(wait_for(WAIT, || c.faults.startup_returned.get().is_some()));
+                exiting.release();
+            },
+        );
+    }
+    let (mut h, dir) = parent("console_end_at_the_startup_verdict", &[]);
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "reason"), "console_end", "{r}");
+    held_then_free(&mut h, &dir.path);
+    assert!(!h.stderr().contains("listening on"), "{}", h.stderr());
 }

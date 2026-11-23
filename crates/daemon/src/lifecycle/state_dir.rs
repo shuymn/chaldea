@@ -76,9 +76,9 @@ fn is_link(m: &std::fs::Metadata) -> bool {
 /// Creates or adopts `dir` (absolute) and returns its canonical path.
 pub(crate) fn prepare(dir: &Path, instance: &str) -> Result<PathBuf, Refused> {
     // Without trailing separators, so the final entry itself is inspected: `dir/` would
-    // resolve a link named `dir` to its target. A root keeps its separator.
-    let normal: PathBuf = dir.components().collect();
-    let dir = normal.as_path();
+    // resolve a link named `dir` to its target.
+    let trimmed = without_trailing_separators(dir);
+    let dir = trimmed.as_path();
     let refuse = |why: String| {
         Refused(format!(
             "the state directory {} is refused: {why}",
@@ -123,6 +123,37 @@ pub(crate) fn prepare(dir: &Path, instance: &str) -> Result<PathBuf, Refused> {
         }
     }
     std::fs::canonicalize(dir).map_err(|e| refuse(format!("it cannot be resolved: {e}")))
+}
+
+/// `path` without its trailing separators; a root keeps its own, and nothing else changes (a
+/// rebuild from components would resolve `..` in a Windows verbatim path).
+pub(crate) fn without_trailing_separators(path: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut b = path.as_os_str().as_bytes();
+        while b.len() > 1
+            && b.ends_with(b"/")
+            && Path::new(std::ffi::OsStr::from_bytes(b)).parent().is_some()
+        {
+            b = &b[..b.len() - 1];
+        }
+        PathBuf::from(std::ffi::OsStr::from_bytes(b))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut w: Vec<u16> = path.as_os_str().encode_wide().collect();
+        let sep = |c: &u16| *c == u16::from(b'\\') || *c == u16::from(b'/');
+        while w.last().is_some_and(sep)
+            && Path::new(&std::ffi::OsString::from_wide(&w))
+                .parent()
+                .is_some()
+        {
+            w.pop();
+        }
+        PathBuf::from(std::ffi::OsString::from_wide(&w))
+    }
 }
 
 /// Empty, ignoring unfinished marker temporaries (regular files only).

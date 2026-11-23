@@ -277,3 +277,49 @@ fn creates_a_state_dir_beyond_max_path() {
         MARKER_CONTENT
     );
 }
+
+// ---- Review round 2 ----
+
+/// Only trailing separators go: a root keeps its own, every other component stays as given.
+#[test]
+fn strips_only_trailing_separators() {
+    use super::super::state_dir::without_trailing_separators as trim;
+    #[cfg(unix)]
+    let cases = [
+        ("/work/state/", "/work/state"),
+        ("/work/state//", "/work/state"),
+        ("/work/x/../state/", "/work/x/../state"),
+        ("/", "/"),
+    ];
+    #[cfg(windows)]
+    let cases = [
+        (r"C:\work\state\", r"C:\work\state"),
+        (r"C:\work\state/", r"C:\work\state"),
+        (
+            r"\\?\C:\work\missing\..\state\",
+            r"\\?\C:\work\missing\..\state",
+        ),
+        (r"\\?\C:\", r"\\?\C:\"),
+        (r"C:\", r"C:\"),
+    ];
+    for (given, want) in cases {
+        assert_eq!(trim(Path::new(given)).as_os_str(), want, "{given}");
+    }
+}
+
+/// A verbatim path with a `..` component is not resolved into another directory (Windows
+/// does not interpret `..` in that syntax).
+#[cfg(windows)]
+#[test]
+fn refuses_verbatim_path_with_parent_component() {
+    let tmp = tempfile::tempdir_in(host::default_state_base().unwrap()).unwrap();
+    let parent = std::fs::canonicalize(tmp.path()).unwrap();
+    let mut raw = parent.as_os_str().to_os_string();
+    raw.push(r"\missing\..\state");
+    let path = Path::new(&raw);
+
+    assert!(std::fs::symlink_metadata(path).is_err());
+    let result = prepare(path, INSTANCE);
+    assert!(result.is_err(), "{result:?}");
+    assert!(!parent.join("state").exists());
+}

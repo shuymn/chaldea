@@ -108,6 +108,15 @@ pub(crate) enum Point {
     /// The coordinator's thread held (blocking) after it submitted `Store::shutdown` and
     /// before it awaits the report.
     CoordinatorBeforeStoreWait,
+    /// The coordinator's thread held (blocking) in the wait for the first request, before it
+    /// polls the startup task and the gate.
+    CoordinatorWaiting,
+    /// The coordinator, after a failed removal of its record and before the retry wait.
+    RecordRetry,
+    /// The coordinator, before it queues the log switch away from `daemon.log`.
+    BeforeLogSwitch,
+    /// The coordinator's thread held (blocking) in a console-end exit, before it returns.
+    CrashExit,
 }
 
 /// What a test injects into one run and what the run publishes back.
@@ -147,6 +156,12 @@ pub(crate) struct Faults {
     pub(crate) bind_attempts: AtomicU32,
     /// The run panics before its runtime exists.
     pub(crate) panic_before_runtime: AtomicBool,
+    /// The next `n` removals of the record fail (`u32::MAX`: every one).
+    pub(crate) record_remove_fails: AtomicU32,
+    /// Removals of the record attempted.
+    pub(crate) record_remove_attempts: AtomicU32,
+    /// The coordinator queued the log switch away from `daemon.log`.
+    pub(crate) log_switch_queued: AtomicBool,
 }
 
 impl Faults {
@@ -181,6 +196,22 @@ impl Faults {
 
     pub(crate) fn marks(&self) -> Vec<(String, Option<Instant>)> {
         lock(&self.marks).clone()
+    }
+
+    /// Counts a removal of the record and fails it while injected failures remain.
+    pub(crate) fn record_remove(&self) -> io::Result<()> {
+        self.record_remove_attempts.fetch_add(1, Ordering::SeqCst);
+        let left = self.record_remove_fails.load(Ordering::SeqCst);
+        if left == 0 {
+            return Ok(());
+        }
+        if left != u32::MAX {
+            self.record_remove_fails.fetch_sub(1, Ordering::SeqCst);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected removal failure",
+        ))
     }
 
     pub(crate) fn bind_fails(&self) -> bool {

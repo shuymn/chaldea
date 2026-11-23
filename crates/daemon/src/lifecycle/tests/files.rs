@@ -330,17 +330,24 @@ fn already_exists_after_create_removes_the_temp() {
 /// Creates a FIFO with `/usr/bin/mkfifo` (no writer ever opens it).
 #[cfg(target_os = "macos")]
 pub(super) fn mkfifo(path: &Path) {
-    let out = super::super::spawn_locked(
+    let mut child = super::super::spawn_locked(
         std::process::Command::new("/usr/bin/mkfifo")
             .args(["-m", "600"])
             .arg(path)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()),
     )
-    .unwrap()
-    .wait()
     .unwrap();
-    assert!(out.success());
+    let mut status = None;
+    let exited = super::wait_for(Duration::from_secs(10), || {
+        status = child.try_wait().unwrap();
+        status.is_some()
+    });
+    if !exited {
+        super::kill_and_reap(&mut child);
+        panic!("mkfifo did not exit within 10 s");
+    }
+    assert!(status.unwrap().success());
 }
 
 /// Runs `f` on a thread and returns its result if it finishes within 2 s; otherwise opens
@@ -360,7 +367,13 @@ pub(super) fn without_blocking<T: Send + 'static>(
             Some(v)
         }
         Err(_) => {
-            let _w = std::fs::OpenOptions::new().write(true).open(fifo).unwrap();
+            // Non-blocking (`O_NONBLOCK`, 0x0004 on macOS): with no reader left the open fails
+            // instead of waiting for one.
+            use std::os::unix::fs::OpenOptionsExt;
+            let _w = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(0x0004)
+                .open(fifo);
             let _ = rx.recv_timeout(Duration::from_secs(10));
             None
         }
