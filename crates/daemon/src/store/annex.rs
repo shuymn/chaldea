@@ -11,7 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// The persisted JSON is serde's externally tagged form:
 /// `{"readiness":{"launch_id":…,"position":42,"counted":["input","human","reply"]}}` or
-/// `{"transcript":"<continuity>"}`.
+/// `{"transcript":"<continuity>"}`, or `{"hook":{"truncated":true}}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum EventAnnex {
@@ -19,6 +19,9 @@ pub enum EventAnnex {
     Readiness(WriteBasis),
     /// On every transcript-sourced event.
     Transcript(Continuity),
+    /// Only on a hook's `raw_unknown`: `truncated` marks a body the emitter cut at 4 MiB,
+    /// whose `raw` is that prefix (`docs/design/hook-ingest.md` §8 D5).
+    Hook { truncated: bool },
 }
 
 /// The PTY writer's basis captured at the readiness evidence's intake: `position` is

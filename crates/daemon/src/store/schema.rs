@@ -16,13 +16,15 @@ pub(crate) const PROJECTION_VERSION: u32 = 1;
 
 /// Ordered migration scripts; `MIGRATIONS[i]` brings `user_version` from `i` to `i + 1`.
 /// Any physical DDL change, projection tables included, is a new migration.
-pub(crate) const MIGRATIONS: &[&str] = &[V1];
+pub(crate) const MIGRATIONS: &[&str] = &[V1, V2];
 
 /// SHA-256 (lowercase hex) of the schema dump of each version (`open::schema_fingerprint`),
 /// in the order of `MIGRATIONS`. `schema_tests::shipped_fingerprints_match_the_migrations`
 /// recomputes them, so a DDL edit without a migration fails a test.
-pub(crate) const FINGERPRINTS: &[&str] =
-    &["497e99858728fa92c32e3f3468a3a0e2f478cc662b76c48e96ce913daf9f405a"];
+pub(crate) const FINGERPRINTS: &[&str] = &[
+    "497e99858728fa92c32e3f3468a3a0e2f478cc662b76c48e96ce913daf9f405a",
+    "1299d9c3158a9ad1da9751087819a6d97649461cc02437724af82db703bca8a7",
+];
 
 const V1: &str = r#"
 CREATE TABLE meta (
@@ -437,4 +439,17 @@ CREATE TABLE proj_transcript_cursors (
   read_continuity  TEXT NOT NULL,
   CHECK (read_offset >= event_offset)
 ) STRICT;
+"#;
+
+/// One binding per launch, only for the stream's current launch (PR 9,
+/// `docs/design/hook-ingest.md` §2.12). The trigger reads `events` only, so it holds while
+/// projections are dropped; `NEW.launch_id IS NULL` keeps a `NULL` operand from passing.
+const V2: &str = r#"
+CREATE TRIGGER events_session_bound_once BEFORE INSERT ON events WHEN NEW.kind = 'session_bound' BEGIN
+  SELECT RAISE(ROLLBACK, 'events_session_bound_once: a binding without a launch, a second binding, or a binding of another launch')
+  WHERE NEW.launch_id IS NULL
+     OR EXISTS (SELECT 1 FROM events WHERE stream_id = NEW.stream_id AND kind = 'session_bound' AND launch_id IS NEW.launch_id)
+     OR NEW.launch_id IS NOT (SELECT launch_id FROM events WHERE stream_id = NEW.stream_id AND kind = 'launch_reserved'
+                              ORDER BY seq DESC LIMIT 1);
+END;
 "#;

@@ -864,3 +864,49 @@ fn readiness_annex_check() {
         .unwrap();
     }
 }
+
+/// `events_session_bound_once`: a second binding of a launch, a binding without a launch,
+/// and a binding of a launch that is not the stream's latest reservation are refused; the
+/// next launch's first binding passes (PR9-CL-6, hook-ingest §2.12).
+#[test]
+fn session_bound_once() {
+    use crate::store::{StoreError, WriteError};
+    let refused_by_trigger =
+        |r: Result<Vec<crate::store::Appended>, WriteError>, what: &str| match r {
+            Err(WriteError::RolledBack(StoreError::Constraint(m))) => assert!(
+                m.contains("events_session_bound_once"),
+                "{what}: refused by another check: {m}"
+            ),
+            other => panic!("{what}: not refused by the trigger: {other:?}"),
+        };
+    let s = TestStore::new();
+    let (t, l1, l2) = (thread(1), launch(1), launch(2));
+    bound_thread(&s, t, l1, Some(A));
+    refused_by_trigger(s.append(vec![bound(t, l1, "s2", None)]), "second binding");
+    let mut no_launch = bound(t, l1, "s3", None);
+    no_launch.launch_id = None;
+    refused_by_trigger(s.append(vec![no_launch]), "no launch");
+    s.append(vec![super::support::exited(t, l1)]).unwrap();
+    s.append(vec![reserved(t, l2), started(t, l2)]).unwrap();
+    // L1 has its binding already; a fresh launch id that was never reserved names another
+    // launch than the stream's latest reservation.
+    let l9 = launch(9);
+    refused_by_trigger(
+        s.append(vec![bound(t, l9, "s9", None)]),
+        "a launch that is not the latest reservation",
+    );
+    s.append(vec![bound(t, l2, "s2", Some("/work/b.jsonl"))])
+        .expect("the next launch's first binding passes");
+    // A reserved launch that was never bound, after the next reservation: only the
+    // latest-reservation clause refuses it.
+    let (t2, l3, l4) = (thread(2), launch(3), launch(4));
+    s.append(vec![super::support::registered(t2, false)])
+        .unwrap();
+    s.append(vec![reserved(t2, l3), started(t2, l3)]).unwrap();
+    s.append(vec![super::support::exited(t2, l3)]).unwrap();
+    s.append(vec![reserved(t2, l4)]).unwrap();
+    refused_by_trigger(
+        s.append(vec![bound(t2, l3, "s3", None)]),
+        "an unbound launch after the next reservation",
+    );
+}

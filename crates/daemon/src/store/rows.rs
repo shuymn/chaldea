@@ -204,6 +204,16 @@ pub struct BufferedDelivery {
     pub hook: BufferedHook,
 }
 
+/// What [`super::ReadTx::buffered_summary`] reads of a launch's buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferedSummary {
+    pub count: u64,
+    /// The summed length of the buffered bodies.
+    pub body_bytes: u64,
+    /// `MIN(received_at)`; `None` for an empty buffer.
+    pub earliest_received_at: Option<Timestamp>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RebuildReport {
     pub events: u64,

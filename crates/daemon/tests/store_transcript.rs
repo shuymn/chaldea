@@ -137,12 +137,40 @@ fn same_path_swapped_file() {
     );
 }
 
-/// A batch read before the launch rebound to another path is refused (StaleBinding).
+/// A batch whose launch is current but whose session or path is not the binding's is
+/// refused (StaleBinding), and so is one read before the thread bound its next launch to
+/// another path.
 #[test]
 fn old_batch_after_rebind_is_refused() {
     let s = TestStore::new();
     let (t, l) = with_lines(&s);
-    s.append(vec![bound(t, l, "s2", Some(B))]).unwrap();
+    let n = head(&s, t);
+    let mut other_session = batch(t, l, A, Some(pos(1, A, "f1", 20)));
+    other_session.session_id = "s2".into();
+    let mut other_path = batch(t, l, B, Some(pos(1, A, "f1", 20)));
+    for b in [&mut other_session, &mut other_path] {
+        b.lines = vec![line(20, 30, "late")];
+        b.advance_to.read_offset = 30;
+    }
+    for b in [other_session, other_path] {
+        let r = submit(&s, b);
+        assert!(
+            matches!(
+                r,
+                Err(WriteError::RolledBack(StoreError::StaleBinding { .. }))
+            ),
+            "{r:?}"
+        );
+    }
+    assert_eq!(head(&s, t), n);
+    let l2 = launch(2);
+    s.append(vec![
+        exited(t, l),
+        reserved(t, l2),
+        started(t, l2),
+        bound(t, l2, "s2", Some(B)),
+    ])
+    .unwrap();
     let n = head(&s, t);
     let mut b = batch(t, l, A, Some(pos(1, A, "f1", 20)));
     b.lines = vec![line(20, 30, "late")];

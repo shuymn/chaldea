@@ -32,6 +32,10 @@ pub struct Deadline(pub Instant);
 pub(crate) type Job<R> = Box<dyn FnOnce(&mut WriteTx<'_>) -> Result<R, JobError> + Send>;
 /// Runs after a job committed, from the task that observed it.
 pub(crate) type AfterOk = Box<dyn FnOnce() + Send>;
+/// Dropped by the observer as soon as `Store::submit` for its job returns, whatever it
+/// returned, or with the observer when the registry refuses or aborts it before it submits
+/// (hook-ingest §2.3 `write_then`).
+pub(crate) type Release = Box<dyn std::any::Any + Send>;
 
 /// One `Store::read` in `spawn_blocking`, with the pool's wait ending at `deadline` and the
 /// result awaited until `deadline` and no longer (design §2.3 "one cutoff"). A store outcome
@@ -44,6 +48,18 @@ pub(crate) async fn read_until<R: Send + 'static>(
     deadline: Instant,
     f: impl FnOnce(&ReadTx<'_>) -> Result<R, StoreError> + Send + 'static,
 ) -> Result<R, ApiError> {
+    read_cut(shared, deadline, f, false).await
+}
+
+/// [`read_until`]; with `strict`, reader-pool exhaustion taken at or after `deadline` is 408
+/// too, like every other result. A ready result is classified by the one clock sample taken
+/// when the wait returned it.
+async fn read_cut<R: Send + 'static>(
+    shared: &Arc<Shared>,
+    deadline: Instant,
+    f: impl FnOnce(&ReadTx<'_>) -> Result<R, StoreError> + Send + 'static,
+    strict: bool,
+) -> Result<R, ApiError> {
     // The cutoff is set before the read starts.
     let cutoff = shared.timer(deadline);
     let handle = spawn_read(shared, deadline, f);
@@ -54,7 +70,12 @@ pub(crate) async fn read_until<R: Send + 'static>(
         .await;
     match timeout_at(cutoff, handle).await {
         Err(_) => Err(ApiError::request_timeout()),
-        Ok(joined) => take_read(shared, deadline, joined),
+        Ok(joined) => {
+            let late = shared.passed(deadline);
+            #[cfg(test)]
+            shared.faults.after_cutoff_sample().await;
+            classify(late, strict, joined)
+        }
     }
 }
 
@@ -81,17 +102,24 @@ pub(crate) fn spawn_read<R: Send + 'static>(
 }
 
 /// A read's result as taken now: any result taken at or after `deadline` (by the server's
-/// clock) is 408, except reader-pool exhaustion, whose wait ends at the cutoff itself (503
-/// `busy`); otherwise the store outcome maps through §2.9.
+/// clock), a failed join included, is 408, except reader-pool exhaustion, whose wait ends at
+/// the cutoff itself (503 `busy`); otherwise the store outcome maps through §2.9.
 pub(crate) fn take_read<R>(
     shared: &Shared,
     deadline: Instant,
     joined: Joined<R>,
 ) -> Result<R, ApiError> {
+    classify(shared.passed(deadline), false, joined)
+}
+
+/// A read's result against one clock sample: `late` (taken at or after the deadline) is
+/// 408, a failed join included, except reader-pool exhaustion unless `strict` (its wait ends
+/// at the cutoff itself: 503 `busy`); otherwise the store outcome maps through §2.9.
+fn classify<R>(late: bool, strict: bool, joined: Joined<R>) -> Result<R, ApiError> {
     match joined {
+        Ok(Err(ReadError::Busy)) if !strict => Err(ApiError::busy()),
+        _ if late => Err(ApiError::request_timeout()),
         Err(_) => Err(ApiError::internal()),
-        Ok(Err(ReadError::Busy)) => Err(ApiError::busy()),
-        Ok(_) if shared.passed(deadline) => Err(ApiError::request_timeout()),
         Ok(Err(e)) => Err(read_error(&e)),
         Ok(Ok(v)) => Ok(v),
     }
@@ -148,9 +176,25 @@ pub(crate) async fn run_write<R: Send + 'static>(
     job: Job<R>,
     after_ok: Option<AfterOk>,
 ) -> Result<R, WriteFailure> {
+    run_write_releasing(shared, not_after, job, after_ok, None).await
+}
+
+/// [`run_write`] that drops `release` as soon as `Store::submit` returns.
+async fn run_write_releasing<R: Send + 'static>(
+    shared: &Shared,
+    not_after: Instant,
+    job: Job<R>,
+    after_ok: Option<AfterOk>,
+    release: Option<Release>,
+) -> Result<R, WriteFailure> {
     #[cfg(test)]
     shared.faults.write_submitted(not_after);
-    let ticket = match shared.store.submit(shared.real(not_after), job) {
+    #[cfg(test)]
+    shared.faults.before_submit().await;
+    let submitted = shared.store.submit(shared.real(not_after), job);
+    // The job is in the writer's queue now, or never will be.
+    drop(release);
+    let ticket = match submitted {
         Ok(t) => t,
         Err(e) => {
             if e == SubmitError::Failed {
@@ -183,16 +227,29 @@ pub(crate) async fn run_write<R: Send + 'static>(
 
 /// For plain writes: registers one observer task running [`run_write`] and returns its
 /// result on a oneshot. Refused once the registry is closing.
+#[cfg(test)]
 pub(crate) fn observe_write<R: Send + 'static>(
     shared: &Arc<Shared>,
     not_after: Instant,
     job: Job<R>,
     after_ok: Option<AfterOk>,
 ) -> Result<oneshot::Receiver<Result<R, WriteFailure>>, Closing> {
+    observe_write_releasing(shared, not_after, job, after_ok, None)
+}
+
+/// [`observe_write`] whose observer owns `release` from its registration: a refused or
+/// aborted observer drops it with its future, a running one at submission.
+fn observe_write_releasing<R: Send + 'static>(
+    shared: &Arc<Shared>,
+    not_after: Instant,
+    job: Job<R>,
+    after_ok: Option<AfterOk>,
+    release: Option<Release>,
+) -> Result<oneshot::Receiver<Result<R, WriteFailure>>, Closing> {
     let (tx, rx) = oneshot::channel();
     let s = shared.clone();
     shared.registry.spawn(TaskKind::Write, async move {
-        let r = run_write(&s, not_after, job, after_ok).await;
+        let r = run_write_releasing(&s, not_after, job, after_ok, release).await;
         let _ = tx.send(r);
     })?;
     Ok(rx)
@@ -209,14 +266,27 @@ pub(crate) async fn await_write<R: Send + 'static>(
     job: Job<R>,
     after_ok: Option<AfterOk>,
 ) -> Result<R, ApiError> {
+    await_write_releasing(shared, deadline, job, after_ok, None).await
+}
+
+/// [`await_write`] whose observer drops `release` once `Store::submit` returned (or with
+/// the observer, refused or aborted before it submitted); past the deadline it is dropped
+/// here, with nothing submitted.
+async fn await_write_releasing<R: Send + 'static>(
+    shared: &Arc<Shared>,
+    deadline: Instant,
+    job: Job<R>,
+    after_ok: Option<AfterOk>,
+    release: Option<Release>,
+) -> Result<R, ApiError> {
     if shared.passed(deadline) {
         return Err(ApiError::request_timeout());
     }
     // The reply cutoff is set before the job is submitted.
     let reply_by = deadline + shared.cfg.write_reply_grace;
     let cutoff = shared.timer(reply_by);
-    let rx =
-        observe_write(shared, deadline, job, after_ok).map_err(|_| ApiError::shutting_down())?;
+    let rx = observe_write_releasing(shared, deadline, job, after_ok, release)
+        .map_err(|_| ApiError::shutting_down())?;
     #[cfg(test)]
     shared.faults.before_cutoff_wait(|| !rx.is_empty()).await;
     match timeout_at(cutoff, rx).await {
@@ -359,8 +429,33 @@ impl WriteCtx {
         &self,
         job: impl FnOnce(&mut WriteTx<'_>, Option<&Authorized>) -> Result<R, JobError> + Send + 'static,
     ) -> Result<R, ApiError> {
+        self.write_releasing(job, None).await
+    }
+
+    /// [`WriteCtx::write`] with `release`, which the observer drops as soon as
+    /// `Store::submit` for the job returns, success or failure; a refused registration, or
+    /// an observer aborted before its first poll, drops it too. Ownership passes to the
+    /// observer at registration, so a client that disconnects afterwards no longer holds it
+    /// (hook-ingest §2.3).
+    ///
+    /// # Errors
+    ///
+    /// As [`WriteCtx::write`].
+    pub(crate) async fn write_then<R: Send + 'static>(
+        &self,
+        job: impl FnOnce(&mut WriteTx<'_>, Option<&Authorized>) -> Result<R, JobError> + Send + 'static,
+        release: Release,
+    ) -> Result<R, ApiError> {
+        self.write_releasing(job, Some(release)).await
+    }
+
+    async fn write_releasing<R: Send + 'static>(
+        &self,
+        job: impl FnOnce(&mut WriteTx<'_>, Option<&Authorized>) -> Result<R, JobError> + Send + 'static,
+        release: Option<Release>,
+    ) -> Result<R, ApiError> {
         let sha = self.principal.as_ref().map(|p| p.token_sha256);
-        await_write(
+        await_write_releasing(
             &self.shared,
             self.deadline,
             Box::new(move |tx| {
@@ -368,7 +463,30 @@ impl WriteCtx {
                 job(tx, auth.as_ref())
             }),
             None,
+            release,
         )
         .await
+    }
+
+    /// One read bounded by `by` (on the server's clock) instead of the request deadline:
+    /// the reader pool's wait ends at `by`, and a result not returned by it, or taken at or
+    /// after it, is 408, reader-pool exhaustion included (a strict cutoff, unlike
+    /// [`read_until`]'s 503 `busy` at the cutoff).
+    ///
+    /// # Errors
+    ///
+    /// 408, 503 `busy` (exhaustion before `by`) / `shutting_down`, 500, or `f`'s store error
+    /// mapped (§2.9).
+    pub(crate) async fn read_by<R: Send + 'static>(
+        &self,
+        by: Instant,
+        f: impl FnOnce(&ReadTx<'_>) -> Result<R, StoreError> + Send + 'static,
+    ) -> Result<R, ApiError> {
+        read_cut(&self.shared, by, f, true).await
+    }
+
+    /// The store's commit notifications, from now on (closed once the store shuts down).
+    pub(crate) fn commits(&self) -> tokio::sync::broadcast::Receiver<crate::store::Committed> {
+        self.shared.store.subscribe()
     }
 }

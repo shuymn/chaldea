@@ -13,6 +13,7 @@
 )]
 
 pub mod commands;
+pub mod hook;
 pub mod http;
 
 use std::collections::{BTreeMap, BTreeSet};

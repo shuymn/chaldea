@@ -354,6 +354,11 @@ impl<'c> WriteTx<'c> {
             (_, Some(EventAnnex::Readiness(_))) => {
                 return Err(AnnexError::Unexpected(row.event.kind()).into());
             }
+            (TypedEvent::RawUnknown(_), Some(EventAnnex::Hook { .. }))
+                if matches!(row.source.kind, Open::Known(SourceKind::Hook)) => {}
+            (_, Some(EventAnnex::Hook { .. })) => {
+                return Err(AnnexError::Unexpected(row.event.kind()).into());
+            }
             (_, Some(EventAnnex::Transcript(_))) if !is_transcript(&row.source) => {
                 return Err(AnnexError::Unexpected(row.event.kind()).into());
             }
