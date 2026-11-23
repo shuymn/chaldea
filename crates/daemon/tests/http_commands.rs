@@ -921,7 +921,7 @@ const HANDLER_CODES: [&str; 6] = [
 ];
 
 /// The handler codes whose reply carries `retry_after` (every other one omits it).
-const RETRY_CODES: [&str; 2] = ["busy", "shutting_down"];
+const RETRY_CODES: [&str; 1] = ["busy"];
 
 /// The code table over every `ErrorCode`, as a refusal and as a stored result: a code a
 /// handler may use, at its status, with `retry_after` exactly when the code calls for it, is
@@ -1010,32 +1010,54 @@ async fn handler_replies_follow_the_code_table() {
     srv.stop().await;
 }
 
-/// A `busy` or `shutting_down` refusal tells the client when to retry: without
-/// `retry_after` it is 500 `internal`, with it 503 as it is; no receipt either way.
+/// A `busy` refusal tells the client when to retry: without `retry_after` it is 500
+/// `internal`, with it 503 as it is; no receipt either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn busy_refusal_has_retry_delay() {
     let (srv, _probe) = TestServer::with_commands(|_| {}).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let mut n = 0;
-    for code in ["busy", "shutting_down"] {
-        for (retry, want_status, want_body) in [
-            (String::new(), 500, INTERNAL.to_vec()),
-            (
-                r#","retry_after":1"#.to_owned(),
-                503,
-                format!(r#"{{"code":"{code}","retry_after":1}}"#).into_bytes(),
-            ),
-        ] {
-            n += 1;
-            let args = format!(r#"{{"how":"code","code":"{code}","status":503{retry}}}"#);
-            let r = srv
-                .send(&srv.command("test_refuse", &owner, cid(n), &args))
-                .await;
-            assert_eq!((r.status, &r.body), (want_status, &want_body), "{args}");
-            assert_eq!(srv.receipt(cid(n)), None, "{args}");
-        }
+    for (retry, want_status, want_body) in [
+        (String::new(), 500, INTERNAL.to_vec()),
+        (
+            r#","retry_after":1"#.to_owned(),
+            503,
+            br#"{"code":"busy","retry_after":1}"#.to_vec(),
+        ),
+    ] {
+        n += 1;
+        let args = format!(r#"{{"how":"code","code":"busy","status":503{retry}}}"#);
+        let r = srv
+            .send(&srv.command("test_refuse", &owner, cid(n), &args))
+            .await;
+        assert_eq!((r.status, &r.body), (want_status, &want_body), "{args}");
+        assert_eq!(srv.receipt(cid(n)), None, "{args}");
     }
     srv.stop().await;
+}
+
+/// A handler's `shutting_down` refusal has the shape of every other `shutting_down` reply
+/// (no `retry_after`): the same body as the guard's once the store is closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutting_down_reply_shape_is_consistent() {
+    let (mut srv, _) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let id = cid(94);
+    let req = srv.command(
+        "test_refuse",
+        &owner,
+        id,
+        r#"{"how":"code","code":"shutting_down","status":503}"#,
+    );
+    let handler = srv.send(&req).await;
+    assert_eq!(srv.receipt(id), None);
+    srv.store.shutdown();
+    let guard = srv.send(&req).await;
+    srv.shutdown_http(std::time::Instant::now() + Duration::from_secs(10))
+        .await;
+    assert_eq!(handler.outcome(), (503, code("shutting_down")));
+    assert_eq!(guard.outcome(), (503, code("shutting_down")));
+    assert_eq!(handler.body, guard.body);
 }
 
 /// A result body that is not one a handler may store is 500 `internal`, stored and

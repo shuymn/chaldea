@@ -115,10 +115,12 @@ fn handler_code(code: ErrorCode) -> Option<HandlerCode> {
         ErrorCode::Forbidden => at(StatusCode::FORBIDDEN),
         ErrorCode::NotFound => at(StatusCode::NOT_FOUND),
         // Transient: the client retries after `retry_after`.
-        ErrorCode::Busy | ErrorCode::ShuttingDown => Some(HandlerCode {
+        ErrorCode::Busy => Some(HandlerCode {
             status: StatusCode::SERVICE_UNAVAILABLE,
             retry_after: true,
         }),
+        // The daemon is stopping: no retry time, as every other `shutting_down` reply.
+        ErrorCode::ShuttingDown => at(StatusCode::SERVICE_UNAVAILABLE),
         ErrorCode::Internal => at(StatusCode::INTERNAL_SERVER_ERROR),
         // Routing, framing, method, and authentication: the outer layer and the guard.
         ErrorCode::MisdirectedRequest
@@ -165,11 +167,12 @@ fn result_allowed(r: &CommandResult) -> bool {
         return false;
     };
     members.keys().all(|k| k == "code" || k == "retry_after")
+        && members.contains_key("retry_after") == body.retry_after.is_some()
         && status != StatusCode::SERVICE_UNAVAILABLE
         && handler_code(body.code)
             == Some(HandlerCode {
                 status,
-                retry_after: members.contains_key("retry_after"),
+                retry_after: body.retry_after.is_some(),
             })
 }
 
