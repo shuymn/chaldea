@@ -392,6 +392,17 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_first_attempt_can_leave_no_time_to_retry() {
+        // Attempt 1 starts at 800 ms and gets no reply by its deadline (2600 ms); a second
+        // would start at 2650 ms, 2650 + 300 > 2900: the hook gets one attempt (§2.13
+        // "Best-effort delivery").
+        let t0 = Instant::now();
+        let clock = TestClock::at(t0 + ms(800));
+        let seen = script(&clock, t0, &[1800], &[next(Err(Transport::Timeout))]);
+        assert_eq!(seen, [(1, ms(800), ms(2600))]);
+    }
+
+    #[test]
     fn deadlines_never_pass_the_work_end() {
         let t0 = Instant::now();
         let clock = TestClock::at(t0 + ms(2000));
