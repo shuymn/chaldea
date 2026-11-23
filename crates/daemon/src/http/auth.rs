@@ -27,6 +27,7 @@ use crate::store::{JobError, NewToken, ReadTx, StoreError, TokenSelector, WriteT
 
 pub(crate) const TOKEN_PREFIX: &str = "chd_";
 pub(crate) const TICKET_PREFIX: &str = "chdt_";
+pub(crate) const PAIR_CODE_PREFIX: &str = "chdp_";
 /// base64url without padding of 32 bytes.
 const SECRET_CHARS: usize = 43;
 

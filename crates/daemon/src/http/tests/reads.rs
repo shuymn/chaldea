@@ -15,33 +15,6 @@ use crate::http::{ApiError, MonotonicClock, Mount, Mounts, ReadCtx, spec};
 use crate::store::StoreError;
 use axum::body::Body;
 
-/// Holds every reader of the pool until the returned sender is dropped.
-fn hold_readers(srv: &TestServer, n: usize) -> mpsc::Sender<()> {
-    let (release_tx, release_rx) = mpsc::channel::<()>();
-    let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
-    let (held_tx, held_rx) = mpsc::channel::<()>();
-    for _ in 0..n {
-        let store = srv.store.store().clone();
-        let held = held_tx.clone();
-        let release = release_rx.clone();
-        std::thread::spawn(move || {
-            let _ = store.read(Instant::now() + Duration::from_secs(5), move |_tx| {
-                held.send(()).unwrap();
-                // Released when the sender drops; every holder then returns.
-                let _ = release
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(20));
-                Ok(())
-            });
-        });
-    }
-    for _ in 0..n {
-        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    }
-    release_tx
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_outcomes_map() {
     let srv = TestServer::start(Mounts::mvp()).await;
@@ -65,7 +38,7 @@ async fn read_outcomes_map() {
     drop(release_tx);
 
     // The reader pool exhausted through the cutoff: 503 `busy` or 408, never a success.
-    let release = hold_readers(&srv, 4);
+    let release = srv.hold_readers(4);
     let r = read_until(&s, Instant::now() + Duration::from_millis(300), |_| Ok(1)).await;
     assert!(
         r == Err(ApiError::busy()) || r == Err(ApiError::request_timeout()),
@@ -198,7 +171,7 @@ async fn lookup_failure_is_not_unauthorized() {
     let req = srv.req("GET", "/api/threads").bearer(&owner);
 
     // The reader pool exhausted through the cutoff: 503 `busy` or 408.
-    let release = hold_readers(&srv, 4);
+    let release = srv.hold_readers(4);
     let r = srv.send(&req).await;
     assert!(
         [

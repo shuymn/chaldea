@@ -12,6 +12,15 @@ use chaldea_core::http::{ErrorBody, ErrorCode};
 
 use crate::store::{JobError, ReadError, StoreError, SubmitError, WriteError};
 
+/// Whether `e` or an error in its source chain satisfies `is`: the walk for an error a
+/// layer may have passed on boxed, tested by type.
+pub(crate) fn in_source_chain(
+    e: &(dyn std::error::Error + 'static),
+    is: impl Fn(&(dyn std::error::Error + 'static)) -> bool,
+) -> bool {
+    std::iter::successors(Some(e), |err| err.source()).any(is)
+}
+
 /// Seconds a client waits before retrying a `busy` or `outcome_unknown` answer.
 pub(crate) const RETRY_AFTER_SECS: u32 = 1;
 

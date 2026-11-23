@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use tokio::sync::oneshot;
@@ -34,6 +34,10 @@ pub(crate) struct Points {
     pub(crate) first_park: Mutex<Option<oneshot::Sender<()>>>,
     /// The upgrade steps recorded, in order.
     pub(crate) steps: Mutex<Vec<&'static str>>,
+    /// Held once by a socket's next send before it writes.
+    pub(crate) socket_send_gate: Mutex<Option<Gate>>,
+    /// While set, sockets drop the store's commit notifications.
+    pub(crate) drop_notifications: AtomicBool,
 }
 
 /// Arms a gate: the returned receiver fires when the gate is reached, and the waiter goes
@@ -157,6 +161,23 @@ impl Points {
             );
             tokio::task::yield_now().await;
         }
+    }
+
+    /// Arms the socket send gate, as [`Points::arm_removal_gate`].
+    pub(crate) fn arm_socket_send_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        arm(&self.socket_send_gate)
+    }
+
+    pub(crate) async fn before_socket_send(&self) {
+        pass(&self.socket_send_gate).await;
+    }
+
+    pub(crate) fn drop_notifications(&self, on: bool) {
+        self.drop_notifications.store(on, Ordering::SeqCst);
+    }
+
+    pub(crate) fn notifications_dropped(&self) -> bool {
+        self.drop_notifications.load(Ordering::SeqCst)
     }
 
     pub(crate) fn step(&self, step: &'static str) {

@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 use tokio::time::timeout_at;
 
 use super::auth::{Authorized, Principal, verify_in_read, verify_opt_in_job};
-use super::error::{ApiError, WriteFailure, read_error, write_failure};
+use super::error::{ApiError, WriteFailure, in_source_chain, read_error, write_failure};
 use super::registry::{Closing, TaskKind};
 use super::{Shared, StoreFatal};
 use crate::store::{JobError, ReadError, ReadTx, StoreError, SubmitError, WriteError, WriteTx};
@@ -46,15 +46,7 @@ pub(crate) async fn read_until<R: Send + 'static>(
 ) -> Result<R, ApiError> {
     // The cutoff is set before the read starts.
     let cutoff = shared.timer(deadline);
-    let s = shared.clone();
-    let handle = tokio::task::spawn_blocking(move || {
-        #[cfg(test)]
-        s.faults.before_read();
-        let r = s.store.read(s.real(deadline), f);
-        #[cfg(test)]
-        s.faults.after_read();
-        r
-    });
+    let handle = spawn_read(shared, deadline, f);
     #[cfg(test)]
     shared
         .faults
@@ -62,11 +54,46 @@ pub(crate) async fn read_until<R: Send + 'static>(
         .await;
     match timeout_at(cutoff, handle).await {
         Err(_) => Err(ApiError::request_timeout()),
-        Ok(Err(_)) => Err(ApiError::internal()),
-        Ok(Ok(Err(ReadError::Busy))) => Err(ApiError::busy()),
-        Ok(Ok(_)) if shared.passed(deadline) => Err(ApiError::request_timeout()),
-        Ok(Ok(Err(e))) => Err(read_error(&e)),
-        Ok(Ok(Ok(v))) => Ok(v),
+        Ok(joined) => take_read(shared, deadline, joined),
+    }
+}
+
+/// The result of a read spawned by [`spawn_read`].
+pub(crate) type Joined<R> = Result<Result<R, ReadError>, tokio::task::JoinError>;
+
+/// Starts one `Store::read` in `spawn_blocking`, the pool's wait ending at `deadline` (on
+/// the server's clock). The caller holds the handle and bounds its wait at the same
+/// deadline; a socket holds it across loop iterations (design §2.6).
+pub(crate) fn spawn_read<R: Send + 'static>(
+    shared: &Arc<Shared>,
+    deadline: Instant,
+    f: impl FnOnce(&ReadTx<'_>) -> Result<R, StoreError> + Send + 'static,
+) -> tokio::task::JoinHandle<Result<R, ReadError>> {
+    let s = shared.clone();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        s.faults.before_read();
+        let r = s.store.read(s.real(deadline), f);
+        #[cfg(test)]
+        s.faults.after_read();
+        r
+    })
+}
+
+/// A read's result as taken now: any result taken at or after `deadline` (by the server's
+/// clock) is 408, except reader-pool exhaustion, whose wait ends at the cutoff itself (503
+/// `busy`); otherwise the store outcome maps through §2.9.
+pub(crate) fn take_read<R>(
+    shared: &Shared,
+    deadline: Instant,
+    joined: Joined<R>,
+) -> Result<R, ApiError> {
+    match joined {
+        Err(_) => Err(ApiError::internal()),
+        Ok(Err(ReadError::Busy)) => Err(ApiError::busy()),
+        Ok(_) if shared.passed(deadline) => Err(ApiError::request_timeout()),
+        Ok(Err(e)) => Err(read_error(&e)),
+        Ok(Ok(v)) => Ok(v),
     }
 }
 
@@ -104,16 +131,10 @@ pub(crate) async fn body_within(
     let max = usize::try_from(max).unwrap_or(usize::MAX);
     match until_deadline(shared, deadline, || Limited::new(body, max).collect()).await? {
         Ok(collected) => Ok(collected.to_bytes()),
-        Err(e) => {
-            let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e.as_ref());
-            while let Some(err) = cur {
-                if err.is::<LengthLimitError>() {
-                    return Err(ApiError::payload_too_large());
-                }
-                cur = err.source();
-            }
-            Err(ApiError::bad_request())
+        Err(e) if in_source_chain(e.as_ref(), <dyn std::error::Error>::is::<LengthLimitError>) => {
+            Err(ApiError::payload_too_large())
         }
+        Err(_) => Err(ApiError::bad_request()),
     }
 }
 
@@ -241,6 +262,15 @@ impl ReadCtx {
         self.shared.store.epoch()
     }
 
+    pub(crate) fn shared(&self) -> &Arc<Shared> {
+        &self.shared
+    }
+
+    /// The blob slots (design §2.7), for a read closure's non-blocking admission.
+    pub(crate) fn blob_slots(&self) -> Arc<tokio::sync::Semaphore> {
+        self.shared.blob_slots.clone()
+    }
+
     /// One read with the request's cutoff; the token is verified first in the same snapshot
     /// as everything `f` reads. A route without a credential has no principal and cannot
     /// read (500).
@@ -301,6 +331,10 @@ impl WriteCtx {
     #[must_use]
     pub fn deadline(&self) -> Instant {
         self.deadline
+    }
+
+    pub(crate) fn shared(&self) -> &Arc<Shared> {
+        &self.shared
     }
 
     /// The request body, by the deadline (408, nothing submitted) and at most `max` bytes.

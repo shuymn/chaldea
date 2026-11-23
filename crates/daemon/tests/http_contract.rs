@@ -98,7 +98,7 @@ async fn error_bodies_match_the_contract() {
             ErrorCode::BadQuery,
         ),
         (
-            srv.req("GET", "/api/threads").bearer(&owner),
+            srv.req("GET", "/api/adapters").bearer(&owner),
             ErrorCode::NotImplemented,
         ),
     ];

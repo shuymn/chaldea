@@ -17,15 +17,20 @@
 //!    head byte, and each connection carries one request.
 
 mod auth;
+mod blobs;
 mod ctx;
 mod error;
 mod guard;
 mod listener;
+mod pair;
 mod registry;
 mod routes;
+mod scope;
+mod sync_api;
 mod tickets;
 mod trace;
 mod upgrade;
+mod ws;
 
 #[cfg(test)]
 mod tests;
@@ -97,10 +102,55 @@ pub struct HttpConfig {
     pub max_body_bytes: u64,
     /// Connections served at once; more wait in the kernel backlog.
     pub max_connections: usize,
+    /// Blob bodies held by responses at once; more are 503 `busy`.
+    pub blob_slots: usize,
+    /// The WebSocket settings and caps.
+    pub ws: WsConfig,
     /// A WebSocket ticket's lifetime.
     pub ticket_ttl: Duration,
+    /// A pair code's lifetime.
+    pub pair_code_ttl: Duration,
     /// The clock every request instant and deadline is read on.
     pub clock: Arc<dyn MonotonicClock>,
+}
+
+/// The WebSocket settings (design §2.6).
+#[derive(Debug, Clone)]
+pub struct WsConfig {
+    /// A heads refresh becomes due this often.
+    pub heads_interval: Duration,
+    /// One frame not sent within it drops the socket.
+    pub send_timeout: Duration,
+    /// No inbound frame (the client answers pings) within it drops the socket.
+    pub idle_timeout: Duration,
+    /// The largest inbound message and frame; larger closes the socket (1009).
+    pub max_message_bytes: usize,
+    /// The socket's write buffer bound.
+    pub max_write_buffer_bytes: usize,
+    /// Streams one `subscribe` may name; more closes the socket (1008).
+    pub max_subscriptions: usize,
+    /// Upgraded sockets at once; more are 503 `busy`.
+    pub max_sockets: usize,
+    /// Upgraded sockets at once for one token.
+    pub max_sockets_per_token: usize,
+    /// How long a close frame may take to send, best effort.
+    pub close_grace: Duration,
+}
+
+impl Default for WsConfig {
+    fn default() -> Self {
+        WsConfig {
+            heads_interval: Duration::from_secs(30),
+            send_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(75),
+            max_message_bytes: 64 * 1024,
+            max_write_buffer_bytes: 256 * 1024,
+            max_subscriptions: 1024,
+            max_sockets: 128,
+            max_sockets_per_token: 16,
+            close_grace: Duration::from_secs(1),
+        }
+    }
 }
 
 impl HttpConfig {
@@ -116,7 +166,10 @@ impl HttpConfig {
             max_header_bytes: 8 * 1024,
             max_body_bytes: 4 * 1024 * 1024,
             max_connections: 128,
+            blob_slots: 4,
+            ws: WsConfig::default(),
             ticket_ttl: Duration::from_secs(30),
+            pair_code_ttl: Duration::from_secs(60),
             clock: Arc::new(SystemMonotonic),
         }
     }
@@ -149,7 +202,12 @@ pub(crate) struct Shared {
     pub(crate) registry: TaskRegistry,
     pub(crate) sink: Arc<dyn LifecycleSink>,
     pub(crate) tickets: tickets::TicketStore,
-    /// Bumped after each committed revocation; sockets re-check their token (PR 7b).
+    pub(crate) pair_codes: tickets::PairCodes,
+    /// Blob bodies held by responses (design §2.7).
+    pub(crate) blob_slots: Arc<tokio::sync::Semaphore>,
+    /// Upgraded sockets, in all and per token (design §2.4 step 3).
+    pub(crate) sockets: upgrade::SocketSlots,
+    /// Bumped after each committed revocation; every socket re-checks its token.
     pub(crate) revocations: watch::Sender<u64>,
     /// Set once by shutdown; every registered task watches it.
     pub(crate) shutdown: watch::Sender<bool>,
@@ -206,10 +264,13 @@ impl HttpServer {
     ) -> HttpServer {
         let shared = Arc::new(Shared {
             store,
-            cfg,
             registry: TaskRegistry::new(),
             sink,
             tickets: tickets::TicketStore::default(),
+            pair_codes: tickets::PairCodes::default(),
+            blob_slots: Arc::new(tokio::sync::Semaphore::new(cfg.blob_slots)),
+            sockets: upgrade::SocketSlots::default(),
+            cfg,
             revocations: watch::channel(0).0,
             shutdown: watch::channel(false).0,
             #[cfg(test)]

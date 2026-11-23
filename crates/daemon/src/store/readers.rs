@@ -617,11 +617,7 @@ impl<'a> ReadTx<'a> {
     /// A store error.
     pub fn host_snapshot(&self) -> Result<(HostSnapshot, u64), StoreError> {
         self.guard(|| {
-            let threads = self
-                .thread_rows("ORDER BY registered_seq", [])?
-                .iter()
-                .map(thread_info)
-                .collect();
+            let threads = self.thread_infos()?;
             let worktrees = self
                 .worktree_rows("ORDER BY worktree_id", [])?
                 .into_iter()
@@ -720,6 +716,21 @@ impl<'a> ReadTx<'a> {
     /// A store error.
     pub fn threads(&self) -> Result<Vec<ThreadRow>, StoreError> {
         self.guard(|| self.thread_rows("ORDER BY registered_seq", []))
+    }
+
+    /// Every thread as the thread list and the host snapshot carry it, in registration order.
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub fn thread_infos(&self) -> Result<Vec<ThreadInfo>, StoreError> {
+        self.guard(|| {
+            Ok(self
+                .thread_rows("ORDER BY registered_seq", [])?
+                .iter()
+                .map(thread_info)
+                .collect())
+        })
     }
 
     fn launch_rows(&self, tail: &str, params: impl Params) -> Result<Vec<LaunchRow>, StoreError> {
@@ -1032,6 +1043,22 @@ impl<'a> ReadTx<'a> {
     /// A store error.
     pub fn transcript_cursor(&self, t: ThreadId) -> Result<Option<TranscriptCursor>, StoreError> {
         self.guard(|| self.cursor_row(t))
+    }
+
+    /// Whether the stream has a `blob_refs` row for the blob (the download check of
+    /// `GET /api/blobs`, decided before any blob body is loaded).
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub fn blob_ref_exists(&self, s: StreamId, sha256: &str) -> Result<bool, StoreError> {
+        self.guard(|| {
+            sql(self.conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM blob_refs WHERE stream_id = ?1 AND sha256 = ?2)",
+                [s.to_string(), sha256.to_owned()],
+                |r| r.get(0),
+            ))
+        })
     }
 
     /// The blob's bytes, only when the stream has a ref to it, with the stream's agreed

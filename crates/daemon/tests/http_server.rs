@@ -110,3 +110,34 @@ async fn shutdown_returns_by_its_deadline() {
     assert_eq!(report.exited.connection, 1, "{report:?}");
     srv.store.shutdown();
 }
+
+/// With every connection permit taken, the accept loop waits for a permit; shutdown still
+/// ends it, and returns by its deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_with_connection_permits_exhausted() {
+    let mut srv = TestServer::start_with(Mounts::mvp(), |c| c.max_connections = 2).await;
+    let base = srv.server.tasks();
+    let _a = connect(srv.port).await;
+    let _b = connect(srv.port).await;
+    let t0 = Instant::now();
+    while srv.server.tasks() < base + 2 {
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "connections not registered"
+        );
+        tokio::task::yield_now().await;
+    }
+    // A third client waits in the backlog: no permit is free.
+    let _c = connect(srv.port).await;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let report = srv.shutdown_http(deadline).await;
+    let late = Instant::now().saturating_duration_since(deadline);
+    assert!(
+        late < Duration::from_millis(500),
+        "shutdown returned {late:?} after its deadline"
+    );
+    assert_eq!(report.exited.accept, 1, "{report:?}");
+    assert_eq!(report.exited.connection, 2, "{report:?}");
+    assert_eq!(report.abort_requested, KindCounts::default(), "{report:?}");
+    srv.store.shutdown();
+}

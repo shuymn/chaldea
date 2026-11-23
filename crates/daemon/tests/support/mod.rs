@@ -308,6 +308,16 @@ pub fn registered(t: ThreadId, task: bool) -> NewEvent {
     )
 }
 
+/// A task-less registration of `t` under `parent`.
+#[must_use]
+pub fn registered_under(t: ThreadId, parent: Option<ThreadId>) -> NewEvent {
+    let mut e = registered(t, false);
+    if let TypedEvent::ThreadRegistered(r) = &mut e.event {
+        r.parent_thread_id = parent;
+    }
+    e
+}
+
 #[must_use]
 pub fn reserved(t: ThreadId, l: LaunchId) -> NewEvent {
     event(
@@ -1584,4 +1594,47 @@ pub fn blob_input(data: &[u8]) -> BlobInput {
     BlobInput {
         data: data.to_vec(),
     }
+}
+
+/// Inserts one event row with raw SQL into the closed store at `path` (the store's checks
+/// on kinds, schema versions, and payloads bypassed; its triggers still run), for rows a
+/// newer daemon or a broken writer could have left: an unknown kind, a newer
+/// `schema_version`, an invalid payload.
+pub fn insert_raw_event(
+    path: &Path,
+    stream: StreamId,
+    key: &str,
+    kind: &str,
+    payload: &str,
+    schema_version: i64,
+) {
+    let c = rusqlite::Connection::open(path).unwrap();
+    c.pragma_update(None, "foreign_keys", 1).unwrap();
+    c.pragma_update(None, "recursive_triggers", 1).unwrap();
+    let thread = match stream {
+        StreamId::Thread(t) => Some(t.to_string()),
+        StreamId::Host => None,
+    };
+    c.execute(
+        "INSERT INTO events (stream_id, seq, event_id, schema_version, idempotency_key, kind,
+           thread_id, launch_id, command_id, source, occurred_at, occurred_explicit, recorded_at, payload,
+           payload_bytes, cum_bytes, annex)
+         VALUES (?1, coalesce((SELECT max(seq) FROM events WHERE stream_id = ?1), 0) + 1,
+           ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?8, 0, ?8, ?9, octet_length(?9),
+           coalesce((SELECT cum_bytes FROM events WHERE stream_id = ?1 ORDER BY seq DESC LIMIT 1), 0)
+             + octet_length(?9),
+           NULL)",
+        rusqlite::params![
+            stream.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            schema_version,
+            key,
+            kind,
+            thread,
+            r#"{"kind":"daemon","agent":null,"cli_version":null,"transcript":null}"#,
+            T0,
+            payload,
+        ],
+    )
+    .unwrap();
 }

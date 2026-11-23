@@ -330,6 +330,32 @@ fn same_blob_across_events() {
     assert_eq!(head(&s, t), 2);
 }
 
+/// `blob_ref_exists` answers per stream: true only where an event of that stream
+/// references the blob.
+#[test]
+fn blob_ref_exists_per_stream() {
+    let s = TestStore::new();
+    let (t, u) = (StreamId::Thread(thread(1)), StreamId::Thread(thread(2)));
+    let p = prep(vec![b'z'; 80_000], TEXT);
+    let h = sha(&p.content);
+    let exists = |stream: StreamId, sha: &str| {
+        let sha = sha.to_owned();
+        s.read(move |tx| tx.blob_ref_exists(stream, &sha))
+    };
+    assert!(!exists(t, &h));
+    s.append(vec![carrying(t, "k", &p)]).unwrap();
+    assert!(exists(t, &h));
+    assert!(
+        !exists(u, &h),
+        "stored, but not referenced from this stream"
+    );
+    assert!(!exists(StreamId::Host, &h));
+    assert!(!exists(t, &"0".repeat(64)));
+    s.append(vec![raw_unknown(u, "k2", p.content.clone())])
+        .unwrap();
+    assert!(exists(u, &h));
+}
+
 /// A blob reference with neither stored bytes nor a blob input aborts the event.
 #[test]
 fn missing_blob_aborts_the_event() {

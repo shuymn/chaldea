@@ -8,15 +8,17 @@ pub(crate) use crate::store::tests::support;
 
 mod auth;
 mod errors;
+mod events;
 mod layers;
 mod listener;
+mod pair;
 mod reads;
 mod registry;
 mod upgrade;
 mod writes;
+mod ws;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::extract::ws::Message;
 use chaldea_core::sync::WsServerMessage;
@@ -24,14 +26,14 @@ use sha2::{Digest, Sha256};
 
 use super::tickets::{TicketEntry, TicketPurpose};
 use super::{Shared, UpgradedSocket};
+pub(crate) use support::http::eventually;
 use support::http::{Req, TestServer};
 
 pub(crate) fn shared(srv: &TestServer) -> Arc<Shared> {
     srv.server.shared().clone()
 }
 
-/// Mints a ticket for the token `secret` directly in the server's ticket store (the
-/// minting route is PR 7b's).
+/// Mints a ticket for the token `secret` directly in the server's ticket store.
 pub(crate) fn mint_ticket(srv: &TestServer, secret: &str, purpose: TicketPurpose) -> String {
     let sha: [u8; 32] = Sha256::digest(secret.as_bytes()).into();
     let row = srv
@@ -39,15 +41,18 @@ pub(crate) fn mint_ticket(srv: &TestServer, secret: &str, purpose: TicketPurpose
         .read(move |tx| tx.token_by_hash(&sha))
         .expect("token exists");
     let s = shared(srv);
+    let now = s.cfg.clock.now();
     s.tickets
-        .mint(TicketEntry {
-            token_id: row.token_id,
-            token_sha256: sha,
-            kind: row.kind,
-            thread: row.thread_id,
-            purpose,
-            expires_at: s.cfg.clock.now() + s.cfg.ticket_ttl,
-        })
+        .mint(
+            TicketEntry {
+                token_id: row.token_id,
+                token_sha256: sha,
+                purpose,
+                expires_at: now + s.cfg.ticket_ttl,
+            },
+            now,
+        )
+        .expect("below the ticket caps")
         .expose()
         .to_owned()
 }
@@ -80,17 +85,5 @@ pub(crate) async fn hello_then_hold(mut s: UpgradedSocket) {
             () = s.shutdown.wait() => return,
             m = s.socket.recv() => if !matches!(m, Some(Ok(_))) { return },
         }
-    }
-}
-
-/// Waits until `cond` holds, polling with yields, at most `within`.
-pub(crate) async fn eventually(within: Duration, what: &str, mut cond: impl FnMut() -> bool) {
-    let until = std::time::Instant::now() + within;
-    while !cond() {
-        assert!(
-            std::time::Instant::now() < until,
-            "not within {within:?}: {what}"
-        );
-        tokio::task::yield_now().await;
     }
 }

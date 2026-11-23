@@ -93,7 +93,7 @@ async fn host_rejections() {
         // Positive controls: `localhost` (any case) and the absolute form with the own
         // authority pass the outer layer.
         let want = if path == "/api/threads" {
-            (501, code("not_implemented"))
+            (200, None)
         } else {
             (404, code("not_found"))
         };
@@ -184,17 +184,14 @@ async fn bearer_rejections() {
         assert_eq!(r.outcome(), (401, code("unauthorized")), "{name}: {r:?}");
         assert_eq!(r.header("www-authenticate"), Some("Bearer"), "{name}");
     }
-    // Positive controls: the owner, `bearer` in any case, and a current agent pass to the
-    // unimplemented handler.
+    // Positive controls: the owner, `bearer` in any case, and a current agent reach the
+    // handler.
     for req in [
         get().bearer(&owner),
         get().header("Authorization", &format!("bEaReR {owner}")),
         get().bearer(&agent),
     ] {
-        assert_eq!(
-            srv.send(&req).await.outcome(),
-            (501, code("not_implemented"))
-        );
+        assert_eq!(srv.send(&req).await.outcome(), (200, None));
     }
     // A rejected token changed nothing (the controls only read).
     assert!(
@@ -451,7 +448,7 @@ async fn get_with_body_is_400() {
     // Any spelling of zero is no body.
     for zero in ["0", "00"] {
         let r = srv.send(&get().header("Content-Length", zero)).await;
-        assert_eq!(r.outcome(), (501, code("not_implemented")), "{zero}");
+        assert_eq!(r.outcome(), (200, None), "{zero}");
     }
     srv.stop().await;
 }
@@ -666,7 +663,7 @@ async fn reserved_launch_token_is_current() {
     );
     let agent = srv.agent(t, l1).await;
     let get = || srv.req("GET", "/api/threads").bearer(&agent);
-    assert_eq!(srv.send(&get()).await.status, 501);
+    assert_eq!(srv.send(&get()).await.status, 200);
     srv.append(vec![exited(t, l1)]).await;
     srv.append(vec![reserved(t, l2)]).await;
     assert_eq!(srv.send(&get()).await.status, 401);
@@ -695,7 +692,7 @@ async fn skewed_clock_keeps_the_budget() {
         .send(&srv.req("GET", "/api/threads").bearer(&owner))
         .await;
     srv.clock.skew(Duration::ZERO);
-    assert_eq!(r.outcome(), (501, code("not_implemented")));
+    assert_eq!(r.outcome(), (200, None));
     srv.stop().await;
 }
 
@@ -724,7 +721,7 @@ async fn http10_gets_the_same_rules() {
         (
             "owner",
             srv.req("GET", "/api/threads").bearer(&owner),
-            (501, code("not_implemented")),
+            (200, None),
         ),
     ] {
         let r = support::http::send(srv.port, &req.http10_bytes()).await;
