@@ -314,7 +314,7 @@ pub enum LockDisposition {
     HeldUntilExit,
 }
 
-/// How [`run`] ended; `main` passes `code` to `std::process::exit`.
+/// How [`run`] ended; the CLI's `dispatch` passes `code` to `std::process::exit`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitReport {
     pub code: ExitCode,
@@ -346,8 +346,8 @@ pub(crate) struct RunEnv {
 }
 
 /// The process entry (design §2.2): registers the active gate and the process log target,
-/// runs one daemon to its end, and returns what `main` passes to `std::process::exit`.
-/// Assumes [`prepare_process`] ran; called once per process.
+/// runs one daemon to its end, and returns what the CLI's `dispatch` passes to
+/// `std::process::exit`. Assumes [`prepare_process`] ran; called once per process.
 #[must_use]
 pub fn run(cfg: DaemonConfig, components: Box<dyn Components>) -> ExitReport {
     let Some(log) = log::process_logger() else {
@@ -476,7 +476,8 @@ pub fn spawn_locked(cmd: &mut Command) -> io::Result<Child> {
     chaldea_pty_runtime::with_spawn_lock(|| cmd.spawn())
 }
 
-/// Flushes the process log queue for at most `wait` (for `main` before `std::process::exit`).
+/// Flushes the process log queue for at most `wait` (for the CLI's `dispatch` before
+/// `std::process::exit`).
 pub fn flush_process_log(wait: Duration) {
     if let Some(l) = log::process_logger() {
         l.flush(wait);

@@ -10,8 +10,8 @@ use chaldea_pty_runtime::host;
 use super::{log, panic};
 
 /// Resets the inherited signal state, installs the panic hook, and starts the log queue and
-/// the global subscriber. Call first in `main` (before argument parsing) and in every test
-/// helper process; a second call does nothing.
+/// the global subscriber. Call first in the CLI's `dispatch` (after its `hook-emit` branch,
+/// before argument parsing) and in every test helper process; a second call does nothing.
 pub fn prepare_process() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {

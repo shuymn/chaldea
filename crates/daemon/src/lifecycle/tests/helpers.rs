@@ -1,6 +1,6 @@
 //! Helper-process tests (design §7): this test binary re-executed with `--exact`, running
-//! `prepare_process` and `run` as `main` does and exiting through `std::process::exit`; the
-//! parent observes the report lines, stderr, the exit code, and the lock, under a 30 s
+//! `prepare_process` and `run` as the CLI's `dispatch` does and exiting through
+//! `std::process::exit`; the parent observes the report lines, stderr, the exit code, and the lock, under a 30 s
 //! timeout. A controller thread inside the helper drives each scenario.
 
 use std::path::{Path, PathBuf};

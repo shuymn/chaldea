@@ -581,3 +581,14 @@ fn mvp_command_is_501_without_receipt() {
     close_store(&store);
     assert!(receipt.is_none(), "{receipt:?}");
 }
+
+/// `hook-emit` is decided before process setup (hook-ingest §2.13); until PR 9a adds the
+/// emitter it answers as an unknown subcommand: exit 2, the usage error on stderr, nothing on
+/// stdout.
+#[test]
+fn hook_emit_is_an_unknown_subcommand_until_9a() {
+    let (code, out, err) = run_to_exit(&mut chaldea(&["hook-emit", "codex"], &[]));
+    assert_eq!(code, 2, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("hook-emit"), "{err}");
+}

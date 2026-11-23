@@ -4,7 +4,7 @@
 //!
 //! std's spawn clears the child's signal mask (and only `posix_spawn`/`exec` without std would
 //! keep it), so the helper sets the inherited state on itself and then runs the same
-//! `prepare_process` call `main` makes first; a control helper skips it and sees `ECHILD`.
+//! `prepare_process` call `dispatch` makes first; a control helper skips it and sees `ECHILD`.
 #![cfg(target_os = "macos")]
 
 mod support;

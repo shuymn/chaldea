@@ -357,7 +357,7 @@ pub(super) fn report(line: &str) {
     let _ = out.flush();
 }
 
-/// The helper's exit path: like `main`, flush and `std::process::exit`.
+/// The helper's exit path: like the CLI's `dispatch`, flush and `std::process::exit`.
 pub(super) fn helper_exit(r: &ExitReport, pause: Duration) -> ! {
     report(&format!(
         "returned code={} reason={} lock={:?}",
