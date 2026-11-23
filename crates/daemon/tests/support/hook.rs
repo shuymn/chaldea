@@ -4,7 +4,7 @@
 //! `/hook` request builder, and the no-side-effect snapshot of B-8.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -207,8 +207,8 @@ type Gate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 pub struct Chains {
     chains: Mutex<HashMap<u32, Ancestry>>,
     holds: Mutex<HashMap<u32, Gate>>,
-    /// Walks started, in order of their start.
-    pub walked: Mutex<Vec<u32>>,
+    /// Walks started.
+    walked: AtomicUsize,
 }
 
 impl Chains {
@@ -227,11 +227,16 @@ impl Chains {
             .insert(pid, (reached_tx, release_rx));
         (reached_rx, release_tx)
     }
+
+    /// How many walks have started.
+    pub fn walked(&self) -> usize {
+        self.walked.load(Ordering::SeqCst)
+    }
 }
 
 impl ProcessProbe for Chains {
     fn chain(&self, emitter_pid: u32, max: usize) -> Ancestry {
-        self.walked.lock().unwrap().push(emitter_pid);
+        self.walked.fetch_add(1, Ordering::SeqCst);
         let hold = self.holds.lock().unwrap().remove(&emitter_pid);
         if let Some((reached, release)) = hold {
             let _ = reached.send(());
@@ -256,18 +261,16 @@ impl ProcessProbe for Chains {
 }
 
 /// Intake facts `{"n": k, "position": k}` (or JSON `null` while `null` is set), `k`
-/// counting calls from 1; records each call's launch and `k` in call order.
+/// counting calls from 1.
 #[derive(Default)]
 pub struct Facts {
     n: AtomicU64,
     pub null: std::sync::atomic::AtomicBool,
-    pub calls: Mutex<Vec<(LaunchId, u64)>>,
 }
 
 impl IntakeProbe for Facts {
-    fn facts(&self, launch: LaunchId) -> Option<IntakeFacts> {
+    fn facts(&self, _launch: LaunchId) -> Option<IntakeFacts> {
         let k = self.n.fetch_add(1, Ordering::SeqCst) + 1;
-        self.calls.lock().unwrap().push((launch, k));
         if self.null.load(Ordering::SeqCst) {
             return Some(IntakeFacts(serde_json::Value::Null));
         }

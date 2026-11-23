@@ -237,17 +237,21 @@ impl TestServer {
 
     /// Registers thread `t` with a started launch `l` and returns an agent token for it.
     pub async fn agent(&self, t: ThreadId, l: LaunchId) -> String {
-        self.append(vec![registered(t, false)]).await;
-        self.append(vec![reserved(t, l), started(t, l)]).await;
-        self.token(TokenKind::Agent, Some(t), Some(l)).await
+        self.started_token(TokenKind::Agent, t, l).await
     }
 
     /// Registers thread `t` with a started launch `l` and returns a hook token scoped to
     /// both (`docs/design/hook-ingest.md` §2.8).
     pub async fn hook(&self, t: ThreadId, l: LaunchId) -> String {
+        self.started_token(TokenKind::Hook, t, l).await
+    }
+
+    /// Registers thread `t`, then reserves and starts launch `l` (two jobs), and returns a
+    /// token of `kind` scoped to both.
+    async fn started_token(&self, kind: TokenKind, t: ThreadId, l: LaunchId) -> String {
         self.append(vec![registered(t, false)]).await;
         self.append(vec![reserved(t, l), started(t, l)]).await;
-        self.token(TokenKind::Hook, Some(t), Some(l)).await
+        self.token(kind, Some(t), Some(l)).await
     }
 
     /// A token of `kind`: an agent or hook token gets its own thread and started launch.

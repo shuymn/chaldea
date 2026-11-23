@@ -77,10 +77,8 @@ struct Obs {
 enum Body {
     /// Nothing; the client only reads.
     Withheld,
-    /// All of it at once, then only reads.
-    All(Vec<u8>),
-    /// Sent concurrently with reading, as fast as the peer takes it.
-    InFlight(Vec<u8>),
+    /// All of it, concurrently with reading, as fast as the peer takes it; then nothing more.
+    Sent(Vec<u8>),
     /// `chunk` every `every` until the connection ends.
     Endless { chunk: usize, every: Duration },
 }
@@ -133,7 +131,7 @@ async fn observe(
                 std::future::pending::<()>().await;
                 None
             }
-            Body::All(b) | Body::InFlight(b) => {
+            Body::Sent(b) => {
                 for c in b.chunks(64 * 1024) {
                     if let Err(e) = wr.write_all(c).await {
                         return failed(e).await;
@@ -298,7 +296,7 @@ async fn table(
 
 fn with_body(req: &Req) -> Body {
     // The request's own body: the bytes after its head.
-    Body::All(req.bytes()[req.head().len()..].to_vec())
+    Body::Sent(req.bytes()[req.head().len()..].to_vec())
 }
 
 // ---- parser -----------------------------------------------------------------------------
@@ -803,7 +801,7 @@ async fn observed_body_in_flight() {
             &req.head(),
             1,
             Duration::ZERO,
-            Body::InFlight(body.clone()),
+            Body::Sent(body.clone()),
             LONG_CASE,
         )
         .await;

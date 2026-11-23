@@ -78,7 +78,7 @@ async fn concurrent_retries_dedup_in_the_job() {
     // both passed the pre-read before either job could commit, and the second job finds
     // the first's delivery only in the job, whenever it was submitted.
     support::http::eventually(Duration::from_secs(10), "both walked", || {
-        h.chains.walked.lock().unwrap().len() >= 3
+        h.chains.walked() >= 3
     })
     .await;
     release.send(()).unwrap();
@@ -402,7 +402,7 @@ async fn queued_earlier_job_releases_at_submit() {
     let mut conn = support::http::connect(h.srv.port).await;
     support::http::write(&mut conn, &first.req(&h.srv).bytes()).await;
     support::http::eventually(Duration::from_secs(10), "hook 1 walked", || {
-        !h.chains.walked.lock().unwrap().is_empty()
+        h.chains.walked() > 0
     })
     .await;
     // The binding SessionStart 2 is submitted too: hook 1's ordinal was released when
@@ -410,7 +410,7 @@ async fn queued_earlier_job_releases_at_submit() {
     let start = Hook::of(&l, "SessionStart", "s");
     let start_reply = h.spawn_post(&start);
     support::http::eventually(Duration::from_secs(10), "the binding walked", || {
-        h.chains.walked.lock().unwrap().len() >= 2
+        h.chains.walked() >= 2
     })
     .await;
     drop(conn);
