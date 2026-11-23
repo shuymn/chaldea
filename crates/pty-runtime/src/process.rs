@@ -353,6 +353,15 @@ mod tests {
         assert!(t.read.is_empty());
     }
 
+    /// The last allowed link is a root: the walk ends at the root, not the limit.
+    #[test]
+    fn root_precedes_the_depth_limit() {
+        let mut t = chain();
+        let a = walk(&mut t, 40, 5);
+        assert_eq!(a.end, AncestryEnd::Root);
+        assert_eq!(pids(&a), [40, 30, 20, 10, 1]);
+    }
+
     #[test]
     fn gone_parent() {
         let mut t = chain();
