@@ -419,7 +419,7 @@ Windows-only runtime checks: `raw_spawn` with real CLIs and its injected failure
 
 ## 5. Runbook
 
-Historical procedure: these commands ran while `spikes/pty-hooks/` was in the tree. To run them again, check out `03b00b8` first, as phase 1 step 1 and phase 2 step 2 do, and use `03b00b8` wherever a later step checks out `origin/main` or `<commit>`.
+Historical procedure: these commands ran while `spikes/pty-hooks/` was in the tree. To run them again, check out `03b00b8c0462c032f5f4a4f057feafa8e366d1b5` first; every step below that checks out a commit names it.
 
 Phase 1, macOS (sets A and B):
 1. `git checkout 03b00b8 && cd spikes/pty-hooks && cargo build --release --locked && ./target/release/chs install-emitter && ./target/release/chs fake all`.
@@ -431,8 +431,8 @@ Phase 2, Windows (sets B and C, same commit, one sitting):
 1. Prereqs: Windows 10 1809+ (record `winver`), rustup (the repo's `rust-toolchain.toml` installs 1.96.0 MSVC), VS Build Tools "Desktop development with C++", Git for Windows, `claude` and `codex` installed and logged in under a standard user account and normal security policy.
 2. Build and set B (PowerShell; pick a short `C:\chs` such as a top-level folder so MSVC stays below its 260-char path limit):
    ```
-   mkdir C:\chs; git clone <repo> C:\chs\src
-   git -C C:\chs\src checkout 03b00b8
+   mkdir C:\chs; git clone https://github.com/shuymn/chaldea.git C:\chs\src
+   git -C C:\chs\src checkout --detach 03b00b8c0462c032f5f4a4f057feafa8e366d1b5
    $env:CARGO_TARGET_DIR = "C:\chs\t"
    cd C:\chs\src\spikes\pty-hooks; cargo build --release --locked
    C:\chs\t\release\chs.exe install-emitter
@@ -445,7 +445,7 @@ Phase 2, Windows (sets B and C, same commit, one sitting):
 Classify each C verdict from the bundle's raw evidence, `go` included (§1 C), and each `fail_observed` against §1 C: a blocker halts further macOS-only work on that seam until resolved; tuning items go to the Windows backlog. An `inconclusive` probe is rerun or investigated, never classified.
 
 Phase 3, Windows follow-up (one sitting, about 4 hours, mostly unattended; one bundle):
-1. Update and build on the same machine and account: `cd C:\chs\src; git fetch; git checkout <commit>`, then as in phase 2 step 2 (`cargo build --release --locked`, `install-emitter`). The emitter path does not change, so Codex hook trust for the console emitter stays valid and no pre-trust step is needed. If a Codex hook review appears anyway (Codex upgraded since phase 2, R5), run `C:\chs\t\release\chs.exe pretrust codex --codex-bin <native codex.exe>`: it launches Codex itself (no command to paste) in each folder it lists, one at a time, and says what to approve there; review the hook entries as in phase 1, quit each launch with `/exit` to move on, and record the re-trust in the run notes. Do not trust any other hook command for the spike: Codex keeps one trusted command per hook position, so trusting a different one (for example the GUI emitter's) breaks the console emitter's trust.
+1. Update and build on the same machine and account: `cd C:\chs\src; git fetch; git checkout --detach 03b00b8c0462c032f5f4a4f057feafa8e366d1b5`, then as in phase 2 step 2 (`cargo build --release --locked`, `install-emitter`). The emitter path does not change, so Codex hook trust for the console emitter stays valid and no pre-trust step is needed. If a Codex hook review appears anyway (Codex upgraded since phase 2, R5), run `C:\chs\t\release\chs.exe pretrust codex --codex-bin <native codex.exe>`: it launches Codex itself (no command to paste) in each folder it lists, one at a time, and says what to approve there; review the hook entries as in phase 1, quit each launch with `/exit` to move on, and record the re-trust in the run notes. Do not trust any other hook command for the spike: Codex keeps one trusted command per hook position, so trusting a different one (for example the GUI emitter's) breaks the console emitter's trust.
 2. Do not change Claude or Codex versions before the run; the report records them.
 3. `C:\chs\t\release\chs.exe win-probe followup --claude-bin <native claude.exe> --codex-bin <native codex.exe> --allow-api-usage` (about 3 hours when the CLIs answer promptly; the budgets allow about 15.2 hours if every wait ran to its bound; no input needed). Expect: `fake all` (a few minutes); Codex input tests, one short Codex session per prompt, 18 per newline variant plus 3 recorded (about 40 minutes); the backend matrix for `P`, `R0`, and `R6`: Claude and Codex launches, Claude pastes, Codex prompts, real tree kills, attach with a resize, and FakeCli injected-failure cases (about 2 hours); then three Codex launches per mode. No window should appear in this step; if one does, note the time and what it showed. Its report is kept; at the end it prints the step 3 report dir and the step 4 command (a PowerShell invocation) with the run id and F-1's winning newline key filled in.
 4. Paste and run the printed `& '…\chs.exe' win-probe console --detached --configs P,R0,R6 --join-run-id … --newline-key … --claude-bin … --codex-bin … --allow-api-usage` (about 45 minutes). It prints the step 4 report dir (where the detached run writes its report) and the step 5 command right away, then keeps this terminal busy while the detached run observes Claude and Codex launches under each configuration, printing its progress every minute. Shortly after it starts, one small window from `chs-fake-cli` appears for about 1 s and closes by itself, and a second one flashes very briefly: both are the calibration, deliberate; do not touch them. Leave the machine idle and do not open other windows or terminals until prompted (a window opening during an observed launch makes that check inconclusive). When the observation ends it prints `now close this terminal, open a new one, and run:` with an `& '…\chs.exe' win-probe attach-client --confirm-close --url …` command and a credential: close the launching terminal and run that command from a new terminal, as in phase 2 (it asks to confirm the close, then sends a fresh nonce). If it instead says the detached run exited early (it says so at once, with the exit status and the report path), that there is no attach URL, or that the observation did not finish, keep the terminal open and go on to step 5. Either way it prints the step 5 command again last.
@@ -463,7 +463,7 @@ Phase 3b, narrow Windows rerun (one sitting, about 40 minutes, unattended; one b
    $codex = (Get-Item '<codex.exe>' -ErrorAction Stop).FullName
    Set-Location "$root\src" -ErrorAction Stop
    git fetch origin; if ($LASTEXITCODE) { throw 'git fetch failed' }
-   git checkout origin/main; if ($LASTEXITCODE) { throw 'git checkout failed' }
+   git checkout --detach 03b00b8c0462c032f5f4a4f057feafa8e366d1b5; if ($LASTEXITCODE) { throw 'git checkout failed' }
    git rev-parse HEAD; if ($LASTEXITCODE) { throw 'git rev-parse failed' }
    $env:CARGO_TARGET_DIR = "$root\t"
    Set-Location "$root\src\spikes\pty-hooks" -ErrorAction Stop
@@ -475,10 +475,10 @@ Phase 3b, narrow Windows rerun (one sitting, about 40 minutes, unattended; one b
 2. At the end it prints its report dir and the bundle command; run it (`& $chs bundle`), which writes `C:\chs\chs-out-windows.zip`. Record the commit printed by `git rev-parse HEAD` alongside the results, inspect the bundle, and evaluate the raw reports (no `f2-verdict` step).
 
 Phase 3c, narrow Windows test (one sitting, about 30 to 60 minutes, unattended; one bundle). It answers four questions under `R0` only (§4.8 `phase3c`): whether Codex submits a prompt with paste-burst detection turned off for the session, whether ZWJ and standalone combining marks arrive when sent as key records (and where they are lost when sent as text), the identity of the `pwsh.exe` shell that sits outside our job, checked against the hook ancestry, and whether the raw backend's reader-start path leaks a handle. Hook trust is unchanged (the new Codex flag is a non-hook session flag), so no pre-trust is needed.
-1. In Windows Terminal (PowerShell, standard user account), set `$commit` to the target 40-character commit, `$codex` to the native `codex.exe` path (observed in phase 3c: Codex 0.171.0), and `$root` to `C:\chs`, then run:
+1. In Windows Terminal (PowerShell, standard user account), set `$codex` to the native `codex.exe` path (observed in phase 3c: Codex 0.171.0) and `$root` to `C:\chs` (`$commit` is the spike's last commit), then run:
    ```powershell
    $ErrorActionPreference = 'Stop'
-   $commit = '<40-character commit>'
+   $commit = '03b00b8c0462c032f5f4a4f057feafa8e366d1b5'
    $root = 'C:\chs'
    $chs = "$root\t\release\chs.exe"
    $codex = (Get-Item '<codex.exe>' -ErrorAction Stop).FullName
