@@ -51,8 +51,8 @@ pub struct Seams {
     /// Runs once `daemon start`'s serving check got its 200, before its last discovery, with
     /// the start's cutoff; returns the cutoff from then on (a test brings it forward to now).
     pub after_answer: Option<Box<dyn Fn(Instant) -> Instant>>,
-    /// Runs once the discovery after the serving check's 200 returned.
-    pub after_recheck: Option<Box<dyn Fn()>>,
+    /// Receives what the discovery after the serving check's 200 found.
+    pub after_recheck: Option<Box<dyn Fn(&lifecycle::Discovery)>>,
     /// Receives what each discovery of `daemon start`'s serving check found.
     pub on_discovery: Option<Box<dyn Fn(&lifecycle::Discovery)>>,
     /// The deadline of `daemon start` and `daemon stop` instead of the design's 15 s: a test

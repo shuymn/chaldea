@@ -35,6 +35,12 @@ name = "daemon_macos"
 path = "tests/daemon_macos.rs"
 harness = false
 
+# The test gate's own guarantee (tests/support/faults.rs): the binary is also the waiter.
+[[test]]
+name = "gates"
+path = "tests/gates.rs"
+harness = false
+
 [dependencies]
 chaldea-daemon = { path = "../daemon" }
 # `chaldea open`'s wire types (`PairCodeResponse`, `ErrorBody`).

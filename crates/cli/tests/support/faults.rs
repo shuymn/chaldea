@@ -3,8 +3,32 @@
 //! variables reach the child `daemon start` launches (std's spawn inherits them; the launchd
 //! job carries the starter's environment), so a starter's faults are its child's too.
 //!
-//! Every pause is a [`Gate`]: the paused side creates `<dir>/reached` and waits until
-//! `<dir>/release` exists, for at most 60 s.
+//! # Gates
+//!
+//! Every pause is a [`Gate`]: a directory shared by the test and the paused process (the
+//! waiter), with one implementation on each side, [`Gate`] for the test and [`wait_at`] for the
+//! waiter. The waiter creates `<dir>/waiting` and `<dir>/reached`, polls `<dir>/decided`, and
+//! removes `waiting` once it has seen a decision. `decided` holds the gate's one decision: each
+//! side writes its outcome to a file of its own and links it to `decided`, so exactly one
+//! outcome wins, `released` (the test's release), `dropped` (the test's guard), or `expired`
+//! (the waiter's bound). A gate guarantees, as a test tool and not a product contract:
+//!
+//! - G1: every wait is bounded. The waiter's bound, [`GATE_MAX`], is longer than the longest
+//!   sequence of watchdog-bounded steps a test may take between creating a gate and releasing
+//!   it: each test-side wait (`Gate::reached`, `wait_for`, `Proc::serving`,
+//!   `Proc::wait_within` with its output drain) adds its watchdog to its thread's total
+//!   (`support::spend`), and `Gate::release` fails unless that total since the gate's creation,
+//!   plus a margin of `WAIT` for the steps without a watchdog (spawns, file operations), is
+//!   within the bound. The longest sequence in these tests is 130 s
+//!   (`stopping_winner_is_not_reported_running`'s held shutdown), so the bound is 4 min.
+//!   `tests/gates.rs` tests G1–G3.
+//! - G2: the waiter continues only on the test's explicit release. Expiry, a missing gate
+//!   directory, a `dropped` decision, or any other gate I/O error ends the waiter with exit code
+//!   [`GATE_FAILED`] and a message on stderr, and the test fails on it: on the waiter's exit
+//!   code or output, and in `Gate::release`, which fails on a gate decided otherwise.
+//! - G3: every gate is its own drop guard: dropping one that was not released decides it
+//!   `dropped` without panicking and keeps its directory until a waiter has seen that (at most
+//!   `WAIT`), so a panicking test never leaves a waiter behind.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -52,14 +76,15 @@ pub const SERVE_PAUSE: &str = "CHALDEA_TEST_SERVE_PAUSE";
 /// (nothing waits for a release).
 pub const EXPIRE_AFTER_ANSWER: &str = "CHALDEA_TEST_EXPIRE_AFTER_ANSWER";
 /// A gate directory: once it read the end of its readiness channel, `daemon start` waits at the
-/// gate, then brings its follow-up's cutoff forward to the moment of the release, so the
-/// follow-up starts after the cutoff.
+/// gate, then sets its follow-up's cutoff to the instant it returns from the gate (at or after
+/// the release), so the follow-up starts after the cutoff.
 pub const EXPIRE_AFTER_EOF: &str = "CHALDEA_TEST_EXPIRE_AFTER_EOF";
 /// A directory: each discovery of `daemon start`'s serving check leaves a file named for what
 /// it found (`starting`, `serving`, `stopping`, `not_running`, `unknown`).
 pub const DISCOVERY_MARKS: &str = "CHALDEA_TEST_DISCOVERY_MARKS";
-/// A gate directory: `daemon start` marks it reached once the discovery after its serving
-/// check's 200 returned (nothing waits for a release).
+/// A gate directory: once the discovery after its serving check's 200 returned, `daemon start`
+/// writes what it found to `<dir>/seen` (`<state> <instance>`, or the state alone) and marks the
+/// gate reached (nothing waits for a release).
 pub const RECHECK_MARK: &str = "CHALDEA_TEST_RECHECK_MARK";
 /// A gate directory: a shutdown participant waits at it, so the daemon stays stopping (its
 /// HTTP surface shut down, its record `stopping`, the lock held) until the test releases it.
@@ -73,24 +98,34 @@ pub const EXIT_RECORD: &str = "CHALDEA_TEST_EXIT_RECORD";
 /// How long the fake EOF child keeps the state directory's lock after closing its channel.
 const EOF_CHILD_LINGER: Duration = Duration::from_secs(5);
 
-/// The longest a gate waits.
-const GATE_MAX: Duration = Duration::from_secs(60);
+/// Set to a gate directory: this process only waits at it (G1–G3) and exits 0 once released.
+pub const GATE_WAITER: &str = "CHALDEA_TEST_GATE_WAITER";
+/// Milliseconds: a [`GATE_WAITER`]'s bound instead of [`GATE_MAX`], for the gate's own tests.
+pub const GATE_BOUND_MS: &str = "CHALDEA_TEST_GATE_BOUND_MS";
 
-/// The exit code of a process whose gate expired before the test released it.
-const GATE_EXPIRED: i32 = 86;
+/// The waiter's bound (G1).
+pub const GATE_MAX: Duration = Duration::from_secs(240);
 
-/// The file a gate's one decision creates: the test's release or the paused side's expiry,
-/// whichever comes first.
+/// The exit code of a waiter whose gate was not released (G2).
+pub const GATE_FAILED: i32 = 86;
+
+/// A gate's files and the outcomes its decision can hold.
 const DECIDED: &str = "decided";
+const WAITING: &str = "waiting";
+const RELEASED: &str = "released";
+const DROPPED: &str = "dropped";
+const EXPIRED: &str = "expired";
 
 /// The secrets the log-marker component writes (redacted in every diagnostic).
 pub const TOKEN_MSG: &str = "chd_MSGMSGMSGMSGMSGMSGMSGMSGMSGMSGMSGMSGMSGMSGM";
 pub const TOKEN_FIELD: &str = "chdt_FIELDFIELDFIELDFIELDFIELDFIELDFIELDFIELDF";
 pub const TOKEN_SPAN: &str = "chdp_SPANSPANSPANSPANSPANSPANSPANSPANSPANSPANS";
 
-/// A pause point shared by a test and its child processes.
+/// A pause point shared by a test and its child processes (G1–G3 in the module doc).
 pub struct Gate {
     dir: TempDir,
+    /// The watchdogs this thread had spent when the gate was created.
+    created: Duration,
 }
 
 impl Gate {
@@ -98,6 +133,7 @@ impl Gate {
     pub fn new() -> Gate {
         Gate {
             dir: tempfile::tempdir().unwrap(),
+            created: super::spent(),
         }
     }
 
@@ -109,6 +145,7 @@ impl Gate {
     /// Waits (bounded) until the paused side reached the gate.
     #[must_use]
     pub fn reached(&self, within: Duration) -> bool {
+        super::spend(within);
         let end = Instant::now() + within;
         loop {
             if self.dir.path().join("reached").exists() {
@@ -121,25 +158,60 @@ impl Gate {
         }
     }
 
-    /// Lets the paused side go on; panics if its gate expired first (the paused process then
-    /// exits with [`GATE_EXPIRED`]).
+    /// Lets the waiter go on, the only way it does (G2). Panics when the watchdogs spent since
+    /// the gate's creation leave no margin within the waiter's bound (G1), or when the gate was
+    /// decided otherwise.
     pub fn release(&self) {
+        let spent = super::spent().saturating_sub(self.created);
         assert!(
-            decide(self.dir.path()),
-            "the gate {} expired before the test released it",
-            self.dir.path().display()
+            spent + super::WAIT <= GATE_MAX,
+            "{spent:?} of watchdogs before this release, plus a margin of {:?}, exceed the \
+             waiter's bound of {GATE_MAX:?}",
+            super::WAIT
         );
+        if let Err(e) = decide(self.path(), RELEASED) {
+            panic!(
+                "the gate {} could not be released ({e}): {}",
+                self.path().display(),
+                decision(self.path())
+            );
+        }
     }
 
-    /// [`Gate::release`] for a cleanup path, which must not panic.
-    pub fn release_quietly(&self) {
-        let _ = decide(self.dir.path());
+    /// Ends the waiter without letting it go on, unless the gate was already decided: the
+    /// directory then stays until a waiter has seen the decision, at most `WAIT` (G3).
+    pub fn abandon(&self) {
+        if decide(self.path(), DROPPED).is_ok() {
+            let end = Instant::now() + super::WAIT;
+            while self.path().join(WAITING).exists() && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 }
 
-/// Creates the gate's decision; `false` when the other side decided first.
-fn decide(dir: &Path) -> bool {
-    std::fs::File::create_new(dir.join(DECIDED)).is_ok()
+impl Drop for Gate {
+    fn drop(&mut self) {
+        self.abandon();
+    }
+}
+
+/// Writes `outcome` to a file of its own and links it to the gate's decision: `AlreadyExists`
+/// when the other side decided first.
+fn decide(dir: &Path, outcome: &str) -> std::io::Result<()> {
+    let own = dir.join(outcome);
+    std::fs::write(&own, outcome)?;
+    let linked = std::fs::hard_link(&own, dir.join(DECIDED));
+    let _ = std::fs::remove_file(&own);
+    linked
+}
+
+/// What the gate's decision says, for a message.
+fn decision(dir: &Path) -> String {
+    match std::fs::read_to_string(dir.join(DECIDED)) {
+        Ok(d) => format!("it was decided {d}"),
+        Err(e) => format!("its decision cannot be read: {e}"),
+    }
 }
 
 impl Default for Gate {
@@ -148,18 +220,43 @@ impl Default for Gate {
     }
 }
 
-/// The paused side of a [`Gate`]: only the test's release lets it go on. A gate that expires
-/// first ends this process with [`GATE_EXPIRED`], and the test's release then fails.
+/// The waiter's side of a [`Gate`], every pause's one implementation: returns only on the
+/// test's release; ends this process with [`GATE_FAILED`] and a message on anything else (G1,
+/// G2).
 fn wait_at(dir: &Path) {
-    let _ = std::fs::write(dir.join("reached"), b"");
-    let end = Instant::now() + GATE_MAX;
-    while !dir.join(DECIDED).exists() {
-        if Instant::now() >= end && decide(dir) {
-            eprintln!(
-                "the test gate {} expired before the test released it",
-                dir.display()
-            );
-            std::process::exit(GATE_EXPIRED);
+    let outcome = await_release(dir);
+    let _ = std::fs::remove_file(dir.join(WAITING));
+    if let Err(why) = outcome {
+        eprintln!("the test gate {} {why}", dir.display());
+        std::process::exit(GATE_FAILED);
+    }
+}
+
+/// Waits at `dir` until the gate is decided, its bound included: `Err` says why it was not
+/// released.
+fn await_release(dir: &Path) -> Result<(), String> {
+    for name in [WAITING, "reached"] {
+        std::fs::write(dir.join(name), b"").map_err(|e| format!("cannot be entered: {e}"))?;
+    }
+    let end = Instant::now() + env_ms(GATE_BOUND_MS).unwrap_or(GATE_MAX);
+    loop {
+        match std::fs::read_to_string(dir.join(DECIDED)) {
+            Ok(d) if d == RELEASED => return Ok(()),
+            Ok(d) => return Err(format!("was decided {d}, not released")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !dir.is_dir() {
+                    return Err("is gone".to_owned());
+                }
+                if Instant::now() >= end {
+                    match decide(dir, EXPIRED) {
+                        Ok(()) => return Err("expired before the test released it".to_owned()),
+                        // Decided meanwhile: the next read says how.
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(e) => return Err(format!("cannot be decided: {e}")),
+                    }
+                }
+            }
+            Err(e) => return Err(format!("cannot be read: {e}")),
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -176,8 +273,13 @@ fn env_ms(name: &str) -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
-/// Acts as `chaldea` (never returns) when [`AS_CHALDEA`] is set.
+/// Acts as `chaldea` (never returns) when [`AS_CHALDEA`] is set, or as a bare waiter when
+/// [`GATE_WAITER`] is.
 pub fn enter_if_chaldea() {
+    if let Some(dir) = env_path(GATE_WAITER) {
+        wait_at(&dir);
+        std::process::exit(0);
+    }
     if std::env::var_os(AS_CHALDEA).is_none() {
         return;
     }
@@ -244,18 +346,20 @@ pub fn enter_if_chaldea() {
     }
     if let Some(dir) = env_path(DISCOVERY_MARKS) {
         seams.on_discovery = Some(Box::new(move |d| {
-            let name = match d {
-                Discovery::Starting(_) => "starting",
-                Discovery::Serving(_) => "serving",
-                Discovery::Stopping(_) => "stopping",
-                Discovery::NotRunning => "not_running",
-                Discovery::Unknown => "unknown",
-            };
-            let _ = std::fs::write(dir.join(name), b"");
+            let _ = std::fs::write(dir.join(state_name(d)), b"");
         }));
     }
     if let Some(dir) = env_path(RECHECK_MARK) {
-        seams.after_recheck = Some(Box::new(move || mark(&dir)));
+        seams.after_recheck = Some(Box::new(move |d| {
+            let seen = match d {
+                Discovery::Starting(r) | Discovery::Serving(r) | Discovery::Stopping(r) => {
+                    format!("{} {}", state_name(d), r.instance)
+                }
+                Discovery::NotRunning | Discovery::Unknown => state_name(d).to_owned(),
+            };
+            let _ = std::fs::write(dir.join("seen"), seen);
+            mark(&dir);
+        }));
     }
     if detached_child && let Some(dir) = env_path(EXIT_RECORD) {
         seams.on_exit = Some(Box::new(move |code| {
@@ -270,6 +374,17 @@ pub fn enter_if_chaldea() {
 fn expire(gate: &Path) -> Instant {
     mark(gate);
     Instant::now()
+}
+
+/// The name of a discovery's state.
+fn state_name(d: &Discovery) -> &'static str {
+    match d {
+        Discovery::Starting(_) => "starting",
+        Discovery::Serving(_) => "serving",
+        Discovery::Stopping(_) => "stopping",
+        Discovery::NotRunning => "not_running",
+        Discovery::Unknown => "unknown",
+    }
 }
 
 /// Marks `gate` reached without waiting for a release.

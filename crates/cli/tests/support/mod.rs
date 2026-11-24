@@ -31,6 +31,25 @@ pub use lifecycle::{kill_and_reap, open_store, token_of};
 /// Every bounded wait of these tests.
 pub const WAIT: Duration = Duration::from_secs(30);
 
+/// How long a wait for an exit then waits for the output collectors.
+const DRAIN: Duration = Duration::from_secs(10);
+
+thread_local! {
+    /// The watchdogs this test's thread has spent (gates, G1 in [`faults`]).
+    static SPENT: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+/// Adds a test-side wait's watchdog to its thread's total (G1 in [`faults`]).
+pub fn spend(watchdog: Duration) {
+    SPENT.with(|s| s.set(s.get() + watchdog));
+}
+
+/// The watchdogs this thread has spent.
+#[must_use]
+pub fn spent() -> Duration {
+    SPENT.with(std::cell::Cell::get)
+}
+
 /// Waits for a write's reply for at most [`WAIT`] (the writer may be parked by a fault) and
 /// returns the job's value.
 pub fn settle<R: Send + 'static>(ticket: chaldea_daemon::store::WriteTicket<R>) -> R {
@@ -218,6 +237,7 @@ impl Proc {
     /// port.
     pub fn serving(&self) -> u16 {
         const PREFIX: &str = "listening on http://127.0.0.1:";
+        spend(WAIT);
         let end = Instant::now() + WAIT;
         loop {
             // Checked before each receive, so lines that keep arriving cannot extend the wait.
@@ -249,11 +269,12 @@ impl Proc {
         if let Some(s) = self.status {
             return s;
         }
+        spend(within + DRAIN);
         let end = Instant::now() + within;
         loop {
             if let Some(s) = self.child.try_wait().unwrap() {
                 self.status = Some(s);
-                let drained = Instant::now() + Duration::from_secs(10);
+                let drained = Instant::now() + DRAIN;
                 while Instant::now() < drained
                     && self.collected.load(std::sync::atomic::Ordering::SeqCst) < 2
                 {
@@ -334,6 +355,7 @@ pub fn serving_record(dir: &Path) -> DiscoveryRecord {
 
 /// Polls `cond` until it holds or `WAIT` passes.
 pub fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
+    spend(WAIT);
     let end = Instant::now() + WAIT;
     while Instant::now() < end {
         if cond() {

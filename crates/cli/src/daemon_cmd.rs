@@ -722,7 +722,7 @@ fn port_conflict(dir: &Path, serving: u16, requested: Option<u16>) -> Option<Exi
 struct StartPauses<'a> {
     after_verdict: Option<&'a dyn Fn()>,
     after_answer: Option<&'a dyn Fn(Instant) -> Instant>,
-    after_recheck: Option<&'a dyn Fn()>,
+    after_recheck: Option<&'a dyn Fn(&Discovery)>,
     on_discovery: Option<&'a dyn Fn(&Discovery)>,
     after_eof: Option<&'a dyn Fn(Instant) -> Instant>,
 }
@@ -838,7 +838,7 @@ fn answers(port: u16, token: &str, deadline: Instant) -> bool {
 /// One look at the daemon serving `dir` (`expect`: the pid and port its verdict named); `None`
 /// while it is starting, stopping, or recorded but not answering. `pauses.after_answer` runs
 /// between the answer and the last discovery and may bring `cutoff` forward,
-/// `pauses.after_recheck` runs after that discovery, and `pauses.on_discovery` sees each
+/// `pauses.after_recheck` sees that discovery, and `pauses.on_discovery` sees each
 /// discovery (a test's pause and marks).
 fn check_serving(
     dir: &Path,
@@ -882,7 +882,7 @@ fn check_serving(
     // held: a daemon that began its shutdown has marked its record `stopping`.
     let again = discover();
     if let Some(mark) = pauses.after_recheck {
-        mark();
+        mark(&again);
     }
     match again {
         Discovery::Serving(again) if again.instance == r.instance => Some(Serving::Confirmed(r)),

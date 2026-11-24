@@ -106,15 +106,6 @@ const READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// no slowness of theirs reaches it, and only the test ends the command's wait.
 const HELD_DEADLINE: &str = "3600000";
 
-/// Releases a gate on every ending of the test.
-struct ReleaseOnDrop<'a>(&'a Gate);
-
-impl Drop for ReleaseOnDrop<'_> {
-    fn drop(&mut self) {
-        self.0.release_quietly();
-    }
-}
-
 /// `chaldea --state-dir <dir> daemon <args…>` with seams, `env` set.
 fn cmd(
     labels: &Labels,
@@ -182,7 +173,7 @@ struct Gated<'a> {
 
 impl Drop for Gated<'_> {
     fn drop(&mut self) {
-        self.gate.release_quietly();
+        self.gate.abandon();
         let end = Instant::now() + WAIT;
         while Instant::now() < end && matches!(self.p.child.try_wait(), Ok(None)) {
             std::thread::sleep(Duration::from_millis(20));
@@ -191,14 +182,19 @@ impl Drop for Gated<'_> {
 }
 
 fn stop(labels: &Labels, dir: &Path) {
-    let mut p = Proc::spawn(&mut cmd(labels, dir, &["daemon", "stop"], &[]));
+    stop_with(labels, dir, &[]);
+}
+
+/// [`stop`] with `env` set.
+fn stop_with(labels: &Labels, dir: &Path, env: &[(&str, &OsStr)]) {
+    let mut p = Proc::spawn(&mut cmd(labels, dir, &["daemon", "stop"], env));
     assert_eq!(p.code(), 0, "stop: {}{}", p.stdout(), p.stderr());
     assert!(p.stdout().contains("stopped"), "{}", p.stdout());
 }
 
 /// Whether a daemon held by its shutdown participant published its `stopping` record, observed
-/// under a watchdog: `false` once the daemon logged that the rewrite missed its 500 ms (a slow
-/// host can make it), which is the design's best effort. A rewrite issued in time can still
+/// under a watchdog: `false` once the daemon logged that the rewrite failed or missed its
+/// 500 ms (a slow host can make it), the design's best effort. A rewrite issued in time can still
 /// land after that log line, so `false` says only that the record may still say `serving`.
 fn stopping_published(dir: &Path) -> bool {
     let log = dir.join(names::LOG);
@@ -611,8 +607,8 @@ fn late_child_serves() {
 
 /// PR8-CL-14: the daemon that sent `ready` is stopped, and another started for the same
 /// directory, before the starter acts on the verdict: the starter reports the stop (exit 1),
-/// never the stopped daemon's URL. The starter and the second start hold a test deadline, so
-/// neither races 15 s.
+/// never the stopped daemon's URL. The starter, the stop, and the second start hold a test
+/// deadline, so none races 15 s.
 fn stopped_after_ready_is_not_reported_started() {
     let labels = Labels::new();
     let d = state();
@@ -633,7 +629,11 @@ fn stopped_after_ready_is_not_reported_started() {
     let first = &mut first.p;
     assert!(gate.reached(WAIT), "{}", first.stderr());
     let stopped = serving(&d.path);
-    stop(&labels, &d.path);
+    stop_with(
+        &labels,
+        &d.path,
+        &[(DEADLINE_MS, OsStr::new(HELD_DEADLINE))],
+    );
     // The next daemon picks a free port from the range: the stopped one's saved port may be
     // taken by another test by now.
     std::fs::remove_file(d.path.join(names::PORT)).unwrap();
@@ -665,14 +665,13 @@ fn stopped_after_ready_is_not_reported_started() {
 /// down (a shutdown participant holds it stopping, with its lock and record, until the test
 /// releases it) does not report that daemon running: it gets `already_running` and reads the
 /// `stopping` record while the daemon is held; released, the daemon exits, and the start
-/// observes that and exits 1. If the record missed its rewrite (logged), the start reads it
-/// `serving` without an answer instead, and the same holds.
+/// observes that and exits 1. After a logged failure or timeout of the `stopping` rewrite, the
+/// start may read the record `serving` without an answer instead, and the same holds.
 fn stopping_winner_is_not_reported_running() {
     let labels = Labels::new();
     let d = state();
     let _stop = StopOnDrop(&labels, &d.path);
     let held = Gate::new();
-    let _release = ReleaseOnDrop(&held);
     let (code, out, err) = start(
         &labels,
         &d.path,
@@ -727,19 +726,20 @@ fn stopping_winner_is_not_reported_running() {
 /// PR8-CL-14: the daemon whose serving check answered 200 begins its shutdown before the
 /// start's last discovery (paused between them; a shutdown participant holds the daemon
 /// stopping, with its lock and its `stopping` record, until the test releases it): that
-/// discovery, which the test sees happen while the daemon is held, finds `stopping`, so once
-/// the daemon exits the start reports the stop (exit 1), never the URL. The starter and the
-/// stop hold a test deadline, so the test's steps never race 15 s. If the record missed its
-/// rewrite (logged), that discovery may still find `serving`, so the test then requires only
-/// that the start reports the stop or the start, nothing else.
+/// discovery, which the test sees happen while the daemon is held, finds this daemon
+/// `stopping`, so the start reports the stop (exit 1) only after it observed the exit, never the
+/// URL. The starter and the stop hold a test deadline, so the test's steps never race 15 s. A
+/// logged failure or timeout of the `stopping` rewrite can leave the record `serving`: if that
+/// discovery found this daemon `serving`, the start reports it started (exit 0), and it may
+/// only then.
 fn stopping_after_the_answer_is_not_reported_started() {
     let labels = Labels::new();
     let d = state();
     let _stop = StopOnDrop(&labels, &d.path);
     let gate = Gate::new();
     let held = Gate::new();
-    let _release = ReleaseOnDrop(&held);
     let recheck = Gate::new();
+    let marks = Gate::new();
     let mut starter = Gated {
         gate: &gate,
         p: Proc::spawn(&mut cmd(
@@ -749,12 +749,14 @@ fn stopping_after_the_answer_is_not_reported_started() {
             &[
                 (SERVE_PAUSE, gate.path().as_os_str()),
                 (RECHECK_MARK, recheck.path().as_os_str()),
+                (DISCOVERY_MARKS, marks.path().as_os_str()),
                 (SHUTDOWN_GATE, held.path().as_os_str()),
                 (DEADLINE_MS, OsStr::new(HELD_DEADLINE)),
             ],
         )),
     };
     assert!(gate.reached(WAIT), "the serving check never answered");
+    let expected = serving(&d.path).instance;
     let mut stopper = Proc::spawn(&mut cmd(
         &labels,
         &d.path,
@@ -771,14 +773,28 @@ fn stopping_after_the_answer_is_not_reported_started() {
         recheck.reached(WAIT),
         "the start's last discovery did not run while the daemon was held"
     );
+    let seen = std::fs::read_to_string(recheck.path().join("seen")).unwrap();
     held.release();
     let p = &mut starter.p;
     let (code, out, err) = (p.code(), p.stdout(), p.stderr());
-    let stopped = code == 1
-        && !out.contains("daemon started")
-        && err.contains("stopped before the start finished");
-    let started = !published && code == 0 && out.contains("daemon started");
-    assert!(stopped || started, "{code}: {out}{err}");
+    if seen == format!("serving {expected}") {
+        // A record once `stopping` never says `serving` again: only a missed rewrite gets here.
+        assert!(
+            !published,
+            "the last discovery found `serving` after `stopping`"
+        );
+        assert_eq!(code, 0, "{out}{err}");
+        assert!(out.contains("daemon started"), "{out}");
+    } else {
+        assert_eq!(seen, format!("stopping {expected}"));
+        assert_eq!(code, 1, "{out}{err}");
+        assert!(!out.contains("daemon started"), "{out}");
+        assert!(err.contains("stopped before the start finished"), "{err}");
+        assert!(
+            marks.path().join("not_running").exists(),
+            "the start reported the stop without observing the exit"
+        );
+    }
     assert_eq!(
         stopper.code(),
         0,
