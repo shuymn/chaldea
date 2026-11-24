@@ -151,7 +151,7 @@ Step 2 is §2.10's "each return is classified with one clock sample"; step 1 is 
 - **Where.** In the daemon's own `clippy.toml`, not a workspace-root one: clippy reads the nearest `clippy.toml` above the crate's manifest and does not merge it with a parent's, so a root file is shadowed by the existing `crates/{core,cli,daemon}/clippy.toml`. Verified with a scratch crate (deleted): a parent's list applied to a child without its own file, and was ignored once the child had one.
 - **Coverage.** The scratch crate showed the lint firing on a `use`-imported bare call, the full path, a module alias, a crate re-export, the function taken as a value (as in `deadline.map(sleep_until)`), inside `#[cfg(test)]` modules, and in integration tests under `--all-targets`; an `allow` with a reason on a function suppressed it. `Sleep::reset`, `interval`, `interval_at`, and timers inside libraries (hyper's `header_read_timeout`) stay outside the lint; review owns them.
 - **Exception scope.** `clippy::disallowed_methods` also carries the router and spawn-lock entries, so no `allow` covers a module, a file, a `select!`, or a function that does more than build one timer. Each exception is a private function whose body is the timer construction alone, with `#[allow(clippy::disallowed_methods, reason = "…")]` naming the rule its callers follow (the repository's form: `routes::build_router`, `lifecycle::spawn_locked`).
-- **Production exceptions (10).**
+- **Production exceptions (8).**
 
   | Function | Wraps | Callers' rule (reason) |
   |---|---|---|
@@ -160,8 +160,6 @@ Step 2 is §2.10's "each return is classified with one clock sample"; step 1 is 
   | `ws::socket_timer` | `sleep_until` | a fired timer drops the socket or ticks; results go through `take_read` or `admit_before` (§2.6) |
   | `commands::reply_wake` | `timeout_at` | wakes the reply loop; the progress read and its sample decide (§2.8) |
   | `commands::backoff_until` | `sleep_until` | backoff; the budget is read before each attempt (§2.8) |
-  | `upgrade::hand_over_bound` | `timeout` | plain bound polled socket first (§2.4) |
-  | `shutdown::participant_bound` | `timeout_at` | plain bound polled participant first, result discarded (§2.8) |
   | `shutdown::record_pause` | `sleep` | retry pause; deletion admitted by the budget checks (§2.8 step 5) |
   | `listener::accept_backoff` | `sleep` | accept-error backoff, shutdown wins (§2.2) |
   | `listener::stall_timer` | `sleep` | write stall, progress first (§2.2 `ConnIo`) |
@@ -194,6 +192,10 @@ Step 2 is §2.10's "each return is classified with one clock sample"; step 1 is 
 | close's peer-close drain (`:388`) | same `before`, result discarded | as above; nothing reads the result |
 | `shutdown::deadline_first` callers: stopping rewrite (`:415`), startup join (`:552`), store report (`:650`) | `deadline_first(now, …)` = `admit_before(std now, end, from_std(end), fut)`, `InTime`/`Late` → `Ok`, `Elapsed` → `Err(Elapsed)` | the same order (clock, poll, timer) and the same timer instant; the added sample only feeds `Late`, mapped back to `Ok` |
 | `registry::wait_empty_until` (`:240`) | `settle_before(std now, deadline, from_std(deadline), notified())`; `InTime`/`Late` → loop, `Elapsed` → `is_empty()` | the unbiased `select!` polls `notified` or the timer first at random; `timeout_at` polls `notified` first, one of those two orders; the result is `()` |
+| `upgrade` hand-over (`upgrade.rs:185`) | `settle_before(tokio now, at, at, rx).admitted()`, with `at` = tokio now + `hand_over` taken where `timeout` is called today | `timeout(d, f)` is `timeout_at(now + d, f)`, and both poll `rx` first; `admitted()` serves a socket queued before the bound, as today |
+| `shutdown` participants (`shutdown.rs:611`) | `settle_before(std now, end, from_std(end), p.shutdown(end))`, result discarded | the same `timeout_at(from_std(end), …)`, polled participant first; the result was already discarded |
+
+`admit_before` must not be used for the last two: a socket queued before the bound but first polled after it is served (`hello` sent) today and would be dropped after `101`; a participant first polled after `C − store_before` is polled once today and would not be polled.
 
 `ws::before` and `shutdown::deadline_first` stay as thin wrappers so their callers and existing tests are untouched; their bodies hold no deadline logic, and they take `now` so §3 D4 can test their mapping. `hook/mod.rs:243`, `:262` follow through `until_deadline`. The `ctx.rs` comments that say the cutoff is set before the read, `start()`, or the job stay true: the caller still computes `cutoff` there.
 
@@ -205,13 +207,11 @@ Step 2 is §2.10's "each return is classified with one clock sample"; step 1 is 
 | WebSocket startup and loop `select!`s (`:475`, `:536`) | three and ten arms | (restructuring, out of scope) |
 | `commands::await_reply` wait (`:568`) | the wait only wakes the loop | an extra clock reading per wake whose value is unused; `HeldClock` tests hand a held reading to the next reader, and the extra reading would take it in place of the loop's sample |
 | `commands::complete` backoff (`:751`) | backoff | — |
-| `upgrade` hand-over (`:185`) | behaviour-changing migration deferred | under `admit_before`: a socket queued before the bound but first polled after it is served (`hello` sent) today, and would be dropped after `101` |
-| `shutdown` participants (`:611`) | behaviour-changing migration deferred | under `admit_before`: a participant first polled after `C − store_before` is polled once today, and would not be polled |
 | record-removal pause, accept backoff, write stall | pauses and a progress-first stall | — |
 
 The read path's non-strict `Busy` is not a kept site: `settle_before` keeps today's order, so a late `ReadError::Busy` still answers 503 `busy`.
 
-**Documents.** daemon-lifecycle §2.8 already states the coordinator's split (deadline first for the rewrite, the join, and the store report; HTTP's own deadline; a plain `timeout_at` for the participants). The implementing PR names `admit_before` there and `settle_before`/`admit_before` in http-surface §2.3 and §2.6 where they name `timeout_at` or the per-poll sample.
+**Documents.** daemon-lifecycle §2.8 already states the coordinator's split (deadline first for the rewrite, the join, and the store report; HTTP's own deadline; a plain `timeout_at` for the participants). The implementing PR names `admit_before` and, for the participants, `settle_before` there, and `settle_before`/`admit_before` in http-surface §2.3 and §2.6 where they name `timeout_at` or the per-poll sample.
 
 ### D4. Test strategy
 
@@ -239,13 +239,17 @@ All deterministic: a counting test clock (a closure over a cell), futures built 
 
 **Admitted sites.** `ws::before` and `shutdown::deadline_first` take `now`, so each gets two unit tests with a test clock: a future whose poll moves the clock past the deadline and returns `Ready` → `Some(v)` / `Ok(v)` (kills `admitted()` → `in_time()`, which §2.6 and §2.8 forbid: a result of an admitted poll counts), and a clock past the deadline before the first poll → `None` / `Err(Elapsed)` with poll count 0. Existing tests stay: `http::tests::ws::{loop_drops_a_send_ready_after_its_deadline, close_drops_a_send_ready_after_its_deadline, send_deadline_drops_without_a_close_frame, close_keeps_the_send_deadline}`, `lifecycle::tests::helpers::{join_ready_after_its_end_is_a_bare_exit, store_report_after_its_end_keeps_the_lock, unjoined_startup_is_a_bare_exit}`, `http::tests::registry` tests.
 
-**Kept sites** keep their tests: `hook::tests::handler::pid_wait_timings`, `http::tests::upgrade::{hand_over_bound_starts_after_the_ticket_is_removed, shutdown_aborts_a_held_socket}`, `lifecycle::tests::helpers::console_end_after_http_starts_no_participant`.
+The hand-over maps through `admitted()` inline, so it gets one site test: `http::tests::upgrade::socket_queued_before_the_bound_is_served`. A new `#[cfg(test)]` gate after the hand-over bound starts holds the socket task while the upgrade queues its socket and the bound (a short `short_deadline` in the test's config) passes; released, the task must serve the socket and the client must receive `hello`. Waiting past the bound is a lower bound, so the test does not depend on timing. It kills `admitted()` → `in_time()` there. The participants' result is discarded, so there is no mapping to test; `console_end_after_http_starts_no_participant` and the existing upgrade tests (`hand_over_bound_starts_after_the_ticket_is_removed`, `shutdown_aborts_a_held_socket`) stay.
 
-**The lint.** CI runs `cargo clippy --workspace --all-targets --locked -- -D warnings` on macOS and Windows, so a raw call without an exception fails it. A membership check alone would miss a lint that stops firing (a renamed path, a shadowing `clippy.toml`), so `crates/cli/tests/lints.rs` gains a test that runs clippy on a probe:
+**Kept sites** keep their tests: `hook::tests::handler::pid_wait_timings` and the `http::tests::commands` reply-time tests.
 
-- `crates/daemon/lint-probe/`: a crate with its own empty `[workspace]` table (outside the workspace's `crates/*` members), depending only on `tokio` with `time`, pinned by its own `Cargo.lock`, whose `src/lib.rs` calls each of the four functions once. It has no `clippy.toml`, so clippy reads `crates/daemon/clippy.toml`, the file under test.
-- The test runs `$CARGO clippy --locked --manifest-path crates/daemon/lint-probe/Cargo.toml --target-dir <workspace target>/lint-probe -- -D clippy::disallowed_methods` through `chaldea_daemon::lifecycle::spawn_locked` (the CLI's `clippy.toml` forbids `Command::output`), and asserts a failing exit and one "use of a disallowed method `tokio::time::<name>`" line per function.
-- The existing membership parse also asserts the four paths, so a deleted entry fails with a precise message.
+**The lint.** CI runs `cargo clippy --workspace --all-targets --locked -- -D warnings` on macOS and Windows, so a raw call without an exception fails it. A membership check alone would miss a lint that stops firing (a renamed path, a shadowing `clippy.toml`), so a probe exercises the ban:
+
+- **The probe is a test target of the daemon itself**, not a separate crate: `crates/daemon/tests/lint_probe.rs` calls each of the four functions once (one through a `use` import). `crates/daemon/Cargo.toml` declares `[features] lint-probe = []` (enables nothing) and `[[test]] name = "lint_probe"`, `required-features = ["lint-probe"]`. So it shares the workspace's `Cargo.lock` and target directory, needs nothing beyond what the workspace fetches, and is skipped by `cargo clippy --workspace --all-targets` and `cargo test --workspace` (cargo builds a target with unmet `required-features` in neither).
+- **The command**, in `scripts/lint-probe.sh` (bash): `cargo clippy --locked -p chaldea-daemon --features lint-probe --test lint_probe --message-format short -- -D warnings`. It must exit non-zero with one ``lint_probe.rs:<line>:<col>: error: use of a disallowed method `tokio::time::<name>` `` line for each of the four names; the pattern accepts either path separator. An error anywhere else stops the daemon's lib before the probe and so fails the check too.
+- **What it rebuilds.** Measured locally on a warm workspace: with the same `-- -D warnings` as the clippy step, only `chaldea-daemon` is re-checked (its feature set changed); every third-party crate, `chaldea-core`, and `chaldea-pty-runtime` stay fresh. Different arguments after `--` would re-check the other workspace crates as well. The re-check took under 2 s while the daemon's lib failed fast on the not-yet-allowed sites; a passing lib check plus the probe is expected to add about the daemon's own clippy time, under 30 s on the CI runners.
+- **Where it runs.** A separate step, "Probe the timer ban", right after "Run clippy" in the `workspace` job on both macOS and Windows (the job's default shell is bash, so Windows runs it in Git Bash), reusing that step's check artifacts. It is not a test inside `cargo test`: a nested cargo would contend for the target directory's lock held by the outer build or need a second target directory, and the pre-push hook's `cargo test` runs without a prior clippy, so the nested check would start cold. lefthook's pre-commit runs the same script as `daemon-lint-probe`, after `workspace-clippy`, with that command's globs.
+- `crates/cli/tests/lints.rs`'s membership parse also asserts the four paths, so a deleted entry fails with a precise message before CI reaches the probe.
 
 ## 4. Purpose Layer and Plan Layer
 
@@ -268,9 +272,10 @@ All deterministic: a counting test clock (a closure over a cell), futures built 
 | DL-CL-5 | When a guarded handler's or body's future completes `Late`, `until_deadline` shall answer 408. | http-surface §2.3 | unit `http::ctx::tests::deadline_outcome_table`; `http::tests::reads::until_deadline_late_result_is_408` |
 | DL-CL-6 | When a plain write's reply is `Late` or `Elapsed`, `await_write` shall answer 503 `outcome_unknown`. | http-surface §2.3 | unit `http::ctx::tests::reply_outcome_table` |
 | DL-CL-7 | When a pid-wait notification wakes the loop at or after `pid_deadline`, the pid wait shall end as its bound. | hook-ingest §2.3 | `hook::tests::handler::pid_wait_timings` (kept site, unchanged) |
-| DL-CL-8 | When a WebSocket send or a coordinator wait completes during a poll admitted before its deadline, the site shall take the result; when it is first polled at or after the deadline, the site shall not poll it. | http-surface §2.4, §2.6; daemon-lifecycle §2.8 | unit `http::ws::tests::before_takes_an_admitted_result`, `…::before_skips_a_late_poll`, `lifecycle::shutdown::tests::deadline_first_takes_an_admitted_result`, `…::deadline_first_skips_a_late_poll`; the existing ws and lifecycle tests of D4 |
-| DL-CL-9 | The kept sites (hand-over, participants, pid wait, reply wake) shall poll as today. | D3 | `http::tests::upgrade::hand_over_bound_starts_after_the_ticket_is_removed`, `console_end_after_http_starts_no_participant`, `pid_wait_timings`, the `http::tests::commands` reply-time tests |
-| DL-CL-10 | Clippy shall reject a call to each of `tokio::time::{timeout, timeout_at, sleep, sleep_until}` in a crate under `crates/daemon` that has no `clippy.toml` of its own. | D2 | `cli/tests/lints.rs::daemon_ban_fires_on_the_probe`; `…::clippy_tomls_list_the_bans` |
+| DL-CL-8 | When a WebSocket send or a coordinator wait completes during a poll admitted before its deadline, the site shall take the result; when it is first polled at or after the deadline, the site shall not poll it. | http-surface §2.6; daemon-lifecycle §2.8 | unit `http::ws::tests::before_takes_an_admitted_result`, `…::before_skips_a_late_poll`, `lifecycle::shutdown::tests::deadline_first_takes_an_admitted_result`, `…::deadline_first_skips_a_late_poll`; the existing ws and lifecycle tests of D4 |
+| DL-CL-9 | When the hand-over's socket was queued before the bound and the socket task first polls after it, the task shall serve the socket. | http-surface §2.4 | `http::tests::upgrade::socket_queued_before_the_bound_is_served`; `…::hand_over_bound_starts_after_the_ticket_is_removed` |
+| DL-CL-10 | Clippy shall reject a call to each of `tokio::time::{timeout, timeout_at, sleep, sleep_until}` in a target of `crates/daemon` that carries no `allow`. | D2 | CI step "Probe the timer ban" (`scripts/lint-probe.sh`); `cli/tests/lints.rs::clippy_tomls_list_the_bans` |
+| DL-CL-11 | The kept sites (pid wait, reply wake) shall poll as today. | D3 | `pid_wait_timings`; the `http::tests::commands` reply-time tests |
 
 ## 5. Out of Scope
 
@@ -279,7 +284,7 @@ All deterministic: a counting test clock (a closure over a cell), futures built 
 - Restructuring the WebSocket `select!`s around the helpers.
 - The CLI crate's `clippy.toml`: the CLI has no tokio outside its tests.
 
-## 6. Follow-ups and Open Questions
+## 6. Follow-ups
 
 Pre-existing mismatches, not changed here (a fix changes timing or reporting):
 
@@ -288,8 +293,3 @@ Pre-existing mismatches, not changed here (a fix changes timing or reporting):
 - **F3.** WebSocket idle: renewal follows the idle timer's readiness, not a strict cutoff (§2.1). http-surface §2.6 says a socket "with no inbound frame for `idle_timeout`" is dropped. Decide whether a frame read after the idle instant but before the timer fires may renew.
 - **F4.** `ConnIo` write stall is progress first: ready I/O after a pause clears a due stall timer. Decide whether expiry must win.
 - **F5.** `until_deadline` builds the handler's future before its first admitted poll; moving construction into the poll would make the guard's admission and the construction one step.
-
-Open questions:
-
-1. `upgrade` hand-over and the participants are kept per this PR's scope, but `settle_before` (poll first, like `timeout` / `timeout_at`) with `admitted()` would migrate both without a behaviour change: `timeout(d, f)` is `timeout_at(now + d, f)`. Move them in this PR, or keep the exceptions?
-2. The lint probe compiles tokio once per cache-cold CI run (its own target directory under the workspace target). Acceptable in the test job, or run it as a separate CI step?
