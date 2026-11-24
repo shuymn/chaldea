@@ -103,7 +103,7 @@ crates/daemon/tests/hook_b8.rs, hook_ingest.rs, support/hook.rs
   "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot, Process32FirstW / NextW (the parent pid of the ancestry walk)
 ```
 
-- New dependency edges: `chaldea-daemon → chaldea-pty-runtime` (normal; PR 10 needs it anyway; its packages are already in `Cargo.lock`); `chaldea-cli → uuid` with `features = ["v4"]` (the `emit_id`; `uuid =1.29.1` already uses `getrandom 0.4.3`); `chaldea-cli → chaldea-pty-runtime` (normal, for `host::exit_now`, §2.13; already a dev-dependency, so `Cargo.lock` is unchanged). Nothing else on the `hook-emit` path: std networking only (prior-art row 5b's hand-written alternative, needed for separate connect and attempt bounds). `crates/cli` dev-dependencies: `chaldea-daemon`, `chaldea-core`, `chaldea-pty-runtime`, `tokio` (`rt-multi-thread`, `net`; the runtime of `hook_e2e`'s in-process server), `tempfile`, `serde_json`, all workspace pins.
+- Dependency edges: `chaldea-daemon → chaldea-pty-runtime` (normal, for the process lookup); `chaldea-cli → uuid` with `features = ["v4"]` (the `emit_id`); `chaldea-cli → chaldea-pty-runtime` (normal, for `host::exit_now`, §2.13). Nothing else on the `hook-emit` path: the adopted client is a hand-written POST on std networking (prior-art row 5b), which gives each attempt its own connect and attempt bounds. `crates/cli` dev-dependencies: `chaldea-daemon`, `chaldea-core`, `chaldea-pty-runtime`, `tokio` (`rt-multi-thread`, `net`; the runtime of `hook_e2e`'s in-process server), `tempfile`, `serde_json`, all workspace pins.
 - `crates/testkit`: unchanged dependencies; FakeCli runs the emitter as a child process given by `--emitter <path>`, as in the spike.
 
 **Workspace and CI.** No new job. `cargo test --workspace --locked` runs everything on both runners. Two steps change in the `workspace` job: the Windows sentinel step lists `chaldea-pty-runtime --test process_native ancestry_of_a_grandchild_reaches_this_process` and the lib test `windows::process::tests::wait_result_mapping` (the Toolhelp path compiles only on Windows); and a new step after "Run tests", `cargo test -p chaldea-daemon --test hook_b8 --locked -- observed_ --show-output`, prints the per-OS observations of the in-flight-body cases on success (the main run captures passing tests' output). The `core` dependency check is unchanged. `lefthook.yml` has no sentinel list and stays unchanged.
@@ -434,7 +434,7 @@ A rejection decided before the body (rows G1–G8, H1, H2) is sent before the ha
 
 ### 2.12 Store Additions
 
-**Migration v2** (the next free `MIGRATIONS` index at merge; PR 7c or PR 8 may take one first) adds one trigger and nothing else:
+**Migration v2** (`MIGRATIONS[1]` in `store/schema.rs`) adds one trigger and nothing else:
 
 ```sql
 CREATE TRIGGER events_session_bound_once BEFORE INSERT ON events WHEN NEW.kind = 'session_bound' BEGIN
