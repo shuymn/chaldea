@@ -776,6 +776,11 @@ async fn deadline_from_first_head_byte() {
             Ok(Ok(n)) => out.extend_from_slice(&buf[..n]),
         }
     }
+    assert!(
+        complete(&out),
+        "no whole Content-Length reply: {:?}",
+        String::from_utf8_lossy(&out)
+    );
     let r = support::http::parse(&out, None);
     assert_eq!(r.outcome(), (408, code("request_timeout")));
     assert!(first.elapsed() < Duration::from_millis(7500));
