@@ -117,14 +117,15 @@ fn replacement_does_not_confuse_completion() {
     let d = state();
     let mut first = foreground(&labels, &d.path, &[]);
     let gate = Gate::new();
-    // A test deadline: the stop waits while the test replaces the daemon, never racing 15 s.
+    // A test deadline of an hour, far beyond the watchdogs of the test's own steps: the stop
+    // waits while the test replaces the daemon, and only the test ends that wait.
     let mut s = Proc::spawn(&mut cmd(
         &labels,
         &d.path,
         &["daemon", "stop"],
         &[
             (STOP_PAUSE, gate.path().as_os_str()),
-            (DEADLINE_MS, OsStr::new("45000")),
+            (DEADLINE_MS, OsStr::new("3600000")),
         ],
     ));
     assert!(gate.reached(WAIT), "{}", s.stderr());

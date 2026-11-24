@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use chaldea_cli::{Seams, Stall};
 use chaldea_daemon::lifecycle::{
-    BuildCtx, Built, Components, MvpComponents, Reconciler, ShutdownParticipant,
+    BuildCtx, Built, Components, Discovery, MvpComponents, Reconciler, ShutdownParticipant,
 };
 use chaldea_daemon::store::Store;
 use chaldea_pty_runtime::host::{self, LaunchctlOutput};
@@ -47,14 +47,17 @@ pub const VERDICT_PAUSE: &str = "CHALDEA_TEST_VERDICT_PAUSE";
 /// A gate directory: `daemon start` waits at it once its serving check got its 200, before
 /// its last discovery.
 pub const SERVE_PAUSE: &str = "CHALDEA_TEST_SERVE_PAUSE";
-/// A gate directory: `daemon start` waits once its serving check got its 200 until its
-/// deadline has passed, so its last discovery comes after the deadline, and then marks the
-/// gate reached (nothing waits for a release).
-pub const SERVE_PAST_DEADLINE: &str = "CHALDEA_TEST_SERVE_PAST_DEADLINE";
-/// A gate directory: `daemon start` waits once it read the end of its readiness channel until
-/// its deadline has passed, so its follow-up starts after the deadline, and then marks the gate
-/// reached.
-pub const EOF_PAST_DEADLINE: &str = "CHALDEA_TEST_EOF_PAST_DEADLINE";
+/// A gate directory: once its serving check got its 200, `daemon start` marks the gate reached
+/// and brings its cutoff forward to that moment, so its last discovery comes after the cutoff
+/// (nothing waits for a release).
+pub const EXPIRE_AFTER_ANSWER: &str = "CHALDEA_TEST_EXPIRE_AFTER_ANSWER";
+/// A gate directory: once it read the end of its readiness channel, `daemon start` waits at the
+/// gate, then brings its follow-up's cutoff forward to the moment of the release, so the
+/// follow-up starts after the cutoff.
+pub const EXPIRE_AFTER_EOF: &str = "CHALDEA_TEST_EXPIRE_AFTER_EOF";
+/// A directory: each discovery of `daemon start`'s serving check leaves a file named for what
+/// it found (`starting`, `serving`, `stopping`, `not_running`, `unknown`).
+pub const DISCOVERY_MARKS: &str = "CHALDEA_TEST_DISCOVERY_MARKS";
 /// A gate directory: `daemon start` marks it reached once the discovery after its serving
 /// check's 200 returned (nothing waits for a release).
 pub const RECHECK_MARK: &str = "CHALDEA_TEST_RECHECK_MARK";
@@ -194,13 +197,31 @@ pub fn enter_if_chaldea() {
         seams.after_verdict = Some(Box::new(move || wait_at(&dir)));
     }
     if let Some(dir) = env_path(SERVE_PAUSE) {
-        seams.after_answer = Some(Box::new(move |_| wait_at(&dir)));
+        seams.after_answer = Some(Box::new(move |cutoff| {
+            wait_at(&dir);
+            cutoff
+        }));
     }
-    if let Some(dir) = env_path(SERVE_PAST_DEADLINE) {
-        seams.after_answer = Some(Box::new(move |d| past(d, &dir)));
+    if let Some(dir) = env_path(EXPIRE_AFTER_ANSWER) {
+        seams.after_answer = Some(Box::new(move |_| expire(&dir)));
     }
-    if let Some(dir) = env_path(EOF_PAST_DEADLINE) {
-        seams.after_eof = Some(Box::new(move |d| past(d, &dir)));
+    if let Some(dir) = env_path(EXPIRE_AFTER_EOF) {
+        seams.after_eof = Some(Box::new(move |_| {
+            wait_at(&dir);
+            Instant::now()
+        }));
+    }
+    if let Some(dir) = env_path(DISCOVERY_MARKS) {
+        seams.on_discovery = Some(Box::new(move |d| {
+            let name = match d {
+                Discovery::Starting(_) => "starting",
+                Discovery::Serving(_) => "serving",
+                Discovery::Stopping(_) => "stopping",
+                Discovery::NotRunning => "not_running",
+                Discovery::Unknown => "unknown",
+            };
+            let _ = std::fs::write(dir.join(name), b"");
+        }));
     }
     if let Some(dir) = env_path(RECHECK_MARK) {
         seams.after_recheck = Some(Box::new(move || mark(&dir)));
@@ -213,13 +234,11 @@ pub fn enter_if_chaldea() {
     chaldea_cli::dispatch_with(&args, Stall::Off, seams)
 }
 
-/// Returns once `deadline` has passed, then marks `gate` reached: the caller's next step comes
-/// after the deadline whatever the host's speed, and the test sees that it got here.
-fn past(deadline: Instant, gate: &Path) {
-    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-        std::thread::sleep(left + Duration::from_millis(1));
-    }
+/// Marks `gate` reached and returns a cutoff that has come: the caller's next observation is
+/// after its cutoff because the test brought it forward, whatever the host's speed.
+fn expire(gate: &Path) -> Instant {
     mark(gate);
+    Instant::now()
 }
 
 /// Marks `gate` reached without waiting for a release.

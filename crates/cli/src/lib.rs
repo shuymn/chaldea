@@ -49,16 +49,19 @@ pub struct Seams {
     /// it acts on it.
     pub after_verdict: Option<Box<dyn Fn()>>,
     /// Runs once `daemon start`'s serving check got its 200, before its last discovery, with
-    /// the start's deadline.
-    pub after_answer: Option<Box<dyn Fn(Instant)>>,
+    /// the start's cutoff; returns the cutoff from then on (a test brings it forward to now).
+    pub after_answer: Option<Box<dyn Fn(Instant) -> Instant>>,
     /// Runs once the discovery after the serving check's 200 returned.
     pub after_recheck: Option<Box<dyn Fn()>>,
+    /// Receives what each discovery of `daemon start`'s serving check found.
+    pub on_discovery: Option<Box<dyn Fn(&lifecycle::Discovery)>>,
     /// The deadline of `daemon start` and `daemon stop` instead of the design's 15 s: a test
-    /// whose own steps run while the command waits holds it longer than those steps take.
+    /// whose own steps run while the command waits holds it far longer than those steps'
+    /// watchdogs, so only the test ends the wait.
     pub deadline: Option<Duration>,
     /// Runs once `daemon start` read the end of its readiness channel without a verdict,
-    /// before its follow-up, with the start's deadline.
-    pub after_eof: Option<Box<dyn Fn(Instant)>>,
+    /// before its follow-up, with the start's cutoff; returns the follow-up's cutoff.
+    pub after_eof: Option<Box<dyn Fn(Instant) -> Instant>>,
     /// Receives the exit code just before the process exits.
     pub on_exit: Option<Box<dyn FnOnce(i32)>>,
 }

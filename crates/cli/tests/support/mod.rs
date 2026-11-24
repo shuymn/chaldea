@@ -220,7 +220,13 @@ impl Proc {
         const PREFIX: &str = "listening on http://127.0.0.1:";
         let end = Instant::now() + WAIT;
         loop {
+            // Checked before each receive, so lines that keep arriving cannot extend the wait.
             let left = end.saturating_duration_since(Instant::now());
+            assert!(
+                !left.is_zero(),
+                "no listening line within {WAIT:?}; stderr:\n{}",
+                self.stderr()
+            );
             match self.stderr_lines.recv_timeout(left) {
                 Ok(line) => {
                     if let Some(i) = line.find(PREFIX) {

@@ -7,6 +7,7 @@
 //! back from launchd to a direct child. `stop` signals the published daemon through the OS and
 //! waits, within one 15 s deadline, until that identity is gone.
 
+use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::io::{self, Write};
@@ -278,6 +279,7 @@ pub(crate) fn start(state_dir: &Path, port: Option<u16>, seams: &Seams) -> ExitC
             after_verdict: seams.after_verdict.as_deref(),
             after_answer: seams.after_answer.as_deref(),
             after_recheck: seams.after_recheck.as_deref(),
+            on_discovery: seams.on_discovery.as_deref(),
             after_eof: seams.after_eof.as_deref(),
         },
         deadline,
@@ -316,15 +318,28 @@ fn launch_direct(
 fn poll_until<T>(
     deadline: Instant,
     period: Duration,
+    observe: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    poll_until_cutoff(&Cell::new(deadline), period, observe)
+}
+
+/// [`poll_until`] against a cutoff a test seam can bring forward while an observation runs: a
+/// result then counts only if it came before the cutoff as it stands after the observation.
+/// Nothing moves the cutoff outside tests.
+fn poll_until_cutoff<T>(
+    cutoff: &Cell<Instant>,
+    period: Duration,
     mut observe: impl FnMut() -> Option<T>,
 ) -> Option<T> {
     loop {
-        match host::observed_before(deadline, &mut observe) {
+        let before = cutoff.get();
+        match host::observed_before(before, &mut observe) {
             None => return None,
+            Some(_) if cutoff.get() != before && Instant::now() >= cutoff.get() => return None,
             Some(Some(t)) => return Some(t),
             Some(None) => {}
         }
-        std::thread::sleep(period.min(deadline.saturating_duration_since(Instant::now())));
+        std::thread::sleep(period.min(cutoff.get().saturating_duration_since(Instant::now())));
     }
 }
 
@@ -706,9 +721,10 @@ fn port_conflict(dir: &Path, serving: u16, requested: Option<u16>) -> Option<Exi
 #[derive(Clone, Copy, Default)]
 struct StartPauses<'a> {
     after_verdict: Option<&'a dyn Fn()>,
-    after_answer: Option<&'a dyn Fn(Instant)>,
+    after_answer: Option<&'a dyn Fn(Instant) -> Instant>,
     after_recheck: Option<&'a dyn Fn()>,
-    after_eof: Option<&'a dyn Fn(Instant)>,
+    on_discovery: Option<&'a dyn Fn(&Discovery)>,
+    after_eof: Option<&'a dyn Fn(Instant) -> Instant>,
 }
 
 fn await_verdict(
@@ -749,7 +765,7 @@ fn await_verdict(
                 if let Some(code) = port_conflict(dir, p, port) {
                     return code;
                 }
-                confirm_started(dir, p, pid, seams, deadline)
+                confirm_started(dir, p, pid, seams, &Cell::new(deadline))
             }
             Some(Verdict::Fail {
                 reason,
@@ -768,7 +784,7 @@ fn await_verdict(
                             "another daemon holds {}; waiting until it serves",
                             dir.display()
                         ));
-                        await_running(dir, port, seams, deadline)
+                        await_running(dir, port, seams, &Cell::new(deadline))
                     }
                     "stopped" => fail("the daemon was stopped before it became ready"),
                     _ => fail(&format!("the daemon did not start ({reason}): {message}")),
@@ -780,10 +796,8 @@ fn await_verdict(
             )),
         },
         Ok(ReadyRead::Eof) => {
-            if let Some(pause) = seams.after_eof {
-                pause(deadline);
-            }
-            eof_follow_up(launched, dir, deadline)
+            let cutoff = seams.after_eof.map_or(deadline, |pause| pause(deadline));
+            eof_follow_up(launched, dir, cutoff)
         }
         Ok(ReadyRead::TimedOut) => fail_with(
             ExitCode::Timeout,
@@ -823,15 +837,23 @@ fn answers(port: u16, token: &str, deadline: Instant) -> bool {
 
 /// One look at the daemon serving `dir` (`expect`: the pid and port its verdict named); `None`
 /// while it is starting, stopping, or recorded but not answering. `pauses.after_answer` runs
-/// between the answer and the last discovery, `pauses.after_recheck` after that discovery (a
-/// test's pause and mark).
+/// between the answer and the last discovery and may bring `cutoff` forward,
+/// `pauses.after_recheck` runs after that discovery, and `pauses.on_discovery` sees each
+/// discovery (a test's pause and marks).
 fn check_serving(
     dir: &Path,
     expect: Option<(u32, u16)>,
     pauses: StartPauses<'_>,
-    deadline: Instant,
+    cutoff: &Cell<Instant>,
 ) -> Option<Serving> {
-    let r = match client::discover(dir) {
+    let discover = || {
+        let d = client::discover(dir);
+        if let Some(mark) = pauses.on_discovery {
+            mark(&d);
+        }
+        d
+    };
+    let r = match discover() {
         Discovery::NotRunning => return Some(Serving::Gone),
         Discovery::Starting(_) | Discovery::Stopping(_) | Discovery::Unknown => return None,
         Discovery::Serving(r) => r,
@@ -850,15 +872,15 @@ fn check_serving(
         Ok(t) => t,
         Err(e) => return Some(Serving::Failed(format!("the owner token: {e}"))),
     };
-    if !answers(port, &token, deadline) {
+    if !answers(port, &token, cutoff.get()) {
         return None;
     }
     if let Some(pause) = pauses.after_answer {
-        pause(deadline);
+        cutoff.set(pause(cutoff.get()));
     }
     // The answer counts only if the record still says this instance serves, with the lock
     // held: a daemon that began its shutdown has marked its record `stopping`.
-    let again = client::discover(dir);
+    let again = discover();
     if let Some(mark) = pauses.after_recheck {
         mark();
     }
@@ -876,10 +898,10 @@ fn confirm_started(
     port: u16,
     pid: u32,
     pauses: StartPauses<'_>,
-    deadline: Instant,
+    cutoff: &Cell<Instant>,
 ) -> ExitCode {
-    match poll_until(deadline, POLL, || {
-        check_serving(dir, Some((pid, port)), pauses, deadline)
+    match poll_until_cutoff(cutoff, POLL, || {
+        check_serving(dir, Some((pid, port)), pauses, cutoff)
     }) {
         Some(Serving::Confirmed(_)) => {
             print_out(&format!(
@@ -907,11 +929,9 @@ fn await_running(
     dir: &Path,
     port: Option<u16>,
     pauses: StartPauses<'_>,
-    deadline: Instant,
+    cutoff: &Cell<Instant>,
 ) -> ExitCode {
-    match poll_until(deadline, POLL, || {
-        check_serving(dir, None, pauses, deadline)
-    }) {
+    match poll_until_cutoff(cutoff, POLL, || check_serving(dir, None, pauses, cutoff)) {
         Some(Serving::Confirmed(r)) => {
             let Some(p) = r.port else {
                 return fail("the serving daemon's record names no port");
@@ -978,7 +998,18 @@ fn eof_follow_up(launched: &mut Launched, dir: &Path, deadline: Instant) -> Exit
 
 /// What [`eof_follow_up`] observed before its cutoff.
 fn eof_observed(launched: &mut Launched, dir: &Path, deadline: Instant) -> String {
-    let until = deadline.min(Instant::now() + EOF_FOLLOW_UP);
+    eof_observed_at(launched, Instant::now(), deadline, || lifecycle::probe(dir))
+}
+
+/// [`eof_observed`] for a follow-up that starts at `now`, probing the lock through `probe`
+/// (macOS).
+fn eof_observed_at(
+    launched: &mut Launched,
+    now: Instant,
+    deadline: Instant,
+    mut probe: impl FnMut() -> io::Result<LockProbe>,
+) -> String {
+    let until = deadline.min(now + EOF_FOLLOW_UP);
     match launched {
         Launched::Child(c) if cfg!(windows) => Some(match c.exit_before(until) {
             Ok(Some(s)) => format!("it exited ({s})"),
@@ -993,7 +1024,7 @@ fn eof_observed(launched: &mut Launched, dir: &Path, deadline: Instant) -> Strin
             ),
             Err(e) => format!("its status cannot be read: {e}"),
         }),
-        _ => follow_up(until, || match lifecycle::probe(dir) {
+        _ => follow_up(until, || match probe() {
             Ok(LockProbe::Free | LockProbe::Missing) => {
                 Seen::Final("no daemon holds the state directory".to_owned())
             }
@@ -1534,30 +1565,36 @@ mod tests {
         assert!(!finished_own_job("Could not find service", &exe));
     }
 
-    /// The EOF follow-up ends at the shared deadline when that comes before its own 2 s: with
-    /// the deadline already passed it observes nothing, though the lock it would poll is held
-    /// (a follow-up bounded by its 2 s alone would report the holder). With time left, it
-    /// reports what it sees.
+    /// The EOF follow-up ends at the shared deadline when that comes before its own 2 s. The
+    /// follow-up's start is injected an hour ahead, so its own 2 s window is open whenever the
+    /// test runs: with the shared deadline already passed the lock is never probed (a probe
+    /// panics) and nothing is reported (a follow-up bounded by its 2 s alone would probe it),
+    /// and with the shared deadline beyond that window the probe runs and its result is
+    /// reported.
     #[test]
     fn eof_follow_up_uses_the_shorter_shared_deadline() {
-        let dir = tempfile::tempdir().unwrap();
         let mut launch = Launched::Launchd {
             label: "unused".into(),
             target: "gui/1".into(),
         };
-        let lock = std::fs::File::create(dir.path().join(names::LOCK)).unwrap();
-        lock.try_lock().unwrap();
+        let ahead = Instant::now() + Duration::from_secs(3600);
         let passed = Instant::now();
+        let held = || -> io::Result<LockProbe> { panic!("probed past the shared deadline") };
         assert_eq!(
-            eof_observed(&mut launch, dir.path(), passed),
+            eof_observed_at(&mut launch, ahead, passed, held),
             "nothing could be observed before the deadline"
         );
-        drop(lock);
-        let later = Instant::now() + Duration::from_secs(60);
+        let probes = Cell::new(0);
+        let free = || {
+            probes.set(probes.get() + 1);
+            Ok(LockProbe::Free)
+        };
+        let later = ahead + Duration::from_secs(3600);
         assert_eq!(
-            eof_observed(&mut launch, dir.path(), later),
+            eof_observed_at(&mut launch, ahead, later, free),
             "no daemon holds the state directory"
         );
+        assert_eq!(probes.get(), 1);
     }
 
     /// The serving check reads the status line only: a 200 whose body is larger than any
