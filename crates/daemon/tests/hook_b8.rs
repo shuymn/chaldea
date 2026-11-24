@@ -47,18 +47,22 @@ enum End {
     Timeout,
 }
 
-/// Whether `out` holds a whole reply: its head and `Content-Length` body bytes.
-fn complete(out: &[u8]) -> bool {
-    let Some(at) = out.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return false;
-    };
+/// The end of a complete head at the start of `out` and its `Content-Length`, if it has one.
+/// Replies are framed by `Content-Length` only (the daemon's and hyper's rejections carry
+/// one); the observer does not decode chunked bodies.
+fn framing(out: &[u8]) -> Option<(usize, Option<usize>)> {
+    let at = out.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
     let head = String::from_utf8_lossy(&out[..at]).to_ascii_lowercase();
     let len = head
         .lines()
         .find_map(|l| l.strip_prefix("content-length:"))
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    out.len() >= at + 4 + len
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    Some((at, len))
+}
+
+/// Whether `out` holds a whole reply: its head and `Content-Length` body bytes.
+fn complete(out: &[u8]) -> bool {
+    framing(out).is_some_and(|(at, len)| len.is_some_and(|n| out.len() >= at + n))
 }
 
 /// The status code of a complete status line at the start of `out`.
@@ -94,6 +98,8 @@ struct Obs {
     send_error: Option<io::ErrorKind>,
     /// Once the reply's head was read: whether it carried `Connection: close`.
     closes: Option<bool>,
+    /// Reply bytes received.
+    received: usize,
     /// From the first byte written to the whole reply, or to the end without one.
     elapsed: Duration,
     /// Body bytes written before the status was read.
@@ -231,15 +237,29 @@ async fn observe(
             None
         }
     });
-    Obs {
+    let o = Obs {
         status: complete(&out).then(|| support::http::parse(&out, None).outcome()),
         status_line: status_line(&out),
         closes: head_closes(&out),
+        received: out.len(),
         end,
         send_error,
         elapsed,
         body_sent_before_status: body_sent_before_status.unwrap_or(0),
-    }
+    };
+    assert!(
+        framing(&out).is_none_or(|(_, len)| len.is_some()),
+        "a reply without Content-Length, which this observer cannot frame: {o:?} {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // Only a reset may cut a reply (it can discard what was not read); a clean EOF comes
+    // after the whole reply or before any of it.
+    assert!(
+        o.end != End::Eof || o.received == 0 || o.status.is_some(),
+        "the reply ended at EOF before its framing completed: {o:?} {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    o
 }
 
 fn os() -> &'static str {
@@ -247,10 +267,12 @@ fn os() -> &'static str {
 }
 
 fn print_observed(case: &str, o: &Obs) {
-    let status = o.status.as_ref().map_or_else(
-        || "none".to_owned(),
-        |(s, c)| format!("{s}/{}", c.as_deref().unwrap_or("-")),
-    );
+    let status = match (&o.status, o.status_line) {
+        (Some((s, c)), _) => format!("{s}/{}", c.as_deref().unwrap_or("-")),
+        // Cut after its status line.
+        (None, Some(s)) => format!("{s}/cut"),
+        (None, None) => "none".to_owned(),
+    };
     let end = match o.end {
         End::Eof => "eof".to_owned(),
         End::Reset(k) => format!("reset:{k:?}"),
@@ -429,11 +451,7 @@ async fn parser_layer() {
         LONG_CASE,
     )
     .await;
-    assert_eq!(
-        (o.status.as_ref(), o.end),
-        (None, End::Eof),
-        "slow head: {o:?}"
-    );
+    assert_eq!((o.received, o.end), (0, End::Eof), "slow head: {o:?}");
     assert!(
         o.elapsed >= Duration::from_millis(4900) && o.elapsed < CASE,
         "slow head: {o:?}"
