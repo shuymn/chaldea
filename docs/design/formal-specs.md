@@ -197,7 +197,7 @@ The `specs` job of `ci.yml` (`ubuntu-latest`, mise pinned in `mise-action`) inst
 
 ## 7. Q-B: Sync Seam
 
-Q-B checks the Sync Seam protocol of mvp §2.4 and the PR 7 design (http §2.5–§2.8, §8 D14, D15) under interleavings before PR 7b (sync reads, WebSocket) and 7c (commands, receipts) implement it. It assumes PR 6's store guarantees (store §2.2, §2.7, §2.8): atomic commits, gapless per-stream `seq`, idempotency, an epoch fixed when the database is created, and one read snapshot per call. Four rules of mvp §2.4 come from Q-B (§7.4: the epoch rule, F1, F2, the backward resync), and the model implements them as written there. Two modules, simulated and traced separately:
+Q-B checks the Sync Seam protocol of mvp §2.4 and the PR 7 design (http §2.5–§2.8, §8 D14, D15) under interleavings; PR 7b (sync reads, WebSocket) and 7c (commands, receipts) implement it. It assumes PR 6's store guarantees (store §2.2, §2.7, §2.8): atomic commits, gapless per-stream `seq`, idempotency, an epoch fixed when the database is created, and one read snapshot per call. Four rules of mvp §2.4 come from Q-B (§7.4: the epoch rule, F1, F2, the backward resync), and the model implements them as written there. Two modules, simulated and traced separately:
 
 - `specs/sync.qnt`: replay, paging, snapshots, epochs, stream existence, and notify-then-pull;
 - `specs/receipts.qnt`: command receipts across retries, lost replies, deadlines, writer contention, and restarts.
