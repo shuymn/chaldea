@@ -354,8 +354,9 @@ pub struct HttpShutdownReport {
     /// pass. That pass runs once the registry is empty or the deadline has passed, so a task
     /// that ends after the deadline but before the pass counts here.
     pub exited: KindCounts,
-    /// Tasks still running at the deadline, which got an abort request; a request does not
-    /// prove the task has ended.
+    /// Tasks still in the registry at the abort pass (once the registry is empty or the
+    /// deadline has passed), which got an abort request; a request does not prove the task
+    /// has ended.
     pub abort_requested: KindCounts,
 }
 
