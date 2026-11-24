@@ -15,8 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chaldea_daemon::lifecycle::{
-    self, Budgets, DaemonConfig, DetachVia, Discovery, DiscoveryRecord, ExitCode, LockProbe,
-    RunMode, diag, names,
+    self, Budgets, DaemonConfig, DetachVia, Discovery, ExitCode, LockProbe, RunMode, diag, names,
 };
 use chaldea_pty_runtime::host::{
     self, Breakaway, DetachedChild, GuiDomain, LaunchctlOutput, ReadyArg, ReadyRead, ReadyReader,
@@ -818,12 +817,12 @@ fn await_verdict(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Serving {
     /// The record names it with the lock held, an owner-token request to it succeeded, and the
-    /// record still names the same instance after the reply.
-    Confirmed(DiscoveryRecord),
+    /// record still names the same instance after the reply: its port and pid.
+    Confirmed { port: u16, pid: u32 },
     /// No daemon holds the directory.
     Gone,
     /// The record names another process than the expected one.
-    Replaced(DiscoveryRecord),
+    Replaced,
     /// Something a later look cannot change.
     Failed(String),
 }
@@ -861,7 +860,7 @@ fn check_serving(
     if let Some((pid, port)) = expect
         && (r.pid != pid || r.port != Some(port))
     {
-        return Some(Serving::Replaced(r));
+        return Some(Serving::Replaced);
     }
     let Some(port) = r.port else {
         return Some(Serving::Failed(
@@ -885,7 +884,9 @@ fn check_serving(
         mark(&again);
     }
     match again {
-        Discovery::Serving(again) if again.instance == r.instance => Some(Serving::Confirmed(r)),
+        Discovery::Serving(again) if again.instance == r.instance => {
+            Some(Serving::Confirmed { port, pid: r.pid })
+        }
         Discovery::NotRunning => Some(Serving::Gone),
         _ => None,
     }
@@ -903,13 +904,13 @@ fn confirm_started(
     match poll_until_cutoff(cutoff, POLL, || {
         check_serving(dir, Some((pid, port)), pauses, cutoff)
     }) {
-        Some(Serving::Confirmed(_)) => {
+        Some(Serving::Confirmed { .. }) => {
             print_out(&format!(
                 "daemon started: http://127.0.0.1:{port} (pid {pid})"
             ));
             ExitCode::Ok
         }
-        Some(Serving::Gone | Serving::Replaced(_)) => fail(&format!(
+        Some(Serving::Gone | Serving::Replaced) => fail(&format!(
             "the daemon (pid {pid}) reported ready but stopped before the start finished; see {}",
             dir.join(names::LOG).display()
         )),
@@ -932,20 +933,16 @@ fn await_running(
     cutoff: &Cell<Instant>,
 ) -> ExitCode {
     match poll_until_cutoff(cutoff, POLL, || check_serving(dir, None, pauses, cutoff)) {
-        Some(Serving::Confirmed(r)) => {
-            let Some(p) = r.port else {
-                return fail("the serving daemon's record names no port");
-            };
+        Some(Serving::Confirmed { port: p, pid }) => {
             if let Some(code) = port_conflict(dir, p, port) {
                 return code;
             }
             print_out(&format!(
-                "daemon already running: http://127.0.0.1:{p} (pid {})",
-                r.pid
+                "daemon already running: http://127.0.0.1:{p} (pid {pid})"
             ));
             ExitCode::Ok
         }
-        Some(Serving::Gone | Serving::Replaced(_)) => fail(&format!(
+        Some(Serving::Gone | Serving::Replaced) => fail(&format!(
             "the daemon starting for {} exited; see {}",
             dir.display(),
             dir.join(names::LOG).display()

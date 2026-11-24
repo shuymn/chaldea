@@ -32,7 +32,6 @@ pub(crate) fn pair_url(dir: &Path) -> Result<String, String> {
         "POST",
         "/api/pair-codes",
         Some(&token),
-        None,
         Instant::now() + REQUEST_WAIT,
     )
     .map_err(|e| format!("the pair-code request failed: {e}"))?;

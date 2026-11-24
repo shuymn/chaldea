@@ -50,9 +50,9 @@ fn left(deadline: Instant) -> io::Result<std::time::Duration> {
 }
 
 /// One request on a new connection to `127.0.0.1:<port>` with `Connection: close`, no
-/// `Origin`, and `Authorization: Bearer <token>` when given; a body is sent as JSON with its
-/// `Content-Length` (0 when absent). The response must carry a `Content-Length` of at most
-/// 1 MiB and be read completely before `deadline`.
+/// `Origin`, no body (`Content-Length: 0`), and `Authorization: Bearer <token>` when given.
+/// The response must carry a `Content-Length` of at most 1 MiB and be read completely before
+/// `deadline`.
 ///
 /// # Errors
 ///
@@ -63,10 +63,9 @@ pub fn request(
     method: &str,
     path: &str,
     token: Option<&str>,
-    body: Option<&[u8]>,
     deadline: Instant,
 ) -> io::Result<Response> {
-    let mut s = send(port, method, path, token, body, deadline)?;
+    let mut s = send(port, method, path, token, deadline)?;
     read_response(|buf| read_some(&mut s, buf, deadline), deadline)
 }
 
@@ -83,7 +82,7 @@ pub fn request_status(
     token: Option<&str>,
     deadline: Instant,
 ) -> io::Result<u16> {
-    let mut s = send(port, method, path, token, None, deadline)?;
+    let mut s = send(port, method, path, token, deadline)?;
     let mut buf = Vec::new();
     let (status, _) = read_head(
         &mut checked(|buf| read_some(&mut s, buf, deadline), deadline),
@@ -92,36 +91,22 @@ pub fn request_status(
     Ok(status)
 }
 
-/// Connects and writes one request, before `deadline`.
+/// Connects and writes one bodiless request, before `deadline`.
 fn send(
     port: u16,
     method: &str,
     path: &str,
     token: Option<&str>,
-    body: Option<&[u8]>,
     deadline: Instant,
 ) -> io::Result<TcpStream> {
     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
     let mut s = TcpStream::connect_timeout(&addr, left(deadline)?)?;
     let auth = token.map_or_else(String::new, |t| format!("Authorization: Bearer {t}\r\n"));
-    let content = body.map_or_else(
-        || "Content-Length: 0\r\n".to_owned(),
-        |b| {
-            format!(
-                "Content-Type: application/json\r\nContent-Length: {}\r\n",
-                b.len()
-            )
-        },
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Length: 0\r\nConnection: close\r\n\r\n"
     );
-    let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}{content}Connection: close\r\n\r\n"
-    )
-    .into_bytes();
-    if let Some(b) = body {
-        req.extend_from_slice(b);
-    }
     s.set_write_timeout(Some(left(deadline)?))?;
-    s.write_all(&req)?;
+    s.write_all(req.as_bytes())?;
     Ok(s)
 }
 
@@ -642,7 +627,6 @@ mod tests {
             "POST",
             "/x",
             Some("t"),
-            None,
             std::time::Instant::now() + std::time::Duration::from_secs(5),
         )
         .unwrap();
