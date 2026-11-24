@@ -9,6 +9,7 @@
 
 use std::fmt;
 
+pub mod adapter;
 pub mod auth;
 pub mod canonical;
 pub mod command;
