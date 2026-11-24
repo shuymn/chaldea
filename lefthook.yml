@@ -21,13 +21,15 @@ pre-commit:
         - "Cargo.{toml,lock}"
         - "rust-toolchain.toml"
       run: cargo clippy --workspace --all-targets --locked -- -D warnings
-    # The daemon's timer bans fire (docs/design/deadlines.md §3 D4).
-    daemon-lint-probe:
+    # The daemon's timer bans fire (docs/design/deadlines.md §3 D4). Commands run in name
+    # order, so this one runs right after workspace-clippy and reuses its check artifacts.
+    workspace-clippy-probe:
       glob:
         - "crates/daemon/clippy.toml"
         - "crates/daemon/Cargo.toml"
         - "crates/daemon/tests/lint_probe.rs"
         - "scripts/lint-probe.sh"
+        - "lefthook.yml"
         - "Cargo.{toml,lock}"
         - "rust-toolchain.toml"
       run: ./scripts/lint-probe.sh
