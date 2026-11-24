@@ -7,7 +7,8 @@
 # span in the fixture, one per banned function;
 # and cargo reports the build finished without success. Human output (stderr) is ignored, so
 # verbosity, colour, and trailers do not matter. A compiler child killed after printing all
-# four messages is reported only on stderr and is not detected (docs/design/deadlines.md §3 D4).
+# four messages is reported only on stderr and is outside the probe's coverage
+# (docs/design/deadlines.md §3 D4).
 #
 #   scripts/lint-probe.sh                 run clippy on the probe and check its messages
 #   scripts/lint-probe.sh --check STATUS  check JSON messages read from stdin, as if cargo had
