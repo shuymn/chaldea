@@ -141,10 +141,11 @@ async fn sample_follows_the_drop() {
 /// clock is not read. The waiter runs in its own task, so the watchdog never polls it.
 #[tokio::test(start_paused = true)]
 async fn timer_ends_a_pending_wait() {
-    let base = Instant::now();
-    let deadline = base + Duration::from_secs(5);
-    let clock = TestClock::at(base);
-    let timer = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Both instants from one sample of the paused clock.
+    let start = tokio::time::Instant::now();
+    let deadline = start.into_std() + Duration::from_secs(5);
+    let clock = TestClock::at(start.into_std());
+    let timer = start + Duration::from_secs(10);
     let c = clock.clone();
     let waiter = tokio::spawn(async move {
         let r = settle_before(
