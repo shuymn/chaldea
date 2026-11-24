@@ -22,7 +22,8 @@ pre-commit:
         - "rust-toolchain.toml"
       run: cargo clippy --workspace --all-targets --locked -- -D warnings
     # The daemon's timer bans fire (docs/design/deadlines.md §3 D4). Commands run in name
-    # order, so this one runs right after workspace-clippy and reuses its check artifacts.
+    # order, so when workspace-clippy also runs, this one follows it and reuses its check
+    # artifacts; a change to only the script or this file runs the probe alone.
     workspace-clippy-probe:
       glob:
         - "crates/daemon/clippy.toml"
@@ -32,7 +33,7 @@ pre-commit:
         - "lefthook.yml"
         - "Cargo.{toml,lock}"
         - "rust-toolchain.toml"
-      run: ./scripts/lint-probe.sh
+      run: mise exec -- bash scripts/lint-probe.sh
     # core is Sans-IO: no async runtime, store, HTTP stack, or random source. Without
     # pipefail the pipeline's status is grep's, so an early grep exit cannot pass it.
     core-deps:

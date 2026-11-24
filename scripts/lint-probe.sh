@@ -1,49 +1,57 @@
 #!/usr/bin/env bash
-# Checks that the timer bans of crates/daemon/clippy.toml fire (docs/design/deadlines.md §3 D4):
-# clippy on the `lint_probe` test target, the negative fixture holding one call of each banned
-# function, must fail with exactly one disallowed-method error per call, cargo's normal summary
-# for that target, and nothing else that reports an error or an abnormal exit.
+# Checks that the timer bans of crates/daemon/clippy.toml fire (docs/design/deadlines.md §3 D4).
+# Clippy runs on the `lint_probe` test target, the negative fixture holding one call of each
+# banned function, and the verdict comes from cargo's JSON messages on stdout only: cargo
+# exits 101; the build has exactly four error-level compiler messages, each
+# `clippy::disallowed_methods` with its primary span in the fixture, one per banned function;
+# and cargo reports the build finished without success. Human output (stderr) is ignored, so
+# verbosity, colour, and trailers do not matter.
 #
-#   scripts/lint-probe.sh                 run clippy on the probe and check its output
-#   scripts/lint-probe.sh --check STATUS  check clippy output read from stdin, as if clippy had
+#   scripts/lint-probe.sh                 run clippy on the probe and check its messages
+#   scripts/lint-probe.sh --check STATUS  check JSON messages read from stdin, as if cargo had
 #                                         exited with STATUS (for testing this script)
 #
-# Short, uncoloured output gives one line per diagnostic, primary span first, on both OSes.
+# Needs jq (pinned in mise.toml): run it as `mise exec -- bash scripts/lint-probe.sh`.
 # The selection (`--workspace` with the feature named through the package) resolves the same
-# dependency features as the workspace clippy step, so the probe reuses its check artifacts.
+# dependency features as the workspace clippy step, so after that step it reuses its check
+# artifacts.
 set -uo pipefail
-
-names=(timeout timeout_at sleep sleep_until)
-probe='crates/daemon/tests/lint_probe\.rs'
-summary="^error: could not compile \`chaldea-daemon\` \\(test \"lint_probe\"\\) due to ${#names[@]} previous errors(; [0-9]+ warnings? emitted)?\$"
 
 fail() {
   echo "lint-probe: $1" >&2
   exit 1
 }
 
+# The banned function is read from the message, which names the resolved path whatever the
+# call's spelling; the span's text would show only `sleep_until` for an imported call.
+verdict='
+def norm: gsub("\\\\"; "/");
+def banned: ["tokio::time::sleep", "tokio::time::sleep_until", "tokio::time::timeout", "tokio::time::timeout_at"];
+[.[] | select(.reason == "compiler-message" and .message.level == "error") | .message] as $errs
+| [.[] | select(.reason == "build-finished")] as $done
+| if ($done | length) != 1 or $done[0].success != false then
+    "expected one build-finished record without success, found \($done)"
+  elif ($errs | length) != (banned | length) then
+    "expected \(banned | length) errors, found \($errs | length): \([$errs[].message])"
+  elif any($errs[]; .code.code? != "clippy::disallowed_methods") then
+    "an error other than clippy::disallowed_methods: \([$errs[] | select(.code.code? != "clippy::disallowed_methods") | .message])"
+  elif any($errs[]; [.spans[] | select(.is_primary)] as $p
+      | ($p | length) != 1 or ($p[0].file_name | norm | test("(^|/)crates/daemon/tests/lint_probe\\.rs$") | not)) then
+    "an error whose primary span is not in the probe: \([$errs[] | [.spans[] | select(.is_primary) | .file_name]])"
+  elif ([$errs[] | .message | capture("`(?<p>tokio::time::[a-z_]+)`").p] | sort) != banned then
+    "expected one error per banned function, found \([$errs[].message])"
+  else
+    "ok"
+  end
+'
+
 check() {
-  local status=$1 text spanned spanless n name
-  # Windows: CRLF line ends, backslash separators, drive-absolute paths.
-  text="$(tr -d '\r' | sed 's#\\#/#g')"
-  [ "$status" -ne 0 ] || fail "clippy passed on the probe: the bans do not fire"
-  # A compiler that crashed or was killed after its diagnostics: cargo's trailer of an
-  # abnormal exit.
-  ! grep -Eiq '^Caused by:|process did(n.t| not) exit successfully|signal: [0-9]+|SIGKILL|SIGSEGV|SIGABRT|panicked at|internal compiler error' <<<"$text" ||
-    fail "abnormal exit: $(grep -Ei 'Caused by:|exit successfully|signal|panicked|internal compiler error' <<<"$text" | head -3)"
-  spanned="$(grep -E '^.+:[0-9]+:[0-9]+: error(\[[^]]*\])?:' <<<"$text")"
-  # The only error without a span allowed is cargo's normal summary for the probe, once.
-  n="$(grep -Ec "$summary" <<<"$text")"
-  [ "$n" -eq 1 ] || fail "expected one normal summary for the probe target, found $n"
-  spanless="$(grep -E '^error(\[[^]]*\])?:' <<<"$text" | grep -Ev "$summary")"
-  [ -z "$spanless" ] || fail "unexpected error: $spanless"
-  n="$(grep -c . <<<"$spanned")"
-  [ "$n" -eq ${#names[@]} ] || fail "expected ${#names[@]} errors, found $n: $spanned"
-  for name in "${names[@]}"; do
-    n="$(grep -Ec "(^|/)${probe}:[0-9]+:[0-9]+: error: use of a disallowed method \`tokio::time::${name}\`" <<<"$spanned")"
-    [ "$n" -eq 1 ] || fail "expected one disallowed-method error for tokio::time::${name} in the probe, found $n"
-  done
-  echo "lint-probe: all ${#names[@]} bans fire"
+  local status=$1 v
+  command -v jq >/dev/null || fail "jq not found; run through mise exec (mise.toml pins it)"
+  [ "$status" -eq 101 ] || fail "cargo exited $status, not 101 (a failed build)"
+  v="$(jq -rs "$verdict" | tr -d '\r')" || fail "cargo's output is not JSON messages"
+  [ "$v" = ok ] || fail "$v"
+  echo "lint-probe: all 4 bans fire"
 }
 
 if [ "${1:-}" = "--check" ]; then
@@ -53,6 +61,6 @@ fi
 
 cd "$(dirname "$0")/.." || exit 1
 out="$(cargo clippy --locked --workspace --features chaldea-daemon/lint-probe --test lint_probe \
-  --color never --message-format short -- -D warnings 2>&1)"
+  --message-format json -- -D warnings 2>/dev/null)"
 status=$?
 check "$status" <<<"$out"
