@@ -626,6 +626,9 @@ async fn origin_matrix() {
     let p = srv.port;
     let ip = format!("127.0.0.1:{p}");
     let lh = format!("localhost:{p}");
+    // A port other than the server's, only ever sent in an `Origin` header (nothing binds or
+    // connects to it).
+    let other = if p == 1 { 2 } else { 1 };
     // (name, Host, Origin values, accepted when the rule is AbsentOrMatching / PresentMatching)
     let variants: Vec<(&str, String, Vec<String>, bool, bool)> = vec![
         ("absent", ip.clone(), vec![], true, false),
@@ -653,7 +656,7 @@ async fn origin_matrix() {
         (
             "other port",
             ip.clone(),
-            vec![format!("http://127.0.0.1:{}", p + 1)],
+            vec![format!("http://127.0.0.1:{other}")],
             false,
             false,
         ),
