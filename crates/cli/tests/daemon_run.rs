@@ -5,9 +5,9 @@
 mod support;
 
 use std::ffi::OsStr;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use chaldea_core::command::ReceiptStatus;
@@ -26,12 +26,52 @@ const FIRST: u16 = 7373;
 const LAST: u16 = 7472;
 
 /// Every daemon of these tests chooses its port from the range (no test picks a port that it
-/// then releases), so the tests run one at a time: a port a test expects to be the first free
-/// one, or its own saved port, is not taken by another test's daemon in between.
-static PORTS: Mutex<()> = Mutex::new(());
+/// then releases), so the tests run one at a time, in this process and across processes: a
+/// port a test expects to be the first free one, or its own saved port, is not taken by
+/// another test's daemon in between. The daemon takes only a port number (`--port`, the
+/// saved port, or the range), never a bound listener, so a port of the range cannot be
+/// reserved for one test.
+///
+/// The turn is an exclusive lock on [`PORTS_LOCK`] in the OS temp directory, taken through
+/// a handle of the test's own. Such locks exclude each other per handle, between threads of
+/// one process as between processes (`flock` on Unix, `LockFileEx` on Windows). Its scope:
+/// the `daemon_run` tests of every process that resolves the same temp directory
+/// (`TMPDIR`; `TMP` or `TEMP` on Windows). Other binaries whose daemons choose ports from
+/// the range, such as `daemon_stop`, do not take it.
+const PORTS_LOCK: &str = "chaldea-daemon-run-ports.lock";
+/// How long a test waits for its turn, from the start of [`serial`] to the lock.
+const PORTS_WAIT: Duration = Duration::from_secs(600);
 
-fn serial() -> MutexGuard<'static, ()> {
-    PORTS.lock().unwrap_or_else(PoisonError::into_inner)
+/// Waits for this test's turn (see [`PORTS_LOCK`]); the turn ends when the returned file
+/// closes, on drop or at the process's exit.
+fn serial() -> File {
+    let end = Instant::now() + PORTS_WAIT;
+    let path = std::env::temp_dir().join(PORTS_LOCK);
+    // A regular file only: opening a FIFO for writing would wait for a reader.
+    if let Ok(m) = std::fs::symlink_metadata(&path) {
+        assert!(m.is_file(), "{} is not a regular file", path.display());
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert!(file.metadata().unwrap().is_file(), "{}", path.display());
+    loop {
+        match file.try_lock() {
+            Ok(()) => return file,
+            Err(TryLockError::WouldBlock) => {
+                assert!(
+                    Instant::now() < end,
+                    "no turn on {} within {PORTS_WAIT:?}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(TryLockError::Error(e)) => panic!("{}: {e}", path.display()),
+        }
+    }
 }
 
 fn bindable(p: u16) -> bool {

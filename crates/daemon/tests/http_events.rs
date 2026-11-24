@@ -15,9 +15,8 @@ use chaldea_core::payload::{
 use chaldea_core::state::AttentionCause;
 use chaldea_core::sync::{EventsResponse, REPLAY_MAX_BYTES, SnapshotReason, StreamSnapshot};
 use chaldea_daemon::http::Mounts;
-use chaldea_daemon::store::NewEvent;
+use chaldea_daemon::store::{Appended, NewEvent};
 use support::http::{Reply, TestServer};
-use support::waits;
 use support::{TestStore, event, insert_raw_event, raw_unknown, registered, started};
 
 fn code(s: &str) -> Option<String> {
@@ -422,37 +421,47 @@ async fn unknown_kind_passes_unchanged() {
     srv.stop().await;
 }
 
+/// Appends `events` in one write and returns their ids in write order, as the writer reports
+/// them (each must be new).
+async fn append_ids(srv: &TestServer, events: Vec<NewEvent>) -> Vec<EventId> {
+    let ticket = srv
+        .store
+        .store()
+        .submit(support::soon(), move |tx| Ok(tx.append(events)?))
+        .unwrap();
+    support::http::settled(ticket)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|a| match a {
+            Appended::New(e) => e.event_id,
+            Appended::Existing(e) => panic!("not new: {e:?}"),
+        })
+        .collect()
+}
+
 /// While events are appended, a client paging forward from 0 with `limit` 7 gets every
-/// event once; each page is consistent with its own head, and the head includes every append
-/// counted in the writer's committed count sampled just before the request.
+/// event once. Between every two requests the test commits one batch of appends (empty for
+/// some), so each request's head is exactly the events committed before it was sent: its
+/// page is the `limit` events after the cursor, or up to that head, with `has_more` saying
+/// whether the head is beyond it. The batches put appends between pages while the reader is
+/// behind the head, at it (an empty page), and across page boundaries. The expected ids are
+/// the writer's, not read back through the store.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_between_pages() {
-    let srv = std::sync::Arc::new(TestServer::start(Mounts::mvp()).await);
+    const BATCHES: [usize; 11] = [0, 2, 9, 1, 7, 0, 14, 3, 8, 5, 11];
+    let srv = TestServer::start(Mounts::mvp()).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
-    let s = thread_with(&srv, 1, 3).await;
-    const APPENDS: u64 = 60;
-    // Appends committed so far; the writer publishes each count after its commit.
-    let (done, mut committed) = tokio::sync::watch::channel(0u64);
-    let writer = {
-        let srv = srv.clone();
-        tokio::spawn(async move {
-            for i in 0..APPENDS {
-                srv.append(vec![raw_unknown(
-                    s,
-                    &format!("live:{i}"),
-                    Content::text("x"),
-                )])
-                .await;
-                done.send_replace(i + 1);
-                tokio::task::yield_now().await;
-            }
-        })
-    };
-    let target = 3 + APPENDS;
-    let mut cursor = 0;
+    srv.clock.stop();
+    let t = ThreadId::from_u128(0xE001);
+    srv.append(vec![registered(t, false)]).await;
+    let s = StreamId::Thread(t);
+    let mut expected = append_ids(&srv, smalls(s, "small", 3)).await;
+    let mut batches = BATCHES.iter().enumerate();
+    let mut cursor = 0u64;
     let mut got: Vec<EventId> = Vec::new();
-    while cursor < target {
-        let floor = 3 + *committed.borrow();
+    loop {
+        let committed = expected.len() as u64;
         let r = get(
             &srv,
             &owner,
@@ -460,41 +469,31 @@ async fn append_between_pages() {
         )
         .await;
         let (_, _, seqs, head, more, before, page_ids) = page(&r);
-        // One snapshot per answer: the page lies within its head, `has_more` says whether
-        // the head is beyond it, and the page starts right after the cursor.
-        assert!(seqs.len() <= 7);
-        assert!(
-            seqs.iter().all(|q| *q <= head),
-            "{seqs:?} beyond head {head}"
-        );
-        assert!(head >= floor, "head {head} misses commits up to {floor}");
-        let last = seqs.last().copied().unwrap_or(cursor);
-        assert_eq!(
-            more,
-            last < head,
-            "has_more {more} with last {last}, head {head}"
-        );
-        assert_eq!(before, cursor >= 1);
+        assert_eq!(head, committed, "head at cursor {cursor}");
+        let last = (cursor + 7).min(committed);
         assert_eq!(seqs, ((cursor + 1)..=last).collect::<Vec<_>>());
+        assert_eq!(more, last < head, "has_more with last {last}, head {head}");
+        assert_eq!(before, cursor >= 1);
+        assert_eq!(
+            page_ids,
+            expected[usize::try_from(cursor).unwrap()..usize::try_from(last).unwrap()]
+        );
         got.extend(page_ids);
-        if last == cursor {
-            // An empty page means the reader is at the head; anything else would loop here.
-            assert_eq!(head, cursor, "empty page below head {head}");
-            // Caught up with the writer: wait for its next commit. The bound only stops a
-            // stalled writer; the pace of appends is the host's.
-            waits::bounded(
-                std::time::Duration::from_secs(30),
-                committed.wait_for(|n| 3 + n > cursor),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("no append committed past {cursor}"))
-            .unwrap();
-        }
         cursor = last;
+        match batches.next() {
+            Some((b, &n)) => {
+                let batch = (0..n)
+                    .map(|i| raw_unknown(s, &format!("live:{b}:{i}"), Content::text("x")))
+                    .collect();
+                expected.extend(append_ids(&srv, batch).await);
+            }
+            None if cursor == head => break,
+            None => {}
+        }
     }
-    writer.await.unwrap();
-    assert_eq!(got, ids(&srv, s, 1..=target), "each event once, in order");
-    std::sync::Arc::into_inner(srv).unwrap().stop().await;
+    assert_eq!(got.len(), 3 + BATCHES.iter().sum::<usize>());
+    assert_eq!(got, expected, "each event once, in order");
+    srv.stop().await;
 }
 
 // ---- snapshots ----------------------------------------------------------------------------

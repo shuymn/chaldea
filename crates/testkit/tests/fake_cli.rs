@@ -18,6 +18,20 @@ fn fake(args: &[&str]) -> Command {
     c
 }
 
+/// Every child of these tests is started under the process-wide spawn lock. Where std
+/// creates a pipe and sets close-on-exec in two steps (macOS has no `pipe2`), a child
+/// another test spawns in between inherits that pipe; it then keeps a pipe the test closed
+/// open (`failed_emit_is_not_acknowledged`) or holds a pipe's write end past its own child.
+trait SpawnLocked {
+    fn spawn_locked(&mut self) -> std::io::Result<Child>;
+}
+
+impl SpawnLocked for Command {
+    fn spawn_locked(&mut self) -> std::io::Result<Child> {
+        chaldea_pty_runtime::with_spawn_lock(|| self.spawn())
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn identify(pid: u32) -> Option<String> {
     chaldea_pty_runtime::fake::identify(pid)
@@ -67,7 +81,7 @@ fn every_mode_reports_hello() {
         if mode == "spawn-tree" {
             args.extend(["--roles", "none"]);
         }
-        let child = fake(&args).spawn().unwrap();
+        let child = fake(&args).spawn_locked().unwrap();
         let pid = child.id();
         cl.own(child);
         let f = l.accept(soon()).unwrap();
@@ -89,7 +103,7 @@ fn spawn_tree_roles_report_directly() {
         "--max-life-secs",
         "60",
     ])
-    .spawn()
+    .spawn_locked()
     .unwrap();
     let tree = child.id();
     cl.own(child);
@@ -132,9 +146,10 @@ fn spawn_tree_roles_report_directly() {
 #[test]
 fn sleeper_ends_after_max_life() {
     // The watchdog starts with the process, so the stream closes no sooner than the bound
-    // after the spawn began, and within it plus `SLACK` for process start and teardown.
+    // after the spawn began. Nothing else ends a sleeper, so its close and its exit 0 are the
+    // watchdog's. How late past the bound it fires is the host's: the watchdog's sleep only
+    // promises not to end early.
     const LIFE: Duration = Duration::from_secs(1);
-    const SLACK: Duration = Duration::from_millis(1500);
     let l = ReportListener::bind().unwrap();
     let started = Instant::now();
     let mut child = fake(&[
@@ -145,13 +160,13 @@ fn sleeper_ends_after_max_life() {
         "--max-life-secs",
         "1",
     ])
-    .spawn()
+    .spawn_locked()
     .unwrap();
     let mut f = l.accept(soon()).unwrap();
     assert!(f.ping(soon()).is_some());
     assert!(f.closed_by(soon()));
     let lived = started.elapsed();
-    assert!(lived >= LIFE && lived < LIFE + SLACK, "{lived:?}");
+    assert!(lived >= LIFE, "{lived:?}");
     assert_eq!(exit_code(&mut child), Some(0));
 }
 
@@ -167,7 +182,7 @@ fn attachable_on_a_pipe_reports_null_size() {
         "--max-life-secs",
         "60",
     ])
-    .spawn()
+    .spawn_locked()
     .unwrap();
     cl.own(child);
     let mut f = l.accept(soon()).unwrap();
@@ -180,18 +195,20 @@ fn attachable_on_a_pipe_reports_null_size() {
 
 #[test]
 fn unknown_mode_exits_2() {
-    let mut c = fake(&["--mode", "nonsense"]).spawn().unwrap();
+    let mut c = fake(&["--mode", "nonsense"]).spawn_locked().unwrap();
     assert_eq!(exit_code(&mut c), Some(2));
-    let mut c = fake(&[]).spawn().unwrap();
+    let mut c = fake(&[]).spawn_locked().unwrap();
     assert_eq!(exit_code(&mut c), Some(2));
 }
 
 #[test]
 fn unknown_flag_exits_2() {
-    let mut c = fake(&["--mode", "sleeper", "--bogus"]).spawn().unwrap();
+    let mut c = fake(&["--mode", "sleeper", "--bogus"])
+        .spawn_locked()
+        .unwrap();
     assert_eq!(exit_code(&mut c), Some(2));
     let mut c = fake(&["--mode", "sleeper", "--role", "bogus"])
-        .spawn()
+        .spawn_locked()
         .unwrap();
     assert_eq!(exit_code(&mut c), Some(2));
 }
@@ -200,7 +217,7 @@ fn unknown_flag_exits_2() {
 fn queries_in_pipe_mode_reports_each_unanswered_query() {
     let l = ReportListener::bind().unwrap();
     let mut c = fake(&["--mode", "queries", "--report", &l.arg()])
-        .spawn()
+        .spawn_locked()
         .unwrap();
     // stdin closed at once: every wait ends at EOF.
     drop(c.stdin.take());
@@ -258,7 +275,7 @@ fn report_process_writes_the_file() {
     let mut c = fake(&["--mode", "report-process", "--out", path, "--", "a b", ""])
         .env_clear()
         .env("K", "v")
-        .spawn()
+        .spawn_locked()
         .unwrap();
     assert_eq!(exit_code(&mut c), Some(0));
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&out.0).unwrap()).unwrap();
@@ -297,7 +314,7 @@ fn emit_output_reports_lines() {
         "60",
     ]);
     c.stdout(Stdio::piped());
-    let mut child = c.spawn().unwrap();
+    let mut child = c.spawn_locked().unwrap();
     let stdout = child.stdout.take().unwrap();
     cl.own(child);
     let mut f = l.accept(soon()).unwrap();
@@ -333,7 +350,7 @@ fn failed_emit_is_not_acknowledged() {
         "60",
     ]);
     c.stdout(Stdio::piped());
-    let mut child = c.spawn().unwrap();
+    let mut child = c.spawn_locked().unwrap();
     drop(child.stdout.take());
     cl.own(child);
     let mut f = l.accept(soon()).unwrap();
@@ -368,7 +385,7 @@ fn validate_input_checks_the_pattern() {
             "--max-life-secs",
             "60",
         ])
-        .spawn()
+        .spawn_locked()
         .unwrap();
         let mut f = l.accept(soon()).unwrap();
         std::io::Write::write_all(c.stdin.as_mut().unwrap(), &payload).unwrap();
@@ -391,7 +408,7 @@ fn validate_input_checks_the_pattern() {
         "--report",
         &l.arg(),
     ])
-    .spawn()
+    .spawn_locked()
     .unwrap();
     let mut f = l.accept(soon()).unwrap();
     let mut stdin = c.stdin.take().unwrap();
@@ -422,7 +439,7 @@ fn double_forked_outlives_its_parent() {
         "--max-life-secs",
         "60",
     ])
-    .spawn()
+    .spawn_locked()
     .unwrap();
     assert_eq!(exit_code(&mut parent), Some(0), "the parent exited");
     let mut g = l.accept(soon()).unwrap();
@@ -447,7 +464,7 @@ fn breakaway_role_reports_its_result() {
         "--max-life-secs",
         "60",
     ])
-    .spawn()
+    .spawn_locked()
     .unwrap();
     cl.own(child);
     let mut root = l.accept(soon()).unwrap();
