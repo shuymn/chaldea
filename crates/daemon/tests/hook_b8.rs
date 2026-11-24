@@ -272,8 +272,12 @@ fn assert_closed(case: &str, o: &Obs) {
     assert!(matches!(o.end, End::Eof | End::Reset(_)), "{case}: {o:?}");
 }
 
-/// Runs each case with `body`, asserting the exact status, the case deadline, and no side
-/// effect.
+/// Runs each case with `body`, asserting the case deadline, no side effect, and the exact
+/// status when no body byte is in flight. A case still sending body bytes when the server
+/// answers from the head may see a reset instead (K2, D9): the server reads what has
+/// arrived once and closes, and a close with unread bytes resets the connection, which on
+/// Windows discards the reply the client has not read yet; a status it does read is the
+/// decided one.
 async fn table(
     h: &HookServer,
     l: &Launch,
@@ -283,8 +287,21 @@ async fn table(
 ) {
     for (name, req, want) in cases {
         let before = h.snapshot(l);
-        let o = observe(h.srv.port, &req.head(), 1, Duration::ZERO, body(&req), CASE).await;
-        assert_eq!(o.status.as_ref(), Some(&want), "{name}: {o:?}");
+        let body = body(&req);
+        let in_flight = match &body {
+            Body::Withheld => false,
+            Body::Sent(b) => !b.is_empty(),
+            Body::Endless { .. } => true,
+        };
+        let o = observe(h.srv.port, &req.head(), 1, Duration::ZERO, body, CASE).await;
+        if in_flight {
+            assert!(
+                o.status.as_ref().is_none_or(|s| s == &want),
+                "{name}: the decided status, EOF, or a reset: {o:?}"
+            );
+        } else {
+            assert_eq!(o.status.as_ref(), Some(&want), "{name}: {o:?}");
+        }
         assert!(o.elapsed < CASE, "{name}: {o:?}");
         assert_closed(name, &o);
         if withheld {
