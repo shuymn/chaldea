@@ -1,6 +1,7 @@
 //! The test runner of the `harness = false` binaries (`daemon_start`, `daemon_stop`,
-//! `daemon_macos`): each binary is also a `chaldea` with test seams ([`super::faults`]), so the
-//! child `daemon start` launches (`current_exe()`) is the same binary. libtest's protocol as far
+//! `daemon_macos`, `gates`): each binary is also a `chaldea` with test seams
+//! ([`super::faults`]), so the child `daemon start` launches (`current_exe()`) is the same
+//! binary, and `gates`'s waiter is too. libtest's protocol as far
 //! as `cargo test` and the helpers use it: `--list`, name filters, `--exact`,
 //! `--test-threads=1`; cases run in parallel otherwise, each on its own thread.
 

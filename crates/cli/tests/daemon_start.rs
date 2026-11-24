@@ -164,8 +164,9 @@ impl Drop for StopOnDrop<'_> {
 }
 
 /// A starter waiting on `gate` (paused there, or waiting for a child paused there): on every
-/// ending the gate is released and the starter given up to 30 s to exit by itself, so it
-/// removes its readiness channel, before `Proc`'s drop kills it.
+/// ending the gate is abandoned (decided `dropped` unless the test released it, which ends a
+/// waiter with the fixture's exit code) and the starter given up to 30 s to exit by itself, so
+/// it removes its readiness channel, before `Proc`'s drop kills it.
 struct Gated<'a> {
     gate: &'a Gate,
     p: Proc,
@@ -216,6 +217,14 @@ fn stopping_published(dir: &Path) -> bool {
         "the record was never marked stopping, and no miss was logged"
     );
     published.unwrap_or_default()
+}
+
+/// The exit code a detached daemon recorded in `dir` through [`EXIT_RECORD`], waited for under a
+/// watchdog. A daemon that ended any other way, a gate's fixture exit included, records none.
+fn recorded_exit(dir: &Path) -> String {
+    let record = dir.join("daemon-exit");
+    assert!(wait_for(|| record.exists()), "the daemon recorded no exit");
+    std::fs::read_to_string(&record).unwrap()
 }
 
 fn serving(dir: &Path) -> chaldea_daemon::lifecycle::DiscoveryRecord {
@@ -354,9 +363,7 @@ fn stopped_before_ready() {
     );
     assert!(!log.contains("ERROR"), "{log}");
     assert_ne!(lock_state(&d.path), LockProbe::Held);
-    let record = exit.path().join("daemon-exit");
-    assert!(wait_for(|| record.exists()), "the daemon recorded no exit");
-    assert_eq!(std::fs::read_to_string(&record).unwrap(), "0");
+    assert_eq!(recorded_exit(exit.path()), "0");
 }
 
 /// PR8-CL-14: two starters at once: one daemon serves, both exit 0 with its URL.
@@ -412,6 +419,7 @@ fn loser_sees_winner_exit() {
     let d = state();
     let _stop = StopOnDrop(&labels, &d.path);
     let gate = Gate::new();
+    let exit = tempfile::tempdir().unwrap();
     let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = held.local_addr().unwrap().port().to_string();
     let mut winner = Proc::spawn(&mut cmd(
@@ -421,6 +429,7 @@ fn loser_sees_winner_exit() {
         &[
             (PARK_RECONCILER, gate.path().as_os_str()),
             (DEADLINE_MS, OsStr::new(HELD_DEADLINE)),
+            (EXIT_RECORD, exit.path().as_os_str()),
         ],
     ));
     assert!(gate.reached(WAIT), "{}", winner.stderr());
@@ -442,6 +451,8 @@ fn loser_sees_winner_exit() {
     );
     gate.release();
     assert_eq!(winner.code(), 1, "{}", winner.stderr());
+    // The released winner failed at bind, not at its gate.
+    assert_eq!(recorded_exit(exit.path()), "1");
     // Exit 1, not 4, and after a discovery that found no daemon: the loser saw the exit.
     assert_eq!(loser.code(), 1, "{}{}", loser.stdout(), loser.stderr());
     assert!(loser.stderr().contains("exited"), "{}", loser.stderr());
@@ -672,11 +683,15 @@ fn stopping_winner_is_not_reported_running() {
     let d = state();
     let _stop = StopOnDrop(&labels, &d.path);
     let held = Gate::new();
+    let exit = tempfile::tempdir().unwrap();
     let (code, out, err) = start(
         &labels,
         &d.path,
         &[],
-        &[(SHUTDOWN_GATE, held.path().as_os_str())],
+        &[
+            (SHUTDOWN_GATE, held.path().as_os_str()),
+            (EXIT_RECORD, exit.path().as_os_str()),
+        ],
     );
     assert_eq!(code, 0, "{out}{err}");
     let deadline = [(DEADLINE_MS, OsStr::new(HELD_DEADLINE))];
@@ -721,6 +736,8 @@ fn stopping_winner_is_not_reported_running() {
         stopper.stderr()
     );
     assert_eq!(discover(&d.path), Discovery::NotRunning);
+    // The released daemon finished its shutdown, not at its gate.
+    assert_eq!(recorded_exit(exit.path()), "0");
 }
 
 /// PR8-CL-14: the daemon whose serving check answered 200 begins its shutdown before the
@@ -740,6 +757,7 @@ fn stopping_after_the_answer_is_not_reported_started() {
     let held = Gate::new();
     let recheck = Gate::new();
     let marks = Gate::new();
+    let exit = tempfile::tempdir().unwrap();
     let mut starter = Gated {
         gate: &gate,
         p: Proc::spawn(&mut cmd(
@@ -751,6 +769,7 @@ fn stopping_after_the_answer_is_not_reported_started() {
                 (RECHECK_MARK, recheck.path().as_os_str()),
                 (DISCOVERY_MARKS, marks.path().as_os_str()),
                 (SHUTDOWN_GATE, held.path().as_os_str()),
+                (EXIT_RECORD, exit.path().as_os_str()),
                 (DEADLINE_MS, OsStr::new(HELD_DEADLINE)),
             ],
         )),
@@ -802,6 +821,8 @@ fn stopping_after_the_answer_is_not_reported_started() {
         stopper.stdout(),
         stopper.stderr()
     );
+    // The released daemon finished its shutdown, not at its gate.
+    assert_eq!(recorded_exit(exit.path()), "0");
 }
 
 /// PR8-CL-14: the serving check answered 200, and a fault then brings the start's cutoff

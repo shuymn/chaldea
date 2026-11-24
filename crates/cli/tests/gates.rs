@@ -29,6 +29,11 @@ fn main() {
             name: "unreadable_decision_fails_the_waiter",
             run: unreadable_decision_fails_the_waiter,
         },
+        #[cfg(unix)]
+        Case {
+            name: "colliding_unreadable_decision_fails_the_waiter",
+            run: colliding_unreadable_decision_fails_the_waiter,
+        },
         Case {
             name: "dropped_gate_ends_its_waiter",
             run: dropped_gate_ends_its_waiter,
@@ -135,4 +140,16 @@ fn release_past_the_bound_fails() {
     assert!(why.contains("exceed the waiter's bound"), "{why}");
     let w = w.as_mut().unwrap();
     assert_eq!(w.code(), GATE_FAILED, "{}", w.stderr());
+}
+
+/// G1, G2: a `decided` entry that exists but reads as missing (a dangling link): once the bound
+/// passes, the waiter's own decision collides with it, and the one read after the collision
+/// fails, so the waiter exits with the fixture's code instead of polling on.
+#[cfg(unix)]
+fn colliding_unreadable_decision_fails_the_waiter() {
+    let gate = Gate::new();
+    std::os::unix::fs::symlink(gate.path().join("absent"), gate.path().join("decided")).unwrap();
+    let mut w = waiter(&gate, &[(GATE_BOUND_MS, OsStr::new("0"))]);
+    assert_eq!(w.code(), GATE_FAILED, "{}", w.stderr());
+    assert!(w.stderr().contains("cannot be read"), "{}", w.stderr());
 }

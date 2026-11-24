@@ -87,7 +87,8 @@ pub const DISCOVERY_MARKS: &str = "CHALDEA_TEST_DISCOVERY_MARKS";
 /// gate reached (nothing waits for a release).
 pub const RECHECK_MARK: &str = "CHALDEA_TEST_RECHECK_MARK";
 /// A gate directory: a shutdown participant waits at it, so the daemon stays stopping (its
-/// HTTP surface shut down, its record `stopping`, the lock held) until the test releases it.
+/// HTTP surface shut down, the lock held, and its record `stopping`, unless the daemon logged a
+/// failure or timeout of that rewrite, which leaves it `serving`) until the test releases it.
 pub const SHUTDOWN_GATE: &str = "CHALDEA_TEST_SHUTDOWN_GATE";
 /// Milliseconds: the deadline of `daemon start` and `daemon stop` instead of 15 s.
 pub const DEADLINE_MS: &str = "CHALDEA_TEST_DEADLINE_MS";
@@ -241,8 +242,7 @@ fn await_release(dir: &Path) -> Result<(), String> {
     let end = Instant::now() + env_ms(GATE_BOUND_MS).unwrap_or(GATE_MAX);
     loop {
         match std::fs::read_to_string(dir.join(DECIDED)) {
-            Ok(d) if d == RELEASED => return Ok(()),
-            Ok(d) => return Err(format!("was decided {d}, not released")),
+            Ok(d) => return verdict(&d),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if !dir.is_dir() {
                     return Err("is gone".to_owned());
@@ -250,8 +250,14 @@ fn await_release(dir: &Path) -> Result<(), String> {
                 if Instant::now() >= end {
                     match decide(dir, EXPIRED) {
                         Ok(()) => return Err("expired before the test released it".to_owned()),
-                        // Decided meanwhile: the next read says how.
-                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        // Decided meanwhile, or an entry that reads as missing: one read
+                        // settles it, so no path returns to the loop after a collision.
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            return match std::fs::read_to_string(dir.join(DECIDED)) {
+                                Ok(d) => verdict(&d),
+                                Err(e) => Err(format!("cannot be read: {e}")),
+                            };
+                        }
                         Err(e) => return Err(format!("cannot be decided: {e}")),
                     }
                 }
@@ -259,6 +265,15 @@ fn await_release(dir: &Path) -> Result<(), String> {
             Err(e) => return Err(format!("cannot be read: {e}")),
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// What a gate's decision `d` lets the waiter do.
+fn verdict(d: &str) -> Result<(), String> {
+    if d == RELEASED {
+        Ok(())
+    } else {
+        Err(format!("was decided {d}, not released"))
     }
 }
 
