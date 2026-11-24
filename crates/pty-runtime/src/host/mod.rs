@@ -811,22 +811,13 @@ impl std::fmt::Debug for ReadyReader {
 pub const READY_PLIST: &str = "job.plist";
 
 /// The starter's channel: macOS a Unix socket `r` in a fresh private directory `chd-<16 hex>`
-/// under the temp directory, made absolute against the working directory (under `/tmp` when
-/// the socket path would exceed [`READY_SOCKET_MAX`] bytes); Windows the child's stdout,
-/// attached by [`spawn_detached`].
+/// under `temp`, the temp directory the caller resolved, made absolute against the working
+/// directory (under `/tmp` when the socket path would exceed [`READY_SOCKET_MAX`] bytes);
+/// Windows the child's stdout, attached by [`spawn_detached`].
 ///
 /// # Errors
 ///
 /// The directory or socket cannot be created.
-pub fn ready_channel() -> io::Result<(ReadyReader, ReadyArg)> {
-    ready_channel_in(&std::env::temp_dir())
-}
-
-/// [`ready_channel`] with `temp` as the temp directory (tests of the length rule).
-///
-/// # Errors
-///
-/// As [`ready_channel`].
 pub fn ready_channel_in(temp: &Path) -> io::Result<(ReadyReader, ReadyArg)> {
     let (inner, arg) = imp::ready_channel_in(temp)?;
     Ok((ReadyReader { inner }, arg))
