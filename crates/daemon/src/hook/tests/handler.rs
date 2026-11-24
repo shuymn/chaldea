@@ -47,13 +47,20 @@ async fn start_now(h: &HookServer, l: &Launch) {
     h.srv.append(events).await;
 }
 
+/// The request deadline of a server whose pid wait runs out in real time: far past the
+/// 300 ms pid wait and every wait these tests make, so the pid-wait bound and not the
+/// request deadline ends the wait on a slow host.
+const LONG_REQUEST: Duration = Duration::from_secs(30);
+
 /// The pid wait: a start committed before its subscription, one committed during it, one
 /// committed after its bound and before the job, re-reads held by the reader pool across
-/// the pid-wait deadline, and a pid-wait deadline equal to the request deadline.
+/// the pid-wait deadline, and a pid-wait deadline equal to the request deadline. Each case
+/// that needs no deadline to pass runs on a stopped clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pid_wait_timings() {
     // Committed after the pre-read, before the subscription: the first re-read sees it.
     let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = unstarted(&h).await;
     let (gate, open) = h.ingest.points.arm_intake(1);
     let x = Hook::of(&l, "SessionStart", "s");
@@ -65,16 +72,11 @@ async fn pid_wait_timings() {
     assert_eq!(h.launch_row(l.launch).session_id.as_deref(), Some("s"));
     h.stop().await;
 
-    // Committed during the wait: the notification wakes it. The pid-wait bound is past the
-    // request deadline, so only the notification can bring the 200.
-    let h = HookServer::start_with(
-        HookConfig {
-            pid_wait: Duration::from_secs(10),
-            ..HookConfig::default()
-        },
-        |_| {},
-    )
-    .await;
+    // Committed during the wait: the notification wakes it. On the stopped clock neither
+    // the pid-wait bound nor the request deadline passes, so only the notification can
+    // bring the 200.
+    let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = unstarted(&h).await;
     let (gate, open) = h.ingest.points.arm_subscribe();
     let x = Hook::of(&l, "SessionStart", "s");
@@ -99,7 +101,7 @@ async fn pid_wait_timings() {
             pid_wait: Duration::from_millis(300),
             ..HookConfig::default()
         },
-        |_| {},
+        |c| c.short_deadline = LONG_REQUEST,
     )
     .await;
     let l = unstarted(&h).await;
@@ -116,6 +118,7 @@ async fn pid_wait_timings() {
 
     // Readers held, released before the pid-wait deadline: the re-read sees the start.
     let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = unstarted(&h).await;
     let (gate, open) = h.ingest.points.arm_intake(1);
     let x = Hook::of(&l, "SessionStart", "s");
@@ -141,7 +144,7 @@ async fn pid_wait_timings() {
             pid_wait: Duration::from_millis(300),
             ..HookConfig::default()
         },
-        |_| {},
+        |c| c.short_deadline = LONG_REQUEST,
     )
     .await;
     let l = unstarted(&h).await;
@@ -163,12 +166,13 @@ async fn pid_wait_timings() {
     // The pid wait starts at intake, sampled under the intake lock with the ordinal and the
     // facts: time spent before the lock (here 1.2 s of server clock, past a 1 s wait counted
     // from any earlier sample) does not shorten it, so a start committed right after intake
-    // binds.
+    // binds. The clock moves only by that step.
     let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = unstarted(&h).await;
     let clock = h.srv.clock.clone();
     *h.ingest.order.before_lock.lock().unwrap() =
-        Some(Box::new(move || clock.skew(Duration::from_millis(1200))));
+        Some(Box::new(move || clock.advance(Duration::from_millis(1200))));
     let (after_intake, go_on) = h.ingest.points.arm_intake(1);
     let x = Hook::of(&l, "SessionStart", "s");
     let reply = h.spawn_post(&x);
@@ -199,7 +203,7 @@ async fn pid_wait_timings() {
     h.stop().await;
 }
 
-/// A server over a store whose fault points the test keeps.
+/// A server on a stopped clock over a store whose fault points the test keeps.
 async fn faulty() -> (HookServer, std::sync::Arc<Faults>) {
     let faults = std::sync::Arc::new(Faults::default());
     let dir = tempfile::tempdir().unwrap();
@@ -214,14 +218,14 @@ async fn faulty() -> (HookServer, std::sync::Arc<Faults>) {
         clock,
         dir,
     };
-    (
-        HookServer::start_on(ts, HookConfig::default(), |_| {}).await,
-        faults,
-    )
+    let h = HookServer::start_on(ts, HookConfig::default(), |_| {}).await;
+    h.srv.clock.stop();
+    (h, faults)
 }
 
 /// Each store outcome of the job maps to its §2.11 J row, and stores nothing except a
-/// commit whose outcome is unknown.
+/// commit whose outcome is unknown. Every server runs on a stopped clock, so no request
+/// deadline passes unless a case moves a clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn store_outcomes_map() {
     use crate::http::MonotonicClock;
@@ -281,6 +285,7 @@ async fn store_outcomes_map() {
         dir,
     };
     let h = HookServer::start_on(ts, HookConfig::default(), |_| {}).await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     bind(&h, &l, "s").await;
     let release = h.srv.hold_writer().await;
@@ -299,6 +304,7 @@ async fn store_outcomes_map() {
 
     // J5: `RolledBack(DiskFull)`: the database may not grow, and a raw body needs pages.
     let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     bind(&h, &l, "s").await;
     h.run(|tx| {
@@ -329,6 +335,7 @@ async fn store_outcomes_map() {
         dir,
     };
     let h = HookServer::start_on(ts, HookConfig::default(), |_| {}).await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     bind(&h, &l, "s").await;
     let other = rusqlite::Connection::open(h.srv.store.path()).unwrap();
@@ -342,6 +349,7 @@ async fn store_outcomes_map() {
 
     // J3: the registry is closing.
     let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     bind(&h, &l, "s").await;
     let (gate, open) = h.ingest.points.arm_job(2);
@@ -363,7 +371,6 @@ async fn store_outcomes_map() {
     // clock stands still, so no reply cutoff fires: each 503 is the observer's, sent after
     // it reported the outcome to the sink.
     let (h, faults) = faulty().await;
-    h.srv.clock.stop();
     let l = h.codex(1).await;
     bind(&h, &l, "s").await;
     *faults.commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
@@ -391,7 +398,6 @@ async fn store_outcomes_map() {
     // J7: the writer is gone. The clock stands still as above: a reply cutoff answers the
     // same 503 before the sink is told (§2.11 J7), which would leave nothing to check here.
     let (h, faults) = faulty().await;
-    h.srv.clock.stop();
     let l = h.codex(1).await;
     bind(&h, &l, "s").await;
     let release = h.srv.hold_writer().await;
@@ -467,7 +473,6 @@ fn request(hook: &Hook) -> axum::http::Request<axum::body::Body> {
 async fn failed_commit_never_replies_ok() {
     for (event, bound) in [("Stop", true), ("UserPromptSubmit", false)] {
         let (h, faults) = faulty().await;
-        h.srv.clock.stop();
         let l = h.codex(1).await;
         if bound {
             bind(&h, &l, "s").await;
@@ -584,10 +589,14 @@ async fn submitted_hook_cannot_reply_before_commit() {
 
 /// A hook whose job passed `Store::submit` and whose client then disconnected is still
 /// decided by the writer: reached after its `not_after`, it expires and stores nothing
-/// (§2.13 "Best-effort delivery"). The empty job after it is a FIFO barrier.
+/// (§2.13 "Best-effort delivery"). The empty job after it is a FIFO barrier. The server's
+/// clock stands still; the store's clock is put past the job's `not_after` instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submitted_hook_can_expire_after_disconnect() {
+    use crate::http::MonotonicClock;
+
     let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     let hook = Hook::of(&l, "Stop", "s");
     let release = h.srv.hold_writer().await;
@@ -599,14 +608,25 @@ async fn submitted_hook_can_expire_after_disconnect() {
         s.faults.submits() > before && !h.ingest.order.is_pending(l.launch, 1)
     })
     .await;
-    let cutoff = *s.faults.submitted_not_afters().last().unwrap();
+    let not_after = h
+        .srv
+        .clock
+        .real(*s.faults.submitted_not_afters().last().unwrap());
     drop(conn);
-    waits::pause_until(tokio::time::Instant::from_std(
-        cutoff + Duration::from_millis(1),
-    ))
-    .await;
+    h.srv
+        .store
+        .clock
+        .lead(not_after.saturating_duration_since(Instant::now()) + Duration::from_millis(1));
     release.send(()).unwrap();
-    h.run(|_| Ok(())).await;
+    // The barrier's own `not_after` is past the store clock's lead.
+    let barrier = h
+        .srv
+        .store
+        .store()
+        .submit(not_after + WAIT, |_tx| Ok(()))
+        .unwrap();
+    super::support::http::settled(barrier).await.unwrap();
+    h.srv.store.clock.lead(Duration::ZERO);
     assert!(h.delivery(l.launch, hook.emit).is_none());
     h.stop().await;
 }
@@ -642,16 +662,28 @@ async fn stopped_clock_keeps_a_queued_hook_past_reply_grace() {
 }
 
 /// The job held inside the writer past the reply grace: 503 `outcome_unknown`, no row yet;
-/// released, the row commits; a retry with the same emit id replays it.
+/// released, the row commits; a retry with the same emit id replays it. The server's clock
+/// stands still except for the held hook's reply wait: frozen at the job point, it lets
+/// that hook's reply cutoff fire in real time, measured from the freeze. The store's clock
+/// lags meanwhile, so the job is not expired in the queue however late the writer takes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn grace_exceeded_then_commits() {
+    use crate::http::MonotonicClock;
+
     let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     bind(&h, &l, "s").await;
     let (reached_job, release) = h.adapter.hold();
+    let (before_job, go_on) = h.ingest.points.arm_job(2);
     let x = Hook::of(&l, "Stop", "s");
     let reply = h.spawn_post(&x);
+    reached(before_job).await;
+    h.srv.store.clock.lag(WAIT);
+    h.srv.clock.freeze(h.srv.clock.now());
+    go_on.send(()).unwrap();
     reached_sync(reached_job).await;
+    h.srv.store.clock.lag(Duration::ZERO);
     assert_eq!(
         outcome(&reply.await.unwrap()),
         (503, Some("outcome_unknown".into()))
@@ -672,6 +704,7 @@ async fn grace_exceeded_then_commits() {
             .is_some()
     })
     .await;
+    h.srv.clock.stop();
     let calls = h.adapter.calls().len();
     ok(&h.post(&x.clone().attempt(Some("2"))).await);
     assert_eq!(h.adapter.calls().len(), calls, "the retry was interpreted");
@@ -682,6 +715,7 @@ async fn grace_exceeded_then_commits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revoked_after_preread() {
     let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     let before = h.snapshot(&l);
     let (gate, open) = h.ingest.points.arm_job(1);
@@ -699,9 +733,13 @@ async fn revoked_after_preread() {
 }
 
 /// G9, H5, H6: a deadline passed before the handler, every pre-read failure, and the walk,
-/// pid wait, and binding order cut by the deadline; none writes anything.
+/// pid wait, and binding order cut by the deadline; none writes anything. A case that
+/// expects another reply, or holds the request at a test gate before its deadline is to
+/// pass, runs on a stopped clock up to that gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn handler_rejections() {
+    use crate::http::MonotonicClock;
+
     let timeout = (408, Some("request_timeout".to_owned()));
     // G9: the server's clock moves past the deadline while the guard checks the token;
     // no handler step runs.
@@ -723,6 +761,7 @@ async fn handler_rejections() {
 
     // H5: the token revoked between the guard and the pre-read.
     let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     let before = h.snapshot(&l);
     let (gate, open) = h.ingest.points.arm_pre_read();
@@ -737,13 +776,16 @@ async fn handler_rejections() {
     assert_eq!(h.snapshot(&l), before);
     h.stop().await;
 
-    // H5: every reader held through the deadline: the pre-read is busy or cut off.
+    // H5: every reader held through the deadline: the pre-read is busy or cut off. The
+    // clock stands still until the pre-read; frozen there, its deadline passes in real time.
     let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     let before = h.snapshot(&l);
     let (gate, open) = h.ingest.points.arm_pre_read();
     let reply = h.spawn_post(&Hook::of(&l, "SessionStart", "s"));
     reached(gate).await;
+    h.srv.clock.freeze(h.srv.clock.now());
     let readers = h.srv.hold_readers(4);
     open.send(()).unwrap();
     let r = reply.await.unwrap();
@@ -757,6 +799,7 @@ async fn handler_rejections() {
 
     // H5: the store closed.
     let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     let (gate, open) = h.ingest.points.arm_pre_read();
     let reply = h.spawn_post(&Hook::of(&l, "SessionStart", "s"));
@@ -772,15 +815,15 @@ async fn handler_rejections() {
 
     // H6: the deadline passed before the walk: 408, and no walk starts.
     let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     let before = h.snapshot(&l);
     let (gate, open) = h.ingest.points.arm_intake(1);
     let reply = h.spawn_post(&Hook::of(&l, "SessionStart", "s"));
     reached(gate).await;
-    h.srv.clock.skew(Duration::from_secs(3));
+    h.srv.clock.advance(Duration::from_secs(3));
     open.send(()).unwrap();
     assert_eq!(outcome(&reply.await.unwrap()), timeout);
-    h.srv.clock.skew(Duration::ZERO);
     assert_eq!(h.ingest.points.walks(), 0, "walked after the deadline");
     assert_eq!(h.snapshot(&l), before);
     h.stop().await;
@@ -800,12 +843,15 @@ async fn handler_rejections() {
 
     // H6: the binding order held past the deadline by a lower ordinal. The lower request
     // holds its ticket at the job point, which its own deadline does not end, so ordinal 1
-    // stays pending through the `SessionStart`'s whole deadline.
+    // stays pending through the `SessionStart`'s whole deadline. The clock stands still
+    // until the lower request is held; frozen there, the deadline passes in real time.
     let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     let (gate, open) = h.ingest.points.arm_job(1);
     let lower = h.spawn_post(&Hook::of(&l, "UserPromptSubmit", "s"));
     reached(gate).await;
+    h.srv.clock.freeze(h.srv.clock.now());
     let start = Hook::of(&l, "SessionStart", "s");
     assert_eq!(outcome(&h.post(&start).await), timeout);
     assert!(h.delivery(l.launch, start.emit).is_none());
@@ -874,6 +920,7 @@ async fn body_permit_lifetime() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn truncated_annex_is_stored() {
     let h = HookServer::start().await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     bind(&h, &l, "s").await;
     let cut = Hook::of(&l, "Stop", "s").truncated();
