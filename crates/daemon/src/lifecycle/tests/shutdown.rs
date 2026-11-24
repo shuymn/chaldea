@@ -825,10 +825,11 @@ fn stopping_rename_is_not_retried_past_its_cutoff() {
             "gave up before its cutoff after {} renames: {why}",
             renames.len()
         );
+        // The injected error is the rename's own; any other error before a rename is a failure.
+        let cutoff =
+            why.contains("its cutoff passed before the rename") || why.contains(" ms ended");
         assert!(
-            ["injected", "cutoff passed before the rename", "ms ended"]
-                .iter()
-                .any(|m| why.contains(m)),
+            cutoff || (!renames.is_empty() && why.contains("injected")),
             "{why}"
         );
         if renames.len() >= 2 {
