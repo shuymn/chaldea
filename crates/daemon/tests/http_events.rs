@@ -422,8 +422,8 @@ async fn unknown_kind_passes_unchanged() {
 }
 
 /// While events are appended, a client paging forward from 0 with `limit` 7 gets every
-/// event once; each page is consistent with its own head and includes every append committed
-/// before it was requested.
+/// event once; each page is consistent with its own head, and the head includes every append
+/// counted in the writer's committed count sampled just before the request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_between_pages() {
     let srv = std::sync::Arc::new(TestServer::start(Mounts::mvp()).await);
@@ -477,6 +477,8 @@ async fn append_between_pages() {
         assert_eq!(seqs, ((cursor + 1)..=last).collect::<Vec<_>>());
         got.extend(page_ids);
         if last == cursor {
+            // An empty page means the reader is at the head; anything else would loop here.
+            assert_eq!(head, cursor, "empty page below head {head}");
             // Caught up with the writer: wait for its next commit. The bound only stops a
             // stalled writer; the pace of appends is the host's.
             tokio::time::timeout(
