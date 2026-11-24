@@ -52,49 +52,47 @@ Sources read for this document:
 
 **Goal.** A `hook` module in `chaldea-daemon` that accepts a CLI hook on `POST /hook`, decides its routing (appended to the thread, buffered while its launch is unbound, or kept as `raw_unknown`) in one store job, binds a launch only through mvp §2.9's rule and never ahead of an earlier hook of the same launch, promotes buffered hooks in receipt order at binding, and replies only after the decision is durable; and `chaldea hook-emit`, which posts one hook payload with one `emit_id`, retries within its budget, and always exits 0 within 3 s with nothing on stdout. Every B-8 case is a table-driven test per layer on `macos-latest` and `windows-latest`.
 
-**PR split** (§3 "PR size"): **9a** — `pty_runtime::process` (public lookup and ancestry walk), `chaldea hook-emit` in `crates/cli`, FakeCli hook emission; **9b** — the daemon's `hook` module, store migration v2, the `/hook` mount, the PR 7 fixture updates, B-8, the end-to-end tests. 9b depends on 9a.
-
-**`crates/cli` ownership.** PR 8 (daemon lifecycle) also creates `crates/cli`. Whichever of PR 8 and 9a merges first creates it with the workspace member entry, `[[bin]] name = "chaldea"`, a library whose `dispatch` runs `hook-emit` first, and a `main.rs` that only calls `dispatch` (§2.13); the other rebases onto it and adds its modules. The dispatch rule (hook-emit first, before any runtime or configuration initialization; mvp §3 "Single binary") is the shared contract.
+**`crates/cli` dispatch.** `crates/cli` (shared with PR 8) builds the `chaldea` binary from a library whose `dispatch` runs `hook-emit` first, before any runtime or configuration initialization (mvp §3 "Single binary"), and a `main.rs` that only calls `dispatch` (§2.13).
 
 **Files.**
 
 ```
-crates/pty-runtime/src/process.rs         # public: ProcessEntry, Lookup, lookup(pid), Ancestry, ancestry(pid, max); the walk over a Table trait (9a)
-crates/pty-runtime/src/unix/table.rs      # + image name (9a)
-crates/pty-runtime/src/unix/sys.rs        # BsdInfo gains `name` from the same proc_pidinfo call; exit_now (`_exit`) (9a)
-crates/pty-runtime/src/windows/process.rs # one Toolhelp snapshot + one handle per link, over a scriptable OS seam (9a)
-crates/pty-runtime/src/windows/sys.rs     # CreateToolhelp32Snapshot, Process32FirstW / NextW wrappers; liveness reuses sys::wait; terminate_current (9a)
-crates/pty-runtime/src/host/{mod,unix,windows,other}.rs  # + exit_now: ends the process without exit handlers (9a)
+crates/pty-runtime/src/process.rs         # public: ProcessEntry, Lookup, lookup(pid), Ancestry, ancestry(pid, max); the walk over a Table trait
+crates/pty-runtime/src/unix/table.rs      # + image name
+crates/pty-runtime/src/unix/sys.rs        # BsdInfo gains `name` from the same proc_pidinfo call; exit_now (`_exit`)
+crates/pty-runtime/src/windows/process.rs # one Toolhelp snapshot + one handle per link, over a scriptable OS seam
+crates/pty-runtime/src/windows/sys.rs     # CreateToolhelp32Snapshot, Process32FirstW / NextW wrappers; liveness reuses sys::wait; terminate_current
+crates/pty-runtime/src/host/{mod,unix,windows,other}.rs  # + exit_now: ends the process without exit handlers
 crates/pty-runtime/tests/process_native.rs
-crates/cli/Cargo.toml, src/{lib,main}.rs  # binary `chaldea`; lib `dispatch` runs `hook-emit` first (created by PR 8 or 9a, whichever merges first)
-crates/cli/src/hook_emit/{mod,env,client,watchdog}.rs   # the emitter (9a)
-crates/cli/tests/hook_emit.rs             # emitter against stub listeners (9a)
-crates/cli/tests/hook_emit_stall.rs       # harness = false: re-executes itself through dispatch, one case per emitter exit (9a)
-crates/cli/tests/hook_e2e.rs              # daemon + FakeCli + emitter, real processes (9b)
-crates/testkit/src/fake_cli/echo.rs       # + --emitter, --agent, --session-id, --nested, --nested-child (lift of spike echo, 9a)
-crates/testkit/src/fake_cli/hooks.rs      # new mode `hooks`: a scripted hook sequence (9a)
-crates/testkit/src/fake_cli/watch.rs      # FakeCli's children: one loop enforces every deadline (9a)
-crates/daemon/src/hook/mod.rs             # HookIngest, HookConfig, HookSeams, mount() (9b)
-crates/daemon/src/hook/request.rs         # X-Chaldea-* header parsing (9b)
-crates/daemon/src/hook/payload.rs         # decode(): the pure hook-head decoder, the fuzz target of PR 22 (9b)
-crates/daemon/src/hook/ancestry.rs        # eligibility (9b)
-crates/daemon/src/hook/intake.rs          # IntakeOrder, IntakeTicket (9b)
-crates/daemon/src/hook/route.rs           # the delivery job: dedup, decide, bind, buffer, promote (9b)
-crates/daemon/src/hook/buffer.rs          # buffer bounds, expiry, resolve_unbindable (PR 10 calls it) (9b)
-crates/daemon/src/hook/adapter.rs         # HookAdapter, MvpHooks (the default until PR 10 / 13 / 14) (9b)
-crates/daemon/src/hook/tests/             # unit tests with the HTTP and store fault points (9b)
-crates/daemon/src/http/ctx.rs             # + WriteCtx::read_by (a read bounded by a given deadline), WriteCtx::commits, WriteCtx::write_then (9b)
-crates/daemon/src/http/auth.rs            # verify_hash_in: the hook token's launch checks (9b)
-crates/daemon/src/http/routes.rs          # Mounts::mvp() mounts /hook with HookSeams::mvp() (9b)
-crates/daemon/src/http/tests/{writes,layers}.rs         # positive controls use scoped hook tokens (9b)
-crates/daemon/src/store/schema.rs         # migration v2 (§2.12) (9b)
-crates/daemon/src/store/{readers,annex}.rs              # buffered_summary, max_receipt_ordinal, binding_receipt_ordinal, EventAnnex::Hook (9b)
-crates/daemon/tests/support/http.rs       # token_of(Hook) mints a scoped hook token for a registered, started launch (9b)
-crates/daemon/tests/http_layers.rs        # hook fixtures scoped; /hook expectations now reach the handler (501 → 400 for a missing emit id) (9b)
-crates/daemon/tests/http_contract.rs      # the 411 / 413 hook cases use a scoped token (9b)
-crates/daemon/tests/http_matrix.rs        # INVENTORY: POST /hook is mounted; hook-kind cells use the scoped token (9b)
-crates/daemon/tests/http_logs.rs          # the hook cases run the real handler with a scoped token and a custom mount (9b)
-crates/daemon/tests/hook_b8.rs, hook_ingest.rs, support/hook.rs   # (9b)
+crates/cli/Cargo.toml, src/{lib,main}.rs  # binary `chaldea`; lib `dispatch` runs `hook-emit` first
+crates/cli/src/hook_emit/{mod,env,client,watchdog}.rs   # the emitter
+crates/cli/tests/hook_emit.rs             # emitter against stub listeners
+crates/cli/tests/hook_emit_stall.rs       # harness = false: re-executes itself through dispatch, one case per emitter exit
+crates/cli/tests/hook_e2e.rs              # daemon + FakeCli + emitter, real processes
+crates/testkit/src/fake_cli/echo.rs       # + --emitter, --agent, --session-id, --nested, --nested-child (lift of spike echo)
+crates/testkit/src/fake_cli/hooks.rs      # new mode `hooks`: a scripted hook sequence
+crates/testkit/src/fake_cli/watch.rs      # FakeCli's children: one loop enforces every deadline
+crates/daemon/src/hook/mod.rs             # HookIngest, HookConfig, HookSeams, mount()
+crates/daemon/src/hook/request.rs         # X-Chaldea-* header parsing
+crates/daemon/src/hook/payload.rs         # decode(): the pure hook-head decoder, the fuzz target of PR 22
+crates/daemon/src/hook/ancestry.rs        # eligibility
+crates/daemon/src/hook/intake.rs          # IntakeOrder, IntakeTicket
+crates/daemon/src/hook/route.rs           # the delivery job: dedup, decide, bind, buffer, promote
+crates/daemon/src/hook/buffer.rs          # buffer bounds, expiry, resolve_unbindable (PR 10 calls it)
+crates/daemon/src/hook/adapter.rs         # HookAdapter, MvpHooks (the default until PR 10 / 13 / 14)
+crates/daemon/src/hook/tests/             # unit tests with the HTTP and store fault points
+crates/daemon/src/http/ctx.rs             # + WriteCtx::read_by (a read bounded by a given deadline), WriteCtx::commits, WriteCtx::write_then
+crates/daemon/src/http/auth.rs            # verify_hash_in: the hook token's launch checks
+crates/daemon/src/http/routes.rs          # Mounts::mvp() mounts /hook with HookSeams::mvp()
+crates/daemon/src/http/tests/{writes,layers}.rs         # positive controls use scoped hook tokens
+crates/daemon/src/store/schema.rs         # migration v2 (§2.12)
+crates/daemon/src/store/{readers,annex}.rs              # buffered_summary, max_receipt_ordinal, binding_receipt_ordinal, EventAnnex::Hook
+crates/daemon/tests/support/http.rs       # token_of(Hook) mints a scoped hook token for a registered, started launch
+crates/daemon/tests/http_layers.rs        # hook fixtures scoped; /hook expectations reach the handler (400 for a missing emit id)
+crates/daemon/tests/http_contract.rs      # the 411 / 413 hook cases use a scoped token
+crates/daemon/tests/http_matrix.rs        # INVENTORY: POST /hook is mounted; hook-kind cells use the scoped token
+crates/daemon/tests/http_logs.rs          # the hook cases run the real handler with a scoped token and a custom mount
+crates/daemon/tests/hook_b8.rs, hook_ingest.rs, support/hook.rs
 .github/workflows/ci.yml                  # Windows sentinel; B-8 observation step (§1 "Workspace and CI")
 ```
 
@@ -105,10 +103,10 @@ crates/daemon/tests/hook_b8.rs, hook_ingest.rs, support/hook.rs   # (9b)
   "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot, Process32FirstW / NextW (the parent pid of the ancestry walk)
 ```
 
-- New dependency edges: `chaldea-daemon → chaldea-pty-runtime` (normal; PR 10 needs it anyway; its packages are already in `Cargo.lock`); `chaldea-cli` (new package in `Cargo.lock` unless PR 8 added it) `→ uuid` with `features = ["v4"]` (the `emit_id`; `uuid =1.29.1` already uses `getrandom 0.4.3`); `chaldea-cli → chaldea-pty-runtime` (normal, for `host::exit_now`, §2.13; already a dev-dependency, so `Cargo.lock` is unchanged). Nothing else on the `hook-emit` path: std networking only (prior-art row 5b's hand-written alternative, needed for separate connect and attempt bounds). `crates/cli` dev-dependencies: `chaldea-daemon`, `chaldea-core`, `chaldea-pty-runtime`, `tokio` (`rt-multi-thread`, `net`; the runtime of `hook_e2e`'s in-process server), `tempfile`, `serde_json`, all workspace pins.
+- New dependency edges: `chaldea-daemon → chaldea-pty-runtime` (normal; PR 10 needs it anyway; its packages are already in `Cargo.lock`); `chaldea-cli → uuid` with `features = ["v4"]` (the `emit_id`; `uuid =1.29.1` already uses `getrandom 0.4.3`); `chaldea-cli → chaldea-pty-runtime` (normal, for `host::exit_now`, §2.13; already a dev-dependency, so `Cargo.lock` is unchanged). Nothing else on the `hook-emit` path: std networking only (prior-art row 5b's hand-written alternative, needed for separate connect and attempt bounds). `crates/cli` dev-dependencies: `chaldea-daemon`, `chaldea-core`, `chaldea-pty-runtime`, `tokio` (`rt-multi-thread`, `net`; the runtime of `hook_e2e`'s in-process server), `tempfile`, `serde_json`, all workspace pins.
 - `crates/testkit`: unchanged dependencies; FakeCli runs the emitter as a child process given by `--emitter <path>`, as in the spike.
 
-**Workspace and CI.** `crates/cli` joins `members` if absent. No new job. `cargo test --workspace --locked` runs everything on both runners. Two steps change in the `workspace` job: the Windows sentinel step lists `chaldea-pty-runtime --test process_native ancestry_of_a_grandchild_reaches_this_process` and the lib test `windows::process::tests::wait_result_mapping` (the Toolhelp path compiles only on Windows; 9a); and a new step after "Run tests", `cargo test -p chaldea-daemon --test hook_b8 --locked -- observed_ --show-output`, prints the per-OS observations of the in-flight-body cases on success (the main run captures passing tests' output; 9b). The `core` dependency check is unchanged. `lefthook.yml` has no sentinel list and stays unchanged.
+**Workspace and CI.** No new job. `cargo test --workspace --locked` runs everything on both runners. Two steps change in the `workspace` job: the Windows sentinel step lists `chaldea-pty-runtime --test process_native ancestry_of_a_grandchild_reaches_this_process` and the lib test `windows::process::tests::wait_result_mapping` (the Toolhelp path compiles only on Windows); and a new step after "Run tests", `cargo test -p chaldea-daemon --test hook_b8 --locked -- observed_ --show-output`, prints the per-OS observations of the in-flight-body cases on success (the main run captures passing tests' output). The `core` dependency check is unchanged. `lefthook.yml` has no sentinel list and stays unchanged.
 
 **FakeCli binary in `crates/cli` tests.** The emitter is `env!("CARGO_BIN_EXE_chaldea")`. FakeCli is `chaldea-fake-cli[.exe]` in the directory above the test executable's `deps/`. Cargo builds testkit's binary for testkit's own integration tests, so under `cargo test --workspace` (the CI command) it exists before any test runs; under `cargo test -p chaldea-cli` alone it may not, and the helper then fails with "build with cargo test --workspace", never skips. Its name (16 characters) survives macOS `pbi_name` truncation.
 
@@ -481,7 +479,7 @@ Nothing is written to stdout or stderr on any path (Claude injects hook stdout i
 
 **Windows.** The same console-subsystem `chaldea.exe` (prior-art row 9; spike C-5 `go`: no window for hook launches); it inherits the CLI's console and creates none. A connect to a closed loopback port can take about 2 s to be refused on Windows (A2); the 500 ms connect bound keeps that inside the attempt. `exit_now` from the watchdog (`TerminateProcess` on the current process) ends a main thread blocked in `connect`, `send`, or `recv`, once the OS has cancelled that I/O. No `cfg` in the emitter.
 
-### 2.14 FakeCli Additions (9a)
+### 2.14 FakeCli Additions
 
 - `echo --emitter <path> [--agent <claude|codex>] [--session-id <id>] [--nested]`: at start, runs the emitter once (`<path> hook-emit <agent>`, agent default `codex`) with `{ "hook_event_name": "SessionStart", "session_id": <id or a random UUID>, "transcript_path": null }` on stdin, and per input line (split at CR or LF, bracketed-paste markers removed, empty lines skipped) a `UserPromptSubmit` with the same `session_id` and the line as `prompt`. `--nested` starts a nested FakeCli (`echo --nested-child`, the same binary, inheriting the environment and the `--report` and `--max-life-secs` arguments) that emits a `SessionStart` with another session id before and after the parent's (spike `src/fake_cli.rs:244-269`, B-11). The order is a handshake of exact lines, each counted only with its LF or CRLF and only when its reader stamped it, after decoding, before the deadline (a line stamped at or after the deadline is late; one stamped in time but published after it, its reader paused, is late when the receiver has already given up, and in time when the receiver is itself late and still finds it queued): the child emits and writes `sent` to its stdout; the parent, having read it, emits its own and writes `go` to the child's stdin; the child, having read it, emits again and exits 0. A side that gets EOF (an unterminated line included), another line, or nothing within 20 s reports `handshake_failed` (`side`: `parent` or `child`; `reason`: `eof`, `unexpected`, or `timeout`), emits no further hook, and exits 1. So does a side whose emitter cannot be started (reported as an `emitted` event with `spawn_failed`), before it writes its line. A failing parent ends the child at once rather than at its bound. The parent awaits the child at most 60 s from its launch.
 - `hooks --emitter <path> [--agent <claude|codex>] --script <json>`: runs a list of steps in order: `{ "emit": <payload> }` (one emitter process with the payload on stdin; waits for its exit), `{ "concurrent": [<payload>, …] }` (one emitter each, all started, then all awaited), `{ "nested": [<step>, …] }` (a nested FakeCli `hooks` with those steps, inheriting the environment and the `--report` and `--max-life-secs` arguments; waits for it at most 60 s from its launch), `{ "wait_file": "<path>" }` (waits until the file exists, at most 10 s, so a test can hold the next step). Every child's deadline is measured from its own launch and enforced in one place (`fake_cli/watch.rs`): one loop over the children of a step kills each at its own deadline (an emitter 10 s after its launch), reaps it, and awaits its counted output pipes until 1 s after that deadline, independently of the order in which results are reported. It reports each emitter's exit code (null when it did not exit before its deadline), elapsed time, and stdout and stderr lengths (each null when that pipe's EOF did not come by the deadline plus 1 s, a descendant holding it; each count carries the instant of its EOF) on the report stream (`emitted`), and each nested run's and `wait_file` step's outcome; a script that is not a JSON array exits 2 after a `script_error` event. A payload given as a JSON string is sent as its raw text (a body that is not JSON). FakeCli's random session ids come from the standard library's hash keys (it has no random source of its own).
@@ -550,7 +548,7 @@ FakeCli stays free of workspace dependencies other than `core` (mvp §3); it sta
 | | B. A 32 MiB byte budget held from read to job end, discriminating fields only before the job; 503 `busy` when full | http blob slots | **Adopted.** |
 | **Stream of a hook `raw_unknown`** | A. `host` when the launch is unbound | — | Rejected: the token names the thread, and the host stream is unreadable to agents. |
 | | B. Always the token's thread | — | **Adopted.** |
-| **Emitter crate** | A. A module of `crates/cli` | mvp §3 | **Adopted**; PR 8 or 9a creates the crate, whichever merges first. |
+| **Emitter crate** | A. A module of `crates/cli` | mvp §3 | **Adopted.** |
 | | B. A separate crate | — | Rejected: one binary either way; no isolation gained. |
 | **PR size** | A. One PR | mvp §4 | Rejected: large, and the emitter is testable alone. |
 | | B. 9a (process lookup, emitter, FakeCli) and 9b (ingest, store v2, B-8, e2e) | http D1 | **Adopted.** |
