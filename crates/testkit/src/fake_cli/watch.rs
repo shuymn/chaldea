@@ -256,8 +256,17 @@ mod tests {
     /// Launches `script` with both outputs counted, to be killed after `wait`.
     #[cfg(unix)]
     fn launch(script: &str, wait: Duration) -> Watched {
+        launch_cmd(sh(script), wait)
+    }
+
+    /// Launches `c` with both outputs counted, to be killed after `wait`. The spawn holds
+    /// the process-wide spawn lock: std sets close-on-exec on a new pipe in a second step on
+    /// macOS (no `pipe2`), and a child another test spawns in between would inherit the pipe
+    /// and hold a counted output open.
+    #[cfg(unix)]
+    fn launch_cmd(mut c: std::process::Command, wait: Duration) -> Watched {
         let launched = Instant::now();
-        let mut child = sh(script).spawn().unwrap();
+        let mut child = chaldea_pty_runtime::with_spawn_lock(|| c.spawn()).unwrap();
         let (out, err) = (child.stdout.take(), child.stderr.take());
         let mut w = Watched::new(child, launched, wait);
         w.count(out);
@@ -303,25 +312,57 @@ mod tests {
         }
     }
 
-    /// Three runs that never exit, settled together: each is killed at its own 300 ms bound,
-    /// so the three end together.
+    /// A run with a 30 s bound that exits only when the test lets it, and two runs that never
+    /// exit with a 300 ms bound, settled together: the two are killed and reaped at their own
+    /// bounds while the first still runs, which serial bounds (one run settled before the
+    /// next is watched) would not do. The first is let go once both are gone, or after 10 s.
     #[cfg(unix)]
     #[test]
     fn each_run_is_bounded_from_its_launch() {
         let wait = Duration::from_millis(300);
-        let t = Instant::now();
-        let ws = (0..3).map(|_| launch("exec sleep 30", wait)).collect();
-        for s in settle(ws) {
+        let mut c = sh("read -r _; exit 0");
+        c.stdin(std::process::Stdio::piped());
+        let mut first = launch_cmd(c, Duration::from_secs(30));
+        let stdin = first.child.stdin.take().unwrap();
+        let rest: Vec<Watched> = (0..2).map(|_| launch("exec sleep 30", wait)).collect();
+        let pids: Vec<rustix::process::Pid> = rest
+            .iter()
+            .map(|w| rustix::process::Pid::from_child(&w.child))
+            .collect();
+        let gate = std::thread::spawn(move || {
+            let end = Instant::now() + Duration::from_secs(10);
+            let gone = loop {
+                // Reaped: no such process any more.
+                if pids
+                    .iter()
+                    .all(|p| rustix::process::test_kill_process(*p).is_err())
+                {
+                    break true;
+                }
+                if Instant::now() >= end {
+                    break false;
+                }
+                std::thread::sleep(POLL);
+            };
+            drop(stdin);
+            gone
+        });
+        let mut ws = vec![first];
+        ws.extend(rest);
+        let r = settle(ws);
+        assert!(
+            gate.join().unwrap(),
+            "the 300 ms runs outlived 10 s while the first ran"
+        );
+        assert_eq!(
+            (r[0].code, &r[0].outputs),
+            (Some(0), &vec![Some(0), Some(0)])
+        );
+        for s in &r[1..] {
             assert_eq!(s.code, None);
             assert!(s.elapsed >= wait, "{:?}", s.elapsed);
             assert_eq!(s.outputs, [Some(0), Some(0)]);
         }
-        // Restated: 300 ms each; serial bounds would end the last at 900 ms.
-        assert!(
-            t.elapsed() < Duration::from_millis(600),
-            "{:?}",
-            t.elapsed()
-        );
     }
 
     /// A run that exits while a descendant holds its stdout: the count is given up at the
