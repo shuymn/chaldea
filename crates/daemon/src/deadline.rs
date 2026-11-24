@@ -10,7 +10,7 @@ use std::future::Future;
 use std::time::Instant;
 
 /// An awaited result classified against its deadline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum Settled<T> {
     /// Ready, and the clock read once after it was taken was before the deadline.
     InTime(T),

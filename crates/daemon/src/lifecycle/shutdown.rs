@@ -128,8 +128,6 @@ async fn deadline_first<F: Future>(end: Instant, fut: F) -> Result<F::Output, El
     .await
 }
 
-/// `deadline_first`'s timer: the clock is checked before every poll, then the future, then
-/// this timer (daemon-lifecycle §2.8).
 #[allow(
     clippy::disallowed_methods,
     reason = "deadline_first's timer: clock, poll, then timer (daemon-lifecycle §2.8)"
@@ -138,8 +136,6 @@ fn deadline_timer(end: tokio::time::Instant) -> tokio::time::Sleep {
     tokio::time::sleep_until(end)
 }
 
-/// The participants' bound: a plain `timeout_at`, polling the participant first; the result
-/// is discarded (daemon-lifecycle §2.8).
 #[allow(
     clippy::disallowed_methods,
     reason = "the participants' plain bound, polled participant first, result discarded (daemon-lifecycle §2.8)"

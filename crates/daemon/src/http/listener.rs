@@ -83,7 +83,6 @@ pub(crate) async fn accept_loop(shared: Arc<Shared>, listener: TcpListener, rout
     }
 }
 
-/// The accept loop's pause after an accept error; shutdown wins (design §2.2).
 #[allow(
     clippy::disallowed_methods,
     reason = "accept-error backoff; shutdown wins (http-surface §2.2)"
@@ -92,8 +91,6 @@ fn accept_backoff() -> Sleep {
     tokio::time::sleep(Duration::from_secs(1))
 }
 
-/// `ConnIo`'s write stall timer, polled only after a write returned `Pending` (design §2.2
-/// "ConnIo").
 #[allow(
     clippy::disallowed_methods,
     reason = "the write stall, progress first: polled only after a pending write (http-surface §2.2)"

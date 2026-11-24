@@ -571,8 +571,6 @@ async fn await_reply(
     }
 }
 
-/// Wakes [`await_reply`]'s loop at a progress change or the reply time; the loop's
-/// progress read and the clock sample after it decide (design §2.8).
 #[allow(
     clippy::disallowed_methods,
     reason = "wakes the reply loop only; its progress read and the sample after it decide (http-surface §2.8)"
@@ -762,7 +760,6 @@ async fn complete(shared: &Shared, command_id: CommandId, result: &CommandResult
     }
 }
 
-/// The completion's backoff pause; the budget is read before each attempt (design §2.8).
 #[allow(
     clippy::disallowed_methods,
     reason = "completion backoff; the budget is read before each attempt (http-surface §2.8)"

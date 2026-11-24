@@ -8,6 +8,8 @@
 use std::future::Future;
 use std::time::Duration;
 
+use futures_util::FutureExt;
+
 /// [`tokio::time::timeout`].
 #[allow(
     clippy::disallowed_methods,
@@ -28,16 +30,10 @@ pub fn bounded_at<F: Future>(at: tokio::time::Instant, fut: F) -> tokio::time::T
 
 /// [`tokio::time::sleep`]: the timer is set now, awaited later.
 pub fn pause(d: Duration) -> impl Future<Output = ()> {
-    let t = bounded(d, std::future::pending::<()>());
-    async move {
-        let _ = t.await;
-    }
+    bounded(d, std::future::pending::<()>()).map(drop)
 }
 
 /// [`tokio::time::sleep_until`].
 pub fn pause_until(at: tokio::time::Instant) -> impl Future<Output = ()> {
-    let t = bounded_at(at, std::future::pending::<()>());
-    async move {
-        let _ = t.await;
-    }
+    bounded_at(at, std::future::pending::<()>()).map(drop)
 }

@@ -12,26 +12,25 @@ use super::{Settled, settle_before};
 use crate::store::tests::support::waits;
 
 /// A clock the test sets, counting its readings.
-#[derive(Default)]
 struct TestClock {
-    state: Mutex<(Option<Instant>, usize)>,
+    state: Mutex<(Instant, usize)>,
 }
 
 impl TestClock {
     fn at(at: Instant) -> Arc<Self> {
         Arc::new(TestClock {
-            state: Mutex::new((Some(at), 0)),
+            state: Mutex::new((at, 0)),
         })
     }
 
     fn set(&self, at: Instant) {
-        self.state.lock().unwrap().0 = Some(at);
+        self.state.lock().unwrap().0 = at;
     }
 
     fn now(&self) -> Instant {
         let mut s = self.state.lock().unwrap();
         s.1 += 1;
-        s.0.unwrap()
+        s.0
     }
 
     fn readings(&self) -> usize {
