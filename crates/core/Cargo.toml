@@ -16,6 +16,9 @@ schemars.workspace = true
 uuid.workspace = true
 # The command request identity (`docs/design/http-surface.md` §2.8).
 sha2.workspace = true
+# The `win_keys` composition and the expected prompt forms (docs/design/input-encoders.md §1).
+unicode-normalization.workspace = true
+unicode-segmentation.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
