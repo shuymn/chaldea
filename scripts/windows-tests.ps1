@@ -202,11 +202,25 @@ function Invoke-Cleanup([string] $WrapperArg, [string] $RunDir, [string] $RunRoo
         }
     }
 
+    # The state directories under the run root, by a walk that checks the time before each
+    # directory it lists, so it ends at the survivor reserve too. Links are not followed; a
+    # directory that cannot be listed is skipped.
     $dirs = @()
-    if (Test-Path -LiteralPath $RunRoot) {
-        $dirs = @(Get-ChildItem -LiteralPath $RunRoot -Recurse -Directory -Force -ErrorAction SilentlyContinue |
-            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'daemon.lock') } |
-            ForEach-Object { $_.FullName })
+    $queue = [Collections.Generic.Queue[string]]::new()
+    if (Test-Path -LiteralPath $RunRoot) { $queue.Enqueue($RunRoot) }
+    while ($queue.Count -gt 0) {
+        if ((& $leftBefore) -eq 0) {
+            $report.errors += 'the search for state directories reached the survivor reserve'
+            break
+        }
+        $dir = $queue.Dequeue()
+        if ($dir -ne $RunRoot -and (Test-Path -LiteralPath (Join-Path $dir 'daemon.lock'))) { $dirs += $dir }
+        try {
+            foreach ($sub in [IO.Directory]::EnumerateDirectories($dir)) {
+                if (-not ([IO.File]::GetAttributes($sub) -band [IO.FileAttributes]::ReparsePoint)) { $queue.Enqueue($sub) }
+            }
+        }
+        catch { }
     }
     foreach ($d in $dirs) {
         if ((& $leftBefore) -eq 0) {
