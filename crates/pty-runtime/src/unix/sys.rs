@@ -661,6 +661,7 @@ mod tests {
     //! test binary re-executed with `--exact` and a flag in that child's environment only.
 
     use std::ffi::c_int;
+    use std::io::Write as _;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -806,6 +807,27 @@ mod tests {
             .into_parts()
     }
 
+    /// A `/bin/cat` child past its own startup, for a count of its descriptors: right after
+    /// exec, dyld holds one of its own (fd 3, `/`) for about a millisecond, which a count
+    /// taken as soon as the spawn returns can see on a loaded host. The terminal echoes the
+    /// line when it is written; its second copy is cat's own output, so cat has reached its
+    /// read loop.
+    fn settled_cat(pty: &UnixPty, dir: &TempDir) -> SpawnedParts {
+        let out = Arc::new(Out::default());
+        let mut p = pty
+            .spawn(&spec(&["/bin/cat"], dir), out.sink())
+            .unwrap()
+            .into_parts();
+        p.input.write_all(b"ready\n").unwrap();
+        p.input.flush().unwrap();
+        assert!(
+            out.wait(|b, _| String::from_utf8_lossy(b).matches("ready").count() >= 2),
+            "cat did not echo the line: {:?}",
+            out.text()
+        );
+        p
+    }
+
     fn sig(pid: u32, s: c_int) {
         // SAFETY: sends a signal to a pid; no memory arguments.
         unsafe { libc::kill(i32::try_from(pid).unwrap(), s) };
@@ -846,7 +868,7 @@ mod tests {
         unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
         let dir = TempDir::new("hygiene");
         let pty = UnixPty::default();
-        let a = spawn(&pty, &["/bin/sleep", "30"], &dir);
+        let a = settled_cat(&pty, &dir);
         let pid = a.child.identity().pid;
         assert_eq!(open_fds(pid).unwrap(), vec![0, 1, 2]);
         sig(pid, libc::SIGHUP);
@@ -877,7 +899,7 @@ mod tests {
         // SAFETY: no arguments.
         assert_eq!(unsafe { getdtablesize() }, 128);
         let dir = TempDir::new("limit");
-        let p = spawn(&UnixPty::default(), &["/bin/sleep", "30"], &dir);
+        let p = settled_cat(&UnixPty::default(), &dir);
         assert_eq!(open_fds(p.child.identity().pid).unwrap(), vec![0, 1, 2]);
         let _ = p.teardown();
     }

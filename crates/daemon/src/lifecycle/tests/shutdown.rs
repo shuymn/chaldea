@@ -571,43 +571,53 @@ fn no_unlink_after_the_record_budget() {
     assert!(log.text().contains("was left in place"), "{}", log.text());
 }
 
-/// PR8-CL-23: the record says `stopping` before HTTP shuts down: a discovery made once HTTP's
-/// shutdown returned (paused there) sees this run stopping, not serving.
-/// The record says `stopping` before HTTP shuts down: while the rewrite runs, HTTP still
-/// answers, and once HTTP's shutdown returned the record says `stopping`.
+/// PR8-CL-23: the record says `stopping` before HTTP shuts down. The rewrite has a
+/// test-set budget of `WAIT` (and the run a shutdown budget long enough to hold it), so a
+/// slow write or a held rewrite does not run out of time; `stalled_stopping_rewrite_does_not_hold_http`
+/// covers the 500 ms budget. While the rewrite is held, HTTP still answers and the coordinator
+/// has not reached HTTP's shutdown; once it reaches it, the record already says `stopping`
+/// with this run's instance, and HTTP still answers.
 #[test]
 fn record_says_stopping_before_http_shuts_down() {
     use super::super::files::{Discovery, discover};
     let dir = state();
     let faults = Arc::new(Faults::default());
+    *faults.stopping_rewrite.lock().unwrap() = Some(WAIT);
     let rewriting = faults.park(Point::InsideStopping);
-    let after_http = faults.park(Point::AfterHttp);
-    let run = start(
-        foreground(&dir.path, Some(hold_port())),
-        TestComponents::default(),
-        faults.clone(),
-    );
+    let before_http = faults.park(Point::BeforeHttp);
+    let mut cfg = foreground(&dir.path, Some(hold_port()));
+    cfg.budgets.total = 3 * WAIT;
+    let run = start(cfg, TestComponents::default(), faults.clone());
     let port = run.serving();
     let Discovery::Serving(serving) = discover(&dir.path) else {
         panic!("not serving: {:?}", discover(&dir.path))
     };
+    let token = super::token_of(&dir.path);
+    let answers = || super::get_status(port, "/api/threads", Some(&token)).is_ok_and(|s| s == 200);
     run.stop();
     let reached = rewriting.wait_reached(WAIT);
-    let http_up = super::get_status(port, "/api/threads", Some(&super::token_of(&dir.path)))
-        .is_ok_and(|s| s == 200);
+    let http_up = answers();
+    let http_began = before_http.wait_reached(Duration::ZERO);
     rewriting.release();
     assert!(reached, "the rewrite did not start");
     assert!(http_up, "HTTP shut down before the rewrite");
-    assert!(after_http.wait_reached(WAIT));
+    assert!(
+        !http_began,
+        "HTTP's shutdown began while the rewrite was held"
+    );
+    assert!(before_http.wait_reached(WAIT));
     let seen = discover(&dir.path);
-    after_http.release();
+    let http_up = answers();
+    before_http.release();
     let log = run.log.clone();
     let r = run.join();
     assert_eq!(r.code.code(), 0, "{}", log.text());
     assert!(
         matches!(&seen, Discovery::Stopping(s) if s.instance == serving.instance),
-        "{seen:?}"
+        "{seen:?}\n{}",
+        log.text()
     );
+    assert!(http_up, "HTTP shut down before its shutdown step");
 }
 
 /// A `stopping` rewrite that does not finish within its 500 ms does not hold HTTP's
@@ -783,26 +793,53 @@ fn stopping_worker_paused_past_its_cutoff_creates_nothing() {
     ));
 }
 
-/// The `stopping` rewrite's failing rename is retried only before the rewrite's cutoff, never
-/// for a fresh retry window.
+/// The `stopping` rewrite's failing rename is retried, only before the rewrite's cutoff and
+/// never for a fresh retry window; the rewrite gives up only at its cutoff. A run that ends at
+/// its cutoff with fewer than two renames (a loaded host's temporary write and sync took the
+/// time) shows nothing about the retries: it is checked for what it did and repeated with
+/// twice the time, from 150 ms.
 #[test]
 fn stopping_rename_is_not_retried_past_its_cutoff() {
     use super::super::files::ReplaceStage;
-    let d = tempfile::tempdir().unwrap();
-    let before = serving_record(d.path(), "i");
-    let renames = Mutex::new(Vec::new());
-    let hook = |_: &str, stage| {
-        if stage == ReplaceStage::Rename {
-            renames.lock().unwrap().push(Instant::now());
-            return Err(std::io::Error::other("injected"));
+    let mut budget = Duration::from_millis(150);
+    loop {
+        let d = tempfile::tempdir().unwrap();
+        let before = serving_record(d.path(), "i");
+        let renames = Mutex::new(Vec::new());
+        let hook = |_: &str, stage| {
+            if stage == ReplaceStage::Rename {
+                renames.lock().unwrap().push(Instant::now());
+                return Err(std::io::Error::other("injected"));
+            }
+            Ok(())
+        };
+        let end = Instant::now() + budget;
+        let r = super::super::shutdown::mark_stopping(d.path(), "i", end, &|| {}, &hook);
+        let returned = Instant::now();
+        let renames = renames.into_inner().unwrap();
+        let why = r.expect_err("every rename fails");
+        assert!(renames.iter().all(|&t| t < end), "{renames:?} {end:?}");
+        assert_eq!(std::fs::read(d.path().join(names::RECORD)).unwrap(), before);
+        assert!(
+            returned >= end,
+            "gave up before its cutoff after {} renames: {why}",
+            renames.len()
+        );
+        // The injected error is the rename's own; any other error before a rename is a failure.
+        let cutoff =
+            why.contains("its cutoff passed before the rename") || why.contains(" ms ended");
+        assert!(
+            cutoff || (!renames.is_empty() && why.contains("injected")),
+            "{why}"
+        );
+        if renames.len() >= 2 {
+            return;
         }
-        Ok(())
-    };
-    let end = Instant::now() + Duration::from_millis(150);
-    let r = super::super::shutdown::mark_stopping(d.path(), "i", end, &|| {}, &hook);
-    assert!(r.is_err());
-    let renames = renames.into_inner().unwrap();
-    assert!(!renames.is_empty());
-    assert!(renames.iter().all(|&t| t < end), "{renames:?} {end:?}");
-    assert_eq!(std::fs::read(d.path().join(names::RECORD)).unwrap(), before);
+        assert!(
+            budget < Duration::from_secs(4),
+            "{} renames before a {budget:?} cutoff: {why}",
+            renames.len()
+        );
+        budget *= 2;
+    }
 }
