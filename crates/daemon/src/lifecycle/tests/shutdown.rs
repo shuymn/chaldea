@@ -9,7 +9,7 @@ use super::super::faults::{Faults, Point};
 use super::super::files::{LockProbe, probe};
 use super::super::gate::{ConsoleEvent, any_registered};
 use super::super::{FailReason, LockDisposition, names};
-use super::{Recorder, TestComponents, WAIT, foreground, free_port, start, state};
+use super::{Recorder, TestComponents, WAIT, foreground, hold_port, start, state};
 use crate::store::test_faults::{CommitFault, Faults as StoreFaults};
 
 /// PR8-CL-4: a stop with every condition met releases the lock in process.
@@ -17,7 +17,7 @@ use crate::store::test_faults::{CommitFault, Faults as StoreFaults};
 fn exited_writer_releases() {
     let dir = state();
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -38,8 +38,8 @@ fn exited_writer_releases() {
     assert_eq!(probe(&dir.path).unwrap(), LockProbe::Free);
 }
 
-/// PR8-CL-5: HTTP, the participants in order, then the store, each with its end measured back
-/// from the cutoff.
+/// PR8-CL-5: the record's `stopping` rewrite, HTTP, the participants in order, then the
+/// store, each with its end measured back from the cutoff (the rewrite's within HTTP's).
 #[test]
 fn order_and_ends() {
     let dir = state();
@@ -61,7 +61,7 @@ fn order_and_ends() {
     let sf = Arc::new(StoreFaults::default());
     *faults.store_faults.lock().unwrap() = Some(sf.clone());
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         comps,
         faults.clone(),
     );
@@ -77,12 +77,19 @@ fn order_and_ends() {
     let names: Vec<&str> = marks.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(
         names,
-        ["http", "participant:first", "participant:second", "store"]
+        [
+            "stopping",
+            "http",
+            "participant:first",
+            "participant:second",
+            "store"
+        ]
     );
-    assert_eq!(marks[0].1, Some(c - Duration::from_secs(5)));
-    assert_eq!(marks[1].1, Some(c - Duration::from_secs(3)));
+    assert!(marks[0].1.is_some_and(|e| e <= c - Duration::from_secs(5)));
+    assert_eq!(marks[1].1, Some(c - Duration::from_secs(5)));
     assert_eq!(marks[2].1, Some(c - Duration::from_secs(3)));
-    assert_eq!(marks[3].1, Some(c));
+    assert_eq!(marks[3].1, Some(c - Duration::from_secs(3)));
+    assert_eq!(marks[4].1, Some(c));
     let seen = seen.lock().unwrap();
     assert_eq!(
         seen.iter().map(|s| s.0).collect::<Vec<_>>(),
@@ -96,7 +103,7 @@ fn order_and_ends() {
 fn removes_only_its_own_record() {
     let dir = state();
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -117,7 +124,7 @@ fn removes_only_its_own_record() {
 
     std::fs::remove_file(&path).unwrap();
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -133,12 +140,12 @@ fn removes_only_its_own_record() {
 fn isolated_runs_register_nothing() {
     let (a, b) = (state(), state());
     let ra = start(
-        foreground(&a.path, Some(free_port())),
+        foreground(&a.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
     let rb = start(
-        foreground(&b.path, Some(free_port())),
+        foreground(&b.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -164,7 +171,7 @@ fn console_end_after_the_lock_decision_keeps_never_taken() {
     let before_lock = faults.park(Point::Before(5));
     let decided = faults.park(Point::AfterLockDecision);
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         faults,
     );
@@ -190,7 +197,7 @@ fn panic_before_the_runtime_is_never_taken() {
         .panic_before_runtime
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let r = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         faults,
     )
@@ -231,7 +238,7 @@ fn token_write_is_drained_before_serve() {
         ..TestComponents::default()
     };
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         comps,
         faults.clone(),
     );
@@ -269,7 +276,7 @@ fn record_removal_failure_is_reported() {
     const FILE_SHARE_READ: u32 = 0x1;
     let dir = state();
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -310,7 +317,7 @@ fn record_retry_spares_a_replacement() {
         .store(1, std::sync::atomic::Ordering::SeqCst);
     let park = faults.park(Point::RecordRetry);
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         faults,
     );
@@ -341,7 +348,7 @@ fn record_removal_is_retried() {
         let faults = Arc::new(Faults::default());
         faults.record_remove_fails.store(fails, Ordering::SeqCst);
         let run = start(
-            foreground(&dir.path, Some(free_port())),
+            foreground(&dir.path, Some(hold_port())),
             TestComponents::default(),
             faults.clone(),
         );
@@ -381,7 +388,7 @@ fn record_verify_failure_is_retried() {
         let dir = state();
         let faults = Arc::new(Faults::default());
         let run = start(
-            foreground(&dir.path, Some(free_port())),
+            foreground(&dir.path, Some(hold_port())),
             TestComponents::default(),
             faults.clone(),
         );
@@ -469,7 +476,7 @@ fn built_commands_are_served_and_drained() {
     let dir = state();
     let faults = Arc::new(Faults::default());
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents {
             commands: Some(commands),
             ..TestComponents::default()
@@ -538,6 +545,132 @@ fn built_commands_are_served_and_drained() {
     );
 }
 
+/// PR8-CL-23: a removal whose re-read returned before the 500 ms budget but reaches the unlink
+/// only after it (paused there) issues no deletion: the budget is checked again just before
+/// the unlink.
+#[test]
+fn no_unlink_after_the_record_budget() {
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    let park = faults.park(Point::AfterRecordVerify);
+    let run = start(
+        foreground(&dir.path, Some(hold_port())),
+        TestComponents::default(),
+        faults.clone(),
+    );
+    run.serving();
+    run.stop();
+    assert!(park.wait_reached(WAIT));
+    // The budget began before the pause was reached.
+    std::thread::sleep(Duration::from_millis(600));
+    park.release();
+    let log = run.log.clone();
+    let r = run.join();
+    assert_eq!(r.code.code(), 0, "{}", log.text());
+    assert!(dir.path.join(names::RECORD).exists(), "{}", log.text());
+    assert!(log.text().contains("was left in place"), "{}", log.text());
+}
+
+/// PR8-CL-23: the record says `stopping` before HTTP shuts down: a discovery made once HTTP's
+/// shutdown returned (paused there) sees this run stopping, not serving.
+/// The record says `stopping` before HTTP shuts down: while the rewrite runs, HTTP still
+/// answers, and once HTTP's shutdown returned the record says `stopping`.
+#[test]
+fn record_says_stopping_before_http_shuts_down() {
+    use super::super::files::{Discovery, discover};
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    let rewriting = faults.park(Point::InsideStopping);
+    let after_http = faults.park(Point::AfterHttp);
+    let run = start(
+        foreground(&dir.path, Some(hold_port())),
+        TestComponents::default(),
+        faults.clone(),
+    );
+    let port = run.serving();
+    let Discovery::Serving(serving) = discover(&dir.path) else {
+        panic!("not serving: {:?}", discover(&dir.path))
+    };
+    run.stop();
+    let reached = rewriting.wait_reached(WAIT);
+    let http_up = super::get_status(port, "/api/threads", Some(&super::token_of(&dir.path)))
+        .is_ok_and(|s| s == 200);
+    rewriting.release();
+    assert!(reached, "the rewrite did not start");
+    assert!(http_up, "HTTP shut down before the rewrite");
+    assert!(after_http.wait_reached(WAIT));
+    let seen = discover(&dir.path);
+    after_http.release();
+    let log = run.log.clone();
+    let r = run.join();
+    assert_eq!(r.code.code(), 0, "{}", log.text());
+    assert!(
+        matches!(&seen, Discovery::Stopping(s) if s.instance == serving.instance),
+        "{seen:?}"
+    );
+}
+
+/// A `stopping` rewrite that does not finish within its 500 ms does not hold HTTP's
+/// shutdown back: shutdown goes on and the log says why.
+#[test]
+fn stalled_stopping_rewrite_does_not_hold_http() {
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    let rewriting = faults.park(Point::InsideStopping);
+    let run = start(
+        foreground(&dir.path, Some(hold_port())),
+        TestComponents::default(),
+        faults.clone(),
+    );
+    run.serving();
+    run.stop();
+    let reached = rewriting.wait_reached(WAIT);
+    let http_went_on = super::wait_for(WAIT, || faults.marks().iter().any(|m| m.0 == "http"));
+    rewriting.release();
+    assert!(reached, "the rewrite did not start");
+    assert!(http_went_on, "HTTP waited for the rewrite");
+    let log = run.log.clone();
+    let r = run.join();
+    assert_eq!(r.code.code(), 0, "{}", log.text());
+    assert!(
+        log.text().contains("was not marked stopping within 500 ms"),
+        "{}",
+        log.text()
+    );
+}
+
+/// A `stopping` rewrite that fails is logged, and shutdown goes on to a clean exit.
+#[test]
+fn failed_stopping_rewrite_is_logged() {
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    let run = start(
+        foreground(&dir.path, Some(hold_port())),
+        TestComponents::default(),
+        faults.clone(),
+    );
+    run.serving();
+    assert!(super::wait_for(WAIT, || matches!(
+        super::super::files::discover(&dir.path),
+        super::super::files::Discovery::Serving(_)
+    )));
+    faults.fail_replace(names::RECORD, super::super::files::ReplaceStage::Write);
+    run.stop();
+    let log = run.log.clone();
+    let r = run.join();
+    assert_eq!(
+        (r.code.code(), r.lock),
+        (0, LockDisposition::Released),
+        "{}",
+        log.text()
+    );
+    assert!(
+        log.text().contains("could not be marked stopping"),
+        "{}",
+        log.text()
+    );
+}
+
 /// A re-read that would first succeed after the 500 ms budget issues no deletion: the wait
 /// is capped at what remains and the deadline is checked before each attempt.
 #[test]
@@ -547,7 +680,7 @@ fn no_deletion_after_the_record_budget() {
     let faults = Arc::new(Faults::default());
     *faults.record_retry.lock().unwrap() = Some(Duration::from_millis(300));
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         faults.clone(),
     );
@@ -564,4 +697,112 @@ fn no_deletion_after_the_record_budget() {
         "{}",
         log.text()
     );
+}
+
+/// A record file of `instance` in `dir`, serving; returns its bytes.
+fn serving_record(dir: &std::path::Path, instance: &str) -> Vec<u8> {
+    use super::super::files::{DiscoveryRecord, Evidence, RecordState};
+    let bytes = DiscoveryRecord {
+        version: 1,
+        instance: instance.to_owned(),
+        pid: std::process::id(),
+        start_time: "1".to_owned(),
+        state: RecordState::Serving,
+        port: Some(7373),
+        url: Some("http://127.0.0.1:7373".to_owned()),
+        started_at: "2026-11-23T00:00:00.000Z".to_owned(),
+        detached: None,
+        evidence: Evidence::default(),
+    }
+    .to_bytes();
+    std::fs::write(dir.join(names::RECORD), &bytes).unwrap();
+    bytes
+}
+
+/// The `stopping` rewrite's thread starting at or after its cutoff does nothing: it does not
+/// read the record, creates no temporary file, and leaves `daemon.json` as it was.
+#[test]
+fn stopping_worker_started_late_does_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let before = serving_record(d.path(), "i");
+    let read = std::sync::atomic::AtomicBool::new(false);
+    let seen = Mutex::new(Vec::new());
+    let hook = |_: &str, stage| {
+        seen.lock().unwrap().push(stage);
+        Ok(())
+    };
+    let r = super::super::shutdown::mark_stopping(
+        d.path(),
+        "i",
+        Instant::now(),
+        &|| read.store(true, std::sync::atomic::Ordering::SeqCst),
+        &hook,
+    );
+    assert!(r.is_err());
+    assert!(
+        !read.load(std::sync::atomic::Ordering::SeqCst),
+        "read past the cutoff"
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "{:?}",
+        seen.lock().unwrap()
+    );
+    assert_eq!(std::fs::read(d.path().join(names::RECORD)).unwrap(), before);
+}
+
+/// The `stopping` rewrite's thread paused after its read until its cutoff creates no
+/// temporary file and leaves `daemon.json` as it was; with time left it rewrites the record.
+#[test]
+fn stopping_worker_paused_past_its_cutoff_creates_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let before = serving_record(d.path(), "i");
+    let seen = Mutex::new(Vec::new());
+    let hook = |_: &str, stage| {
+        seen.lock().unwrap().push(stage);
+        Ok(())
+    };
+    let end = Instant::now() + Duration::from_millis(200);
+    let pause = || std::thread::sleep(end.saturating_duration_since(Instant::now()));
+    let r = super::super::shutdown::mark_stopping(d.path(), "i", end, &pause, &hook);
+    assert!(r.is_err());
+    let stages = seen.lock().unwrap().clone();
+    assert!(stages.is_empty(), "{stages:?}");
+    let temps: Vec<_> = std::fs::read_dir(d.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n.to_string_lossy().contains(".tmp-"))
+        .collect();
+    assert!(temps.is_empty(), "{temps:?}");
+    assert_eq!(std::fs::read(d.path().join(names::RECORD)).unwrap(), before);
+    let soon = Instant::now() + WAIT;
+    super::super::shutdown::mark_stopping(d.path(), "i", soon, &|| {}, &hook).unwrap();
+    assert!(matches!(
+        super::super::files::read_record(d.path()),
+        Ok(Some(r)) if r.state == super::super::files::RecordState::Stopping
+    ));
+}
+
+/// The `stopping` rewrite's failing rename is retried only before the rewrite's cutoff, never
+/// for a fresh retry window.
+#[test]
+fn stopping_rename_is_not_retried_past_its_cutoff() {
+    use super::super::files::ReplaceStage;
+    let d = tempfile::tempdir().unwrap();
+    let before = serving_record(d.path(), "i");
+    let renames = Mutex::new(Vec::new());
+    let hook = |_: &str, stage| {
+        if stage == ReplaceStage::Rename {
+            renames.lock().unwrap().push(Instant::now());
+            return Err(std::io::Error::other("injected"));
+        }
+        Ok(())
+    };
+    let end = Instant::now() + Duration::from_millis(150);
+    let r = super::super::shutdown::mark_stopping(d.path(), "i", end, &|| {}, &hook);
+    assert!(r.is_err());
+    let renames = renames.into_inner().unwrap();
+    assert!(!renames.is_empty());
+    assert!(renames.iter().all(|&t| t < end), "{renames:?} {end:?}");
+    assert_eq!(std::fs::read(d.path().join(names::RECORD)).unwrap(), before);
 }

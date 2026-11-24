@@ -36,9 +36,10 @@ use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHan
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, GetProcessTimes,
-    InitializeProcThreadAttributeList, OpenProcess, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    InitializeProcThreadAttributeList, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use crate::backend::PtySize;
@@ -339,6 +340,15 @@ impl<'a> AttrList<'a> {
             size_of::<HANDLE>(),
         )
     }
+
+    /// The only handles the child inherits (each must be inheritable, none repeated).
+    fn set_handle_list(&mut self, handles: &'a [HANDLE]) -> io::Result<()> {
+        self.update(
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            handles.as_ptr().cast(),
+            size_of_val(handles),
+        )
+    }
 }
 
 impl Drop for AttrList<'_> {
@@ -434,6 +444,86 @@ pub(crate) fn create_process(
         thread,
         pid: pi.dwProcessId,
     })
+}
+
+/// Sets or clears `HANDLE_FLAG_INHERIT` on a handle.
+fn set_inherit(h: HANDLE, inherit: bool) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    let value = if inherit { HANDLE_FLAG_INHERIT } else { 0 };
+    // SAFETY: the caller passes a handle it borrows for the call.
+    if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, value) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `CreateProcessW(app, cmdline, NULL, NULL, TRUE, flags | EXTENDED_STARTUPINFO_PRESENT, NULL,
+/// cwd, &si, &pi)` of a detached child (docs/design/daemon-lifecycle.md §2.10): this
+/// process's environment, the standard handles `stdio` (input, output, error), and
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` naming exactly those, so nothing else this process
+/// holds is inherited. The handles are made inheritable for the call (under the spawn lock,
+/// which every spawn of this process takes) and not inheritable again after it.
+pub(crate) fn create_detached(
+    _held: &SpawnGuard,
+    app: &[u16],
+    cmdline: &mut [u16],
+    cwd: &[u16],
+    flags: u32,
+    stdio: [BorrowedHandle<'_>; 3],
+) -> io::Result<Created> {
+    debug_assert!(app.ends_with(&[0]) && cmdline.ends_with(&[0]) && cwd.ends_with(&[0]));
+    let [input, output, error] = stdio.map(|h| raw(&h));
+    let mut list: Vec<HANDLE> = Vec::with_capacity(3);
+    for h in [input, output, error] {
+        if !list.contains(&h) {
+            list.push(h);
+        }
+    }
+    for h in &list {
+        set_inherit(*h, true)?;
+    }
+    let created = (|| {
+        let mut attrs = AttrList::new(1)?;
+        attrs.set_handle_list(&list)?;
+        let mut si = STARTUPINFOEXW::default();
+        si.StartupInfo.cb = len_u32(size_of::<STARTUPINFOEXW>());
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = input;
+        si.StartupInfo.hStdOutput = output;
+        si.StartupInfo.hStdError = error;
+        si.lpAttributeList = attrs.ptr();
+        let mut pi = PROCESS_INFORMATION::default();
+        // SAFETY: every string is NUL-terminated and borrowed for the call; `cmdline` is a
+        // mutable buffer of this call; `si` is zeroed with `cb` set and points to an
+        // initialised attribute list whose handle list outlives the call; the environment is
+        // NULL (inherited); `pi` is a local.
+        let ok = unsafe {
+            CreateProcessW(
+                app.as_ptr(),
+                cmdline.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                flags | EXTENDED_STARTUPINFO_PRESENT,
+                std::ptr::null(),
+                cwd.as_ptr(),
+                &raw const si.StartupInfo,
+                &raw mut pi,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Created {
+            process: owned(pi.hProcess)?,
+            thread: owned(pi.hThread)?,
+            pid: pi.dwProcessId,
+        })
+    })();
+    for h in &list {
+        let _ = set_inherit(*h, false);
+    }
+    created
 }
 
 /// `ResumeThread`: the previous suspend count; `u32::MAX` is mapped to the last error.
@@ -633,14 +723,9 @@ pub(crate) fn duplicate_with_access(h: &OwnedHandle, access: u32) -> io::Result<
 }
 
 /// Makes a handle inheritable (CL-21).
-#[cfg(test)]
+#[cfg(any(test, feature = "fake"))]
 pub(crate) fn make_inheritable(h: &impl AsRawHandle) -> io::Result<()> {
-    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
-    // SAFETY: the handle is borrowed and valid.
-    if unsafe { SetHandleInformation(raw(h), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    set_inherit(raw(h), true)
 }
 
 /// Whether a pipe's write end is still open anywhere (CL-21): `PeekNamedPipe` on the read
@@ -1127,4 +1212,154 @@ pub(crate) fn console_processes() -> io::Result<Vec<u32>> {
     }
     pids.truncate(usize::try_from(n).unwrap_or(0).min(64));
     Ok(pids)
+}
+
+// ---- Parent job, console, standard handles, browser (`host`, daemon-lifecycle §2.10–§2.13) ----
+
+/// Whether `process` is in any job (`IsProcessInJob(process, NULL)`).
+pub(crate) fn in_any_job(process: HANDLE) -> io::Result<bool> {
+    let mut result = 0;
+    // SAFETY: `process` is a valid handle (or the current-process pseudo-handle) for the call;
+    // a null job handle asks about any job; `result` is a local.
+    if unsafe { IsProcessInJob(process, std::ptr::null_mut(), &raw mut result) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(result != 0)
+}
+
+/// Whether this process is in any job.
+#[cfg(test)]
+pub(crate) fn in_any_job_now() -> io::Result<bool> {
+    in_any_job(current_process())
+}
+
+/// Whether `process` (an open handle) is in any job.
+#[cfg(feature = "fake")]
+pub(crate) fn handle_in_any_job(process: &OwnedHandle) -> io::Result<bool> {
+    in_any_job(raw(process))
+}
+
+/// This process's job state: `None` in no job, else the immediate job's `LimitFlags`
+/// (`QueryInformationJobObject(NULL, JobObjectExtendedLimitInformation)`, L13).
+pub(crate) fn own_job_flags() -> io::Result<Option<u32>> {
+    if !in_any_job(current_process())? {
+        return Ok(None);
+    }
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    // SAFETY: a null job handle queries the immediate job of the calling process; `info` is a
+    // zeroed struct of integers whose size is passed.
+    let ok = unsafe {
+        QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            (&raw mut info).cast(),
+            len_u32(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Some(info.BasicLimitInformation.LimitFlags))
+}
+
+/// `GetConsoleWindow() != NULL`.
+pub(crate) fn has_console_window() -> bool {
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
+    // SAFETY: no arguments.
+    !unsafe { GetConsoleWindow() }.is_null()
+}
+
+/// Takes ownership of this process's standard output handle and sets the process's standard
+/// output to NULL, so std's `Stdout` writes nowhere and nothing else closes the handle.
+pub(crate) fn take_std_output() -> io::Result<OwnedHandle> {
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE, SetStdHandle};
+    // SAFETY: plain call.
+    let h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if h.is_null() || h == INVALID_HANDLE_VALUE {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "this process has no standard output handle",
+        ));
+    }
+    // SAFETY: plain call; NULL is accepted as the new standard handle.
+    if unsafe { SetStdHandle(STD_OUTPUT_HANDLE, std::ptr::null_mut()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `h` was this process's standard output handle; once replaced by NULL no other
+    // code of this process reaches it through `GetStdHandle`, so it is wrapped exactly once.
+    Ok(unsafe { OwnedHandle::from_raw_handle(h) })
+}
+
+/// Resumes every thread of the process `pid` (a process created suspended by a caller that
+/// holds no thread handle): one `TH32CS_SNAPTHREAD` snapshot, `OpenThread` with
+/// `THREAD_SUSPEND_RESUME`, and `ResumeThread` on each of its threads. The number resumed.
+#[cfg(feature = "fake")]
+pub(crate) fn resume_process_threads(pid: u32) -> io::Result<usize> {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, THREAD_SUSPEND_RESUME};
+    // SAFETY: plain call; the result is checked (INVALID_HANDLE_VALUE) before wrapping.
+    let snap = owned(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) })?;
+    let mut e = THREADENTRY32 {
+        dwSize: len_u32(size_of::<THREADENTRY32>()),
+        ..THREADENTRY32::default()
+    };
+    let mut resumed = 0;
+    // SAFETY: the snapshot handle is borrowed and valid; `e` is a local with `dwSize` set.
+    let mut ok = unsafe { Thread32First(raw(&snap), &raw mut e) };
+    while ok != 0 {
+        if e.th32OwnerProcessID == pid {
+            // SAFETY: plain call; the result is checked before wrapping.
+            let t = owned(unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, e.th32ThreadID) })?;
+            resume(&t)?;
+            resumed += 1;
+        }
+        // SAFETY: as for `Thread32First`.
+        ok = unsafe { Thread32Next(raw(&snap), &raw mut e) };
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(ERROR_NO_MORE_FILES) {
+        Ok(resumed)
+    } else {
+        Err(err)
+    }
+}
+
+/// `ShellExecuteExW` with the `open` verb on `url`, `SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI`
+/// (L21), after `CoInitializeEx` as the shell requires.
+pub(crate) fn shell_open(url: &str) -> io::Result<()> {
+    use windows_sys::Win32::System::Com::{
+        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
+    /// `SW_SHOWNORMAL` (`winuser.h`).
+    const SW_SHOWNORMAL: i32 = 1;
+    // SAFETY: reserved pointer null; a failure (already initialized another way) is fine for
+    // the shell call below.
+    let _ = unsafe {
+        CoInitializeEx(
+            std::ptr::null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).cast_unsigned(),
+        )
+    };
+    let verb = wide_str("open");
+    let file = wide_str(url);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: len_u32(size_of::<SHELLEXECUTEINFOW>()),
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: verb.as_ptr(),
+        lpFile: file.as_ptr(),
+        nShow: SW_SHOWNORMAL,
+        ..SHELLEXECUTEINFOW::default()
+    };
+    // SAFETY: `info` is fully initialized with its size; `verb` and `file` are NUL-terminated
+    // and outlive the call.
+    if unsafe { ShellExecuteExW(&raw mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }

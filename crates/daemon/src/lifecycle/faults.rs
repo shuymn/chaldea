@@ -19,6 +19,57 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Listeners the tests bound to `127.0.0.1:0` and keep for the process's lifetime. Step 10
+/// takes a clone of the one on its port instead of binding, so a test's port is never
+/// released for another process to take between the test's choice and the daemon's bind.
+static HELD: Mutex<Vec<std::net::TcpListener>> = Mutex::new(Vec::new());
+
+/// A port of this process's own: bound to `127.0.0.1:0` and never released.
+pub(crate) fn hold_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    lock(&HELD).push(l);
+    port
+}
+
+/// Held for its whole run by every test that binds a port of [`super::PORT_RANGE`] (the range
+/// scan, or a saved port the scan chose), so no other test of this process binds a range port
+/// while that test's port is free between its starts.
+static RANGE: Mutex<()> = Mutex::new(());
+/// Whether a test holds [`RANGE`]; step 10 refuses a range port without it.
+static RANGE_HELD: AtomicBool = AtomicBool::new(false);
+
+/// A test's hold on the port range, released on drop.
+pub(crate) struct RangeHold {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Waits for and takes the port range for the calling test.
+pub(crate) fn hold_range() -> RangeHold {
+    let g = lock(&RANGE);
+    RANGE_HELD.store(true, Ordering::SeqCst);
+    RangeHold { _guard: g }
+}
+
+impl Drop for RangeHold {
+    fn drop(&mut self) {
+        RANGE_HELD.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Whether a test holds the port range.
+pub(crate) fn range_held() -> bool {
+    RANGE_HELD.load(Ordering::SeqCst)
+}
+
+/// A clone of the held listener on `port`, if a test holds one.
+pub(crate) fn held_listener(port: u16) -> Option<io::Result<std::net::TcpListener>> {
+    lock(&HELD)
+        .iter()
+        .find(|l| l.local_addr().is_ok_and(|a| a.port() == port))
+        .map(std::net::TcpListener::try_clone)
+}
+
 /// A gate a step waits at until the test releases it.
 #[derive(Default)]
 pub(crate) struct Park {
@@ -94,6 +145,10 @@ pub(crate) enum Point {
     Inside(u8),
     /// After the `port` rename of step 13.
     AfterPortRename,
+    /// The coordinator, before step 2's console-end check and the `stopping` rewrite.
+    BeforeStopping,
+    /// The `stopping` rewrite's blocking thread (blocking), before it reads the record.
+    InsideStopping,
     /// The coordinator, after HTTP's shutdown returned and before the participants.
     AfterHttp,
     /// The coordinator, right before it submits `Store::shutdown`.
@@ -137,6 +192,9 @@ pub(crate) struct Faults {
     pub(crate) log_cap: Mutex<Option<u64>>,
     /// The store is opened with these fault points.
     pub(crate) store_faults: Mutex<Option<Arc<test_faults::Faults>>>,
+    /// Step 2 reads this job state instead of the process's (an isolated run reads
+    /// `JobState::NONE` when unset).
+    pub(crate) job_state: Mutex<Option<chaldea_pty_runtime::host::JobState>>,
     // Published by the run.
     pub(crate) gate: OnceLock<Arc<ShutdownGate>>,
     pub(crate) store: OnceLock<Store>,

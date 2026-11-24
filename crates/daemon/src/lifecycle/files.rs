@@ -121,16 +121,19 @@ pub fn probe(dir: &Path) -> io::Result<LockProbe> {
 
 // ---- Discovery (design §2.6) ----
 
-/// The daemon's published state.
+/// The daemon's published state (design §2.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordState {
     Starting,
     Serving,
+    /// The shutdown began; written before HTTP shuts down, so it never serves again.
+    Stopping,
 }
 
-/// What the doctor reads about how the daemon was started (Windows job evidence arrives with
-/// the detach path).
+/// What the doctor reads about how the daemon was started: step 2's job state (`in_job` and
+/// the immediate job's limits; recorded on Windows, `null` elsewhere) and whether it has a
+/// console window (`null` off Windows).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Evidence {
     pub job: Option<serde_json::Value>,
@@ -201,27 +204,53 @@ pub enum Discovery {
     Unknown,
     Starting(DiscoveryRecord),
     Serving(DiscoveryRecord),
+    Stopping(DiscoveryRecord),
 }
 
 /// Applies the liveness rule: a record is used only when the lock is held, the record parses
-/// (read without following links), and its `(pid, start_time)` is a live process. Never
-/// removes anything.
+/// (read without following links), its `(pid, start_time)` is a live process, the lock is
+/// still held after the record was read, so a record its daemon removed before releasing the
+/// lock is never returned once the lock is free, and the record read again after that check is
+/// unchanged, so a state the daemon published during the check (`stopping`) is never answered
+/// with the one before it. Never removes anything.
 #[must_use]
 pub fn discover(dir: &Path) -> Discovery {
-    match probe(dir) {
-        Ok(LockProbe::Held) => {}
-        Ok(LockProbe::Free | LockProbe::Missing) => return Discovery::NotRunning,
-        Err(_) => return Discovery::Unknown,
+    discover_paused(dir, || {})
+}
+
+/// [`discover`] with `read` run after the record and its identity were read, before the lock
+/// is checked again (a test's pause).
+pub(crate) fn discover_paused(dir: &Path, read: impl FnOnce()) -> Discovery {
+    let held = || match probe(dir) {
+        Ok(LockProbe::Held) => Some(true),
+        Ok(LockProbe::Free | LockProbe::Missing) => Some(false),
+        Err(_) => None,
+    };
+    match held() {
+        Some(true) => {}
+        Some(false) => return Discovery::NotRunning,
+        None => return Discovery::Unknown,
     }
     let Ok(Some(r)) = read_record(dir) else {
         return Discovery::Unknown;
     };
-    match host::process_identity(r.pid) {
-        Ok(Some(id)) if id.start_time == r.start_time => match r.state {
-            RecordState::Starting => Discovery::Starting(r),
-            RecordState::Serving => Discovery::Serving(r),
-        },
-        _ => Discovery::Unknown,
+    let alive = matches!(
+        host::process_identity(r.pid),
+        Ok(Some(id)) if id.start_time == r.start_time
+    );
+    read();
+    match held() {
+        Some(true) => {}
+        Some(false) => return Discovery::NotRunning,
+        None => return Discovery::Unknown,
+    }
+    if !alive || !matches!(read_record(dir), Ok(Some(again)) if again == r) {
+        return Discovery::Unknown;
+    }
+    match r.state {
+        RecordState::Starting => Discovery::Starting(r),
+        RecordState::Serving => Discovery::Serving(r),
+        RecordState::Stopping => Discovery::Stopping(r),
     }
 }
 
@@ -273,11 +302,15 @@ pub(crate) struct Replaced {
 
 /// Replaces `dir/name` with `bytes`: only an absent entry or a regular file, through a
 /// temporary `.<name>.tmp-<instance>` created owner-only and a rename, which is the commit.
+/// With `rename_until`, no rename is attempted at or after it, and a failed one is retried
+/// every 50 ms until it; without, a failed rename is retried every 50 ms for 500 ms from the
+/// first attempt.
 pub(crate) fn write_replace(
     dir: &Path,
     name: &str,
     bytes: &[u8],
     instance: &str,
+    rename_until: Option<Instant>,
     hook: ReplaceHook<'_>,
 ) -> Result<Replaced, ReplaceError> {
     let target = dir.join(name);
@@ -306,8 +339,15 @@ pub(crate) fn write_replace(
         }
         return Err(ReplaceError::Io(e));
     }
-    let end = Instant::now() + RENAME_RETRY_FOR;
+    let end = rename_until.unwrap_or_else(|| Instant::now() + RENAME_RETRY_FOR);
     loop {
+        if rename_until.is_some_and(|until| Instant::now() >= until) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(ReplaceError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "its cutoff passed before the rename",
+            )));
+        }
         let renamed =
             hook(name, ReplaceStage::Rename).and_then(|()| std::fs::rename(&tmp, &target));
         match renamed {
@@ -404,4 +444,34 @@ pub(crate) fn check_token_file(dir: &Path) -> Result<TokenFile, TokenFileError> 
     token_file_form(&bytes)
         .map(TokenFile::Present)
         .ok_or(TokenFileError::BadForm)
+}
+
+/// The owner token for a client (design §2.13 `chaldea open`, §2.14): the same checks as the
+/// daemon's step 6 (private, regular, not a link, of the token form), the secret without its
+/// newline.
+///
+/// # Errors
+///
+/// What is wrong with the file, as a message without the token.
+pub fn read_owner_token(dir: &Path) -> Result<String, String> {
+    match check_token_file(dir) {
+        Ok(TokenFile::Present(t)) => Ok(t),
+        Ok(TokenFile::Absent) => Err(format!(
+            "{} is missing; start the daemon to issue it",
+            dir.join(names::OWNER_TOKEN).display()
+        )),
+        Err(TokenFileError::NotPrivate(p)) => Err(format!(
+            "{} is not private ({}); its token may be exposed",
+            dir.join(names::OWNER_TOKEN).display(),
+            p.describe()
+        )),
+        Err(TokenFileError::BadForm) => Err(format!(
+            "{} is not a Chaldea token file",
+            dir.join(names::OWNER_TOKEN).display()
+        )),
+        Err(TokenFileError::Io(e)) => Err(format!(
+            "{} cannot be read: {e}",
+            dir.join(names::OWNER_TOKEN).display()
+        )),
+    }
 }

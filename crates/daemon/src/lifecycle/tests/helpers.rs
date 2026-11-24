@@ -18,8 +18,8 @@ use super::super::files::{LockProbe, probe};
 use super::super::gate::{ConsoleEvent, ShutdownGate, SignalName, StopCause};
 use super::super::{DaemonConfig, ShutdownParticipant, names, prepare_process, run_process_with};
 use super::{
-    Helper, RecordingReady, TestComponents, WAIT, detached, field, foreground, free_port,
-    helper_dir, helper_exit, in_helper, report, request, state, token_of, wait_for,
+    Helper, RecordingReady, TestComponents, WAIT, detached, field, foreground, helper_dir,
+    helper_exit, hold_port, in_helper, report, request, state, token_of, wait_for,
 };
 use crate::http::{ApiError, Mount, Mounts, WriteCtx, spec};
 use crate::store::test_faults::{CommitFault, Faults as StoreFaults};
@@ -122,7 +122,7 @@ fn helper(
 }
 
 fn fg() -> DaemonConfig {
-    foreground(&helper_dir(), Some(free_port()))
+    foreground(&helper_dir(), Some(hold_port()))
 }
 
 /// The parent: starts the helper on a fresh state directory.
@@ -296,6 +296,16 @@ fn aborted_http_task_keeps_the_lock() {
     assert!(h.stderr().contains("1 abort requested"), "{}", h.stderr());
 }
 
+/// Fault points for a detached run that is not about job membership: step 2 reads "in no job",
+/// so the run's job (`cargo test` puts its tests in one on Windows) cannot refuse it. The job
+/// check itself is covered by `daemon_windows::child_rejects_any_job` and CL-12's refusal
+/// cases.
+fn not_in_a_job() -> Arc<Faults> {
+    let faults = Arc::new(Faults::default());
+    *faults.job_state.lock().unwrap() = Some(chaldea_pty_runtime::host::JobState::NONE);
+    faults
+}
+
 /// A detached daemon whose log thread does not acknowledge leaving `daemon.log` keeps the
 /// lock.
 #[test]
@@ -303,11 +313,11 @@ fn unacknowledged_log_switch_keeps_the_lock() {
     if in_helper() {
         let dir = helper_dir();
         let ready = RecordingReady::new(&dir);
-        let cfg = detached(&dir, Some(free_port()), &ready);
+        let cfg = detached(&dir, Some(hold_port()), &ready);
         helper(
             cfg,
             TestComponents::default(),
-            Arc::default(),
+            not_in_a_job(),
             Duration::from_secs(2),
             move |c| {
                 c.serving();
@@ -482,7 +492,7 @@ fn console_end_recovers_on_restart() {
         "the record was removed"
     );
     let run = super::start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -639,8 +649,8 @@ fn stop_inside_step() {
         let step: u8 = std::env::var(STEP_ENV).unwrap().parse().unwrap();
         let dir = helper_dir();
         let ready = RecordingReady::new(&dir);
-        let port = free_port();
-        let faults = Arc::new(Faults::default());
+        let port = hold_port();
+        let faults = not_in_a_job();
         let park = faults.park(Point::Inside(step));
         let cfg = detached(&dir, Some(port), &ready);
         helper(
@@ -652,7 +662,7 @@ fn stop_inside_step() {
                 assert!(park.wait_reached(WAIT));
                 c.stop();
                 let second = super::start(
-                    foreground(&c.dir, Some(free_port())),
+                    foreground(&c.dir, Some(hold_port())),
                     TestComponents::default(),
                     Arc::default(),
                 )
@@ -713,9 +723,9 @@ fn unjoined_startup_is_a_bare_exit() {
     if in_helper() {
         let dir = helper_dir();
         let ready = RecordingReady::new(&dir);
-        let faults = Arc::new(Faults::default());
+        let faults = not_in_a_job();
         let park = faults.park(Point::Inside(8));
-        let cfg = detached(&dir, Some(free_port()), &ready);
+        let cfg = detached(&dir, Some(hold_port()), &ready);
         let main_ready = ready.clone();
         prepare_process();
         let ctl = Ctl {
@@ -901,10 +911,10 @@ fn step6_unacknowledged_log_switch_keeps_the_lock() {
     if in_helper() {
         let dir = helper_dir();
         let ready = RecordingReady::new(&dir);
-        let faults = Arc::new(Faults::default());
+        let faults = not_in_a_job();
         faults.withhold_log_ack.store(true, Ordering::SeqCst);
         helper(
-            detached(&dir, Some(free_port()), &ready),
+            detached(&dir, Some(hold_port()), &ready),
             TestComponents::default(),
             faults,
             Duration::from_secs(2),
@@ -959,6 +969,43 @@ fn console_end_after_http_starts_no_participant() {
     held_then_free(&mut h, &dir.path);
 }
 
+/// PR8-CL-10: a console end that arrives before step 2's `stopping` rewrite starts no
+/// rewrite: the record still says `serving`.
+#[test]
+fn console_end_before_the_stopping_rewrite() {
+    if in_helper() {
+        let faults = Arc::new(Faults::default());
+        let park = faults.park(Point::BeforeStopping);
+        helper(
+            fg(),
+            TestComponents::default(),
+            faults,
+            Duration::from_secs(2),
+            move |c| {
+                c.serving();
+                c.stop();
+                assert!(park.wait_reached(WAIT));
+                c.crash();
+                park.release();
+                assert!(returned());
+                let record = std::fs::read_to_string(c.dir.join(names::RECORD)).unwrap();
+                report(&format!(
+                    "checks started={} serving={}",
+                    c.faults.marks().iter().any(|m| m.0 == "stopping"),
+                    record.contains("\"serving\"")
+                ));
+            },
+        );
+    }
+    let (mut h, dir) = parent("console_end_before_the_stopping_rewrite", &[]);
+    let c = h.expect("checks", WAIT);
+    assert_eq!(field(&c, "started"), "false", "{c}");
+    assert_eq!(field(&c, "serving"), "true", "{c}");
+    let r = h.expect("returned", WAIT);
+    assert_eq!(field(&r, "reason"), "console_end", "{r}");
+    held_then_free(&mut h, &dir.path);
+}
+
 /// PR8-CL-10: with no participants, a console end that arrives before the store's shutdown
 /// is submitted keeps it from being submitted.
 #[test]
@@ -1004,10 +1051,10 @@ fn console_end_during_the_log_switch_keeps_the_lock() {
     if in_helper() {
         let dir = helper_dir();
         let ready = RecordingReady::new(&dir);
-        let faults = Arc::new(Faults::default());
+        let faults = not_in_a_job();
         let park = faults.park(Point::AfterLogSwitch);
         helper(
-            detached(&dir, Some(free_port()), &ready),
+            detached(&dir, Some(hold_port()), &ready),
             TestComponents::default(),
             faults,
             Duration::from_secs(2),
@@ -1298,9 +1345,9 @@ fn panic_at_step_11() {
         };
         prepare_process();
         let r = run_process_with(
-            detached(&dir, Some(free_port()), &ready),
+            detached(&dir, Some(hold_port()), &ready),
             Box::new(comps),
-            Arc::default(),
+            not_in_a_job(),
         );
         report(&format!(
             "checks verdicts={} record={}",
@@ -1417,10 +1464,10 @@ fn console_end_before_the_log_switch() {
     if in_helper() {
         let dir = helper_dir();
         let ready = RecordingReady::new(&dir);
-        let faults = Arc::new(Faults::default());
+        let faults = not_in_a_job();
         let park = faults.park(Point::BeforeLogSwitch);
         helper(
-            detached(&dir, Some(free_port()), &ready),
+            detached(&dir, Some(hold_port()), &ready),
             TestComponents::default(),
             faults,
             Duration::from_secs(2),

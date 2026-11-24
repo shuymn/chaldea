@@ -1059,3 +1059,106 @@ pub fn event_sids(name: &str) -> io::Result<(String, Vec<String>)> {
 pub fn user_sid() -> io::Result<String> {
     crate::windows::sys::user_sid()
 }
+
+/// A job object a test owns (Windows, PR8-CL-11, CL-12): limits set at creation, processes
+/// assigned by pid. Closing it (or dropping it) closes the test's only handle, so a
+/// kill-on-close job then kills what is still in it. A process assigned to two jobs in turn
+/// is in the second nested under the first.
+#[cfg(windows)]
+pub struct TestJob {
+    job: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+impl TestJob {
+    /// A new job with these limits.
+    ///
+    /// # Errors
+    ///
+    /// The job cannot be created or limited.
+    pub fn new(limits: crate::host::JobLimits) -> io::Result<TestJob> {
+        use windows_sys::Win32::System::JobObjects::{
+            JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+        };
+        let job = crate::windows::sys::create_job()?;
+        let mut flags = 0;
+        if limits.kill_on_close {
+            flags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        }
+        if limits.breakaway_ok {
+            flags |= JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        }
+        if limits.silent_breakaway_ok {
+            flags |= JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+        }
+        crate::windows::sys::set_job_limit(&job, flags)?;
+        Ok(TestJob { job })
+    }
+
+    /// Assigns the process `pid` to this job.
+    ///
+    /// # Errors
+    ///
+    /// The process cannot be opened or assigned.
+    pub fn assign(&self, pid: u32) -> io::Result<()> {
+        use windows_sys::Win32::System::Threading::{PROCESS_SET_QUOTA, PROCESS_TERMINATE};
+        let p = crate::windows::sys::open_process(pid, PROCESS_SET_QUOTA | PROCESS_TERMINATE)?;
+        crate::windows::sys::assign(&self.job, &p)
+    }
+
+    /// Whether the process `pid` is in this job.
+    ///
+    /// # Errors
+    ///
+    /// The process cannot be opened.
+    pub fn contains(&self, pid: u32) -> io::Result<bool> {
+        let p = crate::windows::sys::open_process(pid, crate::windows::QUERY_SYNC)?;
+        crate::windows::sys::in_job(&p, &self.job)
+    }
+
+    /// Closes the test's handle to the job.
+    pub fn close(self) {
+        drop(self.job);
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for TestJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestJob")
+    }
+}
+
+/// Whether the process `pid` is in any job (`IsProcessInJob(process, NULL)`, Windows).
+///
+/// # Errors
+///
+/// The process cannot be opened.
+#[cfg(windows)]
+pub fn process_in_any_job(pid: u32) -> io::Result<bool> {
+    let p = crate::windows::sys::open_process(pid, crate::windows::QUERY_SYNC)?;
+    crate::windows::sys::handle_in_any_job(&p)
+}
+
+/// Resumes every thread of the process `pid`, one created with `CREATE_SUSPENDED` by a caller
+/// holding no thread handle (std's spawn); the number resumed (Windows).
+///
+/// # Errors
+///
+/// The thread snapshot, an open, or a resume failed.
+#[cfg(windows)]
+pub fn resume_process(pid: u32) -> io::Result<usize> {
+    crate::windows::sys::resume_process_threads(pid)
+}
+
+/// Sets `HANDLE_FLAG_INHERIT` on `h`, so a child created with handle inheritance and no handle
+/// list (std's spawn) inherits it (Windows).
+///
+/// # Errors
+///
+/// `SetHandleInformation` failed.
+#[cfg(windows)]
+pub fn make_inheritable(h: &impl std::os::windows::io::AsRawHandle) -> io::Result<()> {
+    crate::windows::sys::make_inheritable(h)
+}

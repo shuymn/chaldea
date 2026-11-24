@@ -20,15 +20,35 @@ use std::time::{Duration, Instant};
 use chaldea_daemon::lifecycle::{
     Discovery, DiscoveryRecord, LockProbe, STATE_DIR_ENV, discover, names, probe, spawn_locked,
 };
-use tempfile::TempDir;
 
+pub mod faults;
 #[path = "../../../daemon/tests/support/lifecycle.rs"]
 mod lifecycle;
+pub mod runner;
 #[allow(unused_imports, reason = "each test file uses part of these helpers")]
-pub use lifecycle::{free_port, kill_and_reap, open_store, token_of};
+pub use lifecycle::{kill_and_reap, open_store, token_of};
 
 /// Every bounded wait of these tests.
 pub const WAIT: Duration = Duration::from_secs(30);
+
+/// How long a wait for an exit then waits for the output collectors.
+const DRAIN: Duration = Duration::from_secs(10);
+
+thread_local! {
+    /// The watchdogs this test's thread has spent (gates, G1 in [`faults`]).
+    static SPENT: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+/// Adds a test-side wait's watchdog to its thread's total (G1 in [`faults`]).
+pub fn spend(watchdog: Duration) {
+    SPENT.with(|s| s.set(s.get() + watchdog));
+}
+
+/// The watchdogs this thread has spent.
+#[must_use]
+pub fn spent() -> Duration {
+    SPENT.with(std::cell::Cell::get)
+}
 
 /// Waits for a write's reply for at most [`WAIT`] (the writer may be parked by a fault) and
 /// returns the job's value.
@@ -45,28 +65,53 @@ const POLL: Duration = Duration::from_millis(20);
 
 /// A fresh state directory path (absent) under a private temp directory.
 pub struct Dir {
-    pub tmp: TempDir,
+    pub tmp: TempParent,
     pub path: PathBuf,
 }
 
-/// The parent of every test directory: the OS temp directory on macOS; on Windows
-/// `FOLDERID_LocalAppData` (not `%TEMP%`, which can be redirected), asserted private.
-#[must_use]
-pub fn temp_parent() -> TempDir {
-    #[cfg(windows)]
-    {
-        use chaldea_pty_runtime::host::{self, EntryKind, Privacy};
-        let tmp = tempfile::tempdir_in(host::default_state_base().unwrap()).unwrap();
-        assert_eq!(
-            host::privacy(tmp.path(), EntryKind::Directory).unwrap(),
-            Privacy::Private,
-            "{}",
-            tmp.path().display()
-        );
-        tmp
+/// A test's private directory, removed with its contents when dropped.
+pub struct TempParent(PathBuf);
+
+impl TempParent {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.0
     }
+}
+
+impl Drop for TempParent {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Set by the Windows WMI lane (`scripts/windows-tests.ps1`): the run's own directory, under
+/// which every test directory of the run is created, so its cleanup finds them all there.
+pub const TEST_ROOT_ENV: &str = "CHALDEA_TEST_ROOT";
+
+/// The parent of every test directory: under [`TEST_ROOT_ENV`] when set; otherwise on macOS
+/// under the OS temp directory and on Windows under `FOLDERID_LocalAppData` (not `%TEMP%`,
+/// which can be redirected). Created with `host::create_private_dir`, as the daemon creates its
+/// state directory, so its owner is this account whatever owner the process's token gives new
+/// objects (an elevated administrator's token gives them `Administrators`); asserted private.
+#[must_use]
+pub fn temp_parent() -> TempParent {
+    use chaldea_pty_runtime::host::{self, EntryKind, Privacy};
+    #[cfg(windows)]
+    let default = || host::default_state_base().unwrap();
     #[cfg(not(windows))]
-    tempfile::tempdir().unwrap()
+    let default = std::env::temp_dir;
+    let base = std::env::var_os(TEST_ROOT_ENV).map_or_else(default, PathBuf::from);
+    let path = base.join(format!(".chaldea-test-{}", uuid::Uuid::new_v4().simple()));
+    host::create_private_dir(&path).unwrap();
+    let tmp = TempParent(path);
+    assert_eq!(
+        host::privacy(tmp.path(), EntryKind::Directory).unwrap(),
+        Privacy::Private,
+        "{}",
+        tmp.path().display()
+    );
+    tmp
 }
 
 #[must_use]
@@ -192,9 +237,16 @@ impl Proc {
     /// port.
     pub fn serving(&self) -> u16 {
         const PREFIX: &str = "listening on http://127.0.0.1:";
+        spend(WAIT);
         let end = Instant::now() + WAIT;
         loop {
+            // Checked before each receive, so lines that keep arriving cannot extend the wait.
             let left = end.saturating_duration_since(Instant::now());
+            assert!(
+                !left.is_zero(),
+                "no listening line within {WAIT:?}; stderr:\n{}",
+                self.stderr()
+            );
             match self.stderr_lines.recv_timeout(left) {
                 Ok(line) => {
                     if let Some(i) = line.find(PREFIX) {
@@ -217,11 +269,12 @@ impl Proc {
         if let Some(s) = self.status {
             return s;
         }
+        spend(within + DRAIN);
         let end = Instant::now() + within;
         loop {
             if let Some(s) = self.child.try_wait().unwrap() {
                 self.status = Some(s);
-                let drained = Instant::now() + Duration::from_secs(10);
+                let drained = Instant::now() + DRAIN;
                 while Instant::now() < drained
                     && self.collected.load(std::sync::atomic::Ordering::SeqCst) < 2
                 {
@@ -302,6 +355,7 @@ pub fn serving_record(dir: &Path) -> DiscoveryRecord {
 
 /// Polls `cond` until it holds or `WAIT` passes.
 pub fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
+    spend(WAIT);
     let end = Instant::now() + WAIT;
     while Instant::now() < end {
         if cond() {
@@ -441,14 +495,9 @@ pub fn report(line: &str) {
     let _ = out.flush();
 }
 
-/// Runs `test` of this test binary as a helper process with `env` (and `tweak` applied to the
-/// command), requires its success within `within`, and returns its first report line.
-pub fn run_helper(
-    test: &str,
-    env: &[(&str, &OsStr)],
-    within: Duration,
-    tweak: impl FnOnce(&mut Command),
-) -> String {
+/// `test` of this test binary as a helper process with `env`: stdin null, stdout and stderr
+/// piped.
+pub fn helper_cmd(test: &str, env: &[(&str, &OsStr)]) -> Command {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args([test, "--exact", "--nocapture", "--test-threads=1"])
         .stdin(Stdio::null())
@@ -457,6 +506,18 @@ pub fn run_helper(
     for (k, v) in env {
         cmd.env(k, v);
     }
+    cmd
+}
+
+/// Runs `test` of this test binary as a helper process with `env` (and `tweak` applied to the
+/// command), requires its success within `within`, and returns its first report line.
+pub fn run_helper(
+    test: &str,
+    env: &[(&str, &OsStr)],
+    within: Duration,
+    tweak: impl FnOnce(&mut Command),
+) -> String {
+    let mut cmd = helper_cmd(test, env);
     tweak(&mut cmd);
     let mut p = Proc::spawn(&mut cmd);
     let code = p.wait_within(within).code().expect("exited by a signal");

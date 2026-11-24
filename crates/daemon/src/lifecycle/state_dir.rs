@@ -164,6 +164,12 @@ pub(crate) fn without_trailing_separators(path: &Path) -> PathBuf {
 
 /// Empty, ignoring unfinished marker temporaries (regular files only).
 fn is_empty(dir: &Path) -> io::Result<bool> {
+    is_empty_with(dir, |_| {})
+}
+
+/// [`is_empty`] with `listed` run for each marker temporary between its listing and its
+/// inspection (a test's removal).
+pub(crate) fn is_empty_with(dir: &Path, mut listed: impl FnMut(&Path)) -> io::Result<bool> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if !entry
@@ -173,7 +179,13 @@ fn is_empty(dir: &Path) -> io::Result<bool> {
         {
             return Ok(false);
         }
-        let m = std::fs::symlink_metadata(entry.path())?;
+        listed(&entry.path());
+        let m = match std::fs::symlink_metadata(entry.path()) {
+            Ok(m) => m,
+            // A concurrent first start linked its temporary and removed it since the listing.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
         if is_link(&m) || !m.file_type().is_file() {
             return Ok(false);
         }
@@ -191,6 +203,17 @@ fn validate_marker(dir: &Path) -> io::Result<bool> {
     let mut buf = Vec::new();
     f.take(64).read_to_end(&mut buf)?;
     Ok(buf == MARKER_CONTENT)
+}
+
+/// A test pause between the marker's temporary and its link (`daemon_start` holds a child
+/// there while a concurrent start publishes its own marker); never set in production.
+static MARKER_PAUSE: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
+/// Sets the pause between the marker's temporary and its link, once per process (tests of the
+/// concurrent first start).
+#[doc(hidden)]
+pub fn set_marker_pause(pause: Box<dyn Fn() + Send + Sync>) {
+    let _ = MARKER_PAUSE.set(pause);
 }
 
 /// Publishes the marker without replacing anything: a private temporary, linked to
@@ -211,6 +234,9 @@ pub(crate) fn publish_marker(dir: &Path, instance: &str) -> Result<(), String> {
             let _ = std::fs::remove_file(&tmp);
         }
         return Err(format!("its marker cannot be written: {e}"));
+    }
+    if let Some(pause) = MARKER_PAUSE.get() {
+        pause();
     }
     let linked = std::fs::hard_link(&tmp, dir.join(names::MARKER));
     let _ = std::fs::remove_file(&tmp);

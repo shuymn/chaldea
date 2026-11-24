@@ -6,7 +6,7 @@ use std::path::Path;
 use chaldea_pty_runtime::host::{self, EntryKind, Privacy};
 
 use super::super::names;
-use super::super::state_dir::{MARKER_CONTENT, prepare, publish_marker};
+use super::super::state_dir::{MARKER_CONTENT, is_empty_with, prepare, publish_marker};
 
 const INSTANCE: &str = "00000000-0000-4000-8000-000000000002";
 
@@ -94,6 +94,24 @@ fn adopts_with_only_a_marker_temp() {
         std::fs::read(d.join(names::MARKER)).unwrap(),
         MARKER_CONTENT
     );
+}
+
+/// A marker temporary of a concurrent first start that is linked and removed between the
+/// listing and its inspection: the directory still counts as empty (not refused as unlistable).
+#[test]
+fn a_marker_temp_removed_after_the_listing_is_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("state");
+    host::create_private_dir(&d).unwrap();
+    std::fs::write(d.join(".CHALDEA_STATE.tmp-other"), "{").unwrap();
+    let mut removed = 0;
+    let empty = is_empty_with(&d, |p| {
+        std::fs::remove_file(p).unwrap();
+        removed += 1;
+    })
+    .unwrap();
+    assert_eq!(removed, 1);
+    assert!(empty);
 }
 
 /// Publishing over an existing marker with other content (a concurrent writer that won): the

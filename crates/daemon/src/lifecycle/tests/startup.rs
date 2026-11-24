@@ -17,7 +17,7 @@ use super::super::faults::{Faults, Point};
 use super::super::files::{LockProbe, ReplaceStage};
 use super::super::{FailReason, LockDisposition, PORT_RANGE, Reconciler, names};
 use super::{
-    RecordingReady, TestComponents, WAIT, detached, foreground, free_port, get_status, open_store,
+    RecordingReady, TestComponents, WAIT, detached, foreground, get_status, hold_port, open_store,
     request, start, state, token_of,
 };
 use crate::http::{ApiError, Mount, Mounts, WriteCtx, spec};
@@ -67,29 +67,66 @@ fn parked_reconciler(park: Arc<super::super::faults::Park>) -> Reconciler {
     }
 }
 
-/// PR8-CL-6: no listener exists while a reconciler runs; once it commits, the daemon serves.
+/// PR8-CL-6: the port is not bound while a reconciler runs; once it commits, the daemon
+/// serves.
 #[test]
 fn no_listener_during_reconciliation() {
     let dir = state();
-    let port = free_port();
+    let port = hold_port();
     let park = Arc::new(super::super::faults::Park::default());
     let comps = TestComponents {
         extra: vec![parked_reconciler(park.clone())],
         ..TestComponents::default()
     };
-    let run = start(foreground(&dir.path, Some(port)), comps, Arc::default());
+    let faults = Arc::new(Faults::default());
+    let run = start(foreground(&dir.path, Some(port)), comps, faults.clone());
     assert!(park.wait_reached(WAIT));
-    let refused = std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        Duration::from_secs(2),
-    );
-    assert!(refused.is_err(), "a listener existed during reconciliation");
+    let bound = faults.bind_attempts.load(Ordering::SeqCst) > 0 || faults.port.get().is_some();
     park.release();
+    assert!(!bound, "the port was bound during reconciliation");
     assert_eq!(run.serving(), port);
     assert_eq!(
         get_status(port, "/api/threads", Some(&token_of(&dir.path))).unwrap(),
         200
     );
+    run.stop();
+    assert_eq!(run.join().code.code(), 0);
+}
+
+/// PR8-CL-6 through the real bind: a daemon chooses its port from the range and saves it; the
+/// next start on that saved port, parked in a reconciler, refuses a connect to it; released,
+/// it serves there. The test holds the port range throughout, so no other test of this
+/// process binds the saved port while it is free between the two starts.
+#[test]
+fn saved_port_refuses_connects_during_reconciliation() {
+    let _range = super::super::faults::hold_range();
+    let dir = state();
+    let run = start(
+        foreground(&dir.path, None),
+        TestComponents::default(),
+        Arc::default(),
+    );
+    let port = run.serving();
+    assert!(PORT_RANGE.contains(&port), "{port}");
+    run.stop();
+    assert_eq!(run.join().code.code(), 0);
+    let park = Arc::new(super::super::faults::Park::default());
+    let comps = TestComponents {
+        extra: vec![parked_reconciler(park.clone())],
+        ..TestComponents::default()
+    };
+    let run = start(foreground(&dir.path, None), comps, Arc::default());
+    let reached = park.wait_reached(WAIT);
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    let connect = std::net::TcpStream::connect_timeout(&addr, WAIT).map_err(|e| e.kind());
+    park.release();
+    assert!(reached, "the reconciler did not run");
+    assert_eq!(
+        connect.err(),
+        Some(std::io::ErrorKind::ConnectionRefused),
+        "a connect during reconciliation was not refused"
+    );
+    assert_eq!(run.serving(), port);
     run.stop();
     assert_eq!(run.join().code.code(), 0);
 }
@@ -103,7 +140,7 @@ fn submit_failed_is_fatal() {
     *faults.store_faults.lock().unwrap() = Some(store_faults.clone());
     let park = faults.park(Point::Before(9));
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         faults,
     );
@@ -134,7 +171,7 @@ fn commit_unknown_stops_and_restart_reconciles() {
         mounts: Some(intent_mounts()),
         ..TestComponents::default()
     };
-    let run = start(foreground(&dir.path, Some(free_port())), comps, faults);
+    let run = start(foreground(&dir.path, Some(hold_port())), comps, faults);
     let port = run.serving();
     *store_faults.commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
     let (code, _) = request(
@@ -151,7 +188,7 @@ fn commit_unknown_stops_and_restart_reconciles() {
     assert_eq!(receipt(&dir.path), Some(ReceiptStatus::InProgress));
 
     let again = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -170,7 +207,7 @@ fn refuses_linked_database_and_sidecars() {
         let elsewhere = tempfile::tempdir().unwrap();
         // A first run creates the directory; the link is placed before the second.
         let run = start(
-            foreground(&dir.path, Some(free_port())),
+            foreground(&dir.path, Some(hold_port())),
             TestComponents::default(),
             Arc::default(),
         );
@@ -182,7 +219,7 @@ fn refuses_linked_database_and_sidecars() {
         }
         chaldea_pty_runtime::fake::make_link(&dir.path.join(f), elsewhere.path()).unwrap();
         let run = start(
-            foreground(&dir.path, Some(free_port())),
+            foreground(&dir.path, Some(hold_port())),
             TestComponents::default(),
             Arc::default(),
         );
@@ -208,7 +245,7 @@ fn refuses_linked_database_and_sidecars() {
 fn token_store_error_does_not_reissue() {
     let dir = state();
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -219,7 +256,7 @@ fn token_store_error_does_not_reissue() {
     let faults = Arc::new(Faults::default());
     faults.token_read_fails.store(true, Ordering::SeqCst);
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         faults,
     );
@@ -264,7 +301,7 @@ fn port_write_failure_before_rename() {
     let faults = Arc::new(Faults::default());
     faults.fail_replace(names::PORT, ReplaceStage::Write);
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         faults,
     );
@@ -279,7 +316,7 @@ fn port_write_failure_before_rename() {
 #[test]
 fn port_committed_after_rename() {
     let dir = state();
-    let port = free_port();
+    let port = hold_port();
     let faults = Arc::new(Faults::default());
     faults.fail_replace(names::PORT, ReplaceStage::DirSync);
     let run = start(
@@ -306,7 +343,7 @@ fn port_committed_after_rename() {
 #[test]
 fn record_failure_after_port_rename() {
     let dir = state();
-    let (a, b) = (free_port(), free_port());
+    let (a, b) = (hold_port(), hold_port());
     let run = start(
         foreground(&dir.path, Some(a)),
         TestComponents::default(),
@@ -459,7 +496,7 @@ fn failure_at_each_step() {
         let port_before = std::fs::read(dir.path.join(names::PORT)).ok();
         let ready = RecordingReady::new(&dir.path);
         let run = start(
-            detached(&dir.path, Some(free_port()), &ready),
+            detached(&dir.path, Some(hold_port()), &ready),
             comps,
             faults,
         );
@@ -521,7 +558,7 @@ fn ready_write_error_is_ignored() {
         fn close(self: Box<Self>) {}
     }
     let dir = state();
-    let port = free_port();
+    let port = hold_port();
     let cfg = super::DaemonConfig {
         state_dir: dir.path.clone(),
         port: Some(port),
@@ -552,7 +589,7 @@ fn stop_before_and_after_ready() {
     for is_detached in [false, true] {
         for before in [true, false] {
             let dir = state();
-            let port = free_port();
+            let port = hold_port();
             let ready = RecordingReady::new(&dir.path);
             let cfg = if is_detached {
                 detached(&dir.path, Some(port), &ready)
@@ -607,7 +644,7 @@ fn stop_before_the_lock() {
     let faults = Arc::new(Faults::default());
     let park = faults.park(Point::Before(4));
     let run = start(
-        detached(&dir.path, Some(free_port()), &ready),
+        detached(&dir.path, Some(hold_port()), &ready),
         TestComponents::default(),
         faults,
     );
@@ -630,7 +667,7 @@ fn stop_before_the_lock() {
 #[test]
 fn stop_after_port_rename() {
     let dir = state();
-    let (a, b) = (free_port(), free_port());
+    let (a, b) = (hold_port(), hold_port());
     let run = start(
         foreground(&dir.path, Some(a)),
         TestComponents::default(),
@@ -682,7 +719,7 @@ pub(super) fn marked(dir: &Path) {
 fn refuses_hard_linked_database_files() {
     let a = state();
     let run = start(
-        foreground(&a.path, Some(free_port())),
+        foreground(&a.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -700,7 +737,7 @@ fn refuses_hard_linked_database_files() {
             std::fs::hard_link(&source, b.path.join(name)).unwrap();
         }
         let run = start(
-            foreground(&b.path, Some(free_port())),
+            foreground(&b.path, Some(hold_port())),
             TestComponents::default(),
             Arc::default(),
         );
@@ -740,7 +777,7 @@ fn first_request_reads_the_reconciled_receipt() {
     }
     let dir = state();
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -766,7 +803,7 @@ fn first_request_reads_the_reconciled_receipt() {
         ..TestComponents::default()
     };
     let run = start(
-        foreground(&dir.path, Some(free_port())),
+        foreground(&dir.path, Some(hold_port())),
         comps,
         Arc::default(),
     );
@@ -789,7 +826,7 @@ fn first_request_reads_the_reconciled_receipt() {
 #[test]
 fn port_override_says_to_re_pair() {
     let dir = state();
-    let (a, b) = (free_port(), free_port());
+    let (a, b) = (hold_port(), hold_port());
     let run = start(
         foreground(&dir.path, Some(a)),
         TestComponents::default(),
@@ -834,4 +871,67 @@ fn port_zero_is_refused() {
     );
     assert!(log.text().contains("port 0"), "{}", log.text());
     assert!(!dir.path.join(names::PORT).exists());
+}
+
+/// The job state a kill-on-close job without breakaway reports.
+fn in_a_job() -> chaldea_pty_runtime::host::JobState {
+    chaldea_pty_runtime::host::JobState {
+        in_job: true,
+        immediate: Some(chaldea_pty_runtime::host::JobLimits {
+            kill_on_close: true,
+            breakaway_ok: false,
+            silent_breakaway_ok: false,
+        }),
+    }
+}
+
+/// PR8-CL-12 (step 2, the child decides): a detached child in any job fails with `parent_job`
+/// before the state directory, the lock, or anything else; its verdict says so.
+#[test]
+fn detached_child_in_a_job_fails_parent_job() {
+    let dir = state();
+    let ready = RecordingReady::new(&dir.path);
+    let faults = Arc::new(Faults::default());
+    *faults.job_state.lock().unwrap() = Some(in_a_job());
+    let r = start(
+        detached(&dir.path, None, &ready),
+        TestComponents::default(),
+        faults,
+    )
+    .join();
+    assert_eq!(
+        (r.code.code(), r.reason, r.lock),
+        (1, Some(FailReason::ParentJob), LockDisposition::NeverTaken)
+    );
+    assert!(!dir.path.exists(), "the state directory was created");
+    let lines = ready.lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].line.starts_with("fail parent_job "), "{lines:?}");
+    assert!(lines[0].line.contains("kill_on_close=true"), "{lines:?}");
+}
+
+/// PR8-CL-12: a foreground daemon in a job warns, records the job in `daemon.json`'s
+/// evidence, and serves.
+#[test]
+fn foreground_in_a_job_warns_and_serves() {
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    *faults.job_state.lock().unwrap() = Some(in_a_job());
+    let run = start(
+        foreground(&dir.path, Some(hold_port())),
+        TestComponents::default(),
+        faults,
+    );
+    run.serving();
+    assert!(
+        run.log.text().contains("runs inside a job"),
+        "{}",
+        run.log.text()
+    );
+    let record = crate::lifecycle::read_record(&dir.path).unwrap().unwrap();
+    let job = record.evidence.job.expect("job evidence");
+    assert_eq!(job["in_job"], true, "{job}");
+    assert_eq!(job["immediate"]["kill_on_close"], true, "{job}");
+    run.stop();
+    assert_eq!(run.join().code.code(), 0);
 }

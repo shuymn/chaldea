@@ -7,6 +7,14 @@ use std::time::{Duration, Instant};
 /// The longest single wait (below `INFINITE`).
 pub(crate) const MAX_CHUNK_MS: u32 = u32::MAX - 1;
 
+/// One wait for `left`, in whole milliseconds: rounded up, so a sub-millisecond remainder
+/// waits 1 ms, and at most [`MAX_CHUNK_MS`], so a long one never becomes `INFINITE`.
+pub(crate) fn chunk_ms(left: Duration) -> u32 {
+    u32::try_from(left.as_nanos().div_ceil(1_000_000))
+        .unwrap_or(u32::MAX)
+        .clamp(1, MAX_CHUNK_MS)
+}
+
 /// Waits up to `timeout` from `start` in chunks of at most `cap` ms: a zero timeout is one
 /// poll; otherwise each chunk is the remainder rounded up to whole milliseconds (so a
 /// sub-millisecond remainder waits 1 ms, never `INFINITE`). The remainder comes from the
@@ -27,9 +35,7 @@ pub(crate) fn chunked(
         if left.is_zero() {
             return Ok(false);
         }
-        let ceil = left.as_nanos().div_ceil(1_000_000);
-        let ms = u32::try_from(ceil).unwrap_or(u32::MAX).clamp(1, cap.max(1));
-        if wait(ms)? {
+        if wait(chunk_ms(left).min(cap.max(1)))? {
             return Ok(true);
         }
     }
@@ -111,6 +117,16 @@ mod tests {
         let s = Script::new(None);
         assert!(!s.run(Duration::from_micros(500), MAX_CHUNK_MS));
         assert_eq!(*s.waits.borrow(), vec![1]);
+    }
+
+    /// A long remainder waits below `INFINITE`; a sub-millisecond one waits 1 ms.
+    #[test]
+    fn one_wait_is_finite_and_not_zero() {
+        assert_eq!(chunk_ms(Duration::MAX), MAX_CHUNK_MS);
+        let infinite = Duration::from_millis(u64::from(u32::MAX));
+        assert_eq!(chunk_ms(infinite), MAX_CHUNK_MS);
+        assert_eq!(chunk_ms(Duration::from_nanos(1)), 1);
+        assert_eq!(chunk_ms(Duration::from_micros(1500)), 2);
     }
 
     /// `Duration::MAX` waits in capped chunks and never overflows the clock.

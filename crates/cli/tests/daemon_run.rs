@@ -17,20 +17,21 @@ use chaldea_daemon::lifecycle::{LockProbe, STATE_DIR_ENV, names};
 use chaldea_daemon::store::TokenSelector;
 use chaldea_pty_runtime::host::{self, EntryKind, Privacy};
 use support::{
-    Proc, chaldea, close_store, free_port, get_status, listing, lock_state, marked_dir, open_store,
-    run_cmd, run_to_exit, serving_record, state, token_of, wait_for, write_private,
+    Proc, chaldea, close_store, get_status, listing, lock_state, marked_dir, open_store, run_cmd,
+    run_to_exit, serving_record, state, token_of, wait_for, write_private,
 };
 
 /// The design's port range (§2.6), restated.
 const FIRST: u16 = 7373;
 const LAST: u16 = 7472;
 
-/// Tests that let the daemon choose from the range run one at a time; every other test passes
-/// `--port` with an ephemeral port.
-static RANGE: Mutex<()> = Mutex::new(());
+/// Every daemon of these tests chooses its port from the range (no test picks a port that it
+/// then releases), so the tests run one at a time: a port a test expects to be the first free
+/// one, or its own saved port, is not taken by another test's daemon in between.
+static PORTS: Mutex<()> = Mutex::new(());
 
-fn range() -> MutexGuard<'static, ()> {
-    RANGE.lock().unwrap_or_else(PoisonError::into_inner)
+fn serial() -> MutexGuard<'static, ()> {
+    PORTS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn bindable(p: u16) -> bool {
@@ -44,9 +45,9 @@ fn first_free_in_range() -> u16 {
         .expect("a free port in the range")
 }
 
-/// Starts a daemon on `dir` with `--port <ephemeral>` and waits for it to serve.
+/// Starts a daemon on `dir`, which chooses its port, and waits for it to serve.
 fn serve(dir: &Path) -> (Proc, u16) {
-    let p = Proc::spawn(&mut run_cmd(dir, Some(free_port())));
+    let p = Proc::spawn(&mut run_cmd(dir, None));
     let port = p.serving();
     (p, port)
 }
@@ -54,7 +55,7 @@ fn serve(dir: &Path) -> (Proc, u16) {
 /// Starts, serves, and stops a daemon on `dir` (a state directory with a database, a token, and
 /// a saved port).
 fn serve_once(dir: &Path, port: Option<u16>) -> u16 {
-    let mut p = Proc::spawn(&mut run_cmd(dir, Some(port.unwrap_or_else(free_port))));
+    let mut p = Proc::spawn(&mut run_cmd(dir, port));
     let got = p.serving();
     assert_eq!(p.stop_and_wait(dir), 0, "{}", p.stderr());
     got
@@ -68,10 +69,11 @@ fn saved_port(dir: &Path) -> String {
 
 #[test]
 fn second_run_exits_3_and_touches_nothing() {
+    let _s = serial();
     let dir = state();
     let (mut a, port) = serve(&dir.path);
     let before = listing(&dir.path);
-    let (code, _out, err) = run_to_exit(&mut run_cmd(&dir.path, Some(free_port())));
+    let (code, _out, err) = run_to_exit(&mut run_cmd(&dir.path, Some(port)));
     assert_eq!(code, 3, "{err}");
     assert!(err.contains("already holds"), "{err}");
     assert!(err.contains(&format!("pid {}", a.pid())), "{err}");
@@ -82,12 +84,13 @@ fn second_run_exits_3_and_touches_nothing() {
 
 #[test]
 fn reacquire_after_kill() {
+    let _s = serial();
     let dir = state();
     let (mut a, _) = serve(&dir.path);
     a.child.kill().unwrap();
     assert!(a.wait().code() != Some(0));
     // Within the lock's 2 s retry the next run either succeeds or reports the holder.
-    let mut b = Proc::spawn(&mut run_cmd(&dir.path, Some(free_port())));
+    let mut b = Proc::spawn(&mut run_cmd(&dir.path, None));
     let deadline = Instant::now() + support::WAIT;
     let b_serves = loop {
         if let Some(s) = b.child.try_wait().unwrap() {
@@ -103,7 +106,7 @@ fn reacquire_after_kill() {
     };
     if !b_serves {
         assert!(wait_for(|| lock_state(&dir.path) == LockProbe::Free));
-        b = Proc::spawn(&mut run_cmd(&dir.path, Some(free_port())));
+        b = Proc::spawn(&mut run_cmd(&dir.path, None));
     }
     b.serving();
     assert_eq!(b.stop_and_wait(&dir.path), 0);
@@ -120,6 +123,7 @@ fn serving_pid(dir: &Path) -> Option<u32> {
 
 #[test]
 fn in_progress_receipt_becomes_unknown() {
+    let _s = serial();
     let dir = state();
     serve_once(&dir.path, None);
     let cmd = CommandId::from_u128(0x5000_0000_0000_0000_0000_0000_0000_0001);
@@ -149,6 +153,7 @@ fn in_progress_receipt_becomes_unknown() {
 
 #[test]
 fn usage_error_is_redacted() {
+    let _s = serial();
     let secret = format!("chd_{}", "Q".repeat(43));
     let (code, out, err) = run_to_exit(&mut chaldea(&["daemon", "run", "--port", &secret], &[]));
     assert_eq!(code, 2, "{err}");
@@ -160,12 +165,13 @@ fn usage_error_is_redacted() {
 /// A refused state directory whose path holds a token: the refusal names it redacted.
 #[test]
 fn startup_failure_output_is_redacted() {
+    let _s = serial();
     let tmp = support::temp_parent();
     let secret = format!("chd_{}", "R".repeat(43));
     let dir = tmp.path().join(&secret);
     host::create_private_dir(&dir).unwrap();
     std::fs::write(dir.join("unrelated"), b"x").unwrap();
-    let (code, out, err) = run_to_exit(&mut run_cmd(&dir, Some(free_port())));
+    let (code, out, err) = run_to_exit(&mut run_cmd(&dir, None));
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("not a Chaldea state directory"), "{err}");
     assert!(!err.contains(&secret), "{err}");
@@ -176,6 +182,7 @@ fn startup_failure_output_is_redacted() {
 
 #[test]
 fn issues_owner_token() {
+    let _s = serial();
     let dir = state();
     let (mut d, port) = serve(&dir.path);
     let path = dir.path.join(names::OWNER_TOKEN);
@@ -206,6 +213,7 @@ fn issues_owner_token() {
 
 #[test]
 fn keeps_a_valid_token_across_restart() {
+    let _s = serial();
     let dir = state();
     serve_once(&dir.path, None);
     let t1 = token_of(&dir.path);
@@ -222,6 +230,7 @@ fn keeps_a_valid_token_across_restart() {
 
 #[test]
 fn reissues_a_revoked_token() {
+    let _s = serial();
     let dir = state();
     serve_once(&dir.path, None);
     let t1 = token_of(&dir.path);
@@ -259,7 +268,7 @@ fn reissues_a_revoked_token() {
 /// Refused before the log or the store is touched: no database, no `daemon.log`, the file
 /// unchanged.
 fn assert_refused_untouched(dir: &Path, token_bytes: &[u8], want: &str) {
-    let (code, _out, err) = run_to_exit(&mut run_cmd(dir, Some(free_port())));
+    let (code, _out, err) = run_to_exit(&mut run_cmd(dir, None));
     assert_eq!(code, 1, "{err}");
     assert!(err.contains(want), "{err}");
     for f in names::DB_FILES {
@@ -275,6 +284,7 @@ fn assert_refused_untouched(dir: &Path, token_bytes: &[u8], want: &str) {
 
 #[test]
 fn refuses_a_foreign_token_file() {
+    let _s = serial();
     let dir = state();
     marked_dir(&dir.path);
     let bytes = b"not a token\n";
@@ -284,6 +294,7 @@ fn refuses_a_foreign_token_file() {
 
 #[test]
 fn refuses_a_valid_token_with_wrong_permissions() {
+    let _s = serial();
     // A token a daemon issued, copied into a fresh state directory without a database.
     let issued = state();
     serve_once(&issued.path, None);
@@ -310,7 +321,7 @@ fn refuses_a_valid_token_with_wrong_permissions() {
 
 #[test]
 fn first_port_from_the_range() {
-    let _range = range();
+    let _s = serial();
     let dir = state();
     let expected = first_free_in_range();
     let mut d = Proc::spawn(&mut run_cmd(&dir.path, None));
@@ -322,7 +333,7 @@ fn first_port_from_the_range() {
 
 #[test]
 fn taken_first_port_is_skipped() {
-    let _range = range();
+    let _s = serial();
     let dir = state();
     let held_port = first_free_in_range();
     let _held = TcpListener::bind((Ipv4Addr::LOCALHOST, held_port)).unwrap();
@@ -338,6 +349,7 @@ fn taken_first_port_is_skipped() {
 
 #[test]
 fn same_port_after_restart() {
+    let _s = serial();
     let dir = state();
     let first = serve_once(&dir.path, None);
     let mut d = Proc::spawn(&mut run_cmd(&dir.path, None));
@@ -345,8 +357,30 @@ fn same_port_after_restart() {
     assert_eq!(d.stop_and_wait(&dir.path), 0);
 }
 
+/// An explicit `--port` through the real bind: with saved port X, `--port Y` (a port another
+/// daemon chose and released) serves on Y, saves Y, and says to re-pair.
+#[test]
+fn explicit_port_is_served_and_saved() {
+    let _s = serial();
+    let (a, b) = (state(), state());
+    let (mut first, x) = serve(&a.path);
+    let y = serve_once(&b.path, None);
+    assert_eq!(first.stop_and_wait(&a.path), 0, "{}", first.stderr());
+    assert_ne!(x, y);
+    let mut d = Proc::spawn(&mut run_cmd(&a.path, Some(y)));
+    assert_eq!(d.serving(), y);
+    assert_eq!(saved_port(&a.path), format!("{y}\n"));
+    assert_eq!(d.stop_and_wait(&a.path), 0);
+    let err = d.stderr();
+    assert!(
+        err.contains(&format!("port {y} replaces the saved port {x}")),
+        "{err}"
+    );
+}
+
 #[test]
 fn failed_override_keeps_the_saved_port() {
+    let _s = serial();
     let dir = state();
     let saved = serve_once(&dir.path, None);
     let taken = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -359,6 +393,7 @@ fn failed_override_keeps_the_saved_port() {
 
 #[test]
 fn taken_saved_port_is_reported() {
+    let _s = serial();
     let dir = state();
     let saved = serve_once(&dir.path, None);
     let _taken = TcpListener::bind((Ipv4Addr::LOCALHOST, saved)).unwrap();
@@ -375,6 +410,7 @@ fn taken_saved_port_is_reported() {
 
 #[test]
 fn malformed_port_file_fails_before_the_store() {
+    let _s = serial();
     let dir = state();
     marked_dir(&dir.path);
     write_private(&dir.path.join(names::PORT), b"seventy\n");
@@ -401,6 +437,7 @@ fn non_loopback_address() -> Option<std::net::IpAddr> {
 
 #[test]
 fn not_reachable_on_other_addresses() {
+    let _s = serial();
     let dir = state();
     let (mut d, port) = serve(&dir.path);
     let r = serving_record(&dir.path);
@@ -425,12 +462,13 @@ fn not_reachable_on_other_addresses() {
 
 #[test]
 fn flag_overrides_env() {
+    let _s = serial();
     let (a, b) = (state(), state());
     let mut d = Proc::spawn(
         chaldea(&[], &[(STATE_DIR_ENV, b.path.as_os_str())])
             .arg("--state-dir")
             .arg(&a.path)
-            .args(["daemon", "run", "--port", &free_port().to_string()]),
+            .args(["daemon", "run"]),
     );
     d.serving();
     assert_eq!(serving_record(&a.path).pid, d.pid());
@@ -440,9 +478,10 @@ fn flag_overrides_env() {
 
 #[test]
 fn env_only_selects_the_dir() {
+    let _s = serial();
     let b = state();
     let mut d = Proc::spawn(&mut chaldea(
-        &["daemon", "run", "--port", &free_port().to_string()],
+        &["daemon", "run"],
         &[(STATE_DIR_ENV, OsStr::new(&b.path))],
     ));
     d.serving();
@@ -453,6 +492,7 @@ fn env_only_selects_the_dir() {
 /// `--help` goes to stdout, with nothing on stderr, and exits 0.
 #[test]
 fn help_goes_to_stdout() {
+    let _s = serial();
     let (code, out, err) = run_to_exit(&mut chaldea(&["--help"], &[]));
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("Usage"), "{out}");
@@ -464,6 +504,7 @@ fn help_goes_to_stdout() {
 #[cfg(target_os = "macos")]
 #[test]
 fn refuses_a_final_symlink_with_a_trailing_slash() {
+    let _s = serial();
     let root = support::temp_parent();
     let real = root.path().join("real");
     host::create_private_dir(&real).unwrap();
@@ -471,7 +512,7 @@ fn refuses_a_final_symlink_with_a_trailing_slash() {
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let mut spelling = link.into_os_string();
     spelling.push("/");
-    let (code, _out, err) = run_to_exit(&mut run_cmd(Path::new(&spelling), Some(free_port())));
+    let (code, _out, err) = run_to_exit(&mut run_cmd(Path::new(&spelling), None));
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("link"), "{err}");
     assert!(std::fs::read_dir(&real).unwrap().next().is_none());
@@ -482,6 +523,7 @@ fn refuses_a_final_symlink_with_a_trailing_slash() {
 #[cfg(target_os = "macos")]
 #[test]
 fn fifo_record_refusal_releases_the_lock() {
+    let _s = serial();
     use std::os::unix::fs::FileTypeExt;
     use std::process::{Command, Stdio};
     let dir = state();
@@ -496,7 +538,7 @@ fn fifo_record_refusal_releases_the_lock() {
     );
     assert_eq!(code, 0, "{err}");
     let started = Instant::now();
-    let (code, _, err) = run_to_exit(&mut run_cmd(&dir.path, Some(free_port())));
+    let (code, _, err) = run_to_exit(&mut run_cmd(&dir.path, None));
     assert_eq!(code, 1, "{err}");
     assert!(started.elapsed() < Duration::from_secs(11), "{err}");
     assert_eq!(lock_state(&dir.path), LockProbe::Free);
@@ -513,6 +555,7 @@ fn fifo_record_refusal_releases_the_lock() {
 /// with the same owner token, and an authenticated request succeeds on both sides.
 #[test]
 fn restarts_keep_a_usable_saved_endpoint() {
+    let _s = serial();
     for killed in [false, true] {
         let dir = state();
         let (mut first, port) = serve(&dir.path);
@@ -558,6 +601,7 @@ fn restarts_keep_a_usable_saved_endpoint() {
 /// 501 `not_implemented` and leaves no receipt.
 #[test]
 fn mvp_command_is_501_without_receipt() {
+    let _s = serial();
     let dir = state();
     let (mut d, port) = serve(&dir.path);
     let token = token_of(&dir.path);

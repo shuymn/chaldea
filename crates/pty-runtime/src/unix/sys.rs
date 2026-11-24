@@ -502,6 +502,158 @@ pub(crate) fn block_signals(signals: &[c_int]) -> io::Result<()> {
     Ok(())
 }
 
+/// Which side of a `fork` the caller is on.
+pub(crate) enum Forked {
+    Parent,
+    Child,
+}
+
+/// `fork()`. Call only while the process has one thread (`host::leave_launchd_job`, from
+/// `dispatch` before process setup), so the child holds no lock another thread owned.
+pub(crate) fn fork() -> io::Result<Forked> {
+    // SAFETY: the caller guarantees a single-threaded process; the child continues normal
+    // Rust execution, which is sound without other threads.
+    match unsafe { libc::fork() } {
+        -1 => Err(io::Error::last_os_error()),
+        0 => Ok(Forked::Child),
+        _ => Ok(Forked::Parent),
+    }
+}
+
+/// One `kevent` change: `filter` on `ident`, added for this wait only.
+fn kevent_change(ident: usize, filter: i16, fflags: u32) -> libc::kevent {
+    libc::kevent {
+        ident,
+        filter,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    }
+}
+
+/// Blocks until at most `deadline` until `fd` is readable or the process `pid` exits, with a
+/// kqueue of its own. Returns early, without an error, when the process is already gone
+/// (its registration fails with `ESRCH`) or a signal interrupts the wait; the caller looks
+/// again either way.
+///
+/// # Errors
+///
+/// The kqueue cannot be created or waited on, or a registration failed for another reason.
+pub(crate) fn wait_readable_or_exit(
+    fd: Option<std::os::fd::BorrowedFd<'_>>,
+    pid: Option<u32>,
+    deadline: std::time::Instant,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut changes = Vec::with_capacity(2);
+    if let Some(fd) = fd {
+        let ident = usize::try_from(fd.as_raw_fd()).map_err(io::Error::other)?;
+        changes.push(kevent_change(ident, libc::EVFILT_READ, 0));
+    }
+    if let Some(pid) = pid {
+        let ident = usize::try_from(pid).map_err(io::Error::other)?;
+        changes.push(kevent_change(ident, libc::EVFILT_PROC, libc::NOTE_EXIT));
+    }
+    kevent_wait(&changes, deadline)
+}
+
+/// [`wait_readable_or_exit`] on `changes` (at most two). A registration that fails is
+/// returned as an event with `EV_ERROR` and its errno in `data`: `ESRCH` for a process is its
+/// exit, any other is an error. The time left is read after the queue exists, immediately
+/// before `kevent`; none left returns without waiting.
+fn kevent_wait(changes: &[libc::kevent], deadline: std::time::Instant) -> io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: `kqueue` takes no arguments.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `kq` is a new descriptor that nothing else owns.
+    let kq = unsafe { OwnedFd::from_raw_fd(kq) };
+    #[cfg(test)]
+    kevent_probe::queue_created();
+    let Some(timeout) = crate::host::time_left(deadline) else {
+        return Ok(());
+    };
+    #[cfg(test)]
+    kevent_probe::waits(timeout);
+    let mut events = [kevent_change(0, 0, 0); 2];
+    let ts = libc::timespec {
+        tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
+        tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
+    };
+    let n_changes = c_int::try_from(changes.len()).map_err(io::Error::other)?;
+    let n_events = c_int::try_from(events.len()).map_err(io::Error::other)?;
+    // SAFETY: `changes` holds `n_changes` initialized entries and `events` room for
+    // `n_events`; both outlive the call, `ts` is a valid timespec, and `kq` is open.
+    let n = unsafe {
+        libc::kevent(
+            kq.as_raw_fd(),
+            changes.as_ptr(),
+            n_changes,
+            events.as_mut_ptr(),
+            n_events,
+            &raw const ts,
+        )
+    };
+    if n < 0 {
+        let e = io::Error::last_os_error();
+        if matches!(e.raw_os_error(), Some(libc::EINTR | libc::ESRCH)) {
+            return Ok(());
+        }
+        return Err(e);
+    }
+    let n = usize::try_from(n).map_err(io::Error::other)?;
+    for ev in &events[..n.min(events.len())] {
+        if ev.flags & libc::EV_ERROR == 0 || ev.data == 0 {
+            continue;
+        }
+        let errno = i32::try_from(ev.data).map_err(io::Error::other)?;
+        if !(ev.filter == libc::EVFILT_PROC && errno == libc::ESRCH) {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+    }
+    Ok(())
+}
+
+/// Test probes of [`kevent_wait`]: a pause once its queue exists, and the timeouts it passes
+/// to `kevent`, both per thread.
+#[cfg(test)]
+pub(crate) mod kevent_probe {
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    type Hook = Box<dyn FnMut()>;
+
+    thread_local! {
+        static AFTER_QUEUE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static TIMEOUTS: RefCell<Vec<Duration>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Runs `f` in this thread once each wait's queue exists.
+    pub(crate) fn after_queue(f: impl FnMut() + 'static) {
+        AFTER_QUEUE.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    /// The timeouts this thread's waits passed to `kevent` so far.
+    pub(crate) fn timeouts() -> Vec<Duration> {
+        TIMEOUTS.with(|t| t.borrow().clone())
+    }
+
+    pub(super) fn queue_created() {
+        AFTER_QUEUE.with(|h| {
+            if let Some(f) = h.borrow_mut().as_mut() {
+                f();
+            }
+        });
+    }
+
+    pub(super) fn waits(timeout: Duration) {
+        TIMEOUTS.with(|t| t.borrow_mut().push(timeout));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Spawn hygiene, the spawn lock, and `bsd_info`. Tests that change process-wide state
@@ -979,5 +1131,51 @@ mod tests {
         );
         assert!(!spawn_lock_held());
         let _ = p.teardown();
+    }
+
+    /// A registration error comes back as an `EV_ERROR` event: `ESRCH` for a process that does
+    /// not exist (macOS pids stay below 100000) is its exit; another error (`EBADF` for a
+    /// descriptor that is not open) is returned, not taken for a wake-up.
+    #[test]
+    fn kevent_registration_errors() {
+        use std::time::Duration;
+        let gone = super::kevent_change(4_000_000, libc::EVFILT_PROC, libc::NOTE_EXIT);
+        super::kevent_wait(&[gone], std::time::Instant::now() + Duration::from_secs(5)).unwrap();
+        let ident = usize::try_from(i32::MAX).unwrap();
+        let bad = super::kevent_change(ident, libc::EVFILT_READ, 0);
+        let e = super::kevent_wait(&[bad], std::time::Instant::now() + Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EBADF), "{e}");
+    }
+
+    /// The wait's time is read after its queue exists: a queue whose creation takes most of the
+    /// budget leaves `kevent` only the rest, and one that takes all of it leaves no wait.
+    #[test]
+    fn kevent_gets_the_time_left_after_the_queue() {
+        use std::time::{Duration, Instant};
+        let (r, _w) = std::io::pipe().unwrap();
+        let ident = usize::try_from(std::os::fd::AsRawFd::as_raw_fd(&r)).unwrap();
+        let read = super::kevent_change(ident, libc::EVFILT_READ, 0);
+        let end = Instant::now() + Duration::from_secs(1);
+        super::kevent_probe::after_queue(move || {
+            std::thread::sleep(
+                end.saturating_duration_since(Instant::now())
+                    .saturating_sub(Duration::from_millis(300)),
+            );
+        });
+        super::kevent_wait(&[read], end).unwrap();
+        let waited = super::kevent_probe::timeouts();
+        assert_eq!(waited.len(), 1, "{waited:?}");
+        assert!(waited[0] <= Duration::from_millis(300), "{waited:?}");
+        let end = Instant::now() + Duration::from_millis(500);
+        super::kevent_probe::after_queue(move || {
+            std::thread::sleep(end.saturating_duration_since(Instant::now()));
+        });
+        super::kevent_wait(&[read], end).unwrap();
+        assert_eq!(
+            super::kevent_probe::timeouts().len(),
+            1,
+            "waited past the deadline"
+        );
     }
 }

@@ -18,22 +18,48 @@ name = "hook_emit_stall"
 path = "tests/hook_emit_stall.rs"
 harness = false
 
+# Each is also a `chaldea` with test seams (tests/support/faults.rs), the program `daemon
+# start` launches as its child, so it has its own `main` (tests/support/runner.rs).
+[[test]]
+name = "daemon_start"
+path = "tests/daemon_start.rs"
+harness = false
+
+[[test]]
+name = "daemon_stop"
+path = "tests/daemon_stop.rs"
+harness = false
+
+[[test]]
+name = "daemon_macos"
+path = "tests/daemon_macos.rs"
+harness = false
+
+# The test gate's own guarantee (tests/support/faults.rs): the binary is also the waiter.
+[[test]]
+name = "gates"
+path = "tests/gates.rs"
+harness = false
+
 [dependencies]
 chaldea-daemon = { path = "../daemon" }
+# `chaldea open`'s wire types (`PairCodeResponse`, `ErrorBody`).
+chaldea-core = { path = "../core" }
 clap.workspace = true
-# The emitter's exit without exit handlers (`host::exit_now`, hook-ingest §2.13).
+serde_json.workspace = true
+# `host`: the emitter's exit without exit handlers (hook-ingest §2.13), and detaching, the
+# readiness channel, the stop request, and the browser launch (daemon-lifecycle §2.10, §2.13).
 chaldea-pty-runtime = { path = "../pty-runtime" }
-# The emitter's `emit_id` (hook-ingest §2.13).
+# The emitter's `emit_id` (hook-ingest §2.13) and the launchd job's label (daemon-lifecycle §2.10).
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 chaldea-daemon = { path = "../daemon" }
-# Receipt and token ids for the store fixtures.
-chaldea-core = { path = "../core" }
 # The `host` test helpers (signal state, links, ACL grants, console events, the stop event).
 chaldea-pty-runtime = { path = "../pty-runtime", features = ["fake"] }
-serde_json.workspace = true
 tempfile.workspace = true
+# Log lines with secret markers from a test component (PR8-CL-20).
+tracing.workspace = true
 # The runtime of `hook_e2e`'s in-process daemon server.
 tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
 

@@ -9,7 +9,7 @@ mod kill;
 pub(crate) mod sys;
 pub(crate) mod table;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::ffi::{OsStr, OsString};
 use std::io::{Error, ErrorKind};

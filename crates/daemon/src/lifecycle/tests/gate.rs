@@ -34,7 +34,7 @@ fn each_fatal_variant_stops() {
     for f in variants() {
         let dir = state();
         let run = start(
-            foreground(&dir.path, Some(super::free_port())),
+            foreground(&dir.path, Some(super::hold_port())),
             TestComponents::default(),
             Arc::default(),
         );
@@ -63,7 +63,7 @@ fn late_fatal_sets_the_reason() {
     // End to end: the run's exit reason is `store_fatal`.
     let dir = state();
     let run = start(
-        foreground(&dir.path, Some(super::free_port())),
+        foreground(&dir.path, Some(super::hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
@@ -79,7 +79,7 @@ fn late_fatal_sets_the_reason() {
 fn reason_precedence() {
     let dir = state();
     let run = start(
-        foreground(&dir.path, Some(super::free_port())),
+        foreground(&dir.path, Some(super::hold_port())),
         TestComponents::default(),
         Arc::default(),
     );
