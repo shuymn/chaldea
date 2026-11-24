@@ -269,6 +269,11 @@ fn bind(
         #[cfg(test)]
         let l = match super::faults::held_listener(p) {
             Some(held) => held?,
+            None if PORT_RANGE.contains(&p) && !super::faults::range_held() => {
+                return Err(std::io::Error::other(
+                    "a test binds a port of the range without faults::hold_range",
+                ));
+            }
             None => std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, p))?,
         };
         #[cfg(not(test))]

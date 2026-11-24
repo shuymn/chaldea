@@ -95,9 +95,11 @@ fn no_listener_during_reconciliation() {
 
 /// PR8-CL-6 through the real bind: a daemon chooses its port from the range and saves it; the
 /// next start on that saved port, parked in a reconciler, refuses a connect to it; released,
-/// it serves there.
+/// it serves there. The test holds the port range throughout, so no other test of this
+/// process binds the saved port while it is free between the two starts.
 #[test]
 fn saved_port_refuses_connects_during_reconciliation() {
+    let _range = super::super::faults::hold_range();
     let dir = state();
     let run = start(
         foreground(&dir.path, None),

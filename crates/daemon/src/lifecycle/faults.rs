@@ -32,6 +32,36 @@ pub(crate) fn hold_port() -> u16 {
     port
 }
 
+/// Held for its whole run by every test that binds a port of [`super::PORT_RANGE`] (the range
+/// scan, or a saved port the scan chose), so no other test of this process binds a range port
+/// while that test's port is free between its starts.
+static RANGE: Mutex<()> = Mutex::new(());
+/// Whether a test holds [`RANGE`]; step 10 refuses a range port without it.
+static RANGE_HELD: AtomicBool = AtomicBool::new(false);
+
+/// A test's hold on the port range, released on drop.
+pub(crate) struct RangeHold {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Waits for and takes the port range for the calling test.
+pub(crate) fn hold_range() -> RangeHold {
+    let g = lock(&RANGE);
+    RANGE_HELD.store(true, Ordering::SeqCst);
+    RangeHold { _guard: g }
+}
+
+impl Drop for RangeHold {
+    fn drop(&mut self) {
+        RANGE_HELD.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Whether a test holds the port range.
+pub(crate) fn range_held() -> bool {
+    RANGE_HELD.load(Ordering::SeqCst)
+}
+
 /// A clone of the held listener on `port`, if a test holds one.
 pub(crate) fn held_listener(port: u16) -> Option<io::Result<std::net::TcpListener>> {
     lock(&HELD)
