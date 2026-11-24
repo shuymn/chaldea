@@ -698,6 +698,21 @@ impl Req {
         self
     }
 
+    /// The head grown with an unfinished `X-Big` header to exactly `limit` bytes, never
+    /// complete. A server limiting heads to `limit` bytes rejects it only once it has read
+    /// all `limit` bytes (hyper: a partial head with `len >= max_header_size`), so the
+    /// rejection leaves no request byte unread and no reset can discard the reply.
+    #[must_use]
+    pub fn head_at_limit(&self, limit: usize) -> Vec<u8> {
+        let head = self.head();
+        // Without the blank line, then an unfinished header line.
+        let mut out = head[..head.len() - 2].to_vec();
+        out.extend_from_slice(b"X-Big: ");
+        assert!(out.len() < limit, "the head is already {} bytes", out.len());
+        out.resize(limit, b'a');
+        out
+    }
+
     /// The head only, ending with the blank line.
     #[must_use]
     pub fn head(&self) -> Vec<u8> {

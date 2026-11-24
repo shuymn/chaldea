@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use chaldea_core::auth::TokenKind;
 use chaldea_daemon::hook::HookConfig;
 use support::hook::{Hook, HookServer, Launch, Snapshot};
-use support::http::{Reply, Req, connect};
+use support::http::{Req, connect};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// The product limits, set explicitly (not the harness defaults).
@@ -37,35 +37,69 @@ const MIB: usize = 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum End {
     Eof,
+    /// `ConnectionReset` or `ConnectionAborted`: the peer reset the connection.
     Reset(io::ErrorKind),
+    /// Any other read error.
+    Error(io::ErrorKind),
     /// A whole reply came and the connection stayed open for 1 s after it.
     Open,
     /// The case's deadline came first.
     Timeout,
 }
 
-/// Whether `out` holds a whole reply: its head and `Content-Length` body bytes.
-fn complete(out: &[u8]) -> bool {
-    let Some(at) = out.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return false;
-    };
+/// The end of a complete head at the start of `out` and its `Content-Length`, if it has one.
+/// Replies are framed by `Content-Length` only (the daemon's and hyper's rejections carry
+/// one); the observer does not decode chunked bodies.
+fn framing(out: &[u8]) -> Option<(usize, Option<usize>)> {
+    let at = out.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
     let head = String::from_utf8_lossy(&out[..at]).to_ascii_lowercase();
     let len = head
         .lines()
         .find_map(|l| l.strip_prefix("content-length:"))
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    out.len() >= at + 4 + len
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    Some((at, len))
 }
 
-/// What the client observed.
+/// Whether `out` holds a whole reply: its head and `Content-Length` body bytes.
+fn complete(out: &[u8]) -> bool {
+    framing(out).is_some_and(|(at, len)| len.is_some_and(|n| out.len() >= at + n))
+}
+
+/// The status code of a complete status line at the start of `out`.
+fn status_line(out: &[u8]) -> Option<u16> {
+    let at = out.windows(2).position(|w| w == b"\r\n")?;
+    let line = std::str::from_utf8(&out[..at]).ok()?;
+    let mut parts = line.splitn(3, ' ');
+    if !parts.next()?.starts_with("HTTP/1.") {
+        return None;
+    }
+    parts.next()?.parse().ok()
+}
+
+/// Whether a complete head at the start of `out` says `Connection: close`.
+fn head_closes(out: &[u8]) -> Option<bool> {
+    let at = out.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(&out[..at]).to_ascii_lowercase();
+    Some(head.lines().any(|l| {
+        l.strip_prefix("connection:")
+            .is_some_and(|v| v.trim() == "close")
+    }))
+}
+
+/// What the client observed. A reset can cut the reply anywhere, so each part is kept as far
+/// as it was read.
 #[derive(Debug)]
 struct Obs {
+    /// The whole reply (its head and `Content-Length` body): status and `ErrorBody` code.
     status: Option<(u16, Option<String>)>,
+    /// The code of a complete status line, read even when the rest of the reply was not.
+    status_line: Option<u16>,
     end: End,
     send_error: Option<io::ErrorKind>,
-    /// The reply carried `Connection: close`.
-    closes: bool,
+    /// Once the reply's head was read: whether it carried `Connection: close`.
+    closes: Option<bool>,
+    /// Reply bytes received.
+    received: usize,
     /// From the first byte written to the whole reply, or to the end without one.
     elapsed: Duration,
     /// Body bytes written before the status was read.
@@ -171,14 +205,22 @@ async fn observe(
                     until = until.min(tokio::time::Instant::now() + Duration::from_secs(1));
                 }
             }
-            Ok(Err(e)) => break End::Reset(e.kind()),
+            Ok(Err(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                break End::Reset(e.kind());
+            }
+            Ok(Err(e)) => break End::Error(e.kind()),
         }
     };
     let elapsed = replied_at.unwrap_or_else(|| first.elapsed());
     // A writer still sending once the connection ended gets its error soon: wait for it
     // (at most 1 s), then abort a writer still pending (a dropped pending write).
     let mut writer = writer;
-    let ended = matches!(end, End::Eof | End::Reset(_));
+    let ended = matches!(end, End::Eof | End::Reset(_) | End::Error(_));
     let sending = !idle.load(std::sync::atomic::Ordering::SeqCst);
     let waited = if sending && ended {
         let _ = joining.send(true);
@@ -195,21 +237,29 @@ async fn observe(
             None
         }
     });
-    let reply = out
-        .windows(4)
-        .any(|w| w == b"\r\n\r\n")
-        .then(|| support::http::parse(&out, None));
-    Obs {
-        status: reply.as_ref().map(Reply::outcome),
-        closes: reply.as_ref().is_some_and(|r| {
-            r.header("connection")
-                .is_some_and(|v| v.eq_ignore_ascii_case("close"))
-        }),
+    let o = Obs {
+        status: complete(&out).then(|| support::http::parse(&out, None).outcome()),
+        status_line: status_line(&out),
+        closes: head_closes(&out),
+        received: out.len(),
         end,
         send_error,
         elapsed,
         body_sent_before_status: body_sent_before_status.unwrap_or(0),
-    }
+    };
+    assert!(
+        framing(&out).is_none_or(|(_, len)| len.is_some()),
+        "a reply without Content-Length, which this observer cannot frame: {o:?} {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // Only a reset may cut a reply (it can discard what was not read); a clean EOF comes
+    // after the whole reply or before any of it.
+    assert!(
+        o.end != End::Eof || o.received == 0 || o.status.is_some(),
+        "the reply ended at EOF before its framing completed: {o:?} {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    o
 }
 
 fn os() -> &'static str {
@@ -217,13 +267,16 @@ fn os() -> &'static str {
 }
 
 fn print_observed(case: &str, o: &Obs) {
-    let status = o.status.as_ref().map_or_else(
-        || "none".to_owned(),
-        |(s, c)| format!("{s}/{}", c.as_deref().unwrap_or("-")),
-    );
+    let status = match (&o.status, o.status_line) {
+        (Some((s, c)), _) => format!("{s}/{}", c.as_deref().unwrap_or("-")),
+        // Cut after its status line.
+        (None, Some(s)) => format!("{s}/cut"),
+        (None, None) => "none".to_owned(),
+    };
     let end = match o.end {
         End::Eof => "eof".to_owned(),
         End::Reset(k) => format!("reset:{k:?}"),
+        End::Error(k) => format!("error:{k:?}"),
         End::Open => "open".to_owned(),
         End::Timeout => "timeout".to_owned(),
     };
@@ -265,15 +318,32 @@ fn code(s: &str) -> Option<String> {
     Some(s.to_owned())
 }
 
-/// PR 7's close contract: a rejection's reply, when the client read one before the server's
-/// close (a reset can discard it), says `Connection: close`, and the server closes.
+/// PR 7's close contract: a rejection's reply head, when the client read it before the
+/// server's close (a reset can discard it), says `Connection: close`, and the server closes:
+/// EOF or a reset, never an open connection or another read error.
 fn assert_closed(case: &str, o: &Obs) {
-    assert!(o.status.is_none() || o.closes, "{case}: {o:?}");
+    assert_ne!(o.closes, Some(false), "{case}: {o:?}");
     assert!(matches!(o.end, End::Eof | End::Reset(_)), "{case}: {o:?}");
 }
 
-/// Runs each case with `body`, asserting the exact status, the case deadline, and no side
-/// effect.
+/// What a client still sending when the server decides may observe (K2, PR9-CL-20): every
+/// part of the reply it read is the decided one (the status line, then the whole reply with
+/// its `ErrorBody` code); a reset may have cut the rest, or all of it.
+fn assert_decided_part(case: &str, o: &Obs, want: &(u16, Option<String>)) {
+    if let Some(code) = o.status_line {
+        assert_eq!(code, want.0, "{case}: {o:?}");
+    }
+    if let Some(s) = &o.status {
+        assert_eq!(s, want, "{case}: {o:?}");
+    }
+}
+
+/// Runs each case with `body`, asserting the case deadline, no side effect, and the exact
+/// status when no body byte is in flight. A case still sending body bytes when the server
+/// answers from the head may see a reset instead (K2, D9): the server reads what has
+/// arrived once and closes, and a close with unread bytes resets the connection, which on
+/// Windows discards the reply the client has not read yet; a status it does read is the
+/// decided one.
 async fn table(
     h: &HookServer,
     l: &Launch,
@@ -283,8 +353,18 @@ async fn table(
 ) {
     for (name, req, want) in cases {
         let before = h.snapshot(l);
-        let o = observe(h.srv.port, &req.head(), 1, Duration::ZERO, body(&req), CASE).await;
-        assert_eq!(o.status.as_ref(), Some(&want), "{name}: {o:?}");
+        let body = body(&req);
+        let in_flight = match &body {
+            Body::Withheld => false,
+            Body::Sent(b) => !b.is_empty(),
+            Body::Endless { .. } => true,
+        };
+        let o = observe(h.srv.port, &req.head(), 1, Duration::ZERO, body, CASE).await;
+        if in_flight {
+            assert_decided_part(name, &o, &want);
+        } else {
+            assert_eq!(o.status.as_ref(), Some(&want), "{name}: {o:?}");
+        }
         assert!(o.elapsed < CASE, "{name}: {o:?}");
         assert_closed(name, &o);
         if withheld {
@@ -328,11 +408,7 @@ async fn parser_layer() {
                 .head(),
             400,
         ),
-        (
-            "9 KiB head",
-            base.clone().header("X-Big", &"a".repeat(9 * 1024)).head(),
-            431,
-        ),
+        ("head at the 8 KiB limit", base.head_at_limit(8 * 1024), 431),
         ("65 headers", many.head(), 431),
         (
             "HTTP/1.0 with Transfer-Encoding",
@@ -375,11 +451,7 @@ async fn parser_layer() {
         LONG_CASE,
     )
     .await;
-    assert_eq!(
-        (o.status.as_ref(), o.end),
-        (None, End::Eof),
-        "slow head: {o:?}"
-    );
+    assert_eq!((o.received, o.end), (0, End::Eof), "slow head: {o:?}");
     assert!(
         o.elapsed >= Duration::from_millis(4900) && o.elapsed < CASE,
         "slow head: {o:?}"
@@ -607,6 +679,8 @@ async fn handler_layer() {
     )
     .await;
     assert_eq!(o.status, Some((503, code("busy"))), "{o:?}");
+    assert!(o.elapsed < CASE, "{o:?}");
+    assert_closed("budget", &o);
     assert_unchanged(&h, &l, &before, "budget");
     drop(held);
     let ingest = h.ingest.clone();
@@ -639,6 +713,8 @@ async fn ordering_body_withheld() {
     )
     .await;
     assert_eq!(o.status, Some((503, code("busy"))), "{o:?}");
+    assert!(o.elapsed < CASE, "{o:?}");
+    assert_closed("budget", &o);
     assert_eq!(o.body_sent_before_status, 0);
     drop(held);
     let ingest = h.ingest.clone();
@@ -700,6 +776,11 @@ async fn deadline_from_first_head_byte() {
             Ok(Ok(n)) => out.extend_from_slice(&buf[..n]),
         }
     }
+    assert!(
+        complete(&out),
+        "no whole Content-Length reply: {:?}",
+        String::from_utf8_lossy(&out)
+    );
     let r = support::http::parse(&out, None);
     assert_eq!(r.outcome(), (408, code("request_timeout")));
     assert!(first.elapsed() < Duration::from_millis(7500));
@@ -756,10 +837,7 @@ async fn observed_slow_body() {
     )
     .await;
     print_observed("slow_body", &o);
-    assert!(
-        matches!(o.status, Some((408, _)) | None),
-        "never a success: {o:?}"
-    );
+    assert_decided_part("slow body", &o, &(408, code("request_timeout")));
     assert_closed("slow body", &o);
     // The writer was still sending when the server closed: it reports its error.
     assert!(o.send_error.is_some(), "{o:?}");
@@ -784,17 +862,21 @@ async fn observed_body_in_flight() {
     x.token = revoked;
     x.body = body.clone();
     let cases = [
-        ("body_in_flight_401", x.req(&h.srv), 401),
+        (
+            "body_in_flight_401",
+            x.req(&h.srv),
+            (401, code("unauthorized")),
+        ),
         (
             "body_in_flight_413",
             valid(&l)
                 .req(&h.srv)
                 .no_length()
                 .header("Content-Length", &(4 * MIB + 1).to_string()),
-            413,
+            (413, code("payload_too_large")),
         ),
     ];
-    for (name, req, status) in cases {
+    for (name, req, want) in cases {
         let before = h.snapshot(&l);
         let o = observe(
             h.srv.port,
@@ -806,10 +888,7 @@ async fn observed_body_in_flight() {
         )
         .await;
         print_observed(name, &o);
-        assert!(
-            o.status.as_ref().is_none_or(|s| s.0 == status),
-            "{name}: the decided status, EOF, or a reset: {o:?}"
-        );
+        assert_decided_part(name, &o, &want);
         assert_closed(name, &o);
         assert_unchanged(&h, &l, &before, name);
     }

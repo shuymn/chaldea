@@ -12,7 +12,9 @@ use axum::http::{Method, Response};
 use chaldea_core::auth::TokenKind;
 use chaldea_core::ids::{LaunchId, ThreadId};
 use chaldea_daemon::http::{ApiError, Mount, Mounts, ReadCtx, WriteCtx, spec};
-use support::http::{DEADLINE, HEAD_TIMEOUT, Req, TestServer, connect, dump, parse, read_to_end};
+use support::http::{
+    DEADLINE, HEAD_TIMEOUT, Req, TestServer, connect, dump, parse, read_to_end, send,
+};
 use support::{exited, reserved};
 use tokio::io::AsyncWriteExt;
 
@@ -466,7 +468,7 @@ async fn parser_layer_cases() {
     let cases = [
         (
             "Content-Length: +5",
-            get().header("Content-Length", "+5").body(b"hello"),
+            get().header("Content-Length", "+5").body(b"hello").bytes(),
             400,
         ),
         (
@@ -474,18 +476,19 @@ async fn parser_layer_cases() {
             get()
                 .header("Content-Length", "1")
                 .header("Content-Length", "2")
-                .body(b"ab"),
+                .body(b"ab")
+                .bytes(),
             400,
         ),
+        ("65 headers", many.bytes(), 431),
         (
-            "9 KiB head",
-            get().header("X-Big", &"a".repeat(9 * 1024)),
+            "head at the 8 KiB limit",
+            get().head_at_limit(8 * 1024),
             431,
         ),
-        ("65 headers", many, 431),
     ];
-    for (name, req, status) in cases {
-        let r = srv.send(&req).await;
+    for (name, bytes, status) in cases {
+        let r = send(srv.port, &bytes).await;
         assert_eq!(r.status, status, "{name}: {r:?}");
         // hyper's own reply: no ErrorBody, no daemon headers.
         assert_eq!(r.code(), None, "{name}: {r:?}");
