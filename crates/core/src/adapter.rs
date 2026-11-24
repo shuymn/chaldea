@@ -42,6 +42,21 @@ pub enum HostOs {
 /// let mut r = *capabilities(Agent::Codex, HostOs::Macos);
 /// r.pty_encoding = InputEncoding::Positional;
 /// ```
+///
+/// ```compile_fail,E0624
+/// use std::time::Duration;
+/// use chaldea_core::adapter::{Capabilities, HostOs};
+/// use chaldea_core::ids::Agent;
+/// use chaldea_core::payload::InputEncoding;
+///
+/// let _ = Capabilities::new(
+///     Agent::Codex,
+///     HostOs::Macos,
+///     InputEncoding::Positional,
+///     InputEncoding::Positional,
+///     Duration::ZERO,
+/// );
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
     agent: Agent,

@@ -612,6 +612,8 @@ mod tests {
             // CJK compatibility ideographs stay (whole-prompt NFC gives U+795E).
             ("\u{fa19}", "\u{fa19}"),
             ("\u{fa19}\u{301}", "\u{fa19}\u{301}"),
+            // The scalars after a kept ideograph are still composed: U+0344 is NFC-unstable.
+            ("\u{fa19}\u{344}", "\u{fa19}\u{308}\u{301}"),
             // No precomposed form.
             ("\u{31f7}\u{309a}", "\u{31f7}\u{309a}"),
             ("\u{fa19}か\u{3099}", "\u{fa19}が"),

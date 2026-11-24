@@ -2135,6 +2135,39 @@ fn max_prompt_near_bound() {
     assert!(total_len(&e) <= bound(&t));
 }
 
+/// The two `MAX_PROMPT_BYTES` fixtures as attach pastes on every row, compared whole against
+/// bytes built here from §2.6 and §2.7.
+#[test]
+fn max_prompt_attach_paste_bodies() {
+    for (t, composed) in [
+        (near_bound(), near_bound_composed()),
+        (max_prompt_mixed(), max_prompt_mixed()),
+    ] {
+        assert_eq!(t.len(), MAX_PROMPT_BYTES);
+        let paste = [
+            PASTE_START,
+            lf(&t).replace('\n', "\r").as_bytes(),
+            PASTE_END,
+        ]
+        .concat();
+        for row in &CAPABILITIES {
+            let want = match row.pty_encoding() {
+                BracketedPaste => paste.clone(),
+                WinKeys => keys_golden(&composed, false),
+                Positional => unreachable!("no table row has a positional PTY encoding"),
+            };
+            let got = enc(row, &t, Purpose::AttachPaste).unwrap();
+            assert!(
+                got.text == want,
+                "{row:?}: {} bytes, want {}",
+                got.text.len(),
+                want.len()
+            );
+            assert_eq!(got.submit, None);
+        }
+    }
+}
+
 // ---- properties --------------------------------------------------------------------------
 
 /// The shape of a `win_keys` text: the two record shapes, printable ASCII, astral UTF-8.
