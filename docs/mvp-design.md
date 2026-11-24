@@ -280,7 +280,7 @@ All processes also get `CHALDEA_URL`; inherited `CHALDEA_*` variables are scrubb
 
 **Rejections (spike B-8 on hyper).** Two layers, neither with side effects (no event, fixture, or readiness change):
 
-- **Parser layer (hyper)**, before any middleware runs: malformed framing such as `Content-Length: +5` → 400 (RFC 9112 §6.3); an oversized head → hyper's status; a slow head → connection closed within its budget, observed by the client as EOF, never inferred from a client timeout or `status: 0`. Duplicate equal `Content-Length` and `Transfer-Encoding` follow hyper's framing rules; PR 9 records the observed outcome.
+- **Parser layer (hyper)**, before any middleware runs: malformed framing such as `Content-Length: +5` → 400 (RFC 9112 §6.3); an oversized head → hyper's status; a slow head → connection closed within its budget, observed by the client as EOF, never inferred from a client timeout or `status: 0`. Duplicate equal `Content-Length` and `Transfer-Encoding` follow hyper's framing rules and the guard's (`docs/design/hook-ingest.md` K1, §2.11); `crates/daemon/tests/hook_b8.rs` asserts each case (hook-ingest §7.1), and CI prints the per-OS outcomes of the in-flight-body cases as `B8-OBSERVED` lines.
 - **Middleware layer**, for parsed requests only, in order Host → Origin → Bearer → scope → framing → size, before any body byte is used: a missing `Content-Length` on POST → 411, any remaining `Transfer-Encoding` → 400, a body over 4 MiB → 413, the request deadline → 408.
 
 ### 2.6 Worktree Ownership
