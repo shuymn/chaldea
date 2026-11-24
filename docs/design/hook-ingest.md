@@ -550,8 +550,6 @@ FakeCli stays free of workspace dependencies other than `core` (mvp §3); it sta
 | | B. Always the token's thread | — | **Adopted.** |
 | **Emitter crate** | A. A module of `crates/cli` | mvp §3 | **Adopted.** |
 | | B. A separate crate | — | Rejected: one binary either way; no isolation gained. |
-| **PR size** | A. One PR | mvp §4 | Rejected: large, and the emitter is testable alone. |
-| | B. 9a (process lookup, emitter, FakeCli) and 9b (ingest, store v2, B-8, e2e) | http D1 | **Adopted.** |
 
 ## 4. Same-Class Inventory
 

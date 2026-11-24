@@ -191,7 +191,7 @@ The `specs` job of `ci.yml` (`ubuntu-latest`, mise pinned in `mise-action`) inst
 - **PR 9** implements the buffering and promotion the model's `buffer*` actions and `bind` state (hole d).
 - **PR 10** makes the supervisor layer real: each guard here is a checklist item, it decides holes a–c and the recheck-attempt choice of §3, adds §3's competing-submission condition, and grows the model where §1 says. A changed guard changes the spec and its traces in the same PR.
 - **PR 13–14** correlate card resolutions and card keys by `approval_id` (the card finding).
-- **PR 7b, 7c, 8, 18** implement what Q-B states; §7.4 lists the obligations it hands them.
+- **PR 7, 8, 18** implement what Q-B states; §7.4 lists the obligations it hands them.
 - **PR 17**'s `stateright` model checks the Rust sync code; Q-B checks the contract it implements (§7.7).
 - **Phase 2 relay**: §7.1 says where it plugs into Q-B.
 
@@ -324,8 +324,8 @@ Four rules of mvp §2.4 come from what the model needed; it implements them as w
 
 **Obligations handed on.**
 
-- **PR 7b**: http §6.2 PR7-CL-9–11 (one read per answer, the 404 for an unknown stream, snapshot contents) and PR7-CL-16 (`heads` for the latest subscribed set, refreshes, a commit announced by `stream_advanced` or `heads`); a `heads` frame omits streams that do not exist.
-- **PR 7c**: http §6.2 PR7-CL-8 (deadlines and 408) and PR7-CL-18–20 (receipts, the effect once with the receipt completed by the runner, fatal store outcomes reported). Liveness the model does not check: after the runner observed an intent committed with its effect pending, a healthy runner starts the effect and completes the receipt (with PR 17).
+- **PR 7, reads and WebSocket**: http §6.2 PR7-CL-9–11 (one read per answer, the 404 for an unknown stream, snapshot contents) and PR7-CL-16 (`heads` for the latest subscribed set, refreshes, a commit announced by `stream_advanced` or `heads`); a `heads` frame omits streams that do not exist.
+- **PR 7, commands and receipts**: http §6.2 PR7-CL-8 (deadlines and 408) and PR7-CL-18–20 (receipts, the effect once with the receipt completed by the runner, fatal store outcomes reported). Liveness the model does not check: after the runner observed an intent committed with its effect pending, a healthy runner starts the effect and completes the receipt (with PR 17).
 - **PR 8**: `receipts_mark_unknown_after_crash` at startup, before commands are accepted.
 - **PR 18**: the client rules of §7.1 with the epoch rule, F1, F2, and the backward resync; keep announced heads across a delivery (a `stream_advanced` or `heads` that arrives during a fetch); continue while `has_more` and page backward only while `has_more_before`; on a 404 for a followed stream (it is not in the current database, as after a database swap), stop following it: drop its copy, `subscribe` without it, and stop displaying it; retry a failed read (408, 503); refetch every followed stream on reconnect, and keep the intent to load history for a displayed stream across it: opening a socket discards a backward page not yet processed, so reissue the backward fetch from the current copy. Its fast-check reducer covers the `has_more` and reconnect cases.
 
@@ -378,4 +378,4 @@ CI runs the four seeds and the named traces, so every mutation fails CI. `has_mo
 
 ### 7.7 What PR 17 Still Covers
 
-Q-B checks the protocol with the store's guarantees assumed. PR 17's `stateright` model checks the Rust code where Q-B abstracts: the writer thread, the store's commit and crash behaviour (a crash during an append, `CommitUnknown` recovery), the socket loop's single `merge` and frame selection, the runner's effect and completion under real time (a heads refresh against the reply grace, the deadlines), crashes at every point of a command, the liveness of §7.4 PR 7c, and retry after a lost response against the real handlers. PR 18's fast-check reducer checks the client rules of §7.1.
+Q-B checks the protocol with the store's guarantees assumed. PR 17's `stateright` model checks the Rust code where Q-B abstracts: the writer thread, the store's commit and crash behaviour (a crash during an append, `CommitUnknown` recovery), the socket loop's single `merge` and frame selection, the runner's effect and completion under real time (a heads refresh against the reply grace, the deadlines), crashes at every point of a command, the runner liveness of §7.4 (PR 7, commands and receipts), and retry after a lost response against the real handlers. PR 18's fast-check reducer checks the client rules of §7.1.

@@ -684,9 +684,6 @@ The request waits on the `watch` until `reply_by = deadline + write_reply_grace`
 | **Request identity** | A. Bytes as received | — | Rejected: two serializations of one request conflict. |
 | | B. Canonical form of a parsed `serde_json::Value` | — | Rejected: duplicate keys collapse before they can be refused. |
 | | C. Duplicate scan on the raw text, then the canonical form of the handler's typed value | — | **Adopted.** |
-| **PR size** | A. One PR | mvp §4 | Rejected: large and on the longest path. |
-| | B. Two PRs (server and reads; commands) | — | Rejected (§8 D1). |
-| | C. Three PRs: 7a, 7b, 7c | — | **Adopted** (§8 D1). |
 
 ## 4. Same-Class Inventory
 
@@ -829,8 +826,6 @@ deps="$(cargo tree -p chaldea-daemon -e normal,features --prefix none)" && grep 
 plus the `workspace` job green on `macos-latest` and `windows-latest`, and the contract drift test regenerated for `core::http`'s types (§8 D13).
 
 ## 8. Decisions
-
-**D1. PR 7 ships as three PRs.** **7a** (server and access): `HttpServer`, `TaskRegistry`, the accept loop and `ConnIo`, `OuterLayer`, `GuardLayer`, `ROUTES` and `Mounts::mvp()` with every route mounted (handlers 501), `MVP_COMMANDS` and `core::auth`, `TokenService` and `verify_*_in`, `ReadCtx`/`WriteCtx`/`run_write`/`observe_write`, `LifecycleSink`, the status mapping, the span and redaction, `ServeHandle::shutdown`, the public bodies of D13; claims CL-1–CL-7, CL-27–CL-29, the Bearer and command-name cells of CL-4, and the guard, read, and route cases of CL-8, CL-22, CL-24, and CL-25; their remaining cases (commands, `args`, pairing, tickets) run in the part that adds those handlers. **7b** (reads and live): `/api/events`, `/api/threads`, `/api/worktrees`, blobs and `ReadTx::blob_ref_exists`, tickets, pairing, the WebSocket loop; CL-9–CL-17, CL-26, and the ticket and pair-code cells of CL-4. **7c** (commands): the duplicate scan, identity, `CommandHandler`, registry, `CommandRunner`, receipts; CL-18–CL-21, CL-23. PR 8 and PR 9 are siblings that each depend on PR 7 (mvp §4); both need only 7a and start once it merges, while 7b and 7c proceed in parallel with them. PR 10 depends on 8 and 9 and also needs 7c; PR 17 consumes the receipt rules and needs 7c (and 7b's replay rules); PR 18 needs 7b. 7c is on the longest path only if it takes longer than PR 8 and PR 9. The two-way split was rejected because its first half would hold PR 8 and PR 9 behind the sync API and WebSocket, which neither needs.
 
 **D2. Own accept loop on hyper's HTTP/1 builder with a timer**, a 5 s header read timeout, 8 KiB heads, 64 headers, 128 connections, a 30 s write stall armed only while a write is pending, and axum's accept-error rule; HTTP/1.1, with HTTP/1.0 requests under the same rules once parsed (no upgrade; hyper answers an HTTP/1.0 request carrying `Transfer-Encoding` with its own 400 before the `Host` check); one request per connection (`Connection: close` on every final response except a successful `101`, which keeps exactly `Connection: Upgrade` except for one racing shutdown, §6.2 "Known limits").
 
