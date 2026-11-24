@@ -399,9 +399,12 @@ async fn store_outcomes_map() {
         .panic_outside_job
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let x = Hook::of(&l, "Stop", "s");
+    // The writer is let go only once the hook job is in its queue (the observer waits on its
+    // ticket); released earlier, it could end before the submission, which `Closed` then
+    // answers with 503 `shutting_down`.
+    let parked = shared(&h.srv).faults.arm_ticket_park();
     let reply = h.spawn_post(&x);
-    let s = shared(&h.srv);
-    eventually(WAIT, "the hook job is queued", || s.faults.submits() >= 2).await;
+    reached(parked).await;
     release.send(()).unwrap();
     assert_eq!(
         outcome(&reply.await.unwrap()),
