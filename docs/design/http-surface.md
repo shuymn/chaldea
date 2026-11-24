@@ -34,7 +34,7 @@ Sources read for this document (paths are relative to each root):
 | H2 | hyper's HTTP/1 builder has `timer`, `header_read_timeout` (panics if set without a timer), `max_header_size`, `max_headers`, `keep_alive`; `serve_connection(..).with_upgrades()` lets an upgraded connection reach axum's `WebSocketUpgrade`. The header read timeout is armed when the connection starts reading a head, before any byte arrives. A response whose `Connection` header carries `close` is encoded as the connection's last message, and hyper closes the connection after it instead of reading another request; a `101` is always the last HTTP message. With `keep_alive(false)` instead, hyper appends `close` to every response's `Connection` value and writes all values on one line, so a `101` would carry `Connection: upgrade, close`. | hyper `src/server/conn/http1.rs:201`, `:245-262`, `:276-279`, `:341`, `:356`, `:370-373`, `:429`, `:481-483`; `src/proto/h1/conn.rs:224-236`, `:710-720`, `:1100-1117`; `src/proto/h1/role.rs:404-405`, `:847-862` | T (`http_layers::slow_head_is_closed`, `http_layers::one_request_per_connection`, `http_ws::*`) |
 | H3 | hyper rejects a `Content-Length` that is not all digits (`+5`), and two different values, as a header parse error answered 400 before the service is called; a head over the size or count bound is 431. | hyper `src/headers.rs:101-125`; `src/proto/h1/role.rs:295-312`, `:493-500`; `src/error.rs:513`, `:637-638` | T (`http_layers::parser_layer_cases`) |
 | H4 | With `Transfer-Encoding` present, hyper drops `Content-Length` from the parsed headers and keeps `Transfer-Encoding`. | hyper `src/proto/h1/role.rs:275-293` | T (`http_layers::te_with_content_length_is_400`) |
-| H5 | When a response is sent before the request body was read, hyper drains what it can read without waiting and otherwise closes the read side. On Windows a close with unread data can reset the connection (spike F-3c). | hyper `src/proto/h1/conn.rs:875-891`, `src/proto/h1/dispatch.rs:242-243`; spike `docs/spikes/pty-hooks-spike.md` §3 | D here; PR 9 records the observed outcome per OS |
+| H5 | When a response is sent before the request body was read, hyper drains what it can read without waiting and otherwise closes the read side. On Windows a close with unread data can reset the connection (spike F-3c; `crates/daemon/tests/hook_b8.rs::observed_body_in_flight` prints each runner's outcome). | hyper `src/proto/h1/conn.rs:875-891`, `src/proto/h1/dispatch.rs:242-243`; spike `docs/spikes/pty-hooks-spike.md` §3 | D here; PR 9 records the observed outcome per OS |
 | H6 | `tower-http`'s `TimeoutLayer` answers 408 and drops the inner future. | `tower-http` `src/timeout/service.rs:30-35` | D (why write routes have no dropping timeout) |
 | H7 | `tower-http`'s default `MakeSpan` records the full request URI, query included. | `tower-http` `src/trace/make_span.rs:78-90` | D (why §2.10 has its own span) |
 | H8 | axum's `WebSocketUpgrade` checks method, `Connection`, `Upgrade`, `Sec-WebSocket-Key`, and version, not `Origin`; tungstenite answers pings itself; `max_message_size`, `max_frame_size`, and `max_write_buffer_size` are per-socket settings. | axum `src/extract/ws.rs:189-201`, `:449-470`, `:781-790`, `:1220-1221` | D |
@@ -96,7 +96,7 @@ hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 # Sensitive-header marking (§2.10); no TimeoutLayer, no TraceLayer, no body-limit layer (§3).
 tower-http = { version = "=0.7.1", default-features = false, features = ["sensitive-headers"] }
-# Final equality of credential hashes (mvp §2.5, prior-art row 5d); same version as the spike.
+# Final equality of credential hashes (mvp §2.5, prior-art row 5d).
 subtle = "=2.6.1"
 # 256-bit secrets for tokens, tickets, and pair codes from the OS CSPRNG (H9; already in the lock through uuid).
 getrandom = "=0.4.3"
@@ -830,7 +830,7 @@ deps="$(cargo tree -p chaldea-pty-runtime -e normal --prefix none)" && ! grep -E
 deps="$(cargo tree -p chaldea-daemon -e normal,features --prefix none)" && grep -Fxq 'serde_json feature "float_roundtrip"' <<<"$deps"
 ```
 
-plus the `workspace` job green on `macos-latest` and `windows-latest`, the contract drift test regenerated for `core::http`'s types (§8 D13), and the `pty-hooks` job unchanged.
+plus the `workspace` job green on `macos-latest` and `windows-latest`, and the contract drift test regenerated for `core::http`'s types (§8 D13).
 
 ## 8. Decisions
 

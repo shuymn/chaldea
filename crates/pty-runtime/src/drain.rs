@@ -1,8 +1,8 @@
-//! The output drain (`docs/design/pty-runtime.md` §2.4), lifted from
-//! `spikes/pty-hooks/src/os/drain.rs` without its hold: the drain owns the PTY's output
-//! read end, reads until EOF or a read error on every path, passes every chunk to the
-//! session's sink from the first byte, and reports how it ended, never confusing the two.
-//! The sink exists before the backend spawns, so no output is held for a late consumer.
+//! The output drain (`docs/design/pty-runtime.md` §2.4), lifted from the PTY spike's
+//! `os/drain.rs` (`docs/spikes/pty-hooks-spike.md`) without its hold: the drain owns the
+//! PTY's output read end, reads until EOF or a read error on every path, passes every chunk
+//! to the session's sink from the first byte, and reports how it ended, never confusing the
+//! two. The sink exists before the backend spawns, so no output is held for a late consumer.
 
 use std::io::{self, Read};
 use std::sync::{Arc, Condvar, Mutex};

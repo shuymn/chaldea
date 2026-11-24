@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/shuymn/chaldea"
 publish = false
 
-# Exact pins (=x.y.z), as in spikes/pty-hooks: every upgrade is an explicit change.
+# Exact pins (=x.y.z): every upgrade is an explicit change.
 [workspace.dependencies]
 serde = { version = "=1.0.229", features = ["derive"] }
 # `float_roundtrip`: every spelling of a decimal parses to the nearest `f64`, so equal
@@ -75,7 +75,7 @@ hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 # Sensitive-header marking; no TimeoutLayer, no TraceLayer, no body-limit layer.
 tower-http = { version = "=0.7.1", default-features = false, features = ["sensitive-headers"] }
-# Final equality of credential hashes (mvp §2.5, prior-art row 5d); same version as the spike.
+# Final equality of credential hashes (mvp §2.5, prior-art row 5d).
 subtle = "=2.6.1"
 # 256-bit secrets for tokens, tickets, and pair codes from the OS CSPRNG (already in the lock through uuid).
 getrandom = "=0.4.3"

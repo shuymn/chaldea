@@ -13,8 +13,8 @@ ghalint = "1"
 node = "24"
 pnpm = "12"
 
-# Rust is not listed: spikes/pty-hooks is a standalone project whose toolchain
-# is pinned by its own rust-toolchain.toml, which rustup reads directly.
+# Rust is not listed: rust-toolchain.toml pins it, and rustup reads that file
+# directly.
 
 [settings]
 lockfile = true

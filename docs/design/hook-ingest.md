@@ -23,7 +23,7 @@ Sources read for this document:
 | Source | Revision | Read for |
 |---|---|---|
 | This repository | `3df7c70` | `docs/mvp-design.md`, `docs/architecture.md` §5, `docs/prior-art.md` rows 5a, 5b, 6a–6c, 9, `docs/design/{event-store,http-surface,formal-specs,pty-runtime,pty-unix,pty-windows}.md`, `specs/thread_input.qnt` (`bind`, `buffer*`, ack actions), `crates/daemon/src/http/{routes,guard,ctx,auth,error}.rs`, `crates/daemon/src/http/tests/{faults,writes,layers}.rs`, `crates/daemon/src/store/{rows,write_tx,readers,schema,annex,writer}.rs`, `crates/daemon/tests/{http_layers,http_matrix,http_logs,http_contract}.rs`, `tests/support/http.rs`, `crates/core/src/{state,payload,ids}.rs`, `crates/pty-runtime/src/{lib,backend}.rs`, `unix/{table,sys}.rs`, `windows/sys.rs`, `crates/testkit/src/fake_cli/`, `Cargo.toml`, `.github/workflows/ci.yml` |
-| Spike `spikes/pty-hooks` | `3df7c70` | `src/emitter.rs`, `src/http_client.rs`, `src/receiver.rs` (binding, B-8), `src/fake_cli.rs` (`echo --nested`), `src/os/{mod,unix,windows}.rs` (ancestry), `src/scenario/{fake,real}.rs` (CLI names), `docs/spikes/pty-hooks-spike.md` B-8, B-9, B-11, F-3c, §4.3 |
+| Spike [`spikes/pty-hooks`](https://github.com/shuymn/chaldea/tree/03b00b8c0462c032f5f4a4f057feafa8e366d1b5/spikes/pty-hooks) | `3df7c70` | `src/emitter.rs`, `src/http_client.rs`, `src/receiver.rs` (binding, B-8), `src/fake_cli.rs` (`echo --nested`), `src/os/{mod,unix,windows}.rs` (ancestry), `src/scenario/{fake,real}.rs` (CLI names), `docs/spikes/pty-hooks-spike.md` B-8, B-9, B-11, F-3c, §4.3 |
 | `hyper` | crate 1.12.0 | `src/proto/h1/role.rs`, `src/proto/h1/conn.rs` |
 | `libc` | crate 0.2.191 | `src/unix/bsd/apple/mod.rs` (`proc_bsdinfo`) |
 | `windows-sys` | crate 0.61.2 | `Cargo.toml` features (`Win32_System_Diagnostics_ToolHelp`) |
@@ -695,7 +695,7 @@ cargo test -p chaldea-daemon --test hook_b8 --locked -- observed_ --show-output
 deps="$(cargo tree -p chaldea-core -e normal --prefix none)" && ! grep -Eq '^(tokio|rusqlite|axum|hyper|tower|getrandom) ' <<<"$deps"
 ```
 
-plus the `workspace` job green on both runners with the sentinel and the B-8 step of §1, the `specs` job unchanged (no Quint change: the model already states what PR 9 implements, K10), and the `pty-hooks` job unchanged. A regression test counts only after it was seen failing with its guard removed: in particular the binding order and its release at submission (PR9-CL-6), row 7's ancestry check (PR9-CL-8), the promotion recheck (PR9-CL-12), row 5 (PR9-CL-14), the pid wait's re-read bound (PR9-CL-15), the walk's fail-closed ends (PR9-CL-26), the job's dedup (PR9-CL-1, concurrent case), and the emitter's watchdog (PR9-CL-23).
+plus the `workspace` job green on both runners with the sentinel and the B-8 step of §1, and the `specs` job unchanged (no Quint change: the model already states what PR 9 implements, K10). A regression test counts only after it was seen failing with its guard removed: in particular the binding order and its release at submission (PR9-CL-6), row 7's ancestry check (PR9-CL-8), the promotion recheck (PR9-CL-12), row 5 (PR9-CL-14), the pid wait's re-read bound (PR9-CL-15), the walk's fail-closed ends (PR9-CL-26), the job's dedup (PR9-CL-1, concurrent case), and the emitter's watchdog (PR9-CL-23).
 
 ## 8. Decisions
 

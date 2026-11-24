@@ -10,7 +10,7 @@ Sources read for this document (paths are relative to each root):
 
 | Source | Revision | Read for |
 |---|---|---|
-| This repository | `b35d687` | `crates/pty-runtime/src/{backend,session,drain,writer,fake,lib}.rs`, `Cargo.toml`, `.github/workflows/ci.yml`, `lefthook.yml`; spike `spikes/pty-hooks/src/os/{unix,mod}.rs`, `src/session.rs`, `src/fake_cli.rs`; `docs/spikes/pty-hooks-spike.md` §4.5–§4.7; `docs/prior-art.md` rows 1d, 2 |
+| This repository | `b35d687` | `crates/pty-runtime/src/{backend,session,drain,writer,fake,lib}.rs`, `Cargo.toml`, `.github/workflows/ci.yml`, `lefthook.yml`; spike [`spikes/pty-hooks/src/`](https://github.com/shuymn/chaldea/tree/03b00b8c0462c032f5f4a4f057feafa8e366d1b5/spikes/pty-hooks/src) `os/{unix,mod}.rs`, `session.rs`, `fake_cli.rs`; `docs/spikes/pty-hooks-spike.md` §4.5–§4.7; `docs/prior-art.md` rows 1d, 2 |
 | Rust std | 1.96.0 `rust-src` | `library/std/src/sys/process/unix/unix.rs` (fork path, exec-error pipe, signal handling), `sys/pipe/unix.rs` (CLOEXEC on macOS) |
 | `alacritty_terminal` | crate 0.26.0 (in `Cargo.lock`) | `src/tty/unix.rs:249-275` (its `pre_exec`) |
 | `portable-pty` | crate 0.8.1 | `src/unix.rs`, `src/cmdbuilder.rs` (the defects of §3) |

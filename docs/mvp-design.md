@@ -1,6 +1,6 @@
 # MVP Design: Local-First Chaldea
 
-Status: PRs 1–4 and 6 implemented (PR 2–4 designs: `docs/design/pty-runtime.md`, `pty-unix.md`, `pty-windows.md`; PR 6: `docs/design/event-store.md`); the rest is design. It plans the local-first MVP of issue #2. Canonical constraints: `AGENTS.md` and `docs/architecture.md` (cited as "arch §N"). Mechanism decisions: `docs/prior-art.md` (cited as "prior-art row N"). Spike evidence: `docs/spikes/pty-hooks-spike.md` (cited as "spike §N" or by its case ids such as "spike A-8", with report ids) and `spikes/pty-hooks/src/`.
+Status: PRs 1–4 and 6 implemented (PR 2–4 designs: `docs/design/pty-runtime.md`, `pty-unix.md`, `pty-windows.md`; PR 6: `docs/design/event-store.md`); the rest is design. It plans the local-first MVP of issue #2. Canonical constraints: `AGENTS.md` and `docs/architecture.md` (cited as "arch §N"). Mechanism decisions: `docs/prior-art.md` (cited as "prior-art row N"). Spike evidence: `docs/spikes/pty-hooks-spike.md` (cited as "spike §N" or by its case ids such as "spike A-8", with report ids) and the spike's source at its last commit, [`spikes/pty-hooks/src/`](https://github.com/shuymn/chaldea/tree/03b00b8c0462c032f5f4a4f057feafa8e366d1b5/spikes/pty-hooks/src) (spike module paths are relative to it).
 
 **What this document fixes.** Only what PR 1 freezes or what every later PR depends on: the public wire types and payloads, the state machines and their transition rules, the HTTP/CLI surface and its authorization matrix, the receipt and idempotency contract, the sync API contract, and the PR plan. Behaviour owned by one later PR is listed as that PR's **design obligations** (§4) and designed in its own document when the PR starts.
 
@@ -22,7 +22,7 @@ Zed is cited only through prior-art rows. Anything not read in source or docs is
 
 **In scope.** The irreversible core of arch §2 (§2 below); the five seams of arch §4 at the depth the milestones of issue #2 need; the minimum UI (thread list, thread view with events and state, plain `<textarea>` prompt input with IME guards, approval card, read-only VT snapshot, emergency VT keypad, usable on mobile viewports); the minimal A2UI catalog (§2.8) and `surface_action`.
 
-**Non-goals.** The Phase 2 relay (`packages/relay`) and therefore Android remote access; the local PWA binds to `127.0.0.1` only, and contracts leave room for the relay without implementing it. Every reversible layer of arch §2 (Tauri / Capacitor, diff view, split panes, visual styling, a separate PTY-owning process, A2UI beyond the minimal set); `docs/design/chaldea.pen` remains wireframes only. A client-side terminal emulator (invariant 2; the PWA shows snapshots, full access is `chaldea attach`). Orchestration strategy in daemon code (invariant 2). Removing `spikes/` (issue #1).
+**Non-goals.** The Phase 2 relay (`packages/relay`) and therefore Android remote access; the local PWA binds to `127.0.0.1` only, and contracts leave room for the relay without implementing it. Every reversible layer of arch §2 (Tauri / Capacitor, diff view, split panes, visual styling, a separate PTY-owning process, A2UI beyond the minimal set); `docs/design/chaldea.pen` remains wireframes only. A client-side terminal emulator (invariant 2; the PWA shows snapshots, full access is `chaldea attach`). Orchestration strategy in daemon code (invariant 2).
 
 ## 2. Irreversible-Core Contracts
 
@@ -187,7 +187,7 @@ queued ──(gate open; attempt persisted)──▶ sending ──(text + submi
 
 **Residual constraint.** Hooks are asynchronous processes and carry no CLI-side ordering against the daemon's PTY writes, so ack attribution and readiness remain inferences. The contract guarantees only that (a) no input is ever resent automatically, (b) no input is acked without a text match, and (c) any ambiguity leaves the gate closed or the input `unconfirmed`. Later PRs do not need to close this gap.
 
-Alternatives: auto-resend (rejected by arch §4.3; an extra Return can accept a popup, arch §5); ack by screen echo (invariant 1); readiness inferred from DECSET 2004 or the screen (invariant 1; Codex sets 2004 while a review dialog is up, spike §3); special-case rules per input source (rejected: the gate requires the same positive evidence from every source).
+Alternatives: auto-resend (rejected by arch §4.3; an extra Return can accept a popup, arch §5); ack by screen echo (invariant 1); readiness inferred from DECSET 2004 or the screen (invariant 1; Codex sets 2004 while a review dialog is up, spike §3; no test covers this yet, and PR 14 owns Codex startup stalls); special-case rules per input source (rejected: the gate requires the same positive evidence from every source).
 
 Public: state names, payloads, `send`, `ready`, `input resolve`, `input cancel`, the `readiness_evidence` modes. Internal: window, timeout, and settle defaults. The states beyond the architecture's four are §8 D3.
 
@@ -358,7 +358,6 @@ packages/web/       # React + TypeScript strict + Vite + Tailwind PWA, served by
 fixtures/           # real-CLI corpus: fixtures/<agent>/<cli-version>/<case>/
 fuzz/               # cargo-fuzz targets (nightly, outside the stable workspace)
 specs/              # Quint specs of the contracts, their committed ITF traces (docs/design/formal-specs.md)
-spikes/pty-hooks/   # unchanged until issue #1 removes it
 ```
 
 **Dependency direction.** `core` ← `pty-runtime` ← `daemon` ← `cli`; `testkit` may depend on `core` and on no other workspace crate; on Windows it reaches the console through `winapi-util`, keeping `forbid(unsafe_code)`. `core` depends on `serde`, `serde_json` (`raw_value`), `ts-rs`, `schemars`, `uuid`, `unicode-normalization`, `unicode-segmentation`; `sha2` (blob addresses, token hashes), `subtle` (token hash comparison), and `getrandom` (secrets) are `daemon` dependencies. Sans-IO is enforced by `crates/core/clippy.toml` (disallowing `std::fs`, `std::net`, `std::process`, `Instant::now`, `SystemTime::now`, `std::thread::spawn`) and a CI check that `core` has no `tokio`. `unsafe_code = "forbid"` stays workspace-wide except in `pty-runtime`, whose own `[lints]` table (`docs/design/pty-unix.md` §2.7) uses `deny` and allows `unsafe` only in its two `sys` modules (`unix::sys` and `windows::sys`).
@@ -371,7 +370,7 @@ spikes/pty-hooks/   # unchanged until issue #1 removes it
 | Protocol crate + server crate | Codex `codex-rs/app-server-protocol` owning the generated schema | **Adopted** in spirit: `core` owns every public type. |
 | Separate store crate | — | Rejected for the MVP: one user. |
 
-**Spike modules.** Copied, not moved; `spikes/` and its CI job stay until issue #1.
+**Spike modules.** Copied, not moved; the source is the spike at its last commit, [`spikes/pty-hooks/`](https://github.com/shuymn/chaldea/tree/03b00b8c0462c032f5f4a4f057feafa8e366d1b5/spikes/pty-hooks) (`03b00b8`).
 
 | Spike module | Destination | Decision |
 |---|---|---|
@@ -517,7 +516,7 @@ cargo test --workspace --locked
 deps="$(cargo tree -p chaldea-core -e normal --prefix none)" && ! grep -Eq '^(tokio|rusqlite|axum) ' <<<"$deps"
 ```
 
-plus the `workspace` job green on both runners and the `pty-hooks` job unchanged.
+plus the `workspace` job green on both runners.
 
 ## 6. Purpose Layer and Plan Layer
 
@@ -600,7 +599,7 @@ Checked on the real thing (real hosts, real CLIs, the built binary and PWA). Evi
 | Playwright | Desktop and mobile viewports; IME composition sequences; send, approval, keypad against FakeCli. | 18, 19 |
 | Real-host E2E | §6.1 on macOS and Windows with versions recorded. | 15, 23 |
 
-**Verdicts of evidence-collecting harnesses.** `chaldea doctor`, `doctor capture`, and the real-host runs decide their verdict in one function, `core::verdict::evaluate(plan: &CheckPlan, evidence: &[Check]) -> Verdict`, lifted from `spikes/pty-hooks/src/verdict.rs`. Outcomes are typed: `Pass`, `PlatformFail { cause }` (positive evidence of what the CLI or OS did), `HarnessFail { cause }`, `Missing`, `NotExercised { reason }`.
+**Verdicts of evidence-collecting harnesses.** `chaldea doctor`, `doctor capture`, and the real-host runs decide their verdict in one function, `core::verdict::evaluate(plan: &CheckPlan, evidence: &[Check]) -> Verdict`, lifted from the spike's [`src/verdict.rs`](https://github.com/shuymn/chaldea/blob/03b00b8c0462c032f5f4a4f057feafa8e366d1b5/spikes/pty-hooks/src/verdict.rs). Outcomes are typed: `Pass`, `PlatformFail { cause }` (positive evidence of what the CLI or OS did), `HarnessFail { cause }`, `Missing`, `NotExercised { reason }`.
 
 - The plan (required evidence keys and expected context: run, launch, OS build, CLI version) is fixed before observation. An empty plan is `Inconclusive`.
 - Each required key must appear exactly once, with its content checked; a second observation of the same key, even with the same outcome, is `HarnessFail`. This replaces the spike's "last check per key wins" (`verdict.rs:116-135`). Evidence outside the plan is recorded and does not affect the verdict, also a change from the spike.
