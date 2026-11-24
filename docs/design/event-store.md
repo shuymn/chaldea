@@ -873,5 +873,4 @@ None that change a public contract or are irreversible.
 - `docs/mvp-design.md` §2.1 "Store": the trigger set here adds `RAISE(ROLLBACK)` and engine checks for `seq`, global order, `cum_bytes`, membership, and transcript order; the projection table's "write basis" lives in the internal annex (D7).
 - `docs/mvp-design.md` §2.1 "Projections" row "axes, attention set | `status_changed` (plus `task_set`)": `task_set` changes `task_state`; the paired `status_changed(TaskState)` is checked at write time and changes nothing (§2.6).
 - `docs/mvp-design.md` §2.9 "ordered by receipt order at the daemon": PR 9 assigns the receipt ordinal at intake and the store keeps it (§2.3).
-- `docs/mvp-design.md` §3: `sha2` is listed among `core`'s dependencies but `core` does not use it yet; PR 6 adds it to `daemon`.
 - `docs/mvp-design.md` §4 PR 8: the single-instance lock, released only after `ShutdownReport::writer_exited`, the store shutdown rules (blocking call, one budget, file access, stop triggers), and the state directory location (§5).
