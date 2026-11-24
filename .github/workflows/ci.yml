@@ -65,9 +65,7 @@ jobs:
           mise trust mise.toml >/dev/null
           mise install --locked jq
 
-      # The daemon's timer bans fire: clippy must reject each banned call in the probe exactly
-      # once, judged from cargo's JSON messages (docs/design/deadlines.md §3 D4). Reuses the
-      # clippy step's check artifacts.
+      # See docs/design/deadlines.md §3 D4. Reuses the clippy step's check artifacts.
       - name: Probe the timer ban
         run: mise exec jq -- bash scripts/lint-probe.sh
 

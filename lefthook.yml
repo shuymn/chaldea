@@ -21,9 +21,8 @@ pre-commit:
         - "Cargo.{toml,lock}"
         - "rust-toolchain.toml"
       run: cargo clippy --workspace --all-targets --locked -- -D warnings
-    # The daemon's timer bans fire (docs/design/deadlines.md §3 D4). Commands run in name
-    # order, so when workspace-clippy also runs, this one follows it and reuses its check
-    # artifacts; a change to only the script, this file, or the mise files runs the probe alone.
+    # docs/design/deadlines.md §3 D4. Runs after workspace-clippy (name order) and reuses its
+    # check artifacts; a change to only the script, this file, or the mise files runs it alone.
     workspace-clippy-probe:
       glob:
         - "crates/daemon/clippy.toml"
