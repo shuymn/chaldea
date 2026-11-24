@@ -163,12 +163,7 @@ pub fn encode(
     encode_row(capabilities(agent, os), text, purpose)
 }
 
-/// [`encode`] for a given row; `encode` passes its table row.
-pub(crate) fn encode_row(
-    row: &Capabilities,
-    text: &str,
-    purpose: Purpose,
-) -> Result<Encoded, Rejection> {
+fn encode_row(row: &Capabilities, text: &str, purpose: Purpose) -> Result<Encoded, Rejection> {
     let p = path(row.agent(), row.pty_encoding(), purpose).ok_or(UNSUPPORTED)?;
     check_path(p, purpose, text)?;
     let bytes = match (p, purpose) {
