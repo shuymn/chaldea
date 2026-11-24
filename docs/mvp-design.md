@@ -187,7 +187,7 @@ queued ──(gate open; attempt persisted)──▶ sending ──(text + submi
 
 **Residual constraint.** Hooks are asynchronous processes and carry no CLI-side ordering against the daemon's PTY writes, so ack attribution and readiness remain inferences. The contract guarantees only that (a) no input is ever resent automatically, (b) no input is acked without a text match, and (c) any ambiguity leaves the gate closed or the input `unconfirmed`. Later PRs do not need to close this gap.
 
-Alternatives: auto-resend (rejected by arch §4.3; an extra Return can accept a popup, arch §5); ack by screen echo (invariant 1); readiness inferred from DECSET 2004 or the screen (invariant 1; Codex sets 2004 while a review dialog is up, spike §3); special-case rules per input source (rejected: the gate requires the same positive evidence from every source).
+Alternatives: auto-resend (rejected by arch §4.3; an extra Return can accept a popup, arch §5); ack by screen echo (invariant 1); readiness inferred from DECSET 2004 or the screen (invariant 1; Codex sets 2004 while a review dialog is up, spike §3; no test covers this yet, and PR 14 owns Codex startup stalls); special-case rules per input source (rejected: the gate requires the same positive evidence from every source).
 
 Public: state names, payloads, `send`, `ready`, `input resolve`, `input cancel`, the `readiness_evidence` modes. Internal: window, timeout, and settle defaults. The states beyond the architecture's four are §8 D3.
 
@@ -370,7 +370,7 @@ specs/              # Quint specs of the contracts, their committed ITF traces (
 | Protocol crate + server crate | Codex `codex-rs/app-server-protocol` owning the generated schema | **Adopted** in spirit: `core` owns every public type. |
 | Separate store crate | — | Rejected for the MVP: one user. |
 
-**Spike modules.** Lifted from the spike's last commit ([`spikes/pty-hooks/`](https://github.com/shuymn/chaldea/tree/03b00b8c0462c032f5f4a4f057feafa8e366d1b5/spikes/pty-hooks); the directory was removed by issue #1).
+**Spike modules.** Copied, not moved; the source is the spike at its last commit, [`spikes/pty-hooks/`](https://github.com/shuymn/chaldea/tree/03b00b8c0462c032f5f4a4f057feafa8e366d1b5/spikes/pty-hooks) (`03b00b8`).
 
 | Spike module | Destination | Decision |
 |---|---|---|

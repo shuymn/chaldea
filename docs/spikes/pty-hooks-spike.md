@@ -419,8 +419,10 @@ Windows-only runtime checks: `raw_spawn` with real CLIs and its injected failure
 
 ## 5. Runbook
 
+Historical procedure: these commands ran while `spikes/pty-hooks/` was in the tree. To run them again, check out `03b00b8` first, as phase 1 step 1 and phase 2 step 2 do, and use `03b00b8` wherever a later step checks out `origin/main` or `<commit>`.
+
 Phase 1, macOS (sets A and B):
-1. `cd spikes/pty-hooks && cargo build --release --locked && ./target/release/chs install-emitter && ./target/release/chs fake all`.
+1. `git checkout 03b00b8 && cd spikes/pty-hooks && cargo build --release --locked && ./target/release/chs install-emitter && ./target/release/chs fake all`.
 2. Pre-trust: `chs pretrust claude`, then `chs pretrust codex`. Each launches the CLI itself with the harness's exact launch argv (no shell, nothing to paste) in each folder in turn (`~/.chs/work/claude`; `~/.chs/work/codex` and `~/.chs/work/codex2`; and C-2's `~/.chs/work/日本 dir`; env values do not affect trust; Codex's argv includes its positional first prompt, so each pre-trust run also runs one short turn) and says what to approve there: accept folder trust; for Codex, open "Review hooks", check that every pending entry runs the spike command it names, and trust only then; if anything else is pending, quit without trusting and report. Quit each launch with `/exit` to move on to the next folder (a launch still running after 30 minutes is ended and pre-trust stops). `pretrust` then prints the follow-up commands below, each with the exact resolved `--claude-bin` / `--codex-bin`; `chs print-launch claude|codex` prints the same argv for diagnostics only. The CLI binary is found on PATH and its symlink chain is followed to the file it ends at; unless that file is named `claude` / `codex` and is not a script, `pretrust`, `print-launch`, and `real` exit 2 and ask for `--claude-bin` / `--codex-bin`. A version-manager shim (e.g. mise) or the npm `codex.js` needs the native binary, on macOS `…/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex`; `pretrust` prints that exact binary and puts it in every follow-up command.
 3. Set A, every command with `--allow-api-usage` (real CLIs refuse to launch without it) and the `--claude-bin` / `--codex-bin` that `pretrust` printed: `chs real claude-hooks --prompt`, `chs real codex-hooks --launches 3 --cwd2 ~/.chs/work/codex2 --codex-mode both`, `chs real codex-hooks --mutate-command` (answers the A-4 y/n prompt about the review entry), `chs real codex-warm`, `chs real tree-kill --agent claude|codex`, `chs real claude-paste`, `chs real codex-paste`, then `chs real claude-stall` / `codex-stall` in fresh folders. Each `real` scenario has its own default `--deadline-secs` (paste sweeps longest).
 4. Gate to phase 2: set B passes on macOS, `cargo check --target x86_64-pc-windows-msvc` passes (type-checks `cfg(windows)` code only; it does not link or run), set A recorded.
@@ -430,6 +432,7 @@ Phase 2, Windows (sets B and C, same commit, one sitting):
 2. Build and set B (PowerShell; pick a short `C:\chs` such as a top-level folder so MSVC stays below its 260-char path limit):
    ```
    mkdir C:\chs; git clone <repo> C:\chs\src
+   git -C C:\chs\src checkout 03b00b8
    $env:CARGO_TARGET_DIR = "C:\chs\t"
    cd C:\chs\src\spikes\pty-hooks; cargo build --release --locked
    C:\chs\t\release\chs.exe install-emitter
