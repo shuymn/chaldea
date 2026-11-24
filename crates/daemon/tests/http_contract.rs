@@ -19,7 +19,7 @@ use chaldea_core::http::{ErrorBody, ErrorCode};
 use chaldea_core::ids::{CommandId, LaunchId, ThreadId};
 use chaldea_daemon::http::{ApiError, Mount, Mounts, ReadCtx, spec};
 use serde_json::{Value, json};
-use support::http::{Reply, TestServer, settled};
+use support::http::{Reply, TestServer, send, settled};
 use support::soon;
 
 fn validator(name: &str) -> jsonschema::Validator {
@@ -164,22 +164,23 @@ async fn error_bodies_match_the_contract() {
 async fn not_error_bodies() {
     let srv = TestServer::start(Mounts::mvp()).await;
     // hyper's own replies: no ErrorBody, no `Cache-Control`.
-    for (what, req, status) in [
+    for (what, bytes, status) in [
         (
             "malformed Content-Length",
             srv.req("POST", "/hook")
                 .no_length()
                 .header("Content-Length", "+5")
-                .body(b"hello"),
+                .body(b"hello")
+                .bytes(),
             400,
         ),
         (
-            "oversized head",
-            srv.req("GET", "/").header("X-Big", &"a".repeat(9 * 1024)),
+            "head at the 8 KiB limit",
+            srv.req("GET", "/").head_at_limit(8 * 1024),
             431,
         ),
     ] {
-        let r = srv.send(&req).await;
+        let r = send(srv.port, &bytes).await;
         assert_eq!(r.status, status, "{what}");
         assert!(
             serde_json::from_slice::<ErrorBody>(&r.body).is_err(),
