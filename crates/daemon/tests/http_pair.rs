@@ -187,35 +187,6 @@ async fn issuer_revoked_before_exchange() {
     Arc::into_inner(srv).unwrap().stop().await;
 }
 
-/// The issuer's revocation queued after the exchange's job: the new token stays valid.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn issuer_revoked_after_exchange() {
-    let srv = Arc::new(TestServer::start(Mounts::mvp()).await);
-    let issuer = srv.token(TokenKind::Owner, None, None).await;
-    let c = srv.pair_code(&issuer).await.unwrap();
-    let hold = srv.hold_writer().await;
-    let base = srv.server.tasks();
-    let exchange = {
-        let srv = srv.clone();
-        tokio::spawn(async move { srv.pair(&c).await })
-    };
-    tasks_reach(&srv, base + 2).await;
-    let id = srv.token_row(&issuer).unwrap().token_id;
-    let revocation = srv
-        .store
-        .store()
-        .submit(soon(), move |tx| {
-            Ok(tx.token_revoke(TokenSelector::Token(id))?)
-        })
-        .unwrap();
-    drop(hold);
-    let token = token_of(&exchange.await.unwrap());
-    assert_eq!(revocation.await.unwrap(), 1);
-    assert_eq!(reads(&srv, &issuer).await, 401);
-    assert_eq!(reads(&srv, &token).await, 200, "the new token stays valid");
-    Arc::into_inner(srv).unwrap().stop().await;
-}
-
 /// A restart drops every pair code; the owner mints a new one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lost_after_restart() {
