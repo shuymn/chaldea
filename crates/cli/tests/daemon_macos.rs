@@ -151,18 +151,11 @@ mod macos {
     // ---- PR8-CL-13 ----
 
     fn start_cmd(labels: &Labels, dir: &Path, env: &[(&str, &OsStr)]) -> Command {
-        let mut c = faults::chaldea(labels, &[OsStr::new("--state-dir"), dir.as_os_str()]);
-        c.args(["daemon", "start"]);
-        for (k, v) in env {
-            c.env(k, v);
-        }
-        c
+        faults::cmd(labels, dir, &["daemon", "start"], env)
     }
 
     fn stop(labels: &Labels, dir: &Path) {
-        let mut c = faults::chaldea(labels, &[OsStr::new("--state-dir"), dir.as_os_str()]);
-        c.args(["daemon", "stop"]);
-        let mut p = Proc::spawn(&mut c);
+        let mut p = Proc::spawn(&mut faults::cmd(labels, dir, &["daemon", "stop"], &[]));
         assert_eq!(p.code(), 0, "{}{}", p.stdout(), p.stderr());
     }
 
@@ -171,9 +164,7 @@ mod macos {
     impl Drop for StopOnDrop<'_> {
         fn drop(&mut self) {
             if !matches!(discover(self.1), Discovery::NotRunning) {
-                let mut c =
-                    faults::chaldea(self.0, &[OsStr::new("--state-dir"), self.1.as_os_str()]);
-                c.args(["daemon", "stop"]);
+                let mut c = faults::cmd(self.0, self.1, &["daemon", "stop"], &[]);
                 let _ = Proc::spawn(&mut c).wait_within(Duration::from_secs(30));
             }
         }

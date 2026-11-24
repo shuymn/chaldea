@@ -16,7 +16,7 @@ use support::faults::{
     self, DEADLINE_MS, DISCOVERY_MARKS, EOF_CHILD_MS, EXIT_RECORD, EXPIRE_AFTER_ANSWER,
     EXPIRE_AFTER_EOF, Gate, HOLD_READER_MS, LOG_MARKERS, Labels, MARKER_PAUSE, PARK_RECONCILER,
     READY_PAUSE, RECHECK_MARK, SERVE_PAUSE, SHUTDOWN_GATE, TOKEN_FIELD, TOKEN_MSG, TOKEN_SPAN,
-    VERDICT_PAUSE,
+    VERDICT_PAUSE, cmd,
 };
 use support::runner::{Case, main as run_cases};
 use support::{Dir, Proc, WAIT, get_status, lock_state, state, token_of, wait_for};
@@ -105,21 +105,6 @@ const READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// start): an hour, far beyond the watchdogs that bound each of those steps (at most 60 s), so
 /// no slowness of theirs reaches it, and only the test ends the command's wait.
 const HELD_DEADLINE: &str = "3600000";
-
-/// `chaldea --state-dir <dir> daemon <args…>` with seams, `env` set.
-fn cmd(
-    labels: &Labels,
-    dir: &Path,
-    args: &[&str],
-    env: &[(&str, &OsStr)],
-) -> std::process::Command {
-    let mut c = faults::chaldea(labels, &[OsStr::new("--state-dir"), dir.as_os_str()]);
-    c.args(args);
-    for (k, v) in env {
-        c.env(k, v);
-    }
-    c
-}
 
 /// Runs `daemon start [extra…]` to its exit (within 30 s): code, stdout, stderr.
 fn start(

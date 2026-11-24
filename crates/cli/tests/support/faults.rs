@@ -614,6 +614,22 @@ pub fn chaldea(labels: &Labels, args: &[&OsStr]) -> std::process::Command {
     c
 }
 
+/// `chaldea --state-dir <dir> <args…>` (this binary with test seams), `env` set after the
+/// fault entry's own variables.
+pub fn cmd(
+    labels: &Labels,
+    dir: &Path,
+    args: &[&str],
+    env: &[(&str, &OsStr)],
+) -> std::process::Command {
+    let mut c = chaldea(labels, &[OsStr::new("--state-dir"), dir.as_os_str()]);
+    c.args(args);
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    c
+}
+
 /// A test's own launchd label prefix; dropping it boots out every job with that prefix still
 /// in the GUI domain (macOS), so no test job outlives its test.
 pub struct Labels {

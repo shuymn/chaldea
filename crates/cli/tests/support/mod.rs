@@ -495,14 +495,9 @@ pub fn report(line: &str) {
     let _ = out.flush();
 }
 
-/// Runs `test` of this test binary as a helper process with `env` (and `tweak` applied to the
-/// command), requires its success within `within`, and returns its first report line.
-pub fn run_helper(
-    test: &str,
-    env: &[(&str, &OsStr)],
-    within: Duration,
-    tweak: impl FnOnce(&mut Command),
-) -> String {
+/// `test` of this test binary as a helper process with `env`: stdin null, stdout and stderr
+/// piped.
+pub fn helper_cmd(test: &str, env: &[(&str, &OsStr)]) -> Command {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args([test, "--exact", "--nocapture", "--test-threads=1"])
         .stdin(Stdio::null())
@@ -511,6 +506,18 @@ pub fn run_helper(
     for (k, v) in env {
         cmd.env(k, v);
     }
+    cmd
+}
+
+/// Runs `test` of this test binary as a helper process with `env` (and `tweak` applied to the
+/// command), requires its success within `within`, and returns its first report line.
+pub fn run_helper(
+    test: &str,
+    env: &[(&str, &OsStr)],
+    within: Duration,
+    tweak: impl FnOnce(&mut Command),
+) -> String {
+    let mut cmd = helper_cmd(test, env);
     tweak(&mut cmd);
     let mut p = Proc::spawn(&mut cmd);
     let code = p.wait_within(within).code().expect("exited by a signal");

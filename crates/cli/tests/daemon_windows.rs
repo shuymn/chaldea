@@ -16,7 +16,7 @@ use std::ffi::OsStr;
 use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use chaldea_daemon::lifecycle::{
@@ -25,8 +25,8 @@ use chaldea_daemon::lifecycle::{
 use chaldea_pty_runtime::fake::{self, CtrlEvent, TestJob};
 use chaldea_pty_runtime::host::{self, JobLimits};
 use support::{
-    Proc, chaldea, get_status, lock_state, marked_dir, report, run_cmd, run_helper, run_to_exit,
-    serving_record, state, token_of, wait_for,
+    Proc, chaldea, get_status, helper_cmd, lock_state, marked_dir, report, run_cmd, run_helper,
+    run_to_exit, serving_record, state, token_of, wait_for,
 };
 
 /// `CREATE_NEW_CONSOLE` and `CREATE_NEW_PROCESS_GROUP` (`winbase.h`).
@@ -153,13 +153,8 @@ fn wait_go() {
 /// Runs `test` as a helper with `role` and the state directory `dir`, assigned to `jobs` in
 /// order (a second job nests under the first) before it goes; returns its report.
 fn helper_in_jobs(test: &str, role: &str, dir: &Path, jobs: &[&TestJob]) -> String {
-    let mut cmd = Command::new(std::env::current_exe().unwrap());
-    cmd.args([test, "--exact", "--nocapture", "--test-threads=1"])
-        .env(ROLE, role)
-        .env(DIR, dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut cmd = helper_cmd(test, &[(ROLE, OsStr::new(role)), (DIR, dir.as_os_str())]);
+    cmd.stdin(Stdio::piped());
     let mut p = Proc::spawn(&mut cmd);
     for j in jobs {
         j.assign(p.pid()).unwrap();
@@ -518,18 +513,11 @@ fn no_listener_is_reported() {
     }
     let d = state();
     marked_dir(&d.path);
-    let mut cmd = Command::new(std::env::current_exe().unwrap());
-    cmd.args([
+    let mut cmd = helper_cmd(
         "no_listener_is_reported",
-        "--exact",
-        "--nocapture",
-        "--test-threads=1",
-    ])
-    .env(ROLE, "holder")
-    .env(DIR, &d.path)
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+        &[(ROLE, OsStr::new("holder")), (DIR, d.path.as_os_str())],
+    );
+    cmd.stdin(Stdio::piped());
     let mut holder = Proc::spawn(&mut cmd);
     assert!(
         wait_for(|| holder.stdout().contains("@@ holding")),

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use chaldea_daemon::lifecycle::{DiscoveryRecord, Evidence, RecordState, names, spawn_locked};
 use chaldea_pty_runtime::host;
-use support::faults::{self, DEADLINE_MS, Gate, Labels, SLOW_SHUTDOWN_MS, STOP_PAUSE};
+use support::faults::{DEADLINE_MS, Gate, Labels, SLOW_SHUTDOWN_MS, STOP_PAUSE, cmd};
 use support::runner::{Case, main as run_cases};
 use support::{Proc, WAIT, marked_dir, state};
 
@@ -45,15 +45,6 @@ fn main() {
 
 /// The design's stop deadline, restated.
 const STOP_WAIT: Duration = Duration::from_secs(15);
-
-fn cmd(labels: &Labels, dir: &Path, args: &[&str], env: &[(&str, &OsStr)]) -> Command {
-    let mut c = faults::chaldea(labels, &[OsStr::new("--state-dir"), dir.as_os_str()]);
-    c.args(args);
-    for (k, v) in env {
-        c.env(k, v);
-    }
-    c
-}
 
 /// A foreground daemon on `dir`, serving.
 fn foreground(labels: &Labels, dir: &Path, env: &[(&str, &OsStr)]) -> Proc {
