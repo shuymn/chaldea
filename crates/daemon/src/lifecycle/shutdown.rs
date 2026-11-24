@@ -475,7 +475,7 @@ impl Coordinator {
                     instance: self.instance.clone(),
                     log: self.log.clone(),
                     shared: self.shared.clone(),
-                    evidence: std::sync::Mutex::default(),
+                    evidence: files::Evidence::default(),
                     process: env.process,
                     #[cfg(test)]
                     faults: env.faults.clone(),

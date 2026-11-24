@@ -115,7 +115,7 @@ pub(crate) struct StartupCtx {
     pub(crate) log: Logger,
     pub(crate) shared: Arc<Shared>,
     /// Step 2's evidence, recorded in `daemon.json`.
-    pub(crate) evidence: std::sync::Mutex<Evidence>,
+    pub(crate) evidence: Evidence,
     /// A process run (`run`, a helper's `run_process_with`): step 1 may leave the session and
     /// step 2 reads the process's job; an isolated run does neither.
     pub(crate) process: bool,
@@ -190,7 +190,7 @@ impl StartupCtx {
             url: port.map(url),
             started_at: SystemClock.now().1.0,
             detached,
-            evidence: self.evidence.lock().map(|e| e.clone()).unwrap_or_default(),
+            evidence: self.evidence.clone(),
         })
     }
 }
@@ -357,12 +357,10 @@ pub(crate) async fn run(mut cx: StartupCtx) -> Started {
     boundary!(cx, st, 2);
     match job_state(&cx) {
         Ok(job) => {
-            if let Ok(mut e) = cx.evidence.lock() {
-                if cfg!(windows) || job.in_job {
-                    e.job = Some(job_evidence(&job));
-                }
-                e.console = host::has_console();
+            if cfg!(windows) || job.in_job {
+                cx.evidence.job = Some(job_evidence(&job));
             }
+            cx.evidence.console = host::has_console();
             if job.in_job {
                 if detached {
                     return st.failed(
