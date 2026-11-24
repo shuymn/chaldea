@@ -103,7 +103,7 @@ tempfile.workspace = true
 workspace = true
 ```
 
-`Cargo.lock` holds none of `rusqlite`, `libsqlite3-sys`, `sha2`, or `tokio` yet: the implementation adds them, and the PR checks that the lock resolves `libsqlite3-sys` to `0.39.1` (the version this design read; `rusqlite =0.41.1` requires `0.39`) and records the resolved versions in its description. `rusqlite` needs Rust 1.89; the toolchain is 1.96.0. The bundled build needs a C compiler: Xcode's `cc` on `macos-latest`, MSVC on `windows-latest`. `sha2` is listed for `core` in mvp §3 but `core` does not use it; PR 6 adds it to the daemon only. The daemon stays `unsafe_code = "forbid"`; the store needs no `unsafe` (Unix file mode through `std::os::unix::fs::OpenOptionsExt::mode`).
+`Cargo.lock` resolves `libsqlite3-sys` to `0.39.1` (`rusqlite =0.41.1` requires `0.39`). `rusqlite` needs Rust 1.89; the toolchain is 1.96.0. The bundled build needs a C compiler: Xcode's `cc` on `macos-latest`, MSVC on `windows-latest`. The daemon stays `unsafe_code = "forbid"`; the store needs no `unsafe` (Unix file mode through `std::os::unix::fs::OpenOptionsExt::mode`).
 
 **Workspace and CI.** The crate joins `members`. The `workspace` job runs unchanged; `cargo test --workspace --locked` now includes the store's unit and integration tests on both runners. No new CI step: the existing `core` dependency check keeps `rusqlite` and `tokio` out of `core`, and the only `cfg(windows)` store test (`store_open::long_path_vfs_is_selected`) is listed in the Windows sentinel step. `lefthook.yml` needs no change.
 
