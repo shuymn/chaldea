@@ -1216,25 +1216,26 @@ fn identity_failure_has_an_empty_start() {
 
 // ---- CL-21 ----
 
-/// The write end is inheritable only inside the spawn lock, which every other spawn of this
-/// binary takes, so no other test's child can inherit a copy: from `CreateProcessW`'s
-/// `LockAcquired` until it is dropped at `BeforeUnlock`.
-#[test]
-fn child_inherits_no_handle() {
-    let _s = serial();
+/// Spawns `cmd.exe /d /c pause` through the backend, `fault` injected when given, with a
+/// pipe write end inheritable during each stage-5 attempt: made inheritable at its
+/// `LockAcquired` and not inheritable again at its `BeforeUnlock`, so only a create inside
+/// the spawn lock, which every other spawn of this binary takes, can see it. Once the test
+/// drops its own copy, the write end has no writer left while the child lives.
+fn assert_no_inheritance(fault: Option<WindowsFault>, branch: &str, attempts: usize) {
     let (r, w) = std::io::pipe().unwrap();
-    let w = Arc::new(Mutex::new(Some(w)));
+    let w = Arc::new(w);
     let held = w.clone();
+    let inheritable = Arc::new(AtomicU32::new(0));
+    let made = inheritable.clone();
     let pty = WindowsPty {
         hooks: Hooks {
             stage: Some(Box::new(move |s| {
                 match s {
                     Stage::LockAcquired { stage: 5 } => {
-                        if let Some(w) = held.lock().unwrap().as_ref() {
-                            sys::make_inheritable(w).unwrap();
-                        }
+                        sys::make_inheritable(&*held).unwrap();
+                        made.fetch_add(1, Ordering::SeqCst);
                     }
-                    Stage::BeforeUnlock { stage: 5 } => drop(held.lock().unwrap().take()),
+                    Stage::BeforeUnlock { stage: 5 } => sys::clear_inheritable(&*held).unwrap(),
                     _ => {}
                 }
                 false
@@ -1242,11 +1243,22 @@ fn child_inherits_no_handle() {
             ..Hooks::default()
         },
     };
-    let (parts, child) = live_child(&pty);
-    assert!(
-        w.lock().unwrap().is_none(),
-        "the write end was inheritable during a CreateProcessW"
+    let spec = cmd("pause");
+    let spawned = match fault {
+        Some(f) => spawn_with(f, &pty, &spec),
+        None => spawn(&pty, &spec),
+    };
+    let parts = spawned.unwrap_or_else(|e| panic!("{e}"));
+    let child = take_child(&pty).unwrap();
+    let ev: std::collections::HashMap<_, _> = parts.evidence.iter().cloned().collect();
+    assert_eq!(ev["job_branch"], branch, "{ev:?}");
+    assert_eq!(
+        inheritable.load(Ordering::SeqCst),
+        u32::try_from(attempts).unwrap(),
+        "the write end was inheritable during every attempt"
     );
+    drop(pty);
+    drop(Arc::into_inner(w).expect("the hook released its copy"));
     assert_eq!(
         child.wait_timeout(Duration::ZERO).unwrap(),
         None,
@@ -1258,6 +1270,20 @@ fn child_inherits_no_handle() {
     );
     drop(child);
     let _ = release(parts);
+}
+
+#[test]
+fn child_inherits_no_handle() {
+    let _s = serial();
+    assert_no_inheritance(None, "job_list", 1);
+}
+
+/// The suspended attempt, the only real `CreateProcessW` once the job-list attempt is
+/// rejected, passes no handle either.
+#[test]
+fn suspended_child_inherits_no_handle() {
+    let _s = serial();
+    assert_no_inheritance(Some(WindowsFault::RejectJobList(None)), "suspended", 2);
 }
 
 #[test]

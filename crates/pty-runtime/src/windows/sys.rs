@@ -728,6 +728,12 @@ pub(crate) fn make_inheritable(h: &impl AsRawHandle) -> io::Result<()> {
     set_inherit(raw(h), true)
 }
 
+/// Makes a handle not inheritable again (CL-21).
+#[cfg(test)]
+pub(crate) fn clear_inheritable(h: &impl AsRawHandle) -> io::Result<()> {
+    set_inherit(raw(h), false)
+}
+
 /// Whether a pipe's write end is still open anywhere (CL-21): `PeekNamedPipe` on the read
 /// end, `ERROR_BROKEN_PIPE` meaning no writer.
 #[cfg(test)]
