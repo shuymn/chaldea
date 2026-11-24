@@ -76,6 +76,13 @@ const EOF_CHILD_LINGER: Duration = Duration::from_secs(5);
 /// The longest a gate waits.
 const GATE_MAX: Duration = Duration::from_secs(60);
 
+/// The exit code of a process whose gate expired before the test released it.
+const GATE_EXPIRED: i32 = 86;
+
+/// The file a gate's one decision creates: the test's release or the paused side's expiry,
+/// whichever comes first.
+const DECIDED: &str = "decided";
+
 /// The secrets the log-marker component writes (redacted in every diagnostic).
 pub const TOKEN_MSG: &str = "chd_MSGMSGMSGMSGMSGMSGMSGMSGMSGMSGMSGMSGMSGMSGM";
 pub const TOKEN_FIELD: &str = "chdt_FIELDFIELDFIELDFIELDFIELDFIELDFIELDFIELDF";
@@ -114,9 +121,25 @@ impl Gate {
         }
     }
 
+    /// Lets the paused side go on; panics if its gate expired first (the paused process then
+    /// exits with [`GATE_EXPIRED`]).
     pub fn release(&self) {
-        std::fs::write(self.dir.path().join("release"), b"").unwrap();
+        assert!(
+            decide(self.dir.path()),
+            "the gate {} expired before the test released it",
+            self.dir.path().display()
+        );
     }
+
+    /// [`Gate::release`] for a cleanup path, which must not panic.
+    pub fn release_quietly(&self) {
+        let _ = decide(self.dir.path());
+    }
+}
+
+/// Creates the gate's decision; `false` when the other side decided first.
+fn decide(dir: &Path) -> bool {
+    std::fs::File::create_new(dir.join(DECIDED)).is_ok()
 }
 
 impl Default for Gate {
@@ -125,11 +148,19 @@ impl Default for Gate {
     }
 }
 
-/// The paused side of a [`Gate`].
+/// The paused side of a [`Gate`]: only the test's release lets it go on. A gate that expires
+/// first ends this process with [`GATE_EXPIRED`], and the test's release then fails.
 fn wait_at(dir: &Path) {
     let _ = std::fs::write(dir.join("reached"), b"");
     let end = Instant::now() + GATE_MAX;
-    while Instant::now() < end && !dir.join("release").exists() {
+    while !dir.join(DECIDED).exists() {
+        if Instant::now() >= end && decide(dir) {
+            eprintln!(
+                "the test gate {} expired before the test released it",
+                dir.display()
+            );
+            std::process::exit(GATE_EXPIRED);
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -342,8 +373,8 @@ impl ShutdownParticipant for Slow {
     }
 }
 
-/// A shutdown participant that blocks the shutdown at a gate until the test releases it (at
-/// most [`GATE_MAX`]), past its end: the daemon stays stopping meanwhile.
+/// A shutdown participant that blocks the shutdown at a gate until the test releases it, past
+/// its end: the daemon stays stopping meanwhile.
 struct HeldShutdown(PathBuf);
 
 impl ShutdownParticipant for HeldShutdown {
