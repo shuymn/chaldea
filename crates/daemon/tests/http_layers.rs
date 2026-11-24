@@ -11,7 +11,7 @@ use axum::body::Body;
 use axum::http::{Method, Response};
 use chaldea_core::auth::TokenKind;
 use chaldea_core::ids::{LaunchId, ThreadId};
-use chaldea_daemon::http::{ApiError, Mount, Mounts, ReadCtx, WriteCtx, spec};
+use chaldea_daemon::http::{ApiError, MonotonicClock, Mount, Mounts, ReadCtx, WriteCtx, spec};
 use support::http::{
     DEADLINE, HEAD_TIMEOUT, Req, TestServer, connect, dump, parse, read_to_end, send,
 };
@@ -613,14 +613,16 @@ fn plain_write_mount(deadline_tx: tokio::sync::mpsc::UnboundedSender<Instant>) -
     ))
 }
 
+/// A plain write the writer takes after its `not_after` and answers `Expired`, observed before
+/// the reply cutoff: 408. The server's clock stands still, so the request deadline and the
+/// reply cutoff never pass however slow the host is; the store's clock is put past the job's
+/// `not_after` instead, so the writer expires the job when it takes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plain_write_expired_is_408() {
     let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
-    let srv = TestServer::start_with(plain_write_mount(dtx), |c| {
-        c.write_reply_grace = Duration::from_secs(1);
-    })
-    .await;
+    let srv = TestServer::start(plain_write_mount(dtx)).await;
     let hook = srv.token_of(TokenKind::Hook, 1).await;
+    srv.clock.stop();
     let release = srv.hold_writer().await;
     let port = srv.port;
     let req = srv.req("POST", "/hook").bearer(&hook).body(b"{}");
@@ -631,14 +633,14 @@ async fn plain_write_expired_is_408() {
         d = drx.recv() => d.unwrap(),
         r = &mut reply => panic!("answered before the handler ran: {:?}", r.unwrap()),
     };
-    // Release the writer just after the job's `not_after`: it takes the job late and
-    // replies `Expired` within the reply grace.
-    waits::pause_until(tokio::time::Instant::from_std(
-        deadline + Duration::from_millis(100),
-    ))
-    .await;
+    // The job's `not_after` as the writer has it: the real instant of the request deadline.
+    let not_after = srv.clock.real(deadline);
+    srv.store
+        .clock
+        .lead(not_after.saturating_duration_since(Instant::now()) + Duration::from_millis(1));
     release.send(()).unwrap();
     let r = reply.await.unwrap();
+    srv.store.clock.lead(Duration::ZERO);
     assert_eq!(r.outcome(), (408, code("request_timeout")));
     assert!(srv.sink.0.lock().unwrap().is_empty());
     srv.stop().await;
