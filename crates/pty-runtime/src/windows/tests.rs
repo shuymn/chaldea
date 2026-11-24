@@ -1216,14 +1216,37 @@ fn identity_failure_has_an_empty_start() {
 
 // ---- CL-21 ----
 
+/// The write end is inheritable only inside the spawn lock, which every other spawn of this
+/// binary takes, so no other test's child can inherit a copy: from `CreateProcessW`'s
+/// `LockAcquired` until it is dropped at `BeforeUnlock`.
 #[test]
 fn child_inherits_no_handle() {
     let _s = serial();
     let (r, w) = std::io::pipe().unwrap();
-    sys::make_inheritable(&w).unwrap();
-    let pty = WindowsPty::default();
+    let w = Arc::new(Mutex::new(Some(w)));
+    let held = w.clone();
+    let pty = WindowsPty {
+        hooks: Hooks {
+            stage: Some(Box::new(move |s| {
+                match s {
+                    Stage::LockAcquired { stage: 5 } => {
+                        if let Some(w) = held.lock().unwrap().as_ref() {
+                            sys::make_inheritable(w).unwrap();
+                        }
+                    }
+                    Stage::BeforeUnlock { stage: 5 } => drop(held.lock().unwrap().take()),
+                    _ => {}
+                }
+                false
+            })),
+            ..Hooks::default()
+        },
+    };
     let (parts, child) = live_child(&pty);
-    drop(w);
+    assert!(
+        w.lock().unwrap().is_none(),
+        "the write end was inheritable during a CreateProcessW"
+    );
     assert_eq!(
         child.wait_timeout(Duration::ZERO).unwrap(),
         None,
@@ -1241,8 +1264,9 @@ fn child_inherits_no_handle() {
 fn inheriting_child_keeps_the_writer() {
     let _s = serial();
     let (r, w) = std::io::pipe().unwrap();
-    sys::make_inheritable(&w).unwrap();
-    let mut c = crate::with_spawn_lock(|| {
+    // Inheritable only inside the spawn lock, as in `child_inherits_no_handle`.
+    let mut c = crate::with_spawn_lock(move || {
+        sys::make_inheritable(&w)?;
         Command::new(cmd_exe())
             .args(["/d", "/c", "pause"])
             .stdin(Stdio::piped())
@@ -1251,7 +1275,6 @@ fn inheriting_child_keeps_the_writer() {
             .spawn()
     })
     .unwrap();
-    drop(w);
     assert!(sys::pipe_has_writer(&r).unwrap(), "a std child inherits it");
     c.kill().unwrap();
     c.wait().unwrap();
