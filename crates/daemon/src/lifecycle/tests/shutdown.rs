@@ -571,50 +571,44 @@ fn no_unlink_after_the_record_budget() {
     assert!(log.text().contains("was left in place"), "{}", log.text());
 }
 
-/// PR8-CL-23: the record says `stopping` before HTTP shuts down, in two runs, because a held
-/// rewrite spends its own 500 ms: while one run's rewrite is held, HTTP still answers (that
-/// rewrite then misses its budget, as in `stalled_stopping_rewrite_does_not_hold_http`); in
-/// another run, unheld, a discovery while the coordinator is paused after HTTP's shutdown
-/// returned sees that run stopping, not serving.
+/// PR8-CL-23: the record says `stopping` before HTTP shuts down. The rewrite has a
+/// test-set budget of `WAIT` (and the run a shutdown budget long enough to hold it), so a
+/// slow write or a held rewrite does not run out of time; `stalled_stopping_rewrite_does_not_hold_http`
+/// covers the 500 ms budget. While the rewrite is held, HTTP still answers and the coordinator
+/// has not reached HTTP's shutdown; once it reaches it, the record already says `stopping`
+/// with this run's instance, and HTTP still answers.
 #[test]
 fn record_says_stopping_before_http_shuts_down() {
     use super::super::files::{Discovery, discover};
     let dir = state();
     let faults = Arc::new(Faults::default());
+    *faults.stopping_rewrite.lock().unwrap() = Some(WAIT);
     let rewriting = faults.park(Point::InsideStopping);
-    let run = start(
-        foreground(&dir.path, Some(hold_port())),
-        TestComponents::default(),
-        faults.clone(),
-    );
+    let before_http = faults.park(Point::BeforeHttp);
+    let mut cfg = foreground(&dir.path, Some(hold_port()));
+    cfg.budgets.total = 3 * WAIT;
+    let run = start(cfg, TestComponents::default(), faults.clone());
     let port = run.serving();
-    run.stop();
-    let reached = rewriting.wait_reached(WAIT);
-    let http_up = super::get_status(port, "/api/threads", Some(&super::token_of(&dir.path)))
-        .is_ok_and(|s| s == 200);
-    rewriting.release();
-    assert!(reached, "the rewrite did not start");
-    assert!(http_up, "HTTP shut down before the rewrite");
-    let log = run.log.clone();
-    let r = run.join();
-    assert_eq!(r.code.code(), 0, "{}", log.text());
-
-    let dir = state();
-    let faults = Arc::new(Faults::default());
-    let after_http = faults.park(Point::AfterHttp);
-    let run = start(
-        foreground(&dir.path, Some(hold_port())),
-        TestComponents::default(),
-        faults.clone(),
-    );
-    run.serving();
     let Discovery::Serving(serving) = discover(&dir.path) else {
         panic!("not serving: {:?}", discover(&dir.path))
     };
+    let token = super::token_of(&dir.path);
+    let answers = || super::get_status(port, "/api/threads", Some(&token)).is_ok_and(|s| s == 200);
     run.stop();
-    assert!(after_http.wait_reached(WAIT));
+    let reached = rewriting.wait_reached(WAIT);
+    let http_up = answers();
+    let http_began = before_http.wait_reached(Duration::ZERO);
+    rewriting.release();
+    assert!(reached, "the rewrite did not start");
+    assert!(http_up, "HTTP shut down before the rewrite");
+    assert!(
+        !http_began,
+        "HTTP's shutdown began while the rewrite was held"
+    );
+    assert!(before_http.wait_reached(WAIT));
     let seen = discover(&dir.path);
-    after_http.release();
+    let http_up = answers();
+    before_http.release();
     let log = run.log.clone();
     let r = run.join();
     assert_eq!(r.code.code(), 0, "{}", log.text());
@@ -623,6 +617,7 @@ fn record_says_stopping_before_http_shuts_down() {
         "{seen:?}\n{}",
         log.text()
     );
+    assert!(http_up, "HTTP shut down before its shutdown step");
 }
 
 /// A `stopping` rewrite that does not finish within its 500 ms does not hold HTTP's
@@ -798,10 +793,11 @@ fn stopping_worker_paused_past_its_cutoff_creates_nothing() {
     ));
 }
 
-/// The `stopping` rewrite's failing rename is retried only before the rewrite's cutoff, never
-/// for a fresh retry window. A run whose cutoff passed before its first rename (a loaded
-/// host's temporary write and sync) shows nothing about the retries: it is checked for what
-/// it did and repeated with twice the time, from 150 ms.
+/// The `stopping` rewrite's failing rename is retried, only before the rewrite's cutoff and
+/// never for a fresh retry window; the rewrite gives up only at its cutoff. A run that ends at
+/// its cutoff with fewer than two renames (a loaded host's temporary write and sync took the
+/// time) shows nothing about the retries: it is checked for what it did and repeated with
+/// twice the time, from 150 ms.
 #[test]
 fn stopping_rename_is_not_retried_past_its_cutoff() {
     use super::super::files::ReplaceStage;
@@ -819,16 +815,29 @@ fn stopping_rename_is_not_retried_past_its_cutoff() {
         };
         let end = Instant::now() + budget;
         let r = super::super::shutdown::mark_stopping(d.path(), "i", end, &|| {}, &hook);
+        let returned = Instant::now();
         let renames = renames.into_inner().unwrap();
-        assert!(r.is_err(), "{r:?}");
+        let why = r.expect_err("every rename fails");
         assert!(renames.iter().all(|&t| t < end), "{renames:?} {end:?}");
         assert_eq!(std::fs::read(d.path().join(names::RECORD)).unwrap(), before);
-        if !renames.is_empty() {
+        assert!(
+            returned >= end,
+            "gave up before its cutoff after {} renames: {why}",
+            renames.len()
+        );
+        assert!(
+            ["injected", "cutoff passed before the rename", "ms ended"]
+                .iter()
+                .any(|m| why.contains(m)),
+            "{why}"
+        );
+        if renames.len() >= 2 {
             return;
         }
         assert!(
             budget < Duration::from_secs(4),
-            "no rename before a {budget:?} cutoff: {r:?}"
+            "{} renames before a {budget:?} cutoff: {why}",
+            renames.len()
         );
         budget *= 2;
     }

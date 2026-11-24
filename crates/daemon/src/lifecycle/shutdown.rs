@@ -597,13 +597,27 @@ impl Coordinator {
         if self.shared.record_published.load(Ordering::SeqCst)
             && let Some(dir) = self.shared.dir.get().cloned()
         {
-            let end = (Instant::now() + STOPPING_REWRITE).min(cutoff - b.http_before);
+            #[cfg(test)]
+            let budget = self
+                .faults
+                .stopping_rewrite
+                .lock()
+                .ok()
+                .and_then(|w| *w)
+                .unwrap_or(STOPPING_REWRITE);
+            #[cfg(not(test))]
+            let budget = STOPPING_REWRITE;
+            let end = (Instant::now() + budget).min(cutoff - b.http_before);
             if self.publish_stopping(dir, end).await.is_err() {
                 return self.crash_exit(held_now(&st));
             }
         }
         let mut http_aborted = false;
         if let Some(serve) = st.serve.take() {
+            #[cfg(test)]
+            if let Some(p) = self.faults.parked(super::faults::Point::BeforeHttp) {
+                p.hold().await;
+            }
             let end = cutoff - b.http_before;
             self.mark("http", Some(end));
             match self.guarded(serve.shutdown(end)).await {
