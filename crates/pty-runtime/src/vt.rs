@@ -1,7 +1,7 @@
 //! The headless VT and its responder (`docs/design/pty-runtime.md` §2.5, §2.6), lifted
-//! from `spikes/pty-hooks/src/vt.rs`: an `alacritty_terminal` `Term` whose event listener
-//! turns each reply event into one reply write, fed through a parser that never buffers a
-//! synchronized update, plus the packed mode word.
+//! from the PTY spike's `vt.rs` (`docs/spikes/pty-hooks-spike.md`): an `alacritty_terminal`
+//! `Term` whose event listener turns each reply event into one reply write, fed through a
+//! parser that never buffers a synchronized update, plus the packed mode word.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};

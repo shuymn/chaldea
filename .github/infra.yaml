@@ -72,10 +72,6 @@ spec:
               app: github-actions
             - context: workspace (windows-latest)
               app: github-actions
-            - context: pty-hooks (macos-latest)
-              app: github-actions
-            - context: pty-hooks (windows-latest)
-              app: github-actions
             - context: security / betterleaks
               app: github-actions
             - context: mise-lock (macos-latest)

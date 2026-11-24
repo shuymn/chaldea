@@ -1,7 +1,7 @@
 # The same checks CI runs: the workflow linters of the shared gha workflow, the
-# secret scan of the shared security workflow, and the workspace, specs, and
-# pty-hooks spike checks of ci.yml (tests and the specs simulation on push, since
-# they take several seconds).
+# secret scan of the shared security workflow, and the workspace and specs checks
+# of ci.yml (tests and the specs simulation on push, since they take several
+# seconds).
 pre-commit:
   commands:
     actionlint:
@@ -68,14 +68,6 @@ pre-commit:
         - "specs/package.json"
         - "specs/pnpm-*.yaml"
       run: 'mise exec -- pnpm install --frozen-lockfile --silent && mise exec -- pnpm run --silent typecheck && mise exec -- pnpm run --silent traces:check'
-    pty-hooks-fmt:
-      root: spikes/pty-hooks/
-      glob: "*.rs"
-      run: cargo fmt --check
-    pty-hooks-clippy:
-      root: spikes/pty-hooks/
-      glob: "*.{rs,toml,lock}"
-      run: cargo clippy --locked --all-targets -- -D warnings
 
 pre-push:
   commands:
@@ -95,7 +87,3 @@ pre-push:
         - "specs/package.json"
         - "specs/pnpm-*.yaml"
       run: 'mise exec -- pnpm install --frozen-lockfile --silent && mise exec -- pnpm run --silent simulate'
-    pty-hooks-test:
-      root: spikes/pty-hooks/
-      glob: "*.{rs,toml,lock,txt}"
-      run: cargo test --locked
