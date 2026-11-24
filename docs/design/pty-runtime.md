@@ -10,7 +10,7 @@ Sources read for this document (paths are relative to each root):
 
 | Source | Revision | Read for |
 |---|---|---|
-| Spike `spikes/pty-hooks/src/` | this repository | `pty.rs` (writer, gate), `vt.rs` (responder, snapshot), `os/drain.rs`, `os/mod.rs`, `paste.rs` (`win_keys` records), §4.4–§4.7 of `docs/spikes/pty-hooks-spike.md` |
+| Spike [`spikes/pty-hooks/src/`](https://github.com/shuymn/chaldea/tree/03b00b8c0462c032f5f4a4f057feafa8e366d1b5/spikes/pty-hooks/src) | this repository | `pty.rs` (writer, gate), `vt.rs` (responder, snapshot), `os/drain.rs`, `os/mod.rs`, `paste.rs` (`win_keys` records), §4.4–§4.7 of `docs/spikes/pty-hooks-spike.md` |
 | `alacritty_terminal` | crate 0.26.0 | `event.rs`, `term/mod.rs`, `term/cell.rs` |
 | `vte` | crate 0.15.0 (alacritty's parser) | `src/ansi.rs` (synchronized updates) |
 | `portable-pty` | crate 0.8.1 | `lib.rs`, `unix.rs` |
@@ -287,7 +287,7 @@ pub struct ModeView { pub modes: TermModes, pub bracketed_paste_epoch: u64 }
 
 ### 2.4 Drain
 
-Lifted from `spikes/pty-hooks/src/os/drain.rs` without its hold: the drain owns the output read end, reads until EOF or a read error on every path, passes every chunk to the session's sink from the first byte, and reports how it ended (`OutputEnd::Eof` or `Error`, never confusing the two). The spike held output until a consumer attached and forwarded it through an unbounded channel (`drain.rs:93`, `:157-176`); here the sink exists before the backend spawns, so neither is needed.
+Lifted from the spike's [`os/drain.rs`](https://github.com/shuymn/chaldea/blob/03b00b8c0462c032f5f4a4f057feafa8e366d1b5/spikes/pty-hooks/src/os/drain.rs) without its hold: the drain owns the output read end, reads until EOF or a read error on every path, passes every chunk to the session's sink from the first byte, and reports how it ended (`OutputEnd::Eof` or `Error`, never confusing the two). The spike held output until a consumer attached and forwarded it through an unbounded channel (`drain.rs:93`, `:157-176`); here the sink exists before the backend spawns, so neither is needed.
 
 ```rust
 pub(crate) struct Drain { /* thread "pty-drain" */ }
@@ -303,7 +303,7 @@ impl Drain {
 
 ### 2.5 VT Responder
 
-Lifted from `spikes/pty-hooks/src/vt.rs`: `Term<Responder>` with `Config { kitty_keyboard: true, scrolling_history: 0, .. }`, fed by the drain thread through a `vte::ansi::Processor<NoSync>`. `NoSync` implements vte's `Timeout` trait with `pending_timeout()` always false, so the parser never buffers a synchronized update (`CSI ?2026h`): it would otherwise hold every action until `CSI ?2026l` or a 150 ms timeout (`vte 0.15.0 src/ansi.rs:36`, `:298-311`, `:478-488`, `:1606-1607`), hiding 2004 transitions and queries inside it. The `EventListener` turns each reply event into one reply write of origin `VtReply { kind }`:
+Lifted from the spike's [`vt.rs`](https://github.com/shuymn/chaldea/blob/03b00b8c0462c032f5f4a4f057feafa8e366d1b5/spikes/pty-hooks/src/vt.rs): `Term<Responder>` with `Config { kitty_keyboard: true, scrolling_history: 0, .. }`, fed by the drain thread through a `vte::ansi::Processor<NoSync>`. `NoSync` implements vte's `Timeout` trait with `pending_timeout()` always false, so the parser never buffers a synchronized update (`CSI ?2026h`): it would otherwise hold every action until `CSI ?2026l` or a 150 ms timeout (`vte 0.15.0 src/ansi.rs:36`, `:298-311`, `:478-488`, `:1606-1607`), hiding 2004 transitions and queries inside it. The `EventListener` turns each reply event into one reply write of origin `VtReply { kind }`:
 
 | Query | alacritty event | Reply | `ReplyKind` |
 |---|---|---|---|

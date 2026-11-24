@@ -837,7 +837,7 @@ deps="$(cargo tree -p chaldea-core -e normal --prefix none)" && ! grep -Eq '^(to
 deps="$(cargo tree -p chaldea-pty-runtime -e normal --prefix none)" && ! grep -Eq '^tokio ' <<<"$deps"
 ```
 
-plus the `workspace` job green on both runners with `store_open::long_path_vfs_is_selected` added to the Windows sentinel list, and the `pty-hooks` job unchanged.
+plus the `workspace` job green on both runners with `store_open::long_path_vfs_is_selected` added to the Windows sentinel list.
 
 ## 8. Decisions
 
