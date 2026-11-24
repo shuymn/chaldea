@@ -5,6 +5,7 @@
 mod support;
 
 use std::ffi::OsStr;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -26,12 +27,51 @@ const FIRST: u16 = 7373;
 const LAST: u16 = 7472;
 
 /// Every daemon of these tests chooses its port from the range (no test picks a port that it
-/// then releases), so the tests run one at a time: a port a test expects to be the first free
-/// one, or its own saved port, is not taken by another test's daemon in between.
+/// then releases), so the tests run one at a time, in this process and across every process
+/// running them at once: a port a test expects to be the first free one, or its own saved
+/// port, is not taken by another test's daemon in between. The daemon takes only a port
+/// number (`--port`, the saved port, or the range), never a bound listener, so a port of the
+/// range cannot be reserved for one test.
 static PORTS: Mutex<()> = Mutex::new(());
 
-fn serial() -> MutexGuard<'static, ()> {
-    PORTS.lock().unwrap_or_else(PoisonError::into_inner)
+/// The cross-process lock file, in the OS temp directory.
+const PORTS_LOCK: &str = "chaldea-daemon-run-ports.lock";
+/// How long a test waits for the tests of other processes before it fails.
+const PORTS_WAIT: Duration = Duration::from_secs(600);
+
+/// This process's turn, then the turn among processes (an exclusive lock on [`PORTS_LOCK`],
+/// released when the file closes, on drop or at the process's exit).
+struct Serial {
+    _file: File,
+    _turn: MutexGuard<'static, ()>,
+}
+
+fn serial() -> Serial {
+    let turn = PORTS.lock().unwrap_or_else(PoisonError::into_inner);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(std::env::temp_dir().join(PORTS_LOCK))
+        .unwrap();
+    let end = Instant::now() + PORTS_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) => {
+                assert!(
+                    Instant::now() < end,
+                    "another process held {PORTS_LOCK} for {PORTS_WAIT:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(TryLockError::Error(e)) => panic!("{PORTS_LOCK}: {e}"),
+        }
+    }
+    Serial {
+        _file: file,
+        _turn: turn,
+    }
 }
 
 fn bindable(p: u16) -> bool {
