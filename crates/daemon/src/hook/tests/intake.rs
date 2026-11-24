@@ -79,10 +79,14 @@ async fn intake_order() {
     assert!(a.lock().unwrap().is_none(), "the hook did not run");
 }
 
-/// A test server and a request context without a principal, for `write_then`.
+/// A test server on a stopped clock and a request context without a principal, for
+/// `write_then`, whose deadline is on that clock and so never passes.
 async fn server_and_ctx() -> (TestServer, WriteCtx) {
+    use crate::http::MonotonicClock;
+
     let srv = TestServer::start(Mounts::mvp()).await;
-    let ctx = WriteCtx::new(None, Instant::now() + Duration::from_secs(5), shared(&srv));
+    srv.clock.stop();
+    let ctx = WriteCtx::new(None, srv.clock.now() + Duration::from_secs(5), shared(&srv));
     (srv, ctx)
 }
 
