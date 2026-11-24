@@ -70,6 +70,7 @@ async fn issuer_revoked_after_exchange() {
     drop(hold);
     let r = exchange.await.unwrap();
     assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(r.header("cache-control"), Some("no-store"));
     let token = serde_json::from_slice::<PairResponse>(&r.body)
         .unwrap()
         .token;
