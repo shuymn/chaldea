@@ -48,8 +48,12 @@ pub struct Seams {
     /// Runs once `daemon start` read a verdict line (after the launchd job's removal), before
     /// it acts on it.
     pub after_verdict: Option<Box<dyn Fn()>>,
-    /// Runs once `daemon start`'s serving check got its 200, before its last discovery.
-    pub after_answer: Option<Box<dyn Fn()>>,
+    /// Runs once `daemon start`'s serving check got its 200, before its last discovery, with
+    /// the start's deadline.
+    pub after_answer: Option<Box<dyn Fn(Instant)>>,
+    /// Runs once `daemon start` read the end of its readiness channel without a verdict,
+    /// before its follow-up, with the start's deadline.
+    pub after_eof: Option<Box<dyn Fn(Instant)>>,
     /// Receives the exit code just before the process exits.
     pub on_exit: Option<Box<dyn FnOnce(i32)>>,
 }

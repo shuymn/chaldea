@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 
 use chaldea_daemon::lifecycle::{Discovery, LockProbe, discover, names};
 use support::faults::{
-    self, EOF_CHILD_MS, EXIT_RECORD, Gate, HOLD_READER_MS, LOG_MARKERS, Labels, MARKER_PAUSE,
-    PARK_RECONCILER, READY_PAUSE, SERVE_PAUSE, SLOW_SHUTDOWN_MS, TOKEN_FIELD, TOKEN_MSG,
-    TOKEN_SPAN, VERDICT_PAUSE,
+    self, EOF_CHILD_MS, EOF_PAST_DEADLINE, EXIT_RECORD, Gate, HOLD_READER_MS, LOG_MARKERS, Labels,
+    MARKER_PAUSE, PARK_RECONCILER, READY_PAUSE, SERVE_PAST_DEADLINE, SERVE_PAUSE, SLOW_SHUTDOWN_MS,
+    TOKEN_FIELD, TOKEN_MSG, TOKEN_SPAN, VERDICT_PAUSE,
 };
 use support::runner::{Case, main as run_cases};
 use support::{Dir, Proc, WAIT, get_status, lock_state, state, token_of, wait_for};
@@ -416,10 +416,12 @@ fn explicit_port_conflict() {
     stop(&labels, &d.path);
 }
 
-/// PR8-CL-14: a child that closes the channel without a line 13.5 s in and keeps running with
-/// the lock: the follow-up is cut by the 15 s deadline, so the starter exits 1 at 15 s, before
-/// the child exits at 18.5 s, with what it saw before the deadline (macOS: the lock held;
-/// Windows: no exit observed).
+/// PR8-CL-14: a child that closes the channel without a line at once (holding the lock for
+/// 5 s more), and a starter that reads the end and then waits until its deadline has passed
+/// before its follow-up: the follow-up is bounded by that deadline, so it observes nothing and
+/// the starter exits 1 at once, reporting the closed channel and that nothing (macOS) or no
+/// exit (Windows) was observed before the deadline. A follow-up that ignored the deadline
+/// would see the lock free or the child's exit instead.
 fn eof_follow_up_within_deadline() {
     let labels = Labels::new();
     let d = state();
@@ -429,19 +431,24 @@ fn eof_follow_up_within_deadline() {
         &labels,
         &d.path,
         &[],
-        &[(EOF_CHILD_MS, OsStr::new("13500"))],
+        &[
+            (EOF_CHILD_MS, OsStr::new("0")),
+            (EOF_PAST_DEADLINE, OsStr::new("1")),
+        ],
     );
-    let took = t.elapsed();
     assert_eq!(code, 1, "{out}{err}");
     assert!(
         err.contains("closed its readiness channel without a verdict"),
         "{err}"
     );
     #[cfg(not(windows))]
-    assert!(
-        err.contains("a daemon still holds the state directory"),
-        "{err}"
-    );
+    {
+        assert!(
+            err.contains("nothing could be observed before the deadline"),
+            "{err}"
+        );
+        assert!(!err.contains("holds the state directory"), "{err}");
+    }
     // The exit wait ends at the deadline: that end is no observation of the daemon's state.
     #[cfg(windows)]
     {
@@ -449,14 +456,14 @@ fn eof_follow_up_within_deadline() {
             err.contains("exit was not observed before the deadline"),
             "{err}"
         );
+        assert!(!err.contains("it exited"), "{err}");
         assert!(!err.contains("it is still running"), "{err}");
         assert!(
             !err.contains("the daemon exited before reporting readiness"),
             "{err}"
         );
     }
-    assert!(took >= READY_TIMEOUT, "{took:?}");
-    assert!(took < READY_TIMEOUT + Duration::from_secs(1), "{took:?}");
+    assert!(t.elapsed() >= READY_TIMEOUT, "{:?}", t.elapsed());
 }
 
 /// PR8-CL-14: a child that never writes: the starter exits 4 at 15 s naming the pending
@@ -654,34 +661,23 @@ fn stopping_after_the_answer_is_not_reported_started() {
     );
 }
 
-/// PR8-CL-14: the serving check answered 200, and its last discovery runs only after the
-/// deadline (paused between them until 2 s past it): the start times out (exit 4) saying that
-/// serving was not confirmed, never that the daemon did not answer. The daemon serves on.
+/// PR8-CL-14: the serving check answered 200, and the starter then waits until its deadline
+/// has passed before its last discovery: the start times out (exit 4) saying that serving was
+/// not confirmed, never that the daemon did not answer. The daemon serves on.
 fn late_discovery_after_the_answer_claims_no_state() {
     let labels = Labels::new();
     let d = state();
     let _stop = StopOnDrop(&labels, &d.path);
-    let gate = Gate::new();
-    let t = Instant::now();
-    let mut starter = Gated {
-        gate: &gate,
-        p: Proc::spawn(&mut cmd(
-            &labels,
-            &d.path,
-            &["daemon", "start"],
-            &[(SERVE_PAUSE, gate.path().as_os_str())],
-        )),
-    };
-    assert!(gate.reached(WAIT), "the serving check never answered");
-    // The starter's deadline counts from its own start, after the spawn: 2 s of margin.
-    std::thread::sleep((READY_TIMEOUT + Duration::from_secs(2)).saturating_sub(t.elapsed()));
-    gate.release();
-    let p = &mut starter.p;
-    assert_eq!(p.code(), 4, "{}{}", p.stdout(), p.stderr());
-    let err = p.stderr();
+    let (code, out, err) = start(
+        &labels,
+        &d.path,
+        &[],
+        &[(SERVE_PAST_DEADLINE, OsStr::new("1"))],
+    );
+    assert_eq!(code, 4, "{out}{err}");
     assert!(err.contains("was not confirmed within 15 s"), "{err}");
     assert!(!err.contains("did not answer"), "{err}");
-    assert!(!p.stdout().contains("daemon started"), "{}", p.stdout());
+    assert!(!out.contains("daemon started"), "{out}");
     let _ = serving(&d.path);
     stop(&labels, &d.path);
 }

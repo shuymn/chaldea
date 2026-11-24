@@ -277,6 +277,7 @@ pub(crate) fn start(state_dir: &Path, port: Option<u16>, seams: &Seams) -> ExitC
         StartPauses {
             after_verdict: seams.after_verdict.as_deref(),
             after_answer: seams.after_answer.as_deref(),
+            after_eof: seams.after_eof.as_deref(),
         },
         deadline,
     );
@@ -704,7 +705,8 @@ fn port_conflict(dir: &Path, serving: u16, requested: Option<u16>) -> Option<Exi
 #[derive(Clone, Copy, Default)]
 struct StartPauses<'a> {
     after_verdict: Option<&'a dyn Fn()>,
-    after_answer: Option<&'a dyn Fn()>,
+    after_answer: Option<&'a dyn Fn(Instant)>,
+    after_eof: Option<&'a dyn Fn(Instant)>,
 }
 
 fn await_verdict(
@@ -775,7 +777,12 @@ fn await_verdict(
                 log.display()
             )),
         },
-        Ok(ReadyRead::Eof) => eof_follow_up(launched, dir, deadline),
+        Ok(ReadyRead::Eof) => {
+            if let Some(pause) = seams.after_eof {
+                pause(deadline);
+            }
+            eof_follow_up(launched, dir, deadline)
+        }
         Ok(ReadyRead::TimedOut) => fail_with(
             ExitCode::Timeout,
             &format!(
@@ -818,7 +825,7 @@ fn answers(port: u16, token: &str, deadline: Instant) -> bool {
 fn check_serving(
     dir: &Path,
     expect: Option<(u32, u16)>,
-    after_answer: Option<&dyn Fn()>,
+    after_answer: Option<&dyn Fn(Instant)>,
     deadline: Instant,
 ) -> Option<Serving> {
     let r = match client::discover(dir) {
@@ -844,7 +851,7 @@ fn check_serving(
         return None;
     }
     if let Some(pause) = after_answer {
-        pause();
+        pause(deadline);
     }
     // The answer counts only if the record still says this instance serves, with the lock
     // held: a daemon that began its shutdown has marked its record `stopping`.
@@ -861,7 +868,7 @@ fn confirm_started(
     dir: &Path,
     port: u16,
     pid: u32,
-    after_answer: Option<&dyn Fn()>,
+    after_answer: Option<&dyn Fn(Instant)>,
     deadline: Instant,
 ) -> ExitCode {
     match poll_until(deadline, POLL, || {
@@ -892,7 +899,7 @@ fn confirm_started(
 fn await_running(
     dir: &Path,
     port: Option<u16>,
-    after_answer: Option<&dyn Fn()>,
+    after_answer: Option<&dyn Fn(Instant)>,
     deadline: Instant,
 ) -> ExitCode {
     match poll_until(deadline, POLL, || {
@@ -1009,7 +1016,7 @@ pub(crate) fn stop(dir: &Path, seams: &mut Seams) -> ExitCode {
             return fail_with(
                 ExitCode::Timeout,
                 &format!(
-                    "no daemon of {} could be identified within 15 s: no record naming a live daemon was read",
+                    "no daemon of {} could be identified within 15 s",
                     dir.display()
                 ),
             );
@@ -1026,6 +1033,9 @@ pub(crate) fn stop(dir: &Path, seams: &mut Seams) -> ExitCode {
     } else {
         host::send_stop(&target, deadline)
     };
+    // Whether the stop already found the target exited; the completion check then only
+    // confirms it.
+    let mut exited = false;
     match sent {
         Ok(StopSent::Sent) => {}
         Ok(StopSent::DeadlinePassed) => {
@@ -1039,6 +1049,7 @@ pub(crate) fn stop(dir: &Path, seams: &mut Seams) -> ExitCode {
         }
         Ok(StopSent::Exited | StopSent::IdentityMismatch) => {
             print_out("the daemon had already exited");
+            exited = true;
         }
         Ok(StopSent::AccessDenied) => {
             return fail(if cfg!(windows) {
@@ -1075,6 +1086,14 @@ pub(crate) fn stop(dir: &Path, seams: &mut Seams) -> ExitCode {
             }
             ExitCode::Ok
         }
+        // Only what the expired completion check could not confirm.
+        Gone::TimedOut if exited => fail_with(
+            ExitCode::Timeout,
+            &format!(
+                "the completion check did not confirm within 15 s that pid {} is gone",
+                target.pid
+            ),
+        ),
         Gone::TimedOut => fail_with(
             ExitCode::Timeout,
             &format!(

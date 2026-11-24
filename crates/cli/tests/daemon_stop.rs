@@ -178,6 +178,7 @@ fn identity_mismatch_signals_nothing() {
     let err = stop_times_out(sleeper.pid(), "1".to_owned(), RecordState::Serving);
     assert!(err.contains("could be identified within 15 s"), "{err}");
     assert!(!err.contains("a daemon holds"), "{err}");
+    assert!(!err.contains("no record naming"), "{err}");
     assert!(sleeper.alive(), "the unrelated process was signalled");
 }
 

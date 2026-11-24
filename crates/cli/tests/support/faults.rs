@@ -47,6 +47,12 @@ pub const VERDICT_PAUSE: &str = "CHALDEA_TEST_VERDICT_PAUSE";
 /// A gate directory: `daemon start` waits at it once its serving check got its 200, before
 /// its last discovery.
 pub const SERVE_PAUSE: &str = "CHALDEA_TEST_SERVE_PAUSE";
+/// Set: `daemon start` waits once its serving check got its 200 until its deadline has
+/// passed, so its last discovery comes after the deadline.
+pub const SERVE_PAST_DEADLINE: &str = "CHALDEA_TEST_SERVE_PAST_DEADLINE";
+/// Set: `daemon start` waits once it read the end of its readiness channel until its deadline
+/// has passed, so its follow-up starts after the deadline.
+pub const EOF_PAST_DEADLINE: &str = "CHALDEA_TEST_EOF_PAST_DEADLINE";
 /// A directory: a detached child writes its exit code to `<dir>/daemon-exit` just before it
 /// exits.
 pub const EXIT_RECORD: &str = "CHALDEA_TEST_EXIT_RECORD";
@@ -170,7 +176,13 @@ pub fn enter_if_chaldea() {
         seams.after_verdict = Some(Box::new(move || wait_at(&dir)));
     }
     if let Some(dir) = env_path(SERVE_PAUSE) {
-        seams.after_answer = Some(Box::new(move || wait_at(&dir)));
+        seams.after_answer = Some(Box::new(move |_| wait_at(&dir)));
+    }
+    if std::env::var_os(SERVE_PAST_DEADLINE).is_some() {
+        seams.after_answer = Some(Box::new(past));
+    }
+    if std::env::var_os(EOF_PAST_DEADLINE).is_some() {
+        seams.after_eof = Some(Box::new(past));
     }
     if detached_child && let Some(dir) = env_path(EXIT_RECORD) {
         seams.on_exit = Some(Box::new(move |code| {
@@ -178,6 +190,14 @@ pub fn enter_if_chaldea() {
         }));
     }
     chaldea_cli::dispatch_with(&args, Stall::Off, seams)
+}
+
+/// Returns once `deadline` has passed: the caller's next step comes after it, whatever the
+/// host's speed.
+fn past(deadline: Instant) {
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        std::thread::sleep(left + Duration::from_millis(1));
+    }
 }
 
 /// The value after `flag` in `args`.
