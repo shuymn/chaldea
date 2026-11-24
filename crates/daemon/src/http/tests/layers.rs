@@ -14,6 +14,7 @@ use tokio::io::AsyncWriteExt;
 use super::shared;
 use super::support::http::{DEADLINE, Req, TestServer, connect, parse, read_to_end};
 use crate::http::{Mount, Mounts, WriteCtx, spec};
+use crate::store::tests::support::waits;
 
 /// A named request and its expected status and code.
 type Case = (&'static str, Req, (u16, Option<String>));
@@ -161,7 +162,7 @@ async fn slow_head_then_slow_lookup() {
     let first_byte = Instant::now();
     for chunk in head.chunks(head.len().div_ceil(7)) {
         c.write_all(chunk).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        waits::pause(Duration::from_millis(200)).await;
     }
     let (out, end) = read_to_end(&mut c).await;
     let took = first_byte.elapsed();

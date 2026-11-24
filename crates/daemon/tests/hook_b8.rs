@@ -13,6 +13,7 @@ use chaldea_core::auth::TokenKind;
 use chaldea_daemon::hook::HookConfig;
 use support::hook::{Hook, HookServer, Launch, Snapshot};
 use support::http::{Req, connect};
+use support::waits;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// The product limits, set explicitly (not the harness defaults).
@@ -136,7 +137,7 @@ async fn observe(
     let mut send_error = None;
     for (i, chunk) in head.chunks(step).enumerate() {
         if i > 0 {
-            tokio::time::sleep(pause).await;
+            waits::pause(pause).await;
         }
         if let Err(e) = wr.write_all(chunk).await {
             send_error = Some(e.kind());
@@ -181,7 +182,7 @@ async fn observe(
                     return failed(e).await;
                 }
                 record(chunk);
-                tokio::time::sleep(every).await;
+                waits::pause(every).await;
             },
         }
     });
@@ -191,7 +192,7 @@ async fn observe(
     let mut until = until;
     let mut replied_at = None;
     let end = loop {
-        match tokio::time::timeout_at(until, rd.read(&mut buf)).await {
+        match waits::bounded_at(until, rd.read(&mut buf)).await {
             Err(_) if replied_at.is_some() => break End::Open,
             Err(_) => break End::Timeout,
             Ok(Ok(0)) => break End::Eof,
@@ -224,7 +225,7 @@ async fn observe(
     let sending = !idle.load(std::sync::atomic::Ordering::SeqCst);
     let waited = if sending && ended {
         let _ = joining.send(true);
-        tokio::time::timeout(Duration::from_secs(1), &mut writer)
+        waits::bounded(Duration::from_secs(1), &mut writer)
             .await
             .ok()
     } else {
@@ -747,21 +748,21 @@ async fn deadline_from_first_head_byte() {
     let step = head.len().div_ceil(9);
     for (i, chunk) in head.chunks(step).enumerate() {
         if i > 0 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            waits::pause(Duration::from_millis(500)).await;
         }
         wr.write_all(chunk).await.unwrap();
     }
-    tokio::time::sleep_until(tokio::time::Instant::from_std(
+    waits::pause_until(tokio::time::Instant::from_std(
         first + Duration::from_millis(4300),
     ))
     .await;
     wr.write_all(&body[..1024]).await.unwrap();
-    tokio::time::sleep_until(tokio::time::Instant::from_std(
+    waits::pause_until(tokio::time::Instant::from_std(
         first + Duration::from_millis(4600),
     ))
     .await;
     wr.write_all(&body[1024..2048]).await.unwrap();
-    tokio::time::sleep_until(tokio::time::Instant::from_std(
+    waits::pause_until(tokio::time::Instant::from_std(
         first + Duration::from_millis(4800),
     ))
     .await;
@@ -770,7 +771,7 @@ async fn deadline_from_first_head_byte() {
     let until = tokio::time::Instant::from_std(first + Duration::from_millis(7500));
     while !complete(&out) {
         let mut buf = [0u8; 4096];
-        match tokio::time::timeout_at(until, rd.read(&mut buf)).await {
+        match waits::bounded_at(until, rd.read(&mut buf)).await {
             Err(_) => panic!("no 408 by first byte + 7.5 s"),
             Ok(Ok(0) | Err(_)) => break,
             Ok(Ok(n)) => out.extend_from_slice(&buf[..n]),

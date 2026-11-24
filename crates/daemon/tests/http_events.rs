@@ -17,6 +17,7 @@ use chaldea_core::sync::{EventsResponse, REPLAY_MAX_BYTES, SnapshotReason, Strea
 use chaldea_daemon::http::Mounts;
 use chaldea_daemon::store::NewEvent;
 use support::http::{Reply, TestServer};
+use support::waits;
 use support::{TestStore, event, insert_raw_event, raw_unknown, registered, started};
 
 fn code(s: &str) -> Option<String> {
@@ -481,7 +482,7 @@ async fn append_between_pages() {
             assert_eq!(head, cursor, "empty page below head {head}");
             // Caught up with the writer: wait for its next commit. The bound only stops a
             // stalled writer; the pace of appends is the host's.
-            tokio::time::timeout(
+            waits::bounded(
                 std::time::Duration::from_secs(30),
                 committed.wait_for(|n| 3 + n > cursor),
             )

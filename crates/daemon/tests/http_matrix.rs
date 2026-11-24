@@ -24,6 +24,7 @@ use support::http::{Req, TestServer};
 use MountKind::{Read, Upgrade, Write};
 use OriginRule::{AbsentOrMatching, MustBeAbsent, NotChecked, PresentMatching};
 use TokenKind::{Agent, Extension, Hook, Owner, Rescue};
+use support::waits;
 
 /// How a route is authenticated, as the inventory states it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -592,7 +593,7 @@ async fn minted_ticket_matrix() {
             .await
             .unwrap_or_else(|e| panic!("{kind:?}: {e}"));
         assert_eq!(resp.status(), 101, "{kind:?}");
-        let hello = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
+        let hello = waits::bounded(std::time::Duration::from_secs(10), ws.next())
             .await
             .expect("hello within 10 s")
             .unwrap()

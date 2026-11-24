@@ -14,6 +14,7 @@ use chaldea_daemon::http::{HttpConfig, Mounts, WsConfig};
 use chaldea_daemon::store::prepare_content;
 use futures_util::{SinkExt, StreamExt};
 use support::http::{Reply, TestServer, WsClient, connect};
+use support::waits;
 use support::{raw_unknown, registered};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -150,7 +151,7 @@ async fn read_head(c: &mut TcpStream) -> String {
     let mut got = Vec::new();
     let mut byte = [0u8; 1];
     while !got.ends_with(b"\r\n\r\n") {
-        let n = tokio::time::timeout(Duration::from_secs(10), c.read(&mut byte))
+        let n = waits::bounded(Duration::from_secs(10), c.read(&mut byte))
             .await
             .expect("a reply head within 10 s")
             .unwrap();
@@ -222,7 +223,7 @@ async fn refused_with(mut ws: WsClient, m: WsMessage) -> Option<u16> {
     let _ = ws.ws.send(m).await;
     let (code, _) = ws.until_closed().await;
     // After the close frame, the reply to it and then the end of the stream.
-    while let Some(Ok(_)) = tokio::time::timeout(Duration::from_secs(10), ws.ws.next())
+    while let Some(Ok(_)) = waits::bounded(Duration::from_secs(10), ws.ws.next())
         .await
         .expect("the transport ends within the wait")
     {}
@@ -356,7 +357,7 @@ async fn blob_slot_frees_after_a_stalled_client() {
     )
     .await;
     for mut c in held {
-        let got = tokio::time::timeout(Duration::from_secs(10), read_rest(&mut c))
+        let got = waits::bounded(Duration::from_secs(10), read_rest(&mut c))
             .await
             .expect("the stalled connection ends within the wait");
         assert!(got < 32 * 1024 * 1024, "the whole body arrived: {got}");

@@ -18,6 +18,7 @@ use chaldea_daemon::store::{NewEvent, TokenSelector};
 use futures_util::StreamExt;
 use proptest::prelude::*;
 use support::http::{DEADLINE, HEADS_INTERVAL, TestServer, WS_WAIT, eventually, head_of};
+use support::waits;
 use support::{raw_unknown, registered, registered_under, reserved, started};
 use tokio_tungstenite::tungstenite::Error as WsError;
 
@@ -76,7 +77,7 @@ async fn refused(srv: &TestServer, ticket: &str) -> u16 {
 
 /// The first text frame of `ws`, within the wait.
 async fn first_text(ws: &mut Socket) -> String {
-    let m = tokio::time::timeout(WS_WAIT, ws.next())
+    let m = waits::bounded(WS_WAIT, ws.next())
         .await
         .expect("a frame within the wait")
         .expect("open")

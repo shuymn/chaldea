@@ -5,6 +5,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
+use crate::store::tests::support::waits;
 use tokio::sync::oneshot;
 
 type Hook = Box<dyn FnOnce() + Send>;
@@ -96,7 +97,7 @@ async fn pass(slot: &Mutex<Option<Gate>>) -> bool {
         return false;
     };
     let _ = reached.send(());
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(20), release).await;
+    let _ = waits::bounded(std::time::Duration::from_secs(20), release).await;
     true
 }
 

@@ -68,7 +68,7 @@ pub(crate) async fn accept_loop(shared: Arc<Shared>, listener: TcpListener, rout
                 tokio::select! {
                     biased;
                     () = shutdown.wait() => break,
-                    () = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                    () = accept_backoff() => continue,
                 }
             }
         };
@@ -81,6 +81,22 @@ pub(crate) async fn accept_loop(shared: Arc<Shared>, listener: TcpListener, rout
             break;
         }
     }
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "accept-error backoff; shutdown wins (http-surface §2.2)"
+)]
+fn accept_backoff() -> Sleep {
+    tokio::time::sleep(Duration::from_secs(1))
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the write stall, progress first: polled only after a pending write (http-surface §2.2)"
+)]
+fn stall_timer(stall: Duration) -> Sleep {
+    tokio::time::sleep(stall)
 }
 
 /// One connection: served until its response is sent (hyper closes it after a response
@@ -169,7 +185,7 @@ impl<T> ConnIo<T> {
         let stall = self.stall;
         let timer = self
             .timer
-            .get_or_insert_with(|| Box::pin(tokio::time::sleep(stall)));
+            .get_or_insert_with(|| Box::pin(stall_timer(stall)));
         ready!(timer.as_mut().poll(cx));
         Poll::Ready(Err(io::Error::new(
             io::ErrorKind::TimedOut,

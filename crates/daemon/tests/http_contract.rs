@@ -21,6 +21,7 @@ use chaldea_daemon::http::{ApiError, Mount, Mounts, ReadCtx, spec};
 use serde_json::{Value, json};
 use support::http::{Reply, TestServer, send, settled};
 use support::soon;
+use support::waits;
 
 fn validator(name: &str) -> jsonschema::Validator {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -133,7 +134,7 @@ async fn error_bodies_match_the_contract() {
     let slow = srv.command("test_slow_effect", &owner, id(2), r#"{"tag":"c"}"#);
     let (port, bytes) = (srv.port, slow.bytes());
     let running = tokio::spawn(async move { support::http::send(port, &bytes).await });
-    tokio::time::timeout(Duration::from_secs(10), effect_reached)
+    waits::bounded(Duration::from_secs(10), effect_reached)
         .await
         .expect("the effect started within 10 s")
         .unwrap();
@@ -153,7 +154,7 @@ async fn error_bodies_match_the_contract() {
         "unknown_after_crash",
     );
     drop(release);
-    tokio::time::timeout(Duration::from_secs(20), running)
+    waits::bounded(Duration::from_secs(20), running)
         .await
         .expect("the first request ends within 20 s")
         .unwrap();

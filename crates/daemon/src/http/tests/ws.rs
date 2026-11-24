@@ -16,6 +16,7 @@ use crate::http::tickets::TicketPurpose;
 use crate::http::ws::{ReadDone, ReadReq, SocketState, too_big};
 use crate::http::{HttpConfig, Mounts};
 use crate::store::TokenSelector;
+use crate::store::tests::support::waits;
 
 const A: StreamId = StreamId::Host;
 
@@ -205,7 +206,7 @@ fn nudge_reads_the_token_and_revocation_ends() {
 
 async fn redeem_status(srv: &TestServer, ticket: &str) -> u16 {
     let url = format!("ws://127.0.0.1:{}/api/ws?ticket={ticket}", srv.port);
-    let done = tokio::time::timeout(
+    let done = waits::bounded(
         Duration::from_secs(10),
         tokio_tungstenite::connect_async(url),
     )
@@ -219,7 +220,7 @@ async fn redeem_status(srv: &TestServer, ticket: &str) -> u16 {
 }
 
 async fn wait(what: &str, rx: tokio::sync::oneshot::Receiver<()>) {
-    tokio::time::timeout(Duration::from_secs(10), rx)
+    waits::bounded(Duration::from_secs(10), rx)
         .await
         .unwrap_or_else(|_| panic!("{what}"))
         .unwrap();
@@ -500,7 +501,7 @@ async fn revoked_between_admission_and_startup() {
     wait("admission reached the gate", reached).await;
     srv.revoke_quietly(&owner).await;
     drop(release);
-    let (ws, resp) = tokio::time::timeout(Duration::from_secs(10), client)
+    let (ws, resp) = waits::bounded(Duration::from_secs(10), client)
         .await
         .expect("the handshake ends")
         .unwrap()

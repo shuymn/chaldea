@@ -50,6 +50,25 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # jq for the probe below, pinned in mise.lock.
+      - uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
+        with:
+          version: 2026.10.17
+          install: false
+          cache: false
+
+      - name: Install jq
+        env:
+          MISE_GITHUB_TOKEN: ${{ github.token }}
+          MISE_YES: 1
+        run: |
+          mise trust mise.toml >/dev/null
+          mise install --locked jq
+
+      # See docs/design/deadlines.md §3 D4. Reuses the clippy step's check artifacts.
+      - name: Probe the timer ban
+        run: mise exec jq -- bash scripts/lint-probe.sh
+
       # cargo puts the processes of `cargo test` in a kill-on-close job of its own that allows
       # no breakaway, and this runner's own job allows none either, so a `daemon start` under
       # either is refused by design (docs/design/daemon-lifecycle.md §2.12 A-W1, §7). The tests

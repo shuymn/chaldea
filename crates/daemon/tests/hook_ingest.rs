@@ -15,6 +15,7 @@ use support::hook::{
     EMITTER_PID, Hook, HookServer, L_PID, L_START, Launch, Mode, chain, direct, exit, payload,
     reserve_and_start,
 };
+use support::waits;
 use support::{launch, soon, thread};
 use uuid::Uuid;
 
@@ -42,7 +43,7 @@ async fn stopped_clock_converts_a_cutoff_once() {
     let f = clock.now();
     let cutoff = f + support::http::DEADLINE;
     let real_cutoff = clock.real(cutoff);
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    waits::pause(Duration::from_millis(20)).await;
     assert_eq!(clock.now(), f);
     assert!(clock.real(f - Duration::from_millis(1)) < clock.real(f));
     assert!(clock.real(f) <= std::time::Instant::now());

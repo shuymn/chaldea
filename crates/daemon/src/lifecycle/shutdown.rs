@@ -112,9 +112,7 @@ struct Elapsed;
 /// completion first observable after `end` never wins over it (design §2.8).
 async fn deadline_first<F: Future>(end: Instant, fut: F) -> Result<F::Output, Elapsed> {
     let mut fut = std::pin::pin!(fut);
-    let mut sleep = std::pin::pin!(tokio::time::sleep_until(tokio::time::Instant::from_std(
-        end
-    )));
+    let mut sleep = std::pin::pin!(deadline_timer(tokio::time::Instant::from_std(end)));
     std::future::poll_fn(|cx| {
         if Instant::now() >= end {
             return std::task::Poll::Ready(Err(Elapsed));
@@ -128,6 +126,32 @@ async fn deadline_first<F: Future>(end: Instant, fut: F) -> Result<F::Output, El
         std::task::Poll::Pending
     })
     .await
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "deadline_first's timer: clock, poll, then timer (daemon-lifecycle §2.8)"
+)]
+fn deadline_timer(end: tokio::time::Instant) -> tokio::time::Sleep {
+    tokio::time::sleep_until(end)
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the participants' plain bound, polled participant first, result discarded (daemon-lifecycle §2.8)"
+)]
+fn participant_bound<F: Future>(end: tokio::time::Instant, fut: F) -> tokio::time::Timeout<F> {
+    tokio::time::timeout_at(end, fut)
+}
+
+/// The record removal's pause between attempts; the budget is checked before each attempt
+/// and each deletion (daemon-lifecycle §2.8 step 5).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the record-removal retry pause; deletions are admitted by the budget checks (daemon-lifecycle §2.8)"
+)]
+fn record_pause(wait: std::time::Duration) -> tokio::time::Sleep {
+    tokio::time::sleep(wait)
 }
 
 #[cfg(test)]
@@ -250,7 +274,7 @@ impl Coordinator {
         async move {
             #[cfg(test)]
             faults.record_sleeping.store(true, Ordering::SeqCst);
-            tokio::time::sleep(wait).await;
+            record_pause(wait).await;
         }
     }
 
@@ -608,7 +632,7 @@ impl Coordinator {
                 return self.crash_exit(held_now(&st));
             }
             self.mark(&format!("participant:{}", p.name()), Some(end));
-            let fut = tokio::time::timeout_at(tokio::time::Instant::from_std(end), p.shutdown(end));
+            let fut = participant_bound(tokio::time::Instant::from_std(end), p.shutdown(end));
             if self.guarded(fut).await.is_err() {
                 return self.crash_exit(held_now(&st));
             }

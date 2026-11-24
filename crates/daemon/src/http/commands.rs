@@ -28,7 +28,6 @@ use futures_util::future::BoxFuture;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::value::RawValue;
 use tokio::sync::watch;
-use tokio::time::timeout_at;
 
 use super::auth::{Authorized, verify_opt_in_job};
 use super::ctx::{Job, WriteCtx, run_write};
@@ -565,11 +564,19 @@ async fn await_reply(
             _ if late => return Err(at_reply_time(&progress)),
             _ => {}
         }
-        match timeout_at(cutoff, rx.changed()).await {
+        match reply_wake(cutoff, rx.changed()).await {
             Ok(Ok(())) => {}
             Err(_) | Ok(Err(_)) => return Err(at_reply_time(&rx.borrow())),
         }
     }
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "wakes the reply loop only; its progress read and the sample after it decide (http-surface §2.8)"
+)]
+fn reply_wake<F: Future>(cutoff: tokio::time::Instant, changed: F) -> tokio::time::Timeout<F> {
+    tokio::time::timeout_at(cutoff, changed)
 }
 
 fn at_reply_time(p: &Progress) -> ApiError {
@@ -748,7 +755,15 @@ async fn complete(shared: &Shared, command_id: CommandId, result: &CommandResult
         let wake = (from + backoff).min(budget_end);
         #[cfg(test)]
         shared.faults.completion_pause(from, wake);
-        tokio::time::sleep_until(shared.timer(wake)).await;
+        backoff_until(shared.timer(wake)).await;
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "completion backoff; the budget is read before each attempt (http-surface §2.8)"
+)]
+fn backoff_until(wake: tokio::time::Instant) -> tokio::time::Sleep {
+    tokio::time::sleep_until(wake)
 }

@@ -314,7 +314,7 @@ impl HookIngest {
         let mut commits = ctx.commits();
         #[cfg(test)]
         self.points.after_subscribe().await;
-        let timer = tokio::time::sleep_until(shared.timer(pid_deadline));
+        let timer = pid_timer(shared.timer(pid_deadline));
         tokio::pin!(timer);
         let stream = StreamId::Thread(thread);
         loop {
@@ -354,6 +354,16 @@ impl HookIngest {
             }
         }
     }
+}
+
+/// The pid wait's timer: biased first in its `select!`; a wake is followed by one clock
+/// sample and a strict re-read (hook-ingest §2.3 "Pid wait").
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the pid wait's biased timer; a wake is followed by one sample and a strict re-read (hook-ingest §2.3)"
+)]
+fn pid_timer(at: tokio::time::Instant) -> tokio::time::Sleep {
+    tokio::time::sleep_until(at)
 }
 
 /// The pre-read's one snapshot: the token (with the hook checks), the launch and thread,

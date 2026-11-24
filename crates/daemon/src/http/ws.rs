@@ -24,7 +24,6 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
-use tokio::time::sleep_until;
 
 use super::Shared;
 use super::auth::{AuthFailure, verify_hash_in};
@@ -401,7 +400,7 @@ async fn close(
 /// would deliver it.
 async fn before<F: Future>(deadline: tokio::time::Instant, f: F) -> Option<F::Output> {
     let mut f = pin!(f);
-    let mut timer = pin!(sleep_until(deadline));
+    let mut timer = pin!(socket_timer(deadline));
     std::future::poll_fn(|cx| {
         if timer.as_mut().poll(cx).is_ready() || tokio::time::Instant::now() >= deadline {
             return Poll::Ready(None);
@@ -409,6 +408,17 @@ async fn before<F: Future>(deadline: tokio::time::Instant, f: F) -> Option<F::Ou
         f.as_mut().poll(cx).map(Some)
     })
     .await
+}
+
+/// A socket timer: [`before`]'s (timer, clock check, then poll: design §2.6 "Bounded
+/// disconnect"), and the socket loop's and startup's arms, where a fired timer drops the
+/// socket or ticks and results go through `take_read` or [`before`] (§2.6).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "socket timers: a fired timer drops the socket or ticks; results are decided by take_read or before (http-surface §2.6)"
+)]
+fn socket_timer(at: tokio::time::Instant) -> tokio::time::Sleep {
+    tokio::time::sleep_until(at)
 }
 
 /// Whether a socket read error is an inbound message or frame over the size bound:
@@ -477,7 +487,7 @@ pub(crate) async fn events_socket(s: UpgradedSocket) {
         () = shutdown.wait() => {
             return close(&shared, out, &mut stream, code::AWAY, "shutting_down").await;
         }
-        () = sleep_until(startup.timer) => return,
+        () = socket_timer(startup.timer) => return,
         j = startup.handle => take_read(&shared, startup.deadline, j),
     };
     match done {
@@ -536,11 +546,11 @@ pub(crate) async fn events_socket(s: UpgradedSocket) {
         let ev = tokio::select! {
             biased;
             () = shutdown.wait() => Ev::Shutdown,
-            () = pending_opt(send_deadline.map(sleep_until)) => Ev::Dropped,
-            () = pending_opt(read_timer.map(sleep_until)) => Ev::Dropped,
-            () = sleep_until(idle_at) => Ev::Dropped,
+            () = pending_opt(send_deadline.map(socket_timer)) => Ev::Dropped,
+            () = pending_opt(read_timer.map(socket_timer)) => Ev::Dropped,
+            () = socket_timer(idle_at) => Ev::Dropped,
             _ = nudge.changed() => Ev::Nudge,
-            () = sleep_until(next_heads_at) => Ev::Tick,
+            () = socket_timer(next_heads_at) => Ev::Tick,
             j = pending_opt(read.as_mut().map(|r| &mut r.handle)) => Ev::Read(j),
             sent = pending_opt(sending.zip(send_deadline).map(|(f, d)| before(d, f))) => match sent {
                 Some((sink, r)) => Ev::Sent(sink, r),

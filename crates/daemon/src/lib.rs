@@ -19,6 +19,7 @@
 #[cfg(test)]
 extern crate self as chaldea_daemon;
 
+mod deadline;
 pub mod hook;
 pub mod http;
 pub mod lifecycle;

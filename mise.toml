@@ -8,6 +8,8 @@ lefthook = "2"
 actionlint = "1"
 betterleaks = "1"
 ghalint = "1"
+# Reads clippy's JSON messages in scripts/lint-probe.sh (docs/design/deadlines.md).
+jq = "1"
 # Run the Quint specs under specs/ (docs/design/formal-specs.md); Quint itself is
 # pinned in specs/package.json and specs/pnpm-lock.yaml.
 node = "24"

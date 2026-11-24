@@ -47,5 +47,14 @@ tokio-tungstenite.workspace = true
 # The contract fixtures validate captured bodies against packages/contracts/schema.
 jsonschema.workspace = true
 
+[features]
+# Builds the `lint_probe` test target, the negative fixture of `scripts/lint-probe.sh`; enables
+# nothing else.
+lint-probe = []
+
+[[test]]
+name = "lint_probe"
+required-features = ["lint-probe"]
+
 [lints]
 workspace = true

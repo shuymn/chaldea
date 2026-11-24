@@ -18,6 +18,7 @@ use support::commands::{completed_body, slow_body};
 use support::http::{
     Reply, TestServer, eventually, host_events_of, reached, reached_sync, settled, spawn_send,
 };
+use support::waits;
 use support::{event, registered_under, reserved, soon, started};
 
 fn cid(n: u128) -> CommandId {
@@ -29,7 +30,7 @@ fn code(s: &str) -> Option<String> {
 }
 
 async fn joined(h: tokio::task::JoinHandle<Reply>) -> Reply {
-    tokio::time::timeout(Duration::from_secs(20), h)
+    waits::bounded(Duration::from_secs(20), h)
         .await
         .expect("the reply within 20 s")
         .unwrap()
@@ -304,7 +305,7 @@ async fn retry_after_restart_outcomes() {
     let (report, mut store) = srv.into_store(Duration::from_millis(200)).await;
     assert_eq!(report.abort_requested.runner, 1, "{report:?}");
     // Its connection ended at shutdown without a reply.
-    let (bytes, _end) = tokio::time::timeout(Duration::from_secs(20), running)
+    let (bytes, _end) = waits::bounded(Duration::from_secs(20), running)
         .await
         .expect("the client ends within 20 s")
         .unwrap();
@@ -759,7 +760,7 @@ async fn panicking_effect_is_reconciled() {
         store.reopen();
         store
     });
-    let store = tokio::time::timeout(Duration::from_secs(20), reopened)
+    let store = waits::bounded(Duration::from_secs(20), reopened)
         .await
         .expect("the store reopens within 20 s")
         .unwrap();

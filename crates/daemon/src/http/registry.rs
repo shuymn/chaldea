@@ -237,7 +237,7 @@ impl TaskRegistry {
             // returns at once.
             tokio::select! {
                 () = self.inner.empty.notified() => {}
-                () = tokio::time::sleep_until(deadline) => return self.is_empty(),
+                () = drain_timer(deadline) => return self.is_empty(),
             }
         }
     }
@@ -300,6 +300,16 @@ impl TaskRegistry {
             self.inner.empty.notify_one();
         }
     }
+}
+
+/// The drain's timer, one arm of [`TaskRegistry::wait_empty_until`]'s unbiased `select!`;
+/// `ServeHandle::shutdown` decides from the registry, not from the wait (design §2.2).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the drain wait's bound; shutdown counts from the registry at its abort pass (http-surface §2.2)"
+)]
+fn drain_timer(deadline: tokio::time::Instant) -> tokio::time::Sleep {
+    tokio::time::sleep_until(deadline)
 }
 
 /// Removes its task's entry when dropped.
