@@ -422,13 +422,16 @@ async fn unknown_kind_passes_unchanged() {
 }
 
 /// While events are appended, a client paging forward from 0 with `limit` 7 gets every
-/// event once; each page is consistent with its own head.
+/// event once; each page is consistent with its own head and includes every append committed
+/// before it was requested.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_between_pages() {
     let srv = std::sync::Arc::new(TestServer::start(Mounts::mvp()).await);
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let s = thread_with(&srv, 1, 3).await;
     const APPENDS: u64 = 60;
+    // Appends committed so far; the writer publishes each count after its commit.
+    let (done, mut committed) = tokio::sync::watch::channel(0u64);
     let writer = {
         let srv = srv.clone();
         tokio::spawn(async move {
@@ -439,6 +442,7 @@ async fn append_between_pages() {
                     Content::text("x"),
                 )])
                 .await;
+                done.send_replace(i + 1);
                 tokio::task::yield_now().await;
             }
         })
@@ -446,12 +450,8 @@ async fn append_between_pages() {
     let target = 3 + APPENDS;
     let mut cursor = 0;
     let mut got: Vec<EventId> = Vec::new();
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while cursor < target {
-        assert!(
-            std::time::Instant::now() < until,
-            "no progress past {cursor}"
-        );
+        let floor = 3 + *committed.borrow();
         let r = get(
             &srv,
             &owner,
@@ -466,6 +466,7 @@ async fn append_between_pages() {
             seqs.iter().all(|q| *q <= head),
             "{seqs:?} beyond head {head}"
         );
+        assert!(head >= floor, "head {head} misses commits up to {floor}");
         let last = seqs.last().copied().unwrap_or(cursor);
         assert_eq!(
             more,
@@ -476,8 +477,15 @@ async fn append_between_pages() {
         assert_eq!(seqs, ((cursor + 1)..=last).collect::<Vec<_>>());
         got.extend(page_ids);
         if last == cursor {
-            // Caught up with the writer: let it append.
-            tokio::task::yield_now().await;
+            // Caught up with the writer: wait for its next commit. The bound only stops a
+            // stalled writer; the pace of appends is the host's.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                committed.wait_for(|n| 3 + n > cursor),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("no append committed past {cursor}"))
+            .unwrap();
         }
         cursor = last;
     }
