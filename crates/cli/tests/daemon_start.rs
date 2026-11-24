@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 
 use chaldea_daemon::lifecycle::{Discovery, LockProbe, discover, names};
 use support::faults::{
-    self, EOF_CHILD_MS, EOF_PAST_DEADLINE, EXIT_RECORD, Gate, HOLD_READER_MS, LOG_MARKERS, Labels,
-    MARKER_PAUSE, PARK_RECONCILER, READY_PAUSE, SERVE_PAST_DEADLINE, SERVE_PAUSE, SLOW_SHUTDOWN_MS,
-    TOKEN_FIELD, TOKEN_MSG, TOKEN_SPAN, VERDICT_PAUSE,
+    self, DEADLINE_MS, EOF_CHILD_MS, EOF_PAST_DEADLINE, EXIT_RECORD, Gate, HOLD_READER_MS,
+    LOG_MARKERS, Labels, MARKER_PAUSE, PARK_RECONCILER, READY_PAUSE, RECHECK_MARK,
+    SERVE_PAST_DEADLINE, SERVE_PAUSE, SHUTDOWN_GATE, TOKEN_FIELD, TOKEN_MSG, TOKEN_SPAN,
+    VERDICT_PAUSE,
 };
 use support::runner::{Case, main as run_cases};
 use support::{Dir, Proc, WAIT, get_status, lock_state, state, token_of, wait_for};
@@ -99,6 +100,19 @@ fn main() {
 
 /// The design's readiness deadline, restated.
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A deadline the test holds for a command whose wait spans the test's own steps (a stop, a
+/// start), so those steps never race the design's 15 s; below every gate's 60 s.
+const HELD_DEADLINE: &str = "45000";
+
+/// Releases a gate on every ending of the test.
+struct ReleaseOnDrop<'a>(&'a Gate);
+
+impl Drop for ReleaseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
 
 /// `chaldea --state-dir <dir> daemon <args…>` with seams, `env` set.
 fn cmd(
@@ -368,7 +382,8 @@ fn concurrent_first_start_at_marker() {
 }
 
 /// PR8-CL-14: the winner (parked at step 9, then failing at bind) exits during its startup;
-/// the loser, waiting for it, exits 1 before its deadline.
+/// the loser, waiting for it, exits 1 before its deadline (both hold a test deadline, so the
+/// test's steps never race 15 s).
 fn loser_sees_winner_exit() {
     let labels = Labels::new();
     let d = state();
@@ -380,11 +395,18 @@ fn loser_sees_winner_exit() {
         &labels,
         &d.path,
         &["daemon", "start", "--port", &port],
-        &[(PARK_RECONCILER, gate.path().as_os_str())],
+        &[
+            (PARK_RECONCILER, gate.path().as_os_str()),
+            (DEADLINE_MS, OsStr::new(HELD_DEADLINE)),
+        ],
     ));
     assert!(gate.reached(WAIT), "{}", winner.stderr());
-    let t = Instant::now();
-    let mut loser = Proc::spawn(&mut cmd(&labels, &d.path, &["daemon", "start"], &[]));
+    let mut loser = Proc::spawn(&mut cmd(
+        &labels,
+        &d.path,
+        &["daemon", "start"],
+        &[(DEADLINE_MS, OsStr::new(HELD_DEADLINE))],
+    ));
     assert!(
         wait_for(|| loser.stderr().contains("another daemon holds")),
         "{}",
@@ -392,8 +414,8 @@ fn loser_sees_winner_exit() {
     );
     gate.release();
     assert_eq!(winner.code(), 1, "{}", winner.stderr());
+    // Exit 1, not 4: the loser saw the winner's exit before its deadline.
     assert_eq!(loser.code(), 1, "{}{}", loser.stdout(), loser.stderr());
-    assert!(t.elapsed() < READY_TIMEOUT, "{:?}", t.elapsed());
     assert!(loser.stderr().contains("exited"), "{}", loser.stderr());
     drop(held);
 }
@@ -426,6 +448,7 @@ fn eof_follow_up_within_deadline() {
     let labels = Labels::new();
     let d = state();
     let _stop = StopOnDrop(&labels, &d.path);
+    let past = Gate::new();
     let t = Instant::now();
     let (code, out, err) = start(
         &labels,
@@ -433,8 +456,12 @@ fn eof_follow_up_within_deadline() {
         &[],
         &[
             (EOF_CHILD_MS, OsStr::new("0")),
-            (EOF_PAST_DEADLINE, OsStr::new("1")),
+            (EOF_PAST_DEADLINE, past.path().as_os_str()),
         ],
+    );
+    assert!(
+        past.reached(Duration::ZERO),
+        "the start never held the end past its deadline: {out}{err}"
     );
     assert_eq!(code, 1, "{out}{err}");
     assert!(
@@ -538,7 +565,8 @@ fn late_child_serves() {
 
 /// PR8-CL-14: the daemon that sent `ready` is stopped, and another started for the same
 /// directory, before the starter acts on the verdict: the starter reports the stop (exit 1),
-/// never the stopped daemon's URL.
+/// never the stopped daemon's URL. The starter holds a test deadline, so the stop and the
+/// second start never race its 15 s.
 fn stopped_after_ready_is_not_reported_started() {
     let labels = Labels::new();
     let d = state();
@@ -550,7 +578,10 @@ fn stopped_after_ready_is_not_reported_started() {
             &labels,
             &d.path,
             &["daemon", "start"],
-            &[(VERDICT_PAUSE, gate.path().as_os_str())],
+            &[
+                (VERDICT_PAUSE, gate.path().as_os_str()),
+                (DEADLINE_MS, OsStr::new(HELD_DEADLINE)),
+            ],
         )),
     };
     let first = &mut first.p;
@@ -580,29 +611,44 @@ fn stopped_after_ready_is_not_reported_started() {
 }
 
 /// PR8-CL-14: a start that finds the directory held by a daemon whose HTTP surface has shut
-/// down (a 6 s shutdown participant keeps the lock and the record) does not report that daemon
-/// running: it waits, sees it exit, and exits 1.
+/// down (a shutdown participant holds it stopping, with its lock and record, until the test
+/// releases it) does not report that daemon running: it gets `already_running`, and once the
+/// test releases the shutdown it sees the daemon exit and exits 1.
 fn stopping_winner_is_not_reported_running() {
     let labels = Labels::new();
     let d = state();
     let _stop = StopOnDrop(&labels, &d.path);
+    let held = Gate::new();
+    let _release = ReleaseOnDrop(&held);
     let (code, out, err) = start(
         &labels,
         &d.path,
         &[],
-        &[(SLOW_SHUTDOWN_MS, OsStr::new("6000"))],
+        &[(SHUTDOWN_GATE, held.path().as_os_str())],
     );
     assert_eq!(code, 0, "{out}{err}");
-    let mut stopper = Proc::spawn(&mut cmd(&labels, &d.path, &["daemon", "stop"], &[]));
-    let log = d.path.join(names::LOG);
+    let deadline = [(DEADLINE_MS, OsStr::new(HELD_DEADLINE))];
+    let mut stopper = Proc::spawn(&mut cmd(&labels, &d.path, &["daemon", "stop"], &deadline));
     assert!(
-        wait_for(|| std::fs::read_to_string(&log).is_ok_and(|l| l.contains("http shutdown:"))),
-        "the HTTP surface did not shut down"
+        held.reached(WAIT),
+        "the shutdown never reached its held participant"
     );
-    let (code, out, err) = start(&labels, &d.path, &[], &[]);
-    assert_eq!(code, 1, "{out}{err}");
-    assert!(!out.contains("already running"), "{out}");
-    assert!(err.contains("exited"), "{err}");
+    let seen = discover(&d.path);
+    assert!(matches!(seen, Discovery::Stopping(_)), "{seen:?}");
+    let mut second = Proc::spawn(&mut cmd(&labels, &d.path, &["daemon", "start"], &deadline));
+    assert!(
+        wait_for(|| second.stderr().contains("another daemon holds")),
+        "{}",
+        second.stderr()
+    );
+    held.release();
+    assert_eq!(second.code(), 1, "{}{}", second.stdout(), second.stderr());
+    assert!(
+        !second.stdout().contains("already running"),
+        "{}",
+        second.stdout()
+    );
+    assert!(second.stderr().contains("exited"), "{}", second.stderr());
     assert_eq!(
         stopper.code(),
         0,
@@ -614,14 +660,19 @@ fn stopping_winner_is_not_reported_running() {
 }
 
 /// PR8-CL-14: the daemon whose serving check answered 200 begins its shutdown before the
-/// start's last discovery (paused between them; a 6 s shutdown participant keeps the lock and
-/// the record): the record says `stopping`, so the start reports the stop (exit 1), never the
-/// URL.
+/// start's last discovery (paused between them; a shutdown participant holds the daemon
+/// stopping, with its lock and its `stopping` record, until the test releases it): that
+/// discovery, which the test sees happen while the daemon is held, finds `stopping`, so once
+/// the daemon exits the start reports the stop (exit 1), never the URL. The starter and the
+/// stop hold a test deadline, so the test's steps never race 15 s.
 fn stopping_after_the_answer_is_not_reported_started() {
     let labels = Labels::new();
     let d = state();
     let _stop = StopOnDrop(&labels, &d.path);
     let gate = Gate::new();
+    let held = Gate::new();
+    let _release = ReleaseOnDrop(&held);
+    let recheck = Gate::new();
     let mut starter = Gated {
         gate: &gate,
         p: Proc::spawn(&mut cmd(
@@ -630,20 +681,31 @@ fn stopping_after_the_answer_is_not_reported_started() {
             &["daemon", "start"],
             &[
                 (SERVE_PAUSE, gate.path().as_os_str()),
-                (SLOW_SHUTDOWN_MS, OsStr::new("6000")),
+                (RECHECK_MARK, recheck.path().as_os_str()),
+                (SHUTDOWN_GATE, held.path().as_os_str()),
+                (DEADLINE_MS, OsStr::new(HELD_DEADLINE)),
             ],
         )),
     };
     assert!(gate.reached(WAIT), "the serving check never answered");
-    let mut stopper = Proc::spawn(&mut cmd(&labels, &d.path, &["daemon", "stop"], &[]));
-    let log = d.path.join(names::LOG);
+    let mut stopper = Proc::spawn(&mut cmd(
+        &labels,
+        &d.path,
+        &["daemon", "stop"],
+        &[(DEADLINE_MS, OsStr::new(HELD_DEADLINE))],
+    ));
     assert!(
-        wait_for(|| std::fs::read_to_string(&log).is_ok_and(|l| l.contains("http shutdown:"))),
-        "the HTTP surface did not shut down"
+        held.reached(WAIT),
+        "the shutdown never reached its held participant"
     );
     let seen = discover(&d.path);
     assert!(matches!(seen, Discovery::Stopping(_)), "{seen:?}");
     gate.release();
+    assert!(
+        recheck.reached(WAIT),
+        "the start's last discovery did not run while the daemon was held"
+    );
+    held.release();
     let p = &mut starter.p;
     assert_eq!(p.code(), 1, "{}{}", p.stdout(), p.stderr());
     assert!(!p.stdout().contains("daemon started"), "{}", p.stdout());
@@ -662,17 +724,23 @@ fn stopping_after_the_answer_is_not_reported_started() {
 }
 
 /// PR8-CL-14: the serving check answered 200, and the starter then waits until its deadline
-/// has passed before its last discovery: the start times out (exit 4) saying that serving was
-/// not confirmed, never that the daemon did not answer. The daemon serves on.
+/// has passed before its last discovery (the seam marks that it got there): the start times
+/// out (exit 4) saying that serving was not confirmed, never that the daemon did not answer.
+/// The daemon serves on.
 fn late_discovery_after_the_answer_claims_no_state() {
     let labels = Labels::new();
     let d = state();
     let _stop = StopOnDrop(&labels, &d.path);
+    let past = Gate::new();
     let (code, out, err) = start(
         &labels,
         &d.path,
         &[],
-        &[(SERVE_PAST_DEADLINE, OsStr::new("1"))],
+        &[(SERVE_PAST_DEADLINE, past.path().as_os_str())],
+    );
+    assert!(
+        past.reached(Duration::ZERO),
+        "the start never held a 200 past its deadline: {out}{err}"
     );
     assert_eq!(code, 4, "{out}{err}");
     assert!(err.contains("was not confirmed within 15 s"), "{err}");

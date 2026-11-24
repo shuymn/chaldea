@@ -175,7 +175,7 @@ impl Launched {
 
 /// `daemon start` (design §2.10).
 pub(crate) fn start(state_dir: &Path, port: Option<u16>, seams: &Seams) -> ExitCode {
-    let deadline = Instant::now() + READY_TIMEOUT;
+    let deadline = Instant::now() + seams.deadline.unwrap_or(READY_TIMEOUT);
     let real = |args: &[&OsStr], d: Instant| host::launchctl(args, d);
     let launchctl: Launchctl<'_> = seams.launchctl.as_deref().unwrap_or(&real);
     let prefix = seams.label_prefix.as_deref().unwrap_or(LABEL_PREFIX);
@@ -277,6 +277,7 @@ pub(crate) fn start(state_dir: &Path, port: Option<u16>, seams: &Seams) -> ExitC
         StartPauses {
             after_verdict: seams.after_verdict.as_deref(),
             after_answer: seams.after_answer.as_deref(),
+            after_recheck: seams.after_recheck.as_deref(),
             after_eof: seams.after_eof.as_deref(),
         },
         deadline,
@@ -706,6 +707,7 @@ fn port_conflict(dir: &Path, serving: u16, requested: Option<u16>) -> Option<Exi
 struct StartPauses<'a> {
     after_verdict: Option<&'a dyn Fn()>,
     after_answer: Option<&'a dyn Fn(Instant)>,
+    after_recheck: Option<&'a dyn Fn()>,
     after_eof: Option<&'a dyn Fn(Instant)>,
 }
 
@@ -747,7 +749,7 @@ fn await_verdict(
                 if let Some(code) = port_conflict(dir, p, port) {
                     return code;
                 }
-                confirm_started(dir, p, pid, seams.after_answer, deadline)
+                confirm_started(dir, p, pid, seams, deadline)
             }
             Some(Verdict::Fail {
                 reason,
@@ -766,7 +768,7 @@ fn await_verdict(
                             "another daemon holds {}; waiting until it serves",
                             dir.display()
                         ));
-                        await_running(dir, port, seams.after_answer, deadline)
+                        await_running(dir, port, seams, deadline)
                     }
                     "stopped" => fail("the daemon was stopped before it became ready"),
                     _ => fail(&format!("the daemon did not start ({reason}): {message}")),
@@ -820,12 +822,13 @@ fn answers(port: u16, token: &str, deadline: Instant) -> bool {
 }
 
 /// One look at the daemon serving `dir` (`expect`: the pid and port its verdict named); `None`
-/// while it is starting, stopping, or recorded but not answering. `after_answer` runs between
-/// the answer and the last discovery (a test's pause).
+/// while it is starting, stopping, or recorded but not answering. `pauses.after_answer` runs
+/// between the answer and the last discovery, `pauses.after_recheck` after that discovery (a
+/// test's pause and mark).
 fn check_serving(
     dir: &Path,
     expect: Option<(u32, u16)>,
-    after_answer: Option<&dyn Fn(Instant)>,
+    pauses: StartPauses<'_>,
     deadline: Instant,
 ) -> Option<Serving> {
     let r = match client::discover(dir) {
@@ -850,12 +853,16 @@ fn check_serving(
     if !answers(port, &token, deadline) {
         return None;
     }
-    if let Some(pause) = after_answer {
+    if let Some(pause) = pauses.after_answer {
         pause(deadline);
     }
     // The answer counts only if the record still says this instance serves, with the lock
     // held: a daemon that began its shutdown has marked its record `stopping`.
-    match client::discover(dir) {
+    let again = client::discover(dir);
+    if let Some(mark) = pauses.after_recheck {
+        mark();
+    }
+    match again {
         Discovery::Serving(again) if again.instance == r.instance => Some(Serving::Confirmed(r)),
         Discovery::NotRunning => Some(Serving::Gone),
         _ => None,
@@ -868,11 +875,11 @@ fn confirm_started(
     dir: &Path,
     port: u16,
     pid: u32,
-    after_answer: Option<&dyn Fn(Instant)>,
+    pauses: StartPauses<'_>,
     deadline: Instant,
 ) -> ExitCode {
     match poll_until(deadline, POLL, || {
-        check_serving(dir, Some((pid, port)), after_answer, deadline)
+        check_serving(dir, Some((pid, port)), pauses, deadline)
     }) {
         Some(Serving::Confirmed(_)) => {
             print_out(&format!(
@@ -899,11 +906,11 @@ fn confirm_started(
 fn await_running(
     dir: &Path,
     port: Option<u16>,
-    after_answer: Option<&dyn Fn(Instant)>,
+    pauses: StartPauses<'_>,
     deadline: Instant,
 ) -> ExitCode {
     match poll_until(deadline, POLL, || {
-        check_serving(dir, None, after_answer, deadline)
+        check_serving(dir, None, pauses, deadline)
     }) {
         Some(Serving::Confirmed(r)) => {
             let Some(p) = r.port else {
@@ -962,9 +969,17 @@ fn follow_up(until: Instant, mut observe: impl FnMut() -> Seen) -> Option<String
 /// past the deadline (Windows: the child's exit, waited on; macOS: the lock, polled). The
 /// closed channel alone says nothing of the daemon's state, so only an observation names one.
 fn eof_follow_up(launched: &mut Launched, dir: &Path, deadline: Instant) -> ExitCode {
+    let observed = eof_observed(launched, dir, deadline);
+    fail(&format!(
+        "the daemon closed its readiness channel without a verdict: {observed}; see {}",
+        dir.join(names::LOG).display()
+    ))
+}
+
+/// What [`eof_follow_up`] observed before its cutoff.
+fn eof_observed(launched: &mut Launched, dir: &Path, deadline: Instant) -> String {
     let until = deadline.min(Instant::now() + EOF_FOLLOW_UP);
-    let log = dir.join(names::LOG);
-    let observed = match launched {
+    match launched {
         Launched::Child(c) if cfg!(windows) => Some(match c.exit_before(until) {
             Ok(Some(s)) => format!("it exited ({s})"),
             // The wait's end is not a state observed before it.
@@ -988,11 +1003,7 @@ fn eof_follow_up(launched: &mut Launched, dir: &Path, deadline: Instant) -> Exit
             Err(e) => Seen::Final(format!("the lock cannot be probed: {e}")),
         }),
     }
-    .unwrap_or_else(|| "nothing could be observed before the deadline".to_owned());
-    fail(&format!(
-        "the daemon closed its readiness channel without a verdict: {observed}; see {}",
-        log.display()
-    ))
+    .unwrap_or_else(|| "nothing could be observed before the deadline".to_owned())
 }
 
 // ---- stop ----
@@ -1000,7 +1011,7 @@ fn eof_follow_up(launched: &mut Launched, dir: &Path, deadline: Instant) -> Exit
 /// `daemon stop` (design §2.10): one request to the published daemon, then a wait until its
 /// identity is gone.
 pub(crate) fn stop(dir: &Path, seams: &mut Seams) -> ExitCode {
-    let deadline = Instant::now() + STOP_WAIT;
+    let deadline = Instant::now() + seams.deadline.unwrap_or(STOP_WAIT);
     let found = poll_until(deadline, POLL, || match client::discover(dir) {
         Discovery::NotRunning => Some(None),
         Discovery::Starting(r) | Discovery::Serving(r) | Discovery::Stopping(r) => Some(Some(r)),
@@ -1523,22 +1534,30 @@ mod tests {
         assert!(!finished_own_job("Could not find service", &exe));
     }
 
-    /// The EOF follow-up ends at the shared deadline when that comes before its own 2 s.
+    /// The EOF follow-up ends at the shared deadline when that comes before its own 2 s: with
+    /// the deadline already passed it observes nothing, though the lock it would poll is held
+    /// (a follow-up bounded by its 2 s alone would report the holder). With time left, it
+    /// reports what it sees.
     #[test]
     fn eof_follow_up_uses_the_shorter_shared_deadline() {
         let dir = tempfile::tempdir().unwrap();
-        let lock = std::fs::File::create(dir.path().join(names::LOCK)).unwrap();
-        lock.try_lock().unwrap();
         let mut launch = Launched::Launchd {
             label: "unused".into(),
             target: "gui/1".into(),
         };
-        let start = Instant::now();
-        let cutoff = start + Duration::from_millis(200);
-        assert_eq!(eof_follow_up(&mut launch, dir.path(), cutoff).code(), 1);
-        let elapsed = start.elapsed();
-        assert!(elapsed >= Duration::from_millis(200));
-        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        let lock = std::fs::File::create(dir.path().join(names::LOCK)).unwrap();
+        lock.try_lock().unwrap();
+        let passed = Instant::now();
+        assert_eq!(
+            eof_observed(&mut launch, dir.path(), passed),
+            "nothing could be observed before the deadline"
+        );
+        drop(lock);
+        let later = Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            eof_observed(&mut launch, dir.path(), later),
+            "no daemon holds the state directory"
+        );
     }
 
     /// The serving check reads the status line only: a 200 whose body is larger than any

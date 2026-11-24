@@ -47,12 +47,22 @@ pub const VERDICT_PAUSE: &str = "CHALDEA_TEST_VERDICT_PAUSE";
 /// A gate directory: `daemon start` waits at it once its serving check got its 200, before
 /// its last discovery.
 pub const SERVE_PAUSE: &str = "CHALDEA_TEST_SERVE_PAUSE";
-/// Set: `daemon start` waits once its serving check got its 200 until its deadline has
-/// passed, so its last discovery comes after the deadline.
+/// A gate directory: `daemon start` waits once its serving check got its 200 until its
+/// deadline has passed, so its last discovery comes after the deadline, and then marks the
+/// gate reached (nothing waits for a release).
 pub const SERVE_PAST_DEADLINE: &str = "CHALDEA_TEST_SERVE_PAST_DEADLINE";
-/// Set: `daemon start` waits once it read the end of its readiness channel until its deadline
-/// has passed, so its follow-up starts after the deadline.
+/// A gate directory: `daemon start` waits once it read the end of its readiness channel until
+/// its deadline has passed, so its follow-up starts after the deadline, and then marks the gate
+/// reached.
 pub const EOF_PAST_DEADLINE: &str = "CHALDEA_TEST_EOF_PAST_DEADLINE";
+/// A gate directory: `daemon start` marks it reached once the discovery after its serving
+/// check's 200 returned (nothing waits for a release).
+pub const RECHECK_MARK: &str = "CHALDEA_TEST_RECHECK_MARK";
+/// A gate directory: a shutdown participant waits at it, so the daemon stays stopping (its
+/// HTTP surface shut down, its record `stopping`, the lock held) until the test releases it.
+pub const SHUTDOWN_GATE: &str = "CHALDEA_TEST_SHUTDOWN_GATE";
+/// Milliseconds: the deadline of `daemon start` and `daemon stop` instead of 15 s.
+pub const DEADLINE_MS: &str = "CHALDEA_TEST_DEADLINE_MS";
 /// A directory: a detached child writes its exit code to `<dir>/daemon-exit` just before it
 /// exits.
 pub const EXIT_RECORD: &str = "CHALDEA_TEST_EXIT_RECORD";
@@ -144,6 +154,7 @@ pub fn enter_if_chaldea() {
     }
     let mut seams = Seams {
         label_prefix: std::env::var(LABEL_PREFIX).ok(),
+        deadline: env_ms(DEADLINE_MS),
         ..Seams::default()
     };
     if let Ok(f) = std::env::var(LAUNCHCTL) {
@@ -153,13 +164,20 @@ pub fn enter_if_chaldea() {
     let slow = env_ms(SLOW_SHUTDOWN_MS);
     let markers = std::env::var_os(LOG_MARKERS).is_some();
     let hold_reader = env_ms(HOLD_READER_MS);
-    if park.is_some() || slow.is_some() || markers || hold_reader.is_some() {
+    let shutdown_gate = env_path(SHUTDOWN_GATE);
+    if park.is_some()
+        || slow.is_some()
+        || markers
+        || hold_reader.is_some()
+        || shutdown_gate.is_some()
+    {
         seams.components = Some(Box::new(move || {
             Box::new(FaultComponents {
                 park,
                 slow,
                 markers,
                 hold_reader,
+                shutdown_gate,
             }) as Box<dyn Components>
         }));
     }
@@ -178,11 +196,14 @@ pub fn enter_if_chaldea() {
     if let Some(dir) = env_path(SERVE_PAUSE) {
         seams.after_answer = Some(Box::new(move |_| wait_at(&dir)));
     }
-    if std::env::var_os(SERVE_PAST_DEADLINE).is_some() {
-        seams.after_answer = Some(Box::new(past));
+    if let Some(dir) = env_path(SERVE_PAST_DEADLINE) {
+        seams.after_answer = Some(Box::new(move |d| past(d, &dir)));
     }
-    if std::env::var_os(EOF_PAST_DEADLINE).is_some() {
-        seams.after_eof = Some(Box::new(past));
+    if let Some(dir) = env_path(EOF_PAST_DEADLINE) {
+        seams.after_eof = Some(Box::new(move |d| past(d, &dir)));
+    }
+    if let Some(dir) = env_path(RECHECK_MARK) {
+        seams.after_recheck = Some(Box::new(move || mark(&dir)));
     }
     if detached_child && let Some(dir) = env_path(EXIT_RECORD) {
         seams.on_exit = Some(Box::new(move |code| {
@@ -192,12 +213,18 @@ pub fn enter_if_chaldea() {
     chaldea_cli::dispatch_with(&args, Stall::Off, seams)
 }
 
-/// Returns once `deadline` has passed: the caller's next step comes after it, whatever the
-/// host's speed.
-fn past(deadline: Instant) {
+/// Returns once `deadline` has passed, then marks `gate` reached: the caller's next step comes
+/// after the deadline whatever the host's speed, and the test sees that it got here.
+fn past(deadline: Instant, gate: &Path) {
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         std::thread::sleep(left + Duration::from_millis(1));
     }
+    mark(gate);
+}
+
+/// Marks `gate` reached without waiting for a release.
+fn mark(gate: &Path) {
+    let _ = std::fs::write(gate.join("reached"), b"");
 }
 
 /// The value after `flag` in `args`.
@@ -229,6 +256,7 @@ struct FaultComponents {
     slow: Option<Duration>,
     markers: bool,
     hold_reader: Option<Duration>,
+    shutdown_gate: Option<PathBuf>,
 }
 
 impl Components for FaultComponents {
@@ -271,6 +299,9 @@ impl Components for FaultComponents {
         if let Some(d) = self.slow {
             b.participants.push(Box::new(Slow(d)));
         }
+        if let Some(dir) = self.shutdown_gate.clone() {
+            b.participants.push(Box::new(HeldShutdown(dir)));
+        }
         b
     }
 }
@@ -289,6 +320,23 @@ impl ShutdownParticipant for Slow {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         let d = self.0.min(end.saturating_duration_since(Instant::now()));
         Box::pin(async move { std::thread::sleep(d) })
+    }
+}
+
+/// A shutdown participant that blocks the shutdown at a gate until the test releases it (at
+/// most [`GATE_MAX`]), past its end: the daemon stays stopping meanwhile.
+struct HeldShutdown(PathBuf);
+
+impl ShutdownParticipant for HeldShutdown {
+    fn name(&self) -> &'static str {
+        "test_held"
+    }
+
+    fn shutdown(
+        &self,
+        _end: Instant,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move { wait_at(&self.0) })
     }
 }
 

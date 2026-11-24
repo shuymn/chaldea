@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use chaldea_daemon::lifecycle::{DiscoveryRecord, Evidence, RecordState, names, spawn_locked};
 use chaldea_pty_runtime::host;
-use support::faults::{self, Gate, Labels, SLOW_SHUTDOWN_MS, STOP_PAUSE};
+use support::faults::{self, DEADLINE_MS, Gate, Labels, SLOW_SHUTDOWN_MS, STOP_PAUSE};
 use support::runner::{Case, main as run_cases};
 use support::{Proc, WAIT, marked_dir, state};
 
@@ -117,14 +117,21 @@ fn replacement_does_not_confuse_completion() {
     let d = state();
     let mut first = foreground(&labels, &d.path, &[]);
     let gate = Gate::new();
+    // A test deadline: the stop waits while the test replaces the daemon, never racing 15 s.
     let mut s = Proc::spawn(&mut cmd(
         &labels,
         &d.path,
         &["daemon", "stop"],
-        &[(STOP_PAUSE, gate.path().as_os_str())],
+        &[
+            (STOP_PAUSE, gate.path().as_os_str()),
+            (DEADLINE_MS, OsStr::new("45000")),
+        ],
     ));
     assert!(gate.reached(WAIT), "{}", s.stderr());
     assert_eq!(first.code(), 0, "{}", first.stderr());
+    // The next daemon picks a free port from the range: the first one's saved port may be
+    // taken by another test by now.
+    std::fs::remove_file(d.path.join(names::PORT)).unwrap();
     let mut second = foreground(&labels, &d.path, &[]);
     gate.release();
     assert_eq!(s.code(), 0, "{}{}", s.stdout(), s.stderr());

@@ -51,6 +51,11 @@ pub struct Seams {
     /// Runs once `daemon start`'s serving check got its 200, before its last discovery, with
     /// the start's deadline.
     pub after_answer: Option<Box<dyn Fn(Instant)>>,
+    /// Runs once the discovery after the serving check's 200 returned.
+    pub after_recheck: Option<Box<dyn Fn()>>,
+    /// The deadline of `daemon start` and `daemon stop` instead of the design's 15 s: a test
+    /// whose own steps run while the command waits holds it longer than those steps take.
+    pub deadline: Option<Duration>,
     /// Runs once `daemon start` read the end of its readiness channel without a verdict,
     /// before its follow-up, with the start's deadline.
     pub after_eof: Option<Box<dyn Fn(Instant)>>,
