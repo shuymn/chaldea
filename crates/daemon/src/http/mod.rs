@@ -350,7 +350,8 @@ pub struct ServeHandle {
 /// What [`ServeHandle::shutdown`] observed, per task kind.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HttpShutdownReport {
-    /// Tasks that ended before the deadline.
+    /// Tasks registered when shutdown began that were gone from the registry at the abort
+    /// pass, which follows the deadline: a task that ends between the two counts here.
     pub exited: KindCounts,
     /// Tasks still running at the deadline, which got an abort request; a request does not
     /// prove the task has ended.

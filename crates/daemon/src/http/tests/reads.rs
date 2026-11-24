@@ -13,6 +13,7 @@ use crate::http::ctx::read_until;
 use crate::http::tickets::TicketPurpose;
 use crate::http::{ApiError, MonotonicClock, Mount, Mounts, ReadCtx, spec};
 use crate::store::StoreError;
+use crate::store::tests::support::waits;
 use axum::body::Body;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -275,6 +276,62 @@ async fn read_by_cutoff_precedes_the_outcome() {
     assert_eq!(r, Err(ApiError::request_timeout()));
     drop(readers);
     drop(ctx);
+    srv.stop().await;
+}
+
+/// Reader-pool exhaustion on a plain (non-strict) read stays 503 `busy` when its result is
+/// taken after the cutoff: the pool's wait ends at the deadline with `Busy`, and the waiter,
+/// held at its gate until that result is in, takes it ready on its first poll.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_pool_exhaustion_on_a_plain_read_is_busy() {
+    let srv = TestServer::start(Mounts::mvp()).await;
+    let s = shared(&srv);
+    let readers = srv.hold_readers(4);
+    let (reached, release) = s.faults.arm_cutoff_gate();
+    let deadline = srv.clock.now() + Duration::from_millis(200);
+    let w = s.clone();
+    let waiter = tokio::spawn(async move { read_until(&w, deadline, |_| Ok(())).await });
+    waits::bounded(Duration::from_secs(10), reached)
+        .await
+        .expect("the waiter reached its gate")
+        .unwrap();
+    drop(release);
+    let r = waits::bounded(Duration::from_secs(20), waiter)
+        .await
+        .expect("the read ends")
+        .unwrap();
+    assert_eq!(r, Err(ApiError::busy()));
+    assert!(srv.clock.now() >= deadline);
+    drop(readers);
+    srv.stop().await;
+}
+
+/// `until_deadline` reads the clock after the handler's future is dropped: a future ready
+/// before the deadline whose destructor runs past it is 408.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_deadline_drop_past_the_deadline_is_408() {
+    struct SkewOnDrop(std::sync::Arc<super::support::http::SkewClock>);
+    impl std::future::Future for SkewOnDrop {
+        type Output = u8;
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<u8> {
+            std::task::Poll::Ready(7)
+        }
+    }
+    impl Drop for SkewOnDrop {
+        fn drop(&mut self) {
+            self.0.skew(Duration::from_secs(3600));
+        }
+    }
+    let srv = TestServer::start(Mounts::mvp()).await;
+    let s = shared(&srv);
+    let deadline = srv.clock.now() + Duration::from_secs(5);
+    let clock = srv.clock.clone();
+    let r = crate::http::until_deadline(&s, deadline, move || SkewOnDrop(clock)).await;
+    assert_eq!(r, Err(ApiError::request_timeout()));
+    srv.clock.skew(Duration::ZERO);
     srv.stop().await;
 }
 

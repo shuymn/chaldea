@@ -182,7 +182,7 @@ pub(crate) async fn admit(
         }
         #[cfg(test)]
         s.faults.step("hand-over bound started");
-        let Ok(Ok(socket)) = tokio::time::timeout(hand_over, rx).await else {
+        let Ok(Ok(socket)) = hand_over_bound(hand_over, rx).await else {
             return;
         };
         handler
@@ -218,4 +218,14 @@ pub(crate) async fn admit(
     Ok(ws.on_upgrade(move |socket| async move {
         let _ = tx.send(socket);
     }))
+}
+
+/// The socket task's wait for its socket, bounded by the short deadline from the moment the
+/// ticket is removed; a socket queued before the bound is served (design §2.4).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the hand-over bound, polled socket first (http-surface §2.4)"
+)]
+fn hand_over_bound<F: Future>(within: std::time::Duration, rx: F) -> tokio::time::Timeout<F> {
+    tokio::time::timeout(within, rx)
 }

@@ -15,6 +15,7 @@
 pub mod commands;
 pub mod hook;
 pub mod http;
+pub mod waits;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

@@ -11,12 +11,12 @@ use std::time::Instant;
 use axum::body::{Body, Bytes};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use tokio::sync::oneshot;
-use tokio::time::timeout_at;
 
 use super::auth::{Authorized, Principal, verify_in_read, verify_opt_in_job};
 use super::error::{ApiError, WriteFailure, in_source_chain, read_error, write_failure};
 use super::registry::{Closing, TaskKind};
 use super::{Shared, StoreFatal};
+use crate::deadline::{Settled, settle_before};
 use crate::store::{JobError, ReadError, ReadTx, StoreError, SubmitError, WriteError, WriteTx};
 
 /// The instant of the connection's first head byte, on the server's clock: the request's
@@ -68,14 +68,21 @@ async fn read_cut<R: Send + 'static>(
         .faults
         .before_cutoff_wait(|| handle.is_finished())
         .await;
-    match timeout_at(cutoff, handle).await {
-        Err(_) => Err(ApiError::request_timeout()),
-        Ok(joined) => {
-            let late = shared.passed(deadline);
-            #[cfg(test)]
-            shared.faults.after_cutoff_sample().await;
-            classify(late, strict, joined)
-        }
+    let settled = settle_before(|| shared.cfg.clock.now(), deadline, cutoff, handle).await;
+    #[cfg(test)]
+    if !matches!(settled, Settled::Elapsed) {
+        shared.faults.after_cutoff_sample().await;
+    }
+    read_outcome(settled, strict)
+}
+
+/// A read's [`Settled`] result as its reply: a fired cutoff is 408; a ready result goes
+/// through [`classify`], late when its one clock sample was at or after the deadline.
+fn read_outcome<R>(settled: Settled<Joined<R>>, strict: bool) -> Result<R, ApiError> {
+    match settled {
+        Settled::Elapsed => Err(ApiError::request_timeout()),
+        Settled::InTime(joined) => classify(false, strict, joined),
+        Settled::Late(joined) => classify(true, strict, joined),
     }
 }
 
@@ -143,10 +150,10 @@ pub(crate) async fn until_deadline<F: Future>(
     start: impl FnOnce() -> F,
 ) -> Result<F::Output, ApiError> {
     let cutoff = shared.timer(deadline);
-    match timeout_at(cutoff, start()).await {
-        Ok(v) if !shared.passed(deadline) => Ok(v),
-        _ => Err(ApiError::request_timeout()),
-    }
+    settle_before(|| shared.cfg.clock.now(), deadline, cutoff, start())
+        .await
+        .in_time()
+        .ok_or_else(ApiError::request_timeout)
 }
 
 /// Collects `body` until `deadline` (408, [`until_deadline`]), at most `max` bytes (413).
@@ -291,11 +298,24 @@ async fn await_write_releasing<R: Send + 'static>(
         .map_err(|_| ApiError::shutting_down())?;
     #[cfg(test)]
     shared.faults.before_cutoff_wait(|| !rx.is_empty()).await;
-    match timeout_at(cutoff, rx).await {
+    match reply_cutoff(cutoff, rx).await {
         Err(_) | Ok(Err(_)) => Err(ApiError::outcome_unknown()),
         Ok(Ok(_)) if shared.passed(reply_by) => Err(ApiError::outcome_unknown()),
         Ok(Ok(r)) => r.map_err(write_failure),
     }
+}
+
+/// The plain write's reply wait. Not [`settle_before`]: a closed reply channel is 503
+/// before any clock reading, and only a reply is classified by one sample (design §2.3).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the plain write's reply wait: a closed channel answers before any clock reading (http-surface §2.3)"
+)]
+fn reply_cutoff<T>(
+    cutoff: tokio::time::Instant,
+    rx: oneshot::Receiver<T>,
+) -> tokio::time::Timeout<oneshot::Receiver<T>> {
+    tokio::time::timeout_at(cutoff, rx)
 }
 
 /// What a read mount's handler gets (design §2.3).
@@ -490,5 +510,67 @@ impl WriteCtx {
     /// The store's commit notifications, from now on (closed once the store shuts down).
     pub(crate) fn commits(&self) -> tokio::sync::broadcast::Receiver<crate::store::Committed> {
         self.shared.store.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Joined, read_outcome};
+    use crate::deadline::Settled;
+    use crate::http::ApiError;
+    use crate::store::{ReadError, StoreError};
+
+    /// A failed join: a task that panicked.
+    async fn failed_join() -> tokio::task::JoinError {
+        tokio::spawn(async { panic!("the read panics") })
+            .await
+            .unwrap_err()
+    }
+
+    /// `read_cut`'s mapping (docs/design/deadlines.md §3 D4): a late result is 408, except
+    /// reader-pool exhaustion on a non-strict read, which stays 503 `busy`.
+    #[tokio::test]
+    async fn read_outcome_table() {
+        type R = Result<u8, ApiError>;
+        let ok = |v: u8| -> Joined<u8> { Ok(Ok(v)) };
+        let err = |e: ReadError| -> Joined<u8> { Ok(Err(e)) };
+        for strict in [false, true] {
+            assert_eq!(read_outcome(Settled::InTime(ok(7)), strict), R::Ok(7));
+            assert_eq!(
+                read_outcome(Settled::Late(ok(7)), strict),
+                R::Err(ApiError::request_timeout())
+            );
+            assert_eq!(
+                read_outcome(
+                    Settled::Late(err(ReadError::Store(StoreError::DiskFull))),
+                    strict
+                ),
+                R::Err(ApiError::request_timeout())
+            );
+            assert_eq!(
+                read_outcome(Settled::InTime(err(ReadError::Busy)), strict),
+                R::Err(ApiError::busy())
+            );
+            assert_eq!(
+                read_outcome(Settled::Late(Err(failed_join().await)), strict),
+                R::Err(ApiError::request_timeout())
+            );
+            assert_eq!(
+                read_outcome(Settled::InTime(Err(failed_join().await)), strict),
+                R::Err(ApiError::internal())
+            );
+            assert_eq!(
+                read_outcome(Settled::<Joined<u8>>::Elapsed, strict),
+                R::Err(ApiError::request_timeout())
+            );
+        }
+        assert_eq!(
+            read_outcome(Settled::Late(err(ReadError::Busy)), false),
+            R::Err(ApiError::busy())
+        );
+        assert_eq!(
+            read_outcome(Settled::Late(err(ReadError::Busy)), true),
+            R::Err(ApiError::request_timeout())
+        );
     }
 }
