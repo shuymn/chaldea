@@ -164,6 +164,12 @@ pub(crate) fn without_trailing_separators(path: &Path) -> PathBuf {
 
 /// Empty, ignoring unfinished marker temporaries (regular files only).
 fn is_empty(dir: &Path) -> io::Result<bool> {
+    is_empty_with(dir, |_| {})
+}
+
+/// [`is_empty`] with `listed` run for each marker temporary between its listing and its
+/// inspection (a test's removal).
+pub(crate) fn is_empty_with(dir: &Path, mut listed: impl FnMut(&Path)) -> io::Result<bool> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if !entry
@@ -173,7 +179,13 @@ fn is_empty(dir: &Path) -> io::Result<bool> {
         {
             return Ok(false);
         }
-        let m = std::fs::symlink_metadata(entry.path())?;
+        listed(&entry.path());
+        let m = match std::fs::symlink_metadata(entry.path()) {
+            Ok(m) => m,
+            // A concurrent first start linked its temporary and removed it since the listing.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
         if is_link(&m) || !m.file_type().is_file() {
             return Ok(false);
         }
