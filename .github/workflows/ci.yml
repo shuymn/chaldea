@@ -69,7 +69,7 @@ jobs:
       # once, judged from cargo's JSON messages (docs/design/deadlines.md §3 D4). Reuses the
       # clippy step's check artifacts.
       - name: Probe the timer ban
-        run: mise exec -- bash scripts/lint-probe.sh
+        run: mise exec jq -- bash scripts/lint-probe.sh
 
       # cargo puts the processes of `cargo test` in a kill-on-close job of its own that allows
       # no breakaway, and this runner's own job allows none either, so a `daemon start` under

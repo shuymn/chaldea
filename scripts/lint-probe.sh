@@ -2,16 +2,18 @@
 # Checks that the timer bans of crates/daemon/clippy.toml fire (docs/design/deadlines.md §3 D4).
 # Clippy runs on the `lint_probe` test target, the negative fixture holding one call of each
 # banned function, and the verdict comes from cargo's JSON messages on stdout only: cargo
-# exits 101; the build has exactly four error-level compiler messages, each
-# `clippy::disallowed_methods` with its primary span in the fixture, one per banned function;
+# exits 101; the build has exactly four error-level compiler messages (internal compiler errors
+# included), each in the `lint_probe` target, `clippy::disallowed_methods`, with its primary
+# span in the fixture, one per banned function;
 # and cargo reports the build finished without success. Human output (stderr) is ignored, so
-# verbosity, colour, and trailers do not matter.
+# verbosity, colour, and trailers do not matter. A compiler child killed after printing all
+# four messages is reported only on stderr and is not detected (docs/design/deadlines.md §3 D4).
 #
 #   scripts/lint-probe.sh                 run clippy on the probe and check its messages
 #   scripts/lint-probe.sh --check STATUS  check JSON messages read from stdin, as if cargo had
 #                                         exited with STATUS (for testing this script)
 #
-# Needs jq (pinned in mise.toml): run it as `mise exec -- bash scripts/lint-probe.sh`.
+# Needs jq (pinned in mise.toml): run it as `mise exec jq -- bash scripts/lint-probe.sh`.
 # The selection (`--workspace` with the feature named through the package) resolves the same
 # dependency features as the workspace clippy step, so after that step it reuses its check
 # artifacts.
@@ -27,12 +29,15 @@ fail() {
 verdict='
 def norm: gsub("\\\\"; "/");
 def banned: ["tokio::time::sleep", "tokio::time::sleep_until", "tokio::time::timeout", "tokio::time::timeout_at"];
-[.[] | select(.reason == "compiler-message" and .message.level == "error") | .message] as $errs
+[.[] | select(.reason == "compiler-message" and (.message.level | startswith("error")))] as $recs
+| [$recs[] | .message] as $errs
 | [.[] | select(.reason == "build-finished")] as $done
 | if ($done | length) != 1 or $done[0].success != false then
     "expected one build-finished record without success, found \($done)"
   elif ($errs | length) != (banned | length) then
     "expected \(banned | length) errors, found \($errs | length): \([$errs[].message])"
+  elif any($recs[]; .target.name != "lint_probe") then
+    "an error in a target other than lint_probe: \([$recs[] | .target.name])"
   elif any($errs[]; .code.code? != "clippy::disallowed_methods") then
     "an error other than clippy::disallowed_methods: \([$errs[] | select(.code.code? != "clippy::disallowed_methods") | .message])"
   elif any($errs[]; [.spans[] | select(.is_primary)] as $p
