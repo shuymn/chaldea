@@ -92,7 +92,7 @@ Step 3 is §2.10's "each return is classified with one clock sample", and `in_ti
 
 | Site | Code | Why it fits the helper |
 |---|---|---|
-| `ctx::read_cut` | `settle_before(server now, deadline, cutoff, handle)`, then `read_outcome(settled, strict)`: `Elapsed` → 408; `InTime(j)` / `Late(j)` → `after_cutoff_sample`, then `classify(false` / `true, strict, j)` | one `timeout_at(cutoff, handle)`, the handle dropped at the end of its `.await`, one sample (`clock.now() >= deadline`) |
+| `ctx::read_cut` | `settle_before(server now, deadline, cutoff, handle)`; for `InTime` / `Late` the test-only `after_cutoff_sample` gate runs next; then `read_outcome(settled, strict)`: `Elapsed` → 408; `InTime(j)` / `Late(j)` → `classify(false` / `true, strict, j)` | one `timeout_at(cutoff, handle)`, the handle dropped at the end of its `.await`, one sample (`clock.now() >= deadline`) |
 | `ctx::until_deadline` | `settle_before(server now, deadline, cutoff, start())`, then `in_time()`, `None` → 408 | `start()` is evaluated, and `cutoff` converted, before the await; `Err` reads no clock; `Ok` reads it once, after the drop |
 
 `hook/mod.rs` and the guard reach the helper through `until_deadline`. Every kept site keeps its own order with its D2 exception function; `ctx::await_write_releasing` stays out because its closed-channel `Ok(Err(_))` → 503 `outcome_unknown` arm reads no clock, while the helper samples every `Ok`.
