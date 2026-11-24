@@ -111,7 +111,7 @@ impl Probe {
 
     /// The next intent of `test_counter` or `test_slow_effect` blocks the writer: the
     /// returned receiver gets a message when it is reached, and it goes on once the returned
-    /// sender is used or dropped (at most 20 s).
+    /// sender is used or dropped.
     pub fn hold_intent(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -120,7 +120,7 @@ impl Probe {
     }
 
     /// The next effect waits: the returned receiver fires when it starts, and it goes on
-    /// once the returned sender is used or dropped (at most 30 s).
+    /// once the returned sender is used or dropped (or the effect's task is aborted).
     pub fn hold_effect(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (reached_tx, reached_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
@@ -132,7 +132,7 @@ impl Probe {
         let gate = self.intent_gate.lock().unwrap().take();
         if let Some((reached, release)) = gate {
             let _ = reached.send(());
-            let _ = release.recv_timeout(Duration::from_secs(20));
+            let _ = release.recv();
         }
     }
 }
@@ -379,7 +379,7 @@ impl CommandEffect for SlowEffect {
         Box::pin(async move {
             if let Some((reached, release)) = gate {
                 let _ = reached.send(());
-                let _ = waits::bounded(Duration::from_secs(30), release).await;
+                let _ = release.await;
             }
             if run.revoke_self {
                 let id = run.token_id;
