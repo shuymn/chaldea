@@ -24,6 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use super::waits;
 use super::{TestStore, registered, reserved, soon, started};
 
 /// The short deadline of test servers.
@@ -344,7 +345,7 @@ impl TestServer {
             })
             .unwrap();
         tokio::spawn(ticket);
-        tokio::time::timeout(Duration::from_secs(10), entered)
+        waits::bounded(Duration::from_secs(10), entered)
             .await
             .expect("the writer runs the holding job within 10 s")
             .unwrap();
@@ -419,7 +420,7 @@ impl TestServer {
         ticket: &str,
     ) -> Result<WsClient, tokio_tungstenite::tungstenite::Error> {
         let url = format!("ws://127.0.0.1:{}/api/ws?ticket={ticket}", self.port);
-        let (ws, resp) = tokio::time::timeout(WS_WAIT, tokio_tungstenite::connect_async(url))
+        let (ws, resp) = waits::bounded(WS_WAIT, tokio_tungstenite::connect_async(url))
             .await
             .expect("the WebSocket handshake ends within the wait")?;
         assert_eq!(resp.status(), 101);
@@ -529,7 +530,7 @@ impl WsClient {
     /// client library and skipped.
     pub async fn next(&mut self) -> Option<WsServerMessage> {
         loop {
-            let m = tokio::time::timeout(WS_WAIT, self.ws.next())
+            let m = waits::bounded(WS_WAIT, self.ws.next())
                 .await
                 .expect("a frame or the close within the wait");
             match m {
@@ -610,7 +611,7 @@ pub fn spawn_send(srv: &TestServer, req: &Req) -> tokio::task::JoinHandle<Reply>
 
 /// Waits (at most 10 s) for a message on a gate's `reached` receiver.
 pub async fn reached(rx: tokio::sync::oneshot::Receiver<()>) {
-    tokio::time::timeout(Duration::from_secs(10), rx)
+    waits::bounded(Duration::from_secs(10), rx)
         .await
         .expect("the gate was reached within 10 s")
         .unwrap();
@@ -809,7 +810,7 @@ pub async fn read_to_end(s: &mut TcpStream) -> (Vec<u8>, Option<io::ErrorKind>) 
     let mut buf = [0u8; 16 * 1024];
     let until = tokio::time::Instant::now() + CLIENT_WAIT;
     loop {
-        match tokio::time::timeout_at(until, s.read(&mut buf)).await {
+        match waits::bounded_at(until, s.read(&mut buf)).await {
             Err(_) => panic!(
                 "no EOF within {CLIENT_WAIT:?}; read so far: {:?}",
                 String::from_utf8_lossy(&out)
@@ -877,14 +878,14 @@ pub async fn send(port: u16, bytes: &[u8]) -> Reply {
 
 /// Awaits a write's ticket within [`CLIENT_WAIT`].
 pub async fn settled<R>(t: WriteTicket<R>) -> Result<R, WriteError> {
-    tokio::time::timeout(CLIENT_WAIT, t)
+    waits::bounded(CLIENT_WAIT, t)
         .await
         .expect("the writer replied within the client wait")
 }
 
 /// Connects within [`CLIENT_WAIT`].
 pub async fn connect(port: u16) -> TcpStream {
-    tokio::time::timeout(CLIENT_WAIT, TcpStream::connect(("127.0.0.1", port)))
+    waits::bounded(CLIENT_WAIT, TcpStream::connect(("127.0.0.1", port)))
         .await
         .expect("connected within the client wait")
         .unwrap()
@@ -892,7 +893,7 @@ pub async fn connect(port: u16) -> TcpStream {
 
 /// Writes all of `bytes` within [`CLIENT_WAIT`].
 pub async fn write(s: &mut TcpStream, bytes: &[u8]) {
-    tokio::time::timeout(CLIENT_WAIT, s.write_all(bytes))
+    waits::bounded(CLIENT_WAIT, s.write_all(bytes))
         .await
         .expect("written within the client wait")
         .unwrap();

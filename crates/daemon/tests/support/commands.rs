@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::sync::oneshot;
 
+use super::waits;
 use super::{registered, soon};
 
 /// The test command table: test-only names with the actions their checks use.
@@ -378,7 +379,7 @@ impl CommandEffect for SlowEffect {
         Box::pin(async move {
             if let Some((reached, release)) = gate {
                 let _ = reached.send(());
-                let _ = tokio::time::timeout(Duration::from_secs(30), release).await;
+                let _ = waits::bounded(Duration::from_secs(30), release).await;
             }
             if run.revoke_self {
                 let id = run.token_id;
@@ -387,7 +388,7 @@ impl CommandEffect for SlowEffect {
                         Ok(tx.token_revoke(TokenSelector::Token(id))?)
                     })
                     .unwrap();
-                tokio::time::timeout(Duration::from_secs(10), ticket)
+                waits::bounded(Duration::from_secs(10), ticket)
                     .await
                     .expect("the revocation within 10 s")
                     .unwrap();

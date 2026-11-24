@@ -5,6 +5,11 @@
 # Every child the daemon creates goes through `lifecycle::spawn_locked`, under the spawn lock
 # shared with the PTY backends (docs/design/daemon-lifecycle.md §2.11), which carries the one
 # `allow`; tokio's `process` feature stays off (CI checks it).
+#
+# A deadline decision goes through `deadline::settle_before` (docs/design/deadlines.md); any
+# other tokio timer is built by a private function that constructs only that timer and names,
+# in its `allow`, the contract its callers follow. Tests use `tests/support/waits.rs`.
+# `scripts/lint-probe.sh` checks that these four entries fire.
 
 disallowed-methods = [
   { path = "axum::routing::Router::route", reason = "routes come only from http::ROUTES through build_router" },
@@ -17,4 +22,8 @@ disallowed-methods = [
   { path = "std::process::Command::spawn", reason = "spawn through lifecycle::spawn_locked (the spawn lock)" },
   { path = "std::process::Command::output", reason = "spawn through lifecycle::spawn_locked (the spawn lock)" },
   { path = "std::process::Command::status", reason = "spawn through lifecycle::spawn_locked (the spawn lock)" },
+  { path = "tokio::time::timeout", reason = "decide through deadline::settle_before, or a named exception fn" },
+  { path = "tokio::time::timeout_at", reason = "decide through deadline::settle_before, or a named exception fn" },
+  { path = "tokio::time::sleep_until", reason = "a wait to a deadline: deadline::settle_before, or a named exception fn" },
+  { path = "tokio::time::sleep", reason = "a relative wait can express a deadline: deadline::settle_before, or a named exception fn" },
 ]

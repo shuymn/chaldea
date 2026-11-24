@@ -13,6 +13,7 @@ use crate::hook::{IntakeOrder, NoIntakeFacts};
 use crate::http::tests::shared;
 use crate::http::{ApiError, Mounts, WriteCtx};
 use crate::store::Routing;
+use crate::store::tests::support::waits;
 
 fn l() -> LaunchId {
     LaunchId::from_u128(1)
@@ -24,7 +25,7 @@ async fn resolves(
     t: &crate::hook::IntakeTicket,
     within: Duration,
 ) -> bool {
-    tokio::time::timeout(within, order.earlier_released(t))
+    waits::bounded(within, order.earlier_released(t))
         .await
         .is_ok()
 }

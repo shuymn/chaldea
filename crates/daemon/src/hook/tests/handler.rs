@@ -14,6 +14,7 @@ use crate::hook::HookConfig;
 use crate::http::tests::shared;
 use crate::store::Routing;
 use crate::store::test_faults::{CommitFault, Faults, open_with_shared};
+use crate::store::tests::support::waits;
 
 fn outcome(r: &super::support::http::Reply) -> (u16, Option<String>) {
     r.outcome()
@@ -558,7 +559,7 @@ async fn submitted_hook_cannot_reply_before_commit() {
         );
         assert!(h.delivery(l.launch, hook.emit).is_none());
         release.send(()).unwrap();
-        let reply = tokio::time::timeout(WAIT, response.as_mut())
+        let reply = waits::bounded(WAIT, response.as_mut())
             .await
             .unwrap()
             .unwrap();
@@ -592,7 +593,7 @@ async fn submitted_hook_can_expire_after_disconnect() {
     .await;
     let cutoff = *s.faults.submitted_not_afters().last().unwrap();
     drop(conn);
-    tokio::time::sleep_until(tokio::time::Instant::from_std(
+    waits::pause_until(tokio::time::Instant::from_std(
         cutoff + Duration::from_millis(1),
     ))
     .await;
@@ -621,7 +622,7 @@ async fn stopped_clock_keeps_a_queued_hook_past_reply_grace() {
     })
     .await;
     // Measured from the submission, which follows the request's first head byte.
-    tokio::time::sleep(Duration::from_millis(2000 + 100 + 400)).await;
+    waits::pause(Duration::from_millis(2000 + 100 + 400)).await;
     assert!(
         !reply.is_finished(),
         "a cutoff answered while the job was queued"

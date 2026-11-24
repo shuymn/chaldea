@@ -86,17 +86,17 @@ async fn late_read_error_is_408() {
     let waiter = tokio::spawn(async move {
         read_until(&w, deadline, |_| Err::<(), _>(StoreError::DiskFull)).await
     });
-    tokio::time::timeout(Duration::from_secs(10), reached)
+    waits::bounded(Duration::from_secs(10), reached)
         .await
         .expect("the waiter reached its gate")
         .unwrap();
     // A lower bound: the real cutoff (the deadline itself, the clock not skewed) has passed.
-    tokio::time::sleep_until(tokio::time::Instant::from_std(
+    waits::pause_until(tokio::time::Instant::from_std(
         deadline + Duration::from_millis(50),
     ))
     .await;
     drop(release);
-    let r = tokio::time::timeout(Duration::from_secs(20), waiter)
+    let r = waits::bounded(Duration::from_secs(20), waiter)
         .await
         .expect("the read ends")
         .unwrap();
@@ -213,16 +213,16 @@ async fn read_by_cutoff_precedes_the_outcome() {
         })
         .await
     });
-    tokio::time::timeout(Duration::from_secs(10), reached)
+    waits::bounded(Duration::from_secs(10), reached)
         .await
         .expect("the waiter reached its gate")
         .unwrap();
-    tokio::time::sleep_until(tokio::time::Instant::from_std(
+    waits::pause_until(tokio::time::Instant::from_std(
         by + Duration::from_millis(50),
     ))
     .await;
     drop(release);
-    let r = tokio::time::timeout(Duration::from_secs(20), waiter)
+    let r = waits::bounded(Duration::from_secs(20), waiter)
         .await
         .expect("the read ends")
         .unwrap();
@@ -238,16 +238,16 @@ async fn read_by_cutoff_precedes_the_outcome() {
         })
         .await
     });
-    tokio::time::timeout(Duration::from_secs(10), reached)
+    waits::bounded(Duration::from_secs(10), reached)
         .await
         .expect("the waiter reached its gate")
         .unwrap();
-    tokio::time::sleep_until(tokio::time::Instant::from_std(
+    waits::pause_until(tokio::time::Instant::from_std(
         deadline + Duration::from_millis(50),
     ))
     .await;
     drop(release);
-    let r = tokio::time::timeout(Duration::from_secs(20), waiter)
+    let r = waits::bounded(Duration::from_secs(20), waiter)
         .await
         .expect("the read ends")
         .unwrap();
@@ -260,16 +260,16 @@ async fn read_by_cutoff_precedes_the_outcome() {
     let by = srv.clock.now() + Duration::from_millis(200);
     let c = ctx.clone();
     let waiter = tokio::spawn(async move { c.read_by(by, |_| Ok(())).await });
-    tokio::time::timeout(Duration::from_secs(10), reached)
+    waits::bounded(Duration::from_secs(10), reached)
         .await
         .expect("the waiter reached its gate")
         .unwrap();
-    tokio::time::sleep_until(tokio::time::Instant::from_std(
+    waits::pause_until(tokio::time::Instant::from_std(
         by + Duration::from_millis(300),
     ))
     .await;
     drop(release);
-    let r = tokio::time::timeout(Duration::from_secs(20), waiter)
+    let r = waits::bounded(Duration::from_secs(20), waiter)
         .await
         .expect("the read ends")
         .unwrap();
@@ -347,7 +347,7 @@ async fn read_by_classifies_with_one_sample() {
     let by = srv.clock.now() + Duration::from_secs(5);
     let clock = srv.clock.clone();
     let skew = async move {
-        tokio::time::timeout(Duration::from_secs(10), reached)
+        waits::bounded(Duration::from_secs(10), reached)
             .await
             .expect("the waiter took its sample")
             .unwrap();

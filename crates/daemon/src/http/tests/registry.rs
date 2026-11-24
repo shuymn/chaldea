@@ -196,6 +196,7 @@ mod runners {
     use super::super::{eventually, shared};
     use crate::http::StoreFatal;
     use crate::store::test_faults::CommitFault;
+    use crate::store::tests::support::waits;
 
     fn cid(n: u128) -> CommandId {
         CommandId::from_u128(0xC0DE_2000 + n)
@@ -211,7 +212,7 @@ mod runners {
     }
 
     async fn joined<T>(h: tokio::task::JoinHandle<T>) -> T {
-        tokio::time::timeout(Duration::from_secs(20), h)
+        waits::bounded(Duration::from_secs(20), h)
             .await
             .expect("done within 20 s")
             .unwrap()
@@ -236,7 +237,7 @@ mod runners {
             srv.command("test_counter", &owner, cid(1), r#"{"n":1}"#)
                 .bytes(),
         );
-        tokio::time::timeout(Duration::from_secs(10), gate_reached)
+        waits::bounded(Duration::from_secs(10), gate_reached)
             .await
             .expect("the runner reached its gate")
             .unwrap();

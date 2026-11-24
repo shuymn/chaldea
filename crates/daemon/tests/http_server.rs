@@ -12,6 +12,7 @@ use axum::body::Body;
 use axum::http::{Method, Response};
 use chaldea_daemon::http::{ApiError, KindCounts, Mount, Mounts, ReadCtx, WriteCtx, spec};
 use support::http::{TestServer, connect};
+use support::waits;
 use tokio::io::AsyncWriteExt;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -54,8 +55,7 @@ async fn shutdown_stops_accepting() {
             // Something holds the port: whatever answers, this server dispatches nothing.
             let _ = s.write_all(&srv.req("GET", "/").bytes()).await;
             let _ =
-                tokio::time::timeout(Duration::from_secs(5), support::http::read_to_end(&mut s))
-                    .await;
+                waits::bounded(Duration::from_secs(5), support::http::read_to_end(&mut s)).await;
         }
     }
     assert_eq!(

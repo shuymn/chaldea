@@ -14,6 +14,7 @@ use super::shared;
 use super::support::http::{SkewClock, TestServer};
 use crate::http::ctx::await_write;
 use crate::http::{ApiError, MonotonicClock, Mount, Mounts, WriteCtx, spec};
+use crate::store::tests::support::waits;
 
 /// A server over `mounts` whose clock is `clock`.
 async fn start(mounts: Mounts, clock: &Arc<SkewClock>) -> TestServer {
@@ -70,7 +71,7 @@ async fn reply_after_the_grace_is_outcome_unknown() {
     let w = s.clone();
     let waiter =
         tokio::spawn(async move { await_write(&w, deadline, Box::new(|_tx| Ok(())), None).await });
-    tokio::time::timeout(Duration::from_secs(10), reached)
+    waits::bounded(Duration::from_secs(10), reached)
         .await
         .expect("the waiter reached its gate")
         .unwrap();
@@ -79,13 +80,13 @@ async fn reply_after_the_grace_is_outcome_unknown() {
     })
     .await;
     // Lower bounds: the reply cutoff and the job's `not_after` have passed in real time.
-    tokio::time::sleep_until(tokio::time::Instant::from_std(
+    waits::pause_until(tokio::time::Instant::from_std(
         deadline + Duration::from_millis(150),
     ))
     .await;
     writer.send(()).unwrap();
     drop(release);
-    let r = tokio::time::timeout(Duration::from_secs(20), waiter)
+    let r = waits::bounded(Duration::from_secs(20), waiter)
         .await
         .expect("the write reply was taken")
         .unwrap();

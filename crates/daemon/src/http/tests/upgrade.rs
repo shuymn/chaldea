@@ -12,6 +12,7 @@ use super::support::http::{TestServer, connect};
 use super::{handshake, hello_then_hold, mint_ticket};
 use crate::http::tickets::TicketPurpose;
 use crate::http::{Mount, Mounts, UpgradedSocket, spec};
+use crate::store::tests::support::waits;
 
 fn ws_mounts() -> Mounts {
     Mounts::mvp().with(Mount::upgrade(
@@ -25,7 +26,7 @@ async fn read_head(c: &mut tokio::net::TcpStream) -> String {
     let mut got = Vec::new();
     let mut buf = [0u8; 1024];
     while !got.windows(4).any(|w| w == b"\r\n\r\n") {
-        let n = tokio::time::timeout(Duration::from_secs(10), c.read(&mut buf))
+        let n = waits::bounded(Duration::from_secs(10), c.read(&mut buf))
             .await
             .expect("a reply head within 10 s")
             .unwrap();
@@ -154,20 +155,20 @@ async fn hand_over_bound_starts_after_the_ticket_is_removed() {
         ("admission reached the gate", reached),
         ("the socket task parked", parked),
     ] {
-        tokio::time::timeout(Duration::from_secs(10), signal)
+        waits::bounded(Duration::from_secs(10), signal)
             .await
             .expect(what)
             .unwrap();
     }
     assert_eq!(s.faults.steps(), Vec::<&str>::new());
     drop(release);
-    let (mut ws, resp) = tokio::time::timeout(Duration::from_secs(10), client)
+    let (mut ws, resp) = waits::bounded(Duration::from_secs(10), client)
         .await
         .expect("the handshake ends")
         .unwrap()
         .expect("a 101");
     assert_eq!(resp.status(), 101);
-    let hello = tokio::time::timeout(Duration::from_secs(5), ws.next())
+    let hello = waits::bounded(Duration::from_secs(5), ws.next())
         .await
         .expect("hello within 5 s: the socket was handed over")
         .unwrap()

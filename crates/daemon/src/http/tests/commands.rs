@@ -25,6 +25,7 @@ use crate::http::auth::sha256;
 use crate::http::commands::{Admitted, prepare_args, run};
 use crate::http::{ApiError, CommandRegistry, MonotonicClock, Shared, StoreFatal};
 use crate::store::test_faults::CommitFault;
+use crate::store::tests::support::waits;
 use crate::store::{SubmitError, WriteError};
 
 fn cid(n: u128) -> CommandId {
@@ -36,7 +37,7 @@ fn code(s: &str) -> Option<String> {
 }
 
 async fn joined<T>(h: tokio::task::JoinHandle<T>) -> T {
-    tokio::time::timeout(Duration::from_secs(20), h)
+    waits::bounded(Duration::from_secs(20), h)
         .await
         .expect("done within 20 s")
         .unwrap()
@@ -130,7 +131,7 @@ async fn expired_observed_is_408() {
     })
     .await;
     // A lower bound: the deadline has passed; the grace (1 s) has not.
-    tokio::time::sleep_until(tokio::time::Instant::from_std(
+    waits::pause_until(tokio::time::Instant::from_std(
         deadline + Duration::from_millis(50),
     ))
     .await;
@@ -233,7 +234,7 @@ async fn progress_taken_after_the_grace_is_outcome_unknown() {
         "the held reading is before the reply time"
     );
     // Lower bounds: the reply time and the job's `not_after` have passed.
-    tokio::time::sleep_until(tokio::time::Instant::from_std(
+    waits::pause_until(tokio::time::Instant::from_std(
         deadline + Duration::from_millis(150),
     ))
     .await;
@@ -277,7 +278,7 @@ async fn reply_after_the_grace_is_outcome_unknown() {
     })
     .await;
     // Lower bounds: the reply time and the job's `not_after` have passed.
-    tokio::time::sleep_until(tokio::time::Instant::from_std(
+    waits::pause_until(tokio::time::Instant::from_std(
         deadline + Duration::from_millis(150),
     ))
     .await;
@@ -447,9 +448,9 @@ async fn exhaust_the_budget() -> Exhausted {
     let first = s.faults.completion_attempts()[0];
     let budget_end = tokio::time::Instant::from_std(first + Duration::from_secs(60));
     let told = || !srv.sink.0.lock().unwrap().is_empty();
-    tokio::time::sleep_until(budget_end - Duration::from_millis(2)).await;
+    waits::pause_until(budget_end - Duration::from_millis(2)).await;
     let before_end = told();
-    tokio::time::sleep_until(budget_end + Duration::from_millis(2)).await;
+    waits::pause_until(budget_end + Duration::from_millis(2)).await;
     let after_end = told();
     // The waiter replied at its reply time, long before.
     assert_eq!(
@@ -461,7 +462,7 @@ async fn exhaust_the_budget() -> Exhausted {
     // of the 120 s of paused time before the checks.
     let until = budget_end + Duration::from_secs(60);
     while !told() && tokio::time::Instant::now() < until {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        waits::pause(Duration::from_secs(1)).await;
     }
     tokio::time::resume();
     Exhausted {
@@ -478,7 +479,7 @@ impl Exhausted {
     async fn stop(self) {
         self.writer.send(()).unwrap();
         for t in self.queued {
-            tokio::time::timeout(Duration::from_secs(10), t)
+            waits::bounded(Duration::from_secs(10), t)
                 .await
                 .expect("a queued job within 10 s")
                 .unwrap();
@@ -615,7 +616,7 @@ async fn last_admitted_attempt_is_awaited() {
     reached_sync(hold_reached).await;
     let first = s.faults.completion_attempts()[0];
     tokio::time::pause();
-    tokio::time::sleep_until(tokio::time::Instant::from_std(
+    waits::pause_until(tokio::time::Instant::from_std(
         first + Duration::from_secs(61),
     ))
     .await;

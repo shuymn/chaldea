@@ -15,6 +15,7 @@ use chaldea_daemon::http::{ApiError, Mount, Mounts, ReadCtx, WriteCtx, spec};
 use support::http::{
     DEADLINE, HEAD_TIMEOUT, Req, TestServer, connect, dump, parse, read_to_end, send,
 };
+use support::waits;
 use support::{exited, reserved};
 use tokio::io::AsyncWriteExt;
 
@@ -531,7 +532,7 @@ async fn trickle(s: &mut tokio::net::TcpStream, bytes: &[u8], parts: usize, over
     let step = bytes.len().div_ceil(parts);
     for chunk in bytes.chunks(step) {
         s.write_all(chunk).await.unwrap();
-        tokio::time::sleep(over / u32::try_from(parts).unwrap()).await;
+        waits::pause(over / u32::try_from(parts).unwrap()).await;
     }
 }
 
@@ -632,7 +633,7 @@ async fn plain_write_expired_is_408() {
     };
     // Release the writer just after the job's `not_after`: it takes the job late and
     // replies `Expired` within the reply grace.
-    tokio::time::sleep_until(tokio::time::Instant::from_std(
+    waits::pause_until(tokio::time::Instant::from_std(
         deadline + Duration::from_millis(100),
     ))
     .await;
