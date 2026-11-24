@@ -50,6 +50,11 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # The daemon's timer bans fire: clippy must reject each banned call in the probe exactly
+      # once (docs/design/deadlines.md §3 D4). Reuses the step above's check artifacts.
+      - name: Probe the timer ban
+        run: ./scripts/lint-probe.sh
+
       # cargo puts the processes of `cargo test` in a kill-on-close job of its own that allows
       # no breakaway, and this runner's own job allows none either, so a `daemon start` under
       # either is refused by design (docs/design/daemon-lifecycle.md §2.12 A-W1, §7). The tests
