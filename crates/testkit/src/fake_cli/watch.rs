@@ -115,6 +115,12 @@ enum State {
 /// its code; a child still running at its deadline is killed (`None`) and reaped until
 /// [`REAP`] after it; each counted output is awaited until the same bound.
 pub(crate) fn settle(ws: Vec<Watched>) -> Vec<Settled> {
+    settle_reporting(ws, |_| {})
+}
+
+/// [`settle`] that calls `reaped(i)` when it has reaped child `i` (after its exit, or after
+/// its kill within [`REAP`]).
+fn settle_reporting(ws: Vec<Watched>, mut reaped: impl FnMut(usize)) -> Vec<Settled> {
     let mut state: Vec<State> = ws.iter().map(|_| State::Running).collect();
     let mut done: Vec<Settled> = ws
         .iter()
@@ -139,6 +145,7 @@ pub(crate) fn settle(ws: Vec<Watched>) -> Vec<Settled> {
                             done[i].code = code;
                             done[i].elapsed = at - w.launched;
                             state[i] = State::Reaped;
+                            reaped(i);
                         }
                         Next::Kill(at) => {
                             let _ = w.child.kill();
@@ -149,11 +156,14 @@ pub(crate) fn settle(ws: Vec<Watched>) -> Vec<Settled> {
                     }
                 }
                 State::Killed => {
-                    let reaped = !matches!(w.child.try_wait(), Ok(None));
-                    if !reaped && Instant::now() < cutoff {
+                    let gone = !matches!(w.child.try_wait(), Ok(None));
+                    if !gone && Instant::now() < cutoff {
                         busy = true;
                     } else {
                         state[i] = State::Reaped;
+                        if gone {
+                            reaped(i);
+                        }
                     }
                 }
                 State::Reaped => {}
@@ -254,18 +264,14 @@ mod tests {
     }
 
     /// Launches `script` with both outputs counted, to be killed after `wait`.
+    ///
+    /// Every spawn of these tests holds the process-wide spawn lock: std sets close-on-exec
+    /// on a new pipe in a second step on macOS (no `pipe2`), and a child another test spawns
+    /// in between would inherit the pipe and hold a counted output open.
     #[cfg(unix)]
     fn launch(script: &str, wait: Duration) -> Watched {
-        launch_cmd(sh(script), wait)
-    }
-
-    /// Launches `c` with both outputs counted, to be killed after `wait`. The spawn holds
-    /// the process-wide spawn lock: std sets close-on-exec on a new pipe in a second step on
-    /// macOS (no `pipe2`), and a child another test spawns in between would inherit the pipe
-    /// and hold a counted output open.
-    #[cfg(unix)]
-    fn launch_cmd(mut c: std::process::Command, wait: Duration) -> Watched {
         let launched = Instant::now();
+        let mut c = sh(script);
         let mut child = chaldea_pty_runtime::with_spawn_lock(|| c.spawn()).unwrap();
         let (out, err) = (child.stdout.take(), child.stderr.take());
         let mut w = Watched::new(child, launched, wait);
@@ -312,57 +318,59 @@ mod tests {
         }
     }
 
-    /// A run with a 30 s bound that exits only when the test lets it, and two runs that never
-    /// exit with a 300 ms bound, settled together: the two are killed and reaped at their own
-    /// bounds while the first still runs, which serial bounds (one run settled before the
-    /// next is watched) would not do. The first is let go once both are gone, or after 10 s.
+    /// Each run's deadline is its own launch plus its wait. Two runs with the same 40 s wait
+    /// and launch instants set in the past once both are spawned, settled together: X,
+    /// launched 40 s ago, is at its deadline as `settle` starts and never exits; Y, launched
+    /// 20 s ago, has 20 s left and exits only when the test lets it, which it does once
+    /// `settle` reports X reaped. A deadline counted from `settle`'s entry (X not killed),
+    /// one deadline shared by both (X not killed, or Y killed), or runs settled one after
+    /// another (X not watched while Y runs) fails: no report within 5 s, or Y killed.
     #[cfg(unix)]
     #[test]
     fn each_run_is_bounded_from_its_launch() {
-        let wait = Duration::from_millis(300);
-        let mut c = sh("read -r _; exit 0");
-        c.stdin(std::process::Stdio::piped());
-        let mut first = launch_cmd(c, Duration::from_secs(30));
-        let stdin = first.child.stdin.take().unwrap();
-        let rest: Vec<Watched> = (0..2).map(|_| launch("exec sleep 30", wait)).collect();
-        let pids: Vec<rustix::process::Pid> = rest
-            .iter()
-            .map(|w| rustix::process::Pid::from_child(&w.child))
+        let wait = Duration::from_secs(40);
+        let mut y = sh("read -r _; exit 0");
+        y.stdin(std::process::Stdio::piped());
+        let spawn = |mut c: std::process::Command| {
+            chaldea_pty_runtime::with_spawn_lock(|| c.spawn()).unwrap()
+        };
+        let mut children = [spawn(y), spawn(sh("exec sleep 30"))];
+        let stdin = children[0].stdin.take().unwrap();
+        // Set after the spawns, so X's reap bound (`REAP` past its deadline) starts now.
+        let now = Instant::now();
+        let ago = |s: u64| {
+            now.checked_sub(Duration::from_secs(s))
+                .expect("the host has been up for 40 s")
+        };
+        let ws: Vec<Watched> = children
+            .into_iter()
+            .zip([ago(20), ago(40)])
+            .map(|(mut child, launched)| {
+                let (out, err) = (child.stdout.take(), child.stderr.take());
+                let mut w = Watched::new(child, launched, wait);
+                w.count(out);
+                w.count(err);
+                w
+            })
             .collect();
+        let (tx, rx) = mpsc::channel();
         let gate = std::thread::spawn(move || {
-            let end = Instant::now() + Duration::from_secs(10);
-            let gone = loop {
-                // Reaped: no such process any more.
-                if pids
-                    .iter()
-                    .all(|p| rustix::process::test_kill_process(*p).is_err())
-                {
-                    break true;
-                }
-                if Instant::now() >= end {
-                    break false;
-                }
-                std::thread::sleep(POLL);
-            };
+            let x_reaped = rx.recv_timeout(Duration::from_secs(5)) == Ok(1);
             drop(stdin);
-            gone
+            x_reaped
         });
-        let mut ws = vec![first];
-        ws.extend(rest);
-        let r = settle(ws);
-        assert!(
-            gate.join().unwrap(),
-            "the 300 ms runs outlived 10 s while the first ran"
-        );
+        let r = settle_reporting(ws, move |i| {
+            let _ = tx.send(i);
+        });
+        assert!(gate.join().unwrap(), "X was not reaped first, within 5 s");
         assert_eq!(
             (r[0].code, &r[0].outputs),
-            (Some(0), &vec![Some(0), Some(0)])
+            (Some(0), &vec![Some(0), Some(0)]),
+            "Y"
         );
-        for s in &r[1..] {
-            assert_eq!(s.code, None);
-            assert!(s.elapsed >= wait, "{:?}", s.elapsed);
-            assert_eq!(s.outputs, [Some(0), Some(0)]);
-        }
+        assert_eq!(r[1].code, None, "X");
+        assert!(r[1].elapsed >= wait, "{:?}", r[1].elapsed);
+        assert_eq!(r[1].outputs, [Some(0), Some(0)]);
     }
 
     /// A run that exits while a descendant holds its stdout: the count is given up at the
