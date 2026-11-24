@@ -359,8 +359,11 @@ async fn store_outcomes_map() {
     let (_, mut store) = srv.into_store(WAIT).await;
     store.shutdown();
 
-    // J7 then J8: commit unknown (the row committed), then the failed store.
+    // J7 then J8: commit unknown (the row committed), then the failed store. The server's
+    // clock stands still, so no reply cutoff fires: each 503 is the observer's, sent after
+    // it reported the outcome to the sink.
     let (h, faults) = faulty().await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     bind(&h, &l, "s").await;
     *faults.commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
@@ -385,8 +388,10 @@ async fn store_outcomes_map() {
     let (_, mut store) = srv.into_store(WAIT).await;
     store.shutdown();
 
-    // J7: the writer is gone.
+    // J7: the writer is gone. The clock stands still as above: a reply cutoff answers the
+    // same 503 before the sink is told (§2.11 J7), which would leave nothing to check here.
     let (h, faults) = faulty().await;
+    h.srv.clock.stop();
     let l = h.codex(1).await;
     bind(&h, &l, "s").await;
     let release = h.srv.hold_writer().await;
