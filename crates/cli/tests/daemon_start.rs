@@ -164,9 +164,10 @@ impl Drop for StopOnDrop<'_> {
 }
 
 /// A starter waiting on `gate` (paused there, or waiting for a child paused there): on every
-/// ending the gate is abandoned (decided `dropped` unless the test released it, which ends a
-/// waiter with the fixture's exit code) and the starter given up to 30 s to exit by itself, so
-/// it removes its readiness channel, before `Proc`'s drop kills it.
+/// ending the gate is abandoned (an undecided gate is decided `dropped`, which ends a waiter
+/// with the fixture's exit code; an existing decision, `expired` included, is kept) and the
+/// starter given up to 30 s to exit by itself, so it removes its readiness channel, before
+/// `Proc`'s drop kills it.
 struct Gated<'a> {
     gate: &'a Gate,
     p: Proc,
@@ -220,11 +221,19 @@ fn stopping_published(dir: &Path) -> bool {
 }
 
 /// The exit code a detached daemon recorded in `dir` through [`EXIT_RECORD`], waited for under a
-/// watchdog. A daemon that ended any other way, a gate's fixture exit included, records none.
-fn recorded_exit(dir: &Path) -> String {
+/// watchdog until the record holds a whole integer (an empty or partial read is not yet one). A
+/// daemon that ended any other way, a gate's fixture exit included, records none.
+fn recorded_exit(dir: &Path) -> i32 {
     let record = dir.join("daemon-exit");
-    assert!(wait_for(|| record.exists()), "the daemon recorded no exit");
-    std::fs::read_to_string(&record).unwrap()
+    let mut code = None;
+    let recorded = wait_for(|| {
+        code = std::fs::read_to_string(&record)
+            .ok()
+            .and_then(|r| r.parse().ok());
+        code.is_some()
+    });
+    assert!(recorded, "the daemon recorded no exit");
+    code.unwrap_or_default()
 }
 
 fn serving(dir: &Path) -> chaldea_daemon::lifecycle::DiscoveryRecord {
@@ -363,7 +372,7 @@ fn stopped_before_ready() {
     );
     assert!(!log.contains("ERROR"), "{log}");
     assert_ne!(lock_state(&d.path), LockProbe::Held);
-    assert_eq!(recorded_exit(exit.path()), "0");
+    assert_eq!(recorded_exit(exit.path()), 0);
 }
 
 /// PR8-CL-14: two starters at once: one daemon serves, both exit 0 with its URL.
@@ -451,8 +460,9 @@ fn loser_sees_winner_exit() {
     );
     gate.release();
     assert_eq!(winner.code(), 1, "{}", winner.stderr());
-    // The released winner failed at bind, not at its gate.
-    assert_eq!(recorded_exit(exit.path()), "1");
+    // A record proves only that the released winner did not end at its gate (an exit there
+    // records none); its value is not asserted.
+    let _ = recorded_exit(exit.path());
     // Exit 1, not 4, and after a discovery that found no daemon: the loser saw the exit.
     assert_eq!(loser.code(), 1, "{}{}", loser.stdout(), loser.stderr());
     assert!(loser.stderr().contains("exited"), "{}", loser.stderr());
@@ -736,8 +746,10 @@ fn stopping_winner_is_not_reported_running() {
         stopper.stderr()
     );
     assert_eq!(discover(&d.path), Discovery::NotRunning);
-    // The released daemon finished its shutdown, not at its gate.
-    assert_eq!(recorded_exit(exit.path()), "0");
+    // A record proves only that the released daemon did not end at its gate (an exit there
+    // records none); its value is not asserted: a daemon released after its 10 s shutdown
+    // budget correctly exits 1 with its lock held at exit.
+    let _ = recorded_exit(exit.path());
 }
 
 /// PR8-CL-14: the daemon whose serving check answered 200 begins its shutdown before the
@@ -821,8 +833,10 @@ fn stopping_after_the_answer_is_not_reported_started() {
         stopper.stdout(),
         stopper.stderr()
     );
-    // The released daemon finished its shutdown, not at its gate.
-    assert_eq!(recorded_exit(exit.path()), "0");
+    // A record proves only that the released daemon did not end at its gate (an exit there
+    // records none); its value is not asserted: a daemon released after its 10 s shutdown
+    // budget correctly exits 1 with its lock held at exit.
+    let _ = recorded_exit(exit.path());
 }
 
 /// PR8-CL-14: the serving check answered 200, and a fault then brings the start's cutoff

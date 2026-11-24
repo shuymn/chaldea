@@ -87,8 +87,9 @@ pub const DISCOVERY_MARKS: &str = "CHALDEA_TEST_DISCOVERY_MARKS";
 /// gate reached (nothing waits for a release).
 pub const RECHECK_MARK: &str = "CHALDEA_TEST_RECHECK_MARK";
 /// A gate directory: a shutdown participant waits at it, so the daemon stays stopping (its
-/// HTTP surface shut down, the lock held, and its record `stopping`, unless the daemon logged a
-/// failure or timeout of that rewrite, which leaves it `serving`) until the test releases it.
+/// HTTP surface shut down, the lock held, and its record `stopping`; after a logged failure or
+/// timeout of that rewrite the record may stay `serving`, as a rename already issued at the
+/// timeout can still land) until the test releases it.
 pub const SHUTDOWN_GATE: &str = "CHALDEA_TEST_SHUTDOWN_GATE";
 /// Milliseconds: the deadline of `daemon start` and `daemon stop` instead of 15 s.
 pub const DEADLINE_MS: &str = "CHALDEA_TEST_DEADLINE_MS";
