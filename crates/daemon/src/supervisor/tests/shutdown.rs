@@ -591,6 +591,8 @@ async fn git_late_handoff() {
             c.git = super::workspace::sleeping_git();
         })
         .await;
+        // Running: the probe ends only at its deadline, while git still sleeps.
+        rig.clock.resume();
         let created = if panics {
             rig.pauses.arm_panic(Pause::GitAfterCreate)
         } else {
