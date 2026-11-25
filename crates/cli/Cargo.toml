@@ -30,6 +30,12 @@ name = "daemon_stop"
 path = "tests/daemon_stop.rs"
 harness = false
 
+# A foreground daemon of this binary whose agent program is FakeCli (tests/support/faults.rs).
+[[test]]
+name = "supervisor_e2e"
+path = "tests/supervisor_e2e.rs"
+harness = false
+
 [[test]]
 name = "daemon_macos"
 path = "tests/daemon_macos.rs"

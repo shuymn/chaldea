@@ -45,6 +45,9 @@ use tempfile::TempDir;
 
 /// Set: this process is `chaldea` with test seams.
 pub const AS_CHALDEA: &str = "CHALDEA_TEST_AS_CHALDEA";
+/// The supervisor's agent program for every agent, a JSON array of the program and its
+/// leading arguments: `daemon run` builds `SupervisorComponents` with it.
+pub const AGENT_PROGRAM: &str = "CHALDEA_TEST_AGENT_PROGRAM";
 /// The launchd label prefix (every test start on a GUI host uses its own).
 pub const LABEL_PREFIX: &str = "CHALDEA_TEST_LABEL_PREFIX";
 /// A `launchctl` fault: see [`launchctl_fault`].
@@ -332,6 +335,22 @@ pub fn enter_if_chaldea() {
                 hold_reader,
                 shutdown_gate,
             }) as Box<dyn Components>
+        }));
+    }
+    if let Ok(json) = std::env::var(AGENT_PROGRAM) {
+        let argv: Vec<OsString> = serde_json::from_str::<Vec<String>>(&json)
+            .expect("CHALDEA_TEST_AGENT_PROGRAM is a JSON array of strings")
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        seams.components = Some(Box::new(move || {
+            let host = chaldea_core::adapter::HostOs::from_os_str(std::env::consts::OS)
+                .expect("a supported host");
+            let mut cfg = chaldea_daemon::supervisor::SupervisorConfig::default();
+            cfg.program = Some(std::sync::Arc::new(move |_| Some(argv.clone())));
+            Box::new(chaldea_daemon::supervisor::SupervisorComponents::new(
+                host, cfg,
+            )) as Box<dyn Components>
         }));
     }
     if let Some(dir) = env_path(MARKER_PAUSE) {
