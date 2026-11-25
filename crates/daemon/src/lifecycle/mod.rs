@@ -490,8 +490,10 @@ pub fn spawn_locked(cmd: &mut Command) -> io::Result<Child> {
 }
 
 /// [`spawn_locked`] that waits for the spawn lock only until `deadline`, and creates the child
-/// only when `under_lock`, run while the lock is held, returns true. `None` when the lock was
-/// not taken by `deadline` or `under_lock` refused; nothing was created then.
+/// only when `under_lock`, run while the lock is held, returns true and `deadline` has not
+/// passed after it: the deadline check (`host::act_before`) is the last step before the OS
+/// spawn. `None` when the lock was not taken by `deadline`, `under_lock` refused, or the
+/// deadline passed after it; nothing was created then.
 ///
 /// # Errors
 ///
@@ -509,8 +511,13 @@ pub(crate) fn spawn_locked_before(
     deadline: Instant,
     under_lock: impl FnOnce() -> bool,
 ) -> Option<io::Result<Child>> {
-    chaldea_pty_runtime::with_spawn_lock_before(deadline, || under_lock().then(|| cmd.spawn()))
-        .flatten()
+    chaldea_pty_runtime::with_spawn_lock_before(deadline, || {
+        if !under_lock() {
+            return None;
+        }
+        chaldea_pty_runtime::host::act_before(deadline, || cmd.spawn())
+    })
+    .flatten()
 }
 
 /// Flushes the process log queue for at most `wait` (for the CLI's `dispatch` before

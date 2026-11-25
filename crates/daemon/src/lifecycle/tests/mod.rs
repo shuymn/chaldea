@@ -529,6 +529,17 @@ fn spawn_locked_before_creates_only_under_the_lock() {
 
     assert!(spawn_locked_before(&mut cmd(), soon(), || false).is_none());
 
+    // A free lock and a future deadline, but `under_lock` returns only after the deadline:
+    // nothing is created.
+    let deadline = Instant::now() + Duration::from_millis(50);
+    let late = spawn_locked_before(&mut cmd(), deadline, || {
+        while Instant::now() <= deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    });
+    assert!(late.is_none(), "no child after the deadline");
+
     // The lock held by another thread past the deadline.
     let (entered_tx, entered) = mpsc::channel();
     let (release, wait) = mpsc::channel::<()>();
