@@ -63,9 +63,17 @@ async fn cases() {
 }
 
 /// PR10a1-CL-39 `stop_result`: a launch that exits by itself between the close's intent and
-/// the stop's seal: `stop` is `already_exited`, the thread closed.
+/// the stop's seal: `stop` is `already_exited`, the thread closed; its
+/// `confirmed_within_deadline` is true when the stop's re-read returned by `RequestStart` +
+/// 5 s, and false when the clock passed that before the re-read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stop_result() {
+    for late in [false, true] {
+        stop_result_with(late).await;
+    }
+}
+
+async fn stop_result_with(late: bool) {
     let rig = Rig::new().await;
     let (t, l) = rig.spawn_codex(None).await;
     let child = rig.pty.take_child().unwrap();
@@ -88,12 +96,16 @@ async fn stop_result() {
         rig.launch(l).exit_reason.is_some()
     })
     .await;
+    if late {
+        rig.clock.skew(std::time::Duration::from_secs(6));
+    }
     start.go();
     let r = reply.await.unwrap();
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     let v = json(&r);
     assert_eq!(v["stop"]["outcome"], "already_exited", "{v}");
     assert_eq!(v["stop"]["death_confirmed"], true);
+    assert_eq!(v["stop"]["confirmed_within_deadline"], !late, "{v}");
     assert!(rig.thread(t).closed);
     // One exit, the natural one: the stop recorded none.
     let exits: Vec<_> = rig
