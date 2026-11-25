@@ -497,6 +497,11 @@ impl PtyChild for FakeProcess {
         if p.exited() {
             return report(METHOD, KillAttempt::AlreadyDead, Some(Instant::now()));
         }
+        // The deadline is checked again right before the signal-equivalent operation, as a
+        // native call checks it before each OS call.
+        if Instant::now() >= deadline {
+            return report(METHOD, KillAttempt::NotAttempted, None);
+        }
         let signal = || {
             p.record(FakeEvent::Signal);
             p.signals.fetch_add(1, Ordering::AcqRel) + 1
@@ -1465,6 +1470,36 @@ mod tests {
         let r = child.kill_tree(&[], soon(), soon());
         assert_eq!((r.tree_dead, r.attempt), (true, KillAttempt::AlreadyDead));
         assert!(r.proved_at.unwrap() >= before);
+        assert_eq!(signals(&c), 0);
+    }
+
+    /// A call that holds the kill-state lock but reaches its signal only after its deadline
+    /// (the exit state's lock held across it) sends nothing.
+    #[test]
+    fn deadline_rechecked_before_the_signal() {
+        let (child, c, _parts) = spawn(FakeScript::default());
+        let exit_state = c.proc.exit.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let call = std::thread::spawn(move || child.kill_tree(&[], deadline, deadline));
+        // The call recorded its entry and took the kill-state lock: it is past its entry check
+        // and waits on the exit state.
+        let entered = soon();
+        while !(*c.proc.kill_lock.lock().unwrap()) {
+            assert!(
+                Instant::now() < entered,
+                "the call takes the kill-state lock"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        while Instant::now() <= deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(exit_state);
+        let r = call.join().unwrap();
+        assert_eq!(
+            (r.tree_dead, r.attempt, r.proved_at),
+            (false, KillAttempt::NotAttempted, None)
+        );
         assert_eq!(signals(&c), 0);
     }
 
