@@ -100,6 +100,7 @@ async fn full_list_every_call() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn busy_before_seal() {
     let rig = Rig::new().await;
+    rig.clock.resume();
     let (t, l) = rig.spawn_codex(None).await;
     let child = rig.pty.take_child().unwrap();
     let entry = rig.sup.entry(l).unwrap();
@@ -167,6 +168,7 @@ async fn records_one_exit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_from_request_start() {
     let rig = Rig::new().await;
+    rig.clock.resume();
     for (skew, within) in [(6, false), (1, true)] {
         let (t, _l) = rig.spawn_codex(None).await;
         let child = rig.pty.take_child().unwrap();
@@ -222,6 +224,7 @@ async fn not_attempted_unconfirmed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn busy_retry() {
     let rig = Rig::new().await;
+    rig.clock.resume();
     let (t, l) = rig.spawn_codex(None).await;
     let id = ProcessIdentity {
         pid: 4242,
@@ -262,6 +265,7 @@ async fn stalled_task_unconfirmed() {
         c.kill_budget = Duration::from_millis(500);
     })
     .await;
+    rig.clock.resume();
     let (t, _l) = rig.spawn_codex(None).await;
     let child = rig.pty.take_child().unwrap();
     let task = rig.pauses.arm(Pause::KillTaskStart);
@@ -297,6 +301,7 @@ async fn while_starting() {
 
 async fn while_starting_with(late: bool) {
     let rig = Rig::new().await;
+    rig.clock.resume();
     let (spawn, stop, after, start) = stop_while_starting(&rig).await;
     // The stop's request is in its op: it goes on to wait on the op lock, and nothing is
     // killed while the spawn is held.
@@ -362,6 +367,7 @@ async fn stop_while_starting(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn starting_past_the_bound() {
     let rig = Rig::new().await;
+    rig.clock.resume();
     let (spawn, stop, after, start) = stop_while_starting(&rig).await;
     rig.clock.skew(Duration::from_secs(11));
     start.go();
@@ -414,6 +420,7 @@ async fn failed_start_already_exited() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn already_exited_in_intent() {
     let rig = Rig::new().await;
+    rig.clock.resume();
     let (t, l) = rig.spawn_codex(None).await;
     rig.cmd("stop", &json!({ "thread_id": t })).await;
     let r = rig.cmd("stop", &json!({ "thread_id": t })).await;
@@ -492,6 +499,7 @@ async fn proof_in_close_by() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn late_join_unconfirmed() {
     let rig = Rig::new().await;
+    rig.clock.resume();
     rig.pty.script_next(FakeScript {
         kill: KillBehavior::ProveOnCall(2),
         ..FakeScript::default()
@@ -819,6 +827,7 @@ async fn proof_cutoff() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn late_proof_confirms() {
     let rig = Rig::new().await;
+    rig.clock.resume();
     rig.pty.script_next(FakeScript {
         kill: KillBehavior::ExitAfter(Duration::from_millis(1500)),
         ..FakeScript::default()
@@ -907,6 +916,7 @@ async fn seal_before_stop_requested() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drop_never_confirms() {
     let rig = Rig::new().await;
+    rig.clock.resume();
     let (t, l) = rig.spawn_codex(None).await;
     let child = rig.pty.take_child().unwrap();
     let fault = rig.pauses.arm_panic(Pause::KillTaskStart);

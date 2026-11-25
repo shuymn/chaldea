@@ -377,7 +377,7 @@ async fn input_commands() {
         .await;
     assert_eq!(v["code"], json!("input_state"));
     rig.clock
-        .skew(super::super::ACK_WINDOW + std::time::Duration::from_secs(1));
+        .advance(super::super::ACK_WINDOW + std::time::Duration::from_secs(1));
     rig.tick().await;
     rig.until_input(s, InputState::Unconfirmed).await;
     let v = rig

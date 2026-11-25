@@ -248,6 +248,7 @@ async fn last_round_ends_at_the_total() {
     use crate::http::StoreFatal;
     use crate::supervisor::{EXIT_TOTAL, Pause};
     let rig = Rig::new().await;
+    rig.clock.resume();
     let (_t, l) = rig.spawn_codex(None).await;
     let held = rig.sup.entry(l).unwrap().ops.clone().lock_owned().await;
     let round = rig.pauses.arm(Pause::ExitRound);

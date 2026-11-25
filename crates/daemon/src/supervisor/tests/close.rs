@@ -75,6 +75,7 @@ async fn stop_result() {
 
 async fn stop_result_with(late: bool) {
     let rig = Rig::new().await;
+    rig.clock.resume();
     let (t, l) = rig.spawn_codex(None).await;
     let child = rig.pty.take_child().unwrap();
     let start = rig.pauses.arm(Pause::StopStart);

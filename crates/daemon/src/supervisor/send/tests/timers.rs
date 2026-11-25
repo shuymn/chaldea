@@ -20,6 +20,7 @@ use crate::supervisor::send::{ACK_WINDOW, GATE_TIMEOUT};
 async fn timers() {
     for vt_held in [false, true] {
         let rig = SRig::new().await;
+        rig.clock.resume();
         let (live, _) = rig.spawn(Agent::Codex, None).await;
         // The clock runs (the snapshot's 250 ms bound is real); the timers see injected ticks.
         let id = rig.send(&live, "waits").await;

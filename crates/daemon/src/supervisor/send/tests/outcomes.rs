@@ -67,6 +67,7 @@ fn key_from_point(rig: &SRig, live: &Live) -> impl FnOnce() + Send + 'static {
 async fn outcomes() {
     // Incomplete: the submit part fails.
     let rig = SRig::new().await;
+    rig.clock.resume();
     let live = rig.claude().await;
     let text = "partial";
     let paste_len = u64::try_from(b"\x1b[200~partial\x1b[201~".len()).unwrap();
@@ -89,6 +90,7 @@ async fn outcomes() {
 
     // Busy: the op lock taken between the open job and the submit.
     let rig = SRig::new().await;
+    rig.clock.resume();
     let live = rig.claude().await;
     let entry = rig.sup.entry(live.l).unwrap();
     let held = Arc::new(std::sync::Mutex::new(None));
@@ -231,6 +233,7 @@ async fn dispatch_wait() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn held_before_permission() {
     let rig = SRig::new().await;
+    rig.clock.resume();
     let live = rig.claude().await;
     let probe = rig.probe(&live).await;
     let park = probe.park(ProbePoint::Dispatching);

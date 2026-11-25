@@ -248,6 +248,7 @@ async fn probe_bounded() {
         c.git = sleeping_git();
     })
     .await;
+    rig.clock.resume();
     let dir = tempfile::tempdir().unwrap();
     let started = Instant::now();
     assert_eq!(
@@ -293,6 +294,7 @@ async fn admission_at_spawn() {
     let dir = tempfile::tempdir().unwrap();
     // Admission closed before the admit.
     let rig = Rig::new().await;
+    rig.clock.resume();
     let held = rig.pauses.arm(Pause::GitBeforeAdmit);
     let (sup, cwd) = (rig.sup.clone(), dir.path().to_path_buf());
     let probe =
@@ -305,6 +307,7 @@ async fn admission_at_spawn() {
     rig.srv.stop().await;
     // Held after the admit until past the deadline.
     let rig = Rig::new().await;
+    rig.clock.resume();
     let held = rig.pauses.arm(Pause::GitAfterAdmit);
     let deadline = rig.sup.now() + Duration::from_millis(200);
     let real = rig.sup.real(deadline);
@@ -334,6 +337,7 @@ async fn probe_panic() {
         c.git = sleeping_git();
     })
     .await;
+    rig.clock.resume();
     let dir = tempfile::tempdir().unwrap();
     let fault = rig.pauses.arm_panic(Pause::GitAfterCreate);
     let (sup, cwd) = (rig.sup.clone(), dir.path().to_path_buf());

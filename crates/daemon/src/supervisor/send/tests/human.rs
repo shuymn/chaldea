@@ -202,6 +202,7 @@ async fn human_writes_recorded() {
 async fn human_writes_at_exit() {
     for rollback in [false, true] {
         let rig = SRig::new().await;
+        rig.clock.resume();
         let live = rig.claude().await;
         let sl = rig.sl(&live);
         let (entered, go, point) = gate_point();
@@ -607,6 +608,7 @@ async fn card_key_order() {
 async fn key_outcomes() {
     // Pending: held in its write.
     let rig = SRig::new().await;
+    rig.clock.resume();
     let live = rig.claude().await;
     let hold = live.child.hold_writes();
     let r = key(&rig, &live, &["escape"], None).await;
@@ -623,6 +625,7 @@ async fn key_outcomes() {
 
     // Never reached: queued behind a held unit, cancelled.
     let rig = SRig::new().await;
+    rig.clock.resume();
     let live = rig.claude().await;
     let hold = live.child.hold_writes();
     let far = rig.sup.real(rig.sup.now() + Duration::from_secs(60));
@@ -636,6 +639,7 @@ async fn key_outcomes() {
     // DECCKM toggled between the encode and the writer reaching the unit (queued behind a
     // held input unit): the recheck refuses it.
     let rig = SRig::new().await;
+    rig.clock.resume();
     let live = rig.claude().await;
     let hold = live.child.hold_writes();
     let _busy = rig.send(&live, "busy").await;
@@ -679,6 +683,7 @@ async fn key_outcomes() {
     // word waits for the queue lock, so the key is written in the form it was checked
     // against, before the change.
     let rig = SRig::new().await;
+    rig.clock.resume();
     let live = rig.claude().await;
     let rx = rig.watch(&live).await;
     let probe = rig.probe(&live).await;
@@ -734,6 +739,7 @@ async fn key_outcomes() {
 
     // Busy: the op lock held past the effect's wait.
     let rig = SRig::new().await;
+    rig.clock.resume();
     let live = rig.claude().await;
     let entry = rig.sup.entry(live.l).unwrap();
     let g = entry.ops.clone().lock_owned().await;
@@ -811,6 +817,7 @@ async fn open_rechecks_human() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn key_past_deadline_at_boundary() {
     let rig = SRig::new().await;
+    rig.clock.resume();
     let live = rig.claude().await;
     let probe = rig.probe(&live).await;
     let park = probe.park(ProbePoint::Dispatching);

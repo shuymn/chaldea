@@ -273,7 +273,10 @@ impl Rig {
         tune: impl FnOnce(&mut SupervisorConfig),
         mounts: impl FnOnce(&Arc<Supervisor>) -> crate::http::Mounts,
     ) -> Rig {
+        // Stopped: no deadline taken from it passes however slowly the host runs. A test
+        // whose subject needs time to pass resumes it (`rig.clock.resume()`) or advances it.
         let clock = Arc::new(SkewClock::default());
+        clock.stop();
         let sink = Arc::new(RecordingSink::default());
         let pty = Arc::new(FakePty::new());
         let pauses = Arc::new(Pauser::default());
