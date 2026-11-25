@@ -137,8 +137,13 @@ async fn late_ack() {
     let id = rig.send(&live, "late").await;
     rig.until_input(id, InputState::Sent).await;
     rig.clock.stop();
-    let t0 = rig.sup.now();
-    tick_at(&rig, &live, t0).await;
+    // The window runs from the completion job's commit, which the worker records.
+    let sl = rig.sl(&live);
+    rig.until("the window started", || {
+        sl.state().sent_at.contains_key(&id)
+    })
+    .await;
+    let t0 = sl.state().sent_at[&id];
     tick_at(&rig, &live, t0 + ACK_WINDOW - Duration::from_millis(1)).await;
     assert_eq!(rig.input(id).state, InputState::Sent);
     tick_at(&rig, &live, t0 + ACK_WINDOW).await;
