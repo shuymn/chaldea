@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chaldea_core::command::{StopOutcome, StopResult};
+use chaldea_core::command::{CloseResult, StopOutcome, StopResult};
 use chaldea_core::event::{
     EventEnvelope, GenericEvent, GenericReason, Source, TranscriptPos, TypedEvent,
 };
@@ -701,6 +701,38 @@ fn golden_round_trip_for_stop_results() {
         ),
     ] {
         round_trip(&format!("commands/stop_result_{name}"), &value);
+    }
+}
+
+/// `CloseResult` with no stop (`stop: null`) and with an inner stop whose exit fields are
+/// both `null`: every field present in both.
+#[test]
+fn golden_round_trip_for_close_results() {
+    let inner = StopResult {
+        launch_id: LAUNCH,
+        outcome: StopOutcome::Stopped,
+        death_confirmed: true,
+        confirmed_within_deadline: true,
+        exit_code: None,
+        signal: None,
+    };
+    for (name, value) in [
+        (
+            "without_stop",
+            CloseResult {
+                thread_id: THREAD,
+                stop: None,
+            },
+        ),
+        (
+            "with_stop",
+            CloseResult {
+                thread_id: THREAD,
+                stop: Some(inner),
+            },
+        ),
+    ] {
+        round_trip(&format!("commands/close_result_{name}"), &value);
     }
 }
 
