@@ -74,11 +74,11 @@ pub(crate) mod wire {
         T::deserialize(d).map(Some)
     }
 
-    /// [`present`] for a struct member, which must also be a JSON object: serde would read a
-    /// struct from an array too, which the schema refuses.
-    pub(crate) fn present_object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    /// A struct that must be a JSON object: serde would read a struct from an array too,
+    /// which the schema refuses. `T` is the struct's field shape.
+    pub(crate) fn object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
         d: D,
-    ) -> Result<Option<T>, D::Error> {
+    ) -> Result<T, D::Error> {
         struct Object<T>(std::marker::PhantomData<T>);
         impl<'de, T: Deserialize<'de>> de::Visitor<'de> for Object<T> {
             type Value = T;
@@ -90,7 +90,6 @@ pub(crate) mod wire {
             }
         }
         d.deserialize_map(Object(std::marker::PhantomData))
-            .map(Some)
     }
 
     #[allow(

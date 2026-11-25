@@ -165,6 +165,12 @@ fn payload_verdicts_agree() {
             false,
         ),
         (
+            "failed_start with a null pgid_or_job",
+            "launch_exited",
+            with_failed_start(json!({ "pid": 42, "pgid_or_job": null })),
+            false,
+        ),
+        (
             "failed_start without its pid",
             "launch_exited",
             with_failed_start(json!({ "start_time": "1" })),
@@ -207,6 +213,14 @@ fn payload_verdicts_agree() {
             false,
         ),
     ];
+    // `FailedStart` itself decodes only from an object.
+    assert!(
+        serde_json::from_value::<chaldea_core::payload::FailedStart>(json!([42, "1", "42"]))
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<chaldea_core::payload::FailedStart>(json!({ "pid": 42 })).is_ok()
+    );
     for (name, kind, payload, want) in cases {
         let rust = rust_decodes(kind, &payload);
         let schema = typed.is_valid(&json!({ "kind": kind, "payload": payload }));
