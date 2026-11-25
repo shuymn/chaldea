@@ -123,6 +123,8 @@ async fn git_path_kept_whole() {
             c.git = printing_git(printed);
         })
         .await;
+        // Stopped: the probe's deadline never passes, however slowly the shell starts.
+        rig.clock.stop();
         let (sup, cwd) = (rig.sup.clone(), std::env::temp_dir());
         let got = tokio::task::spawn_blocking(move || {
             common_dir(&sup, &cwd, sup.now() + Duration::from_secs(10))
@@ -148,6 +150,8 @@ async fn git_discovery_env() {
         c.git_env = Some(env);
     })
     .await;
+    // Stopped: the probe's deadline never passes, however slowly the shell starts.
+    rig.clock.stop();
     let (sup, cwd) = (rig.sup.clone(), std::env::temp_dir());
     let got = tokio::task::spawn_blocking(move || {
         common_dir(&sup, &cwd, sup.now() + Duration::from_secs(10))
