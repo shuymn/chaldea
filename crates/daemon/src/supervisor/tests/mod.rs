@@ -165,6 +165,7 @@ pub(crate) fn config(
         program: Some(Arc::new(|_| Some(vec![OsString::from(PROGRAM)]))),
         env: Some(vec![(OsString::from("HOME_LIKE"), OsString::from("/work"))]),
         git: vec![OsString::from("git")],
+        git_env: None,
         kill_budget: Duration::from_secs(5),
         close_bounds: CloseBounds::default(),
         pty_size: PtySize::new(80, 24).unwrap(),

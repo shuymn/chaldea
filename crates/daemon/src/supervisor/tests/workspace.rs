@@ -75,6 +75,32 @@ async fn ids() {
     rig.srv.stop().await;
 }
 
+/// PR10a1-CL-28: a daemon environment with `GIT_DIR` naming a repository: a plain
+/// directory still gets its own id from its canonical path, and the repository its own
+/// (discovery from the cwd alone).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn git_env_ignored() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    let plain = root.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    let rig = Rig::new().await;
+    let id_repo = workspace_of(&rig.sup, &repo).await;
+    rig.srv.stop().await;
+    let git_dir = std::fs::canonicalize(repo.join(".git")).unwrap();
+    let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, move |c| {
+        let mut env: Vec<_> = std::env::vars_os().collect();
+        env.push(("GIT_DIR".into(), git_dir.into_os_string()));
+        c.git_env = Some(env);
+    })
+    .await;
+    assert_eq!(workspace_of(&rig.sup, &plain).await, canonical_id(&plain));
+    assert_eq!(workspace_of(&rig.sup, &repo).await, id_repo);
+    rig.srv.stop().await;
+}
+
 /// A `git` that ignores its arguments and sleeps far beyond every bound of these tests.
 pub(super) fn sleeping_git() -> Vec<std::ffi::OsString> {
     let argv: &[&str] = if cfg!(windows) {

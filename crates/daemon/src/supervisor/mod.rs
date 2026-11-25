@@ -188,6 +188,10 @@ pub struct SupervisorConfig {
     /// The `git` the workspace probe runs, and its leading arguments.
     #[doc(hidden)]
     pub git: Vec<OsString>,
+    /// The environment the workspace probe's `git` starts from, before git's own variables
+    /// are removed: `None` inherits the process's own.
+    #[doc(hidden)]
+    pub git_env: Option<Vec<(OsString, OsString)>>,
     /// The kill phase of a stop's cleanup budget (5 s).
     #[doc(hidden)]
     pub kill_budget: Duration,
@@ -219,6 +223,7 @@ impl Default for SupervisorConfig {
             program: None,
             env: None,
             git: vec![OsString::from("git")],
+            git_env: None,
             kill_budget: Duration::from_secs(5),
             close_bounds: CloseBounds::default(),
             pty_size: PtySize::new(120, 40).unwrap_or_else(|_| unreachable_size()),

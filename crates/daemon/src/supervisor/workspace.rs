@@ -88,8 +88,32 @@ impl Drop for GitLease {
     }
 }
 
-/// `git -C <cwd> rev-parse --path-format=absolute --git-common-dir`, bounded by `deadline`
-/// (supervisor clock). `Err` names why the canonical cwd is used instead.
+/// Git's own variables (`git rev-parse --local-env-vars`): each can point discovery at
+/// another repository or change what git reads there, so the probe's `git` runs without
+/// them and discovers from `cwd` alone. Variables that only restrict discovery
+/// (`GIT_CEILING_DIRECTORIES`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`) stay, since they can only
+/// make the canonical cwd the id.
+const GIT_LOCAL_ENV: [&str; 15] = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// `git -C <cwd> rev-parse --path-format=absolute --git-common-dir` without git's own
+/// variables ([`GIT_LOCAL_ENV`]), bounded by `deadline` (supervisor clock). `Err` names why
+/// the canonical cwd is used instead.
 pub(crate) fn common_dir(
     sup: &Supervisor,
     cwd: &Path,
@@ -109,6 +133,12 @@ pub(crate) fn common_dir(
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .stdout(Stdio::piped());
+    if let Some(env) = &sup.cfg.git_env {
+        cmd.env_clear().envs(env.iter().cloned());
+    }
+    for name in GIT_LOCAL_ENV {
+        cmd.env_remove(name);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
