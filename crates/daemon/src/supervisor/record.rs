@@ -1,0 +1,92 @@
+//! `supervisor::record`: every job after the runner's intent (design §2.1 rule 1, §2.10
+//! "Store jobs"). Attempts of `COMPLETION_ATTEMPT` through `write_with`, retried only on
+//! `retryable` outcomes with the runner's backoff, admitted for `COMPLETION_BUDGET`; an
+//! admitted attempt is awaited to the writer's answer.
+
+use std::sync::Arc;
+
+use crate::http::{
+    BACKOFF_FIRST, BACKOFF_MAX, COMPLETION_ATTEMPT, COMPLETION_BUDGET, WriteFailure,
+    backoff_until, retryable, write_with,
+};
+use crate::store::{JobError, SubmitError, WriteError, WriteTx};
+
+use super::Supervisor;
+
+/// One job, run again on each attempt.
+pub(crate) type Job = Arc<dyn Fn(&mut WriteTx<'_>) -> Result<(), JobError> + Send + Sync>;
+
+/// A job returning a value, run again on each attempt.
+pub(crate) type JobOf<R> = Arc<dyn Fn(&mut WriteTx<'_>) -> Result<R, JobError> + Send + Sync>;
+
+/// How a recorded job ended.
+#[derive(Debug)]
+pub(crate) enum Recorded<R> {
+    /// Committed.
+    Done(R),
+    /// The job refused (rolled back): a value, not a failure.
+    Refused(JobError),
+    /// Not recorded within the budget, or a fatal outcome `write_with` reported, while the
+    /// daemon runs.
+    Unrecorded,
+    /// Not recorded once admission closed, or the store refused it as `Closed`.
+    ShuttingDown,
+}
+
+/// Runs `job` by the completion policy. `nudge`: the job ends a token's validity, so the
+/// revocation nudge runs once it committed.
+pub(crate) async fn record<R: Send + 'static>(
+    sup: &Arc<Supervisor>,
+    job: JobOf<R>,
+    nudge: bool,
+) -> Recorded<R> {
+    let budget_end = sup.now() + COMPLETION_BUDGET;
+    let mut backoff = BACKOFF_FIRST;
+    loop {
+        let now = sup.now();
+        if now >= budget_end {
+            return sup.unrecorded();
+        }
+        let not_after = (now + COMPLETION_ATTEMPT).min(budget_end);
+        let j = job.clone();
+        let after_ok: Option<crate::http::AfterOk> = nudge.then(|| {
+            let s = sup.clone();
+            Box::new(move || s.nudge()) as crate::http::AfterOk
+        });
+        let r = write_with(
+            &sup.store,
+            sup.sink.as_ref(),
+            sup.clock(),
+            not_after,
+            Box::new(move |tx| j(tx)),
+            after_ok,
+            || {},
+        )
+        .await;
+        match r {
+            Ok(v) => return Recorded::Done(v),
+            Err(WriteFailure::Write(WriteError::Rejected(e))) => return Recorded::Refused(e),
+            Err(WriteFailure::Submit(SubmitError::Closed)) => return Recorded::ShuttingDown,
+            Err(f) if retryable(&f) => {}
+            Err(f) => {
+                tracing::warn!(failure = ?f, "a supervisor job was not recorded");
+                return sup.unrecorded();
+            }
+        }
+        let from = sup.now();
+        let wake = (from + backoff).min(budget_end);
+        backoff_until(sup.timer(wake)).await;
+        backoff = (backoff * 2).min(BACKOFF_MAX);
+    }
+}
+
+impl Supervisor {
+    /// `Unrecorded` while admission is open, `ShuttingDown` once it closed.
+    pub(crate) fn unrecorded<R>(&self) -> Recorded<R> {
+        if self.tracker.accepting() {
+            Recorded::Unrecorded
+        } else {
+            Recorded::ShuttingDown
+        }
+    }
+}
