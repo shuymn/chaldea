@@ -367,3 +367,83 @@ fn terminal_inputs_are_not_loaded() {
     assert_eq!(ids, [input(1)]);
     assert_eq!(queued.len(), 1);
 }
+
+/// `inputs_in_states` reads every thread's inputs in the given states, by thread, then
+/// creation.
+#[test]
+fn inputs_in_states_across_threads() {
+    let s = TestStore::new();
+    let created = |t, n: u128| {
+        event(
+            StreamId::Thread(t),
+            &format!("input-{n}"),
+            TypedEvent::InputCreated(InputCreated {
+                input_id: input(n),
+                launch_id: None,
+                initial_state: InputInitialState::Queued,
+                text: Content::text("hello"),
+                encoding: InputEncoding::WinKeys,
+                origin: InputOrigin::Pwa,
+                created_by: Actor::Human,
+            }),
+        )
+    };
+    let (a, b) = (thread(1), thread(2));
+    // Thread `b`'s input is created first; the order is by thread, then creation.
+    s.append(vec![
+        registered(a, false),
+        registered(b, false),
+        created(b, 3),
+        created(a, 1),
+        created(a, 2),
+    ])
+    .unwrap();
+    let ids = |states: &'static [InputState]| {
+        s.read(move |r| r.inputs_in_states(states))
+            .into_iter()
+            .map(|i| (i.thread_id, i.input_id))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(&[InputState::Queued, InputState::Sent]),
+        [(a, input(1)), (a, input(2)), (b, input(3))]
+    );
+    assert_eq!(ids(&[InputState::Sent]), []);
+}
+
+/// `thread_summary`: the thread's states, its attention count, and its current launch;
+/// `None` for a missing thread.
+#[test]
+fn thread_summary_of_a_launch() {
+    use chaldea_core::sync::LaunchInfo;
+    let s = TestStore::new();
+    let (t, l) = (thread(1), launch(1));
+    s.append(vec![registered(t, false)]).unwrap();
+    s.append(vec![support::reserved(t, l), started(t, l)])
+        .unwrap();
+    let (summary, missing) =
+        s.read(move |r| Ok((r.thread_summary(t)?, r.thread_summary(thread(2))?)));
+    let summary = summary.unwrap();
+    let snapshot = s.read(move |r| r.thread_snapshot(t)).unwrap().0;
+    assert_eq!(summary.thread_id, t);
+    assert!(!summary.closed);
+    assert_eq!(
+        (
+            summary.process_state,
+            summary.turn_state,
+            summary.task_state
+        ),
+        (
+            snapshot.thread.process_state,
+            snapshot.thread.turn_state,
+            snapshot.thread.task_state
+        )
+    );
+    assert_eq!(summary.attention_count, 0);
+    assert_eq!(
+        summary.launch.as_ref().map(|x: &LaunchInfo| x.launch_id),
+        Some(l)
+    );
+    assert_eq!(summary.launch, snapshot.launch);
+    assert_eq!(missing, None);
+}

@@ -238,6 +238,18 @@ pub struct TokenService {
     shared: Arc<Shared>,
 }
 
+/// A random token id (v4) and secret, data only: for components that build token rows
+/// without the server.
+#[must_use]
+pub(crate) fn mint_token() -> MintedToken {
+    let secret = Secret::generate(TOKEN_PREFIX);
+    MintedToken {
+        token_id: TokenId(Uuid::new_v4()),
+        sha256: secret.sha256(),
+        secret,
+    }
+}
+
 impl fmt::Debug for TokenService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TokenService").finish_non_exhaustive()
@@ -252,12 +264,7 @@ impl TokenService {
     /// A random id (v4) and secret; touches nothing.
     #[must_use]
     pub fn mint(&self) -> MintedToken {
-        let secret = Secret::generate(TOKEN_PREFIX);
-        MintedToken {
-            token_id: TokenId(Uuid::new_v4()),
-            sha256: secret.sha256(),
-            secret,
-        }
+        mint_token()
     }
 
     /// The row to insert for `m`.

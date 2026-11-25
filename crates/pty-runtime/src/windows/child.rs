@@ -84,7 +84,12 @@ impl PtyChild for WindowsChild {
         Ok(Some(*self.exit.get_or_init(|| e)))
     }
 
-    fn kill_tree(&self, extra: &[ProcessIdentity], deadline: Instant) -> KillReport {
+    fn kill_tree(
+        &self,
+        extra: &[ProcessIdentity],
+        lock_by: Instant,
+        deadline: Instant,
+    ) -> KillReport {
         #[cfg(any(test, feature = "fake"))]
         let deadline = if self.kill_expired.load(std::sync::atomic::Ordering::Acquire) {
             Instant::now()
@@ -101,7 +106,7 @@ impl PtyChild for WindowsChild {
             #[cfg(test)]
             in_kill: &self.in_kill,
         };
-        kill::kill_tree(&os, &leader, extra, deadline, &self.kill)
+        kill::kill_tree(&os, &leader, extra, lock_by, deadline, &self.kill)
     }
 }
 

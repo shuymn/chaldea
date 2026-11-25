@@ -36,7 +36,8 @@ use std::time::{Duration, Instant};
 
 use chaldea_cli::{Seams, Stall};
 use chaldea_daemon::lifecycle::{
-    BuildCtx, Built, Components, Discovery, MvpComponents, Reconciler, ShutdownParticipant,
+    BuildCtx, Built, Components, Discovery, MvpComponents, ParticipantEnd, Reconciler,
+    ShutdownParticipant,
 };
 use chaldea_daemon::store::Store;
 use chaldea_pty_runtime::host::{self, LaunchctlOutput};
@@ -498,9 +499,12 @@ impl ShutdownParticipant for Slow {
     fn shutdown(
         &self,
         end: Instant,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ParticipantEnd> + Send + '_>> {
         let d = self.0.min(end.saturating_duration_since(Instant::now()));
-        Box::pin(async move { std::thread::sleep(d) })
+        Box::pin(async move {
+            std::thread::sleep(d);
+            ParticipantEnd::Clean
+        })
     }
 }
 
@@ -516,8 +520,11 @@ impl ShutdownParticipant for HeldShutdown {
     fn shutdown(
         &self,
         _end: Instant,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-        Box::pin(async move { wait_at(&self.0) })
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ParticipantEnd> + Send + '_>> {
+        Box::pin(async move {
+            wait_at(&self.0);
+            ParticipantEnd::Clean
+        })
     }
 }
 

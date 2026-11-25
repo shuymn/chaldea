@@ -248,6 +248,11 @@ pub(crate) struct Fired {
 }
 
 impl Fired {
+    /// The records of the units this settled, in order.
+    pub(crate) fn records(&self) -> Vec<WriteRecord> {
+        self.completions.iter().map(|(_, r)| r.clone()).collect()
+    }
+
     pub(crate) fn fire(self, sh: &Shared) {
         drop(self.guards);
         for (done, rec) in self.completions {
@@ -328,6 +333,11 @@ impl Queue {
             evicted_through: 0,
             next_id: REPLY + 1,
         }
+    }
+
+    /// The highest dispatched `seq` per class, indexed by `OriginClass::index`.
+    pub(crate) fn last_started_each(&self) -> [u64; 3] {
+        self.last_started
     }
 
     pub(crate) fn last_started(&self, classes: ClassSet) -> u64 {

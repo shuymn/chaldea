@@ -415,6 +415,27 @@
         }
       ]
     },
+    "FailedStart": {
+      "description": "The identity a `StartedThenFailed` spawn returned. A part the backend returned empty is\nabsent (never `null`), so such a record never identifies a process by its pid alone.",
+      "properties": {
+        "pgid_or_job": {
+          "type": "string"
+        },
+        "pid": {
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_time": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pid"
+      ],
+      "type": "object"
+    },
     "HumanWrite": {
       "properties": {
         "approval_id": {
@@ -792,6 +813,10 @@
         "death_confirmed": {
           "description": "False until the whole process tree is proven dead (§2.9 \"Daemon restart\").",
           "type": "boolean"
+        },
+        "failed_start": {
+          "$ref": "#/$defs/FailedStart",
+          "description": "The identity a failed start returned when its cleanup is unresolved (a launch with no\n`launch_started`). Absent otherwise, never `null`: the one exception to this module's\nrule that an `Option` is present as `null`, so every earlier payload keeps its\nspelling."
         },
         "launch_id": {
           "$ref": "#/$defs/LaunchId"

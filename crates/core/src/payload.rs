@@ -143,6 +143,55 @@ pub struct LaunchExited {
     pub reason: ExitReason,
     /// False until the whole process tree is proven dead (§2.9 "Daemon restart").
     pub death_confirmed: bool,
+    /// The identity a failed start returned when its cleanup is unresolved (a launch with no
+    /// `launch_started`). Absent otherwise, never `null`: the one exception to this module's
+    /// rule that an `Option` is present as `null`, so every earlier payload keeps its
+    /// spelling.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::wire::present"
+    )]
+    #[ts(optional)]
+    #[schemars(with = "FailedStart")]
+    pub failed_start: Option<FailedStart>,
+}
+
+/// The identity a `StartedThenFailed` spawn returned. A part the backend returned empty is
+/// absent (never `null`), so such a record never identifies a process by its pid alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS, JsonSchema)]
+pub struct FailedStart {
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(with = "String")]
+    pub start_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(with = "String")]
+    pub pgid_or_job: Option<String>,
+}
+
+/// [`FailedStart`]'s members as decoded: a part, when present, holds a value.
+#[derive(Deserialize)]
+struct FailedStartFields {
+    pid: u32,
+    #[serde(default, deserialize_with = "crate::wire::present")]
+    start_time: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::present")]
+    pgid_or_job: Option<String>,
+}
+
+/// Decodes only from a JSON object, as the schema says.
+impl<'de> Deserialize<'de> for FailedStart {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let f: FailedStartFields = crate::wire::object(d)?;
+        Ok(FailedStart {
+            pid: f.pid,
+            start_time: f.start_time,
+            pgid_or_job: f.pgid_or_job,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]

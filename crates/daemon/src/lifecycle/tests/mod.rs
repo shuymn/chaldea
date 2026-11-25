@@ -34,8 +34,8 @@ use super::gate::{ShutdownGate, SignalName, StopCause};
 use super::log::TestLog;
 use super::{
     Budgets, BuildCtx, Built, Components, DaemonConfig, DetachVia, ExitReport, LockProbe,
-    ReadyWriter, Reconciler, RunMode, ShutdownParticipant, probe, receipts_reconciler,
-    run_isolated, spawn_locked,
+    ParticipantEnd, ReadyWriter, Reconciler, RunMode, ShutdownParticipant, probe,
+    receipts_reconciler, run_isolated, spawn_locked,
 };
 use crate::http::{HttpServer, Mounts};
 use crate::store::Store;
@@ -276,12 +276,12 @@ impl ShutdownParticipant for Recorder {
         self.name
     }
 
-    fn shutdown(&self, end: Instant) -> BoxFuture<'_, ()> {
+    fn shutdown(&self, end: Instant) -> BoxFuture<'_, ParticipantEnd> {
         self.seen
             .lock()
             .unwrap()
             .push((self.name, Instant::now(), end));
-        Box::pin(async {})
+        Box::pin(async { ParticipantEnd::Clean })
     }
 }
 
@@ -486,4 +486,79 @@ pub(super) fn field<'a>(line: &'a str, key: &str) -> &'a str {
     line.split(' ')
         .find_map(|w| w.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
         .unwrap_or_else(|| panic!("no {key} in {line:?}"))
+}
+
+/// `spawn_locked_before` creates the child only under the spawn lock and only when its
+/// check, run under that lock, allows it; a lock not taken by the deadline creates nothing
+/// and runs no check.
+#[test]
+fn spawn_locked_before_creates_only_under_the_lock() {
+    use super::spawn_locked_before;
+
+    let cmd = || {
+        let mut c = Command::new(std::env::current_exe().unwrap());
+        c.arg("--list")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        c
+    };
+    let soon = || Instant::now() + Duration::from_secs(20);
+
+    let mut checked = false;
+    let mut child = spawn_locked_before(&mut cmd(), soon(), || {
+        // Another thread cannot take the lock meanwhile.
+        let other = std::thread::spawn(|| {
+            chaldea_pty_runtime::with_spawn_lock_before(
+                Instant::now() + Duration::from_millis(50),
+                || (),
+            )
+        });
+        checked = other.join().unwrap().is_none();
+        true
+    })
+    .expect("the lock taken")
+    .expect("spawned");
+    assert!(checked, "the check ran under the lock");
+    assert!(child.wait().unwrap().success());
+
+    assert!(spawn_locked_before(&mut cmd(), soon(), || false).is_none());
+
+    // A free lock and a future deadline, but `under_lock` returns only after the deadline:
+    // nothing is created.
+    let deadline = Instant::now() + Duration::from_millis(50);
+    let mut late_ran = false;
+    let late = spawn_locked_before(&mut cmd(), deadline, || {
+        late_ran = true;
+        while Instant::now() <= deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    });
+    assert!(late_ran, "the check ran under the lock");
+    assert!(late.is_none(), "no child after the deadline");
+
+    // The lock held by another thread past the deadline.
+    let (entered_tx, entered) = mpsc::channel();
+    let (release, wait) = mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        chaldea_pty_runtime::with_spawn_lock(|| {
+            entered_tx.send(()).unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(20));
+        });
+    });
+    entered.recv_timeout(Duration::from_secs(20)).unwrap();
+    let mut ran = false;
+    let r = spawn_locked_before(
+        &mut cmd(),
+        Instant::now() + Duration::from_millis(50),
+        || {
+            ran = true;
+            true
+        },
+    );
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    assert!(r.is_none());
+    assert!(!ran, "no check without the lock");
 }

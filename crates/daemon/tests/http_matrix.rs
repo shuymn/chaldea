@@ -194,6 +194,20 @@ const INVENTORY: &[Row] = &[
         200,
         None,
     ),
+    // A missing thread: the handler's 404.
+    reaches(
+        row(
+            "GET",
+            "/api/threads/{thread_id}",
+            "/api/threads/00000000-0000-0000-0000-000000000001",
+            Read,
+            AbsentOrMatching,
+            Cred::Bearer(READ_KINDS),
+            Some(Action::ReadStream),
+        ),
+        404,
+        Some("not_found"),
+    ),
     reaches(
         row(
             "GET",

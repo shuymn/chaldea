@@ -24,6 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chaldea_core::MAX_SAFE_INTEGER;
+use chaldea_core::command::{CloseResult, StopResult};
 use chaldea_core::event::{EventEnvelope, GenericEvent, TypedEvent};
 use chaldea_core::http::{
     CommandRequest, ErrorBody, PairCodeResponse, PairRequest, PairResponse, ThreadsResponse,
@@ -103,6 +104,8 @@ fn generate(out: &Path) -> (PathBuf, PathBuf) {
     export_ts::<PairResponse>(&cfg);
     export_ts::<ThreadsResponse>(&cfg);
     export_ts::<WorktreesResponse>(&cfg);
+    export_ts::<StopResult>(&cfg);
+    export_ts::<CloseResult>(&cfg);
 
     export_schema::<EventEnvelope>(&schema);
     export_schema::<TypedEvent>(&schema);
@@ -118,6 +121,8 @@ fn generate(out: &Path) -> (PathBuf, PathBuf) {
     export_schema::<PairResponse>(&schema);
     export_schema::<ThreadsResponse>(&schema);
     export_schema::<WorktreesResponse>(&schema);
+    export_schema::<StopResult>(&schema);
+    export_schema::<CloseResult>(&schema);
 
     (ts, schema)
 }
@@ -213,4 +218,55 @@ fn committed_contracts_equal_generated_output() {
          `CHALDEA_BLESS=1 cargo test -p chaldea-core --test contracts_export`:\n{}",
         problems.join("\n")
     );
+}
+
+/// `StopResult`'s `exit_code` and `signal` and `CloseResult`'s `stop` are always present on
+/// the wire, as `null` when unknown or when no stop ran: each schema lists them in
+/// `required`.
+#[test]
+fn nullable_result_fields_are_required() {
+    let required = |schema: Value| -> Vec<String> {
+        schema["required"]
+            .as_array()
+            .expect("a required list")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let stop = required(serde_json::to_value(schemars::schema_for!(StopResult)).unwrap());
+    for f in [
+        "launch_id",
+        "outcome",
+        "death_confirmed",
+        "confirmed_within_deadline",
+        "exit_code",
+        "signal",
+    ] {
+        assert!(stop.iter().any(|r| r == f), "StopResult: {f} not required");
+    }
+    let close = required(serde_json::to_value(schemars::schema_for!(CloseResult)).unwrap());
+    for f in ["thread_id", "stop"] {
+        assert!(
+            close.iter().any(|r| r == f),
+            "CloseResult: {f} not required"
+        );
+    }
+}
+
+/// No success type of the launch commands has a top-level `code` property: a client decodes
+/// `ErrorBody` only from a non-2xx status, and a success body must not look like one.
+#[test]
+fn success_schemas_have_no_code() {
+    use chaldea_core::command::{ResumeResult, SpawnResult};
+    for (name, schema) in [
+        ("SpawnResult", schemars::schema_for!(SpawnResult)),
+        ("ResumeResult", schemars::schema_for!(ResumeResult)),
+        ("StopResult", schemars::schema_for!(StopResult)),
+        ("CloseResult", schemars::schema_for!(CloseResult)),
+    ] {
+        let v = serde_json::to_value(schema).unwrap();
+        let props = v["properties"].as_object().expect("an object schema");
+        assert!(!props.is_empty(), "{name}: no properties");
+        assert!(!props.contains_key("code"), "{name} has a top-level code");
+    }
 }

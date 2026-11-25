@@ -494,8 +494,13 @@ fn wait_timeout_runs_during_kill() {
     ready(&out);
     let child = take_child(&pty);
     let k = child.clone();
-    let killer =
-        std::thread::spawn(move || k.kill_tree(&[], Instant::now() + Duration::from_secs(5)));
+    let killer = std::thread::spawn(move || {
+        k.kill_tree(
+            &[],
+            Instant::now() + Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(5),
+        )
+    });
     // The kill holds its lock through the HUP and TERM grace waits.
     let end = Instant::now() + BOUND;
     while !child.kill_lock_held() {
@@ -605,9 +610,11 @@ fn loss_before_observation() {
         .wait_timeout(Duration::from_millis(10))
         .unwrap_err();
     assert!(e.to_string().contains("reaped outside"), "{e}");
-    let k = parts
-        .child
-        .kill_tree(&[], Instant::now() + Duration::from_secs(5));
+    let k = parts.child.kill_tree(
+        &[],
+        Instant::now() + Duration::from_secs(5),
+        Instant::now() + Duration::from_secs(5),
+    );
     assert_eq!(k.method, "unix_ownership_lost");
     assert!(!k.tree_dead);
     let _ = parts.teardown();
@@ -626,9 +633,11 @@ fn loss_after_cached_exit() {
     let leader = parts.child.identity().pid;
     assert!(parts.child.wait_timeout(BOUND).unwrap().is_some());
     assert!(reap(leader));
-    let k = parts
-        .child
-        .kill_tree(&[], Instant::now() + Duration::from_secs(5));
+    let k = parts.child.kill_tree(
+        &[],
+        Instant::now() + Duration::from_secs(5),
+        Instant::now() + Duration::from_secs(5),
+    );
     assert_eq!(k.method, "unix_ownership_lost");
     assert!(!k.tree_dead);
     let _ = parts.teardown();

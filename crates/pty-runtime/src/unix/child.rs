@@ -204,7 +204,12 @@ impl PtyChild for UnixChild {
         }
     }
 
-    fn kill_tree(&self, extra: &[ProcessIdentity], deadline: Instant) -> KillReport {
+    fn kill_tree(
+        &self,
+        extra: &[ProcessIdentity],
+        lock_by: Instant,
+        deadline: Instant,
+    ) -> KillReport {
         #[cfg(test)]
         super::trace::record("kill_tree");
         #[cfg(test)]
@@ -222,6 +227,7 @@ impl PtyChild for UnixChild {
             &RealOs { own: &self.own },
             leader,
             extra,
+            lock_by,
             deadline,
             &self.kill,
         )

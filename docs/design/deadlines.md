@@ -73,13 +73,13 @@ Step 3 is §2.10's "each return is classified with one clock sample", and `in_ti
   | `deadline::bound` | `timeout_at` | `settle_before` (D1) |
   | `ctx::reply_cutoff` | `timeout_at` | `await_write_releasing`: a closed reply channel is 503 `outcome_unknown` before any clock reading; a reply is classified by one sample against `reply_by` (http-surface §2.3). The cutoff is converted before the observer registers and the job is submitted. |
   | `commands::reply_wake` | `timeout_at` | `await_reply`: wakes the loop; the progress read and its sample decide (§2.8) |
-  | `commands::backoff_until` | `sleep_until` | completion backoff; the budget is read before each attempt (§2.8) |
+  | `commands::backoff_until` | `sleep_until` | completion backoff; the budget is read before each attempt (§2.8). Re-exported from `http` with the rest of the completion policy for components' own retried writes, which follow the same contract. |
   | `ws::socket_timer` | `sleep_until` | `before` (timer, clock check, then poll: §2.6 "Bounded disconnect"), and the startup and loop `select!` arms (a fired timer drops the socket or ticks; results go through `take_read` or `before`, §2.6). The startup `select!` is `biased`: shutdown, then the timer, then the startup read's join. |
   | `hook::pid_timer` | `sleep_until` | pid wait: biased timer, then one sample and a strict re-read (hook-ingest §2.3) |
   | `registry::drain_timer` | `sleep_until` | `wait_empty_until`'s unbiased `select!` (§2.2 "Shutdown") |
   | `upgrade::hand_over_bound` | `timeout` | hand-over, polled socket first (§2.4) |
   | `shutdown::deadline_timer` | `sleep_until` | `deadline_first`: clock, poll, timer (daemon-lifecycle §2.8) |
-  | `shutdown::participant_bound` | `timeout_at` | participants, polled first, result discarded (§2.8) |
+  | `shutdown::participant_bound` | `timeout_at` | participants, polled first; a result taken at or after the participant's end counts as not done by it, which keeps the lock (§2.8 steps 3 and 6) |
   | `shutdown::record_pause` | `sleep` | record-removal retry; the deletion is admitted by the budget checks (§2.8 step 5) |
   | `listener::accept_backoff` | `sleep` | accept-error backoff, shutdown wins (§2.2) |
   | `listener::stall_timer` | `sleep` | `ConnIo` write stall, progress first (§2.2) |
@@ -154,7 +154,8 @@ The kept sites keep their own tests, among them `http::tests::writes::reply_afte
 
 ## 5. Out of Scope
 
-- The synchronous helpers of `pty-runtime::host`, the CLI's `poll_until`, ticket and pair-code expiry, and the store's blocking waits.
+- The synchronous helpers of `pty-runtime::host`, the CLI's polls (`cli::poll`: `poll_until`, and `poll_until_with`, which reads its cutoff on an injected clock), ticket and pair-code expiry, and the store's blocking waits.
+- A write's ticket: `run_write` and `write_with` await an admitted job's ticket to the writer's answer with no timeout of their own; `not_after` bounds only the writer's start of the job.
 - hyper's `header_read_timeout`, `Sleep::reset`, `interval` (review-only).
 - Moving the kept sites onto `settle_before`.
 - The CLI crate's `clippy.toml`: the CLI has no tokio outside its tests.

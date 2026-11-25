@@ -45,7 +45,12 @@ fn timed_out() -> io::Error {
 }
 
 fn left(deadline: Instant) -> io::Result<std::time::Duration> {
-    let d = deadline.saturating_duration_since(Instant::now());
+    left_at(deadline, Instant::now())
+}
+
+/// [`left`] at `now`.
+fn left_at(deadline: Instant, now: Instant) -> io::Result<std::time::Duration> {
+    let d = deadline.saturating_duration_since(now);
     if d.is_zero() { Err(timed_out()) } else { Ok(d) }
 }
 
@@ -65,7 +70,28 @@ pub fn request(
     token: Option<&str>,
     deadline: Instant,
 ) -> io::Result<Response> {
-    let mut s = send(port, method, path, token, deadline)?;
+    let mut s = send(port, method, path, token, None, deadline)?;
+    read_response(|buf| read_some(&mut s, buf, deadline), deadline)
+}
+
+/// A `POST` as [`request`] sends one, with `body` as its JSON body (`Content-Type:
+/// application/json` and its `Content-Length`), under the same deadline rules.
+///
+/// # Errors
+///
+/// As [`request`].
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the agent commands in PR 10a1 part 2")
+)]
+pub fn post_json(
+    port: u16,
+    path: &str,
+    token: Option<&str>,
+    body: &[u8],
+    deadline: Instant,
+) -> io::Result<Response> {
+    let mut s = send(port, "POST", path, token, Some(body), deadline)?;
     read_response(|buf| read_some(&mut s, buf, deadline), deadline)
 }
 
@@ -82,7 +108,7 @@ pub fn request_status(
     token: Option<&str>,
     deadline: Instant,
 ) -> io::Result<u16> {
-    let mut s = send(port, method, path, token, deadline)?;
+    let mut s = send(port, method, path, token, None, deadline)?;
     let mut buf = Vec::new();
     let (status, _) = read_head(
         &mut checked(|buf| read_some(&mut s, buf, deadline), deadline),
@@ -91,23 +117,59 @@ pub fn request_status(
     Ok(status)
 }
 
-/// Connects and writes one bodiless request, before `deadline`.
+/// Connects and writes one request, bodiless or with a JSON `body`, before `deadline`.
 fn send(
     port: u16,
     method: &str,
     path: &str,
     token: Option<&str>,
+    body: Option<&[u8]>,
     deadline: Instant,
 ) -> io::Result<TcpStream> {
     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-    let mut s = TcpStream::connect_timeout(&addr, left(deadline)?)?;
+    let s = TcpStream::connect_timeout(&addr, left(deadline)?)?;
     let auth = token.map_or_else(String::new, |t| format!("Authorization: Bearer {t}\r\n"));
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Length: 0\r\nConnection: close\r\n\r\n"
-    );
-    s.set_write_timeout(Some(left(deadline)?))?;
-    s.write_all(req.as_bytes())?;
+    let (kind, len) = body.map_or((String::new(), 0), |b| {
+        ("Content-Type: application/json\r\n".to_owned(), b.len())
+    });
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}{kind}Content-Length: {len}\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    req.extend_from_slice(body.unwrap_or_default());
+    let mut set_timeout = |d| s.set_write_timeout(Some(d));
+    write_before(
+        &mut set_timeout,
+        &mut |b: &[u8]| (&s).write(b),
+        &req,
+        deadline,
+        &Instant::now,
+    )?;
     Ok(s)
+}
+
+/// Writes all of `bytes` through `write`, each call with the time left before `deadline` as
+/// its timeout (`set_timeout`), recomputed before every call, and the deadline checked again
+/// right before the call: no write starts at or after the deadline, however the peer splits
+/// its reads. `now` reads the clock.
+fn write_before(
+    set_timeout: &mut impl FnMut(std::time::Duration) -> io::Result<()>,
+    write: &mut impl FnMut(&[u8]) -> io::Result<usize>,
+    mut bytes: &[u8],
+    deadline: Instant,
+    now: &dyn Fn() -> Instant,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        set_timeout(left_at(deadline, now())?)?;
+        left_at(deadline, now())?;
+        match write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// `read` followed by the deadline check, before its own result: whatever a read returned at
@@ -636,5 +698,116 @@ mod tests {
         assert!(req.contains("Authorization: Bearer t\r\n"), "{req}");
         assert!(req.contains("Content-Length: 0\r\n"), "{req}");
         assert!(!req.to_ascii_lowercase().contains("origin:"), "{req}");
+    }
+
+    /// A write split into small parts by its peer, on a controlled clock that only writes
+    /// advance: each write has its own timeout update, the time left, and none starts at or
+    /// after the deadline.
+    #[test]
+    fn writes_stop_at_the_deadline() {
+        use std::cell::{Cell, RefCell};
+        use std::time::{Duration, Instant};
+        let clock = Cell::new(Instant::now());
+        let deadline = clock.get() + Duration::from_millis(60);
+        let log = RefCell::new(String::new());
+        let mut timeouts = Vec::new();
+        let mut starts = Vec::new();
+        let r = super::write_before(
+            &mut |d| {
+                timeouts.push(d);
+                log.borrow_mut().push('T');
+                Ok(())
+            },
+            &mut |b: &[u8]| {
+                starts.push(clock.get());
+                log.borrow_mut().push('W');
+                clock.set(clock.get() + Duration::from_millis(25));
+                Ok(b.len().min(1))
+            },
+            &[0u8; 10],
+            deadline,
+            &|| clock.get(),
+        );
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(starts.len(), 3, "{starts:?}");
+        assert!(starts.iter().all(|t| *t < deadline), "{starts:?}");
+        assert_eq!(
+            log.into_inner(),
+            "TWTWTW",
+            "each write has its own timeout update"
+        );
+        assert!(timeouts.windows(2).all(|w| w[1] < w[0]), "{timeouts:?}");
+    }
+
+    /// A timeout update that returns at or after the deadline: the write does not start.
+    #[test]
+    fn no_write_after_a_late_timeout_update() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        let clock = Cell::new(Instant::now());
+        let deadline = clock.get() + Duration::from_millis(20);
+        let mut updates = 0;
+        let mut writes = 0;
+        let r = super::write_before(
+            &mut |_| {
+                updates += 1;
+                clock.set(deadline);
+                Ok(())
+            },
+            &mut |b: &[u8]| {
+                writes += 1;
+                Ok(b.len())
+            },
+            &[0u8; 4],
+            deadline,
+            &|| clock.get(),
+        );
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!((updates, writes), (1, 0));
+    }
+
+    /// `post_json` sends its body with its type and length, and reads the response as
+    /// `request` does.
+    #[test]
+    fn post_json_sends_its_body() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let body = r#"{"command_id":"x","args":{"t":"é"}}"#;
+        let server = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut got = Vec::new();
+            let mut b = [0u8; 1024];
+            while !got.ends_with(body.as_bytes()) {
+                let n = std::io::Read::read(&mut c, &mut b).unwrap();
+                assert_ne!(n, 0, "the body ended early");
+                got.extend_from_slice(&b[..n]);
+            }
+            std::io::Write::write_all(
+                &mut c,
+                b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            )
+            .unwrap();
+            String::from_utf8(got).unwrap()
+        });
+        let r = super::post_json(
+            port,
+            "/api/commands/stop",
+            Some("t"),
+            body.as_bytes(),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!((r.status, r.body.as_slice()), (201, b"{}".as_slice()));
+        let req = server.join().unwrap();
+        assert!(
+            req.starts_with("POST /api/commands/stop HTTP/1.1\r\n"),
+            "{req}"
+        );
+        assert!(req.contains("Content-Type: application/json\r\n"), "{req}");
+        assert!(
+            req.contains(&format!("Content-Length: {}\r\n", body.len())),
+            "{req}"
+        );
+        assert!(req.ends_with(&format!("\r\n\r\n{body}")), "{req}");
     }
 }

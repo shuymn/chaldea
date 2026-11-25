@@ -71,7 +71,7 @@ crates/daemon/src/http/tickets.rs    # TicketStore, PairCodes (memory, single us
 crates/daemon/src/http/ctx.rs        # ReadCtx, WriteCtx, run_write (the one submit-and-observe path), observe_write
 crates/daemon/src/http/error.rs      # ApiError, codes, the store-outcome mapping, extractor-rejection mapping (§2.9)
 crates/daemon/src/http/scope.rs      # ReadScope: the streams, threads, and worktrees a token may read (§2.7)
-crates/daemon/src/http/sync_api.rs   # GET /api/events, /api/threads, /api/worktrees
+crates/daemon/src/http/sync_api.rs   # GET /api/events, /api/threads, /api/threads/{thread_id}, /api/worktrees
 crates/daemon/src/http/blobs.rs      # GET /api/blobs/{sha256}
 crates/daemon/src/http/ws.rs         # POST /api/ws-ticket, GET /api/ws socket loop
 crates/daemon/src/http/pair.rs       # POST /api/pair, POST /api/pair-codes (§8 D12)
@@ -157,7 +157,11 @@ pub struct HttpConfig {
 }
 /// PR 8's seam: told of every fatal store outcome `run_write` meets while serving, and of an uncompleted receipt.
 pub trait LifecycleSink: Send + Sync + 'static { fn store_fatal(&self, f: StoreFatal); }
-pub enum StoreFatal { CommitUnknown, WriterGone, Failed, ReceiptUncompleted { command_id: CommandId } }
+pub enum StoreFatal {
+    CommitUnknown, WriterGone, Failed,
+    ReceiptUncompleted { command_id: CommandId },   // the runner (§2.8)
+    LaunchUnrecorded { launch_id: LaunchId },       // the supervisor: a launch's exit not recorded within its bound
+}
 pub struct HttpServer { /* Arc<AppState>: store, config, TokenService, TicketStore, PairCodes, CommandRegistry,
                           TaskRegistry, blob slots, revocation nudge, LifecycleSink */ }
 impl HttpServer {
@@ -166,7 +170,11 @@ impl HttpServer {
     pub fn shutdown_handle(&self) -> ServeHandle;   // drains the registry of a server that may never serve (PR 8's start)
     pub fn tokens(&self) -> &TokenService;     // PR 8 (owner token file), PR 10 (launch tokens), PR 20
     pub fn nudge_revocation(&self);            // re-check every WebSocket's token now (§2.6)
+    pub(crate) fn revocation_nudge(&self) -> RevocationNudge;   // for a component's own revoking jobs (§2.4)
 }
+/// Cloneable; holds the server weakly, so a nudge after the server is gone does nothing.
+#[derive(Clone)] pub(crate) struct RevocationNudge { /* Weak<Shared> */ }
+impl RevocationNudge { pub(crate) fn nudge(&self); }
 impl ServeHandle {
     /// Closes the registry, stops accepting, asks every task to finish, waits until `deadline`,
     /// requests abort of the rest, and reports.
@@ -230,6 +238,7 @@ pub(crate) fn build_router(mounts: &[Mount], state: AppState) -> Router;  // the
 | `GET /api/events` | Read | AbsentOrMatching | Bearer(owner, agent, rescue) | `ReadStream` | 7 |
 | `GET /api/blobs/{sha256}` | Read | AbsentOrMatching | Bearer(owner, agent, rescue) | `ReadBlob` | 7 |
 | `GET /api/threads` | Read | AbsentOrMatching | Bearer(owner, agent, rescue) | `ReadThreadList` | 7 |
+| `GET /api/threads/{thread_id}` | Read | AbsentOrMatching | Bearer(owner, agent, rescue) | `ReadStream` | 10 |
 | `GET /api/worktrees` | Read | AbsentOrMatching | Bearer(owner, agent, rescue) | `ReadWorktrees` | 7 |
 | `GET /api/adapters` | Read | AbsentOrMatching | Bearer(owner, agent, rescue) | `ReadAdapters` | 10 |
 | `GET /api/doctor` | Read | AbsentOrMatching | Bearer(owner, rescue) | `ReadDoctor` | 21 |
@@ -330,7 +339,7 @@ impl TokenService {
 
 **`verify_hash_in`** (the one token check; step 4 and every read, write, and socket check run it): `token_by_hash`, constant-time equality, `revoked_at IS NULL`; for `agent`, also: the token's launch is its thread's `current_launch_id` and that launch has no `exit_reason` (mvp §2.5 "one launch" holds at use time even before PR 10 revokes); for `hook`, the token names a thread and a launch, and that launch is of that thread (hook-ingest §2.8); it need not be current, live, or bound, so late hooks are kept, and revocation ends it. `rescue` and `owner`: until revoked. `extension`: until revoked; its one-run lifetime is PR 20's revocation after the run. No `token_by_id` is needed: every later check has the hash.
 
-**Revocation nudges come from the observer.** `TokenService::revoke` passes the nudge as `after_ok` to `observe_write`, so it fires from the task that observes the commit, also when the request that asked for the revocation has gone. PR 10 and PR 16 pass the same `after_ok` to `run_write` for their own revoking jobs.
+**Revocation nudges come from the observer.** `TokenService::revoke` passes the nudge as `after_ok` to `observe_write`, so it fires from the task that observes the commit, also when the request that asked for the revocation has gone. A command whose intent can revoke a token sets `CommandHandler::revokes`, and the runner passes the nudge as the intent job's `after_ok`. A component's own revoking jobs pass a `RevocationNudge`, taken from `HttpServer::revocation_nudge`, as the `after_ok` of `write_with` (§2.11). The nudge runs for every commit the writer acknowledged. A job whose commit outcome is unknown (`CommitUnknown`) gets no nudge, though its revocation may be visible: the write path (`run_write` and `write_with`) reports `CommitUnknown` to the lifecycle sink, which stops the daemon (daemon-lifecycle §2.8), and the shutdown closes every socket (§2.2 "Shutdown").
 
 | Credential | Lives in | Restart | Expiry enforced at | Single use decided by |
 |---|---|---|---|---|
@@ -416,7 +425,7 @@ pub struct WsConfig {
 
 **Socket ownership.** axum's `on_upgrade` runs its callback in a task it spawns, and hyper's connection task ends at the upgrade (H10). So the upgrade handler registers the socket's own task (holding the socket slot and a `oneshot::Receiver<WebSocket>`) before the ticket is spent (§2.4 step 3), then calls `on_upgrade(|ws| async move { let _ = tx.send(ws); })`: axum's task only hands the socket over and ends. The registered task waits for the socket until the short deadline (a failed upgrade drops the sender and ends it), then runs the loop. Every socket is therefore in the registry from before `101` to its exit, and an abort request drops it. PR 11's attach handler gets the same `UpgradeHandler` seam.
 
-**Startup.** The task takes its `broadcast::Receiver<Committed>` first and the revocation nudge's `watch::Receiver` second (marked seen), then runs the **startup read** (`verify_hash_in`): a revocation committed after the final admission read and before this read fails it (close 1008), and one committed after it fires the nudge, which the socket already watches. Then `hello { epoch, server_time }`.
+**Startup.** The task takes its `broadcast::Receiver<Committed>` first and the revocation nudge's `watch::Receiver` second (marked seen), then runs the **startup read** (`verify_hash_in`): a revocation committed after the final admission read and before this read fails it (close 1008), and one committed after it fires the nudge, which the socket already watches (a commit whose outcome is unknown fires none and stops the daemon instead, §2.4). Then `hello { epoch, server_time }`.
 
 **State.** The subscription set `S`; `known: BTreeMap<StreamId, u64>` (the newest head this socket knows per stream of `S`); `announced: BTreeMap<StreamId, u64>` (the newest head sent per stream); `heads_due: bool`; at most one read and one send in flight.
 
@@ -466,7 +475,7 @@ T3 Code's WebSocket is an Effect RPC transport (`apps/server/src/ws.ts`) with se
 
 Head, page, snapshot, and `as_of_seq` come from that one read transaction (store §2.2, PR6-CL-18). The snapshot semantics are PR 6's: `as_of_seq` is the requested stream's head in that transaction, and the snapshot's other fields (a thread's `ThreadInfo` in the host snapshot, a worktree in a thread snapshot) come from the same database state, which can change without that stream advancing. The byte bound uses `cum_bytes` through `StreamHead`. The reply always carries the server epoch; a backward page with a mismatched epoch is still a page (`decide_replay`), and the client resyncs forward (mvp §2.4). `before_seq = 1` returns `events: []` with `has_more_before: false`; `before_seq > head_seq` selects the latest page by the store's `seq < before_seq` predicate (a separate matter from the store clamping values above `i64::MAX`). Events of an unknown kind, newer `schema_version`, or invalid payload are returned as stored (store §2.7). The 404 precedes the 400 of step 2 because `decide_replay` takes the stream head (`crates/core/src/sync.rs`, "a 404 decided before this call"). This is T3 Code's `decideThreadResume` (`apps/server/src/orchestration-v2/ThreadStream.ts:100-118`, bounds at `:18`, `:20`) with mvp's bounds and epoch.
 
-**`GET /api/threads`** → `ThreadsResponse { epoch, threads: Vec<ThreadInfo> }` filtered (§2.5). **`GET /api/worktrees`** → `WorktreesResponse { epoch, worktrees: Vec<WorktreeChanged> }` filtered. **`GET /api/adapters`** and **`GET /api/doctor`**: route, guard, and 501 until PR 10 and PR 21.
+**`GET /api/threads`** → `ThreadsResponse { epoch, threads: Vec<ThreadInfo> }` filtered (§2.5). **`GET /api/threads/{thread_id}`** (mounted by `Mounts::mvp()`, `sync_api::thread_summary`) → `ThreadSummary { thread_id, closed, process_state, turn_state, task_state, attention_count, launch }` from one read (`ReadTx::thread_summary`, which counts the attention causes in SQL), authorized as `GET /api/events` authorizes the thread's stream: a thread the token cannot read, a missing thread, and a `{thread_id}` that is not a lowercase hyphenated UUID are one 404 `not_found`; a query parameter is 400 `bad_query`. Every field is bounded (the count and the optional launch change only its length within that bound), so the body stays small whatever the thread's history or attention. **`GET /api/worktrees`** → `WorktreesResponse { epoch, worktrees: Vec<WorktreeChanged> }` filtered. **`GET /api/adapters`** and **`GET /api/doctor`**: route, guard, and 501 until PR 10 and PR 21.
 
 **`GET /api/blobs/{sha256}?stream_id=`.** `sha256` must be 64 lowercase hex and `stream_id` present and valid (no other parameter), else 400 `bad_query`. One read, in this order in one snapshot:
 
@@ -497,14 +506,29 @@ pub trait CommandHandler: Send + Sync + 'static {
     fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError>;
     /// Required for a handler whose intent can return `Pending`; runs on the runner after the commit.
     fn effect(&self) -> Option<&dyn CommandEffect> { None }
+    /// Whether the intent can revoke a token: the runner then passes the revocation nudge as the intent
+    /// job's `after_ok` (§2.4).
+    fn revokes(&self) -> bool { false }
 }
 pub trait CommandEffect: Send + Sync {
-    /// Resolves to the command's terminal result, a handler reply ("Handler replies" below). The owning
-    /// PR guarantees that it resolves within a bound it states, and that a result it returns for work that did
-    /// not happen (a refusal, or work that ran out of its time: 504 with a code the owning PR adds to `ErrorCode`
-    /// and classifies in "Handler replies", never 408) means the work can no longer happen later. The runner adds
-    /// no timeout of its own.
-    fn run(&self, run: EffectRun) -> BoxFuture<'static, CommandResult>;
+    /// Resolves to how the effect ended; `Done` carries the command's terminal result, a handler reply
+    /// ("Handler replies" below). The owning PR states the bound of each stage of its effect, and guarantees
+    /// that a result it returns for work that did not happen (a refusal, or work that ran out of its time: 504
+    /// with a code the owning PR adds to `ErrorCode` and classifies in "Handler replies", never 408) means the
+    /// work can no longer happen later. The runner adds no timeout of its own. An effect may hand its work to a
+    /// task its component owns, which outlives the runner, and await that task's result.
+    fn run(&self, run: EffectRun) -> BoxFuture<'static, EffectOutcome>;
+}
+pub enum EffectOutcome {
+    Done(CommandResult),
+    Unrecorded,     // a job of the effect could not be recorded while the daemon runs
+    ShuttingDown,   // stopped by the daemon's shutdown (admission closed, or a write refused `Closed`)
+}
+pub struct CommandCtx { /* private */ }
+impl CommandCtx {
+    pub fn command_id(&self) -> CommandId;
+    pub fn request_start(&self) -> Instant;   // the request's `RequestStart`, carried through `Admitted.start`
+    pub fn job_start(&self) -> Instant;       // the server's clock read in the intent job before the intent runs
 }
 pub struct Prepared {
     pub normalized: CanonicalJson,                          // CanonicalJson::of(&the parsed arguments)
@@ -536,6 +560,9 @@ The guard resolves `{name}` (404, 403, 501) through the server's registry, which
 | `misdirected_request`, `origin_rejected`, `unauthorized`, `method_not_allowed`, `length_required`, `payload_too_large`, `bad_request`, `bad_query`, `not_implemented` | 421, 403, 401, 405, 411, 413, 400, 400, 501 | the outer layer and the guard (routing, framing, method, authentication; `unauthorized` also the intent job's token check) |
 | `request_timeout`, `in_progress`, `conflict`, `unknown_after_crash`, `outcome_unknown` | 408, 409, 409, 409, 503 | the runner and the request path (the deadline, the receipt, an outcome not known) |
 | `disk_full`, `store_failed` | 503 | the store's state, through the runner's mapping |
+| `thread_closed`, `launch_changed`, `launch_live`, `death_unconfirmed`, `worktree_unavailable`, `no_session` | 409 | handlers (the launch commands' refusals, `docs/design/supervisor.md` §2.2) |
+| `prompt_rejected`, `prompt_too_large` | 400 | handlers (the launch commands' prompt checks) |
+| `launch_busy` | 504 | handlers (a stop that could not take its launch in time; nothing changed) |
 
 The table governs every non-2xx reply a handler produces; the runner's and the guard's own replies follow the reply table below and §2.9. A client must decode `ErrorBody` only from a non-2xx status (§2.9); a 2xx body is the command's own typed result, whose schema its owning PR defines, and the runner checks only that it is JSON, since reading it for an error-shaped member would make the runner interpret data it does not own. An owning PR's success schema therefore has no top-level `code` member, which that PR's own contract drift test checks. In a handler reply, `retry_after` is present exactly where the table gives it (on `busy`) and omitted everywhere else, never `null` (§2.9); the runner's own `in_progress` and `outcome_unknown` carry it as the reply table below says. A **refusal** (an `ApiError`) is answered as it is only when its code is a handler code at that code's status, with `retry_after` exactly where the table gives it; a refusal that is not an `ApiError` is 500 `internal`. No handler code needs a header the runner does not send (`Allow` belongs to `method_not_allowed`, `WWW-Authenticate` to `unauthorized`). A **result** is stored and replayed byte for byte, so it must be one the reply path sends unchanged and one that means the same on every replay: a success (2xx except 204 and 205: hyper sends 204 without a body, and 205 must have none) whose body parses as JSON; or an `ErrorBody` (only `code` and `retry_after`, once each, every value one `serde_json::Value` holds) whose code is a handler code at exactly the result's status, with `retry_after` exactly where the table gives it, other than 503 (a replayed result would tell a client to retry it forever). Anything that does not parse is refused, never passed. A reply that fails its check is a programming error of its handler and becomes 500 `internal`: a refusal or a `prepare` error with nothing written, a result stored (`receipt_complete`) and replayed as 500 (in the intent job for `Completed`, on the runner for an effect's result). Codes of a command's own outcome (such as `card_closed`, or the 504 of an effect whose work ran out of its own time) are added to `ErrorCode` by the owning PR and classified in this table at their status; until then a reply naming one is 500. The runner is the only writer of command results: a receipt row written any other way is outside this guarantee.
 
@@ -544,7 +571,7 @@ The table governs every non-2xx reply a handler produces; the runner's and the g
 1. The request reads the body (`body_within`; an incomplete body by the deadline is 408 with nothing submitted), runs the duplicate scan and `prepare`, computes the identity, checks the deadline once more (passed → 408, nothing submitted), and registers the runner (closing → 503 `shutting_down`, nothing submitted). It receives a `watch::Receiver<Progress>` (`Submitted` → `IntentCommitted` → `Done(reply)`).
 2. The runner awaits `run_write` for **the intent job** (`not_after = deadline`; one `BEGIN IMMEDIATE` transaction, the single deciding point): `verify_hash_in` (invalid → `Refused(401)`); `receipt_begin(command_id, token_id, identity)`, which looks the receipt up and inserts `in_progress` only for `New`, and anything but `New` returns that lookup with nothing written; `prepared.intent(…)` (object authorization, then the intent's writes; `Refused` rolls back the whole job, the receipt row included); for `Intent::Completed(r)`, `receipt_complete(command_id, &r)`, with `r` and any refusal checked as handler replies. `run_write` owns the ticket and awaits it without the request deadline, and reports a fatal outcome to `LifecycleSink::store_fatal`.
 3. On `Ok(Pending(run))` the runner publishes `IntentCommitted`, starts the effect **once** (`effect.run(run)`, awaited to its terminal result with no timeout of the runner's own; the bound is the owning PR's guarantee), checks its result as a handler reply, then **completes the receipt**: attempts of `receipt_complete(command_id, &r)` through `run_write` with `not_after = min(now + 5 s, budget_end)`, retried on `Expired`, `Busy`, `QueueFull`, and `RolledBack(Busy)` with backoff (10 ms, doubling to 1 s) clipped to the remainder. `budget_end` is 60 s after the first attempt (on the server's clock) and bounds the **admission** of attempts only, checked before each attempt: an admitted attempt is awaited to its reply. No token check: the effect has run, and a caller revoked meanwhile (possibly by the command itself) does not undo it. The runner publishes `Done(r)` only after that job commits.
-4. If completion cannot commit (a terminal store outcome, or no attempt admitted within the budget), or the effect panics and leaves no result, the runner reports `StoreFatal::ReceiptUncompleted { command_id }` (`run_write` has already reported a fatal store kind, if any); PR 8 stops the daemon, and restart turns the `in_progress` receipt into `unknown_after_crash`. The effect is never run again, and a waiting request gets 503 `outcome_unknown`.
+4. If completion cannot commit (a terminal store outcome, or no attempt admitted within the budget), or the effect panics and leaves no result, or it ends `EffectOutcome::Unrecorded`, the runner reports `StoreFatal::ReceiptUncompleted { command_id }` (`run_write` has already reported a fatal store kind, if any); PR 8 stops the daemon, and restart turns the `in_progress` receipt into `unknown_after_crash`. The effect is never run again, and a waiting request gets 503 `outcome_unknown`. An effect that ends `EffectOutcome::ShuttingDown` leaves the receipt `in_progress` the same way and gets the same reply, with no report: the daemon is already stopping.
 5. Every other outcome publishes `Done(mapped reply)` at once.
 
 `closing` stops the admission of new requests and new runners only. An admitted runner keeps running after `closing`: its effect, its completion, and its writes go through the store, which is still open until PR 8 shuts it down after `ServeHandle::shutdown` returns. A runner still running at the drain deadline gets an abort request. If no completion job was submitted, its receipt stays `in_progress` and becomes `unknown_after_crash` at restart; a completion job already submitted may still commit, and the retry after restart then replays its result (CL-20).
@@ -602,8 +629,9 @@ The request waits on the `watch` until `deadline + write_reply_grace` and replie
 |---|---|---|
 | Listener and lifecycle | `HttpServer::new`, `serve(TcpListener)`, `ServeHandle::shutdown(deadline)`, `LifecycleSink` | PR 8 |
 | Token issuance and revocation | `TokenService::{mint, new_token, issue_owner, revoke}`, `nudge_revocation`, the `after_ok` of `run_write` / `observe_write` | PR 8 (owner token file), PR 10 (launch tokens), PR 16, PR 20 |
-| Commands | `CommandHandler`, `CommandEffect` (with its bounded-result obligation), `CommandRegistry::register`, `Prepared`, `Authorized`, `deny_for`, `ObjectScope` | PR 10, 16, 20, 21 |
-| Hook route | `Mount::write` for `POST /hook` (spec in `ROUTES`), `WriteCtx` (`write_then`, `read_by`, `commits`); `Mounts::mvp` mounts it with `HookSeams::mvp` | PR 9; PR 10, 13, 14 replace the seams |
+| Commands | `CommandHandler` (with `revokes`), `CommandEffect` (with its bounded-result obligation) and `EffectOutcome`, `CommandCtx::{request_start, job_start}`, `CommandRegistry::register`, `Prepared`, `Authorized`, `deny_for`, `ObjectScope` | PR 10, 16, 20, 21 |
+| Writes outside a request | re-exported from `http` as `pub(crate) use`: `write_with(&Store, &dyn LifecycleSink, &dyn MonotonicClock, not_after, job, after_ok, on_submit)`, the body of `run_write` without the server, which calls `on_submit` synchronously right after `Store::submit` returns, before it examines the result, and reports fatal outcomes to the sink; `mint_token` (data only; `TokenService::mint` calls it); the completion policy (`COMPLETION_ATTEMPT`, `COMPLETION_BUDGET`, `BACKOFF_FIRST`, `BACKOFF_MAX`, `retryable`, `backoff_until`); `RevocationNudge` | PR 10 |
+| Hook route | `Mount::write` for `POST /hook` (spec in `ROUTES`), `WriteCtx` (`write_then`, `read_by`, `commits`); `Mounts::mvp` mounts it with `HookSeams::mvp`, `Mounts::mvp_with(hook_seams, extra_reads)` with the given seams and a component's read mounts | PR 9; PR 10, 13, 14 replace the seams |
 | Attach | `Mount::upgrade` for `GET /api/attach/{thread}`; the handler gets `AttachGrant { thread, token_id, token_sha256 }` and runs in a registered socket task | PR 11 |
 | Read routes | `Mount::read` for `/api/adapters`, `/api/doctor`, `/`, `/assets/*` with `ReadCtx` | PR 10, 21, 18 |
 | `POST /events` | `Mount::write`, `ObjectScope::stored_surface` | PR 20 |
@@ -693,7 +721,7 @@ Every later PR that adds a route, a command, a token use, or a WebSocket purpose
 |---|---|---|---|
 | 8 lifecycle | starts and stops the server; owner token file; fatal store outcomes; panic hook | `HttpServer::new`, `serve`, `ServeHandle::shutdown`, `LifecycleSink`, `TokenService::issue_owner`, `trace::redact_secrets` | Startup order (PR 8): open store → `receipts_mark_unknown_after_crash` and launch recovery (PR 10's) → `serve`. Shutdown order: `ServeHandle::shutdown(budget)` first, then `Store::shutdown` with the same budget. PR 8 stops the daemon on `store_fatal` (including `ReceiptUncompleted`); keeps the single-instance lock until it observes the writer's exit (or the process exits) and reconciles receipts before serving again (§2.2); and installs a panic hook that omits the payload, verified on stderr with a body marker (§2.10). |
 | 9 hooks | `POST /hook` handler; hook token use | `Mount::write` (spec already in `ROUTES`), `WriteCtx` | Host, `Origin` must be absent, `hook` kind only, framing, size, and the deadline from the connection's first head byte before the handler (one request per connection, so every hook delivery is its own connection); `verify_hash_in` checks revocation only; hook bodies never logged. B-8 cases on both OSes, including H5's large-body case, are PR 9's. |
-| 10 supervisor | `spawn`, `resume`, `send`, `ready`, `key`, `stop`, `close`, `input_resolve`, `input_cancel`; agent and hook tokens; `GET /api/adapters` | `CommandHandler`, `CommandEffect` (a bounded terminal result; a negative result means the work cannot happen later), `TokenService::{mint, new_token, revoke}`, the `after_ok` nudge, `Mount::read` | Guard (kind and action per command name), receipt, identity, runner, mapping, object-scope functions, `deny_for` |
+| 10 supervisor | `spawn`, `resume`, `send`, `ready`, `key`, `stop`, `close`, `input_resolve`, `input_cancel`; agent and hook tokens; `GET /api/adapters`; `GET /api/threads/{thread_id}` | `CommandHandler`, `CommandEffect` (a bounded terminal result; a negative result means the work cannot happen later), `TokenService::{mint, new_token, revoke}`, the `after_ok` nudge, `Mount::read`, and the seams for writes outside a request (§2.11: `write_with`, `mint_token`, the completion policy, `RevocationNudge`) | Guard (kind and action per command name), receipt, identity, runner, mapping, object-scope functions, `deny_for` |
 | 11 attach | `GET /api/attach/{thread}` socket bytes | `Mount::upgrade`, `AttachGrant` | ticket purpose `attach:<thread>`, owner-only at issue and redeem, single use, a registered socket task |
 | 16 agent control | `task_set`, `mailbox_send`, `worktree_remove` | `CommandHandler` | `SelfAndDirectChildren`, `ParentAndChildren`, `OwnWorktree`, `CreatedBySelf` grants |
 | 17 `stateright` | the Sync model | — | the replay rules (§2.7) and the receipt and runner rules (§2.8), cited by claim id |

@@ -75,6 +75,16 @@ pub fn with_spawn_lock<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// [`with_spawn_lock`] that waits for the lock only until `deadline`: runs `f` and returns its
+/// result when the lock is acquired before `deadline`; `None`, with nothing run, once the
+/// deadline has passed (even with the lock free). `f` follows `with_spawn_lock`'s rules; a
+/// child it creates should still be created through [`crate::host::act_before`] with the
+/// same deadline, so nothing done under the lock carries the creation past it.
+pub fn with_spawn_lock_before<R>(deadline: Instant, f: impl FnOnce() -> R) -> Option<R> {
+    let _guard = spawn_lock_before(deadline)?;
+    Some(f())
+}
+
 /// Proof that the process-wide spawn lock is held: only [`spawn_lock`] and
 /// [`spawn_lock_before`] build one, so a function taking `&SpawnGuard` cannot be called under
 /// some other mutex.
