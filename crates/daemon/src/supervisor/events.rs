@@ -28,8 +28,8 @@ pub(crate) fn derived(cause: &IdempotencyKey, name: &str) -> IdempotencyKey {
 
 /// A job's events on one thread, with the thread's state as the job has changed it.
 pub(crate) struct ThreadJob {
-    pub(crate) thread: ThreadId,
-    pub(crate) agent: Agent,
+    thread: ThreadId,
+    agent: Agent,
     pub(crate) state: ThreadState,
     kind: SourceKind,
     command: Option<CommandId>,
@@ -150,7 +150,7 @@ impl ThreadJob {
         by: &InputInput,
         sent_after_seq: Option<u64>,
         launch: Option<LaunchId>,
-    ) -> Result<InputState, JobError> {
+    ) -> Result<(), JobError> {
         let to = step(input.state, by).map_err(refusal)?;
         let id = input.input_id;
         self.push(
@@ -168,7 +168,7 @@ impl ThreadJob {
         if to == InputState::Unconfirmed {
             self.raise_unconfirmed(cause, id, launch)?;
         }
-        Ok(to)
+        Ok(())
     }
 
     fn raise_unconfirmed(

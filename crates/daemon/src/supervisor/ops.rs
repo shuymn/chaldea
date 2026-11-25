@@ -1114,9 +1114,3 @@ pub(crate) async fn close_and_record(
 async fn late_creation(sup: &Arc<Supervisor>, entry: &LiveLaunch, tracked: TrackedSession) {
     close_and_record(sup, entry, tracked, Pause::LateCloseEnd).await;
 }
-
-#[cfg(test)]
-pub(crate) fn _assert_send() {
-    fn is_send<T: Send>(_: T) {}
-    let _ = |sup: Arc<Supervisor>, req: LaunchReq| is_send(launch_op(sup, req));
-}

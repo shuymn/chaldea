@@ -39,7 +39,7 @@ impl Supervisor {
                 && let Some(c) = l.committed()
                 && now >= c.at + SESSION_START_TIMEOUT
             {
-                jobs.push(session_start_timeout(l));
+                jobs.push(session_start_timeout(l, c.identity.pid));
             }
             jobs.push(expire_buffer(self, l));
         }
@@ -68,9 +68,8 @@ impl Supervisor {
 
 /// Raises `session_start_timeout` only for the thread's current, started, live, unbound
 /// launch whose cause is absent (design §2.6).
-fn session_start_timeout(l: &LiveLaunch) -> Job {
+fn session_start_timeout(l: &LiveLaunch, pid: u32) -> Job {
     let (thread, launch) = (l.thread_id, l.launch_id);
-    let pid = l.committed().map(|c| c.identity.pid);
     Arc::new(move |tx| {
         let r = tx.read();
         let (Some(t), Some(row)) = (r.thread(thread)?, r.launch(launch)?) else {
@@ -82,8 +81,7 @@ fn session_start_timeout(l: &LiveLaunch) -> Job {
         );
         let cause = AttentionCause::SessionStartTimeout;
         if t.current_launch_id != Some(launch)
-            || row.pid.is_none()
-            || row.pid != pid
+            || row.pid != Some(pid)
             || row.exit_reason.is_some()
             || !alive
             || row.session_id.is_some()

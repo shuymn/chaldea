@@ -22,14 +22,8 @@ pub(crate) fn launches(steps: Vec<Arc<dyn ExitStep>>) -> Reconciler {
         name: "supervisor_launches",
         job: Box::new(move |tx| {
             let mut n = 0u64;
-            let mut open: Vec<_> = tx
-                .read()
-                .open_launches()?
-                .into_iter()
-                .filter(|l| l.exit_reason.is_none())
-                .collect();
-            open.sort_by_key(|l| (l.thread_id, l.reserved_seq));
-            for l in open {
+            let open = tx.read().open_launches()?;
+            for l in open.into_iter().filter(|l| l.exit_reason.is_none()) {
                 let reason = if l.pid.is_some() {
                     ExitReason::DaemonRestart
                 } else {

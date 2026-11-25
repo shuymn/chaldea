@@ -774,10 +774,4 @@ impl chaldea_daemon::supervisor::Pauses for GatePause {
             let _ = tokio::task::spawn_blocking(move || wait_at(&dir)).await;
         })
     }
-
-    fn blocking(&self, p: chaldea_daemon::supervisor::Pause) {
-        if p == self.at {
-            wait_at(&self.dir);
-        }
-    }
 }
