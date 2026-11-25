@@ -202,10 +202,11 @@ pub trait IntakeProbe: Send + Sync + 'static {
     /// The facts the send side needs at the hook's intake with receipt ordinal `ordinal` (the PTY
     /// writer's positions, the dispatched input), or None. Non-blocking: it runs under the intake mutex.
     fn facts(&self, launch: LaunchId, ordinal: u64) -> Option<IntakeFacts>;
-    /// The intake ended: its job committed with `marks` (receipt ordinal, `TurnMark`), or decided
-    /// nothing (no marks). Called once per intake by its `IntakeGuard`, never for an outcome that
-    /// stays unknown.
-    fn finished(&self, launch: LaunchId, ordinal: u64, marks: &[(u64, TurnMark)]) {}
+    /// The intake ended: its job committed with `marks` (receipt ordinal, `TurnMark`) at
+    /// `committed_at` (the clock read at the end of the committing job), or decided nothing (no
+    /// marks, no instant). Called once per intake by its `IntakeGuard`, never for an outcome
+    /// that stays unknown.
+    fn finished(&self, launch: LaunchId, ordinal: u64, marks: &[(u64, TurnMark)], committed_at: Option<Instant>) {}
 }
 #[derive(Clone, Serialize, Deserialize)] pub struct IntakeFacts(pub serde_json::Value);   // opaque to PR 9
 /// Finishes one intake exactly once: owned by the request from its intake, then by the write

@@ -168,6 +168,8 @@ pub(crate) struct Delivery {
     pub(crate) pid_wait_expired: bool,
     pub(crate) adapter: Arc<dyn HookAdapter>,
     pub(crate) cfg: HookConfig,
+    /// Read at the end of the job: the commit instant its turn marks carry.
+    pub(crate) clock: Arc<dyn crate::http::MonotonicClock>,
 }
 
 /// The routing a delivery is recorded with.
@@ -206,6 +208,8 @@ fn unparseable(truncated: bool) -> Decision {
 pub(crate) struct Ran {
     pub(crate) reply: HookReply,
     pub(crate) marks: Vec<(u64, TurnMark)>,
+    /// The clock at the end of the job, just before its commit.
+    pub(crate) at: std::time::Instant,
 }
 
 /// The job: §2.7 steps 1–7.
@@ -216,7 +220,11 @@ pub(crate) fn run(
 ) -> Result<Ran, JobError> {
     let mut marks = Vec::new();
     let reply = run_marking(d, tx, auth, &mut marks)?;
-    Ok(Ran { reply, marks })
+    Ok(Ran {
+        reply,
+        marks,
+        at: d.clock.now(),
+    })
 }
 
 fn run_marking(

@@ -164,13 +164,17 @@ pub(crate) async fn pass(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>) {
     .flatten() else {
         return;
     };
+    // The read's instant: a timer this read starts starts here, not after the jobs below.
+    let read_at = sup.now();
+    #[cfg(test)]
+    super::run_hook(&sl.hooks.after_read);
     if view.thread.current_launch_id != Some(launch) || view.launch.exit_reason.is_some() {
         return;
     }
     let now = pass_now(sup, sl);
     running_unit(sup, sl, now).await;
-    gate_timeouts(sup, sl, &entry, &view, now).await;
-    ack_windows(sup, sl, &entry, &view, now).await;
+    gate_timeouts(sup, sl, &entry, &view, now, read_at).await;
+    ack_windows(sup, sl, &entry, &view, now, read_at).await;
     settle(sup, sl, &view, now).await;
     open(sup, sl, &entry, &view).await;
 }
@@ -236,8 +240,8 @@ async fn gate_timeouts(
     entry: &LiveLaunch,
     view: &View,
     now: Instant,
+    read_at: Instant,
 ) {
-    let observed = sup.now();
     let due: Vec<InputId> = {
         let mut st = sl.state();
         let queued: Vec<InputId> = view
@@ -250,7 +254,7 @@ async fn gate_timeouts(
         queued
             .into_iter()
             .filter(|id| {
-                let at = *st.queued_at.entry(*id).or_insert(observed);
+                let at = *st.queued_at.entry(*id).or_insert(read_at);
                 now >= at + GATE_TIMEOUT && !st.timed_out.contains(id)
             })
             .collect()
@@ -304,26 +308,26 @@ async fn gate_timeouts(
     }
 }
 
+/// Whether a startup cause (session start timeout, startup stall) is raised on the thread.
+fn startup_cause(t: &ThreadRow) -> bool {
+    t.state
+        .attention
+        .contains(&AttentionCause::SessionStartTimeout)
+        || t.state.attention.contains(&AttentionCause::StartupStall)
+}
+
 /// `AckWindowExpired` for a `sent` input `ACK_WINDOW` after its completion's commit; for the
-/// positional input, from the committed start and only while no startup cause is active.
+/// positional input, from the committed start and only while no startup cause is active,
+/// which its job reads again.
 async fn ack_windows(
     sup: &Arc<Supervisor>,
     sl: &Arc<SendLaunch>,
     entry: &LiveLaunch,
     view: &View,
     now: Instant,
+    read_at: Instant,
 ) {
-    let startup = view
-        .thread
-        .state
-        .attention
-        .contains(&AttentionCause::SessionStartTimeout)
-        || view
-            .thread
-            .state
-            .attention
-            .contains(&AttentionCause::StartupStall);
-    let observed = sup.now();
+    let startup = startup_cause(&view.thread);
     let due: Vec<InputId> = {
         let mut st = sl.state();
         view.inputs
@@ -337,7 +341,7 @@ async fn ack_windows(
                     }
                     entry.committed().map(|c| c.at)?
                 } else {
-                    *st.sent_at.entry(id).or_insert(observed)
+                    *st.sent_at.entry(id).or_insert(read_at)
                 };
                 (now >= start + ACK_WINDOW).then_some(id)
             })
@@ -345,8 +349,14 @@ async fn ack_windows(
     };
     for id in due {
         let (thread, launch) = (sl.thread_id, sl.launch_id);
+        let positional = sl.positional == Some(id);
         let cause = IdempotencyKey(format!("ack_window:{launch}:{id}"));
+        #[cfg(test)]
+        super::run_hook(&sl.hooks.ack_window_job);
         let job: JobOf<bool> = Arc::new(move |tx| {
+            if positional && startup_cause(&thread_row(tx, thread)?) {
+                return Ok(false);
+            }
             move_input(
                 tx,
                 thread,

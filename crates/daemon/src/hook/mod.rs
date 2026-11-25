@@ -278,6 +278,7 @@ impl HookIngest {
             pid_wait_expired,
             adapter: self.seams.adapter.clone(),
             cfg: self.cfg.clone(),
+            clock: shared.cfg.clock.clone(),
         };
         let r = ctx
             .write_then(
@@ -367,7 +368,7 @@ impl crate::http::OnReply<route::Ran> for IntakeGuard {
     fn replied(self: Box<Self>, r: &Result<route::Ran, crate::http::WriteFailure>) {
         use crate::store::WriteError;
         match r {
-            Ok(ran) => (*self).replied(Some(&ran.marks), false),
+            Ok(ran) => (*self).replied(Some((&ran.marks, ran.at)), false),
             Err(crate::http::WriteFailure::Write(
                 WriteError::CommitUnknown(_) | WriteError::WriterGone,
             )) => (*self).replied(None, true),

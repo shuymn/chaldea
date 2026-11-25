@@ -2,6 +2,7 @@
 //! completion applied to its input, each human unit's `human_write`, in `record.seq` order.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use chaldea_core::event::TypedEvent;
 use chaldea_core::ids::{IdempotencyKey, InputId, LaunchId, StreamId, ThreadId};
@@ -56,8 +57,14 @@ pub(crate) fn move_input(
 
 /// The completion job of an input unit's record: `Written` → `sent`, `NotStarted` →
 /// `cancelled`, `Incomplete` → `unconfirmed`, only for an input still `sending` of a launch
-/// with no exit.
-fn completion_job(sl: &SendLaunch, rec: &WriteRecord, input: InputId) -> JobOf<bool> {
+/// with no exit; with the clock at the end of the job (the commit instant the ack window
+/// starts from).
+fn completion_job(
+    sup: &Supervisor,
+    sl: &SendLaunch,
+    rec: &WriteRecord,
+    input: InputId,
+) -> JobOf<(bool, Instant)> {
     let (thread, launch) = (sl.thread_id, sl.launch_id);
     let by = match &rec.outcome {
         WriteOutcome::Written => InputInput::WriteCompleted,
@@ -67,7 +74,11 @@ fn completion_job(sl: &SendLaunch, rec: &WriteRecord, input: InputId) -> JobOf<b
         }
     };
     let cause = write_key(launch, rec.seq, input);
-    Arc::new(move |tx| move_input(tx, thread, launch, input, InputState::Sending, &by, &cause))
+    let clock = sup.cfg.clock.clone();
+    Arc::new(move |tx| {
+        let moved = move_input(tx, thread, launch, input, InputState::Sending, &by, &cause)?;
+        Ok((moved, clock.now()))
+    })
 }
 
 /// Appends `rec`'s `human_write` once: for `Written` or `Incomplete`, nothing for
@@ -156,14 +167,16 @@ pub(crate) async fn apply_records(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>) {
         }
         #[cfg(test)]
         super::run_hook(&sl.hooks.record_job);
-        match record(sup, completion_job(sl, &f.record, id), false).await {
-            Recorded::Done(moved) => {
+        match record(sup, completion_job(sup, sl, &f.record, id), false).await {
+            Recorded::Done((moved, at)) => {
+                #[cfg(test)]
+                super::run_hook(&sl.hooks.after_record);
                 let mut st = sl.state();
                 if st.running.as_ref().is_some_and(|r| r.input_id == id) {
                     sl.set_running(&mut st, None);
                 }
                 if moved && f.record.outcome == WriteOutcome::Written {
-                    st.sent_at.insert(id, sup.now());
+                    st.sent_at.insert(id, at);
                 }
             }
             Recorded::Refused(e) => {

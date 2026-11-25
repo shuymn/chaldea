@@ -1,14 +1,17 @@
 //! Timers (send §2.7): the gate timeout with its snapshot, and the snapshot's lock use.
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chaldea_core::ids::Agent;
+use chaldea_core::ids::{Agent, InputId};
+use chaldea_core::input::InputState;
 use chaldea_core::state::AttentionCause;
 use chaldea_pty_runtime::fake::ProbePoint;
 
 use super::SRig;
+use super::gate::set;
 use super::outcomes::tick_at;
-use crate::supervisor::send::GATE_TIMEOUT;
+use crate::supervisor::send::{ACK_WINDOW, GATE_TIMEOUT};
 
 /// PR10b-CL-15: `input_gate_timeout` is raised once, `GATE_TIMEOUT` after the worker first
 /// read the input `queued`, with a `vt_snapshot_taken` when one was taken in time, and
@@ -120,5 +123,99 @@ async fn gate_timeout_cleared_at_exit() {
         "{:?}",
         rig.thread(live.t).state.attention
     );
+    rig.stop().await;
+}
+
+/// The clock's reading, kept from inside a test point that then moves the clock 1 s on (a
+/// late worker or observer).
+fn late_by_one_second(rig: &SRig) -> (Arc<Mutex<Option<Instant>>>, impl FnOnce() + Send + 'static) {
+    let seen = Arc::new(Mutex::new(None));
+    let (s2, clock) = (seen.clone(), rig.clock.clone());
+    (seen, move || {
+        *s2.lock().unwrap() = Some(crate::http::MonotonicClock::now(&*clock));
+        clock.advance(Duration::from_secs(1));
+    })
+}
+
+/// PR10b-CL-15: the gate timeout runs from the pass's read of the input as `queued`, however
+/// late the pass reaches its timers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gate_timeout_from_read() {
+    let rig = SRig::new().await;
+    let (live, _) = rig.spawn(Agent::Codex, None).await;
+    rig.clock.stop();
+    let sl = rig.sl(&live);
+    rig.pass(&live).await;
+    let (read, point) = late_by_one_second(&rig);
+    set(&sl.hooks.after_read, point);
+    let id = rig.send(&live, "waits").await;
+    rig.until("the first read", || sl.state().queued_at.contains_key(&id))
+        .await;
+    let t0 = read.lock().unwrap().unwrap();
+    assert_eq!(sl.state().queued_at[&id], t0);
+    let cause = AttentionCause::InputGateTimeout { input_id: id };
+    tick_at(&rig, &live, t0 + GATE_TIMEOUT).await;
+    rig.until("raised", || {
+        rig.thread(live.t).state.attention.contains(&cause)
+    })
+    .await;
+    rig.stop().await;
+}
+
+/// PR10b-CL-8: the ack window runs from the completion job's commit, however late the worker
+/// applies it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ack_window_from_commit() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    rig.clock.stop();
+    let sl = rig.sl(&live);
+    let (committed, point) = late_by_one_second(&rig);
+    set(&sl.hooks.after_record, point);
+    let id = rig.send(&live, "late").await;
+    rig.until_input(id, InputState::Sent).await;
+    rig.until("the window started", || {
+        sl.state().sent_at.contains_key(&id)
+    })
+    .await;
+    let t0 = committed.lock().unwrap().unwrap();
+    assert_eq!(sl.state().sent_at[&id], t0);
+    tick_at(&rig, &live, t0 + ACK_WINDOW).await;
+    rig.until_input(id, InputState::Unconfirmed).await;
+    rig.stop().await;
+}
+
+/// PR10b-CL-8: the positional input's window job reads the startup causes again: a
+/// `session_start_timeout` committed after the pass chose the input and before its job
+/// leaves the input `sent`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn positional_window_rereads_startup() {
+    let rig = SRig::new().await;
+    let (live, v) = rig.spawn(Agent::Codex, Some("first")).await;
+    let id: InputId = serde_json::from_value(v["input_id"].clone()).unwrap();
+    assert_eq!(rig.input(id).state, InputState::Sent);
+    rig.clock.stop();
+    let start = rig.sup.entry(live.l).unwrap().committed().unwrap().at;
+    let sl = rig.sl(&live);
+    let (entered_tx, entered) = tokio::sync::oneshot::channel::<()>();
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    set(&sl.hooks.ack_window_job, move || {
+        let _ = entered_tx.send(());
+        let _ = wait.recv_timeout(Duration::from_secs(20));
+    });
+    rig.clock
+        .advance((start + ACK_WINDOW).saturating_duration_since(rig.sup.now()));
+    sl.wake.notify_one();
+    entered.await.unwrap();
+    rig.sup.tick(rig.sup.now()).await;
+    assert!(
+        rig.thread(live.t)
+            .state
+            .attention
+            .contains(&AttentionCause::SessionStartTimeout)
+    );
+    go.send(()).unwrap();
+    rig.pass(&live).await;
+    assert_eq!(rig.input(id).state, InputState::Sent);
     rig.stop().await;
 }

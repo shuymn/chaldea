@@ -338,6 +338,36 @@ async fn settle_running() {
     rig.stop().await;
 }
 
+/// PR10b-CL-4: the settle clock runs from the `Stop`'s commit, however late its observer
+/// finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_from_commit() {
+    let (rig, live) = settle_rig().await;
+    rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "p" }))
+        .await;
+    let sl = rig.sl(&live);
+    let committed = Arc::new(std::sync::Mutex::new(None));
+    let (c2, clock) = (committed.clone(), rig.clock.clone());
+    set(&sl.hooks.finished, move || {
+        *c2.lock().unwrap() = Some(crate::http::MonotonicClock::now(&*clock));
+        clock.advance(Duration::from_secs(1));
+    });
+    rig.hook(&live, "Stop", &json!({})).await;
+    let t0 = committed.lock().unwrap().unwrap();
+    assert_eq!(last_at(&rig, &live), t0);
+    // The clock is 1 s past the commit: `SETTLE` after it is 1 s short of `SETTLE` from now.
+    advance(
+        &rig,
+        &live,
+        SETTLE - Duration::from_secs(1) - Duration::from_millis(1),
+    )
+    .await;
+    assert_eq!(count(&rig, &live, "stop_settled"), 0);
+    advance(&rig, &live, Duration::from_millis(1)).await;
+    assert_eq!(count(&rig, &live, "stop_settled"), 1);
+    rig.stop().await;
+}
+
 /// PR10b-CL-4 (P-1): a `Stop` taken in after the input's unit was written and acked, before
 /// the completion job recorded it, is a candidate decided again after the record: it settles,
 /// and the next send is written.

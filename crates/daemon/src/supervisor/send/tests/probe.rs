@@ -46,7 +46,7 @@ async fn probe() {
         assert_eq!(sl.latest_intake.load(Ordering::SeqCst), ordinal);
         seen = IntakeFactsV1::parse(f.as_ref());
         if seen.is_none() {
-            p.finished(live.l, ordinal, &[]);
+            p.finished(live.l, ordinal, &[], None);
             ordinal += 1;
         }
         seen.is_some()
@@ -62,7 +62,7 @@ async fn probe() {
         .reference;
     assert_eq!(f.reference, published);
     assert!(!f.running && !f.human_running && f.inflight.is_none());
-    p.finished(live.l, ordinal, &[]);
+    p.finished(live.l, ordinal, &[], None);
     // The `SendLaunch` mutex held: `None` at once, the fence still advanced.
     {
         let _held = sl.state();
@@ -70,13 +70,13 @@ async fn probe() {
         assert!(p.facts(live.l, 11).is_none());
         assert_eq!(word(&sl), w + (1 << OPEN_BITS) + 1);
     }
-    p.finished(live.l, 11, &[]);
+    p.finished(live.l, 11, &[], None);
     // The live map held: unobservable, `None`.
     {
         let _map = rig.sup.live.lock();
         assert!(p.facts(live.l, 12).is_none());
     }
-    p.finished(live.l, 12, &[]);
+    p.finished(live.l, 12, &[], None);
     assert!(fence_quiet(word(&sl)));
     // A dispatched input shows in the facts.
     let id = rig.send(&live, "seen").await;
@@ -87,7 +87,7 @@ async fn probe() {
     let mut seen = None;
     rig.until("facts observed", || {
         let f = p.facts(live.l, ordinal);
-        p.finished(live.l, ordinal, &[]);
+        p.finished(live.l, ordinal, &[], None);
         ordinal += 1;
         seen = IntakeFactsV1::parse(f.as_ref());
         seen.is_some()
@@ -265,6 +265,6 @@ async fn probe_beside_map_reader() {
     rig.until("the probe answered", || h.is_finished()).await;
     drop(held);
     assert!(h.join().unwrap());
-    p.finished(live.l, 50, &[]);
+    p.finished(live.l, 50, &[], None);
     rig.stop().await;
 }

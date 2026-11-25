@@ -2,6 +2,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use chaldea_core::ids::{InputId, LaunchId};
 use chaldea_pty_runtime::OriginClass;
@@ -115,14 +116,20 @@ impl IntakeProbe for SupervisorProbe {
         serde_json::to_value(&f).ok().map(IntakeFacts)
     }
 
-    fn finished(&self, launch: LaunchId, ordinal: u64, marks: &[(u64, TurnMark)]) {
+    fn finished(
+        &self,
+        launch: LaunchId,
+        ordinal: u64,
+        marks: &[(u64, TurnMark)],
+        committed_at: Option<Instant>,
+    ) {
         let Some(sl) = self.side.launch(launch) else {
             return;
         };
         #[cfg(test)]
         super::run_hook(&sl.hooks.finished);
-        let at = self.sup.upgrade().map(|s| s.now());
-        if let Some(at) = at {
+        // Each mark carries its job's commit instant, however late this observer runs.
+        if let Some(at) = committed_at {
             let mut st = sl.state();
             for (o, m) in marks {
                 st.log.insert(*o, *m, at);

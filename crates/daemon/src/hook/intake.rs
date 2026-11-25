@@ -23,12 +23,19 @@ pub trait IntakeProbe: Send + Sync + 'static {
     fn facts(&self, launch: LaunchId, ordinal: u64) -> Option<IntakeFacts>;
 
     /// The intake `ordinal` of `launch` is finished: its job committed with `marks` (its own
-    /// delivery's and, in a binding job, each promoted delivery's, by receipt ordinal), or
-    /// decided nothing (`marks` empty: rolled back, refused, or never submitted). Called at
+    /// delivery's and, in a binding job, each promoted delivery's, by receipt ordinal) at
+    /// `committed_at` (the clock read at the end of the committing job), or decided nothing
+    /// (`marks` empty and no instant: rolled back, refused, or never submitted). Called at
     /// most once per intake through its [`IntakeGuard`], and never for an intake whose job's
     /// outcome stays unknown. Non-blocking.
-    fn finished(&self, launch: LaunchId, ordinal: u64, marks: &[(u64, TurnMark)]) {
-        let _ = (launch, ordinal, marks);
+    fn finished(
+        &self,
+        launch: LaunchId,
+        ordinal: u64,
+        marks: &[(u64, TurnMark)],
+        committed_at: Option<Instant>,
+    ) {
+        let _ = (launch, ordinal, marks, committed_at);
     }
 }
 
@@ -84,13 +91,18 @@ impl IntakeGuard {
         self.submitted = true;
     }
 
-    /// The writer's answer: committed with `marks`, or `None` for a reply that decided
-    /// nothing; `unknown` for an outcome that stays unknown (the intake stays unfinished).
-    pub(crate) fn replied(mut self, marks: Option<&[(u64, TurnMark)]>, unknown: bool) {
+    /// The writer's answer: committed with `marks` at the job's instant, or `None` for a
+    /// reply that decided nothing; `unknown` for an outcome that stays unknown (the intake
+    /// stays unfinished).
+    pub(crate) fn replied(
+        mut self,
+        committed: Option<(&[(u64, TurnMark)], Instant)>,
+        unknown: bool,
+    ) {
         self.done = true;
         if !unknown {
-            self.probe
-                .finished(self.launch, self.ordinal, marks.unwrap_or(&[]));
+            let (marks, at) = committed.map_or((&[][..], None), |(m, at)| (m, Some(at)));
+            self.probe.finished(self.launch, self.ordinal, marks, at);
         }
     }
 }
@@ -99,7 +111,7 @@ impl Drop for IntakeGuard {
     fn drop(&mut self) {
         if !self.done && !self.submitted {
             self.done = true;
-            self.probe.finished(self.launch, self.ordinal, &[]);
+            self.probe.finished(self.launch, self.ordinal, &[], None);
         }
     }
 }
