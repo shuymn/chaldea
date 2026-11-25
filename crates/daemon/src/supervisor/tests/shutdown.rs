@@ -101,13 +101,17 @@ async fn close_stop_after_admission() {
     let store = rig.srv.store.store().clone();
     let closing =
         std::thread::spawn(move || store.shutdown(Instant::now() + Duration::from_secs(20)));
+    // Only `Closed` says admission closed: the polls themselves fill the writer queue
+    // (`QueueFull`) while the shutdown thread has not yet begun.
     rig.until("admission closed", || {
         let job: crate::http::Job<()> = Box::new(|_| Ok(()));
-        rig.srv
-            .store
-            .store()
-            .submit(Instant::now() + Duration::from_secs(5), job)
-            .is_err()
+        matches!(
+            rig.srv
+                .store
+                .store()
+                .submit(Instant::now() + Duration::from_secs(5), job),
+            Err(crate::store::SubmitError::Closed)
+        )
     })
     .await;
     held.go();
