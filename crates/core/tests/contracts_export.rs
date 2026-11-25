@@ -252,3 +252,21 @@ fn nullable_result_fields_are_required() {
         );
     }
 }
+
+/// No success type of the launch commands has a top-level `code` property: a client decodes
+/// `ErrorBody` only from a non-2xx status, and a success body must not look like one.
+#[test]
+fn success_schemas_have_no_code() {
+    use chaldea_core::command::{ResumeResult, SpawnResult};
+    for (name, schema) in [
+        ("SpawnResult", schemars::schema_for!(SpawnResult)),
+        ("ResumeResult", schemars::schema_for!(ResumeResult)),
+        ("StopResult", schemars::schema_for!(StopResult)),
+        ("CloseResult", schemars::schema_for!(CloseResult)),
+    ] {
+        let v = serde_json::to_value(schema).unwrap();
+        let props = v["properties"].as_object().expect("an object schema");
+        assert!(!props.is_empty(), "{name}: no properties");
+        assert!(!props.contains_key("code"), "{name} has a top-level code");
+    }
+}
