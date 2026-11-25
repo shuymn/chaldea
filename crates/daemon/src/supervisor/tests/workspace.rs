@@ -6,8 +6,16 @@ use std::process::{Command, Stdio};
 use super::Rig;
 use crate::supervisor::workspace::workspace_of;
 
+/// Runs git on a fixture repository. Every inherited `GIT_*` variable is removed: a
+/// git hook (e.g. pre-push running the tests) exports `GIT_DIR`, which would point
+/// these commands at the enclosing repository instead of `dir`.
 fn git(dir: &Path, args: &[&str]) {
     let mut cmd = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(key);
+        }
+    }
     cmd.arg("-C")
         .arg(dir)
         .args(args)
