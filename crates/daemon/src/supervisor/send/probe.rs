@@ -140,9 +140,10 @@ impl IntakeProbe for SupervisorProbe {
             for (o, m) in marks {
                 st.log.insert(*o, *m, at);
                 // A card's basis is its own; whether the card is open is the store's, never
-                // this observer's order against another hook's. Only the card's own
-                // resolution drops it; a card a turn boundary closed keeps its basis until the
-                // launch's side is dropped (a key for it is refused by the store's check).
+                // this observer's order against another hook's. The card's own resolution
+                // drops it here by card id, and a key whose store read finds the card closed
+                // drops it too; a turn boundary leaves it alone (a key for that card is
+                // refused by the store's check).
                 match *m {
                     TurnMark::Card {
                         approval_id,

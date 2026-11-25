@@ -168,7 +168,8 @@ pub(crate) struct Delivery {
     pub(crate) pid_wait_expired: bool,
     pub(crate) adapter: Arc<dyn HookAdapter>,
     pub(crate) cfg: HookConfig,
-    /// Read at the end of the job: the commit instant its turn marks carry.
+    /// Read right after the job's SQLite `COMMIT` (a `CommitStamp`): the commit instant its
+    /// turn marks carry.
     pub(crate) clock: Arc<dyn crate::http::MonotonicClock>,
 }
 

@@ -100,7 +100,9 @@ pub enum InputInput {
     Rejected(RejectReason),
     /// `chaldea input cancel`.
     Cancelled,
-    /// The writer's recheck failed before the first byte.
+    /// The unit wrote zero bytes: the writer refused it before the first byte (its fence,
+    /// basis, or recheck failed, its deadline passed, or the session closed), or its
+    /// submission was refused.
     RecheckFailed,
     LaunchExited,
     DaemonRestarted,
@@ -169,8 +171,8 @@ fn input_name(i: &InputInput) -> &'static str {
 
 /// Applies one input to an input's state.
 ///
-/// An ack that arrives while the input is `sending` is not an input here: the daemon
-/// keeps it as the candidate and feeds `AckAttributed` once `sent` is recorded.
+/// An attributable ack of a `sending` input whose unit was written is fed as
+/// `WriteCompleted` then `AckAttributed` in the hook's own job (send §2.5).
 ///
 /// # Errors
 ///
@@ -266,7 +268,8 @@ pub enum GateDecision {
 
 /// The one conservative gate rule: open only with positive readiness evidence newer than
 /// the last write of any origin and every other condition met. Unknown means closed.
-/// The writer evaluates it again under its lock before the first byte.
+/// The writer does not evaluate it again: before the first byte it checks, under its lock,
+/// the open's fence word and write basis (send §2.3).
 #[must_use]
 pub fn gate(g: &GateView) -> GateDecision {
     use GateClosedReason as R;
