@@ -403,9 +403,10 @@ async fn spawn_caller() {
 }
 
 /// PR10a1-CL-35: an agent token acts on its own thread; against an unrelated thread each of
-/// `stop`, `close`, `close --stop`, and `resume` is 404 before any read of its launch, with
-/// no receipt, no kill, and the thread unchanged; also with a stale `expected_launch_id`,
-/// which a generation read before the scope check would answer 409.
+/// `stop`, `close`, `close --stop`, and `resume` is 404 before any read of its launch (the
+/// store's reads of that launch's row, and of a stale `expected_launch_id`'s, counted: none),
+/// with no receipt, no kill, and the thread unchanged; also with a stale
+/// `expected_launch_id`, which a generation read before the scope check would answer 409.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn target_scope() {
     let rig = Rig::new().await;
@@ -418,6 +419,9 @@ async fn target_scope() {
         .await;
     let head = rig.kinds(other).len();
     let stale = LaunchId(uuid::Uuid::new_v4());
+    use crate::store::launch_reads;
+    launch_reads::watch(ol);
+    launch_reads::watch(stale);
     for (name, args) in [
         ("stop", json!({ "thread_id": other })),
         (
@@ -455,6 +459,11 @@ async fn target_scope() {
             "{name} {args}"
         );
         assert!(rig.srv.receipt(id).is_none(), "{name}");
+        assert_eq!(
+            (launch_reads::count(ol), launch_reads::count(stale)),
+            (0, 0),
+            "{name} {args}: a launch read before the scope check"
+        );
     }
     assert!(
         !other_child

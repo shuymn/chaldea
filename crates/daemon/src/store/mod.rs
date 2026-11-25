@@ -62,6 +62,8 @@ pub use annex::{AnnexError, Continuity, CountedClass, CountedClasses, EventAnnex
 pub use clock::{RandomIds, SystemClock};
 pub use content::{ContentError, MAX_BLOB_BYTES, Prepared, prepare_content};
 pub use error::{OpenError, ProjectionError, ReadError, StoreError};
+#[cfg(test)]
+pub(crate) use readers::launch_reads;
 pub use readers::{Page, ReadTx};
 pub use rows::{
     ApprovalRow, Binding, BlobBody, BufferedDelivery, BufferedHook, BufferedSummary, HookDelivery,

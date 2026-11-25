@@ -793,6 +793,8 @@ impl<'a> ReadTx<'a> {
     }
 
     fn launch_row(&self, l: LaunchId) -> Result<Option<LaunchRow>, StoreError> {
+        #[cfg(test)]
+        launch_reads::seen(l);
         Ok(self
             .launch_rows("WHERE launch_id = ?1", [l.to_string()])?
             .pop())
@@ -1535,4 +1537,43 @@ fn decode_launch(v: &[rusqlite::types::Value]) -> Result<LaunchRow, StoreError> 
         last_human_write_seq: opt_u64(int(22)?)?,
         last_turn_start_seq: opt_u64(int(23)?)?,
     })
+}
+
+/// Counts reads of watched launch rows (unit tests only), for tests that show a read never
+/// ran: process-wide, so each test watches only its own launch ids.
+#[cfg(test)]
+pub(crate) mod launch_reads {
+    use std::sync::Mutex;
+
+    use chaldea_core::ids::LaunchId;
+
+    static WATCHED: Mutex<Vec<(LaunchId, usize)>> = Mutex::new(Vec::new());
+
+    /// Starts counting reads of `l` from zero.
+    pub(crate) fn watch(l: LaunchId) {
+        let mut w = WATCHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        w.retain(|(x, _)| *x != l);
+        w.push((l, 0));
+    }
+
+    /// Reads of `l` since [`watch`].
+    pub(crate) fn count(l: LaunchId) -> usize {
+        WATCHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(x, _)| *x == l)
+            .map_or(0, |(_, n)| *n)
+    }
+
+    pub(super) fn seen(l: LaunchId) {
+        let mut w = WATCHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, n)) = w.iter_mut().find(|(x, _)| *x == l) {
+            *n += 1;
+        }
+    }
 }
