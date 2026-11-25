@@ -1165,6 +1165,44 @@ async fn revoking_intent_nudges() {
     srv.stop().await;
 }
 
+/// A revoking intent whose commit outcome is unknown: the revocation may be visible, no
+/// nudge runs (the nudge is guaranteed for acknowledged commits only), and `CommitUnknown`
+/// reaches the sink, which stops the daemon and so closes every socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn revoking_commit_unknown_is_fatal() {
+    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let s = shared(&srv);
+    let victim = srv.token(TokenKind::Owner, None, None).await;
+    let id = srv.token_row(&victim).unwrap().token_id;
+    let before = *s.revocations.borrow();
+    let (intent_reached, intent_release) = probe.hold_intent();
+    let reply = spawn_send(
+        &srv,
+        &srv.command(
+            "test_revoke",
+            &owner,
+            cid(1),
+            &format!(r#"{{"token":"{id}"}}"#),
+        ),
+    );
+    reached_sync(intent_reached).await;
+    *srv.store.store().faults().commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
+    intent_release.send(()).unwrap();
+    assert_eq!(
+        joined(reply).await.outcome(),
+        (503, code("outcome_unknown"))
+    );
+    assert_eq!(
+        *s.revocations.borrow(),
+        before,
+        "no nudge without an acknowledged commit"
+    );
+    assert!(srv.token_row(&victim).unwrap().revoked_at.is_some());
+    assert_eq!(*srv.sink.0.lock().unwrap(), [StoreFatal::CommitUnknown]);
+    srv.stop().await;
+}
+
 /// How an effect ends decides the reply and the report: `Unrecorded` answers 503
 /// `outcome_unknown` at once with no completion attempt and reports `ReceiptUncompleted`;
 /// after the request's reply time it reports once the effect ends; `ShuttingDown` answers
