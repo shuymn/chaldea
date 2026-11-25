@@ -1,6 +1,7 @@
 //! Send-side unit tests (send §5.2, §6): `FakePty`, the in-process store and server,
 //! `FakeDecoder` behind the real `/hook` route, and the send side's test points.
 
+mod evidence;
 mod flow;
 mod gate;
 mod probe;

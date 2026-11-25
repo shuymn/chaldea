@@ -211,7 +211,7 @@ async fn undispatched_match() {
     rig.paste(&live, true).await;
     rig.hook(&live, "SessionStart", &json!({})).await;
     let id = rig.send(&live, "not yet").await;
-    rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": " not yet " }))
+    rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "not yet" }))
         .await;
     let msgs = rig.of_kind(live.t, "user_message");
     assert_eq!(msgs.len(), 1);
