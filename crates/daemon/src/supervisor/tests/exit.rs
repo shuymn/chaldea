@@ -128,3 +128,194 @@ async fn unrecorded_exit_job() {
     let row = store.read(move |r| r.launch(l)).unwrap();
     assert_eq!(row.exit_reason, Some(ExitReason::DaemonRestart));
 }
+
+/// Two units on launch `l`'s session, neither permitted: `a`, whose recheck holds the
+/// writer until `gate` is sent, and `b`, queued behind it. A seal settles both `Closed`.
+pub(super) struct Queued {
+    pub gate: std::sync::mpsc::Sender<()>,
+    pub a: chaldea_pty_runtime::CompletionReceiver,
+    pub b: chaldea_pty_runtime::CompletionReceiver,
+    pub b_origin: chaldea_pty_runtime::WriteOrigin,
+}
+
+pub(super) async fn queue_behind_recheck(rig: &Rig, l: chaldea_core::ids::LaunchId) -> Queued {
+    use chaldea_pty_runtime::{Guard, WriteOrigin, WriteUnit, completion_channel};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let entry = rig.sup.entry(l).unwrap();
+    let (gate, gate_rx) = mpsc::channel::<()>();
+    let (entered_tx, entered) = mpsc::channel::<()>();
+    let (a_done, a) = completion_channel();
+    let (b_done, b) = completion_channel();
+    let b_origin = WriteOrigin::Input {
+        input_id: chaldea_core::ids::InputId(uuid::Uuid::new_v4()),
+    };
+    let far = std::time::Instant::now() + Duration::from_secs(60);
+    let origin = b_origin.clone();
+    entry
+        .with_session(&rig.sup, rig.sup.now() + Duration::from_secs(5), move |s| {
+            let mut g = Guard::until(far);
+            g.recheck = Some(Box::new(move |_| {
+                let _ = entered_tx.send(());
+                let _ = gate_rx.recv_timeout(Duration::from_secs(60));
+                Ok(())
+            }));
+            s.submit(WriteUnit::bytes(WriteOrigin::Key, b"a".to_vec()), g, a_done)
+                .unwrap();
+            s.submit(
+                WriteUnit::bytes(origin, b"b".to_vec()),
+                Guard::until(far),
+                b_done,
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+    entered
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the writer is in `a`'s recheck");
+    Queued {
+        gate,
+        a,
+        b,
+        b_origin,
+    }
+}
+
+impl Queued {
+    /// Releases the writer once `b` settled (the seal settles it), on a thread: `b`'s record.
+    pub(super) fn release_after_seal(
+        self,
+    ) -> std::thread::JoinHandle<chaldea_pty_runtime::WriteRecord> {
+        std::thread::spawn(move || {
+            let r = self
+                .b
+                .recv_deadline(std::time::Instant::now() + std::time::Duration::from_secs(20))
+                .expect("the seal settles `b`");
+            let _ = self.gate.send(());
+            drop(self.a);
+            r
+        })
+    }
+}
+
+/// A stand-in for 10b's exit steps: the `ExitFacts.sealed` of every exit job, by launch.
+#[derive(Default)]
+pub(super) struct SealedSeen(
+    pub  std::sync::Mutex<
+        Vec<(
+            chaldea_core::ids::LaunchId,
+            Vec<chaldea_pty_runtime::WriteRecord>,
+        )>,
+    >,
+);
+
+impl crate::supervisor::exit::ExitStep for SealedSeen {
+    fn in_exit_job(
+        &self,
+        _tx: &mut crate::store::WriteTx<'_>,
+        exit: &crate::supervisor::exit::ExitFacts,
+    ) -> Result<(), crate::store::StoreError> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((exit.launch_id, exit.sealed.clone()));
+        Ok(())
+    }
+}
+
+impl SealedSeen {
+    fn of(&self, l: chaldea_core::ids::LaunchId) -> Vec<chaldea_pty_runtime::WriteRecord> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(x, _)| *x == l)
+            .flat_map(|(_, s)| s.clone())
+            .collect()
+    }
+}
+
+/// PR10a1-CL-29 `sealed_on_every_path`: a unit queued and not permitted, then a natural
+/// exit, a stop whose `StopRequested` job rolls back (its exit job applies it), and a
+/// shutdown close: each exit job's `ExitFacts.sealed` holds the unit's record, settled
+/// `Closed`. A second seal of one session settles nothing and leaves `settled` as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sealed_on_every_path() {
+    use crate::store::test_faults::CommitFault;
+    use chaldea_pty_runtime::{Refusal, WriteOutcome};
+    let seen = std::sync::Arc::new(SealedSeen::default());
+    let step = seen.clone();
+    let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, move |c| {
+        c.exit_steps.push(step);
+    })
+    .await;
+    let check = |l, r: &chaldea_pty_runtime::WriteRecord, origin, path: &str| {
+        assert_eq!(
+            r.outcome,
+            WriteOutcome::NotStarted(Refusal::Closed),
+            "{path}"
+        );
+        assert_eq!(r.origin, origin, "{path}");
+        let sealed = seen.of(l);
+        assert!(sealed.contains(r), "{path}: {sealed:?}");
+    };
+    // A natural exit.
+    let (_t, l) = rig.spawn_codex(None).await;
+    let child = rig.pty.take_child().unwrap();
+    let q = queue_behind_recheck(&rig, l).await;
+    let origin = q.b_origin.clone();
+    let b = q.release_after_seal();
+    child.exit(ChildExit {
+        code: Some(0),
+        signal: None,
+    });
+    rig.until("the exit is recorded", || {
+        rig.launch(l).exit_reason.is_some()
+    })
+    .await;
+    check(l, &b.join().unwrap(), origin, "natural exit");
+    // A stop whose `StopRequested` job rolls back.
+    let (t, l) = rig.spawn_codex(None).await;
+    let q = queue_behind_recheck(&rig, l).await;
+    let origin = q.b_origin.clone();
+    let b = q.release_after_seal();
+    let held = rig.pauses.arm(crate::supervisor::Pause::InStopRequested);
+    let reply = super::support::http::spawn_send(
+        &rig.srv,
+        &rig.srv.command(
+            "stop",
+            &rig.owner,
+            super::cid(),
+            &serde_json::json!({ "thread_id": t }).to_string(),
+        ),
+    );
+    held.wait();
+    *rig.srv.store.store().faults().commit.lock().unwrap() = Some(CommitFault::BusyBeforeCommit);
+    held.go();
+    assert_eq!(reply.await.unwrap().status, 200);
+    check(l, &b.join().unwrap(), origin, "stop, rolled back");
+    // A second seal.
+    let (_t, l) = rig.spawn_codex(None).await;
+    let q = queue_behind_recheck(&rig, l).await;
+    let entry = rig.sup.entry(l).unwrap();
+    {
+        let guard = entry.ops.clone().lock_owned().await;
+        entry.seal(&guard);
+        let first = entry.settled();
+        assert!(first.iter().any(|r| r.origin == q.b_origin), "{first:?}");
+        assert!(guard.as_ref().unwrap().seal().is_empty());
+        entry.seal(&guard);
+        assert_eq!(entry.settled(), first);
+    }
+    let _ = q.gate.send(());
+    // A shutdown close (last: it closes admission).
+    let (_t, l) = rig.spawn_codex(None).await;
+    let q = queue_behind_recheck(&rig, l).await;
+    let origin = q.b_origin.clone();
+    let b = q.release_after_seal();
+    let end = rig.sup.now() + std::time::Duration::from_secs(5);
+    crate::supervisor::components::shutdown(rig.sup.clone(), end).await;
+    check(l, &b.join().unwrap(), origin, "shutdown close");
+    rig.srv.stop().await;
+}

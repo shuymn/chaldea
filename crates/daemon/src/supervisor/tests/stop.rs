@@ -746,3 +746,32 @@ async fn reply_by() {
     assert_eq!((r2.status, &r2.body), (200, &r1.body));
     rig.srv.stop().await;
 }
+
+/// PR10a1-CL-29 `seal_before_stop_requested`: a unit held in its recheck when the stop
+/// begins; with the `StopRequested` job held in the writer and the kill task held before
+/// its first call, the unit, released, settles `NotStarted(Closed)` and no byte reaches the
+/// child: the stop's seal came first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seal_before_stop_requested() {
+    use chaldea_pty_runtime::{Refusal, WriteOutcome};
+    let rig = Rig::new().await;
+    let (t, l) = rig.spawn_codex(None).await;
+    let child = rig.pty.take_child().unwrap();
+    let q = super::exit::queue_behind_recheck(&rig, l).await;
+    let held = rig.pauses.arm(Pause::InStopRequested);
+    // The kill task held before its first call, so its close cannot seal the queue first.
+    let task = rig.pauses.arm(Pause::KillTaskStart);
+    let reply = stop_with(&rig, t);
+    held.wait();
+    task.wait();
+    q.gate.send(()).unwrap();
+    let a =
+        q.a.recv_deadline(std::time::Instant::now() + Duration::from_secs(20))
+            .unwrap();
+    assert_eq!(a.outcome, WriteOutcome::NotStarted(Refusal::Closed));
+    assert!(child.writes().is_empty(), "{:?}", child.writes());
+    task.go();
+    held.go();
+    assert_eq!(reply.await.unwrap().status, 200);
+    rig.srv.stop().await;
+}
