@@ -122,7 +122,7 @@ fn send(
     deadline: Instant,
 ) -> io::Result<TcpStream> {
     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-    let mut s = TcpStream::connect_timeout(&addr, left(deadline)?)?;
+    let s = TcpStream::connect_timeout(&addr, left(deadline)?)?;
     let auth = token.map_or_else(String::new, |t| format!("Authorization: Bearer {t}\r\n"));
     let (kind, len) = body.map_or((String::new(), 0), |b| {
         ("Content-Type: application/json\r\n".to_owned(), b.len())
@@ -132,9 +132,35 @@ fn send(
     )
     .into_bytes();
     req.extend_from_slice(body.unwrap_or_default());
-    s.set_write_timeout(Some(left(deadline)?))?;
-    s.write_all(&req)?;
+    let mut set_timeout = |d| s.set_write_timeout(Some(d));
+    write_before(
+        &mut set_timeout,
+        &mut |b: &[u8]| (&s).write(b),
+        &req,
+        deadline,
+    )?;
     Ok(s)
+}
+
+/// Writes all of `bytes` through `write`, each call with the time left before `deadline` as
+/// its timeout (`set_timeout`), recomputed before every call: no write starts at or after
+/// the deadline, however the peer splits its reads.
+fn write_before(
+    set_timeout: &mut impl FnMut(std::time::Duration) -> io::Result<()>,
+    write: &mut impl FnMut(&[u8]) -> io::Result<usize>,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        set_timeout(left(deadline)?)?;
+        match write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// `read` followed by the deadline check, before its own result: whatever a read returned at
@@ -663,6 +689,33 @@ mod tests {
         assert!(req.contains("Authorization: Bearer t\r\n"), "{req}");
         assert!(req.contains("Content-Length: 0\r\n"), "{req}");
         assert!(!req.to_ascii_lowercase().contains("origin:"), "{req}");
+    }
+
+    /// A write split into small parts by its peer: each part gets the time left as its
+    /// timeout, and none starts at or after the deadline.
+    #[test]
+    fn writes_stop_at_the_deadline() {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_millis(60);
+        let mut timeouts = Vec::new();
+        let mut starts = Vec::new();
+        let r = super::write_before(
+            &mut |d| {
+                timeouts.push(d);
+                Ok(())
+            },
+            &mut |b: &[u8]| {
+                starts.push(Instant::now());
+                std::thread::sleep(Duration::from_millis(25));
+                Ok(b.len().min(1))
+            },
+            &[0u8; 10],
+            deadline,
+        );
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(starts.len() < 10, "{starts:?}");
+        assert!(starts.iter().all(|t| *t < deadline), "{starts:?}");
+        assert!(timeouts.windows(2).all(|w| w[1] < w[0]), "{timeouts:?}");
     }
 
     /// `post_json` sends its body with its type and length, and reads the response as
