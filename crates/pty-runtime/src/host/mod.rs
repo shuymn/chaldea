@@ -1142,12 +1142,14 @@ fn executable(p: &Path) -> bool {
     let Ok(m) = std::fs::metadata(p) else {
         return false;
     };
-    #[cfg(unix)]
+    // On macOS: executable by this process, its effective ids against the file's mode and
+    // owner as `exec` checks them, not any execute bit. Elsewhere (Windows): a `.exe` file.
+    #[cfg(target_os = "macos")]
     {
-        use std::os::unix::fs::PermissionsExt;
-        m.is_file() && m.permissions().mode() & 0o111 != 0
+        use rustix::fs::{Access, AtFlags, CWD, accessat};
+        m.is_file() && accessat(CWD, p, Access::EXEC_OK, AtFlags::EACCESS).is_ok()
     }
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "macos"))]
     {
         m.is_file()
     }
@@ -1158,24 +1160,25 @@ mod tests {
     use std::io;
     use std::time::{Duration, Instant};
 
-    /// The search passes a candidate without an execute bit and a directory of the same
-    /// name, and takes the next executable file.
+    /// The search passes a candidate without an execute bit, one whose only execute bit is
+    /// for others (not executable by its owner, this test's user), and a directory of the
+    /// same name, and takes the next executable file.
     #[cfg(target_os = "macos")]
     #[test]
     fn find_program_skips_what_cannot_run() {
         use std::os::unix::fs::PermissionsExt;
         let root = crate::unix::tests::TempDir::new("find-program");
-        let [plain, dir, exec] = ["plain", "dir", "exec"].map(|d| root.0.join(d));
-        for d in [&plain, &dir, &exec] {
+        let [plain, others, dir, exec] = ["plain", "others", "dir", "exec"].map(|d| root.0.join(d));
+        for d in [&plain, &others, &dir, &exec] {
             std::fs::create_dir(d).unwrap();
         }
-        for (d, mode) in [(&plain, 0o644), (&exec, 0o755)] {
+        for (d, mode) in [(&plain, 0o644), (&others, 0o001), (&exec, 0o755)] {
             let f = d.join("codex");
             std::fs::write(&f, b"").unwrap();
             std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).unwrap();
         }
         std::fs::create_dir(dir.join("codex")).unwrap();
-        let path = std::env::join_paths([&plain, &dir, &exec]).unwrap();
+        let path = std::env::join_paths([&plain, &others, &dir, &exec]).unwrap();
         assert_eq!(
             super::find_program("codex", &path),
             Some(exec.join("codex"))
