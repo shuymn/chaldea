@@ -164,3 +164,50 @@ async fn nudges() {
     assert_eq!(count(), n.get(), "a refused close");
     rig.srv.stop().await;
 }
+
+/// PR10a1-CL-25 `stop_then_newer_launch`: a `close --stop` held after its stop, before its
+/// closing job, while a resume starts a newer launch: the closing job answers
+/// `launch_changed`, the thread stays open, and the newer launch keeps running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_then_newer_launch() {
+    let rig = Rig::new().await;
+    let (t, l) = rig.spawn_codex(None).await;
+    rig.bind(t, l, "the-session").await;
+    let held = rig.pauses.arm(Pause::BeforeClosingJob);
+    let reply = spawn_send(
+        &rig.srv,
+        &rig.srv.command(
+            "close",
+            &rig.owner,
+            cid(),
+            &json!({ "thread_id": t, "expected_launch_id": l, "stop": true }).to_string(),
+        ),
+    );
+    let held = tokio::task::spawn_blocking(move || {
+        held.wait();
+        held
+    })
+    .await
+    .unwrap();
+    assert!(rig.launch(l).death_confirmed, "the stop half ran");
+    let r = rig
+        .cmd(
+            "resume",
+            &json!({ "thread_id": t, "expected_launch_id": l }),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let l2: LaunchId = serde_json::from_value(json(&r)["launch_id"].clone()).unwrap();
+    held.go();
+    let r = reply.await.unwrap();
+    assert_eq!(
+        (r.status, code(&r).as_str()),
+        (409, "launch_changed"),
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert!(!rig.thread(t).closed);
+    assert_eq!(rig.thread(t).current_launch_id, Some(l2));
+    assert_eq!(rig.launch(l2).exit_reason, None, "the newer launch runs");
+    rig.srv.stop().await;
+}
