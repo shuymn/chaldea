@@ -702,6 +702,7 @@ async fn grace_exceeded_then_commits() {
     let x = Hook::of(&l, "Stop", "s");
     let reply = h.spawn_post(&x);
     reached(before_job).await;
+    let timers = shared(&h.srv).faults.timers().len();
     h.srv.store.clock.lag(WAIT);
     h.srv.clock.freeze(h.srv.clock.now());
     go_on.send(()).unwrap();
@@ -711,7 +712,7 @@ async fn grace_exceeded_then_commits() {
         outcome(&reply.await.unwrap()),
         (503, Some("outcome_unknown".into()))
     );
-    assert_reply_cutoff(&h);
+    assert_reply_cutoff(&h, timers);
     assert!(
         h.delivery(l.launch, x.emit).is_none(),
         "a row before commit"
@@ -735,15 +736,17 @@ async fn grace_exceeded_then_commits() {
     h.stop().await;
 }
 
-/// The reply cutoff of the hook's last write `run_write` submitted is its `not_after` (the
-/// request deadline) plus the reply grace, as the server's clock has them.
-fn assert_reply_cutoff(h: &HookServer) {
+/// The only timer the hook's write set after its job point (`from`, the timer count there)
+/// is the reply cutoff: its `not_after` (the request deadline) plus the reply grace, as the
+/// server's clock has them. Earlier requests' timers do not count.
+fn assert_reply_cutoff(h: &HookServer, from: usize) {
     let s = shared(&h.srv);
     let deadline = *s.faults.submitted_not_afters().last().unwrap();
     let reply_by = deadline + s.cfg.write_reply_grace;
-    assert!(
-        s.faults.timers().contains(&reply_by),
-        "no reply timer at deadline + write_reply_grace"
+    assert_eq!(
+        s.faults.timers()[from..],
+        [reply_by],
+        "the reply timer is not at deadline + write_reply_grace"
     );
 }
 
@@ -769,12 +772,13 @@ async fn reply_inside_the_grace_is_ok() {
     let x = Hook::of(&l, "Stop", "s");
     let reply = h.spawn_post(&x);
     reached(before_job).await;
+    let timers = shared(&h.srv).faults.timers().len();
     h.srv.store.clock.lag(WAIT);
     h.srv.clock.freeze(h.srv.clock.now());
     go_on.send(()).unwrap();
     reached_sync(reached_job).await;
     h.srv.store.clock.lag(Duration::ZERO);
-    assert_reply_cutoff(&h);
+    assert_reply_cutoff(&h, timers);
     // The request deadline (the job's `not_after`) has passed; the grace has not.
     let deadline = *shared(&h.srv).faults.submitted_not_afters().last().unwrap();
     h.srv.clock.freeze(deadline + Duration::from_secs(1));
