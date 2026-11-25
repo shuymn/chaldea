@@ -9,9 +9,7 @@ use std::time::Instant;
 use chaldea_core::event::TypedEvent;
 use chaldea_core::ids::{IdempotencyKey, InputId, StreamId};
 use chaldea_core::input::encode::{Purpose, encode};
-use chaldea_core::input::{
-    GateClosedReason, GateDecision, GateView, InputInput, InputState, blocks_gate, gate,
-};
+use chaldea_core::input::{GateDecision, GateView, InputInput, InputState, blocks_gate, gate};
 use chaldea_core::payload::{InputEncoding, ReadinessEvidence, SourceKind};
 use chaldea_core::state::{AttentionCause, ProcessState, StateInput, TurnState};
 use chaldea_pty_runtime::{
@@ -21,7 +19,7 @@ use chaldea_pty_runtime::{
 use tokio::sync::broadcast::error::RecvError;
 
 use super::super::Supervisor;
-use super::super::events::{ThreadJob, derived, seq_of, thread_row};
+use super::super::events::{ThreadJob, derived, thread_row};
 use super::super::live::{LaunchObservation, LiveLaunch};
 use super::super::record::{JobOf, Recorded, record};
 use super::attribution::content_text;
@@ -496,16 +494,6 @@ pub(crate) fn readiness_in(
 
 // ---- open and submit ------------------------------------------------------------------------
 
-/// Why the open job left the input `queued`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Closed {
-    /// A hook intake is unfinished, or the fence word is closed.
-    Fence,
-    Gate(GateClosedReason),
-    /// The input is not the launch's oldest queued one, or the launch is not current.
-    Moved,
-}
-
 /// What the open job committed.
 #[derive(Debug, Clone)]
 pub(crate) struct Opened {
@@ -536,7 +524,7 @@ fn open_job(
     input: InputId,
     modes: ModeView,
     last_started: [u64; 3],
-) -> JobOf<Result<Opened, Closed>> {
+) -> JobOf<Option<Opened>> {
     let me = sl.clone();
     let (thread, launch) = (sl.thread_id, sl.launch_id);
     Arc::new(move |tx| {
@@ -544,19 +532,19 @@ fn open_job(
         super::run_hook(&me.hooks.open_job);
         let word = me.fence.load(Ordering::Acquire);
         if !fence_quiet(word) {
-            return Ok(Err(Closed::Fence));
+            return Ok(None);
         }
         // A unit that may still write: a running input unit, or a human unit not yet
         // recorded (submitted after the worker sampled the session).
         if me.running_flag.load(Ordering::SeqCst) || me.human_flag.load(Ordering::SeqCst) > 0 {
-            return Ok(Err(Closed::Moved));
+            return Ok(None);
         }
         #[cfg(test)]
         super::run_hook(&me.hooks.open_after_flags);
         let r = tx.read();
         let (Some(t), Some(l), Some(q)) = (r.thread(thread)?, r.launch(launch)?, r.input(input)?)
         else {
-            return Ok(Err(Closed::Moved));
+            return Ok(None);
         };
         if t.closed
             || t.current_launch_id != Some(launch)
@@ -564,7 +552,7 @@ fn open_job(
             || q.state != InputState::Queued
             || q.launch_id != Some(launch)
         {
-            return Ok(Err(Closed::Moved));
+            return Ok(None);
         }
         let live = r.inputs(
             thread,
@@ -580,7 +568,7 @@ fn open_job(
             .find(|i| i.state == InputState::Queued && i.launch_id == Some(launch))
             .map(|i| i.input_id);
         if oldest != Some(input) {
-            return Ok(Err(Closed::Moved));
+            return Ok(None);
         }
         let needs_paste = q.encoding == InputEncoding::BracketedPaste;
         let view = GateView {
@@ -597,12 +585,12 @@ fn open_job(
             needs_bracketed_paste: needs_paste,
             bracketed_paste_on: modes.modes.bracketed_paste,
         };
-        if let GateDecision::Closed(why) = gate(&view) {
-            return Ok(Err(Closed::Gate(why)));
+        if let GateDecision::Closed(_) = gate(&view) {
+            return Ok(None);
         }
         // SB3: a counted write after the evidence's basis with no event of its own.
         let Some(basis) = l.write_basis.as_ref() else {
-            return Ok(Err(Closed::Gate(GateClosedReason::NoEvidence)));
+            return Ok(None);
         };
         let counted = classes(basis.counted);
         let last = counted
@@ -611,7 +599,7 @@ fn open_job(
             .max()
             .unwrap_or(0);
         if last > basis.position {
-            return Ok(Err(Closed::Gate(GateClosedReason::WriteAfterEvidence)));
+            return Ok(None);
         }
         let text = content_text(&r, StreamId::Thread(thread), &q.text)?;
         let head = r.head(StreamId::Thread(thread), 0)?.head_seq;
@@ -621,7 +609,7 @@ fn open_job(
         {
             let st = me.state();
             if st.running.is_some() || st.human_unsettled > 0 {
-                return Ok(Err(Closed::Moved));
+                return Ok(None);
             }
         }
         let competing = match (l.last_human_write_seq, l.last_turn_start_seq) {
@@ -640,9 +628,8 @@ fn open_job(
             Some(head),
             Some(launch),
         )?;
-        let appended = job.flush(tx)?;
-        let _attempt = seq_of(&appended, &derived(&cause, &format!("input:{input}")))?;
-        Ok(Ok(Opened {
+        job.flush(tx)?;
+        Ok(Some(Opened {
             basis: basis.position,
             epoch: modes.bracketed_paste_epoch,
             word,
@@ -681,8 +668,8 @@ async fn open(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>, entry: &LiveLaunch, v
         return;
     };
     let opened = match record(sup, open_job(sl, q, modes, last_started), false).await {
-        Recorded::Done(Ok(o)) => o,
-        Recorded::Done(Err(_)) => return,
+        Recorded::Done(Some(o)) => o,
+        Recorded::Done(None) => return,
         Recorded::Refused(e) => {
             tracing::error!(error = ?e, "an open job refused");
             return;
