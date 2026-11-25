@@ -80,10 +80,6 @@ pub fn request(
 /// # Errors
 ///
 /// As [`request`].
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the agent commands in PR 10a1 part 2")
-)]
 pub fn post_json(
     port: u16,
     path: &str,

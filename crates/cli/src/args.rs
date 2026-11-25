@@ -2,8 +2,12 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use chaldea_core::ids::{Agent, ThreadId};
 use clap::{Parser, Subcommand};
+
+pub use crate::agent_cmd::Until;
 
 /// Chaldea: a PTY-launched AI coding agent client and control plane.
 #[derive(Debug, Parser)]
@@ -30,6 +34,68 @@ pub enum Command {
         #[arg(long)]
         print_url: bool,
     },
+    /// Start an agent CLI in a new thread.
+    Spawn {
+        /// The agent CLI.
+        #[arg(long, value_enum)]
+        agent: AgentArg,
+        /// Its working directory (else the current one).
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<PathBuf>,
+        /// A first prompt, passed to Codex as its positional argument.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// The thread's task.
+        #[arg(long)]
+        task: Option<String>,
+    },
+    /// Start a thread's agent CLI again on its session.
+    Resume {
+        #[arg(value_parser = crate::agent_cmd::thread_id)]
+        thread: ThreadId,
+        /// A first prompt, passed to Codex as its positional argument.
+        #[arg(long)]
+        prompt: Option<String>,
+    },
+    /// Stop a thread's agent CLI and its process tree.
+    Stop {
+        #[arg(value_parser = crate::agent_cmd::thread_id)]
+        thread: ThreadId,
+    },
+    /// Close a thread whose agent CLI has ended.
+    Close {
+        #[arg(value_parser = crate::agent_cmd::thread_id)]
+        thread: ThreadId,
+        /// Stop a running agent CLI first.
+        #[arg(long)]
+        stop: bool,
+    },
+    /// Wait until a thread's process exits, its turn is idle, or it needs attention.
+    Wait {
+        #[arg(value_parser = crate::agent_cmd::thread_id)]
+        thread: ThreadId,
+        #[arg(long, value_enum, default_value = "exited")]
+        until: Until,
+        /// How long to wait, such as 30s, 10m, or 500ms.
+        #[arg(long, value_parser = crate::agent_cmd::duration, default_value = "10m")]
+        timeout: Duration,
+    },
+}
+
+/// `--agent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum AgentArg {
+    Claude,
+    Codex,
+}
+
+impl From<AgentArg> for Agent {
+    fn from(a: AgentArg) -> Agent {
+        match a {
+            AgentArg::Claude => Agent::Claude,
+            AgentArg::Codex => Agent::Codex,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]

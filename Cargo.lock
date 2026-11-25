@@ -285,6 +285,7 @@ dependencies = [
  "chaldea-pty-runtime",
  "clap",
  "rustix",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

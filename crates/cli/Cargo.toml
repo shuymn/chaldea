@@ -46,6 +46,8 @@ chaldea-daemon = { path = "../daemon" }
 # `chaldea open`'s wire types (`PairCodeResponse`, `ErrorBody`).
 chaldea-core = { path = "../core" }
 clap.workspace = true
+# The agent commands' wire bodies (`chaldea_core::command`, `ThreadSummary`).
+serde.workspace = true
 serde_json.workspace = true
 # `host`: the emitter's exit without exit handlers (hook-ingest §2.13), and detaching, the
 # readiness channel, the stop request, and the browser launch (daemon-lifecycle §2.10, §2.13).
