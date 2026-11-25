@@ -504,9 +504,8 @@ async fn git_late_handoff() {
         };
         let read = rig.pauses.arm(Pause::GitShutdownRead);
         let (sup, cwd) = (rig.sup.clone(), dir.path().to_path_buf());
-        let probe = std::thread::spawn(move || {
-            common_dir(&sup, &cwd, sup.now() + Duration::from_millis(500))
-        });
+        let probe =
+            std::thread::spawn(move || common_dir(&sup, &cwd, sup.now() + Duration::from_secs(3)));
         created.wait();
         let end = rig.sup.now() + Duration::from_secs(5);
         let sd = tokio::spawn(shutdown(rig.sup.clone(), end));

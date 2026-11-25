@@ -465,6 +465,10 @@ async fn proof_before_slow_join() {
         rig.sup.tracker.count() > 0,
         "counted while the close is held"
     );
+    rig.until("the op classified the report", || {
+        rig.pauses.passed(Pause::ReportSettled)
+    })
+    .await;
     rig.clock
         .skew(crate::supervisor::PROOF_CUTOFF + Duration::from_secs(1));
     close.go();

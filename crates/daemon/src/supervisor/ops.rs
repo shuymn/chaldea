@@ -773,10 +773,13 @@ pub(crate) struct Proof {
 pub(crate) async fn await_kill(sup: &Supervisor, k: KillTask) -> Proof {
     let cutoff = k.submitted + PROOF_CUTOFF;
     let now = || sup.now();
-    let (first, joined) = tokio::join!(
-        settle_before(now, cutoff, sup.timer(cutoff), k.first),
-        settle_before(now, cutoff, sup.timer(cutoff), k.join),
-    );
+    let first = async {
+        let s = settle_before(now, cutoff, sup.timer(cutoff), k.first).await;
+        sup.pauses().at(Pause::ReportSettled).await;
+        s
+    };
+    let joined = settle_before(now, cutoff, sup.timer(cutoff), k.join);
+    let (first, joined) = tokio::join!(first, joined);
     let first = first.in_time().and_then(Result::ok);
     let joined = match joined {
         Settled::InTime(Ok(o)) => Some(o),

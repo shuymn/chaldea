@@ -112,6 +112,8 @@ pub enum Pause {
     /// A stop op after its `StopRequested` write answered and the kill was classified,
     /// before the exit job.
     StopWritten,
+    /// A stop op after it classified the kill task's first report against the cutoff.
+    ReportSettled,
     /// A kill task right after it fixed its budget (blocking).
     KillTaskStart,
     /// A kill task after `close_by` returned, before the task returns (blocking).
