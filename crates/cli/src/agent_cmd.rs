@@ -91,6 +91,20 @@ pub(crate) enum End {
     Fail(String),
 }
 
+/// Why a command ended without its result.
+#[derive(Debug)]
+enum CommandEnd {
+    Ended(End),
+    /// The refusal's status and code.
+    Refused(u16, Option<ErrorCode>),
+}
+
+impl From<End> for CommandEnd {
+    fn from(e: End) -> Self {
+        CommandEnd::Ended(e)
+    }
+}
+
 /// A request to send, the same bytes on every attempt.
 enum Req<'a> {
     Get(&'a str),
@@ -103,12 +117,12 @@ impl Client<'_> {
     /// polled. A response read at or after the cutoff is not adopted.
     fn exchange<T>(
         &self,
-        cutoff: &Cell<Instant>,
+        cutoff: Instant,
         req: &Req<'_>,
         daemon_required: bool,
         decide: &mut dyn FnMut(Response) -> Option<Result<T, End>>,
     ) -> Result<T, End> {
-        let seen = poll_until_with(cutoff, self.period, self.now, || {
+        let seen = poll_until_with(&Cell::new(cutoff), self.period, self.now, || {
             let port = match (self.discover)() {
                 Ok(Found::Port(p)) => p,
                 Ok(Found::NotRunning) if daemon_required => {
@@ -121,8 +135,8 @@ impl Client<'_> {
             };
             let token = Some(self.token.as_str());
             let r = match req {
-                Req::Get(path) => client::request(port, "GET", path, token, cutoff.get()),
-                Req::Post(path, body) => client::post_json(port, path, token, body, cutoff.get()),
+                Req::Get(path) => client::request(port, "GET", path, token, cutoff),
+                Req::Post(path, body) => client::post_json(port, path, token, body, cutoff),
             };
             match r {
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => Some(Err(End::Timeout)),
@@ -138,7 +152,7 @@ impl Client<'_> {
     /// under SD16's rules.
     fn summary_until(
         &self,
-        cutoff: &Cell<Instant>,
+        cutoff: Instant,
         t: ThreadId,
         daemon_required: bool,
         cond: &dyn Fn(&ThreadSummary) -> Option<Result<(), End>>,
@@ -166,24 +180,24 @@ impl Client<'_> {
     }
 
     /// One summary.
-    fn summary(&self, cutoff: &Cell<Instant>, t: ThreadId) -> Result<ThreadSummary, End> {
+    fn summary(&self, cutoff: Instant, t: ThreadId) -> Result<ThreadSummary, End> {
         self.summary_until(cutoff, t, true, &|_| Some(Ok(())))
     }
 
-    /// One command: its result, or the refusal's status and code.
-    fn command<A: Serialize>(
+    /// One command: its decoded result, or why it ended without one.
+    fn command<A: Serialize, T: serde::de::DeserializeOwned>(
         &self,
-        cutoff: &Cell<Instant>,
+        cutoff: Instant,
         name: &str,
         args: &A,
-    ) -> Result<Result<Response, (u16, Option<ErrorCode>)>, End> {
+    ) -> Result<T, CommandEnd> {
         let body = serde_json::to_vec(&serde_json::json!({
             "command_id": CommandId(uuid::Uuid::new_v4()),
             "args": args,
         }))
         .map_err(|e| End::Fail(format!("the command could not be encoded: {e}")))?;
         let path = format!("/api/commands/{name}");
-        self.exchange(cutoff, &Req::Post(&path, &body), true, &mut |r| {
+        let r = self.exchange(cutoff, &Req::Post(&path, &body), true, &mut |r| {
             let again = matches!(r.status, 408 | 503)
                 || (r.status == 409 && code(&r) == Some(ErrorCode::InProgress));
             match r.status {
@@ -191,7 +205,11 @@ impl Client<'_> {
                 200 => Some(Ok(Ok(r))),
                 s => Some(Ok(Err((s, code(&r))))),
             }
-        })
+        })?;
+        match r {
+            Ok(r) => Ok(decode(&r)?),
+            Err((s, c)) => Err(CommandEnd::Refused(s, c)),
+        }
     }
 }
 
@@ -245,6 +263,14 @@ fn print<T: Serialize>(out: &mut dyn Write, v: &T) {
 fn decode<T: serde::de::DeserializeOwned>(r: &Response) -> Result<T, End> {
     serde_json::from_slice(&r.body)
         .map_err(|e| End::Fail(format!("the daemon's result is not readable: {e}")))
+}
+
+/// A command's end without its result; `death_unconfirmed` is the caller's.
+fn not_done(e: CommandEnd, err: &mut dyn Write) -> ExitCode {
+    match e {
+        CommandEnd::Ended(e) => ended(e, err),
+        CommandEnd::Refused(s, c) => refused(s, c, err),
+    }
 }
 
 /// A refusal's message and exit code; `death_unconfirmed` is the caller's.
@@ -342,8 +368,8 @@ fn launch_outcome(o: LaunchOutcome, err: &mut dyn Write) -> ExitCode {
 }
 
 impl Client<'_> {
-    fn cutoff(&self, d: Duration) -> Cell<Instant> {
-        Cell::new((self.now)() + d)
+    fn cutoff(&self, d: Duration) -> Instant {
+        (self.now)() + d
     }
 
     pub(crate) fn spawn(
@@ -356,22 +382,17 @@ impl Client<'_> {
             return ExitCode::Usage;
         }
         let cutoff = self.cutoff(COMMAND_CUTOFF);
-        let r = match self.command(&cutoff, "spawn", args) {
-            Err(e) => return ended(e, err),
-            Ok(Err((s, c))) => return refused(s, c, err),
-            Ok(Ok(r)) => r,
-        };
-        match decode::<SpawnResult>(&r) {
+        match self.command::<_, SpawnResult>(cutoff, "spawn", args) {
             Ok(v) => {
                 print(out, &v);
                 launch_outcome(v.outcome, err)
             }
-            Err(e) => ended(e, err),
+            Err(e) => not_done(e, err),
         }
     }
 
     /// The current launch, read once before the command, pinned as `expected_launch_id`.
-    fn pinned(&self, cutoff: &Cell<Instant>, t: ThreadId) -> Result<LaunchId, End> {
+    fn pinned(&self, cutoff: Instant, t: ThreadId) -> Result<LaunchId, End> {
         let s = self.summary(cutoff, t)?;
         s.launch
             .map(|l| l.launch_id)
@@ -382,7 +403,7 @@ impl Client<'_> {
     /// within the same cutoff decides the line.
     fn pinned_unconfirmed(
         &self,
-        cutoff: &Cell<Instant>,
+        cutoff: Instant,
         t: ThreadId,
         pinned: LaunchId,
         err: &mut dyn Write,
@@ -402,7 +423,7 @@ impl Client<'_> {
             return ExitCode::Usage;
         }
         let cutoff = self.cutoff(COMMAND_CUTOFF);
-        let l = match self.pinned(&cutoff, t) {
+        let l = match self.pinned(cutoff, t) {
             Ok(l) => l,
             Err(e) => return ended(e, err),
         };
@@ -411,20 +432,15 @@ impl Client<'_> {
             expected_launch_id: l,
             prompt,
         };
-        let r = match self.command(&cutoff, "resume", &args) {
-            Err(e) => return ended(e, err),
-            Ok(Err((_, Some(ErrorCode::DeathUnconfirmed)))) => {
-                return self.pinned_unconfirmed(&cutoff, t, l, err);
-            }
-            Ok(Err((s, c))) => return refused(s, c, err),
-            Ok(Ok(r)) => r,
-        };
-        match decode::<ResumeResult>(&r) {
+        match self.command::<_, ResumeResult>(cutoff, "resume", &args) {
             Ok(v) => {
                 print(out, &v);
                 launch_outcome(v.outcome, err)
             }
-            Err(e) => ended(e, err),
+            Err(CommandEnd::Refused(_, Some(ErrorCode::DeathUnconfirmed))) => {
+                self.pinned_unconfirmed(cutoff, t, l, err)
+            }
+            Err(e) => not_done(e, err),
         }
     }
 
@@ -434,20 +450,15 @@ impl Client<'_> {
             thread_id: t,
             expected_launch_id: None,
         };
-        let r = match self.command(&cutoff, "stop", &args) {
-            Err(e) => return ended(e, err),
-            Ok(Err((_, Some(ErrorCode::DeathUnconfirmed)))) => {
-                return unconfirmed(None, None, err);
-            }
-            Ok(Err((s, c))) => return refused(s, c, err),
-            Ok(Ok(r)) => r,
-        };
-        match decode::<StopResult>(&r) {
+        match self.command::<_, StopResult>(cutoff, "stop", &args) {
             Ok(v) => {
                 print(out, &v);
                 stop_exit(&v, err)
             }
-            Err(e) => ended(e, err),
+            Err(CommandEnd::Refused(_, Some(ErrorCode::DeathUnconfirmed))) => {
+                unconfirmed(None, None, err)
+            }
+            Err(e) => not_done(e, err),
         }
     }
 
@@ -459,7 +470,7 @@ impl Client<'_> {
         err: &mut dyn Write,
     ) -> ExitCode {
         let cutoff = self.cutoff(COMMAND_CUTOFF);
-        let l = match self.pinned(&cutoff, t) {
+        let l = match self.pinned(cutoff, t) {
             Ok(l) => l,
             Err(e) => return ended(e, err),
         };
@@ -468,20 +479,15 @@ impl Client<'_> {
             expected_launch_id: l,
             stop,
         };
-        let r = match self.command(&cutoff, "close", &args) {
-            Err(e) => return ended(e, err),
-            Ok(Err((_, Some(ErrorCode::DeathUnconfirmed)))) => {
-                return self.pinned_unconfirmed(&cutoff, t, l, err);
-            }
-            Ok(Err((s, c))) => return refused(s, c, err),
-            Ok(Ok(r)) => r,
-        };
-        match decode::<CloseResult>(&r) {
+        match self.command::<_, CloseResult>(cutoff, "close", &args) {
             Ok(v) => {
                 print(out, &v);
                 v.stop.as_ref().map_or(ExitCode::Ok, |s| stop_exit(s, err))
             }
-            Err(e) => ended(e, err),
+            Err(CommandEnd::Refused(_, Some(ErrorCode::DeathUnconfirmed))) => {
+                self.pinned_unconfirmed(cutoff, t, l, err)
+            }
+            Err(e) => not_done(e, err),
         }
     }
 
@@ -499,7 +505,6 @@ impl Client<'_> {
             say(err, "the timeout is too long");
             return ExitCode::Usage;
         };
-        let cutoff = Cell::new(at);
         let cond = |s: &ThreadSummary| {
             let exited = s.process_state == ProcessState::Exited;
             let holds = match until {
@@ -517,7 +522,7 @@ impl Client<'_> {
                 None
             }
         };
-        match self.summary_until(&cutoff, t, false, &cond) {
+        match self.summary_until(at, t, false, &cond) {
             Ok(s) => {
                 print(out, &s);
                 ExitCode::Ok
