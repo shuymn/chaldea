@@ -3,6 +3,7 @@
 
 mod flow;
 mod gate;
+mod probe;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

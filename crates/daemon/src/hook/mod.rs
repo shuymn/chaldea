@@ -19,7 +19,7 @@ mod buffer;
 mod intake;
 pub mod payload;
 mod request;
-mod route;
+pub(crate) mod route;
 
 #[cfg(test)]
 mod tests;

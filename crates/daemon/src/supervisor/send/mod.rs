@@ -63,8 +63,8 @@ pub(crate) const SAMPLE_WAIT: Duration = Duration::from_millis(250);
 // ---- the fence word -------------------------------------------------------------------------
 
 /// The low bits count the intakes not yet finished; the high bits count every intake.
-const OPEN_BITS: u32 = 20;
-const OPEN_MASK: u64 = (1 << OPEN_BITS) - 1;
+pub(crate) const OPEN_BITS: u32 = 20;
+pub(crate) const OPEN_MASK: u64 = (1 << OPEN_BITS) - 1;
 const COUNT_MAX: u64 = (1 << (64 - OPEN_BITS)) - 1;
 /// The closed word: every send and key of the launch is refused until it exits.
 pub(crate) const FENCE_CLOSED: u64 = u64::MAX;
