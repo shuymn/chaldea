@@ -404,7 +404,7 @@ Every MVP place that kills processes, reads pids, or spawns children:
 | Place | PR | How this design serves it or stays out |
 |---|---|---|
 | `Session::kill`, `Session::close` step 2, `SpawnedPty` teardown | 2 | `UnixChild::kill_tree`. |
-| `chaldea stop`, `close --stop`, `resume` death check | 10 | The supervisor calls `Session::close(extra, ..)`; `KillReport::method` becomes `launch_death_confirmed.method`; `tree_dead: false` keeps `death_confirmed: false`. |
+| `chaldea stop`, `close --stop`, `resume` death check | 10 | The supervisor calls `Session::kill_by` with the full list, retrying only busy reports, then `Session::close_by`; death is confirmed by the first full-list proving report the op accepts before the kill's submission + 12 s, from `kill_by` or as `CloseOutcome.kill`, whose method becomes `launch_death_confirmed.method`; without one, `death_confirmed: false` (`docs/design/supervisor.md` §2.3 Stop). |
 | Recorded descendants (`extra`) | 10 | The identity format of §2.1. PR 10 records only identities it can prove belong to the launch (its containment evidence and its own spawn records); hook-emitter ancestry is not a source (`docs/design/hook-ingest.md` D10). The public lookup arrives with PR 9 (`pty_runtime::process`), which uses it only for hook binding. |
 | Daemon restart: old tree check by recorded sid and start window | 10 | Stays out. The new daemon does not own the old leader, so it may signal only verified identities: exactly the ownership-lost mode of §2.5. `unix::kill` takes its `Os` and leader as parameters so PR 10 can add an entry point for an unowned leader without changing the engine. |
 | Daemon process rules | 8, 10 | The spawn rule of §2.1 and the ownership precondition of §2.4; loss is detected (`ECHILD` or a start mismatch → `WaitFailed` or the ownership-lost kill). |
@@ -414,7 +414,7 @@ Every MVP place that kills processes, reads pids, or spawns children:
 | Doctor: FakeCli tree kill | 21 | `native()` + `Session` + FakeCli; how the shipped binary gets FakeCli is PR 21's choice. |
 | Windows tree kill (job + recorded descendants) | 4 | Shares the `extra` rule, the caller's full-list obligation, `KillReport`, and testkit (`docs/design/pty-windows.md`). |
 | FakeCli's own children | 3 | testkit only; every sleeper takes `--max-life-secs`; tests hold a `Cleanup`. |
-| Spike watchdog and emergency kill | — | Not lifted; the supervisor (PR 10) decides. |
+| Spike watchdog and emergency kill | — | None: the emergency kill is `stop` (`docs/design/supervisor.md` SD15). |
 
 ## 5. Resource Paths
 

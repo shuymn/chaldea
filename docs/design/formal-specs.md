@@ -68,7 +68,7 @@ Two layers in one module:
 | `reserve(cfg)` | only after `exited` with death confirmed; resets the gate projection, writer, and buffer; a positional prompt is created `sending` | mvp §2.9:323, §2.3:186 |
 | `reserveRefused` | death unconfirmed: raise `resume_blocked`; the reducer then refuses `Reserved` | mvp §2.9:326 |
 | `confirmDeath` | `launch_death_confirmed` | mvp §2.1:84 |
-| `spawn` / `spawnFail` | `launch_started` moves the positional prompt to `sent` with `sent_after_seq` = its seq; a confirmed spawn failure rejects it | mvp §2.3:186 |
+| `spawn` / `spawnFail` / `spawnStartedThenFailed(dc)` | `launch_started` moves the positional prompt to `sent` with `sent_after_seq` = its seq; a spawn that never started rejects it; a process that started and then failed exits the launch `spawn_failed` with no `launch_started`, the positional prompt `unconfirmed` through `LaunchExited`, and death confirmed exactly when the cleanup was (`dc`) | mvp §2.3:186; `docs/design/supervisor.md` §2.3 |
 | `manualFirstTurn` | a human starts a manual Codex launch's first turn through attach (an attach write); its hooks fire from then on | mvp §2.7:303 |
 | `sessionStartHook`, `bind` | the launch's `SessionStart` arrives and invalidates pending candidates; binding records `session_bound` (a turn start), makes Claude's `SessionStart` the evidence candidate, and promotes the buffered hooks in intake order with their intake facts | mvp §2.1:115, §2.7, §2.9:325 |
 | `bufferPrompt`, `bufferStop`, `bufferReady(ev, stop)` | hooks of an unbound live launch, buffered; a settle completion only for the buffered `Stop` it names while no later hook arrived; promotion applies it only if that `Stop` is then the current turn's candidate, and keeps an unsettled `Stop` as the candidate only if it was still live at intake | mvp §2.9:325 |
@@ -84,7 +84,7 @@ Two layers in one module:
 | `stop`, `exit(reason, dc)`, `restart` | stop; exit recovers the launch's inputs and expires its cards; restart exits the open launch with death unconfirmed and recovers every input; buffered hooks of a launch that can no longer bind are dropped (`raw_unknown`) | mvp §2.3:183, §2.4:214, §2.9:325-326 |
 | `stopOfTurn(t)` (`turnStop` for the current turn), `interrupt` | the current turn's `Stop` supersedes the cards and becomes the evidence candidate; a late `Stop` of the previous turn ends nothing and leaves a candidate of its own turn, which backs no evidence; Codex's interrupt supersedes the cards and invalidates the candidate | mvp §2.2:135, §2.10:335 |
 | `cardOpen(c)`, `cardResolve(c)`, `lateResolve(c)` | a card of the current turn; resolving the last open card of the turn feeds `ApprovalsAllResolved`; a resolution of a closed card feeds nothing; each invalidates the evidence candidate | mvp §2.10 |
-| `sessionTimer`, `stall` | `session_start_timeout` for a non-manual live launch with no `SessionStart`; `startup_stall` for an upgraded Codex launch before binding | mvp §2.2:142-143, §2.7 |
+| `sessionTimer`, `stall` | `session_start_timeout` for a non-manual live launch that is unbound (a `SessionStart` that does not bind, such as `foreign_session`, does not stop it); `startup_stall` for an upgraded Codex launch before binding | mvp §2.2:142-143, §2.7 |
 | `setTask`, `decset` | `task_set`; DECSET 2004 | mvp §2.2, §2.3 |
 | `raw(i)`, `rawReadyUnbound(ev)` | reducer inputs with no supervisor guard; `stepUnguarded` adds them | §3 |
 | `rawStep(id, ii)` | an input step with no guard, for deterministic replay coverage of a rejected step in a named trace | §4 |
@@ -135,8 +135,8 @@ All are checked by `pnpm run simulate` (§5). Each reads facts recorded where th
 
 | Trace | What the reducers admit | Contract | Owner |
 |---|---|---|---|
-| `trace_hole_a_reserve_without_death` | after a restart, `Reserved` before any `resume_blocked`: `Exited` carries no death bit and `Reserved` checks only the attention flag (`state.rs:174`, `:278-288`) | mvp §2.9:323 | PR 10 |
-| `trace_hole_c_stale_startup_cause` | `AttentionRaised(StartupStall)` while `exited`, which then survives `Reserved` into the next launch (`state.rs:369-371`) | mvp §2.2:142-143 | PR 10 |
+| `trace_hole_a_reserve_without_death` | after a restart, `Reserved` before any `resume_blocked`: `Exited` carries no death bit and `Reserved` checks only the attention flag (`state.rs:174`, `:278-288`) | mvp §2.9:323 | PR 10a1 |
+| `trace_hole_c_stale_startup_cause` | `AttentionRaised(StartupStall)` while `exited`, which then survives `Reserved` into the next launch (`state.rs:369-371`) | mvp §2.2:142-143 | PR 10a1 |
 | `trace_hole_d_unbound_readiness` | `ReadinessObserved` of an unbound Codex launch (`state.rs:333-336`); fed directly instead of buffered, it survives binding as gate evidence older than the binding | mvp §2.3:171, §2.9:325 | PR 9 |
 | `trace_finding_resolution_without_card_identity` | `ApprovalsAllResolved` carries no card identity: fed for card 1 after card 2 opened in the next turn, it ends the wait for card 2 (`state.rs:362-367`) | mvp §2.10:333-336 | PR 10, PR 13–14 |
 
@@ -189,7 +189,10 @@ The `specs` job of `ci.yml` (`ubuntu-latest`, mise pinned in `mise-action`) inst
 ## 6. Extending
 
 - **PR 9** implements the buffering and promotion the model's `buffer*` actions and `bind` state (hole d).
-- **PR 10** makes the supervisor layer real: each guard here is a checklist item, it decides holes a–c and the recheck-attempt choice of §3, adds §3's competing-submission condition, and grows the model where §1 says. A changed guard changes the spec and its traces in the same PR.
+- **PR 10** makes the supervisor layer real, in three parts: each guard here is a checklist item, and a changed guard changes the spec and its traces in the same PR.
+  - **10a1** (`docs/design/supervisor.md`) implements the launch guards and closes holes a and c in the job that decides them; its guard-to-test table (supervisor §7) maps each daemon guard the core replay cannot see to its test. `sessionTimer` is guarded by `not(st.gp.bound)` (`trace_session_timer_after_unbound_session_start`), and `spawnStartedThenFailed(dc)` models a spawn that started and then failed (`trace_spawn_started_then_failed`, extending `trace_positional_spawn_outcomes`).
+  - **10b**, the send and ack half, decides the recheck-attempt choice of §3, adds §3's competing-submission condition, and grows the model where §1 says.
+  - **10a2** owns `confirmDeath`'s site (the owner's confirmation of a launch 10a1 leaves unconfirmed).
 - **PR 13–14** correlate card resolutions and card keys by `approval_id` (the card finding).
 - **PR 7, 8, 18** implement what Q-B states; §7.4 lists the obligations it hands them.
 - **PR 17**'s `stateright` model checks the Rust sync code; Q-B checks the contract it implements (§7.7).
