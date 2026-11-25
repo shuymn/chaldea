@@ -286,47 +286,25 @@ async fn stalled_task_unconfirmed() {
 }
 
 /// PR10a1-CL-12 `while_starting`: a stop of a launch whose op holds its lock between the
-/// reservation commit and `Session::spawn` waits for it, then stops it.
+/// reservation commit and `Session::spawn` waits for it, then stops it; released after the
+/// clock passed `RequestStart` + 5 s, `confirmed_within_deadline` is false.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn while_starting() {
+    for late in [false, true] {
+        while_starting_with(late).await;
+    }
+}
+
+async fn while_starting_with(late: bool) {
     let rig = Rig::new().await;
-    let after = rig.pauses.arm(Pause::AfterReserve);
-    let cwd = rig.cwd.path().to_string_lossy().into_owned();
-    let spawn = spawn_send(
-        &rig.srv,
-        &rig.srv.command(
-            "spawn",
-            &rig.owner,
-            super::cid(),
-            &json!({ "agent": "codex", "cwd": cwd }).to_string(),
-        ),
-    );
-    after.wait();
-    let t = rig
-        .srv
-        .store
-        .read(|r| Ok(r.threads()?.pop().unwrap().thread_id));
-    let stop = spawn_send(
-        &rig.srv,
-        &rig.srv.command(
-            "stop",
-            &rig.owner,
-            super::cid(),
-            &json!({ "thread_id": t }).to_string(),
-        ),
-    );
-    // The stop waits on the op lock: nothing is killed while the spawn is held.
-    rig.until("the stop's request is admitted", || {
-        rig.srv.store.read(|r| {
-            Ok(
-                r.events_after(chaldea_core::ids::StreamId::Thread(t), 0, 100)?
-                    .events
-                    .len(),
-            )
-        }) > 0
-    })
-    .await;
+    let (spawn, stop, after, start) = stop_while_starting(&rig).await;
+    // The stop's request is in its op: it goes on to wait on the op lock, and nothing is
+    // killed while the spawn is held.
+    start.go();
     assert!(rig.pty.spawns().is_empty());
+    if late {
+        rig.clock.skew(Duration::from_secs(6));
+    }
     after.go();
     let s = spawn.await.unwrap();
     assert_eq!(json(&s)["outcome"], "started");
@@ -334,6 +312,7 @@ async fn while_starting() {
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(json(&r)["outcome"], "stopped");
     assert_eq!(json(&r)["death_confirmed"], true);
+    assert_eq!(json(&r)["confirmed_within_deadline"], !late);
     rig.srv.stop().await;
 }
 
