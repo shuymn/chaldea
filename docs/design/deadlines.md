@@ -79,7 +79,7 @@ Step 3 is §2.10's "each return is classified with one clock sample", and `in_ti
   | `registry::drain_timer` | `sleep_until` | `wait_empty_until`'s unbiased `select!` (§2.2 "Shutdown") |
   | `upgrade::hand_over_bound` | `timeout` | hand-over, polled socket first (§2.4) |
   | `shutdown::deadline_timer` | `sleep_until` | `deadline_first`: clock, poll, timer (daemon-lifecycle §2.8) |
-  | `shutdown::participant_bound` | `timeout_at` | participants, polled first, result discarded (§2.8) |
+  | `shutdown::participant_bound` | `timeout_at` | participants, polled first; a result taken at or after the participant's end counts as not done by it, which keeps the lock (§2.8 steps 3 and 6) |
   | `shutdown::record_pause` | `sleep` | record-removal retry; the deletion is admitted by the budget checks (§2.8 step 5) |
   | `listener::accept_backoff` | `sleep` | accept-error backoff, shutdown wins (§2.2) |
   | `listener::stall_timer` | `sleep` | `ConnIo` write stall, progress first (§2.2) |

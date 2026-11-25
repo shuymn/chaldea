@@ -138,7 +138,7 @@ fn deadline_timer(end: tokio::time::Instant) -> tokio::time::Sleep {
 
 #[allow(
     clippy::disallowed_methods,
-    reason = "the participants' plain bound, polled participant first, result discarded (daemon-lifecycle §2.8)"
+    reason = "the participants' bound, polled participant first; a result taken at or after the end counts as not done (daemon-lifecycle §2.8)"
 )]
 fn participant_bound<F: Future>(end: tokio::time::Instant, fut: F) -> tokio::time::Timeout<F> {
     tokio::time::timeout_at(end, fut)
@@ -648,13 +648,22 @@ impl Coordinator {
             }
             self.mark(&format!("participant:{}", p.name()), Some(end));
             let fut = participant_bound(tokio::time::Instant::from_std(end), p.shutdown(end));
-            match self.guarded(fut).await {
+            let ended = self.guarded(fut).await;
+            // A result taken at or after `end` (the participant is polled before its timer)
+            // counts as not done by its end.
+            let ended = match ended {
+                Ok(Ok(_)) if Instant::now() >= end => Ok(Err(())),
+                Ok(Ok(e)) => Ok(Ok(e)),
+                Ok(Err(_)) => Ok(Err(())),
+                Err(c) => Err(c),
+            };
+            match ended {
                 Err(Crashed) => return self.crash_exit(held_now(&st)),
                 Ok(Ok(ParticipantEnd::Clean)) => {}
                 Ok(Ok(ParticipantEnd::LeftRunning)) => {
                     participants_left.push(format!("participant {} left work running", p.name()));
                 }
-                Ok(Err(_elapsed)) => {
+                Ok(Err(())) => {
                     participants_left.push(format!("participant {} not done by its end", p.name()));
                 }
             }

@@ -857,16 +857,25 @@ fn participant_left_running_keeps_the_lock() {
     enum How {
         Answer(ParticipantEnd),
         PastItsEnd,
+        /// `Clean` from a poll that ends just after `end`: the participant blocks its thread
+        /// until then, so its timer cannot fire first.
+        CleanJustAfterItsEnd,
     }
     struct Ends(How);
     impl ShutdownParticipant for Ends {
         fn name(&self) -> &'static str {
             "ends"
         }
-        fn shutdown(&self, _end: Instant) -> BoxFuture<'_, ParticipantEnd> {
+        fn shutdown(&self, end: Instant) -> BoxFuture<'_, ParticipantEnd> {
             match self.0 {
                 How::Answer(e) => Box::pin(async move { e }),
                 How::PastItsEnd => Box::pin(std::future::pending()),
+                How::CleanJustAfterItsEnd => Box::pin(async move {
+                    while Instant::now() <= end {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    ParticipantEnd::Clean
+                }),
             }
         }
     }
@@ -884,6 +893,13 @@ fn participant_left_running_keeps_the_lock() {
         ),
         (
             How::PastItsEnd,
+            (
+                Some(FailReason::LockHeldAtExit),
+                LockDisposition::HeldUntilExit,
+            ),
+        ),
+        (
+            How::CleanJustAfterItsEnd,
             (
                 Some(FailReason::LockHeldAtExit),
                 LockDisposition::HeldUntilExit,
