@@ -1535,15 +1535,20 @@ fn panicking_kill() -> (Session, FakeChild) {
 }
 
 /// The kill was made and panicked; the input, the control, and the child are released
-/// anyway, the child never having exited.
+/// anyway, the child never having exited. The writer thread drops the input on its own
+/// exit, which may come after the waiter drops the child, so the input's drop is awaited.
 fn released_after_a_kill_panic(child: &FakeChild) {
     assert!(
         child.wait_dropped(Instant::now() + WAIT),
         "the waiter still holds the child"
     );
+    assert!(
+        wait_until(|| child.log().contains(&FakeEvent::InputDropped)),
+        "{:?}",
+        child.log()
+    );
     let log = child.log();
     assert!(log.contains(&FakeEvent::Kill { extra: Vec::new() }));
-    assert!(log.contains(&FakeEvent::InputDropped), "{log:?}");
     assert!(log.contains(&FakeEvent::ControlClosed), "{log:?}");
     assert!(!log.contains(&FakeEvent::Exited), "{log:?}");
 }
