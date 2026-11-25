@@ -17,13 +17,15 @@ use super::eventually;
 use super::shared;
 use super::support::commands::{CounterArgs, Probe, counter, slow_body};
 use super::support::http::{
-    TestServer, connect, host_events_of, parse, reached, reached_sync, read_to_end, settled,
-    spawn_send, write,
+    DEADLINE, TestServer, connect, host_events_of, parse, reached, reached_sync, read_to_end,
+    settled, spawn_send, write,
 };
 use super::support::soon;
 use crate::http::auth::sha256;
 use crate::http::commands::{Admitted, prepare_args, run};
-use crate::http::{ApiError, CommandRegistry, MonotonicClock, Shared, StoreFatal};
+use crate::http::{
+    ApiError, CommandRegistry, MonotonicClock, RequestStart, Shared, StoreFatal, WriteFailure,
+};
 use crate::store::test_faults::CommitFault;
 use crate::store::tests::support::waits;
 use crate::store::{SubmitError, WriteError};
@@ -54,6 +56,7 @@ fn admitted(s: &Shared, name: &str, secret: &str, id: CommandId, args: &str) -> 
         identity,
         intent: prepared.intent,
         handler,
+        start: RequestStart(s.cfg.clock.now()),
     }
 }
 
@@ -77,6 +80,37 @@ async fn fill_queue(
     }
     assert_eq!(queued.len(), 256);
     (writer, queued)
+}
+
+/// The ticket-park signal fires on an admitted write's parked ticket: a submission refused
+/// before it (`QueueFull`) does not consume it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ticket_park_signal_skips_a_refused_submission() {
+    let (srv, _probe) = TestServer::with_commands(|_| {}).await;
+    let s = shared(&srv);
+    let parked = s.faults.arm_ticket_park();
+    let (writer, queued) = fill_queue(&srv).await;
+    let refused = crate::http::ctx::run_write(&s, soon(), Box::new(|_tx| Ok(())), None).await;
+    assert!(
+        matches!(refused, Err(WriteFailure::Submit(SubmitError::QueueFull))),
+        "{refused:?}"
+    );
+    writer.send(()).unwrap();
+    for t in queued {
+        settled(t).await.unwrap();
+    }
+    let writer = srv.hold_writer().await;
+    let s2 = s.clone();
+    let admitted = tokio::spawn(async move {
+        crate::http::ctx::run_write(&s2, soon(), Box::new(|_tx| Ok(())), None).await
+    });
+    waits::bounded(Duration::from_secs(10), parked)
+        .await
+        .expect("parked in time")
+        .expect("the signal of the admitted ticket");
+    writer.send(()).unwrap();
+    assert!(joined(admitted).await.is_ok());
+    srv.stop().await;
 }
 
 /// 32 concurrent requests with one `command_id` reach the writer as 32 jobs (all queued
@@ -1104,4 +1138,289 @@ fn identity_covers_name_and_values() {
     assert_ne!(request_identity("test_completed", &normalized), id);
     // Number spellings: an integer field refuses `1.0`.
     assert_eq!(identity(r#"{"n":1.0}"#), Err(ApiError::bad_args()));
+}
+
+/// A handler whose `revokes()` is true nudges the sockets once its intent committed: no
+/// nudge while the intent job is held, one after, and the revocation is visible to a read
+/// when the nudge arrives. A handler whose `revokes()` is false never nudges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn revoking_intent_nudges() {
+    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let s = shared(&srv);
+    for (n, name, nudges) in [(1, "test_revoke", 1), (2, "test_revoke_quiet", 0)] {
+        let victim = srv.token(TokenKind::Owner, None, None).await;
+        let id = srv.token_row(&victim).unwrap().token_id;
+        let mut rx = s.revocations.subscribe();
+        let before = *rx.borrow_and_update();
+        // Each nudge records whether the revocation was visible to a read when it arrived.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (store, sha, record) = (srv.store.store().clone(), sha256(&victim), seen.clone());
+        let watcher = tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let row = store
+                    .read(soon(), move |tx| tx.token_by_hash(&sha))
+                    .unwrap();
+                record
+                    .lock()
+                    .unwrap()
+                    .push(row.is_some_and(|r| r.revoked_at.is_some()));
+            }
+        });
+        let (intent_reached, intent_release) = probe.hold_intent();
+        let reply = spawn_send(
+            &srv,
+            &srv.command(name, &owner, cid(n), &format!(r#"{{"token":"{id}"}}"#)),
+        );
+        reached_sync(intent_reached).await;
+        assert_eq!(
+            *s.revocations.borrow(),
+            before,
+            "{name}: no nudge before the commit"
+        );
+        intent_release.send(()).unwrap();
+        assert_eq!(joined(reply).await.status, 200, "{name}");
+        // `after_ok` runs before the runner publishes the reply.
+        assert_eq!(*s.revocations.borrow(), before + nudges, "{name}");
+        if nudges == 1 {
+            eventually(Duration::from_secs(10), "the nudge is read", || {
+                !seen.lock().unwrap().is_empty()
+            })
+            .await;
+            assert_eq!(*seen.lock().unwrap(), [true], "{name}");
+        }
+        watcher.abort();
+        assert!(
+            srv.token_row(&victim).unwrap().revoked_at.is_some(),
+            "{name}"
+        );
+    }
+    srv.stop().await;
+}
+
+/// A revoking intent whose commit outcome is unknown: the revocation may be visible, no
+/// nudge runs (the nudge is guaranteed for acknowledged commits only), and `CommitUnknown`
+/// is delivered to the sink. This checks that delivery; that the daemon's sink then stops
+/// the daemon is the lifecycle gate's (`lifecycle::tests::gate`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn revoking_commit_unknown_is_fatal() {
+    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let s = shared(&srv);
+    let victim = srv.token(TokenKind::Owner, None, None).await;
+    let id = srv.token_row(&victim).unwrap().token_id;
+    let before = *s.revocations.borrow();
+    let (intent_reached, intent_release) = probe.hold_intent();
+    let reply = spawn_send(
+        &srv,
+        &srv.command(
+            "test_revoke",
+            &owner,
+            cid(1),
+            &format!(r#"{{"token":"{id}"}}"#),
+        ),
+    );
+    reached_sync(intent_reached).await;
+    *srv.store.store().faults().commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
+    intent_release.send(()).unwrap();
+    assert_eq!(
+        joined(reply).await.outcome(),
+        (503, code("outcome_unknown"))
+    );
+    assert_eq!(
+        *s.revocations.borrow(),
+        before,
+        "no nudge without an acknowledged commit"
+    );
+    assert!(srv.token_row(&victim).unwrap().revoked_at.is_some());
+    assert_eq!(*srv.sink.0.lock().unwrap(), [StoreFatal::CommitUnknown]);
+    srv.stop().await;
+}
+
+/// How an effect ends decides the reply and the report: `Unrecorded` answers 503
+/// `outcome_unknown` at once with no completion attempt and reports `ReceiptUncompleted`;
+/// after the request's reply time it reports once the effect ends; `ShuttingDown` answers
+/// the same with no report. The receipt stays `in_progress` in each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn effect_outcomes() {
+    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let s = shared(&srv);
+    let cmd = |n, outcome: &str| {
+        srv.command(
+            "test_effect_outcome",
+            &owner,
+            cid(n),
+            &format!(r#"{{"outcome":"{outcome}"}}"#),
+        )
+    };
+
+    // Unrecorded while the request waits.
+    let before = s.faults.submits();
+    let started = std::time::Instant::now();
+    let r = srv.send(&cmd(1, "unrecorded")).await;
+    assert_eq!(r.outcome(), (503, code("outcome_unknown")));
+    assert!(
+        started.elapsed() < DEADLINE,
+        "answered before the reply time"
+    );
+    assert_eq!(
+        s.faults.submits(),
+        before + 1,
+        "the intent only: no completion"
+    );
+    assert_eq!(
+        std::mem::take(&mut *srv.sink.0.lock().unwrap()),
+        [StoreFatal::ReceiptUncompleted { command_id: cid(1) }]
+    );
+    assert_eq!(
+        srv.receipt(cid(1)).unwrap().status,
+        ReceiptStatus::InProgress
+    );
+
+    // Unrecorded after the request's reply time.
+    let (effect_reached, release) = probe.hold_effect();
+    let first = spawn_send(&srv, &cmd(2, "unrecorded"));
+    reached(effect_reached).await;
+    assert_eq!(joined(first).await.outcome(), (409, code("in_progress")));
+    assert!(srv.sink.0.lock().unwrap().is_empty());
+    release.send(()).unwrap();
+    let sink = srv.sink.clone();
+    eventually(Duration::from_secs(10), "the sink is told", move || {
+        !sink.0.lock().unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(
+        std::mem::take(&mut *srv.sink.0.lock().unwrap()),
+        [StoreFatal::ReceiptUncompleted { command_id: cid(2) }]
+    );
+    assert_eq!(
+        srv.receipt(cid(2)).unwrap().status,
+        ReceiptStatus::InProgress
+    );
+
+    // ShuttingDown.
+    let before = s.faults.submits();
+    let r = srv.send(&cmd(3, "shutting_down")).await;
+    assert_eq!(r.outcome(), (503, code("outcome_unknown")));
+    assert_eq!(s.faults.submits(), before + 1);
+    assert!(srv.sink.0.lock().unwrap().is_empty());
+    assert_eq!(
+        srv.receipt(cid(3)).unwrap().status,
+        ReceiptStatus::InProgress
+    );
+    assert_eq!(probe.effects(), 3);
+    srv.stop().await;
+}
+
+/// The nudge a component takes from the server bumps the sockets' revocation counter, and
+/// holds the server weakly: once the server is gone it does nothing.
+#[tokio::test]
+async fn revocation_nudge_from_the_server() {
+    let (srv, _probe) = TestServer::with_commands(|_| {}).await;
+    let s = shared(&srv);
+    let nudge = srv.server.revocation_nudge();
+    let before = *s.revocations.borrow();
+    nudge.clone().nudge();
+    assert_eq!(*s.revocations.borrow(), before + 1);
+    let weak = Arc::downgrade(&s);
+    drop(s);
+    srv.stop().await;
+    assert!(weak.upgrade().is_none(), "the server is gone");
+    nudge.nudge();
+}
+
+/// The launch commands' codes (supervisor §2.2) are handler replies at one status each: a
+/// result with the code at that status is stored and answered as it is; at any other status
+/// it is 500 `internal`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launch_codes_at_their_statuses() {
+    let (srv, _probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let codes = [
+        ("thread_closed", 409),
+        ("launch_changed", 409),
+        ("launch_live", 409),
+        ("death_unconfirmed", 409),
+        ("worktree_unavailable", 409),
+        ("no_session", 409),
+        ("prompt_rejected", 400),
+        ("prompt_too_large", 400),
+        ("launch_busy", 504),
+    ];
+    let mut n = 0;
+    for (c, status) in codes {
+        for (at, want) in [
+            (status, (status, code(c))),
+            (
+                if status == 409 { 400 } else { 409 },
+                (500, code("internal")),
+            ),
+        ] {
+            n += 1;
+            let args = format!(r#"{{"text":"x","code":"{c}","status":{at}}}"#);
+            let r = srv
+                .send(&srv.command("test_completed", &owner, cid(n), &args))
+                .await;
+            assert_eq!(r.outcome(), want, "{c} at {at}");
+        }
+    }
+    srv.stop().await;
+}
+
+/// Through the HTTP path: `dispatch` hands the intent the request's `RequestStart` (its first
+/// head byte), not a later reading. The server's clock moves 1 s, within the 2 s budget,
+/// while the guard's token read is held, after the request was received.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn dispatch_copies_request_start() {
+    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    srv.clock.stop();
+    let origin = srv.clock.now();
+    let (reached_tx, reached) = std::sync::mpsc::channel();
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    shared(&srv).faults.arm_before_read(0, move || {
+        let _ = reached_tx.send(());
+        let _ = wait.recv_timeout(Duration::from_secs(10));
+    });
+    let reply = spawn_send(&srv, &srv.command("test_ctx", &owner, cid(1), "{}"));
+    reached_sync(reached).await;
+    srv.clock.advance(Duration::from_secs(1));
+    release.send(()).unwrap();
+    assert_eq!(joined(reply).await.status, 200);
+    let seen = probe.ctx_seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, origin, "the first head byte's reading");
+    srv.stop().await;
+}
+
+/// The intent sees the request's `RequestStart` as `request_start`, and as `job_start` the
+/// server's clock read in its job: a clock moved while the job waits behind the writer is
+/// seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn intent_sees_request_and_job_start() {
+    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let s = shared(&srv);
+    let origin = s.cfg.clock.now() - Duration::from_secs(1);
+    let mut cmd = admitted(&s, "test_ctx", &owner, cid(1), "{}");
+    cmd.start = RequestStart(origin);
+    let writer = srv.hold_writer().await;
+    let before = s.faults.submits();
+    let w = s.clone();
+    let reply = tokio::spawn(async move { run(&w, origin + Duration::from_secs(60), cmd).await });
+    eventually(Duration::from_secs(10), "the intent job is queued", || {
+        s.faults.submits() == before + 1
+    })
+    .await;
+    let moved = s.cfg.clock.now() + Duration::from_secs(2);
+    srv.clock.skew(Duration::from_secs(2));
+    writer.send(()).unwrap();
+    assert_eq!(joined(reply).await.unwrap().status(), 200);
+    let seen = probe.ctx_seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, origin);
+    assert!(seen[0].1 >= moved, "the job's reading, not the request's");
+    srv.clock.skew(Duration::ZERO);
+    srv.stop().await;
 }

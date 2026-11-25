@@ -112,6 +112,51 @@
           "const": "internal",
           "description": "500.",
           "type": "string"
+        },
+        {
+          "const": "thread_closed",
+          "description": "409: resume or close of a closed thread.",
+          "type": "string"
+        },
+        {
+          "const": "launch_changed",
+          "description": "409: the expected launch is not the thread's current launch.",
+          "type": "string"
+        },
+        {
+          "const": "launch_live",
+          "description": "409: resume or close (without `stop`) while the current launch has not exited.",
+          "type": "string"
+        },
+        {
+          "const": "death_unconfirmed",
+          "description": "409: the current launch exited without confirmed death.",
+          "type": "string"
+        },
+        {
+          "const": "worktree_unavailable",
+          "description": "409: the launch's worktree is not `active` or `released`.",
+          "type": "string"
+        },
+        {
+          "const": "no_session",
+          "description": "409: resume of a thread with no bound session.",
+          "type": "string"
+        },
+        {
+          "const": "prompt_rejected",
+          "description": "400: the input encoders' check refused the positional prompt.",
+          "type": "string"
+        },
+        {
+          "const": "prompt_too_large",
+          "description": "400: the prompt exceeds `MAX_PROMPT_BYTES`.",
+          "type": "string"
+        },
+        {
+          "const": "launch_busy",
+          "description": "504: a stop could not take its launch and re-read it in time; nothing changed.",
+          "type": "string"
         }
       ]
     }

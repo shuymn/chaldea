@@ -62,6 +62,12 @@ fn launch_exited(code: &Value) -> Value {
     json!({ "launch_id": UUID, "code": code, "signal": null, "reason": "exit", "death_confirmed": true })
 }
 
+fn with_failed_start(failed: Value) -> Value {
+    let mut v = launch_exited(&json!(null));
+    v["failed_start"] = failed;
+    v
+}
+
 fn generation(g: &Value) -> Value {
     json!({ "generation": g, "path": "/work/s.jsonl", "file_id": "1:2" })
 }
@@ -123,6 +129,60 @@ fn payload_verdicts_agree() {
             false,
         ),
         (
+            "launch_exited without failed_start",
+            "launch_exited",
+            launch_exited(&json!(0)),
+            true,
+        ),
+        (
+            "launch_exited with a full failed_start",
+            "launch_exited",
+            with_failed_start(json!({ "pid": 42, "start_time": "1", "pgid_or_job": "42" })),
+            true,
+        ),
+        (
+            "launch_exited with a bare failed_start pid",
+            "launch_exited",
+            with_failed_start(json!({ "pid": 42 })),
+            true,
+        ),
+        (
+            "launch_exited with failed_start null",
+            "launch_exited",
+            with_failed_start(json!(null)),
+            false,
+        ),
+        (
+            "failed_start as an array",
+            "launch_exited",
+            with_failed_start(json!([42, "1", "42"])),
+            false,
+        ),
+        (
+            "failed_start with a null part",
+            "launch_exited",
+            with_failed_start(json!({ "pid": 42, "start_time": null })),
+            false,
+        ),
+        (
+            "failed_start with a null pgid_or_job",
+            "launch_exited",
+            with_failed_start(json!({ "pid": 42, "pgid_or_job": null })),
+            false,
+        ),
+        (
+            "failed_start without its pid",
+            "launch_exited",
+            with_failed_start(json!({ "start_time": "1" })),
+            false,
+        ),
+        (
+            "failed_start pid overflow",
+            "launch_exited",
+            with_failed_start(json!({ "pid": 4_294_967_296_u64 })),
+            false,
+        ),
+        (
             "u16 at its maximum",
             "vt_snapshot_taken",
             vt(&json!(65_535)),
@@ -153,6 +213,14 @@ fn payload_verdicts_agree() {
             false,
         ),
     ];
+    // `FailedStart` itself decodes only from an object.
+    assert!(
+        serde_json::from_value::<chaldea_core::payload::FailedStart>(json!([42, "1", "42"]))
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<chaldea_core::payload::FailedStart>(json!({ "pid": 42 })).is_ok()
+    );
     for (name, kind, payload, want) in cases {
         let rust = rust_decodes(kind, &payload);
         let schema = typed.is_valid(&json!({ "kind": kind, "payload": payload }));

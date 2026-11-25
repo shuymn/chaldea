@@ -398,6 +398,7 @@ pub fn exited(t: ThreadId, l: LaunchId) -> NewEvent {
             signal: None,
             reason: ExitReason::Exit,
             death_confirmed: true,
+            failed_start: None,
         }),
     )
 }
@@ -847,6 +848,7 @@ impl Model {
                 signal: None,
                 reason: ExitReason::Exit,
                 death_confirmed: confirmed,
+                failed_start: None,
             }),
         ));
         let m = self.launches.get_mut(&l).unwrap();

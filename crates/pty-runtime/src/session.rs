@@ -157,6 +157,7 @@ pub struct SessionStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseOutcome {
+    /// The kill step's report, or the earlier proving report the close reused.
     pub kill: KillReport,
     pub close: CloseReport,
     pub output: Option<OutputEnd>,
@@ -169,6 +170,8 @@ pub struct CloseOutcome {
     /// True when the drain ended before the snapshot was taken.
     pub final_after_end: bool,
     pub elapsed: Duration,
+    /// The exit the waiter reported by the end of the close; `None` when it had not.
+    pub exit: Option<ChildExit>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,8 +226,9 @@ const EV_VT_FAILED: u8 = 1 << 4;
 
 /// State shared by the session, its threads, and its sink.
 pub(crate) struct Shared {
-    /// Queue lock: both lanes, the slot, the counters, the ring.
-    pub(crate) q: Mutex<Queue>,
+    /// Queue lock: both lanes, the slot, the counters, the ring. Shared with every
+    /// [`WriterObserver`].
+    pub(crate) q: Arc<Mutex<Queue>>,
     pub(crate) cv: Condvar,
     /// VT lock: the `Term`, the parser, the subscribers, the output end.
     vt: Mutex<VtState>,
@@ -274,7 +278,7 @@ impl Shared {
             let vt = Vt::new(size, target);
             let modes = ModeWord::new(vt.modes());
             Shared {
-                q: Mutex::new(Queue::new(limits.log_records)),
+                q: Arc::new(Mutex::new(Queue::new(limits.log_records))),
                 cv: Condvar::new(),
                 vt: Mutex::new(VtState {
                     vt,
@@ -517,7 +521,8 @@ pub struct Session {
     waiter: Option<JoinHandle<()>>,
     waiter_stop: Arc<AtomicBool>,
     drain: Option<Drain>,
-    last_kill: Mutex<Option<KillReport>>,
+    /// The last kill report and the `extra` list it was made with.
+    last_kill: Mutex<Option<(KillReport, Vec<ProcessIdentity>)>>,
     closed: bool,
 }
 
@@ -684,6 +689,40 @@ impl Session {
         lock(&self.sh.q).last_started(classes)
     }
 
+    /// A reader of the writer's positions that does not borrow the session and outlives it.
+    #[must_use]
+    pub fn observer(&self) -> WriterObserver {
+        WriterObserver {
+            q: self.sh.q.clone(),
+        }
+    }
+
+    /// Close's step 1 alone: closes the queue, so no unit is permitted after it; settles
+    /// every unit not yet permitted `Closed` with zero bytes, runs their completions before
+    /// it returns, and returns their records. A later call (or the close's own step 1)
+    /// settles nothing more and returns none.
+    pub fn seal(&self) -> Vec<WriteRecord> {
+        let fired = self.close_queue();
+        let records = fired.records();
+        fired.fire(&self.sh);
+        records
+    }
+
+    /// Closes the queue and wakes the writer; the caller fires what it settled.
+    fn close_queue(&self) -> Fired {
+        let mut fired = Fired::default();
+        {
+            let mut q = lock(&self.sh.q);
+            let n = q.close(&mut fired);
+            self.sh
+                .responder
+                .dropped_after_end
+                .fetch_add(n, Ordering::Relaxed);
+        }
+        self.sh.cv.notify_all();
+        fired
+    }
+
     /// The records after `seq` (the in-progress one included), from the diagnostic ring.
     pub fn writes_after(&self, seq: u64) -> Result<Vec<WriteRecord>, LogTruncated> {
         lock(&self.sh.q).writes_after(seq)
@@ -789,25 +828,53 @@ impl Session {
         }
     }
 
-    /// Tree kill only; I/O stays up.
+    /// Tree kill only; I/O stays up. [`Session::kill_by`] with `deadline` as `lock_by`.
     ///
     /// `extra` is the caller's full list of the launch's recorded descendants, on every
     /// call, retries included; the report's survivors are diagnostic, not a list to
     /// resubmit. A supervisor retries through `kill` while the session is available.
     pub fn kill(&self, extra: &[ProcessIdentity], deadline: Instant) -> KillReport {
-        let report = self.child.kill_tree(extra, deadline);
-        *lock(&self.last_kill) = Some(report.clone());
+        self.kill_by(extra, deadline, deadline)
+    }
+
+    /// [`Session::kill`] whose wait for a kill-state lock another call holds ends at
+    /// `lock_by` with a busy report ([`KillReport::is_busy`], no signal): a lock held at the
+    /// first try and obtained at or after `lock_by` counts as not taken. A call made at or
+    /// after `deadline` still makes no OS call.
+    pub fn kill_by(
+        &self,
+        extra: &[ProcessIdentity],
+        lock_by: Instant,
+        deadline: Instant,
+    ) -> KillReport {
+        let report = self.child.kill_tree(extra, lock_by, deadline);
+        *lock(&self.last_kill) = Some((report.clone(), extra.to_vec()));
         report
     }
 
     /// The bounded close order of §2.2.
     ///
     /// `extra` is the caller's full list of the launch's recorded descendants, as for
-    /// [`Session::kill`]. When this consuming close cannot prove death (`tree_dead: false`),
-    /// the caller keeps the launch unresolved.
+    /// [`Session::kill`]. The kill step reuses the last kill report when that proved the
+    /// tree dead and `extra` is empty. When this consuming close cannot prove death
+    /// (`tree_dead: false`), the caller keeps the launch unresolved.
     #[must_use = "the outcome says what was confirmed released"]
     pub fn close(mut self, extra: &[ProcessIdentity], bounds: CloseBounds) -> CloseOutcome {
-        self.close_inner(extra, bounds)
+        self.close_inner(extra, bounds, None)
+    }
+
+    /// [`Session::close`] whose kill step waits only until the absolute `kill_deadline`
+    /// (also its `lock_by`) instead of `now + bounds.kill`, and reuses the last kill report
+    /// when that proved the tree dead for the same `extra` list, empty or not. The other
+    /// steps keep `bounds`.
+    #[must_use = "the outcome says what was confirmed released"]
+    pub fn close_by(
+        mut self,
+        extra: &[ProcessIdentity],
+        kill_deadline: Instant,
+        bounds: CloseBounds,
+    ) -> CloseOutcome {
+        self.close_inner(extra, bounds, Some(kill_deadline))
     }
 
     /// Test signals.
@@ -823,28 +890,34 @@ impl Session {
         self.sh.fail_vt_next.store(true, Ordering::Release);
     }
 
-    fn close_inner(&mut self, extra: &[ProcessIdentity], bounds: CloseBounds) -> CloseOutcome {
+    fn close_inner(
+        &mut self,
+        extra: &[ProcessIdentity],
+        bounds: CloseBounds,
+        kill_deadline: Option<Instant>,
+    ) -> CloseOutcome {
         self.closed = true;
         let t0 = Instant::now();
         let sh = self.sh.clone();
 
         // 1. Close the queue and settle everything that has not dispatched.
-        let mut fired = Fired::default();
-        {
-            let mut q = lock(&sh.q);
-            let n = q.close(&mut fired);
-            sh.responder
-                .dropped_after_end
-                .fetch_add(n, Ordering::Relaxed);
-        }
-        sh.cv.notify_all();
-        fired.fire(&sh);
+        self.close_queue().fire(&sh);
 
-        // 2. Kill, unless the tree is already reported dead and nothing new is named.
-        let prior = lock(&self.last_kill).clone();
-        let kill = match prior {
-            Some(k) if k.tree_dead && extra.is_empty() => k,
-            _ => self.kill(extra, Instant::now() + bounds.kill),
+        // 2. Kill, unless the tree is already reported dead and nothing new is named
+        // (`close`), or the same list is named (`close_by`).
+        let prior = self
+            .last_kill
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let kill = match (prior, kill_deadline) {
+            (Some((k, _)), None) if k.tree_dead && extra.is_empty() => k,
+            (Some((k, list)), Some(_)) if k.tree_dead && list == extra => k,
+            (_, None) => {
+                let at = Instant::now() + bounds.kill;
+                self.child.kill_tree(extra, at, at)
+            }
+            (_, Some(at)) => self.child.kill_tree(extra, at, at),
         };
 
         // 3. Release the input.
@@ -921,6 +994,7 @@ impl Session {
             final_snapshot,
             final_after_end,
             elapsed: t0.elapsed(),
+            exit: sh.exit.get().copied(),
         }
     }
 }
@@ -930,7 +1004,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         if !self.closed {
-            let _ = self.close_inner(&[], CloseBounds::default());
+            let _ = self.close_inner(&[], CloseBounds::default(), None);
         }
     }
 }
@@ -953,6 +1027,45 @@ fn waiter_main(sh: &Shared, child: &dyn PtyChild, stop: &AtomicBool) {
     }));
     if r.is_err() {
         sh.publish_wait_failed("waiter panicked".into());
+    }
+}
+
+/// Reads the writer's dispatch positions without the session: a clone of the session's
+/// queue lock, so it outlives the session. `Clone`.
+#[derive(Clone)]
+pub struct WriterObserver {
+    q: Arc<Mutex<Queue>>,
+}
+
+impl fmt::Debug for WriterObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WriterObserver")
+    }
+}
+
+impl WriterObserver {
+    /// The highest `seq` dispatched in any of `classes`; 0 before any.
+    #[must_use]
+    pub fn last_started(&self, classes: ClassSet) -> u64 {
+        lock(&self.q).last_started(classes)
+    }
+
+    /// The highest `seq` dispatched per class, indexed by `OriginClass::index`, under one
+    /// queue lock.
+    #[must_use]
+    pub fn last_started_each(&self) -> [u64; 3] {
+        lock(&self.q).last_started_each()
+    }
+
+    /// [`WriterObserver::last_started_each`] without waiting: `None` while another thread
+    /// holds the queue lock.
+    #[must_use]
+    pub fn try_last_started_each(&self) -> Option<[u64; 3]> {
+        match self.q.try_lock() {
+            Ok(q) => Some(q.last_started_each()),
+            Err(TryLockError::Poisoned(e)) => Some(e.into_inner().last_started_each()),
+            Err(TryLockError::WouldBlock) => None,
+        }
     }
 }
 

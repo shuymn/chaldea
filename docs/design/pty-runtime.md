@@ -29,7 +29,7 @@ Sources read for this document (paths are relative to each root):
 
 **Threading model.** The crate is synchronous: std threads, blocking I/O, no async runtime. PTY ends block on both OSes (the macOS master is nonblocking behind a reader and writer that block in `poll` and stop on close; ConPTY uses synchronous anonymous pipes), so an async runtime would only wrap them in blocking tasks, as Codex does (`utils/pty/src/pty.rs:241`, `:285`). Every callback the crate invokes (`Completion`, `OutputSink`, `on_event`) must return without blocking, and the crate never waits on a caller. The daemon bridges to tokio by passing callbacks that `try_send` on a tokio channel or complete a `oneshot`, and calls `close`, `kill`, and `resize` from `spawn_blocking`.
 
-**Spawn lock.** Every child the daemon process creates is created under the process-wide spawn lock (`with_spawn_lock`, `src/spawn.rs`). On macOS it keeps the exec-error pipe and the PTY slave from leaking into a concurrent fork; on Windows the backend holds it around `CreatePseudoConsole`, which holds inheritable duplicates of conhost's pipe ends during the call, and around each `CreateProcessW`. A crate function that needs the lock takes `&SpawnGuard`, a guard only that lock produces; failure-path waits and releases run without it.
+**Spawn lock.** Every child the daemon process creates is created under the process-wide spawn lock (`with_spawn_lock`, `src/spawn.rs`; `with_spawn_lock_before` waits for it only until a deadline and returns `None` when the lock was not taken by then, running nothing). On macOS it keeps the exec-error pipe and the PTY slave from leaking into a concurrent fork; on Windows the backend holds it around `CreatePseudoConsole`, which holds inheritable duplicates of conhost's pipe ends during the call, and around each `CreateProcessW`. A crate function that needs the lock takes `&SpawnGuard`, a guard only that lock produces; failure-path waits and releases run without it.
 
 **Locks and callbacks.** Lock order: control lock → VT lock → queue lock; no code takes them in another order.
 
@@ -85,8 +85,10 @@ pub trait PtyChild: Send + Sync {
     /// Kills the whole tree plus the recorded descendants in `extra` (identities the daemon
     /// proves belong to the launch, never hook-emitter ancestry); idempotent; returns by `deadline`. The caller passes its
     /// full list of recorded descendants on every call, retries included; the report's
-    /// survivors are diagnostic, never a list to resubmit.
-    fn kill_tree(&self, extra: &[ProcessIdentity], deadline: Instant) -> KillReport;
+    /// survivors are diagnostic, never a list to resubmit. A kill-state lock another call
+    /// holds is waited for only until `lock_by` (at most `deadline`); one held at the first
+    /// try and obtained at or after `lock_by` counts as not taken: a busy report, no signal.
+    fn kill_tree(&self, extra: &[ProcessIdentity], lock_by: Instant, deadline: Instant) -> KillReport;
 }
 pub trait PtyControl: Send {
     /// Resizes the PTY. Not bounded by the crate: ConPTY's resize can wait on conhost.
@@ -97,7 +99,13 @@ pub trait PtyControl: Send {
 
 pub struct ProcessIdentity { pub pid: u32, pub start_time: String, pub group: String }  // → launch_started { pid, start_time, pgid_or_job }
 pub struct ChildExit { pub code: Option<i32>, pub signal: Option<i32> }               // → launch_exited { code, signal }
-pub struct KillReport { pub method: String, pub tree_dead: bool, pub survivors: Vec<ProcessIdentity> }  // method → launch_death_confirmed
+pub struct KillReport {                      // method → launch_death_confirmed
+    pub method: String, pub tree_dead: bool, pub survivors: Vec<ProcessIdentity>,
+    pub attempt: KillAttempt,                // what this call did to the tree
+    pub proved_at: Option<Instant>,          // with tree_dead: the backend's clock read right after the proving read
+}
+impl KillReport { pub fn is_busy(&self) -> bool; }   // unix_busy, windows_busy, fake_busy
+pub enum KillAttempt { Signalled, AlreadyDead, NotAttempted }   // tree_dead: true only with the first two
 pub struct CloseReport { pub elapsed: Option<Duration> }                              // None: did not return by the deadline
 
 pub enum SpawnError {
@@ -115,12 +123,12 @@ pub enum Cleanup { Confirmed, Unresolved { kill: Option<KillReport>, close: Opti
 
 - `spawn` returns either a `SpawnedPty` or an error after releasing everything it created: no process alive, no handle or descriptor open (spike F-2c). When it cannot prove that, the error carries `Cleanup::Unresolved`. Every release attempts the kill first and releases I/O even when the kill could not prove death (then `Unresolved`). Once a process exists, release follows `SpawnedParts::teardown`: kill the tree, drop the input write end, close the PTY while the drain reads, finish the drain. Before any process exists the order is the backend's (Windows: close while the drain reads, then input, drain, job; `docs/design/pty-windows.md` §2.2, spike §4.6).
 - The PTY is opened at `spec.size`: the session initialises the VT and the responder's size from it before the drain starts.
-- The child's environment is exactly `spec.env` (macOS: `Command::env_clear` then `envs`; Windows: an explicit `CREATE_UNICODE_ENVIRONMENT` block). The scrub list is the daemon's (mvp §2.7 "Env scrub").
+- The child's environment is exactly `spec.env` (macOS: `Command::env_clear` then `envs`; Windows: an explicit `CREATE_UNICODE_ENVIRONMENT` block). The scrub list is the daemon's (mvp §2.7 "Env scrub"); it compares keys with `env_key_eq` and `env_key_has_prefix`, which compare as the backend's environment block does: `CompareStringOrdinal(…, TRUE)` over UTF-16 units on Windows (a prefix compares the key's first units), exact bytes on macOS.
 - The backend starts a `Drain` (§2.4) over its output read end with the given `DrainSink`, so every output byte reaches the session's VT from the first one. Windows starts it right after `CreatePseudoConsole`, before `CreateProcessW` (spike §4.6); macOS after the PTY is opened and sized. The reader the drain owns returns `Ok(0)` once every slave end is closed: the Unix backend maps the master's `EIO` after hangup to EOF, and drops the parent's slave handle right after spawn (spike §4.7); on Windows conhost is the last writer of the output pipe and closes its end at `ClosePseudoConsole`, or earlier if conhost dies.
 - **Dropping `input` writes no bytes.** portable-pty's writer writes `\n` + VEOF on drop (`unix.rs:351-361`); the macOS backend writes through its own handle on a dup of the master fd, and the Windows backend through the input pipe's write end; neither drop writes anything. With this obligation the session can release the input whenever the writer thread finishes, without an ordering hazard against a live CLI.
 - `input` accepts each `write` call whole or fails: the macOS writer loops on a nonblocking master until every byte is accepted, and returns a short count only after progress followed by close or an error; Windows `WriteFile` on a synchronous pipe completes fully. A short write is tolerated by the writer (it loops) and recorded (§2.3).
 - `PtyChild::wait_timeout` never blocks past `timeout` (Windows `WaitForSingleObject(timeout)`; macOS `waitid(WNOWAIT)` polling; the backend owns reaping) and must not hold a lock `kill_tree` needs.
-- `kill_tree` is the PR 3 / PR 4 tree kill (`killpg` HUP→TERM→KILL plus `getsid` scan; job termination) applied also to every identity in `extra` that is still alive with the same start time, and returns by its deadline; `tree_dead: false` with survivors when it could not prove death. The caller passes its full list of recorded descendants on every call (the first stop, a retry after a busy report or `tree_dead: false`, and `close` after an earlier `kill`). What a backend keeps across calls is internal margin that the full-list rule makes invisible to the caller (`docs/design/pty-unix.md` §2.5, `docs/design/pty-windows.md` §2.5). `method` names how the kill ran: `unix_*` on macOS; `windows_job`, `windows_job_incomplete` (the job's member list may be incomplete), or `windows_busy` (another kill of the same child held the kill state) on Windows, and `windows_process` for the process-only kill of a failed spawn.
+- `kill_tree` is the PR 3 / PR 4 tree kill (`killpg` HUP→TERM→KILL plus `getsid` scan; job termination) applied also to every identity in `extra` that is still alive with the same start time, and returns by its deadline; `tree_dead: false` with survivors when it could not prove death. The caller passes its full list of recorded descendants on every call (the first stop, a retry after a busy report or `tree_dead: false`, and `close` after an earlier `kill`). What a backend keeps across calls is internal margin that the full-list rule makes invisible to the caller (`docs/design/pty-unix.md` §2.5, `docs/design/pty-windows.md` §2.5). `method` names how the kill ran: `unix_*` on macOS (`unix_busy` when another kill of the same child held the kill state past `lock_by`); `windows_job`, `windows_job_incomplete` (the job's member list may be incomplete), or `windows_busy` (another kill of the same child held the kill state past `lock_by`) on Windows, and `windows_process` for the process-only kill of a failed spawn. A busy call, and a call made at or after `deadline`, make no OS call. `attempt` is `Signalled` when this call signalled or terminated anything, `AlreadyDead` when the tree was proven dead without that, and `NotAttempted` otherwise (busy, expired, or, on macOS, ownership lost before any signal). `proved_at` is read right after the proving read, so a proof from the last observation started before the deadline can carry an instant past it.
 - `PtyControl::close` returns by the caller's deadline even when the OS close blocks (Windows: `ClosePseudoConsole` on a close worker started before the pseudoconsole exists, since some builds block until output is read; `docs/design/pty-windows.md` §2.3). `CloseReport::elapsed` is `Some` when the close operation returned; a hung close shows as `elapsed: None` and `Released::control == false`.
 - `evidence` carries what doctor and the real-host runs record (Windows: `job_branch` = `job_list` or `suspended`, `conpty_module`, and `job_list_error` when the job-list attempt failed and the suspended branch ran).
 - Every `unsafe` block lives in `unix::sys` or `windows::sys` (D7).
@@ -155,8 +163,12 @@ impl Session {
     pub fn resize(&self, size: PtySize) -> io::Result<Resized>;      // Resized::{PtyAndVt, PtyOnly}
 
     pub fn status(&self) -> SessionStatus;                               // exit, output end, input state, vt_failed, ResponderStatus
-    pub fn kill(&self, extra: &[ProcessIdentity], deadline: Instant) -> KillReport;   // tree kill only; I/O stays up
+    pub fn observer(&self) -> WriterObserver;                            // the writer's positions, outliving the session
+    pub fn seal(&self) -> Vec<WriteRecord>;                              // close step 1 alone
+    pub fn kill(&self, extra: &[ProcessIdentity], deadline: Instant) -> KillReport;   // kill_by(extra, deadline, deadline)
+    pub fn kill_by(&self, extra: &[ProcessIdentity], lock_by: Instant, deadline: Instant) -> KillReport;   // tree kill only; I/O stays up
     pub fn close(self, extra: &[ProcessIdentity], bounds: CloseBounds) -> CloseOutcome;
+    pub fn close_by(self, extra: &[ProcessIdentity], kill_deadline: Instant, bounds: CloseBounds) -> CloseOutcome;
     #[cfg(feature = "fake")] pub fn probe(&self) -> Probe;               // test signals (§2.7)
     #[cfg(feature = "fake")] pub fn fail_vt_on_next_piece(&self);
 }
@@ -167,6 +179,13 @@ pub enum OutputEvent<'a> { Bytes { offset: u64, bytes: &'a [u8] }, End(&'a Outpu
 pub enum Flow { Continue, Stop }
 pub fn channel_sink(capacity: usize) -> (OutputSink, OutputReceiver);   // one FIFO channel + byte budget
 pub enum Received { Bytes { offset: u64, bytes: Vec<u8> }, End(OutputEnd), Lagged { at: u64 } }   // OutputReceiver::recv_timeout
+
+#[derive(Clone)] pub struct WriterObserver { /* the session's queue lock */ }
+impl WriterObserver {
+    pub fn last_started(&self, classes: ClassSet) -> u64;
+    pub fn last_started_each(&self) -> [u64; 3];                 // per class (OriginClass::index), under one queue lock
+    pub fn try_last_started_each(&self) -> Option<[u64; 3]>;     // None while another thread holds the queue lock
+}
 ```
 
 **Start.** The drain feeds the VT from the first output byte, so startup queries are parsed while `spawn` runs; their replies wait in the reply lane until the writer thread exists, and an EOF or read error before then is an ordinary `OutputEnded`. Until the input is handed to the writer, the guard owns every endpoint, so a thread-creation failure leaves no partially started writer owning the input; the tree is killed before any PTY end is released. The VT and the responder are initialised from `spec.size` before the backend spawns, so a startup `CSI 18 t` is answered correctly.
@@ -177,10 +196,14 @@ pub enum Received { Bytes { offset: u64, bytes: Vec<u8> }, End(OutputEnd), Lagge
 
 **Subscribe.** A diagnostic snapshot plus the output bytes after its offset, with no gap and no duplicate. Under the VT lock (taken by `try_lock` until `deadline`, else `VtUnavailable`) the session takes the snapshot with its `output_offset`, registers the sink, and reads the output end; the drain publishes the end under the same lock, so a subscriber racing EOF gets exactly one `End` (from dispatch, or at once after registration when the output already ended). Under one VT lock hold the drain feeds a piece, advances `output_offset` past it, and takes the registered sinks; it dispatches the piece to them after releasing the lock, so a sink registered later gets whole pieces from its snapshot's offset on. It is not a replay checkpoint: the snapshot holds no pending escape sequence, rendition, or saved terminal state; attach's repaint is PR 11's design. At most `limits.subscribers` sinks; a sink that returns `Stop` or panics is removed and never called again. `channel_sink` sends byte chunks and the terminal item through one FIFO channel that never blocks the sender; a separate atomic budget bounds the queued bytes, so the terminal item always fits: when a chunk would exceed the budget it drops the bytes, sends `Lagged { at }` (the offset of the first dropped byte), and returns `Stop`; `End` is always sent. Its receiver yields every queued byte chunk, then `Lagged` if a byte was dropped, else `End`; `recv_timeout` applies one deadline to both taking the receiver and the receive.
 
+**Seal.** `seal` is close step 1 alone: no unit is permitted after it; every unit not yet permitted is settled `NotStarted(Closed)` with zero bytes, its completion runs before `seal` returns, and `seal` returns their records. A later call, or the close's own step 1, settles nothing more and returns none.
+
+**Kill and close by an instant.** `kill_by` passes `lock_by` to `PtyChild::kill_tree`: a busy report (`KillReport::is_busy`) means another kill held the kill state past `lock_by` and nothing was signalled. `close_by` is `close` whose kill step runs `kill_by(extra, kill_deadline, kill_deadline)` instead of a call bounded by `now + bounds.kill`, and whose reuse rule is the same full `extra` list: the last kill report is reused when it proved the tree dead for an identical list, empty or not. `close` reuses it only when `extra` is empty. The other steps keep `bounds`.
+
 **Close order** (`close` and `Drop`). Every step has an absolute budget from `CloseBounds`; a step that runs out of budget is reported and the next step runs.
 
 1. **Close the queue** (closed flag set under the queue lock): no further write call gets permission (§2.3); new `submit` calls fail `Closed`; every queued unit, and a unit in the slot that has not dispatched, is settled `NotStarted(Closed)`, a never-dequeued unit getting its `seq` then; their completions fire after unlocking. Settling never depends on the writer thread.
-2. **Kill** `kill_tree(extra, kill)` unless the tree is already reported dead and `extra` is empty.
+2. **Kill** `kill_tree(extra, kill)` (for `close_by`, with `kill_deadline` as both instants) unless the last kill report proved the tree dead and `extra` is empty (for `close_by`: `extra` is that report's list).
 3. **Release the input**: signal the writer and wait up to `input` for it to drop `input` and exit. A writer inside a permitted `write` call keeps `input` until that call returns; dropping writes no bytes (§2.1).
 4. **Close the PTY** `control.close(close)` under the control lock, while the drain keeps reading (ConPTY is never closed under an undrained pipe).
 5. **Finish the drain** `Drain::finish(drain)`: wait for EOF or a read error and join the drain thread, else abandon it.
@@ -195,6 +218,7 @@ pub struct CloseOutcome {
     pub final_snapshot: Option<Snapshot>, // taken in step 6 only if the VT lock was free
     pub final_after_end: bool,            // true when the drain ended before the snapshot was taken
     pub elapsed: Duration,
+    pub exit: Option<ChildExit>,          // the exit the waiter reported by the end of the close
 }
 pub struct Released { pub input: bool, pub control: bool, pub output: bool, pub tree_dead: bool }
 ```
@@ -382,8 +406,9 @@ impl FakePty {
 pub struct FakeScript {
     pub fail: Option<SpawnError>,                                // spawn returns this
     pub startup_output: Vec<u8>,                                 // written before spawn returns; spawn returns after the sink parsed it
-    pub kill: KillBehavior,                                      // ExitOnKill (default) | Ignore | ExitAfter(Duration)
+    pub kill: KillBehavior,                                      // ExitOnKill (default) | Ignore | ExitAfter(Duration) | Unconfirmed | ProveOnCall(n) | Panic
     pub hang_control_close: bool,                                // control.close blocks until its deadline, CloseReport { elapsed: None }
+    pub hold_waiter: bool,                                       // wait_timeout blocks until FakeChild::release_waiter
 }
 pub struct FakeChild { /* … */ }
 impl FakeChild {
@@ -392,6 +417,10 @@ impl FakeChild {
     pub fn close_output(&self);                                  // EOF
     pub fn fail_output(&self, kind: io::ErrorKind);              // sets the error, then writes a wake byte the reader swallows
     pub fn exit(&self, e: ChildExit);
+    pub fn fail_wait(&self);                                     // every later wait_timeout fails: WaitFailed, no exit
+    pub fn release_waiter(&self);                                // ends hold_waiter's block
+    pub fn hold_kill_lock(&self) -> KillLockHold;                // holds the kill state until released or dropped
+    pub fn signals(&self) -> u32;                                // signal-equivalent operations so far
     pub fn hold_writes(&self) -> WriteHold;                      // the next write() blocks until released or dropped
     pub fn fail_writes_after(&self, bytes: u64, kind: io::ErrorKind);
     pub fn short_writes(&self, max: usize);                      // write() accepts at most `max` bytes per call
@@ -399,7 +428,7 @@ impl FakeChild {
     pub fn fail_next_resize(&self);
     pub fn writes(&self) -> Vec<Vec<u8>>;                        // every write() call's bytes, in order (call boundaries kept)
     pub fn input(&self) -> Vec<u8>;
-    pub fn log(&self) -> Vec<FakeEvent>;  // Spawned, WriteEntered, Write(n), Resize(size), ResizeFailed, Kill { extra }, InputDropped, ControlClosed, OutputClosed, Exited
+    pub fn log(&self) -> Vec<FakeEvent>;  // Spawned, WriteEntered, Write(n), Resize(size), ResizeFailed, Kill { extra }, Signal, InputDropped, ControlClosed, OutputClosed, Exited
 }
 impl WriteHold { pub fn wait_entered(&self, deadline: Instant) -> bool; pub fn release(self); }
 impl OutputReceiver { pub fn hold(&self) -> impl Sized + '_; }   // holds the receiver's side; the sink must still make progress
@@ -412,7 +441,7 @@ impl Probe {
 }
 ```
 
-`SessionConfig` has a `#[cfg(feature = "fake")]` start fault (`StartFault::Writer`, `StartFault::Waiter`, failing that thread's creation). Identity: `pid` from a counter, `start_time` `fake-<n>`, `group` `fake-<n>`. `kill_tree` records its `extra` and reports `method: "fake"` and `tree_dead` per `KillBehavior`. `WriteHold::wait_entered` and `Probe` are the deterministic signals that a thread is at a given point; `FakeEvent` order is what the close-order tests assert.
+`SessionConfig` has a `#[cfg(feature = "fake")]` start fault (`StartFault::Writer`, `StartFault::Waiter`, failing that thread's creation). Identity: `pid` from a counter, `start_time` `fake-<n>`, `group` `fake-<n>`. `kill_tree` records `Kill { extra }` on every call; an expired call or a dead child then signals nothing (`NotAttempted` or `AlreadyDead`), and the deadline is checked again right before the signal, so a call that reaches it at or after its deadline also sends nothing (`NotAttempted`); a kill-state lock held by `hold_kill_lock` past `lock_by` gives `fake_busy`; otherwise it records `Signal` exactly where a native backend would signal and reports `method: "fake"` (`fake_unconfirmed` for `Unconfirmed`) and `tree_dead` per `KillBehavior`: `Unconfirmed` returns at once with no signal, `ProveOnCall(n)` returns `Signalled` and `tree_dead: false` before the `n`-th signal and proves the tree dead on it, and `Panic` panics inside the call. `WriteHold::wait_entered` and `Probe` are the deterministic signals that a thread is at a given point; `FakeEvent` order is what the close-order tests assert.
 
 ## 3. Structure Options
 
@@ -488,7 +517,8 @@ Every MVP path where bytes reach the PTY or PTY output is consumed:
 | Spawn failure | The backend returns `NeverStarted` or `StartedThenFailed` with its cleanup result (§2.1); nothing is handed over. |
 | Thread creation fails in `Session::spawn` | Created threads are stopped and joined, then the guard's teardown runs (the input never left it); `StartedThenFailed` carries the cleanup result, with an abandoned drain reported apart from confirmed release. |
 | Child exit | Exit published, then `Exited` once; undispatched units refused `ChildExited`; a dispatched unit stops before its next write call; drain continues to EOF; session stays until close. |
-| `kill` | `kill_tree(extra, deadline)`; I/O stays up so the final output and snapshot remain available. |
+| `kill` / `kill_by` | `kill_tree(extra, lock_by, deadline)`; I/O stays up so the final output and snapshot remain available. |
+| `seal` | Close step 1; the session stays up for `kill_by` and `close_by`. |
 | `close` / `Drop` | Close order of §2.2, each step bounded; blocked threads abandoned and named; `Released` says what was confirmed. `Drop` blocks at most the sum of the `CloseBounds`; the daemon calls `close` itself from `spawn_blocking`. |
 | Reader EOF | `OutputEnded(Eof)`; sinks get `End`; the VT and snapshots stay. |
 | Read error | `OutputEnded(Error)`, never reported as EOF. |
@@ -498,7 +528,7 @@ Every MVP path where bytes reach the PTY or PTY output is consumed:
 | Panic in the writer thread (e.g. a backend `write`) | `catch_unwind` around the writer loop; then the writer closes the queue, settles queued units `NotStarted(Closed)`, records the slot's unit as `Incomplete { error: "unknown_after_panic" }` if dispatched (its confirmed prefix kept; the call that panicked may have written more), marks input broken (`InputBroken` cause `writer_panicked`). |
 | Panic in the waiter | `catch_unwind` around the wait loop; then `WaitFailed("waiter panicked")`. |
 
-Every wait of the crate is bounded except `resize`: `CompletionReceiver::recv_deadline`, `OutputReceiver::recv_timeout`, `snapshot` and `subscribe` (their deadline), `kill(deadline)`, `close(bounds)` (all six steps), `wait_timeout`, `Drain::finish(bound)`, the Windows close worker wait, the writer's pause (`max_pause`). Two blocking calls have no deadline of their own, a `write` to a child that stopped reading and a `read` the backend has not unblocked; close does not wait on them past its budgets, reports their threads as abandoned, and their endpoints are released when the call returns.
+Every timed wait of the crate is bounded by its own deadline: `CompletionReceiver::recv_deadline`, `OutputReceiver::recv_timeout`, `snapshot` and `subscribe` (their deadline), `kill(deadline)` and `kill_by` (the lock wait until `lock_by`, the call until `deadline`), `close(bounds)` and `close_by` (all six steps), `wait_timeout`, `Drain::finish(bound)`, the Windows close worker wait, and the writer's pause (`max_pause`). `resize` has no deadline. `WriterObserver::last_started_each` blocks on the queue lock with no deadline; every holder keeps that lock only for one queue operation, and `try_last_started_each` never waits. FakePty's `FakeScript.hold_waiter` blocks the fake waiter until the test calls `FakeChild::release_waiter`; a close bounds its wait for it and reports `pty-wait` abandoned. Two blocking calls have no deadline of their own, a `write` to a child that stopped reading and a `read` the backend has not unblocked; close does not wait on them past its budgets, reports their threads as abandoned, and their endpoints are released when the call returns.
 
 ## 6. Purpose Layer and Plan Layer
 

@@ -17,7 +17,8 @@ use super::super::faults::{Faults, Point};
 use super::super::files::{LockProbe, probe};
 use super::super::gate::{ConsoleEvent, ShutdownGate, SignalName, StopCause};
 use super::super::{
-    Budgets, DaemonConfig, ShutdownParticipant, names, prepare_process, run_process_with,
+    Budgets, DaemonConfig, ParticipantEnd, ShutdownParticipant, names, prepare_process,
+    run_process_with,
 };
 use super::{
     Helper, RecordingReady, TestComponents, WAIT, detached, field, foreground, helper_dir,
@@ -654,7 +655,7 @@ fn coordinator_panic_returns() {
         fn name(&self) -> &'static str {
             "bomb"
         }
-        fn shutdown(&self, _end: Instant) -> BoxFuture<'_, ()> {
+        fn shutdown(&self, _end: Instant) -> BoxFuture<'_, ParticipantEnd> {
             Box::pin(async { panic!("participant") })
         }
     }
@@ -910,13 +911,13 @@ fn sigchld_default_while_serving() {
         fn name(&self) -> &'static str {
             "signals"
         }
-        fn shutdown(&self, _end: Instant) -> BoxFuture<'_, ()> {
+        fn shutdown(&self, _end: Instant) -> BoxFuture<'_, ParticipantEnd> {
             let s = chaldea_pty_runtime::host::signal_state().unwrap();
             report(&format!(
                 "checks sigchld={:?} nocldwait={}",
                 s.sigchld, s.no_cldwait
             ));
-            Box::pin(async {})
+            Box::pin(async { ParticipantEnd::Clean })
         }
     }
     if in_helper() {

@@ -3,15 +3,33 @@
 
 use std::time::Duration;
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use ts_rs::TS;
+
 use crate::ids::Agent;
 use crate::payload::InputEncoding;
 
 /// The OS of the host a daemon runs on. The daemon maps `std::env::consts::OS` to it once at
-/// startup; `core` never reads the host OS itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// startup with [`HostOs::from_os_str`]; `core` never reads the host OS itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum HostOs {
     Macos,
     Windows,
+}
+
+impl HostOs {
+    /// The host OS named by a `std::env::consts::OS` value: `"macos"` and `"windows"`;
+    /// any other value is `None` (a daemon there refuses to start).
+    #[must_use]
+    pub fn from_os_str(os: &str) -> Option<HostOs> {
+        match os {
+            "macos" => Some(HostOs::Macos),
+            "windows" => Some(HostOs::Windows),
+            _ => None,
+        }
+    }
 }
 
 /// One row of `docs/mvp-design.md` §2.7, the columns the input encoders own.
@@ -212,6 +230,20 @@ mod tests {
             }
         }
         assert_eq!(from_match, CAPABILITIES);
+    }
+
+    #[test]
+    fn host_os_from_str() {
+        assert_eq!(HostOs::from_os_str("macos"), Some(HostOs::Macos));
+        assert_eq!(HostOs::from_os_str("windows"), Some(HostOs::Windows));
+        assert_eq!(HostOs::from_os_str("linux"), None);
+        assert_eq!(HostOs::from_os_str(""), None);
+        assert_eq!(HostOs::from_os_str("Windows"), None);
+        assert_eq!(serde_json::to_string(&HostOs::Macos).unwrap(), r#""macos""#);
+        assert_eq!(
+            serde_json::from_str::<HostOs>(r#""windows""#).unwrap(),
+            HostOs::Windows
+        );
     }
 
     #[test]

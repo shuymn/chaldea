@@ -8,7 +8,7 @@ use std::io;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
-use crate::backend::{KillReport, ProcessIdentity};
+use crate::backend::{KillAttempt, KillReport, ProcessIdentity};
 
 pub(crate) const METHOD: &str = "windows_job";
 pub(crate) const METHOD_INCOMPLETE: &str = "windows_job_incomplete";
@@ -271,11 +271,30 @@ fn dedup(groups: [Vec<ProcessIdentity>; 5]) -> Vec<ProcessIdentity> {
     out
 }
 
-fn report(method: &str, tree_dead: bool, survivors: Vec<ProcessIdentity>) -> KillReport {
+/// A report of a call that did not prove the tree dead.
+fn report(method: &str, attempt: KillAttempt, survivors: Vec<ProcessIdentity>) -> KillReport {
     KillReport {
         method: method.to_owned(),
-        tree_dead,
+        tree_dead: false,
         survivors,
+        attempt,
+        proved_at: None,
+    }
+}
+
+/// The report of a proof: `proved_at` is the clock read right after the proving read, taken
+/// before any handle is released.
+fn proved<O: JobOs>(call: &Call<'_, O>) -> KillReport {
+    KillReport {
+        method: METHOD.to_owned(),
+        tree_dead: true,
+        survivors: Vec::new(),
+        attempt: if call.terminated {
+            KillAttempt::Signalled
+        } else {
+            KillAttempt::AlreadyDead
+        },
+        proved_at: call.observed_at,
     }
 }
 
@@ -287,14 +306,17 @@ fn lock_state<H>(m: &Mutex<KillState<H>>) -> Option<MutexGuard<'_, KillState<H>>
     }
 }
 
-/// The steps of §2.5.
+/// The steps of §2.5. A held kill lock is waited for until `lock_by` (capped at
+/// `deadline`); one obtained only at or after it counts as not taken.
 pub(crate) fn kill_tree<O: JobOs>(
     os: &O,
     leader: &Leader<'_, O::Held>,
     extra: &[ProcessIdentity],
+    lock_by: Instant,
     deadline: Instant,
     state: &Mutex<KillState<O::Held>>,
 ) -> KillReport {
+    let lock_by = lock_by.min(deadline);
     let supplied = split(extra, leader.me);
     let supplied_ids = || {
         supplied
@@ -306,7 +328,7 @@ pub(crate) fn kill_tree<O: JobOs>(
     let busy = || {
         report(
             METHOD_BUSY,
-            false,
+            KillAttempt::NotAttempted,
             dedup([
                 vec![leader.identity.clone()],
                 Vec::new(),
@@ -325,7 +347,7 @@ pub(crate) fn kill_tree<O: JobOs>(
         let held = st.held.keys().map(|&(p, t)| held_identity(p, t)).collect();
         return report(
             METHOD_INCOMPLETE,
-            false,
+            KillAttempt::NotAttempted,
             dedup([
                 vec![leader.identity.clone()],
                 held,
@@ -334,15 +356,20 @@ pub(crate) fn kill_tree<O: JobOs>(
                 supplied.malformed.clone(),
             ]),
         );
+    } else if let Some(st) = lock_state(state) {
+        st
     } else {
         loop {
-            if let Some(st) = lock_state(state) {
-                break st;
-            }
-            if expired(os, deadline) {
+            if expired(os, lock_by) {
                 return busy();
             }
-            pace(os, deadline);
+            pace(os, lock_by);
+            if let Some(st) = lock_state(state) {
+                if expired(os, lock_by) {
+                    return busy();
+                }
+                break st;
+            }
         }
     };
 
@@ -356,6 +383,8 @@ pub(crate) fn kill_tree<O: JobOs>(
         snapshot: None,
         snapshot_taken: false,
         malformed: !supplied.malformed.is_empty(),
+        terminated: false,
+        observed_at: None,
     };
     let wanted: Vec<(u32, u64)> = supplied.wanted.iter().map(|w| (w.0, w.1)).collect();
     for w in &wanted {
@@ -373,11 +402,12 @@ pub(crate) fn kill_tree<O: JobOs>(
 
     // 3. Opening check: an already dead tree is proven with no termination call.
     if call.opening_check(&mut st, &wanted) {
-        return report(METHOD, true, Vec::new());
+        return proved(&call);
     }
 
     // 4. Terminate. Failures are not recorded as proof either way: step 5 reads.
     if !call.expired() {
+        call.terminated = true;
         let _ = os.terminate_job();
     }
     call.terminate_held(&st);
@@ -401,16 +431,18 @@ pub(crate) fn kill_tree<O: JobOs>(
         call.last_count = count.as_ref().ok().copied();
         match count {
             Ok(0) => {
+                call.observed_at = Some(os.now());
                 call.snapshot = None;
                 if call.wait_handles(&mut st) {
                     progress = true;
                 }
                 if call.proven(&st, &wanted) {
-                    return report(METHOD, true, Vec::new());
+                    return proved(&call);
                 }
             }
             Ok(_) => {
                 if !call.expired() {
+                    call.terminated = true;
                     let _ = os.terminate_job();
                 }
                 // 5.4 Member snapshot, once, in the first round with a nonzero count.
@@ -450,9 +482,14 @@ pub(crate) fn kill_tree<O: JobOs>(
         .filter(|w| !call.resolved.contains(&(w.0, w.1)))
         .map(|w| w.2.clone())
         .collect();
+    let attempt = if call.terminated {
+        KillAttempt::Signalled
+    } else {
+        KillAttempt::NotAttempted
+    };
     report(
         method,
-        false,
+        attempt,
         dedup([
             leader_group,
             held,
@@ -475,6 +512,11 @@ struct Call<'a, O: JobOs> {
     snapshot: Option<Vec<ProcessIdentity>>,
     snapshot_taken: bool,
     malformed: bool,
+    /// A `terminate_job` or `terminate` call was made in this call.
+    terminated: bool,
+    /// The clock read right after the latest observation that counts toward the proof (a
+    /// zero count, or a handle seen signalled), before a signalled handle is released.
+    observed_at: Option<Instant>,
 }
 
 impl<O: JobOs> Call<'_, O> {
@@ -483,11 +525,12 @@ impl<O: JobOs> Call<'_, O> {
     }
 
     /// `terminate()` on each held handle while time remains.
-    fn terminate_held(&self, st: &KillState<O::Held>) {
+    fn terminate_held(&mut self, st: &KillState<O::Held>) {
         for h in st.held.values() {
             if self.expired() {
                 break;
             }
+            self.terminated = true;
             let _ = self.os.terminate(h);
         }
     }
@@ -517,6 +560,7 @@ impl<O: JobOs> Call<'_, O> {
                 return any;
             };
             if self.os.signalled(self.leader.handle, wait).unwrap_or(false) {
+                self.observed_at = Some(self.os.now());
                 self.leader_dead = true;
                 any = true;
             }
@@ -531,6 +575,7 @@ impl<O: JobOs> Call<'_, O> {
                 .get(&k)
                 .is_some_and(|h| self.os.signalled(h, wait).unwrap_or(false))
             {
+                self.observed_at = Some(self.os.now());
                 st.held.remove(&k);
                 any = true;
             }
@@ -559,6 +604,7 @@ impl<O: JobOs> Call<'_, O> {
         if count.ok() != Some(0) {
             return false;
         }
+        self.observed_at = Some(self.os.now());
         if self.expired() {
             return false;
         }
@@ -569,6 +615,7 @@ impl<O: JobOs> Call<'_, O> {
         {
             return false;
         }
+        self.observed_at = Some(self.os.now());
         self.leader_dead = true;
         let keys: Vec<(u32, u64)> = st.held.keys().copied().collect();
         for k in keys {
@@ -582,6 +629,7 @@ impl<O: JobOs> Call<'_, O> {
             if !signalled {
                 return false;
             }
+            self.observed_at = Some(self.os.now());
             st.held.remove(&k);
         }
         true
@@ -593,6 +641,7 @@ mod tests {
     //! The real engine and helpers over a scripted process table and clock.
 
     use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
 
     use super::*;
 
@@ -624,6 +673,8 @@ mod tests {
         deny_kill_access: bool,
         open_error: Option<i32>,
         times_error: bool,
+        /// Closing a handle opened on it advances the clock this much.
+        close_cost: Option<Duration>,
     }
 
     fn proc(start: u64, in_job: bool) -> P {
@@ -636,22 +687,35 @@ mod tests {
             deny_kill_access: false,
             open_error: None,
             times_error: false,
+            close_cost: None,
         }
     }
 
-    /// A handle: the pid and the start of the process it was opened on, and its rights.
-    #[derive(Debug, Clone, Copy)]
+    /// A handle: the pid and the start of the process it was opened on, and its rights; with
+    /// `drop_cost`, closing it advances the clock.
+    #[derive(Debug, Clone)]
     struct H {
         pid: u32,
         start: u64,
         access: Access,
+        drop_cost: Option<(Rc<Cell<Duration>>, Duration)>,
+    }
+
+    impl Drop for H {
+        fn drop(&mut self) {
+            if let Some((now, d)) = &self.drop_cost {
+                now.set(now.get() + *d);
+            }
+        }
     }
 
     type Hook = Box<dyn Fn(&C, &Os)>;
+    /// A held kill lock and the clock time a sleep frees it at.
+    type HeldLock = (MutexGuard<'static, KillState<H>>, Option<Duration>);
 
     struct Os {
         base: Instant,
-        now: Cell<Duration>,
+        now: Rc<Cell<Duration>>,
         procs: RefCell<HashMap<u32, P>>,
         calls: RefCell<Vec<C>>,
         count_error: Cell<bool>,
@@ -662,13 +726,15 @@ mod tests {
         /// Clock advance of every OS call (not `now`).
         cost: Cell<Duration>,
         hook: RefCell<Option<Hook>>,
+        /// A kill lock "another call" holds, dropped once a sleep reaches the instant.
+        held_lock: RefCell<Option<HeldLock>>,
     }
 
     impl Os {
         fn new() -> Os {
             let os = Os {
                 base: Instant::now(),
-                now: Cell::new(Duration::ZERO),
+                now: Rc::new(Cell::new(Duration::ZERO)),
                 procs: RefCell::new(HashMap::new()),
                 calls: RefCell::new(Vec::new()),
                 count_error: Cell::new(false),
@@ -677,6 +743,7 @@ mod tests {
                 terminate_job_error: Cell::new(false),
                 cost: Cell::new(Duration::ZERO),
                 hook: RefCell::new(None),
+                held_lock: RefCell::new(None),
             };
             os.add(L, proc(1_000, true));
             os
@@ -726,6 +793,7 @@ mod tests {
                 pid: L,
                 start: 1_000,
                 access: Access::Kill,
+                drop_cost: None,
             }
         }
 
@@ -746,7 +814,7 @@ mod tests {
                 handle: &h,
                 me: ME,
             };
-            kill_tree(self, &leader, extra, deadline, st)
+            kill_tree(self, &leader, extra, deadline, deadline, st)
         }
     }
 
@@ -764,6 +832,14 @@ mod tests {
         fn sleep(&self, d: Duration) {
             self.calls.borrow_mut().push(C::Sleep(d));
             self.now.set(self.now.get() + d);
+            let free = self
+                .held_lock
+                .borrow()
+                .as_ref()
+                .is_some_and(|(_, at)| at.is_some_and(|t| self.now.get() >= t));
+            if free {
+                self.held_lock.borrow_mut().take();
+            }
         }
 
         fn terminate_job(&self) -> io::Result<()> {
@@ -828,6 +904,7 @@ mod tests {
                 pid,
                 start: p.start,
                 access,
+                drop_cost: p.close_cost.map(|d| (self.now.clone(), d)),
             })
         }
 
@@ -910,7 +987,8 @@ mod tests {
         let os = Os::new();
         os.add(200, proc(5, false));
         let r = os.kill(&[id(200, 5)], os.at(5_000), &state());
-        assert_eq!(r, report(METHOD, true, Vec::new()));
+        assert!(r.tree_dead, "{r:?}");
+        assert_eq!((r.method.as_str(), r.survivors.len()), (METHOD, 0));
         assert!(!os.live(L, 1_000));
         assert!(!os.live(200, 5));
     }
@@ -1581,5 +1659,172 @@ mod tests {
             "the leader entry wins"
         );
         assert_eq!(r.survivors[1].start_time, "8");
+    }
+
+    // ---- PR 10a1: `lock_by`, `attempt`, `proved_at` ----
+
+    /// The kill lock held by "another call", freed once a sleep reaches `free_ms` (never
+    /// when `None`).
+    fn held_until(os: &Os, free_ms: Option<u64>) -> &'static Mutex<KillState<H>> {
+        let st: &'static Mutex<KillState<H>> = Box::leak(Box::new(state()));
+        *os.held_lock.borrow_mut() = Some((st.lock().unwrap(), free_ms.map(Duration::from_millis)));
+        st
+    }
+
+    fn kill_by(
+        os: &Os,
+        lock_by: Instant,
+        deadline: Instant,
+        st: &Mutex<KillState<H>>,
+    ) -> KillReport {
+        let identity = ProcessIdentity {
+            group: format!("job:{L}"),
+            ..id(L, 1_000)
+        };
+        let h = os.leader_handle();
+        let leader = Leader {
+            identity: &identity,
+            handle: &h,
+            me: ME,
+        };
+        kill_tree(os, &leader, &[], lock_by, deadline, st)
+    }
+
+    fn signal_ops(os: &Os) -> usize {
+        os.count(|c| matches!(c, C::TerminateJob | C::Terminate(_)))
+    }
+
+    #[test]
+    fn busy_at_lock_by() {
+        // Freed before `lock_by`: the kill runs.
+        let os = Os::new();
+        let st = held_until(&os, Some(100));
+        let r = kill_by(&os, os.at(250), os.at(5_000), st);
+        assert!(r.tree_dead && !r.is_busy(), "{r:?}");
+        assert!(signal_ops(&os) > 0);
+        // Freed exactly at `lock_by`, and just after it: busy, with zero signal operations.
+        for free in [Some(250), Some(260), None] {
+            let os = Os::new();
+            let st = held_until(&os, free);
+            let r = kill_by(&os, os.at(250), os.at(5_000), st);
+            assert_eq!(
+                (r.method.as_str(), r.tree_dead, r.attempt, r.proved_at),
+                (METHOD_BUSY, false, KillAttempt::NotAttempted, None),
+                "{free:?}"
+            );
+            assert!(r.is_busy());
+            assert!(
+                os.calls().iter().all(|c| matches!(c, C::Sleep(_))),
+                "{free:?}: {:?}",
+                os.calls()
+            );
+            assert_eq!(os.now(), os.at(250), "waited to lock_by");
+        }
+    }
+
+    #[test]
+    fn attempt_and_proof_time() {
+        // Proven after termination: `Signalled`, `proved_at` the proving read's reading.
+        let os = Os::new();
+        os.cost.set(Duration::from_millis(1));
+        let r = os.kill(&[], os.at(5_000), &state());
+        assert_eq!(
+            (r.tree_dead, r.attempt),
+            (true, KillAttempt::Signalled),
+            "{r:?}"
+        );
+        assert_eq!(r.proved_at, Some(os.now()));
+        // A dead tree: `AlreadyDead`, `proved_at` the opening check's reading, no termination.
+        let os = Os::new();
+        os.cost.set(Duration::from_millis(1));
+        os.set(L, |p| p.alive = false);
+        let r = os.kill(&[], os.at(5_000), &state());
+        assert_eq!(
+            (r.tree_dead, r.attempt),
+            (true, KillAttempt::AlreadyDead),
+            "{r:?}"
+        );
+        assert_eq!(r.proved_at, Some(os.now()));
+        assert_eq!(signal_ops(&os), 0);
+        // Expired and busy: `NotAttempted`, no proof time.
+        let os = Os::new();
+        let r = os.kill(&[], os.at(0), &state());
+        assert_eq!((r.attempt, r.proved_at), (KillAttempt::NotAttempted, None));
+        let os = Os::new();
+        let st = held_until(&os, None);
+        let r = os.kill(&[], os.at(300), st);
+        assert_eq!((r.attempt, r.proved_at), (KillAttempt::NotAttempted, None));
+        // Not proven after termination: `Signalled`, no proof time.
+        let os = Os::new();
+        os.set(L, |p| p.immortal = true);
+        let r = os.kill(&[], os.at(300), &state());
+        assert_eq!(
+            (r.tree_dead, r.attempt, r.proved_at),
+            (false, KillAttempt::Signalled, None)
+        );
+        // The last observation started before the deadline and finished after it: the
+        // proof counts, with a `proved_at` past the deadline.
+        let os = Os::new();
+        os.set(L, |p| p.alive = false);
+        os.cost.set(Duration::from_millis(60));
+        let deadline = os.at(100);
+        let r = os.kill(&[], deadline, &state());
+        assert_eq!(
+            (r.tree_dead, r.attempt),
+            (true, KillAttempt::AlreadyDead),
+            "{r:?}"
+        );
+        assert!(r.proved_at.unwrap() > deadline, "{r:?}");
+        // The proving read is the extra handle's: `proved_at` is the clock right after it,
+        // before that handle is closed (closing it costs 2 ms here).
+        let os = Os::new();
+        os.cost.set(Duration::from_millis(1));
+        os.set(L, |p| p.alive = false);
+        os.add(200, proc(5, false));
+        os.set(200, |p| {
+            p.dies_at = Some(Duration::from_millis(4));
+            p.close_cost = Some(Duration::from_millis(2));
+        });
+        let seen = Rc::new(Cell::new(None));
+        let at = seen.clone();
+        *os.hook.borrow_mut() = Some(Box::new(move |c, os| {
+            if matches!(c, C::Signalled(200, _)) {
+                at.set(Some(os.now()));
+            }
+        }));
+        let r = os.kill(&[id(200, 5)], os.at(5_000), &state());
+        assert_eq!(
+            (r.tree_dead, r.attempt),
+            (true, KillAttempt::AlreadyDead),
+            "{r:?} {:?}",
+            os.calls()
+        );
+        assert!(seen.get().is_some(), "{:?}", os.calls());
+        assert_eq!(r.proved_at, seen.get(), "{:?}", os.calls());
+        // The same in the proof loop after termination: the extra handle is the last to
+        // signal, and `proved_at` is the clock right after that read, before its close.
+        let os = Os::new();
+        os.cost.set(Duration::from_millis(1));
+        os.add(200, proc(5, false));
+        os.set(200, |p| {
+            p.dies_at = Some(Duration::from_millis(50));
+            p.close_cost = Some(Duration::from_millis(2));
+        });
+        let seen = Rc::new(Cell::new(None));
+        let at = seen.clone();
+        *os.hook.borrow_mut() = Some(Box::new(move |c, os| {
+            if matches!(c, C::Signalled(200, _)) {
+                at.set(Some(os.now()));
+            }
+        }));
+        let r = os.kill(&[id(200, 5)], os.at(5_000), &state());
+        assert_eq!(
+            (r.tree_dead, r.attempt),
+            (true, KillAttempt::Signalled),
+            "{r:?} {:?}",
+            os.calls()
+        );
+        assert!(seen.get().is_some(), "{:?}", os.calls());
+        assert_eq!(r.proved_at, seen.get(), "{:?}", os.calls());
     }
 }

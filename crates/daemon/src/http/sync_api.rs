@@ -1,18 +1,19 @@
 //! The sync read routes (design §2.7): `GET /api/events`, `GET /api/threads`,
-//! `GET /api/worktrees`. Each answer comes from one read transaction: the token check, the
-//! readability check, the head, and the page or snapshot.
+//! `GET /api/threads/{thread_id}`, `GET /api/worktrees`. Each answer comes from one read
+//! transaction: the token check, the readability check, the head, and the page or snapshot.
 
 use axum::body::Body;
 use axum::http::{HeaderValue, Request, Response, header};
 use chaldea_core::MAX_SAFE_INTEGER;
 use chaldea_core::auth::Action;
 use chaldea_core::http::{ThreadsResponse, WorktreesResponse};
-use chaldea_core::ids::{Epoch, StreamId};
+use chaldea_core::ids::{Epoch, StreamId, ThreadId};
 use chaldea_core::sync::{EventsQuery, EventsResponse, ReplayPlan, StreamSnapshot, decide_replay};
 use serde::Serialize;
 
 use super::ctx::ReadCtx;
 use super::error::{ApiError, read_error};
+use super::guard::path_param;
 use super::scope::ReadScope;
 use crate::store::{ReadError, StoreError};
 
@@ -220,6 +221,41 @@ pub(crate) async fn threads(ctx: ReadCtx, req: Request<Body>) -> Result<Response
         .await?;
     json(&ThreadsResponse { epoch, threads })
 }
+
+/// `GET /api/threads/{thread_id}`: the thread's [`ThreadSummary`](chaldea_core::sync::ThreadSummary),
+/// authorized as `GET /api/events` authorizes its stream. A thread the token cannot read, a
+/// missing thread, and an unparseable id are one 404.
+pub(crate) async fn thread_summary(
+    ctx: ReadCtx,
+    req: Request<Body>,
+) -> Result<Response<Body>, ApiError> {
+    no_query(&req)?;
+    // The canonical form only, as a thread stream id spells it.
+    let t: ThreadId = match path_param(THREAD_PATH, req.uri().path(), "thread_id")
+        .and_then(|p| format!("thread:{p}").parse().ok())
+    {
+        Some(StreamId::Thread(t)) => t,
+        _ => return Err(ApiError::not_found()),
+    };
+    let summary = ctx
+        .read(move |tx, auth| {
+            let scope = ReadScope::of(tx, auth, Action::ReadStream).map_err(store)?;
+            if !scope
+                .readable_stream(tx, StreamId::Thread(t))
+                .map_err(store)?
+            {
+                return Err(ApiError::not_found());
+            }
+            tx.thread_summary(t)
+                .map_err(store)?
+                .ok_or_else(ApiError::not_found)
+        })
+        .await?;
+    json(&summary)
+}
+
+/// The path of [`thread_summary`].
+pub(crate) const THREAD_PATH: &str = "/api/threads/{thread_id}";
 
 /// `GET /api/worktrees`: all for `owner` and `rescue`, human-owned included; for `agent`,
 /// those whose current owner is in self+.

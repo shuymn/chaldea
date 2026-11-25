@@ -424,7 +424,8 @@ fn built_commands_are_served_and_drained() {
     use serde_json::value::RawValue;
 
     use crate::http::{
-        ApiError, CommandEffect, CommandHandler, CommandRegistry, EffectRun, Intent, Prepared,
+        ApiError, CommandEffect, CommandHandler, CommandRegistry, EffectOutcome, EffectRun, Intent,
+        Prepared,
     };
 
     static SPECS: &[CommandSpec] = &[CommandSpec {
@@ -454,17 +455,17 @@ fn built_commands_are_served_and_drained() {
         }
     }
     impl CommandEffect for Held {
-        fn run(&self, _run: EffectRun) -> BoxFuture<'static, CommandResult> {
+        fn run(&self, _run: EffectRun) -> BoxFuture<'static, EffectOutcome> {
             let gate = self.0.lock().unwrap().take();
             Box::pin(async move {
                 if let Some((started, release)) = gate {
                     let _ = started.send(());
                     let _ = release.await;
                 }
-                CommandResult {
+                EffectOutcome::Done(CommandResult {
                     http_status: 200,
                     body: "{}".to_owned(),
-                }
+                })
             })
         }
     }
@@ -841,5 +842,86 @@ fn stopping_rename_is_not_retried_past_its_cutoff() {
             renames.len()
         );
         budget *= 2;
+    }
+}
+
+/// Step 6's lock rule counts the participants: one that answers `LeftRunning`, and one not
+/// done by its end, each keep the instance lock held until exit (`lock_held_at_exit`); a
+/// participant that answers `Clean` keeps nothing.
+#[test]
+fn participant_left_running_keeps_the_lock() {
+    use futures_util::future::BoxFuture;
+
+    use super::super::{ParticipantEnd, ShutdownParticipant};
+
+    enum How {
+        Answer(ParticipantEnd),
+        PastItsEnd,
+        /// `Clean` from a poll that ends just after `end`: the participant blocks its thread
+        /// until then, so its timer cannot fire first.
+        CleanJustAfterItsEnd,
+    }
+    struct Ends(How);
+    impl ShutdownParticipant for Ends {
+        fn name(&self) -> &'static str {
+            "ends"
+        }
+        fn shutdown(&self, end: Instant) -> BoxFuture<'_, ParticipantEnd> {
+            match self.0 {
+                How::Answer(e) => Box::pin(async move { e }),
+                How::PastItsEnd => Box::pin(std::future::pending()),
+                How::CleanJustAfterItsEnd => Box::pin(async move {
+                    while Instant::now() <= end {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    ParticipantEnd::Clean
+                }),
+            }
+        }
+    }
+    for (how, want) in [
+        (
+            How::Answer(ParticipantEnd::Clean),
+            (None, LockDisposition::Released),
+        ),
+        (
+            How::Answer(ParticipantEnd::LeftRunning),
+            (
+                Some(FailReason::LockHeldAtExit),
+                LockDisposition::HeldUntilExit,
+            ),
+        ),
+        (
+            How::PastItsEnd,
+            (
+                Some(FailReason::LockHeldAtExit),
+                LockDisposition::HeldUntilExit,
+            ),
+        ),
+        (
+            How::CleanJustAfterItsEnd,
+            (
+                Some(FailReason::LockHeldAtExit),
+                LockDisposition::HeldUntilExit,
+            ),
+        ),
+    ] {
+        let dir = state();
+        let mut cfg = foreground(&dir.path, Some(hold_port()));
+        // A participant window of 1 s.
+        cfg.budgets.total = Duration::from_secs(5);
+        cfg.budgets.startup_join_before = Duration::from_secs(4);
+        cfg.budgets.http_before = Duration::from_secs(4);
+        cfg.budgets.store_before = Duration::from_secs(3);
+        let comps = TestComponents {
+            participants: vec![Box::new(Ends(how))],
+            ..TestComponents::default()
+        };
+        let run = start(cfg, comps, Arc::default());
+        run.serving();
+        run.stop();
+        let r = run.join();
+        assert_eq!((r.reason, r.lock), want);
+        assert_eq!(r.code.code() == 0, want.0.is_none(), "{:?}", r.reason);
     }
 }

@@ -85,6 +85,24 @@ pub enum ErrorCode {
     OutcomeUnknown,
     /// 500.
     Internal,
+    /// 409: resume or close of a closed thread.
+    ThreadClosed,
+    /// 409: the expected launch is not the thread's current launch.
+    LaunchChanged,
+    /// 409: resume or close (without `stop`) while the current launch has not exited.
+    LaunchLive,
+    /// 409: the current launch exited without confirmed death.
+    DeathUnconfirmed,
+    /// 409: the launch's worktree is not `active` or `released`.
+    WorktreeUnavailable,
+    /// 409: resume of a thread with no bound session.
+    NoSession,
+    /// 400: the input encoders' check refused the positional prompt.
+    PromptRejected,
+    /// 400: the prompt exceeds `MAX_PROMPT_BYTES`.
+    PromptTooLarge,
+    /// 504: a stop could not take its launch and re-read it in time; nothing changed.
+    LaunchBusy,
 }
 
 /// The body of every rejection the daemon decides. `retry_after` is whole seconds and

@@ -10,9 +10,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::backend::{
-    ChildExit, Cleanup, CloseReport, DrainSink, KillReport, NeverStartedKind, ProcessIdentity,
-    PtyChild, PtyControl, PtyRuntime, PtySize, SpawnError, SpawnSpec, SpawnedParts, SpawnedPty,
-    sealed,
+    ChildExit, Cleanup, CloseReport, DrainSink, KillAttempt, KillReport, NeverStartedKind,
+    ProcessIdentity, PtyChild, PtyControl, PtyRuntime, PtySize, SpawnError, SpawnSpec,
+    SpawnedParts, SpawnedPty, sealed,
 };
 use crate::drain::Drain;
 use crate::session::lock;
@@ -22,7 +22,16 @@ const STARTUP_PARSE: Duration = Duration::from_secs(5);
 /// The byte `fail_output` writes to wake a blocked read; the reader swallows it.
 const WAKE: u8 = 0;
 
-/// What `kill_tree` does.
+/// The method of a fake report whose call did not get the kill-state lock.
+const METHOD_BUSY: &str = "fake_busy";
+/// The method of every other fake report but `Unconfirmed`'s.
+const METHOD: &str = "fake";
+/// The method of `KillBehavior::Unconfirmed`'s report (not busy, as `unix_ownership_lost`).
+const METHOD_UNCONFIRMED: &str = "fake_unconfirmed";
+
+/// What `kill_tree` does once it holds the kill-state lock with the child alive and the call
+/// not expired. Every behaviour but `Unconfirmed` and `Panic` first performs the fake's
+/// signal-equivalent operation (`FakeEvent::Signal`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KillBehavior {
     /// The child exits at once and the tree is reported dead.
@@ -32,6 +41,14 @@ pub enum KillBehavior {
     Ignore,
     /// The child exits after this long; dead if that is within the deadline.
     ExitAfter(Duration),
+    /// Returns at once with no signal: `NotAttempted`, `tree_dead: false`, a method that is
+    /// not busy.
+    Unconfirmed,
+    /// The calls before the `n`-th signal return at once (`Signalled`, `tree_dead: false`,
+    /// not busy); the `n`-th proves the tree dead.
+    ProveOnCall(u32),
+    /// Panics inside `kill_tree`.
+    Panic,
 }
 
 /// The script of the next spawn.
@@ -44,6 +61,9 @@ pub struct FakeScript {
     pub kill: KillBehavior,
     /// `control.close` blocks until its deadline and reports `elapsed: None`.
     pub hang_control_close: bool,
+    /// The child's `wait_timeout` blocks until [`FakeChild::release_waiter`], so a close
+    /// returns with `pty-wait` abandoned.
+    pub hold_waiter: bool,
 }
 
 /// What the fake child observed, in order.
@@ -54,7 +74,12 @@ pub enum FakeEvent {
     Write(usize),
     Resize(PtySize),
     ResizeFailed,
-    Kill { extra: Vec<ProcessIdentity> },
+    /// A `kill_tree` call, at its entry.
+    Kill {
+        extra: Vec<ProcessIdentity>,
+    },
+    /// The signal-equivalent operation, made exactly when a native backend would signal.
+    Signal,
     InputDropped,
     ControlClosed,
     OutputClosed,
@@ -94,6 +119,16 @@ struct Proc {
     input: Mutex<InputState>,
     input_cv: Condvar,
     fail_resize: AtomicBool,
+    /// The kill-state lock: whether a `kill_tree` call or a test hold has it.
+    kill_lock: Mutex<bool>,
+    kill_cv: Condvar,
+    /// Signals made so far (`ProveOnCall`).
+    signals: AtomicU32,
+    /// `wait_timeout` fails (`fail_wait`).
+    wait_fails: AtomicBool,
+    /// `wait_timeout` blocks while set (`hold_waiter`).
+    waiter_held: Mutex<bool>,
+    waiter_cv: Condvar,
 }
 
 impl Proc {
@@ -126,6 +161,38 @@ impl Proc {
 
     fn exited(&self) -> bool {
         lock(&self.exit).is_some()
+    }
+
+    /// Takes the kill-state lock: at once when free; otherwise waits until `lock_by`, and a
+    /// lock freed only at or after `lock_by` counts as not taken.
+    fn kill_lock(&self, lock_by: Instant) -> bool {
+        let mut held = lock(&self.kill_lock);
+        if *held {
+            loop {
+                let left = lock_by.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                held = self
+                    .kill_cv
+                    .wait_timeout(held, left)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
+                if !*held {
+                    if Instant::now() >= lock_by {
+                        return false;
+                    }
+                    break;
+                }
+            }
+        }
+        *held = true;
+        true
+    }
+
+    fn unlock_kill(&self) {
+        *lock(&self.kill_lock) = false;
+        self.kill_cv.notify_all();
     }
 
     fn input_state(&self) -> MutexGuard<'_, InputState> {
@@ -209,6 +276,12 @@ impl PtyRuntime for FakePty {
             input: Mutex::new(InputState::default()),
             input_cv: Condvar::new(),
             fail_resize: AtomicBool::new(false),
+            kill_lock: Mutex::new(false),
+            kill_cv: Condvar::new(),
+            signals: AtomicU32::new(0),
+            wait_fails: AtomicBool::new(false),
+            waiter_held: Mutex::new(script.hold_waiter),
+            waiter_cv: Condvar::new(),
         });
         let reader = FakeReader {
             pipe: r,
@@ -365,35 +438,136 @@ impl PtyChild for FakeProcess {
     }
 
     fn wait_timeout(&self, timeout: Duration) -> io::Result<Option<ChildExit>> {
-        let x = lock(&self.0.exit);
-        let (x, _) = self
-            .0
+        let p = &self.0;
+        {
+            let mut held = lock(&p.waiter_held);
+            while *held {
+                held = p
+                    .waiter_cv
+                    .wait(held)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+        let fails = || p.wait_fails.load(Ordering::Acquire);
+        let x = lock(&p.exit);
+        let (x, _) = p
             .exit_cv
-            .wait_timeout_while(x, timeout, |x| x.is_none())
+            .wait_timeout_while(x, timeout, |x| x.is_none() && !fails())
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if x.is_none() && fails() {
+            return Err(io::Error::other("injected wait failure"));
+        }
         Ok(*x)
     }
 
-    fn kill_tree(&self, extra: &[ProcessIdentity], deadline: Instant) -> KillReport {
+    fn kill_tree(
+        &self,
+        extra: &[ProcessIdentity],
+        lock_by: Instant,
+        deadline: Instant,
+    ) -> KillReport {
+        self.kill_with(extra, lock_by, deadline, || {})
+    }
+}
+
+impl FakeProcess {
+    /// `kill_tree`, with `before_signal` run after the earlier deadline checks, right before
+    /// the log's mutex is taken for the signal.
+    fn kill_with(
+        &self,
+        extra: &[ProcessIdentity],
+        lock_by: Instant,
+        deadline: Instant,
+        before_signal: impl FnOnce(),
+    ) -> KillReport {
         let p = &self.0;
         p.record(FakeEvent::Kill {
             extra: extra.to_vec(),
         });
-        let dead = match p.kill {
+        let report = |method: &str, attempt: KillAttempt, proved_at: Option<Instant>| {
+            let dead = proved_at.is_some();
+            KillReport {
+                method: method.to_owned(),
+                tree_dead: dead,
+                survivors: if dead {
+                    Vec::new()
+                } else {
+                    vec![p.identity.clone()]
+                },
+                attempt,
+                proved_at,
+            }
+        };
+        // An expired call performs no operation, as a native expired call makes no OS call.
+        if Instant::now() >= deadline {
+            return report(METHOD, KillAttempt::NotAttempted, None);
+        }
+        if !p.kill_lock(lock_by.min(deadline)) {
+            return report(METHOD_BUSY, KillAttempt::NotAttempted, None);
+        }
+        let _held = KillLockHold {
+            proc: Some(p.clone()),
+        };
+        if p.exited() {
+            return report(METHOD, KillAttempt::AlreadyDead, Some(Instant::now()));
+        }
+        // The deadline is checked again right before the signal-equivalent operation, as a
+        // native call checks it before each OS call.
+        if Instant::now() >= deadline {
+            return report(METHOD, KillAttempt::NotAttempted, None);
+        }
+        // The signal-equivalent operation: the deadline is checked once more under the log's
+        // mutex, right before the signal is recorded and counted. `None`: not performed.
+        let signal = || {
+            before_signal();
+            let mut log = lock(&p.log);
+            if Instant::now() >= deadline {
+                return None;
+            }
+            log.push(FakeEvent::Signal);
+            Some(p.signals.fetch_add(1, Ordering::AcqRel) + 1)
+        };
+        let proved = |attempt| report(METHOD, attempt, Some(Instant::now()));
+        let not_attempted = || report(METHOD, KillAttempt::NotAttempted, None);
+        match p.kill {
+            KillBehavior::Panic => panic!("injected kill_tree panic"),
+            KillBehavior::Unconfirmed => {
+                report(METHOD_UNCONFIRMED, KillAttempt::NotAttempted, None)
+            }
             KillBehavior::ExitOnKill => {
+                if signal().is_none() {
+                    return not_attempted();
+                }
                 p.exit(KILLED);
-                true
+                proved(KillAttempt::Signalled)
             }
             KillBehavior::Ignore => {
+                if signal().is_none() {
+                    return not_attempted();
+                }
                 sleep_until(deadline);
-                false
+                report(METHOD, KillAttempt::Signalled, None)
+            }
+            KillBehavior::ProveOnCall(n) => {
+                let Some(count) = signal() else {
+                    return not_attempted();
+                };
+                if count >= n {
+                    p.exit(KILLED);
+                    proved(KillAttempt::Signalled)
+                } else {
+                    report(METHOD, KillAttempt::Signalled, None)
+                }
             }
             KillBehavior::ExitAfter(d) => {
+                if signal().is_none() {
+                    return not_attempted();
+                }
                 let at = Instant::now() + d;
                 if at <= deadline {
                     sleep_until(at);
                     p.exit(KILLED);
-                    true
+                    proved(KillAttempt::Signalled)
                 } else {
                     let later = p.clone();
                     std::thread::spawn(move || {
@@ -401,18 +575,30 @@ impl PtyChild for FakeProcess {
                         later.exit(KILLED);
                     });
                     sleep_until(deadline);
-                    p.exited()
+                    if p.exited() {
+                        proved(KillAttempt::Signalled)
+                    } else {
+                        report(METHOD, KillAttempt::Signalled, None)
+                    }
                 }
             }
-        };
-        KillReport {
-            method: "fake".to_owned(),
-            tree_dead: dead,
-            survivors: if dead {
-                Vec::new()
-            } else {
-                vec![p.identity.clone()]
-            },
+        }
+    }
+}
+
+/// Holds the fake's kill-state lock until dropped (also while unwinding).
+pub struct KillLockHold {
+    proc: Option<Arc<Proc>>,
+}
+
+impl KillLockHold {
+    pub fn release(self) {}
+}
+
+impl Drop for KillLockHold {
+    fn drop(&mut self) {
+        if let Some(p) = self.proc.take() {
+            p.unlock_kill();
         }
     }
 }
@@ -453,6 +639,45 @@ impl FakeChild {
 
     pub fn exit(&self, e: ChildExit) {
         self.proc.exit(e);
+    }
+
+    /// The waiter's next and every later `wait_timeout` fails: the session reports
+    /// `WaitFailed` and no exit.
+    pub fn fail_wait(&self) {
+        self.proc.wait_fails.store(true, Ordering::Release);
+        let _x = lock(&self.proc.exit);
+        self.proc.exit_cv.notify_all();
+    }
+
+    /// Ends the block of `FakeScript.hold_waiter`.
+    pub fn release_waiter(&self) {
+        *lock(&self.proc.waiter_held) = false;
+        self.proc.waiter_cv.notify_all();
+    }
+
+    /// Takes the kill-state lock (waiting while a kill call holds it) and holds it until the
+    /// returned guard is released or dropped: a `kill_tree` call meanwhile waits for it until
+    /// its `lock_by`, and one that gets it only at or after `lock_by` reports `fake_busy`.
+    #[must_use]
+    pub fn hold_kill_lock(&self) -> KillLockHold {
+        let mut held = lock(&self.proc.kill_lock);
+        while *held {
+            held = self
+                .proc
+                .kill_cv
+                .wait(held)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *held = true;
+        KillLockHold {
+            proc: Some(self.proc.clone()),
+        }
+    }
+
+    /// Signal-equivalent operations so far.
+    #[must_use]
+    pub fn signals(&self) -> u32 {
+        self.proc.signals.load(Ordering::Acquire)
     }
 
     /// The next `write()` blocks until the hold is released or dropped.
@@ -1161,4 +1386,253 @@ pub fn resume_process(pid: u32) -> io::Result<usize> {
 #[cfg(windows)]
 pub fn make_inheritable(h: &impl std::os::windows::io::AsRawHandle) -> io::Result<()> {
     crate::windows::sys::make_inheritable(h)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn spawn(script: FakeScript) -> (Arc<dyn PtyChild>, FakeChild, SpawnedParts) {
+        let fake = FakePty::new();
+        fake.script_next(script);
+        let spec = SpawnSpec {
+            argv: vec![OsString::from("/work/bin/agent")],
+            cwd: PathBuf::from("/work/repo"),
+            env: Vec::new(),
+            size: PtySize::new(80, 24).unwrap(),
+        };
+        let parts = fake
+            .spawn(&spec, DrainSink::test(|_| {}))
+            .unwrap()
+            .into_parts();
+        (parts.child.clone(), fake.take_child().unwrap(), parts)
+    }
+
+    fn soon() -> Instant {
+        Instant::now() + Duration::from_secs(10)
+    }
+
+    fn signals(c: &FakeChild) -> usize {
+        c.log().iter().filter(|e| **e == FakeEvent::Signal).count()
+    }
+
+    /// Releases `hold` from another thread once `Instant::now()` reached `at` (a sleep alone
+    /// can end slightly before it on this clock). The thread takes the fake lock's inner
+    /// mutex 50 ms before `at` and keeps it until the release, so a waiter whose wait ends
+    /// meanwhile sees the release only after it: the lock is first seen free at `at` or later.
+    fn release_at(hold: KillLockHold, at: Instant) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut hold = hold;
+            let p = hold.proc.take().expect("a held lock");
+            sleep_until(at.checked_sub(Duration::from_millis(50)).unwrap_or(at));
+            let mut held = lock(&p.kill_lock);
+            while Instant::now() < at {
+                sleep_until(at);
+            }
+            *held = false;
+            p.kill_cv.notify_all();
+        })
+    }
+
+    #[test]
+    fn busy_at_lock_by() {
+        // Freed before `lock_by`: the kill runs.
+        let (child, c, _parts) = spawn(FakeScript::default());
+        let lock_by = Instant::now() + Duration::from_millis(500);
+        let t = release_at(
+            c.hold_kill_lock(),
+            Instant::now() + Duration::from_millis(50),
+        );
+        let r = child.kill_tree(&[], lock_by, soon());
+        t.join().unwrap();
+        assert!(r.tree_dead && !r.is_busy(), "{r:?}");
+        assert_eq!(signals(&c), 1);
+        // Freed at `lock_by` and just after it, or never: busy, no signal.
+        for after in [Some(0), Some(50), None] {
+            let (child, c, _parts) = spawn(FakeScript::default());
+            let lock_by = Instant::now() + Duration::from_millis(100);
+            let hold = c.hold_kill_lock();
+            let (t, kept) = match after {
+                Some(ms) => (
+                    Some(release_at(hold, lock_by + Duration::from_millis(ms))),
+                    None,
+                ),
+                None => (None, Some(hold)),
+            };
+            let r = child.kill_tree(&[], lock_by, soon());
+            drop(kept);
+            assert!(Instant::now() >= lock_by, "returned before lock_by");
+            assert_eq!(
+                (r.method.as_str(), r.tree_dead, r.attempt, r.proved_at),
+                (METHOD_BUSY, false, KillAttempt::NotAttempted, None),
+                "{after:?}"
+            );
+            assert_eq!(signals(&c), 0, "{after:?}");
+            assert!(!c.proc.exited());
+            if let Some(t) = t {
+                t.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn expired_and_dead_calls_signal_nothing() {
+        let (child, c, _parts) = spawn(FakeScript::default());
+        let past = Instant::now();
+        let r = child.kill_tree(&[], past, past);
+        assert_eq!(
+            (r.tree_dead, r.attempt, r.proved_at),
+            (false, KillAttempt::NotAttempted, None)
+        );
+        assert_eq!(signals(&c), 0);
+        assert_eq!(
+            c.log().last(),
+            Some(&FakeEvent::Kill { extra: Vec::new() }),
+            "every call is recorded at its entry"
+        );
+        c.exit(ChildExit {
+            code: Some(0),
+            signal: None,
+        });
+        let before = Instant::now();
+        let r = child.kill_tree(&[], soon(), soon());
+        assert_eq!((r.tree_dead, r.attempt), (true, KillAttempt::AlreadyDead));
+        assert!(r.proved_at.unwrap() >= before);
+        assert_eq!(signals(&c), 0);
+    }
+
+    /// A call that holds the kill-state lock but reaches its signal only after its deadline
+    /// (the exit state's lock held across it) sends nothing.
+    #[test]
+    fn deadline_rechecked_before_the_signal() {
+        let (child, c, _parts) = spawn(FakeScript::default());
+        let exit_state = c.proc.exit.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let call = std::thread::spawn(move || child.kill_tree(&[], deadline, deadline));
+        // The call recorded its entry and took the kill-state lock: it is past its entry check
+        // and waits on the exit state.
+        let entered = soon();
+        while !(*c.proc.kill_lock.lock().unwrap()) {
+            assert!(
+                Instant::now() < entered,
+                "the call takes the kill-state lock"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        while Instant::now() <= deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(exit_state);
+        let r = call.join().unwrap();
+        assert_eq!(
+            (r.tree_dead, r.attempt, r.proved_at),
+            (false, KillAttempt::NotAttempted, None)
+        );
+        assert_eq!(signals(&c), 0);
+    }
+
+    /// The deadline checked again under the log's mutex: a call held after its earlier
+    /// checks and before that mutex until past its deadline records no signal.
+    #[test]
+    fn deadline_rechecked_under_the_log() {
+        let (_child, c, _parts) = spawn(FakeScript::default());
+        let (reached_tx, reached) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let process = FakeProcess(c.proc.clone());
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let call = std::thread::spawn(move || {
+            process.kill_with(&[], deadline, deadline, move || {
+                reached_tx.send(()).unwrap();
+                let _ = wait.recv_timeout(Duration::from_secs(20));
+            })
+        });
+        // The call passed its earlier checks and is about to take the log's mutex.
+        reached.recv_timeout(Duration::from_secs(20)).unwrap();
+        while Instant::now() <= deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        release.send(()).unwrap();
+        let r = call.join().unwrap();
+        assert_eq!(
+            (r.tree_dead, r.attempt, r.proved_at),
+            (false, KillAttempt::NotAttempted, None)
+        );
+        assert_eq!(signals(&c), 0);
+    }
+
+    #[test]
+    fn behaviours() {
+        // Unconfirmed: at once, no signal, not busy.
+        let (child, c, _parts) = spawn(FakeScript {
+            kill: KillBehavior::Unconfirmed,
+            ..FakeScript::default()
+        });
+        let r = child.kill_tree(&[], soon(), soon());
+        assert_eq!(
+            (r.method.as_str(), r.tree_dead, r.attempt),
+            (METHOD_UNCONFIRMED, false, KillAttempt::NotAttempted)
+        );
+        assert!(!r.is_busy());
+        assert_eq!(signals(&c), 0);
+        // ProveOnCall(2): the first call signals and returns at once unproven, the second
+        // proves.
+        let (child, c, _parts) = spawn(FakeScript {
+            kill: KillBehavior::ProveOnCall(2),
+            ..FakeScript::default()
+        });
+        let r = child.kill_tree(&[], soon(), soon());
+        assert_eq!((r.tree_dead, r.attempt), (false, KillAttempt::Signalled));
+        assert!(!r.is_busy());
+        let r = child.kill_tree(&[], soon(), soon());
+        assert_eq!((r.tree_dead, r.attempt), (true, KillAttempt::Signalled));
+        assert!(r.proved_at.is_some());
+        assert_eq!(signals(&c), 2);
+        // Panic: inside `kill_tree`, and the kill-state lock is released by the unwind.
+        let (child, c, _parts) = spawn(FakeScript {
+            kill: KillBehavior::Panic,
+            ..FakeScript::default()
+        });
+        let k = child.clone();
+        let panicked = std::thread::spawn(move || k.kill_tree(&[], soon(), soon())).join();
+        assert!(panicked.is_err());
+        drop(c.hold_kill_lock());
+        // Ignore: signals, uses its deadline, unproven.
+        let (child, c, _parts) = spawn(FakeScript {
+            kill: KillBehavior::Ignore,
+            ..FakeScript::default()
+        });
+        let r = child.kill_tree(&[], soon(), Instant::now() + Duration::from_millis(20));
+        assert_eq!((r.tree_dead, r.attempt), (false, KillAttempt::Signalled));
+        assert_eq!(signals(&c), 1);
+    }
+
+    #[test]
+    fn waiter_controls() {
+        let (child, c, _parts) = spawn(FakeScript::default());
+        c.fail_wait();
+        assert!(child.wait_timeout(Duration::from_secs(5)).is_err());
+        let (child, c, _parts) = spawn(FakeScript {
+            hold_waiter: true,
+            ..FakeScript::default()
+        });
+        c.exit(KILLED);
+        let k = child.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let _ = tx.send(k.wait_timeout(Duration::from_millis(10)));
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "held past its timeout"
+        );
+        c.release_waiter();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(),
+            Some(KILLED)
+        );
+        t.join().unwrap();
+    }
 }

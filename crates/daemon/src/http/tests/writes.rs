@@ -9,12 +9,21 @@ use axum::body::Body;
 use axum::http::{Method, Request, Response};
 use chaldea_core::auth::TokenKind;
 
+use std::sync::atomic::Ordering;
+
 use super::eventually;
 use super::shared;
 use super::support::http::{SkewClock, TestServer};
-use crate::http::ctx::await_write;
-use crate::http::{ApiError, MonotonicClock, Mount, Mounts, WriteCtx, spec};
+use super::support::{TestStore, soon};
+use crate::http::ctx::{await_write, write_with};
+use crate::http::error::WriteFailure;
+use crate::http::{
+    ApiError, LifecycleSink, MonotonicClock, Mount, Mounts, StoreFatal, SystemMonotonic, WriteCtx,
+    spec,
+};
+use crate::store::test_faults::CommitFault;
 use crate::store::tests::support::waits;
+use crate::store::{SubmitError, WriteError};
 
 /// A server over `mounts` whose clock is `clock`.
 async fn start(mounts: Mounts, clock: &Arc<SkewClock>) -> TestServer {
@@ -93,4 +102,96 @@ async fn reply_after_the_grace_is_outcome_unknown() {
     assert_eq!(r, Err(ApiError::outcome_unknown()));
     assert!(srv.sink.0.lock().unwrap().is_empty());
     srv.stop().await;
+}
+
+/// Records each fatal with whether `on_submit` had run when the sink was told.
+struct OrderSink(
+    Arc<std::sync::atomic::AtomicBool>,
+    std::sync::Mutex<Vec<(StoreFatal, bool)>>,
+);
+
+impl LifecycleSink for OrderSink {
+    fn store_fatal(&self, f: StoreFatal) {
+        let ran = self.0.load(Ordering::SeqCst);
+        self.1.lock().unwrap().push((f, ran));
+    }
+}
+
+/// `write_with` calls `on_submit` synchronously once `Store::submit` returned: on the first
+/// poll, while the writer still holds the job, and, when the submission fails, before the
+/// sink is told of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_with_calls_on_submit_first() {
+    let store = TestStore::new();
+    let submitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sink = OrderSink(submitted.clone(), std::sync::Mutex::default());
+    let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Accepted, the writer held: on_submit has run before the first poll returns.
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    tokio::spawn(
+        store
+            .store()
+            .submit(soon(), move |_tx| {
+                let _ = entered_tx.send(());
+                let _ = wait.recv();
+                Ok(())
+            })
+            .unwrap(),
+    );
+    entered.await.unwrap();
+    let (s, c) = (submitted.clone(), committed.clone());
+    let mut write = std::pin::pin!(write_with(
+        store.store(),
+        &sink,
+        &SystemMonotonic,
+        soon(),
+        Box::new(|_tx| Ok(7)),
+        Some(Box::new(move || c.store(true, Ordering::SeqCst))),
+        move || s.store(true, Ordering::SeqCst),
+    ));
+    assert!(futures_util::FutureExt::now_or_never(write.as_mut()).is_none());
+    assert!(
+        submitted.load(Ordering::SeqCst),
+        "on_submit before any await"
+    );
+    assert!(!committed.load(Ordering::SeqCst));
+    release.send(()).unwrap();
+    assert_eq!(
+        waits::bounded(Duration::from_secs(10), write)
+            .await
+            .unwrap()
+            .ok(),
+        Some(7)
+    );
+    assert!(committed.load(Ordering::SeqCst), "after_ok once committed");
+
+    // A writer retired by a commit fault: `SubmitError::Failed` at once, reported after
+    // on_submit ran.
+    *store.store().faults().commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
+    let r = waits::bounded(
+        Duration::from_secs(10),
+        store.store().submit(soon(), |_tx| Ok(())).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(r, Err(WriteError::CommitUnknown(_))), "{r:?}");
+    submitted.store(false, Ordering::SeqCst);
+    let s = submitted.clone();
+    let r = write_with(
+        store.store(),
+        &sink,
+        &SystemMonotonic,
+        soon(),
+        Box::new(|_tx| Ok(())),
+        None,
+        move || s.store(true, Ordering::SeqCst),
+    )
+    .await;
+    assert!(
+        matches!(r, Err(WriteFailure::Submit(SubmitError::Failed))),
+        "{r:?}"
+    );
+    assert_eq!(*sink.1.lock().unwrap(), [(StoreFatal::Failed, true)]);
 }

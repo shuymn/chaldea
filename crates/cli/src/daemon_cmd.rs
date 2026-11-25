@@ -14,6 +14,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use chaldea_core::adapter::HostOs;
 use chaldea_daemon::lifecycle::{
     self, Budgets, DaemonConfig, DetachVia, Discovery, ExitCode, LockProbe, RunMode, diag, names,
 };
@@ -24,6 +25,7 @@ use chaldea_pty_runtime::host::{
 
 use crate::Seams;
 use crate::client;
+use crate::poll::{poll_until, poll_until_cutoff};
 
 /// `daemon start`'s one deadline (herdr's bound, design L9).
 pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -109,6 +111,16 @@ pub(crate) fn ready_channel_arg(
 
 /// `daemon run`: a foreground daemon, or the detached child `start` launched.
 pub(crate) fn run(state_dir: PathBuf, a: &RunArgs, seams: &mut Seams) -> ExitCode {
+    // The host OS is mapped once, before anything starts; an unmapped one runs nothing.
+    let os = seams
+        .host_os
+        .take()
+        .unwrap_or_else(|| std::env::consts::OS.to_owned());
+    if HostOs::from_os_str(&os).is_none() {
+        return fail(&format!(
+            "the daemon runs on macOS and Windows only, not on `{os}`"
+        ));
+    }
     let ready = match ready_channel_arg(a.detached_child, a.ready.as_deref()) {
         Ok(r) => r,
         Err(e) => return fail_with(ExitCode::Usage, &e),
@@ -308,37 +320,6 @@ fn launch_direct(
             ExitCode::Failed,
             format!("the daemon cannot be started: {e}"),
         )),
-    }
-}
-
-/// Polls `observe` every `period` until it decides, each observation through
-/// `host::observed_before`: `None` at the deadline, also for a result first observed at or
-/// after it.
-fn poll_until<T>(
-    deadline: Instant,
-    period: Duration,
-    observe: impl FnMut() -> Option<T>,
-) -> Option<T> {
-    poll_until_cutoff(&Cell::new(deadline), period, observe)
-}
-
-/// [`poll_until`] against a cutoff a test seam can bring forward while an observation runs: a
-/// result then counts only if it came before the cutoff as it stands after the observation.
-/// Nothing moves the cutoff outside tests.
-fn poll_until_cutoff<T>(
-    cutoff: &Cell<Instant>,
-    period: Duration,
-    mut observe: impl FnMut() -> Option<T>,
-) -> Option<T> {
-    loop {
-        let before = cutoff.get();
-        match host::observed_before(before, &mut observe) {
-            None => return None,
-            Some(_) if cutoff.get() != before && Instant::now() >= cutoff.get() => return None,
-            Some(Some(t)) => return Some(t),
-            Some(None) => {}
-        }
-        std::thread::sleep(period.min(cutoff.get().saturating_duration_since(Instant::now())));
     }
 }
 
@@ -1644,5 +1625,26 @@ mod tests {
             Some(Breakaway::NotRequested)
         );
         assert_eq!(breakaway_for(&limits(false, false)), None);
+    }
+
+    /// An OS other than macOS and Windows stops `daemon run` before startup: exit `Failed`,
+    /// and nothing created in the state directory.
+    #[test]
+    fn unmapped_os_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        let args = RunArgs {
+            port: None,
+            from_launchd: false,
+            detached_child: false,
+            ready: None,
+        };
+        let mut seams = Seams {
+            host_os: Some("linux".to_owned()),
+            ..Seams::default()
+        };
+        assert_eq!(run(dir.clone(), &args, &mut seams), ExitCode::Failed);
+        assert!(!dir.exists(), "the state directory was created");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 }

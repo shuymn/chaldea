@@ -21,8 +21,8 @@ use super::panic::RUNTIME_THREAD;
 use super::ready::fail_line;
 use super::startup::{self, Failure, Outcome, Started, StartupCtx};
 use super::{
-    Budgets, Components, DaemonConfig, ExitCode, ExitReport, FailReason, LockDisposition, RunEnv,
-    RunMode, names, signals,
+    Budgets, Components, DaemonConfig, ExitCode, ExitReport, FailReason, LockDisposition,
+    ParticipantEnd, RunEnv, RunMode, names, signals,
 };
 use crate::store::ShutdownReport;
 
@@ -138,7 +138,7 @@ fn deadline_timer(end: tokio::time::Instant) -> tokio::time::Sleep {
 
 #[allow(
     clippy::disallowed_methods,
-    reason = "the participants' plain bound, polled participant first, result discarded (daemon-lifecycle §2.8)"
+    reason = "the participants' bound, polled participant first; a result taken at or after the end counts as not done (daemon-lifecycle §2.8)"
 )]
 fn participant_bound<F: Future>(end: tokio::time::Instant, fut: F) -> tokio::time::Timeout<F> {
     tokio::time::timeout_at(end, fut)
@@ -641,14 +641,26 @@ impl Coordinator {
         // 3. The participants in order, until C − 3 s.
         let participants = std::mem::take(&mut st.participants);
         let end = cutoff - b.store_before;
+        let mut participants_left: Vec<String> = Vec::new();
         for p in &participants {
             if self.gate.crashed().is_some() {
                 return self.crash_exit(held_now(&st));
             }
             self.mark(&format!("participant:{}", p.name()), Some(end));
             let fut = participant_bound(tokio::time::Instant::from_std(end), p.shutdown(end));
-            if self.guarded(fut).await.is_err() {
-                return self.crash_exit(held_now(&st));
+            // A result taken at or after `end` (the participant is polled before its timer)
+            // counts as not done by its end.
+            match self.guarded(fut).await {
+                Err(Crashed) => return self.crash_exit(held_now(&st)),
+                Ok(Ok(e)) if Instant::now() < end => {
+                    if e == ParticipantEnd::LeftRunning {
+                        participants_left
+                            .push(format!("participant {} left work running", p.name()));
+                    }
+                }
+                Ok(_) => {
+                    participants_left.push(format!("participant {} not done by its end", p.name()));
+                }
             }
         }
         drop(participants);
@@ -719,7 +731,7 @@ impl Coordinator {
         let lock = match st.lock.take() {
             None => held_now(&st),
             Some(l) => {
-                let mut why = Vec::new();
+                let mut why: Vec<&str> = participants_left.iter().map(String::as_str).collect();
                 if http_aborted {
                     why.push("an HTTP task did not end");
                 }

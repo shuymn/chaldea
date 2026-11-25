@@ -76,6 +76,9 @@ fn fatal_label(f: &StoreFatal) -> String {
         StoreFatal::ReceiptUncompleted { command_id } => {
             format!("receipt_uncompleted {command_id}")
         }
+        StoreFatal::LaunchUnrecorded { launch_id } => {
+            format!("launch_unrecorded {launch_id}")
+        }
     }
 }
 

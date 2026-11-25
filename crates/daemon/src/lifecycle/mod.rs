@@ -196,8 +196,20 @@ pub struct Built {
 /// `C − 3 s` (design §2.14).
 pub trait ShutdownParticipant: Send + Sync {
     fn name(&self) -> &'static str;
-    /// Stops by `end`; the coordinator stops waiting at `end` either way.
-    fn shutdown(&self, end: Instant) -> BoxFuture<'_, ()>;
+    /// Stops by `end`; the coordinator stops waiting at `end` either way. A participant not
+    /// done by `end`, like one that answers [`ParticipantEnd::LeftRunning`], keeps the
+    /// instance lock held until the process exits (design §2.8 step 6).
+    fn shutdown(&self, end: Instant) -> BoxFuture<'_, ParticipantEnd>;
+}
+
+/// How a shutdown participant ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParticipantEnd {
+    /// Everything it owned has ended.
+    Clean,
+    /// Work it owns may still be running (a child process not proven gone): the instance lock
+    /// stays held until the process exits.
+    LeftRunning,
 }
 
 /// What later PRs plug in, called at fixed steps (design §2.14).
@@ -475,6 +487,37 @@ fn run_env(cfg: DaemonConfig, components: Box<dyn Components>, env: RunEnv) -> E
 )]
 pub fn spawn_locked(cmd: &mut Command) -> io::Result<Child> {
     chaldea_pty_runtime::with_spawn_lock(|| cmd.spawn())
+}
+
+/// [`spawn_locked`] that waits for the spawn lock only until `deadline`, and creates the child
+/// only when `under_lock`, run while the lock is held, returns true and `deadline` has not
+/// passed after it: the deadline check (`host::act_before`) is the last step before the OS
+/// spawn. `None` when the lock was not taken by `deadline`, `under_lock` refused, or the
+/// deadline passed after it; nothing was created then.
+///
+/// # Errors
+///
+/// The spawn error, inside `Some`.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the one spawn site; every child is created under the spawn lock"
+)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the supervisor in PR 10a1 part 2")
+)]
+pub(crate) fn spawn_locked_before(
+    cmd: &mut Command,
+    deadline: Instant,
+    under_lock: impl FnOnce() -> bool,
+) -> Option<io::Result<Child>> {
+    chaldea_pty_runtime::with_spawn_lock_before(deadline, || {
+        if !under_lock() {
+            return None;
+        }
+        chaldea_pty_runtime::host::act_before(deadline, || cmd.spawn())
+    })
+    .flatten()
 }
 
 /// Flushes the process log queue for at most `wait` (for the CLI's `dispatch` before

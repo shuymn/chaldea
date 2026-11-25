@@ -33,6 +33,7 @@
 
 mod backend;
 mod drain;
+mod env;
 pub mod host;
 mod limits;
 mod origin;
@@ -52,7 +53,7 @@ mod windows;
 #[path = "windows"]
 mod windows {
     #![allow(dead_code, reason = "only their unit tests run off Windows")]
-    mod cmdline;
+    pub(crate) mod cmdline;
     mod kill;
     mod process;
     mod wait;
@@ -72,10 +73,11 @@ macro_rules! probe {
 pub(crate) use probe;
 
 pub use backend::{
-    ChildExit, Cleanup, CloseReport, DrainSink, KillReport, MAX_DIMENSION, NeverStartedKind,
-    ProcessIdentity, PtyChild, PtyControl, PtyRuntime, PtySize, SizeError, SpawnError, SpawnSpec,
-    SpawnedPty,
+    ChildExit, Cleanup, CloseReport, DrainSink, KillAttempt, KillReport, MAX_DIMENSION,
+    NeverStartedKind, ProcessIdentity, PtyChild, PtyControl, PtyRuntime, PtySize, SizeError,
+    SpawnError, SpawnSpec, SpawnedPty,
 };
+pub use env::{env_key_eq, env_key_has_prefix};
 pub use limits::{CloseBounds, Limits};
 pub use origin::{ClassSet, OriginClass, ReplyKind, WriteOrigin};
 #[cfg(feature = "fake")]
@@ -83,10 +85,10 @@ pub use session::StartFault;
 pub use session::{
     CloseOutcome, Flow, OutputEnd, OutputEvent, OutputReceiver, OutputSink, Received, Released,
     Resized, ResponderStatus, Session, SessionConfig, SessionEvent, SessionStatus, SubscribeError,
-    SubscriptionId, VtUnavailable, channel_sink,
+    SubscriptionId, VtUnavailable, WriterObserver, channel_sink,
 };
 pub use snapshot::{Cell, CellWidth, Cursor, GridError, Line, Snapshot, TermModes, decode_grid};
-pub use spawn::with_spawn_lock;
+pub use spawn::{with_spawn_lock, with_spawn_lock_before};
 #[cfg(target_os = "macos")]
 pub use unix::native;
 pub use vt::ModeView;
