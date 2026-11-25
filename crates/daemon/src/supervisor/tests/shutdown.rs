@@ -128,3 +128,281 @@ async fn close_stop_after_admission() {
     );
     rig.srv.stop().await;
 }
+
+/// A graceful stop of `rig`'s supervisor with 1 s to go.
+async fn graceful(rig: &Rig) -> ParticipantEnd {
+    shutdown(rig.sup.clone(), rig.sup.now() + Duration::from_secs(1)).await
+}
+
+/// PR10a1-CL-36 `release_rule`: a token is released only by a close that released
+/// everything. Each of these leaves it counted, so a later graceful stop is `LeftRunning`:
+/// a close with `pty-wait` abandoned (the launch still `death_confirmed`, the tree proven
+/// dead), a kill that panics, a `StartedThenFailed` with an unresolved cleanup, a close with
+/// `tree_dead: false`. Controls, `Clean`: a close that released everything, a `NeverStarted`
+/// with a confirmed cleanup, and a program not found, which takes no token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn release_rule() {
+    use chaldea_pty_runtime::{Cleanup, NeverStartedKind, SpawnError};
+    use serde_json::json;
+    let stopped = |kill, hold_waiter| FakeScript {
+        kill,
+        hold_waiter,
+        ..FakeScript::default()
+    };
+    // Stopped launches.
+    for (name, script, confirmed, want) in [
+        (
+            "pty-wait abandoned",
+            stopped(KillBehavior::ExitOnKill, true),
+            true,
+            ParticipantEnd::LeftRunning,
+        ),
+        (
+            "kill panics",
+            stopped(KillBehavior::Panic, false),
+            false,
+            ParticipantEnd::LeftRunning,
+        ),
+        (
+            "tree_dead false",
+            stopped(KillBehavior::Ignore, false),
+            false,
+            ParticipantEnd::LeftRunning,
+        ),
+        (
+            "everything released",
+            stopped(KillBehavior::ExitOnKill, false),
+            true,
+            ParticipantEnd::Clean,
+        ),
+    ] {
+        let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
+            c.kill_budget = Duration::from_millis(300);
+            c.close_bounds.join = Duration::from_millis(300);
+        })
+        .await;
+        rig.pty.script_next(script);
+        let (t, l) = rig.spawn_codex(None).await;
+        let r = rig.cmd("stop", &json!({ "thread_id": t })).await;
+        assert_eq!(r.status, 200, "{name}");
+        assert_eq!(rig.launch(l).death_confirmed, confirmed, "{name}");
+        assert_eq!(graceful(&rig).await, want, "{name}");
+        rig.srv.stop().await;
+    }
+    // Spawn failures.
+    let unresolved = Cleanup::Unresolved {
+        kill: None,
+        close: None,
+        drain_abandoned: false,
+    };
+    for (name, fail, want) in [
+        (
+            "StartedThenFailed, unresolved",
+            SpawnError::StartedThenFailed {
+                stage: "s",
+                error: std::io::Error::other("x"),
+                identity: None,
+                cleanup: unresolved,
+            },
+            ParticipantEnd::LeftRunning,
+        ),
+        (
+            "NeverStarted, confirmed",
+            SpawnError::NeverStarted {
+                kind: NeverStartedKind::Setup,
+                error: std::io::Error::other("x"),
+                cleanup: Cleanup::Confirmed,
+            },
+            ParticipantEnd::Clean,
+        ),
+    ] {
+        let rig = Rig::new().await;
+        rig.pty.script_next(FakeScript {
+            fail: Some(fail),
+            ..FakeScript::default()
+        });
+        let cwd = rig.cwd.path().to_string_lossy().into_owned();
+        let r = rig
+            .cmd("spawn", &json!({ "agent": "codex", "cwd": cwd }))
+            .await;
+        assert_eq!(super::json(&r)["outcome"], "spawn_failed", "{name}");
+        assert_eq!(graceful(&rig).await, want, "{name}");
+        rig.srv.stop().await;
+    }
+    // A program not found: no token.
+    let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
+        c.program = Some(Arc::new(|_| None));
+    })
+    .await;
+    let cwd = rig.cwd.path().to_string_lossy().into_owned();
+    let r = rig
+        .cmd("spawn", &json!({ "agent": "codex", "cwd": cwd }))
+        .await;
+    assert_eq!(super::json(&r)["outcome"], "spawn_failed");
+    assert!(rig.pty.spawns().is_empty());
+    assert_eq!(rig.sup.tracker.count(), 0);
+    assert_eq!(graceful(&rig).await, ParticipantEnd::Clean);
+    rig.srv.stop().await;
+}
+
+/// Starts a graceful stop with 1 s to go while `held` holds a token's owner, and releases
+/// it before the end (once admission closed) or only after the stop returned.
+async fn stop_while_held(
+    rig: &Rig,
+    held: super::Armed,
+    release_before_end: bool,
+) -> ParticipantEnd {
+    let sd = tokio::spawn(shutdown(
+        rig.sup.clone(),
+        rig.sup.now() + Duration::from_secs(1),
+    ));
+    if release_before_end {
+        rig.until("admission closed", || !rig.sup.tracker.accepting())
+            .await;
+        held.go();
+        sd.await.unwrap()
+    } else {
+        let end = sd.await.unwrap();
+        held.go();
+        end
+    }
+}
+
+fn stop_req(rig: &Rig, t: chaldea_core::ids::ThreadId) -> super::support::http::Req {
+    rig.srv.command(
+        "stop",
+        &rig.owner,
+        super::cid(),
+        &serde_json::json!({ "thread_id": t }).to_string(),
+    )
+}
+
+/// PR10a1-CL-36 `tracker`: a token held by each of these, past the stop's end →
+/// `LeftRunning`, released before it → `Clean`: an op after its token and before
+/// `Session::spawn` returns; a natural-exit op after taking the session out of its slot,
+/// before its kill task; a sealed stop's kill task before its start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tracker() {
+    use crate::supervisor::Pause;
+    use chaldea_pty_runtime::ChildExit;
+    for release_before_end in [false, true] {
+        let want = if release_before_end {
+            ParticipantEnd::Clean
+        } else {
+            ParticipantEnd::LeftRunning
+        };
+        // Before `Session::spawn`.
+        let rig = Rig::new().await;
+        let held = rig.pauses.arm(Pause::BeforeSpawn);
+        let cwd = rig.cwd.path().to_string_lossy().into_owned();
+        let reply = super::support::http::spawn_send(
+            &rig.srv,
+            &rig.srv.command(
+                "spawn",
+                &rig.owner,
+                super::cid(),
+                &serde_json::json!({ "agent": "codex", "cwd": cwd }).to_string(),
+            ),
+        );
+        held.wait();
+        assert_eq!(
+            stop_while_held(&rig, held, release_before_end).await,
+            want,
+            "before spawn"
+        );
+        let _ = reply.await;
+        rig.srv.stop().await;
+        // A natural exit's session out of its slot.
+        let rig = Rig::new().await;
+        let (_t, _l) = rig.spawn_codex(None).await;
+        let child = rig.pty.take_child().unwrap();
+        let held = rig.pauses.arm(Pause::ExitTookSession);
+        child.exit(ChildExit {
+            code: Some(0),
+            signal: None,
+        });
+        held.wait();
+        assert_eq!(
+            stop_while_held(&rig, held, release_before_end).await,
+            want,
+            "natural exit"
+        );
+        rig.srv.stop().await;
+        // A sealed stop's kill task before its start.
+        let rig = Rig::new().await;
+        let (t, _l) = rig.spawn_codex(None).await;
+        let held = rig.pauses.arm(Pause::KillTaskStart);
+        let reply = super::support::http::spawn_send(&rig.srv, &stop_req(&rig, t));
+        held.wait();
+        assert_eq!(
+            stop_while_held(&rig, held, release_before_end).await,
+            want,
+            "kill task"
+        );
+        let _ = reply.await;
+        rig.srv.stop().await;
+    }
+}
+
+/// PR10a1-CL-36 `publish_vs_admission`: a publication either completes before admission
+/// closes or does not happen. Held before `Tracker::while_accepting` while admission
+/// closes: refused, the op closes its own session (its late-creation close) and records
+/// `launch_started` and `stopped`. Held inside it: `close_admission` waits for it, and the
+/// participant finds the entry published and closes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publish_vs_admission() {
+    use crate::supervisor::Pause;
+    for (at, closer) in [
+        (Pause::BeforePublish, Pause::LateCloseEnd),
+        (Pause::InPublish, Pause::ShutdownCloseEnd),
+    ] {
+        let rig = Rig::new().await;
+        let held = rig.pauses.arm(at);
+        let closed_by = rig.pauses.arm(closer);
+        let cwd = rig.cwd.path().to_string_lossy().into_owned();
+        let reply = super::support::http::spawn_send(
+            &rig.srv,
+            &rig.srv.command(
+                "spawn",
+                &rig.owner,
+                super::cid(),
+                &serde_json::json!({ "agent": "codex", "cwd": cwd }).to_string(),
+            ),
+        );
+        held.wait();
+        // Inside the publication, admission's mutex is held: `close_admission` waits.
+        assert_eq!(
+            rig.sup.tracker.mutex_held(),
+            at == Pause::InPublish,
+            "{at:?}"
+        );
+        let sd = tokio::spawn(shutdown(
+            rig.sup.clone(),
+            rig.sup.now() + Duration::from_secs(5),
+        ));
+        if at == Pause::BeforePublish {
+            rig.until("admission closed", || !rig.sup.tracker.accepting())
+                .await;
+        }
+        held.go();
+        closed_by.wait();
+        closed_by.go();
+        assert_eq!(sd.await.unwrap(), ParticipantEnd::Clean, "{at:?}");
+        let _ = reply.await;
+        let l = rig
+            .srv
+            .store
+            .read(|r| Ok(r.threads()?.pop().unwrap().current_launch_id.unwrap()));
+        let kinds = rig.kinds(rig.launch(l).thread_id);
+        assert!(
+            kinds.iter().any(|k| k == "launch_started"),
+            "{at:?}: {kinds:?}"
+        );
+        assert_eq!(
+            rig.launch(l).exit_reason,
+            Some(ExitReason::Stopped),
+            "{at:?}"
+        );
+        rig.srv.stop().await;
+    }
+}

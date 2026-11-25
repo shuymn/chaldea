@@ -107,6 +107,15 @@ impl Tracker {
         self.lock().accepting = false;
     }
 
+    /// Whether the tracker's mutex is held right now (admission is being read or changed).
+    #[cfg(test)]
+    pub(crate) fn mutex_held(&self) -> bool {
+        matches!(
+            self.state.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+
     /// Tokens not yet released.
     pub(crate) fn count(&self) -> usize {
         self.lock().count
