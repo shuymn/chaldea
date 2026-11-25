@@ -6,7 +6,7 @@ import type { RejectReason } from "./RejectReason";
 /**
  * The success body of `send`: the input, `queued` or `rejected` with its reason.
  */
-export type SendResult = { input_id: InputId, state: InputState, 
+export type SendResult = { input_id: InputId, state: InputState,
 /**
  * `null` unless `state` is `rejected`.
  */

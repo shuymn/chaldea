@@ -3,7 +3,7 @@ import type { Component } from "./Component";
 import type { SurfaceId } from "./SurfaceId";
 import type { SurfaceScope } from "./SurfaceScope";
 
-export type SurfaceUpdate = { surface_id: SurfaceId, scope: SurfaceScope, 
+export type SurfaceUpdate = { surface_id: SurfaceId, scope: SurfaceScope,
 /**
  * An empty list removes the surface.
  */

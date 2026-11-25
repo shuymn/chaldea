@@ -8,11 +8,11 @@ import type { WorktreeState } from "./WorktreeState";
 /**
  * The full worktree record, carried on every change.
  */
-export type WorktreeChanged = { worktree_id: WorktreeId, repo: string, workspace_id: WorkspaceId, path: string, branch: string, base_ref: string, 
+export type WorktreeChanged = { worktree_id: WorktreeId, repo: string, workspace_id: WorkspaceId, path: string, branch: string, base_ref: string,
 /**
  * The resolved SHA of `base_ref`.
  */
-base_commit: string, 
+base_commit: string,
 /**
  * `null` when the human owner holds it.
  */

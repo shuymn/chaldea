@@ -3,11 +3,11 @@ import type { ExitReason } from "./ExitReason";
 import type { FailedStart } from "./FailedStart";
 import type { LaunchId } from "./LaunchId";
 
-export type LaunchExited = { launch_id: LaunchId, code: number | null, signal: number | null, reason: ExitReason, 
+export type LaunchExited = { launch_id: LaunchId, code: number | null, signal: number | null, reason: ExitReason,
 /**
  * False until the whole process tree is proven dead (§2.9 "Daemon restart").
  */
-death_confirmed: boolean, 
+death_confirmed: boolean,
 /**
  * The identity a failed start returned when its cleanup is unresolved (a launch with no
  * `launch_started`). Absent otherwise, never `null`: the one exception to this module's

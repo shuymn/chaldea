@@ -4,7 +4,7 @@ import type { SurfaceActionKind } from "./SurfaceActionKind";
 /**
  * Run only when a human with an owner token clicks its button.
  */
-export type SurfaceAction = { action_id: string, kind: SurfaceActionKind, 
+export type SurfaceAction = { action_id: string, kind: SurfaceActionKind,
 /**
  * Action arguments, validated by the command the action runs.
  */

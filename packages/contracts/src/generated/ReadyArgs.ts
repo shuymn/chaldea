@@ -5,7 +5,7 @@ import type { ThreadId } from "./ThreadId";
 /**
  * The arguments of `ready`.
  */
-export type ReadyArgs = { thread_id: ThreadId, 
+export type ReadyArgs = { thread_id: ThreadId,
 /**
  * When given, the current launch must be this one (`launch_changed` otherwise).
  */

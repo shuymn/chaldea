@@ -4,7 +4,7 @@ import type { KeyOutcome } from "./KeyOutcome";
 /**
  * The success body of `key`.
  */
-export type KeyResult = { outcome: KeyOutcome, 
+export type KeyResult = { outcome: KeyOutcome,
 /**
  * `null` for `pending`.
  */

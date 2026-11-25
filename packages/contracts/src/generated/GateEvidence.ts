@@ -4,11 +4,11 @@ import type { ReadinessEvidence } from "./ReadinessEvidence";
 /**
  * The gate evidence of the current launch, as thread-stream positions.
  */
-export type GateEvidence = { readiness_seq: number | null, readiness_evidence: ReadinessEvidence | null, 
+export type GateEvidence = { readiness_seq: number | null, readiness_evidence: ReadinessEvidence | null,
 /**
  * The last write of any origin.
  */
-last_write_seq: number | null, 
+last_write_seq: number | null,
 /**
  * The last human write that closes the gate (`attach` or `key`).
  */

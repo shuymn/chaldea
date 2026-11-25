@@ -83,6 +83,26 @@ fn export_schema<T: JsonSchema>(dir: &Path) {
     fs::write(dir.join(format!("{name}.schema.json")), text).expect("write schema");
 }
 
+/// Drops the spaces ts-rs leaves at the end of a line (before a field's doc comment), so the
+/// committed files pass `git diff --check`.
+fn trim_line_ends(dir: &Path) {
+    for entry in fs::read_dir(dir).expect("read ts dir") {
+        let path = entry.expect("ts dir entry").path();
+        let text = fs::read_to_string(&path).expect("read ts file");
+        let trimmed: String = text
+            .split_inclusive('\n')
+            .map(|l| {
+                let body = l.strip_suffix('\n').unwrap_or(l);
+                let end = if l.ends_with('\n') { "\n" } else { "" };
+                format!("{}{end}", body.trim_end_matches([' ', '\t']))
+            })
+            .collect();
+        if trimmed != text {
+            fs::write(&path, trimmed).expect("write ts file");
+        }
+    }
+}
+
 /// Writes every generated file under `out/ts` and `out/schema`.
 fn generate(out: &Path) -> (PathBuf, PathBuf) {
     let ts = out.join("ts");
@@ -118,6 +138,7 @@ fn generate(out: &Path) -> (PathBuf, PathBuf) {
     export_ts::<InputResolveArgs>(&cfg);
     export_ts::<InputCancelArgs>(&cfg);
     export_ts::<InputCommandResult>(&cfg);
+    trim_line_ends(&ts);
 
     export_schema::<EventEnvelope>(&schema);
     export_schema::<TypedEvent>(&schema);

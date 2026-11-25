@@ -3,7 +3,7 @@ import type { Content } from "./Content";
 import type { MessageId } from "./MessageId";
 import type { ThreadId } from "./ThreadId";
 
-export type MailboxMessage = { message_id: MessageId, 
+export type MailboxMessage = { message_id: MessageId,
 /**
  * `null` when a human sent it.
  */

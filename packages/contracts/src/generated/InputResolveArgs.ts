@@ -4,7 +4,7 @@ import type { InputId } from "./InputId";
 /**
  * The arguments of `input_resolve`.
  */
-export type InputResolveArgs = { input_id: InputId, 
+export type InputResolveArgs = { input_id: InputId,
 /**
  * `true`: the owner saw it delivered (`acked`); `false`: `dismissed`.
  */

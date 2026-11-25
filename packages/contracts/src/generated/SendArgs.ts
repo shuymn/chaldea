@@ -5,7 +5,7 @@ import type { ThreadId } from "./ThreadId";
 /**
  * The arguments of `send`.
  */
-export type SendArgs = { thread_id: ThreadId, text: string, 
+export type SendArgs = { thread_id: ThreadId, text: string,
 /**
  * The client's claim of where the text came from; `cli` when absent. Informational.
  */

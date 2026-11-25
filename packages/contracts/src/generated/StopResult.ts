@@ -7,15 +7,15 @@ import type { StopOutcome } from "./StopOutcome";
  * present, `exit_code` and `signal` as `null` when unknown, and each is in the JSON
  * Schema's `required` list.
  */
-export type StopResult = { launch_id: LaunchId, outcome: StopOutcome, 
+export type StopResult = { launch_id: LaunchId, outcome: StopOutcome,
 /**
  * The launch's process tree was proven dead.
  */
-death_confirmed: boolean, 
+death_confirmed: boolean,
 /**
  * Death was confirmed and proven at or before the request's start + 5 s.
  */
-confirmed_within_deadline: boolean, 
+confirmed_within_deadline: boolean,
 /**
  * The leader's exit code; `null` when the waiter had not reported an exit, and for
  * `already_exited` (the launch's own `launch_exited` carries it).

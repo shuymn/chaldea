@@ -2,7 +2,7 @@
 import type { Content } from "./Content";
 import type { InputId } from "./InputId";
 
-export type UserMessage = { prompt: Content, 
+export type UserMessage = { prompt: Content,
 /**
  * The input this prompt acknowledged, when attributed (§2.3 "Ack").
  */
