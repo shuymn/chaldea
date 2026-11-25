@@ -129,6 +129,9 @@ struct Proc {
     /// `wait_timeout` blocks while set (`hold_waiter`).
     waiter_held: Mutex<bool>,
     waiter_cv: Condvar,
+    /// Every `PtyChild` reference to this process is gone (`wait_dropped`).
+    dropped: Mutex<bool>,
+    dropped_cv: Condvar,
 }
 
 impl Proc {
@@ -282,6 +285,8 @@ impl PtyRuntime for FakePty {
             wait_fails: AtomicBool::new(false),
             waiter_held: Mutex::new(script.hold_waiter),
             waiter_cv: Condvar::new(),
+            dropped: Mutex::new(false),
+            dropped_cv: Condvar::new(),
         });
         let reader = FakeReader {
             pipe: r,
@@ -426,6 +431,14 @@ fn sleep_until(deadline: Instant) {
 }
 
 struct FakeProcess(Arc<Proc>);
+
+/// The last `PtyChild` reference going, as a native child's handles close with it.
+impl Drop for FakeProcess {
+    fn drop(&mut self) {
+        *lock(&self.0.dropped) = true;
+        self.0.dropped_cv.notify_all();
+    }
+}
 
 const KILLED: ChildExit = ChildExit {
     code: None,
@@ -647,6 +660,20 @@ impl FakeChild {
         self.proc.wait_fails.store(true, Ordering::Release);
         let _x = lock(&self.proc.exit);
         self.proc.exit_cv.notify_all();
+    }
+
+    /// Waits until every `PtyChild` reference to the process is gone (the session's and its
+    /// waiter's), as a native child's last handle closes, until `deadline`; true when gone.
+    #[must_use]
+    pub fn wait_dropped(&self, deadline: Instant) -> bool {
+        let d = lock(&self.proc.dropped);
+        let left = deadline.saturating_duration_since(Instant::now());
+        let (d, _) = self
+            .proc
+            .dropped_cv
+            .wait_timeout_while(d, left, |d| !*d)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *d
     }
 
     /// Ends the block of `FakeScript.hold_waiter`.

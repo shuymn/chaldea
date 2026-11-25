@@ -328,6 +328,12 @@ impl Shared {
 
     /// The responder's target; runs on the drain thread under the VT lock (VT lock →
     /// queue lock is the lock order).
+    /// Stops the writer: it takes no more units and ends once idle.
+    fn stop_writer(&self) {
+        lock(&self.q).stop = true;
+        self.cv.notify_all();
+    }
+
     fn enqueue_reply(&self, kind: ReplyKind, bytes: Vec<u8>) {
         {
             let mut q = lock(&self.q);
@@ -899,6 +905,11 @@ impl Session {
         self.closed = true;
         let t0 = Instant::now();
         let sh = self.sh.clone();
+        let _release = Release {
+            sh: sh.clone(),
+            waiter_stop: self.waiter_stop.clone(),
+            close: bounds.close,
+        };
 
         // 1. Close the queue and settle everything that has not dispatched.
         self.close_queue().fire(&sh);
@@ -921,11 +932,7 @@ impl Session {
         };
 
         // 3. Release the input.
-        {
-            let mut q = lock(&sh.q);
-            q.stop = true;
-        }
-        sh.cv.notify_all();
+        sh.stop_writer();
         let _ = wait_finished(self.writer.as_ref(), Instant::now() + bounds.input);
 
         // 4. Close the PTY while the drain keeps reading.
@@ -995,6 +1002,29 @@ impl Session {
             final_after_end,
             elapsed: t0.elapsed(),
             exit: sh.exit.get().copied(),
+        }
+    }
+}
+
+/// Runs when `close_inner` returns or unwinds (a step's panic, e.g. a backend's kill or
+/// close): ends the writer, stops the waiter, and closes the control unless a step already
+/// did, so the threads end and drop their references to the input, the child, and the PTY.
+/// On Windows the child's job handle closes with the last of them, which ends the tree
+/// (kill-on-close) even after a kill that panicked.
+struct Release {
+    sh: Arc<Shared>,
+    waiter_stop: Arc<AtomicBool>,
+    close: Duration,
+}
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.sh.stop_writer();
+        self.waiter_stop.store(true, Ordering::Release);
+        let control = lock(&self.sh.control).take();
+        if let Some(c) = control {
+            let deadline = Instant::now() + self.close;
+            let _ = catch_unwind(AssertUnwindSafe(|| c.close(deadline)));
         }
     }
 }

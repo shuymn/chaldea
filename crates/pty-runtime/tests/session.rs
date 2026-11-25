@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use chaldea_pty_runtime::fake::{FakeEvent, FakePty, FakeScript, KillBehavior, ProbePoint};
+use chaldea_pty_runtime::fake::{
+    FakeChild, FakeEvent, FakePty, FakeScript, KillBehavior, ProbePoint,
+};
 use chaldea_pty_runtime::{
     ChildExit, Cleanup, CloseBounds, Flow, KillAttempt, Limits, OutputEnd, OutputEvent, OutputSink,
     ProcessIdentity, PtySize, Received, Refusal, Resized, Session, SessionConfig, SessionEvent,
@@ -1457,9 +1459,33 @@ fn kill_by_is_busy_after_lock_by() {
 }
 
 /// A session dropped during an unwind, its implicit close's kill panicking: the panic stays
-/// inside the drop, so the unwind ends where it is caught, not in an abort.
+/// inside the drop, so the unwind ends where it is caught, not in an abort, and the close
+/// still releases the session (`released_after_a_kill_panic`).
 #[test]
 fn implicit_close_survives_an_unwind() {
+    let (session, child) = panicking_kill();
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _held = session;
+        panic!("a fault while the session is open");
+    }));
+    assert!(run.is_err());
+    released_after_a_kill_panic(&child);
+}
+
+/// An explicit close whose kill panics: the panic leaves the close, and the close still
+/// ends the writer, closes the control, and stops the waiter, so every reference to the
+/// child is gone (on Windows, the job's last handle, which ends the tree).
+#[test]
+fn close_releases_after_a_kill_panic() {
+    let (session, child) = panicking_kill();
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        session.close(&[], CloseBounds::default())
+    }));
+    assert!(run.is_err());
+    released_after_a_kill_panic(&child);
+}
+
+fn panicking_kill() -> (Session, FakeChild) {
     let r = rig_with(
         FakeScript {
             kill: KillBehavior::Panic,
@@ -1469,12 +1495,19 @@ fn implicit_close_survives_an_unwind() {
         80,
         24,
     );
-    let (session, child) = (r.session, r.child);
-    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        let _held = session;
-        panic!("a fault while the session is open");
-    }));
-    assert!(run.is_err());
-    assert!(child.log().contains(&FakeEvent::Kill { extra: Vec::new() }));
-    child.close_output();
+    (r.session, r.child)
+}
+
+/// The kill was made and panicked; the input, the control, and the child are released
+/// anyway, the child never having exited.
+fn released_after_a_kill_panic(child: &FakeChild) {
+    assert!(
+        child.wait_dropped(Instant::now() + WAIT),
+        "the waiter still holds the child"
+    );
+    let log = child.log();
+    assert!(log.contains(&FakeEvent::Kill { extra: Vec::new() }));
+    assert!(log.contains(&FakeEvent::InputDropped), "{log:?}");
+    assert!(log.contains(&FakeEvent::ControlClosed), "{log:?}");
+    assert!(!log.contains(&FakeEvent::Exited), "{log:?}");
 }
