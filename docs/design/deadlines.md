@@ -65,7 +65,7 @@ Step 3 is §2.10's "each return is classified with one clock sample", and `in_ti
 
 - **Where.** In the daemon's own `clippy.toml`: clippy reads the nearest `clippy.toml` above the crate's manifest and does not merge it with a parent's, so a workspace-root file would be shadowed by `crates/{core,cli,daemon}/clippy.toml`.
 - **Coverage.** The lint fires on a `use`-imported bare call, the full path, a module alias, a crate re-export, the function taken as a value (as in `deadline.map(sleep_until)`), inside `#[cfg(test)]` modules, and in integration tests under `--all-targets`. `Sleep::reset`, `interval`, `interval_at`, and timers inside libraries (hyper's `header_read_timeout`) are outside it; review owns them.
-- **Exception scope.** `clippy::disallowed_methods` also carries the router and spawn-lock entries, so an `allow` covers only a private function whose body is the one tokio call, with `#[allow(clippy::disallowed_methods, reason = "…")]` naming the contract its callers follow (the repository's form: `routes::build_router`, `lifecycle::spawn_locked`). Each call site calls the function where it would call tokio, so the timer is constructed at that point with those arguments, including Tokio's relative `timeout` with its checked add at the hand-over.
+- **Exception scope.** `clippy::disallowed_methods` also carries the router and spawn-lock entries, so an `allow` covers only a private function whose body is the one tokio call, with `#[allow(clippy::disallowed_methods, reason = "…")]` naming the contract its callers follow (the repository's form: `routes::build_router`, `lifecycle::spawn_locked`). Each call site calls the function where it would call tokio, so the timer is constructed at that point with the same instant or duration, including Tokio's relative `timeout` with its checked add at the hand-over; `listener::accept_backoff` takes no argument and holds its constant 1 s inside.
 - **Production exceptions (13).**
 
   | Function | Wraps | Callers and the contract in the reason |
@@ -150,7 +150,7 @@ The kept sites keep their own tests, among them `http::tests::writes::reply_afte
 | DL-CL-4 | When a read's result is taken before its deadline, `read_cut` shall keep it even if the waiter resumes after the deadline. | http-surface §2.3 | `http::tests::reads::read_by_classifies_with_one_sample` |
 | DL-CL-5 | When the future of `until_deadline` is first observed at or after its deadline, or its destructor runs past it, `until_deadline` shall answer 408. | http-surface §2.3 | `http::tests::reads::{until_deadline_drop_past_the_deadline_is_408, late_body_is_408}` |
 | DL-CL-6 | Clippy shall reject a direct call to each of `tokio::time::{timeout, timeout_at, sleep, sleep_until}` in a target of `crates/daemon` that carries no `allow`. | D2 | CI step "Probe the timer ban" (`scripts/lint-probe.sh`); `cli/tests/lints.rs::clippy_tomls_list_the_bans` |
-| DL-CL-7 | The kept sites shall keep their code, except that each tokio timer call becomes a call of its exception function at the same point with the same arguments. | D3 | review of the diff; their existing tests (D4) |
+| DL-CL-7 | The kept sites shall keep their code, except that each tokio timer call becomes a call of its exception function at the same point with the same instant or duration (`listener::accept_backoff` holds its constant 1 s inside). | D3 | review of the diff; their existing tests (D4) |
 
 ## 5. Out of Scope
 

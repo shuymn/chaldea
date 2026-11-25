@@ -149,6 +149,8 @@ pub(crate) enum Point {
     BeforeStopping,
     /// The `stopping` rewrite's blocking thread (blocking), before it reads the record.
     InsideStopping,
+    /// The coordinator, after the `stopping` rewrite and right before HTTP's shutdown.
+    BeforeHttp,
     /// The coordinator, after HTTP's shutdown returned and before the participants.
     AfterHttp,
     /// The coordinator, right before it submits `Store::shutdown`.
@@ -226,6 +228,8 @@ pub(crate) struct Faults {
     pub(crate) record_verify_fails: AtomicU32,
     /// The wait between removal attempts instead of 50 ms.
     pub(crate) record_retry: Mutex<Option<Duration>>,
+    /// The `stopping` rewrite's budget instead of 500 ms (still within HTTP's).
+    pub(crate) stopping_rewrite: Mutex<Option<Duration>>,
     /// The wait between removal attempts was first polled.
     pub(crate) record_sleeping: AtomicBool,
     /// The coordinator took the startup task's result in its wait for the first request.
