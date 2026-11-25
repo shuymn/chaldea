@@ -116,11 +116,11 @@ pub(crate) fn run(state_dir: PathBuf, a: &RunArgs, seams: &mut Seams) -> ExitCod
         .host_os
         .take()
         .unwrap_or_else(|| std::env::consts::OS.to_owned());
-    if HostOs::from_os_str(&os).is_none() {
+    let Some(host_os) = HostOs::from_os_str(&os) else {
         return fail(&format!(
             "the daemon runs on macOS and Windows only, not on `{os}`"
         ));
-    }
+    };
     let ready = match ready_channel_arg(a.detached_child, a.ready.as_deref()) {
         Ok(r) => r,
         Err(e) => return fail_with(ExitCode::Usage, &e),
@@ -145,10 +145,15 @@ pub(crate) fn run(state_dir: PathBuf, a: &RunArgs, seams: &mut Seams) -> ExitCod
     } else {
         RunMode::Foreground
     };
-    let components = seams
-        .components
-        .take()
-        .map_or_else(|| Box::new(lifecycle::MvpComponents) as _, |f| f());
+    let components = seams.components.take().map_or_else(
+        || {
+            Box::new(chaldea_daemon::supervisor::SupervisorComponents::new(
+                host_os,
+                chaldea_daemon::supervisor::SupervisorConfig::default(),
+            )) as _
+        },
+        |f| f(),
+    );
     lifecycle::run(
         DaemonConfig {
             state_dir,

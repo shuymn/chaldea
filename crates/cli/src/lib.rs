@@ -36,7 +36,7 @@ const FINAL_FLUSH: Duration = Duration::from_millis(100);
     reason = "test seams named for what they replace"
 )]
 pub struct Seams {
-    /// `daemon run`'s components instead of `MvpComponents`.
+    /// `daemon run`'s components instead of `SupervisorComponents`.
     pub components: Option<Box<dyn FnOnce() -> Box<dyn Components>>>,
     /// The starter's `launchctl` instead of `host::launchctl`.
     pub launchctl: Option<Box<dyn Fn(&[&OsStr], Instant) -> std::io::Result<LaunchctlOutput>>>,
