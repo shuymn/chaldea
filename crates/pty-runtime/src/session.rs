@@ -328,6 +328,12 @@ impl Shared {
 
     /// The responder's target; runs on the drain thread under the VT lock (VT lock →
     /// queue lock is the lock order).
+    /// Stops the writer: it takes no more units and ends once idle.
+    fn stop_writer(&self) {
+        lock(&self.q).stop = true;
+        self.cv.notify_all();
+    }
+
     fn enqueue_reply(&self, kind: ReplyKind, bytes: Vec<u8>) {
         {
             let mut q = lock(&self.q);
@@ -545,6 +551,19 @@ fn spawn_thread(
         return Err(io::Error::other(format!("injected {name} thread failure")));
     }
     std::thread::Builder::new().name(name.to_owned()).spawn(f)
+}
+
+/// A close step's bound in place of one too long for an `Instant`.
+const FAR: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// `now + d`, or [`FAR`] from now when `d` is too long for an `Instant`: no close step's or
+/// guard's deadline sum panics (`CloseBounds` with `Duration::MAX`), which in the guard,
+/// during an unwind, would abort the process.
+pub(crate) fn deadline_in(d: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(d)
+        .or_else(|| now.checked_add(FAR))
+        .unwrap_or(now)
 }
 
 /// Waits until `h` finished or `deadline`; true when it finished.
@@ -899,6 +918,11 @@ impl Session {
         self.closed = true;
         let t0 = Instant::now();
         let sh = self.sh.clone();
+        let _release = Release {
+            sh: &sh,
+            waiter_stop: &self.waiter_stop,
+            close: bounds.close,
+        };
 
         // 1. Close the queue and settle everything that has not dispatched.
         self.close_queue().fire(&sh);
@@ -913,26 +937,21 @@ impl Session {
         let kill = match (prior, kill_deadline) {
             (Some((k, _)), None) if k.tree_dead && extra.is_empty() => k,
             (Some((k, list)), Some(_)) if k.tree_dead && list == extra => k,
-            (_, None) => {
-                let at = Instant::now() + bounds.kill;
+            (_, at) => {
+                let at = at.unwrap_or_else(|| deadline_in(bounds.kill));
                 self.child.kill_tree(extra, at, at)
             }
-            (_, Some(at)) => self.child.kill_tree(extra, at, at),
         };
 
         // 3. Release the input.
-        {
-            let mut q = lock(&sh.q);
-            q.stop = true;
-        }
-        sh.cv.notify_all();
-        let _ = wait_finished(self.writer.as_ref(), Instant::now() + bounds.input);
+        sh.stop_writer();
+        let _ = wait_finished(self.writer.as_ref(), deadline_in(bounds.input));
 
         // 4. Close the PTY while the drain keeps reading.
         let close = {
             let mut ctl = lock(&sh.control);
             match ctl.take() {
-                Some(c) => c.close(Instant::now() + bounds.close),
+                Some(c) => c.close(deadline_in(bounds.close)),
                 None => CloseReport {
                     elapsed: Some(Duration::ZERO),
                 },
@@ -943,7 +962,7 @@ impl Session {
         let output = self.drain.take().and_then(|d| d.finish(bounds.drain));
 
         // 6. Join and snapshot.
-        let deadline = Instant::now() + bounds.join;
+        let deadline = deadline_in(bounds.join);
         self.waiter_stop.store(true, Ordering::Release);
         let writer_done = wait_finished(self.writer.as_ref(), deadline);
         if writer_done && let Some(h) = self.writer.take() {
@@ -999,12 +1018,39 @@ impl Session {
     }
 }
 
+/// Runs when `close_inner` returns or unwinds (a step's panic, e.g. a backend's kill or
+/// close): ends the writer, stops the waiter, and closes the control unless a step already
+/// did, so the threads end and drop their references to the input, the child, and the PTY.
+/// On Windows the child's job handle closes with the last of them, which ends the tree
+/// (kill-on-close) even after a kill that panicked.
+struct Release<'a> {
+    sh: &'a Shared,
+    waiter_stop: &'a AtomicBool,
+    close: Duration,
+}
+
+impl Drop for Release<'_> {
+    fn drop(&mut self) {
+        self.sh.stop_writer();
+        self.waiter_stop.store(true, Ordering::Release);
+        let control = lock(&self.sh.control).take();
+        if let Some(c) = control {
+            let deadline = deadline_in(self.close);
+            let _ = catch_unwind(AssertUnwindSafe(|| c.close(deadline)));
+        }
+    }
+}
+
 /// An implicit drop closes with an empty `extra`: best-effort cleanup that can never name
-/// the recorded descendants, so it is never a death proof.
+/// the recorded descendants, so it is never a death proof. A panic inside that cleanup (a
+/// backend's kill or close) is caught and the session's remaining parts drop as values: the
+/// drop may run during an unwind, where an escaping panic aborts the process.
 impl Drop for Session {
     fn drop(&mut self) {
         if !self.closed {
-            let _ = self.close_inner(&[], CloseBounds::default(), None);
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                self.close_inner(&[], CloseBounds::default(), None)
+            }));
         }
     }
 }

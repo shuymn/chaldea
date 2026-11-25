@@ -66,8 +66,8 @@ pub use upgrade::{ShutdownSignal, UpgradeGrant, UpgradedSocket};
 pub(crate) use auth::{TOKEN_PREFIX, has_secret_form, verify_in_read};
 pub(crate) use ctx::until_deadline;
 pub(crate) use error::refused;
+pub(crate) use sync_api::{json, no_query};
 // The seams for components that write without a request (the supervisor's ops).
-#[expect(unused_imports, reason = "used by the supervisor in PR 10a1 part 2")]
 pub(crate) use {
     auth::mint_token,
     commands::{
@@ -378,10 +378,6 @@ impl HttpServer {
     }
 
     /// The nudge a component keeps to run after its own revoking jobs commit.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the supervisor in PR 10a1 part 2")
-    )]
     #[must_use]
     pub(crate) fn revocation_nudge(&self) -> RevocationNudge {
         self.shared.revocation_nudge()

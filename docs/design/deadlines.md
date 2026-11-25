@@ -66,14 +66,14 @@ Step 3 is §2.10's "each return is classified with one clock sample", and `in_ti
 - **Where.** In the daemon's own `clippy.toml`: clippy reads the nearest `clippy.toml` above the crate's manifest and does not merge it with a parent's, so a workspace-root file would be shadowed by `crates/{core,cli,daemon}/clippy.toml`.
 - **Coverage.** The lint fires on a `use`-imported bare call, the full path, a module alias, a crate re-export, the function taken as a value (as in `deadline.map(sleep_until)`), inside `#[cfg(test)]` modules, and in integration tests under `--all-targets`. `Sleep::reset`, `interval`, `interval_at`, and timers inside libraries (hyper's `header_read_timeout`) are outside it; review owns them.
 - **Exception scope.** `clippy::disallowed_methods` also carries the router and spawn-lock entries, so an `allow` covers only a private function whose body is the one tokio call, with `#[allow(clippy::disallowed_methods, reason = "…")]` naming the contract its callers follow (the repository's form: `routes::build_router`, `lifecycle::spawn_locked`). Each call site calls the function where it would call tokio, so the timer is constructed at that point with the same instant or duration, including Tokio's relative `timeout` with its checked add at the hand-over; `listener::accept_backoff` takes no argument and holds its constant 1 s inside.
-- **Production exceptions (13).**
+- **Production exceptions (14).**
 
   | Function | Wraps | Callers and the contract in the reason |
   |---|---|---|
   | `deadline::bound` | `timeout_at` | `settle_before` (D1) |
   | `ctx::reply_cutoff` | `timeout_at` | `await_write_releasing`: a closed reply channel is 503 `outcome_unknown` before any clock reading; a reply is classified by one sample against `reply_by` (http-surface §2.3). The cutoff is converted before the observer registers and the job is submitted. |
   | `commands::reply_wake` | `timeout_at` | `await_reply`: wakes the loop; the progress read and its sample decide (§2.8) |
-  | `commands::backoff_until` | `sleep_until` | completion backoff; the budget is read before each attempt (§2.8). Re-exported from `http` with the rest of the completion policy for components' own retried writes, which follow the same contract. |
+  | `commands::backoff_until` | `sleep_until` | completion backoff; the budget is read before each attempt (§2.8). Re-exported from `http` with the rest of the completion policy and shared with the supervisor, whose retried writes (`supervisor::record`) follow the same contract. |
   | `ws::socket_timer` | `sleep_until` | `before` (timer, clock check, then poll: §2.6 "Bounded disconnect"), and the startup and loop `select!` arms (a fired timer drops the socket or ticks; results go through `take_read` or `before`, §2.6). The startup `select!` is `biased`: shutdown, then the timer, then the startup read's join. |
   | `hook::pid_timer` | `sleep_until` | pid wait: biased timer, then one sample and a strict re-read (hook-ingest §2.3) |
   | `registry::drain_timer` | `sleep_until` | `wait_empty_until`'s unbiased `select!` (§2.2 "Shutdown") |
@@ -83,6 +83,7 @@ Step 3 is §2.10's "each return is classified with one clock sample", and `in_ti
   | `shutdown::record_pause` | `sleep` | record-removal retry; the deletion is admitted by the budget checks (§2.8 step 5) |
   | `listener::accept_backoff` | `sleep` | accept-error backoff, shutdown wins (§2.2) |
   | `listener::stall_timer` | `sleep` | `ConnIo` write stall, progress first (§2.2) |
+  | `supervisor::tick_timer` | `sleep_until` | the supervisor's 1 s tick period; each tick decides from the store (`docs/design/supervisor.md` §2.6) |
 
   Moving one of these sites to `settle_before` needs its own design for the poll, sample, and drop order it changes.
 
@@ -156,6 +157,7 @@ The kept sites keep their own tests, among them `http::tests::writes::reply_afte
 
 - The synchronous helpers of `pty-runtime::host`, the CLI's polls (`cli::poll`: `poll_until`, and `poll_until_with`, which reads its cutoff on an injected clock), ticket and pair-code expiry, and the store's blocking waits.
 - A write's ticket: `run_write` and `write_with` await an admitted job's ticket to the writer's answer with no timeout of their own; `not_after` bounds only the writer's start of the job.
+- The supervisor's await of `Session::spawn`, which has no deadline: cancelling it cannot stop the blocking call from creating the child, so the launch op awaits it to its result, bounded by the spawn lock's holders, each of which does bounded work except the OS's process creation itself: on macOS `Command::spawn` returns once the child's `exec` reports through its close-on-exec pipe, and an `exec` the kernel holds (an unresponsive filesystem) holds the lock without bound; nothing in the daemon can end that wait, and it is accepted; the request replies at its own deadline through the runner (`docs/design/supervisor.md` §2.10).
 - hyper's `header_read_timeout`, `Sleep::reset`, `interval` (review-only).
 - Moving the kept sites onto `settle_before`.
 - The CLI crate's `clippy.toml`: the CLI has no tokio outside its tests.

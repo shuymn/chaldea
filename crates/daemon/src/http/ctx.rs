@@ -230,10 +230,6 @@ async fn run_write_releasing<R: Send + 'static>(
 /// # Errors
 ///
 /// The submission's or the write's failure.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the supervisor in PR 10a1 part 2")
-)]
 pub(crate) async fn write_with<R: Send + 'static>(
     store: &Store,
     sink: &dyn LifecycleSink,

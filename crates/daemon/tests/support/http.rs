@@ -38,12 +38,18 @@ pub const HEADS_INTERVAL: Duration = Duration::from_millis(200);
 /// How long a WebSocket client waits for one frame or the close.
 pub const WS_WAIT: Duration = Duration::from_secs(10);
 
-/// Records every fatal store outcome.
+/// A test's observer of each fatal outcome, called before it is recorded.
+pub type OnFatal = Box<dyn Fn(&StoreFatal) + Send + Sync>;
+
+/// Records every fatal store outcome, calling the observer first when one is set.
 #[derive(Default)]
-pub struct RecordingSink(pub Mutex<Vec<StoreFatal>>);
+pub struct RecordingSink(pub Mutex<Vec<StoreFatal>>, pub Mutex<Option<OnFatal>>);
 
 impl LifecycleSink for RecordingSink {
     fn store_fatal(&self, f: StoreFatal) {
+        if let Some(on) = &*self.1.lock().unwrap() {
+            on(&f);
+        }
         self.0.lock().unwrap().push(f);
     }
 }
@@ -178,9 +184,24 @@ impl TestServer {
         commands: CommandRegistry,
         tune: impl FnOnce(&mut HttpConfig),
     ) -> TestServer {
+        let parts = (
+            Arc::new(SkewClock::default()),
+            Arc::new(RecordingSink::default()),
+        );
+        Self::start_parts(store, mounts, commands, parts, tune).await
+    }
+
+    /// As [`TestServer::start_full`], reading `clock` and reporting to `sink`, which the
+    /// caller shares with components it built.
+    pub async fn start_parts(
+        store: TestStore,
+        mounts: Mounts,
+        commands: CommandRegistry,
+        (clock, sink): (Arc<SkewClock>, Arc<RecordingSink>),
+        tune: impl FnOnce(&mut HttpConfig),
+    ) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let clock = Arc::new(SkewClock::default());
         let mut cfg = HttpConfig::new(port);
         cfg.short_deadline = DEADLINE;
         cfg.header_read_timeout = HEAD_TIMEOUT;
@@ -188,7 +209,6 @@ impl TestServer {
         cfg.ws.heads_interval = HEADS_INTERVAL;
         cfg.clock = clock.clone();
         tune(&mut cfg);
-        let sink = Arc::new(RecordingSink::default());
         let server = HttpServer::new(cfg, store.store().clone(), commands, sink.clone(), mounts);
         let handle = server.serve(listener);
         TestServer {

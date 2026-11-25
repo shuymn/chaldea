@@ -4,6 +4,7 @@
 //! parsing whose errors go through the redacting `diag`, the daemon's process entry, and an
 //! exit through `std::process::exit` on every path.
 
+mod agent_cmd;
 mod args;
 mod client;
 mod daemon_cmd;
@@ -36,7 +37,7 @@ const FINAL_FLUSH: Duration = Duration::from_millis(100);
     reason = "test seams named for what they replace"
 )]
 pub struct Seams {
-    /// `daemon run`'s components instead of `MvpComponents`.
+    /// `daemon run`'s components instead of `SupervisorComponents`.
     pub components: Option<Box<dyn FnOnce() -> Box<dyn Components>>>,
     /// The starter's `launchctl` instead of `host::launchctl`.
     pub launchctl: Option<Box<dyn Fn(&[&OsStr], Instant) -> std::io::Result<LaunchctlOutput>>>,
@@ -200,5 +201,38 @@ fn command(cli: Cli, seams: &mut Seams) -> ExitCode {
             command: DaemonCommand::Stop,
         } => daemon_cmd::stop(&state_dir, seams),
         Command::Open { print_url } => open::run(&state_dir, print_url, &host::open_url),
+        Command::Spawn {
+            agent,
+            cwd,
+            prompt,
+            task,
+        } => agent_cmd::run(
+            &state_dir,
+            agent_cmd::Verb::Spawn {
+                agent: agent.into(),
+                cwd,
+                prompt,
+                task,
+            },
+        ),
+        Command::Resume { thread, prompt } => {
+            agent_cmd::run(&state_dir, agent_cmd::Verb::Resume { thread, prompt })
+        }
+        Command::Stop { thread } => agent_cmd::run(&state_dir, agent_cmd::Verb::Stop { thread }),
+        Command::Close { thread, stop } => {
+            agent_cmd::run(&state_dir, agent_cmd::Verb::Close { thread, stop })
+        }
+        Command::Wait {
+            thread,
+            until,
+            timeout,
+        } => agent_cmd::run(
+            &state_dir,
+            agent_cmd::Verb::Wait {
+                thread,
+                until,
+                timeout,
+            },
+        ),
     }
 }

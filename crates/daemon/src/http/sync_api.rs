@@ -200,7 +200,7 @@ pub(crate) async fn events(ctx: ReadCtx, req: Request<Body>) -> Result<Response<
 }
 
 /// A route that takes no query: any parameter is 400 `bad_query`.
-fn no_query(req: &Request<Body>) -> Result<(), ApiError> {
+pub(crate) fn no_query(req: &Request<Body>) -> Result<(), ApiError> {
     params(req.uri().query(), &[]).map(|_| ())
 }
 

@@ -1707,3 +1707,27 @@ fn dropping_the_child_kills_through_the_job() {
     let _ = control.close(Instant::now() + BOUND);
     let _ = output.finish(BOUND);
 }
+
+/// A session whose close's kill panics inside `terminate_job`: the close still stops the
+/// waiter and closes the control, so the last references to the child go, and with them
+/// the job's last handle: kill-on-close ends the leader while the test process lives on.
+#[test]
+fn panicking_close_kill_closes_the_job() {
+    let _s = serial();
+    let pty = WindowsPty::default();
+    let session = crate::Session::spawn(&pty, &cmd("pause"), crate::SessionConfig::new(|_| {}))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let child = take_child(&pty).unwrap();
+    let id = child.identity().clone();
+    let watch = open_verified(id.pid, &id.start_time);
+    *child.in_kill.lock().unwrap() = Some(Box::new(|| panic!("injected terminate_job panic")));
+    drop(child);
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        session.close(&[], crate::CloseBounds::default())
+    }));
+    assert!(run.is_err(), "the kill's panic leaves the close");
+    assert!(
+        sys::wait_floor(watch.as_handle(), BOUND).unwrap(),
+        "kill-on-close ended the leader"
+    );
+}

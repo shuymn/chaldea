@@ -1105,10 +1105,82 @@ pub fn open_url(url: &str) -> io::Result<()> {
     imp::open_url(url)
 }
 
+// ---- Helper programs (docs/design/supervisor.md §2.3 step 1, §2.7) ----
+
+/// Starts `cmd`'s child without a console window of its own: `CREATE_NO_WINDOW` on Windows,
+/// nothing elsewhere. For a short helper the daemon reads, such as the workspace probe's
+/// `git`.
+pub fn no_console_window(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        /// `CREATE_NO_WINDOW` (`winbase.h`).
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
+/// The first `name` (`name.exe` on Windows) in an absolute directory of `path` (a `PATH`
+/// value) that is an executable file (on macOS, one this process may execute by its
+/// effective ids), as a shell's search continues past a candidate it cannot run.
+#[must_use]
+pub fn find_program(name: &str, path: &OsStr) -> Option<PathBuf> {
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
+    std::env::split_paths(path)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(&file))
+        .find(|p| executable(p))
+}
+
+fn executable(p: &Path) -> bool {
+    // On macOS: executable by this process, its effective ids against the file's mode and
+    // owner as `exec` checks them, not any execute bit. Elsewhere (Windows): a `.exe` file.
+    #[cfg(target_os = "macos")]
+    {
+        use rustix::fs::{Access, AtFlags, CWD, accessat};
+        p.is_file() && accessat(CWD, p, Access::EXEC_OK, AtFlags::EACCESS).is_ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        p.is_file()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
     use std::time::{Duration, Instant};
+
+    /// The search passes a candidate without an execute bit, one whose only execute bit is
+    /// for others (not executable by its owner, this test's user), and a directory of the
+    /// same name, and takes the next executable file.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn find_program_skips_what_cannot_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::unix::tests::TempDir::new("find-program");
+        let [plain, others, dir, exec] = ["plain", "others", "dir", "exec"].map(|d| root.0.join(d));
+        for d in [&plain, &others, &dir, &exec] {
+            std::fs::create_dir(d).unwrap();
+        }
+        for (d, mode) in [(&plain, 0o644), (&others, 0o001), (&exec, 0o755)] {
+            let f = d.join("codex");
+            std::fs::write(&f, b"").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        std::fs::create_dir(dir.join("codex")).unwrap();
+        let path = std::env::join_paths([&plain, &others, &dir, &exec]).unwrap();
+        assert_eq!(
+            super::find_program("codex", &path),
+            Some(exec.join("codex"))
+        );
+    }
 
     use super::{GuiDomain, LaunchctlOutput, classify_gui_probe};
 

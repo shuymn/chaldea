@@ -45,6 +45,16 @@ use tempfile::TempDir;
 
 /// Set: this process is `chaldea` with test seams.
 pub const AS_CHALDEA: &str = "CHALDEA_TEST_AS_CHALDEA";
+/// The supervisor's agent program for every agent, a JSON array of the program and its
+/// leading arguments: `daemon run` builds `SupervisorComponents` with it.
+pub const AGENT_PROGRAM: &str = "CHALDEA_TEST_AGENT_PROGRAM";
+/// With [`AGENT_PROGRAM`]: the supervisor holds at this pause point (`after_reserve`,
+/// `after_spawn`) on the gate at [`SUPERVISOR_GATE`].
+pub const SUPERVISOR_PAUSE: &str = "CHALDEA_TEST_SUPERVISOR_PAUSE";
+pub const SUPERVISOR_GATE: &str = "CHALDEA_TEST_SUPERVISOR_GATE";
+/// With [`AGENT_PROGRAM`], set: the supervisor runs on `FakePty`, its first child's waiter
+/// held, so a close of it abandons `pty-wait` and its token stays counted.
+pub const FAKE_PTY_HOLD_WAITER: &str = "CHALDEA_TEST_FAKE_PTY_HOLD_WAITER";
 /// The launchd label prefix (every test start on a GUI host uses its own).
 pub const LABEL_PREFIX: &str = "CHALDEA_TEST_LABEL_PREFIX";
 /// A `launchctl` fault: see [`launchctl_fault`].
@@ -179,6 +189,12 @@ impl Gate {
                 decision(self.path())
             );
         }
+    }
+
+    /// The test killed the waiting process: its `waiting` marker goes with it, so dropping
+    /// the gate does not wait for a waiter that is gone.
+    pub fn waiter_killed(&self) {
+        let _ = std::fs::remove_file(self.path().join(WAITING));
     }
 
     /// Ends the waiter without letting it go on, unless the gate was already decided: the
@@ -332,6 +348,40 @@ pub fn enter_if_chaldea() {
                 hold_reader,
                 shutdown_gate,
             }) as Box<dyn Components>
+        }));
+    }
+    if let Ok(json) = std::env::var(AGENT_PROGRAM) {
+        let argv: Vec<OsString> = serde_json::from_str::<Vec<String>>(&json)
+            .expect("CHALDEA_TEST_AGENT_PROGRAM is a JSON array of strings")
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        seams.components = Some(Box::new(move || {
+            let host = chaldea_core::adapter::HostOs::from_os_str(std::env::consts::OS)
+                .expect("a supported host");
+            let mut cfg = chaldea_daemon::supervisor::SupervisorConfig::default();
+            cfg.program = Some(std::sync::Arc::new(move |_| Some(argv.clone())));
+            if let (Ok(at), Some(dir)) =
+                (std::env::var(SUPERVISOR_PAUSE), env_path(SUPERVISOR_GATE))
+            {
+                let at = match at.as_str() {
+                    "after_reserve" => chaldea_daemon::supervisor::Pause::AfterReserve,
+                    "after_spawn" => chaldea_daemon::supervisor::Pause::AfterSpawn,
+                    other => panic!("unknown supervisor pause {other}"),
+                };
+                cfg.pauses = std::sync::Arc::new(GatePause { at, dir });
+            }
+            if std::env::var_os(FAKE_PTY_HOLD_WAITER).is_some() {
+                let pty = chaldea_pty_runtime::fake::FakePty::new();
+                pty.script_next(chaldea_pty_runtime::fake::FakeScript {
+                    hold_waiter: true,
+                    ..chaldea_pty_runtime::fake::FakeScript::default()
+                });
+                cfg.runtime = std::sync::Arc::new(pty);
+            }
+            Box::new(chaldea_daemon::supervisor::SupervisorComponents::new(
+                host, cfg,
+            )) as Box<dyn Components>
         }));
     }
     if let Some(dir) = env_path(MARKER_PAUSE) {
@@ -702,5 +752,26 @@ impl Drop for Labels {
             let code = Labels::bootout(&l);
             eprintln!("test cleanup: booted out {l} ({code:?})");
         }
+    }
+}
+
+/// Holds the supervisor at one pause point on a test gate.
+struct GatePause {
+    at: chaldea_daemon::supervisor::Pause,
+    dir: PathBuf,
+}
+
+impl chaldea_daemon::supervisor::Pauses for GatePause {
+    fn at(
+        &self,
+        p: chaldea_daemon::supervisor::Pause,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        if p != self.at {
+            return Box::pin(async {});
+        }
+        let dir = self.dir.clone();
+        Box::pin(async move {
+            let _ = tokio::task::spawn_blocking(move || wait_at(&dir)).await;
+        })
     }
 }

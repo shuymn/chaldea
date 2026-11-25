@@ -793,6 +793,8 @@ impl<'a> ReadTx<'a> {
     }
 
     fn launch_row(&self, l: LaunchId) -> Result<Option<LaunchRow>, StoreError> {
+        #[cfg(test)]
+        launch_reads::seen(l);
         Ok(self
             .launch_rows("WHERE launch_id = ?1", [l.to_string()])?
             .pop())
@@ -1535,4 +1537,34 @@ fn decode_launch(v: &[rusqlite::types::Value]) -> Result<LaunchRow, StoreError> 
         last_human_write_seq: opt_u64(int(22)?)?,
         last_turn_start_seq: opt_u64(int(23)?)?,
     })
+}
+
+/// Records whether a watched launch row was read (unit tests only), for tests that show a
+/// read never ran: process-wide, so each test watches only its own launch ids.
+#[cfg(test)]
+pub(crate) mod launch_reads {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    use chaldea_core::ids::LaunchId;
+
+    use crate::store::lock;
+
+    static WATCHED: Mutex<BTreeMap<LaunchId, bool>> = Mutex::new(BTreeMap::new());
+
+    /// Starts watching `l`, as not read.
+    pub(crate) fn watch(l: LaunchId) {
+        lock(&WATCHED).insert(l, false);
+    }
+
+    /// Whether `l` was read since [`watch`].
+    pub(crate) fn was_read(l: LaunchId) -> bool {
+        lock(&WATCHED).get(&l).copied().unwrap_or(false)
+    }
+
+    pub(super) fn seen(l: LaunchId) {
+        if let Some(read) = lock(&WATCHED).get_mut(&l) {
+            *read = true;
+        }
+    }
 }

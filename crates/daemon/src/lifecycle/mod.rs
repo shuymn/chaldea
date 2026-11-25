@@ -502,10 +502,6 @@ pub fn spawn_locked(cmd: &mut Command) -> io::Result<Child> {
     clippy::disallowed_methods,
     reason = "the one spawn site; every child is created under the spawn lock"
 )]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the supervisor in PR 10a1 part 2")
-)]
 pub(crate) fn spawn_locked_before(
     cmd: &mut Command,
     deadline: Instant,

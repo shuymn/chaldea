@@ -24,3 +24,4 @@ pub mod hook;
 pub mod http;
 pub mod lifecycle;
 pub mod store;
+pub mod supervisor;

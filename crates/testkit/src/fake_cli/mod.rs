@@ -1,7 +1,7 @@
 //! `chaldea-fake-cli` (`docs/design/pty-unix.md` §2.8):
 //!
 //! ```text
-//! chaldea-fake-cli --mode <echo|queries|attachable|spawn-tree|sleeper|report-process|hooks>
+//! chaldea-fake-cli --mode <echo|queries|attachable|spawn-tree|sleeper|report-process|hooks|banner>
 //!                  [--report <127.0.0.1:port>] [--role <role>] [--roles <list>]
 //!                  [--max-life-secs <n>] [--reply-timeout-ms <n>] [--raw] [--setsid]
 //!                  [--escape-orphan] [--orphan-keeps-tty] [--out <path>] [--emit-output]
@@ -17,6 +17,7 @@
 //! records them with the rest of its argv; `docs/design/pty-windows.md` §2.8).
 
 mod attachable;
+mod banner;
 mod echo;
 mod hooks;
 mod queries;
@@ -42,6 +43,7 @@ pub(crate) enum Mode {
     Sleeper,
     ReportProcess,
     Hooks,
+    Banner,
 }
 
 impl Mode {
@@ -54,6 +56,7 @@ impl Mode {
             Mode::Sleeper => "sleeper",
             Mode::ReportProcess => "report-process",
             Mode::Hooks => "hooks",
+            Mode::Banner => "banner",
         }
     }
 }
@@ -129,6 +132,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
                     "sleeper" => Mode::Sleeper,
                     "report-process" => Mode::ReportProcess,
                     "hooks" => Mode::Hooks,
+                    "banner" => Mode::Banner,
                     m => return Err(format!("unknown mode {m}")),
                 });
             }
@@ -196,6 +200,7 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> i32 {
         Mode::Sleeper => sleeper::run(&o),
         Mode::ReportProcess => report_process::run(&o),
         Mode::Hooks => hooks::run(&o),
+        Mode::Banner => banner::run(&o),
     };
     crate::report::end();
     code
