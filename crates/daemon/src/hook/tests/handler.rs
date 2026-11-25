@@ -58,6 +58,8 @@ const LONG_REQUEST: Duration = Duration::from_secs(30);
 /// that needs no deadline to pass runs on a stopped clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pid_wait_timings() {
+    use crate::http::MonotonicClock;
+
     // Committed after the pre-read, before the subscription: the first re-read sees it.
     let h = HookServer::start().await;
     h.srv.clock.stop();
@@ -198,10 +200,16 @@ async fn pid_wait_timings() {
     h.srv.clock.stop();
     let l = unstarted(&h).await;
     let before = h.snapshot(&l);
+    let request_deadline = h.srv.clock.now() + super::support::http::DEADLINE;
     let (subscribed, go_on) = h.ingest.points.arm_subscribe();
     let (mut job, _job_open) = h.ingest.points.arm_job(1);
     let reply = h.spawn_post(&Hook::of(&l, "SessionStart", "s"));
     reached(subscribed).await;
+    assert_eq!(
+        shared(&h.srv).faults.pid_wait_deadlines(),
+        [request_deadline],
+        "the pid-wait deadline is not the request deadline"
+    );
     h.srv.clock.advance(super::support::http::DEADLINE);
     go_on.send(()).unwrap();
     let r = waits::bounded(WAIT, reply)
@@ -703,6 +711,7 @@ async fn grace_exceeded_then_commits() {
         outcome(&reply.await.unwrap()),
         (503, Some("outcome_unknown".into()))
     );
+    assert_reply_cutoff(&h);
     assert!(
         h.delivery(l.launch, x.emit).is_none(),
         "a row before commit"
@@ -726,12 +735,24 @@ async fn grace_exceeded_then_commits() {
     h.stop().await;
 }
 
+/// The reply cutoff of the hook's last write `run_write` submitted is its `not_after` (the
+/// request deadline) plus the reply grace, as the server's clock has them.
+fn assert_reply_cutoff(h: &HookServer) {
+    let s = shared(&h.srv);
+    let deadline = *s.faults.submitted_not_afters().last().unwrap();
+    let reply_by = deadline + s.cfg.write_reply_grace;
+    assert!(
+        s.faults.timers().contains(&reply_by),
+        "no reply timer at deadline + write_reply_grace"
+    );
+}
+
 /// A job's answer taken after the request deadline and before `deadline +
 /// write_reply_grace` is the reply: 200 and the row. The server's clock stands still until
-/// the job point and is frozen there, so the reply cutoff counts in real time from the
-/// freeze; the grace (30 s) puts it far past the request deadline, and the store's clock
-/// lags so the queued job is not expired. A cutoff at the request deadline answers 503
-/// before the job is released.
+/// the job point and is frozen there; the grace (30 s) keeps the reply cutoff far past the
+/// request deadline, and the store's clock lags so the queued job is not expired. With
+/// the job held, the clock is set inside the grace, past the deadline, and the job is
+/// released.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reply_inside_the_grace_is_ok() {
     use crate::http::MonotonicClock;
@@ -753,15 +774,10 @@ async fn reply_inside_the_grace_is_ok() {
     go_on.send(()).unwrap();
     reached_sync(reached_job).await;
     h.srv.store.clock.lag(Duration::ZERO);
-    // The request deadline (the job's `not_after`) passes while the job is held.
-    let deadline = h
-        .srv
-        .clock
-        .real(*shared(&h.srv).faults.submitted_not_afters().last().unwrap());
-    waits::pause_until(tokio::time::Instant::from_std(
-        deadline + Duration::from_millis(200),
-    ))
-    .await;
+    assert_reply_cutoff(&h);
+    // The request deadline (the job's `not_after`) has passed; the grace has not.
+    let deadline = *shared(&h.srv).faults.submitted_not_afters().last().unwrap();
+    h.srv.clock.freeze(deadline + Duration::from_secs(1));
     release.send(()).unwrap();
     ok(&reply.await.unwrap());
     assert!(h.delivery(l.launch, x.emit).is_some());
@@ -908,24 +924,27 @@ async fn handler_rejections() {
 
     // H6: the binding order held past the deadline by a lower ordinal. The lower request
     // holds its ticket at the job point, which its own deadline does not end, so ordinal 1
-    // stays pending through the `SessionStart`'s whole deadline. The clock stands still
-    // until the `SessionStart`'s walk, its last step before the binding order, is held;
-    // frozen there, the deadline passes in real time while the binding order waits.
+    // stays pending through the `SessionStart`'s whole deadline. The `SessionStart` names
+    // no emitter pid and its launch has started, so neither a walk nor a pid wait comes
+    // between its intake and the binding order: the clock stands still until its intake
+    // gate and, frozen there, the deadline passes in real time while the binding order
+    // waits.
     let h = HookServer::start().await;
     h.srv.clock.stop();
     let l = h.codex(1).await;
     let (gate, open) = h.ingest.points.arm_job(1);
     let lower = h.spawn_post(&Hook::of(&l, "UserPromptSubmit", "s"));
     reached(gate).await;
-    let (walking, walk_release) = h.chains.hold(super::support::hook::EMITTER_PID);
     let (waiting, at_wait) = tokio::sync::oneshot::channel();
     *h.ingest.order.between_check_and_await.lock().unwrap() =
         Some(Box::new(move || waiting.send(()).unwrap()));
-    let start = Hook::of(&l, "SessionStart", "s");
+    let mut start = Hook::of(&l, "SessionStart", "s");
+    start.pid = None;
+    let (intake, go_on) = h.ingest.points.arm_intake(2);
     let reply = h.spawn_post(&start);
-    reached_sync(walking).await;
+    reached(intake).await;
     h.srv.clock.freeze(h.srv.clock.now());
-    drop(walk_release);
+    go_on.send(()).unwrap();
     reached(at_wait).await;
     assert_eq!(outcome(&reply.await.unwrap()), timeout);
     assert!(h.delivery(l.launch, start.emit).is_none());
