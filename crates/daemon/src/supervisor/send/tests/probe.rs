@@ -35,11 +35,24 @@ async fn probe() {
     let word = |sl: &crate::supervisor::send::SendLaunch| sl.fence.load(Ordering::SeqCst);
     // An unknown launch.
     assert!(p.facts(LaunchId::from_u128(99), 1).is_none());
-    // Observed: the facts.
-    let w0 = word(&sl);
-    let f = IntakeFactsV1::parse(p.facts(live.l, 10).as_ref()).unwrap();
-    assert_eq!(word(&sl), w0 + (1 << OPEN_BITS) + 1, "advanced");
-    assert_eq!(sl.latest_intake.load(Ordering::SeqCst), 10);
+    // Observed: the facts. The worker may hold the `SendLaunch` mutex for a moment after the
+    // launch bound; the probe answers `None` then, so a later intake asks again.
+    let mut ordinal = 10;
+    let mut seen = None;
+    rig.until("facts observed", || {
+        let w0 = word(&sl);
+        let f = p.facts(live.l, ordinal);
+        assert_eq!(word(&sl), w0 + (1 << OPEN_BITS) + 1, "advanced");
+        assert_eq!(sl.latest_intake.load(Ordering::SeqCst), ordinal);
+        seen = IntakeFactsV1::parse(f.as_ref());
+        if seen.is_none() {
+            p.finished(live.l, ordinal, &[]);
+            ordinal += 1;
+        }
+        seen.is_some()
+    })
+    .await;
+    let f = seen.unwrap();
     let published = rig
         .sup
         .entry(live.l)
@@ -49,7 +62,7 @@ async fn probe() {
         .reference;
     assert_eq!(f.reference, published);
     assert!(!f.running && !f.human_running && f.inflight.is_none());
-    p.finished(live.l, 10, &[]);
+    p.finished(live.l, ordinal, &[]);
     // The `SendLaunch` mutex held: `None` at once, the fence still advanced.
     {
         let _held = sl.state();
@@ -68,11 +81,21 @@ async fn probe() {
     // A dispatched input shows in the facts.
     let id = rig.send(&live, "seen").await;
     rig.until_input(id, InputState::Sent).await;
-    let f = IntakeFactsV1::parse(p.facts(live.l, 13).as_ref()).unwrap();
-    let inflight = f.inflight.unwrap();
+    // The worker may still hold the `SendLaunch` mutex or the writer's queue lock after its
+    // completion job; the probe answers `None` then, so a later intake asks again.
+    let mut ordinal = 13;
+    let mut seen = None;
+    rig.until("facts observed", || {
+        let f = p.facts(live.l, ordinal);
+        p.finished(live.l, ordinal, &[]);
+        ordinal += 1;
+        seen = IntakeFactsV1::parse(f.as_ref());
+        seen.is_some()
+    })
+    .await;
+    let inflight = seen.unwrap().inflight.unwrap();
     assert_eq!(inflight.input_id, id);
     assert!(inflight.written && inflight.position.is_some());
-    p.finished(live.l, 13, &[]);
     rig.stop().await;
 }
 
