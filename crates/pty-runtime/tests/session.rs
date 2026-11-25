@@ -1485,6 +1485,42 @@ fn close_releases_after_a_kill_panic() {
     released_after_a_kill_panic(&child);
 }
 
+/// Every bound `Duration::MAX`: no deadline sum overflows, in the close or in its guard.
+/// With a panicking kill the close still releases the session, and the process does not
+/// abort (a panic in the guard during the unwind would); with a kill that proves, the close
+/// returns with everything released.
+#[test]
+fn unbounded_close_has_deadlines() {
+    let max = CloseBounds {
+        kill: Duration::MAX,
+        input: Duration::MAX,
+        close: Duration::MAX,
+        drain: Duration::MAX,
+        join: Duration::MAX,
+    };
+    let (session, child) = panicking_kill();
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        session.close(&[], max)
+    }));
+    assert!(run.is_err());
+    released_after_a_kill_panic(&child);
+
+    let r = rig_with(
+        FakeScript {
+            kill: KillBehavior::ExitOnKill,
+            ..FakeScript::default()
+        },
+        Limits::default(),
+        80,
+        24,
+    );
+    let o = r.session.close(&[], max);
+    assert!(
+        o.released.tree_dead && o.released.control && o.released.input && o.released.output,
+        "{o:?}"
+    );
+}
+
 fn panicking_kill() -> (Session, FakeChild) {
     let r = rig_with(
         FakeScript {

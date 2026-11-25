@@ -553,6 +553,19 @@ fn spawn_thread(
     std::thread::Builder::new().name(name.to_owned()).spawn(f)
 }
 
+/// A close step's bound in place of one too long for an `Instant`.
+const FAR: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// `now + d`, or [`FAR`] from now when `d` is too long for an `Instant`: no close step's or
+/// guard's deadline sum panics (`CloseBounds` with `Duration::MAX`), which in the guard,
+/// during an unwind, would abort the process.
+pub(crate) fn deadline_in(d: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(d)
+        .or_else(|| now.checked_add(FAR))
+        .unwrap_or(now)
+}
+
 /// Waits until `h` finished or `deadline`; true when it finished.
 fn wait_finished(h: Option<&JoinHandle<()>>, deadline: Instant) -> bool {
     let Some(h) = h else {
@@ -925,7 +938,7 @@ impl Session {
             (Some((k, _)), None) if k.tree_dead && extra.is_empty() => k,
             (Some((k, list)), Some(_)) if k.tree_dead && list == extra => k,
             (_, None) => {
-                let at = Instant::now() + bounds.kill;
+                let at = deadline_in(bounds.kill);
                 self.child.kill_tree(extra, at, at)
             }
             (_, Some(at)) => self.child.kill_tree(extra, at, at),
@@ -933,13 +946,13 @@ impl Session {
 
         // 3. Release the input.
         sh.stop_writer();
-        let _ = wait_finished(self.writer.as_ref(), Instant::now() + bounds.input);
+        let _ = wait_finished(self.writer.as_ref(), deadline_in(bounds.input));
 
         // 4. Close the PTY while the drain keeps reading.
         let close = {
             let mut ctl = lock(&sh.control);
             match ctl.take() {
-                Some(c) => c.close(Instant::now() + bounds.close),
+                Some(c) => c.close(deadline_in(bounds.close)),
                 None => CloseReport {
                     elapsed: Some(Duration::ZERO),
                 },
@@ -950,7 +963,7 @@ impl Session {
         let output = self.drain.take().and_then(|d| d.finish(bounds.drain));
 
         // 6. Join and snapshot.
-        let deadline = Instant::now() + bounds.join;
+        let deadline = deadline_in(bounds.join);
         self.waiter_stop.store(true, Ordering::Release);
         let writer_done = wait_finished(self.writer.as_ref(), deadline);
         if writer_done && let Some(h) = self.writer.take() {
@@ -1023,7 +1036,7 @@ impl Drop for Release {
         self.waiter_stop.store(true, Ordering::Release);
         let control = lock(&self.sh.control).take();
         if let Some(c) = control {
-            let deadline = Instant::now() + self.close;
+            let deadline = deadline_in(self.close);
             let _ = catch_unwind(AssertUnwindSafe(|| c.close(deadline)));
         }
     }
