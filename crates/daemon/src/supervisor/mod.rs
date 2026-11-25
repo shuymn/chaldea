@@ -32,9 +32,7 @@ pub(crate) mod workspace;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
 use std::ffi::OsString;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -48,9 +46,9 @@ use crate::http::{LifecycleSink, MonotonicClock, RevocationNudge, SystemMonotoni
 use crate::store::Store;
 
 pub use components::SupervisorComponents;
-pub(crate) use exit::{ExitFacts, ExitStep};
-pub(crate) use live::{LaunchObservation, LiveLaunch, SessionError};
-pub(crate) use tick::{TickStep, tick_timer};
+pub(crate) use exit::ExitStep;
+pub(crate) use live::LiveLaunch;
+pub(crate) use tick::TickStep;
 
 use live::LiveMap;
 use tracker::Tracker;
@@ -238,7 +236,6 @@ pub(crate) struct Supervisor {
     pub(crate) store: Store,
     pub(crate) sink: Arc<dyn LifecycleSink>,
     pub(crate) port: u16,
-    pub(crate) state_dir: PathBuf,
     pub(crate) cfg: SupervisorConfig,
     pub(crate) live: LiveMap,
     pub(crate) tracker: Arc<Tracker>,
@@ -278,6 +275,7 @@ impl Supervisor {
 
     /// The entry of `launch` when its thread is `thread` (design §2.11 "Lookup by
     /// generation").
+    #[allow(dead_code, reason = "10b's sends look launches up")]
     pub(crate) fn live(&self, thread: ThreadId, launch: LaunchId) -> Option<Arc<LiveLaunch>> {
         self.live
             .lock()
@@ -298,6 +296,3 @@ impl Supervisor {
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
-
-/// The map type behind [`Supervisor::live`].
-pub(crate) type Map = HashMap<LaunchId, Arc<LiveLaunch>>;

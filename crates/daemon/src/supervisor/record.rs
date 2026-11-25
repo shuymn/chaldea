@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use crate::http::{
-    BACKOFF_FIRST, BACKOFF_MAX, COMPLETION_ATTEMPT, COMPLETION_BUDGET, WriteFailure,
-    backoff_until, retryable, write_with,
+    BACKOFF_FIRST, BACKOFF_MAX, COMPLETION_ATTEMPT, COMPLETION_BUDGET, WriteFailure, backoff_until,
+    retryable, write_with,
 };
 use crate::store::{JobError, SubmitError, WriteError, WriteTx};
 

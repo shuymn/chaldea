@@ -12,14 +12,14 @@ use chaldea_core::adapter::capabilities;
 use chaldea_core::command::{
     CommandResult, LaunchOutcome, ResumeResult, SpawnResult, StopOutcome, StopResult,
 };
+use chaldea_core::event::TypedEvent;
 use chaldea_core::http::ErrorCode;
 use chaldea_core::ids::{Actor, Agent, CommandId, InputId, LaunchId, ThreadId};
-use chaldea_core::input::{InputInput, RejectReason};
+use chaldea_core::input::{InputInput, InputState, RejectReason};
 use chaldea_core::launch::{LaunchInput, plan};
 use chaldea_core::payload::{
     ExitReason, FailedStart, InputCreated, InputEncoding, InputInitialState, InputOrigin,
-    InputState, LaunchReserved, LaunchStarted, SourceKind, ThreadRegistered, ThreadRole,
-    TypedEvent, WorktreeState,
+    LaunchReserved, LaunchStarted, SourceKind, ThreadRegistered, ThreadRole, WorktreeState,
 };
 use chaldea_core::state::{AttentionCause, ProcessState, StateInput, ThreadState};
 use chaldea_pty_runtime::{
@@ -32,8 +32,7 @@ use tokio::task::JoinHandle;
 
 use crate::deadline::{Settled, settle_before};
 use crate::http::{
-    ApiError, COMPLETION_ATTEMPT, EffectOutcome, MintedToken, StoreFatal, TokenService,
-    write_with,
+    ApiError, COMPLETION_ATTEMPT, EffectOutcome, MintedToken, StoreFatal, TokenService, write_with,
 };
 use crate::store::{JobError, LaunchRow, ThreadRow, TokenKind, WriteTx};
 
@@ -43,8 +42,7 @@ use super::live::{CommittedStart, LiveLaunch, OpGuard, Published};
 use super::record::{JobOf, Recorded, record};
 use super::tracker::TrackedSession;
 use super::{
-    EXIT_ROUND, EXIT_TOTAL, KILL_LOCK_WAIT, PROOF_CUTOFF, Pause, STOP_LOCK, STOP_REPORT,
-    Supervisor,
+    EXIT_ROUND, EXIT_TOTAL, KILL_LOCK_WAIT, PROOF_CUTOFF, Pause, STOP_LOCK, STOP_REPORT, Supervisor,
 };
 
 // ---- results --------------------------------------------------------------------------------
@@ -126,13 +124,16 @@ pub(crate) enum LaunchKind {
 struct Reserved {
     agent: Agent,
     cwd: PathBuf,
-    manual: bool,
     upgraded: bool,
     args: Vec<String>,
     env: Vec<(OsString, OsString)>,
 }
 
 /// The spawn or resume op (design §2.3 "Spawn and resume").
+#[allow(
+    clippy::result_large_err,
+    reason = "the spawn error carries its cleanup evidence by value, as Session::spawn returns it"
+)]
 pub(crate) async fn launch_op(sup: Arc<Supervisor>, req: LaunchReq) -> EffectOutcome {
     // Step 1: inputs.
     let mut workspace = None;
@@ -158,7 +159,9 @@ pub(crate) async fn launch_op(sup: Arc<Supervisor>, req: LaunchReq) -> EffectOut
         }
         other => {
             sup.remove(req.launch);
-            return outcome_of(other.map_done()).err().unwrap_or(EffectOutcome::Unrecorded);
+            return outcome_of(other.map_done())
+                .err()
+                .unwrap_or(EffectOutcome::Unrecorded);
         }
     };
     let _ = agent_hint;
@@ -184,15 +187,17 @@ pub(crate) async fn launch_op(sup: Arc<Supervisor>, req: LaunchReq) -> EffectOut
     let runtime = sup.cfg.runtime.clone();
     let spawned = sup
         .rt
-        .spawn_blocking(move || match Session::spawn(runtime.as_ref(), &spec, config) {
-            Ok(s) => Ok(TrackedSession::new(s, token)),
-            Err(e) => {
-                if spawn_cleanup_confirmed(&e) {
-                    token.release();
+        .spawn_blocking(
+            move || match Session::spawn(runtime.as_ref(), &spec, config) {
+                Ok(s) => Ok(TrackedSession::new(s, token)),
+                Err(e) => {
+                    if spawn_cleanup_confirmed(&e) {
+                        token.release();
+                    }
+                    Err(e)
                 }
-                Err(e)
-            }
-        })
+            },
+        )
         .await;
     let tracked = match spawned {
         Ok(Ok(t)) => t,
@@ -293,7 +298,8 @@ impl<R> Recorded<R> {
 
 fn spawn_cleanup_confirmed(e: &SpawnError) -> bool {
     match e {
-        SpawnError::NeverStarted { cleanup, .. } | SpawnError::StartedThenFailed { cleanup, .. } => {
+        SpawnError::NeverStarted { cleanup, .. }
+        | SpawnError::StartedThenFailed { cleanup, .. } => {
             matches!(cleanup, Cleanup::Confirmed)
         }
     }
@@ -330,7 +336,8 @@ fn reservation_job(
     let prompt = req.prompt.clone();
     let input_id = req.input_id;
     let caller = req.caller;
-    let token = TokenService::new_token(&req.hook_token, TokenKind::Hook, Some(thread), Some(launch));
+    let token =
+        TokenService::new_token(&req.hook_token, TokenKind::Hook, Some(thread), Some(launch));
     let secret = req.hook_token.secret.expose().to_owned();
     let kind = match &req.kind {
         LaunchKind::Spawn {
@@ -343,75 +350,80 @@ fn reservation_job(
     };
     Arc::new(move |tx: &mut WriteTx<'_>| {
         let (spawn, expected) = &kind;
-        let (agent, cwd, prev, resume_session, mut job) = if let Some((agent, cwd, task, parent)) =
-            spawn
-        {
-            let ws = workspace.clone().ok_or_else(|| refusal("no workspace id"))?;
-            let mut job = ThreadJob::new(
-                thread,
-                *agent,
-                ThreadState::registered(task.is_some()),
-                SourceKind::Command,
-                Some(cid),
-            );
-            job.push_host(
-                command_key(cid, 0),
-                TypedEvent::ThreadRegistered(ThreadRegistered {
-                    thread_id: thread,
-                    agent: *agent,
-                    cwd: cwd.clone(),
-                    workspace_id: ws,
-                    parent_thread_id: *parent,
-                    role: ThreadRole::Standard,
-                    task: task.clone(),
-                }),
-            );
-            (*agent, cwd.clone(), None, None, job)
-        } else {
-            let expected = expected.ok_or_else(|| refusal("no expected launch"))?;
-            let r = tx.read();
-            let Some(t) = r.thread(thread)? else {
-                return Ok(Err(ErrorCode::NotFound));
-            };
-            if t.closed {
-                return Ok(Err(ErrorCode::ThreadClosed));
-            }
-            if t.current_launch_id != Some(expected) {
-                return Ok(Err(ErrorCode::LaunchChanged));
-            }
-            let Some(prev) = r.launch(expected)? else {
-                return Ok(Err(ErrorCode::LaunchChanged));
-            };
-            if prev.exit_reason.is_none() {
-                return Ok(Err(ErrorCode::LaunchLive));
-            }
-            drop(r);
-            let mut job =
-                ThreadJob::new(thread, t.agent, t.state.clone(), SourceKind::Command, Some(cid));
-            if !prev.death_confirmed {
-                if !job.raised(AttentionCause::ResumeBlocked) {
-                    let key = command_key(cid, 0);
-                    job.apply(
-                        &key,
-                        "resume_blocked",
-                        &StateInput::AttentionRaised(AttentionCause::ResumeBlocked),
-                        Some(expected),
-                    )?;
-                    job.flush(tx)?;
+        let (agent, cwd, prev, resume_session, mut job) =
+            if let Some((agent, cwd, task, parent)) = spawn {
+                let ws = workspace
+                    .clone()
+                    .ok_or_else(|| refusal("no workspace id"))?;
+                let mut job = ThreadJob::new(
+                    thread,
+                    *agent,
+                    ThreadState::registered(task.is_some()),
+                    SourceKind::Command,
+                    Some(cid),
+                );
+                job.push_host(
+                    command_key(cid, 0),
+                    TypedEvent::ThreadRegistered(ThreadRegistered {
+                        thread_id: thread,
+                        agent: *agent,
+                        cwd: cwd.clone(),
+                        workspace_id: ws,
+                        parent_thread_id: *parent,
+                        role: ThreadRole::Standard,
+                        task: task.clone(),
+                    }),
+                );
+                (*agent, cwd.clone(), None, None, job)
+            } else {
+                let expected = expected.ok_or_else(|| refusal("no expected launch"))?;
+                let r = tx.read();
+                let Some(t) = r.thread(thread)? else {
+                    return Ok(Err(ErrorCode::NotFound));
+                };
+                if t.closed {
+                    return Ok(Err(ErrorCode::ThreadClosed));
                 }
-                return Ok(Err(ErrorCode::DeathUnconfirmed));
-            }
-            if let Some(w) = &prev.worktree_id {
-                let state = tx.read().worktree(w)?.map(|row| row.record.state);
-                if !matches!(state, Some(WorktreeState::Active | WorktreeState::Released)) {
-                    return Ok(Err(ErrorCode::WorktreeUnavailable));
+                if t.current_launch_id != Some(expected) {
+                    return Ok(Err(ErrorCode::LaunchChanged));
                 }
-            }
-            let Some(session) = t.session_id.clone() else {
-                return Ok(Err(ErrorCode::NoSession));
+                let Some(prev) = r.launch(expected)? else {
+                    return Ok(Err(ErrorCode::LaunchChanged));
+                };
+                if prev.exit_reason.is_none() {
+                    return Ok(Err(ErrorCode::LaunchLive));
+                }
+                let mut job = ThreadJob::new(
+                    thread,
+                    t.agent,
+                    t.state.clone(),
+                    SourceKind::Command,
+                    Some(cid),
+                );
+                if !prev.death_confirmed {
+                    if !job.raised(AttentionCause::ResumeBlocked) {
+                        let key = command_key(cid, 0);
+                        job.apply(
+                            &key,
+                            "resume_blocked",
+                            &StateInput::AttentionRaised(AttentionCause::ResumeBlocked),
+                            Some(expected),
+                        )?;
+                        job.flush(tx)?;
+                    }
+                    return Ok(Err(ErrorCode::DeathUnconfirmed));
+                }
+                if let Some(w) = &prev.worktree_id {
+                    let state = tx.read().worktree(w)?.map(|row| row.record.state);
+                    if !matches!(state, Some(WorktreeState::Active | WorktreeState::Released)) {
+                        return Ok(Err(ErrorCode::WorktreeUnavailable));
+                    }
+                }
+                let Some(session) = t.session_id.clone() else {
+                    return Ok(Err(ErrorCode::NoSession));
+                };
+                (t.agent, t.cwd.clone(), Some(prev), Some(session), job)
             };
-            (t.agent, t.cwd.clone(), Some(prev), Some(session), job)
-        };
         let lp = plan(&LaunchInput {
             agent,
             host_os: sup2.host_os,
@@ -419,7 +431,9 @@ fn reservation_job(
             launch_id: launch,
             resume_session,
             prompt: prompt.clone(),
-            worktree_id: prev.as_ref().and_then(|p: &LaunchRow| p.worktree_id.clone()),
+            worktree_id: prev
+                .as_ref()
+                .and_then(|p: &LaunchRow| p.worktree_id.clone()),
             daemon_env: sup2.daemon_env(),
             key_eq: chaldea_pty_runtime::env_key_eq,
             key_has_prefix: chaldea_pty_runtime::env_key_has_prefix,
@@ -489,7 +503,6 @@ fn reservation_job(
             Reserved {
                 agent,
                 cwd: PathBuf::from(cwd),
-                manual: lp.manual,
                 upgraded: lp.upgraded,
                 args: lp.args,
                 env: lp.env,
@@ -600,7 +613,10 @@ async fn spawn_failed(
 }
 
 /// Records an exit job (with the nudge) and runs the steps' `after_commit`.
-async fn record_exit(sup: &Arc<Supervisor>, plan: ExitPlan) -> Result<Option<ExitFacts>, EffectOutcome> {
+async fn record_exit(
+    sup: &Arc<Supervisor>,
+    plan: ExitPlan,
+) -> Result<Option<ExitFacts>, EffectOutcome> {
     let steps = sup.cfg.exit_steps.clone();
     let job: JobOf<Option<ExitFacts>> = Arc::new(move |tx| exit_in(tx, &steps, &plan));
     let facts = outcome_of(record(sup, job, true).await)?;
@@ -736,12 +752,7 @@ pub(crate) async fn await_kill(sup: &Supervisor, k: KillTask) -> Proof {
         }
         Settled::Late(_) | Settled::Elapsed => None,
     };
-    let report = first.or_else(|| {
-        joined
-            .as_ref()
-            .map(|o| o.kill.clone())
-            .filter(proving)
-    });
+    let report = first.or_else(|| joined.as_ref().map(|o| o.kill.clone()).filter(proving));
     Proof {
         report,
         exit: joined.and_then(|o| o.exit),
@@ -772,9 +783,14 @@ pub(crate) async fn stop_launch(
     // Step 1: the lock.
     let guard = match &entry {
         Some(e) => {
-            match settle_before(|| sup.now(), bound, sup.timer(bound), e.ops.clone().lock_owned())
-                .await
-                .in_time()
+            match settle_before(
+                || sup.now(),
+                bound,
+                sup.timer(bound),
+                e.ops.clone().lock_owned(),
+            )
+            .await
+            .in_time()
             {
                 Some(g) => Some(g),
                 None => return Err(done_code(ErrorCode::LaunchBusy)),
@@ -791,9 +807,10 @@ pub(crate) async fn stop_launch(
         s2.pauses().blocking(Pause::StopReread);
         store.read(wait, |r| Ok((r.thread(thread)?, r.launch(launch)?)))
     });
-    let Some(Ok(Ok((Some(t), Some(l))))) = settle_before(|| sup.now(), bound, sup.timer(bound), read)
-        .await
-        .in_time()
+    let Some(Ok(Ok((Some(t), Some(l))))) =
+        settle_before(|| sup.now(), bound, sup.timer(bound), read)
+            .await
+            .in_time()
     else {
         return Err(done_code(ErrorCode::LaunchBusy));
     };
@@ -805,7 +822,10 @@ pub(crate) async fn stop_launch(
         if !l.death_confirmed {
             return Err(done_code(ErrorCode::DeathUnconfirmed));
         }
-        return Ok(already_exited(req.launch, read_at <= req.request_start + STOP_REPORT));
+        return Ok(already_exited(
+            req.launch,
+            read_at <= req.request_start + STOP_REPORT,
+        ));
     }
     let (Some(entry), Some(mut guard)) = (entry, guard) else {
         // An open launch with no slot: its op ended without recording; the next start
@@ -1019,8 +1039,7 @@ pub(crate) async fn close_and_record(
     pause: Pause,
 ) {
     let (close_end, end) = sup.window_or_now();
-    let records = tracked.seal();
-    super::lock(&entry.settled).extend(records);
+    entry.add_settled(tracked.seal());
     let identity = tracked.identity().clone();
     let bounds = scaled(close_end.saturating_duration_since(sup.now()));
     let extra = entry.extra();

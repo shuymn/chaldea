@@ -3,8 +3,8 @@
 
 use axum::body::Body;
 use axum::http::{Method, Request, Response};
-use chaldea_core::Open;
 use chaldea_core::adapter::{CAPABILITIES, HostOs};
+use chaldea_core::ids::Open;
 use chaldea_core::sync::{AdapterInfo, AdaptersResponse};
 use futures_util::future::BoxFuture;
 

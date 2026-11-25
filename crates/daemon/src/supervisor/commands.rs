@@ -9,11 +9,12 @@ use std::time::Duration;
 use chaldea_core::auth::{Action, Grant, ThreadGraph, grant, may_act_on_thread};
 use chaldea_core::canonical::CanonicalJson;
 use chaldea_core::command::{CloseArgs, CloseResult, ResumeArgs, SpawnArgs, StopArgs};
+use chaldea_core::event::TypedEvent;
 use chaldea_core::http::ErrorCode;
 use chaldea_core::ids::{Actor, Agent, CommandId, InputId, LaunchId, ThreadId};
 use chaldea_core::input::MAX_PROMPT_BYTES;
 use chaldea_core::input::encode::{Purpose, check};
-use chaldea_core::payload::{InputEncoding, SourceKind, ThreadClosed, TypedEvent};
+use chaldea_core::payload::{InputEncoding, SourceKind, ThreadClosed};
 use futures_util::future::BoxFuture;
 use serde::Serialize;
 use serde_json::value::RawValue;
@@ -311,7 +312,6 @@ fn closing_in(
     let Some(l) = r.launch(expected)? else {
         return Ok(Err(ErrorCode::LaunchChanged));
     };
-    drop(r);
     if l.exit_reason.is_none() {
         return Ok(Err(ErrorCode::LaunchLive));
     }

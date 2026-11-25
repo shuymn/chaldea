@@ -45,6 +45,7 @@ pub(crate) type Ops = Arc<tokio::sync::Mutex<Option<TrackedSession>>>;
 pub(crate) type OpGuard = OwnedMutexGuard<Option<TrackedSession>>;
 
 /// One launch the daemon may still own a process of.
+#[allow(dead_code, reason = "`agent` and `caps` are 10b's")]
 pub(crate) struct LiveLaunch {
     pub thread_id: ThreadId,
     pub launch_id: LaunchId,
@@ -75,6 +76,7 @@ pub(crate) struct Published {
 /// The committed start: its seq, the identity, and the supervisor-clock instant read after
 /// the commit.
 #[derive(Debug, Clone)]
+#[allow(dead_code, reason = "`seq` is 10b's")]
 pub(crate) struct CommittedStart {
     pub seq: u64,
     pub identity: ProcessIdentity,
@@ -94,7 +96,10 @@ pub(crate) enum LaunchObservation {
     /// No child creation has begun.
     Reserved,
     /// Published: the reference and the per-class positions.
-    Started { reference: u64, last_started: [u64; 3] },
+    Started {
+        reference: u64,
+        last_started: [u64; 3],
+    },
     /// Creation begun and unpublished, contended, or no entry.
     Unobservable,
 }
@@ -157,7 +162,10 @@ impl LiveLaunch {
     }
 
     /// Records an identity proven to belong to the launch.
-    #[cfg_attr(not(test), allow(dead_code, reason = "a later producer records identities"))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "a later producer records identities")
+    )]
     pub(crate) fn record_extra(&self, id: ProcessIdentity) {
         lock(&self.extra).push(id);
     }
@@ -165,6 +173,11 @@ impl LiveLaunch {
     /// The records of every seal so far.
     pub(crate) fn settled(&self) -> Vec<WriteRecord> {
         lock(&self.settled).clone()
+    }
+
+    /// Appends a seal's records.
+    pub(crate) fn add_settled(&self, records: Vec<WriteRecord>) {
+        lock(&self.settled).extend(records);
     }
 
     /// Seals the session held in `guard` and appends its records to `settled`.
@@ -185,7 +198,7 @@ impl LiveLaunch {
 
     /// Takes the op lock by `deadline` (supervisor clock) and runs `f` inline; `f` must not
     /// block.
-    #[cfg_attr(not(test), allow(dead_code, reason = "10b's sends use it"))]
+    #[allow(dead_code, reason = "10b's sends use it")]
     pub(crate) async fn with_session<R>(
         &self,
         sup: &Supervisor,
@@ -210,7 +223,7 @@ impl LiveLaunch {
 
 impl Supervisor {
     /// Never waits: for the hook intake path (design §2.11 "Observation").
-    #[cfg_attr(not(test), allow(dead_code, reason = "10b's IntakeProbe reads it"))]
+    #[allow(dead_code, reason = "10b's IntakeProbe reads it")]
     pub(crate) fn observe(&self, launch: LaunchId) -> LaunchObservation {
         let Some(map) = self.live.try_lock() else {
             return LaunchObservation::Unobservable;

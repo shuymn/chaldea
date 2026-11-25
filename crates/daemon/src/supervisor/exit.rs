@@ -5,11 +5,11 @@
 
 use std::sync::Arc;
 
+use chaldea_core::event::TypedEvent;
 use chaldea_core::ids::{InputId, LaunchId, ThreadId};
-use chaldea_core::input::InputInput;
+use chaldea_core::input::{InputInput, InputState};
 use chaldea_core::payload::{
-    ExitReason, FailedStart, InputState, LaunchDeathConfirmed, LaunchExited, LaunchStarted,
-    SourceKind, TypedEvent,
+    ExitReason, FailedStart, LaunchDeathConfirmed, LaunchExited, LaunchStarted, SourceKind,
 };
 use chaldea_core::state::{ProcessState, StateInput};
 use chaldea_pty_runtime::{ProcessIdentity, WriteRecord};
@@ -32,6 +32,7 @@ pub(crate) trait ExitStep: Send + Sync {
 
 /// What the exit job recorded, as the steps see it.
 #[derive(Debug, Clone)]
+#[allow(dead_code, reason = "read by 10b's exit steps")]
 pub(crate) struct ExitFacts {
     pub thread_id: ThreadId,
     pub launch_id: LaunchId,
@@ -107,7 +108,6 @@ pub(crate) fn exit_in(
     let Some(t) = r.thread(plan.thread)? else {
         return Err(refusal("the thread has no row"));
     };
-    drop(r);
     let kind = if plan.restart {
         SourceKind::Daemon
     } else {
@@ -150,7 +150,14 @@ pub(crate) fn exit_in(
         }),
         lid,
     );
-    job.apply(&key, "exited", &StateInput::Exited { reason: plan.reason }, lid)?;
+    job.apply(
+        &key,
+        "exited",
+        &StateInput::Exited {
+            reason: plan.reason,
+        },
+        lid,
+    )?;
     if let (true, Some(method)) = (plan.death_confirmed, &plan.method) {
         let dkey = launch_key(plan.launch, "death_confirmed");
         job.push(
@@ -211,7 +218,6 @@ pub(crate) fn sweep(
     let Some(t) = r.thread(thread)? else {
         return Err(refusal("the thread has no row"));
     };
-    drop(r);
     let kind = if restart {
         SourceKind::Daemon
     } else {

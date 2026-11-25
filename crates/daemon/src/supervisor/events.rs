@@ -1,13 +1,13 @@
 //! Event builders for the supervisor's jobs: the idempotency keys of mvp §2.1 and a thread
 //! job that applies each state input through the reducer and appends its `status_changed`.
 
-use chaldea_core::event::Source;
-use chaldea_core::ids::{Actor, Agent, CommandId, IdempotencyKey, InputId, LaunchId, ThreadId};
-use chaldea_core::input::{InputInput, step};
-use chaldea_core::payload::{InputReason, InputState, InputStateChanged, SourceKind, TypedEvent};
+use chaldea_core::event::{Source, TypedEvent};
+use chaldea_core::ids::{
+    Actor, Agent, CommandId, IdempotencyKey, InputId, LaunchId, Open, StreamId, ThreadId,
+};
+use chaldea_core::input::{InputInput, InputReason, InputState, step};
+use chaldea_core::payload::{InputStateChanged, SourceKind};
 use chaldea_core::state::{AttentionCause, StateInput, ThreadState, reduce};
-use chaldea_core::sync::StreamId;
-use chaldea_core::Open;
 
 use crate::store::{Appended, InputRow, JobError, NewEvent, StoreError, WriteTx};
 
@@ -81,7 +81,12 @@ impl ThreadJob {
     }
 
     /// An event on the thread's stream.
-    pub(crate) fn push(&mut self, key: IdempotencyKey, event: TypedEvent, launch: Option<LaunchId>) {
+    pub(crate) fn push(
+        &mut self,
+        key: IdempotencyKey,
+        event: TypedEvent,
+        launch: Option<LaunchId>,
+    ) {
         let e = self.event(StreamId::Thread(self.thread), key, event, launch);
         self.pending.push(e);
     }

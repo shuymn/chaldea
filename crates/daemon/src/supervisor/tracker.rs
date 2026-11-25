@@ -49,7 +49,9 @@ fn run_hook(h: &Mutex<Option<Box<dyn FnOnce() + Send>>>) {
 
 impl std::fmt::Debug for Tracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Tracker").field("state", &*self.lock()).finish()
+        f.debug_struct("Tracker")
+            .field("state", &*self.lock())
+            .finish()
     }
 }
 

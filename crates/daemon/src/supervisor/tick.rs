@@ -76,8 +76,10 @@ fn session_start_timeout(l: &LiveLaunch) -> Job {
         let (Some(t), Some(row)) = (r.thread(thread)?, r.launch(launch)?) else {
             return Ok(());
         };
-        drop(r);
-        let alive = matches!(t.state.process, ProcessState::Running | ProcessState::Stopping);
+        let alive = matches!(
+            t.state.process,
+            ProcessState::Running | ProcessState::Stopping
+        );
         let cause = AttentionCause::SessionStartTimeout;
         if t.current_launch_id != Some(launch)
             || row.pid.is_none()
@@ -91,7 +93,12 @@ fn session_start_timeout(l: &LiveLaunch) -> Job {
         }
         let mut job = ThreadJob::new(thread, t.agent, t.state, SourceKind::Daemon, None);
         let key = derived(&launch_key(launch, "started"), "session_start_timeout");
-        job.apply(&key, "raise", &StateInput::AttentionRaised(cause), Some(launch))?;
+        job.apply(
+            &key,
+            "raise",
+            &StateInput::AttentionRaised(cause),
+            Some(launch),
+        )?;
         job.flush(tx)?;
         Ok(())
     })

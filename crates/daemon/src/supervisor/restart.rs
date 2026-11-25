@@ -6,7 +6,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use chaldea_core::ids::IdempotencyKey;
-use chaldea_core::payload::{ExitReason, InputState};
+use chaldea_core::input::InputState;
+use chaldea_core::payload::ExitReason;
 
 use crate::lifecycle::Reconciler;
 use crate::store::TokenSelector;
