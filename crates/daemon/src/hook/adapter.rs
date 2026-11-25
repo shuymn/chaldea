@@ -1,8 +1,10 @@
 //! The adapter seam (`docs/design/hook-ingest.md` §2.6): what a selected hook means is the
 //! adapter's (PR 10, 13, 14); PR 9 decides only routing, binding, and selection.
 
+use std::borrow::Cow;
+
 use chaldea_core::event::TypedEvent;
-use chaldea_core::ids::{Agent, ThreadId};
+use chaldea_core::ids::{Agent, ApprovalId, ThreadId};
 use chaldea_core::payload::RawUnknownReason;
 use chaldea_pty_runtime::process::Ancestry;
 use uuid::Uuid;
@@ -35,8 +37,8 @@ pub trait HookAdapter: Send + Sync + 'static {
         launch: &LaunchRow,
     ) -> Result<Option<String>, StoreError>;
 
-    /// Events for one selected hook of the current, live, bound launch. Reads see the
-    /// job's earlier appends.
+    /// Events for one selected hook of the current, live, bound launch, with the hook's
+    /// turn mark. Reads see the job's earlier appends.
     ///
     /// # Errors
     ///
@@ -45,7 +47,26 @@ pub trait HookAdapter: Send + Sync + 'static {
         &self,
         tx: &ReadTx<'_>,
         hook: &AcceptedHook<'_>,
-    ) -> Result<Interpretation, StoreError>;
+    ) -> Result<(Interpretation, TurnMark), StoreError>;
+}
+
+/// What an interpreted hook tells the supervisor once its job committed
+/// (supervisor-send §2.4 "Settle completion"): data, handed to
+/// [`super::IntakeProbe::finished`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnMark {
+    /// A turn started (`UserPromptSubmit`).
+    Start,
+    /// A turn ended (`Stop`, interrupt); `settle` when the end may start a settle.
+    End { settle: bool },
+    /// A card opened; `human_at` is the human writer position at its intake, `None` when
+    /// it cannot be relied on.
+    Card {
+        approval_id: ApprovalId,
+        human_at: Option<u64>,
+    },
+    /// Any other hook.
+    Other,
 }
 
 /// What `interpret` decided.
@@ -62,7 +83,7 @@ pub enum Interpretation {
 #[derive(Debug, Clone)]
 pub struct HookEvent {
     pub event: TypedEvent,
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     pub annex: Option<EventAnnex>,
     pub blobs: Vec<BlobInput>,
 }
@@ -105,7 +126,7 @@ impl ProcessProbe for OsProcesses {
     }
 }
 
-/// The adapter until PR 10 / 13 / 14 replace it: §2.5's rules, the expected session from
+/// The adapter with no decoder: §2.5's rules, the expected session from
 /// stored facts, and every selected hook kept as `raw_unknown` `unknown_event` (no decoder
 /// exists yet).
 #[derive(Debug, Default, Clone, Copy)]
@@ -135,7 +156,10 @@ impl HookAdapter for MvpHooks {
         &self,
         _tx: &ReadTx<'_>,
         _hook: &AcceptedHook<'_>,
-    ) -> Result<Interpretation, StoreError> {
-        Ok(Interpretation::Raw(RawUnknownReason::UnknownEvent))
+    ) -> Result<(Interpretation, TurnMark), StoreError> {
+        Ok((
+            Interpretation::Raw(RawUnknownReason::UnknownEvent),
+            TurnMark::Other,
+        ))
     }
 }

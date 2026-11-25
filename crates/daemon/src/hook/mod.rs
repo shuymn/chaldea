@@ -36,11 +36,11 @@ use tokio::sync::broadcast::error::RecvError;
 
 pub use adapter::{
     AcceptedHook, BindingRule, HookAdapter, HookEvent, Interpretation, MvpHooks, OsProcesses,
-    ProcessProbe,
+    ProcessProbe, TurnMark,
 };
 pub use ancestry::{Chain, Link, eligible};
 pub use buffer::{expire, resolve_unbindable};
-pub use intake::{IntakeFacts, IntakeOrder, IntakeProbe, IntakeTicket, NoIntakeFacts};
+pub use intake::{IntakeFacts, IntakeGuard, IntakeOrder, IntakeProbe, IntakeTicket, NoIntakeFacts};
 
 use crate::http::{ApiError, Mount, WriteCtx, spec, until_deadline, verify_in_read};
 use crate::store::{HookDelivery, HookReply, JobError, LaunchRow, ReadTx, StoreError};
@@ -222,10 +222,10 @@ impl HookIngest {
             return Ok(reply(&d.first_reply));
         }
         // 5. Intake: the ordinal, the facts, and the pid wait's origin together.
-        let (ticket, facts, intake_at) = self.order.intake(
+        let (ticket, facts, guard, intake_at) = self.order.intake(
             pre.launch.launch_id,
             pre.stored_max,
-            &*self.seams.intake,
+            &self.seams.intake,
             || shared.cfg.clock.now(),
         );
         #[cfg(test)]
@@ -283,10 +283,11 @@ impl HookIngest {
             .write_then(
                 move |tx, auth| route::run(&delivery, tx, auth),
                 Box::new(ticket),
+                Some(Box::new(guard)),
             )
             .await?;
         // 10. Reply.
-        Ok(reply(&r))
+        Ok(reply(&r.reply))
     }
 
     /// Design §2.3 "Pid wait": `Ok(true)` when the 1 s side ran out (the job records
@@ -354,6 +355,23 @@ impl HookIngest {
             if shared.passed(pid_deadline) {
                 return ran_out();
             }
+        }
+    }
+}
+
+impl crate::http::OnReply<route::Ran> for IntakeGuard {
+    fn submitted(&mut self) {
+        IntakeGuard::submitted(self);
+    }
+
+    fn replied(self: Box<Self>, r: &Result<route::Ran, crate::http::WriteFailure>) {
+        use crate::store::WriteError;
+        match r {
+            Ok(ran) => (*self).replied(Some(&ran.marks), false),
+            Err(crate::http::WriteFailure::Write(
+                WriteError::CommitUnknown(_) | WriteError::WriterGone,
+            )) => (*self).replied(None, true),
+            Err(_) => (*self).replied(None, false),
         }
     }
 }
