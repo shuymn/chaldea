@@ -17,7 +17,7 @@ fn gate() -> Arc<ShutdownGate> {
     ))
 }
 
-fn variants() -> [StoreFatal; 4] {
+fn variants() -> [StoreFatal; 5] {
     [
         StoreFatal::CommitUnknown,
         StoreFatal::WriterGone,
@@ -25,7 +25,25 @@ fn variants() -> [StoreFatal; 4] {
         StoreFatal::ReceiptUncompleted {
             command_id: chaldea_core::ids::CommandId(uuid::Uuid::from_u128(7)),
         },
+        StoreFatal::LaunchUnrecorded {
+            launch_id: chaldea_core::ids::LaunchId(uuid::Uuid::from_u128(8)),
+        },
     ]
+}
+
+/// Each variant's label in the stop cause, an id included where the variant has one.
+#[test]
+fn fatal_labels() {
+    let want = [
+        "store fatal: commit_unknown",
+        "store fatal: writer_gone",
+        "store fatal: failed",
+        "store fatal: receipt_uncompleted 00000000-0000-0000-0000-000000000007",
+        "store fatal: launch_unrecorded 00000000-0000-0000-0000-000000000008",
+    ];
+    for (f, w) in variants().into_iter().zip(want) {
+        assert_eq!(StopCause::StoreFatal(f).to_string(), w);
+    }
 }
 
 /// Each variant passed to the sink of a serving daemon stops it with exit 1 `store_fatal`.
