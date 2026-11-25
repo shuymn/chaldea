@@ -68,14 +68,16 @@ pub(crate) struct SupervisorProbe {
 impl IntakeProbe for SupervisorProbe {
     fn facts(&self, launch: LaunchId, ordinal: u64) -> Option<IntakeFacts> {
         let sl = self.side.launch(launch)?;
-        // One observation point (send §2.5): the launch's state is held across the fence
-        // advance, and the dispatch's `written` is read before it, so a completion that
-        // lands after this intake was counted is not one of its facts.
+        // One observation point (send §2.5): the launch's state is held across the read of
+        // the dispatch's `written` and the fence advance, and a completion publishes
+        // `written` under the same state, so it is either before this intake or after it.
         let st = sl.try_state();
         let written = st
             .as_ref()
             .and_then(|st| st.dispatch.as_ref())
             .is_some_and(|d| d.written.load(Ordering::Acquire));
+        #[cfg(test)]
+        super::run_hook(&sl.hooks.after_written_read);
         sl.latest_intake.store(ordinal, Ordering::SeqCst);
         fence_advance(&sl.fence);
         let sup = self.sup.upgrade()?;

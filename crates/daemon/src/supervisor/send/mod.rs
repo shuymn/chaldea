@@ -246,6 +246,9 @@ pub(crate) struct SendHooks {
     pub settle_job: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs inside the open job (on the store writer).
     pub open_job: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs in the probe's `facts` after `written` was read, before the fence advance (the
+    /// launch's state held).
+    pub after_written_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs at the start of the probe's `finished` (on the write's observer), before the
     /// hook's turn marks are applied.
     pub finished: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -340,8 +343,10 @@ impl SendLaunch {
         }
     }
 
-    /// A completion that hands its record to the worker and never blocks; `written` is set
-    /// first for a `Written` outcome.
+    /// A completion that hands its record to the worker; `written` is set first for a
+    /// `Written` outcome, under the launch's state, so the probe's one observation point
+    /// (send §2.5) orders it against the intake. That is its only wait: the state is never
+    /// held across a write call, and a cancel fired under it is never `Written`.
     pub(crate) fn completion(
         self: &Arc<Self>,
         written: Option<Arc<AtomicBool>>,
@@ -357,6 +362,7 @@ impl SendLaunch {
             if r.outcome == chaldea_pty_runtime::WriteOutcome::Written
                 && let Some(w) = &written
             {
+                let _st = me.state();
                 w.store(true, Ordering::Release);
             }
             lock(&me.fired).push(Fired {
