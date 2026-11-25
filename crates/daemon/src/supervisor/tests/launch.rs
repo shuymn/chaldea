@@ -541,3 +541,54 @@ async fn wait_failed() {
         rig.srv.stop().await;
     }
 }
+
+/// PR10a1-CL-22 `unrecorded_start_job`: the start job's commit fails with `CommitUnknown`:
+/// 503 `outcome_unknown` before the deadline with no completion attempt; after a restart
+/// the reconcilers make the receipt `unknown_after_crash`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unrecorded_start_job() {
+    use crate::store::test_faults::CommitFault;
+    let rig = Rig::new().await;
+    let id = super::cid();
+    let cwd = rig.cwd.path().to_string_lossy().into_owned();
+    let held = rig.pauses.arm(crate::supervisor::Pause::InStartJob);
+    let started = std::time::Instant::now();
+    let reply = super::support::http::spawn_send(
+        &rig.srv,
+        &rig.srv.command(
+            "spawn",
+            &rig.owner,
+            id,
+            &json!({ "agent": "codex", "cwd": cwd }).to_string(),
+        ),
+    );
+    held.wait();
+    *rig.srv.store.store().faults().commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
+    held.go();
+    let r = reply.await.unwrap();
+    assert_eq!(
+        (r.status, json(&r)["code"].clone()),
+        (503, json!("outcome_unknown")),
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert!(started.elapsed() < crate::supervisor::COMMAND_DEADLINE);
+    // No completion was attempted (an attempt on the retired writer would report
+    // `Failed`): the commit's outcome, then the runner's uncompleted receipt.
+    assert_eq!(
+        *rig.sink.0.lock().unwrap(),
+        [
+            crate::http::StoreFatal::CommitUnknown,
+            crate::http::StoreFatal::ReceiptUncompleted { command_id: id }
+        ]
+    );
+    drop(rig.sup);
+    let (_, mut store) = rig.srv.into_store(std::time::Duration::from_secs(10)).await;
+    store.reopen();
+    super::restart::restart_all(&store);
+    let receipt = store.read(move |r| r.receipt(id)).unwrap();
+    assert_eq!(
+        receipt.status,
+        chaldea_core::command::ReceiptStatus::UnknownAfterCrash
+    );
+}

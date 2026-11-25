@@ -118,6 +118,8 @@ pub enum Pause {
     KillTaskEnd,
     /// Inside the close's drain step: before `close_by` (blocking).
     BeforeCloseBy,
+    /// A `close --stop` after its stop, before the closing job.
+    BeforeClosingJob,
     /// An exit op after taking the session out of its slot, before its kill task starts.
     ExitTookSession,
     /// An exit op before its lock wait.

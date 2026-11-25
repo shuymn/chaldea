@@ -32,7 +32,7 @@ use super::ops::{
     stop_launch, stop_op,
 };
 use super::record::{JobOf, Recorded, record};
-use super::{COMMAND_DEADLINE, STOP_REPORT, Supervisor};
+use super::{COMMAND_DEADLINE, Pause, STOP_REPORT, Supervisor};
 
 fn parse<T: serde::de::DeserializeOwned + Serialize>(
     args: &RawValue,
@@ -409,6 +409,7 @@ async fn close_op(sup: Arc<Supervisor>, req: CloseReq) -> EffectOutcome {
         Ok(s) => s,
         Err(o) => return o,
     };
+    sup.pauses().at(Pause::BeforeClosingJob).await;
     let (thread, launch, cid, by) = (
         req.stop.thread,
         req.stop.launch,

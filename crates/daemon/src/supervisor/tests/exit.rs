@@ -91,3 +91,40 @@ async fn buffer_resolved() {
     );
     rig.srv.stop().await;
 }
+
+/// PR10a1-CL-22 `unrecorded_exit_job`: a natural exit whose exit job cannot be submitted
+/// (the writer retired by a job outside the supervisor) reports `LaunchUnrecorded`; the
+/// row stays open, and after a restart the reconcilers record it `daemon_restart`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unrecorded_exit_job() {
+    use crate::http::StoreFatal;
+    use crate::store::test_faults::CommitFault;
+    let rig = Rig::new().await;
+    let (_t, l) = rig.spawn_codex(None).await;
+    let child = rig.pty.take_child().unwrap();
+    let took = rig.pauses.arm(crate::supervisor::Pause::ExitTookSession);
+    child.exit(ChildExit {
+        code: Some(0),
+        signal: None,
+    });
+    took.wait();
+    *rig.srv.store.store().faults().commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
+    let job: crate::http::Job<()> = Box::new(|_| Ok(()));
+    assert!(tokio::task::block_in_place(|| rig.srv.store.run(job)).is_err());
+    took.go();
+    rig.until("LaunchUnrecorded reported", || {
+        rig.sink
+            .0
+            .lock()
+            .unwrap()
+            .contains(&StoreFatal::LaunchUnrecorded { launch_id: l })
+    })
+    .await;
+    assert_eq!(rig.launch(l).exit_reason, None, "the row stays open");
+    drop(rig.sup);
+    let (_, mut store) = rig.srv.into_store(std::time::Duration::from_secs(10)).await;
+    store.reopen();
+    super::restart::restart_all(&store);
+    let row = store.read(move |r| r.launch(l)).unwrap();
+    assert_eq!(row.exit_reason, Some(ExitReason::DaemonRestart));
+}

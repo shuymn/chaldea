@@ -74,3 +74,57 @@ async fn zero_wakeup() {
             .await
     );
 }
+
+/// PR10a1-CL-22 `close_stop_after_admission`: a `close --stop` whose stop committed and
+/// whose closing job is refused `Closed` once the store's admission closed: 503
+/// `outcome_unknown`, nothing reported to the sink; after a restart the same `command_id`
+/// is 409 `unknown_after_crash`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_stop_after_admission() {
+    use serde_json::json;
+    let rig = Rig::new().await;
+    let (t, l) = rig.spawn_codex(None).await;
+    let id = super::cid();
+    let args = json!({ "thread_id": t, "expected_launch_id": l, "stop": true });
+    let held = rig.pauses.arm(crate::supervisor::Pause::BeforeClosingJob);
+    let reply = super::support::http::spawn_send(
+        &rig.srv,
+        &rig.srv.command("close", &rig.owner, id, &args.to_string()),
+    );
+    held.wait();
+    assert_eq!(rig.launch(l).exit_reason, Some(ExitReason::Stopped));
+    let store = rig.srv.store.store().clone();
+    let closing =
+        std::thread::spawn(move || store.shutdown(Instant::now() + Duration::from_secs(20)));
+    rig.until("admission closed", || {
+        let job: crate::http::Job<()> = Box::new(|_| Ok(()));
+        rig.srv
+            .store
+            .store()
+            .submit(Instant::now() + Duration::from_secs(5), job)
+            .is_err()
+    })
+    .await;
+    held.go();
+    let r = reply.await.unwrap();
+    assert_eq!(
+        (r.status, super::json(&r)["code"].clone()),
+        (503, json!("outcome_unknown")),
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert!(rig.sink.0.lock().unwrap().is_empty(), "{:?}", rig.sink.0);
+    assert!(closing.join().unwrap().writer_exited);
+    let owner = rig.owner.clone();
+    drop(rig.sup);
+    let (_, mut store) = rig.srv.into_store(Duration::from_secs(10)).await;
+    store.reopen();
+    super::restart::restart_all(&store);
+    let rig = Rig::on(store, chaldea_core::adapter::HostOs::Macos, |_| {}).await;
+    let r = rig.cmd_as(&owner, "close", id, &args).await;
+    assert_eq!(
+        (r.status, super::json(&r)["code"].clone()),
+        (409, json!("unknown_after_crash"))
+    );
+    rig.srv.stop().await;
+}
