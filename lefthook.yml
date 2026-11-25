@@ -91,7 +91,10 @@ pre-push:
         - "specs/traces/**"
         - "Cargo.{toml,lock}"
         - "rust-toolchain.toml"
-      run: cargo test --workspace --locked --no-fail-fast
+      # git exports GIT_DIR (and in some cases GIT_INDEX_FILE, GIT_WORK_TREE, ...) to the
+      # hook; a test that spawns git would inherit them and act on this repository instead
+      # of its fixture. Drop every GIT_* variable before the tests start.
+      run: bash -c 'unset $(compgen -e GIT_); exec cargo test --workspace --locked --no-fail-fast'
     specs-simulate:
       root: specs/
       glob:
