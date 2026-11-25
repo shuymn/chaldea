@@ -404,7 +404,8 @@ async fn spawn_caller() {
 
 /// PR10a1-CL-35: an agent token acts on its own thread; against an unrelated thread each of
 /// `stop`, `close`, `close --stop`, and `resume` is 404 before any read of its launch, with
-/// no receipt, no kill, and the thread unchanged.
+/// no receipt, no kill, and the thread unchanged; also with a stale `expected_launch_id`,
+/// which a generation read before the scope check would answer 409.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn target_scope() {
     let rig = Rig::new().await;
@@ -416,6 +417,7 @@ async fn target_scope() {
         .token(TokenKind::Agent, Some(own), Some(own_l))
         .await;
     let head = rig.kinds(other).len();
+    let stale = LaunchId(uuid::Uuid::new_v4());
     for (name, args) in [
         ("stop", json!({ "thread_id": other })),
         (
@@ -429,6 +431,20 @@ async fn target_scope() {
         (
             "resume",
             json!({ "thread_id": other, "expected_launch_id": ol }),
+        ),
+        // A stale `expected_launch_id`: a generation read before the scope check would
+        // answer 409 `launch_changed` and reveal the launch.
+        (
+            "stop",
+            json!({ "thread_id": other, "expected_launch_id": stale }),
+        ),
+        (
+            "close",
+            json!({ "thread_id": other, "expected_launch_id": stale, "stop": true }),
+        ),
+        (
+            "resume",
+            json!({ "thread_id": other, "expected_launch_id": stale }),
         ),
     ] {
         let id = cid();
