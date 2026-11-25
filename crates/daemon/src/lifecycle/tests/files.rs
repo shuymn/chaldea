@@ -126,9 +126,15 @@ fn no_rename_at_or_after_its_cutoff() {
         }
     };
     let until = std::time::Instant::now() + Duration::from_millis(120);
-    assert!(write_replace(d.path(), "port", b"7373\n", INSTANCE, Some(until), &fail).is_err());
+    let err = write_replace(d.path(), "port", b"7373\n", INSTANCE, Some(until), &fail)
+        .expect_err("every rename fails");
     let attempts = attempts.into_inner().unwrap();
-    assert!(!attempts.is_empty());
+    // A slow host can pass the cutoff while writing; then no rename is attempted at all.
+    let why = format!("{err:?}");
+    assert!(
+        !attempts.is_empty() || why.contains("its cutoff passed before the rename"),
+        "{why}"
+    );
     assert!(
         attempts.iter().all(|&t| t < until),
         "{attempts:?} {until:?}"
