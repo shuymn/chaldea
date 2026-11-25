@@ -28,6 +28,12 @@ pub(crate) struct Points {
     pub(crate) submits: AtomicUsize,
     /// The `not_after` of each job `run_write` submitted, in order.
     pub(crate) submitted_not_afters: Mutex<Vec<std::time::Instant>>,
+    /// Write jobs whose ticket answered `run_write` with `WriteError::Expired`.
+    pub(crate) expired_writes: AtomicUsize,
+    /// The server-clock instant of each timer set through `Shared::timer`, in order.
+    pub(crate) timers: Mutex<Vec<std::time::Instant>>,
+    /// The deadline of each hook pid wait, in order.
+    pub(crate) pid_wait_deadlines: Mutex<Vec<std::time::Instant>>,
     /// Held once by an upgrade admission between its final read and the ticket removal.
     pub(crate) removal_gate: Mutex<Option<Gate>>,
     /// Held once by a read's or a write reply's waiter before it first polls its result
@@ -184,6 +190,42 @@ impl Points {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(not_after);
+    }
+
+    pub(crate) fn write_expired(&self) {
+        self.expired_writes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn expired_writes(&self) -> usize {
+        self.expired_writes.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn timer_set(&self, at: std::time::Instant) {
+        self.timers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(at);
+    }
+
+    pub(crate) fn timers(&self) -> Vec<std::time::Instant> {
+        self.timers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn pid_wait_started(&self, deadline: std::time::Instant) {
+        self.pid_wait_deadlines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(deadline);
+    }
+
+    pub(crate) fn pid_wait_deadlines(&self) -> Vec<std::time::Instant> {
+        self.pid_wait_deadlines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn submitted_not_afters(&self) -> Vec<std::time::Instant> {

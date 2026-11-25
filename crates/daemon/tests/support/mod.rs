@@ -54,14 +54,15 @@ use tempfile::TempDir;
 pub const T0: &str = "2026-11-22T00:00:00.000Z";
 
 /// A clock whose wall time is fixed (settable) and whose instant is real, or real plus a
-/// settable lead (the writer's deadline checks read it).
-pub struct FixedClock(Mutex<Timestamp>, Mutex<Duration>);
+/// settable lead or less a settable lag (the writer's deadline checks read it).
+pub struct FixedClock(Mutex<Timestamp>, Mutex<Duration>, Mutex<Duration>);
 
 impl FixedClock {
     #[must_use]
     pub fn new(ts: &str) -> Arc<Self> {
         Arc::new(FixedClock(
             Mutex::new(Timestamp(ts.to_owned())),
+            Mutex::new(Duration::ZERO),
             Mutex::new(Duration::ZERO),
         ))
     }
@@ -74,12 +75,21 @@ impl FixedClock {
     pub fn lead(&self, by: Duration) {
         *self.1.lock().unwrap() = by;
     }
+
+    /// Puts the clock's instant `by` behind real time: a queued job's `not_after` passes
+    /// `by` later.
+    pub fn lag(&self, by: Duration) {
+        *self.2.lock().unwrap() = by;
+    }
 }
 
 impl Clock for FixedClock {
     fn now(&self) -> (Instant, Timestamp) {
+        let ahead = Instant::now() + *self.1.lock().unwrap();
         (
-            Instant::now() + *self.1.lock().unwrap(),
+            ahead
+                .checked_sub(*self.2.lock().unwrap())
+                .expect("the lag is within the platform's instants"),
             self.0.lock().unwrap().clone(),
         )
     }
