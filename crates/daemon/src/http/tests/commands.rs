@@ -1200,7 +1200,8 @@ async fn revoking_intent_nudges() {
 
 /// A revoking intent whose commit outcome is unknown: the revocation may be visible, no
 /// nudge runs (the nudge is guaranteed for acknowledged commits only), and `CommitUnknown`
-/// reaches the sink, which stops the daemon and so closes every socket.
+/// is delivered to the sink. This checks that delivery; that the daemon's sink then stops
+/// the daemon is the lifecycle gate's (`lifecycle::tests::gate`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn revoking_commit_unknown_is_fatal() {
     let (srv, probe) = TestServer::with_commands(|_| {}).await;
