@@ -316,17 +316,17 @@ impl HookAdapter for SupervisorHooks {
                 ev.apply("stop", &StateInput::TurnStopped);
                 ev.close_cards(tx, thread, ApprovalOutcome::Superseded)?;
                 // A unit that ran to `Written` before the intake, with its input already acked
-                // by its own turn's `UserPromptSubmit`, ended before this `Stop`; the settle
-                // waits for its record (§2.4 step 3). Any other running unit's turn may still
-                // run.
+                // by a hook (its own turn's `UserPromptSubmit`: `acked` with an `ack_seq`; an
+                // owner's resolution sets none), ended before this `Stop`; the settle waits for
+                // its record (§2.4 step 3). Any other running unit's turn may still run.
                 let settle = hook.intake_reliable
                     && match facts {
                         None => false,
                         Some(f) if !f.running => true,
                         Some(f) => match f.inflight.as_ref().filter(|i| i.written) {
-                            Some(i) => tx
-                                .input(i.input_id)?
-                                .is_some_and(|r| r.state == InputState::Acked),
+                            Some(i) => tx.input(i.input_id)?.is_some_and(|r| {
+                                r.state == InputState::Acked && r.ack_seq.is_some()
+                            }),
                             None => false,
                         },
                     };
