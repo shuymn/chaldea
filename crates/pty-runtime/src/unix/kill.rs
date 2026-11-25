@@ -113,8 +113,8 @@ impl Pass {
 /// What a proof step established.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Proof {
-    /// Every covered identity was read resolved.
-    Dead,
+    /// Every covered identity was read resolved; the clock read right after those reads.
+    Dead(Instant),
     /// A covered process was read live or unreadable.
     Alive,
     /// Nothing may be proven yet (an unclean pass, no ownership, or the deadline).
@@ -157,8 +157,6 @@ struct Call<'a, O: Os> {
     unknown: BTreeMap<u32, Option<u32>>,
     /// A `killpg` or `kill` was made in this call.
     signalled: bool,
-    /// The clock read right after the reads that proved the tree dead.
-    proved_at: Option<Instant>,
 }
 
 impl<O: Os> Call<'_, O> {
@@ -396,8 +394,7 @@ impl<O: Os> Call<'_, O> {
             self.read(st, pid, None);
         }
         if st.targets.is_empty() && self.unknown.is_empty() {
-            self.proved_at = Some(self.os.now());
-            Proof::Dead
+            Proof::Dead(self.os.now())
         } else {
             Proof::Alive
         }
@@ -650,7 +647,6 @@ pub(crate) fn kill_tree<O: Os>(
         owned0: false,
         unknown: BTreeMap::new(),
         signalled: false,
-        proved_at: None,
     };
     if leader.start.is_none() {
         call.unknown.insert(leader.pid, Some(leader.pid));
@@ -668,7 +664,7 @@ pub(crate) fn kill_tree<O: Os>(
             break;
         }
         match call.prove(&pass, st) {
-            Proof::Dead => return finish(&call, st, true),
+            Proof::Dead(at) => return finish(&call, st, Some(at)),
             Proof::Alive => {
                 alive = true;
                 break;
@@ -676,7 +672,7 @@ pub(crate) fn kill_tree<O: Os>(
             Proof::Unknown => {}
         }
         if os.lost() || call.expired() {
-            return finish(&call, st, false);
+            return finish(&call, st, None);
         }
         if !pass.churn_only {
             break;
@@ -702,11 +698,11 @@ pub(crate) fn kill_tree<O: Os>(
         pass = call.round(st);
         if !pass.alive {
             match call.prove(&pass, st) {
-                Proof::Dead => return finish(&call, st, true),
+                Proof::Dead(at) => return finish(&call, st, Some(at)),
                 Proof::Alive => {}
                 Proof::Unknown => {
                     if os.lost() {
-                        return finish(&call, st, false);
+                        return finish(&call, st, None);
                     }
                     if !pass.churn_only {
                         call.sleep(STEP);
@@ -718,13 +714,14 @@ pub(crate) fn kill_tree<O: Os>(
         call.signal(Sig::Kill, st);
         call.sleep(STEP);
     }
-    finish(&call, st, false)
+    finish(&call, st, None)
 }
 
 /// The report, derived from the retained targets: nothing is pruned or added here, since
-/// every read already updated them.
-fn finish<O: Os>(call: &Call<'_, O>, st: &KillState, tree_dead: bool) -> KillReport {
-    let tree_dead = tree_dead && !call.os.lost();
+/// every read already updated them. `proved_at`: when the call proved the tree dead.
+fn finish<O: Os>(call: &Call<'_, O>, st: &KillState, proved_at: Option<Instant>) -> KillReport {
+    let proved_at = proved_at.filter(|_| !call.os.lost());
+    let tree_dead = proved_at.is_some();
     let attempt = if call.signalled {
         KillAttempt::Signalled
     } else if tree_dead {
@@ -736,7 +733,7 @@ fn finish<O: Os>(call: &Call<'_, O>, st: &KillState, tree_dead: bool) -> KillRep
         method: method(call.os).to_owned(),
         tree_dead,
         attempt,
-        proved_at: if tree_dead { call.proved_at } else { None },
+        proved_at,
         survivors: if tree_dead {
             Vec::new()
         } else {
@@ -1283,7 +1280,6 @@ mod tests {
             owned0: true,
             unknown: BTreeMap::new(),
             signalled: false,
-            proved_at: None,
         };
         let mut st = KillState::default();
         let first = call.pass(&mut st);

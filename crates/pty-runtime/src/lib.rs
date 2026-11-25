@@ -53,7 +53,7 @@ mod windows;
 #[path = "windows"]
 mod windows {
     #![allow(dead_code, reason = "only their unit tests run off Windows")]
-    mod cmdline;
+    pub(crate) mod cmdline;
     mod kill;
     mod process;
     mod wait;

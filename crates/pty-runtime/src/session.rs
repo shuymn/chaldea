@@ -702,6 +702,14 @@ impl Session {
     /// it returns, and returns their records. A later call (or the close's own step 1)
     /// settles nothing more and returns none.
     pub fn seal(&self) -> Vec<WriteRecord> {
+        let fired = self.close_queue();
+        let records = fired.records();
+        fired.fire(&self.sh);
+        records
+    }
+
+    /// Closes the queue and wakes the writer; the caller fires what it settled.
+    fn close_queue(&self) -> Fired {
         let mut fired = Fired::default();
         {
             let mut q = lock(&self.sh.q);
@@ -712,9 +720,7 @@ impl Session {
                 .fetch_add(n, Ordering::Relaxed);
         }
         self.sh.cv.notify_all();
-        let records = fired.records();
-        fired.fire(&self.sh);
-        records
+        fired
     }
 
     /// The records after `seq` (the in-progress one included), from the diagnostic ring.
@@ -895,16 +901,23 @@ impl Session {
         let sh = self.sh.clone();
 
         // 1. Close the queue and settle everything that has not dispatched.
-        let _ = self.seal();
+        self.close_queue().fire(&sh);
 
         // 2. Kill, unless the tree is already reported dead and nothing new is named
         // (`close`), or the same list is named (`close_by`).
-        let prior = lock(&self.last_kill).clone();
+        let prior = self
+            .last_kill
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         let kill = match (prior, kill_deadline) {
             (Some((k, _)), None) if k.tree_dead && extra.is_empty() => k,
             (Some((k, list)), Some(_)) if k.tree_dead && list == extra => k,
-            (_, None) => self.kill(extra, Instant::now() + bounds.kill),
-            (_, Some(at)) => self.kill_by(extra, at, at),
+            (_, None) => {
+                let at = Instant::now() + bounds.kill;
+                self.child.kill_tree(extra, at, at)
+            }
+            (_, Some(at)) => self.child.kill_tree(extra, at, at),
         };
 
         // 3. Release the input.

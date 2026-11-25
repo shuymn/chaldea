@@ -294,7 +294,7 @@ fn proved<O: JobOs>(call: &Call<'_, O>) -> KillReport {
         } else {
             KillAttempt::AlreadyDead
         },
-        proved_at: Some(call.observed_at.unwrap_or_else(|| call.os.now())),
+        proved_at: call.observed_at,
     }
 }
 

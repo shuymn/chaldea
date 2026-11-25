@@ -2,11 +2,10 @@
 //! `CompareStringOrdinal(…, TRUE)` over the keys' UTF-16 units (the block refuses two keys
 //! equal under it, `docs/design/pty-windows.md` §2.2 "Buffers"); exact bytes on macOS.
 
-use std::cmp::Ordering;
 use std::ffi::OsStr;
 
-/// A key order whose `Equal` is the backend's key equality.
-type Compare = fn(&[u16], &[u16]) -> Ordering;
+#[cfg(any(windows, test))]
+use crate::windows::cmdline::{Compare, wide};
 
 /// Whether `a` and `b` name the same variable in a spawned child's environment.
 #[must_use]
@@ -40,31 +39,21 @@ pub fn env_key_has_prefix(key: &OsStr, prefix: &OsStr) -> bool {
     }
 }
 
-fn wide(s: &OsStr) -> Vec<u16> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        s.encode_wide().collect()
-    }
-    #[cfg(not(windows))]
-    {
-        s.to_string_lossy().encode_utf16().collect()
-    }
-}
-
-#[cfg_attr(not(any(windows, test)), allow(dead_code, reason = "the Windows rule"))]
+#[cfg(any(windows, test))]
 fn eq_with(cmp: Compare, a: &OsStr, b: &OsStr) -> bool {
-    cmp(&wide(a), &wide(b)) == Ordering::Equal
+    cmp(&wide(a), &wide(b)).is_eq()
 }
 
-#[cfg_attr(not(any(windows, test)), allow(dead_code, reason = "the Windows rule"))]
+#[cfg(any(windows, test))]
 fn prefix_with(cmp: Compare, key: &OsStr, prefix: &OsStr) -> bool {
     let (k, p) = (wide(key), wide(prefix));
-    k.len() >= p.len() && cmp(&k[..p.len()], &p) == Ordering::Equal
+    k.len() >= p.len() && cmp(&k[..p.len()], &p).is_eq()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use super::*;
 
     /// The Windows comparison's case folding, for the rule's tests on every OS.

@@ -23,11 +23,11 @@ const STARTUP_PARSE: Duration = Duration::from_secs(5);
 const WAKE: u8 = 0;
 
 /// The method of a fake report whose call did not get the kill-state lock.
-pub const METHOD_BUSY: &str = "fake_busy";
+const METHOD_BUSY: &str = "fake_busy";
 /// The method of every other fake report but `Unconfirmed`'s.
-pub const METHOD: &str = "fake";
+const METHOD: &str = "fake";
 /// The method of `KillBehavior::Unconfirmed`'s report (not busy, as `unix_ownership_lost`).
-pub const METHOD_UNCONFIRMED: &str = "fake_unconfirmed";
+const METHOD_UNCONFIRMED: &str = "fake_unconfirmed";
 
 /// What `kill_tree` does once it holds the kill-state lock with the child alive and the call
 /// not expired. Every behaviour but `Unconfirmed` and `Panic` first performs the fake's
@@ -129,10 +129,6 @@ struct Proc {
     /// `wait_timeout` blocks while set (`hold_waiter`).
     waiter_held: Mutex<bool>,
     waiter_cv: Condvar,
-    /// Runs in a `kill_tree` call after its earlier deadline checks, right before it takes
-    /// the log's mutex for the signal (tests of this module).
-    #[cfg(test)]
-    before_signal: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Proc {
@@ -286,8 +282,6 @@ impl PtyRuntime for FakePty {
             wait_fails: AtomicBool::new(false),
             waiter_held: Mutex::new(script.hold_waiter),
             waiter_cv: Condvar::new(),
-            #[cfg(test)]
-            before_signal: Mutex::new(None),
         });
         let reader = FakeReader {
             pipe: r,
@@ -472,6 +466,20 @@ impl PtyChild for FakeProcess {
         lock_by: Instant,
         deadline: Instant,
     ) -> KillReport {
+        self.kill_with(extra, lock_by, deadline, || {})
+    }
+}
+
+impl FakeProcess {
+    /// `kill_tree`, with `before_signal` run after the earlier deadline checks, right before
+    /// the log's mutex is taken for the signal.
+    fn kill_with(
+        &self,
+        extra: &[ProcessIdentity],
+        lock_by: Instant,
+        deadline: Instant,
+        before_signal: impl FnOnce(),
+    ) -> KillReport {
         let p = &self.0;
         p.record(FakeEvent::Kill {
             extra: extra.to_vec(),
@@ -511,10 +519,7 @@ impl PtyChild for FakeProcess {
         // The signal-equivalent operation: the deadline is checked once more under the log's
         // mutex, right before the signal is recorded and counted. `None`: not performed.
         let signal = || {
-            #[cfg(test)]
-            if let Some(f) = lock(&p.before_signal).take() {
-                f();
-            }
+            before_signal();
             let mut log = lock(&p.log);
             if Instant::now() >= deadline {
                 return None;
@@ -1533,15 +1538,17 @@ mod tests {
     /// checks and before that mutex until past its deadline records no signal.
     #[test]
     fn deadline_rechecked_under_the_log() {
-        let (child, c, _parts) = spawn(FakeScript::default());
+        let (_child, c, _parts) = spawn(FakeScript::default());
         let (reached_tx, reached) = std::sync::mpsc::channel();
         let (release, wait) = std::sync::mpsc::channel::<()>();
-        *c.proc.before_signal.lock().unwrap() = Some(Box::new(move || {
-            reached_tx.send(()).unwrap();
-            let _ = wait.recv_timeout(Duration::from_secs(20));
-        }));
+        let process = FakeProcess(c.proc.clone());
         let deadline = Instant::now() + Duration::from_millis(500);
-        let call = std::thread::spawn(move || child.kill_tree(&[], deadline, deadline));
+        let call = std::thread::spawn(move || {
+            process.kill_with(&[], deadline, deadline, move || {
+                reached_tx.send(()).unwrap();
+                let _ = wait.recv_timeout(Duration::from_secs(20));
+            })
+        });
         // The call passed its earlier checks and is about to take the log's mutex.
         reached.recv_timeout(Duration::from_secs(20)).unwrap();
         while Instant::now() <= deadline {
