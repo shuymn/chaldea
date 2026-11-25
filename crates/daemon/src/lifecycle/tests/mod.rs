@@ -532,12 +532,18 @@ fn spawn_locked_before_creates_only_under_the_lock() {
     // A free lock and a future deadline, but `under_lock` returns only after the deadline:
     // nothing is created.
     let deadline = Instant::now() + Duration::from_millis(50);
+    let late_ran = AtomicBool::new(false);
     let late = spawn_locked_before(&mut cmd(), deadline, || {
+        late_ran.store(true, Ordering::SeqCst);
         while Instant::now() <= deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
         true
     });
+    assert!(
+        late_ran.load(Ordering::SeqCst),
+        "the check ran under the lock"
+    );
     assert!(late.is_none(), "no child after the deadline");
 
     // The lock held by another thread past the deadline.
