@@ -128,6 +128,41 @@ async fn ack_while_sending() {
     rig.stop().await;
 }
 
+/// PR10b-CL-7/8: a hook taken in before its unit's completion does not see the unit written
+/// when the completion lands while the intake gathers its facts (after the fence advanced):
+/// no `input_id`, and the input goes on to `sent`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completion_during_intake() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    // The worker waits after its `submit`, so the launch's state stays free for the probe.
+    let (submitted, resume, after_submit) = gate_point();
+    set(&sl.hooks.after_submit, after_submit);
+    let (entered, go, point) = gate_point();
+    set(&sl.hooks.completion, point);
+    let id = rig.send(&live, "P").await;
+    submitted.await.unwrap();
+    entered.await.unwrap();
+    // Inside the intake: the completion sets `written` and hands its record over.
+    let me = sl.clone();
+    *crate::supervisor::send::lock(&sl.hooks.observe) = Some(Box::new(move |sup, l| {
+        go.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        while me.outstanding.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            assert!(Instant::now() < until, "the completion ran");
+            std::thread::yield_now();
+        }
+        sup.observe(l)
+    }));
+    prompt(&rig, &live, "P").await;
+    assert!(crate::supervisor::send::lock(&sl.hooks.observe).is_none());
+    assert_eq!(last_ack(&rig, &live), None);
+    resume.send(()).unwrap();
+    rig.until_input(id, InputState::Sent).await;
+    rig.stop().await;
+}
+
 /// PR10b-CL-8: a `sent` input whose ack window expired is `unconfirmed`; a hook that arrives
 /// for it while its launch lives acks it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
