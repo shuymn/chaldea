@@ -509,3 +509,35 @@ async fn startup_stall_only_upgraded_codex() {
     }
     rig.srv.stop().await;
 }
+
+/// PR10a1-CL-13 `wait_failed`: the waiter fails: the exit op kills and closes; death is
+/// confirmed exactly when the kill proved it, and the status is null.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wait_failed() {
+    use chaldea_pty_runtime::fake::{FakeScript, KillBehavior};
+    for (kill, confirmed) in [
+        (KillBehavior::ExitOnKill, true),
+        (KillBehavior::Ignore, false),
+    ] {
+        let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
+            c.kill_budget = std::time::Duration::from_millis(300);
+        })
+        .await;
+        rig.pty.script_next(FakeScript {
+            kill,
+            ..FakeScript::default()
+        });
+        let (_t, l) = rig.spawn_codex(None).await;
+        let child = rig.pty.take_child().unwrap();
+        child.fail_wait();
+        rig.until("the exit is recorded", || {
+            rig.launch(l).exit_reason.is_some()
+        })
+        .await;
+        let row = rig.launch(l);
+        assert_eq!(row.exit_reason, Some(ExitReason::Exit));
+        assert_eq!(row.death_confirmed, confirmed);
+        assert_eq!((row.exit_code, row.exit_signal), (None, None));
+        rig.srv.stop().await;
+    }
+}

@@ -1,10 +1,12 @@
 //! Supervisor unit tests (design §5.2, §6): `FakePty`, the in-process store and server, and
 //! `cfg(test)` pause points.
 
+mod close;
 mod commands;
 mod launch;
 mod race;
 mod reserve;
+mod restart;
 mod stop;
 
 use std::collections::HashMap;
