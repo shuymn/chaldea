@@ -241,6 +241,32 @@ module thread_input_traces {
       .then(restart)
       .expect(stateOf(st, 2) == Unconfirmed and st.thread.attention == Set(InputUnconfirmed(2)))
 
+  /// A spawn whose process existed and then failed: the positional prompt `unconfirmed`,
+  /// death confirmed exactly as the cleanup was, with either cleanup.
+  run trace_spawn_started_then_failed =
+    initWith(false)
+      .then(reserve(CODEX))
+      .then(spawnStartedThenFailed(true))
+      .expect(stateOf(st, 1) == Unconfirmed and st.deathConfirmed
+        and st.thread.process == Exited and st.thread.attention == Set(InputUnconfirmed(1)))
+      .then(reserve(CODEX))
+      .then(spawnStartedThenFailed(false))
+      .expect(stateOf(st, 2) == Unconfirmed and not(st.deathConfirmed)
+        and st.thread.attention == Set(InputUnconfirmed(1), InputUnconfirmed(2)))
+
+  /// A `SessionStart` that does not bind leaves the launch unbound: the timer still raises
+  /// `session_start_timeout`, and the exit clears it.
+  run trace_session_timer_after_unbound_session_start =
+    initWith(false)
+      .then(reserve(CODEX))
+      .then(spawn)
+      .then(sessionStartHook)
+      .expect(not(st.gp.bound))
+      .then(sessionTimer)
+      .expect(st.thread.attention.contains(SessionStartTimeout))
+      .then(exit(ExitNormal, true))
+      .expect(not(st.thread.attention.contains(SessionStartTimeout)))
+
   /// Refused: evidence of the same turn as a `key` write arrives after the gate opened;
   /// the writer's recheck sees `EvidenceOfSameTurn` and cancels with zero bytes.
   run trace_refused_recheck_same_turn_evidence =

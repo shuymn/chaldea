@@ -431,6 +431,7 @@ module thread_input {
     | ReserveRefused
     | Spawn
     | SpawnFail
+    | SpawnStartedThenFailed(bool)
     | SessionStartHook
     | ManualFirstTurn
     | Bind
@@ -858,6 +859,16 @@ module thread_input {
     commit(SpawnFail, withState(o3, s => { ...s, deathConfirmed: true })),
   }
 
+  /// A process existed and its setup then failed (`SpawnError::StartedThenFailed`): the
+  /// positional prompt may have run, so it is `unconfirmed` through `LaunchExited`; death is
+  /// confirmed exactly when the backend confirmed the cleanup (`dc`).
+  action spawnStartedThenFailed(dc: bool): bool = all {
+    st.thread.process == Starting,
+    val o1 = red(bump(start(st)), ExitedBy(ExitSpawnFailed))
+    val o2 = recoverInputs(o1, st.launch, LaunchExited)
+    commit(SpawnStartedThenFailed(dc), withState(o2, s => { ...s, deathConfirmed: dc })),
+  }
+
   /// The launch's `SessionStart` arrived; binding (its ancestry check) may still be pending.
   /// As a later hook it invalidates pending candidates.
   action sessionStartHook: bool = all {
@@ -1267,11 +1278,12 @@ module thread_input {
     commit(LateResolve(c), if (alive(st) and st.cards.get(c).launch == st.launch) invalidate(start(st)) else start(st)),
   }
 
-  /// No `SessionStart` 20 s after `launch_started` of a non-manual launch (mvp §2.2:142).
-  /// The timer belongs to the current launch and also runs while `stopping`.
+  /// The launch unbound 20 s after `launch_started` of a non-manual launch (mvp §2.2:142):
+  /// a `SessionStart` that did not bind leaves it unbound (hook-ingest:268). The timer
+  /// belongs to the current launch and also runs while `stopping`.
   action sessionTimer: bool = all {
     alive(st),
-    not(st.sessionStartSeen),
+    not(st.gp.bound),
     st.cfg.adapter != CodexManual,
     not(st.thread.attention.contains(SessionStartTimeout)),
     commit(SessionTimer, red(bump(start(st)), AttentionRaised(SessionStartTimeout))),
@@ -1360,6 +1372,8 @@ module thread_input {
     nondet dc = Bool.oneOf()
     exit(r, dc),
     spawnFail,
+    nondet sdc = Bool.oneOf()
+    spawnStartedThenFailed(sdc),
     restart,
     interrupt,
     sessionTimer,
