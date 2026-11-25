@@ -1367,6 +1367,32 @@ async fn launch_codes_at_their_statuses() {
     srv.stop().await;
 }
 
+/// Through the HTTP path: `dispatch` hands the intent the request's `RequestStart` (its first
+/// head byte), not a later reading. The server's clock moves 1 s, within the 2 s budget,
+/// while the guard's token read is held, after the request was received.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn dispatch_copies_request_start() {
+    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    srv.clock.stop();
+    let origin = srv.clock.now();
+    let (reached_tx, reached) = std::sync::mpsc::channel();
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    shared(&srv).faults.arm_before_read(0, move || {
+        let _ = reached_tx.send(());
+        let _ = wait.recv_timeout(Duration::from_secs(10));
+    });
+    let reply = spawn_send(&srv, &srv.command("test_ctx", &owner, cid(1), "{}"));
+    reached_sync(reached).await;
+    srv.clock.advance(Duration::from_secs(1));
+    release.send(()).unwrap();
+    assert_eq!(joined(reply).await.status, 200);
+    let seen = probe.ctx_seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, origin, "the first head byte's reading");
+    srv.stop().await;
+}
+
 /// The intent sees the request's `RequestStart` as `request_start`, and as `job_start` the
 /// server's clock read in its job: a clock moved while the job waits behind the writer is
 /// seen.
