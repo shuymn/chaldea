@@ -351,8 +351,6 @@ async fn ack_windows(
         let (thread, launch) = (sl.thread_id, sl.launch_id);
         let positional = sl.positional == Some(id);
         let cause = IdempotencyKey(format!("ack_window:{launch}:{id}"));
-        #[cfg(test)]
-        super::run_hook(&sl.hooks.ack_window_job);
         let job: JobOf<bool> = Arc::new(move |tx| {
             if positional && startup_cause(&thread_row(tx, thread)?) {
                 return Ok(false);

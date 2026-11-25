@@ -261,8 +261,6 @@ pub(crate) struct SendHooks {
     /// Runs on the worker after an input's completion job was recorded, before its result
     /// is applied.
     pub after_record: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    /// Runs on the worker before an ack-window job is submitted.
-    pub ack_window_job: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Takes the place of the probe's observation of the launch at one intake (on the
     /// hook's request task, synchronously).
     #[allow(clippy::type_complexity, reason = "a one-shot test point")]

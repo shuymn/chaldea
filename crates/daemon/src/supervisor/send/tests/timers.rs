@@ -222,8 +222,8 @@ async fn ack_window_from_sqlite_commit() {
 }
 
 /// PR10b-CL-8: the positional input's window job reads the startup causes again: a
-/// `session_start_timeout` committed after the pass chose the input and before its job
-/// leaves the input `sent`.
+/// `session_start_timeout` committed after the pass read its view and before its job leaves
+/// the input `sent`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn positional_window_rereads_startup() {
     let rig = SRig::new().await;
@@ -235,7 +235,7 @@ async fn positional_window_rereads_startup() {
     let sl = rig.sl(&live);
     let (entered_tx, entered) = tokio::sync::oneshot::channel::<()>();
     let (go, wait) = std::sync::mpsc::channel::<()>();
-    set(&sl.hooks.ack_window_job, move || {
+    set(&sl.hooks.after_read, move || {
         let _ = entered_tx.send(());
         let _ = wait.recv_timeout(Duration::from_secs(20));
     });
