@@ -246,3 +246,39 @@ async fn snapshot_copy_outside_lock() {
     let _ = snap.await.unwrap();
     rig.stop().await;
 }
+
+/// PR10b-CL-15 (P-2): with the session's VT failed, the gate timeout is raised bare (no
+/// `vt_snapshot_taken`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gate_timeout_vt_failed() {
+    let rig = SRig::new().await;
+    let (live, _) = rig.spawn(Agent::Codex, None).await;
+    let entry = rig.sup.entry(live.l).unwrap();
+    entry
+        .with_session(&rig.sup, rig.sup.now() + Duration::from_secs(5), |s| {
+            s.fail_vt_on_next_piece();
+        })
+        .await
+        .unwrap();
+    live.child.emit(b"x");
+    rig.until_async("the VT failed", || async {
+        entry
+            .with_session(&rig.sup, rig.sup.now() + Duration::from_secs(5), |s| {
+                s.status().vt_failed
+            })
+            .await
+            .unwrap()
+    })
+    .await;
+    let id = rig.send(&live, "waits").await;
+    rig.pass(&live).await;
+    let t0 = rig.sl(&live).state().queued_at[&id];
+    tick_at(&rig, &live, t0 + GATE_TIMEOUT).await;
+    let cause = AttentionCause::InputGateTimeout { input_id: id };
+    rig.until("raised", || {
+        rig.thread(live.t).state.attention.contains(&cause)
+    })
+    .await;
+    assert!(rig.of_kind(live.t, "vt_snapshot_taken").is_empty());
+    rig.stop().await;
+}

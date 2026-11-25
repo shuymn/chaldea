@@ -447,6 +447,138 @@ async fn settle_after_human_record() {
     rig.stop().await;
 }
 
+/// PR10b-CL-4 (P-1): a Codex launch whose first turn's `UserPromptSubmit` and `Stop` are
+/// taken in before the binding `SessionStart` committed (both buffered, promoted at the
+/// binding) acks the positional input. Received after the `SessionStart`, the promoted `Stop`
+/// is the log's highest entry and settles, so the next send is written; received before it,
+/// the binding's own mark is the highest entry (a later hook ends a candidate, §2.4 step 2),
+/// so the next send waits for `ready`, as after any turn the log cannot place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn buffered_stop() {
+    for stop_first in [false, true] {
+        let rig = SRig::new().await;
+        let (live, v) = rig.spawn(Agent::Codex, Some("first")).await;
+        let id: InputId = serde_json::from_value(v["input_id"].clone()).unwrap();
+        rig.paste(&live, true).await;
+        rig.clock.stop();
+        if stop_first {
+            rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "first" }))
+                .await;
+            rig.hook(&live, "Stop", &json!({})).await;
+            rig.hook(&live, "SessionStart", &json!({})).await;
+        } else {
+            let (got, release) = rig.ingest.points.arm_job(rig.next_ordinal(&live));
+            let h = rig.hook_of(&live, "SessionStart", &json!({}));
+            let binding =
+                crate::supervisor::tests::support::http::spawn_send(&rig.srv, &h.req(&rig.srv));
+            got.await.unwrap();
+            rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "first" }))
+                .await;
+            rig.hook(&live, "Stop", &json!({})).await;
+            release.send(()).unwrap();
+            assert_eq!(binding.await.unwrap().status, 200);
+        }
+        assert!(rig.launch(live.l).session_id.is_some(), "bound");
+        assert_eq!(
+            rig.input(id).state,
+            InputState::Acked,
+            "stop first: {stop_first}"
+        );
+        advance(&rig, &live, SETTLE).await;
+        assert_eq!(
+            count(&rig, &live, "stop_settled"),
+            usize::from(!stop_first),
+            "stop first: {stop_first}"
+        );
+        let next = rig.send(&live, "next").await;
+        if stop_first {
+            rig.pass(&live).await;
+            assert_eq!(rig.input(next).state, InputState::Queued);
+            rig.cmd_ok("ready", &json!({ "thread_id": live.t }), 200)
+                .await;
+        }
+        rig.until_input(next, InputState::Sent).await;
+        rig.stop().await;
+    }
+}
+
+/// `FakeDecoder` that runs a one-shot test point inside the job of the next `Stop`.
+struct HoldStop(std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+impl crate::supervisor::send::HookDecoder for HoldStop {
+    fn decode(
+        &self,
+        tx: &crate::store::ReadTx<'_>,
+        hook: &crate::hook::AcceptedHook<'_>,
+    ) -> Result<
+        (
+            crate::supervisor::send::hooks::HookFact,
+            Vec<crate::hook::HookEvent>,
+        ),
+        crate::store::StoreError,
+    > {
+        if hook.event_name == "Stop" {
+            let f = self.0.lock().unwrap().take();
+            if let Some(f) = f {
+                f();
+            }
+        }
+        crate::supervisor::send::HookDecoder::decode(
+            &crate::supervisor::send::fake_decoder::FakeDecoder,
+            tx,
+            hook,
+        )
+    }
+}
+
+/// PR10b-CL-4 (P-1): a `Stop` whose request ended `outcome_unknown` (its job still running
+/// at the reply cutoff) and whose job committed after it reaches the turn log: it settles, and
+/// the next send is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_after_outcome_unknown() {
+    let hold = Arc::new(HoldStop(std::sync::Mutex::new(None)));
+    let h2 = hold.clone();
+    let rig = SRig::with(move |c| c.decoder = h2).await;
+    let live = rig.bound(Agent::Codex).await;
+    rig.clock.stop();
+    rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "p" }))
+        .await;
+    let (entered_tx, entered) = tokio::sync::oneshot::channel::<()>();
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    *hold.0.lock().unwrap() = Some(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = wait.recv_timeout(Duration::from_secs(20));
+    }));
+    let h = rig.hook_of(&live, "Stop", &json!({}));
+    let stop = crate::supervisor::tests::support::http::spawn_send(&rig.srv, &h.req(&rig.srv));
+    entered.await.unwrap();
+    // Past the request's reply cutoff while its job runs.
+    rig.clock.advance(Duration::from_secs(10));
+    go.send(()).unwrap();
+    let r = stop.await.unwrap();
+    assert_eq!(
+        (r.status, r.code()),
+        (503, Some("outcome_unknown".to_owned())),
+        "{r:?}"
+    );
+    rig.until("the mark reached the log", || {
+        rig.sl(&live)
+            .state()
+            .log
+            .0
+            .values()
+            .next_back()
+            .map(|(m, _)| *m)
+            == Some(crate::hook::TurnMark::End { settle: true })
+    })
+    .await;
+    advance(&rig, &live, SETTLE).await;
+    assert_eq!(count(&rig, &live, "stop_settled"), 1);
+    let next = rig.send(&live, "next").await;
+    rig.until_input(next, InputState::Sent).await;
+    rig.stop().await;
+}
+
 /// PR10b-CL-4: the candidate needs the current turn's start to follow an end the daemon saw:
 /// out-of-order commits of a start and its `Stop` settle once both are in; a `ready` before
 /// `P1`'s `Stop` leaves `P2`'s turn unsettled until `ready` and `P3`; a second `Stop` on an
