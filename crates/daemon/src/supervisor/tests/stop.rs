@@ -575,10 +575,11 @@ async fn replay_bytes() {
 }
 
 /// PR10a1-CL-11 `proof_before_slow_join`: the task's first call proves and sends its report;
-/// the close is held before it starts until the clock passed the kill's submission + 12 s:
-/// the join is late, the early report still confirms death with its method, and the token
-/// stays counted until the close ends. A task that panics right after sending its report
-/// still confirms death, and its token stays counted.
+/// while the close is held before it starts, the token stays counted; the stop confirms
+/// death with the report's method, the close reuses the proof, and the token is released
+/// when the close ends. A task that panics right after sending its report still confirms
+/// death, and its token stays counted. A join that ends past the kill's submission + 12 s is
+/// `ops::report_before_a_late_join`, at the op's waits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn proof_before_slow_join() {
     let rig = Rig::new().await;
@@ -591,12 +592,6 @@ async fn proof_before_slow_join() {
         rig.sup.tracker.count() > 0,
         "counted while the close is held"
     );
-    rig.until("the op classified the report", || {
-        rig.pauses.passed(Pause::ReportSettled)
-    })
-    .await;
-    rig.clock
-        .skew(crate::supervisor::PROOF_CUTOFF + Duration::from_secs(1));
     close.go();
     let r = reply.await.unwrap();
     assert_eq!(kills(&child.log()).len(), 1, "the close reused the proof");
@@ -629,35 +624,6 @@ async fn proof_before_slow_join() {
         1,
         "the panicked close released nothing"
     );
-    rig.srv.stop().await;
-}
-
-/// PR10a1-CL-11 `proof_cutoff` (join first): the kill task panics right after sending its
-/// report, and its join is classified while the report's classification is held: the exit
-/// waits for both, and the report is accepted.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn join_classified_first() {
-    let rig = Rig::new().await;
-    let (t, l) = rig.spawn_codex(None).await;
-    let fault = rig.pauses.arm_panic(Pause::BeforeCloseBy);
-    let report = rig.pauses.arm(Pause::ReportSettled);
-    let reply = stop_with(&rig, t);
-    fault.wait();
-    fault.go();
-    report.wait();
-    rig.until("the join was classified", || {
-        rig.pauses.passed(Pause::JoinSettled)
-    })
-    .await;
-    assert!(
-        !reply.is_finished(),
-        "the exit waits for the report's classification"
-    );
-    assert_eq!(rig.launch(l).exit_reason, None);
-    report.go();
-    let r = reply.await.unwrap();
-    assert_eq!(json(&r)["death_confirmed"], true, "{}", json(&r));
-    assert!(rig.launch(l).death_confirmed);
     rig.srv.stop().await;
 }
 

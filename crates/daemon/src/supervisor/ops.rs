@@ -661,6 +661,22 @@ pub(crate) struct KillTask {
     first: oneshot::Receiver<KillReport>,
 }
 
+#[cfg(test)]
+impl KillTask {
+    /// A kill task's parts, for tests of [`await_kill`].
+    pub(crate) fn of(
+        submitted: Instant,
+        join: JoinHandle<CloseOutcome>,
+        first: oneshot::Receiver<KillReport>,
+    ) -> KillTask {
+        KillTask {
+            submitted,
+            join,
+            first,
+        }
+    }
+}
+
 /// Submits the kill task (§2.3 Stop step 4) and reads the clock for its submission.
 pub(crate) fn submit_kill(
     sup: &Arc<Supervisor>,
@@ -732,17 +748,10 @@ pub(crate) struct Proof {
 pub(crate) async fn await_kill(sup: &Supervisor, k: KillTask) -> Proof {
     let cutoff = k.submitted + PROOF_CUTOFF;
     let now = || sup.now();
-    let first = async {
-        let s = settle_before(now, cutoff, sup.timer(cutoff), k.first).await;
-        sup.pauses().at(Pause::ReportSettled).await;
-        s
-    };
-    let joined = async {
-        let s = settle_before(now, cutoff, sup.timer(cutoff), k.join).await;
-        sup.pauses().at(Pause::JoinSettled).await;
-        s
-    };
-    let (first, joined) = tokio::join!(first, joined);
+    let (first, joined) = tokio::join!(
+        settle_before(now, cutoff, sup.timer(cutoff), k.first),
+        settle_before(now, cutoff, sup.timer(cutoff), k.join),
+    );
     let first = first.in_time().and_then(Result::ok);
     let joined = match joined {
         Settled::InTime(Ok(o)) => Some(o),
