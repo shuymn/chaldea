@@ -143,8 +143,9 @@ fn send(
 }
 
 /// Writes all of `bytes` through `write`, each call with the time left before `deadline` as
-/// its timeout (`set_timeout`), recomputed before every call: no write starts at or after
-/// the deadline, however the peer splits its reads.
+/// its timeout (`set_timeout`), recomputed before every call, and the deadline checked again
+/// right before the call: no write starts at or after the deadline, however the peer splits
+/// its reads.
 fn write_before(
     set_timeout: &mut impl FnMut(std::time::Duration) -> io::Result<()>,
     write: &mut impl FnMut(&[u8]) -> io::Result<usize>,
@@ -153,6 +154,7 @@ fn write_before(
 ) -> io::Result<()> {
     while !bytes.is_empty() {
         set_timeout(left(deadline)?)?;
+        left(deadline)?;
         match write(bytes) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(n) => bytes = &bytes[n..],
@@ -715,7 +717,34 @@ mod tests {
         assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         assert!(starts.len() < 10, "{starts:?}");
         assert!(starts.iter().all(|t| *t < deadline), "{starts:?}");
+        assert_eq!(timeouts.len(), starts.len(), "one timeout per write");
         assert!(timeouts.windows(2).all(|w| w[1] < w[0]), "{timeouts:?}");
+    }
+
+    /// A timeout update that returns at or after the deadline: the write does not start.
+    #[test]
+    fn no_write_after_a_late_timeout_update() {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let mut updates = 0;
+        let mut writes = 0;
+        let r = super::write_before(
+            &mut |_| {
+                updates += 1;
+                while Instant::now() < deadline {
+                    std::hint::spin_loop();
+                }
+                Ok(())
+            },
+            &mut |b: &[u8]| {
+                writes += 1;
+                Ok(b.len())
+            },
+            &[0u8; 4],
+            deadline,
+        );
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!((updates, writes), (1, 0));
     }
 
     /// `post_json` sends its body with its type and length, and reads the response as
