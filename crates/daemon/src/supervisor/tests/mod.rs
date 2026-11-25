@@ -1,7 +1,10 @@
 //! Supervisor unit tests (design §5.2, §6): `FakePty`, the in-process store and server, and
 //! `cfg(test)` pause points.
 
+mod commands;
 mod launch;
+mod race;
+mod reserve;
 mod stop;
 
 use std::collections::HashMap;
@@ -217,6 +220,24 @@ impl Rig {
             serde_json::from_value(v["thread_id"].clone()).unwrap(),
             serde_json::from_value(v["launch_id"].clone()).unwrap(),
         )
+    }
+
+    /// Binds launch `l` of thread `t` to `session`, as a `SessionStart` hook would.
+    pub(crate) async fn bind(&self, t: ThreadId, l: LaunchId, session: &str) {
+        self.srv
+            .append(vec![support::bound(t, l, session, None)])
+            .await;
+    }
+
+    /// Spawns a Codex thread, binds its session, and stops it (death confirmed).
+    pub(crate) async fn stopped_bound(&self) -> (ThreadId, LaunchId) {
+        let (t, l) = self.spawn_codex(None).await;
+        self.bind(t, l, &format!("session-{l}")).await;
+        let r = self
+            .cmd("stop", &serde_json::json!({ "thread_id": t }))
+            .await;
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        (t, l)
     }
 
     pub(crate) fn thread(&self, t: ThreadId) -> ThreadRow {
