@@ -299,9 +299,9 @@ pub(crate) struct SendLaunch {
     /// Units submitted whose completion has not fired.
     pub outstanding: AtomicU64,
     pub wake: Notify,
-    /// Passes finished (tests wait on it).
+    /// Passes finished (tests poll it).
+    #[cfg(test)]
     pub passes: AtomicU64,
-    pub passed: Notify,
     /// The latest tick's instant (supervisor clock).
     pub tick: Mutex<Option<Instant>>,
     #[cfg(test)]
@@ -324,8 +324,8 @@ impl SendLaunch {
             fired: Mutex::new(Vec::new()),
             outstanding: AtomicU64::new(0),
             wake: Notify::new(),
+            #[cfg(test)]
             passes: AtomicU64::new(0),
-            passed: Notify::new(),
             tick: Mutex::new(None),
             #[cfg(test)]
             hooks: SendHooks::default(),

@@ -208,9 +208,8 @@ pub struct SupervisorConfig {
     /// an adapter PR adds one; tests pass `FakeDecoder`.
     #[doc(hidden)]
     pub decoder: Arc<dyn send::HookDecoder>,
-    /// The readiness mode of every row, when a test overrides the capability table's.
-    #[doc(hidden)]
-    pub readiness_mode: Option<ReadinessMode>,
+    /// The readiness mode of every row, when a unit test overrides the capability table's.
+    pub(crate) readiness_mode: Option<ReadinessMode>,
     /// Whether each launch's send worker and the driver run (unit tests that drive no send
     /// turn them off).
     pub(crate) send_workers: bool,

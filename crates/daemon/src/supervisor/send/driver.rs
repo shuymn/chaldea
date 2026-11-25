@@ -79,8 +79,8 @@ fn wake_all(sup: &Supervisor, tick: Option<Instant>) {
 pub(crate) async fn worker(sup: Arc<Supervisor>, sl: Arc<SendLaunch>) {
     loop {
         pass(&sup, &sl).await;
+        #[cfg(test)]
         sl.passes.fetch_add(1, Ordering::SeqCst);
-        sl.passed.notify_waiters();
         let done = sup.entry(sl.launch_id).is_none()
             && sl.outstanding.load(Ordering::Acquire) == 0
             && lock(&sl.fired).is_empty()
