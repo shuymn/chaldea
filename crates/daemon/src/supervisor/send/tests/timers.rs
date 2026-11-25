@@ -219,3 +219,30 @@ async fn positional_window_rereads_startup() {
     assert_eq!(rig.input(id).state, InputState::Sent);
     rig.stop().await;
 }
+
+/// PR10b-CL-15 (send §2.9 D2): a snapshot holds the op lock only while it takes the session's
+/// screen: a stop started while the snapshot waits to copy the screen takes the lock at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_copy_outside_lock() {
+    let rig = SRig::new().await;
+    let (live, _) = rig.spawn(Agent::Codex, None).await;
+    let entry = rig.sup.entry(live.l).unwrap();
+    let armed = rig.pauses.arm(crate::supervisor::Pause::SnapshotCopy);
+    let sup = rig.sup.clone();
+    let e2 = entry.clone();
+    let snap = tokio::spawn(async move {
+        e2.snapshot_before(&sup, sup.now() + Duration::from_secs(10))
+            .await
+    });
+    let reached = armed.reached;
+    tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(entry.ops.try_lock().is_ok(), "the op lock is free");
+    rig.cmd_ok("stop", &serde_json::json!({ "thread_id": live.t }), 200)
+        .await;
+    armed.release.send(()).unwrap();
+    let _ = snap.await.unwrap();
+    rig.stop().await;
+}

@@ -157,7 +157,8 @@ impl Session {
     pub fn writes_after(&self, seq: u64) -> Result<Vec<WriteRecord>, LogTruncated>;   // diagnostic ring
 
     pub fn modes(&self) -> ModeView;                                     // one atomic load
-    pub fn snapshot(&self, deadline: Instant) -> Result<Snapshot, VtUnavailable>;      // §2.6
+    pub fn snapshot(&self, deadline: Instant) -> Result<Snapshot, VtUnavailable>;      // §2.6; screen().snapshot(deadline)
+    pub fn screen(&self) -> Screen;                                      // the screen, copied without the session
     pub fn subscribe(&self, sink: OutputSink, deadline: Instant) -> Result<(Snapshot, SubscriptionId), SubscribeError>;
     pub fn unsubscribe(&self, id: SubscriptionId);
     pub fn resize(&self, size: PtySize) -> io::Result<Resized>;      // Resized::{PtyAndVt, PtyOnly}
@@ -179,6 +180,11 @@ pub enum OutputEvent<'a> { Bytes { offset: u64, bytes: &'a [u8] }, End(&'a Outpu
 pub enum Flow { Continue, Stop }
 pub fn channel_sink(capacity: usize) -> (OutputSink, OutputReceiver);   // one FIFO channel + byte budget
 pub enum Received { Bytes { offset: u64, bytes: Vec<u8> }, End(OutputEnd), Lagged { at: u64 } }   // OutputReceiver::recv_timeout
+
+pub struct Screen { /* the session's VT state */ }
+impl Screen {
+    pub fn snapshot(&self, deadline: Instant) -> Result<Snapshot, VtUnavailable>;   // as Session::snapshot; outlives the session
+}
 
 #[derive(Clone)] pub struct WriterObserver { /* the session's queue lock */ }
 impl WriterObserver {

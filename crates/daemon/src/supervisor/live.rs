@@ -223,9 +223,9 @@ impl LiveLaunch {
 
     /// One VT snapshot by `deadline` (supervisor clock), never waiting for the op lock
     /// (send §2.9 D2): a blocking task that, once running and before `deadline`, takes the op
-    /// lock with one `try_lock` (`Busy` when held), takes the snapshot with the session's own
-    /// deadline, and releases the lock; the join is awaited with `settle_before` until
-    /// `deadline` (`Busy` when it has not answered).
+    /// lock with one `try_lock` (`Busy` when held), takes the session's screen, releases the
+    /// lock, and copies the screen with the session's own deadline; the join is awaited with
+    /// `settle_before` until `deadline` (`Busy` when it has not answered).
     pub(crate) async fn snapshot_before(
         &self,
         sup: &Supervisor,
@@ -233,13 +233,21 @@ impl LiveLaunch {
     ) -> Result<chaldea_pty_runtime::Snapshot, SnapshotError> {
         let ops = self.ops.clone();
         let real = sup.real(deadline);
+        let pauses = sup.cfg.pauses.clone();
         let task = sup.rt.spawn_blocking(move || {
             if Instant::now() >= real {
                 return Err(SnapshotError::Busy);
             }
-            let guard = ops.try_lock().map_err(|_| SnapshotError::Busy)?;
-            let s = guard.as_ref().ok_or(SnapshotError::Gone)?;
-            s.snapshot(real).map_err(|_| SnapshotError::VtUnavailable)
+            // The op lock only while the screen is taken: the copy waits for the VT lock
+            // without holding up a stop.
+            let screen = {
+                let guard = ops.try_lock().map_err(|_| SnapshotError::Busy)?;
+                guard.as_ref().ok_or(SnapshotError::Gone)?.screen()
+            };
+            pauses.blocking(super::Pause::SnapshotCopy);
+            screen
+                .snapshot(real)
+                .map_err(|_| SnapshotError::VtUnavailable)
         });
         match settle_before(|| sup.now(), deadline, sup.timer(deadline), task)
             .await

@@ -411,12 +411,16 @@ impl LiveLaunch {
         &self, deadline: Instant, f: impl FnOnce(&Session) -> R,
     ) -> Result<R, SessionError>;
     /// A blocking task that, once running and before `deadline`, takes the op lock with one
-    /// `try_lock` (held → `Busy`), takes `Session::snapshot`, and releases the lock; the join is
-    /// awaited until `deadline`. A task waiting for the blocking pool holds no lock, so a stop or
-    /// exit is never delayed by a snapshot.
+    /// `try_lock` (held → `Busy`), takes `Session::screen` (no session → `Gone`), releases the
+    /// lock, and copies the screen with `Screen::snapshot(clock.real(deadline))` (VT failed or its
+    /// lock not taken in time → `VtUnavailable`); the join is awaited with `settle_before` until
+    /// `deadline` (no answer → `Busy`). The op lock is held only while the screen is taken, so a
+    /// stop or exit is never delayed by a snapshot, waiting for the blocking pool or the VT lock.
     pub(crate) async fn snapshot_before(&self, sup: &Supervisor, deadline: Instant)
         -> Result<Snapshot, SnapshotError>;
 }
+/// Why `snapshot_before` took no snapshot.
+pub(crate) enum SnapshotError { Busy, Gone, VtUnavailable }
 
 // crates/pty-runtime/src/backend.rs (new). `KillReport` gains `pub attempt: KillAttempt` and
 // `pub proved_at: Option<Instant>`: the backend's clock read right after the read that proved the

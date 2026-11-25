@@ -139,6 +139,8 @@ pub enum Pause {
     GitShutdownReap,
     /// The shutdown git step after reading the slot (async).
     GitShutdownRead,
+    /// A VT snapshot's task before it copies the screen (blocking).
+    SnapshotCopy,
 }
 
 /// The test seam of [`Pause`]: the daemon's own is [`NoPauses`].
