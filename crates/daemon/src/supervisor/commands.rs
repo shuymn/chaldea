@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chaldea_core::adapter::{HostOs, capabilities};
 use chaldea_core::auth::{Action, Grant, ThreadGraph, grant, may_act_on_thread};
 use chaldea_core::canonical::CanonicalJson;
 use chaldea_core::command::{CloseArgs, CloseResult, ResumeArgs, SpawnArgs, StopArgs};
@@ -14,7 +15,7 @@ use chaldea_core::http::ErrorCode;
 use chaldea_core::ids::{Actor, Agent, CommandId, InputId, LaunchId, ThreadId};
 use chaldea_core::input::MAX_PROMPT_BYTES;
 use chaldea_core::input::encode::{Purpose, check};
-use chaldea_core::payload::{InputEncoding, SourceKind, ThreadClosed};
+use chaldea_core::payload::{SourceKind, ThreadClosed};
 use futures_util::future::BoxFuture;
 use serde::Serialize;
 use serde_json::value::RawValue;
@@ -42,26 +43,22 @@ pub(crate) fn parse<T: serde::de::DeserializeOwned + Serialize>(
     Ok((a, n))
 }
 
-/// Prompt admission (design §2.2, C1; send §2.2) for `agent`: the size, then `check` in the
-/// agent's first-prompt encoding (Codex's positional argument, Claude's queued input).
-fn admit_prompt(agent: Agent, prompt: Option<&str>) -> Result<(), ApiError> {
+/// Prompt admission (design §2.2, C1; send §2.2) for `agent` on `os`: the size, then `check`
+/// in the row's first-prompt encoding (Codex's positional argument, Claude's queued input).
+fn admit_prompt(agent: Agent, os: HostOs, prompt: Option<&str>) -> Result<(), ApiError> {
     let Some(text) = prompt else {
         return Ok(());
     };
     if text.len() > MAX_PROMPT_BYTES {
         return Err(code(ErrorCode::PromptTooLarge));
     }
-    check(agent, first_prompt_encoding(agent), Purpose::Send, text)
-        .map_err(|_| code(ErrorCode::PromptRejected))
-}
-
-/// The encoding of a launch's first prompt: Codex takes it as its positional argument;
-/// Claude's becomes a queued input written through the PTY (send §2.9 D3).
-pub(crate) fn first_prompt_encoding(agent: Agent) -> InputEncoding {
-    match agent {
-        Agent::Codex => InputEncoding::Positional,
-        Agent::Claude => InputEncoding::BracketedPaste,
-    }
+    check(
+        agent,
+        capabilities(agent, os).first_prompt(),
+        Purpose::Send,
+        text,
+    )
+    .map_err(|_| code(ErrorCode::PromptRejected))
 }
 
 pub(crate) fn caller(auth: &Authorized) -> Actor {
@@ -121,7 +118,7 @@ impl CommandHandler for SpawnHandler {
 
     fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError> {
         let (a, normalized) = parse::<SpawnArgs>(args)?;
-        admit_prompt(a.agent, a.prompt.as_deref())?;
+        admit_prompt(a.agent, self.0.host_os, a.prompt.as_deref())?;
         let thread = ThreadId(Uuid::new_v4());
         let launch = LaunchId(Uuid::new_v4());
         let input_id = a.prompt.as_ref().map(|_| InputId(Uuid::new_v4()));
@@ -188,6 +185,7 @@ impl CommandHandler for ResumeHandler {
 
     fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError> {
         let (a, normalized) = parse::<ResumeArgs>(args)?;
+        let os = self.0.host_os;
         let launch = LaunchId(Uuid::new_v4());
         let input_id = a.prompt.as_ref().map(|_| InputId(Uuid::new_v4()));
         let token = mint_token();
@@ -197,7 +195,7 @@ impl CommandHandler for ResumeHandler {
                 // The prompt's checks need the thread's agent, so they run here, in CL-1's
                 // order (a Claude prompt first); a refusal rolls back the receipt with the job.
                 let t = target(tx, auth, Action::Resume, a.thread_id)?;
-                admit_prompt(t.agent, a.prompt.as_deref()).map_err(refused)?;
+                admit_prompt(t.agent, os, a.prompt.as_deref()).map_err(refused)?;
                 Ok(Intent::Pending(EffectRun::new(LaunchReq {
                     command_id: ctx.command_id(),
                     thread: a.thread_id,

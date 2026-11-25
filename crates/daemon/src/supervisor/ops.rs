@@ -454,7 +454,7 @@ fn reservation_job(
                         InputInitialState::Queued
                     },
                     text: prepared.content,
-                    encoding: super::commands::first_prompt_encoding(agent),
+                    encoding: capabilities(agent, sup2.host_os).first_prompt(),
                     origin: InputOrigin::Cli,
                     created_by: caller,
                 }),
