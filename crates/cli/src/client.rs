@@ -700,9 +700,9 @@ mod tests {
         assert!(!req.to_ascii_lowercase().contains("origin:"), "{req}");
     }
 
-    /// A write split into small parts by its peer, on a controlled clock: each write has its
-    /// own timeout update, the time left, and none starts at or after the deadline; a final
-    /// update may have no write.
+    /// A write split into small parts by its peer, on a controlled clock that only writes
+    /// advance: each write has its own timeout update, the time left, and none starts at or
+    /// after the deadline.
     #[test]
     fn writes_stop_at_the_deadline() {
         use std::cell::{Cell, RefCell};
@@ -731,11 +731,10 @@ mod tests {
         assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(starts.len(), 3, "{starts:?}");
         assert!(starts.iter().all(|t| *t < deadline), "{starts:?}");
-        let log = log.into_inner();
-        let pairs = log.strip_suffix('T').unwrap_or(&log);
-        assert!(
-            pairs.len().is_multiple_of(2) && pairs.as_bytes().chunks(2).all(|c| c == b"TW"),
-            "each write has its own timeout update: {log}"
+        assert_eq!(
+            log.into_inner(),
+            "TWTWTW",
+            "each write has its own timeout update"
         );
         assert!(timeouts.windows(2).all(|w| w[1] < w[0]), "{timeouts:?}");
     }
