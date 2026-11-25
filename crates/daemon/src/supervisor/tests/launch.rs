@@ -176,3 +176,336 @@ async fn close_with_stop() {
     assert!(rig.thread(t).closed);
     rig.srv.stop().await;
 }
+
+fn argv(spec: &chaldea_pty_runtime::SpawnSpec) -> Vec<String> {
+    spec.argv
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn env_of<'a>(spec: &'a chaldea_pty_runtime::SpawnSpec, key: &str) -> Vec<&'a std::ffi::OsStr> {
+    spec.env
+        .iter()
+        .filter(|(k, _)| chaldea_pty_runtime::env_key_eq(k, std::ffi::OsStr::new(key)))
+        .map(|(_, v)| v.as_os_str())
+        .collect()
+}
+
+/// PR10a1-CL-2: the argv comes from the mapped `host_os`, whatever the runner's OS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_row() {
+    for (host, flag) in [
+        (chaldea_core::adapter::HostOs::Windows, true),
+        (chaldea_core::adapter::HostOs::Macos, false),
+    ] {
+        let rig = Rig::with(host, |_| {}).await;
+        rig.spawn_codex(None).await;
+        let a = argv(&rig.pty.spawns()[0]);
+        let has = a
+            .windows(2)
+            .any(|w| w == ["-c", "tui.disable_paste_burst=true"]);
+        assert_eq!(has, flag, "{host:?}: {a:?}");
+        rig.srv.stop().await;
+    }
+}
+
+/// PR10a1-CL-6: the launch's own hook token (one row per launch), the URLs and thread id,
+/// the scrubbed names gone and the user's variables kept, and Claude's session flag: fresh,
+/// then resumed after binding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn env_and_session_args() {
+    use std::ffi::OsString;
+    let seeded: Vec<(OsString, OsString)> = [
+        ("CLAUDECODE", "1"),
+        ("CLAUDE_CODE_CHILD_SESSION", "x"),
+        ("CLAUDE_CODE_SESSION_ID", "x"),
+        ("CLAUDE_CODE_MESSAGING_TOKEN", "x"),
+        ("CODEX_THREAD_ID", "x"),
+        ("CODEX_SESSION_ID", "x"),
+        ("CHALDEA_AGENT_TOKEN", "x"),
+        ("CHALDEA_HOOK_TOKEN", "stale"),
+        ("CODEX_HOME", "/work/codex"),
+        ("CLAUDE_CODE_USE_BEDROCK", "1"),
+        ("PATH", "/work/bin"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+    .collect();
+    let mut env = seeded.clone();
+    // Mixed case: the same variables on Windows, other variables on macOS.
+    env.push((
+        OsString::from("Chaldea_Hook_Token"),
+        OsString::from("mixed"),
+    ));
+    env.push((OsString::from("claudecode"), OsString::from("mixed")));
+    let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, move |c| {
+        c.env = Some(env);
+    })
+    .await;
+    let cwd = rig.cwd.path().to_string_lossy().into_owned();
+    let r = rig
+        .cmd("spawn", &json!({ "agent": "claude", "cwd": cwd }))
+        .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v = json(&r);
+    let t: chaldea_core::ids::ThreadId = serde_json::from_value(v["thread_id"].clone()).unwrap();
+    let l1: chaldea_core::ids::LaunchId = serde_json::from_value(v["launch_id"].clone()).unwrap();
+    rig.bind(t, l1, "the-session").await;
+    rig.cmd("stop", &json!({ "thread_id": t })).await;
+    let r = rig
+        .cmd(
+            "resume",
+            &json!({ "thread_id": t, "expected_launch_id": l1 }),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let l2: chaldea_core::ids::LaunchId =
+        serde_json::from_value(json(&r)["launch_id"].clone()).unwrap();
+    let spawns = rig.pty.spawns();
+    assert_eq!(spawns.len(), 2);
+    let mut secrets = Vec::new();
+    for (spec, l) in [(&spawns[0], l1), (&spawns[1], l2)] {
+        let one = |k: &str| {
+            let v = env_of(spec, k);
+            assert_eq!(v.len(), 1, "{k}: {v:?}");
+            v[0].to_string_lossy().into_owned()
+        };
+        assert!(one("CHALDEA_URL").starts_with("http://127.0.0.1:"));
+        assert_eq!(
+            one("CHALDEA_HOOK_URL"),
+            format!("{}/hook", one("CHALDEA_URL"))
+        );
+        assert_eq!(one("CHALDEA_THREAD_ID"), t.to_string());
+        let secret = one("CHALDEA_HOOK_TOKEN");
+        let row = rig.srv.token_row(&secret).expect("the launch's token row");
+        assert_eq!(row.kind, crate::store::TokenKind::Hook);
+        assert_eq!((row.thread_id, row.launch_id), (Some(t), Some(l)));
+        secrets.push(secret);
+        for name in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CODEX_THREAD_ID",
+            "CODEX_SESSION_ID",
+            "CHALDEA_AGENT_TOKEN",
+        ] {
+            assert!(env_of(spec, name).is_empty(), "{name} scrubbed");
+        }
+        assert_eq!(one("CODEX_HOME"), "/work/codex");
+        assert_eq!(one("CLAUDE_CODE_USE_BEDROCK"), "1");
+        assert_eq!(one("PATH"), "/work/bin");
+    }
+    assert_ne!(secrets[0], secrets[1], "a token per launch");
+    let a1 = argv(&spawns[0]);
+    assert!(
+        a1.windows(2)
+            .any(|w| w == ["--session-id".to_owned(), l1.to_string()]),
+        "{a1:?}"
+    );
+    let a2 = argv(&spawns[1]);
+    assert!(
+        a2.windows(2).any(|w| w == ["--resume", "the-session"]),
+        "{a2:?}"
+    );
+    assert!(
+        !a2.iter().any(|a| *a == l2.to_string()),
+        "the launch id is not a session"
+    );
+    rig.srv.stop().await;
+}
+
+/// PR10a1-CL-7: the start job records the backend's identity, and the positional input's
+/// `sent` (after `launch_started`'s seq) in the same commit, right after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn started_job() {
+    let rig = Rig::new().await;
+    // A second spawn, so the backend's pid is not the first one a fixed value could match.
+    rig.spawn_codex(None).await;
+    let (t, l) = rig.spawn_codex(Some("hello")).await;
+    let child = rig.pty.take_child().unwrap();
+    let id = child.identity();
+    assert_ne!(id.pid, 1);
+    let row = rig.launch(l);
+    assert_eq!(row.pid, Some(id.pid));
+    let events = rig.srv.store.read(move |r| {
+        Ok(
+            r.events_after(chaldea_core::ids::StreamId::Thread(t), 0, 10_000)?
+                .events,
+        )
+    });
+    let started = events
+        .iter()
+        .find(|e| serde_json::to_value(&e.kind).unwrap() == "launch_started")
+        .unwrap();
+    let p: serde_json::Value = serde_json::from_str(started.payload.get()).unwrap();
+    assert_eq!(p["pid"], id.pid);
+    assert_eq!(p["start_time"], id.start_time);
+    assert_eq!(p["pgid_or_job"], id.group);
+    let sent = events
+        .iter()
+        .find(|e| {
+            serde_json::to_value(&e.kind).unwrap() == "input_state_changed"
+                && serde_json::from_str::<serde_json::Value>(e.payload.get()).unwrap()["to"]
+                    == "sent"
+        })
+        .unwrap();
+    let sp: serde_json::Value = serde_json::from_str(sent.payload.get()).unwrap();
+    assert_eq!(sp["sent_after_seq"], json!(started.seq));
+    assert!(sent.seq > started.seq);
+    // Derived from the start job's cause, and nothing else between them.
+    assert_eq!(
+        sent.idempotency_key.0,
+        format!(
+            "derived:launch:{l}:started:input:{}",
+            sp["input_id"].as_str().unwrap()
+        )
+    );
+    assert!(
+        events
+            .iter()
+            .filter(|e| e.seq > started.seq && e.seq < sent.seq)
+            .all(|e| e
+                .idempotency_key
+                .0
+                .starts_with(&format!("derived:launch:{l}:started:"))),
+        "{events:?}"
+    );
+    rig.srv.stop().await;
+}
+
+/// PR10a1-CL-9: each spawn error and cleanup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spawn_errors() {
+    use chaldea_pty_runtime::fake::FakeScript;
+    use chaldea_pty_runtime::{Cleanup, NeverStartedKind, ProcessIdentity, SpawnError};
+    let unresolved = || Cleanup::Unresolved {
+        kill: None,
+        close: None,
+        drain_abandoned: false,
+    };
+    let id = |start: &str, group: &str| ProcessIdentity {
+        pid: 77,
+        start_time: start.to_owned(),
+        group: group.to_owned(),
+    };
+    let rig = Rig::new().await;
+    type Case = (SpawnError, bool, &'static str, serde_json::Value);
+    let cases: Vec<Case> = vec![
+        (
+            SpawnError::NeverStarted {
+                kind: NeverStartedKind::Setup,
+                error: std::io::Error::other("x"),
+                cleanup: Cleanup::Confirmed,
+            },
+            true,
+            "rejected",
+            serde_json::Value::Null,
+        ),
+        (
+            SpawnError::StartedThenFailed {
+                stage: "s",
+                error: std::io::Error::other("x"),
+                identity: Some(id("st", "g")),
+                cleanup: Cleanup::Confirmed,
+            },
+            true,
+            "unconfirmed",
+            serde_json::Value::Null,
+        ),
+        (
+            SpawnError::StartedThenFailed {
+                stage: "s",
+                error: std::io::Error::other("x"),
+                identity: Some(id("st", "g")),
+                cleanup: unresolved(),
+            },
+            false,
+            "unconfirmed",
+            json!({ "pid": 77, "start_time": "st", "pgid_or_job": "g" }),
+        ),
+        (
+            SpawnError::StartedThenFailed {
+                stage: "s",
+                error: std::io::Error::other("x"),
+                identity: Some(id("", "")),
+                cleanup: unresolved(),
+            },
+            false,
+            "unconfirmed",
+            json!({ "pid": 77 }),
+        ),
+        (
+            SpawnError::StartedThenFailed {
+                stage: "s",
+                error: std::io::Error::other("x"),
+                identity: None,
+                cleanup: unresolved(),
+            },
+            false,
+            "unconfirmed",
+            serde_json::Value::Null,
+        ),
+    ];
+    for (fail, confirmed, input, failed_start) in cases {
+        let what = format!("{fail}");
+        rig.pty.script_next(FakeScript {
+            fail: Some(fail),
+            ..FakeScript::default()
+        });
+        let cwd = rig.cwd.path().to_string_lossy().into_owned();
+        let r = rig
+            .cmd(
+                "spawn",
+                &json!({ "agent": "codex", "cwd": cwd, "prompt": "hi" }),
+            )
+            .await;
+        assert_eq!(r.status, 200, "{what}");
+        let v = json(&r);
+        assert_eq!(v["outcome"], "spawn_failed", "{what}");
+        let t: chaldea_core::ids::ThreadId =
+            serde_json::from_value(v["thread_id"].clone()).unwrap();
+        let events = rig.events(t);
+        assert!(!events.iter().any(|(k, _)| k == "launch_started"), "{what}");
+        let exited = &events.iter().find(|(k, _)| k == "launch_exited").unwrap().1;
+        assert_eq!(exited["reason"], "spawn_failed", "{what}");
+        assert_eq!(exited["death_confirmed"], confirmed, "{what}");
+        match &failed_start {
+            serde_json::Value::Null => {
+                assert!(exited.get("failed_start").is_none(), "{what}: {exited}");
+            }
+            f => assert_eq!(&exited["failed_start"], f, "{what}"),
+        }
+        assert!(
+            events
+                .iter()
+                .any(|(k, p)| k == "input_state_changed" && p["to"] == input),
+            "{what}: {events:?}"
+        );
+    }
+    rig.srv.stop().await;
+}
+
+/// PR10a1-CL-17 (start part): `startup_stall` only for an upgraded Codex launch; no launch
+/// is upgraded before PR 14, so neither agent raises it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn startup_stall_only_upgraded_codex() {
+    let rig = Rig::new().await;
+    let (codex, _) = rig.spawn_codex(None).await;
+    let cwd = rig.cwd.path().to_string_lossy().into_owned();
+    let r = rig
+        .cmd("spawn", &json!({ "agent": "claude", "cwd": cwd }))
+        .await;
+    let claude: chaldea_core::ids::ThreadId =
+        serde_json::from_value(json(&r)["thread_id"].clone()).unwrap();
+    for t in [codex, claude] {
+        assert!(
+            !rig.events(t)
+                .iter()
+                .any(|(_, p)| p.to_string().contains("startup_stall")),
+            "{t}"
+        );
+    }
+    rig.srv.stop().await;
+}
