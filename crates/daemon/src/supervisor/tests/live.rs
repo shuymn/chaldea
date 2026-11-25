@@ -60,18 +60,26 @@ async fn observe() {
         assert!(last_started[reply_class] <= reference, "{seen:?}");
         let child = rig.pty.take_child().unwrap();
         child.emit(b"\x1b[5n");
-        rig.until("the responder answered", || !child.writes().is_empty())
-            .await;
-        let after = rig.sup.observe(launch);
-        let LaunchObservation::Started {
-            reference: same,
-            last_started,
-        } = after
-        else {
-            panic!("{after:?}");
-        };
-        assert_eq!(same, reference, "the reference sampled before publication");
-        assert!(last_started[reply_class] > reference, "{after:?}");
+        // The writer may still hold the queue lock right after the write (`Unobservable`).
+        let mut same = None;
+        rig.until("the reply's dispatch observed", || {
+            match rig.sup.observe(launch) {
+                LaunchObservation::Started {
+                    reference: r,
+                    last_started,
+                } if last_started[reply_class] > reference => {
+                    same = Some(r);
+                    true
+                }
+                _ => false,
+            }
+        })
+        .await;
+        assert_eq!(
+            same,
+            Some(reference),
+            "the reference sampled before publication"
+        );
         let map = rig.sup.live.lock();
         assert_eq!(rig.sup.observe(launch), LaunchObservation::Unobservable);
         drop(map);
