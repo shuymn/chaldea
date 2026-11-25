@@ -288,3 +288,35 @@ async fn zero_byte_attempt() {
         rig.stop().await;
     }
 }
+
+/// PR10b-CL-5: the drain publishes a mode change under the queue lock, so one that arrives
+/// while the writer holds a unit at its dispatch boundary is ordered after the unit's first
+/// permission: the unit is written in the mode it was checked against, and the change is
+/// delivered after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn modes_at_dispatch() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let rx = rig.watch(&live).await;
+    let probe = rig.probe(&live).await;
+    let parsed = probe.count(ProbePoint::PieceParsing);
+    let park = probe.park(ProbePoint::Dispatching);
+    let id = rig.send(&live, "日本語😀").await;
+    reached(&rig, &live, ProbePoint::Dispatching, 1).await;
+    live.child.emit(PASTE_OFF);
+    // The drain holds the piece (its mode word waits for the queue lock).
+    reached(&rig, &live, ProbePoint::PieceParsing, parsed + 1).await;
+    // Not delivered while the writer holds the queue lock (the drain waits for it).
+    assert!(
+        tokio::task::block_in_place(|| rx.recv_timeout(Duration::from_millis(500))).is_err(),
+        "the mode change waits for the permission"
+    );
+    drop(park);
+    rig.until_input(id, InputState::Sent).await;
+    assert!(
+        live.child.input().starts_with(b"\x1b[200~"),
+        "written as a paste"
+    );
+    SRig::delivered(&rx, PASTE_OFF).await;
+    rig.stop().await;
+}

@@ -519,6 +519,63 @@ async fn key_outcomes() {
     );
     rig.stop().await;
 
+    // DECCKM toggled while the writer holds the key unit at its dispatch boundary: the mode
+    // word waits for the queue lock, so the key is written in the form it was checked
+    // against, before the change.
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let rx = rig.watch(&live).await;
+    let probe = rig.probe(&live).await;
+    let parsed = probe.count(ProbePoint::PieceParsing);
+    let park = probe.park(ProbePoint::Dispatching);
+    let args = json!({ "thread_id": live.t, "launch_id": live.l, "keys": ["up"] });
+    let pending = crate::supervisor::tests::support::http::spawn_send(
+        &rig.srv,
+        &rig.srv.command(
+            "key",
+            &rig.owner,
+            crate::supervisor::tests::cid(),
+            &args.to_string(),
+        ),
+    );
+    let p2 = probe.clone();
+    assert!(
+        tokio::task::spawn_blocking(move || p2.wait(
+            ProbePoint::Dispatching,
+            1,
+            Instant::now() + Duration::from_secs(10)
+        ))
+        .await
+        .unwrap()
+    );
+    live.child.emit(b"\x1b[?1h");
+    let p3 = probe.clone();
+    assert!(
+        tokio::task::spawn_blocking(move || p3.wait(
+            ProbePoint::PieceParsing,
+            parsed + 1,
+            Instant::now() + Duration::from_secs(10)
+        ))
+        .await
+        .unwrap()
+    );
+    // Not delivered while the writer holds the queue lock (the drain waits for it).
+    assert!(
+        tokio::task::block_in_place(|| rx.recv_timeout(Duration::from_millis(500))).is_err(),
+        "the mode change waits for the permission"
+    );
+    drop(park);
+    let r = pending.await.unwrap();
+    let v: Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!((r.status, v["outcome"].clone()), (200, json!("written")));
+    assert_eq!(
+        live.child.input(),
+        b"\x1b[A",
+        "the CSI form checked against"
+    );
+    SRig::delivered(&rx, b"\x1b[?1h").await;
+    rig.stop().await;
+
     // Busy: the op lock held past the effect's wait.
     let rig = SRig::new().await;
     let live = rig.claude().await;

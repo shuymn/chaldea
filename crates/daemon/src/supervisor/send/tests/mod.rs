@@ -182,6 +182,36 @@ impl SRig {
         .await;
     }
 
+    /// A subscription to the launch's output, taken now. The drain publishes a piece's modes
+    /// before it delivers the piece, so a delivered byte has its mode change applied; the
+    /// wait needs no op lock, which a worker blocked on the writer may hold.
+    pub(crate) async fn watch(&self, live: &Live) -> chaldea_pty_runtime::OutputReceiver {
+        let (sink, rx) = chaldea_pty_runtime::channel_sink(64);
+        let e = self.sup.entry(live.l).unwrap();
+        e.with_session(&self.sup, self.sup.now() + Duration::from_secs(5), |s| {
+            s.subscribe(sink, std::time::Instant::now() + Duration::from_secs(5))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        rx
+    }
+
+    /// Waits until `rx` delivered `bytes`, so their mode changes are applied.
+    pub(crate) async fn delivered(rx: &chaldea_pty_runtime::OutputReceiver, bytes: &[u8]) {
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        let mut seen = Vec::new();
+        while !seen.windows(bytes.len()).any(|w| w == bytes) {
+            let left = end.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "output {bytes:?} delivered");
+            if let Ok(chaldea_pty_runtime::Received::Bytes { bytes: b, .. }) =
+                tokio::task::block_in_place(|| rx.recv_timeout(left.min(Duration::from_millis(50))))
+            {
+                seen.extend_from_slice(&b);
+            }
+        }
+    }
+
     /// The session's modes, or `None` when the entry is gone or busy.
     pub(crate) async fn modes(&self, live: &Live) -> Option<chaldea_pty_runtime::ModeView> {
         let e = self.sup.entry(live.l)?;
