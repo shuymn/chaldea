@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::Supervisor;
 use super::super::live::LaunchObservation;
-use super::{CardBasis, SendSide, fence_advance, fence_release};
+use super::{SendSide, fence_advance, fence_release};
 use crate::hook::{IntakeFacts, IntakeProbe, TurnMark};
 
 /// The facts at a hook's intake, version 1.
@@ -135,36 +135,21 @@ impl IntakeProbe for SupervisorProbe {
             let mut st = sl.state();
             for (o, m) in marks {
                 st.log.insert(*o, *m, at);
-                // A card's basis is its own, and receipt ordinals, not this observer's order
-                // against another hook's, say which close it: a boundary above it or its
-                // resolution, whichever observer runs first.
+                // A card's basis is its own; whether the card is open is the store's, never
+                // this observer's order against another hook's. Only the card's own
+                // resolution drops it; a card a turn boundary closed keeps its basis until the
+                // launch's side is dropped (a key for it is refused by the store's check).
                 match *m {
                     TurnMark::Card {
                         approval_id,
                         human_at,
                     } => {
-                        let closed = st.log.0.iter().any(|(k, (n, _))| {
-                            *k > *o
-                                && (matches!(n, TurnMark::Start | TurnMark::End { .. })
-                                    || *n == TurnMark::Resolved { approval_id })
-                        });
-                        if !closed {
-                            st.cards.insert(
-                                approval_id,
-                                CardBasis {
-                                    ordinal: *o,
-                                    human_at,
-                                },
-                            );
-                        }
-                    }
-                    TurnMark::Start | TurnMark::End { .. } => {
-                        st.cards.retain(|_, c| c.ordinal > *o);
+                        st.cards.insert(approval_id, human_at);
                     }
                     TurnMark::Resolved { approval_id } => {
                         st.cards.remove(&approval_id);
                     }
-                    TurnMark::Other => {}
+                    TurnMark::Start | TurnMark::End { .. } | TurnMark::Other => {}
                 }
             }
         }

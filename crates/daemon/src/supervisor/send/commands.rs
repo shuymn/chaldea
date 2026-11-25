@@ -449,7 +449,7 @@ async fn key_op(sup: Arc<Supervisor>, req: KeyReq) -> EffectOutcome {
                 sl.state().cards.remove(&id);
                 return done(ErrorCode::CardClosed);
             }
-            match sl.state().cards.get(&id).and_then(|c| c.human_at) {
+            match sl.state().cards.get(&id).copied().flatten() {
                 Some(h) => Some(h),
                 None => return done(ErrorCode::KeyNotWritten),
             }

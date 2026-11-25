@@ -243,10 +243,10 @@ async fn same_turn_evidence() {
     }
 }
 
-/// PR10b-CL-13: a card's basis is dropped when the card closes, by its resolution or by a turn
-/// boundary, so the launch's card memory does not grow with the cards it has seen.
+/// PR10b-CL-13: a card's basis is dropped at the card's own resolution, so cards resolved by
+/// their evidence leave nothing behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn card_basis_dropped_at_close() {
+async fn card_basis_dropped_at_resolution() {
     let rig = SRig::new().await;
     let live = rig.claude().await;
     let sl = rig.sl(&live);
@@ -263,10 +263,47 @@ async fn card_basis_dropped_at_close() {
         assert_eq!(sl.state().cards.len(), 2);
         rig.hook(&live, "PostToolUse", &json!({ "tool_use_id": r }))
             .await;
-        assert_eq!(sl.state().cards.len(), 1, "the resolved card's basis");
+        assert_eq!(sl.state().cards.len(), 1, "the first resolved card's basis");
+        rig.hook(&live, "PostToolUse", &json!({ "tool_use_id": s }))
+            .await;
+        assert_eq!(
+            sl.state().cards.len(),
+            0,
+            "the second resolved card's basis"
+        );
         rig.hook(&live, "Stop", &json!({})).await;
-        assert_eq!(sl.state().cards.len(), 0, "the superseded card's basis");
     }
+    rig.stop().await;
+}
+
+/// PR10b-CL-13: a card whose hook was taken in before a `Stop` but committed after it is open
+/// in the store, and its basis stays: a card key for it is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn card_committed_after_later_stop() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "t" }))
+        .await;
+    let (got, release) = rig.ingest.points.arm_job(rig.next_ordinal(&live));
+    let h = rig.hook_of(
+        &live,
+        "PermissionRequest",
+        &json!({ "tool_name": "Bash", "tool_input": { "command": "ls" }, "tool_use_id": "t1" }),
+    );
+    let reply = crate::supervisor::tests::support::http::spawn_send(&rig.srv, &h.req(&rig.srv));
+    got.await.unwrap();
+    // The later `Stop` commits and finishes first; the card's job then commits.
+    rig.hook(&live, "Stop", &json!({})).await;
+    release.send(()).unwrap();
+    assert_eq!(reply.await.unwrap().status, 200);
+    let id = ApprovalId(h.emit);
+    assert_eq!(outcome(&rig, id), None, "open in the store");
+    let r = key(&rig, &live, &["enter"], Some(id)).await;
+    assert_eq!(
+        (r.0, r.1["outcome"].clone()),
+        (200, json!("written")),
+        "{r:?}"
+    );
     rig.stop().await;
 }
 
