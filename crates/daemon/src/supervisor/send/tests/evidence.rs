@@ -398,6 +398,47 @@ async fn settle_after_input_record() {
     rig.stop().await;
 }
 
+/// PR10b-CL-4: a `Stop` taken in while the next input's unit is `Written` but neither recorded
+/// nor acked (the previous turn's late `Stop`) is no candidate: the input's own turn may still
+/// run, so a later send waits for new evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_before_next_ack() {
+    let (rig, live) = settle_rig().await;
+    let sl = rig.sl(&live);
+    rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "p1" }))
+        .await;
+    // P1's `Stop` is held back; the owner asserts the thread ready.
+    rig.cmd_ok("ready", &json!({ "thread_id": live.t }), 200)
+        .await;
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, entered) = tokio::sync::oneshot::channel::<()>();
+    set(&sl.hooks.record_job, move || {
+        let _ = entered_tx.send(());
+        let _ = rx.recv_timeout(Duration::from_secs(20));
+    });
+    let p2 = rig.send(&live, "p2").await;
+    entered.await.unwrap();
+    // P2's `UserPromptSubmit` is not delivered; P1's `Stop` arrives.
+    rig.hook(&live, "Stop", &json!({})).await;
+    tx.send(()).unwrap();
+    rig.until("the unit was recorded", || sl.state().running.is_none())
+        .await;
+    advance(&rig, &live, SETTLE).await;
+    assert_eq!(count(&rig, &live, "stop_settled"), 0);
+    advance(&rig, &live, crate::supervisor::send::ACK_WINDOW).await;
+    rig.until_input(p2, InputState::Unconfirmed).await;
+    rig.cmd_ok(
+        "input_resolve",
+        &json!({ "input_id": p2, "delivered": true }),
+        200,
+    )
+    .await;
+    let p3 = rig.send(&live, "p3").await;
+    rig.pass(&live).await;
+    assert_eq!(rig.input(p3).state, InputState::Queued);
+    rig.stop().await;
+}
+
 /// PR10b-CL-4/12: a `Stop` taken in while a card key's completion is held settles only after
 /// that key's `human_write`, so the next send is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
