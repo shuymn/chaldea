@@ -649,7 +649,7 @@ fn mvp_command_is_501_without_receipt() {
     let (status, body) = support::request_complete(
         port,
         "POST",
-        "/api/commands/spawn",
+        "/api/commands/send",
         &token,
         Some(&format!(r#"{{"command_id":"{cmd}","args":{{}}}}"#)),
     );
