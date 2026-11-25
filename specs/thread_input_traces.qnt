@@ -217,6 +217,25 @@ module thread_input_traces {
       .then(open(2))
       .expect(stateOf(st, 2) == Sending)
 
+  /// SB15: with new evidence the gate's projection is open, yet the next input stays
+  /// `queued` while the stalled unit may still write (the daemon also takes no evidence
+  /// while a unit runs, a stronger rule the model leaves out); its record lets it open.
+  run trace_stall_blocks_open_gate =
+    readyLaunch
+      .then(send(1))
+      .then(open(1))
+      .then(dispatch(1))
+      .then(writeStalled(1))
+      .then(resolveInput(1, false))
+      .then(prompt(Set()))
+      .then(turnStop)
+      .then(settle)
+      .then(send(2))
+      .expect(last.gate == Open and not(openAllowed(st, 2)))
+      .then(writerDone(1, true))
+      .then(open(2))
+      .expect(stateOf(st, 2) == Sending)
+
   /// mvp §2.3: a `key` write after the input's write makes the ack non-attributable; the
   /// input is resolved by the owner. Evidence of the same turn as an attach write does not
   /// reopen the gate; `chaldea ready` does.
