@@ -88,7 +88,11 @@ pub(crate) async fn worker(sup: Arc<Supervisor>, sl: Arc<SendLaunch>) {
             && lock(&sl.fired).is_empty()
             && sl.state().held.is_empty();
         if done {
-            lock(&sup.send.map).remove(&sl.launch_id);
+            sup.send
+                .map
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&sl.launch_id);
             return;
         }
         sl.wake.notified().await;

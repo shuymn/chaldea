@@ -515,12 +515,9 @@ async fn key_op(sup: Arc<Supervisor>, req: KeyReq) -> EffectOutcome {
         })),
         Some(Ok(KeyReport::NotStarted)) => done(ErrorCode::KeyNotWritten),
         Some(Err(_)) | None => {
-            let cancelled = sup
-                .rt
-                .spawn_blocking(move || ticket.cancel())
-                .await
-                .unwrap_or(false);
-            if cancelled {
+            // Never waits for the queue lock: a writer holding it at the unit's dispatch
+            // boundary may still permit it, so that is `pending` too.
+            if ticket.try_cancel() == Some(true) {
                 done(ErrorCode::KeyNotWritten)
             } else {
                 EffectOutcome::Done(ok(&KeyResult {

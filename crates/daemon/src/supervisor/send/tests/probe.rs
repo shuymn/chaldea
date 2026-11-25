@@ -247,3 +247,24 @@ async fn undispatched_match() {
     assert_eq!(rig.input(id).state, InputState::Queued);
     rig.stop().await;
 }
+
+/// PR10b-CL-7: the intake does not wait on another reader of the send side's launch map (a
+/// command or the driver looking a launch up).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "the held map guard is the test's subject"
+)]
+async fn probe_beside_map_reader() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let p = probe_of(&rig);
+    let held = rig.sup.send.map.read().unwrap();
+    let (l, p2) = (live.l, p.clone());
+    let h = std::thread::spawn(move || p2.facts(l, 50).is_some());
+    rig.until("the probe answered", || h.is_finished()).await;
+    drop(held);
+    assert!(h.join().unwrap());
+    p.finished(live.l, 50, &[]);
+    rig.stop().await;
+}

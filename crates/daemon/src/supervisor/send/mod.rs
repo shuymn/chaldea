@@ -26,7 +26,7 @@ pub(crate) mod tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use chaldea_core::adapter::{Capabilities, ReadinessMode};
@@ -393,7 +393,9 @@ impl SendLaunch {
 
 /// The send side's shared parts: the launches, the decoder, and the driver's channel.
 pub(crate) struct SendSide {
-    pub map: Mutex<HashMap<LaunchId, Arc<SendLaunch>>>,
+    /// Readers (the intake probe, commands, the driver) never wait on each other; a writer
+    /// holds it only for one insert or remove.
+    pub map: RwLock<HashMap<LaunchId, Arc<SendLaunch>>>,
     pub decoder: Arc<dyn HookDecoder>,
     /// The readiness mode of every row, when a test sets one.
     pub mode: Option<ReadinessMode>,
@@ -405,11 +407,20 @@ pub(crate) struct SendSide {
 
 impl SendSide {
     pub(crate) fn launch(&self, l: LaunchId) -> Option<Arc<SendLaunch>> {
-        lock(&self.map).get(&l).cloned()
+        self.map
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&l)
+            .cloned()
     }
 
     pub(crate) fn all(&self) -> Vec<Arc<SendLaunch>> {
-        lock(&self.map).values().cloned().collect()
+        self.map
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn mode(&self, caps: &Capabilities) -> ReadinessMode {
@@ -420,7 +431,7 @@ impl SendSide {
 /// Creates the send side and registers its exit and tick steps in `cfg` (send §2.9 D4).
 pub(crate) fn install(cfg: &mut SupervisorConfig) -> Arc<SendSide> {
     let side = Arc::new(SendSide {
-        map: Mutex::new(HashMap::new()),
+        map: RwLock::new(HashMap::new()),
         decoder: cfg.decoder.clone(),
         mode: cfg.readiness_mode,
         ticks: tokio::sync::watch::channel(None).0,
@@ -436,7 +447,11 @@ pub(crate) fn install(cfg: &mut SupervisorConfig) -> Arc<SendSide> {
 impl Supervisor {
     /// Creates `entry`'s send side and its worker once (the reservation job).
     pub(crate) fn send_launch(self: &Arc<Self>, entry: &LiveLaunch) {
-        let mut map = lock(&self.send.map);
+        let mut map = self
+            .send
+            .map
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         if map.contains_key(&entry.launch_id) {
             return;
         }

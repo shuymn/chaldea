@@ -619,3 +619,39 @@ async fn open_waits_for_human() {
     assert!(!live.child.input().ends_with(b"after-key\x1b[201~\r"));
     rig.stop().await;
 }
+
+/// PR10b-CL-16: a key unit held at its dispatch boundary (the queue lock held) past the
+/// report's deadline answers `pending` without waiting for the queue lock; released after
+/// its dispatch deadline, it is refused with nothing written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn key_past_deadline_at_boundary() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let probe = rig.probe(&live).await;
+    let park = probe.park(ProbePoint::Dispatching);
+    let args = json!({ "thread_id": live.t, "launch_id": live.l, "keys": ["escape"] });
+    let pending = crate::supervisor::tests::support::http::spawn_send(
+        &rig.srv,
+        &rig.srv.command(
+            "key",
+            &rig.owner,
+            crate::supervisor::tests::cid(),
+            &args.to_string(),
+        ),
+    );
+    // The report's wait is real time (`KEY_WAIT` + `READ_WAIT`); the answer comes while the
+    // writer still holds the queue lock.
+    rig.until("answered while parked", || pending.is_finished())
+        .await;
+    let r = pending.await.unwrap();
+    let v: Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!((r.status, v["outcome"].clone()), (200, json!("pending")));
+    // Released past its dispatch deadline: the writer refuses it, nothing written.
+    drop(park);
+    let sl = rig.sl(&live);
+    rig.until("settled", || sl.state().human_unsettled == 0)
+        .await;
+    assert!(human_writes(&rig, &live).is_empty());
+    assert!(live.child.input().is_empty());
+    rig.stop().await;
+}
