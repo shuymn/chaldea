@@ -38,12 +38,18 @@ pub const HEADS_INTERVAL: Duration = Duration::from_millis(200);
 /// How long a WebSocket client waits for one frame or the close.
 pub const WS_WAIT: Duration = Duration::from_secs(10);
 
-/// Records every fatal store outcome.
+/// A test's observer of each fatal outcome, called before it is recorded.
+pub type OnFatal = Box<dyn Fn(&StoreFatal) + Send + Sync>;
+
+/// Records every fatal store outcome, calling the observer first when one is set.
 #[derive(Default)]
-pub struct RecordingSink(pub Mutex<Vec<StoreFatal>>);
+pub struct RecordingSink(pub Mutex<Vec<StoreFatal>>, pub Mutex<Option<OnFatal>>);
 
 impl LifecycleSink for RecordingSink {
     fn store_fatal(&self, f: StoreFatal) {
+        if let Some(on) = &*self.1.lock().unwrap() {
+            on(&f);
+        }
         self.0.lock().unwrap().push(f);
     }
 }

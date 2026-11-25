@@ -66,23 +66,37 @@ impl Armed {
 struct Hold {
     reached: mpsc::Sender<()>,
     release: mpsc::Receiver<()>,
+    /// Panics once released instead of returning (a fault on that thread).
+    panic: bool,
 }
 
 impl Hold {
     fn block(self) {
         let _ = self.reached.send(());
         let _ = self.release.recv_timeout(Duration::from_secs(60));
+        assert!(!self.panic, "a test fault at a pause point");
     }
 }
 
-/// The supervisor's pause points, each armed at most once at a time.
+/// The supervisor's pause points, each armed at most once at a time; every point reached
+/// is logged, armed or not.
 #[derive(Default)]
 pub(crate) struct Pauser {
     holds: Mutex<HashMap<Pause, Hold>>,
+    passed: Mutex<Vec<Pause>>,
 }
 
 impl Pauser {
     pub(crate) fn arm(&self, p: Pause) -> Armed {
+        self.arm_with(p, false)
+    }
+
+    /// Like [`Pauser::arm`], but the thread panics at `p` once released.
+    pub(crate) fn arm_panic(&self, p: Pause) -> Armed {
+        self.arm_with(p, true)
+    }
+
+    fn arm_with(&self, p: Pause, panic: bool) -> Armed {
         let (reached_tx, reached) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
         self.holds.lock().unwrap().insert(
@@ -90,12 +104,19 @@ impl Pauser {
             Hold {
                 reached: reached_tx,
                 release: release_rx,
+                panic,
             },
         );
         Armed { reached, release }
     }
 
+    /// Whether `p` was reached.
+    pub(crate) fn passed(&self, p: Pause) -> bool {
+        self.passed.lock().unwrap().contains(&p)
+    }
+
     fn take(&self, p: Pause) -> Option<Hold> {
+        self.passed.lock().unwrap().push(p);
         self.holds.lock().unwrap().remove(&p)
     }
 }

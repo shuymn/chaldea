@@ -451,7 +451,8 @@ async fn replay_bytes() {
 /// PR10a1-CL-11 `proof_before_slow_join`: the task's first call proves and sends its report;
 /// the close is held before it starts until the clock passed the kill's submission + 12 s:
 /// the join is late, the early report still confirms death with its method, and the token
-/// stays counted until the close ends.
+/// stays counted until the close ends. A task that panics right after sending its report
+/// still confirms death, and its token stays counted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn proof_before_slow_join() {
     let rig = Rig::new().await;
@@ -484,5 +485,264 @@ async fn proof_before_slow_join() {
         "{:?}",
         rig.events(t)
     );
+    // The task panics right after sending its report: still confirmed, the token counted.
+    let (u, ul) = rig.spawn_codex(None).await;
+    let fault = rig.pauses.arm_panic(Pause::BeforeCloseBy);
+    let reply = stop_with(&rig, u);
+    fault.wait();
+    fault.go();
+    let r = reply.await.unwrap();
+    assert_eq!(json(&r)["death_confirmed"], true, "{}", json(&r));
+    assert!(rig.launch(ul).death_confirmed);
+    assert_eq!(
+        rig.sup.tracker.count(),
+        1,
+        "the panicked close released nothing"
+    );
+    rig.srv.stop().await;
+}
+
+fn exited(events: &[FakeEvent]) -> bool {
+    events.iter().any(|e| matches!(e, FakeEvent::Exited))
+}
+
+/// PR10a1-CL-11 `kill_before_store_answer`: the `StopRequested` job held inside the writer,
+/// past its deadline check: the kill is sent and the tree proven dead while the job is
+/// held; released with an I/O error after its commit, its ticket answers `CommitUnknown`,
+/// which reaches the sink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kill_before_store_answer() {
+    use crate::http::StoreFatal;
+    use crate::store::test_faults::CommitFault;
+    let rig = Rig::new().await;
+    let (t, _l) = rig.spawn_codex(None).await;
+    let child = rig.pty.take_child().unwrap();
+    let held = rig.pauses.arm(Pause::InStopRequested);
+    let reply = stop_with(&rig, t);
+    held.wait();
+    rig.until("the kill proved while StopRequested is held", || {
+        let log = child.log();
+        !kills(&log).is_empty() && signals(&log) > 0 && exited(&log)
+    })
+    .await;
+    assert!(rig.sink.0.lock().unwrap().is_empty());
+    *rig.srv.store.store().faults().commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
+    held.go();
+    rig.until("CommitUnknown reported", || {
+        rig.sink
+            .0
+            .lock()
+            .unwrap()
+            .contains(&StoreFatal::CommitUnknown)
+    })
+    .await;
+    let _ = reply.await;
+}
+
+/// PR10a1-CL-11 `kill_before_fatal`: the writer retired by a job submitted outside
+/// `write_with` (the sink sees nothing of it); the stop's `Store::submit` then fails at
+/// once, and when the sink is told, the kill was already submitted; the kill follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kill_before_fatal() {
+    use crate::http::StoreFatal;
+    use crate::store::test_faults::CommitFault;
+    let rig = Rig::new().await;
+    let (t, _l) = rig.spawn_codex(None).await;
+    let child = rig.pty.take_child().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let (seen, pauses) = (seen.clone(), rig.pauses.clone());
+        *rig.sink.1.lock().unwrap() = Some(Box::new(move |f: &StoreFatal| {
+            seen.lock()
+                .unwrap()
+                .push((f.clone(), pauses.passed(Pause::KillSubmitted)));
+        }));
+    }
+    let start = rig.pauses.arm(Pause::StopStart);
+    let reply = stop_with(&rig, t);
+    start.wait();
+    *rig.srv.store.store().faults().commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
+    let job: crate::http::Job<()> = Box::new(|_| Ok(()));
+    let r = tokio::task::block_in_place(|| rig.srv.store.run(job));
+    assert!(r.is_err(), "the direct job's commit is unknown");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the sink saw nothing of it"
+    );
+    start.go();
+    rig.until("the sink is told", || {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|(f, _)| *f == StoreFatal::Failed)
+    })
+    .await;
+    let first = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(f, _)| *f == StoreFatal::Failed)
+        .cloned()
+        .unwrap();
+    assert!(first.1, "the kill was submitted before the sink was told");
+    rig.until("the kill follows", || !kills(&child.log()).is_empty())
+        .await;
+    let _ = reply.await;
+}
+
+/// The thread's kinds from `stopping`'s `status_changed` on.
+fn after_stopping(rig: &Rig, t: chaldea_core::ids::ThreadId) -> Vec<String> {
+    let ev = rig.events(t);
+    let stopping = |(k, p): &(String, serde_json::Value)| {
+        k == "status_changed" && p["field"] == "process_state" && p["to"] == "stopping"
+    };
+    assert_eq!(ev.iter().filter(|e| stopping(e)).count(), 1, "{ev:?}");
+    let i = ev.iter().position(stopping).unwrap();
+    assert_eq!(ev[i].1["cause"], "stop_requested");
+    ev[i..].iter().map(|(k, _)| k.clone()).collect()
+}
+
+/// PR10a1-CL-11 `uncommitted_stop_requested`: a `StopRequested` write that expired in the
+/// writer's queue, and one rolled back: no second attempt, the kill still sent, and the
+/// exit job applies `StopRequested` itself before `launch_exited`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uncommitted_stop_requested() {
+    use crate::store::test_faults::CommitFault;
+    let rig = Rig::new().await;
+    // Expired: the writer held (after the intent committed) while the job waits, its clock
+    // then past `not_after`.
+    let (t, _l) = rig.spawn_codex(None).await;
+    let child = rig.pty.take_child().unwrap();
+    let start = rig.pauses.arm(Pause::StopStart);
+    let written = rig.pauses.arm(Pause::StopWritten);
+    let reply = stop_with(&rig, t);
+    start.wait();
+    let release = rig.srv.hold_writer().await;
+    start.go();
+    rig.until("the kill is sent", || !kills(&child.log()).is_empty())
+        .await;
+    rig.srv
+        .store
+        .clock
+        .lead(crate::http::COMPLETION_ATTEMPT + Duration::from_secs(1));
+    release.send(()).unwrap();
+    written.wait();
+    rig.srv.store.clock.lead(Duration::ZERO);
+    written.go();
+    let r = reply.await.unwrap();
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let ks = after_stopping(&rig, t);
+    assert_eq!(ks.first().map(String::as_str), Some("status_changed"));
+    assert!(ks.iter().any(|k| k == "launch_exited"), "{ks:?}");
+    // Rolled back: no second attempt.
+    let (u, _ul) = rig.spawn_codex(None).await;
+    let uchild = rig.pty.take_child().unwrap();
+    let held = rig.pauses.arm(Pause::InStopRequested);
+    let reply = stop_with(&rig, u);
+    held.wait();
+    *rig.srv.store.store().faults().commit.lock().unwrap() = Some(CommitFault::BusyBeforeCommit);
+    let again = rig.pauses.arm(Pause::InStopRequested);
+    held.go();
+    let r = reply.await.unwrap();
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert!(again.reached.try_recv().is_err(), "no second attempt");
+    assert!(!kills(&uchild.log()).is_empty());
+    let ks = after_stopping(&rig, u);
+    assert!(ks.iter().any(|k| k == "launch_exited"), "{ks:?}");
+    rig.srv.stop().await;
+}
+
+/// PR10a1-CL-11 `proof_cutoff`: on a stopped clock, the seal, the kill's submission, and the
+/// task's start at three instants (`S`, `S + 2 s`, `S + 5 s`); the report and the join both
+/// read the clock at the kill's submission + 12 s less 1 ms (accepted) and at exactly it
+/// (`Late`, unconfirmed). A cutoff from the seal or from the task's start classifies one of
+/// them the other way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proof_cutoff() {
+    let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
+        c.kill_budget = Duration::from_secs(60);
+    })
+    .await;
+    for (before, want) in [(Duration::from_millis(1), true), (Duration::ZERO, false)] {
+        let (t, l) = rig.spawn_codex(None).await;
+        let seal = rig.pauses.arm(Pause::StopAfterSeal);
+        let submit = rig.pauses.arm(Pause::KillSubmitted);
+        let task = rig.pauses.arm(Pause::KillTaskStart);
+        let reply = stop_with(&rig, t);
+        seal.wait();
+        rig.clock.stop();
+        rig.clock.advance(Duration::from_secs(2));
+        seal.go();
+        submit.wait();
+        rig.clock.advance(Duration::from_secs(3));
+        submit.go();
+        task.wait();
+        rig.clock
+            .advance(crate::supervisor::PROOF_CUTOFF - Duration::from_secs(3) - before);
+        task.go();
+        let r = reply.await.unwrap();
+        let v = json(&r);
+        assert_eq!(v["death_confirmed"], want, "{before:?}: {v}");
+        assert_eq!(rig.launch(l).death_confirmed, want);
+    }
+    rig.srv.stop().await;
+}
+
+/// PR10a1-CL-11 `late_proof_confirms`: a kill that proves the tree dead after
+/// `RequestStart` + 5 s and within its budget: `death_confirmed: true`,
+/// `confirmed_within_deadline: false`, the token released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_proof_confirms() {
+    let rig = Rig::new().await;
+    rig.pty.script_next(FakeScript {
+        kill: KillBehavior::ExitAfter(Duration::from_millis(1500)),
+        ..FakeScript::default()
+    });
+    let (t, l) = rig.spawn_codex(None).await;
+    // The op starts 4 s after `RequestStart` on the supervisor's clock; the proof comes
+    // 1.5 s later.
+    let start = rig.pauses.arm(Pause::StopStart);
+    let reply = stop_with(&rig, t);
+    start.wait();
+    rig.clock.skew(Duration::from_secs(4));
+    start.go();
+    let r = reply.await.unwrap();
+    let v = json(&r);
+    assert_eq!(v["death_confirmed"], true, "{v}");
+    assert_eq!(v["confirmed_within_deadline"], false, "{v}");
+    assert!(rig.launch(l).death_confirmed);
+    rig.until("the token released", || rig.sup.tracker.count() == 0)
+        .await;
+    rig.srv.stop().await;
+}
+
+/// PR10a1-CL-11 `reply_by` (the retry half): while the op runs after the intent committed,
+/// the same `command_id` is 409 `in_progress`; once the result is stored, it replays the
+/// stored `StopResult` byte for byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reply_by() {
+    let rig = Rig::new().await;
+    let (t, _l) = rig.spawn_codex(None).await;
+    let id = super::cid();
+    let args = json!({ "thread_id": t }).to_string();
+    let held = rig.pauses.arm(Pause::StopWritten);
+    let first = spawn_send(&rig.srv, &rig.srv.command("stop", &rig.owner, id, &args));
+    held.wait();
+    let r = rig
+        .srv
+        .send(&rig.srv.command("stop", &rig.owner, id, &args))
+        .await;
+    assert_eq!(
+        (r.status, json(&r)["code"].clone()),
+        (409, json!("in_progress"))
+    );
+    held.go();
+    let r1 = first.await.unwrap();
+    assert_eq!(r1.status, 200);
+    let r2 = rig
+        .srv
+        .send(&rig.srv.command("stop", &rig.owner, id, &args))
+        .await;
+    assert_eq!((r2.status, &r2.body), (200, &r1.body));
     rig.srv.stop().await;
 }

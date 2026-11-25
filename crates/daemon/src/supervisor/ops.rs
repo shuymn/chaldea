@@ -678,11 +678,14 @@ pub(crate) fn submit_kill(
     let s = sup.clone();
     let extra = entry.extra();
     let launch = entry.launch_id;
+    // The cutoff's origin, read before the task exists, so no task start precedes it.
+    let submitted = sup.now();
+    sup.pauses().blocking(Pause::KillSubmitted);
     let join = sup
         .rt
         .spawn_blocking(move || kill_task(&s, launch, tracked, &extra, tx));
     KillTask {
-        submitted: sup.now(),
+        submitted,
         join,
         first,
     }
@@ -867,6 +870,7 @@ pub(crate) async fn stop_launch(
     if let Err(f) = written {
         tracing::warn!(%launch, failure = ?f, "StopRequested was not committed");
     }
+    sup.pauses().at(Pause::StopWritten).await;
     // Step 5: the exit job.
     let mut plan = ExitPlan::new(thread, launch, ExitReason::Stopped);
     plan.stop_first = true;

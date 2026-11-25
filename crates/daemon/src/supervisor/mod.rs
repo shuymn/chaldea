@@ -106,6 +106,12 @@ pub enum Pause {
     StopAfterSeal,
     /// Inside the `StopRequested` job (blocking, on the store writer).
     InStopRequested,
+    /// A stop's kill submission, after it read the submission instant and before the
+    /// kill task is spawned (blocking, in the `StopRequested` write's `on_submit`).
+    KillSubmitted,
+    /// A stop op after its `StopRequested` write answered and the kill was classified,
+    /// before the exit job.
+    StopWritten,
     /// A kill task right after it fixed its budget (blocking).
     KillTaskStart,
     /// A kill task after `close_by` returned, before the task returns (blocking).
