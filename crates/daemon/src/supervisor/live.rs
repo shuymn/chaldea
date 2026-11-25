@@ -92,17 +92,6 @@ pub(crate) enum SessionError {
     Busy,
 }
 
-/// Why [`LiveLaunch::snapshot_before`] took no snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SnapshotError {
-    /// The op lock was held, or the task did not answer in time.
-    Busy,
-    /// The session left the slot.
-    Gone,
-    /// The VT is failed or its lock was not taken in time.
-    VtUnavailable,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaunchObservation {
     /// No child creation has begun.
@@ -223,39 +212,34 @@ impl LiveLaunch {
 
     /// One VT snapshot by `deadline` (supervisor clock), never waiting for the op lock
     /// (send §2.9 D2): a blocking task that, once running and before `deadline`, takes the op
-    /// lock with one `try_lock` (`Busy` when held), takes the session's screen, releases the
-    /// lock, and copies the screen with the session's own deadline; the join is awaited with
-    /// `settle_before` until `deadline` (`Busy` when it has not answered).
+    /// lock with one `try_lock`, takes the session's screen, releases the lock, and copies the
+    /// screen with the session's own deadline; the join is awaited with `settle_before` until
+    /// `deadline`. `None`: past the deadline, the op lock held, no session, the VT failed or
+    /// its lock not taken in time, or no answer in time.
     pub(crate) async fn snapshot_before(
         &self,
         sup: &Supervisor,
         deadline: Instant,
-    ) -> Result<chaldea_pty_runtime::Snapshot, SnapshotError> {
+    ) -> Option<chaldea_pty_runtime::Snapshot> {
         let ops = self.ops.clone();
         let real = sup.real(deadline);
+        #[cfg(test)]
         let pauses = sup.cfg.pauses.clone();
         let task = sup.rt.spawn_blocking(move || {
             if Instant::now() >= real {
-                return Err(SnapshotError::Busy);
+                return None;
             }
             // The op lock only while the screen is taken: the copy waits for the VT lock
             // without holding up a stop.
-            let screen = {
-                let guard = ops.try_lock().map_err(|_| SnapshotError::Busy)?;
-                guard.as_ref().ok_or(SnapshotError::Gone)?.screen()
-            };
+            let screen = ops.try_lock().ok()?.as_ref()?.screen();
+            #[cfg(test)]
             pauses.blocking(super::Pause::SnapshotCopy);
-            screen
-                .snapshot(real)
-                .map_err(|_| SnapshotError::VtUnavailable)
+            screen.snapshot(real).ok()
         });
-        match settle_before(|| sup.now(), deadline, sup.timer(deadline), task)
+        settle_before(|| sup.now(), deadline, sup.timer(deadline), task)
             .await
-            .in_time()
-        {
-            Some(Ok(r)) => r,
-            Some(Err(_)) | None => Err(SnapshotError::Busy),
-        }
+            .in_time()?
+            .ok()?
     }
 
     /// Takes the op lock by `deadline` (supervisor clock) and runs `f` inline; `f` must not

@@ -242,7 +242,7 @@ Stop\r\nAllow this command? [y/n]\r\n> \r\n",
             entry
                 .snapshot_before(&sup, sup.now() + Duration::from_secs(5))
                 .await
-                .is_ok_and(|s| {
+                .is_some_and(|s| {
                     s.lines
                         .iter()
                         .any(|l| l.text().contains("Allow this command?"))

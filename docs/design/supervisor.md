@@ -411,18 +411,17 @@ impl LiveLaunch {
         &self, deadline: Instant, f: impl FnOnce(&Session) -> R,
     ) -> Result<R, SessionError>;
     /// A blocking task that, once running and before `deadline`, takes the op lock with one
-    /// `try_lock` (held → `Busy`), takes `Session::screen` (no session → `Gone`), releases the
-    /// lock, and copies the screen with `Screen::snapshot(clock.real(deadline))` (VT failed or its
-    /// lock not taken in time → `VtUnavailable`); the join is awaited with `settle_before` until
-    /// `deadline` (no answer → `Busy`). The op lock is held only while the screen is taken, so a
+    /// `try_lock`, takes `Session::screen`, releases the lock, and copies the screen with
+    /// `Screen::snapshot(clock.real(deadline))`; the join is awaited with `settle_before` until
+    /// `deadline`. `None` when the lock was held, there was no session, the VT failed or its
+    /// lock was not taken in time, or no answer came in time: every caller only needs whether
+    /// a snapshot was taken. The op lock is held only while the screen is taken, so a
     /// snapshot never carries it into its wait for the blocking pool or the VT lock, or into
     /// its copy; a stop's drain waiting on the VT lock the copy holds is bounded by
     /// `CloseBounds::drain` (pty-runtime §2.2 "Close order").
     pub(crate) async fn snapshot_before(&self, sup: &Supervisor, deadline: Instant)
-        -> Result<Snapshot, SnapshotError>;
+        -> Option<Snapshot>;
 }
-/// Why `snapshot_before` took no snapshot.
-pub(crate) enum SnapshotError { Busy, Gone, VtUnavailable }
 
 // crates/pty-runtime/src/backend.rs (new). `KillReport` gains `pub attempt: KillAttempt` and
 // `pub proved_at: Option<Instant>`: the backend's clock read right after the read that proved the

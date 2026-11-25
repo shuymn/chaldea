@@ -139,7 +139,8 @@ pub enum Pause {
     GitShutdownReap,
     /// The shutdown git step after reading the slot (async).
     GitShutdownRead,
-    /// A VT snapshot's task before it copies the screen (blocking).
+    /// A VT snapshot's task before it copies the screen (blocking; unit tests only).
+    #[cfg(test)]
     SnapshotCopy,
 }
 

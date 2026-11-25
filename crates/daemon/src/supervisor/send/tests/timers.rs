@@ -75,20 +75,20 @@ async fn snapshot_pool() {
     let entry = rig.sup.entry(live.l).unwrap();
     // Past its deadline: busy at once, the op lock free.
     let r = entry.snapshot_before(&rig.sup, rig.sup.now()).await;
-    assert!(r.is_err());
+    assert!(r.is_none());
     assert!(entry.ops.try_lock().is_ok(), "no lock taken");
     // In time: a snapshot.
     let r = entry
         .snapshot_before(&rig.sup, rig.sup.now() + Duration::from_secs(5))
         .await;
-    assert!(r.is_ok(), "{:?}", r.err());
+    assert!(r.is_some());
     // The op lock held by a stop: the snapshot answers busy without waiting for it.
     let g = entry.ops.clone().lock_owned().await;
     let started = Instant::now();
     let r = entry
         .snapshot_before(&rig.sup, rig.sup.now() + Duration::from_secs(5))
         .await;
-    assert!(r.is_err());
+    assert!(r.is_none());
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "never waits for the op lock"
