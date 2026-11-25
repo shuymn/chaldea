@@ -282,7 +282,8 @@ fn report(method: &str, attempt: KillAttempt, survivors: Vec<ProcessIdentity>) -
     }
 }
 
-/// The report of a proof: `proved_at` is the clock read right after the proving read.
+/// The report of a proof: `proved_at` is the clock read right after the proving read, taken
+/// before any handle is released.
 fn proved<O: JobOs>(call: &Call<'_, O>) -> KillReport {
     KillReport {
         method: METHOD.to_owned(),
@@ -293,7 +294,7 @@ fn proved<O: JobOs>(call: &Call<'_, O>) -> KillReport {
         } else {
             KillAttempt::AlreadyDead
         },
-        proved_at: Some(call.os.now()),
+        proved_at: Some(call.observed_at.unwrap_or_else(|| call.os.now())),
     }
 }
 
@@ -383,6 +384,7 @@ pub(crate) fn kill_tree<O: JobOs>(
         snapshot_taken: false,
         malformed: !supplied.malformed.is_empty(),
         terminated: false,
+        observed_at: None,
     };
     let wanted: Vec<(u32, u64)> = supplied.wanted.iter().map(|w| (w.0, w.1)).collect();
     for w in &wanted {
@@ -429,6 +431,7 @@ pub(crate) fn kill_tree<O: JobOs>(
         call.last_count = count.as_ref().ok().copied();
         match count {
             Ok(0) => {
+                call.observed_at = Some(os.now());
                 call.snapshot = None;
                 if call.wait_handles(&mut st) {
                     progress = true;
@@ -511,6 +514,9 @@ struct Call<'a, O: JobOs> {
     malformed: bool,
     /// A `terminate_job` or `terminate` call was made in this call.
     terminated: bool,
+    /// The clock read right after the latest observation that counts toward the proof (a
+    /// zero count, or a handle seen signalled), before a signalled handle is released.
+    observed_at: Option<Instant>,
 }
 
 impl<O: JobOs> Call<'_, O> {
@@ -554,6 +560,7 @@ impl<O: JobOs> Call<'_, O> {
                 return any;
             };
             if self.os.signalled(self.leader.handle, wait).unwrap_or(false) {
+                self.observed_at = Some(self.os.now());
                 self.leader_dead = true;
                 any = true;
             }
@@ -568,6 +575,7 @@ impl<O: JobOs> Call<'_, O> {
                 .get(&k)
                 .is_some_and(|h| self.os.signalled(h, wait).unwrap_or(false))
             {
+                self.observed_at = Some(self.os.now());
                 st.held.remove(&k);
                 any = true;
             }
@@ -596,6 +604,7 @@ impl<O: JobOs> Call<'_, O> {
         if count.ok() != Some(0) {
             return false;
         }
+        self.observed_at = Some(self.os.now());
         if self.expired() {
             return false;
         }
@@ -606,6 +615,7 @@ impl<O: JobOs> Call<'_, O> {
         {
             return false;
         }
+        self.observed_at = Some(self.os.now());
         self.leader_dead = true;
         let keys: Vec<(u32, u64)> = st.held.keys().copied().collect();
         for k in keys {
@@ -619,6 +629,7 @@ impl<O: JobOs> Call<'_, O> {
             if !signalled {
                 return false;
             }
+            self.observed_at = Some(self.os.now());
             st.held.remove(&k);
         }
         true
@@ -630,6 +641,7 @@ mod tests {
     //! The real engine and helpers over a scripted process table and clock.
 
     use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
 
     use super::*;
 
@@ -661,6 +673,8 @@ mod tests {
         deny_kill_access: bool,
         open_error: Option<i32>,
         times_error: bool,
+        /// Closing a handle opened on it advances the clock this much.
+        close_cost: Option<Duration>,
     }
 
     fn proc(start: u64, in_job: bool) -> P {
@@ -673,15 +687,26 @@ mod tests {
             deny_kill_access: false,
             open_error: None,
             times_error: false,
+            close_cost: None,
         }
     }
 
-    /// A handle: the pid and the start of the process it was opened on, and its rights.
-    #[derive(Debug, Clone, Copy)]
+    /// A handle: the pid and the start of the process it was opened on, and its rights; with
+    /// `drop_cost`, closing it advances the clock.
+    #[derive(Debug, Clone)]
     struct H {
         pid: u32,
         start: u64,
         access: Access,
+        drop_cost: Option<(Rc<Cell<Duration>>, Duration)>,
+    }
+
+    impl Drop for H {
+        fn drop(&mut self) {
+            if let Some((now, d)) = &self.drop_cost {
+                now.set(now.get() + *d);
+            }
+        }
     }
 
     type Hook = Box<dyn Fn(&C, &Os)>;
@@ -690,7 +715,7 @@ mod tests {
 
     struct Os {
         base: Instant,
-        now: Cell<Duration>,
+        now: Rc<Cell<Duration>>,
         procs: RefCell<HashMap<u32, P>>,
         calls: RefCell<Vec<C>>,
         count_error: Cell<bool>,
@@ -709,7 +734,7 @@ mod tests {
         fn new() -> Os {
             let os = Os {
                 base: Instant::now(),
-                now: Cell::new(Duration::ZERO),
+                now: Rc::new(Cell::new(Duration::ZERO)),
                 procs: RefCell::new(HashMap::new()),
                 calls: RefCell::new(Vec::new()),
                 count_error: Cell::new(false),
@@ -768,6 +793,7 @@ mod tests {
                 pid: L,
                 start: 1_000,
                 access: Access::Kill,
+                drop_cost: None,
             }
         }
 
@@ -878,6 +904,7 @@ mod tests {
                 pid,
                 start: p.start,
                 access,
+                drop_cost: p.close_cost.map(|d| (self.now.clone(), d)),
             })
         }
 
@@ -1748,5 +1775,31 @@ mod tests {
             "{r:?}"
         );
         assert!(r.proved_at.unwrap() > deadline, "{r:?}");
+        // The proving read is the extra handle's: `proved_at` is the clock right after it,
+        // before that handle is closed (closing it costs 2 ms here).
+        let os = Os::new();
+        os.cost.set(Duration::from_millis(1));
+        os.set(L, |p| p.alive = false);
+        os.add(200, proc(5, false));
+        os.set(200, |p| {
+            p.dies_at = Some(Duration::from_millis(4));
+            p.close_cost = Some(Duration::from_millis(2));
+        });
+        let seen = Rc::new(Cell::new(None));
+        let at = seen.clone();
+        *os.hook.borrow_mut() = Some(Box::new(move |c, os| {
+            if matches!(c, C::Signalled(200, _)) {
+                at.set(Some(os.now()));
+            }
+        }));
+        let r = os.kill(&[id(200, 5)], os.at(5_000), &state());
+        assert_eq!(
+            (r.tree_dead, r.attempt),
+            (true, KillAttempt::AlreadyDead),
+            "{r:?} {:?}",
+            os.calls()
+        );
+        assert!(seen.get().is_some(), "{:?}", os.calls());
+        assert_eq!(r.proved_at, seen.get(), "{:?}", os.calls());
     }
 }
