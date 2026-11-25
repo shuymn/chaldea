@@ -586,3 +586,36 @@ async fn key_outcomes() {
     drop(g);
     rig.stop().await;
 }
+
+/// PR10b-CL-3: a human unit submitted after the worker sampled the session for the open job,
+/// still unrecorded when the job runs, keeps the input `queued` (the job decides on
+/// `human_unsettled` too), with none of its bytes written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_waits_for_human() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let hold = live.child.hold_writes();
+    let (entered, go, point) = gate_point();
+    set(&sl.hooks.open_job, point);
+    let id = rig.send(&live, "after-key").await;
+    entered.await.unwrap();
+    let far = rig.sup.real(rig.sup.now() + Duration::from_secs(60));
+    human_unit(&rig, &live, WriteOrigin::Key, Guard::until(far)).await;
+    assert!(hold.wait_entered(Instant::now() + Duration::from_secs(10)));
+    assert_eq!(sl.state().human_unsettled, 1);
+    go.send(()).unwrap();
+    rig.pass(&live).await;
+    assert_eq!(rig.input(id).state, InputState::Queued);
+    drop(hold);
+    rig.until("the key recorded", || human_writes(&rig, &live).len() == 1)
+        .await;
+    rig.pass(&live).await;
+    assert_eq!(
+        rig.input(id).state,
+        InputState::Queued,
+        "the key closed the gate"
+    );
+    assert!(!live.child.input().ends_with(b"after-key\x1b[201~\r"));
+    rig.stop().await;
+}

@@ -218,7 +218,7 @@ pub(crate) fn settle_human(sl: &SendLaunch, seq: u64, report: KeyReport) {
         return;
     };
     let f = st.held.remove(i);
-    st.human_unsettled = st.human_unsettled.saturating_sub(1);
+    sl.human_down(&mut st);
     drop(st);
     if let Some(tx) = f.report {
         let _ = tx.send(report);

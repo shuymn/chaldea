@@ -25,7 +25,7 @@ mod tick;
 pub(crate) mod tests;
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
@@ -267,6 +267,8 @@ pub(crate) struct SendLaunch {
     pub latest_intake: AtomicU64,
     /// Mirrors `state.running.is_some()` for jobs on the store writer.
     pub running_flag: AtomicBool,
+    /// Mirrors `state.human_unsettled` for jobs on the store writer.
+    pub human_flag: AtomicU32,
     pub state: Mutex<SendState>,
     /// Completions fired and not yet taken by the worker.
     pub fired: Mutex<Vec<Fired>>,
@@ -293,6 +295,7 @@ impl SendLaunch {
             fence: Arc::new(AtomicU64::new(0)),
             latest_intake: AtomicU64::new(0),
             running_flag: AtomicBool::new(false),
+            human_flag: AtomicU32::new(0),
             state: Mutex::new(SendState::default()),
             fired: Mutex::new(Vec::new()),
             outstanding: AtomicU64::new(0),
@@ -360,14 +363,25 @@ impl SendLaunch {
         guard: chaldea_pty_runtime::Guard,
         report: Option<oneshot::Sender<KeyReport>>,
     ) -> Result<WriteTicket, chaldea_pty_runtime::SubmitError> {
-        self.state().human_unsettled += 1;
+        self.human_up(&mut self.state());
         self.outstanding.fetch_add(1, Ordering::AcqRel);
         let done = self.completion(None, report);
         s.submit(unit, guard, done).inspect_err(|_| {
             self.outstanding.fetch_sub(1, Ordering::AcqRel);
-            let mut st = self.state();
-            st.human_unsettled = st.human_unsettled.saturating_sub(1);
+            self.human_down(&mut self.state());
         })
+    }
+
+    /// One more human unit submitted and not yet recorded, and its flag.
+    pub(crate) fn human_up(&self, st: &mut SendState) {
+        st.human_unsettled += 1;
+        self.human_flag.store(st.human_unsettled, Ordering::SeqCst);
+    }
+
+    /// One human unit recorded (or never queued), and its flag.
+    pub(crate) fn human_down(&self, st: &mut SendState) {
+        st.human_unsettled = st.human_unsettled.saturating_sub(1);
+        self.human_flag.store(st.human_unsettled, Ordering::SeqCst);
     }
 
     /// Sets the running unit and its flag.

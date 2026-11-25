@@ -530,7 +530,9 @@ fn open_job(
         if !fence_quiet(word) {
             return Ok(Err(Closed::Fence));
         }
-        if me.running_flag.load(Ordering::SeqCst) {
+        // A unit that may still write: a running input unit, or a human unit not yet
+        // recorded (submitted after the worker sampled the session).
+        if me.running_flag.load(Ordering::SeqCst) || me.human_flag.load(Ordering::SeqCst) > 0 {
             return Ok(Err(Closed::Moved));
         }
         let r = tx.read();
