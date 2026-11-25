@@ -41,7 +41,8 @@ async fn owned_close() {
 
 /// PR10a1-CL-36 `zero_wakeup`: the last token released before the wait, between its
 /// wake-up's enable and its count read, and after a nonzero read before its first await:
-/// true by the wake-up each time, long before `end`.
+/// true by the wake-up each time, long before `end`. A token never released: false at `end`;
+/// a zero read only at `end`: false.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_wakeup() {
     let end = || Instant::now() + Duration::from_secs(20);
@@ -73,6 +74,10 @@ async fn zero_wakeup() {
         !t.empty_before(Instant::now() + Duration::from_millis(50))
             .await
     );
+    // A zero read after `end` (its last token released late): not adopted.
+    let t = Arc::new(Tracker::default());
+    t.admit().unwrap().release();
+    assert!(!t.empty_before(Instant::now()).await);
 }
 
 /// PR10a1-CL-22 `close_stop_after_admission`: a `close --stop` whose stop committed and
@@ -440,7 +445,8 @@ async fn git_spawn_stalled() {
 
 /// PR10a1-CL-19 `git_reaped`: a sleeping git still held by its probe at shutdown is killed
 /// at the probe's next poll and reaped by the end, `Clean`; a sleeping git in `left` is
-/// killed and reaped by the participant, `Clean`.
+/// killed and reaped by the participant, `Clean`; that reap held past `end`: `LeftRunning`
+/// by `end`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn git_reaped() {
     use crate::supervisor::Pause;
@@ -481,6 +487,37 @@ async fn git_reaped() {
         }
         rig.srv.stop().await;
     }
+    // The participant's reap of `left` held past `end`: the participant answers
+    // `LeftRunning` by `end` without waiting for it, and a reap that then succeeds changes
+    // nothing.
+    let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
+        c.git = super::workspace::sleeping_git();
+    })
+    .await;
+    let created = rig.pauses.arm_panic(Pause::GitAfterCreate);
+    let (sup, cwd) = (rig.sup.clone(), dir.path().to_path_buf());
+    let probe =
+        std::thread::spawn(move || common_dir(&sup, &cwd, sup.now() + Duration::from_secs(20)));
+    created.wait();
+    created.go();
+    assert!(probe.join().is_err(), "the probe panicked");
+    let reap = rig.pauses.arm(Pause::GitShutdownReap);
+    let end = rig.sup.now() + Duration::from_secs(1);
+    let sd = tokio::spawn(shutdown(rig.sup.clone(), end));
+    let reap = tokio::task::spawn_blocking(move || {
+        reap.wait();
+        reap
+    })
+    .await
+    .unwrap();
+    rig.until("the participant answered with the reap held", || {
+        sd.is_finished()
+    })
+    .await;
+    reap.go();
+    assert_eq!(sd.await.unwrap(), ParticipantEnd::LeftRunning);
+    rig.until("the held reap ran", || rig.sup.git.idle()).await;
+    rig.srv.stop().await;
 }
 
 /// PR10a1-CL-19 `git_late_handoff`: the git step reads the slot while a probe holds the

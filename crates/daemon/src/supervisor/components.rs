@@ -195,15 +195,19 @@ async fn git_step(sup: &Arc<Supervisor>, end: Instant) {
         changed.as_mut().enable();
         let git = sup.git.clone();
         let s = sup.clone();
-        let reaped = sup
-            .rt
-            .spawn_blocking(move || {
-                s.pauses().blocking(Pause::GitShutdownReap);
-                git.reap_left();
-                git.idle()
-            })
+        let reap = sup.rt.spawn_blocking(move || {
+            s.pauses().blocking(Pause::GitShutdownReap);
+            git.reap_left();
+            git.idle()
+        });
+        // A reap that answers after `end` is not waited for: the step ends with it.
+        let Some(reaped) = settle_before(|| sup.now(), end, sup.timer(end), reap)
             .await
-            .unwrap_or(false);
+            .in_time()
+        else {
+            return;
+        };
+        let reaped = reaped.unwrap_or(false);
         sup.pauses().at(Pause::GitShutdownRead).await;
         if reaped {
             return;

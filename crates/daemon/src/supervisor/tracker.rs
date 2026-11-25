@@ -132,7 +132,8 @@ impl Tracker {
     }
 
     /// Whether the count is 0 by `end` (real time): the zero wake-up is created and enabled
-    /// first, then the count read, then the wake-up awaited with `settle_before`.
+    /// first, then the count read, then the wake-up awaited with `settle_before`. A zero read
+    /// at or after `end` is not adopted.
     pub(crate) async fn empty_before(&self, end: Instant) -> bool {
         loop {
             let notified = self.zero.notified();
@@ -144,7 +145,7 @@ impl Tracker {
             #[cfg(test)]
             run_hook(&self.hooks.after_count);
             if count == 0 {
-                return true;
+                return Instant::now() < end;
             }
             let woke = settle_before(
                 Instant::now,
