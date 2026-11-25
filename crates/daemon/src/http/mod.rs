@@ -245,6 +245,8 @@ impl Shared {
 
     /// [`Shared::real`] as a tokio instant.
     pub(crate) fn timer(&self, at: Instant) -> tokio::time::Instant {
+        #[cfg(test)]
+        self.faults.timer_set(at);
         tokio::time::Instant::from_std(self.real(at))
     }
 

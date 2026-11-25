@@ -303,6 +303,8 @@ impl HookIngest {
         let deadline = ctx.deadline();
         let pid_deadline = (intake_at + self.cfg.pid_wait).min(deadline);
         let request_side = pid_deadline >= deadline;
+        #[cfg(test)]
+        shared.faults.pid_wait_started(pid_deadline);
         let ran_out = || {
             if request_side {
                 Err(ApiError::request_timeout())

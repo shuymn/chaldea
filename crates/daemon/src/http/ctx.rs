@@ -220,6 +220,10 @@ async fn run_write_releasing<R: Send + 'static>(
             Ok(r)
         }
         Err(e) => {
+            #[cfg(test)]
+            if matches!(e, WriteError::Expired) {
+                shared.faults.write_expired();
+            }
             let fatal = match &e {
                 WriteError::CommitUnknown(_) => Some(StoreFatal::CommitUnknown),
                 WriteError::WriterGone => Some(StoreFatal::WriterGone),

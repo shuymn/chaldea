@@ -100,6 +100,18 @@ impl SkewClock {
         });
     }
 
+    /// Moves a stopped clock's reading `by` forward: a deadline the new reading reaches has
+    /// passed (its real instant is before the real stop instant), and later ones still never
+    /// pass.
+    pub fn advance(&self, by: Duration) {
+        let mut held = self.held.lock().unwrap();
+        let h = held
+            .as_mut()
+            .filter(|h| h.stopped)
+            .expect("a stopped clock");
+        h.at += by;
+    }
+
     fn offset(&self) -> Duration {
         Duration::from_millis(self.offset_ms.load(Ordering::SeqCst))
     }
