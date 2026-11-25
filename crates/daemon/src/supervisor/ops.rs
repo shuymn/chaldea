@@ -635,15 +635,28 @@ async fn record_exit(
     sup: &Arc<Supervisor>,
     plan: ExitPlan,
 ) -> Result<Option<ExitFacts>, EffectOutcome> {
+    let facts = commit_exit(sup, plan).await?;
+    after_commit(sup, facts.as_ref());
+    Ok(facts)
+}
+
+/// [`record_exit`]'s job, without the steps' `after_commit`.
+async fn commit_exit(
+    sup: &Arc<Supervisor>,
+    plan: ExitPlan,
+) -> Result<Option<ExitFacts>, EffectOutcome> {
     let steps = sup.cfg.exit_steps.clone();
     let job: JobOf<Option<ExitFacts>> = Arc::new(move |tx| exit_in(tx, &steps, &plan));
-    let facts = outcome_of(record(sup, job, true).await)?;
-    if let Some(f) = &facts {
+    outcome_of(record(sup, job, true).await)
+}
+
+/// The exit steps' `after_commit`, when the exit job wrote an exit.
+fn after_commit(sup: &Supervisor, facts: Option<&ExitFacts>) {
+    if let Some(f) = facts {
         for s in &sup.cfg.exit_steps {
             s.after_commit(f);
         }
     }
-    Ok(facts)
 }
 
 /// `config.on_event`: forwards `Exited` and `WaitFailed` to the launch's exit op without
@@ -1024,7 +1037,11 @@ pub(crate) async fn exit_op(
     let Some(tracked) = guard.take() else {
         return;
     };
-    let _unwound = UnrecordedOnUnwind { sup: &sup, launch };
+    let mut unwound = UnrecordedOnUnwind {
+        sup: &sup,
+        launch,
+        armed: true,
+    };
     sup.pauses().at(Pause::ExitTookSession).await;
     let k = submit_kill(&sup, &entry, tracked);
     let proof = await_kill(&sup, k).await;
@@ -1034,7 +1051,13 @@ pub(crate) async fn exit_op(
     plan.code = exit.and_then(|x| x.code);
     plan.signal = exit.and_then(|x| x.signal);
     plan.sealed = entry.settled();
-    let r = record_exit(&sup, plan).await;
+    let r = commit_exit(&sup, plan).await;
+    // The exit job answered: an unwind from here on (an exit step's `after_commit`) leaves
+    // nothing unrecorded, and an unrecorded answer is reported below.
+    unwound.armed = false;
+    if let Ok(f) = &r {
+        after_commit(&sup, f.as_ref());
+    }
     drop(guard);
     sup.remove(launch);
     if let Err(EffectOutcome::Unrecorded) = r {
@@ -1043,22 +1066,27 @@ pub(crate) async fn exit_op(
     }
 }
 
-/// Reports `LaunchUnrecorded` for `launch` when dropped during an unwind: an exit op that
-/// panics after it took the session records no exit for it.
+/// Reports `LaunchUnrecorded` for `launch` when dropped armed during an unwind while
+/// admission is open: an exit op that panics after it took the session and before its exit
+/// job answered records no exit for it. Once shutdown started, the op ends unreported, as
+/// every op shutdown ends does (PR10a1-CL-22).
 struct UnrecordedOnUnwind<'a> {
     sup: &'a Supervisor,
     launch: LaunchId,
+    armed: bool,
 }
 
 impl Drop for UnrecordedOnUnwind<'_> {
     fn drop(&mut self) {
-        if std::thread::panicking() {
+        if self.armed && std::thread::panicking() {
             let fatal = StoreFatal::LaunchUnrecorded {
                 launch_id: self.launch,
             };
             // A panic leaving a drop during an unwind aborts the process.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.sup.sink.store_fatal(fatal);
+                if self.sup.tracker.accepting() {
+                    self.sup.sink.store_fatal(fatal);
+                }
             }));
         }
     }

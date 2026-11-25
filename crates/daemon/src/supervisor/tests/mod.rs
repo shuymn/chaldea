@@ -49,6 +49,9 @@ pub(crate) const PROGRAM: &str = if cfg!(windows) {
 pub(crate) struct Armed {
     pub reached: mpsc::Receiver<()>,
     pub release: mpsc::Sender<()>,
+    /// Told when the panic of [`Pauser::arm_panic`] has ended its unwind (its payload,
+    /// an [`Unwound`], dropped where the panic was caught).
+    pub unwound: mpsc::Receiver<()>,
 }
 
 impl Armed {
@@ -62,6 +65,23 @@ impl Armed {
     pub(crate) fn go(self) {
         let _ = self.release.send(());
     }
+
+    /// Releases the point and waits (20 s at most) until its panic has unwound.
+    pub(crate) fn go_and_unwind(self) {
+        let _ = self.release.send(());
+        self.unwound
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the pause point's panic unwound");
+    }
+}
+
+/// A panic payload that says, when dropped where the panic was caught, that the unwind ended.
+pub(crate) struct Unwound(pub mpsc::Sender<()>);
+
+impl Drop for Unwound {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
 }
 
 struct Hold {
@@ -69,13 +89,16 @@ struct Hold {
     release: mpsc::Receiver<()>,
     /// Panics once released instead of returning (a fault on that thread).
     panic: bool,
+    unwound: mpsc::Sender<()>,
 }
 
 impl Hold {
     fn block(self) {
         let _ = self.reached.send(());
         let _ = self.release.recv_timeout(Duration::from_secs(60));
-        assert!(!self.panic, "a test fault at a pause point");
+        if self.panic {
+            std::panic::panic_any(Unwound(self.unwound));
+        }
     }
 }
 
@@ -100,15 +123,21 @@ impl Pauser {
     fn arm_with(&self, p: Pause, panic: bool) -> Armed {
         let (reached_tx, reached) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
+        let (unwound_tx, unwound) = mpsc::channel();
         self.holds.lock().unwrap().insert(
             p,
             Hold {
                 reached: reached_tx,
                 release: release_rx,
                 panic,
+                unwound: unwound_tx,
             },
         );
-        Armed { reached, release }
+        Armed {
+            reached,
+            release,
+            unwound,
+        }
     }
 
     /// Whether `p` was reached.

@@ -60,6 +60,90 @@ async fn unwind_after_taking_the_session() {
     rig.srv.stop().await;
 }
 
+/// An exit op whose exit job committed, then an exit step's `after_commit` panicked: the
+/// exit is recorded, and no `LaunchUnrecorded` is reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unwind_after_the_commit() {
+    use crate::http::StoreFatal;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let step = std::sync::Arc::new(PanicAfterCommit(std::sync::Mutex::new(Some(tx))));
+    let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, move |c| {
+        c.exit_steps.push(step);
+    })
+    .await;
+    let (_t, l) = rig.spawn_codex(None).await;
+    rig.pty.take_child().unwrap().exit(ChildExit {
+        code: Some(0),
+        signal: None,
+    });
+    tokio::task::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(20)))
+        .await
+        .unwrap()
+        .expect("the after_commit panic unwound");
+    assert_eq!(rig.launch(l).exit_reason, Some(ExitReason::Exit));
+    assert!(
+        !rig.sink
+            .0
+            .lock()
+            .unwrap()
+            .contains(&StoreFatal::LaunchUnrecorded { launch_id: l })
+    );
+    rig.srv.stop().await;
+}
+
+/// Panics in `after_commit` with an [`super::Unwound`] payload.
+struct PanicAfterCommit(std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>);
+
+impl crate::supervisor::exit::ExitStep for PanicAfterCommit {
+    fn in_exit_job(
+        &self,
+        _tx: &mut crate::store::WriteTx<'_>,
+        _exit: &crate::supervisor::exit::ExitFacts,
+    ) -> Result<(), crate::store::StoreError> {
+        Ok(())
+    }
+
+    fn after_commit(&self, _exit: &crate::supervisor::exit::ExitFacts) {
+        if let Some(tx) = self.0.lock().unwrap().take() {
+            std::panic::panic_any(super::Unwound(tx));
+        }
+    }
+}
+
+/// An exit op that panics after it took the session once admission closed: no
+/// `LaunchUnrecorded`, as every op shutdown ends goes unreported (PR10a1-CL-22).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unwind_after_admission_closed() {
+    use crate::http::StoreFatal;
+    use crate::supervisor::Pause;
+    let rig = Rig::new().await;
+    let (_t, l) = rig.spawn_codex(None).await;
+    let fault = rig.pauses.arm_panic(Pause::ExitTookSession);
+    rig.pty.take_child().unwrap().exit(ChildExit {
+        code: Some(0),
+        signal: None,
+    });
+    let fault = tokio::task::spawn_blocking(move || {
+        fault.wait();
+        fault
+    })
+    .await
+    .unwrap();
+    rig.sup.tracker.close_admission();
+    tokio::task::spawn_blocking(move || fault.go_and_unwind())
+        .await
+        .unwrap();
+    assert!(
+        !rig.sink
+            .0
+            .lock()
+            .unwrap()
+            .contains(&StoreFatal::LaunchUnrecorded { launch_id: l })
+    );
+    assert_eq!(rig.launch(l).exit_reason, None);
+    rig.srv.stop().await;
+}
+
 /// One buffered hook delivery for `l`, written as PR 9's intake writes one for a launch
 /// with no bound session.
 pub(super) fn buffer_one(store: &super::support::TestStore, l: chaldea_core::ids::LaunchId) {
