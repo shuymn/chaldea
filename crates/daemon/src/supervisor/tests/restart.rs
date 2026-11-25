@@ -161,3 +161,21 @@ async fn inputs_recovered() {
     assert_eq!(signalled(), old, "the restart signalled nothing");
     rig.srv.stop().await;
 }
+
+/// PR10a1-CL-15 `buffers_resolved`: a buffer left by a launch that exited in an earlier run
+/// is resolved by the restart's `supervisor_buffers`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn buffers_resolved() {
+    let rig = Rig::new().await;
+    let (t, l) = rig.stopped_bound().await;
+    super::exit::buffer_one(&rig.srv.store, l);
+    assert_eq!(super::exit::buffered(&rig.srv.store), vec![l]);
+    assert!(restart_all(&rig.srv.store) > 0);
+    assert!(super::exit::buffered(&rig.srv.store).is_empty());
+    assert!(
+        rig.kinds(t).iter().any(|k| k == "raw_unknown"),
+        "{:?}",
+        rig.kinds(t)
+    );
+    rig.srv.stop().await;
+}

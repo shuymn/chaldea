@@ -63,3 +63,28 @@ async fn session_start_timeout() {
     assert!(!raised(&rig, e));
     rig.srv.stop().await;
 }
+
+/// PR10a1-CL-15 `expires_buffer`: the tick expires a live, unbound launch's buffer once the
+/// store's stamp is past the earliest delivery + `buffer_ttl`, and not at it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expires_buffer() {
+    let rig = Rig::new().await;
+    let (t, l) = rig.spawn_codex(None).await;
+    let clock = &rig.srv.store.clock;
+    clock.set("2026-11-22T00:00:00.000Z");
+    super::exit::buffer_one(&rig.srv.store, l);
+    // At the TTL: kept.
+    clock.set("2026-11-22T00:00:30.000Z");
+    rig.sup.tick(rig.sup.now()).await;
+    assert_eq!(super::exit::buffered(&rig.srv.store), vec![l]);
+    // Past it: expired to `raw_unknown`.
+    clock.set("2026-11-22T00:00:30.001Z");
+    rig.sup.tick(rig.sup.now()).await;
+    assert!(super::exit::buffered(&rig.srv.store).is_empty());
+    assert!(
+        rig.kinds(t).iter().any(|k| k == "raw_unknown"),
+        "{:?}",
+        rig.kinds(t)
+    );
+    rig.srv.stop().await;
+}
