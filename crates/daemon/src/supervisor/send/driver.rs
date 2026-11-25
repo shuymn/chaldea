@@ -106,7 +106,7 @@ struct View {
 }
 
 /// A read on a blocking task, bounded by now + 1 s; `None` when not in time.
-async fn read<R: Send + 'static>(
+pub(super) async fn read<R: Send + 'static>(
     sup: &Supervisor,
     f: impl FnOnce(&crate::store::ReadTx<'_>) -> Result<R, crate::store::StoreError> + Send + 'static,
 ) -> Option<R> {

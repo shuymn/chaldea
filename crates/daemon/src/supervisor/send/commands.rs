@@ -419,20 +419,13 @@ async fn key_op(sup: Arc<Supervisor>, req: KeyReq) -> EffectOutcome {
     }
     // 2. The launch and the card, read afresh.
     let (thread, launch, card) = (req.thread, req.launch, req.card);
-    let deadline = sup.now() + READ_WAIT;
-    let store = sup.store.clone();
-    let real = sup.real(deadline);
-    let read = sup.rt.spawn_blocking(move || {
-        store.read(real, |r| {
-            let t = r.thread(thread)?;
-            let l = r.launch(launch)?;
-            let c = card.map(|c| r.approval(c)).transpose()?.flatten();
-            Ok((t, l, c))
-        })
-    });
-    let Some(Ok(Ok((t, l, c)))) = settle_before(|| sup.now(), deadline, sup.timer(deadline), read)
-        .await
-        .in_time()
+    let Some((t, l, c)) = super::driver::read(&sup, move |r| {
+        let t = r.thread(thread)?;
+        let l = r.launch(launch)?;
+        let c = card.map(|c| r.approval(c)).transpose()?.flatten();
+        Ok((t, l, c))
+    })
+    .await
     else {
         return done(ErrorCode::KeyNotWritten);
     };
