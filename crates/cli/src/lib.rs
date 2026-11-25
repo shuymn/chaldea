@@ -9,6 +9,7 @@ mod client;
 mod daemon_cmd;
 mod hook_emit;
 mod open;
+mod poll;
 
 #[doc(hidden)]
 pub use hook_emit::Stall;
@@ -64,6 +65,8 @@ pub struct Seams {
     pub after_eof: Option<Box<dyn Fn(Instant) -> Instant>>,
     /// Receives the exit code just before the process exits.
     pub on_exit: Option<Box<dyn FnOnce(i32)>>,
+    /// `daemon run`'s OS name instead of `std::env::consts::OS`.
+    pub host_os: Option<String>,
 }
 
 /// The `chaldea` process from its arguments (`argv[0]` first) to its exit; `main` is this one

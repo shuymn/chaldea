@@ -65,7 +65,28 @@ pub fn request(
     token: Option<&str>,
     deadline: Instant,
 ) -> io::Result<Response> {
-    let mut s = send(port, method, path, token, deadline)?;
+    let mut s = send(port, method, path, token, None, deadline)?;
+    read_response(|buf| read_some(&mut s, buf, deadline), deadline)
+}
+
+/// A `POST` as [`request`] sends one, with `body` as its JSON body (`Content-Type:
+/// application/json` and its `Content-Length`), under the same deadline rules.
+///
+/// # Errors
+///
+/// As [`request`].
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the agent commands in PR 10a1 part 2")
+)]
+pub fn post_json(
+    port: u16,
+    path: &str,
+    token: Option<&str>,
+    body: &[u8],
+    deadline: Instant,
+) -> io::Result<Response> {
+    let mut s = send(port, "POST", path, token, Some(body), deadline)?;
     read_response(|buf| read_some(&mut s, buf, deadline), deadline)
 }
 
@@ -82,7 +103,7 @@ pub fn request_status(
     token: Option<&str>,
     deadline: Instant,
 ) -> io::Result<u16> {
-    let mut s = send(port, method, path, token, deadline)?;
+    let mut s = send(port, method, path, token, None, deadline)?;
     let mut buf = Vec::new();
     let (status, _) = read_head(
         &mut checked(|buf| read_some(&mut s, buf, deadline), deadline),
@@ -91,22 +112,28 @@ pub fn request_status(
     Ok(status)
 }
 
-/// Connects and writes one bodiless request, before `deadline`.
+/// Connects and writes one request, bodiless or with a JSON `body`, before `deadline`.
 fn send(
     port: u16,
     method: &str,
     path: &str,
     token: Option<&str>,
+    body: Option<&[u8]>,
     deadline: Instant,
 ) -> io::Result<TcpStream> {
     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
     let mut s = TcpStream::connect_timeout(&addr, left(deadline)?)?;
     let auth = token.map_or_else(String::new, |t| format!("Authorization: Bearer {t}\r\n"));
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Length: 0\r\nConnection: close\r\n\r\n"
-    );
+    let (kind, len) = body.map_or((String::new(), 0), |b| {
+        ("Content-Type: application/json\r\n".to_owned(), b.len())
+    });
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}{kind}Content-Length: {len}\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    req.extend_from_slice(body.unwrap_or_default());
     s.set_write_timeout(Some(left(deadline)?))?;
-    s.write_all(req.as_bytes())?;
+    s.write_all(&req)?;
     Ok(s)
 }
 
@@ -636,5 +663,50 @@ mod tests {
         assert!(req.contains("Authorization: Bearer t\r\n"), "{req}");
         assert!(req.contains("Content-Length: 0\r\n"), "{req}");
         assert!(!req.to_ascii_lowercase().contains("origin:"), "{req}");
+    }
+
+    /// `post_json` sends its body with its type and length, and reads the response as
+    /// `request` does.
+    #[test]
+    fn post_json_sends_its_body() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let body = r#"{"command_id":"x","args":{"t":"é"}}"#;
+        let server = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut got = Vec::new();
+            let mut b = [0u8; 1024];
+            while !got.ends_with(body.as_bytes()) {
+                let n = std::io::Read::read(&mut c, &mut b).unwrap();
+                assert_ne!(n, 0, "the body ended early");
+                got.extend_from_slice(&b[..n]);
+            }
+            std::io::Write::write_all(
+                &mut c,
+                b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            )
+            .unwrap();
+            String::from_utf8(got).unwrap()
+        });
+        let r = super::post_json(
+            port,
+            "/api/commands/stop",
+            Some("t"),
+            body.as_bytes(),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!((r.status, r.body.as_slice()), (201, b"{}".as_slice()));
+        let req = server.join().unwrap();
+        assert!(
+            req.starts_with("POST /api/commands/stop HTTP/1.1\r\n"),
+            "{req}"
+        );
+        assert!(req.contains("Content-Type: application/json\r\n"), "{req}");
+        assert!(
+            req.contains(&format!("Content-Length: {}\r\n", body.len())),
+            "{req}"
+        );
+        assert!(req.ends_with(&format!("\r\n\r\n{body}")), "{req}");
     }
 }
