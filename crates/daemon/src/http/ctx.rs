@@ -208,7 +208,8 @@ async fn run_write_releasing<R: Send + 'static>(
         job,
         // The job is in the writer's queue now, or never will be.
         move || drop(release),
-    )?;
+    )
+    .map_err(WriteFailure::Submit)?;
     #[cfg(test)]
     let ticket = shared.faults.signal_ticket_park(ticket);
     let result = await_ticket(ticket, shared.sink.as_ref(), after_ok).await;
@@ -242,16 +243,13 @@ pub(crate) async fn write_with<R: Send + 'static>(
     after_ok: Option<AfterOk>,
     on_submit: impl FnOnce(),
 ) -> Result<R, WriteFailure> {
-    let ticket = submit_with(store, sink, clock, not_after, job, on_submit)?;
+    let ticket =
+        submit_with(store, sink, clock, not_after, job, on_submit).map_err(WriteFailure::Submit)?;
     await_ticket(ticket, sink, after_ok).await
 }
 
 /// [`write_with`]'s submission: `Store::submit`, then `on_submit`, then the submission's
 /// result examined (`SubmitError::Failed` reported to `sink`).
-#[allow(
-    clippy::result_large_err,
-    reason = "the write paths' one failure type, returned by value as run_write returns it"
-)]
 fn submit_with<R: Send + 'static>(
     store: &Store,
     sink: &dyn LifecycleSink,
@@ -259,14 +257,13 @@ fn submit_with<R: Send + 'static>(
     not_after: Instant,
     job: Job<R>,
     on_submit: impl FnOnce(),
-) -> Result<crate::store::WriteTicket<R>, WriteFailure> {
+) -> Result<crate::store::WriteTicket<R>, SubmitError> {
     let submitted = store.submit(clock.real(not_after), job);
     on_submit();
-    submitted.map_err(|e| {
-        if e == SubmitError::Failed {
+    submitted.inspect_err(|e| {
+        if *e == SubmitError::Failed {
             sink.store_fatal(StoreFatal::Failed);
         }
-        WriteFailure::Submit(e)
     })
 }
 
