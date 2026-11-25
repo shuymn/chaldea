@@ -200,19 +200,18 @@ async fn run_write_releasing<R: Send + 'static>(
     shared.faults.write_submitted(not_after);
     #[cfg(test)]
     shared.faults.before_submit().await;
-    let write = write_with(
+    let ticket = submit_with(
         &shared.store,
         shared.sink.as_ref(),
         shared.cfg.clock.as_ref(),
         not_after,
         job,
-        after_ok,
         // The job is in the writer's queue now, or never will be.
         move || drop(release),
-    );
+    )?;
     #[cfg(test)]
-    let write = shared.faults.signal_ticket_park(write);
-    let result = write.await;
+    let ticket = shared.faults.signal_ticket_park(ticket);
+    let result = await_ticket(ticket, shared.sink.as_ref(), after_ok).await;
     #[cfg(test)]
     if matches!(result, Err(WriteFailure::Write(WriteError::Expired))) {
         shared.faults.write_expired();
@@ -230,6 +229,10 @@ async fn run_write_releasing<R: Send + 'static>(
 /// # Errors
 ///
 /// The submission's or the write's failure.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the supervisor in PR 10a1 part 2")
+)]
 pub(crate) async fn write_with<R: Send + 'static>(
     store: &Store,
     sink: &dyn LifecycleSink,
@@ -239,17 +242,41 @@ pub(crate) async fn write_with<R: Send + 'static>(
     after_ok: Option<AfterOk>,
     on_submit: impl FnOnce(),
 ) -> Result<R, WriteFailure> {
+    let ticket = submit_with(store, sink, clock, not_after, job, on_submit)?;
+    await_ticket(ticket, sink, after_ok).await
+}
+
+/// [`write_with`]'s submission: `Store::submit`, then `on_submit`, then the submission's
+/// result examined (`SubmitError::Failed` reported to `sink`).
+#[allow(
+    clippy::result_large_err,
+    reason = "the write paths' one failure type, returned by value as run_write returns it"
+)]
+fn submit_with<R: Send + 'static>(
+    store: &Store,
+    sink: &dyn LifecycleSink,
+    clock: &dyn MonotonicClock,
+    not_after: Instant,
+    job: Job<R>,
+    on_submit: impl FnOnce(),
+) -> Result<crate::store::WriteTicket<R>, WriteFailure> {
     let submitted = store.submit(clock.real(not_after), job);
     on_submit();
-    let ticket = match submitted {
-        Ok(t) => t,
-        Err(e) => {
-            if e == SubmitError::Failed {
-                sink.store_fatal(StoreFatal::Failed);
-            }
-            return Err(WriteFailure::Submit(e));
+    submitted.map_err(|e| {
+        if e == SubmitError::Failed {
+            sink.store_fatal(StoreFatal::Failed);
         }
-    };
+        WriteFailure::Submit(e)
+    })
+}
+
+/// [`write_with`]'s wait: the writer's answer to an admitted job, a fatal outcome reported to
+/// `sink`, `after_ok` run once it committed.
+async fn await_ticket<R>(
+    ticket: impl Future<Output = Result<R, WriteError>>,
+    sink: &dyn LifecycleSink,
+    after_ok: Option<AfterOk>,
+) -> Result<R, WriteFailure> {
     match ticket.await {
         Ok(r) => {
             if let Some(f) = after_ok {

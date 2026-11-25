@@ -23,7 +23,9 @@ use super::support::http::{
 use super::support::soon;
 use crate::http::auth::sha256;
 use crate::http::commands::{Admitted, prepare_args, run};
-use crate::http::{ApiError, CommandRegistry, MonotonicClock, RequestStart, Shared, StoreFatal};
+use crate::http::{
+    ApiError, CommandRegistry, MonotonicClock, RequestStart, Shared, StoreFatal, WriteFailure,
+};
 use crate::store::test_faults::CommitFault;
 use crate::store::tests::support::waits;
 use crate::store::{SubmitError, WriteError};
@@ -78,6 +80,37 @@ async fn fill_queue(
     }
     assert_eq!(queued.len(), 256);
     (writer, queued)
+}
+
+/// The ticket-park signal fires on an admitted write's parked ticket: a submission refused
+/// before it (`QueueFull`) does not consume it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ticket_park_signal_skips_a_refused_submission() {
+    let (srv, _probe) = TestServer::with_commands(|_| {}).await;
+    let s = shared(&srv);
+    let parked = s.faults.arm_ticket_park();
+    let (writer, queued) = fill_queue(&srv).await;
+    let refused = crate::http::ctx::run_write(&s, soon(), Box::new(|_tx| Ok(())), None).await;
+    assert!(
+        matches!(refused, Err(WriteFailure::Submit(SubmitError::QueueFull))),
+        "{refused:?}"
+    );
+    writer.send(()).unwrap();
+    for t in queued {
+        settled(t).await.unwrap();
+    }
+    let writer = srv.hold_writer().await;
+    let s2 = s.clone();
+    let admitted = tokio::spawn(async move {
+        crate::http::ctx::run_write(&s2, soon(), Box::new(|_tx| Ok(())), None).await
+    });
+    waits::bounded(Duration::from_secs(10), parked)
+        .await
+        .expect("parked in time")
+        .expect("the signal of the admitted ticket");
+    writer.send(()).unwrap();
+    assert!(joined(admitted).await.is_ok());
+    srv.stop().await;
 }
 
 /// 32 concurrent requests with one `command_id` reach the writer as 32 jobs (all queued
