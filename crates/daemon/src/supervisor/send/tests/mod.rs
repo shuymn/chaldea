@@ -4,6 +4,7 @@
 mod evidence;
 mod flow;
 mod gate;
+mod outcomes;
 mod probe;
 
 use std::sync::Arc;
