@@ -30,7 +30,8 @@ pub trait IntakeProbe: Send + Sync + 'static {
     /// `committed_at` (the clock read right after a successful SQLite `COMMIT`), or decided
     /// nothing (`marks` empty and no instant: rolled back, refused, or never submitted).
     /// Called at most once per intake through its [`IntakeGuard`], and never for an intake
-    /// whose job's outcome stays unknown. Non-blocking.
+    /// whose job's outcome stays unknown. It waits only as [`IntakeProbe::facts`] may: on short
+    /// sections with no await, I/O, or other lock inside them, with no deadline of its own.
     fn finished(
         &self,
         launch: LaunchId,

@@ -59,9 +59,11 @@ impl IntakeFactsV1 {
     }
 }
 
-/// The real `IntakeProbe`: waits on nothing but its read of the send side's launch map,
-/// which may wait on a short write section (one `SendLaunch` constructed and inserted, or
-/// one removed; no await, I/O, or other lock inside it), with no deadline of its own.
+/// The real `IntakeProbe`. `facts` waits on nothing but its read of the send side's launch
+/// map, which may wait on a short write section (one `SendLaunch` constructed and inserted,
+/// or one removed; no await, I/O, or other lock inside it); `finished` also takes the
+/// launch's state mutex, held only for short sections of the same kind. Neither wait has a
+/// deadline of its own.
 pub(crate) struct SupervisorProbe {
     pub sup: Weak<Supervisor>,
     pub side: Arc<SendSide>,
