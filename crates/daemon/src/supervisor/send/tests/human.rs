@@ -4,7 +4,7 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use chaldea_core::ids::{Agent, ApprovalId};
+use chaldea_core::ids::ApprovalId;
 use chaldea_core::input::InputState;
 use chaldea_core::payload::ApprovalOutcome;
 use chaldea_pty_runtime::fake::ProbePoint;
@@ -42,44 +42,8 @@ async fn card(rig: &SRig, live: &Live, tool_use_id: &str) -> ApprovalId {
         "PermissionRequest",
         &json!({ "tool_name": "Bash", "tool_input": { "command": "ls" }, "tool_use_id": tool_use_id }),
     );
-    assert_eq!(rig.post(&h).await.status, 200);
+    assert_eq!(rig.post_for(live, &h).await.status, 200);
     ApprovalId(h.emit)
-}
-
-/// Runs `hook` with `live`'s send worker parked after a pass's read, outside the live map, so
-/// the intake's observation never meets the worker's map lock (which it would answer with no
-/// facts). The worker is released before the caller waits on anything it records.
-async fn worker_parked<T>(
-    rig: &SRig,
-    live: &Live,
-    hook: impl std::future::Future<Output = T>,
-) -> T {
-    let sl = rig.sl(live);
-    let (entered_tx, entered) = tokio::sync::oneshot::channel::<()>();
-    let (go, wait) = std::sync::mpsc::channel::<()>();
-    set(&sl.hooks.after_read, move || {
-        let _ = entered_tx.send(());
-        let _ = wait.recv();
-    });
-    sl.wake.notify_one();
-    entered.await.unwrap();
-    let out = hook.await;
-    go.send(()).unwrap();
-    out
-}
-
-/// [`SRig::claude`] with its `SessionStart` taken in while the worker is parked.
-async fn claude_parked(rig: &SRig) -> Live {
-    let (live, _) = rig.spawn(Agent::Claude, None).await;
-    rig.paste(&live, true).await;
-    worker_parked(rig, &live, rig.hook(&live, "SessionStart", &json!({}))).await;
-    assert!(rig.launch(live.l).readiness.is_some(), "session_start");
-    live
-}
-
-/// [`card`] taken in while the worker is parked.
-async fn card_parked(rig: &SRig, live: &Live, tool_use_id: &str) -> ApprovalId {
-    worker_parked(rig, live, card(rig, live, tool_use_id)).await
 }
 
 fn outcome(rig: &SRig, id: ApprovalId) -> Option<ApprovalOutcome> {
@@ -464,8 +428,8 @@ async fn card_key_order() {
     // Written; a second card key to the same card (another `command_id`) is refused.
     let rig = SRig::new().await;
     rig.clock.stop();
-    let live = claude_parked(&rig).await;
-    let c = card_parked(&rig, &live, "t1").await;
+    let live = rig.claude().await;
+    let c = card(&rig, &live, "t1").await;
     let r = key(&rig, &live, &["down", "down", "enter"], Some(c)).await;
     assert_eq!(
         (r.0, r.1["outcome"].clone()),
@@ -485,10 +449,10 @@ async fn card_key_order() {
         );
     }
     // A raw key between a card's observation and its card key: refused; a new card: written.
-    let c2 = card_parked(&rig, &live, "t2").await;
+    let c2 = card(&rig, &live, "t2").await;
     assert_eq!(key(&rig, &live, &["escape"], None).await.0, 200);
     assert!(not_written(&key(&rig, &live, &["enter"], Some(c2)).await));
-    let c3 = card_parked(&rig, &live, "t3").await;
+    let c3 = card(&rig, &live, "t3").await;
     assert_eq!(key(&rig, &live, &["enter"], Some(c3)).await.0, 200);
     rig.stop().await;
 
@@ -496,8 +460,8 @@ async fn card_key_order() {
     for point in [ProbePoint::RecheckEntered, ProbePoint::Dispatching] {
         let rig = SRig::new().await;
         rig.clock.stop();
-        let live = claude_parked(&rig).await;
-        let c = card_parked(&rig, &live, "t1").await;
+        let live = rig.claude().await;
+        let c = card(&rig, &live, "t1").await;
         let probe = rig.probe(&live).await;
         let park = probe.park(point);
         let n = live.child.input().len();
@@ -537,8 +501,8 @@ async fn card_key_order() {
     // A hook's intake unfinished at the effect's start.
     let rig = SRig::new().await;
     rig.clock.stop();
-    let live = claude_parked(&rig).await;
-    let c = card_parked(&rig, &live, "t1").await;
+    let live = rig.claude().await;
+    let c = card(&rig, &live, "t1").await;
     let (got, release) = rig.ingest.points.arm_intake(rig.next_ordinal(&live));
     let h = rig.hook_of(&live, "Notification", &json!({}));
     let reply = crate::supervisor::tests::support::http::spawn_send(&rig.srv, &h.req(&rig.srv));
@@ -553,7 +517,7 @@ async fn card_key_order() {
     // completes, until a new card arrives.
     let rig = SRig::new().await;
     rig.clock.stop();
-    let live = claude_parked(&rig).await;
+    let live = rig.claude().await;
     let hold = live.child.hold_writes();
     let raw = {
         let args = json!({ "thread_id": live.t, "launch_id": live.l, "keys": ["escape"] });
@@ -568,21 +532,21 @@ async fn card_key_order() {
         )
     };
     assert!(hold.wait_entered(Instant::now() + Duration::from_secs(10)));
-    let c = card_parked(&rig, &live, "t1").await;
+    let c = card(&rig, &live, "t1").await;
     assert!(not_written(&key(&rig, &live, &["enter"], Some(c)).await));
     drop(hold);
     let _ = raw.await;
     rig.until("recorded", || human_writes(&rig, &live).len() == 1)
         .await;
     assert!(not_written(&key(&rig, &live, &["enter"], Some(c)).await));
-    let c2 = card_parked(&rig, &live, "t2").await;
+    let c2 = card(&rig, &live, "t2").await;
     assert_eq!(key(&rig, &live, &["enter"], Some(c2)).await.0, 200);
     rig.stop().await;
 
     // A card opened by a retried delivery (`intake_reliable: false`).
     let rig = SRig::new().await;
     rig.clock.stop();
-    let live = claude_parked(&rig).await;
+    let live = rig.claude().await;
     let h = rig
         .hook_of(
             &live,

@@ -169,9 +169,44 @@ impl SRig {
         self.srv.send(&h.req(&self.srv)).await
     }
 
-    /// Posts a hook and requires 200.
+    /// Posts `h`, a hook of `live`, with `live`'s send worker parked ([`SRig::worker_parked`])
+    /// unless one of its send side's test points is armed or running: a test that holds the
+    /// worker, or is about to, keeps the order it set up.
+    pub(crate) async fn post_for(&self, live: &Live, h: &Hook) -> Reply {
+        if self.points_idle(live) {
+            self.worker_parked(live, self.post(h)).await
+        } else {
+            self.post(h).await
+        }
+    }
+
+    /// Whether no test point of `live`'s send side that runs on the worker or the writer is
+    /// set or running (`observe` runs on the hook's own request).
+    fn points_idle(&self, live: &Live) -> bool {
+        let sl = self.sl(live);
+        let h = &sl.hooks;
+        [
+            &h.completion,
+            &h.before_submit,
+            &h.after_submit,
+            &h.record_job,
+            &h.settle_job,
+            &h.open_job,
+            &h.open_after_flags,
+            &h.after_written_read,
+            &h.finished,
+            &h.after_read,
+            &h.after_record,
+        ]
+        .into_iter()
+        .all(|slot| {
+            crate::supervisor::send::lock(slot).is_none() && !Running::of(slot).is_running()
+        })
+    }
+
+    /// Posts a hook of `live` ([`SRig::post_for`]) and requires 200.
     pub(crate) async fn hook(&self, live: &Live, event: &str, extra: &Value) -> Reply {
-        let r = self.post(&self.hook_of(live, event, extra)).await;
+        let r = self.post_for(live, &self.hook_of(live, event, extra)).await;
         assert_eq!(r.status, 200, "{event}: {r:?}");
         r
     }
@@ -225,6 +260,35 @@ impl SRig {
         })
         .await
         .ok()
+    }
+
+    /// Runs `f` with `live`'s send worker parked after a pass's read, outside the live map and
+    /// out of the runtime's way (`block_in_place`): an intake meanwhile never meets the
+    /// worker's map lock (which it would answer with no facts), and a test holding the map
+    /// never has the worker block a runtime thread on it. The worker is released before the
+    /// caller waits on anything it records.
+    pub(crate) fn worker_parked<'a, T: 'a>(
+        &'a self,
+        live: &'a Live,
+        f: impl std::future::Future<Output = T> + 'a,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>> {
+        // Boxed: the setup helpers nest it, and an inline future would grow theirs.
+        Box::pin(async move {
+            let sl = self.sl(live);
+            let (entered_tx, entered) = tokio::sync::oneshot::channel::<()>();
+            let (go, wait) = std::sync::mpsc::channel::<()>();
+            gate::set(&sl.hooks.after_read, move || {
+                let _ = entered_tx.send(());
+                tokio::task::block_in_place(|| {
+                    let _ = wait.recv();
+                });
+            });
+            sl.wake.notify_one();
+            entered.await.unwrap();
+            let out = f.await;
+            go.send(()).unwrap();
+            out
+        })
     }
 
     /// A Claude launch, DECSET 2004 on, bound by its `SessionStart` (its evidence recorded).
@@ -382,5 +446,40 @@ impl SRig {
             String::from_utf8_lossy(&r.body)
         );
         serde_json::from_slice(&r.body).unwrap_or(Value::Null)
+    }
+}
+
+/// The test points of the send sides now running, by slot address: a point taken from its
+/// slot and running (a worker or writer parked in it) leaves the slot empty.
+static RUNNING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// One slot's entry in [`RUNNING`].
+#[derive(Clone, Copy)]
+pub(crate) struct Running(usize);
+
+impl Running {
+    pub(crate) fn of<T>(slot: &std::sync::Mutex<T>) -> Running {
+        Running(std::ptr::from_ref(slot) as usize)
+    }
+
+    fn is_running(self) -> bool {
+        crate::supervisor::send::lock(&RUNNING).contains(&self.0)
+    }
+
+    /// Marks the slot running until the guard drops (also while unwinding).
+    pub(crate) fn enter(self) -> impl Drop {
+        crate::supervisor::send::lock(&RUNNING).push(self.0);
+        Left(self.0)
+    }
+}
+
+struct Left(usize);
+
+impl Drop for Left {
+    fn drop(&mut self) {
+        let mut r = crate::supervisor::send::lock(&RUNNING);
+        if let Some(i) = r.iter().position(|k| *k == self.0) {
+            r.swap_remove(i);
+        }
     }
 }

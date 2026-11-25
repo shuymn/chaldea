@@ -125,21 +125,25 @@ async fn evidence_kinds() {
     assert!(rig.launch(live.l).session_id.is_some(), "bound");
     assert_eq!(count(&rig, &live, "session_start"), 0);
     // A `PostDecision` without facts (the launch unobservable at its intake: the live map
-    // held) records none.
+    // held) records none. The worker is parked meanwhile, so it never blocks a runtime
+    // thread on the held map.
     rig.stop().await;
     let (rig, live) = bound_in(ReadinessMode::PostDecision, Agent::Codex).await;
-    let (locked_tx, locked) = tokio::sync::oneshot::channel();
-    let (release, released) = std::sync::mpsc::channel::<()>();
-    let sup = rig.sup.clone();
-    let holder = tokio::task::spawn_blocking(move || {
-        let _map = sup.live.lock();
-        let _ = locked_tx.send(());
-        let _ = released.recv_timeout(Duration::from_secs(20));
-    });
-    locked.await.unwrap();
-    rig.hook(&live, "PostDecision", &json!({})).await;
-    release.send(()).unwrap();
-    holder.await.unwrap();
+    rig.worker_parked(&live, async {
+        let (locked_tx, locked) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let sup = rig.sup.clone();
+        let holder = tokio::task::spawn_blocking(move || {
+            let _map = sup.live.lock();
+            let _ = locked_tx.send(());
+            let _ = released.recv_timeout(Duration::from_secs(20));
+        });
+        locked.await.unwrap();
+        rig.hook(&live, "PostDecision", &json!({})).await;
+        release.send(()).unwrap();
+        holder.await.unwrap();
+    })
+    .await;
     assert_eq!(count(&rig, &live, "post_decision"), 0);
     rig.hook(&live, "PostDecision", &json!({})).await;
     assert_eq!(count(&rig, &live, "post_decision"), 1);

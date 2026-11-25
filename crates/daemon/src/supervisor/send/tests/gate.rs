@@ -12,12 +12,17 @@ use serde_json::json;
 use super::{Live, PASTE_OFF, PASTE_ON, SRig};
 use crate::supervisor::lock;
 
-/// Sets a test point of the launch's send side.
+/// Sets a test point of the launch's send side, marked running while it runs (see
+/// [`super::Running`]).
 pub(crate) fn set(
     slot: &Mutex<Option<Box<dyn FnOnce() + Send>>>,
     f: impl FnOnce() + Send + 'static,
 ) {
-    *lock(slot) = Some(Box::new(f));
+    let running = super::Running::of(slot);
+    *lock(slot) = Some(Box::new(move || {
+        let _running = running.enter();
+        f();
+    }));
 }
 
 /// Whether the child's input holds `text`'s bytes.
