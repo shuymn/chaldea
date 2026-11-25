@@ -101,13 +101,15 @@ async fn git_env_ignored() {
     rig.srv.stop().await;
 }
 
-/// PR10a1-CL-28: git's output loses only its line end: a path ending in a space, or holding
-/// a newline, is kept whole.
+/// PR10a1-CL-28: git's output loses only its line end: a path ending in a space, holding a
+/// newline, or on Unix ending in a CR, is kept whole.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn git_path_kept_whole() {
     use crate::supervisor::workspace::common_dir;
     use std::time::Duration;
-    for printed in ["/work/a b \n", "/work/a\nb\n"] {
+    let cr: &[&str] = if cfg!(windows) { &[] } else { &["/work/a\r\n"] };
+    for printed in ["/work/a b \n", "/work/a\nb\n"].iter().chain(cr) {
+        let printed = *printed;
         let path = printed.strip_suffix('\n').unwrap().to_owned();
         let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, move |c| {
             c.git = printing_git(printed);
@@ -122,6 +124,68 @@ async fn git_path_kept_whole() {
         assert_eq!(got, Ok(std::path::PathBuf::from(&path)), "{printed:?}");
         rig.srv.stop().await;
     }
+}
+
+/// PR10a1-CL-28: the probe's `git` runs without `GIT_DIR` and
+/// `GIT_DISCOVERY_ACROSS_FILESYSTEM` from the daemon's environment, and with
+/// `GIT_CEILING_DIRECTORIES`: a `git` that prints which of the three it sees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn git_discovery_env() {
+    use crate::supervisor::workspace::common_dir;
+    use std::time::Duration;
+    let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
+        c.git = env_git(&NAMES);
+        let mut env: Vec<_> = std::env::vars_os().collect();
+        env.extend(NAMES.map(|n| (n.into(), "/work".into())));
+        c.git_env = Some(env);
+    })
+    .await;
+    let (sup, cwd) = (rig.sup.clone(), std::env::temp_dir());
+    let got = tokio::task::spawn_blocking(move || {
+        common_dir(&sup, &cwd, sup.now() + Duration::from_secs(10))
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        got,
+        Ok(std::path::PathBuf::from(
+            "/work/probe+GIT_CEILING_DIRECTORIES"
+        ))
+    );
+    rig.srv.stop().await;
+}
+
+const NAMES: [&str; 3] = [
+    "GIT_DIR",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CEILING_DIRECTORIES",
+];
+
+/// A `git` that ignores its arguments and prints `/work/probe`, then `+NAME` for each of
+/// `names` set in its environment, then a line end.
+fn env_git(names: &[&str]) -> Vec<std::ffi::OsString> {
+    let argv: Vec<String> = if cfg!(windows) {
+        let list: Vec<String> = names.iter().map(|n| format!("'{n}'")).collect();
+        vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            format!(
+                "$p = '/work/probe'; foreach ($n in @({})) {{ if (Test-Path \"env:$n\") {{ $p += \"+$n\" }} }}; [Console]::Out.Write($p + [char]10); #",
+                list.join(",")
+            ),
+        ]
+    } else {
+        vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "p=/work/probe; for n in {}; do env | grep -q \"^$n=\" && p=\"$p+$n\"; done; printf '%s\\n' \"$p\"",
+                names.join(" ")
+            ),
+        ]
+    };
+    argv.into_iter().map(std::ffi::OsString::from).collect()
 }
 
 /// A `git` that ignores its arguments and prints `text` exactly (the probe adds no line end).

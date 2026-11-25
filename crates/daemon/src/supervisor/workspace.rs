@@ -88,12 +88,13 @@ impl Drop for GitLease {
     }
 }
 
-/// Git's own variables (`git rev-parse --local-env-vars`): each can point discovery at
-/// another repository or change what git reads there, so the probe's `git` runs without
-/// them and discovers from `cwd` alone. Variables that only restrict discovery
-/// (`GIT_CEILING_DIRECTORIES`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`) stay, since they can only
-/// make the canonical cwd the id.
-const GIT_LOCAL_ENV: [&str; 15] = [
+/// Git's own variables (`git rev-parse --local-env-vars`), each able to point discovery at
+/// another repository or change what git reads there, and `GIT_DISCOVERY_ACROSS_FILESYSTEM`,
+/// which lets discovery cross into a parent repository on another filesystem: the probe's
+/// `git` runs without them and discovers from `cwd` by git's defaults.
+/// `GIT_CEILING_DIRECTORIES` stays, since it can only stop discovery, making the canonical
+/// cwd the id.
+const GIT_LOCAL_ENV: [&str; 16] = [
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CONFIG",
     "GIT_CONFIG_PARAMETERS",
@@ -109,6 +110,7 @@ const GIT_LOCAL_ENV: [&str; 15] = [
     "GIT_PREFIX",
     "GIT_SHALLOW_FILE",
     "GIT_COMMON_DIR",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
 ];
 
 /// `git -C <cwd> rev-parse --path-format=absolute --git-common-dir` without git's own
@@ -166,8 +168,10 @@ pub(crate) fn common_dir(
                 if let Some(s) = stdout.as_mut() {
                     let _ = s.read_to_string(&mut out);
                 }
-                // Only the line end git adds: a path may itself hold spaces or newlines.
+                // Only the line end git adds (LF; CRLF on Windows): a path may itself hold
+                // spaces, newlines, or on Unix a trailing CR.
                 let path = out.strip_suffix('\n').unwrap_or(&out);
+                #[cfg(windows)]
                 let path = path.strip_suffix('\r').unwrap_or(path);
                 if path.is_empty() {
                     return Err("git printed no path");
