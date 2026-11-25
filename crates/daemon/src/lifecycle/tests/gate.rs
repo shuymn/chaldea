@@ -110,15 +110,30 @@ fn reason_precedence() {
     assert_eq!((r.code.code(), r.reason), (1, Some(FailReason::Panic)));
 }
 
-/// Only the first request is first; the cutoff is first request + 10 s.
+/// Only the first request is first; the cutoff is first request + 10 s, whichever stop
+/// request or signal comes first (the helper tests measure their bounds from that cutoff).
 #[test]
 fn first_request_fixes_the_cutoff() {
-    let g = gate();
-    let before = std::time::Instant::now();
-    assert!(g.request(StopCause::StopRequest));
-    let after = std::time::Instant::now();
-    let c = g.stopping().unwrap().cutoff;
-    assert!(c >= before + Duration::from_secs(10) && c <= after + Duration::from_secs(10));
-    assert!(!g.request(StopCause::Signal(SignalName::Int)));
-    assert_eq!(g.stopping().unwrap().cause, StopCause::StopRequest);
+    let firsts = [
+        StopCause::StopRequest,
+        StopCause::Signal(SignalName::Term),
+        StopCause::Signal(SignalName::Int),
+        StopCause::Signal(SignalName::Hup),
+        StopCause::Signal(SignalName::CtrlC),
+        StopCause::Signal(SignalName::CtrlBreak),
+    ];
+    for first in firsts {
+        let g = gate();
+        let before = std::time::Instant::now();
+        assert!(g.request(first.clone()), "{first:?}");
+        let after = std::time::Instant::now();
+        let c = g.stopping().unwrap().cutoff;
+        assert!(
+            c >= before + Duration::from_secs(10) && c <= after + Duration::from_secs(10),
+            "{first:?}"
+        );
+        assert!(!g.request(StopCause::Panic), "{first:?}");
+        assert_eq!(g.stopping().unwrap().cause, first);
+        assert_eq!(g.stopping().unwrap().cutoff, c, "{first:?}");
+    }
 }
