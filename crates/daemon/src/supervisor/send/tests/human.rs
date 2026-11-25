@@ -302,6 +302,23 @@ async fn cards() {
     assert_eq!(got, Some(ApprovalOutcome::Expired));
 }
 
+/// PR10b-CL-16: a key whose launch is current and `running` in the store but whose session
+/// left its slot (`with_session` → `Gone`) answers `no_live_launch` with zero bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn key_gone() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let entry = rig.sup.entry(live.l).unwrap();
+    let taken = entry.ops.lock().await.take();
+    assert!(taken.is_some());
+    let n = live.child.input().len();
+    let r = key(&rig, &live, &["escape"], None).await;
+    assert_eq!(r.1["code"], json!("no_live_launch"), "{r:?}");
+    assert_eq!(live.child.input().len(), n, "no byte");
+    drop(taken);
+    rig.stop().await;
+}
+
 /// PR10b-CL-13: a turn start whose observer finishes after a later card's hook finished
 /// leaves that card's basis: the card is open in the store and its key is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

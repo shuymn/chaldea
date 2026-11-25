@@ -415,3 +415,32 @@ async fn sealed_applied_once() {
         rig.stop().await;
     }
 }
+
+/// PR10b-CL-6: the session gone from its slot between the open job and the submission
+/// (`with_session` → `Gone`): the input is `cancelled` with zero bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn submit_gone() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let entry = rig.sup.entry(live.l).unwrap();
+    let taken = Arc::new(std::sync::Mutex::new(None));
+    let t2 = taken.clone();
+    set(&sl.hooks.before_submit, move || {
+        let mut slot = entry.ops.try_lock().expect("the op lock is free");
+        *t2.lock().unwrap() = slot.take();
+    });
+    let n = live.child.input().len();
+    let id = rig.send(&live, "gone").await;
+    rig.until_input(id, InputState::Cancelled).await;
+    assert!(taken.lock().unwrap().is_some(), "the session was taken");
+    assert_eq!(live.child.input().len(), n, "no byte");
+    assert_eq!(
+        moves(&rig, &live, id),
+        [
+            ("queued".to_owned(), "sending".to_owned()),
+            ("sending".to_owned(), "cancelled".to_owned())
+        ]
+    );
+    rig.stop().await;
+}
