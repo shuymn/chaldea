@@ -2,7 +2,6 @@
 //! completion applied to its input, each human unit's `human_write`, in `record.seq` order.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use chaldea_core::event::TypedEvent;
 use chaldea_core::ids::{IdempotencyKey, InputId, LaunchId, StreamId, ThreadId};
@@ -14,7 +13,7 @@ use super::super::Supervisor;
 use super::super::events::{ThreadJob, thread_row};
 use super::super::record::{JobOf, Recorded, record};
 use super::{Fired, KeyReport, SendLaunch};
-use crate::store::{JobError, WriteTx};
+use crate::store::{CommitStamp, JobError, WriteTx};
 
 /// `derived:human_write:<launch_id>:<seq>`: a retried job finds its event.
 pub(crate) fn human_key(l: LaunchId, seq: u64) -> IdempotencyKey {
@@ -57,14 +56,14 @@ pub(crate) fn move_input(
 
 /// The completion job of an input unit's record: `Written` → `sent`, `NotStarted` →
 /// `cancelled`, `Incomplete` → `unconfirmed`, only for an input still `sending` of a launch
-/// with no exit; with the clock at the end of the job (the commit instant the ack window
-/// starts from).
+/// with no exit; with the clock right after the job's SQLite `COMMIT` (the instant the ack
+/// window starts from).
 fn completion_job(
     sup: &Supervisor,
     sl: &SendLaunch,
     rec: &WriteRecord,
     input: InputId,
-) -> JobOf<(bool, Instant)> {
+) -> JobOf<(bool, CommitStamp)> {
     let (thread, launch) = (sl.thread_id, sl.launch_id);
     let by = match &rec.outcome {
         WriteOutcome::Written => InputInput::WriteCompleted,
@@ -77,7 +76,8 @@ fn completion_job(
     let clock = sup.cfg.clock.clone();
     Arc::new(move |tx| {
         let moved = move_input(tx, thread, launch, input, InputState::Sending, &by, &cause)?;
-        Ok((moved, clock.now()))
+        let clock = clock.clone();
+        Ok((moved, tx.commit_stamp(move || clock.now())))
     })
 }
 
@@ -176,7 +176,8 @@ pub(crate) async fn apply_records(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>) {
                     sl.set_running(&mut st, None);
                 }
                 if moved && f.record.outcome == WriteOutcome::Written {
-                    st.sent_at.insert(id, at);
+                    // A committed job's stamp is filled before its reply.
+                    st.sent_at.insert(id, at.get().unwrap_or_else(|| sup.now()));
                 }
             }
             Recorded::Refused(e) => {

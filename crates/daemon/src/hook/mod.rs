@@ -368,7 +368,11 @@ impl crate::http::OnReply<route::Ran> for IntakeGuard {
     fn replied(self: Box<Self>, r: &Result<route::Ran, crate::http::WriteFailure>) {
         use crate::store::WriteError;
         match r {
-            Ok(ran) => (*self).replied(Some((&ran.marks, ran.at)), false),
+            // A committed job's stamp is filled before its reply.
+            Ok(ran) => match ran.at.get() {
+                Some(at) => (*self).replied(Some((&ran.marks, at)), false),
+                None => (*self).replied(None, false),
+            },
             Err(crate::http::WriteFailure::Write(
                 WriteError::CommitUnknown(_) | WriteError::WriterGone,
             )) => (*self).replied(None, true),

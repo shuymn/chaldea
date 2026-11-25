@@ -185,6 +185,42 @@ async fn ack_window_from_commit() {
     rig.stop().await;
 }
 
+/// PR10b-CL-8: the ack window runs from the instant right after the completion job's SQLite
+/// `COMMIT`, not from the end of its closure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ack_window_from_sqlite_commit() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    rig.clock.stop();
+    let sl = rig.sl(&live);
+    let ran = Arc::new(Mutex::new(None));
+    let (r2, clock, srv) = (
+        ran.clone(),
+        rig.clock.clone(),
+        rig.srv.store.store().clone(),
+    );
+    // Armed just before the completion job is submitted.
+    set(&sl.hooks.record_job, move || {
+        *srv.faults().before_commit.lock().unwrap() = Some(Box::new(move || {
+            *r2.lock().unwrap() = Some(crate::http::MonotonicClock::now(&*clock));
+            clock.advance(Duration::from_secs(1));
+        }));
+    });
+    let id = rig.send(&live, "late").await;
+    rig.until_input(id, InputState::Sent).await;
+    rig.until("the window started", || {
+        sl.state().sent_at.contains_key(&id)
+    })
+    .await;
+    let t0 = ran.lock().unwrap().unwrap() + Duration::from_secs(1);
+    assert_eq!(sl.state().sent_at[&id], t0);
+    tick_at(&rig, &live, t0 + ACK_WINDOW - Duration::from_millis(1)).await;
+    assert_eq!(rig.input(id).state, InputState::Sent);
+    tick_at(&rig, &live, t0 + ACK_WINDOW).await;
+    rig.until_input(id, InputState::Unconfirmed).await;
+    rig.stop().await;
+}
+
 /// PR10b-CL-8: the positional input's window job reads the startup causes again: a
 /// `session_start_timeout` committed after the pass chose the input and before its job
 /// leaves the input `sent`.

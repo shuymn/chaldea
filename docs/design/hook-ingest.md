@@ -203,7 +203,7 @@ pub trait IntakeProbe: Send + Sync + 'static {
     /// writer's positions, the dispatched input), or None. Non-blocking: it runs under the intake mutex.
     fn facts(&self, launch: LaunchId, ordinal: u64) -> Option<IntakeFacts>;
     /// The intake ended: its job committed with `marks` (receipt ordinal, `TurnMark`) at
-    /// `committed_at` (the clock read at the end of the committing job), or decided nothing (no
+    /// `committed_at` (the clock read right after the job's SQLite `COMMIT`, event-store §2.2 step 6), or decided nothing (no
     /// marks, no instant). Called once per intake by its `IntakeGuard`, never for an outcome
     /// that stays unknown.
     fn finished(&self, launch: LaunchId, ordinal: u64, marks: &[(u64, TurnMark)], committed_at: Option<Instant>) {}

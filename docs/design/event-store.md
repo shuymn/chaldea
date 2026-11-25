@@ -152,6 +152,8 @@ impl Store {
 pub struct WriteTicket<R>(tokio::sync::oneshot::Receiver<Result<R, WriteError>>);
 impl<R> Future for WriteTicket<R> { type Output = Result<R, WriteError>; }   // async callers
 impl<R> WriteTicket<R> { pub fn blocking_wait(self) -> Result<R, WriteError>; } // tests, sync callers
+impl WriteTx<'_> { pub fn commit_stamp(&mut self, now: impl FnOnce() -> Instant + Send + 'static) -> CommitStamp; }
+impl CommitStamp { pub fn get(&self) -> Option<Instant>; }  // `now()` read right after this job's COMMIT; empty otherwise
 
 pub enum SubmitError { QueueFull, Closed, Failed }
 /// What happened to a job. Each variant says whether the job's effects are in the database.
@@ -177,7 +179,7 @@ pub struct Committed { pub heads: Vec<StreamHeadEntry> }   // streams this job a
 3. reads the clock again; if `now > not_after`, `ROLLBACK` and replies `Expired`. This second check is the boundary between "no effect" and "may commit" (mvp §2.5 "Deadlines"): a job runs its closure only if its deadline had not passed once it held the lock. `recorded_at` is stamped from this clock read;
 4. reads `meta.projection_version` (one primary-key read); if it differs from the code's, `ROLLBACK`, replies `Failed(ProjectionVersion)`, and enters the failed state: another process rebuilt the projections with another `apply`, and this one must not write with its own (§2.4);
 5. runs the closure under `catch_unwind` with a fresh `WriteTx`;
-6. if the closure returned `Ok` and the `WriteTx` is not poisoned, checks `!is_autocommit()` (S14) and runs `COMMIT`; the outcomes are in the table below;
+6. if the closure returned `Ok` and the `WriteTx` is not poisoned, checks `!is_autocommit()` (S14) and runs `COMMIT`; the outcomes are in the table below. After a successful `COMMIT` and before the reply it fills each `CommitStamp` the closure took with `WriteTx::commit_stamp(now)`, calling that `now` (the caller's clock), so a caller's timer can start at the commit itself; a job that does not commit leaves its stamps empty;
 7. otherwise (closure `Err`, panic, or a poisoned `WriteTx` whatever the closure returned), rolls back: if `is_autocommit()` already holds (S4: `RAISE(ROLLBACK)`, some `SQLITE_FULL`), there is nothing to roll back; else `ROLLBACK`. The reply is the poisoning error when there is one (`RolledBack`), else `Rejected` or `Panicked`.
 
 | Point | Outcome | Reply | Writer afterwards |

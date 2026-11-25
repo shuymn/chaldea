@@ -104,6 +104,10 @@ pub(crate) struct Faults {
     pub(crate) after_create: Option<Box<dyn Fn() + Send + Sync>>,
     /// The projection version this store uses instead of the code's.
     pub(crate) projection_version: Option<u32>,
+    /// Runs once on the writer between the next job's closure and its `COMMIT` (unit tests
+    /// only).
+    #[cfg(test)]
+    pub(crate) before_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Ordered marks of shutdown's call boundaries (unit tests only).
     #[cfg(test)]
     pub(crate) marks: Mutex<Vec<&'static str>>,
@@ -385,6 +389,7 @@ impl WriterCtx {
         let ran = job.run(&mut tx);
         let poison = tx.take_poison();
         let heads = tx.take_heads();
+        let after_commit = tx.take_after_commit();
         drop(tx);
         count(&self.shared, &mut self.jobs_run);
         // 7. Roll back after an error, a panic, or a poisoned WriteTx.
@@ -413,6 +418,13 @@ impl WriterCtx {
             })));
             return Next::Continue;
         }
+        #[cfg(test)]
+        {
+            let point = lock(&self.faults.before_commit).take();
+            if let Some(f) = point {
+                f();
+            }
+        }
         let fault = lock(&self.faults.commit).take();
         let committed = match fault {
             Some(CommitFault::BusyBeforeCommit) => Err(StoreError::Busy),
@@ -427,6 +439,9 @@ impl WriterCtx {
         };
         match committed {
             Ok(()) => {
+                for f in after_commit {
+                    f();
+                }
                 job.reply(Ok(()));
                 if !heads.is_empty() {
                     let _ = self.notifier.send(Committed { heads });

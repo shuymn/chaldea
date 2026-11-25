@@ -208,8 +208,8 @@ fn unparseable(truncated: bool) -> Decision {
 pub(crate) struct Ran {
     pub(crate) reply: HookReply,
     pub(crate) marks: Vec<(u64, TurnMark)>,
-    /// The clock at the end of the job, just before its commit.
-    pub(crate) at: std::time::Instant,
+    /// The clock right after the job's SQLite `COMMIT`.
+    pub(crate) at: crate::store::CommitStamp,
 }
 
 /// The job: §2.7 steps 1–7.
@@ -220,10 +220,11 @@ pub(crate) fn run(
 ) -> Result<Ran, JobError> {
     let mut marks = Vec::new();
     let reply = run_marking(d, tx, auth, &mut marks)?;
+    let clock = d.clock.clone();
     Ok(Ran {
         reply,
         marks,
-        at: d.clock.now(),
+        at: tx.commit_stamp(move || clock.now()),
     })
 }
 
