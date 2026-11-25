@@ -415,7 +415,8 @@ async fn card_after_late_start() {
 }
 
 /// PR10b-CL-13: the card key's rule end to end, with cards opened through the hook route.
-/// Each case stops the clock, so no request's deadline passes while another is parked.
+/// Each case stops the clock before its setup, so no request's deadline passes on a slow host
+/// or while another request is parked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(
     clippy::too_many_lines,
@@ -424,8 +425,8 @@ async fn card_after_late_start() {
 async fn card_key_order() {
     // Written; a second card key to the same card (another `command_id`) is refused.
     let rig = SRig::new().await;
-    let live = rig.claude().await;
     rig.clock.stop();
+    let live = rig.claude().await;
     let c = card(&rig, &live, "t1").await;
     let r = key(&rig, &live, &["down", "down", "enter"], Some(c)).await;
     assert_eq!(
@@ -456,8 +457,8 @@ async fn card_key_order() {
     // A `Stop` taken in while the card key is parked at its recheck, and at its boundary.
     for point in [ProbePoint::RecheckEntered, ProbePoint::Dispatching] {
         let rig = SRig::new().await;
-        let live = rig.claude().await;
         rig.clock.stop();
+        let live = rig.claude().await;
         let c = card(&rig, &live, "t1").await;
         let probe = rig.probe(&live).await;
         let park = probe.park(point);
@@ -497,8 +498,8 @@ async fn card_key_order() {
 
     // A hook's intake unfinished at the effect's start.
     let rig = SRig::new().await;
-    let live = rig.claude().await;
     rig.clock.stop();
+    let live = rig.claude().await;
     let c = card(&rig, &live, "t1").await;
     let (got, release) = rig.ingest.points.arm_intake(rig.next_ordinal(&live));
     let h = rig.hook_of(&live, "Notification", &json!({}));
@@ -513,8 +514,8 @@ async fn card_key_order() {
     // shows a human unit unrecorded, so its card key is refused, also after the raw key
     // completes, until a new card arrives.
     let rig = SRig::new().await;
-    let live = rig.claude().await;
     rig.clock.stop();
+    let live = rig.claude().await;
     let hold = live.child.hold_writes();
     let raw = {
         let args = json!({ "thread_id": live.t, "launch_id": live.l, "keys": ["escape"] });
@@ -542,8 +543,8 @@ async fn card_key_order() {
 
     // A card opened by a retried delivery (`intake_reliable: false`).
     let rig = SRig::new().await;
-    let live = rig.claude().await;
     rig.clock.stop();
+    let live = rig.claude().await;
     let h = rig
         .hook_of(
             &live,
