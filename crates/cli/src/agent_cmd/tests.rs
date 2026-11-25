@@ -582,4 +582,6 @@ fn durations() {
     assert!(super::duration("0s").is_err());
     assert!(super::duration("5d").is_err());
     assert!(super::duration("m").is_err());
+    assert!(super::duration("18446744073709551615s").is_err());
+    assert!(super::duration("18446744073709551615h").is_err());
 }

@@ -522,7 +522,8 @@ impl Client<'_> {
     }
 }
 
-/// Parses `--timeout`: a whole number with `ms`, `s`, `m`, or `h` (seconds when bare).
+/// Parses `--timeout`: a whole number with `ms`, `s`, `m`, or `h` (seconds when bare), no
+/// longer than an `Instant` can reach from now.
 ///
 /// # Errors
 ///
@@ -542,6 +543,10 @@ pub(crate) fn duration(s: &str) -> Result<Duration, String> {
     };
     if d.is_zero() {
         return Err("the timeout must be above zero".to_owned());
+    }
+    // The wait's cutoff is an `Instant` this far ahead, which must exist.
+    if Instant::now().checked_add(d).is_none() {
+        return Err(format!("`{s}` is too long a timeout"));
     }
     Ok(d)
 }
