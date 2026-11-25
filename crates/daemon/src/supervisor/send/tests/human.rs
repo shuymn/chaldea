@@ -243,6 +243,33 @@ async fn same_turn_evidence() {
     }
 }
 
+/// PR10b-CL-13: a card's basis is dropped when the card closes, by its resolution or by a turn
+/// boundary, so the launch's card memory does not grow with the cards it has seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn card_basis_dropped_at_close() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    for k in 0..10 {
+        rig.hook(
+            &live,
+            "UserPromptSubmit",
+            &json!({ "prompt": format!("t{k}") }),
+        )
+        .await;
+        let (r, s) = (format!("r{k}"), format!("s{k}"));
+        card(&rig, &live, &r).await;
+        card(&rig, &live, &s).await;
+        assert_eq!(sl.state().cards.len(), 2);
+        rig.hook(&live, "PostToolUse", &json!({ "tool_use_id": r }))
+            .await;
+        assert_eq!(sl.state().cards.len(), 1, "the resolved card's basis");
+        rig.hook(&live, "Stop", &json!({})).await;
+        assert_eq!(sl.state().cards.len(), 0, "the superseded card's basis");
+    }
+    rig.stop().await;
+}
+
 /// PR10b-CL-13: `ApprovalsAllResolved` only when the last open card resolves; one `Stop`
 /// supersedes every open card; cards expire at exit and at restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

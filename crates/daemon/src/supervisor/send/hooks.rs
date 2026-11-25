@@ -382,6 +382,9 @@ impl HookAdapter for SupervisorHooks {
                         .as_ref()
                         .is_some_and(|k| k.tool_use_id == tool_use_id)
                 });
+                let mark = hit.map_or(TurnMark::Other, |c| TurnMark::Resolved {
+                    approval_id: c.approval_id,
+                });
                 if let Some(c) = hit {
                     ev.push(
                         format!("card:{}", c.approval_id),
@@ -394,7 +397,7 @@ impl HookAdapter for SupervisorHooks {
                         ev.apply("resolved", &StateInput::ApprovalsAllResolved);
                     }
                 }
-                TurnMark::Other
+                mark
             }
             HookFact::PostDecision => {
                 if let Some(p) = self.evidence(l, ReadinessEvidence::PostDecision, hook, facts) {

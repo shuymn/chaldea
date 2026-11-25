@@ -292,7 +292,7 @@ pub trait HookAdapter: Send + Sync + 'static {
     fn interpret(&self, tx: &ReadTx<'_>, hook: &AcceptedHook<'_>) -> Result<(Interpretation, TurnMark), StoreError>;
 }
 pub enum Interpretation { Events(Vec<HookEvent>), Raw(RawUnknownReason) }       // Events non-empty
-pub enum TurnMark { Start, End { settle: bool }, Card { approval_id: ApprovalId, human_at: Option<u64> }, Other }
+pub enum TurnMark { Start, End { settle: bool }, Card { approval_id: ApprovalId, human_at: Option<u64> }, Resolved { approval_id: ApprovalId }, Other }
 pub struct HookEvent { pub event: TypedEvent, pub name: Cow<'static, str>, pub annex: Option<EventAnnex>, pub blobs: Vec<BlobInput> }
 pub struct AcceptedHook<'a> {
     pub thread: ThreadId, pub launch: &'a LaunchRow, pub emit_id: Uuid, pub receipt_ordinal: u64,

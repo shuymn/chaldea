@@ -148,6 +148,14 @@ pub(crate) struct Fired {
     pub report: Option<oneshot::Sender<KeyReport>>,
 }
 
+/// A card's basis (send §2.6): its hook's receipt ordinal and the human writer position at
+/// its observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CardBasis {
+    pub ordinal: u64,
+    pub human_at: Option<u64>,
+}
+
 /// The turn log (send §2.4 "Settle completion"): each interpreted hook's mark by receipt
 /// ordinal, with its commit instant.
 #[derive(Debug, Default, Clone)]
@@ -213,9 +221,11 @@ pub(crate) struct SendState {
     pub dispatch: Option<Dispatch>,
     pub running: Option<RunningUnit>,
     pub human_unsettled: u32,
-    /// Each card's human writer position at its observation; `None` when unreliable. Kept
-    /// until a key finds its card closed in the store, or the launch's side is dropped.
-    pub cards: HashMap<ApprovalId, Option<u64>>,
+    /// Each open card's receipt ordinal and human writer position at its observation
+    /// (`None` when unreliable). Dropped at the card's resolution, at a turn boundary with a
+    /// higher ordinal, when a key finds the card closed in the store, or with the launch's
+    /// side.
+    pub cards: HashMap<ApprovalId, CardBasis>,
     pub log: TurnLog,
     /// The worker's first read of each input as `queued`.
     pub queued_at: HashMap<InputId, Instant>,

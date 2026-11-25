@@ -65,6 +65,8 @@ pub enum TurnMark {
         approval_id: ApprovalId,
         human_at: Option<u64>,
     },
+    /// A card resolved by this hook's evidence.
+    Resolved { approval_id: ApprovalId },
     /// Any other hook.
     Other,
 }
