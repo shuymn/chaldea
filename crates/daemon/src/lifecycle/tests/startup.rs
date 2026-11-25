@@ -663,7 +663,10 @@ fn stop_before_the_lock() {
 }
 
 /// Saved port A, `--port B`, a stop between the port rename and step 14: exit 0, the verdict
-/// `fail stopped port_saved=B` with the notice, and the next start serves on B.
+/// `fail stopped port_saved=B` with the notice, and the next start serves on B. The stopped
+/// run has a test-set budget of 20 s, so its join has 14 s: the `serving` record write after
+/// the release does not race the default 4 s, which `helpers::unjoined_startup_is_a_bare_exit`
+/// covers.
 #[test]
 fn stop_after_port_rename() {
     let dir = state();
@@ -679,11 +682,9 @@ fn stop_after_port_rename() {
     let ready = RecordingReady::new(&dir.path);
     let faults = Arc::new(Faults::default());
     let park = faults.park(Point::AfterPortRename);
-    let run = start(
-        detached(&dir.path, Some(b), &ready),
-        TestComponents::default(),
-        faults,
-    );
+    let mut cfg = detached(&dir.path, Some(b), &ready);
+    cfg.budgets.total = Duration::from_secs(20);
+    let run = start(cfg, TestComponents::default(), faults);
     assert!(park.wait_reached(WAIT));
     run.stop();
     park.release();
