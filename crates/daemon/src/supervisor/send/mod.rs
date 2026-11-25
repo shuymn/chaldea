@@ -429,9 +429,6 @@ pub(crate) struct SendSide {
     /// The readiness mode of every row, when a test sets one.
     pub mode: Option<ReadinessMode>,
     pub ticks: tokio::sync::watch::Sender<Option<Instant>>,
-    /// The exit job's next attempt rolls back after it recorded `exit_set` (a test point).
-    #[cfg(test)]
-    pub exit_rollback_once: AtomicBool,
 }
 
 impl SendSide {
@@ -464,8 +461,6 @@ pub(crate) fn install(cfg: &mut SupervisorConfig) -> Arc<SendSide> {
         decoder: cfg.decoder.clone(),
         mode: cfg.readiness_mode,
         ticks: tokio::sync::watch::channel(None).0,
-        #[cfg(test)]
-        exit_rollback_once: AtomicBool::new(false),
     });
     cfg.exit_steps
         .push(Arc::new(exit::SendExitStep(side.clone())));

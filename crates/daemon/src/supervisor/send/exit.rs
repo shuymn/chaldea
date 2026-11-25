@@ -2,8 +2,6 @@
 //! human records recorded, and the launch's open cards expired, in the exit job.
 
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::atomic::Ordering;
 
 use chaldea_core::event::TypedEvent;
 use chaldea_core::ids::IdempotencyKey;
@@ -66,11 +64,6 @@ impl ExitStep for SendExitStep {
         }
         for rec in self.exit_set(exit) {
             human_write_in(tx, thread, launch, &rec).map_err(store_err)?;
-        }
-        #[cfg(test)]
-        if self.0.exit_rollback_once.swap(false, Ordering::SeqCst) {
-            tx.poison_for_test(StoreError::Busy);
-            return Err(StoreError::Busy);
         }
         // The launch's open cards expire.
         let cards: Vec<_> = tx

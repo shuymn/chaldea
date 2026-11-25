@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use super::gate::set;
 use super::{Live, SRig};
+use crate::store::test_faults::CommitFault;
 use crate::supervisor::send::SETTLE;
 
 /// `key` as the owner: the status and the body.
@@ -176,10 +177,12 @@ async fn human_writes_at_exit() {
         human_unit(&rig, &live, WriteOrigin::Key, Guard::until(Instant::now())).await;
         rig.until("both fired", || sl.outstanding.load(Ordering::SeqCst) == 0)
             .await;
-        rig.sup
-            .send
-            .exit_rollback_once
-            .store(rollback, Ordering::SeqCst);
+        // The exit job is the next commit: its first attempt copies `exit_set`, then its
+        // `COMMIT` is refused `Busy` and it is retried.
+        let faults = rig.srv.store.store().faults();
+        if rollback {
+            *faults.commit.lock().unwrap() = Some(CommitFault::BusyBeforeCommit);
+        }
         live.child.exit(chaldea_pty_runtime::ChildExit {
             code: Some(0),
             signal: None,
@@ -188,7 +191,10 @@ async fn human_writes_at_exit() {
             rig.launch(live.l).exit_reason.is_some()
         })
         .await;
-        assert!(!rig.sup.send.exit_rollback_once.load(Ordering::SeqCst));
+        assert!(
+            faults.commit.lock().unwrap().is_none(),
+            "the fault was taken"
+        );
         assert_eq!(human_writes(&rig, &live), ["key"], "by the exit job");
         go.send(()).unwrap();
         rig.until("the worker ended", || rig.sup.send.launch(live.l).is_none())
