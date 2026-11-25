@@ -596,13 +596,10 @@ async fn spawn_failed(
 }
 
 /// Records an exit job (with the nudge) and runs the steps' `after_commit`.
-async fn record_exit(
-    sup: &Arc<Supervisor>,
-    plan: ExitPlan,
-) -> Result<Option<ExitFacts>, EffectOutcome> {
+async fn record_exit(sup: &Arc<Supervisor>, plan: ExitPlan) -> Result<(), EffectOutcome> {
     let facts = commit_exit(sup, plan).await?;
     after_commit(sup, facts.as_ref());
-    Ok(facts)
+    Ok(())
 }
 
 /// [`record_exit`]'s job, without the steps' `after_commit`.
@@ -698,16 +695,13 @@ fn kill_task(
     let kill_end = start + sup.cfg.kill_budget;
     tracing::info!(%launch, ?kill_end, "kill task started");
     sup.pauses().blocking(Pause::KillTaskStart);
-    let mut tx = Some(tx);
     loop {
         let now = sup.now();
         let lock_by = (now + KILL_LOCK_WAIT).min(kill_end);
         let r = tracked.kill_by(extra, sup.real(lock_by), sup.real(kill_end));
         tracing::info!(%launch, ?lock_by, attempt = ?r.attempt, method = %r.method, proved_at = ?r.proved_at, "kill call");
         if proving(&r) {
-            if let Some(t) = tx.take() {
-                let _ = t.send(r);
-            }
+            let _ = tx.send(r);
             break;
         }
         if !r.tree_dead && !r.survivors.is_empty() {
@@ -982,11 +976,7 @@ pub(crate) async fn exit_op(
     let Some(tracked) = guard.take() else {
         return;
     };
-    let mut unwound = UnrecordedOnUnwind {
-        sup: &sup,
-        launch,
-        armed: true,
-    };
+    let unwound = UnrecordedOnUnwind { sup: &sup, launch };
     sup.pauses().at(Pause::ExitTookSession).await;
     let k = submit_kill(&sup, &entry, tracked);
     let proof = await_kill(&sup, k).await;
@@ -999,7 +989,7 @@ pub(crate) async fn exit_op(
     let r = commit_exit(&sup, plan).await;
     // The exit job answered: an unwind from here on (an exit step's `after_commit`) leaves
     // nothing unrecorded, and an unrecorded answer is reported below.
-    unwound.armed = false;
+    drop(unwound);
     if let Ok(f) = &r {
         after_commit(&sup, f.as_ref());
     }
@@ -1011,19 +1001,18 @@ pub(crate) async fn exit_op(
     }
 }
 
-/// Reports `LaunchUnrecorded` for `launch` when dropped armed during an unwind while
-/// admission is open: an exit op that panics after it took the session and before its exit
-/// job answered records no exit for it. Once shutdown started, the op ends unreported, as
-/// every op shutdown ends does (PR10a1-CL-22).
+/// Reports `LaunchUnrecorded` for `launch` when dropped during an unwind while admission is
+/// open: an exit op that panics after it took the session and before its exit job answered
+/// (when the op drops it) records no exit for it. Once shutdown started, the op ends
+/// unreported, as every op shutdown ends does (PR10a1-CL-22).
 struct UnrecordedOnUnwind<'a> {
     sup: &'a Supervisor,
     launch: LaunchId,
-    armed: bool,
 }
 
 impl Drop for UnrecordedOnUnwind<'_> {
     fn drop(&mut self) {
-        if self.armed && std::thread::panicking() {
+        if std::thread::panicking() {
             let fatal = StoreFatal::LaunchUnrecorded {
                 launch_id: self.launch,
             };
@@ -1104,13 +1093,11 @@ pub(crate) async fn close_and_record(
         None,
         || {},
     );
-    if let Some(Ok(Some(f))) = settle_before(|| sup.now(), end, sup.timer(end), write)
+    if let Some(Ok(f)) = settle_before(|| sup.now(), end, sup.timer(end), write)
         .await
         .in_time()
     {
-        for s in &sup.cfg.exit_steps {
-            s.after_commit(&f);
-        }
+        after_commit(sup, f.as_ref());
     }
 }
 
