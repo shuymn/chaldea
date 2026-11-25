@@ -494,7 +494,12 @@ impl Client<'_> {
         out: &mut dyn Write,
         err: &mut dyn Write,
     ) -> ExitCode {
-        let cutoff = self.cutoff(timeout);
+        // Checked again here, where the cutoff is built: the parse checked an earlier now.
+        let Some(at) = (self.now)().checked_add(timeout) else {
+            say(err, "the timeout is too long");
+            return ExitCode::Usage;
+        };
+        let cutoff = Cell::new(at);
         let cond = |s: &ThreadSummary| {
             let exited = s.process_state == ProcessState::Exited;
             let holds = match until {

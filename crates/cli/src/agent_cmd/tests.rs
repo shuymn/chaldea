@@ -573,6 +573,43 @@ fn prompt_checked_first() {
     }
 }
 
+/// A timeout the parse accepted that no `Instant` reaches from the wait's own now: a usage
+/// error, the daemon never asked.
+#[test]
+fn wait_timeout_past_the_last_instant() {
+    let base = Instant::now();
+    // The longest whole-second timeout an `Instant` reaches from `base`.
+    let (mut lo, mut hi) = (0u64, u64::MAX);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if base.checked_add(Duration::from_secs(mid)).is_some() {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let timeout = Duration::from_secs(lo);
+    let later = base + Duration::from_secs(60);
+    let now = move || later;
+    let asked = AtomicUsize::new(0);
+    let discover = || {
+        asked.fetch_add(1, Ordering::SeqCst);
+        Err("not asked".to_owned())
+    };
+    let c = Client {
+        discover: &discover,
+        token: "chdo_test".to_owned(),
+        now: &now,
+        period: Duration::from_millis(1),
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = c.wait(T, Until::Exited, timeout, &mut out, &mut err);
+    let err = String::from_utf8(err).unwrap();
+    assert_eq!(code, ExitCode::Usage, "{err}");
+    assert!(err.contains("too long"), "{err}");
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+}
+
 #[test]
 fn durations() {
     assert_eq!(super::duration("10m"), Ok(Duration::from_secs(600)));
