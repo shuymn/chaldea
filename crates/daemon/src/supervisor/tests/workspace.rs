@@ -101,6 +101,53 @@ async fn git_env_ignored() {
     rig.srv.stop().await;
 }
 
+/// PR10a1-CL-28: git's output loses only its line end: a path ending in a space, or holding
+/// a newline, is kept whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn git_path_kept_whole() {
+    use crate::supervisor::workspace::common_dir;
+    use std::time::Duration;
+    for printed in ["/work/a b \n", "/work/a\nb\n"] {
+        let path = printed.strip_suffix('\n').unwrap().to_owned();
+        let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, move |c| {
+            c.git = printing_git(printed);
+        })
+        .await;
+        let (sup, cwd) = (rig.sup.clone(), std::env::temp_dir());
+        let got = tokio::task::spawn_blocking(move || {
+            common_dir(&sup, &cwd, sup.now() + Duration::from_secs(10))
+        })
+        .await
+        .unwrap();
+        assert_eq!(got, Ok(std::path::PathBuf::from(&path)), "{printed:?}");
+        rig.srv.stop().await;
+    }
+}
+
+/// A `git` that ignores its arguments and prints `text` exactly (the probe adds no line end).
+fn printing_git(text: &str) -> Vec<std::ffi::OsString> {
+    let argv: Vec<String> = if cfg!(windows) {
+        let chars: Vec<String> = text
+            .chars()
+            .map(|c| format!("[char]{}", c as u32))
+            .collect();
+        vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            format!("[Console]::Out.Write(-join @({})); #", chars.join(",")),
+        ]
+    } else {
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "printf '%s' \"$0\"".into(),
+            text.to_owned(),
+        ]
+    };
+    argv.into_iter().map(std::ffi::OsString::from).collect()
+}
+
 /// A `git` that ignores its arguments and sleeps far beyond every bound of these tests.
 pub(super) fn sleeping_git() -> Vec<std::ffi::OsString> {
     let argv: &[&str] = if cfg!(windows) {

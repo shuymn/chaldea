@@ -171,11 +171,13 @@ pub(crate) fn common_dir(
                 if let Some(s) = stdout.as_mut() {
                     let _ = s.read_to_string(&mut out);
                 }
-                let line = out.lines().next().unwrap_or("").trim();
-                if line.is_empty() {
+                // Only the line end git adds: a path may itself hold spaces or newlines.
+                let path = out.strip_suffix('\n').unwrap_or(&out);
+                let path = path.strip_suffix('\r').unwrap_or(path);
+                if path.is_empty() {
                     return Err("git printed no path");
                 }
-                return Ok(PathBuf::from(line));
+                return Ok(PathBuf::from(path));
             }
             Some(None) => std::thread::sleep(POLL),
             None => {
