@@ -416,13 +416,10 @@
       ]
     },
     "FailedStart": {
-      "description": "The identity a `StartedThenFailed` spawn returned. A part the backend returned empty is\nabsent, so such a record never identifies a process by its pid alone.",
+      "description": "The identity a `StartedThenFailed` spawn returned. A part the backend returned empty is\nabsent (never `null`), so such a record never identifies a process by its pid alone.",
       "properties": {
         "pgid_or_job": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "pid": {
           "format": "uint32",
@@ -431,10 +428,7 @@
           "type": "integer"
         },
         "start_time": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         }
       },
       "required": [
@@ -821,15 +815,8 @@
           "type": "boolean"
         },
         "failed_start": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/FailedStart"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The identity a failed start returned when its cleanup is unresolved (a launch with no\n`launch_started`). Absent otherwise: the one exception to this module's rule that an\n`Option` is present as `null`, so every earlier payload keeps its spelling."
+          "$ref": "#/$defs/FailedStart",
+          "description": "The identity a failed start returned when its cleanup is unresolved (a launch with no\n`launch_started`). Absent otherwise, never `null`: the one exception to this module's\nrule that an `Option` is present as `null`, so every earlier payload keeps its\nspelling."
         },
         "launch_id": {
           "$ref": "#/$defs/LaunchId"

@@ -150,7 +150,19 @@ fn payload_verdicts_agree() {
             "launch_exited with failed_start null",
             "launch_exited",
             with_failed_start(json!(null)),
-            true,
+            false,
+        ),
+        (
+            "failed_start as an array",
+            "launch_exited",
+            with_failed_start(json!([42, "1", "42"])),
+            false,
+        ),
+        (
+            "failed_start with a null part",
+            "launch_exited",
+            with_failed_start(json!({ "pid": 42, "start_time": null })),
+            false,
         ),
         (
             "failed_start without its pid",

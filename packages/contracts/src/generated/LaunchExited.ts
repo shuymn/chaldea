@@ -10,7 +10,8 @@ export type LaunchExited = { launch_id: LaunchId, code: number | null, signal: n
 death_confirmed: boolean, 
 /**
  * The identity a failed start returned when its cleanup is unresolved (a launch with no
- * `launch_started`). Absent otherwise: the one exception to this module's rule that an
- * `Option` is present as `null`, so every earlier payload keeps its spelling.
+ * `launch_started`). Absent otherwise, never `null`: the one exception to this module's
+ * rule that an `Option` is present as `null`, so every earlier payload keeps its
+ * spelling.
  */
 failed_start?: FailedStart, };

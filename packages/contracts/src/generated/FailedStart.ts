@@ -2,6 +2,6 @@
 
 /**
  * The identity a `StartedThenFailed` spawn returned. A part the backend returned empty is
- * absent, so such a record never identifies a process by its pid alone.
+ * absent (never `null`), so such a record never identifies a process by its pid alone.
  */
 export type FailedStart = { pid: number, start_time?: string, pgid_or_job?: string, };
