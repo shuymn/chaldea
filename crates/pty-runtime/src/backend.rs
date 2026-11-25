@@ -131,11 +131,21 @@ pub trait PtyChild: Send + Sync {
     /// Kills the whole tree plus the recorded descendants in `extra`; idempotent; returns
     /// by `deadline`.
     ///
+    /// A kill-state lock another call holds is waited for only until `lock_by` (capped at
+    /// `deadline`): a lock held at the first try and obtained only at or after `lock_by`
+    /// counts as not taken, and the call returns a busy report with no signal. A call made at
+    /// or after `deadline` makes no OS call.
+    ///
     /// The caller passes its full list of recorded descendants on every call: the first
     /// stop, a retry after a busy report or `tree_dead: false`, and a close after an earlier
     /// kill. A report's survivors are diagnostic (one entry per pid, possibly naming the
     /// leader instead of an extra) and are never the list to resubmit.
-    fn kill_tree(&self, extra: &[ProcessIdentity], deadline: Instant) -> KillReport;
+    fn kill_tree(
+        &self,
+        extra: &[ProcessIdentity],
+        lock_by: Instant,
+        deadline: Instant,
+    ) -> KillReport;
 }
 
 pub trait PtyControl: Send {
@@ -166,6 +176,36 @@ pub struct KillReport {
     pub method: String,
     pub tree_dead: bool,
     pub survivors: Vec<ProcessIdentity>,
+    /// What this call did; `tree_dead: true` comes only with `Signalled` or `AlreadyDead`.
+    pub attempt: KillAttempt,
+    /// The backend's clock read right after the read that proved the tree dead; `None`
+    /// unless `tree_dead`. A proof from the last observation started before the deadline
+    /// counts, so this instant can fall slightly after the deadline.
+    pub proved_at: Option<Instant>,
+}
+
+/// The methods of a report whose call did not get the kill-state lock.
+const BUSY_METHODS: [&str; 3] = ["unix_busy", "windows_busy", "fake_busy"];
+
+impl KillReport {
+    /// Whether the call did not get the kill-state lock (`unix_busy`, `windows_busy`,
+    /// `fake_busy`): it sent nothing, and a retry with the same list may succeed.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        BUSY_METHODS.contains(&self.method.as_str())
+    }
+}
+
+/// What one `kill_tree` call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillAttempt {
+    /// The call made at least one signal (Unix) or termination (Windows) call.
+    Signalled,
+    /// The tree was proven dead before any signal.
+    AlreadyDead,
+    /// No signal was sent: the call was busy, expired, or (macOS) found ownership lost
+    /// before any signal.
+    NotAttempted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,7 +284,7 @@ pub(crate) const TEARDOWN_CLOSE: Duration = Duration::from_secs(2);
 pub(crate) const TEARDOWN_DRAIN: Duration = Duration::from_secs(2);
 
 /// Internal owning guard for everything a spawn created; `Session::spawn` consumes it.
-/// Dropped unconsumed it runs the failure teardown: `kill_tree(&[], 5 s)` → drop input →
+/// Dropped unconsumed it runs the failure teardown: `kill_tree(&[], 5 s, 5 s)` → drop input →
 /// `control.close(2 s)` → drain finish (2 s).
 pub struct SpawnedPty {
     parts: Option<SpawnedParts>,
@@ -279,7 +319,8 @@ impl SpawnedParts {
             control,
             ..
         } = self;
-        let kill = child.kill_tree(&[], Instant::now() + TEARDOWN_KILL);
+        let deadline = Instant::now() + TEARDOWN_KILL;
+        let kill = child.kill_tree(&[], deadline, deadline);
         #[cfg(all(windows, any(test, feature = "fake")))]
         crate::windows::hooks::after_teardown_kill();
         drop(input);

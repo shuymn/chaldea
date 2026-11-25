@@ -8,7 +8,7 @@ use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use super::table::{Lookup, Proc};
-use crate::backend::{KillReport, ProcessIdentity};
+use crate::backend::{KillAttempt, KillReport, ProcessIdentity};
 
 pub(crate) const METHOD: &str = "unix_killpg_session_scan";
 pub(crate) const METHOD_LOST: &str = "unix_ownership_lost";
@@ -155,6 +155,10 @@ struct Call<'a, O: Os> {
     /// Covered processes without a readable start (unreadable session members, and the
     /// leader while its start is unknown): pid → its group when known.
     unknown: BTreeMap<u32, Option<u32>>,
+    /// A `killpg` or `kill` was made in this call.
+    signalled: bool,
+    /// The clock read right after the reads that proved the tree dead.
+    proved_at: Option<Instant>,
 }
 
 impl<O: Os> Call<'_, O> {
@@ -392,6 +396,7 @@ impl<O: Os> Call<'_, O> {
             self.read(st, pid, None);
         }
         if st.targets.is_empty() && self.unknown.is_empty() {
+            self.proved_at = Some(self.os.now());
             Proof::Dead
         } else {
             Proof::Alive
@@ -417,6 +422,7 @@ impl<O: Os> Call<'_, O> {
             if self.expired() {
                 return;
             }
+            self.signalled = true;
             self.os.killpg(self.leader.pid, sig);
         }
         let ids: Vec<((u32, u64), u32)> = st.targets.iter().map(|(k, g)| (*k, *g)).collect();
@@ -446,6 +452,7 @@ impl<O: Os> Call<'_, O> {
             if self.expired() {
                 return;
             }
+            self.signalled = true;
             self.os.kill(pid, sig);
         }
     }
@@ -551,33 +558,48 @@ fn unresolved(leader: Leader, extra: &[(u32, u64)], method: &'static str) -> Kil
         method: method.to_owned(),
         tree_dead: false,
         survivors,
+        attempt: KillAttempt::NotAttempted,
+        proved_at: None,
     }
 }
 
+fn try_state(state: &Mutex<KillState>) -> Option<MutexGuard<'_, KillState>> {
+    match state.try_lock() {
+        Ok(g) => Some(g),
+        Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
+}
+
+/// The kill lock: taken at once when free; otherwise polled until `lock_by`, and a lock
+/// obtained only at or after `lock_by` counts as not taken (§2.5 step 1).
 fn lock_until<'m, O: Os>(
     os: &O,
     state: &'m Mutex<KillState>,
-    deadline: Instant,
+    lock_by: Instant,
 ) -> Option<MutexGuard<'m, KillState>> {
+    if let Some(g) = try_state(state) {
+        return Some(g);
+    }
     loop {
-        match state.try_lock() {
-            Ok(g) => return Some(g),
-            Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
-            Err(TryLockError::WouldBlock) => {}
-        }
         let now = os.now();
-        if now >= deadline {
+        if now >= lock_by {
             return None;
         }
-        os.sleep(LOCK_STEP.min(deadline - now));
+        os.sleep(LOCK_STEP.min(lock_by - now));
+        if let Some(g) = try_state(state) {
+            return (os.now() < lock_by).then_some(g);
+        }
     }
 }
 
-/// The steps of §2.5. Every result comes from this call's own reads.
+/// The steps of §2.5. Every result comes from this call's own reads. A held kill lock is
+/// waited for until `lock_by` (capped at `deadline`).
 pub(crate) fn kill_tree<O: Os>(
     os: &O,
     leader: Leader,
     extra: &[ProcessIdentity],
+    lock_by: Instant,
     deadline: Instant,
     state: &Mutex<KillState>,
 ) -> KillReport {
@@ -590,12 +612,7 @@ pub(crate) fn kill_tree<O: Os>(
         // No read and no blocking lock. When the state is free at once, the new `extra`
         // entries are kept for the next call and the kept targets are listed.
         let mut report = unresolved(leader, &accepted, method(os));
-        let kept = match state.try_lock() {
-            Ok(g) => Some(g),
-            Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
-            Err(TryLockError::WouldBlock) => None,
-        };
-        if let Some(mut g) = kept {
+        if let Some(mut g) = try_state(state) {
             for key in &accepted {
                 g.targets.entry(*key).or_insert(0);
             }
@@ -615,7 +632,7 @@ pub(crate) fn kill_tree<O: Os>(
         }
         return report;
     }
-    let Some(mut guard) = lock_until(os, state, deadline) else {
+    let Some(mut guard) = lock_until(os, state, lock_by.min(deadline)) else {
         return unresolved(leader, &accepted, METHOD_BUSY);
     };
     let st = &mut *guard;
@@ -632,6 +649,8 @@ pub(crate) fn kill_tree<O: Os>(
         zombies: BTreeSet::new(),
         owned0: false,
         unknown: BTreeMap::new(),
+        signalled: false,
+        proved_at: None,
     };
     if leader.start.is_none() {
         call.unknown.insert(leader.pid, Some(leader.pid));
@@ -706,9 +725,18 @@ pub(crate) fn kill_tree<O: Os>(
 /// every read already updated them.
 fn finish<O: Os>(call: &Call<'_, O>, st: &KillState, tree_dead: bool) -> KillReport {
     let tree_dead = tree_dead && !call.os.lost();
+    let attempt = if call.signalled {
+        KillAttempt::Signalled
+    } else if tree_dead {
+        KillAttempt::AlreadyDead
+    } else {
+        KillAttempt::NotAttempted
+    };
     KillReport {
         method: method(call.os).to_owned(),
         tree_dead,
+        attempt,
+        proved_at: if tree_dead { call.proved_at } else { None },
         survivors: if tree_dead {
             Vec::new()
         } else {
@@ -934,7 +962,7 @@ mod tests {
             st: &Mutex<KillState>,
         ) -> KillReport {
             let deadline = self.base + self.now.get() + Duration::from_millis(budget_ms);
-            kill_tree(self, self.leader(), extra, deadline, st)
+            kill_tree(self, self.leader(), extra, deadline, deadline, st)
         }
 
         fn on(&self, f: impl FnMut(&mut World, Ev) + 'static) {
@@ -1254,6 +1282,8 @@ mod tests {
             zombies: BTreeSet::new(),
             owned0: true,
             unknown: BTreeMap::new(),
+            signalled: false,
+            proved_at: None,
         };
         let mut st = KillState::default();
         let first = call.pass(&mut st);
@@ -2041,7 +2071,7 @@ mod tests {
             start: None,
             ..sim.leader()
         };
-        let r = kill_tree(&sim, leader, &[], sim.at(300), &state());
+        let r = kill_tree(&sim, leader, &[], sim.at(300), sim.at(300), &state());
         assert!(!r.tree_dead, "{r:?}");
         assert!(
             r.survivors
@@ -2263,5 +2293,130 @@ mod tests {
         let targets = st.lock().unwrap().targets.clone();
         assert!(!targets.contains_key(&(280, 2_800)), "{targets:?}");
         assert!(targets.contains_key(&(260, 2_600)), "{targets:?}");
+    }
+
+    // ---- PR 10a1: `lock_by`, `attempt`, `proved_at` ----
+
+    /// The kill lock held by "another call" from the start, freed once the synthetic clock
+    /// reaches `free_ms` (during the sleep that ends there; never when `None`).
+    fn held_until(sim: &Sim, free_ms: Option<u64>) -> &'static Mutex<KillState> {
+        let st: &'static Mutex<KillState> = Box::leak(Box::new(state()));
+        let guard = Rc::new(RefCell::new(Some(st.lock().unwrap())));
+        let mut slept = Duration::ZERO;
+        *sim.clock.borrow_mut() = Some(Box::new(move |ev| {
+            if let Ev::Sleep(d) = ev {
+                slept += d;
+                if free_ms.is_some_and(|ms| slept >= Duration::from_millis(ms)) {
+                    guard.borrow_mut().take();
+                }
+            }
+            Duration::ZERO
+        }));
+        st
+    }
+
+    fn kill_by(sim: &Sim, lock_by_ms: u64, budget_ms: u64, st: &Mutex<KillState>) -> KillReport {
+        let now = sim.base + sim.now.get();
+        let lock_by = now + Duration::from_millis(lock_by_ms);
+        let deadline = now + Duration::from_millis(budget_ms);
+        kill_tree(sim, sim.leader(), &[], lock_by, deadline, st)
+    }
+
+    #[test]
+    fn busy_at_lock_by() {
+        // Freed before `lock_by`: the kill runs.
+        let sim = Sim::new();
+        let st = held_until(&sim, Some(100));
+        let r = kill_by(&sim, 250, 5_000, st);
+        assert!(r.tree_dead && !r.is_busy(), "{r:?}");
+        assert!(!sim.signals().is_empty());
+        // Freed exactly at `lock_by`, and just after it: busy, with zero signal operations.
+        for free in [Some(250), Some(260), None] {
+            let sim = Sim::new();
+            let st = held_until(&sim, free);
+            let r = kill_by(&sim, 250, 5_000, st);
+            assert_eq!(
+                (r.method.as_str(), r.tree_dead, r.attempt, r.proved_at),
+                (METHOD_BUSY, false, KillAttempt::NotAttempted, None),
+                "{free:?}"
+            );
+            assert!(r.is_busy());
+            assert!(
+                sim.log()
+                    .iter()
+                    .all(|e| matches!(e, Ev::Now | Ev::Sleep(_))),
+                "{free:?}: {:?}",
+                sim.log()
+            );
+            assert_eq!(
+                sim.now.get(),
+                Duration::from_millis(250),
+                "waited to lock_by"
+            );
+        }
+    }
+
+    #[test]
+    fn attempt_and_proof_time() {
+        let now = |sim: &Sim| sim.base + sim.now.get();
+        // Proven after signals: `Signalled`, `proved_at` the proving read's reading.
+        let sim = Sim::new();
+        sim.cost(|ev| matches!(ev, Ev::Lookup(_)), Duration::from_millis(1));
+        let st = state();
+        let r = sim.kill(&[], 5_000, &st);
+        assert_eq!(
+            (r.tree_dead, r.attempt),
+            (true, KillAttempt::Signalled),
+            "{r:?}"
+        );
+        assert_eq!(r.proved_at, Some(now(&sim)));
+        assert_eq!(
+            sim.log().last(),
+            Some(&Ev::Now),
+            "the clock read follows the proof"
+        );
+        // A dead tree: `AlreadyDead`, `proved_at` the opening pass's reading, no signal.
+        sim.log.borrow_mut().clear();
+        let r = sim.kill(&[], 5_000, &st);
+        assert_eq!(
+            (r.tree_dead, r.attempt),
+            (true, KillAttempt::AlreadyDead),
+            "{r:?}"
+        );
+        assert_eq!(r.proved_at, Some(now(&sim)));
+        assert!(sim.signals().is_empty());
+        // Expired: `NotAttempted`, no proof time.
+        let r = sim.kill(&[], 0, &st);
+        assert_eq!((r.attempt, r.proved_at), (KillAttempt::NotAttempted, None));
+        // Ownership lost before any signal (the leader reaped outside the backend):
+        // `NotAttempted`. A loss with a verified live target still signals it by pid.
+        let sim = Sim::new();
+        sim.owned.set(false);
+        sim.world.borrow_mut().procs.remove(&L);
+        let r = sim.kill(&[], 5_000, &state());
+        assert_eq!(r.method, METHOD_LOST);
+        assert_eq!(
+            (r.tree_dead, r.attempt, r.proved_at),
+            (false, KillAttempt::NotAttempted, None)
+        );
+        assert!(sim.signals().is_empty());
+        // Busy: `NotAttempted`.
+        let sim = Sim::new();
+        let st = held_until(&sim, None);
+        let r = sim.kill(&[], 300, st);
+        assert_eq!((r.attempt, r.proved_at), (KillAttempt::NotAttempted, None));
+        // The last observation started before the deadline and finished after it: the proof
+        // counts, with a `proved_at` past the deadline.
+        let sim = Sim::new();
+        sim.world.borrow_mut().procs.remove(&L);
+        sim.cost(|ev| ev == Ev::Lookup(L), Duration::from_secs(10));
+        let deadline = sim.at(5_000);
+        let r = sim.kill(&[], 5_000, &state());
+        assert_eq!(
+            (r.tree_dead, r.attempt),
+            (true, KillAttempt::AlreadyDead),
+            "{r:?}"
+        );
+        assert!(r.proved_at.unwrap() > deadline, "{r:?}");
     }
 }

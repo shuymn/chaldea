@@ -1316,6 +1316,37 @@ mod tests {
         assert!(!crate::spawn::spawn_lock_held());
     }
 
+    /// `with_spawn_lock_before` runs its closure only under the lock acquired before the
+    /// deadline, and runs nothing when the lock stays held past it.
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn with_spawn_lock_before_runs_only_under_the_lock() {
+        const HELPER: &str = "CHALDEA_HOST_WITH_LOCK_BEFORE";
+        if std::env::var_os(HELPER).is_none() {
+            alone(
+                "host::tests::with_spawn_lock_before_runs_only_under_the_lock",
+                HELPER,
+            );
+            return;
+        }
+        let soon = Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            crate::with_spawn_lock_before(soon, crate::spawn::spawn_lock_held),
+            Some(true)
+        );
+        assert!(!crate::spawn::spawn_lock_held());
+        let held = crate::spawn::spawn_lock();
+        let ran = std::thread::spawn(|| {
+            crate::with_spawn_lock_before(Instant::now() + Duration::from_millis(50), || ())
+        })
+        .join()
+        .unwrap();
+        assert!(ran.is_none(), "ran without the lock");
+        drop(held);
+        let past = Instant::now();
+        assert!(crate::with_spawn_lock_before(past, || ()).is_none());
+    }
+
     /// A waiter that a release wakes and that then finds its deadline passed (it pauses after
     /// the wake until then) does not take the release from an untimed waiter behind it: that
     /// waiter still takes the lock. The timed waiter's wake is the release, not its timeout.

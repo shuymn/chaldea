@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use chaldea_pty_runtime::fake::{FakeEvent, FakePty, FakeScript, KillBehavior, ProbePoint};
 use chaldea_pty_runtime::{
-    ChildExit, Cleanup, CloseBounds, Flow, Limits, OutputEnd, OutputEvent, OutputSink,
+    ChildExit, Cleanup, CloseBounds, Flow, KillAttempt, Limits, OutputEnd, OutputEvent, OutputSink,
     ProcessIdentity, PtySize, Received, Refusal, Resized, Session, SessionConfig, SessionEvent,
     SpawnError, StartFault, SubscribeError, VtUnavailable, WriteOutcome, channel_sink,
 };
@@ -443,6 +443,7 @@ fn close_order() {
             FakeEvent::Kill {
                 extra: vec![extra()]
             },
+            FakeEvent::Signal,
             FakeEvent::Exited,
             FakeEvent::InputDropped,
             FakeEvent::ControlClosed,
@@ -649,6 +650,7 @@ fn writer_creation_failure_tears_down() {
         vec![
             FakeEvent::Spawned,
             FakeEvent::Kill { extra: vec![] },
+            FakeEvent::Signal,
             FakeEvent::Exited,
             FakeEvent::InputDropped,
             FakeEvent::ControlClosed,
@@ -684,6 +686,7 @@ fn waiter_creation_failure_tears_down() {
         vec![
             FakeEvent::Spawned,
             FakeEvent::Kill { extra: vec![] },
+            FakeEvent::Signal,
             FakeEvent::Exited,
             FakeEvent::InputDropped,
             FakeEvent::ControlClosed,
@@ -1174,6 +1177,7 @@ fn failed_spawn_reports_unconfirmed_kill_with_ends_released() {
         vec![
             FakeEvent::Spawned,
             FakeEvent::Kill { extra: vec![] },
+            FakeEvent::Signal,
             FakeEvent::InputDropped,
             FakeEvent::ControlClosed,
             FakeEvent::OutputClosed,
@@ -1219,4 +1223,218 @@ fn snapshot_checks_its_deadline_before_returning() {
         t.elapsed()
     );
     assert!(r.session.snapshot(soon()).is_ok());
+}
+
+/// PR 10a1 `Session::seal`: every unit not yet permitted settles `Closed` with zero bytes,
+/// its completion runs before `seal` returns, and its record is returned; nothing is
+/// permitted after it, and a second seal (or the close's own step 1) returns nothing.
+#[test]
+fn seal_settles_unpermitted_units_once() {
+    let r = rig();
+    let hold = r.child.hold_writes();
+    let a = submit(&r.session, key(b"a"), open());
+    assert!(hold.wait_entered(soon()));
+    let (done, seen) = counting();
+    r.session.submit(key(b"b"), open(), done).unwrap();
+    let records = r.session.seal();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        (
+            records[0].seq,
+            records[0].bytes_written,
+            &records[0].outcome
+        ),
+        (2, 0, &WriteOutcome::NotStarted(Refusal::Closed))
+    );
+    // The completion ran before `seal` returned.
+    assert_eq!(seen.lock().unwrap().as_slice(), records.as_slice());
+    assert!(r.session.seal().is_empty(), "a second seal settles nothing");
+    let (done, _) = counting();
+    assert!(
+        r.session.submit(key(b"c"), open(), done).is_err(),
+        "the queue is closed"
+    );
+    hold.release();
+    assert_eq!(a.wait().outcome, WriteOutcome::Written);
+    let child = r.child.clone();
+    let _ = r.session.close(&[], short_bounds());
+    assert_eq!(child.input(), b"a");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the close settled nothing again"
+    );
+}
+
+/// PR 10a1 `WriterObserver`: the per-class positions under one queue lock, `None` from the
+/// non-waiting read while the lock is held, and readable after the session is gone.
+#[test]
+fn writer_observer_reads_positions() {
+    use chaldea_pty_runtime::{ClassSet, OriginClass};
+    let r = rig();
+    let obs = r.session.observer();
+    assert_eq!(obs.last_started_each(), [0; 3]);
+    assert_eq!(submit(&r.session, key(b"k"), open()).wait().seq, 1);
+    let each = obs.last_started_each();
+    for c in OriginClass::ALL {
+        assert_eq!(
+            each[c.index()],
+            r.session.last_started(ClassSet::of(&[c])),
+            "{c:?}"
+        );
+    }
+    assert_eq!(obs.last_started(ClassSet::ALL), 1);
+    assert_eq!(obs.try_last_started_each(), Some(each));
+    // The writer parks with the queue lock held.
+    let park = r.session.probe().park(ProbePoint::Dispatching);
+    let p = submit(&r.session, key(b"x"), open());
+    assert!(r.session.probe().wait(ProbePoint::Dispatching, 2, soon()));
+    assert_eq!(obs.try_last_started_each(), None);
+    park.release();
+    assert_eq!(p.wait().seq, 2);
+    let _ = r.session.close(&[], short_bounds());
+    assert_eq!(obs.last_started(ClassSet::ALL), 2, "outlives the session");
+}
+
+/// PR 10a1 `CloseOutcome.exit`: the exit the waiter reported by the close's end, `None`
+/// when it reported none.
+#[test]
+fn close_reports_the_waiters_exit() {
+    let r = rig();
+    let code = ChildExit {
+        code: Some(3),
+        signal: None,
+    };
+    r.child.exit(code);
+    assert!(r.events.wait(|e| matches!(e, SessionEvent::Exited(_))));
+    let out = r.session.close(&[], short_bounds());
+    assert_eq!(out.exit, Some(code));
+
+    let r = rig_with(
+        FakeScript {
+            kill: KillBehavior::Unconfirmed,
+            ..FakeScript::default()
+        },
+        Limits::default(),
+        80,
+        24,
+    );
+    let out = r.session.close(&[], short_bounds());
+    assert!(!out.released.tree_dead);
+    assert_eq!(out.exit, None);
+}
+
+/// PR10a1-CL-11 at the `Session` layer: `close_by` reuses a proof only for the same list.
+/// A `kill_by` with a list proves; `close_by` with that list makes no new kill call; with
+/// an identity added, it kills again with the full new list. (FakePty models no process for
+/// an `extra` identity, so no signal to it is asserted.)
+#[test]
+fn close_by_reuse_needs_same_list() {
+    let kills = |log: Vec<FakeEvent>| -> Vec<FakeEvent> {
+        log.into_iter()
+            .filter(|e| matches!(e, FakeEvent::Kill { .. }))
+            .collect()
+    };
+    let list = vec![extra()];
+    let r = rig();
+    let k = r.session.kill_by(&list, soon(), soon());
+    assert!(k.tree_dead && k.proved_at.is_some(), "{k:?}");
+    let child = r.child.clone();
+    let out = r.session.close_by(&list, soon(), CloseBounds::default());
+    assert_eq!(out.kill, k, "the proving report is reused");
+    assert_eq!(
+        kills(child.log()),
+        vec![FakeEvent::Kill {
+            extra: list.clone()
+        }]
+    );
+
+    let added = ProcessIdentity {
+        pid: 4343,
+        start_time: "added".into(),
+        group: "fake-d".into(),
+    };
+    let r = rig();
+    assert!(r.session.kill_by(&list, soon(), soon()).tree_dead);
+    let child = r.child.clone();
+    let mut longer = list.clone();
+    longer.push(added.clone());
+    let out = r.session.close_by(&longer, soon(), CloseBounds::default());
+    assert!(out.kill.tree_dead);
+    assert_eq!(
+        kills(child.log()),
+        vec![
+            FakeEvent::Kill {
+                extra: list.clone()
+            },
+            FakeEvent::Kill { extra: longer }
+        ]
+    );
+    // `close` keeps its own rule: reuse only for an empty list.
+    let r = rig();
+    assert!(r.session.kill_by(&list, soon(), soon()).tree_dead);
+    let child = r.child.clone();
+    let _ = r.session.close(&list, CloseBounds::default());
+    assert_eq!(kills(child.log()).len(), 2);
+}
+
+/// PR 10a1 `Session::close_by`: its kill step waits until the absolute instant, not
+/// `now + bounds.kill`, and a call after that instant sends nothing.
+#[test]
+fn close_by_kill_step_uses_the_absolute_deadline() {
+    let r = rig_with(
+        FakeScript {
+            kill: KillBehavior::Ignore,
+            ..FakeScript::default()
+        },
+        Limits::default(),
+        80,
+        24,
+    );
+    let child = r.child.clone();
+    let t0 = Instant::now();
+    let out = r
+        .session
+        .close_by(&[], t0 + Duration::from_millis(200), CloseBounds::default());
+    assert!(!out.kill.tree_dead);
+    // The default kill bound is 5 s; the absolute instant ends it after 200 ms.
+    assert!(out.elapsed < Duration::from_secs(4), "{:?}", out.elapsed);
+    assert_eq!(child.signals(), 1);
+
+    let r = rig();
+    let child = r.child.clone();
+    let past = Instant::now();
+    let out = r.session.close_by(&[], past, CloseBounds::default());
+    assert_eq!(
+        (out.kill.tree_dead, out.kill.attempt),
+        (false, KillAttempt::NotAttempted)
+    );
+    assert_eq!(child.signals(), 0, "an expired call sends nothing");
+}
+
+/// PR 10a1 `Session::kill_by`: a kill-state lock held past `lock_by` gives a busy report with
+/// no signal; a lock freed before `lock_by` lets the kill run.
+#[test]
+fn kill_by_is_busy_after_lock_by() {
+    let r = rig();
+    let held = r.child.hold_kill_lock();
+    let t = Instant::now();
+    let k = r
+        .session
+        .kill_by(&[], t + Duration::from_millis(100), soon());
+    assert!(k.is_busy() && !k.tree_dead, "{k:?}");
+    assert_eq!(k.attempt, KillAttempt::NotAttempted);
+    assert!(
+        t.elapsed() < Duration::from_secs(4),
+        "waited only until lock_by"
+    );
+    assert_eq!(r.child.signals(), 0);
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        held.release();
+    });
+    let k = r.session.kill_by(&[], soon(), soon());
+    releaser.join().unwrap();
+    assert!(k.tree_dead && !k.is_busy(), "{k:?}");
+    assert_eq!(k.attempt, KillAttempt::Signalled);
 }

@@ -32,9 +32,9 @@ use self::child::{KILL_CODE, WindowsChild};
 use self::cmdline::{Buffers, Cwd, EnvError, MAX_COMMAND_LINE};
 use self::control::{CloseWorker, WindowsControl};
 use crate::backend::{
-    Cleanup, CloseReport, DrainSink, KillReport, NeverStartedKind, ProcessIdentity, PtyChild,
-    PtyControl, PtyRuntime, SpawnError, SpawnSpec, SpawnedParts, SpawnedPty, TEARDOWN_CLOSE,
-    TEARDOWN_DRAIN, sealed,
+    Cleanup, CloseReport, DrainSink, KillAttempt, KillReport, NeverStartedKind, ProcessIdentity,
+    PtyChild, PtyControl, PtyRuntime, SpawnError, SpawnSpec, SpawnedParts, SpawnedPty,
+    TEARDOWN_CLOSE, TEARDOWN_DRAIN, sealed,
 };
 use crate::drain::Drain;
 use crate::spawn::spawn_lock;
@@ -512,10 +512,13 @@ impl PtyRuntime for WindowsPty {
                     error,
                     identity: Some(identity.clone()),
                     cleanup: Cleanup::Unresolved {
+                        // The suspended branch terminated the process or its job.
                         kill: Some(KillReport {
                             method: method.to_owned(),
                             tree_dead: false,
                             survivors: vec![identity],
+                            attempt: KillAttempt::Signalled,
+                            proved_at: None,
                         }),
                         close: Some(close),
                         drain_abandoned: !drained,

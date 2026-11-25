@@ -1110,7 +1110,13 @@ fn wait_timeout_runs_during_kill() {
     }));
     let killer = {
         let c = child.clone();
-        std::thread::spawn(move || c.kill_tree(&[], Instant::now() + Duration::from_secs(20)))
+        std::thread::spawn(move || {
+            c.kill_tree(
+                &[],
+                Instant::now() + Duration::from_secs(20),
+                Instant::now() + Duration::from_secs(20),
+            )
+        })
     };
     entered_rx.recv_timeout(BOUND).expect("kill_tree entered");
     let (wait_tx, wait_rx) = mpsc::channel();
@@ -1602,9 +1608,11 @@ fn nesting_helper() {
     let parts = spawn(&pty, &cmd("pause")).unwrap_or_else(|e| panic!("{e}"));
     let ev: std::collections::HashMap<_, _> = parts.evidence.iter().cloned().collect();
     assert_eq!(ev["job_branch"], "job_list");
-    let k = parts
-        .child
-        .kill_tree(&[], Instant::now() + Duration::from_secs(5));
+    let k = parts.child.kill_tree(
+        &[],
+        Instant::now() + Duration::from_secs(5),
+        Instant::now() + Duration::from_secs(5),
+    );
     assert!(k.tree_dead, "{k:?}");
     drop(take_child(&pty));
     let _ = release(parts);
