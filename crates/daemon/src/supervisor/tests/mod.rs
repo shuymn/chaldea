@@ -6,6 +6,7 @@ mod close;
 mod commands;
 mod exit;
 mod launch;
+mod live;
 mod ops;
 mod race;
 mod reserve;
