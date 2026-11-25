@@ -447,3 +447,42 @@ async fn replay_bytes() {
     assert_eq!(String::from_utf8_lossy(&r.body), body);
     rig.srv.stop().await;
 }
+
+/// PR10a1-CL-11 `proof_before_slow_join`: the task's first call proves and sends its report;
+/// the close is held before it starts until the clock passed the kill's submission + 12 s:
+/// the join is late, the early report still confirms death with its method, and the token
+/// stays counted until the close ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proof_before_slow_join() {
+    let rig = Rig::new().await;
+    let (t, l) = rig.spawn_codex(None).await;
+    let child = rig.pty.take_child().unwrap();
+    let close = rig.pauses.arm(Pause::BeforeCloseBy);
+    let reply = stop_with(&rig, t);
+    close.wait();
+    assert!(
+        rig.sup.tracker.count() > 0,
+        "counted while the close is held"
+    );
+    rig.clock
+        .skew(crate::supervisor::PROOF_CUTOFF + Duration::from_secs(1));
+    close.go();
+    let r = reply.await.unwrap();
+    assert_eq!(kills(&child.log()).len(), 1, "the close reused the proof");
+    rig.until("the close released the token", || {
+        rig.sup.tracker.count() == 0
+    })
+    .await;
+    let v = json(&r);
+    assert_eq!(v["death_confirmed"], true, "{v}");
+    let row = rig.launch(l);
+    assert!(row.death_confirmed);
+    assert!(
+        rig.events(t)
+            .iter()
+            .any(|(k, p)| k == "launch_death_confirmed" && p["method"] == "fake"),
+        "{:?}",
+        rig.events(t)
+    );
+    rig.srv.stop().await;
+}
