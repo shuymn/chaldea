@@ -1801,5 +1801,30 @@ mod tests {
         );
         assert!(seen.get().is_some(), "{:?}", os.calls());
         assert_eq!(r.proved_at, seen.get(), "{:?}", os.calls());
+        // The same in the proof loop after termination: the extra handle is the last to
+        // signal, and `proved_at` is the clock right after that read, before its close.
+        let os = Os::new();
+        os.cost.set(Duration::from_millis(1));
+        os.add(200, proc(5, false));
+        os.set(200, |p| {
+            p.dies_at = Some(Duration::from_millis(50));
+            p.close_cost = Some(Duration::from_millis(2));
+        });
+        let seen = Rc::new(Cell::new(None));
+        let at = seen.clone();
+        *os.hook.borrow_mut() = Some(Box::new(move |c, os| {
+            if matches!(c, C::Signalled(200, _)) {
+                at.set(Some(os.now()));
+            }
+        }));
+        let r = os.kill(&[id(200, 5)], os.at(5_000), &state());
+        assert_eq!(
+            (r.tree_dead, r.attempt),
+            (true, KillAttempt::Signalled),
+            "{r:?} {:?}",
+            os.calls()
+        );
+        assert!(seen.get().is_some(), "{:?}", os.calls());
+        assert_eq!(r.proved_at, seen.get(), "{:?}", os.calls());
     }
 }
