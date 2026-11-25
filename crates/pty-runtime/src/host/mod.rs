@@ -1123,7 +1123,8 @@ pub fn no_console_window(cmd: &mut std::process::Command) {
 }
 
 /// The first `name` (`name.exe` on Windows) in an absolute directory of `path` (a `PATH`
-/// value) that is a file.
+/// value) that is an executable file (on Unix, a file with an execute bit set), as a shell's
+/// search continues past a candidate it cannot run.
 #[must_use]
 pub fn find_program(name: &str, path: &OsStr) -> Option<PathBuf> {
     let file = if cfg!(windows) {
@@ -1134,13 +1135,52 @@ pub fn find_program(name: &str, path: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path)
         .filter(|d| d.is_absolute())
         .map(|d| d.join(&file))
-        .find(|p| p.is_file())
+        .find(|p| executable(p))
+}
+
+fn executable(p: &Path) -> bool {
+    let Ok(m) = std::fs::metadata(p) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        m.is_file() && m.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        m.is_file()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::io;
     use std::time::{Duration, Instant};
+
+    /// The search passes a candidate without an execute bit and a directory of the same
+    /// name, and takes the next executable file.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn find_program_skips_what_cannot_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::unix::tests::TempDir::new("find-program");
+        let [plain, dir, exec] = ["plain", "dir", "exec"].map(|d| root.0.join(d));
+        for d in [&plain, &dir, &exec] {
+            std::fs::create_dir(d).unwrap();
+        }
+        for (d, mode) in [(&plain, 0o644), (&exec, 0o755)] {
+            let f = d.join("codex");
+            std::fs::write(&f, b"").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        std::fs::create_dir(dir.join("codex")).unwrap();
+        let path = std::env::join_paths([&plain, &dir, &exec]).unwrap();
+        assert_eq!(
+            super::find_program("codex", &path),
+            Some(exec.join("codex"))
+        );
+    }
 
     use super::{GuiDomain, LaunchctlOutput, classify_gui_probe};
 
