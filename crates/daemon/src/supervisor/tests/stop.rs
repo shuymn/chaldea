@@ -337,6 +337,98 @@ async fn while_starting() {
     rig.srv.stop().await;
 }
 
+/// A spawn held after its reservation commit (op lock held, `starting`), and a stop of its
+/// thread held at its start: returns the spawn's and the stop's replies and the pauses.
+async fn stop_while_starting(
+    rig: &Rig,
+) -> (
+    tokio::task::JoinHandle<super::support::http::Reply>,
+    tokio::task::JoinHandle<super::support::http::Reply>,
+    super::Armed,
+    super::Armed,
+) {
+    let after = rig.pauses.arm(Pause::AfterReserve);
+    let start = rig.pauses.arm(Pause::StopStart);
+    let cwd = rig.cwd.path().to_string_lossy().into_owned();
+    let spawn = spawn_send(
+        &rig.srv,
+        &rig.srv.command(
+            "spawn",
+            &rig.owner,
+            super::cid(),
+            &json!({ "agent": "codex", "cwd": cwd }).to_string(),
+        ),
+    );
+    after.wait();
+    let t = rig
+        .srv
+        .store
+        .read(|r| Ok(r.threads()?.pop().unwrap().thread_id));
+    let stop = spawn_send(
+        &rig.srv,
+        &rig.srv.command(
+            "stop",
+            &rig.owner,
+            super::cid(),
+            &json!({ "thread_id": t }).to_string(),
+        ),
+    );
+    start.wait();
+    (spawn, stop, after, start)
+}
+
+/// PR10a1-CL-12 `starting_past_the_bound`: a stop whose op-lock wait for a `starting` launch
+/// passes the op's start + 10 s: 504 `launch_busy`; the spawn then completes and nothing
+/// stops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn starting_past_the_bound() {
+    let rig = Rig::new().await;
+    let (spawn, stop, after, start) = stop_while_starting(&rig).await;
+    rig.clock.skew(Duration::from_secs(11));
+    start.go();
+    let r = stop.await.unwrap();
+    assert_eq!(r.status, 504, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(json(&r)["code"], "launch_busy");
+    after.go();
+    let s = spawn.await.unwrap();
+    assert_eq!(json(&s)["outcome"], "started");
+    let l: chaldea_core::ids::LaunchId =
+        serde_json::from_value(json(&s)["launch_id"].clone()).unwrap();
+    assert_eq!(rig.launch(l).exit_reason, None, "nothing stops it later");
+    let child = rig.pty.take_child().unwrap();
+    assert!(kills(&child.log()).is_empty());
+    rig.srv.stop().await;
+}
+
+/// PR10a1-CL-12 `failed_start_already_exited`: a stop that waits on the op lock of a
+/// `starting` launch whose spawn then fails before any process exists (`NeverStarted`, its
+/// death confirmed): `already_exited`, `death_confirmed: true`, and no kill.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_start_already_exited() {
+    use chaldea_pty_runtime::fake::FakeScript;
+    use chaldea_pty_runtime::{Cleanup, NeverStartedKind, SpawnError};
+    let rig = Rig::new().await;
+    rig.pty.script_next(FakeScript {
+        fail: Some(SpawnError::NeverStarted {
+            kind: NeverStartedKind::Setup,
+            error: std::io::Error::other("x"),
+            cleanup: Cleanup::Confirmed,
+        }),
+        ..FakeScript::default()
+    });
+    let (spawn, stop, after, start) = stop_while_starting(&rig).await;
+    start.go();
+    after.go();
+    let s = spawn.await.unwrap();
+    assert_eq!(json(&s)["outcome"], "spawn_failed");
+    let r = stop.await.unwrap();
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v = json(&r);
+    assert_eq!(v["outcome"], "already_exited", "{v}");
+    assert_eq!(v["death_confirmed"], true, "{v}");
+    rig.srv.stop().await;
+}
+
 /// PR10a1-CL-39 `already_exited_in_intent`: the intent finds the launch exited with death
 /// confirmed: `already_exited`, completed in the intent's job; in time when the job started
 /// by `RequestStart` + 5 s, late when the writer held it past that.
