@@ -324,3 +324,85 @@ async fn already_exited_in_intent() {
     assert_eq!(v["confirmed_within_deadline"], false);
     rig.srv.stop().await;
 }
+
+fn stop_with(
+    rig: &Rig,
+    t: chaldea_core::ids::ThreadId,
+) -> tokio::task::JoinHandle<super::support::http::Reply> {
+    spawn_send(
+        &rig.srv,
+        &rig.srv.command(
+            "stop",
+            &rig.owner,
+            super::cid(),
+            &json!({ "thread_id": t }).to_string(),
+        ),
+    )
+}
+
+/// PR10a1-CL-11 `proof_in_close_by`: the task's call signals without proving and is not
+/// busy, so it is not retried; the close's kill step is the second kill and the proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proof_in_close_by() {
+    let rig = Rig::new().await;
+    rig.pty.script_next(FakeScript {
+        kill: KillBehavior::ProveOnCall(2),
+        ..FakeScript::default()
+    });
+    let (t, l) = rig.spawn_codex(None).await;
+    let child = rig.pty.take_child().unwrap();
+    let r = stop_with(&rig, t).await.unwrap();
+    let v = json(&r);
+    assert_eq!(v["death_confirmed"], true, "{v}");
+    assert_eq!(v["confirmed_within_deadline"], true, "{v}");
+    assert_eq!(kills(&child.log()).len(), 2, "{:?}", child.log());
+    assert!(rig.launch(l).death_confirmed);
+    rig.srv.stop().await;
+}
+
+/// PR10a1-CL-10 `late_join_unconfirmed`: no call proves before the close, whose kill step
+/// proves the tree dead, and whose return is held until the clock passed the kill's
+/// submission + 12 s: the join is `Late`, death unconfirmed despite `tree_dead`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_join_unconfirmed() {
+    let rig = Rig::new().await;
+    rig.pty.script_next(FakeScript {
+        kill: KillBehavior::ProveOnCall(2),
+        ..FakeScript::default()
+    });
+    let (t, l) = rig.spawn_codex(None).await;
+    let child = rig.pty.take_child().unwrap();
+    let end = rig.pauses.arm(Pause::KillTaskEnd);
+    let reply = stop_with(&rig, t);
+    end.wait();
+    assert_eq!(kills(&child.log()).len(), 2, "the close's kill step ran");
+    rig.clock
+        .skew(crate::supervisor::PROOF_CUTOFF + Duration::from_secs(1));
+    end.go();
+    let r = reply.await.unwrap();
+    let v = json(&r);
+    assert_eq!(v["death_confirmed"], false, "{v}");
+    assert!(!rig.launch(l).death_confirmed);
+    rig.srv.stop().await;
+}
+
+/// PR10a1-CL-11 `reused_proof`: the task's first call proves for the full, non-empty list;
+/// the close reuses that report for the identical list and records no second kill.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reused_proof() {
+    let rig = Rig::new().await;
+    let (t, l) = rig.spawn_codex(None).await;
+    let id = ProcessIdentity {
+        pid: 4242,
+        start_time: "s".to_owned(),
+        group: "g".to_owned(),
+    };
+    rig.sup.entry(l).unwrap().record_extra(id.clone());
+    let child = rig.pty.take_child().unwrap();
+    let r = stop_with(&rig, t).await.unwrap();
+    let v = json(&r);
+    assert_eq!(v["death_confirmed"], true, "{v}");
+    assert_eq!(v["confirmed_within_deadline"], true, "{v}");
+    assert_eq!(kills(&child.log()), vec![vec![id]]);
+    rig.srv.stop().await;
+}

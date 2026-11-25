@@ -4,6 +4,7 @@
 mod adapters;
 mod close;
 mod commands;
+mod exit;
 mod launch;
 mod ops;
 mod race;
