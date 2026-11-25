@@ -611,15 +611,6 @@ fn open_job(
             Some(head),
             Some(launch),
         )?;
-        let gate_cause = AttentionCause::InputGateTimeout { input_id: input };
-        if job.raised(gate_cause) {
-            job.apply(
-                &cause,
-                "cleared",
-                &StateInput::AttentionCleared(gate_cause),
-                Some(launch),
-            )?;
-        }
         let appended = job.flush(tx)?;
         let _attempt = seq_of(&appended, &derived(&cause, &format!("input:{input}")))?;
         Ok(Ok(Opened {

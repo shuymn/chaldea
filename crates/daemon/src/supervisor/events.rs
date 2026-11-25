@@ -151,7 +151,7 @@ impl ThreadJob {
     }
 
     /// Moves `input` by `by`, keyed under `cause`; `unconfirmed` also raises
-    /// `input_unconfirmed` for it.
+    /// `input_unconfirmed` for it, and leaving `queued` clears its `input_gate_timeout`.
     ///
     /// # Errors
     ///
@@ -181,7 +181,33 @@ impl ThreadJob {
         if to == InputState::Unconfirmed {
             self.raise_unconfirmed(cause, id, launch)?;
         }
+        if input.state == InputState::Queued {
+            self.left_queued(cause, id, launch)?;
+        }
         Ok(())
+    }
+
+    /// Clears `input_gate_timeout(id)` when raised: the input left `queued` (mvp §2.2).
+    ///
+    /// # Errors
+    ///
+    /// The reducer's refusal, as a job refusal.
+    pub(crate) fn left_queued(
+        &mut self,
+        cause: &IdempotencyKey,
+        id: InputId,
+        launch: Option<LaunchId>,
+    ) -> Result<(), JobError> {
+        let c = AttentionCause::InputGateTimeout { input_id: id };
+        if !self.raised(c) {
+            return Ok(());
+        }
+        self.apply(
+            cause,
+            &format!("gate_cleared:{id}"),
+            &StateInput::AttentionCleared(c),
+            launch,
+        )
     }
 
     fn raise_unconfirmed(

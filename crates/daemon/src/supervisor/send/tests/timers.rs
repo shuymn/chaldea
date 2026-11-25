@@ -93,3 +93,32 @@ async fn snapshot_pool() {
     drop(g);
     rig.stop().await;
 }
+
+/// mvp §2.2 (`input_gate_timeout` only while `queued`): an input that leaves `queued` at the
+/// launch's exit loses its gate timeout with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gate_timeout_cleared_at_exit() {
+    let rig = SRig::new().await;
+    let (live, _) = rig.spawn(Agent::Claude, None).await;
+    let id = rig.send(&live, "waits").await;
+    rig.pass(&live).await;
+    let t0 = rig.sl(&live).state().queued_at[&id];
+    tick_at(&rig, &live, t0 + GATE_TIMEOUT).await;
+    let cause = AttentionCause::InputGateTimeout { input_id: id };
+    rig.until("raised", || {
+        rig.thread(live.t).state.attention.contains(&cause)
+    })
+    .await;
+    live.child.exit(chaldea_pty_runtime::ChildExit {
+        code: Some(0),
+        signal: None,
+    });
+    rig.until_input(id, chaldea_core::input::InputState::Cancelled)
+        .await;
+    assert!(
+        !rig.thread(live.t).state.attention.contains(&cause),
+        "{:?}",
+        rig.thread(live.t).state.attention
+    );
+    rig.stop().await;
+}

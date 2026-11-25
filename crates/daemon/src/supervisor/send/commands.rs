@@ -70,6 +70,7 @@ fn input_moved(
     launch: Option<LaunchId>,
 ) -> Result<InputState, JobError> {
     let to = step(from, by_input).map_err(refusal)?;
+    let gate_key = key.clone();
     job.push(
         key,
         TypedEvent::InputStateChanged(InputStateChanged {
@@ -82,6 +83,9 @@ fn input_moved(
         }),
         launch,
     );
+    if from == InputState::Queued {
+        job.left_queued(&gate_key, input, launch)?;
+    }
     Ok(to)
 }
 
@@ -636,17 +640,6 @@ impl CommandHandler for InputCancelHandler {
                     caller(auth),
                     row.launch_id,
                 )?;
-                let cause = AttentionCause::InputGateTimeout {
-                    input_id: a.input_id,
-                };
-                if job.raised(cause) {
-                    job.apply(
-                        &command_key(cid, 1),
-                        "cleared",
-                        &StateInput::AttentionCleared(cause),
-                        row.launch_id,
-                    )?;
-                }
                 job.flush(tx)?;
                 Ok(Intent::Completed(ok(&InputCommandResult {
                     input_id: a.input_id,

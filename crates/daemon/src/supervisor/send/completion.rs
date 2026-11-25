@@ -7,7 +7,6 @@ use chaldea_core::event::TypedEvent;
 use chaldea_core::ids::{IdempotencyKey, InputId, LaunchId, StreamId, ThreadId};
 use chaldea_core::input::{InputInput, InputState};
 use chaldea_core::payload::{HumanWrite, SourceKind};
-use chaldea_core::state::{AttentionCause, StateInput};
 use chaldea_pty_runtime::{WriteOrigin, WriteOutcome, WriteRecord};
 
 use super::super::Supervisor;
@@ -51,15 +50,6 @@ pub(crate) fn move_input(
     let t = thread_row(tx, thread)?;
     let mut job = ThreadJob::new(thread, t.agent, t.state, SourceKind::Daemon, None);
     job.step_input(cause, &row, by, None, Some(launch))?;
-    let gate = AttentionCause::InputGateTimeout { input_id: input };
-    if from == InputState::Queued && job.raised(gate) {
-        job.apply(
-            cause,
-            &format!("cleared:{input}"),
-            &StateInput::AttentionCleared(gate),
-            Some(launch),
-        )?;
-    }
     job.flush(tx)?;
     Ok(true)
 }
