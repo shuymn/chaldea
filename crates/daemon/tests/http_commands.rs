@@ -842,7 +842,7 @@ async fn reserved_handler_replies_are_500() {
             "test_completed",
             &owner,
             cid(20),
-            r#"{"text":"r","status":409,"code":"card_closed"}"#,
+            r#"{"text":"r","status":409,"code":"not_a_code"}"#,
         ))
         .await;
     assert_eq!((r.status, r.body.as_slice()), (500, INTERNAL));

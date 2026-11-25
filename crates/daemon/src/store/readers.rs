@@ -30,7 +30,7 @@ use super::rows::{
     ApprovalRow, BlobBody, BufferedDelivery, BufferedHook, BufferedSummary, HookDelivery,
     HookReply, InputRow, LaunchRow, Routing, SchemaInfo, SurfaceRow, ThreadRow, TokenKind,
     TokenRow, TranscriptCursor, WorktreeRow, command_result, enum_text, opt_u64, opt_uuid,
-    parse_enum, parse_json, parse_uuid, to_u64,
+    parse_enum, parse_json, parse_uuid, to_i64, to_u64,
 };
 
 /// [`ReadTx::binding_receipt_ordinal`]'s query: the binding is searched within the thread's
@@ -1344,6 +1344,26 @@ impl<'a> ReadTx<'a> {
                 |r| r.get(0),
             ))?;
             to_u64(max)
+        })
+    }
+
+    /// The stream seq of the primary event of launch `l`'s delivery with receipt ordinal
+    /// `ordinal`; `None` when there is none or it is still buffered.
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub fn delivery_seq(&self, l: LaunchId, ordinal: u64) -> Result<Option<u64>, StoreError> {
+        self.guard(|| {
+            let seq: Option<Option<i64>> = sql(self
+                .conn
+                .query_row(
+                    "SELECT seq FROM hook_deliveries WHERE launch_id = ?1 AND receipt_ordinal = ?2",
+                    rusqlite::params![l.to_string(), to_i64(ordinal)?],
+                    |r| r.get(0),
+                )
+                .optional())?;
+            opt_u64(seq.flatten())
         })
     }
 

@@ -35,7 +35,7 @@ use crate::store::{LaunchRow, ThreadRow, TokenKind};
 use support::TestStore;
 use support::http::{RecordingSink, Reply, SkewClock, TestServer};
 
-use super::components::{mounts_with, new_supervisor, registry};
+use super::components::{mounts_with, new_supervisor, registry, seams};
 use super::{Pause, Pauses, Supervisor, SupervisorConfig};
 
 /// The program the fake runtime "runs".
@@ -204,6 +204,9 @@ pub(crate) fn config(
         exit_steps: Vec::new(),
         tick_steps: Vec::new(),
         tick_task: false,
+        decoder: Arc::new(crate::supervisor::send::fake_decoder::FakeDecoder),
+        readiness_mode: None,
+        send_workers: true,
     }
 }
 
@@ -221,13 +224,7 @@ impl Rig {
         host: HostOs,
         tune: impl FnOnce(&mut SupervisorConfig),
     ) -> Rig {
-        Rig::on_mounts(
-            store,
-            host,
-            tune,
-            mounts_with(host, crate::hook::HookSeams::mvp()),
-        )
-        .await
+        Rig::on_mounts(store, host, tune, |sup| mounts_with(host, seams(sup))).await
     }
 
     /// A rig whose `/hook` walks the test's process chains instead of the OS's; also
@@ -240,26 +237,27 @@ impl Rig {
         Arc<crate::hook::HookIngest>,
     ) {
         let chains = Arc::new(support::hook::Chains::default());
-        let ingest = crate::hook::HookIngest::new(
-            crate::hook::HookConfig::default(),
-            crate::hook::HookSeams {
-                procs: chains.clone(),
-                ..crate::hook::HookSeams::mvp()
-            },
-        );
-        let mounts = mounts_with(HostOs::Macos, crate::hook::HookSeams::mvp()).with(ingest.mount());
-        (
-            Rig::on_mounts(TestStore::new(), HostOs::Macos, tune, mounts).await,
-            chains,
-            ingest,
-        )
+        let made = Arc::new(Mutex::new(None));
+        let (c, m) = (chains.clone(), made.clone());
+        let rig = Rig::on_mounts(TestStore::new(), HostOs::Macos, tune, move |sup| {
+            let chained = crate::hook::HookSeams {
+                procs: c,
+                ..seams(sup)
+            };
+            let ingest = crate::hook::HookIngest::new(crate::hook::HookConfig::default(), chained);
+            *m.lock().unwrap() = Some(ingest.clone());
+            mounts_with(HostOs::Macos, seams(sup)).with(ingest.mount())
+        })
+        .await;
+        let ingest = made.lock().unwrap().take().unwrap();
+        (rig, chains, ingest)
     }
 
     async fn on_mounts(
         store: TestStore,
         host: HostOs,
         tune: impl FnOnce(&mut SupervisorConfig),
-        mounts: crate::http::Mounts,
+        mounts: impl FnOnce(&Arc<Supervisor>) -> crate::http::Mounts,
     ) -> Rig {
         let clock = Arc::new(SkewClock::default());
         let sink = Arc::new(RecordingSink::default());
@@ -267,10 +265,12 @@ impl Rig {
         let pauses = Arc::new(Pauser::default());
         let mut cfg = config(&pty, &clock, &pauses);
         tune(&mut cfg);
-        let sup = new_supervisor(host, cfg, store.store().clone(), sink.clone(), 0);
+        let side = crate::supervisor::send::install(&mut cfg);
+        let sup = new_supervisor(host, cfg, side, store.store().clone(), sink.clone(), 0);
+        sup.start_send_driver();
         let srv = TestServer::start_parts(
             store,
-            mounts,
+            mounts(&sup),
             registry(&sup),
             (clock.clone(), sink.clone()),
             |_| {},

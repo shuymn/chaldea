@@ -19,6 +19,7 @@ use crate::store::Store;
 use super::commands::{CloseHandler, ResumeHandler, SpawnHandler, StopHandler};
 use super::live::LiveMap;
 use super::ops::close_and_record;
+use super::send::{self, SendSide};
 use super::tracker::Tracker;
 use super::workspace::GitSlot;
 use super::{Pause, Supervisor, SupervisorConfig, Window, adapters, restart};
@@ -27,15 +28,18 @@ use super::{Pause, Supervisor, SupervisorConfig, Window, adapters, restart};
 pub struct SupervisorComponents {
     host_os: HostOs,
     cfg: Option<SupervisorConfig>,
+    side: Arc<SendSide>,
     sup: Option<Arc<Supervisor>>,
 }
 
 impl SupervisorComponents {
     #[must_use]
-    pub fn new(host_os: HostOs, cfg: SupervisorConfig) -> SupervisorComponents {
+    pub fn new(host_os: HostOs, mut cfg: SupervisorConfig) -> SupervisorComponents {
+        let side = send::install(&mut cfg);
         SupervisorComponents {
             host_os,
             cfg: Some(cfg),
+            side,
             sup: None,
         }
     }
@@ -60,13 +64,14 @@ impl Components for SupervisorComponents {
         let sup = new_supervisor(
             self.host_os,
             cfg,
+            self.side.clone(),
             ctx.store.clone(),
             ctx.sink.clone(),
             ctx.port,
         );
         self.sup = Some(sup.clone());
         Built {
-            mounts: mounts(self.host_os),
+            mounts: mounts_with(self.host_os, seams(&sup)),
             commands: registry(&sup),
             participants: vec![Box::new(Participant(sup))],
         }
@@ -80,6 +85,7 @@ impl Components for SupervisorComponents {
         if sup.cfg.tick_task {
             sup.rt.spawn(sup.clone().tick_loop());
         }
+        sup.start_send_driver();
     }
 }
 
@@ -87,6 +93,7 @@ impl Components for SupervisorComponents {
 pub(crate) fn new_supervisor(
     host_os: HostOs,
     cfg: SupervisorConfig,
+    send: Arc<SendSide>,
     store: Store,
     sink: Arc<dyn crate::http::LifecycleSink>,
     port: u16,
@@ -102,23 +109,36 @@ pub(crate) fn new_supervisor(
         git: Arc::new(GitSlot::default()),
         nudge: OnceLock::new(),
         window: OnceLock::new(),
+        send,
         rt: tokio::runtime::Handle::current(),
     })
 }
 
-/// The command registry with the four launch handlers.
+/// The command registry with the four launch handlers and the five send handlers.
 pub(crate) fn registry(sup: &Arc<Supervisor>) -> CommandRegistry {
     let mut commands = CommandRegistry::mvp();
     commands.register(Box::new(SpawnHandler(sup.clone())));
     commands.register(Box::new(ResumeHandler(sup.clone())));
     commands.register(Box::new(StopHandler(sup.clone())));
     commands.register(Box::new(CloseHandler(sup.clone())));
+    send::register(&mut commands, sup);
     commands
 }
 
-/// The MVP mounts with `GET /api/adapters`.
-pub(crate) fn mounts(host_os: HostOs) -> Mounts {
-    mounts_with(host_os, HookSeams::mvp())
+/// The hook seams of `sup`: the send side's adapter and intake probe, the OS process walk.
+pub(crate) fn seams(sup: &Arc<Supervisor>) -> HookSeams {
+    HookSeams {
+        adapter: Arc::new(send::SupervisorHooks {
+            host_os: sup.host_os,
+            decoder: sup.send.decoder.clone(),
+            mode: sup.send.mode,
+        }),
+        intake: Arc::new(send::SupervisorProbe {
+            sup: Arc::downgrade(sup),
+            side: sup.send.clone(),
+        }),
+        ..HookSeams::mvp()
+    }
 }
 
 /// [`mounts`] over the given hook seams.

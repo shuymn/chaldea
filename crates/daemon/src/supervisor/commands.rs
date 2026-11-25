@@ -34,7 +34,7 @@ use super::ops::{
 use super::record::{JobOf, Recorded, record};
 use super::{COMMAND_DEADLINE, Pause, STOP_REPORT, Supervisor};
 
-fn parse<T: serde::de::DeserializeOwned + Serialize>(
+pub(crate) fn parse<T: serde::de::DeserializeOwned + Serialize>(
     args: &RawValue,
 ) -> Result<(T, CanonicalJson), ApiError> {
     let a: T = serde_json::from_str(args.get()).map_err(|_| ApiError::bad_args())?;
@@ -42,23 +42,29 @@ fn parse<T: serde::de::DeserializeOwned + Serialize>(
     Ok((a, n))
 }
 
-/// Prompt admission (design §2.2, C1) for `agent`: a Claude prompt is `bad_args`, then the
-/// size, then `check` for Codex's positional prompt.
+/// Prompt admission (design §2.2, C1; send §2.2) for `agent`: the size, then `check` in the
+/// agent's first-prompt encoding (Codex's positional argument, Claude's queued input).
 fn admit_prompt(agent: Agent, prompt: Option<&str>) -> Result<(), ApiError> {
     let Some(text) = prompt else {
         return Ok(());
     };
-    if agent == Agent::Claude {
-        return Err(ApiError::bad_args());
-    }
     if text.len() > MAX_PROMPT_BYTES {
         return Err(code(ErrorCode::PromptTooLarge));
     }
-    check(Agent::Codex, InputEncoding::Positional, Purpose::Send, text)
+    check(agent, first_prompt_encoding(agent), Purpose::Send, text)
         .map_err(|_| code(ErrorCode::PromptRejected))
 }
 
-fn caller(auth: &Authorized) -> Actor {
+/// The encoding of a launch's first prompt: Codex takes it as its positional argument;
+/// Claude's becomes a queued input written through the PTY (send §2.9 D3).
+pub(crate) fn first_prompt_encoding(agent: Agent) -> InputEncoding {
+    match agent {
+        Agent::Codex => InputEncoding::Positional,
+        Agent::Claude => InputEncoding::BracketedPaste,
+    }
+}
+
+pub(crate) fn caller(auth: &Authorized) -> Actor {
     match (auth.kind, auth.thread) {
         (TokenKind::Agent, Some(t)) => Actor::Thread(t),
         _ => Actor::Human,
@@ -67,7 +73,7 @@ fn caller(auth: &Authorized) -> Actor {
 
 /// The target-scope check (design §2.2 "Target scope first"): before any other read of the
 /// thread; a refusal is `deny_for`.
-fn target(
+pub(crate) fn target(
     tx: &WriteTx<'_>,
     auth: &Authorized,
     action: Action,
@@ -87,7 +93,7 @@ fn target(
     r.thread(t)?.ok_or_else(|| refused(ApiError::not_found()))
 }
 
-fn run_op(
+pub(crate) fn run_op(
     sup: &Arc<Supervisor>,
     fut: impl std::future::Future<Output = EffectOutcome> + Send + 'static,
 ) -> BoxFuture<'static, EffectOutcome> {

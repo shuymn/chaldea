@@ -104,6 +104,19 @@ impl ThreadJob {
         self.pending.push(e);
     }
 
+    /// An event on the thread's stream with its annex.
+    pub(crate) fn push_annex(
+        &mut self,
+        key: IdempotencyKey,
+        event: TypedEvent,
+        launch: Option<LaunchId>,
+        annex: crate::store::EventAnnex,
+    ) {
+        let mut e = self.event(StreamId::Thread(self.thread), key, event, launch);
+        e.annex = Some(annex);
+        self.pending.push(e);
+    }
+
     /// An event on the host stream (`thread_registered`, `thread_closed`).
     pub(crate) fn push_host(&mut self, key: IdempotencyKey, event: TypedEvent) {
         let e = self.event(StreamId::Host, key, event, None);
