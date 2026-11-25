@@ -667,8 +667,10 @@ fn coordinator_panic_returns() {
 
 /// Barriers inside steps 8, 13, and 14: while parked, a second daemon exits 3, then a stop
 /// arrives and the lock is still held; released, the task finishes the step, publishes
-/// nothing after it, and the lock is released only after the join. The second daemon runs
-/// before the stop: its 2 s lock retry would otherwise run on the join's 4 s.
+/// nothing after it, and the lock is released only after the join. The run has a test-set
+/// budget of 20 s, so its join has 14 s: what runs after the stop (the lock probe, step 8's
+/// fresh `Store::open`, step 13's `port` and record writes) does not race the default 4 s,
+/// which `unjoined_startup_is_a_bare_exit` covers.
 #[test]
 fn stop_inside_step() {
     if in_helper() {
@@ -678,7 +680,8 @@ fn stop_inside_step() {
         let port = hold_port();
         let faults = not_in_a_job();
         let park = faults.park(Point::Inside(step));
-        let cfg = detached(&dir, Some(port), &ready);
+        let mut cfg = detached(&dir, Some(port), &ready);
+        cfg.budgets.total = Duration::from_secs(20);
         helper(
             cfg,
             TestComponents::default(),
