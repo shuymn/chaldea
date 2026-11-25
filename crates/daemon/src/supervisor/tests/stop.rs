@@ -406,3 +406,44 @@ async fn reused_proof() {
     assert_eq!(kills(&child.log()), vec![vec![id]]);
     rig.srv.stop().await;
 }
+
+/// PR10a1-CL-39 `replay_bytes`: a receipt row written directly, holding a `StopResult` whose
+/// whitespace and key order differ from serde's: the replay returns those bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replay_bytes() {
+    use chaldea_core::command::CommandResult;
+    let rig = Rig::new().await;
+    let (t, l) = rig.spawn_codex(None).await;
+    let args = json!({ "thread_id": t }).to_string();
+    let first = super::cid();
+    let r = spawn_send(&rig.srv, &rig.srv.command("stop", &rig.owner, first, &args))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 200);
+    // The same token and request identity under a new `command_id`, completed with bytes
+    // serde would not write.
+    let row = rig.srv.receipt(first).unwrap();
+    let body = format!(
+        "{{ \"signal\" : 9,\n  \"exit_code\":null, \"confirmed_within_deadline\" : true,\"death_confirmed\": true, \"outcome\" :\"stopped\", \"launch_id\": \"{l}\" }}"
+    );
+    let stored = CommandResult {
+        http_status: 200,
+        body: body.clone(),
+    };
+    let second = super::cid();
+    let job: crate::http::Job<()> = Box::new(move |tx| {
+        tx.receipt_begin(second, row.token, row.request_sha256)?;
+        tx.receipt_complete(second, &stored)?;
+        Ok(())
+    });
+    tokio::task::block_in_place(|| rig.srv.store.run(job).unwrap());
+    let r = spawn_send(
+        &rig.srv,
+        &rig.srv.command("stop", &rig.owner, second, &args),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status, 200);
+    assert_eq!(String::from_utf8_lossy(&r.body), body);
+    rig.srv.stop().await;
+}

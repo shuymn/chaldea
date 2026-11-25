@@ -105,3 +105,50 @@ async fn stop_result() {
     assert_eq!(exits[0].1["reason"], "exit");
     rig.srv.stop().await;
 }
+
+/// PR10a1-CL-20 `nudges`: one socket nudge per committed revoking job (a stop's exit job, a
+/// close's intent; a `close --stop`'s intent, exit job, and closing job), none for a refused
+/// close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nudges() {
+    let rig = Rig::new().await;
+    let count = || *rig.srv.server.shared().revocations.borrow();
+    let (t, l) = rig.spawn_codex(None).await;
+    let n = std::cell::Cell::new(count());
+    let step = |name: &str, r: super::support::http::Reply, want: u64| {
+        assert_eq!(
+            r.status,
+            200,
+            "{name}: {}",
+            String::from_utf8_lossy(&r.body)
+        );
+        let now = count();
+        assert_eq!(now - n.get(), want, "{name}");
+        n.set(now);
+    };
+    let r = rig.cmd("stop", &json!({ "thread_id": t })).await;
+    step("stop", r, 1);
+    let r = rig
+        .cmd("close", &json!({ "thread_id": t, "expected_launch_id": l }))
+        .await;
+    step("close", r, 1);
+    let (u, ul) = rig.spawn_codex(None).await;
+    n.set(count());
+    let r = rig
+        .cmd(
+            "close",
+            &json!({ "thread_id": u, "expected_launch_id": ul, "stop": true }),
+        )
+        .await;
+    step("close --stop", r, 3);
+    // Refused: nothing committed, no nudge.
+    let r = rig
+        .cmd(
+            "close",
+            &json!({ "thread_id": u, "expected_launch_id": LaunchId(uuid::Uuid::new_v4()) }),
+        )
+        .await;
+    assert_eq!(r.status, 409);
+    assert_eq!(count(), n.get(), "a refused close");
+    rig.srv.stop().await;
+}
