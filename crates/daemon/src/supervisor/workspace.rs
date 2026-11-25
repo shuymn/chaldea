@@ -62,11 +62,6 @@ impl GitSlot {
         let st = lock(&self.state);
         !st.busy && st.left.is_none()
     }
-
-    #[cfg(test)]
-    pub(crate) fn has_left(&self) -> bool {
-        lock(&self.state).left.is_some()
-    }
 }
 
 /// The right to run one git child. Its drop, on every path including a panic, kills an

@@ -29,8 +29,6 @@ pub struct SupervisorComponents {
     host_os: HostOs,
     cfg: Option<SupervisorConfig>,
     sup: Option<Arc<Supervisor>>,
-    /// Set by `build` for tests that drive the supervisor directly.
-    built: Arc<OnceLock<Arc<Supervisor>>>,
 }
 
 impl SupervisorComponents {
@@ -40,14 +38,7 @@ impl SupervisorComponents {
             host_os,
             cfg: Some(cfg),
             sup: None,
-            built: Arc::new(OnceLock::new()),
         }
-    }
-
-    /// The supervisor once built (tests).
-    #[cfg(test)]
-    pub(crate) fn handle(&self) -> Arc<OnceLock<Arc<Supervisor>>> {
-        self.built.clone()
     }
 }
 
@@ -67,29 +58,17 @@ impl Components for SupervisorComponents {
 
     fn build(&mut self, ctx: &BuildCtx) -> Built {
         let cfg = self.cfg.take().unwrap_or_default();
-        let sup = Arc::new(Supervisor {
-            host_os: self.host_os,
-            store: ctx.store.clone(),
-            sink: ctx.sink.clone(),
-            port: ctx.port,
+        let sup = new_supervisor(
+            self.host_os,
             cfg,
-            live: LiveMap::default(),
-            tracker: Arc::new(Tracker::default()),
-            git: Arc::new(GitSlot::default()),
-            nudge: OnceLock::new(),
-            window: OnceLock::new(),
-            rt: tokio::runtime::Handle::current(),
-        });
-        let mut commands = CommandRegistry::mvp();
-        commands.register(Box::new(SpawnHandler(sup.clone())));
-        commands.register(Box::new(ResumeHandler(sup.clone())));
-        commands.register(Box::new(StopHandler(sup.clone())));
-        commands.register(Box::new(CloseHandler(sup.clone())));
-        let _ = self.built.set(sup.clone());
+            ctx.store.clone(),
+            ctx.sink.clone(),
+            ctx.port,
+        );
         self.sup = Some(sup.clone());
         Built {
-            mounts: Mounts::mvp_with(HookSeams::mvp(), vec![adapters::mount(self.host_os)]),
-            commands,
+            mounts: mounts(self.host_os),
+            commands: registry(&sup),
             participants: vec![Box::new(Participant(sup))],
         }
     }
@@ -105,8 +84,46 @@ impl Components for SupervisorComponents {
     }
 }
 
+/// A supervisor over `store` on the current runtime.
+pub(crate) fn new_supervisor(
+    host_os: HostOs,
+    cfg: SupervisorConfig,
+    store: Store,
+    sink: Arc<dyn crate::http::LifecycleSink>,
+    port: u16,
+) -> Arc<Supervisor> {
+    Arc::new(Supervisor {
+        host_os,
+        store,
+        sink,
+        port,
+        cfg,
+        live: LiveMap::default(),
+        tracker: Arc::new(Tracker::default()),
+        git: Arc::new(GitSlot::default()),
+        nudge: OnceLock::new(),
+        window: OnceLock::new(),
+        rt: tokio::runtime::Handle::current(),
+    })
+}
+
+/// The command registry with the four launch handlers.
+pub(crate) fn registry(sup: &Arc<Supervisor>) -> CommandRegistry {
+    let mut commands = CommandRegistry::mvp();
+    commands.register(Box::new(SpawnHandler(sup.clone())));
+    commands.register(Box::new(ResumeHandler(sup.clone())));
+    commands.register(Box::new(StopHandler(sup.clone())));
+    commands.register(Box::new(CloseHandler(sup.clone())));
+    commands
+}
+
+/// The MVP mounts with `GET /api/adapters`.
+pub(crate) fn mounts(host_os: HostOs) -> Mounts {
+    Mounts::mvp_with(HookSeams::mvp(), vec![adapters::mount(host_os)])
+}
+
 /// The shutdown participant (design §2.9 "Shutdown").
-struct Participant(Arc<Supervisor>);
+pub(crate) struct Participant(pub(crate) Arc<Supervisor>);
 
 impl ShutdownParticipant for Participant {
     fn name(&self) -> &'static str {
