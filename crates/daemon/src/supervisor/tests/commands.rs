@@ -459,9 +459,8 @@ async fn target_scope() {
             "{name} {args}"
         );
         assert!(rig.srv.receipt(id).is_none(), "{name}");
-        assert_eq!(
-            (launch_reads::count(ol), launch_reads::count(stale)),
-            (0, 0),
+        assert!(
+            !launch_reads::was_read(ol) && !launch_reads::was_read(stale),
             "{name} {args}: a launch read before the scope check"
         );
     }

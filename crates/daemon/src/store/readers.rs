@@ -1539,41 +1539,32 @@ fn decode_launch(v: &[rusqlite::types::Value]) -> Result<LaunchRow, StoreError> 
     })
 }
 
-/// Counts reads of watched launch rows (unit tests only), for tests that show a read never
-/// ran: process-wide, so each test watches only its own launch ids.
+/// Records whether a watched launch row was read (unit tests only), for tests that show a
+/// read never ran: process-wide, so each test watches only its own launch ids.
 #[cfg(test)]
 pub(crate) mod launch_reads {
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     use chaldea_core::ids::LaunchId;
 
-    static WATCHED: Mutex<Vec<(LaunchId, usize)>> = Mutex::new(Vec::new());
+    use crate::store::lock;
 
-    /// Starts counting reads of `l` from zero.
+    static WATCHED: Mutex<BTreeMap<LaunchId, bool>> = Mutex::new(BTreeMap::new());
+
+    /// Starts watching `l`, as not read.
     pub(crate) fn watch(l: LaunchId) {
-        let mut w = WATCHED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        w.retain(|(x, _)| *x != l);
-        w.push((l, 0));
+        lock(&WATCHED).insert(l, false);
     }
 
-    /// Reads of `l` since [`watch`].
-    pub(crate) fn count(l: LaunchId) -> usize {
-        WATCHED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .find(|(x, _)| *x == l)
-            .map_or(0, |(_, n)| *n)
+    /// Whether `l` was read since [`watch`].
+    pub(crate) fn was_read(l: LaunchId) -> bool {
+        lock(&WATCHED).get(&l).copied().unwrap_or(false)
     }
 
     pub(super) fn seen(l: LaunchId) {
-        let mut w = WATCHED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((_, n)) = w.iter_mut().find(|(x, _)| *x == l) {
-            *n += 1;
+        if let Some(read) = lock(&WATCHED).get_mut(&l) {
+            *read = true;
         }
     }
 }
