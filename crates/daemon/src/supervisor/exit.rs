@@ -16,7 +16,7 @@ use chaldea_pty_runtime::{ProcessIdentity, WriteRecord};
 
 use crate::store::{JobError, StoreError, WriteTx};
 
-use super::events::{ThreadJob, launch_key, refusal, seq_of};
+use super::events::{ThreadJob, launch_key, refusal, seq_of, thread_row};
 
 /// A step 10b (and later PRs) add to every exit job, before 10a1's sweep.
 pub(crate) trait ExitStep: Send + Sync {
@@ -106,9 +106,7 @@ pub(crate) fn exit_in(
     if l.exit_reason.is_some() {
         return Ok(None);
     }
-    let Some(t) = r.thread(plan.thread)? else {
-        return Err(refusal("the thread has no row"));
-    };
+    let t = thread_row(tx, plan.thread)?;
     let kind = if plan.restart {
         SourceKind::Daemon
     } else {
@@ -204,9 +202,7 @@ pub(crate) fn sweep(
     if inputs.is_empty() {
         return Ok(());
     }
-    let Some(t) = r.thread(thread)? else {
-        return Err(refusal("the thread has no row"));
-    };
+    let t = thread_row(tx, thread)?;
     let kind = if restart {
         SourceKind::Daemon
     } else {

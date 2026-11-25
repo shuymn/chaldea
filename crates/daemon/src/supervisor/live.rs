@@ -187,8 +187,7 @@ impl LiveLaunch {
     /// Seals the session held in `guard` and appends its records to `settled`.
     pub(crate) fn seal(&self, guard: &OpGuard) {
         if let Some(s) = guard.as_ref() {
-            let records = s.seal();
-            lock(&self.settled).extend(records);
+            self.add_settled(s.seal());
         }
     }
 
@@ -200,6 +199,18 @@ impl LiveLaunch {
         guard.take()
     }
 
+    /// The op lock taken by `deadline` (supervisor clock); `None`: not in time.
+    pub(crate) async fn lock_before(&self, sup: &Supervisor, deadline: Instant) -> Option<OpGuard> {
+        settle_before(
+            || sup.now(),
+            deadline,
+            sup.timer(deadline),
+            self.ops.clone().lock_owned(),
+        )
+        .await
+        .in_time()
+    }
+
     /// Takes the op lock by `deadline` (supervisor clock) and runs `f` inline; `f` must not
     /// block.
     #[allow(dead_code, reason = "10b's sends use it")]
@@ -209,15 +220,10 @@ impl LiveLaunch {
         deadline: Instant,
         f: impl FnOnce(&Session) -> R,
     ) -> Result<R, SessionError> {
-        let guard = settle_before(
-            || sup.now(),
-            deadline,
-            sup.timer(deadline),
-            self.ops.clone().lock_owned(),
-        )
-        .await
-        .in_time()
-        .ok_or(SessionError::Busy)?;
+        let guard = self
+            .lock_before(sup, deadline)
+            .await
+            .ok_or(SessionError::Busy)?;
         match guard.as_ref() {
             Some(s) => Ok(f(s)),
             None => Err(SessionError::Gone),

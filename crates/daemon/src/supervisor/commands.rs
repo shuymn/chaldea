@@ -42,12 +42,15 @@ fn parse<T: serde::de::DeserializeOwned + Serialize>(
     Ok((a, n))
 }
 
-/// Prompt admission (design §2.2, C1): the size first, then `check` for Codex's positional
-/// prompt. A Claude prompt is refused by the caller, which knows the agent.
-fn admit_prompt(prompt: Option<&str>) -> Result<(), ApiError> {
+/// Prompt admission (design §2.2, C1) for `agent`: a Claude prompt is `bad_args`, then the
+/// size, then `check` for Codex's positional prompt.
+fn admit_prompt(agent: Agent, prompt: Option<&str>) -> Result<(), ApiError> {
     let Some(text) = prompt else {
         return Ok(());
     };
+    if agent == Agent::Claude {
+        return Err(ApiError::bad_args());
+    }
     if text.len() > MAX_PROMPT_BYTES {
         return Err(code(ErrorCode::PromptTooLarge));
     }
@@ -112,10 +115,7 @@ impl CommandHandler for SpawnHandler {
 
     fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError> {
         let (a, normalized) = parse::<SpawnArgs>(args)?;
-        if a.prompt.is_some() && a.agent == Agent::Claude {
-            return Err(ApiError::bad_args());
-        }
-        admit_prompt(a.prompt.as_deref())?;
+        admit_prompt(a.agent, a.prompt.as_deref())?;
         let thread = ThreadId(Uuid::new_v4());
         let launch = LaunchId(Uuid::new_v4());
         let input_id = a.prompt.as_ref().map(|_| InputId(Uuid::new_v4()));
@@ -191,10 +191,7 @@ impl CommandHandler for ResumeHandler {
                 // The prompt's checks need the thread's agent, so they run here, in CL-1's
                 // order (a Claude prompt first); a refusal rolls back the receipt with the job.
                 let t = target(tx, auth, Action::Resume, a.thread_id)?;
-                if a.prompt.is_some() && t.agent == Agent::Claude {
-                    return Err(refused(ApiError::bad_args()));
-                }
-                admit_prompt(a.prompt.as_deref()).map_err(refused)?;
+                admit_prompt(t.agent, a.prompt.as_deref()).map_err(refused)?;
                 Ok(Intent::Pending(EffectRun::new(LaunchReq {
                     command_id: ctx.command_id(),
                     thread: a.thread_id,

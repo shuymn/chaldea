@@ -34,9 +34,9 @@ use crate::deadline::{Settled, settle_before};
 use crate::http::{
     ApiError, COMPLETION_ATTEMPT, EffectOutcome, MintedToken, StoreFatal, TokenService, write_with,
 };
-use crate::store::{JobError, LaunchRow, ThreadRow, TokenKind, WriteTx};
+use crate::store::{JobError, LaunchRow, TokenKind, WriteTx};
 
-use super::events::{ThreadJob, command_key, launch_key, refusal, seq_of};
+use super::events::{ThreadJob, command_key, launch_key, refusal, seq_of, thread_row};
 use super::exit::{ExitFacts, ExitPlan, exit_in};
 use super::live::{CommittedStart, LiveLaunch, OpGuard, Published};
 use super::record::{JobOf, Recorded, record};
@@ -553,12 +553,6 @@ pub(crate) fn started_in(
     Ok((key, seq))
 }
 
-fn thread_row(tx: &WriteTx<'_>, t: ThreadId) -> Result<ThreadRow, JobError> {
-    tx.read()
-        .thread(t)?
-        .ok_or_else(|| refusal("the thread has no row"))
-}
-
 enum SpawnFailure {
     NeverStarted,
     StartedThenFailed {
@@ -794,20 +788,10 @@ pub(crate) async fn stop_launch(
     let entry = sup.entry(req.launch);
     // Step 1: the lock.
     let guard = match &entry {
-        Some(e) => {
-            match settle_before(
-                || sup.now(),
-                bound,
-                sup.timer(bound),
-                e.ops.clone().lock_owned(),
-            )
-            .await
-            .in_time()
-            {
-                Some(g) => Some(g),
-                None => return Err(done_code(ErrorCode::LaunchBusy)),
-            }
-        }
+        Some(e) => match e.lock_before(sup, bound).await {
+            Some(g) => Some(g),
+            None => return Err(done_code(ErrorCode::LaunchBusy)),
+        },
         None => None,
     };
     // Step 2: the re-read.
@@ -977,15 +961,7 @@ pub(crate) async fn exit_op(
         sup.pauses().at(Pause::ExitRound).await;
         // No round runs past the total: a lock taken after it does not count.
         let round = (sup.now() + EXIT_ROUND).min(start + EXIT_TOTAL);
-        let got = settle_before(
-            || sup.now(),
-            round,
-            sup.timer(round),
-            entry.ops.clone().lock_owned(),
-        )
-        .await
-        .in_time();
-        if let Some(g) = got {
+        if let Some(g) = entry.lock_before(&sup, round).await {
             break g;
         }
         if entry.stop_requested() || sup.entry(launch).is_none() {

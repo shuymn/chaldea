@@ -9,7 +9,7 @@ use chaldea_core::input::{InputInput, InputReason, InputState, step};
 use chaldea_core::payload::{InputStateChanged, SourceKind};
 use chaldea_core::state::{AttentionCause, StateInput, ThreadState, reduce};
 
-use crate::store::{Appended, InputRow, JobError, NewEvent, StoreError, WriteTx};
+use crate::store::{Appended, InputRow, JobError, NewEvent, StoreError, ThreadRow, WriteTx};
 
 /// `launch:<launch_id>:<name>` (mvp §2.1 "Process lifecycle").
 pub(crate) fn launch_key(l: LaunchId, name: &str) -> IdempotencyKey {
@@ -197,6 +197,13 @@ impl ThreadJob {
         }
         tx.append(events)
     }
+}
+
+/// The thread's row, or a refusal when it has none.
+pub(crate) fn thread_row(tx: &WriteTx<'_>, t: ThreadId) -> Result<ThreadRow, JobError> {
+    tx.read()
+        .thread(t)?
+        .ok_or_else(|| refusal("the thread has no row"))
 }
 
 /// A rule refusal inside a job: the job rolls back (a programming error of its guards, or

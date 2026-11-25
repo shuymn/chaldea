@@ -159,16 +159,9 @@ pub(crate) async fn shutdown(sup: Arc<Supervisor>, end: Instant) -> ParticipantE
             .into_iter()
             .filter(|e| e.published().is_some())
             .collect();
-        let locks = futures_util::future::join_all(entries.iter().map(|e| {
-            let ops = e.ops.clone();
-            let s = sup.clone();
-            async move {
-                settle_before(|| s.now(), lock_by, s.timer(lock_by), ops.lock_owned())
-                    .await
-                    .in_time()
-            }
-        }))
-        .await;
+        let locks =
+            futures_util::future::join_all(entries.iter().map(|e| e.lock_before(&sup, lock_by)))
+                .await;
         // Steps 4–5: each locked slot that still holds a session.
         let closes = entries.iter().zip(locks).filter_map(|(e, g)| {
             let mut g = g?;
