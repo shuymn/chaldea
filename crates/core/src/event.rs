@@ -165,17 +165,8 @@ macro_rules! event_kinds {
             /// serde also reads a struct from a JSON array, which the schema refuses, so
             /// that form is rejected before typed decoding.
             fn decode_payload(kind: &str, raw: &RawValue) -> Option<Result<Self, serde_json::Error>> {
-                let object = || {
-                    if raw.get().trim_start().starts_with('{') {
-                        Ok(raw.get())
-                    } else {
-                        Err(<serde_json::Error as serde::de::Error>::custom("payload is not a JSON object"))
-                    }
-                };
                 match kind {
-                    $($kind => Some(object().and_then(|text| {
-                        serde_json::from_str::<$payload>(text).map(TypedEvent::$variant)
-                    })),)*
+                    $($kind => Some(crate::wire::object::<_, $payload>(raw).map(TypedEvent::$variant)),)*
                     _ => None,
                 }
             }
