@@ -12,10 +12,14 @@ use crate::supervisor::live::LaunchObservation;
 /// after the reference was sampled, before publication) `Unobservable`; published, with the
 /// start job held, `Started` with the sampled `reference`, and a terminal reply the
 /// responder then writes has its class position above it; with the map mutex held
-/// `Unobservable` at once; an unknown launch `Unobservable`.
+/// `Unobservable` at once; an unknown launch `Unobservable`. No send worker runs: its pass
+/// takes the map mutex, which `observe` would answer with `Unobservable`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn observe() {
-    let rig = Rig::new().await;
+    let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
+        c.send_workers = false;
+    })
+    .await;
     let points = [
         (Pause::AfterReserve, Some(LaunchObservation::Reserved)),
         (Pause::BeforeSpawn, Some(LaunchObservation::Unobservable)),
@@ -48,7 +52,14 @@ async fn observe() {
             held.go();
             continue;
         }
-        // Published, the start job not yet run.
+        // Published, the start job not yet run. The writer thread takes the queue lock when
+        // it first runs (`Unobservable` while it holds it).
+        let mut seen = seen;
+        rig.until("the published launch observed", || {
+            seen = rig.sup.observe(launch);
+            seen != LaunchObservation::Unobservable
+        })
+        .await;
         let LaunchObservation::Started {
             reference,
             last_started,
