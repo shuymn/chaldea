@@ -379,18 +379,18 @@ async fn positional_anchor() {
                 prompt(&rig, &live, "first").await;
             }
             _ => {
-                let (locked_tx, locked) = tokio::sync::oneshot::channel();
-                let (release, released) = std::sync::mpsc::channel::<()>();
-                let sup = rig.sup.clone();
-                let holder = tokio::task::spawn_blocking(move || {
+                // The live map held across the intake's observation only, by the request
+                // task itself: the runtime tasks that look a launch up never wait on it.
+                let sl = rig.sl(&live);
+                *crate::supervisor::send::lock(&sl.hooks.observe) = Some(Box::new(|sup, l| {
                     let _map = sup.live.lock();
-                    let _ = locked_tx.send(());
-                    let _ = released.recv_timeout(Duration::from_secs(20));
-                });
-                locked.await.unwrap();
+                    sup.observe(l)
+                }));
                 prompt(&rig, &live, "first").await;
-                release.send(()).unwrap();
-                holder.await.unwrap();
+                assert!(
+                    crate::supervisor::send::lock(&sl.hooks.observe).is_none(),
+                    "observed with the map held"
+                );
             }
         }
         let want = if case == "reply" {

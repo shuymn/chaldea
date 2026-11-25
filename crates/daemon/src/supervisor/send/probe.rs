@@ -70,7 +70,14 @@ impl IntakeProbe for SupervisorProbe {
         sl.latest_intake.store(ordinal, Ordering::SeqCst);
         fence_advance(&sl.fence);
         let sup = self.sup.upgrade()?;
-        let (reference, last_started) = match sup.observe(launch) {
+        #[cfg(test)]
+        let observed = match super::lock(&sl.hooks.observe).take() {
+            Some(f) => f(&sup, launch),
+            None => sup.observe(launch),
+        };
+        #[cfg(not(test))]
+        let observed = sup.observe(launch);
+        let (reference, last_started) = match observed {
             LaunchObservation::Started {
                 reference,
                 last_started,

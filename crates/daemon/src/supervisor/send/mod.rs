@@ -245,6 +245,14 @@ pub(crate) struct SendHooks {
     pub settle_job: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs inside the open job (on the store writer).
     pub open_job: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Takes the place of the probe's observation of the launch at one intake (on the
+    /// hook's request task, synchronously).
+    #[allow(clippy::type_complexity, reason = "a one-shot test point")]
+    pub observe: Mutex<
+        Option<
+            Box<dyn FnOnce(&super::Supervisor, LaunchId) -> super::live::LaunchObservation + Send>,
+        >,
+    >,
 }
 
 #[cfg(test)]
