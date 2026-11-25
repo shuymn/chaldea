@@ -391,6 +391,7 @@ async fn publish_vs_admission() {
             rig.until("admission closed", || !rig.sup.tracker.accepting())
                 .await;
         }
+        let mut commits = rig.srv.store.store().subscribe();
         held.go();
         closed_by.wait();
         closed_by.go();
@@ -431,6 +432,15 @@ async fn publish_vs_admission() {
                 .expect("the positional input moved to sent");
             assert_eq!(payload(sent)["sent_after_seq"], started.seq);
             assert!(started.seq < sent.seq && sent.seq < exited.seq);
+            // The commit that first shows `launch_started` already shows `sent`.
+            let stream = chaldea_core::ids::StreamId::Thread(t);
+            let first = std::iter::from_fn(|| commits.try_recv().ok())
+                .flat_map(|c| c.heads)
+                .filter(|h| h.stream_id == stream)
+                .map(|h| h.head_seq)
+                .find(|&head| head >= started.seq)
+                .expect("a commit shows launch_started");
+            assert!(first >= sent.seq, "sent in a later commit: {first}");
             assert_eq!(
                 sent.idempotency_key.0,
                 format!(
