@@ -182,8 +182,8 @@ impl TurnLog {
 
     /// The settle candidate: the highest entry, when its ordinal is `latest`, it is
     /// `End { settle: true }`, the boundary below it is a `Start`, and the boundary below
-    /// that start is an `End` or none. Returns its ordinal and commit instant.
-    pub(crate) fn candidate(&self, latest: u64) -> Option<(u64, Instant)> {
+    /// that start is an `End` or none. Returns its commit instant (its ordinal is `latest`).
+    pub(crate) fn candidate(&self, latest: u64) -> Option<Instant> {
         let (&s, &(mark, at)) = self.0.iter().next_back()?;
         if s != latest || mark != (TurnMark::End { settle: true }) {
             return None;
@@ -193,14 +193,12 @@ impl TurnLog {
             .range(..s)
             .rev()
             .filter(|(_, (m, _))| Self::boundary(m));
-        let (&t, (start, _)) = below.next()?;
+        let (_, (start, _)) = below.next()?;
         if *start != TurnMark::Start {
             return None;
         }
-        let _ = t;
         match below.next() {
-            None => Some((s, at)),
-            Some((_, (TurnMark::End { .. }, _))) => Some((s, at)),
+            None | Some((_, (TurnMark::End { .. }, _))) => Some(at),
             Some(_) => None,
         }
     }

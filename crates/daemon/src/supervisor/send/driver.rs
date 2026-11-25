@@ -382,9 +382,10 @@ async fn settle(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>, view: &View, now: I
         }
         st.log.candidate(latest)
     };
-    let Some((ordinal, at)) = candidate else {
+    let Some(at) = candidate else {
         return;
     };
+    let ordinal = latest;
     if now < at + SETTLE || view.thread.state.turn != TurnState::Unknown {
         return;
     }

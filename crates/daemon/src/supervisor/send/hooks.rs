@@ -95,12 +95,7 @@ struct Events {
 
 impl Events {
     fn push(&mut self, name: impl Into<Cow<'static, str>>, event: TypedEvent) {
-        self.out.push(HookEvent {
-            event,
-            name: name.into(),
-            annex: None,
-            blobs: Vec::new(),
-        });
+        self.push_full(name, event, None, Vec::new());
     }
 
     fn push_full(
@@ -162,12 +157,12 @@ impl Events {
         input.state = to;
     }
 
-    /// Closes every open card of the launch as `outcome`, each named `card:<approval_id>`.
+    /// Closes every open card of the launch as `superseded`, each named
+    /// `card:<approval_id>`.
     fn close_cards(
         &mut self,
         tx: &ReadTx<'_>,
         thread: chaldea_core::ids::ThreadId,
-        outcome: ApprovalOutcome,
     ) -> Result<(), StoreError> {
         for c in tx.open_approvals(thread)? {
             if c.launch_id != self.launch {
@@ -177,7 +172,7 @@ impl Events {
                 format!("card:{}", c.approval_id),
                 TypedEvent::ApprovalResolved(ApprovalResolved {
                     approval_id: c.approval_id,
-                    outcome,
+                    outcome: ApprovalOutcome::Superseded,
                 }),
             );
         }
@@ -309,32 +304,31 @@ impl HookAdapter for SupervisorHooks {
                     }
                 }
                 ev.apply("prompt", &StateInput::PromptSubmitted);
-                ev.close_cards(tx, thread, ApprovalOutcome::Superseded)?;
+                ev.close_cards(tx, thread)?;
                 TurnMark::Start
             }
             HookFact::Stop => {
                 ev.apply("stop", &StateInput::TurnStopped);
-                ev.close_cards(tx, thread, ApprovalOutcome::Superseded)?;
+                ev.close_cards(tx, thread)?;
                 // A unit that ran to `Written` before the intake, with its input already acked
                 // by a hook (its own turn's `UserPromptSubmit`: `acked` with an `ack_seq`; an
                 // owner's resolution sets none), ended before this `Stop`; the settle waits for
                 // its record (§2.4 step 3). Any other running unit's turn may still run.
-                let settle = hook.intake_reliable
-                    && match facts {
-                        None => false,
-                        Some(f) if !f.running => true,
-                        Some(f) => match f.inflight.as_ref().filter(|i| i.written) {
-                            Some(i) => tx.input(i.input_id)?.is_some_and(|r| {
-                                r.state == InputState::Acked && r.ack_seq.is_some()
-                            }),
-                            None => false,
-                        },
-                    };
+                let written = facts
+                    .filter(|f| f.running)
+                    .and_then(|f| f.inflight.as_ref().filter(|i| i.written));
+                let settle = match (hook.intake_reliable, facts, written) {
+                    (true, Some(f), _) if !f.running => true,
+                    (true, Some(_), Some(i)) => tx
+                        .input(i.input_id)?
+                        .is_some_and(|r| r.state == InputState::Acked && r.ack_seq.is_some()),
+                    _ => false,
+                };
                 TurnMark::End { settle }
             }
             HookFact::Interrupt => {
                 ev.apply("interrupt", &StateInput::Interrupted);
-                ev.close_cards(tx, thread, ApprovalOutcome::Superseded)?;
+                ev.close_cards(tx, thread)?;
                 TurnMark::End { settle: false }
             }
             HookFact::CardOpened {
