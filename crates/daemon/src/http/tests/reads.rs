@@ -361,3 +361,130 @@ async fn read_by_classifies_with_one_sample() {
     drop(ctx);
     srv.stop().await;
 }
+
+/// `GET /api/threads/{thread_id}` (PR10a1-CL-38): owner and rescue read any thread, an agent
+/// its own; an unrelated, missing, or unparseable thread is one 404; the guard rules are
+/// those of `GET /api/events`; and the body has a fixed size, whatever the thread's attention
+/// causes and history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_summary() {
+    use chaldea_core::sync::ThreadSummary;
+
+    use super::support::{launch, thread};
+
+    let (big, other) = (thread(3), thread(4));
+    // The store's own calls block; the preparation runs off the runtime's threads.
+    let store = tokio::task::spawn_blocking(move || prepare_big_thread(big, other))
+        .await
+        .unwrap();
+    let srv = TestServer::start_on(store, Mounts::mvp(), |_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let rescue = srv.token(TokenKind::Rescue, None, None).await;
+    let (mine, l) = (thread(1), launch(1));
+    let agent = srv.agent(mine, l).await;
+    let hook = srv.hook(thread(2), launch(2)).await;
+    let get = |t: &str| srv.req("GET", &format!("/api/threads/{t}"));
+    let outcome = |r: &super::support::http::Reply| (r.status, r.code());
+
+    for secret in [&owner, &rescue] {
+        let r = srv.send(&get(&big.to_string()).bearer(secret)).await;
+        assert_eq!(r.status, 200, "{r:?}");
+        assert!(r.body.len() < 1024 * 1024, "{} bytes", r.body.len());
+        let s: ThreadSummary = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(
+            (s.thread_id, s.attention_count, s.launch),
+            (big, 10_000, None)
+        );
+    }
+    let r = srv.send(&get(&mine.to_string()).bearer(&agent)).await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let s: ThreadSummary = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(
+        (
+            s.thread_id,
+            s.attention_count,
+            s.launch.map(|x| x.launch_id)
+        ),
+        (mine, 0, Some(l))
+    );
+
+    let not_found = (404, Some("not_found".to_owned()));
+    for (what, target, secret) in [
+        ("an unrelated thread", other.to_string(), &agent),
+        ("a missing thread", thread(9).to_string(), &owner),
+        ("an unparseable id", "not-a-thread".to_owned(), &owner),
+        ("a non-canonical id", big.0.simple().to_string(), &owner),
+    ] {
+        let r = srv.send(&get(&target).bearer(secret)).await;
+        assert_eq!(outcome(&r), not_found, "{what}");
+    }
+    let target = big.to_string();
+    let r = srv.send(&get(&target)).await;
+    assert_eq!(outcome(&r), (401, Some("unauthorized".to_owned())));
+    let r = srv.send(&get(&target).bearer(&hook)).await;
+    assert_eq!(r.status, 403, "{r:?}");
+    let r = srv
+        .send(
+            &get(&target)
+                .bearer(&owner)
+                .host(Some(&format!("evil:{}", srv.port))),
+        )
+        .await;
+    assert_eq!(outcome(&r), (421, Some("misdirected_request".to_owned())));
+    let r = srv
+        .send(&get(&target).bearer(&owner).header("Origin", "http://evil"))
+        .await;
+    assert_eq!(r.status, 403, "{r:?}");
+    srv.stop().await;
+}
+
+/// A store with threads `big` (a long history and 10,000 unresolved attention causes) and
+/// `other`.
+fn prepare_big_thread(
+    big: chaldea_core::ids::ThreadId,
+    other: chaldea_core::ids::ThreadId,
+) -> super::support::TestStore {
+    use std::collections::BTreeSet;
+
+    use chaldea_core::ids::{InputId, StreamId};
+    use chaldea_core::payload::Content;
+    use chaldea_core::state::AttentionCause;
+
+    use super::support::{TestStore, raw_unknown, registered};
+
+    let mut store = TestStore::new();
+    store
+        .append(vec![registered(big, false), registered(other, false)])
+        .unwrap();
+    for chunk in 0..10 {
+        let history = (0..200)
+            .map(|i| {
+                raw_unknown(
+                    StreamId::Thread(big),
+                    &format!("h{chunk}-{i}"),
+                    Content::text("x".repeat(200)),
+                )
+            })
+            .collect();
+        store.append(history).unwrap();
+    }
+    store.shutdown();
+    // 10,000 unresolved causes, written into the projection directly.
+    let causes: BTreeSet<AttentionCause> = (0..10_000u128)
+        .map(|n| AttentionCause::InputUnconfirmed {
+            input_id: InputId::from_u128(n),
+        })
+        .collect();
+    {
+        let c = rusqlite::Connection::open(store.path()).unwrap();
+        let changed = c
+            .execute(
+                "UPDATE proj_threads SET attention = ?1 WHERE thread_id = ?2",
+                [serde_json::to_string(&causes).unwrap(), big.to_string()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+    store.reopen();
+    store
+}

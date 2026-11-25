@@ -49,8 +49,8 @@ pub use auth::{
     verify_hash_in, verify_secret_in,
 };
 pub use commands::{
-    CommandCtx, CommandEffect, CommandHandler, CommandRegistry, EffectRun, Intent, IntentFn,
-    Prepared,
+    CommandCtx, CommandEffect, CommandHandler, CommandRegistry, EffectOutcome, EffectRun, Intent,
+    IntentFn, Prepared,
 };
 pub use ctx::{Deadline, ReadCtx, RequestStart, WriteCtx};
 pub use error::ApiError;
@@ -66,6 +66,16 @@ pub use upgrade::{ShutdownSignal, UpgradeGrant, UpgradedSocket};
 pub(crate) use auth::{TOKEN_PREFIX, has_secret_form, verify_in_read};
 pub(crate) use ctx::until_deadline;
 pub(crate) use error::refused;
+// The seams for components that write without a request (the supervisor's ops).
+#[expect(unused_imports, reason = "used by the supervisor in PR 10a1 part 2")]
+pub(crate) use {
+    auth::mint_token,
+    commands::{
+        BACKOFF_FIRST, BACKOFF_MAX, COMPLETION_ATTEMPT, COMPLETION_BUDGET, backoff_until, retryable,
+    },
+    ctx::{AfterOk, Job, write_with},
+    error::WriteFailure,
+};
 
 /// The server's monotonic clock (design §2.3): request origins, deadlines, the cutoff
 /// checks, and ticket expiry are all read on it; tests inject one.
@@ -202,6 +212,11 @@ pub enum StoreFatal {
     ReceiptUncompleted {
         command_id: chaldea_core::ids::CommandId,
     },
+    /// A launch's exit could not be recorded within its bound while the daemon ran (the
+    /// supervisor's exit op).
+    LaunchUnrecorded {
+        launch_id: chaldea_core::ids::LaunchId,
+    },
 }
 
 /// State every request, task, and handle of one server shares.
@@ -252,6 +267,30 @@ impl Shared {
 
     pub(crate) fn nudge(&self) {
         self.revocations.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    pub(crate) fn revocation_nudge(self: &Arc<Self>) -> RevocationNudge {
+        RevocationNudge(Arc::downgrade(self))
+    }
+}
+
+/// Asks every WebSocket of one server to re-check its token (design §2.4): run after a
+/// committed job that may have revoked a token. Holds the server weakly; a nudge after the
+/// server is gone does nothing.
+#[derive(Clone)]
+pub(crate) struct RevocationNudge(std::sync::Weak<Shared>);
+
+impl RevocationNudge {
+    pub(crate) fn nudge(&self) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.nudge();
+        }
+    }
+}
+
+impl std::fmt::Debug for RevocationNudge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RevocationNudge").finish_non_exhaustive()
     }
 }
 
@@ -336,6 +375,16 @@ impl HttpServer {
     /// Asks every WebSocket to re-check its token now.
     pub fn nudge_revocation(&self) {
         self.shared.nudge();
+    }
+
+    /// The nudge a component keeps to run after its own revoking jobs commit.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the supervisor in PR 10a1 part 2")
+    )]
+    #[must_use]
+    pub(crate) fn revocation_nudge(&self) -> RevocationNudge {
+        self.shared.revocation_nudge()
     }
 
     #[cfg(test)]

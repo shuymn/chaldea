@@ -242,6 +242,14 @@ pub static ROUTES: &[RouteSpec] = {
             7,
         ),
         get(
+            "/api/threads/{thread_id}",
+            M::Read,
+            O::AbsentOrMatching,
+            C::Bearer(READERS),
+            A::Fixed(Action::ReadStream),
+            10,
+        ),
+        get(
             "/api/worktrees",
             M::Read,
             O::AbsentOrMatching,
@@ -443,19 +451,26 @@ pub struct Mounts(Vec<Mount>);
 impl Mounts {
     /// Every route of [`ROUTES`]: PR 7's sync reads, blobs, tickets, pairing, the WebSocket
     /// loop, and the command dispatcher (each command 501 until its handler is registered),
-    /// PR 9's `/hook` with [`crate::hook::HookSeams::mvp`], and a 501 handler for every
-    /// route whose PR has not mounted one.
+    /// PR 10's thread summary, PR 9's `/hook` with [`crate::hook::HookSeams::mvp`], and a
+    /// 501 handler for every route whose PR has not mounted one.
+    #[must_use]
+    pub fn mvp() -> Mounts {
+        Mounts::mvp_with(crate::hook::HookSeams::mvp(), Vec::new())
+    }
+
+    /// [`Mounts::mvp`] with `/hook` built over `hook_seams`, and each of `extra_reads`
+    /// replacing its route's mount (a component's reads, such as `GET /api/adapters`).
     ///
     /// # Panics
     ///
     /// Never: every route named here is in [`ROUTES`].
     #[must_use]
-    pub fn mvp() -> Mounts {
+    pub fn mvp_with(hook_seams: crate::hook::HookSeams, extra_reads: Vec<Mount>) -> Mounts {
         use super::{blobs, commands, pair, sync_api, ws};
         let at = |method: Method, path: &str| {
             spec(&method, path).unwrap_or_else(|| panic!("{method} {path} is in ROUTES"))
         };
-        Mounts(ROUTES.iter().map(Mount::unimplemented).collect())
+        let mounts = Mounts(ROUTES.iter().map(Mount::unimplemented).collect())
             .with(Mount::read(
                 at(Method::GET, "/api/events"),
                 sync_api::events,
@@ -463,6 +478,10 @@ impl Mounts {
             .with(Mount::read(
                 at(Method::GET, "/api/threads"),
                 sync_api::threads,
+            ))
+            .with(Mount::read(
+                at(Method::GET, sync_api::THREAD_PATH),
+                sync_api::thread_summary,
             ))
             .with(Mount::read(
                 at(Method::GET, "/api/worktrees"),
@@ -491,8 +510,9 @@ impl Mounts {
             ))
             .with(crate::hook::mount(
                 crate::hook::HookConfig::default(),
-                crate::hook::HookSeams::mvp(),
-            ))
+                hook_seams,
+            ));
+        extra_reads.into_iter().fold(mounts, Mounts::with)
     }
 
     /// No mounts (for building inconsistent sets in tests).

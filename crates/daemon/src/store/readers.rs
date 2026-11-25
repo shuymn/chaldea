@@ -17,7 +17,7 @@ use chaldea_core::payload::{ApprovalRequested, SurfaceUpdate, VtSnapshotTaken, W
 use chaldea_core::state::ThreadState;
 use chaldea_core::sync::{
     GateEvidence, HostSnapshot, InputInfo, LaunchInfo, SNAPSHOT_RECENT_EVENTS, SessionInfo,
-    StreamHead, StreamHeadEntry, ThreadInfo, ThreadSnapshot,
+    StreamHead, StreamHeadEntry, ThreadInfo, ThreadSnapshot, ThreadSummary,
 };
 use rusqlite::{Connection, OptionalExtension, Params, Row};
 use uuid::Uuid;
@@ -585,13 +585,7 @@ impl<'a> ReadTx<'a> {
             recent_events.reverse();
             let snapshot = ThreadSnapshot {
                 thread: thread_info(&thread),
-                launch: launch.as_ref().map(|l| LaunchInfo {
-                    launch_id: l.launch_id,
-                    pid: l.pid,
-                    manual: l.manual,
-                    exit_reason: l.exit_reason,
-                    death_confirmed: l.death_confirmed,
-                }),
+                launch: launch.as_ref().map(launch_info),
                 session,
                 gate,
                 inputs,
@@ -602,6 +596,45 @@ impl<'a> ReadTx<'a> {
                 recent_events,
             };
             Ok(Some((snapshot, self.stream_head(stream)?)))
+        })
+    }
+
+    /// The fixed-size facts of one thread (`GET /api/threads/{thread_id}`): its states, the
+    /// number of its unresolved attention causes, counted in SQL without decoding them, and
+    /// its current launch. `None` for a missing thread.
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub fn thread_summary(&self, t: ThreadId) -> Result<Option<ThreadSummary>, StoreError> {
+        self.guard(|| {
+            type Raw = (bool, String, String, String, i64, Option<String>);
+            let Some(r) = self
+                .rows(
+                    "SELECT closed, process_state, turn_state, task_state, json_array_length(attention),
+                       current_launch_id FROM proj_threads WHERE thread_id = ?1",
+                    [t.to_string()],
+                    |r| -> rusqlite::Result<Raw> {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                    },
+                )?
+                .pop()
+            else {
+                return Ok(None);
+            };
+            let launch = match opt_uuid(r.5.as_deref())?.map(LaunchId) {
+                Some(l) => self.launch_row(l)?,
+                None => None,
+            };
+            Ok(Some(ThreadSummary {
+                thread_id: t,
+                closed: r.0,
+                process_state: parse_enum(&r.1)?,
+                turn_state: parse_enum(&r.2)?,
+                task_state: parse_enum(&r.3)?,
+                attention_count: u32::try_from(r.4).map_err(StoreError::decode)?,
+                launch: launch.as_ref().map(launch_info),
+            }))
         })
     }
 
@@ -801,6 +834,22 @@ impl<'a> ReadTx<'a> {
     }
 
     /// The thread's inputs in `states`, selected in SQL so other rows are never read.
+    /// Every input of any thread in one of `states`, by thread, then creation.
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub fn inputs_in_states(&self, states: &[InputState]) -> Result<Vec<InputRow>, StoreError> {
+        self.guard(|| {
+            let wanted: Vec<String> = states.iter().map(enum_text).collect();
+            let wanted = serde_json::to_string(&wanted).map_err(StoreError::decode)?;
+            self.input_rows(
+                "WHERE state IN (SELECT value FROM json_each(?1)) ORDER BY thread_id, created_seq",
+                [wanted],
+            )
+        })
+    }
+
     fn inputs_in(&self, t: ThreadId, states: &[InputState]) -> Result<Vec<InputRow>, StoreError> {
         let wanted: Vec<String> = states.iter().map(enum_text).collect();
         let wanted = serde_json::to_string(&wanted).map_err(StoreError::decode)?;
@@ -1398,6 +1447,16 @@ impl<'a> ReadTx<'a> {
                 })?;
             Ok(if lines == ["ok"] { Vec::new() } else { lines })
         })
+    }
+}
+
+fn launch_info(l: &LaunchRow) -> LaunchInfo {
+    LaunchInfo {
+        launch_id: l.launch_id,
+        pid: l.pid,
+        manual: l.manual,
+        exit_reason: l.exit_reason,
+        death_confirmed: l.death_confirmed,
     }
 }
 

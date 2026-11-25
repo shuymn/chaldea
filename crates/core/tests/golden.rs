@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use chaldea_core::command::{StopOutcome, StopResult};
 use chaldea_core::event::{
     EventEnvelope, GenericEvent, GenericReason, Source, TranscriptPos, TypedEvent,
 };
@@ -284,6 +285,7 @@ fn samples() -> Vec<(StreamId, TypedEvent)> {
                 signal: Some(15),
                 reason: ExitReason::Stopped,
                 death_confirmed: true,
+                failed_start: None,
             }),
         ),
         (
@@ -662,6 +664,44 @@ fn golden_round_trip_for_ws_messages() {
             stream_ids: vec![StreamId::Host, StreamId::Thread(THREAD)],
         },
     );
+}
+
+/// `StopResult` on each of its branches (supervisor §2.2): every field present, `exit_code`
+/// and `signal` as `null` when unknown.
+#[test]
+fn golden_round_trip_for_stop_results() {
+    let stop = |outcome, confirmed, within, exit_code, signal| StopResult {
+        launch_id: LAUNCH,
+        outcome,
+        death_confirmed: confirmed,
+        confirmed_within_deadline: within,
+        exit_code,
+        signal,
+    };
+    for (name, value) in [
+        (
+            "stopped_within_deadline",
+            stop(StopOutcome::Stopped, true, true, None, Some(15)),
+        ),
+        (
+            "stopped_confirmed_late",
+            stop(StopOutcome::Stopped, true, false, Some(0), None),
+        ),
+        (
+            "stopped_unconfirmed",
+            stop(StopOutcome::Stopped, false, false, None, None),
+        ),
+        (
+            "already_exited_in_intent",
+            stop(StopOutcome::AlreadyExited, true, true, None, None),
+        ),
+        (
+            "already_exited_on_reread",
+            stop(StopOutcome::AlreadyExited, true, false, None, None),
+        ),
+    ] {
+        round_trip(&format!("commands/stop_result_{name}"), &value);
+    }
 }
 
 // ---- forward-compatible decoding ---------------------------------------------------------------

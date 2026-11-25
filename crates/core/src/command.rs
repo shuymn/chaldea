@@ -2,10 +2,13 @@
 //!
 //! Internal: the store keeps receipts, HTTP maps a [`ReceiptLookup`] to its reply.
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use ts_rs::TS;
 
 use crate::canonical::CanonicalJson;
-use crate::ids::{CommandId, TokenId};
+use crate::ids::{Agent, CommandId, InputId, LaunchId, ThreadId, TokenId};
 
 /// The domain of [`request_identity`]: a new identity scheme gets a new one.
 pub const IDENTITY_DOMAIN: &str = "chaldea-command-v1";
@@ -89,4 +92,126 @@ pub fn check_receipt(
         ReceiptStatus::Completed(res) => ReceiptLookup::Replay(res.clone()),
         ReceiptStatus::UnknownAfterCrash => ReceiptLookup::UnknownAfterCrash,
     }
+}
+
+// ---- launch commands (`docs/design/supervisor.md` §2.2) ----------------------------------------
+
+/// The arguments of `spawn`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnArgs {
+    pub agent: Agent,
+    pub cwd: String,
+    /// A Codex positional first prompt; a Claude one is refused (`bad_args`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub prompt: Option<String>,
+    /// The task given at spawn (`thread_registered.task`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub task: Option<String>,
+}
+
+/// The arguments of `resume`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResumeArgs {
+    pub thread_id: ThreadId,
+    /// The launch the client read as current; another current launch is `launch_changed`.
+    pub expected_launch_id: LaunchId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub prompt: Option<String>,
+}
+
+/// The arguments of `stop`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StopArgs {
+    pub thread_id: ThreadId,
+    /// When given, the current launch must be this one (`launch_changed` otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub expected_launch_id: Option<LaunchId>,
+}
+
+/// The arguments of `close`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CloseArgs {
+    pub thread_id: ThreadId,
+    pub expected_launch_id: LaunchId,
+    /// Stop a live current launch first; absent means false.
+    #[serde(default)]
+    pub stop: bool,
+}
+
+/// Whether a spawn or resume started its process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchOutcome {
+    Started,
+    SpawnFailed,
+}
+
+/// The success body of `spawn`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+pub struct SpawnResult {
+    pub thread_id: ThreadId,
+    pub launch_id: LaunchId,
+    /// The positional first prompt's input; `null` without one.
+    pub input_id: Option<InputId>,
+    pub outcome: LaunchOutcome,
+}
+
+/// The success body of `resume`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+pub struct ResumeResult {
+    pub launch_id: LaunchId,
+    pub input_id: Option<InputId>,
+    pub outcome: LaunchOutcome,
+}
+
+/// How a stop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StopOutcome {
+    /// This stop sealed and killed the launch.
+    Stopped,
+    /// The launch had already exited with its death confirmed.
+    AlreadyExited,
+}
+
+/// The success body of `stop` (`docs/design/supervisor.md` §2.2). Every field is always
+/// present, `exit_code` and `signal` as `null` when unknown, and each is in the JSON
+/// Schema's `required` list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+#[schemars(extend("required" = [
+    "launch_id",
+    "outcome",
+    "death_confirmed",
+    "confirmed_within_deadline",
+    "exit_code",
+    "signal"
+]))]
+pub struct StopResult {
+    pub launch_id: LaunchId,
+    pub outcome: StopOutcome,
+    /// The launch's process tree was proven dead.
+    pub death_confirmed: bool,
+    /// Death was confirmed and proven at or before the request's start + 5 s.
+    pub confirmed_within_deadline: bool,
+    /// The leader's exit code; `null` when the waiter had not reported an exit, and for
+    /// `already_exited` (the launch's own `launch_exited` carries it).
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+}
+
+/// The success body of `close`: `stop` is the result of the stop a `close --stop` ran, and
+/// `null` when none ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+#[schemars(extend("required" = ["thread_id", "stop"]))]
+pub struct CloseResult {
+    pub thread_id: ThreadId,
+    pub stop: Option<StopResult>,
 }

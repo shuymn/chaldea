@@ -15,9 +15,11 @@ use tokio::sync::oneshot;
 use super::auth::{Authorized, Principal, verify_in_read, verify_opt_in_job};
 use super::error::{ApiError, WriteFailure, in_source_chain, read_error, write_failure};
 use super::registry::{Closing, TaskKind};
-use super::{Shared, StoreFatal};
+use super::{LifecycleSink, MonotonicClock, Shared, StoreFatal};
 use crate::deadline::{Settled, settle_before};
-use crate::store::{JobError, ReadError, ReadTx, StoreError, SubmitError, WriteError, WriteTx};
+use crate::store::{
+    JobError, ReadError, ReadTx, Store, StoreError, SubmitError, WriteError, WriteTx,
+};
 
 /// The instant of the connection's first head byte, on the server's clock: the request's
 /// origin.
@@ -198,20 +200,56 @@ async fn run_write_releasing<R: Send + 'static>(
     shared.faults.write_submitted(not_after);
     #[cfg(test)]
     shared.faults.before_submit().await;
-    let submitted = shared.store.submit(shared.real(not_after), job);
-    // The job is in the writer's queue now, or never will be.
-    drop(release);
+    let write = write_with(
+        &shared.store,
+        shared.sink.as_ref(),
+        shared.cfg.clock.as_ref(),
+        not_after,
+        job,
+        after_ok,
+        // The job is in the writer's queue now, or never will be.
+        move || drop(release),
+    );
+    #[cfg(test)]
+    let write = shared.faults.signal_ticket_park(write);
+    let result = write.await;
+    #[cfg(test)]
+    if matches!(result, Err(WriteFailure::Write(WriteError::Expired))) {
+        shared.faults.write_expired();
+    }
+    result
+}
+
+/// The one submit-and-observe path of a write, for the server and for components that
+/// hold the store, the sink, and a clock but no server: submits `job` with `not_after` on
+/// `clock`, calls `on_submit` synchronously right after `Store::submit` returns, whatever it
+/// returned and before that result is examined, then awaits the writer's answer. A
+/// `SubmitError::Failed`, `CommitUnknown`, `WriterGone`, or `Failed` is reported to `sink`;
+/// `after_ok` runs once the job committed.
+///
+/// # Errors
+///
+/// The submission's or the write's failure.
+pub(crate) async fn write_with<R: Send + 'static>(
+    store: &Store,
+    sink: &dyn LifecycleSink,
+    clock: &dyn MonotonicClock,
+    not_after: Instant,
+    job: Job<R>,
+    after_ok: Option<AfterOk>,
+    on_submit: impl FnOnce(),
+) -> Result<R, WriteFailure> {
+    let submitted = store.submit(clock.real(not_after), job);
+    on_submit();
     let ticket = match submitted {
         Ok(t) => t,
         Err(e) => {
             if e == SubmitError::Failed {
-                shared.sink.store_fatal(StoreFatal::Failed);
+                sink.store_fatal(StoreFatal::Failed);
             }
             return Err(WriteFailure::Submit(e));
         }
     };
-    #[cfg(test)]
-    let ticket = shared.faults.signal_ticket_park(ticket);
     match ticket.await {
         Ok(r) => {
             if let Some(f) = after_ok {
@@ -220,10 +258,6 @@ async fn run_write_releasing<R: Send + 'static>(
             Ok(r)
         }
         Err(e) => {
-            #[cfg(test)]
-            if matches!(e, WriteError::Expired) {
-                shared.faults.write_expired();
-            }
             let fatal = match &e {
                 WriteError::CommitUnknown(_) => Some(StoreFatal::CommitUnknown),
                 WriteError::WriterGone => Some(StoreFatal::WriterGone),
@@ -231,7 +265,7 @@ async fn run_write_releasing<R: Send + 'static>(
                 _ => None,
             };
             if let Some(f) = fatal {
-                shared.sink.store_fatal(f);
+                sink.store_fatal(f);
             }
             Err(WriteFailure::Write(e))
         }

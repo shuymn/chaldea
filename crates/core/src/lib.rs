@@ -17,6 +17,7 @@ pub mod event;
 pub mod http;
 pub mod ids;
 pub mod input;
+pub mod launch;
 pub mod payload;
 pub mod state;
 pub mod sync;

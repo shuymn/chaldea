@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
 use ts_rs::TS;
 
+use crate::adapter::HostOs;
 use crate::event::EventEnvelope;
 use crate::ids::{
     Actor, Agent, Epoch, InputId, LaunchId, Open, StreamId, ThreadId, Timestamp, WorkspaceId,
@@ -342,6 +343,41 @@ impl<'de> Deserialize<'de> for EventsResponse {
             other => Err(de::Error::unknown_variant(other, &["replay", "snapshot"])),
         }
     }
+}
+
+// ---- adapters and thread summaries ----------------------------------------------------------------
+
+/// The body of `GET /api/adapters`: this host's rows of the capability table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+pub struct AdaptersResponse {
+    pub host_os: Open<HostOs>,
+    /// This host's rows, in `CAPABILITIES` order.
+    pub adapters: Vec<AdapterInfo>,
+}
+
+/// One row of the capability table, as clients see it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+pub struct AdapterInfo {
+    pub agent: Open<Agent>,
+    /// `bracketed_paste` or `win_keys`.
+    pub pty_encoding: Open<InputEncoding>,
+    /// `bracketed_paste`, `win_keys`, or `positional`.
+    pub first_prompt: Open<InputEncoding>,
+}
+
+/// The body of `GET /api/threads/{thread_id}`: fixed-size facts of one thread, whatever its
+/// history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+pub struct ThreadSummary {
+    pub thread_id: ThreadId,
+    pub closed: bool,
+    pub process_state: ProcessState,
+    pub turn_state: TurnState,
+    pub task_state: TaskState,
+    /// Unresolved attention causes.
+    pub attention_count: u32,
+    /// The current launch.
+    pub launch: Option<LaunchInfo>,
 }
 
 // ---- live notifications ------------------------------------------------------------------------

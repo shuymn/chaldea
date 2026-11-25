@@ -180,6 +180,8 @@ pub enum TokenSelector {
     Token(TokenId),
     Launch(LaunchId),
     Thread(ThreadId),
+    /// Every token bound to a launch, whichever launch.
+    LaunchScoped,
 }
 
 /// A `task_set` of this job that may justify one derived `status_changed(TaskState)`.
@@ -1019,16 +1021,24 @@ impl<'c> WriteTx<'c> {
     /// A store error.
     pub fn token_revoke(&mut self, which: TokenSelector) -> Result<u64, StoreError> {
         self.guard(|tx| {
+            let at = tx.recorded_at.0.clone();
             let (column, id) = match which {
                 TokenSelector::Token(t) => ("token_id", t.to_string()),
                 TokenSelector::Launch(l) => ("launch_id", l.to_string()),
                 TokenSelector::Thread(t) => ("thread_id", t.to_string()),
+                TokenSelector::LaunchScoped => {
+                    let n = tx.conn.execute(
+                        "UPDATE tokens SET revoked_at = ?1 WHERE launch_id IS NOT NULL AND revoked_at IS NULL",
+                        [at],
+                    )?;
+                    return Ok(n as u64);
+                }
             };
             let n = tx.conn.execute(
                 &format!(
                     "UPDATE tokens SET revoked_at = ?1 WHERE {column} = ?2 AND revoked_at IS NULL"
                 ),
-                [tx.recorded_at.0.clone(), id],
+                [at, id],
             )?;
             Ok(n as u64)
         })

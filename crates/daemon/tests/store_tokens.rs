@@ -88,3 +88,37 @@ fn duplicate_hash_is_refused() {
         TokenKind::Owner
     );
 }
+
+/// `LaunchScoped` revokes every token bound to a launch, whichever launch, and leaves the
+/// tokens without one.
+#[test]
+fn launch_scoped_revokes_every_launch_token() {
+    let s = TestStore::new();
+    let mut other = token(4, TokenKind::Hook, 4);
+    other.launch_id = Some(launch(2));
+    let rows = vec![
+        token(1, TokenKind::Owner, 1),
+        token(2, TokenKind::Hook, 2),
+        token(3, TokenKind::Agent, 3),
+        other,
+    ];
+    s.run(move |tx| {
+        for t in rows {
+            tx.token_insert(t)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let n = s
+        .run(|tx| Ok(tx.token_revoke(TokenSelector::LaunchScoped)?))
+        .unwrap();
+    assert_eq!(n, 3);
+    for (h, revoked) in [(1, false), (2, true), (3, true), (4, true)] {
+        let row = s.read(move |r| r.token_by_hash(&[h; 32])).unwrap();
+        assert_eq!(row.revoked_at.is_some(), revoked, "token {h}");
+    }
+    let n = s
+        .run(|tx| Ok(tx.token_revoke(TokenSelector::LaunchScoped)?))
+        .unwrap();
+    assert_eq!(n, 0);
+}

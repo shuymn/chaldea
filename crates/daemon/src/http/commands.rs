@@ -30,11 +30,11 @@ use serde_json::value::RawValue;
 use tokio::sync::watch;
 
 use super::auth::{Authorized, verify_opt_in_job};
-use super::ctx::{Job, WriteCtx, run_write};
+use super::ctx::{AfterOk, Job, RequestStart, WriteCtx, run_write};
 use super::error::{ApiError, WriteFailure, refused, write_failure};
 use super::guard::path_param;
 use super::registry::TaskKind;
-use super::{Shared, StoreFatal};
+use super::{MonotonicClock, Shared, StoreFatal};
 use crate::store::{JobError, StoreError, SubmitError, WriteError, WriteTx};
 
 /// The command route's path template.
@@ -45,8 +45,8 @@ pub(crate) const COMPLETION_BUDGET: Duration = Duration::from_secs(60);
 /// The longest `not_after` of one completion attempt.
 pub(crate) const COMPLETION_ATTEMPT: Duration = Duration::from_secs(5);
 /// The first and the largest pause between completion attempts.
-const BACKOFF_FIRST: Duration = Duration::from_millis(10);
-const BACKOFF_MAX: Duration = Duration::from_secs(1);
+pub(crate) const BACKOFF_FIRST: Duration = Duration::from_millis(10);
+pub(crate) const BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 // ---- the dispatch seam ----------------------------------------------------------------------
 
@@ -74,20 +74,45 @@ pub trait CommandHandler: Send + Sync + 'static {
     fn effect(&self) -> Option<&dyn CommandEffect> {
         None
     }
+
+    /// Whether the intent can revoke a token: the runner then passes the revocation nudge as
+    /// the intent job's `after_ok`, so sockets re-check their tokens once it committed
+    /// (design §2.4). A nudge after a commit that revoked nothing (a refusal's replay) is
+    /// harmless: the nudge carries no decision.
+    fn revokes(&self) -> bool {
+        false
+    }
 }
 
 /// A command's effect, run once by the runner after its intent committed.
 pub trait CommandEffect: Send + Sync {
-    /// Resolves to the command's terminal result, a handler reply (design §2.8 "Handler
-    /// replies": a JSON success other than 204 and 205, or an `ErrorBody` whose code a
-    /// handler may use, at that code's status; otherwise the runner stores and answers 500
-    /// `internal`). The owning PR guarantees that it resolves within a bound it states, and
-    /// that a result it returns for work that did not happen (a refusal, or work that ran
-    /// out of its time) means the work can no longer happen later. Work that ran out of its
-    /// time is 504 with a code the owning PR adds to `ErrorCode` and classifies in
-    /// `handler_code`, never 408: 408 says the request's deadline kept its intent from
-    /// committing. The runner adds no timeout of its own.
-    fn run(&self, run: EffectRun) -> BoxFuture<'static, CommandResult>;
+    /// Resolves to how the effect ended. `Done` carries the command's terminal result, a
+    /// handler reply (design §2.8 "Handler replies": a JSON success other than 204 and 205,
+    /// or an `ErrorBody` whose code a handler may use, at that code's status; otherwise the
+    /// runner stores and answers 500 `internal`). The owning PR states the bound of each
+    /// stage of its effect, and guarantees that a result it returns for work that did not
+    /// happen (a refusal, or work that ran out of its time) means the work can no longer
+    /// happen later. Work that ran out of its time is 504 with a code the owning PR adds to
+    /// `ErrorCode` and classifies in `handler_code`, never 408: 408 says the request's
+    /// deadline kept its intent from committing. The runner adds no timeout of its own. An
+    /// effect may hand its work to a task its component owns, which outlives the runner,
+    /// and await that task's result.
+    fn run(&self, run: EffectRun) -> BoxFuture<'static, EffectOutcome>;
+}
+
+/// How a command's effect ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectOutcome {
+    /// The terminal result: the runner completes the receipt with it and replies.
+    Done(CommandResult),
+    /// A job of the effect could not be recorded while the daemon runs: the receipt stays
+    /// `in_progress` (it becomes `unknown_after_crash` at the next start), a waiting request
+    /// gets 503 `outcome_unknown`, and the runner reports `ReceiptUncompleted`.
+    Unrecorded,
+    /// The effect stopped because the daemon is shutting down (admission closed, or the
+    /// store refused a write as `Closed`): answered as `Unrecorded` on the wire, with no
+    /// fatal report.
+    ShuttingDown,
 }
 
 /// How a handler may reply with a code: at `status`, with `retry_after` exactly when
@@ -121,6 +146,17 @@ fn handler_code(code: ErrorCode) -> Option<HandlerCode> {
         // The daemon is stopping: no retry time, as every other `shutting_down` reply.
         ErrorCode::ShuttingDown => at(StatusCode::SERVICE_UNAVAILABLE),
         ErrorCode::Internal => at(StatusCode::INTERNAL_SERVER_ERROR),
+        // The launch commands' refusals (supervisor §2.2): nothing happened, and the work
+        // cannot happen later.
+        ErrorCode::ThreadClosed
+        | ErrorCode::LaunchChanged
+        | ErrorCode::LaunchLive
+        | ErrorCode::DeathUnconfirmed
+        | ErrorCode::WorktreeUnavailable
+        | ErrorCode::NoSession => at(StatusCode::CONFLICT),
+        ErrorCode::PromptRejected | ErrorCode::PromptTooLarge => at(StatusCode::BAD_REQUEST),
+        // A stop that could not take its launch in time; nothing changed.
+        ErrorCode::LaunchBusy => at(StatusCode::GATEWAY_TIMEOUT),
         // Routing, framing, method, and authentication: the outer layer and the guard.
         ErrorCode::MisdirectedRequest
         | ErrorCode::OriginRejected
@@ -225,6 +261,8 @@ fn checked_refusal(command_id: CommandId, e: JobError) -> JobError {
 #[derive(Debug)]
 pub struct CommandCtx {
     command_id: CommandId,
+    request_start: Instant,
+    job_start: Instant,
 }
 
 impl CommandCtx {
@@ -232,6 +270,20 @@ impl CommandCtx {
     #[must_use]
     pub fn command_id(&self) -> CommandId {
         self.command_id
+    }
+
+    /// The request's [`RequestStart`]: its connection's first head byte, on the server's
+    /// clock, before the guard authenticated it.
+    #[must_use]
+    pub fn request_start(&self) -> Instant {
+        self.request_start
+    }
+
+    /// The server's clock read in the intent job, right before the intent runs. The writer
+    /// runs one job at a time, so a state the intent reads was committed before this instant.
+    #[must_use]
+    pub fn job_start(&self) -> Instant {
+        self.job_start
     }
 }
 
@@ -462,6 +514,11 @@ pub(crate) async fn dispatch(ctx: WriteCtx, req: Request<Body>) -> Result<Respon
         .principal()
         .map(|p| p.token_sha256)
         .ok_or_else(ApiError::internal)?;
+    let start = req
+        .extensions()
+        .get::<RequestStart>()
+        .copied()
+        .unwrap_or_else(|| RequestStart(shared.cfg.clock.now()));
     let body = ctx
         .body_within(req.into_body(), shared.cfg.max_body_bytes)
         .await?;
@@ -485,6 +542,7 @@ pub(crate) async fn dispatch(ctx: WriteCtx, req: Request<Body>) -> Result<Respon
             identity,
             intent: prepared.intent,
             handler,
+            start,
         },
     )
     .await
@@ -497,6 +555,8 @@ pub(crate) struct Admitted {
     pub(crate) identity: [u8; 32],
     pub(crate) intent: IntentFn,
     pub(crate) handler: Arc<dyn CommandHandler>,
+    /// The request's origin, copied by `dispatch` for [`CommandCtx::request_start`].
+    pub(crate) start: RequestStart,
 }
 
 /// What the runner has reached; the request reads it at reply time.
@@ -626,7 +686,7 @@ async fn runner(
 }
 
 async fn drive(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     deadline: Instant,
     cmd: Admitted,
     progress: &watch::Sender<Progress>,
@@ -637,8 +697,10 @@ async fn drive(
         identity,
         intent,
         handler,
+        start,
     } = cmd;
     let has_effect = handler.effect().is_some();
+    let clock: Arc<dyn MonotonicClock> = shared.cfg.clock.clone();
     // The single deciding point: the token, the receipt lookup and insert, the object
     // checks and the intent's writes, in one transaction.
     let job: Job<Begun> = Box::new(move |tx| {
@@ -649,7 +711,11 @@ async fn drive(
         if lookup != ReceiptLookup::New {
             return Ok(Begun::Lookup(lookup));
         }
-        let mut ctx = CommandCtx { command_id };
+        let mut ctx = CommandCtx {
+            command_id,
+            request_start: start.0,
+            job_start: clock.now(),
+        };
         let decided = intent(tx, &auth, &mut ctx).map_err(|e| checked_refusal(command_id, e));
         match decided? {
             Intent::Completed(r) => {
@@ -662,7 +728,12 @@ async fn drive(
             Intent::Pending(_) => Err(refused(ApiError::internal())),
         }
     });
-    let run = match run_write(shared, deadline, job, None).await {
+    // A revoking intent nudges the sockets once its job committed (design §2.4).
+    let nudge: Option<AfterOk> = handler.revokes().then(|| {
+        let n = shared.revocation_nudge();
+        Box::new(move || n.nudge()) as AfterOk
+    });
+    let run = match run_write(shared, deadline, job, nudge).await {
         Err(f) => return Err(write_failure(f)),
         Ok(Begun::Lookup(l)) => return lookup_reply(l),
         Ok(Begun::Completed(r)) => return Ok(r),
@@ -679,12 +750,25 @@ async fn drive(
     .catch_unwind()
     .await;
     // A panic (its payload is not logged) leaves no result to store.
-    let Ok(Some(result)) = effect else {
-        tracing::error!(%command_id, "command effect ended without a result");
-        shared
-            .sink
-            .store_fatal(StoreFatal::ReceiptUncompleted { command_id });
-        return Err(ApiError::outcome_unknown());
+    let result = match effect {
+        Ok(Some(EffectOutcome::Done(result))) => result,
+        // Shutdown: the receipt stays `in_progress`; nothing is reported, so a graceful stop
+        // does not end as a fatal.
+        Ok(Some(EffectOutcome::ShuttingDown)) => return Err(ApiError::outcome_unknown()),
+        Ok(Some(EffectOutcome::Unrecorded)) => {
+            tracing::error!(%command_id, "command effect could not record its work");
+            shared
+                .sink
+                .store_fatal(StoreFatal::ReceiptUncompleted { command_id });
+            return Err(ApiError::outcome_unknown());
+        }
+        Ok(None) | Err(_) => {
+            tracing::error!(%command_id, "command effect ended without a result");
+            shared
+                .sink
+                .store_fatal(StoreFatal::ReceiptUncompleted { command_id });
+            return Err(ApiError::outcome_unknown());
+        }
     };
     let result = checked_result(command_id, result);
     if complete(shared, command_id, &result).await {
@@ -710,7 +794,7 @@ fn lookup_reply(l: ReceiptLookup) -> Result<CommandResult, ApiError> {
 
 /// Whether a completion attempt may be retried: nothing was written and the writer is
 /// healthy.
-fn retryable(f: &WriteFailure) -> bool {
+pub(crate) fn retryable(f: &WriteFailure) -> bool {
     matches!(
         f,
         WriteFailure::Submit(SubmitError::QueueFull)
@@ -764,6 +848,6 @@ async fn complete(shared: &Shared, command_id: CommandId, result: &CommandResult
     clippy::disallowed_methods,
     reason = "completion backoff; the budget is read before each attempt (http-surface §2.8)"
 )]
-fn backoff_until(wake: tokio::time::Instant) -> tokio::time::Sleep {
+pub(crate) fn backoff_until(wake: tokio::time::Instant) -> tokio::time::Sleep {
     tokio::time::sleep_until(wake)
 }

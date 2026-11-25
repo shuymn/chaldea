@@ -16,6 +16,11 @@
 //! - `test_worktree_remove`: the `OwnWorktree` object check.
 //! - `test_long_deadline`: completed in its intent job, with a budget of its own
 //!   ([`LONG_DEADLINE`]).
+//! - `test_revoke` and `test_revoke_quiet`: completed in an intent job that revokes the token
+//!   the arguments name, after the intent gate; only `test_revoke` declares `revokes()`.
+//! - `test_effect_outcome`: a pending intent whose effect, after the effect gate, ends with
+//!   the `EffectOutcome` the arguments name.
+//! - `test_ctx`: completed in its intent job, which records the `CommandCtx` instants.
 //!
 //! The gates block inside intent closures and effects on purpose; production intents
 //! capture data only (store §5).
@@ -23,7 +28,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
 use chaldea_core::auth::{
@@ -35,8 +40,8 @@ use chaldea_core::command::CommandResult;
 use chaldea_core::http::ErrorCode;
 use chaldea_core::ids::{ThreadId, TokenId, WorktreeId};
 use chaldea_daemon::http::{
-    ApiError, Authorized, CommandEffect, CommandHandler, CommandRegistry, EffectRun, Intent,
-    Prepared, deny_for,
+    ApiError, Authorized, CommandEffect, CommandHandler, CommandRegistry, EffectOutcome, EffectRun,
+    Intent, Prepared, deny_for,
 };
 use chaldea_daemon::store::{JobError, ReadTx, Store, StoreError, TokenSelector};
 use futures_util::future::BoxFuture;
@@ -79,6 +84,26 @@ pub static TEST_COMMANDS: &[CommandSpec] = &[
         action: Action::Send,
         owner_pr: 7,
     },
+    CommandSpec {
+        name: "test_revoke",
+        action: Action::Send,
+        owner_pr: 10,
+    },
+    CommandSpec {
+        name: "test_revoke_quiet",
+        action: Action::Send,
+        owner_pr: 10,
+    },
+    CommandSpec {
+        name: "test_effect_outcome",
+        action: Action::Send,
+        owner_pr: 10,
+    },
+    CommandSpec {
+        name: "test_ctx",
+        action: Action::Send,
+        owner_pr: 10,
+    },
 ];
 
 /// `test_long_deadline`'s budget, from its connection's first head byte; longer than the
@@ -95,6 +120,7 @@ pub struct Probe {
     effects: AtomicUsize,
     intent_gate: Mutex<Option<SyncGate>>,
     effect_gate: Mutex<Option<AsyncGate>>,
+    ctx_seen: Mutex<Vec<(Instant, Instant)>>,
 }
 
 impl Probe {
@@ -102,6 +128,11 @@ impl Probe {
     /// checks (rolled-back runs included).
     pub fn intents(&self) -> usize {
         self.intents.load(Ordering::SeqCst)
+    }
+
+    /// `(request_start, job_start)` of each `test_ctx` intent run.
+    pub fn ctx_seen(&self) -> Vec<(Instant, Instant)> {
+        self.ctx_seen.lock().unwrap().clone()
     }
 
     /// Effects of `test_slow_effect` started.
@@ -149,6 +180,16 @@ pub fn registry(store: &Store, probe: &Arc<Probe>) -> CommandRegistry {
     r.register(Box::new(Refuse));
     r.register(Box::new(WorktreeRemove));
     r.register(Box::new(LongDeadline));
+    r.register(Box::new(Revoke {
+        probe: probe.clone(),
+        nudges: true,
+    }));
+    r.register(Box::new(Revoke {
+        probe: probe.clone(),
+        nudges: false,
+    }));
+    r.register(Box::new(Outcome(probe.clone())));
+    r.register(Box::new(Ctx(probe.clone())));
     r
 }
 
@@ -366,7 +407,7 @@ impl CommandHandler for SlowEffect {
 }
 
 impl CommandEffect for SlowEffect {
-    fn run(&self, run: EffectRun) -> BoxFuture<'static, CommandResult> {
+    fn run(&self, run: EffectRun) -> BoxFuture<'static, EffectOutcome> {
         // Counted before the data is read: every start is an effect started.
         self.probe.effects.fetch_add(1, Ordering::SeqCst);
         let run = run.downcast::<SlowRun>().unwrap_or_else(|_| SlowRun {
@@ -400,10 +441,10 @@ impl CommandEffect for SlowEffect {
                 "effect_panic" => panic!("test_slow_effect panics in its effect"),
                 _ => 200,
             };
-            CommandResult {
+            EffectOutcome::Done(CommandResult {
                 http_status,
                 body: slow_body(&run.tag),
-            }
+            })
         })
     }
 }
@@ -561,6 +602,137 @@ impl CommandHandler for LongDeadline {
                 Ok(Intent::Completed(CommandResult {
                     http_status: 200,
                     body: r#"{"long":true}"#.to_owned(),
+                }))
+            }),
+        })
+    }
+}
+
+// ---- test_revoke, test_revoke_quiet -------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeArgs {
+    token: TokenId,
+}
+
+struct Revoke {
+    probe: Arc<Probe>,
+    nudges: bool,
+}
+
+impl CommandHandler for Revoke {
+    fn name(&self) -> &'static str {
+        if self.nudges {
+            "test_revoke"
+        } else {
+            "test_revoke_quiet"
+        }
+    }
+
+    fn revokes(&self) -> bool {
+        self.nudges
+    }
+
+    fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError> {
+        let (a, normalized): (RevokeArgs, _) = parse(args)?;
+        let probe = self.probe.clone();
+        Ok(Prepared {
+            normalized,
+            intent: Box::new(move |tx, _auth, _ctx| {
+                probe.pass_intent_gate();
+                tx.token_revoke(TokenSelector::Token(a.token))?;
+                Ok(Intent::Completed(CommandResult {
+                    http_status: 200,
+                    body: "{}".to_owned(),
+                }))
+            }),
+        })
+    }
+}
+
+// ---- test_effect_outcome ------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OutcomeKind {
+    Unrecorded,
+    ShuttingDown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutcomeArgs {
+    outcome: OutcomeKind,
+}
+
+struct Outcome(Arc<Probe>);
+
+impl CommandHandler for Outcome {
+    fn name(&self) -> &'static str {
+        "test_effect_outcome"
+    }
+
+    fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError> {
+        let (a, normalized): (OutcomeArgs, _) = parse(args)?;
+        Ok(Prepared {
+            normalized,
+            intent: Box::new(move |_tx, _auth, _ctx| {
+                Ok(Intent::Pending(EffectRun::new(a.outcome)))
+            }),
+        })
+    }
+
+    fn effect(&self) -> Option<&dyn CommandEffect> {
+        Some(self)
+    }
+}
+
+impl CommandEffect for Outcome {
+    fn run(&self, run: EffectRun) -> BoxFuture<'static, EffectOutcome> {
+        self.0.effects.fetch_add(1, Ordering::SeqCst);
+        let kind = run.downcast::<OutcomeKind>().ok();
+        let gate = self.0.effect_gate.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some((reached, release)) = gate {
+                let _ = reached.send(());
+                let _ = release.await;
+            }
+            match kind {
+                Some(OutcomeKind::Unrecorded) => EffectOutcome::Unrecorded,
+                Some(OutcomeKind::ShuttingDown) => EffectOutcome::ShuttingDown,
+                None => EffectOutcome::Done(CommandResult {
+                    http_status: 200,
+                    body: "{}".to_owned(),
+                }),
+            }
+        })
+    }
+}
+
+// ---- test_ctx -----------------------------------------------------------------------------
+
+struct Ctx(Arc<Probe>);
+
+impl CommandHandler for Ctx {
+    fn name(&self) -> &'static str {
+        "test_ctx"
+    }
+
+    fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError> {
+        let (NoArgs {}, normalized) = parse(args)?;
+        let probe = self.0.clone();
+        Ok(Prepared {
+            normalized,
+            intent: Box::new(move |_tx, _auth, ctx| {
+                probe
+                    .ctx_seen
+                    .lock()
+                    .unwrap()
+                    .push((ctx.request_start(), ctx.job_start()));
+                Ok(Intent::Completed(CommandResult {
+                    http_status: 200,
+                    body: "{}".to_owned(),
                 }))
             }),
         })

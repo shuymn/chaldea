@@ -143,6 +143,25 @@ pub struct LaunchExited {
     pub reason: ExitReason,
     /// False until the whole process tree is proven dead (§2.9 "Daemon restart").
     pub death_confirmed: bool,
+    /// The identity a failed start returned when its cleanup is unresolved (a launch with no
+    /// `launch_started`). Absent otherwise: the one exception to this module's rule that an
+    /// `Option` is present as `null`, so every earlier payload keeps its spelling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub failed_start: Option<FailedStart>,
+}
+
+/// The identity a `StartedThenFailed` spawn returned. A part the backend returned empty is
+/// absent, so such a record never identifies a process by its pid alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+pub struct FailedStart {
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub start_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pgid_or_job: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]

@@ -1,0 +1,71 @@
+{
+  "$defs": {
+    "LaunchId": {
+      "description": "A launch: one process lifetime of a thread.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "StopOutcome": {
+      "description": "How a stop ended.",
+      "oneOf": [
+        {
+          "const": "stopped",
+          "description": "This stop sealed and killed the launch.",
+          "type": "string"
+        },
+        {
+          "const": "already_exited",
+          "description": "The launch had already exited with its death confirmed.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The success body of `stop` (`docs/design/supervisor.md` §2.2). Every field is always\npresent, `exit_code` and `signal` as `null` when unknown, and each is in the JSON\nSchema's `required` list.",
+  "properties": {
+    "confirmed_within_deadline": {
+      "description": "Death was confirmed and proven at or before the request's start + 5 s.",
+      "type": "boolean"
+    },
+    "death_confirmed": {
+      "description": "The launch's process tree was proven dead.",
+      "type": "boolean"
+    },
+    "exit_code": {
+      "description": "The leader's exit code; `null` when the waiter had not reported an exit, and for\n`already_exited` (the launch's own `launch_exited` carries it).",
+      "format": "int32",
+      "maximum": 2147483647,
+      "minimum": -2147483648,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "launch_id": {
+      "$ref": "#/$defs/LaunchId"
+    },
+    "outcome": {
+      "$ref": "#/$defs/StopOutcome"
+    },
+    "signal": {
+      "format": "int32",
+      "maximum": 2147483647,
+      "minimum": -2147483648,
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "launch_id",
+    "outcome",
+    "death_confirmed",
+    "confirmed_within_deadline",
+    "exit_code",
+    "signal"
+  ],
+  "title": "StopResult",
+  "type": "object"
+}
