@@ -118,7 +118,12 @@ pub(crate) fn registry(sup: &Arc<Supervisor>) -> CommandRegistry {
 
 /// The MVP mounts with `GET /api/adapters`.
 pub(crate) fn mounts(host_os: HostOs) -> Mounts {
-    Mounts::mvp_with(HookSeams::mvp(), vec![adapters::mount(host_os)])
+    mounts_with(host_os, HookSeams::mvp())
+}
+
+/// [`mounts`] over the given hook seams.
+pub(crate) fn mounts_with(host_os: HostOs, seams: HookSeams) -> Mounts {
+    Mounts::mvp_with(seams, vec![adapters::mount(host_os)])
 }
 
 /// The shutdown participant (design §2.9 "Shutdown").

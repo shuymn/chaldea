@@ -34,7 +34,7 @@ use crate::store::{LaunchRow, ThreadRow, TokenKind};
 use support::TestStore;
 use support::http::{RecordingSink, Reply, SkewClock, TestServer};
 
-use super::components::{mounts, new_supervisor, registry};
+use super::components::{mounts_with, new_supervisor, registry};
 use super::{Pause, Pauses, Supervisor, SupervisorConfig};
 
 /// The program the fake runtime "runs".
@@ -191,6 +191,30 @@ impl Rig {
         host: HostOs,
         tune: impl FnOnce(&mut SupervisorConfig),
     ) -> Rig {
+        Rig::on_seams(store, host, tune, crate::hook::HookSeams::mvp()).await
+    }
+
+    /// A rig whose `/hook` walks the test's process chains instead of the OS's.
+    pub(crate) async fn with_chains(
+        tune: impl FnOnce(&mut SupervisorConfig),
+    ) -> (Rig, Arc<support::hook::Chains>) {
+        let chains = Arc::new(support::hook::Chains::default());
+        let seams = crate::hook::HookSeams {
+            procs: chains.clone(),
+            ..crate::hook::HookSeams::mvp()
+        };
+        (
+            Rig::on_seams(TestStore::new(), HostOs::Macos, tune, seams).await,
+            chains,
+        )
+    }
+
+    async fn on_seams(
+        store: TestStore,
+        host: HostOs,
+        tune: impl FnOnce(&mut SupervisorConfig),
+        seams: crate::hook::HookSeams,
+    ) -> Rig {
         let clock = Arc::new(SkewClock::default());
         let sink = Arc::new(RecordingSink::default());
         let pty = Arc::new(FakePty::new());
@@ -200,7 +224,7 @@ impl Rig {
         let sup = new_supervisor(host, cfg, store.store().clone(), sink.clone(), 0);
         let srv = TestServer::start_parts(
             store,
-            mounts(host),
+            mounts_with(host, seams),
             registry(&sup),
             (clock.clone(), sink.clone()),
             |_| {},

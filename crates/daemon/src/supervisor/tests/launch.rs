@@ -592,3 +592,131 @@ async fn unrecorded_start_job() {
         chaldea_core::command::ReceiptStatus::UnknownAfterCrash
     );
 }
+
+/// A spawn held before its start job, with a `SessionStart` of its launch sent to `/hook`
+/// (the emitter's chain reaching the spawned identity); returns the rig, the held pause, the
+/// hook's reply, and the ids. The hook is inside its pid wait when this returns.
+async fn early_session_start(
+    stop_clock: bool,
+) -> (
+    Rig,
+    super::Armed,
+    tokio::task::JoinHandle<super::support::http::Reply>,
+    chaldea_core::ids::LaunchId,
+    uuid::Uuid,
+) {
+    use super::support::hook::{EMITTER_PID, Hook, Launch, chain};
+    use crate::supervisor::Pause;
+    use chaldea_core::ids::Agent;
+    use chaldea_pty_runtime::process::AncestryEnd;
+    let (rig, chains) = Rig::with_chains(|_| {}).await;
+    let held = rig.pauses.arm(Pause::BeforeStartJob);
+    let cwd = rig.cwd.path().to_string_lossy().into_owned();
+    let _spawn = super::support::http::spawn_send(
+        &rig.srv,
+        &rig.srv.command(
+            "spawn",
+            &rig.owner,
+            super::cid(),
+            &json!({ "agent": "codex", "cwd": cwd }).to_string(),
+        ),
+    );
+    let held = tokio::task::spawn_blocking(move || {
+        held.wait();
+        held
+    })
+    .await
+    .unwrap();
+    let spec = rig.pty.spawns().remove(0);
+    let token = env_of(&spec, "CHALDEA_HOOK_TOKEN")[0]
+        .to_string_lossy()
+        .into_owned();
+    let id = rig.pty.take_child().unwrap().identity();
+    chains.set(
+        EMITTER_PID,
+        chain(
+            &[
+                (EMITTER_PID, "3000", "chaldea"),
+                (id.pid, &id.start_time, "codex"),
+                (1, "1", "launchd"),
+            ],
+            AncestryEnd::Root,
+        ),
+    );
+    let row = rig.srv.store.read(|r| Ok(r.threads()?.pop().unwrap()));
+    let l = row.current_launch_id.unwrap();
+    let hook = Hook::of(
+        &Launch {
+            thread: row.thread_id,
+            launch: l,
+            agent: Agent::Codex,
+            token,
+        },
+        "SessionStart",
+        "s",
+    );
+    if stop_clock {
+        rig.clock.stop();
+    }
+    let reply = super::support::http::spawn_send(&rig.srv, &hook.req(&rig.srv));
+    rig.until("the hook is in its pid wait", || {
+        crate::http::tests::shared(&rig.srv)
+            .faults
+            .pid_wait_deadlines()
+            .len()
+            == 1
+    })
+    .await;
+    (rig, held, reply, l, hook.emit)
+}
+
+/// PR10a1-CL-7: a `SessionStart` that arrives before the start job commits, with the
+/// supervisor wired. Its pid wait ending inside its deadline (a stopped clock, so only the
+/// start's commit can end it): the reply follows the start's commit and the launch is bound,
+/// `session_bound` after `launch_started`. Its pid wait running out first: the PR 9 result,
+/// 200 with `raw_unknown` (`unbound`) while the start is still held, and no binding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn early_hook_pid_wait() {
+    use chaldea_core::payload::RawUnknownReason;
+    // Inside the deadline.
+    let (rig, held, reply, l, _) = early_session_start(true).await;
+    assert!(!reply.is_finished(), "decided only after the start commits");
+    held.go();
+    rig.until("the hook answered", || reply.is_finished()).await;
+    let r = reply.await.unwrap();
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(rig.launch(l).session_id.as_deref(), Some("s"));
+    let kinds = rig.kinds(rig.launch(l).thread_id);
+    let at = |k: &str| kinds.iter().position(|x| x == k).unwrap();
+    assert!(at("launch_started") < at("session_bound"), "{kinds:?}");
+    rig.srv.stop().await;
+    // Past it.
+    let (rig, held, reply, l, emit) = early_session_start(false).await;
+    rig.until("the hook answered", || reply.is_finished()).await;
+    let r = reply.await.unwrap();
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(rig.launch(l).pid, None, "the start is still held");
+    let d = rig
+        .srv
+        .store
+        .read(move |r| r.hook_delivery(l, emit))
+        .expect("a delivery");
+    let crate::store::Routing::RawUnknown { stream_id, seq } = d.routing else {
+        panic!("not raw_unknown: {d:?}");
+    };
+    let e = rig
+        .srv
+        .store
+        .read(move |r| Ok(r.events_after(stream_id, seq - 1, 1)?.events.remove(0)));
+    let chaldea_core::event::TypedEvent::RawUnknown(raw) =
+        chaldea_core::event::TypedEvent::decode(&e).unwrap()
+    else {
+        panic!("{e:?}");
+    };
+    assert_eq!(raw.reason, RawUnknownReason::Unbound);
+    held.go();
+    rig.until("the start committed", || rig.launch(l).pid.is_some())
+        .await;
+    assert_eq!(rig.launch(l).session_id, None);
+    rig.srv.stop().await;
+}
