@@ -246,6 +246,9 @@ pub(crate) struct SendHooks {
     pub settle_job: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs inside the open job (on the store writer).
     pub open_job: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs inside the open job after its first check of the running and human units, before
+    /// its read (on the store writer).
+    pub open_after_flags: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs in the probe's `facts` after `written` was read, before the fence advance (the
     /// launch's state held).
     pub after_written_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,

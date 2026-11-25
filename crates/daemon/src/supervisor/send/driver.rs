@@ -553,6 +553,8 @@ fn open_job(
         if me.running_flag.load(Ordering::SeqCst) || me.human_flag.load(Ordering::SeqCst) > 0 {
             return Ok(Err(Closed::Moved));
         }
+        #[cfg(test)]
+        super::run_hook(&me.hooks.open_after_flags);
         let r = tx.read();
         let (Some(t), Some(l), Some(q)) = (r.thread(thread)?, r.launch(launch)?, r.input(input)?)
         else {
@@ -615,6 +617,15 @@ fn open_job(
         }
         let text = content_text(&r, StreamId::Thread(thread), &q.text)?;
         let head = r.head(StreamId::Thread(thread), 0)?.head_seq;
+        // The decision, after the last read, under the state a human unit's registration
+        // takes: a unit registered before it keeps the input queued; one registered after it
+        // is ordered after the open (its writer refuses this unit if it starts first).
+        {
+            let st = me.state();
+            if st.running.is_some() || st.human_unsettled > 0 {
+                return Ok(Err(Closed::Moved));
+            }
+        }
         let competing = match (l.last_human_write_seq, l.last_turn_start_seq) {
             (Some(h), Some(s)) => h > s,
             (Some(_), None) => true,

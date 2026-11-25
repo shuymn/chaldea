@@ -662,6 +662,35 @@ async fn open_waits_for_human() {
     rig.stop().await;
 }
 
+/// PR10b-CL-3: a human unit registered while the open job runs, after the job's first check
+/// of the human units and before its read, keeps the input `queued`: the job's decision
+/// checks again, after its last read, under the state the registration takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_rechecks_human() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let hold = live.child.hold_writes();
+    let (entered, go, point) = gate_point();
+    set(&sl.hooks.open_after_flags, point);
+    let id = rig.send(&live, "after-key").await;
+    entered.await.unwrap();
+    let far = rig.sup.real(rig.sup.now() + Duration::from_secs(60));
+    human_unit(&rig, &live, WriteOrigin::Key, Guard::until(far)).await;
+    assert!(hold.wait_entered(Instant::now() + Duration::from_secs(10)));
+    assert_eq!(sl.state().human_unsettled, 1);
+    go.send(()).unwrap();
+    rig.pass(&live).await;
+    assert_eq!(rig.input(id).state, InputState::Queued);
+    drop(hold);
+    rig.until("the key recorded", || human_writes(&rig, &live).len() == 1)
+        .await;
+    rig.pass(&live).await;
+    assert_eq!(rig.input(id).state, InputState::Queued);
+    assert!(!live.child.input().ends_with(b"after-key\x1b[201~\r"));
+    rig.stop().await;
+}
+
 /// PR10b-CL-16: a key unit held at its dispatch boundary (the queue lock held) past the
 /// report's deadline answers `pending` without waiting for the queue lock; released after
 /// its dispatch deadline, it is refused with nothing written.
