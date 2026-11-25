@@ -632,6 +632,35 @@ async fn proof_before_slow_join() {
     rig.srv.stop().await;
 }
 
+/// PR10a1-CL-11 `proof_cutoff` (join first): the kill task panics right after sending its
+/// report, and its join is classified while the report's classification is held: the exit
+/// waits for both, and the report is accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_classified_first() {
+    let rig = Rig::new().await;
+    let (t, l) = rig.spawn_codex(None).await;
+    let fault = rig.pauses.arm_panic(Pause::BeforeCloseBy);
+    let report = rig.pauses.arm(Pause::ReportSettled);
+    let reply = stop_with(&rig, t);
+    fault.wait();
+    fault.go();
+    report.wait();
+    rig.until("the join was classified", || {
+        rig.pauses.passed(Pause::JoinSettled)
+    })
+    .await;
+    assert!(
+        !reply.is_finished(),
+        "the exit waits for the report's classification"
+    );
+    assert_eq!(rig.launch(l).exit_reason, None);
+    report.go();
+    let r = reply.await.unwrap();
+    assert_eq!(json(&r)["death_confirmed"], true, "{}", json(&r));
+    assert!(rig.launch(l).death_confirmed);
+    rig.srv.stop().await;
+}
+
 fn exited(events: &[FakeEvent]) -> bool {
     events.iter().any(|e| matches!(e, FakeEvent::Exited))
 }
