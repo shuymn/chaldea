@@ -16,7 +16,9 @@ use futures_util::future::BoxFuture;
 use super::super::faults::{Faults, Point};
 use super::super::files::{LockProbe, probe};
 use super::super::gate::{ConsoleEvent, ShutdownGate, SignalName, StopCause};
-use super::super::{DaemonConfig, ShutdownParticipant, names, prepare_process, run_process_with};
+use super::super::{
+    Budgets, DaemonConfig, ShutdownParticipant, names, prepare_process, run_process_with,
+};
 use super::{
     Helper, RecordingReady, TestComponents, WAIT, detached, field, foreground, helper_dir,
     helper_exit, hold_port, in_helper, report, request, state, token_of, wait_for,
@@ -29,8 +31,8 @@ const PREFIX: &str = "lifecycle::tests::helpers::";
 const TOKEN: &str = "chd_TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT";
 const STEP_ENV: &str = "CHALDEA_LIFECYCLE_STEP";
 
-/// When the controller requested the stop.
-static STOPPED_AT: OnceLock<Instant> = OnceLock::new();
+/// The controller requested the stop.
+static STOPPED: AtomicBool = AtomicBool::new(false);
 /// When the controller signalled a console end.
 static CRASHED_AT: OnceLock<Instant> = OnceLock::new();
 /// `run` returned (the controller may still be checking what it left).
@@ -38,6 +40,14 @@ static RETURNED: AtomicBool = AtomicBool::new(false);
 
 fn returned() -> bool {
     wait_for(WAIT, || RETURNED.load(Ordering::SeqCst))
+}
+
+/// The time since the first stop request, measured from the instant the gate read for its
+/// cutoff (`C − total`), so the controller's own scheduling before the request is not counted
+/// against the run's bounds (design §6.2 PR8-CL-4: "within its cutoff plus 1 s").
+fn since_request(faults: &Faults, total: Duration) -> Option<Duration> {
+    let s = faults.gate.get()?.stopping()?;
+    Some((s.cutoff - total).elapsed())
 }
 
 /// The helper's view of its own run.
@@ -67,7 +77,7 @@ impl Ctl {
     }
 
     fn stop(&self) {
-        let _ = STOPPED_AT.set(Instant::now());
+        STOPPED.store(true, Ordering::SeqCst);
         self.gate().request(StopCause::Signal(SignalName::Term));
     }
 
@@ -96,10 +106,14 @@ fn helper(
         dir: helper_dir(),
     };
     let controller = std::thread::spawn(move || controller(&ctl));
+    let (total, seen) = (cfg.budgets.total, faults.clone());
     let r = run_process_with(cfg, Box::new(comps), faults);
     RETURNED.store(true, Ordering::SeqCst);
     let (since_stop, since_crash) = (
-        STOPPED_AT.get().map(Instant::elapsed),
+        STOPPED
+            .load(Ordering::SeqCst)
+            .then(|| since_request(&seen, total))
+            .flatten(),
         CRASHED_AT.get().map(Instant::elapsed),
     );
     // The controller's own reports come before the exit; its failure fails the helper.
@@ -188,7 +202,8 @@ fn drop_does_not_release() {
 
 // ---- PR8-CL-4: the lock is kept unless every condition holds ----
 
-/// A writer job held past the cutoff: `writer_exited: false`; `run` returns within 10 s + 1 s.
+/// A writer job held past the cutoff: `writer_exited: false`; `run` returns within its
+/// cutoff plus 1 s.
 #[test]
 fn blocked_writer_keeps_the_lock() {
     if in_helper() {
@@ -213,12 +228,19 @@ fn blocked_writer_keeps_the_lock() {
     let (mut h, dir) = parent("blocked_writer_keeps_the_lock", &[]);
     let since = h.expect("since_stop_ms", WAIT);
     let ms: u64 = field(&since, "since_stop_ms").parse().unwrap();
-    assert!(ms <= 11_000, "{ms} ms");
+    assert!(ms <= 11_000, "{ms} ms; stderr:\n{}", h.stderr());
     let r = h.expect("returned", WAIT);
     assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
     assert_eq!(field(&r, "reason"), "lock_held_at_exit", "{r}");
     held_then_free(&mut h, &dir.path);
-    assert!(h.stderr().contains("writer_exited false"), "{}", h.stderr());
+    // The report, if seen within the grace, says the writer did not exit; one first seen
+    // after the grace is counted as such (design §2.8 step 4).
+    let err = h.stderr();
+    assert!(
+        err.contains("writer_exited false")
+            || err.contains("the store's shutdown report was not seen"),
+        "{err}"
+    );
 }
 
 /// A `CommitUnknown` retires the writer, then a real reader is held past the cutoff: the
@@ -346,6 +368,9 @@ fn unacknowledged_log_switch_keeps_the_lock() {
 
 // ---- PR8-CL-5: the store shutdown runs off the workers ----
 
+/// A held reader keeps the real `Store::shutdown` blocked while the checks run; it is released
+/// once they are done, so the store has the rest of the budget to close it and let the writer
+/// exit.
 #[test]
 fn store_shutdown_runs_off_the_workers() {
     if in_helper() {
@@ -371,14 +396,6 @@ fn store_shutdown_runs_off_the_workers() {
                 });
                 in_rx.recv_timeout(WAIT).unwrap();
                 c.stop();
-                let cutoff = c.gate().stopping().unwrap().cutoff;
-                // The reader is held until 1 s before the cutoff.
-                std::thread::spawn(move || {
-                    std::thread::sleep(
-                        (cutoff - Duration::from_secs(1)).saturating_duration_since(Instant::now()),
-                    );
-                    let _ = rel_tx.send(());
-                });
                 assert!(wait_for(WAIT, || c
                     .faults
                     .marks()
@@ -414,6 +431,9 @@ fn store_shutdown_runs_off_the_workers() {
                     "checks crossed={crossed} off_workers={off_workers} probe={probed} probe_ms={} workers={workers}",
                     t0.elapsed().as_millis()
                 ));
+                // The checks are done: dropping the sender releases the reader (a failed
+                // check's unwind drops it too).
+                drop(rel_tx);
             },
         );
     }
@@ -423,9 +443,14 @@ fn store_shutdown_runs_off_the_workers() {
     assert_eq!(field(&checks, "off_workers"), "true", "{checks}");
     assert_eq!(field(&checks, "probe"), "true", "{checks}");
     let r = h.expect("returned", WAIT);
-    assert_eq!(field(&r, "code"), "0", "{r}");
-    assert_eq!(field(&r, "lock"), "Released", "{r}");
     h.wait(WAIT);
+    assert_eq!(field(&r, "code"), "0", "{r}; stderr:\n{}", h.stderr());
+    assert_eq!(
+        field(&r, "lock"),
+        "Released",
+        "{r}; stderr:\n{}",
+        h.stderr()
+    );
 }
 
 // ---- PR8-CL-10 ----
@@ -640,9 +665,10 @@ fn coordinator_panic_returns() {
 
 // ---- PR8-CL-25: stops inside a step ----
 
-/// Barriers inside steps 8, 13, and 14: a stop while parked; a second daemon meanwhile exits
-/// 3; released, the task finishes the step, publishes nothing after it, and the lock is
-/// released only after the join.
+/// Barriers inside steps 8, 13, and 14: while parked, a second daemon exits 3, then a stop
+/// arrives and the lock is still held; released, the task finishes the step, publishes
+/// nothing after it, and the lock is released only after the join. The second daemon runs
+/// before the stop: its 2 s lock retry would otherwise run on the join's 4 s.
 #[test]
 fn stop_inside_step() {
     if in_helper() {
@@ -660,24 +686,29 @@ fn stop_inside_step() {
             Duration::ZERO,
             move |c| {
                 assert!(park.wait_reached(WAIT));
-                c.stop();
                 let second = super::start(
                     foreground(&c.dir, Some(hold_port())),
                     TestComponents::default(),
                     Arc::default(),
                 )
                 .join();
+                c.stop();
                 let held = probe(&c.dir).ok() == Some(LockProbe::Held);
                 park.release();
-                assert!(wait_for(WAIT, || !ready.lines().is_empty()));
-                let v = ready.lines().remove(0);
+                // The verdict precedes the return; a run that returned without one sent none.
+                assert!(wait_for(WAIT, || !ready.lines().is_empty()
+                    || RETURNED.load(Ordering::SeqCst)));
+                let v = ready.lines().first().cloned();
                 report(&format!(
                     "checks second={} held_while_parked={held} port_file={} record_at_verdict={} lock_at_verdict={:?} verdict={}",
                     second.code.code(),
                     c.dir.join(names::PORT).exists(),
-                    v.record_present,
-                    v.lock,
-                    v.line.trim_end().replace(' ', "_"),
+                    v.as_ref().is_some_and(|v| v.record_present),
+                    v.as_ref().and_then(|v| v.lock),
+                    v.map_or_else(
+                        || "none".to_owned(),
+                        |v| v.line.trim_end().replace(' ', "_")
+                    ),
                 ));
             },
         );
@@ -686,29 +717,38 @@ fn stop_inside_step() {
         let (mut h, dir) = parent("stop_inside_step", &[(STEP_ENV, step)]);
         let checks = h.expect("checks", WAIT);
         let r = h.expect("returned", WAIT);
-        assert_eq!(field(&r, "code"), "0", "step {step}: {r}");
-        assert_eq!(field(&r, "lock"), "Released", "step {step}: {r}");
-        assert_eq!(field(&checks, "second"), "3", "step {step}: {checks}");
-        assert_eq!(field(&checks, "held_while_parked"), "true", "step {step}");
-        assert_eq!(field(&checks, "record_at_verdict"), "false", "step {step}");
-        assert_eq!(
-            field(&checks, "lock_at_verdict"),
-            "Some(Free)",
-            "step {step}"
-        );
+        // The verdict first: a run that sent none fails here, with its return.
         let verdict = field(&checks, "verdict");
         assert!(
             verdict.starts_with("fail_stopped_"),
-            "step {step}: {verdict}"
+            "step {step}: {checks}; {r}"
+        );
+        assert_eq!(field(&r, "code"), "0", "step {step}: {r}");
+        assert_eq!(field(&r, "lock"), "Released", "step {step}: {r}");
+        assert_eq!(field(&checks, "second"), "3", "step {step}: {checks}");
+        assert_eq!(
+            field(&checks, "held_while_parked"),
+            "true",
+            "step {step}: {checks}"
+        );
+        assert_eq!(
+            field(&checks, "record_at_verdict"),
+            "false",
+            "step {step}: {checks}"
+        );
+        assert_eq!(
+            field(&checks, "lock_at_verdict"),
+            "Some(Free)",
+            "step {step}: {checks}"
         );
         match step {
             "8" => {
-                assert_eq!(field(&checks, "port_file"), "false", "step 8");
-                assert!(!verdict.contains("port_saved"), "{verdict}");
+                assert_eq!(field(&checks, "port_file"), "false", "step 8: {checks}");
+                assert!(!verdict.contains("port_saved"), "{checks}");
             }
             _ => {
-                assert_eq!(field(&checks, "port_file"), "true", "step {step}");
-                assert!(verdict.contains("port_saved="), "{verdict}");
+                assert_eq!(field(&checks, "port_file"), "true", "step {step}: {checks}");
+                assert!(verdict.contains("port_saved="), "{checks}");
             }
         }
         h.wait(WAIT);
@@ -736,10 +776,13 @@ fn unjoined_startup_is_a_bare_exit() {
             assert!(park.wait_reached(WAIT));
             ctl.stop();
         });
+        let seen = faults.clone();
         let r = run_process_with(cfg, Box::new(TestComponents::default()), faults);
         report(&format!(
             "since_stop_ms={}",
-            STOPPED_AT.get().unwrap().elapsed().as_millis()
+            since_request(&seen, Budgets::DEFAULT.total)
+                .unwrap()
+                .as_millis()
         ));
         report(&format!(
             "verdict lines={} closed={} record={}",
