@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::Instant;
 
 use chaldea_core::adapter::Capabilities;
-use chaldea_core::ids::{Agent, LaunchId, ThreadId};
+use chaldea_core::ids::{Agent, InputId, LaunchId, ThreadId};
 use chaldea_pty_runtime::{ProcessIdentity, Session, WriteRecord, WriterObserver};
 use tokio::sync::OwnedMutexGuard;
 
@@ -53,6 +53,8 @@ pub(crate) struct LiveLaunch {
     pub caps: &'static Capabilities,
     /// A Codex launch without a first prompt.
     pub manual: bool,
+    /// The launch's positional input, if it has one.
+    pub positional: Option<InputId>,
     /// Set before `Session::spawn`; never cleared.
     creation_started: AtomicBool,
     /// Set with the stop's seal, under the op lock.
@@ -111,6 +113,7 @@ impl LiveLaunch {
         agent: Agent,
         caps: &'static Capabilities,
         manual: bool,
+        positional: Option<InputId>,
     ) -> Self {
         LiveLaunch {
             thread_id,
@@ -118,6 +121,7 @@ impl LiveLaunch {
             agent,
             caps,
             manual,
+            positional,
             creation_started: AtomicBool::new(false),
             stop_requested: AtomicBool::new(false),
             published: OnceLock::new(),

@@ -9,7 +9,7 @@ use chaldea_core::event::TypedEvent;
 use chaldea_core::ids::{InputId, LaunchId, ThreadId};
 use chaldea_core::input::{InputInput, InputState};
 use chaldea_core::payload::{
-    ExitReason, FailedStart, LaunchDeathConfirmed, LaunchExited, LaunchStarted, SourceKind,
+    ExitReason, FailedStart, LaunchDeathConfirmed, LaunchExited, SourceKind,
 };
 use chaldea_core::state::{ProcessState, StateInput};
 use chaldea_pty_runtime::{ProcessIdentity, WriteRecord};
@@ -61,9 +61,10 @@ pub(crate) struct ExitPlan {
     /// Applies `StopRequested` first when the recorded state is still `running` (a stop
     /// whose own write did not commit; the participant).
     pub stop_first: bool,
-    /// Records `launch_started` first when the launch has none (the participant's or a
-    /// late creation's published session whose start job did not commit).
-    pub start_identity: Option<ProcessIdentity>,
+    /// Records the start first, as the start job would, when the launch has none (the
+    /// participant's or a late creation's published session whose start job did not
+    /// commit): the identity and the launch's positional input.
+    pub start: Option<(ProcessIdentity, Option<InputId>)>,
     /// The positional input's own move, before the steps (a spawn failure).
     pub positional: Option<(InputId, InputInput)>,
 }
@@ -82,7 +83,7 @@ impl ExitPlan {
             restart: false,
             sealed: Vec::new(),
             stop_first: false,
-            start_identity: None,
+            start: None,
             positional: None,
         }
     }
@@ -115,23 +116,11 @@ pub(crate) fn exit_in(
     };
     let mut job = ThreadJob::new(t.thread_id, t.agent, t.state.clone(), kind, None);
     let lid = Some(plan.launch);
-    if let Some(id) = &plan.start_identity
+    if let Some((id, input)) = &plan.start
         && l.pid.is_none()
         && job.state.process == ProcessState::Starting
     {
-        let key = launch_key(plan.launch, "started");
-        job.push(
-            key.clone(),
-            TypedEvent::LaunchStarted(LaunchStarted {
-                launch_id: plan.launch,
-                pid: id.pid,
-                start_time: id.start_time.clone(),
-                pgid_or_job: id.group.clone(),
-                cli_version: None,
-            }),
-            lid,
-        );
-        job.apply(&key, "spawned", &StateInput::Spawned, lid)?;
+        super::ops::started_in(tx, &mut job, plan.launch, id, *input)?;
     }
     if plan.stop_first && job.state.process == ProcessState::Running {
         let key = launch_key(plan.launch, "stop_requested");

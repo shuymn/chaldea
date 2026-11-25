@@ -14,7 +14,7 @@ use chaldea_core::command::{
 };
 use chaldea_core::event::TypedEvent;
 use chaldea_core::http::ErrorCode;
-use chaldea_core::ids::{Actor, Agent, CommandId, InputId, LaunchId, ThreadId};
+use chaldea_core::ids::{Actor, Agent, CommandId, IdempotencyKey, InputId, LaunchId, ThreadId};
 use chaldea_core::input::{InputInput, InputState, RejectReason};
 use chaldea_core::launch::{LaunchInput, plan};
 use chaldea_core::payload::{
@@ -492,6 +492,7 @@ fn reservation_job(
             agent,
             capabilities(agent, sup2.host_os),
             lp.manual,
+            input_id,
         ));
         let guard = entry
             .ops
@@ -529,28 +530,8 @@ fn start_job(
         sup2.pauses().blocking(Pause::InStartJob);
         let t = thread_row(tx, thread)?;
         let mut job = ThreadJob::new(thread, t.agent, t.state, SourceKind::Process, None);
-        let key = launch_key(launch, "started");
+        let (key, seq) = started_in(tx, &mut job, launch, &id, input)?;
         let lid = Some(launch);
-        job.push(
-            key.clone(),
-            TypedEvent::LaunchStarted(LaunchStarted {
-                launch_id: launch,
-                pid: id.pid,
-                start_time: id.start_time.clone(),
-                pgid_or_job: id.group.clone(),
-                cli_version: None,
-            }),
-            lid,
-        );
-        job.apply(&key, "spawned", &StateInput::Spawned, lid)?;
-        let appended = job.flush(tx)?;
-        let seq = seq_of(&appended, &key)?;
-        if let Some(i) = input
-            && let Some(row) = tx.read().input(i)?
-            && row.state == InputState::Sending
-        {
-            job.step_input(&key, &row, &InputInput::WriteCompleted, Some(seq), lid)?;
-        }
         if upgraded && t.agent == Agent::Codex && !job.raised(AttentionCause::StartupStall) {
             job.apply(
                 &key,
@@ -562,6 +543,42 @@ fn start_job(
         job.flush(tx)?;
         Ok(seq)
     })
+}
+
+/// `launch_started` from `id`, `Spawned`, then the positional input `sending → sent` with
+/// `sent_after_seq` = that event's seq, in `job`'s transaction: the start job's records, and
+/// the exit job's when it records a start the start job did not commit. Returns the
+/// event's key and seq.
+pub(crate) fn started_in(
+    tx: &mut WriteTx<'_>,
+    job: &mut ThreadJob,
+    launch: LaunchId,
+    id: &ProcessIdentity,
+    input: Option<InputId>,
+) -> Result<(IdempotencyKey, u64), JobError> {
+    let key = launch_key(launch, "started");
+    let lid = Some(launch);
+    job.push(
+        key.clone(),
+        TypedEvent::LaunchStarted(LaunchStarted {
+            launch_id: launch,
+            pid: id.pid,
+            start_time: id.start_time.clone(),
+            pgid_or_job: id.group.clone(),
+            cli_version: None,
+        }),
+        lid,
+    );
+    job.apply(&key, "spawned", &StateInput::Spawned, lid)?;
+    let appended = job.flush(tx)?;
+    let seq = seq_of(&appended, &key)?;
+    if let Some(i) = input
+        && let Some(row) = tx.read().input(i)?
+        && row.state == InputState::Sending
+    {
+        job.step_input(&key, &row, &InputInput::WriteCompleted, Some(seq), lid)?;
+    }
+    Ok((key, seq))
 }
 
 fn thread_row(tx: &WriteTx<'_>, t: ThreadId) -> Result<ThreadRow, JobError> {
@@ -1067,7 +1084,7 @@ pub(crate) async fn close_and_record(
         tracing::warn!(launch = %entry.launch_id, survivors = ?o.kill.survivors, "shutdown close left survivors");
     }
     let mut plan = ExitPlan::new(entry.thread_id, entry.launch_id, ExitReason::Stopped);
-    plan.start_identity = Some(identity);
+    plan.start = Some((identity, entry.positional));
     plan.stop_first = true;
     plan.death_confirmed = proving(&o.kill);
     plan.method = plan.death_confirmed.then(|| o.kill.method.clone());

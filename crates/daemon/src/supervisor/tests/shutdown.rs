@@ -352,8 +352,10 @@ async fn tracker() {
 /// PR10a1-CL-36 `publish_vs_admission`: a publication either completes before admission
 /// closes or does not happen. Held before `Tracker::while_accepting` while admission
 /// closes: refused, the op closes its own session (its late-creation close) and records
-/// `launch_started` and `stopped`. Held inside it: `close_admission` waits for it, and the
-/// participant finds the entry published and closes it.
+/// `launch_started` and `stopped`, with the positional input moved `sending → sent` after
+/// `launch_started`'s seq by the start's own records, as a normal start job does. Held
+/// inside it: `close_admission` waits for it, and the participant finds the entry published
+/// and closes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publish_vs_admission() {
     use crate::supervisor::Pause;
@@ -371,7 +373,7 @@ async fn publish_vs_admission() {
                 "spawn",
                 &rig.owner,
                 super::cid(),
-                &serde_json::json!({ "agent": "codex", "cwd": cwd }).to_string(),
+                &serde_json::json!({ "agent": "codex", "cwd": cwd, "prompt": "hi" }).to_string(),
             ),
         );
         held.wait();
@@ -408,6 +410,36 @@ async fn publish_vs_admission() {
             Some(ExitReason::Stopped),
             "{at:?}"
         );
+        if at == Pause::BeforePublish {
+            let t = rig.launch(l).thread_id;
+            let events = rig.srv.store.read(move |r| {
+                Ok(
+                    r.events_after(chaldea_core::ids::StreamId::Thread(t), 0, 10_000)?
+                        .events,
+                )
+            });
+            let kind =
+                |e: &chaldea_core::event::EventEnvelope| serde_json::to_value(&e.kind).unwrap();
+            let payload = |e: &chaldea_core::event::EventEnvelope| -> serde_json::Value {
+                serde_json::from_str(e.payload.get()).unwrap()
+            };
+            let started = events.iter().find(|e| kind(e) == "launch_started").unwrap();
+            let exited = events.iter().find(|e| kind(e) == "launch_exited").unwrap();
+            let sent = events
+                .iter()
+                .find(|e| kind(e) == "input_state_changed" && payload(e)["to"] == "sent")
+                .expect("the positional input moved to sent");
+            assert_eq!(payload(sent)["sent_after_seq"], started.seq);
+            assert!(started.seq < sent.seq && sent.seq < exited.seq);
+            assert_eq!(
+                sent.idempotency_key.0,
+                format!(
+                    "derived:launch:{l}:started:input:{}",
+                    payload(sent)["input_id"].as_str().unwrap()
+                ),
+                "derived from the start's own record"
+            );
+        }
         rig.srv.stop().await;
     }
 }
