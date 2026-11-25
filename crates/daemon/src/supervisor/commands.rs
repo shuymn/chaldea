@@ -182,17 +182,19 @@ impl CommandHandler for ResumeHandler {
 
     fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError> {
         let (a, normalized) = parse::<ResumeArgs>(args)?;
-        admit_prompt(a.prompt.as_deref())?;
         let launch = LaunchId(Uuid::new_v4());
         let input_id = a.prompt.as_ref().map(|_| InputId(Uuid::new_v4()));
         let token = mint_token();
         Ok(Prepared {
             normalized,
             intent: Box::new(move |tx, auth, ctx| {
+                // The prompt's checks need the thread's agent, so they run here, in CL-1's
+                // order (a Claude prompt first); a refusal rolls back the receipt with the job.
                 let t = target(tx, auth, Action::Resume, a.thread_id)?;
                 if a.prompt.is_some() && t.agent == Agent::Claude {
                     return Err(refused(ApiError::bad_args()));
                 }
+                admit_prompt(a.prompt.as_deref()).map_err(refused)?;
                 Ok(Intent::Pending(EffectRun::new(LaunchReq {
                     command_id: ctx.command_id(),
                     thread: a.thread_id,

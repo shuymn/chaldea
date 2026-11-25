@@ -39,10 +39,15 @@ async fn prompt_admission() {
     let rig = Rig::new().await;
     let (t, l) = rig.spawn_codex(None).await;
     rig.cmd("stop", &json!({ "thread_id": t })).await;
+    let cwd = rig.cwd.path().to_string_lossy().into_owned();
+    let r = rig
+        .cmd("spawn", &json!({ "agent": "claude", "cwd": cwd }))
+        .await;
+    let (ct, cl) = (json(&r)["thread_id"].clone(), json(&r)["launch_id"].clone());
+    rig.cmd("stop", &json!({ "thread_id": ct })).await;
     let head = host_head(&rig);
     let thread_head = rig.kinds(t).len();
     let spawned = rig.pty.spawns().len();
-    let cwd = rig.cwd.path().to_string_lossy().into_owned();
     let big = "a".repeat(chaldea_core::input::MAX_PROMPT_BYTES + 1);
     let cases = [
         (
@@ -74,6 +79,12 @@ async fn prompt_admission() {
             json!({ "thread_id": t, "expected_launch_id": l, "prompt": "a\u{7}" }),
             400,
             "prompt_rejected",
+        ),
+        (
+            "resume",
+            json!({ "thread_id": ct, "expected_launch_id": cl, "prompt": big }),
+            400,
+            "bad_args",
         ),
     ];
     for (name, args, status, want) in cases {
