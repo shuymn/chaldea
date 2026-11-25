@@ -493,8 +493,6 @@ pub(super) fn field<'a>(line: &'a str, key: &str) -> &'a str {
 /// and runs no check.
 #[test]
 fn spawn_locked_before_creates_only_under_the_lock() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use super::spawn_locked_before;
 
     let cmd = || {
@@ -507,7 +505,7 @@ fn spawn_locked_before_creates_only_under_the_lock() {
     };
     let soon = || Instant::now() + Duration::from_secs(20);
 
-    let checked = AtomicBool::new(false);
+    let mut checked = false;
     let mut child = spawn_locked_before(&mut cmd(), soon(), || {
         // Another thread cannot take the lock meanwhile.
         let other = std::thread::spawn(|| {
@@ -516,15 +514,12 @@ fn spawn_locked_before_creates_only_under_the_lock() {
                 || (),
             )
         });
-        checked.store(other.join().unwrap().is_none(), Ordering::SeqCst);
+        checked = other.join().unwrap().is_none();
         true
     })
     .expect("the lock taken")
     .expect("spawned");
-    assert!(
-        checked.load(Ordering::SeqCst),
-        "the check ran under the lock"
-    );
+    assert!(checked, "the check ran under the lock");
     assert!(child.wait().unwrap().success());
 
     assert!(spawn_locked_before(&mut cmd(), soon(), || false).is_none());
@@ -532,18 +527,15 @@ fn spawn_locked_before_creates_only_under_the_lock() {
     // A free lock and a future deadline, but `under_lock` returns only after the deadline:
     // nothing is created.
     let deadline = Instant::now() + Duration::from_millis(50);
-    let late_ran = AtomicBool::new(false);
+    let mut late_ran = false;
     let late = spawn_locked_before(&mut cmd(), deadline, || {
-        late_ran.store(true, Ordering::SeqCst);
+        late_ran = true;
         while Instant::now() <= deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
         true
     });
-    assert!(
-        late_ran.load(Ordering::SeqCst),
-        "the check ran under the lock"
-    );
+    assert!(late_ran, "the check ran under the lock");
     assert!(late.is_none(), "no child after the deadline");
 
     // The lock held by another thread past the deadline.
@@ -556,17 +548,17 @@ fn spawn_locked_before_creates_only_under_the_lock() {
         });
     });
     entered.recv_timeout(Duration::from_secs(20)).unwrap();
-    let ran = AtomicBool::new(false);
+    let mut ran = false;
     let r = spawn_locked_before(
         &mut cmd(),
         Instant::now() + Duration::from_millis(50),
         || {
-            ran.store(true, Ordering::SeqCst);
+            ran = true;
             true
         },
     );
     release.send(()).unwrap();
     holder.join().unwrap();
     assert!(r.is_none());
-    assert!(!ran.load(Ordering::SeqCst), "no check without the lock");
+    assert!(!ran, "no check without the lock");
 }

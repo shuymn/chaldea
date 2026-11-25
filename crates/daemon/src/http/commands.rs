@@ -749,6 +749,13 @@ async fn drive(
     })
     .catch_unwind()
     .await;
+    // The receipt stays `in_progress`: reported as a fatal, the outcome unknown to the caller.
+    let uncompleted = || {
+        shared
+            .sink
+            .store_fatal(StoreFatal::ReceiptUncompleted { command_id });
+        Err(ApiError::outcome_unknown())
+    };
     // A panic (its payload is not logged) leaves no result to store.
     let result = match effect {
         Ok(Some(EffectOutcome::Done(result))) => result,
@@ -757,27 +764,18 @@ async fn drive(
         Ok(Some(EffectOutcome::ShuttingDown)) => return Err(ApiError::outcome_unknown()),
         Ok(Some(EffectOutcome::Unrecorded)) => {
             tracing::error!(%command_id, "command effect could not record its work");
-            shared
-                .sink
-                .store_fatal(StoreFatal::ReceiptUncompleted { command_id });
-            return Err(ApiError::outcome_unknown());
+            return uncompleted();
         }
         Ok(None) | Err(_) => {
             tracing::error!(%command_id, "command effect ended without a result");
-            shared
-                .sink
-                .store_fatal(StoreFatal::ReceiptUncompleted { command_id });
-            return Err(ApiError::outcome_unknown());
+            return uncompleted();
         }
     };
     let result = checked_result(command_id, result);
     if complete(shared, command_id, &result).await {
         Ok(result)
     } else {
-        shared
-            .sink
-            .store_fatal(StoreFatal::ReceiptUncompleted { command_id });
-        Err(ApiError::outcome_unknown())
+        uncompleted()
     }
 }
 

@@ -242,7 +242,7 @@ pub static ROUTES: &[RouteSpec] = {
             7,
         ),
         get(
-            "/api/threads/{thread_id}",
+            super::sync_api::THREAD_PATH,
             M::Read,
             O::AbsentOrMatching,
             C::Bearer(READERS),
