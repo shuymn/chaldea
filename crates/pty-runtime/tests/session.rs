@@ -1274,7 +1274,16 @@ fn writer_observer_reads_positions() {
     let r = rig();
     let obs = r.session.observer();
     assert_eq!(obs.last_started_each(), [0; 3]);
+    // One write of each class: a key (Human), an input, and a VT reply.
     assert_eq!(submit(&r.session, key(b"k"), open()).wait().seq, 1);
+    assert_eq!(
+        submit(&r.session, unit(input_origin(1), vec![b("i")]), open())
+            .wait()
+            .seq,
+        2
+    );
+    r.child.emit(b"\x1b[5n");
+    assert!(wait_until(|| r.child.writes().len() == 3));
     let each = obs.last_started_each();
     for c in OriginClass::ALL {
         assert_eq!(
@@ -1283,17 +1292,25 @@ fn writer_observer_reads_positions() {
             "{c:?}"
         );
     }
-    assert_eq!(obs.last_started(ClassSet::ALL), 1);
+    let mut seqs = each.to_vec();
+    seqs.sort_unstable();
+    assert_eq!(seqs, [1, 2, 3], "each class has its own position: {each:?}");
+    assert_eq!(obs.last_started(ClassSet::ALL), 3);
     assert_eq!(obs.try_last_started_each(), Some(each));
     // The writer parks with the queue lock held.
+    let dispatched = r.session.probe().count(ProbePoint::Dispatching);
     let park = r.session.probe().park(ProbePoint::Dispatching);
     let p = submit(&r.session, key(b"x"), open());
-    assert!(r.session.probe().wait(ProbePoint::Dispatching, 2, soon()));
+    assert!(
+        r.session
+            .probe()
+            .wait(ProbePoint::Dispatching, dispatched + 1, soon())
+    );
     assert_eq!(obs.try_last_started_each(), None);
     park.release();
-    assert_eq!(p.wait().seq, 2);
+    assert_eq!(p.wait().seq, 4);
     let _ = r.session.close(&[], short_bounds());
-    assert_eq!(obs.last_started(ClassSet::ALL), 2, "outlives the session");
+    assert_eq!(obs.last_started(ClassSet::ALL), 4, "outlives the session");
 }
 
 /// PR 10a1 `CloseOutcome.exit`: the exit the waiter reported by the close's end, `None`

@@ -360,3 +360,35 @@ impl fmt::Debug for SpawnedPty {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{KillAttempt, KillReport};
+
+    /// Busy is exactly the three lock-not-taken methods; every other method a backend or
+    /// FakePty reports is not busy.
+    #[test]
+    fn busy_methods() {
+        let methods = [
+            ("unix_busy", true),
+            ("windows_busy", true),
+            ("fake_busy", true),
+            ("unix_killpg_session_scan", false),
+            ("unix_ownership_lost", false),
+            ("windows_job", false),
+            ("windows_job_incomplete", false),
+            ("fake", false),
+            ("fake_unconfirmed", false),
+        ];
+        for (method, busy) in methods {
+            let r = KillReport {
+                method: method.to_owned(),
+                tree_dead: false,
+                survivors: Vec::new(),
+                attempt: KillAttempt::NotAttempted,
+                proved_at: None,
+            };
+            assert_eq!(r.is_busy(), busy, "{method}");
+        }
+    }
+}
