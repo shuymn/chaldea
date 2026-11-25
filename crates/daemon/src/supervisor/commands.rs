@@ -24,7 +24,7 @@ use crate::http::{
     ApiError, Authorized, CommandEffect, CommandHandler, EffectOutcome, EffectRun, Intent,
     Prepared, deny_for, mint_token, refused,
 };
-use crate::store::{JobError, ThreadRow, TokenKind, TokenSelector, WriteTx};
+use crate::store::{JobError, LaunchRow, ThreadRow, TokenKind, TokenSelector, WriteTx};
 
 use super::events::{ThreadJob, command_key, refusal};
 use super::ops::{
@@ -292,8 +292,8 @@ struct CloseReq {
     by: Actor,
 }
 
-/// The closing job's checks and writes, shared by the intent and the op. `Ok(Err(code))`
-/// is a refusal that wrote nothing.
+/// The closing job (after `close --stop`'s stop): reads the rows afresh, then
+/// [`close_launch`]. `Ok(Err(code))` is a refusal that wrote nothing.
 fn closing_in(
     tx: &mut WriteTx<'_>,
     thread: ThreadId,
@@ -311,7 +311,21 @@ fn closing_in(
     if t.current_launch_id != Some(expected) {
         return Ok(Err(ErrorCode::LaunchChanged));
     }
-    let Some(l) = r.launch(expected)? else {
+    let l = r.launch(expected)?;
+    close_launch(tx, t, l, cid, by)
+}
+
+/// The close's launch checks and writes, for an open thread `t` whose current launch has
+/// the row `l`, both read in this transaction. `Ok(Err(code))` is a refusal that wrote
+/// nothing.
+fn close_launch(
+    tx: &mut WriteTx<'_>,
+    t: ThreadRow,
+    l: Option<LaunchRow>,
+    cid: CommandId,
+    by: Actor,
+) -> Result<Result<(), ErrorCode>, JobError> {
+    let Some(l) = l else {
         return Ok(Err(ErrorCode::LaunchChanged));
     };
     if l.exit_reason.is_none() {
@@ -320,6 +334,7 @@ fn closing_in(
     if !l.death_confirmed {
         return Ok(Err(ErrorCode::DeathUnconfirmed));
     }
+    let thread = t.thread_id;
     let mut job = ThreadJob::new(thread, t.agent, t.state, SourceKind::Command, Some(cid));
     job.push_host(
         command_key(cid, 0),
@@ -358,11 +373,8 @@ impl CommandHandler for CloseHandler {
                 if t.current_launch_id != Some(a.expected_launch_id) {
                     return Err(refused(code(ErrorCode::LaunchChanged)));
                 }
-                let live = tx
-                    .read()
-                    .launch(a.expected_launch_id)?
-                    .is_some_and(|l| l.exit_reason.is_none());
-                if a.stop && live {
+                let l = tx.read().launch(a.expected_launch_id)?;
+                if a.stop && l.as_ref().is_some_and(|l| l.exit_reason.is_none()) {
                     return Ok(Intent::Pending(EffectRun::new(CloseReq {
                         stop: StopReq {
                             command_id: ctx.command_id(),
@@ -373,13 +385,7 @@ impl CommandHandler for CloseHandler {
                         by: caller(auth),
                     })));
                 }
-                match closing_in(
-                    tx,
-                    a.thread_id,
-                    a.expected_launch_id,
-                    ctx.command_id(),
-                    caller(auth),
-                )? {
+                match close_launch(tx, t, l, ctx.command_id(), caller(auth))? {
                     Ok(()) => Ok(Intent::Completed(ok(&CloseResult {
                         thread_id: a.thread_id,
                         stop: None,
