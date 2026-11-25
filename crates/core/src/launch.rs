@@ -361,14 +361,15 @@ mod tests {
     }
 
     fn daemon_env() -> Vec<(OsString, OsString)> {
-        let mut env: Vec<(OsString, OsString)> = ENV_SCRUB
-            .iter()
-            .map(|e| match e {
-                Scrub::Name(n) => (OsString::from(*n), OsString::from("x")),
-                Scrub::Prefix(p) => (OsString::from(format!("{p}AGENT_TOKEN")), "x".into()),
-            })
-            .collect();
+        let mut env: Vec<(OsString, OsString)> = Vec::new();
         for (k, v) in [
+            ("CLAUDECODE", "x"),
+            ("CLAUDE_CODE_CHILD_SESSION", "x"),
+            ("CLAUDE_CODE_SESSION_ID", "x"),
+            ("CLAUDE_CODE_MESSAGING_TOKEN", "x"),
+            ("CODEX_THREAD_ID", "x"),
+            ("CODEX_SESSION_ID", "x"),
+            ("CHALDEA_AGENT_TOKEN", "x"),
             ("Chaldea_Hook_Token", "stale"),
             ("claudecode", "1"),
             ("CODEX_HOME", "/work/codex"),
@@ -389,10 +390,17 @@ mod tests {
         let mut i = input(Agent::Claude, HostOs::Macos);
         i.daemon_env = daemon_env();
         let env = plan(&i).env;
-        for e in ENV_SCRUB {
-            if let Scrub::Name(n) = e {
-                assert!(get(&env, n).is_empty(), "{n}");
-            }
+        // The design's list (supervisor §2.7), written out again rather than read from
+        // `ENV_SCRUB`.
+        for n in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CODEX_THREAD_ID",
+            "CODEX_SESSION_ID",
+        ] {
+            assert!(get(&env, n).is_empty(), "{n}");
         }
         assert!(get(&env, "CHALDEA_AGENT_TOKEN").is_empty());
         for (k, v) in [
