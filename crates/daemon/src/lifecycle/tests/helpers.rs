@@ -51,6 +51,21 @@ fn since_request(faults: &Faults, total: Duration) -> Option<Duration> {
     Some((s.cutoff - total).elapsed())
 }
 
+/// The startup join's end the coordinator recorded (its `startup_join` mark), as the time
+/// after the first stop request; design §2.8 step 1 puts it 4 s after that request.
+fn join_end_after_request(faults: &Faults, total: Duration) -> Option<Duration> {
+    let s = faults.gate.get()?.stopping()?;
+    let end = faults
+        .marks()
+        .into_iter()
+        .find(|m| m.0 == "startup_join")?
+        .1?;
+    Some(end.duration_since(s.cutoff - total))
+}
+
+/// The join's end design §2.8 step 1 states, in the unit [`join_end_after_request`] reports.
+const JOIN_END_NS: u128 = Duration::from_secs(4).as_nanos();
+
 /// The helper's view of its own run.
 struct Ctl {
     faults: Arc<Faults>,
@@ -668,8 +683,10 @@ fn coordinator_panic_returns() {
 
 /// Barriers inside steps 8, 13, and 14: while parked, a second daemon exits 3, then a stop
 /// arrives and the lock is still held; released, the task finishes the step, publishes
-/// nothing after it, and the lock is released only after the join. The second daemon runs
-/// before the stop: its 2 s lock retry would otherwise run on the join's 4 s.
+/// nothing after it, and the lock is released only after the join. The run has a test-set
+/// budget of 20 s, so its join has 14 s: what runs after the stop (the lock probe, step 8's
+/// fresh `Store::open`, step 13's `port` and record writes) does not race the default 4 s,
+/// which `unjoined_startup_is_a_bare_exit` covers.
 #[test]
 fn stop_inside_step() {
     if in_helper() {
@@ -679,7 +696,8 @@ fn stop_inside_step() {
         let port = hold_port();
         let faults = not_in_a_job();
         let park = faults.park(Point::Inside(step));
-        let cfg = detached(&dir, Some(port), &ready);
+        let mut cfg = detached(&dir, Some(port), &ready);
+        cfg.budgets.total = Duration::from_secs(20);
         helper(
             cfg,
             TestComponents::default(),
@@ -757,8 +775,8 @@ fn stop_inside_step() {
     }
 }
 
-/// Step 8 parked past the join end: a bare exit 4–4.5 s after the stop, holding the lock,
-/// the record left, no verdict.
+/// Step 8 parked past the join end: the coordinator's recorded join end exactly 4 s after the
+/// stop, a bare exit 4–4.5 s after it, holding the lock, the record left, no verdict.
 #[test]
 fn unjoined_startup_is_a_bare_exit() {
     if in_helper() {
@@ -780,10 +798,13 @@ fn unjoined_startup_is_a_bare_exit() {
         let seen = faults.clone();
         let r = run_process_with(cfg, Box::new(TestComponents::default()), faults);
         report(&format!(
-            "since_stop_ms={}",
+            "since_stop_ms={} join_end_ns={}",
             since_request(&seen, Budgets::DEFAULT.total)
                 .unwrap()
-                .as_millis()
+                .as_millis(),
+            join_end_after_request(&seen, Budgets::DEFAULT.total)
+                .unwrap()
+                .as_nanos()
         ));
         report(&format!(
             "verdict lines={} closed={} record={}",
@@ -795,6 +816,12 @@ fn unjoined_startup_is_a_bare_exit() {
     }
     let (mut h, dir) = parent("unjoined_startup_is_a_bare_exit", &[]);
     let since = h.expect("since_stop_ms", WAIT);
+    assert_eq!(
+        field(&since, "join_end_ns"),
+        JOIN_END_NS.to_string(),
+        "{since}"
+    );
+    // A watchdog on the wall clock: the exit follows the join's end.
     let ms: u64 = field(&since, "since_stop_ms").parse().unwrap();
     assert!((4000..=4500).contains(&ms), "{ms} ms");
     let v = h.expect("verdict", WAIT);
@@ -1179,7 +1206,8 @@ fn console_end_during_startup() {
 }
 
 /// PR8-CL-25: a startup task that returns after the join's end, first observed with the end
-/// already passed, does not win: the exit is bare and holds the lock.
+/// already passed, does not win: the exit is bare and holds the lock. The coordinator's
+/// recorded join end is exactly 4 s after the stop.
 #[test]
 fn join_ready_after_its_end_is_a_bare_exit() {
     if in_helper() {
@@ -1194,8 +1222,11 @@ fn join_ready_after_its_end_is_a_bare_exit() {
             move |c| {
                 assert!(inside.wait_reached(WAIT));
                 c.stop();
-                let end = c.gate().stopping().unwrap().cutoff - Duration::from_secs(6);
                 assert!(coordinator.wait_reached(WAIT));
+                let total = Budgets::DEFAULT.total;
+                let join_end = join_end_after_request(&c.faults, total).unwrap();
+                report(&format!("checks join_end_ns={}", join_end.as_nanos()));
+                let end = c.gate().stopping().unwrap().cutoff - total + join_end;
                 // Past the join's end, the startup task returns while the coordinator is held.
                 assert!(wait_for(WAIT, || Instant::now() > end + Duration::from_millis(200)));
                 inside.release();
@@ -1205,6 +1236,8 @@ fn join_ready_after_its_end_is_a_bare_exit() {
         );
     }
     let (mut h, dir) = parent("join_ready_after_its_end_is_a_bare_exit", &[]);
+    let c = h.expect("checks", WAIT);
+    assert_eq!(field(&c, "join_end_ns"), JOIN_END_NS.to_string(), "{c}");
     let r = h.expect("returned", WAIT);
     assert_eq!(field(&r, "reason"), "startup_unjoined", "{r}");
     assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
