@@ -271,6 +271,13 @@ impl<'c> WriteTx<'c> {
             .collect()
     }
 
+    /// Poisons the transaction as a failed statement would (unit tests of a rolled-back
+    /// attempt).
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self, e: StoreError) {
+        *self.poison.borrow_mut() = Some(e);
+    }
+
     /// The writer connection, for unit tests that run raw SQL inside a job.
     #[cfg(test)]
     pub(crate) fn raw(&self) -> &Connection {

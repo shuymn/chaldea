@@ -5,6 +5,7 @@ mod ack;
 mod evidence;
 mod flow;
 mod gate;
+mod human;
 mod outcomes;
 mod probe;
 

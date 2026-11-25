@@ -17,7 +17,7 @@ fn run(store: &TestStore, r: Reconciler) -> u64 {
 }
 
 /// Every reconciler of the supervisor's components, in order, as startup step 9 runs them.
-pub(super) fn restart_all(store: &TestStore) -> u64 {
+pub(crate) fn restart_all(store: &TestStore) -> u64 {
     let mut c = SupervisorComponents::new(
         chaldea_core::adapter::HostOs::Macos,
         SupervisorConfig::default(),

@@ -10,7 +10,7 @@ mod live;
 mod ops;
 mod race;
 mod reserve;
-mod restart;
+pub(crate) mod restart;
 mod shutdown;
 mod stop;
 mod tick;
