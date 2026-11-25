@@ -1105,6 +1105,38 @@ pub fn open_url(url: &str) -> io::Result<()> {
     imp::open_url(url)
 }
 
+// ---- Helper programs (docs/design/supervisor.md §2.3 step 1, §2.7) ----
+
+/// Starts `cmd`'s child without a console window of its own: `CREATE_NO_WINDOW` on Windows,
+/// nothing elsewhere. For a short helper the daemon reads, such as the workspace probe's
+/// `git`.
+pub fn no_console_window(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        /// `CREATE_NO_WINDOW` (`winbase.h`).
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
+/// The first `name` (`name.exe` on Windows) in an absolute directory of `path` (a `PATH`
+/// value) that is a file.
+#[must_use]
+pub fn find_program(name: &str, path: &OsStr) -> Option<PathBuf> {
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
+    std::env::split_paths(path)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(&file))
+        .find(|p| p.is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;

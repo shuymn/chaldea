@@ -1,7 +1,6 @@
 //! `SupervisorComponents` (design §2.9 "Components"): the restart reconcilers, the
 //! `Supervisor` with its four handlers, the shutdown participant, the mounts, and the tick.
 
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -254,21 +253,8 @@ impl Supervisor {
             chaldea_core::ids::Agent::Claude => "claude",
             chaldea_core::ids::Agent::Codex => "codex",
         };
-        let path = resolve(name, &std::env::var_os("PATH")?)?;
+        let path = chaldea_pty_runtime::host::find_program(name, &std::env::var_os("PATH")?)?;
         tracing::info!(program = %path.display(), "resolved the agent program");
         Some(vec![path.into_os_string()])
     }
-}
-
-/// The first `name` (with `.exe` on Windows) on `path` that is a file.
-fn resolve(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
-    let file = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_owned()
-    };
-    std::env::split_paths(path)
-        .filter(|d| d.is_absolute())
-        .map(|d| d.join(&file))
-        .find(|p| p.is_file())
 }

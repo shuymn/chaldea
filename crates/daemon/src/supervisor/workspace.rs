@@ -139,12 +139,7 @@ pub(crate) fn common_dir(
     for name in GIT_LOCAL_ENV {
         cmd.env_remove(name);
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    chaldea_pty_runtime::host::no_console_window(&mut cmd);
     let real_deadline = sup.real(deadline);
     let child = match TrackedChild::spawn(&mut cmd, &sup.tracker, real_deadline, sup.pauses()) {
         None => return Err("git was not created (spawn lock, admission, or deadline)"),
