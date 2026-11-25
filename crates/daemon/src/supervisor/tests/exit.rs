@@ -471,3 +471,147 @@ async fn stop_owns_exit() {
     assert!(rig.launch(l).death_confirmed);
     rig.srv.stop().await;
 }
+
+/// One input's events on thread `t`: created `queued` with `launch`, then each step.
+fn input_events(
+    t: chaldea_core::ids::ThreadId,
+    launch: Option<chaldea_core::ids::LaunchId>,
+    i: chaldea_core::ids::InputId,
+    steps: &[chaldea_core::input::InputInput],
+) -> Vec<crate::store::NewEvent> {
+    use super::support::event;
+    use chaldea_core::event::TypedEvent;
+    use chaldea_core::ids::{Actor, StreamId};
+    use chaldea_core::input::{InputState, step};
+    use chaldea_core::payload::{
+        Content, InputCreated, InputEncoding, InputInitialState, InputOrigin, InputStateChanged,
+    };
+    let mut out = vec![event(
+        StreamId::Thread(t),
+        &format!("test-input:{i}"),
+        TypedEvent::InputCreated(InputCreated {
+            input_id: i,
+            launch_id: launch,
+            initial_state: InputInitialState::Queued,
+            text: Content::text("hello"),
+            encoding: InputEncoding::BracketedPaste,
+            origin: InputOrigin::Cli,
+            created_by: Actor::Human,
+        }),
+    )];
+    let mut state = InputState::Queued;
+    for (n, how) in steps.iter().enumerate() {
+        let to = step(state, how).unwrap();
+        let mut e = event(
+            StreamId::Thread(t),
+            &format!("test-input:{i}:{n}"),
+            TypedEvent::InputStateChanged(InputStateChanged {
+                input_id: i,
+                from: state,
+                to,
+                reason: how.into(),
+                sent_after_seq: None,
+                by: None,
+            }),
+        );
+        e.launch_id = launch;
+        out.push(e);
+        state = to;
+    }
+    out
+}
+
+/// A test exit step that cancels one `queued` input before the sweep runs.
+struct CancelFirst(chaldea_core::ids::InputId);
+
+impl crate::supervisor::exit::ExitStep for CancelFirst {
+    fn in_exit_job(
+        &self,
+        tx: &mut crate::store::WriteTx<'_>,
+        exit: &crate::supervisor::exit::ExitFacts,
+    ) -> Result<(), crate::store::StoreError> {
+        use chaldea_core::input::InputInput;
+        let mut e = input_events(
+            exit.thread_id,
+            Some(exit.launch_id),
+            self.0,
+            &[InputInput::Cancelled],
+        );
+        e.remove(0);
+        e[0].idempotency_key = chaldea_core::ids::IdempotencyKey(format!("step-cancel:{}", self.0));
+        tx.append(e)?;
+        Ok(())
+    }
+}
+
+/// PR10a1-CL-14 `inputs_recovered`: a natural exit's job moves the thread's inputs still
+/// `queued`, `sending`, or `sent` of the launch, and the queue of no launch, after the
+/// registered exit steps: an input a test step cancelled first is left as it settled; an
+/// `unconfirmed` input keeps its state and gets no event; all in the exit job, after
+/// `launch_exited`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inputs_recovered() {
+    use chaldea_core::ids::InputId;
+    use chaldea_core::input::InputInput as I;
+    let id = || InputId(uuid::Uuid::new_v4());
+    let (queued, sending, sent, unassigned, unconfirmed, cancelled) =
+        (id(), id(), id(), id(), id(), id());
+    let step = std::sync::Arc::new(CancelFirst(cancelled));
+    let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, move |c| {
+        c.exit_steps.push(step);
+    })
+    .await;
+    let (t, l) = rig.spawn_codex(None).await;
+    let open = I::GateOpened { sent_after_seq: 1 };
+    let mut events = Vec::new();
+    for (i, launch, steps) in [
+        (queued, Some(l), vec![]),
+        (sending, Some(l), vec![open]),
+        (sent, Some(l), vec![open, I::WriteCompleted]),
+        (unassigned, None, vec![]),
+        (unconfirmed, Some(l), vec![open, I::WriteOutcomeUnknown]),
+        (cancelled, Some(l), vec![]),
+    ] {
+        events.extend(input_events(t, launch, i, &steps));
+    }
+    rig.srv.append(events).await;
+    let before = rig.events(t).len();
+    rig.pty.take_child().unwrap().exit(ChildExit {
+        code: Some(0),
+        signal: None,
+    });
+    rig.until("the exit recorded", || rig.launch(l).exit_reason.is_some())
+        .await;
+    let after: Vec<_> = rig.events(t).split_off(before);
+    let moved = |i: InputId| -> Vec<(String, String)> {
+        after
+            .iter()
+            .filter(|(k, p)| k == "input_state_changed" && p["input_id"] == i.to_string())
+            .map(|(_, p)| {
+                (
+                    p["from"].as_str().unwrap().to_owned(),
+                    p["to"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let pair = |a: &str, b: &str| vec![(a.to_owned(), b.to_owned())];
+    assert_eq!(moved(queued), pair("queued", "cancelled"));
+    assert_eq!(moved(sending), pair("sending", "unconfirmed"));
+    assert_eq!(moved(sent), pair("sent", "unconfirmed"));
+    assert_eq!(moved(unassigned), pair("queued", "cancelled"));
+    assert_eq!(moved(unconfirmed), vec![], "kept");
+    assert_eq!(
+        moved(cancelled),
+        pair("queued", "cancelled"),
+        "the step's move only"
+    );
+    // Order: `launch_exited`, the step's move, then the sweep's.
+    let at =
+        |pred: &dyn Fn(&(String, serde_json::Value)) -> bool| after.iter().position(pred).unwrap();
+    let exited = at(&|(k, _)| k == "launch_exited");
+    let stepped = at(&|(_, p)| p["input_id"] == cancelled.to_string());
+    let swept = at(&|(_, p)| p["input_id"] == queued.to_string());
+    assert!(exited < stepped && stepped < swept, "{after:?}");
+    rig.srv.stop().await;
+}
