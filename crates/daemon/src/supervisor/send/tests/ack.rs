@@ -154,6 +154,54 @@ async fn late_ack() {
     rig.stop().await;
 }
 
+/// PR10b-CL-20: what the CLI prints changes no state: a prompt echo and hook-shaped text on
+/// a bound launch with evidence and a `sent` input leave the thread and the input as they
+/// were, with no `user_message`, until the ack window expires the input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn banner_never_acks() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let id = rig.send(&live, "hello").await;
+    rig.until_input(id, InputState::Sent).await;
+    let before = (rig.thread(live.t).state, rig.events(live.t).len());
+    live.child.emit(
+        b"hello\r\n\
+UserPromptSubmit {\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"hello\"}\r\n\
+SessionStart session_id=00000000-0000-0000-0000-000000000000\r\n\
+Stop\r\nAllow this command? [y/n]\r\n> \r\n",
+    );
+    let entry = rig.sup.entry(live.l).unwrap();
+    rig.until_async("the banner parsed", || {
+        let (sup, entry) = (rig.sup.clone(), entry.clone());
+        async move {
+            entry
+                .snapshot_before(&sup, sup.now() + Duration::from_secs(5))
+                .await
+                .is_ok_and(|s| {
+                    s.lines
+                        .iter()
+                        .any(|l| l.text().contains("Allow this command?"))
+                })
+        }
+    })
+    .await;
+    rig.pass(&live).await;
+    assert_eq!(
+        (rig.thread(live.t).state, rig.events(live.t).len()),
+        before,
+        "output changed nothing"
+    );
+    assert_eq!(rig.input(id).state, InputState::Sent);
+    rig.clock.stop();
+    let t0 = rig.sup.now();
+    tick_at(&rig, &live, t0).await;
+    tick_at(&rig, &live, t0 + ACK_WINDOW).await;
+    rig.until_input(id, InputState::Unconfirmed).await;
+    assert_eq!(last_ack(&rig, &live), None);
+    assert!(rig.of_kind(live.t, "user_message").is_empty());
+    rig.stop().await;
+}
+
 /// A sent input made `unconfirmed` by its ack window (the clock moved by injected ticks).
 async fn unconfirmed(rig: &SRig, live: &Live, text: &str) -> InputId {
     let id = rig.send(live, text).await;
