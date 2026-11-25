@@ -484,18 +484,8 @@ async fn key_op(sup: Arc<Supervisor>, req: KeyReq) -> EffectOutcome {
                     expect: word,
                 }),
             };
-            me.state().human_unsettled += 1;
-            me.outstanding.fetch_add(1, Ordering::AcqRel);
-            let done = me.completion(None, Some(tx_report));
-            match s.submit(WriteUnit::bytes(origin, bytes), guard, done) {
-                Ok(t) => Some(t),
-                Err(_) => {
-                    me.outstanding.fetch_sub(1, Ordering::AcqRel);
-                    let mut st = me.state();
-                    st.human_unsettled = st.human_unsettled.saturating_sub(1);
-                    None
-                }
-            }
+            me.submit_human(s, WriteUnit::bytes(origin, bytes), guard, Some(tx_report))
+                .ok()
         })
         .await;
     let ticket = match submitted {

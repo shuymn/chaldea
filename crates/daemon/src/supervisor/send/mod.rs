@@ -345,6 +345,30 @@ impl SendLaunch {
         })
     }
 
+    /// Submits a human unit (`Key`, `CardKey`, `Attach`) inside `with_session` (send §2.6
+    /// "Human units"): `human_unsettled` goes up just before `submit` and back down at once
+    /// when `submit` fails; the worker records the unit's completion.
+    ///
+    /// # Errors
+    ///
+    /// The session refused the unit (nothing was queued).
+    pub(crate) fn submit_human(
+        self: &Arc<Self>,
+        s: &chaldea_pty_runtime::Session,
+        unit: chaldea_pty_runtime::WriteUnit,
+        guard: chaldea_pty_runtime::Guard,
+        report: Option<oneshot::Sender<KeyReport>>,
+    ) -> Result<WriteTicket, chaldea_pty_runtime::SubmitError> {
+        self.state().human_unsettled += 1;
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
+        let done = self.completion(None, report);
+        s.submit(unit, guard, done).inspect_err(|_| {
+            self.outstanding.fetch_sub(1, Ordering::AcqRel);
+            let mut st = self.state();
+            st.human_unsettled = st.human_unsettled.saturating_sub(1);
+        })
+    }
+
     /// Sets the running unit and its flag.
     pub(crate) fn set_running(&self, st: &mut SendState, r: Option<RunningUnit>) {
         self.running_flag.store(r.is_some(), Ordering::SeqCst);
