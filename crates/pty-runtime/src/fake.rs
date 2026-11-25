@@ -502,28 +502,42 @@ impl PtyChild for FakeProcess {
         if Instant::now() >= deadline {
             return report(METHOD, KillAttempt::NotAttempted, None);
         }
+        // The signal-equivalent operation: the deadline is checked once more under the log's
+        // mutex, right before the signal is recorded and counted. `None`: not performed.
         let signal = || {
-            p.record(FakeEvent::Signal);
-            p.signals.fetch_add(1, Ordering::AcqRel) + 1
+            let mut log = lock(&p.log);
+            if Instant::now() >= deadline {
+                return None;
+            }
+            log.push(FakeEvent::Signal);
+            Some(p.signals.fetch_add(1, Ordering::AcqRel) + 1)
         };
         let proved = |attempt| report(METHOD, attempt, Some(Instant::now()));
+        let not_attempted = || report(METHOD, KillAttempt::NotAttempted, None);
         match p.kill {
             KillBehavior::Panic => panic!("injected kill_tree panic"),
             KillBehavior::Unconfirmed => {
                 report(METHOD_UNCONFIRMED, KillAttempt::NotAttempted, None)
             }
             KillBehavior::ExitOnKill => {
-                signal();
+                if signal().is_none() {
+                    return not_attempted();
+                }
                 p.exit(KILLED);
                 proved(KillAttempt::Signalled)
             }
             KillBehavior::Ignore => {
-                signal();
+                if signal().is_none() {
+                    return not_attempted();
+                }
                 sleep_until(deadline);
                 report(METHOD, KillAttempt::Signalled, None)
             }
             KillBehavior::ProveOnCall(n) => {
-                if signal() >= n {
+                let Some(count) = signal() else {
+                    return not_attempted();
+                };
+                if count >= n {
                     p.exit(KILLED);
                     proved(KillAttempt::Signalled)
                 } else {
@@ -531,7 +545,9 @@ impl PtyChild for FakeProcess {
                 }
             }
             KillBehavior::ExitAfter(d) => {
-                signal();
+                if signal().is_none() {
+                    return not_attempted();
+                }
                 let at = Instant::now() + d;
                 if at <= deadline {
                     sleep_until(at);
@@ -1495,6 +1511,37 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         drop(exit_state);
+        let r = call.join().unwrap();
+        assert_eq!(
+            (r.tree_dead, r.attempt, r.proved_at),
+            (false, KillAttempt::NotAttempted, None)
+        );
+        assert_eq!(signals(&c), 0);
+    }
+
+    /// The deadline checked again under the log's mutex: a call that passed the earlier
+    /// check and waited on that mutex past its deadline records no signal.
+    #[test]
+    fn deadline_rechecked_under_the_log() {
+        let (child, c, _parts) = spawn(FakeScript::default());
+        let exit_state = c.proc.exit.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let call = std::thread::spawn(move || child.kill_tree(&[], deadline, deadline));
+        let entered = soon();
+        while !(*c.proc.kill_lock.lock().unwrap()) {
+            assert!(
+                Instant::now() < entered,
+                "the call takes the kill-state lock"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The call waits on the exit state; the log is held before it is let through.
+        let log = c.proc.log.lock().unwrap();
+        drop(exit_state);
+        while Instant::now() <= deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(log);
         let r = call.join().unwrap();
         assert_eq!(
             (r.tree_dead, r.attempt, r.proved_at),
