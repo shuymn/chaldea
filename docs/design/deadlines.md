@@ -157,7 +157,7 @@ The kept sites keep their own tests, among them `http::tests::writes::reply_afte
 
 - The synchronous helpers of `pty-runtime::host`, the CLI's polls (`cli::poll`: `poll_until`, and `poll_until_with`, which reads its cutoff on an injected clock), ticket and pair-code expiry, and the store's blocking waits.
 - A write's ticket: `run_write` and `write_with` await an admitted job's ticket to the writer's answer with no timeout of their own; `not_after` bounds only the writer's start of the job.
-- The supervisor's await of `Session::spawn`, which has no deadline: cancelling it cannot stop the blocking call from creating the child, so the launch op awaits it to its result, bounded by the spawn lock's holders, each of which does bounded work; the request replies at its own deadline through the runner (`docs/design/supervisor.md` §2.10).
+- The supervisor's await of `Session::spawn`, which has no deadline: cancelling it cannot stop the blocking call from creating the child, so the launch op awaits it to its result, bounded by the spawn lock's holders, each of which does bounded work except the OS's process creation itself: on macOS `Command::spawn` returns once the child's `exec` reports through its close-on-exec pipe, and an `exec` the kernel holds (an unresponsive filesystem) holds the lock without bound; nothing in the daemon can end that wait, and it is accepted; the request replies at its own deadline through the runner (`docs/design/supervisor.md` §2.10).
 - hyper's `header_read_timeout`, `Sleep::reset`, `interval` (review-only).
 - Moving the kept sites onto `settle_before`.
 - The CLI crate's `clippy.toml`: the CLI has no tokio outside its tests.

@@ -502,8 +502,7 @@ fn stop_result(confirmed: bool, within: bool) -> StopResult {
 /// when confirmed late, and 1 with the general line when unconfirmed; the result is printed.
 #[test]
 fn stop_outcomes() {
-    let late =
-        "chaldea: The process ended, but its end was not confirmed within 5 s of the stop request.";
+    let late = "chaldea: The process ended, but its end was not confirmed within 5 s of the stop request the daemon accepted.";
     for (r, code, lines) in [
         (stop_result(true, true), ExitCode::Ok, vec![]),
         (

@@ -48,9 +48,9 @@ const UNCONFIRMED_RESTART: &str = "The previous process of this thread could not
 const UNCONFIRMED_STOPPED: &str =
     "The previous process of this thread could not be confirmed to have ended when it stopped.";
 const UNCONFIRMED_TAIL: &str = "This version cannot resume or close this thread. Its history is kept, and new threads can be started.";
-/// The line of a stop whose death was confirmed after its 5 s.
-const CONFIRMED_LATE: &str =
-    "The process ended, but its end was not confirmed within 5 s of the stop request.";
+/// The line of a stop whose death was confirmed after its 5 s, counted from the attempt the
+/// daemon accepted.
+const CONFIRMED_LATE: &str = "The process ended, but its end was not confirmed within 5 s of the stop request the daemon accepted.";
 
 /// Where the daemon is, as one attempt sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]

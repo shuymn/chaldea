@@ -58,6 +58,10 @@ pub enum Command {
         prompt: Option<String>,
     },
     /// Stop a thread's agent CLI and its process tree.
+    ///
+    /// Exits 0 when the tree's end was confirmed within 5 s of the stop request the daemon
+    /// accepted, 4 when it was confirmed later, and 1 when it could not be confirmed. A
+    /// request retried after a refused attempt counts from the attempt the daemon accepted.
     Stop {
         #[arg(value_parser = crate::agent_cmd::thread_id)]
         thread: ThreadId,

@@ -343,7 +343,7 @@ impl TokenService {
 
 | Credential | Lives in | Restart | Expiry enforced at | Single use decided by |
 |---|---|---|---|---|
-| Token (`owner`, `agent`, `rescue`, `hook`, `extension`) | SQLite `tokens` (hash only) | survives; mvp §2.9 restart revokes every open launch's tokens (PR 10) | `verify_hash_in` in the transaction that uses it | — (multi-use) |
+| Token (`owner`, `agent`, `rescue`, `hook`, `extension`) | SQLite `tokens` (hash only) | survives; mvp §2.9 restart revokes every launch's tokens (PR 10) | `verify_hash_in` in the transaction that uses it | — (multi-use) |
 | WS ticket | memory `TicketStore`: hash → `{ token_id, token_sha256, purpose, expires_at }` | lost; clients mint a new one (they reconnect after a restart anyway, mvp §2.4) | at the conditional removal | `Mutex` + conditional `remove` |
 | Pair code | memory `PairCodes`: hash → `{ issuer_sha256, expires_at }` | lost; the user runs `chaldea open` again | at the conditional removal | `Mutex` + conditional `remove` |
 | Command receipt | SQLite `command_receipts` | `in_progress` → `unknown_after_crash` (PR 8/10 call `receipts_mark_unknown_after_crash`) | — | the writer's job order (§2.8) |
