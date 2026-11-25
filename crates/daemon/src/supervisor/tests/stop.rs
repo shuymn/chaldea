@@ -20,23 +20,78 @@ fn kills(events: &[FakeEvent]) -> Vec<Vec<ProcessIdentity>> {
         .collect()
 }
 
-/// Every kill and close gets the launch's full recorded list (PR10a1-CL-10).
+/// Every kill and close gets the launch's full recorded list (PR10a1-CL-10): a stop's, a
+/// natural exit's, the shutdown participant's, and a late creation's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_list_every_call() {
-    let rig = Rig::new().await;
-    let (t, l) = rig.spawn_codex(None).await;
+    use crate::supervisor::components::shutdown;
     let id = ProcessIdentity {
         pid: 4242,
         start_time: "s".to_owned(),
         group: "g".to_owned(),
     };
+    let only_id = |path: &str, child: &chaldea_pty_runtime::fake::FakeChild| {
+        let ks = kills(&child.log());
+        assert!(!ks.is_empty(), "{path}");
+        assert!(
+            ks.iter().all(|k| k == std::slice::from_ref(&id)),
+            "{path}: {ks:?}"
+        );
+    };
+    // A stop.
+    let rig = Rig::new().await;
+    let (t, l) = rig.spawn_codex(None).await;
     rig.sup.entry(l).unwrap().record_extra(id.clone());
     let child = rig.pty.take_child().unwrap();
     let r = rig.cmd("stop", &json!({ "thread_id": t })).await;
     assert_eq!(r.status, 200);
-    let ks = kills(&child.log());
-    assert!(!ks.is_empty());
-    assert!(ks.iter().all(|k| k == std::slice::from_ref(&id)), "{ks:?}");
+    only_id("stop", &child);
+    // A natural exit.
+    let (_t, l) = rig.spawn_codex(None).await;
+    rig.sup.entry(l).unwrap().record_extra(id.clone());
+    let child = rig.pty.take_child().unwrap();
+    child.exit(chaldea_pty_runtime::ChildExit {
+        code: Some(0),
+        signal: None,
+    });
+    rig.until("the exit recorded", || rig.launch(l).exit_reason.is_some())
+        .await;
+    only_id("natural exit", &child);
+    // The participant.
+    let (_t, l) = rig.spawn_codex(None).await;
+    rig.sup.entry(l).unwrap().record_extra(id.clone());
+    let child = rig.pty.take_child().unwrap();
+    shutdown(rig.sup.clone(), rig.sup.now() + Duration::from_secs(2)).await;
+    only_id("participant", &child);
+    rig.srv.stop().await;
+    // A late creation: admission closed while the op holds its session unpublished.
+    let rig = Rig::new().await;
+    let held = rig.pauses.arm(Pause::BeforePublish);
+    let cwd = rig.cwd.path().to_string_lossy().into_owned();
+    let reply = spawn_send(
+        &rig.srv,
+        &rig.srv.command(
+            "spawn",
+            &rig.owner,
+            super::cid(),
+            &json!({ "agent": "codex", "cwd": cwd }).to_string(),
+        ),
+    );
+    held.wait();
+    let l = rig
+        .srv
+        .store
+        .read(|r| Ok(r.threads()?.pop().unwrap().current_launch_id.unwrap()));
+    rig.sup.entry(l).unwrap().record_extra(id.clone());
+    let child = rig.pty.take_child().unwrap();
+    rig.sup.tracker.close_admission();
+    held.go();
+    let _ = reply.await;
+    rig.until("the late close recorded", || {
+        rig.launch(l).exit_reason.is_some()
+    })
+    .await;
+    only_id("late creation", &child);
     rig.srv.stop().await;
 }
 
