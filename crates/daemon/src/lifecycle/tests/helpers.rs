@@ -233,7 +233,14 @@ fn blocked_writer_keeps_the_lock() {
     assert_eq!(field(&r, "lock"), "HeldUntilExit", "{r}");
     assert_eq!(field(&r, "reason"), "lock_held_at_exit", "{r}");
     held_then_free(&mut h, &dir.path);
-    assert!(h.stderr().contains("writer_exited false"), "{}", h.stderr());
+    // The report, if seen within the grace, says the writer did not exit; one first seen
+    // after the grace is counted as such (design §2.8 step 4).
+    let err = h.stderr();
+    assert!(
+        err.contains("writer_exited false")
+            || err.contains("the store's shutdown report was not seen"),
+        "{err}"
+    );
 }
 
 /// A `CommitUnknown` retires the writer, then a real reader is held past the cutoff: the
@@ -438,7 +445,12 @@ fn store_shutdown_runs_off_the_workers() {
     let r = h.expect("returned", WAIT);
     h.wait(WAIT);
     assert_eq!(field(&r, "code"), "0", "{r}; stderr:\n{}", h.stderr());
-    assert_eq!(field(&r, "lock"), "Released", "{r}");
+    assert_eq!(
+        field(&r, "lock"),
+        "Released",
+        "{r}; stderr:\n{}",
+        h.stderr()
+    );
 }
 
 // ---- PR8-CL-10 ----
@@ -705,29 +717,38 @@ fn stop_inside_step() {
         let (mut h, dir) = parent("stop_inside_step", &[(STEP_ENV, step)]);
         let checks = h.expect("checks", WAIT);
         let r = h.expect("returned", WAIT);
-        assert_eq!(field(&r, "code"), "0", "step {step}: {r}");
-        assert_eq!(field(&r, "lock"), "Released", "step {step}: {r}");
-        assert_eq!(field(&checks, "second"), "3", "step {step}: {checks}");
-        assert_eq!(field(&checks, "held_while_parked"), "true", "step {step}");
-        assert_eq!(field(&checks, "record_at_verdict"), "false", "step {step}");
-        assert_eq!(
-            field(&checks, "lock_at_verdict"),
-            "Some(Free)",
-            "step {step}"
-        );
+        // The verdict first: a run that sent none fails here, with its return.
         let verdict = field(&checks, "verdict");
         assert!(
             verdict.starts_with("fail_stopped_"),
-            "step {step}: {verdict}"
+            "step {step}: {checks}; {r}"
+        );
+        assert_eq!(field(&r, "code"), "0", "step {step}: {r}");
+        assert_eq!(field(&r, "lock"), "Released", "step {step}: {r}");
+        assert_eq!(field(&checks, "second"), "3", "step {step}: {checks}");
+        assert_eq!(
+            field(&checks, "held_while_parked"),
+            "true",
+            "step {step}: {checks}"
+        );
+        assert_eq!(
+            field(&checks, "record_at_verdict"),
+            "false",
+            "step {step}: {checks}"
+        );
+        assert_eq!(
+            field(&checks, "lock_at_verdict"),
+            "Some(Free)",
+            "step {step}: {checks}"
         );
         match step {
             "8" => {
-                assert_eq!(field(&checks, "port_file"), "false", "step 8");
-                assert!(!verdict.contains("port_saved"), "{verdict}");
+                assert_eq!(field(&checks, "port_file"), "false", "step 8: {checks}");
+                assert!(!verdict.contains("port_saved"), "{checks}");
             }
             _ => {
-                assert_eq!(field(&checks, "port_file"), "true", "step {step}");
-                assert!(verdict.contains("port_saved="), "{verdict}");
+                assert_eq!(field(&checks, "port_file"), "true", "step {step}: {checks}");
+                assert!(verdict.contains("port_saved="), "{checks}");
             }
         }
         h.wait(WAIT);
