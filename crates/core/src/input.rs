@@ -13,6 +13,7 @@ use crate::payload::ReadinessEvidence;
 use crate::state::{ProcessState, TurnState};
 
 pub mod encode;
+pub mod key;
 
 /// The largest prompt text, in UTF-8 bytes, that `send` and recognised attach pastes
 /// admit (§2.3 "Prompt limit"). Longer text is refused before admission, with zero bytes

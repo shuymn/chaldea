@@ -154,6 +154,13 @@ fn handler_code(code: ErrorCode) -> Option<HandlerCode> {
         | ErrorCode::DeathUnconfirmed
         | ErrorCode::WorktreeUnavailable
         | ErrorCode::NoSession => at(StatusCode::CONFLICT),
+        // The send-side commands' refusals (supervisor-send §2.2): nothing was written.
+        ErrorCode::NoLiveLaunch
+        | ErrorCode::NotBound
+        | ErrorCode::CardClosed
+        | ErrorCode::KeyNotWritten
+        | ErrorCode::InputState
+        | ErrorCode::UnitRunning => at(StatusCode::CONFLICT),
         ErrorCode::PromptRejected | ErrorCode::PromptTooLarge => at(StatusCode::BAD_REQUEST),
         // A stop that could not take its launch in time; nothing changed.
         ErrorCode::LaunchBusy => at(StatusCode::GATEWAY_TIMEOUT),

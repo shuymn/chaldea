@@ -8,7 +8,10 @@ use sha2::{Digest, Sha256};
 use ts_rs::TS;
 
 use crate::canonical::CanonicalJson;
-use crate::ids::{Agent, CommandId, InputId, LaunchId, ThreadId, TokenId};
+use crate::ids::{Agent, ApprovalId, CommandId, InputId, LaunchId, ThreadId, TokenId};
+use crate::input::key::KeyToken;
+use crate::input::{InputState, RejectReason};
+use crate::payload::InputOrigin;
 
 /// The domain of [`request_identity`]: a new identity scheme gets a new one.
 pub const IDENTITY_DOMAIN: &str = "chaldea-command-v1";
@@ -214,4 +217,106 @@ pub struct StopResult {
 pub struct CloseResult {
     pub thread_id: ThreadId,
     pub stop: Option<StopResult>,
+}
+
+// ---- send-side commands (`docs/design/supervisor-send.md` §2.2) -------------------------------
+
+/// The arguments of `send`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SendArgs {
+    pub thread_id: ThreadId,
+    pub text: String,
+    /// The client's claim of where the text came from; `cli` when absent. Informational.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub origin: Option<InputOrigin>,
+}
+
+/// The success body of `send`: the input, `queued` or `rejected` with its reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+#[schemars(extend("required" = ["input_id", "state", "reject_reason"]))]
+pub struct SendResult {
+    pub input_id: InputId,
+    pub state: InputState,
+    /// `null` unless `state` is `rejected`.
+    pub reject_reason: Option<RejectReason>,
+}
+
+/// The arguments of `ready`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadyArgs {
+    pub thread_id: ThreadId,
+    /// When given, the current launch must be this one (`launch_changed` otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub expected_launch_id: Option<LaunchId>,
+}
+
+/// The success body of `ready`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+pub struct ReadyResult {
+    pub launch_id: LaunchId,
+}
+
+/// The arguments of `key`: 1 to `MAX_KEYS` tokens; with `approval_id`, every token before
+/// the last is a navigation key of the row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeyArgs {
+    pub thread_id: ThreadId,
+    pub launch_id: LaunchId,
+    pub keys: Vec<KeyToken>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub approval_id: Option<ApprovalId>,
+}
+
+/// What a `key` request knew of its unit when it replied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyOutcome {
+    /// Every byte was written and the `human_write` committed.
+    Written,
+    /// Some bytes may have reached the CLI; the `human_write` committed.
+    Incomplete,
+    /// No recorded outcome was known at the reply; the daemon records it later.
+    Pending,
+}
+
+/// The success body of `key`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+#[schemars(extend("required" = ["outcome", "bytes_written"]))]
+pub struct KeyResult {
+    pub outcome: KeyOutcome,
+    /// `null` for `pending`.
+    #[serde(
+        serialize_with = "crate::wire::ser_opt_safe_u64",
+        deserialize_with = "crate::wire::opt_safe_u64"
+    )]
+    pub bytes_written: Option<u64>,
+}
+
+/// The arguments of `input_resolve`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InputResolveArgs {
+    pub input_id: InputId,
+    /// `true`: the owner saw it delivered (`acked`); `false`: `dismissed`.
+    pub delivered: bool,
+}
+
+/// The arguments of `input_cancel`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InputCancelArgs {
+    pub input_id: InputId,
+}
+
+/// The success body of `input_resolve` and `input_cancel`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+pub struct InputCommandResult {
+    pub input_id: InputId,
+    pub state: InputState,
 }
