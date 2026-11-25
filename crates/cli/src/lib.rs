@@ -218,6 +218,34 @@ fn command(cli: Cli, seams: &mut Seams) -> ExitCode {
         Command::Resume { thread, prompt } => {
             agent_cmd::run(&state_dir, agent_cmd::Verb::Resume { thread, prompt })
         }
+        Command::Send { thread, text } => {
+            agent_cmd::run(&state_dir, agent_cmd::Verb::Send { thread, text })
+        }
+        Command::Ready { thread } => agent_cmd::run(&state_dir, agent_cmd::Verb::Ready { thread }),
+        Command::Key {
+            thread,
+            keys,
+            approval,
+        } => agent_cmd::run(
+            &state_dir,
+            agent_cmd::Verb::Key {
+                thread,
+                keys,
+                approval,
+            },
+        ),
+        Command::Input {
+            command: args::InputCommand::Resolve { input, outcome },
+        } => agent_cmd::run(
+            &state_dir,
+            agent_cmd::Verb::InputResolve {
+                input,
+                delivered: outcome == args::Resolution::Delivered,
+            },
+        ),
+        Command::Input {
+            command: args::InputCommand::Cancel { input },
+        } => agent_cmd::run(&state_dir, agent_cmd::Verb::InputCancel { input }),
         Command::Stop { thread } => agent_cmd::run(&state_dir, agent_cmd::Verb::Stop { thread }),
         Command::Close { thread, stop } => {
             agent_cmd::run(&state_dir, agent_cmd::Verb::Close { thread, stop })

@@ -1,5 +1,6 @@
 //! `chaldea spawn`, `resume`, `stop`, `close`, and `wait` (docs/design/supervisor.md §2.2,
-//! SD16): each command is one `POST /api/commands/{name}` with one `command_id`, sent again
+//! SD16), and `send`, `ready`, `key`, `input resolve`, and `input cancel`
+//! (docs/design/supervisor-send.md §2.2): each command is one `POST /api/commands/{name}` with one `command_id`, sent again
 //! unchanged on a transport failure, `408`, `503`, or `409 in_progress` until one cutoff; the
 //! reads are `GET /api/threads/{thread_id}` under the same rules.
 
@@ -9,13 +10,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chaldea_core::command::{
-    CloseArgs, CloseResult, LaunchOutcome, ResumeArgs, ResumeResult, SpawnArgs, SpawnResult,
-    StopArgs, StopResult,
+    CloseArgs, CloseResult, InputCancelArgs, InputCommandResult, InputResolveArgs, KeyArgs,
+    KeyOutcome, KeyResult, LaunchOutcome, ReadyArgs, ReadyResult, ResumeArgs, ResumeResult,
+    SendArgs, SendResult, SpawnArgs, SpawnResult, StopArgs, StopResult,
 };
 use chaldea_core::http::{ErrorBody, ErrorCode};
-use chaldea_core::ids::{Agent, CommandId, LaunchId, ThreadId};
+use chaldea_core::ids::{Agent, ApprovalId, CommandId, InputId, LaunchId, ThreadId};
 use chaldea_core::input::MAX_PROMPT_BYTES;
 use chaldea_core::input::encode::{Purpose, check};
+use chaldea_core::input::key::KeyToken;
 use chaldea_core::payload::{ExitReason, InputEncoding};
 use chaldea_core::state::{ProcessState, TurnState};
 use chaldea_core::sync::ThreadSummary;
@@ -325,34 +328,35 @@ fn stop_exit(r: &StopResult, err: &mut dyn Write) -> ExitCode {
     }
 }
 
-/// The prompt checks the daemon makes first, so their reason can be printed.
+/// The prompt checks the daemon makes first, so their reason can be printed: the size, and,
+/// when the agent is known, `check` in its first prompt's encoding (Codex's positional
+/// argument, Claude's queued input). A resumed thread's agent is the daemon's to check.
 fn admit_prompt(agent: Option<Agent>, prompt: Option<&str>, err: &mut dyn Write) -> bool {
     let Some(text) = prompt else {
         return true;
     };
-    let refuse = |err: &mut dyn Write, m: &str| {
-        say(err, m);
-        false
-    };
-    if agent == Some(Agent::Claude) {
-        return refuse(
-            err,
-            "a Claude prompt cannot be given at spawn; start it without --prompt",
-        );
-    }
     if text.len() > MAX_PROMPT_BYTES {
-        return refuse(
+        say(
             err,
             &format!("the prompt is longer than {MAX_PROMPT_BYTES} bytes"),
         );
+        return false;
     }
-    if let Err(r) = check(Agent::Codex, InputEncoding::Positional, Purpose::Send, text) {
+    let encoding = match agent {
+        Some(Agent::Codex) => InputEncoding::Positional,
+        Some(Agent::Claude) => InputEncoding::BracketedPaste,
+        None => return true,
+    };
+    if let Some(a) = agent
+        && let Err(r) = check(a, encoding, Purpose::Send, text)
+    {
         let reason = serde_json::to_value(r.reason)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))
             .unwrap_or_default();
         let at = r.at.map(|a| format!(" at byte {a}")).unwrap_or_default();
-        return refuse(err, &format!("the prompt is refused: {reason}{at}"));
+        say(err, &format!("the prompt is refused: {reason}{at}"));
+        return false;
     }
     true
 }
@@ -491,6 +495,122 @@ impl Client<'_> {
         }
     }
 
+    /// `chaldea send`: the input and its state; a rejected text exits 1 with its reason.
+    pub(crate) fn send(
+        &self,
+        t: ThreadId,
+        text: String,
+        out: &mut dyn Write,
+        err: &mut dyn Write,
+    ) -> ExitCode {
+        if text.len() > MAX_PROMPT_BYTES {
+            say(
+                err,
+                &format!("the prompt is longer than {MAX_PROMPT_BYTES} bytes"),
+            );
+            return ExitCode::Failed;
+        }
+        let cutoff = self.cutoff(COMMAND_CUTOFF);
+        let args = SendArgs {
+            thread_id: t,
+            text,
+            origin: None,
+        };
+        match self.command::<_, SendResult>(cutoff, "send", &args) {
+            Ok(v) => {
+                print(out, &v);
+                if let Some(r) = v.reject_reason {
+                    let reason = serde_json::to_value(r)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .unwrap_or_default();
+                    say(err, &format!("the prompt is refused: {reason}"));
+                    return ExitCode::Failed;
+                }
+                ExitCode::Ok
+            }
+            Err(e) => not_done(e, err),
+        }
+    }
+
+    /// `chaldea ready`, pinned to the current launch.
+    pub(crate) fn ready(&self, t: ThreadId, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+        let cutoff = self.cutoff(COMMAND_CUTOFF);
+        let l = match self.pinned(cutoff, t) {
+            Ok(l) => l,
+            Err(e) => return ended(e, err),
+        };
+        let args = ReadyArgs {
+            thread_id: t,
+            expected_launch_id: Some(l),
+        };
+        match self.command::<_, ReadyResult>(cutoff, "ready", &args) {
+            Ok(v) => {
+                print(out, &v);
+                ExitCode::Ok
+            }
+            Err(e) => not_done(e, err),
+        }
+    }
+
+    /// `chaldea key`, to the current launch: 0 once every byte was written; 1 for
+    /// `incomplete` or `pending`, whose bytes may or may not have reached the CLI.
+    pub(crate) fn key(
+        &self,
+        t: ThreadId,
+        keys: Vec<KeyToken>,
+        approval: Option<ApprovalId>,
+        out: &mut dyn Write,
+        err: &mut dyn Write,
+    ) -> ExitCode {
+        let cutoff = self.cutoff(COMMAND_CUTOFF);
+        let l = match self.pinned(cutoff, t) {
+            Ok(l) => l,
+            Err(e) => return ended(e, err),
+        };
+        let args = KeyArgs {
+            thread_id: t,
+            launch_id: l,
+            keys,
+            approval_id: approval,
+        };
+        match self.command::<_, KeyResult>(cutoff, "key", &args) {
+            Ok(v) => {
+                print(out, &v);
+                match v.outcome {
+                    KeyOutcome::Written => ExitCode::Ok,
+                    KeyOutcome::Incomplete => {
+                        say(err, "only part of the keys was written");
+                        ExitCode::Failed
+                    }
+                    KeyOutcome::Pending => {
+                        say(err, "the keys were not confirmed written in time");
+                        ExitCode::Failed
+                    }
+                }
+            }
+            Err(e) => not_done(e, err),
+        }
+    }
+
+    /// `chaldea input resolve` and `chaldea input cancel`.
+    pub(crate) fn input(
+        &self,
+        name: &str,
+        args: &impl Serialize,
+        out: &mut dyn Write,
+        err: &mut dyn Write,
+    ) -> ExitCode {
+        let cutoff = self.cutoff(COMMAND_CUTOFF);
+        match self.command::<_, InputCommandResult>(cutoff, name, args) {
+            Ok(v) => {
+                print(out, &v);
+                ExitCode::Ok
+            }
+            Err(e) => not_done(e, err),
+        }
+    }
+
     /// `chaldea wait` (SD16): polls the summary until `until` holds, against one cutoff.
     pub(crate) fn wait(
         &self,
@@ -566,6 +686,30 @@ pub(crate) fn duration(s: &str) -> Result<Duration, String> {
 /// # Errors
 ///
 /// The message clap prints.
+/// A key name (`enter`, `ctrl_c`, ...) or one printable character.
+pub(crate) fn key_token(s: &str) -> Result<KeyToken, String> {
+    if let Ok(k) = serde_json::from_value::<KeyToken>(serde_json::Value::String(s.to_owned())) {
+        return Ok(k);
+    }
+    let mut cs = s.chars();
+    match (cs.next(), cs.next()) {
+        (Some(c), None) if (' '..='~').contains(&c) => Ok(KeyToken::Char(c)),
+        _ => Err(format!("not a key: {s}")),
+    }
+}
+
+pub(crate) fn approval_id(s: &str) -> Result<ApprovalId, String> {
+    uuid::Uuid::parse_str(s)
+        .map(ApprovalId)
+        .map_err(|e| format!("not an approval id: {e}"))
+}
+
+pub(crate) fn input_id(s: &str) -> Result<InputId, String> {
+    uuid::Uuid::parse_str(s)
+        .map(InputId)
+        .map_err(|e| format!("not an input id: {e}"))
+}
+
 pub(crate) fn thread_id(s: &str) -> Result<ThreadId, String> {
     uuid::Uuid::parse_str(s)
         .map(ThreadId)
@@ -603,6 +747,25 @@ pub(crate) enum Verb {
     Resume {
         thread: ThreadId,
         prompt: Option<String>,
+    },
+    Send {
+        thread: ThreadId,
+        text: String,
+    },
+    Ready {
+        thread: ThreadId,
+    },
+    Key {
+        thread: ThreadId,
+        keys: Vec<KeyToken>,
+        approval: Option<ApprovalId>,
+    },
+    InputResolve {
+        input: InputId,
+        delivered: bool,
+    },
+    InputCancel {
+        input: InputId,
     },
     Stop {
         thread: ThreadId,
@@ -657,6 +820,28 @@ pub(crate) fn run(dir: &Path, verb: Verb) -> ExitCode {
             )
         }
         Verb::Resume { thread, prompt } => c.resume(thread, prompt, out, err),
+        Verb::Send { thread, text } => c.send(thread, text, out, err),
+        Verb::Ready { thread } => c.ready(thread, out, err),
+        Verb::Key {
+            thread,
+            keys,
+            approval,
+        } => c.key(thread, keys, approval, out, err),
+        Verb::InputResolve { input, delivered } => c.input(
+            "input_resolve",
+            &InputResolveArgs {
+                input_id: input,
+                delivered,
+            },
+            out,
+            err,
+        ),
+        Verb::InputCancel { input } => c.input(
+            "input_cancel",
+            &InputCancelArgs { input_id: input },
+            out,
+            err,
+        ),
         Verb::Stop { thread } => c.stop(thread, out, err),
         Verb::Close { thread, stop } => c.close(thread, stop, out, err),
         Verb::Wait {

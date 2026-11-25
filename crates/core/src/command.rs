@@ -105,7 +105,7 @@ pub fn check_receipt(
 pub struct SpawnArgs {
     pub agent: Agent,
     pub cwd: String,
-    /// A Codex positional first prompt; a Claude one is refused (`bad_args`).
+    /// A first prompt: Codex's positional argument, or a queued input for Claude.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub prompt: Option<String>,
@@ -162,7 +162,7 @@ pub enum LaunchOutcome {
 pub struct SpawnResult {
     pub thread_id: ThreadId,
     pub launch_id: LaunchId,
-    /// The positional first prompt's input; `null` without one.
+    /// The first prompt's input; `null` without one.
     pub input_id: Option<InputId>,
     pub outcome: LaunchOutcome,
 }
