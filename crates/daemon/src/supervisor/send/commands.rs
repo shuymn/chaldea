@@ -17,7 +17,7 @@ use chaldea_core::ids::{
     Actor, ApprovalId, CommandId, IdempotencyKey, InputId, LaunchId, ThreadId,
 };
 use chaldea_core::input::encode::{Purpose, check};
-use chaldea_core::input::key::{KeyToken, MAX_KEYS, encode_keys};
+use chaldea_core::input::key::{KeyToken, encode_keys};
 use chaldea_core::input::{InputInput, InputReason, InputState, MAX_PROMPT_BYTES, step};
 use chaldea_core::payload::{
     InputCreated, InputInitialState, InputOrigin, InputStateChanged, ReadinessEvidence, SourceKind,
@@ -339,7 +339,8 @@ impl CommandHandler for KeyHandler {
 
     fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError> {
         let (a, normalized) = parse::<KeyArgs>(args)?;
-        if a.keys.is_empty() || a.keys.len() > MAX_KEYS || encode_keys(&a.keys, false).is_err() {
+        // The count (1 to `MAX_KEYS`) and every token.
+        if encode_keys(&a.keys, false).is_err() {
             return Err(ApiError::bad_args());
         }
         let host_os = self.0.host_os;
