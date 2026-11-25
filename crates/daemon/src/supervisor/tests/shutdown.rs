@@ -406,3 +406,120 @@ async fn publish_vs_admission() {
         rig.srv.stop().await;
     }
 }
+
+/// PR10a1-CL-19 `git_spawn_stalled`: a probe held at the OS spawn's entry with its token:
+/// shutdown closes admission at once, a live PTY is closed and recorded, and the
+/// participant is `LeftRunning` by its end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn git_spawn_stalled() {
+    use crate::supervisor::Pause;
+    use crate::supervisor::workspace::common_dir;
+    let rig = Rig::new().await;
+    let (_t, l) = rig.spawn_codex(None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let held = rig.pauses.arm(Pause::GitAfterAdmit);
+    let (sup, cwd) = (rig.sup.clone(), dir.path().to_path_buf());
+    let probe =
+        std::thread::spawn(move || common_dir(&sup, &cwd, sup.now() + Duration::from_secs(5)));
+    held.wait();
+    assert_eq!(
+        rig.sup.tracker.count(),
+        2,
+        "the PTY's token and the probe's"
+    );
+    let end = rig.sup.now() + Duration::from_secs(1);
+    assert_eq!(
+        shutdown(rig.sup.clone(), end).await,
+        ParticipantEnd::LeftRunning
+    );
+    assert_eq!(rig.launch(l).exit_reason, Some(ExitReason::Stopped));
+    held.go();
+    let _ = probe.join();
+    rig.srv.stop().await;
+}
+
+/// PR10a1-CL-19 `git_reaped`: a sleeping git still held by its probe at shutdown is killed
+/// at the probe's next poll and reaped by the end, `Clean`; a sleeping git in `left` is
+/// killed and reaped by the participant, `Clean`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn git_reaped() {
+    use crate::supervisor::Pause;
+    use crate::supervisor::workspace::common_dir;
+    let dir = tempfile::tempdir().unwrap();
+    for in_left in [false, true] {
+        let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
+            c.git = super::workspace::sleeping_git();
+        })
+        .await;
+        let created = if in_left {
+            rig.pauses.arm_panic(Pause::GitAfterCreate)
+        } else {
+            rig.pauses.arm(Pause::GitAfterCreate)
+        };
+        let (sup, cwd) = (rig.sup.clone(), dir.path().to_path_buf());
+        let probe =
+            std::thread::spawn(move || common_dir(&sup, &cwd, sup.now() + Duration::from_secs(20)));
+        created.wait();
+        created.go();
+        let mut probe = Some(probe);
+        if in_left {
+            let p = probe.take().unwrap();
+            assert!(p.join().is_err(), "the probe panicked");
+            assert!(!rig.sup.git.idle(), "the child is in `left`");
+        }
+        let started = Instant::now();
+        let end = rig.sup.now() + Duration::from_secs(3);
+        assert_eq!(
+            shutdown(rig.sup.clone(), end).await,
+            ParticipantEnd::Clean,
+            "in_left {in_left}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(rig.sup.git.idle());
+        if let Some(p) = probe {
+            assert!(p.join().unwrap().is_err(), "the probe's git was killed");
+        }
+        rig.srv.stop().await;
+    }
+}
+
+/// PR10a1-CL-19 `git_late_handoff`: the git step reads the slot while a probe holds the
+/// lease with `left` empty. Released, the probe kills its git at its next poll (admission
+/// closed) and reaps it; in a second run it panics and its lease hands the child to `left`.
+/// Either way the step frees the slot before the end, `Clean`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn git_late_handoff() {
+    use crate::supervisor::Pause;
+    use crate::supervisor::workspace::common_dir;
+    let dir = tempfile::tempdir().unwrap();
+    for panics in [false, true] {
+        let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
+            c.git = super::workspace::sleeping_git();
+        })
+        .await;
+        let created = if panics {
+            rig.pauses.arm_panic(Pause::GitAfterCreate)
+        } else {
+            rig.pauses.arm(Pause::GitAfterCreate)
+        };
+        let read = rig.pauses.arm(Pause::GitShutdownRead);
+        let (sup, cwd) = (rig.sup.clone(), dir.path().to_path_buf());
+        let probe = std::thread::spawn(move || {
+            common_dir(&sup, &cwd, sup.now() + Duration::from_millis(500))
+        });
+        created.wait();
+        let end = rig.sup.now() + Duration::from_secs(5);
+        let sd = tokio::spawn(shutdown(rig.sup.clone(), end));
+        read.wait();
+        assert!(!rig.sup.git.idle(), "the lease is busy");
+        created.go();
+        let _ = probe.join();
+        read.go();
+        let started = Instant::now();
+        assert_eq!(sd.await.unwrap(), ParticipantEnd::Clean, "panics {panics}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(rig.sup.git.idle());
+        assert_eq!(rig.sup.tracker.count(), 0);
+        rig.srv.stop().await;
+    }
+}
