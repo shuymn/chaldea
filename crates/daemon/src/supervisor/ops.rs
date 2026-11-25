@@ -988,7 +988,9 @@ pub(crate) async fn exit_op(
         if entry.stop_requested() {
             return;
         }
-        let round = sup.now() + EXIT_ROUND;
+        sup.pauses().at(Pause::ExitRound).await;
+        // No round runs past the total: a lock taken after it does not count.
+        let round = (sup.now() + EXIT_ROUND).min(start + EXIT_TOTAL);
         let got = settle_before(
             || sup.now(),
             round,

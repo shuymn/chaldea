@@ -129,6 +129,42 @@ async fn unrecorded_exit_job() {
     assert_eq!(row.exit_reason, Some(ExitReason::DaemonRestart));
 }
 
+/// PR10a1-CL-22: an exit op whose last lock round starts with the clock past its start +
+/// 60 s: the lock, free by then, is not taken; `LaunchUnrecorded` is reported and the row
+/// stays open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn last_round_ends_at_the_total() {
+    use crate::http::StoreFatal;
+    use crate::supervisor::{EXIT_TOTAL, Pause};
+    let rig = Rig::new().await;
+    let (_t, l) = rig.spawn_codex(None).await;
+    let held = rig.sup.entry(l).unwrap().ops.clone().lock_owned().await;
+    let round = rig.pauses.arm(Pause::ExitRound);
+    rig.pty.take_child().unwrap().exit(ChildExit {
+        code: Some(0),
+        signal: None,
+    });
+    let round = tokio::task::spawn_blocking(move || {
+        round.wait();
+        round
+    })
+    .await
+    .unwrap();
+    rig.clock.skew(EXIT_TOTAL);
+    drop(held);
+    round.go();
+    rig.until("LaunchUnrecorded reported", || {
+        rig.sink
+            .0
+            .lock()
+            .unwrap()
+            .contains(&StoreFatal::LaunchUnrecorded { launch_id: l })
+    })
+    .await;
+    assert_eq!(rig.launch(l).exit_reason, None, "the row stays open");
+    rig.srv.stop().await;
+}
+
 /// Two units on launch `l`'s session, neither permitted: `a`, whose recheck holds the
 /// writer until `gate` is sent, and `b`, queued behind it. A seal settles both `Closed`.
 pub(super) struct Queued {

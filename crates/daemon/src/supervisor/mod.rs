@@ -126,6 +126,8 @@ pub enum Pause {
     ExitTookSession,
     /// An exit op at its start, before it reads its entry.
     ExitStart,
+    /// An exit op at the start of each lock round, before it computes the round's end.
+    ExitRound,
     /// An exit op before its lock wait.
     ExitBeforeLock,
     /// The participant's close task, before it returns (blocking).
