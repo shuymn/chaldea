@@ -139,7 +139,8 @@ pub(crate) async fn launch_op(sup: Arc<Supervisor>, req: LaunchReq) -> EffectOut
     let mut workspace = None;
     if let LaunchKind::Spawn { cwd, .. } = &req.kind {
         let path = PathBuf::from(cwd);
-        if !std::fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
+        // Absolute: the PTY backends start the child in exactly this path.
+        if !path.is_absolute() || !std::fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
             return done_code(ErrorCode::BadArgs);
         }
         workspace = Some(super::workspace::workspace_of(&sup, &path).await);

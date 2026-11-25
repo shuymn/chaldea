@@ -99,16 +99,18 @@ async fn prompt_admission() {
     rig.srv.stop().await;
 }
 
-/// PR10a1-CL-1: a `cwd` that is a file or missing is 400 `bad_args` from the op, with a
-/// receipt holding that reply and nothing else written; the same `command_id` replays it
-/// after the directory appears.
+/// PR10a1-CL-1: a `cwd` that is a file, missing, or relative (even naming an existing directory)
+/// is 400 `bad_args` from the op, with a receipt holding that reply and nothing else written;
+/// the same `command_id` replays it after the directory appears.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bad_cwd() {
     let rig = Rig::new().await;
     let file = rig.cwd.path().join("file");
     std::fs::write(&file, b"x").unwrap();
     let missing = rig.cwd.path().join("missing");
-    for path in [&file, &missing] {
+    // A relative path naming an existing directory (the daemon's own working directory).
+    let relative = std::path::PathBuf::from(".");
+    for path in [&file, &missing, &relative] {
         let head = host_head(&rig);
         let id = cid();
         let args = json!({ "agent": "codex", "cwd": path.to_string_lossy() });
