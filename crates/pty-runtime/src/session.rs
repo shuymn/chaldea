@@ -919,8 +919,8 @@ impl Session {
         let t0 = Instant::now();
         let sh = self.sh.clone();
         let _release = Release {
-            sh: sh.clone(),
-            waiter_stop: self.waiter_stop.clone(),
+            sh: &sh,
+            waiter_stop: &self.waiter_stop,
             close: bounds.close,
         };
 
@@ -937,11 +937,10 @@ impl Session {
         let kill = match (prior, kill_deadline) {
             (Some((k, _)), None) if k.tree_dead && extra.is_empty() => k,
             (Some((k, list)), Some(_)) if k.tree_dead && list == extra => k,
-            (_, None) => {
-                let at = deadline_in(bounds.kill);
+            (_, at) => {
+                let at = at.unwrap_or_else(|| deadline_in(bounds.kill));
                 self.child.kill_tree(extra, at, at)
             }
-            (_, Some(at)) => self.child.kill_tree(extra, at, at),
         };
 
         // 3. Release the input.
@@ -1024,13 +1023,13 @@ impl Session {
 /// did, so the threads end and drop their references to the input, the child, and the PTY.
 /// On Windows the child's job handle closes with the last of them, which ends the tree
 /// (kill-on-close) even after a kill that panicked.
-struct Release {
-    sh: Arc<Shared>,
-    waiter_stop: Arc<AtomicBool>,
+struct Release<'a> {
+    sh: &'a Shared,
+    waiter_stop: &'a AtomicBool,
     close: Duration,
 }
 
-impl Drop for Release {
+impl Drop for Release<'_> {
     fn drop(&mut self) {
         self.sh.stop_writer();
         self.waiter_stop.store(true, Ordering::Release);

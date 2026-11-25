@@ -1123,8 +1123,8 @@ pub fn no_console_window(cmd: &mut std::process::Command) {
 }
 
 /// The first `name` (`name.exe` on Windows) in an absolute directory of `path` (a `PATH`
-/// value) that is an executable file (on Unix, a file with an execute bit set), as a shell's
-/// search continues past a candidate it cannot run.
+/// value) that is an executable file (on macOS, one this process may execute by its
+/// effective ids), as a shell's search continues past a candidate it cannot run.
 #[must_use]
 pub fn find_program(name: &str, path: &OsStr) -> Option<PathBuf> {
     let file = if cfg!(windows) {
@@ -1139,19 +1139,16 @@ pub fn find_program(name: &str, path: &OsStr) -> Option<PathBuf> {
 }
 
 fn executable(p: &Path) -> bool {
-    let Ok(m) = std::fs::metadata(p) else {
-        return false;
-    };
     // On macOS: executable by this process, its effective ids against the file's mode and
     // owner as `exec` checks them, not any execute bit. Elsewhere (Windows): a `.exe` file.
     #[cfg(target_os = "macos")]
     {
         use rustix::fs::{Access, AtFlags, CWD, accessat};
-        m.is_file() && accessat(CWD, p, Access::EXEC_OK, AtFlags::EACCESS).is_ok()
+        p.is_file() && accessat(CWD, p, Access::EXEC_OK, AtFlags::EACCESS).is_ok()
     }
     #[cfg(not(target_os = "macos"))]
     {
-        m.is_file()
+        p.is_file()
     }
 }
 
