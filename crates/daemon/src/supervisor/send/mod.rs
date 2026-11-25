@@ -232,7 +232,8 @@ pub(crate) struct SendState {
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct SendHooks {
-    /// Runs inside a unit's completion before the record is handed to the worker.
+    /// Runs inside a unit's completion (on the writer thread, after its last write call)
+    /// before `written` is set and the record is handed to the worker.
     pub completion: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs between the open job's commit and the unit's submission (async-free).
     pub before_submit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -329,13 +330,13 @@ impl SendLaunch {
             let Some(me) = Weak::upgrade(&me) else {
                 return;
             };
+            #[cfg(test)]
+            run_hook(&me.hooks.completion);
             if r.outcome == chaldea_pty_runtime::WriteOutcome::Written
                 && let Some(w) = &written
             {
                 w.store(true, Ordering::Release);
             }
-            #[cfg(test)]
-            run_hook(&me.hooks.completion);
             lock(&me.fired).push(Fired {
                 record: r.clone(),
                 report,
