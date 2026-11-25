@@ -458,8 +458,7 @@ pub(crate) trait ExitStep: Send + Sync {
     fn after_commit(&self, _exit: &ExitFacts) {}
 }
 pub(crate) struct ExitFacts {
-    pub thread_id: ThreadId, pub launch_id: LaunchId, pub reason: ExitReason,
-    pub death_confirmed: bool, pub exited_seq: u64, pub restart: bool,
+    pub thread_id: ThreadId, pub launch_id: LaunchId, pub restart: bool,
     pub sealed: Vec<WriteRecord>,                 // the launch's `settled`; empty at restart
 }
 pub(crate) trait TickStep: Send + Sync {
