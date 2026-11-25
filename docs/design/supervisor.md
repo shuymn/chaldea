@@ -415,7 +415,9 @@ impl LiveLaunch {
     /// lock, and copies the screen with `Screen::snapshot(clock.real(deadline))` (VT failed or its
     /// lock not taken in time → `VtUnavailable`); the join is awaited with `settle_before` until
     /// `deadline` (no answer → `Busy`). The op lock is held only while the screen is taken, so a
-    /// stop or exit is never delayed by a snapshot, waiting for the blocking pool or the VT lock.
+    /// snapshot never carries it into its wait for the blocking pool or the VT lock, or into
+    /// its copy; a stop's drain waiting on the VT lock the copy holds is bounded by
+    /// `CloseBounds::drain` (pty-runtime §2.2 "Close order").
     pub(crate) async fn snapshot_before(&self, sup: &Supervisor, deadline: Instant)
         -> Result<Snapshot, SnapshotError>;
 }
