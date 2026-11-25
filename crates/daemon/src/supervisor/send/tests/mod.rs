@@ -74,8 +74,13 @@ impl SRig {
         SRig::on(HostOs::Macos, tune).await
     }
 
+    /// A rig with the send workers and driver running.
     pub(crate) async fn on(host: HostOs, tune: impl FnOnce(&mut SupervisorConfig)) -> SRig {
-        let (rig, chains, ingest) = Rig::with_chains_on(host, tune).await;
+        let (rig, chains, ingest) = Rig::with_chains_on(host, |c| {
+            c.send_workers = true;
+            tune(c);
+        })
+        .await;
         SRig {
             rig,
             chains,

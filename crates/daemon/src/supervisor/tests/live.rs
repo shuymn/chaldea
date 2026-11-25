@@ -12,14 +12,11 @@ use crate::supervisor::live::LaunchObservation;
 /// after the reference was sampled, before publication) `Unobservable`; published, with the
 /// start job held, `Started` with the sampled `reference`, and a terminal reply the
 /// responder then writes has its class position above it; with the map mutex held
-/// `Unobservable` at once; an unknown launch `Unobservable`. No send worker runs: its pass
-/// takes the map mutex, which `observe` would answer with `Unobservable`.
+/// `Unobservable` at once; an unknown launch `Unobservable`. No send worker runs (the rig's
+/// default): its pass takes the map mutex, which `observe` would answer with `Unobservable`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn observe() {
-    let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
-        c.send_workers = false;
-    })
-    .await;
+    let rig = Rig::new().await;
     let points = [
         (Pause::AfterReserve, Some(LaunchObservation::Reserved)),
         (Pause::BeforeSpawn, Some(LaunchObservation::Unobservable)),

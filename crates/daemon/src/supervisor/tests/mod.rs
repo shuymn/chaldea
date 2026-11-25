@@ -183,7 +183,9 @@ pub(crate) struct Rig {
     pub cwd: TempDir,
 }
 
-/// The test configuration: `FakePty`, the given clock and pauses, no tick task.
+/// The test configuration: `FakePty`, the given clock and pauses, no tick task, and no send
+/// worker or driver: a worker's pass takes the live map, which an intake or `observe` meeting
+/// it answers with no observation. The send tests' rig turns them on.
 pub(crate) fn config(
     pty: &Arc<FakePty>,
     clock: &Arc<SkewClock>,
@@ -206,7 +208,7 @@ pub(crate) fn config(
         tick_task: false,
         decoder: Arc::new(crate::supervisor::send::fake_decoder::FakeDecoder),
         readiness_mode: None,
-        send_workers: true,
+        send_workers: false,
     }
 }
 
