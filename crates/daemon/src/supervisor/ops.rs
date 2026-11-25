@@ -108,6 +108,7 @@ pub(crate) struct LaunchReq {
     pub caller: Actor,
 }
 
+#[derive(Clone)]
 pub(crate) enum LaunchKind {
     Spawn {
         agent: Agent,
@@ -146,11 +147,6 @@ pub(crate) async fn launch_op(sup: Arc<Supervisor>, req: LaunchReq) -> EffectOut
         workspace = Some(super::workspace::workspace_of(&sup, &path).await);
     }
     // Step 2: the slot, its op lock taken by this op.
-    let agent_hint = match &req.kind {
-        LaunchKind::Spawn { agent, .. } => Some(*agent),
-        LaunchKind::Resume { .. } => None,
-    };
-    sup.pauses().at(Pause::BeforeReserve).await;
     // Step 3: the reservation job (it builds the plan from the thread it reads).
     let job = reservation_job(&sup, &req, workspace);
     let reserved = match record(&sup, job, false).await {
@@ -160,12 +156,9 @@ pub(crate) async fn launch_op(sup: Arc<Supervisor>, req: LaunchReq) -> EffectOut
         }
         other => {
             sup.remove(req.launch);
-            return outcome_of(other.map_done())
-                .err()
-                .unwrap_or(EffectOutcome::Unrecorded);
+            return outcome_of(other).err().unwrap_or(EffectOutcome::Unrecorded);
         }
     };
-    let _ = agent_hint;
     let (r, (entry, mut guard)) = reserved;
     sup.pauses().at(Pause::AfterReserve).await;
     // Step 4: spawn.
@@ -192,7 +185,7 @@ pub(crate) async fn launch_op(sup: Arc<Supervisor>, req: LaunchReq) -> EffectOut
             move || match Session::spawn(runtime.as_ref(), &spec, config) {
                 Ok(s) => Ok(TrackedSession::new(s, token)),
                 Err(e) => {
-                    if spawn_cleanup_confirmed(&e) {
+                    if matches!(e.cleanup(), Cleanup::Confirmed) {
                         token.release();
                     }
                     Err(e)
@@ -286,26 +279,6 @@ pub(crate) async fn launch_op(sup: Arc<Supervisor>, req: LaunchReq) -> EffectOut
     launch_result(&req, LaunchOutcome::Started)
 }
 
-impl<R> Recorded<R> {
-    fn map_done(self) -> Recorded<()> {
-        match self {
-            Recorded::Done(_) => Recorded::Done(()),
-            Recorded::Refused(e) => Recorded::Refused(e),
-            Recorded::Unrecorded => Recorded::Unrecorded,
-            Recorded::ShuttingDown => Recorded::ShuttingDown,
-        }
-    }
-}
-
-fn spawn_cleanup_confirmed(e: &SpawnError) -> bool {
-    match e {
-        SpawnError::NeverStarted { cleanup, .. }
-        | SpawnError::StartedThenFailed { cleanup, .. } => {
-            matches!(cleanup, Cleanup::Confirmed)
-        }
-    }
-}
-
 fn launch_result(req: &LaunchReq, outcome: LaunchOutcome) -> EffectOutcome {
     EffectOutcome::Done(match req.kind {
         LaunchKind::Spawn { .. } => ok(&SpawnResult {
@@ -340,19 +313,15 @@ fn reservation_job(
     let token =
         TokenService::new_token(&req.hook_token, TokenKind::Hook, Some(thread), Some(launch));
     let secret = req.hook_token.secret.expose().to_owned();
-    let kind = match &req.kind {
-        LaunchKind::Spawn {
-            agent,
-            cwd,
-            task,
-            parent,
-        } => (Some((*agent, cwd.clone(), task.clone(), *parent)), None),
-        LaunchKind::Resume { expected } => (None, Some(*expected)),
-    };
+    let kind = req.kind.clone();
     Arc::new(move |tx: &mut WriteTx<'_>| {
-        let (spawn, expected) = &kind;
-        let (agent, cwd, prev, resume_session, mut job) =
-            if let Some((agent, cwd, task, parent)) = spawn {
+        let (agent, cwd, prev, resume_session, mut job) = match &kind {
+            LaunchKind::Spawn {
+                agent,
+                cwd,
+                task,
+                parent,
+            } => {
                 let ws = workspace
                     .clone()
                     .ok_or_else(|| refusal("no workspace id"))?;
@@ -376,8 +345,9 @@ fn reservation_job(
                     }),
                 );
                 (*agent, cwd.clone(), None, None, job)
-            } else {
-                let expected = expected.ok_or_else(|| refusal("no expected launch"))?;
+            }
+            LaunchKind::Resume { expected } => {
+                let expected = *expected;
                 let r = tx.read();
                 let Some(t) = r.thread(thread)? else {
                     return Ok(Err(ErrorCode::NotFound));
@@ -424,7 +394,8 @@ fn reservation_job(
                     return Ok(Err(ErrorCode::NoSession));
                 };
                 (t.agent, t.cwd.clone(), Some(prev), Some(session), job)
-            };
+            }
+        };
         let lp = plan(&LaunchInput {
             agent,
             host_os: sup2.host_os,
@@ -841,13 +812,11 @@ pub(crate) async fn stop_launch(
     };
     // Step 2: the re-read.
     let store = sup.store.clone();
-    let s2 = sup.clone();
     let (thread, launch) = (req.thread, req.launch);
     let wait = sup.real(bound);
-    let read = sup.rt.spawn_blocking(move || {
-        s2.pauses().blocking(Pause::StopReread);
-        store.read(wait, |r| Ok((r.thread(thread)?, r.launch(launch)?)))
-    });
+    let read = sup
+        .rt
+        .spawn_blocking(move || store.read(wait, |r| Ok((r.thread(thread)?, r.launch(launch)?))));
     let Some(Ok(Ok((Some(t), Some(l))))) =
         settle_before(|| sup.now(), bound, sup.timer(bound), read)
             .await

@@ -82,8 +82,6 @@ pub(crate) const COMMAND_DEADLINE: Duration = Duration::from_secs(30);
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Pause {
-    /// A launch op after inserting its slot, before the reservation job.
-    BeforeReserve,
     /// After the reservation committed, before the token and `Session::spawn`.
     AfterReserve,
     /// After taking the tracker token, before `Session::spawn` (on the op).
@@ -100,8 +98,6 @@ pub enum Pause {
     InStartJob,
     /// A stop op at its start, before its lock wait.
     StopStart,
-    /// A stop op's re-read, on the reader (blocking).
-    StopReread,
     /// Between a stop's seal and the submission of its `StopRequested` write.
     StopAfterSeal,
     /// Inside the `StopRequested` job (blocking, on the store writer).
@@ -142,8 +138,6 @@ pub enum Pause {
     GitAfterAdmit,
     /// The git probe right after the child was created (blocking).
     GitAfterCreate,
-    /// The git probe's poll (blocking), before each `try_reap`.
-    GitPoll,
     /// The shutdown git step's reap, before each `try_reap` (blocking).
     GitShutdownReap,
     /// The shutdown git step after reading the slot (async).

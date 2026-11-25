@@ -152,7 +152,6 @@ pub(crate) fn common_dir(
     sup.pauses().blocking(Pause::GitAfterCreate);
     let mut stdout = lease.child.as_mut().and_then(TrackedChild::take_stdout);
     loop {
-        sup.pauses().blocking(Pause::GitPoll);
         let Some(c) = lease.child.as_mut() else {
             return Err("no git child");
         };
