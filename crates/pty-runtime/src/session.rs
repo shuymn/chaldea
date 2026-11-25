@@ -1000,11 +1000,15 @@ impl Session {
 }
 
 /// An implicit drop closes with an empty `extra`: best-effort cleanup that can never name
-/// the recorded descendants, so it is never a death proof.
+/// the recorded descendants, so it is never a death proof. A panic inside that cleanup (a
+/// backend's kill or close) is caught and the session's remaining parts drop as values: the
+/// drop may run during an unwind, where an escaping panic aborts the process.
 impl Drop for Session {
     fn drop(&mut self) {
         if !self.closed {
-            let _ = self.close_inner(&[], CloseBounds::default(), None);
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                self.close_inner(&[], CloseBounds::default(), None)
+            }));
         }
     }
 }

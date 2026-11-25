@@ -1455,3 +1455,26 @@ fn kill_by_is_busy_after_lock_by() {
     assert!(k.tree_dead && !k.is_busy(), "{k:?}");
     assert_eq!(k.attempt, KillAttempt::Signalled);
 }
+
+/// A session dropped during an unwind, its implicit close's kill panicking: the panic stays
+/// inside the drop, so the unwind ends where it is caught, not in an abort.
+#[test]
+fn implicit_close_survives_an_unwind() {
+    let r = rig_with(
+        FakeScript {
+            kill: KillBehavior::Panic,
+            ..FakeScript::default()
+        },
+        Limits::default(),
+        80,
+        24,
+    );
+    let (session, child) = (r.session, r.child);
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _held = session;
+        panic!("a fault while the session is open");
+    }));
+    assert!(run.is_err());
+    assert!(child.log().contains(&FakeEvent::Kill { extra: Vec::new() }));
+    child.close_output();
+}

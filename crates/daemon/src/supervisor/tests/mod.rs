@@ -125,8 +125,11 @@ impl Pauses for Pauser {
     fn at(&self, p: Pause) -> BoxFuture<'static, ()> {
         let hold = self.take(p);
         Box::pin(async move {
-            if let Some(h) = hold {
-                let _ = tokio::task::spawn_blocking(move || h.block()).await;
+            if let Some(h) = hold
+                && let Err(e) = tokio::task::spawn_blocking(move || h.block()).await
+                && e.is_panic()
+            {
+                std::panic::resume_unwind(e.into_panic());
             }
         })
     }

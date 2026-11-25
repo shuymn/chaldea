@@ -522,3 +522,60 @@ async fn git_late_handoff() {
         rig.srv.stop().await;
     }
 }
+
+/// An op that panics while it owns an open session, the session's kill panicking too: the
+/// session's implicit close runs during the unwind and its panic stays inside the drop, so
+/// the op's task fails, the token stays counted, and the daemon reaches its shutdown
+/// verdict, `LeftRunning`. At the stop's kill submission (before the kill task exists), after
+/// the stop's seal, and before a spawn's publication.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unwind_with_an_open_session() {
+    use super::support::http::spawn_send;
+    use crate::supervisor::Pause;
+    use chaldea_pty_runtime::fake::FakeEvent;
+    use serde_json::json;
+    for at in [
+        Pause::KillSubmitted,
+        Pause::StopAfterSeal,
+        Pause::BeforePublish,
+    ] {
+        let rig = Rig::new().await;
+        rig.pty.script_next(FakeScript {
+            kill: KillBehavior::Panic,
+            ..FakeScript::default()
+        });
+        let fault = rig.pauses.arm_panic(at);
+        let _reply = if at == Pause::BeforePublish {
+            let args = json!({ "agent": "codex", "cwd": rig.cwd.path().to_string_lossy() });
+            Some(spawn_send(
+                &rig.srv,
+                &rig.srv
+                    .command("spawn", &rig.owner, super::cid(), &args.to_string()),
+            ))
+        } else {
+            let (t, _l) = rig.spawn_codex(None).await;
+            let args = json!({ "thread_id": t });
+            Some(spawn_send(
+                &rig.srv,
+                &rig.srv
+                    .command("stop", &rig.owner, super::cid(), &args.to_string()),
+            ))
+        };
+        let reached = tokio::task::spawn_blocking(move || {
+            fault.wait();
+            fault
+        })
+        .await
+        .unwrap();
+        let child = rig.pty.take_child().unwrap();
+        reached.go();
+        rig.until("the session's implicit close ran", || {
+            child.log().contains(&FakeEvent::Kill { extra: Vec::new() })
+        })
+        .await;
+        assert!(rig.sup.tracker.count() > 0, "{at:?}");
+        assert_eq!(graceful(&rig).await, ParticipantEnd::LeftRunning, "{at:?}");
+        child.close_output();
+        rig.srv.stop().await;
+    }
+}

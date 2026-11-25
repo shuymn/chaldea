@@ -345,10 +345,13 @@ impl SpawnedParts {
     }
 }
 
+/// The failure teardown of an unconsumed guard. A panic inside it (a backend's kill or close)
+/// is caught and the parts not yet torn down drop as values: the drop may run during an
+/// unwind, where an escaping panic aborts the process.
 impl Drop for SpawnedPty {
     fn drop(&mut self) {
         if let Some(p) = self.parts.take() {
-            let _ = p.teardown();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.teardown()));
         }
     }
 }
@@ -390,5 +393,33 @@ mod tests {
             };
             assert_eq!(r.is_busy(), busy, "{method}");
         }
+    }
+
+    /// An unconsumed spawn dropped during an unwind, its teardown's kill panicking: the
+    /// panic stays inside the drop, so the unwind ends where it is caught, not in an abort.
+    #[cfg(feature = "fake")]
+    #[test]
+    fn unconsumed_spawn_survives_an_unwind() {
+        use crate::fake::{FakeEvent, FakePty, FakeScript, KillBehavior};
+        use crate::{PtyRuntime, PtySize, SpawnSpec};
+        let fake = FakePty::new();
+        fake.script_next(FakeScript {
+            kill: KillBehavior::Panic,
+            ..FakeScript::default()
+        });
+        let spec = SpawnSpec {
+            argv: vec!["/work/bin/agent".into()],
+            cwd: "/work/repo".into(),
+            env: Vec::new(),
+            size: PtySize::new(80, 24).unwrap(),
+        };
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _spawned = fake.spawn(&spec, super::DrainSink::test(|_| {})).unwrap();
+            panic!("a fault while the spawn is unconsumed");
+        }));
+        assert!(r.is_err());
+        let child = fake.take_child().unwrap();
+        assert!(child.log().contains(&FakeEvent::Kill { extra: Vec::new() }));
+        child.close_output();
     }
 }
