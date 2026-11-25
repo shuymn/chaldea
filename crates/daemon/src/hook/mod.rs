@@ -110,7 +110,7 @@ pub struct HookIngest {
     order: Arc<IntakeOrder>,
     budget: Arc<Semaphore>,
     #[cfg(test)]
-    points: tests::points::Points,
+    pub(crate) points: tests::points::Points,
 }
 
 /// The `/hook` mount with a new [`HookIngest`].

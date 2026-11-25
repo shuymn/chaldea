@@ -192,29 +192,45 @@ impl Rig {
         host: HostOs,
         tune: impl FnOnce(&mut SupervisorConfig),
     ) -> Rig {
-        Rig::on_seams(store, host, tune, crate::hook::HookSeams::mvp()).await
+        Rig::on_mounts(
+            store,
+            host,
+            tune,
+            mounts_with(host, crate::hook::HookSeams::mvp()),
+        )
+        .await
     }
 
-    /// A rig whose `/hook` walks the test's process chains instead of the OS's.
+    /// A rig whose `/hook` walks the test's process chains instead of the OS's; also
+    /// returns that `/hook`'s ingest, for its sync points.
     pub(crate) async fn with_chains(
         tune: impl FnOnce(&mut SupervisorConfig),
-    ) -> (Rig, Arc<support::hook::Chains>) {
+    ) -> (
+        Rig,
+        Arc<support::hook::Chains>,
+        Arc<crate::hook::HookIngest>,
+    ) {
         let chains = Arc::new(support::hook::Chains::default());
-        let seams = crate::hook::HookSeams {
-            procs: chains.clone(),
-            ..crate::hook::HookSeams::mvp()
-        };
+        let ingest = crate::hook::HookIngest::new(
+            crate::hook::HookConfig::default(),
+            crate::hook::HookSeams {
+                procs: chains.clone(),
+                ..crate::hook::HookSeams::mvp()
+            },
+        );
+        let mounts = mounts_with(HostOs::Macos, crate::hook::HookSeams::mvp()).with(ingest.mount());
         (
-            Rig::on_seams(TestStore::new(), HostOs::Macos, tune, seams).await,
+            Rig::on_mounts(TestStore::new(), HostOs::Macos, tune, mounts).await,
             chains,
+            ingest,
         )
     }
 
-    async fn on_seams(
+    async fn on_mounts(
         store: TestStore,
         host: HostOs,
         tune: impl FnOnce(&mut SupervisorConfig),
-        seams: crate::hook::HookSeams,
+        mounts: crate::http::Mounts,
     ) -> Rig {
         let clock = Arc::new(SkewClock::default());
         let sink = Arc::new(RecordingSink::default());
@@ -225,7 +241,7 @@ impl Rig {
         let sup = new_supervisor(host, cfg, store.store().clone(), sink.clone(), 0);
         let srv = TestServer::start_parts(
             store,
-            mounts_with(host, seams),
+            mounts,
             registry(&sup),
             (clock.clone(), sink.clone()),
             |_| {},

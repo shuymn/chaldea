@@ -593,23 +593,33 @@ async fn unrecorded_start_job() {
     );
 }
 
+/// The hook's job gate: reached, release.
+type JobGate = (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+);
+
 /// A spawn held before its start job, with a `SessionStart` of its launch sent to `/hook`
 /// (the emitter's chain reaching the spawned identity); returns the rig, the held pause, the
-/// hook's reply, and the ids. The hook is inside its pid wait when this returns.
+/// hook's reply, the ids, and, with `hold_job`, the gate holding the hook before its job. The
+/// hook is inside its pid wait when this returns.
 async fn early_session_start(
     stop_clock: bool,
+    hold_job: bool,
 ) -> (
     Rig,
     super::Armed,
     tokio::task::JoinHandle<super::support::http::Reply>,
     chaldea_core::ids::LaunchId,
     uuid::Uuid,
+    Option<JobGate>,
 ) {
     use super::support::hook::{EMITTER_PID, Hook, Launch, chain};
     use crate::supervisor::Pause;
     use chaldea_core::ids::Agent;
     use chaldea_pty_runtime::process::AncestryEnd;
-    let (rig, chains) = Rig::with_chains(|_| {}).await;
+    let (rig, chains, ingest) = Rig::with_chains(|_| {}).await;
+    let job = hold_job.then(|| ingest.points.arm_job(1));
     let held = rig.pauses.arm(Pause::BeforeStartJob);
     let cwd = rig.cwd.path().to_string_lossy().into_owned();
     let _spawn = super::support::http::spawn_send(
@@ -667,19 +677,21 @@ async fn early_session_start(
             == 1
     })
     .await;
-    (rig, held, reply, l, hook.emit)
+    (rig, held, reply, l, hook.emit, job)
 }
 
 /// PR10a1-CL-7: a `SessionStart` that arrives before the start job commits, with the
 /// supervisor wired. Its pid wait ending inside its deadline (a stopped clock, so only the
 /// start's commit can end it): the reply follows the start's commit and the launch is bound,
-/// `session_bound` after `launch_started`. Its pid wait running out first: the PR 9 result,
-/// 200 with `raw_unknown` (`unbound`) while the start is still held, and no binding.
+/// `session_bound` after `launch_started`. Its pid wait running out first, the hook then held
+/// before its job while the start commits, then released: the PR 9 result, decided at the
+/// wait's end, 200 with `raw_unknown` (`unbound`) and no binding, though the job sees the
+/// start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn early_hook_pid_wait() {
     use chaldea_core::payload::RawUnknownReason;
     // Inside the deadline.
-    let (rig, held, reply, l, _) = early_session_start(true).await;
+    let (rig, held, reply, l, _, _) = early_session_start(true, false).await;
     assert!(!reply.is_finished(), "decided only after the start commits");
     held.go();
     rig.until("the hook answered", || reply.is_finished()).await;
@@ -691,11 +703,18 @@ async fn early_hook_pid_wait() {
     assert!(at("launch_started") < at("session_bound"), "{kinds:?}");
     rig.srv.stop().await;
     // Past it.
-    let (rig, held, reply, l, emit) = early_session_start(false).await;
-    rig.until("the hook answered", || reply.is_finished()).await;
+    let (rig, held, reply, l, emit, job) = early_session_start(false, true).await;
+    let (reached, release) = job.unwrap();
+    reached
+        .await
+        .expect("the hook reaches its job after the wait ran out");
+    assert_eq!(rig.launch(l).pid, None, "the wait ran out before the start");
+    held.go();
+    rig.until("the start committed", || rig.launch(l).pid.is_some())
+        .await;
+    release.send(()).unwrap();
     let r = reply.await.unwrap();
     assert_eq!(r.status, 200, "{r:?}");
-    assert_eq!(rig.launch(l).pid, None, "the start is still held");
     let d = rig
         .srv
         .store
@@ -714,9 +733,6 @@ async fn early_hook_pid_wait() {
         panic!("{e:?}");
     };
     assert_eq!(raw.reason, RawUnknownReason::Unbound);
-    held.go();
-    rig.until("the start committed", || rig.launch(l).pid.is_some())
-        .await;
     assert_eq!(rig.launch(l).session_id, None);
     rig.srv.stop().await;
 }
