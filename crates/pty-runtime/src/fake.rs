@@ -129,6 +129,10 @@ struct Proc {
     /// `wait_timeout` blocks while set (`hold_waiter`).
     waiter_held: Mutex<bool>,
     waiter_cv: Condvar,
+    /// Runs in a `kill_tree` call after its earlier deadline checks, right before it takes
+    /// the log's mutex for the signal (tests of this module).
+    #[cfg(test)]
+    before_signal: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Proc {
@@ -282,6 +286,8 @@ impl PtyRuntime for FakePty {
             wait_fails: AtomicBool::new(false),
             waiter_held: Mutex::new(script.hold_waiter),
             waiter_cv: Condvar::new(),
+            #[cfg(test)]
+            before_signal: Mutex::new(None),
         });
         let reader = FakeReader {
             pipe: r,
@@ -505,6 +511,10 @@ impl PtyChild for FakeProcess {
         // The signal-equivalent operation: the deadline is checked once more under the log's
         // mutex, right before the signal is recorded and counted. `None`: not performed.
         let signal = || {
+            #[cfg(test)]
+            if let Some(f) = lock(&p.before_signal).take() {
+                f();
+            }
             let mut log = lock(&p.log);
             if Instant::now() >= deadline {
                 return None;
@@ -1519,29 +1529,25 @@ mod tests {
         assert_eq!(signals(&c), 0);
     }
 
-    /// The deadline checked again under the log's mutex: a call that passed the earlier
-    /// check and waited on that mutex past its deadline records no signal.
+    /// The deadline checked again under the log's mutex: a call held after its earlier
+    /// checks and before that mutex until past its deadline records no signal.
     #[test]
     fn deadline_rechecked_under_the_log() {
         let (child, c, _parts) = spawn(FakeScript::default());
-        let exit_state = c.proc.exit.lock().unwrap();
-        let deadline = Instant::now() + Duration::from_millis(200);
+        let (reached_tx, reached) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        *c.proc.before_signal.lock().unwrap() = Some(Box::new(move || {
+            reached_tx.send(()).unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(20));
+        }));
+        let deadline = Instant::now() + Duration::from_millis(500);
         let call = std::thread::spawn(move || child.kill_tree(&[], deadline, deadline));
-        let entered = soon();
-        while !(*c.proc.kill_lock.lock().unwrap()) {
-            assert!(
-                Instant::now() < entered,
-                "the call takes the kill-state lock"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        // The call waits on the exit state; the log is held before it is let through.
-        let log = c.proc.log.lock().unwrap();
-        drop(exit_state);
+        // The call passed its earlier checks and is about to take the log's mutex.
+        reached.recv_timeout(Duration::from_secs(20)).unwrap();
         while Instant::now() <= deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
-        drop(log);
+        release.send(()).unwrap();
         let r = call.join().unwrap();
         assert_eq!(
             (r.tree_dead, r.attempt, r.proved_at),

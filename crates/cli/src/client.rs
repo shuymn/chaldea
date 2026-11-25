@@ -45,7 +45,12 @@ fn timed_out() -> io::Error {
 }
 
 fn left(deadline: Instant) -> io::Result<std::time::Duration> {
-    let d = deadline.saturating_duration_since(Instant::now());
+    left_at(deadline, Instant::now())
+}
+
+/// [`left`] at `now`.
+fn left_at(deadline: Instant, now: Instant) -> io::Result<std::time::Duration> {
+    let d = deadline.saturating_duration_since(now);
     if d.is_zero() { Err(timed_out()) } else { Ok(d) }
 }
 
@@ -138,6 +143,7 @@ fn send(
         &mut |b: &[u8]| (&s).write(b),
         &req,
         deadline,
+        &Instant::now,
     )?;
     Ok(s)
 }
@@ -145,16 +151,17 @@ fn send(
 /// Writes all of `bytes` through `write`, each call with the time left before `deadline` as
 /// its timeout (`set_timeout`), recomputed before every call, and the deadline checked again
 /// right before the call: no write starts at or after the deadline, however the peer splits
-/// its reads.
+/// its reads. `now` reads the clock.
 fn write_before(
     set_timeout: &mut impl FnMut(std::time::Duration) -> io::Result<()>,
     write: &mut impl FnMut(&[u8]) -> io::Result<usize>,
     mut bytes: &[u8],
     deadline: Instant,
+    now: &dyn Fn() -> Instant,
 ) -> io::Result<()> {
     while !bytes.is_empty() {
-        set_timeout(left(deadline)?)?;
-        left(deadline)?;
+        set_timeout(left_at(deadline, now())?)?;
+        left_at(deadline, now())?;
         match write(bytes) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(n) => bytes = &bytes[n..],
@@ -693,47 +700,59 @@ mod tests {
         assert!(!req.to_ascii_lowercase().contains("origin:"), "{req}");
     }
 
-    /// A write split into small parts by its peer: each part gets the time left as its
-    /// timeout, and none starts at or after the deadline.
+    /// A write split into small parts by its peer, on a controlled clock: each write has its
+    /// own timeout update, the time left, and none starts at or after the deadline; a final
+    /// update may have no write.
     #[test]
     fn writes_stop_at_the_deadline() {
+        use std::cell::{Cell, RefCell};
         use std::time::{Duration, Instant};
-        let deadline = Instant::now() + Duration::from_millis(60);
+        let clock = Cell::new(Instant::now());
+        let deadline = clock.get() + Duration::from_millis(60);
+        let log = RefCell::new(String::new());
         let mut timeouts = Vec::new();
         let mut starts = Vec::new();
         let r = super::write_before(
             &mut |d| {
                 timeouts.push(d);
+                log.borrow_mut().push('T');
                 Ok(())
             },
             &mut |b: &[u8]| {
-                starts.push(Instant::now());
-                std::thread::sleep(Duration::from_millis(25));
+                starts.push(clock.get());
+                log.borrow_mut().push('W');
+                clock.set(clock.get() + Duration::from_millis(25));
                 Ok(b.len().min(1))
             },
             &[0u8; 10],
             deadline,
+            &|| clock.get(),
         );
         assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
-        assert!(starts.len() < 10, "{starts:?}");
+        assert_eq!(starts.len(), 3, "{starts:?}");
         assert!(starts.iter().all(|t| *t < deadline), "{starts:?}");
-        assert_eq!(timeouts.len(), starts.len(), "one timeout per write");
+        let log = log.into_inner();
+        let pairs = log.strip_suffix('T').unwrap_or(&log);
+        assert!(
+            pairs.len().is_multiple_of(2) && pairs.as_bytes().chunks(2).all(|c| c == b"TW"),
+            "each write has its own timeout update: {log}"
+        );
         assert!(timeouts.windows(2).all(|w| w[1] < w[0]), "{timeouts:?}");
     }
 
     /// A timeout update that returns at or after the deadline: the write does not start.
     #[test]
     fn no_write_after_a_late_timeout_update() {
+        use std::cell::Cell;
         use std::time::{Duration, Instant};
-        let deadline = Instant::now() + Duration::from_millis(20);
+        let clock = Cell::new(Instant::now());
+        let deadline = clock.get() + Duration::from_millis(20);
         let mut updates = 0;
         let mut writes = 0;
         let r = super::write_before(
             &mut |_| {
                 updates += 1;
-                while Instant::now() < deadline {
-                    std::hint::spin_loop();
-                }
+                clock.set(deadline);
                 Ok(())
             },
             &mut |b: &[u8]| {
@@ -742,6 +761,7 @@ mod tests {
             },
             &[0u8; 4],
             deadline,
+            &|| clock.get(),
         );
         assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         assert_eq!((updates, writes), (1, 0));
