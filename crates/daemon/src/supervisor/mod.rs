@@ -170,43 +170,36 @@ pub struct SupervisorConfig {
     /// The PTY backend.
     pub runtime: Arc<dyn PtyRuntime>,
     /// The clock every supervisor instant is read on; tests pass the server's.
-    pub clock: Arc<dyn MonotonicClock>,
+    pub(crate) clock: Arc<dyn MonotonicClock>,
     /// The program of each agent: `None` resolves `claude` or `codex` on the daemon's own
     /// `PATH`; tests replace it with FakeCli.
     #[doc(hidden)]
     pub program: Option<ProgramFn>,
     /// The daemon environment a launch's environment is built from: `None` reads the
     /// process's own.
-    #[doc(hidden)]
-    pub env: Option<Vec<(OsString, OsString)>>,
+    pub(crate) env: Option<Vec<(OsString, OsString)>>,
     /// The `git` the workspace probe runs, and its leading arguments.
-    #[doc(hidden)]
-    pub git: Vec<OsString>,
-    /// The environment the workspace probe's `git` starts from, before git's own variables
-    /// are removed: `None` inherits the process's own.
-    #[doc(hidden)]
-    pub git_env: Option<Vec<(OsString, OsString)>>,
+    pub(crate) git: Vec<OsString>,
+    /// The environment the workspace probe's `git` starts from (unit tests), before git's
+    /// own variables are removed: `None` inherits the process's own.
+    #[cfg(test)]
+    pub(crate) git_env: Option<Vec<(OsString, OsString)>>,
     /// The kill phase of a stop's cleanup budget (5 s).
-    #[doc(hidden)]
-    pub kill_budget: Duration,
+    pub(crate) kill_budget: Duration,
     /// The close's other bounds.
-    #[doc(hidden)]
-    pub close_bounds: CloseBounds,
+    pub(crate) close_bounds: CloseBounds,
     /// The PTY size of a launch.
-    #[doc(hidden)]
-    pub pty_size: PtySize,
+    pub(crate) pty_size: PtySize,
     /// The test pause points.
     #[doc(hidden)]
     pub pauses: Arc<dyn Pauses>,
     /// The hook settings (the tick's buffer expiry).
-    #[doc(hidden)]
-    pub hook: HookConfig,
+    pub(crate) hook: HookConfig,
     /// 10b's exit and tick steps, added before startup step 9 (design §2.11).
     pub(crate) exit_steps: Vec<Arc<dyn ExitStep>>,
     pub(crate) tick_steps: Vec<Arc<dyn TickStep>>,
     /// Whether the tick task runs (tests drive [`Supervisor::tick`] themselves).
-    #[doc(hidden)]
-    pub tick_task: bool,
+    pub(crate) tick_task: bool,
 }
 
 impl Default for SupervisorConfig {
@@ -217,6 +210,7 @@ impl Default for SupervisorConfig {
             program: None,
             env: None,
             git: vec![OsString::from("git")],
+            #[cfg(test)]
             git_env: None,
             kill_budget: Duration::from_secs(5),
             close_bounds: CloseBounds::default(),

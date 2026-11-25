@@ -45,8 +45,8 @@ impl GitSlot {
         })
     }
 
-    /// Kills and reaps the `left` child, if any. True when the slot holds no child after.
-    pub(crate) fn reap_left(&self) -> bool {
+    /// Kills and reaps the `left` child, if any.
+    pub(crate) fn reap_left(&self) {
         let mut st = lock(&self.state);
         if let Some(c) = st.left.as_mut() {
             c.kill();
@@ -54,7 +54,6 @@ impl GitSlot {
                 st.left = None;
             }
         }
-        st.left.is_none()
     }
 
     /// The lease free and `left` empty.
@@ -135,6 +134,7 @@ pub(crate) fn common_dir(
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .stdout(Stdio::piped());
+    #[cfg(test)]
     if let Some(env) = &sup.cfg.git_env {
         cmd.env_clear().envs(env.iter().cloned());
     }
@@ -148,13 +148,10 @@ pub(crate) fn common_dir(
         Some(Err(_)) => return Err("git could not be spawned"),
         Some(Ok(c)) => c,
     };
-    lease.child = Some(child);
+    let c = lease.child.insert(child);
     sup.pauses().blocking(Pause::GitAfterCreate);
-    let mut stdout = lease.child.as_mut().and_then(TrackedChild::take_stdout);
+    let mut stdout = c.take_stdout();
     loop {
-        let Some(c) = lease.child.as_mut() else {
-            return Err("no git child");
-        };
         if !sup.tracker.accepting() {
             c.kill();
         }
