@@ -275,7 +275,7 @@ impl SRig {
         // Boxed: the setup helpers nest it, and an inline future would grow theirs.
         Box::pin(async move {
             let sl = self.sl(live);
-            let (entered_tx, entered) = tokio::sync::oneshot::channel::<()>();
+            let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
             let (go, wait) = std::sync::mpsc::channel::<()>();
             gate::set(&sl.hooks.after_read, move || {
                 let _ = entered_tx.send(());
@@ -284,7 +284,9 @@ impl SRig {
                 });
             });
             sl.wake.notify_one();
-            entered.await.unwrap();
+            // Real time: a worker that never reaches its read fails the test instead of hanging it.
+            tokio::task::block_in_place(|| entered.recv_timeout(Duration::from_secs(30)))
+                .expect("the send worker parked after its read");
             let out = f.await;
             go.send(()).unwrap();
             out
