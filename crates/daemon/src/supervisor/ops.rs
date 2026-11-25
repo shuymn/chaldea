@@ -1024,6 +1024,7 @@ pub(crate) async fn exit_op(
     let Some(tracked) = guard.take() else {
         return;
     };
+    let _unwound = UnrecordedOnUnwind { sup: &sup, launch };
     sup.pauses().at(Pause::ExitTookSession).await;
     let k = submit_kill(&sup, &entry, tracked);
     let proof = await_kill(&sup, k).await;
@@ -1039,6 +1040,27 @@ pub(crate) async fn exit_op(
     if let Err(EffectOutcome::Unrecorded) = r {
         sup.sink
             .store_fatal(StoreFatal::LaunchUnrecorded { launch_id: launch });
+    }
+}
+
+/// Reports `LaunchUnrecorded` for `launch` when dropped during an unwind: an exit op that
+/// panics after it took the session records no exit for it.
+struct UnrecordedOnUnwind<'a> {
+    sup: &'a Supervisor,
+    launch: LaunchId,
+}
+
+impl Drop for UnrecordedOnUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let fatal = StoreFatal::LaunchUnrecorded {
+                launch_id: self.launch,
+            };
+            // A panic leaving a drop during an unwind aborts the process.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.sup.sink.store_fatal(fatal);
+            }));
+        }
     }
 }
 

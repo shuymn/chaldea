@@ -33,6 +33,33 @@ async fn natural_exit() {
     rig.srv.stop().await;
 }
 
+/// An exit op that panics after it took the session (a fault at `ExitTookSession`) records
+/// no exit, and reports `LaunchUnrecorded` for the launch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unwind_after_taking_the_session() {
+    use crate::http::StoreFatal;
+    use crate::supervisor::Pause;
+    let rig = Rig::new().await;
+    let (_t, l) = rig.spawn_codex(None).await;
+    let fault = rig.pauses.arm_panic(Pause::ExitTookSession);
+    rig.pty.take_child().unwrap().exit(ChildExit {
+        code: Some(0),
+        signal: None,
+    });
+    fault.wait();
+    fault.go();
+    rig.until("LaunchUnrecorded reported", || {
+        rig.sink
+            .0
+            .lock()
+            .unwrap()
+            .contains(&StoreFatal::LaunchUnrecorded { launch_id: l })
+    })
+    .await;
+    assert_eq!(rig.launch(l).exit_reason, None);
+    rig.srv.stop().await;
+}
+
 /// One buffered hook delivery for `l`, written as PR 9's intake writes one for a launch
 /// with no bound session.
 pub(super) fn buffer_one(store: &super::support::TestStore, l: chaldea_core::ids::LaunchId) {
