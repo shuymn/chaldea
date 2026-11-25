@@ -381,6 +381,10 @@ fn child_exited_precedes_other_checks() {
             ran2.store(true, Ordering::SeqCst);
             Err("no".into())
         })),
+        fence: Some(chaldea_pty_runtime::Fence {
+            word: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            expect: 0,
+        }),
     };
     assert_refused(
         &submit(&r.session, key(b"x"), g).wait(),
@@ -1187,4 +1191,76 @@ fn deadline_passed_before_first_permission_expires() {
         assert_refused(&p.wait(), &Refusal::Expired);
         assert!(r.child.input().is_empty(), "recheck: {recheck}");
     }
+}
+
+/// W1 (pty-runtime §2.3): a fence word that moved before the unit dequeues refuses it
+/// `FenceMoved` with zero bytes; one that moves while the writer is parked at its dispatch
+/// boundary refuses it there; one that moves after the permission does not.
+#[test]
+fn fence_refuses_until_the_permission() {
+    use chaldea_pty_runtime::Fence;
+    use std::sync::atomic::AtomicU64;
+    let fenced = |word: &Arc<AtomicU64>| Guard {
+        fence: Some(Fence {
+            word: word.clone(),
+            expect: 0,
+        }),
+        ..open()
+    };
+    // Moved before dequeue.
+    let r = rig();
+    let word = Arc::new(AtomicU64::new(1));
+    assert_refused(
+        &submit(&r.session, key(b"x"), fenced(&word)).wait(),
+        &Refusal::FenceMoved,
+    );
+    assert!(r.child.input().is_empty());
+    // Moved while parked at the boundary (pre-check passed).
+    let r = rig();
+    let word = Arc::new(AtomicU64::new(0));
+    let probe = r.session.probe();
+    let park = probe.park(ProbePoint::Dispatching);
+    let p = submit(&r.session, key(b"x"), fenced(&word));
+    assert!(probe.wait(ProbePoint::Dispatching, 1, soon()));
+    word.store(1, Ordering::Release);
+    park.release();
+    assert_refused(&p.wait(), &Refusal::FenceMoved);
+    assert!(r.child.input().is_empty());
+    // Moved after the permission: written.
+    let r = rig();
+    let word = Arc::new(AtomicU64::new(0));
+    let hold = r.child.hold_writes();
+    let p = submit(&r.session, key(b"x"), fenced(&word));
+    assert!(hold.wait_entered(soon()));
+    word.store(1, Ordering::Release);
+    hold.release();
+    assert_eq!(p.wait().outcome, WriteOutcome::Written);
+    assert_eq!(r.child.input(), b"x");
+}
+
+/// W2 and W3: `started_at` is unset until the first permission and set with it;
+/// `try_cancel` answers `None` while the writer holds the queue lock at its boundary,
+/// `Some(true)` for a queued unit, and `Some(false)` once the unit is permitted.
+#[test]
+fn ticket_started_at_and_try_cancel() {
+    let r = rig();
+    let probe = r.session.probe();
+    let park = probe.park(ProbePoint::Dispatching);
+    let a = submit(&r.session, key(b"a"), open());
+    assert!(probe.wait(ProbePoint::Dispatching, 1, soon()));
+    assert_eq!(a.ticket.started_at(), None);
+    assert_eq!(a.ticket.try_cancel(), None, "the queue lock is held");
+    let hold = r.child.hold_writes();
+    park.release();
+    assert!(hold.wait_entered(soon()));
+    let started = a.ticket.started_at().expect("set with the permission");
+    let b = submit(&r.session, key(b"b"), open());
+    assert_eq!(b.ticket.try_cancel(), Some(true));
+    assert_refused(&b.wait(), &Refusal::Cancelled);
+    assert_eq!(b.ticket.started_at(), None);
+    assert_eq!(a.ticket.try_cancel(), Some(false));
+    hold.release();
+    let rec = a.wait();
+    assert_eq!(rec.started_at, Some(started));
+    assert_eq!(r.child.input(), b"a");
 }

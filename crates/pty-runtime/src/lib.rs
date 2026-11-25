@@ -95,7 +95,7 @@ pub use vt::ModeView;
 #[cfg(windows)]
 pub use windows::native;
 pub use writer::{
-    Basis, Completion, CompletionReceiver, Guard, LogTruncated, MAX_PARTS, Part, Recheck, Refusal,
-    SubmitError, WriteContext, WriteOutcome, WriteRecord, WriteTicket, WriteUnit,
+    Basis, Completion, CompletionReceiver, Fence, Guard, LogTruncated, MAX_PARTS, Part, Recheck,
+    Refusal, SubmitError, WriteContext, WriteOutcome, WriteRecord, WriteTicket, WriteUnit,
     completion_channel,
 };
