@@ -446,6 +446,7 @@ async fn key_op(sup: Arc<Supervisor>, req: KeyReq) -> EffectOutcome {
         None => None,
         Some(id) => {
             if !c.is_some_and(|c| c.outcome.is_none() && c.launch_id == launch) {
+                sl.state().cards.remove(&id);
                 return done(ErrorCode::CardClosed);
             }
             match sl.state().cards.get(&id).copied().flatten() {

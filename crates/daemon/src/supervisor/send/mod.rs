@@ -213,7 +213,8 @@ pub(crate) struct SendState {
     pub dispatch: Option<Dispatch>,
     pub running: Option<RunningUnit>,
     pub human_unsettled: u32,
-    /// Each open card's human writer position at its observation; `None` when unreliable.
+    /// Each card's human writer position at its observation; `None` when unreliable. Kept
+    /// until a key finds its card closed in the store, or the launch's side is dropped.
     pub cards: HashMap<ApprovalId, Option<u64>>,
     pub log: TurnLog,
     /// The worker's first read of each input as `queued`.
@@ -245,6 +246,9 @@ pub(crate) struct SendHooks {
     pub settle_job: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs inside the open job (on the store writer).
     pub open_job: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs at the start of the probe's `finished` (on the write's observer), before the
+    /// hook's turn marks are applied.
+    pub finished: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Takes the place of the probe's observation of the launch at one intake (on the
     /// hook's request task, synchronously).
     #[allow(clippy::type_complexity, reason = "a one-shot test point")]

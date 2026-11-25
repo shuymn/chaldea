@@ -302,6 +302,31 @@ async fn cards() {
     assert_eq!(got, Some(ApprovalOutcome::Expired));
 }
 
+/// PR10b-CL-13: a turn start whose observer finishes after a later card's hook finished
+/// leaves that card's basis: the card is open in the store and its key is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn card_after_late_start() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let (parked, go, point) = gate_point();
+    set(&sl.hooks.finished, point);
+    let h = rig.hook_of(&live, "UserPromptSubmit", &json!({ "prompt": "go" }));
+    let first = crate::supervisor::tests::support::http::spawn_send(&rig.srv, &h.req(&rig.srv));
+    parked.await.unwrap();
+    let c = card(&rig, &live, "t1").await;
+    go.send(()).unwrap();
+    assert_eq!(first.await.unwrap().status, 200);
+    assert_eq!(outcome(&rig, c), None, "the card is open");
+    let r = key(&rig, &live, &["enter"], Some(c)).await;
+    assert_eq!(
+        (r.0, r.1["outcome"].clone()),
+        (200, json!("written")),
+        "{r:?}"
+    );
+    rig.stop().await;
+}
+
 /// PR10b-CL-13: the card key's rule end to end, with cards opened through the hook route.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(

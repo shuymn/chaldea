@@ -119,20 +119,22 @@ impl IntakeProbe for SupervisorProbe {
         let Some(sl) = self.side.launch(launch) else {
             return;
         };
+        #[cfg(test)]
+        super::run_hook(&sl.hooks.finished);
         let at = self.sup.upgrade().map(|s| s.now());
         if let Some(at) = at {
             let mut st = sl.state();
             for (o, m) in marks {
                 st.log.insert(*o, *m, at);
-                match m {
-                    TurnMark::Card {
-                        approval_id,
-                        human_at,
-                    } => {
-                        st.cards.insert(*approval_id, *human_at);
-                    }
-                    TurnMark::Start | TurnMark::End { .. } => st.cards.clear(),
-                    TurnMark::Other => {}
+                // A card's basis is its own; whether the card is open is the store's (a
+                // turn boundary's commit closes it), never this observer's order against
+                // another hook's.
+                if let TurnMark::Card {
+                    approval_id,
+                    human_at,
+                } = m
+                {
+                    st.cards.insert(*approval_id, *human_at);
                 }
             }
         }
