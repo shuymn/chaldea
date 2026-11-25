@@ -19,15 +19,18 @@ pub struct IntakeFacts(pub serde_json::Value);
 /// Supplies a hook's intake facts and learns when the intake is finished.
 pub trait IntakeProbe: Send + Sync + 'static {
     /// The facts at the intake of the hook with receipt ordinal `ordinal`, or `None` (no
-    /// session yet). Non-blocking: it runs under the intake mutex.
+    /// session yet). It runs under the intake mutex; an implementation waits on nothing but
+    /// short sections with no await, I/O, or other lock inside them, and that wait has no
+    /// deadline of its own (the send side's: its launch map's write section, one launch
+    /// constructed and inserted or one removed).
     fn facts(&self, launch: LaunchId, ordinal: u64) -> Option<IntakeFacts>;
 
     /// The intake `ordinal` of `launch` is finished: its job committed with `marks` (its own
     /// delivery's and, in a binding job, each promoted delivery's, by receipt ordinal) at
-    /// `committed_at` (the clock read at the end of the committing job), or decided nothing
-    /// (`marks` empty and no instant: rolled back, refused, or never submitted). Called at
-    /// most once per intake through its [`IntakeGuard`], and never for an intake whose job's
-    /// outcome stays unknown. Non-blocking.
+    /// `committed_at` (the clock read right after a successful SQLite `COMMIT`), or decided
+    /// nothing (`marks` empty and no instant: rolled back, refused, or never submitted).
+    /// Called at most once per intake through its [`IntakeGuard`], and never for an intake
+    /// whose job's outcome stays unknown. Non-blocking.
     fn finished(
         &self,
         launch: LaunchId,
