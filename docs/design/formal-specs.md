@@ -158,7 +158,7 @@ All are checked by `pnpm run simulate` (§5). Each reads facts recorded where th
 - a VT reply after the admitted basis (the recheck keeps the basis the send relied on, and the next input stays `queued` while the gate's projection is open);
 - readiness after a Codex interrupt (no `Stop` backs it);
 - a settle completion after a late card resolution of the same launch (a later hook);
-- a late `Stop` of the previous turn backing the current turn, or a settle completion of a `Stop` that a later one replaced;
+- a late `Stop` of the previous turn backing the current turn, or a settle completion of a `Stop` that a later one replaced (the model refuses it; the daemon cannot tell such a `Stop` from the current turn's when the earlier turn's `UserPromptSubmit` was lost or that turn had a second `Stop`, and departs from this refusal there: `docs/design/supervisor-send.md` L-11);
 - a buffered `Stop` followed by `SessionStart` (a later hook): neither a buffered settle completion nor one after binding counts, and no input is written (`trace_buffered_stop_after_session_start` shows a `Stop` buffered after `SessionStart` still settling);
 - a key from a card that `Stop` superseded (nothing written, no event).
 

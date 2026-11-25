@@ -493,12 +493,12 @@ Every MVP path where bytes reach the PTY or PTY output is consumed:
 
 | Path | PR | How this design covers it |
 |---|---|---|
-| Send path: text + submit | 10 (encoders 5) | `Input` unit `[text, Pause, submit]`, `Guard` with the readiness basis, 2004 epoch, and gate recheck; outcome mapping and ack facts in §2.3; prompt size refused before admission (D8). |
-| Codex positional first prompt | 10, 14 | No PTY write: it is in `SpawnSpec::argv`, anchored by `launch_started`; `SpawnError` tells whether it may have run. |
+| Send path: text + submit | 10 (encoders 5) | `Input` unit `[text, Pause, submit]`, `Guard` with the readiness basis, the 2004 epoch, and the launch's hook fence, no recheck (§2.3); outcome mapping and ack facts in §2.3; prompt size refused before admission (D8). |
+| Codex positional first prompt | 10, 14 | No PTY write: it is in `SpawnSpec::argv`, anchored at the `last_started` the launch published (§2.3); `SpawnError` tells whether it may have run. |
 | Attach typing and recognised pastes | 11 | `Attach` units; a paste is one unit without submit, refused before admission above the prompt limit; queued behind any input unit, never inside it; `QueueFull` is returned to the attach client. |
 | Attach screen and size | 11 | `subscribe` gives a diagnostic snapshot plus gapless bytes after it and reports `Lagged`; the repaint mechanism is PR 11's. `resize` follows the attach client's size; resizing during a unit is PR 11 policy. |
 | Raw `key`, keypad, `surface_action send_key` | 10, 19, 20 | `Key` units with a recheck (process running, owner). Arrow encoding reads `modes().app_cursor`; a recheck can refuse when the mode changed since encoding. |
-| Approval card keys | 10, 19 | `CardKey { approval_id }` with a recheck that the card is still open (409 otherwise, mvp §2.10); class `Human`, mapped to `card_key`, which does not close the gate. |
+| Approval card keys | 10, 19 | `CardKey { approval_id }` whose `Guard` has the hook fence and a `basis` at the human writer position of the card's observation, with the `app_cursor` recheck; the effect reads the card open first (409 `card_closed` otherwise, mvp §2.10); class `Human`, mapped to `card_key`, which does not close the gate. |
 | VT responder | 2 | `VtReply` writes in the reply lane, one write each, at unit boundaries (§2.5); class `Reply`, counted by default. |
 | Gate timeout, attention, approval card snapshot | 10, 13 | `snapshot(deadline).to_payload()` → `vt_snapshot_taken`; `CloseOutcome::final_snapshot` after teardown. |
 | Gate's DECSET 2004 condition | 10 | `ModeView` before the decision, `Guard::bracketed_paste` and the dispatch boundary at the writer. |

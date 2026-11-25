@@ -566,7 +566,7 @@ FakeCli stays free of workspace dependencies other than `core` (mvp §3); it sta
 
 ## 4. Same-Class Inventory
 
-Every parallel or later PR that consumes hook facts or adds hook kinds, and the seam it uses. None changes PR 9's types.
+Every parallel or later PR that consumes hook facts or adds hook kinds, and the seam it uses. Apart from 10b's changes to `IntakeProbe`, `HookAdapter`, and `HookEvent` (§2.4, §2.6), none changes PR 9's types.
 
 | PR | Consumes or adds | Seam | What PR 9 provides; what that PR must do |
 |---|---|---|---|
