@@ -775,3 +775,28 @@ async fn seal_before_stop_requested() {
     assert_eq!(reply.await.unwrap().status, 200);
     rig.srv.stop().await;
 }
+
+/// PR10a1-CL-10 `drop_never_confirms`: a kill task that panics before its first call drops
+/// its session; the drop's implicit close (empty list) kills the tree, yet confirms
+/// nothing: `death_confirmed: false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drop_never_confirms() {
+    let rig = Rig::new().await;
+    let (t, l) = rig.spawn_codex(None).await;
+    let child = rig.pty.take_child().unwrap();
+    let fault = rig.pauses.arm_panic(Pause::KillTaskStart);
+    let reply = stop_with(&rig, t);
+    fault.wait();
+    fault.go();
+    let r = reply.await.unwrap();
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(json(&r)["death_confirmed"], false, "{}", json(&r));
+    assert!(!rig.launch(l).death_confirmed);
+    let ks = kills(&child.log());
+    assert_eq!(
+        ks,
+        vec![Vec::<ProcessIdentity>::new()],
+        "only the drop's close killed"
+    );
+    rig.srv.stop().await;
+}

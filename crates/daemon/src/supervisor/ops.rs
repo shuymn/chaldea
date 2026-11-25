@@ -985,6 +985,7 @@ pub(crate) async fn exit_op(
     launch: LaunchId,
     exit: Option<ChildExit>,
 ) {
+    sup.pauses().at(Pause::ExitStart).await;
     let Some(entry) = sup.entry(launch) else {
         return;
     };

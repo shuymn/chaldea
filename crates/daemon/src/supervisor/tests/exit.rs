@@ -319,3 +319,119 @@ async fn sealed_on_every_path() {
     check(l, &b.join().unwrap(), origin, "shutdown close");
     rig.srv.stop().await;
 }
+
+fn launch_exits(rig: &Rig, t: chaldea_core::ids::ThreadId) -> Vec<serde_json::Value> {
+    rig.events(t)
+        .into_iter()
+        .filter(|(k, _)| k == "launch_exited")
+        .map(|(_, p)| p)
+        .collect()
+}
+
+fn stop_req(rig: &Rig, t: chaldea_core::ids::ThreadId) -> super::support::http::Req {
+    rig.srv.command(
+        "stop",
+        &rig.owner,
+        super::cid(),
+        &serde_json::json!({ "thread_id": t }).to_string(),
+    )
+}
+
+/// PR10a1-CL-13 `sealing_op_records`: the child exits while a stop holds the launch after
+/// its seal: the exit op returns before its lock wait, and the stop records the one
+/// `launch_exited` (`stopped`). When the stop's exit job then fails (the writer retired),
+/// the exit op still records and reports nothing; the row stays open until the reconcilers
+/// record it `daemon_restart`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sealing_op_records() {
+    use crate::http::StoreFatal;
+    use crate::store::test_faults::CommitFault;
+    use crate::supervisor::Pause;
+    // The stop records.
+    let rig = Rig::new().await;
+    let (t, l) = rig.spawn_codex(None).await;
+    let child = rig.pty.take_child().unwrap();
+    let seal = rig.pauses.arm(Pause::StopAfterSeal);
+    let start = rig.pauses.arm(Pause::ExitStart);
+    let reply = super::support::http::spawn_send(&rig.srv, &stop_req(&rig, t));
+    seal.wait();
+    child.exit(ChildExit {
+        code: Some(0),
+        signal: None,
+    });
+    start.wait();
+    start.go();
+    seal.go();
+    assert_eq!(reply.await.unwrap().status, 200);
+    let exits = launch_exits(&rig, t);
+    assert_eq!(exits.len(), 1, "{exits:?}");
+    assert_eq!(exits[0]["reason"], "stopped");
+    assert!(!rig.pauses.passed(Pause::ExitBeforeLock));
+    assert_eq!(rig.launch(l).exit_reason, Some(ExitReason::Stopped));
+    rig.srv.stop().await;
+    // The stop's exit job fails: nothing recorded or reported by the exit op.
+    let rig = Rig::new().await;
+    let (t, l) = rig.spawn_codex(None).await;
+    let start = rig.pauses.arm(Pause::ExitStart);
+    let written = rig.pauses.arm(Pause::StopWritten);
+    let reply = super::support::http::spawn_send(&rig.srv, &stop_req(&rig, t));
+    written.wait();
+    start.wait();
+    start.go();
+    *rig.srv.store.store().faults().commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
+    let job: crate::http::Job<()> = Box::new(|_| Ok(()));
+    assert!(tokio::task::block_in_place(|| rig.srv.store.run(job)).is_err());
+    written.go();
+    assert_eq!(reply.await.unwrap().status, 503);
+    assert!(!rig.pauses.passed(Pause::ExitBeforeLock));
+    assert!(
+        !rig.sink
+            .0
+            .lock()
+            .unwrap()
+            .contains(&StoreFatal::LaunchUnrecorded { launch_id: l }),
+        "{:?}",
+        rig.sink.0
+    );
+    assert_eq!(rig.launch(l).exit_reason, None, "the row stays open");
+    drop(rig.sup);
+    let (_, mut store) = rig.srv.into_store(std::time::Duration::from_secs(10)).await;
+    store.reopen();
+    super::restart::restart_all(&store);
+    let row = store.read(move |r| r.launch(l)).unwrap();
+    assert_eq!(row.exit_reason, Some(ExitReason::DaemonRestart));
+}
+
+/// PR10a1-CL-13 `stop_owns_exit`: the kill's exit reaches an exit op while the stop's
+/// `StopRequested` job is held in the writer: the exit op returns before its lock wait, so
+/// its 60 s bound never runs and it reports no `LaunchUnrecorded`; once the ticket answers,
+/// the stop records one `launch_exited` (`stopped`) with its accepted proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_owns_exit() {
+    use crate::http::StoreFatal;
+    use crate::supervisor::Pause;
+    let rig = Rig::new().await;
+    let (t, l) = rig.spawn_codex(None).await;
+    let held = rig.pauses.arm(Pause::InStopRequested);
+    let start = rig.pauses.arm(Pause::ExitStart);
+    let reply = super::support::http::spawn_send(&rig.srv, &stop_req(&rig, t));
+    held.wait();
+    start.wait();
+    start.go();
+    held.go();
+    let r = reply.await.unwrap();
+    assert_eq!(super::json(&r)["death_confirmed"], true);
+    assert!(!rig.pauses.passed(Pause::ExitBeforeLock));
+    assert!(
+        !rig.sink
+            .0
+            .lock()
+            .unwrap()
+            .contains(&StoreFatal::LaunchUnrecorded { launch_id: l })
+    );
+    let exits = launch_exits(&rig, t);
+    assert_eq!(exits.len(), 1, "{exits:?}");
+    assert_eq!(exits[0]["reason"], "stopped");
+    assert!(rig.launch(l).death_confirmed);
+    rig.srv.stop().await;
+}

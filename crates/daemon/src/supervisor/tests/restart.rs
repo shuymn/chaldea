@@ -104,9 +104,8 @@ async fn crash_before_started() {
     rig.srv.stop().await;
 }
 
-/// PR10a1-CL-14, CL-16: a running launch with a recorded pid is `daemon_restart`, its `sent`
-/// positional input `unconfirmed`, its hook token revoked; a second restart writes nothing;
-/// the restarted supervisor spawned and signalled nothing.
+/// PR10a1-CL-14: a running launch with a recorded pid is `daemon_restart`, its `sent`
+/// positional input `unconfirmed`, its hook token revoked; a second restart writes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inputs_recovered() {
     let rig = Rig::new().await;
@@ -116,14 +115,7 @@ async fn inputs_recovered() {
     let owner = rig.owner.clone();
     let (_, store) = rig.srv.into_store(std::time::Duration::from_secs(10)).await;
     drop(rig.sup);
-    let signalled = || {
-        child
-            .log()
-            .iter()
-            .filter(|e| matches!(e, FakeEvent::Kill { .. } | FakeEvent::Signal))
-            .count()
-    };
-    let old = signalled();
+    drop(child);
     assert!(restart_all(&store) > 0);
     let before = store.read(move |r| {
         Ok(
@@ -155,10 +147,6 @@ async fn inputs_recovered() {
     );
     assert!(rig.srv.token_row(&hook).unwrap().revoked_at.is_some());
     assert!(rig.srv.token_row(&owner).unwrap().revoked_at.is_none());
-    // No signal and no spawn from the restart, the build, or a tick.
-    rig.sup.tick(rig.sup.now()).await;
-    assert!(rig.pty.spawns().is_empty());
-    assert_eq!(signalled(), old, "the restart signalled nothing");
     rig.srv.stop().await;
 }
 
@@ -178,4 +166,58 @@ async fn buffers_resolved() {
         rig.kinds(t)
     );
     rig.srv.stop().await;
+}
+
+/// A `git` that appends a line to `marker` and nothing else: any run of it is counted.
+fn counting_git(marker: &std::path::Path) -> Vec<std::ffi::OsString> {
+    let m = marker.to_string_lossy();
+    let argv: Vec<String> = if cfg!(windows) {
+        vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            format!("Add-Content -LiteralPath '{m}' -Value x; #"),
+        ]
+    } else {
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "echo x >> \"$0\"".into(),
+            m.into_owned(),
+        ]
+    };
+    argv.into_iter().map(std::ffi::OsString::from).collect()
+}
+
+/// PR10a1-CL-16 `no_signal`: with each host's adapters, a launch left open with a recorded
+/// pid; the reconcilers, the build, and one tick: no spawn, no kill or signal to the old
+/// launch's processes, no git run, and the launch recorded `daemon_restart`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_signal() {
+    use chaldea_core::adapter::HostOs;
+    for host in [HostOs::Macos, HostOs::Windows] {
+        let rig = Rig::with(host, |_| {}).await;
+        let (_t, l) = rig.spawn_codex(None).await;
+        let child = rig.pty.take_child().unwrap();
+        let (_, store) = rig.srv.into_store(std::time::Duration::from_secs(10)).await;
+        drop(rig.sup);
+        let before = child.log().len();
+        assert!(restart_all(&store) > 0);
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("git-ran");
+        let git = counting_git(&marker);
+        let rig = Rig::on(store, host, move |c| c.git = git).await;
+        rig.sup.tick(rig.sup.now()).await;
+        assert!(rig.pty.spawns().is_empty(), "{host:?}: no spawn");
+        let after = &child.log()[before..];
+        assert!(
+            !after
+                .iter()
+                .any(|e| matches!(e, FakeEvent::Kill { .. } | FakeEvent::Signal)),
+            "{host:?}: {after:?}"
+        );
+        assert!(!marker.exists(), "{host:?}: git ran");
+        assert_eq!(rig.launch(l).exit_reason, Some(ExitReason::DaemonRestart));
+        rig.srv.stop().await;
+    }
 }

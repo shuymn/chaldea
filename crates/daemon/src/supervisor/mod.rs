@@ -122,6 +122,8 @@ pub enum Pause {
     BeforeClosingJob,
     /// An exit op after taking the session out of its slot, before its kill task starts.
     ExitTookSession,
+    /// An exit op at its start, before it reads its entry.
+    ExitStart,
     /// An exit op before its lock wait.
     ExitBeforeLock,
     /// The participant's close task, before it returns (blocking).
