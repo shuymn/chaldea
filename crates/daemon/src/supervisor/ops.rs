@@ -691,6 +691,10 @@ pub(crate) fn submit_kill(
     }
 }
 
+/// The kill task. A panic inside it (the backend's kill included) must not unwind through
+/// the session: the session's drop would run the kill again during the unwind, and a second
+/// panic there aborts the process. So the panic is caught, the session dropped as an
+/// ordinary value (its token stays counted), and the panic resumed.
 fn kill_task(
     sup: &Supervisor,
     launch: LaunchId,
@@ -698,6 +702,30 @@ fn kill_task(
     extra: &[ProcessIdentity],
     tx: oneshot::Sender<KillReport>,
 ) -> CloseOutcome {
+    let mut held = Some(tracked);
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        kill_and_close(sup, launch, &mut held, extra, tx)
+    }));
+    match run {
+        Ok(o) => o,
+        Err(p) => {
+            drop(held.take());
+            std::panic::resume_unwind(p)
+        }
+    }
+}
+
+/// [`kill_task`]'s body: `held` is taken only by the close.
+fn kill_and_close(
+    sup: &Supervisor,
+    launch: LaunchId,
+    held: &mut Option<TrackedSession>,
+    extra: &[ProcessIdentity],
+    tx: oneshot::Sender<KillReport>,
+) -> CloseOutcome {
+    let Some(tracked) = held.as_ref() else {
+        unreachable!("the kill task starts with its session");
+    };
     let start = sup.now();
     let kill_end = start + sup.cfg.kill_budget;
     tracing::info!(%launch, ?kill_end, "kill task started");
@@ -722,6 +750,9 @@ fn kill_task(
         }
     }
     sup.pauses().blocking(Pause::BeforeCloseBy);
+    let Some(tracked) = held.take() else {
+        unreachable!("only the close takes the session");
+    };
     let o = tracked.close_by(extra, sup.real(kill_end), sup.cfg.close_bounds);
     if !o.kill.tree_dead {
         tracing::warn!(%launch, survivors = ?o.kill.survivors, "close left survivors");
