@@ -398,7 +398,11 @@ async fn settle(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>, view: &View, now: I
     let job: JobOf<()> = Arc::new(move |tx| {
         #[cfg(test)]
         super::run_hook(&me.hooks.settle_job);
-        if me.fence.load(Ordering::Acquire) != word || me.running_flag.load(Ordering::SeqCst) {
+        // An unrecorded unit keeps the candidate; a later pass decides it again.
+        if me.fence.load(Ordering::Acquire) != word
+            || me.running_flag.load(Ordering::SeqCst)
+            || me.human_flag.load(Ordering::SeqCst) > 0
+        {
             return Ok(());
         }
         let r = tx.read();

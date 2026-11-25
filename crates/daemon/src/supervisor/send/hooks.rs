@@ -315,7 +315,12 @@ impl HookAdapter for SupervisorHooks {
             HookFact::Stop => {
                 ev.apply("stop", &StateInput::TurnStopped);
                 ev.close_cards(tx, thread, ApprovalOutcome::Superseded)?;
-                let settle = hook.intake_reliable && facts.is_some_and(|f| !f.running);
+                // A unit that ran to `Written` before the intake ended before this `Stop`;
+                // the settle waits for its record (§2.4 step 3).
+                let settle = hook.intake_reliable
+                    && facts.is_some_and(|f| {
+                        !f.running || f.inflight.as_ref().is_some_and(|i| i.written)
+                    });
                 TurnMark::End { settle }
             }
             HookFact::Interrupt => {

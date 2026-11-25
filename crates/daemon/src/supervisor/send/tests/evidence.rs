@@ -275,8 +275,8 @@ async fn running_unit(
 
 /// PR10b-CL-4: a `Stop` taken in while an input unit may still write never settles, even
 /// after the unit ends: one taken in while the unit is held in its write, and one taken in
-/// after the unit's first permission while `submit`'s return is held (`running` is set
-/// before `submit`).
+/// after the unit's first permission while `submit`'s return and the unit's completion are
+/// held (`running` is set before `submit`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn settle_running() {
     // Held in its write.
@@ -298,6 +298,11 @@ async fn settle_running() {
         let _ = entered_tx.send(());
         let _ = rx.recv_timeout(Duration::from_secs(20));
     });
+    // The unit's completion held too: the `Stop` is taken in before it is `Written`.
+    let (complete, held) = std::sync::mpsc::channel::<()>();
+    set(&sl.hooks.completion, move || {
+        let _ = held.recv_timeout(Duration::from_secs(20));
+    });
     let probe = rig.probe(&live).await;
     let id = rig.send(&live, "permitted").await;
     entered.await.unwrap();
@@ -318,6 +323,7 @@ async fn settle_running() {
         Some(&crate::hook::TurnMark::End { settle: false }),
         "the facts showed the unit running"
     );
+    complete.send(()).unwrap();
     tx.send(()).unwrap();
     rig.until_input(id, InputState::Sent).await;
     advance(&rig, &live, SETTLE).await;
@@ -329,6 +335,85 @@ async fn settle_running() {
     rig.hook(&live, "Stop", &json!({})).await;
     advance(&rig, &live, SETTLE).await;
     assert_eq!(count(&rig, &live, "stop_settled"), 1);
+    rig.stop().await;
+}
+
+/// PR10b-CL-4 (P-1): a `Stop` taken in after the input's unit was written and acked, before
+/// the completion job recorded it, is a candidate decided again after the record: it settles,
+/// and the next send is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_after_input_record() {
+    let (rig, live) = settle_rig().await;
+    let sl = rig.sl(&live);
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, entered) = tokio::sync::oneshot::channel::<()>();
+    set(&sl.hooks.record_job, move || {
+        let _ = entered_tx.send(());
+        let _ = rx.recv_timeout(Duration::from_secs(20));
+    });
+    let id = rig.send(&live, "p").await;
+    entered.await.unwrap();
+    rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "p" }))
+        .await;
+    assert_eq!(rig.input(id).state, InputState::Acked);
+    rig.hook(&live, "Stop", &json!({})).await;
+    assert!(sl.state().running.is_some(), "not yet recorded");
+    tx.send(()).unwrap();
+    rig.until("the unit was recorded", || sl.state().running.is_none())
+        .await;
+    advance(&rig, &live, SETTLE).await;
+    assert_eq!(count(&rig, &live, "stop_settled"), 1);
+    let next = rig.send(&live, "q").await;
+    rig.until_input(next, InputState::Sent).await;
+    rig.stop().await;
+}
+
+/// PR10b-CL-4/12: a `Stop` taken in while a card key's completion is held settles only after
+/// that key's `human_write`, so the next send is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_after_human_record() {
+    let (rig, live) = settle_rig().await;
+    let sl = rig.sl(&live);
+    rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "p" }))
+        .await;
+    let h = rig.hook_of(
+        &live,
+        "PermissionRequest",
+        &json!({ "tool_name": "Bash", "tool_input": { "command": "ls" }, "tool_use_id": "t1" }),
+    );
+    assert_eq!(rig.post(&h).await.status, 200);
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, entered) = tokio::sync::oneshot::channel::<()>();
+    set(&sl.hooks.completion, move || {
+        let _ = entered_tx.send(());
+        let _ = rx.recv_timeout(Duration::from_secs(20));
+    });
+    let args = json!({ "thread_id": live.t, "launch_id": live.l, "keys": ["enter"], "approval_id": h.emit });
+    let key = crate::supervisor::tests::support::http::spawn_send(
+        &rig.srv,
+        &rig.srv.command(
+            "key",
+            &rig.owner,
+            crate::supervisor::tests::cid(),
+            &args.to_string(),
+        ),
+    );
+    entered.await.unwrap();
+    rig.hook(&live, "Stop", &json!({})).await;
+    advance(&rig, &live, SETTLE).await;
+    assert_eq!(
+        count(&rig, &live, "stop_settled"),
+        0,
+        "the key is not recorded"
+    );
+    tx.send(()).unwrap();
+    rig.until("the settle after the key's record", || {
+        count(&rig, &live, "stop_settled") == 1
+    })
+    .await;
+    assert_eq!(key.await.unwrap().status, 200);
+    let next = rig.send(&live, "after").await;
+    rig.until_input(next, InputState::Sent).await;
     rig.stop().await;
 }
 
