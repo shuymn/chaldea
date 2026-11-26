@@ -562,6 +562,14 @@ async fn revoke_after_waiter_left_still_nudges() {
     let mut ws = srv.ws(&owner).await;
     let id = srv.token_row(&owner).unwrap().token_id;
     let hold = srv.hold_writer().await;
+    // A connection task can outlive its reply: the base is taken once only the accept loop
+    // and the socket remain, so no task leaves while the observer registers.
+    eventually(
+        WS_WAIT,
+        "only the accept loop and the socket remain",
+        || srv.server.tasks() == 2,
+    )
+    .await;
     let base = srv.server.tasks();
     let revoking = {
         let srv = srv.clone();
