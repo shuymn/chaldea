@@ -470,10 +470,12 @@ async fn bounded() {
     let script = Script::parking(Fate::Gone);
     let rig = probing(store, HostOs::Macos, &script).await;
     // Running: the joins' cutoff passes in real time; the parked tasks never return by it.
+    // Every dispatch is after `dispatched`, so no join's cutoff is before `elapsed_by`.
     rig.clock.resume();
+    let dispatched = std::time::Instant::now();
     let run = tokio::spawn(prober::run(rig.sup.clone()));
     script.park.reached(PROBE_SLOTS);
-    let elapsed_by = std::time::Instant::now() + PROBE_BUDGET + PROBE_JOIN_GRACE;
+    let elapsed_by = dispatched + PROBE_BUDGET + PROBE_JOIN_GRACE;
     let recorded = || {
         ids.iter()
             .filter(|(t, _)| !evidence(&rig, *t).is_empty())
