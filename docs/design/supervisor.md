@@ -101,7 +101,7 @@ Registered through `CommandRegistry::register` in `Built::commands` (E1). The gu
 |---|---|---|---|---|---|
 | `spawn` | `SpawnArgs { agent, cwd, prompt?, task? }` | object authorization; returns `Pending` | §2.3 "Spawn and resume" | `SpawnResult { thread_id, launch_id, input_id?, outcome: started \| spawn_failed }` | 30 s |
 | `resume` | `ResumeArgs { thread_id, expected_launch_id, prompt? }` | target scope; returns `Pending` | §2.3 "Spawn and resume" (the reservation checks run in the op's reservation job) | `ResumeResult { launch_id, input_id?, outcome }` | 30 s |
-| `stop` | `StopArgs { thread_id, expected_launch_id? }` | target scope; the current launch `L` (it must equal `expected_launch_id` when given, else `launch_changed`); `L` exited with death confirmed → `Completed(already_exited)`, result and receipt in this job, `confirmed_within_deadline` from `CommandCtx::job_start()` (the `StopResult` table below); exited unconfirmed → `death_unconfirmed`; else `Pending(L)` with `L`'s state and `CommandCtx::request_start()` | §2.3 "Stop" for `L` | `StopResult { launch_id, outcome: stopped \| already_exited, death_confirmed, confirmed_within_deadline, exit_code, signal }` | 30 s |
+| `stop` | `StopArgs { thread_id, expected_launch_id?, assume_dead? }` | target scope; with `assume_dead`, the owner's assertion (`docs/design/supervisor-recovery.md` §2.5); the current launch `L` (it must equal `expected_launch_id` when given, else `launch_changed`); `L` exited with death confirmed → `Completed(already_exited)`, result and receipt in this job, `confirmed_within_deadline` from `CommandCtx::job_start()` (the `StopResult` table below); exited unconfirmed → `death_unconfirmed`; else `Pending(L)` with `L`'s state and `CommandCtx::request_start()` | §2.3 "Stop" for `L` | `StopResult { launch_id, outcome: stopped \| already_exited \| asserted, death_confirmed, confirmed_within_deadline, exit_code, signal }` | 30 s |
 | `close` | `CloseArgs { thread_id, expected_launch_id, stop?: bool }` | target scope; `thread_closed`; `launch_changed` (current ≠ `expected_launch_id`); then §2.3 "Close" | stop of a live `L`, then the closing job (with the nudge) | `CloseResult { thread_id, stop }` | 30 s |
 
 `chaldea wait` is a CLI read loop, not a command (SD16).
@@ -119,7 +119,7 @@ Registered through `CommandRegistry::register` in `Built::commands` (E1). The gu
 | `thread_closed` | 409 | resume or close on a closed thread (a closed thread's launch is confirmed dead, so its stop is `already_exited`) | no |
 | `launch_changed` | 409 | `expected_launch_id` is not the thread's current launch; a stop or close `--stop` whose target launch stopped being current before its op acted | no |
 | `launch_live` | 409 | resume or close (without `stop`) while the current launch has not exited | no |
-| `death_unconfirmed` | 409 | resume, close, or stop while the current launch exited without confirmed death (resume also raises `resume_blocked` in the same job); 10a1 has no rule that confirms it (§2.4) | no |
+| `death_unconfirmed` | 409 | resume, close, or stop while the current launch exited without confirmed death (resume also raises `resume_blocked` in the same job); the owner's assertion confirms it (§2.4) | no |
 | `worktree_unavailable` | 409 | the launch's worktree is not `active` or `released` | no |
 | `no_session` | 409 | resume of a thread with no bound `session_id` | no |
 | `prompt_rejected` | 400 | `check` refused the positional prompt | no |
@@ -128,7 +128,7 @@ Registered through `CommandRegistry::register` in `Built::commands` (E1). The gu
 
 Success types have no top-level `code` field (http-surface.md:544); a test asserts it per type (E2), so a process's exit code is `exit_code`.
 
-**`death_unconfirmed` in the CLI.** The error body carries only the code, and the code is the same whether a crash or an owned close left the launch unconfirmed. `chaldea resume` and `close` pinned `expected_launch_id` from their read before the request (SD16); on this code they read `GET /api/threads/{thread_id}` once within the same cutoff, and only when its current launch is that pinned id and is exited with death unconfirmed do they print by its `exit_reason`: `daemon_restart` or `unknown_after_crash` → "The previous process of this thread could not be confirmed to have ended after the daemon restarted."; `stopped`, `exit`, or `spawn_failed` → "The previous process of this thread could not be confirmed to have ended when it stopped." In every other case (`chaldea stop`, which pins no launch; a read that fails or ends at the cutoff; another current launch) they print "The thread's last process could not be confirmed to have ended." Then, in every case, "This version cannot resume or close this thread. Its history is kept, and new threads can be started." The command exits 1. API clients read the same facts from the launch's `exit_reason` and `death_confirmed`.
+**`death_unconfirmed` in the CLI.** The error body carries only the code, and the code is the same whether a crash or an owned close left the launch unconfirmed. `chaldea resume` and `close` pinned `expected_launch_id` from their read before the request (SD16); on this code they read `GET /api/threads/{thread_id}` once within the same cutoff, and only when its current launch is that pinned id and is exited with death unconfirmed do they print by its `exit_reason`: `daemon_restart` or `unknown_after_crash` → "The previous process of this thread could not be confirmed to have ended after the daemon restarted."; `stopped`, `exit`, or `spawn_failed` → "The previous process of this thread could not be confirmed to have ended when it stopped." In every other case (`chaldea stop`, which pins no launch; a read that fails or ends at the cutoff; another current launch) they print "The thread's last process could not be confirmed to have ended." Then, in every case, "To review what was checked, run `chaldea stop <thread> --assume-dead`; once you have made sure its processes ended, confirm with `--launch <id>`. Its history is kept, and new threads can be started.", with the thread's id for `<thread>`. The command exits 1. API clients read the same facts from the launch's `exit_reason` and `death_confirmed`.
 
 **`StopResult` and `CloseResult`.** Every field is always present, `exit_code` and `signal` as `null` when unknown (`payload.rs:3-4`'s rule, with no `skip_serializing_if` and no `#[ts(optional)]`), and each is in the JSON Schema's `required` list. The 5 s of mvp P-3, counted from `RequestStart`, is reported here and bounds no work of the stop (§2.3). By branch:
 
@@ -137,8 +137,10 @@ Success types have no top-level `code` field (http-surface.md:544); a test asser
 | `stopped` | true exactly when there is the first full-list proving report accepted by the op before the kill's submission + 12 s (from `Session::kill_by` via the one-shot, or as `CloseOutcome.kill` when `close_by` returns in time), its `attempt` then `Signalled` or `AlreadyDead` (§2.3 Stop step 5) | `death_confirmed`, and that report's `KillReport.proved_at` is at or before `RequestStart` + 5 s | from `CloseOutcome.exit`; `null` when the waiter had not reported an exit |
 | `already_exited`, decided by the intent | true (an exit without confirmed death is the `death_unconfirmed` refusal) | true exactly when `CommandCtx::job_start()` is at or before `RequestStart` + 5 s: the writer runs one job at a time, so the death the intent reads was confirmed before its job started; the row holds no proof time, so a slow intent can report `false` for a process that died in time (only the report and the CLI's exit 4 differ) | `null`: the launch's own `launch_exited` carries them |
 | `already_exited`, decided by the op's re-read (the launch exited between the intent and the seal) | true | the same rule, with the clock read after that re-read returned | `null` |
+| `already_exited` of a launch confirmed by `owner_asserted`, from the intent or the re-read | true | false: an assertion is not a stop's proof | `null` |
+| `asserted` (only to `assume_dead`; `docs/design/supervisor-recovery.md` §2.5) | true | false | `null` |
 
-`CloseResult.stop` is the `StopResult` of the stop a `close --stop` ran (§2.3 "Close"): `stopped`, or `already_exited` when the launch exited between the close's intent and the stop's seal; it is `null` without `--stop` and when the close's intent found the launch exited, since no stop ran. `chaldea stop` exits 0 when `confirmed_within_deadline` is true. When `death_confirmed` is true and `confirmed_within_deadline` false, it prints one line, "The process ended, but its end was not confirmed within 5 s of the stop request the daemon accepted.", and exits 4 (`ExitCode::Timeout`, `lifecycle/mod.rs:243-251`, the code `chaldea wait` uses for a passed cutoff). When `death_confirmed` is false, it prints the general message above and exits 1 (`ExitCode::Failed`). `chaldea close --stop` reads `CloseResult.stop` the same way once the thread is closed; an inner stop that did not confirm death ends the close as the `death_unconfirmed` refusal.
+`CloseResult.stop` is the `StopResult` of the stop a `close --stop` ran (§2.3 "Close"): `stopped`, or `already_exited` when the launch exited between the close's intent and the stop's seal; it is `null` without `--stop` and when the close's intent found the launch exited, since no stop ran. `chaldea stop` exits 0 when `confirmed_within_deadline` is true. When `outcome` is `asserted`, it prints "The owner confirmed that launch <id> has ended." and exits 0. When `death_confirmed` is true and `confirmed_within_deadline` false, it prints one line, "The process ended, but its end was not confirmed within 5 s of the stop request the daemon accepted." (for `already_exited`: "The process had already ended, but this stop did not confirm its end within 5 s (its end may have been confirmed by the owner's assertion).", since the result does not say which), and exits 4 (`ExitCode::Timeout`, `lifecycle/mod.rs:243-251`, the code `chaldea wait` uses for a passed cutoff). When `death_confirmed` is false, it prints the general message above and exits 1 (`ExitCode::Failed`). `chaldea close --stop` reads `CloseResult.stop` the same way once the thread is closed; an inner stop that did not confirm death ends the close as the `death_unconfirmed` refusal.
 
 ### 2.3 Launch Lifecycle
 
@@ -184,7 +186,7 @@ A handler cannot reply 503 itself (`result_allowed`, `commands.rs:152-176`), and
 
 **`extra` and its source** (B1, A3, A26). The supervisor passes, on every `kill` and `close`, every identity it can prove belongs to the launch: its own spawn records and containment it can show (hook-ingest D10). In the MVP no such identity exists outside what the backend already covers: job members (Windows) and session and group members observed while owned (macOS) are the backend's, the daemon creates no other process per launch, and PR 9 records none (hook-ingest D10). So the full list is the empty list on every call; a descendant that left the session before any observation is PR3-P-1's stated limit. A later producer records identities on the `LiveLaunch` and they are passed from then on.
 
-**Unconfirmed launches.** A launch exits with `death_confirmed: false` when its owned kills and close could not prove death, when a `StartedThenFailed` cleanup is unresolved, or at a restart (`daemon_restart`, `unknown_after_crash`; §2.5). 10a1 has no rule that confirms such a launch: `stop` answers `death_unconfirmed`, `resume` and `close` refuse with it (resume raising `resume_blocked`), and the launch's worktree stays in use. New threads spawn as usual, and history is intact. Confirming such a launch is PR 10a2's (§2.12, L-1).
+**Unconfirmed launches.** A launch exits with `death_confirmed: false` when its owned kills and close could not prove death, when a `StartedThenFailed` cleanup is unresolved, or at a restart (`daemon_restart`, `unknown_after_crash`; §2.5). Until the owner confirms it, `stop` answers `death_unconfirmed`, `resume` and `close` refuse with it (resume raising `resume_blocked`), and the launch's worktree stays in use. New threads spawn as usual, and history is intact. The owner confirms such a launch with `chaldea stop <thread> --assume-dead --launch <id>`, after reading what was checked (`docs/design/supervisor-recovery.md` §2.5); no check confirms it.
 
 **A29 on Windows.** A crash between the suspended `CreateProcessW` and `AssignProcessToJobObject` leaves a reservation without identity and a suspended child outside the launch's job (pty-windows §2.2 "Crash window"). 10a1 records the launch `unknown_after_crash` (§2.5) and keeps pty-windows' suspended fallback unchanged (SD2); what PR 21's finder receives is 10a2's.
 
@@ -482,6 +484,8 @@ pub(crate) async fn record<R: Send + 'static>(sup: &Arc<Supervisor>, job: JobOf<
 
 ### 2.12 Handed to PR 10a2
 
+PR 10a2's design is `docs/design/supervisor-recovery.md`.
+
 **What moves.** The restart probe of old processes (the recorded identities of `daemon_restart` launches, including those an earlier start recorded), launch evidence for the owner, `stop --assume-dead` and its preview, the evidence PR 21's finder receives for A29, the confirmation of every launch 10a1 leaves unconfirmed (§2.4), and mvp P-18's survivor policy, an owner decision taken when 10a2 is designed. 10a2 implements the owner decision of 2026-11-25 (header): a check that covers only recorded identities unlocks nothing; the owner confirms after reading the evidence.
 
 **What 10a1 records for it.** All of it is in append-only events, so launches 10a1 marked stay readable across upgrades and repeated restarts, and a later restart changes none of them (§2.5):
@@ -585,8 +589,8 @@ Obligation ids number the PR 10 obligations collected from the sources in the se
 
 | Id | Source | 10a1's answer |
 |---|---|---|
-| A1 | mvp:439; pty-unix:409 | PR 10a2: the restart scan of old processes (§2.12; SD3). 10a1 records `daemon_restart` (§2.5; PR10a1-CL-16) |
-| A2 | mvp:439 | §2.5 `unknown_after_crash`, §2.4 refusals; SD2; PR10a1-CL-8. The owner's assertion: PR 10a2 |
+| A1 | mvp:439; pty-unix:409 | `docs/design/supervisor-recovery.md` (the restart prober). 10a1 records `daemon_restart` (§2.5; PR10a1-CL-16) |
+| A2 | mvp:439 | §2.5 `unknown_after_crash`, §2.4 refusals; SD2; PR10a1-CL-8. The owner's assertion: `docs/design/supervisor-recovery.md` |
 | A3 | mvp:439 | §2.4 "`extra` and its source"; PR10a1-CL-10 |
 | A4 | mvp:439 | §2.3 Spawn and resume, Close; PR10a1-CL-4, PR10a1-CL-25 |
 | A5 | mvp:439; mvp CL-18 | §2.3 step 3 (check and carry-over); PR10a1-CL-3 (removal race: PR 16) |
@@ -598,8 +602,8 @@ Obligation ids number the PR 10 obligations collected from the sources in the se
 | A25 | mvp:439; daemon-lifecycle §2.11 | §2.3 Natural exit, §2.9 ownership; PR10a1-CL-13, PR10a1-CL-19, PR10a1-CL-36 |
 | A26 | mvp:439; pty-windows:202 | §2.1 rule 5, §2.3 Stop step 4 (busy retries), §2.4; SD20; PR10a1-CL-10, PR10a1-CL-11 |
 | A27 | mvp:439 | §2.3 Stop, §2.4; PR10a1-CL-10 |
-| A28 | mvp:439; pty-windows:412 | PR 10a2: the Windows old-tree check after a restart (§2.12) |
-| A29 | mvp:439; pty-windows:129,465 | §2.4 "A29 on Windows", SD2: recorded `unknown_after_crash`, fallback kept. The finder's evidence: PR 10a2 |
+| A28 | mvp:439; pty-windows:412 | `docs/design/supervisor-recovery.md` (the restart prober on Windows) |
+| A29 | mvp:439; pty-windows:129,465 | §2.4 "A29 on Windows", SD2: recorded `unknown_after_crash`, fallback kept. The finder's evidence: `docs/design/supervisor-recovery.md` §2.6 |
 | A30 | mvp:439; formal-specs §3 hole a | §2.3 step 3; PR10a1-CL-3; §7 |
 | A32 | mvp:439; formal-specs §3 hole c | §2.6; PR10a1-CL-17; §7 |
 | A35 (anchor part) | mvp:439; formal-specs §3 | §2.3 step 5, §2.11 Observation; PR10a1-CL-30 (the ack decision: 10b) |
@@ -615,7 +619,7 @@ Obligation ids number the PR 10 obligations collected from the sources in the se
 | E4, X1 | http-surface:333; `commands.rs:665` | SD1; PR10a1-CL-20 |
 | E5 | daemon-lifecycle:625-628 | §2.9; SD10, SD17; PR10a1-CL-22, PR10a1-CL-33, PR10a1-CL-36 |
 | E6 | daemon-lifecycle PR8-P-3b | PR10a1-CL-23 |
-| F1 | pty-unix:409 | PR 10a2: the identity-only kill after a restart (§2.12; SD3) |
+| F1 | pty-unix:409 | `docs/design/supervisor-recovery.md` (`orphan::kill_recorded`, identity-only) |
 | F2 | pty-unix:417 | SD15; PR10a1-CL-11 (the emergency kill is `stop`) |
 | X5 | `state.rs:255-258` | §2.3 Stop; SD4, SD11; PR10a1-CL-12 |
 | A38 | formal-specs:192 | own guards: §7; PR10a1-CL-27 |
@@ -692,8 +696,8 @@ Tests named `supervisor::…` are daemon unit tests under `crates/daemon/src/sup
 
 | ID | Limit | Decided by | Why it does not defeat the purpose |
 |---|---|---|---|
-| L-1 | Until PR 10a2, a launch whose death is unconfirmed (after a crash, owned kills and a close that could not prove death, or an unresolved `StartedThenFailed`) keeps its thread from resume and close, and its worktree in use. | the owner decision (2026-11-25); §2.12 | history is intact and new threads spawn; the CLI says so (§2.2); the MVP is unreleased, and 10a2 lands before PR 15. |
-| L-2 | mvp P-18 is not met until PR 10a2: after a crash the new daemon neither signals nor checks old processes. | the rescope of crash recovery (§2.12); SD3 | on macOS the PTY hangup at the old daemon's exit ends most CLIs, and on Windows the job's kill-on-close ends the tree; the launch reads unconfirmed, so nothing relaunches on its session. |
+| L-1 | A launch whose death is unconfirmed (after a crash, owned kills and a close that could not prove death, or an unresolved `StartedThenFailed`) keeps its thread from resume and close, and its worktree in use, until the owner's assertion (`docs/design/supervisor-recovery.md` §2.5, L-9). | the owner decision (2026-11-25); §2.12 | history is intact and new threads spawn; the CLI names the preview and the assertion (§2.2). |
+| L-2 | After a crash the new daemon signals and checks only the recorded identities of old launches; processes without a recorded identity are mvp P-18's exception (`docs/design/supervisor-recovery.md` L-1, L-2, RD9). | the rescope of crash recovery (§2.12); SD3 | on macOS the PTY hangup at the old daemon's exit ends most CLIs, and on Windows the job's kill-on-close ends the tree; the evidence names the unchecked scope, and nothing unlocks without the owner's assertion. |
 | L-3 | A Codex positional prompt longer than Windows' command-line limit fails as `spawn_failed`. | `CreateProcessW` `lpCommandLine` (32,767 characters) | the input ends `rejected` with zero bytes written, visible to the owner; PR 14 can refuse earlier. |
 | L-4 | Until PR 13 and PR 14, a real CLI launched by 10a1 never binds: `session_start_timeout` appears and `resume` answers `no_session`. | SD14 | spawn, stop, close, restart, and their proofs work; binding and resume are tested with FakeCli `hooks`; real resume is PR 13/14's gate. |
 | L-5 | After `chaldea daemon stop`, a session whose close result was not received by `close_end` reads `daemon_restart` (or `unknown_after_crash` if it had not started) at the next start, and so falls under L-1. | SD10 | its history is intact; the stop's share is 2 s for every session, and the instance lock stays held while the daemon still holds it. |
@@ -738,7 +742,7 @@ What changes in `specs/thread_input.qnt` (in the implementation PR, with `pnpm r
 2. **New action `spawnStartedThenFailed(dc: bool)`** beside `spawnFail`: from `Starting`, `ExitedBy(ExitSpawnFailed)`, the positional input `sending → unconfirmed` through `LaunchExited`, `deathConfirmed = dc`. New trace `trace_spawn_started_then_failed` (both `dc`), extending `trace_positional_spawn_outcomes`.
 3. **Hole a**: no guard change. `reserve` already requires `st.deathConfirmed` (`thread_input.qnt:791-793`); 10a1 makes the reservation job enforce it (PR10a1-CL-3). `trace_hole_a_reserve_without_death` stays as the statement of what `reduce` alone admits, and `reservedOnlyAfterDeath` is the checked invariant.
 4. **Hole c**: no model change. `sessionTimer` and `stall` already require a live, current launch (`alive` includes a recorded start); 10a1's job-side guards implement them, including the committed start (PR10a1-CL-17). `trace_hole_c_stale_startup_cause` stays.
-5. **Unchanged and mapped**: `stop` requires `Running` (X5's hold is outside the model: the stop is applied after the outcome); `dispatch` requires the recheck's gate to be open, which a `stopping` launch closes: 10a1's seal implements that order (SD18); `restart` uses `UnknownAfterCrash` exactly for a `Starting` launch, which in Rust is "no pid recorded", and recovers inputs other than `unconfirmed`; `confirmDeath` has no 10a1 site (PR 10a2's owner assertion). The tracker is daemon ownership, outside the model.
+5. **Unchanged and mapped**: `stop` requires `Running` (X5's hold is outside the model: the stop is applied after the outcome); `dispatch` requires the recheck's gate to be open, which a `stopping` launch closes: 10a1's seal implements that order (SD18); `restart` uses `UnknownAfterCrash` exactly for a `Starting` launch, which in Rust is "no pid recorded", and recovers inputs other than `unconfirmed`; `confirmDeath`'s site is the `stop` intent with `assume_dead`, the owner's assertion (`docs/design/supervisor-recovery.md` §2.5). The tracker is daemon ownership, outside the model.
 
 **Guard-to-test table** (the daemon guards the core replay cannot see; reviewed with PR10a1-CL-27):
 
@@ -749,6 +753,7 @@ What changes in `specs/thread_input.qnt` (in the implementation PR, with `pnpm r
 | `sessionTimer`, `stall`: alive, current, unbound | tick and start jobs (§2.6) | PR10a1-CL-17 |
 | `stop`: `Running` | stop op steps 2, 3 (the `StopRequested` write, after the seal) and 5; participant job (§2.9 step 5) | PR10a1-CL-11, PR10a1-CL-12, PR10a1-CL-29, PR10a1-CL-33 |
 | `restart`: reason by start state; inputs but `unconfirmed` | `supervisor_launches` | PR10a1-CL-8, PR10a1-CL-14 |
+| `confirmDeath`: exited, unconfirmed | the `stop` intent with `assume_dead` (`docs/design/supervisor-recovery.md` §2.5) | PR10a2-CL-8 |
 
 formal-specs §3's owner column for holes a and c becomes "PR 10a1", and §6's PR 10 bullet points here (§8).
 

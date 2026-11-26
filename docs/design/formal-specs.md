@@ -198,7 +198,7 @@ The `specs` job of `ci.yml` (`ubuntu-latest`, mise pinned in `mise-action`) inst
 - **PR 10** makes the supervisor layer real, in three parts: each guard here is a checklist item, and a changed guard changes the spec and its traces in the same PR.
   - **10a1** (`docs/design/supervisor.md`) implements the launch guards and closes holes a and c in the job that decides them; its guard-to-test table (supervisor §7) maps each daemon guard the core replay cannot see to its test. `sessionTimer` is guarded by `not(st.gp.bound)` (`trace_session_timer_after_unbound_session_start`), and `spawnStartedThenFailed(dc)` models a spawn that started and then failed (`trace_spawn_started_then_failed`, extending `trace_positional_spawn_outcomes`).
   - **10b**, the send and ack half: its guard-to-test table (`docs/design/supervisor-send.md` §7) maps each daemon guard the core replay cannot see to its test, the hook fence among them.
-  - **10a2** owns `confirmDeath`'s site (the owner's confirmation of a launch 10a1 leaves unconfirmed).
+  - **10a2** (`docs/design/supervisor-recovery.md`) owns `confirmDeath`'s site: the `stop` intent with `assume_dead`, the owner's confirmation of a launch exited with death unconfirmed. No guard changes: the restart prober and `launch_evidence` change no state and stay outside the model. `trace_repeated_restart_then_assert` states that a second restart changes nothing the assertion depends on.
 - **PR 13–14** correlate card resolutions and card keys by `approval_id` (the card finding).
 - **PR 7, 8, 18** implement what Q-B states; §7.4 lists the obligations it hands them.
 - **PR 17**'s `stateright` model checks the Rust sync code; Q-B checks the contract it implements (§7.7).
