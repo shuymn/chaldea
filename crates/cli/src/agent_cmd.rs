@@ -421,6 +421,14 @@ const CLAUDE_COMMAND: &str = "Claude runs a prompt that starts with `!` as a she
 one that starts with `/` (after leading white space) as a slash command, so it is not sent; \
 type it through attach";
 
+/// The D16 explanation where the thread's agent is not known (`send`, `resume`): named for a
+/// Claude thread, printed when `text` is one Claude would run as a command.
+fn claude_command_hint(text: &str, err: &mut dyn Write) {
+    if claude_command_at(text).is_some() {
+        say(err, &format!("for a Claude thread: {CLAUDE_COMMAND}"));
+    }
+}
+
 fn admit_prompt(agent: Option<Agent>, prompt: Option<&str>, err: &mut dyn Write) -> bool {
     let Some(text) = prompt else {
         return true;
@@ -537,6 +545,13 @@ impl Client<'_> {
             Err(CommandEnd::Refused(_, Some(ErrorCode::DeathUnconfirmed))) => {
                 self.pinned_unconfirmed(cutoff, t, l, err)
             }
+            Err(e @ CommandEnd::Refused(_, Some(ErrorCode::PromptRejected))) => {
+                let code = not_done(e, err);
+                if let Some(p) = args.prompt.as_deref() {
+                    claude_command_hint(p, err);
+                }
+                code
+            }
             Err(e) => not_done(e, err),
         }
     }
@@ -629,9 +644,8 @@ impl Client<'_> {
                         .and_then(|v| v.as_str().map(str::to_owned))
                         .unwrap_or_default();
                     say(err, &format!("the prompt is refused: {reason}"));
-                    // The thread's agent is not known here: the explanation names Claude.
-                    if r == RejectReason::LossyText && claude_command_at(&args.text).is_some() {
-                        say(err, &format!("for a Claude thread: {CLAUDE_COMMAND}"));
+                    if r == RejectReason::LossyText {
+                        claude_command_hint(&args.text, err);
                     }
                     return ExitCode::Failed;
                 }

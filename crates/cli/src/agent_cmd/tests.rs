@@ -749,8 +749,8 @@ fn unconfirmed_text() {
 
 mod preview;
 
-/// C1 D16: a Claude first prompt refused as `lossy_text` is explained as a command Claude
-/// would run; another reason is not.
+/// C1 D16: a Claude first prompt refused as `lossy_text`, or a resume prompt the daemon
+/// refuses that Claude would run, is explained as a command Claude would run; another is not.
 #[test]
 fn claude_command_explained() {
     let mut err = Vec::new();
@@ -769,4 +769,20 @@ fn claude_command_explained() {
         &mut err
     ));
     assert!(!String::from_utf8(err).unwrap().contains("slash command"));
+    // `resume`: the daemon's `prompt_rejected` carries no reason, so the explanation is
+    // named for a Claude thread and printed only for a text Claude would run.
+    for (prompt, explained) in [(" /clear", true), ("a\u{1b}b", false)] {
+        let stub = Stub::start(vec![
+            ok(exited_l()),
+            Reply::Json(400, error("prompt_rejected")),
+        ]);
+        let (code, _, err) = run(&stub, |c, o, e| c.resume(T, Some(prompt.to_owned()), o, e));
+        assert_eq!(code, ExitCode::Failed, "{err}");
+        assert!(err.contains("prompt_rejected"), "{err}");
+        assert_eq!(
+            err.contains("for a Claude thread:") && err.contains("slash command"),
+            explained,
+            "{err}"
+        );
+    }
 }
