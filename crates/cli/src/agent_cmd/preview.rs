@@ -66,12 +66,11 @@ fn meaning(u: Unchecked) -> &'static str {
     }
 }
 
-/// What the backward scan kept of launch `L`, in seq order.
+/// What the backward scan kept of launch `L`, in seq order. The scan ends at its stop event
+/// or interrupted: every other way out of it names why.
 #[derive(Default)]
 struct Scan {
     events: Vec<EventEnvelope>,
-    /// The scan reached its stop event.
-    reached: bool,
     /// Why it was interrupted, if it was.
     interrupted: Option<String>,
 }
@@ -129,7 +128,7 @@ impl Client<'_> {
         let mut before = MAX_SAFE_INTEGER;
         let mut limit = FIRST_LIMIT;
         let mut epoch: Option<Epoch> = None;
-        loop {
+        'pages: loop {
             let resp = match self.page(cutoff, run, stream, before, limit) {
                 Ok(r) => r,
                 Err(End::TooLarge) if limit > 1 => {
@@ -206,12 +205,8 @@ impl Client<'_> {
                     scan.events.push(e);
                 }
                 if stop {
-                    scan.reached = true;
-                    break;
+                    break 'pages;
                 }
-            }
-            if scan.reached {
-                break;
             }
             if !has_more_before {
                 scan.interrupted = Some("the history ended before the launch's exit".into());
@@ -230,7 +225,7 @@ impl Client<'_> {
         out: &mut dyn Write,
         err: &mut dyn Write,
     ) -> ExitCode {
-        let cutoff = (self.now)() + PREVIEW_CUTOFF;
+        let cutoff = self.cutoff(PREVIEW_CUTOFF);
         // Step 1.
         let instance = match self.serving(cutoff) {
             Ok((_, i)) => i,
@@ -289,7 +284,7 @@ impl Client<'_> {
                     .get_or_insert_with(|| "the daemon could not be read again".into());
             }
         }
-        let complete = scan.reached && scan.interrupted.is_none();
+        let complete = scan.interrupted.is_none();
         let text = render(t, &l, reason, &instance, &scan, complete, unconfirmed);
         let _ = out.write_all(text.as_bytes());
         if complete {
