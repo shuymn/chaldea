@@ -123,6 +123,8 @@ pub enum Pause {
     KillTaskStart,
     /// A kill task after `close_by` returned, before the task returns (blocking).
     KillTaskEnd,
+    /// The kill task before it publishes a non-proving report to its slot (blocking).
+    KillReportPublish,
     /// Inside the close's drain step: before `close_by` (blocking).
     BeforeCloseBy,
     /// A `close --stop` after its stop, before the closing job.

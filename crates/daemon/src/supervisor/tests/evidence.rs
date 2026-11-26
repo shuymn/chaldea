@@ -253,10 +253,15 @@ async fn recorded_closes() {
 
 /// PR10a2-CL-7 `recorded`, a close not received by the cutoff: a stop whose first `kill_by`
 /// reported survivors and whose join the clock makes late records those survivors with
-/// `result_not_received`; a report published only after the cutoff is not kept.
+/// `result_not_received`; a report published only after the cutoff is not kept, a report
+/// whose publication the cutoff passed between its report and its slot write included.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recorded_late_close() {
-    for published_late in [false, true] {
+    for (hold_at, published_late) in [
+        (Pause::KillTaskEnd, false),
+        (Pause::KillTaskStart, true),
+        (Pause::KillReportPublish, true),
+    ] {
         let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
             c.kill_budget = Duration::from_secs(60);
         })
@@ -267,11 +272,7 @@ async fn recorded_late_close() {
         });
         let (t, l) = rig.spawn_codex(None).await;
         let leader = super::prober_leader(&rig, l);
-        let hold = if published_late {
-            rig.pauses.arm(Pause::KillTaskStart)
-        } else {
-            rig.pauses.arm(Pause::KillTaskEnd)
-        };
+        let hold = rig.pauses.arm(hold_at);
         let reply = super::support::http::spawn_send(
             &rig.srv,
             &rig.srv.command(
@@ -292,7 +293,7 @@ async fn recorded_late_close() {
         } else {
             json!([{ "pid": leader.pid, "start_time": leader.start_time, "observed": "unresolved" }])
         };
-        assert_eq!(p["identities"], want, "{published_late}");
+        assert_eq!(p["identities"], want, "{hold_at:?}");
         assert_eq!(
             p["unchecked"],
             json!(["tree_unproven", "result_not_received"])

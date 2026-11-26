@@ -838,8 +838,12 @@ fn kill_task(
         }
         if !r.tree_dead && !r.survivors.is_empty() {
             tracing::warn!(%launch, survivors = ?r.survivors, "kill left survivors");
-            let at = sup.now();
-            *super::lock(slot) = Some((r.clone(), at));
+            sup.pauses().blocking(Pause::KillReportPublish);
+            // The publication time is read while the slot is held, so a reader that finds the
+            // report finds it published at or before that time.
+            let report = r.clone();
+            let mut published = super::lock(slot);
+            *published = Some((report, sup.now()));
         }
         if !(r.is_busy() && sup.now() < kill_end) {
             break;
