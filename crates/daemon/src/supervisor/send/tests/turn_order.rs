@@ -54,7 +54,7 @@ async fn hold(rig: &SRig, live: &Live, hook: Hook, park: bool) -> Held {
     // The reply's handle is not awaited here: the request waits in its job's hold.
     let taken_in = async {
         let reply = spawn_send(&rig.srv, &req);
-        got.await.unwrap();
+        reached(got).await;
         Pending(reply)
     };
     let Pending(reply) = if park {
