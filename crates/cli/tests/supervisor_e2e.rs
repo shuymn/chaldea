@@ -42,6 +42,20 @@ fn main() {
             name: "left_running_exit",
             run: left_running_exit,
         },
+        Case {
+            name: "second_crash_before_probe",
+            run: second_crash_before_probe,
+        },
+        #[cfg(target_os = "macos")]
+        Case {
+            name: "unrecorded_member_after_crash",
+            run: unrecorded_member_after_crash,
+        },
+        #[cfg(windows)]
+        Case {
+            name: "a29_child_suspended",
+            run: a29_child_suspended,
+        },
     ]);
 }
 
@@ -495,4 +509,332 @@ fn left_running_exit() {
 
 fn uuid_v4() -> String {
     chaldea_core::ids::CommandId(uuid::Uuid::new_v4()).to_string()
+}
+
+/// The thread stream `t`'s envelopes.
+fn envelopes(port: u16, token: &str, t: &str) -> Vec<Value> {
+    let (status, body) = request_complete(
+        port,
+        "GET",
+        &format!("/api/events?stream_id=thread:{t}&limit=1000"),
+        token,
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    v["events"].as_array().unwrap().clone()
+}
+
+fn of_kind<'a>(events: &'a [Value], kind: &str) -> Vec<&'a Value> {
+    events.iter().filter(|e| e["kind"] == kind).collect()
+}
+
+/// A daemon held at `prober_start` on `gate`.
+fn held_at_probe(labels: &Labels, dir: &Path, args: &[&str], gate: &Gate) -> (Proc, u16) {
+    let (d, port) = daemon_with(
+        labels,
+        dir,
+        args,
+        &[
+            (SUPERVISOR_PAUSE, OsStr::new("prober_start")),
+            (SUPERVISOR_GATE, gate.path().as_os_str()),
+        ],
+    );
+    assert!(gate.reached(WAIT), "the prober reached prober_start");
+    (d, port)
+}
+
+/// PR10a2-CL-4 `second_crash_before_probe`: daemon 1 is killed with a live leader and a
+/// positional input `sent`; daemon 2 is killed at `prober_start` after its reconcilers
+/// committed; daemon 3's probe, once released, records the leader `gone` with the host's
+/// unchecked scope. No command is sent, death stays unconfirmed, daemon 1's events stay a
+/// prefix of the stream, and the one input change is the restart's `sent -> unconfirmed`.
+fn second_crash_before_probe() {
+    let labels = Labels::new();
+    let d = state();
+    let cwd = tempfile::tempdir().unwrap();
+    let report = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("127.0.0.1:{}", report.local_addr().unwrap().port());
+    let seen = hellos(report);
+    // macOS: a leader that survives the hangup of its terminal, so only the probe ends it.
+    #[cfg(unix)]
+    let (role, args) = (
+        "ignore-term",
+        [
+            "--mode",
+            "sleeper",
+            "--role",
+            "ignore-term",
+            "--report",
+            &addr,
+            "--max-life-secs",
+            "120",
+        ],
+    );
+    #[cfg(windows)]
+    let (role, args) = (
+        "plain",
+        [
+            "--mode",
+            "sleeper",
+            "--role",
+            "plain",
+            "--report",
+            &addr,
+            "--max-life-secs",
+            "120",
+        ],
+    );
+    let (mut d1, port) = daemon(&labels, &d.path, &args);
+    let token = chaldea_daemon::lifecycle::read_owner_token(&d.path).unwrap();
+    let (code, v, err) = agent(
+        &labels,
+        &d.path,
+        &[
+            "spawn",
+            "--agent",
+            "codex",
+            "--cwd",
+            &cwd.path().to_string_lossy(),
+            "--prompt",
+            "hello",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = v["thread_id"].as_str().unwrap().to_owned();
+    let before = envelopes(port, &token, &t);
+    let started = &of_kind(&before, "launch_started")[0]["payload"];
+    let leader = u32::try_from(started["pid"].as_u64().unwrap()).unwrap();
+    // Its hello: the leader's handlers are in place.
+    assert_eq!(
+        seen.recv_timeout(WAIT).expect("the leader's hello"),
+        (role.to_owned(), leader)
+    );
+    let start = started["start_time"].as_str().unwrap().to_owned();
+    assert!(
+        of_kind(&before, "input_state_changed")
+            .iter()
+            .any(|e| e["payload"]["to"] == "sent"),
+        "{before:?}"
+    );
+    d1.child.kill().unwrap();
+    let _ = d1.wait();
+    // Daemon 2: its reconcilers committed, killed before its probe.
+    let gate = Gate::new();
+    let (mut d2, _) = held_at_probe(&labels, &d.path, &args, &gate);
+    d2.child.kill().unwrap();
+    let _ = d2.wait();
+    gate.waiter_killed();
+    // Daemon 3: the leader is still live with its recorded start (macOS), then the probe.
+    let gate = Gate::new();
+    let (mut d3, port) = held_at_probe(&labels, &d.path, &args, &gate);
+    let instance = support::serving_record(&d.path).instance;
+    #[cfg(unix)]
+    match chaldea_pty_runtime::process::lookup(leader) {
+        chaldea_pty_runtime::process::Lookup::Live(e) => {
+            assert_eq!(e.identity.start_time, start);
+        }
+        other => panic!("the leader before the probe: {other:?}"),
+    }
+    gate.release();
+    let mut leader_at_probe = None;
+    assert!(
+        support::wait_for(|| {
+            if of_kind(&envelopes(port, &token, &t), "launch_evidence").is_empty() {
+                return false;
+            }
+            leader_at_probe = Some(chaldea_pty_runtime::process::lookup(leader));
+            true
+        }),
+        "the probe's evidence"
+    );
+    let after = envelopes(port, &token, &t);
+    assert_eq!(
+        leader_at_probe,
+        Some(chaldea_pty_runtime::process::Lookup::Gone)
+    );
+    assert_eq!(after[..before.len()], before[..], "an unchanged prefix");
+    let evidence = of_kind(&after, "launch_evidence");
+    assert_eq!(evidence.len(), 1, "{after:?}");
+    let scope = if cfg!(windows) {
+        "unrecorded_job_and_outside_job"
+    } else {
+        "unrecorded_session_members"
+    };
+    assert_eq!(
+        evidence[0]["payload"],
+        serde_json::json!({
+            "launch_id": started["launch_id"],
+            "source": "probe",
+            "identities": [{ "pid": leader, "start_time": start, "observed": "gone" }],
+            "unchecked": [scope],
+            "probe_run": instance,
+        })
+    );
+    let tail = &after[before.len()..];
+    let inputs = of_kind(tail, "input_state_changed");
+    assert_eq!(inputs.len(), 1, "{tail:?}");
+    assert_eq!(inputs[0]["payload"]["from"], "sent");
+    assert_eq!(inputs[0]["payload"]["to"], "unconfirmed");
+    assert!(of_kind(&after, "launch_death_confirmed").is_empty());
+    assert!(tail.iter().all(|e| e["command_id"].is_null()), "{tail:?}");
+    let (status, body) = request_complete(port, "GET", &format!("/api/threads/{t}"), &token, None);
+    assert_eq!(status, 200, "{body}");
+    let summary: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(summary["launch"]["exit_reason"], "daemon_restart");
+    assert_eq!(summary["launch"]["death_confirmed"], false);
+    assert_eq!(d3.stop_and_wait(&d.path), 0, "{}", d3.stderr());
+    #[cfg(unix)]
+    if !gone(leader) {
+        support::term(leader, rustix::process::Signal::KILL);
+    }
+}
+
+/// The documentation test of RD9's exception (`docs/design/supervisor-recovery.md` §6): a
+/// spawn-tree's `ignore-term` sleeper stays in the crashed launch's session with no recorded
+/// identity; the restart's probe names `unrecorded_session_members`. The sleeper's fate is
+/// printed, not asserted, and the test ends it.
+#[cfg(target_os = "macos")]
+fn unrecorded_member_after_crash() {
+    let labels = Labels::new();
+    let d = state();
+    let cwd = tempfile::tempdir().unwrap();
+    let report = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("127.0.0.1:{}", report.local_addr().unwrap().port());
+    let seen = hellos(report);
+    let args = [
+        "--mode",
+        "spawn-tree",
+        "--roles",
+        "ignore-term",
+        "--report",
+        &addr,
+        "--max-life-secs",
+        "120",
+    ];
+    let (mut d1, _) = daemon(&labels, &d.path, &args);
+    let t = spawn_codex(&labels, &d.path, cwd.path());
+    let sleeper = loop {
+        let (role, pid) = seen.recv_timeout(WAIT).expect("the sleeper's hello");
+        if role == "ignore-term" {
+            break pid;
+        }
+    };
+    d1.child.kill().unwrap();
+    let _ = d1.wait();
+    let (mut d2, port) = daemon(&labels, &d.path, &args);
+    let token = chaldea_daemon::lifecycle::read_owner_token(&d.path).unwrap();
+    let mut evidence = Value::Null;
+    assert!(
+        support::wait_for(|| {
+            let events = envelopes(port, &token, &t);
+            match of_kind(&events, "launch_evidence").first() {
+                Some(e) => {
+                    evidence = e["payload"].clone();
+                    true
+                }
+                None => false,
+            }
+        }),
+        "the probe's evidence"
+    );
+    assert_eq!(
+        evidence["unchecked"],
+        serde_json::json!(["unrecorded_session_members"])
+    );
+    eprintln!(
+        "the unrecorded sleeper {sleeper} after the probe: {:?}",
+        chaldea_pty_runtime::process::lookup(sleeper)
+    );
+    assert_eq!(d2.stop_and_wait(&d.path), 0, "{}", d2.stderr());
+    if !gone(sleeper) {
+        support::term(sleeper, rustix::process::Signal::KILL);
+    }
+    assert!(support::wait_for(|| gone(sleeper)));
+}
+
+/// PR10a2-CL-10 `a29_child_suspended` (Windows): the helper daemon runs inside a test job
+/// from its first instruction; its first spawn is held after the suspended create, before
+/// the assignment, and the helper is killed there. After a restart the launch is
+/// `unknown_after_crash`, and the child is still suspended in the test's job, which ends it.
+#[cfg(windows)]
+fn a29_child_suspended() {
+    use std::os::windows::process::CommandExt;
+
+    use chaldea_pty_runtime::fake::{self, TestJob};
+    use chaldea_pty_runtime::host::JobLimits;
+    use support::faults::A29_GATE;
+
+    /// `CREATE_SUSPENDED` (`winbase.h`).
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+    let labels = Labels::new();
+    let d = state();
+    let cwd = tempfile::tempdir().unwrap();
+    let args = ["--mode", "sleeper", "--max-life-secs", "120"];
+    let mut argv = vec![fake_cli().to_string_lossy().into_owned()];
+    argv.extend(args.iter().map(|a| (*a).to_owned()));
+    argv.push("--".to_owned());
+    let json = serde_json::to_string(&argv).unwrap();
+    let gate = Gate::new();
+    let job = TestJob::new(JobLimits {
+        kill_on_close: true,
+        breakaway_ok: false,
+        silent_breakaway_ok: false,
+    })
+    .unwrap();
+    let mut c = cmd(
+        &labels,
+        &d.path,
+        &["daemon", "run"],
+        &[
+            (AGENT_PROGRAM, OsStr::new(&json)),
+            (A29_GATE, gate.path().as_os_str()),
+        ],
+    );
+    c.creation_flags(CREATE_SUSPENDED);
+    let mut helper = Proc::spawn(&mut c);
+    job.assign(helper.pid()).unwrap();
+    assert!(job.contains(helper.pid()).unwrap());
+    assert!(fake::resume_process(helper.pid()).unwrap() >= 1);
+    let port = helper.serving();
+    let token = chaldea_daemon::lifecycle::read_owner_token(&d.path).unwrap();
+    let body = serde_json::json!({
+        "command_id": uuid_v4(),
+        "args": { "agent": "codex", "cwd": cwd.path().to_string_lossy() }
+    })
+    .to_string();
+    let request = format!(
+        "POST /api/commands/spawn HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut conn = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    std::io::Write::write_all(&mut conn, request.as_bytes()).unwrap();
+    assert!(gate.reached(WAIT), "the suspended create");
+    let child: u32 = std::fs::read_to_string(gate.path().join("pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    helper.child.kill().unwrap();
+    let _ = helper.wait();
+    gate.waiter_killed();
+    drop(conn);
+    let (mut d2, port) = daemon(&labels, &d.path, &args);
+    let (_, events) = thread_events(port, &token);
+    let exited = &events.iter().find(|(k, _)| k == "launch_exited").unwrap().1;
+    assert_eq!(exited["reason"], "unknown_after_crash");
+    assert_eq!(exited["death_confirmed"], false);
+    assert!(fake::suspend_count(child).unwrap() >= 1, "the child runs");
+    assert!(
+        job.contains(child).unwrap(),
+        "the child is in the test's job"
+    );
+    assert_eq!(d2.stop_and_wait(&d.path), 0, "{}", d2.stderr());
+    // Closing the kill-on-close job ends the child the test caused.
+    job.close();
+    assert!(support::wait_for(|| matches!(
+        chaldea_pty_runtime::process::lookup(child),
+        chaldea_pty_runtime::process::Lookup::Gone
+    )));
 }
