@@ -256,11 +256,14 @@ async fn socket_gone(srv: &TestServer, base: usize) {
 
 /// The idle deadline fires while a send and a read are both pending: the socket is dropped
 /// with neither released. The held send is a `stream_advanced` after `hello`, whose sent
-/// completion starts the idle period.
+/// completion starts the idle period. The idle period is long enough for the setup between
+/// inbound frames, and the send and read deadlines far longer still.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_deadlines_fire_during_a_pending_send_and_read() {
     let srv = TestServer::start_with(Mounts::mvp(), |c: &mut HttpConfig| {
-        c.ws.idle_timeout = Duration::from_millis(300);
+        c.ws.idle_timeout = Duration::from_secs(3);
+        c.ws.send_timeout = Duration::from_secs(60);
+        c.short_deadline = Duration::from_secs(60);
         c.ws.heads_interval = Duration::from_secs(600);
     })
     .await;
@@ -296,8 +299,8 @@ async fn control_deadlines_fire_during_a_pending_send_and_read() {
     let at = Instant::now();
     socket_gone(&srv, base).await;
     assert!(
-        at.elapsed() < Duration::from_secs(2),
-        "the idle deadline, not the read deadline"
+        at.elapsed() < Duration::from_secs(30),
+        "the idle deadline, not the read or send deadline"
     );
     srv.stop().await;
 }
