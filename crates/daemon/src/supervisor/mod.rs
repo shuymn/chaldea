@@ -160,8 +160,6 @@ pub enum Pause {
     ProbeQueued,
     /// A probe's start, under the tracker's mutex, before its start mark (blocking).
     ProbeStarting,
-    /// A probe's blocking task after `kill_recorded` returned (blocking).
-    ProbeTask,
     /// A VT snapshot's task before it copies the screen (blocking; unit tests only).
     #[cfg(test)]
     SnapshotCopy,

@@ -174,9 +174,10 @@ pub(crate) async fn run(sup: Arc<Supervisor>) -> Vec<JoinHandle<()>> {
                 s.pauses().blocking(Pause::ProbeStarting);
                 on_start.store(true, Ordering::SeqCst);
             })?;
-            let report = (s.cfg.kill_recorded)(std::slice::from_ref(&target), s.real(deadline));
-            s.pauses().blocking(Pause::ProbeTask);
-            Some(report)
+            Some((s.cfg.kill_recorded)(
+                std::slice::from_ref(&target),
+                s.real(deadline),
+            ))
         });
         // 3.5: a task of its own awaits the join and records the evidence.
         // The join's timer is set at dispatch, with the blocking task.
