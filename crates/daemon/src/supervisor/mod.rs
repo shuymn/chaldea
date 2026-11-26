@@ -307,7 +307,7 @@ pub(crate) struct Supervisor {
     /// The restart prober's concurrency slots (`PROBE_SLOTS`).
     pub(crate) probe_slots: Arc<tokio::sync::Semaphore>,
     /// Version probes killed at their deadline and not yet reaped (C1 D11).
-    pub(crate) version_left: Arc<version::VersionLeft>,
+    pub(crate) version_left: version::VersionLeft,
 }
 
 impl Supervisor {
@@ -353,6 +353,25 @@ impl Supervisor {
 
     pub(crate) fn remove(&self, launch: LaunchId) {
         self.live.lock().remove(&launch);
+    }
+}
+
+/// A store read on a blocking task, bounded by now + [`send::READ_WAIT`]; `None` when the read
+/// fails or is not in time.
+pub(crate) async fn read_bounded<R: Send + 'static>(
+    sup: &Supervisor,
+    f: impl FnOnce(&crate::store::ReadTx<'_>) -> Result<R, crate::store::StoreError> + Send + 'static,
+) -> Option<R> {
+    let deadline = sup.now() + send::READ_WAIT;
+    let store = sup.store.clone();
+    let real = sup.real(deadline);
+    let task = sup.rt.spawn_blocking(move || store.read(real, f));
+    match crate::deadline::settle_before(|| sup.now(), deadline, sup.timer(deadline), task)
+        .await
+        .in_time()
+    {
+        Some(Ok(Ok(v))) => Some(v),
+        _ => None,
     }
 }
 

@@ -201,20 +201,6 @@ async fn descendant_gone(rig: &Rig, pid: u32) {
     .await;
 }
 
-/// A child that does not exit gives `None` once the deadline passes (the clock moved to it),
-/// killed and reaped; before that, nothing returns.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn version_timeout() {
-    let rig = Rig::new().await;
-    let v = probed(&rig, &["--version-sleep-ms", "600000"], || {
-        rig.clock.advance(VERSION_PROBE);
-    })
-    .await;
-    assert_eq!(v, None);
-    nothing_left(&rig).await;
-    rig.srv.stop().await;
-}
-
 /// A child still running at the deadline, with a descendant, gives `None`, its whole tree
 /// killed: the deadline passes (the clock moved) once the descendant has started.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

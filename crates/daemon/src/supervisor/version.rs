@@ -52,13 +52,13 @@ impl VersionLeft {
 /// an unreaped child (its group id still its own), then the child, and moves the child with its
 /// token into [`VersionLeft`] when it cannot be reaped at once. Dropping the tree closes a
 /// Windows job, which kills what is left in it.
-struct Held {
-    left: Arc<VersionLeft>,
+struct Held<'a> {
+    left: &'a VersionLeft,
     child: Option<TrackedChild>,
     tree: Option<ProcessTree>,
 }
 
-impl Drop for Held {
+impl Drop for Held<'_> {
     fn drop(&mut self) {
         let Some(mut c) = self.child.take() else {
             return;
@@ -112,7 +112,7 @@ pub(crate) fn probe(sup: &Supervisor, argv: &[OsString], deadline: Instant) -> O
     // The command holds the child's handle to the file: drop it, so only the child keeps it.
     drop(cmd);
     let mut held = Held {
-        left: sup.version_left.clone(),
+        left: &sup.version_left,
         child: Some(child),
         tree: None,
     };

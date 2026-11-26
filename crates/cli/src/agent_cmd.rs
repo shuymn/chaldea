@@ -413,9 +413,6 @@ fn stop_exit(t: ThreadId, r: &StopResult, err: &mut dyn Write) -> ExitCode {
     }
 }
 
-/// The prompt checks the daemon makes first, so their reason can be printed: the size, and,
-/// when the agent is known, `check` in its first prompt's encoding (Codex's positional
-/// argument, Claude's queued input). A resumed thread's agent is the daemon's to check.
 /// Why Claude's `lossy_text` refuses a prompt (C1 D16).
 const CLAUDE_COMMAND: &str = "Claude runs a prompt that starts with `!` as a shell command and \
 one that starts with `/` (after leading white space) as a slash command, so it is not sent; \
@@ -437,6 +434,9 @@ fn claude_command_hint(text: &str, err: &mut dyn Write) {
     }
 }
 
+/// The prompt checks the daemon makes first, so their reason can be printed: the size, and,
+/// when the agent is known, `check` in its first prompt's encoding (Codex's positional
+/// argument, Claude's queued input). A resumed thread's agent is the daemon's to check.
 fn admit_prompt(agent: Option<Agent>, prompt: Option<&str>, err: &mut dyn Write) -> bool {
     let Some(text) = prompt else {
         return true;

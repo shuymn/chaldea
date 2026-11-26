@@ -24,8 +24,8 @@ use crate::hook::{
     AcceptedHook, BindingRule, HookAdapter, HookEvent, Interpretation, MvpHooks, TurnMark,
 };
 use crate::store::{
-    ApprovalRow, BlobInput, CountedClasses, EventAnnex, InputRow, LaunchRow, ReadTx, StoreError,
-    WriteBasis, prepare_content,
+    ApprovalRow, BlobInput, CountedClasses, EventAnnex, InputRow, LaunchRow, Prepared, ReadTx,
+    StoreError, WriteBasis, prepare_content,
 };
 
 /// What one hook says, as a decoder reads its payload.
@@ -478,10 +478,7 @@ impl HookAdapter for SupervisorHooks {
                 correlation,
             } => {
                 let approval_id = ApprovalId(hook.emit_id);
-                let input = serde_json::to_vec(&tool_input)
-                    .map_err(|e| StoreError::Decode(e.to_string()))?;
-                let prepared =
-                    prepare_content(input, "application/json").map_err(StoreError::Content)?;
+                let prepared = json_content(&tool_input)?;
                 ev.push_full(
                     "card",
                     TypedEvent::ApprovalRequested(ApprovalRequested {
@@ -573,4 +570,10 @@ impl HookAdapter for SupervisorHooks {
         }
         Ok((Interpretation::Events(events), mark))
     }
+}
+
+/// `v` as JSON content: inline, or a blob over the inline limit.
+pub(super) fn json_content(v: &serde_json::Value) -> Result<Prepared, StoreError> {
+    let bytes = serde_json::to_vec(v).map_err(|e| StoreError::Decode(e.to_string()))?;
+    prepare_content(bytes, "application/json").map_err(StoreError::Content)
 }

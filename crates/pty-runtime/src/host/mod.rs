@@ -1174,8 +1174,8 @@ pub fn adopt_tree(child: &std::process::Child) -> io::Result<ProcessTree> {
         use std::os::windows::io::AsHandle;
         let job = sys::create_job()?;
         sys::set_job_limit(&job, sys::KILL_ON_JOB_CLOSE)?;
-        sys::assign_borrowed(&job, child.as_handle())?;
-        if sys::resume_threads(child.id())? == 0 {
+        sys::assign(&job, &child.as_handle())?;
+        if sys::resume_process_threads(child.id())? == 0 {
             return Err(io::Error::other("no thread of the child to resume"));
         }
         Ok(ProcessTree { job })

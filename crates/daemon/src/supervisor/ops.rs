@@ -301,19 +301,10 @@ pub(crate) async fn launch_op(sup: Arc<Supervisor>, req: LaunchReq) -> EffectOut
 /// The thread's agent from a read bounded by 1 s; `None` when not read in time or absent
 /// (the reservation job decides the refusal).
 async fn thread_agent(sup: &Arc<Supervisor>, thread: ThreadId) -> Option<Agent> {
-    let deadline = sup.now() + Duration::from_secs(1);
-    let store = sup.store.clone();
-    let real = sup.real(deadline);
-    let read = sup
-        .rt
-        .spawn_blocking(move || store.read(real, |r| r.thread(thread)));
-    match settle_before(|| sup.now(), deadline, sup.timer(deadline), read)
+    super::read_bounded(sup, move |r| r.thread(thread))
         .await
-        .in_time()
-    {
-        Some(Ok(Ok(Some(t)))) => Some(t.agent),
-        _ => None,
-    }
+        .flatten()
+        .map(|t| t.agent)
 }
 
 fn launch_result(req: &LaunchReq, outcome: LaunchOutcome) -> EffectOutcome {

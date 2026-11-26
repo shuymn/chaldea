@@ -151,7 +151,7 @@ pub(crate) fn new_supervisor(
         rt: tokio::runtime::Handle::current(),
         instance,
         probe_slots: Arc::new(tokio::sync::Semaphore::new(super::PROBE_SLOTS)),
-        version_left: Arc::default(),
+        version_left: super::version::VersionLeft::default(),
     })
 }
 

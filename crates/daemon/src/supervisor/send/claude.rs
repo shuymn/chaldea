@@ -19,9 +19,9 @@ use chaldea_core::event::TypedEvent;
 use chaldea_core::payload::{ToolActivity, ToolPhase};
 use serde_json::Value;
 
-use super::hooks::{HookDecoder, HookFact};
+use super::hooks::{HookDecoder, HookFact, json_content};
 use crate::hook::{AcceptedHook, HookEvent};
-use crate::store::{ReadTx, StoreError, prepare_content};
+use crate::store::{ReadTx, StoreError};
 
 /// A tool call's activity, as a hook reports it.
 #[derive(Debug, Clone, PartialEq)]
@@ -153,23 +153,15 @@ impl ClaudeDecoder {
     }
 }
 
-/// `v` as JSON content.
-fn json_content(
-    v: &Value,
-) -> Result<(chaldea_core::payload::Content, Vec<crate::store::BlobInput>), StoreError> {
-    let bytes = serde_json::to_vec(v).map_err(|e| StoreError::Decode(e.to_string()))?;
-    let p = prepare_content(bytes, "application/json").map_err(StoreError::Content)?;
-    Ok((p.content, p.blob.into_iter().collect()))
-}
-
 /// The `tool_activity` event of `a`, named `tool_activity`.
 pub(crate) fn activity_event(a: Activity) -> Result<HookEvent, StoreError> {
-    let (input, mut blobs) = json_content(&a.input)?;
+    let input = json_content(&a.input)?;
+    let mut blobs: Vec<_> = input.blob.into_iter().collect();
     let output = match &a.output {
         Some(o) => {
-            let (c, b) = json_content(o)?;
-            blobs.extend(b);
-            Some(c)
+            let p = json_content(o)?;
+            blobs.extend(p.blob);
+            Some(p.content)
         }
         None => None,
     };
@@ -179,7 +171,7 @@ pub(crate) fn activity_event(a: Activity) -> Result<HookEvent, StoreError> {
             tool_name: a.tool_name,
             tool_use_id: a.tool_use_id,
             turn_ref: a.turn_ref,
-            input,
+            input: input.content,
             output,
         }),
         name: "tool_activity".into(),
