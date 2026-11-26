@@ -257,7 +257,12 @@ pub(crate) fn apply(p: &mut ProjectionTx<'_>, e: &StoredEvent) -> Result<(), Sto
         }
         TypedEvent::UserMessage(m) => {
             let thread = thread_of(e)?;
-            if let Some(launch) = env.launch_id {
+            // A superseded prompt (its job committed after a later turn boundary) keeps the
+            // launch's previous turn-start basis.
+            let superseded = matches!(e.annex()?, Some(EventAnnex::Prompt { superseded: true }));
+            if let Some(launch) = env.launch_id
+                && !superseded
+            {
                 p.exec_one(
                     "user_message",
                     "UPDATE proj_launches SET last_turn_start_seq = ?1 WHERE launch_id = ?2 AND thread_id = ?3",

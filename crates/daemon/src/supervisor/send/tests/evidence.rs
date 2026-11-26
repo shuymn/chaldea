@@ -24,7 +24,7 @@ pub(crate) fn evidences(rig: &SRig, live: &Live) -> Vec<String> {
         .collect()
 }
 
-fn count(rig: &SRig, live: &Live, kind: &str) -> usize {
+pub(super) fn count(rig: &SRig, live: &Live, kind: &str) -> usize {
     evidences(rig, live).iter().filter(|k| *k == kind).count()
 }
 
@@ -41,7 +41,7 @@ fn last_at(rig: &SRig, live: &Live) -> Instant {
 }
 
 /// Moves the stopped clock `by` forward and runs a pass.
-async fn advance(rig: &SRig, live: &Live, by: Duration) {
+pub(super) async fn advance(rig: &SRig, live: &Live, by: Duration) {
     rig.clock.advance(by);
     rig.pass(live).await;
 }
@@ -152,7 +152,7 @@ async fn evidence_kinds() {
 
 /// A Codex launch with `ready` asserted and the clock stopped: settles come only from
 /// [`advance`].
-async fn settle_rig() -> (SRig, Live) {
+pub(super) async fn settle_rig() -> (SRig, Live) {
     let rig = SRig::new().await;
     let live = rig.bound(Agent::Codex).await;
     rig.clock.stop();
@@ -697,32 +697,11 @@ async fn stop_after_outcome_unknown() {
 }
 
 /// PR10b-CL-4: the candidate needs the current turn's start to follow an end the daemon saw:
-/// out-of-order commits of a start and its `Stop` settle once both are in; a `ready` before
-/// `P1`'s `Stop` leaves `P2`'s turn unsettled until `ready` and `P3`; a second `Stop` on an
-/// `unknown` turn does not settle.
+/// a `ready` before `P1`'s `Stop` leaves `P2`'s turn unsettled until `ready` and `P3`; a
+/// second `Stop` on an `unknown` turn does not settle. Both commit orders of a start and its
+/// `Stop` are in `turn_order`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn settle_turn_order() {
-    // The start's job held while its `Stop` commits.
-    let (rig, live) = settle_rig().await;
-    let start_ord = rig.next_ordinal(&live);
-    let (got, release) = rig.ingest.points.arm_job(start_ord);
-    let start = rig.hook_of(&live, "UserPromptSubmit", &json!({ "prompt": "p" }));
-    let reply = crate::supervisor::tests::support::http::spawn_send(&rig.srv, &start.req(&rig.srv));
-    got.await.unwrap();
-    let stop = rig.hook_of(&live, "Stop", &json!({}));
-    let stop_reply =
-        crate::supervisor::tests::support::http::spawn_send(&rig.srv, &stop.req(&rig.srv));
-    rig.until("the stop was taken in", || {
-        rig.sl(&live).latest_intake.load(Ordering::SeqCst) == start_ord + 1
-    })
-    .await;
-    release.send(()).unwrap();
-    assert_eq!(reply.await.unwrap().status, 200);
-    assert_eq!(stop_reply.await.unwrap().status, 200);
-    advance(&rig, &live, SETTLE).await;
-    assert_eq!(count(&rig, &live, "stop_settled"), 1);
-    rig.stop().await;
-
     // `ready` before P1's `Stop`; P2 sent and acked; P1's `Stop`; P2's `Stop`.
     let (rig, live) = settle_rig().await;
     rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "P1" }))

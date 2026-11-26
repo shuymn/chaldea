@@ -11,7 +11,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// The persisted JSON is serde's externally tagged form:
 /// `{"readiness":{"launch_id":…,"position":42,"counted":["input","human","reply"]}}` or
-/// `{"transcript":"<continuity>"}`, or `{"hook":{"truncated":true}}`.
+/// `{"transcript":"<continuity>"}`, `{"hook":{"truncated":true}}`, or
+/// `{"prompt":{"superseded":true}}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum EventAnnex {
@@ -22,6 +23,10 @@ pub enum EventAnnex {
     /// Only on a hook's `raw_unknown`: `truncated` marks a body the emitter cut at 4 MiB,
     /// whose `raw` is that prefix (`docs/design/hook-ingest.md` §8 D5).
     Hook { truncated: bool },
+    /// Only on a hook's `user_message`: `superseded` marks a prompt whose job committed
+    /// after a later turn boundary of its launch, so it does not move the launch's turn-start
+    /// basis (`docs/design/supervisor-send.md` §2.4).
+    Prompt { superseded: bool },
 }
 
 /// The PTY writer's basis captured at the readiness evidence's intake: `position` is

@@ -287,6 +287,9 @@ pub(crate) struct SendLaunch {
     pub positional: Option<InputId>,
     pub fence: Arc<AtomicU64>,
     pub latest_intake: AtomicU64,
+    /// The highest receipt ordinal among the launch's committed turn boundaries (§2.4),
+    /// raised only by the store writer after a delivery job's `COMMIT`.
+    pub turn_watermark: Arc<AtomicU64>,
     /// Mirrors `state.running.is_some()` for jobs on the store writer.
     pub running_flag: AtomicBool,
     /// Mirrors `state.human_unsettled` for jobs on the store writer.
@@ -316,6 +319,7 @@ impl SendLaunch {
             positional: e.positional,
             fence: Arc::new(AtomicU64::new(0)),
             latest_intake: AtomicU64::new(0),
+            turn_watermark: Arc::new(AtomicU64::new(0)),
             running_flag: AtomicBool::new(false),
             human_flag: AtomicU32::new(0),
             state: Mutex::new(SendState::default()),
@@ -418,8 +422,9 @@ impl SendLaunch {
 
 /// The send side's shared parts: the launches, the decoder, and the driver's channel.
 pub(crate) struct SendSide {
-    /// Readers (the intake probe, commands, the driver) never wait on each other; a writer
-    /// holds it only for one insert or remove.
+    /// Readers (the intake probe, commands, the driver, and hook jobs on the store writer)
+    /// never wait on each other; a writer holds it only for one insert or remove. Nothing
+    /// holding it waits on the store writer.
     pub map: RwLock<HashMap<LaunchId, Arc<SendLaunch>>>,
     pub decoder: Arc<dyn HookDecoder>,
     /// The readiness mode of every row, when a test sets one.

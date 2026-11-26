@@ -12,7 +12,7 @@ pub(crate) const APPLICATION_ID: i32 = 0x4348_4C44;
 /// How `project::apply` interprets events on the current DDL. A change of interpretation
 /// without a DDL change bumps it; `open` then rebuilds the projections, and a process with
 /// another value refuses to write (§2.2 step 4).
-pub(crate) const PROJECTION_VERSION: u32 = 2;
+pub(crate) const PROJECTION_VERSION: u32 = 3;
 
 /// Ordered migration scripts; `MIGRATIONS[i]` brings `user_version` from `i` to `i + 1`.
 /// Any physical DDL change, projection tables included, is a new migration.

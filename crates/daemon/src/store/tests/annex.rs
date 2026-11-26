@@ -2,7 +2,7 @@
 
 use crate::store::{Continuity, CountedClass, CountedClasses, EventAnnex, WriteBasis};
 
-/// Both variants serialize to exactly the JSON of §2.6 and read back.
+/// Every variant serializes to exactly the JSON of §2.6 and reads back.
 #[test]
 fn golden_json() {
     let readiness = EventAnnex::Readiness(WriteBasis {
@@ -26,6 +26,10 @@ fn golden_json() {
     let json = r#"{"hook":{"truncated":true}}"#;
     assert_eq!(serde_json::to_string(&hook).unwrap(), json);
     assert_eq!(serde_json::from_str::<EventAnnex>(json).unwrap(), hook);
+    let prompt = EventAnnex::Prompt { superseded: true };
+    let json = r#"{"prompt":{"superseded":true}}"#;
+    assert_eq!(serde_json::to_string(&prompt).unwrap(), json);
+    assert_eq!(serde_json::from_str::<EventAnnex>(json).unwrap(), prompt);
 }
 
 /// The hook annex is accepted only on a `raw_unknown` whose source kind is `hook`.
@@ -67,6 +71,63 @@ fn hook_annex_only_on_a_hook_raw_unknown() {
     other.source = source(SourceKind::Hook);
     other.annex = Some(EventAnnex::Hook { truncated: false });
     unexpected(s.append(vec![other]), "another kind");
+}
+
+/// The prompt annex is accepted only on a `user_message` whose source kind is `hook`.
+#[test]
+fn prompt_annex_only_on_a_hook_user_message() {
+    use chaldea_core::ids::StreamId;
+    use chaldea_core::payload::{Content, Encoding, SourceKind, UserMessage};
+
+    use super::support::{TestStore, event, raw_unknown, registered, source, thread};
+    use chaldea_core::event::TypedEvent;
+
+    use crate::store::{AnnexError, StoreError, WriteError};
+
+    let s = TestStore::new();
+    let t = thread(1);
+    s.append(vec![registered(t, false)]).unwrap();
+    let message = |key: &str, kind: SourceKind| {
+        let mut e = event(
+            StreamId::Thread(t),
+            key,
+            TypedEvent::UserMessage(UserMessage {
+                prompt: Content::text("p".to_owned()),
+                input_id: None,
+            }),
+        );
+        e.source = source(kind);
+        e.annex = Some(EventAnnex::Prompt { superseded: true });
+        e
+    };
+    s.append(vec![message("hook:1", SourceKind::Hook)])
+        .expect("a hook user_message takes the annex");
+    let unexpected = |r: Result<_, WriteError>, what: &str| {
+        assert!(
+            matches!(
+                r,
+                Err(WriteError::RolledBack(StoreError::Annex(
+                    AnnexError::Unexpected(_)
+                )))
+            ),
+            "{what}: {r:?}"
+        );
+    };
+    unexpected(
+        s.append(vec![message("daemon:1", SourceKind::Daemon)]),
+        "a daemon-sourced user_message",
+    );
+    let mut raw = raw_unknown(
+        StreamId::Thread(t),
+        "hook:2",
+        Content::Inline {
+            inline: "x".into(),
+            encoding: Encoding::Utf8,
+        },
+    );
+    raw.source = source(SourceKind::Hook);
+    raw.annex = Some(EventAnnex::Prompt { superseded: true });
+    unexpected(s.append(vec![raw]), "a hook raw_unknown");
 }
 
 /// A counted set has one spelling: the fixed order, no repeats, known classes only.
