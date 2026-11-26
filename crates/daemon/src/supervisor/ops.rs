@@ -836,16 +836,16 @@ fn kill_task(
             let _ = tx.send(r);
             break;
         }
+        let busy = r.is_busy();
         if !r.tree_dead && !r.survivors.is_empty() {
             tracing::warn!(%launch, survivors = ?r.survivors, "kill left survivors");
             sup.pauses().blocking(Pause::KillReportPublish);
             // The publication time is read while the slot is held, so a reader that finds the
             // report finds it published at or before that time.
-            let report = r.clone();
             let mut published = super::lock(slot);
-            *published = Some((report, sup.now()));
+            *published = Some((r, sup.now()));
         }
-        if !(r.is_busy() && sup.now() < kill_end) {
+        if !(busy && sup.now() < kill_end) {
             break;
         }
     }
@@ -916,8 +916,7 @@ pub(crate) async fn await_kill(sup: &Supervisor, k: KillTask) -> Proof {
             CloseReceipt::NotReceived(
                 slot.try_lock()
                     .ok()
-                    .and_then(|g| g.clone())
-                    .filter(|(_, at)| *at < cutoff)
+                    .and_then(|mut g| g.take_if(|(_, at)| *at < cutoff))
                     .map(|(r, _)| r),
             )
         }
