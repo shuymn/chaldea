@@ -462,10 +462,12 @@ fn preview_bound_to_one_run() {
     for switch in [2, 4, 6] {
         let calls = AtomicUsize::new(0);
         let discover = || {
-            if calls.fetch_add(1, Ordering::SeqCst) < switch {
-                Ok(Found::Port(port, RUN.to_owned()))
-            } else {
+            // Only the re-check after the response is not able to tell: an attempt that
+            // finds no daemon serving before it sends would retry until the cutoff.
+            if calls.fetch_add(1, Ordering::SeqCst) == switch {
                 Ok(Found::NotYet)
+            } else {
+                Ok(Found::Port(port, RUN.to_owned()))
             }
         };
         let (code, out, err) = run_with(&stub, &discover, |c, o, e| c.preview(T, o, e));
