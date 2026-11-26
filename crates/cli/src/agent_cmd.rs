@@ -16,9 +16,9 @@ use chaldea_core::command::{
 };
 use chaldea_core::http::{ErrorBody, ErrorCode};
 use chaldea_core::ids::{Agent, ApprovalId, CommandId, InputId, LaunchId, ThreadId};
-use chaldea_core::input::MAX_PROMPT_BYTES;
-use chaldea_core::input::encode::{Purpose, check};
+use chaldea_core::input::encode::{Purpose, check, claude_command_at};
 use chaldea_core::input::key::KeyToken;
+use chaldea_core::input::{MAX_PROMPT_BYTES, RejectReason};
 use chaldea_core::payload::{ExitReason, InputEncoding};
 use chaldea_core::state::{ProcessState, TurnState};
 use chaldea_core::sync::ThreadSummary;
@@ -416,6 +416,11 @@ fn stop_exit(t: ThreadId, r: &StopResult, err: &mut dyn Write) -> ExitCode {
 /// The prompt checks the daemon makes first, so their reason can be printed: the size, and,
 /// when the agent is known, `check` in its first prompt's encoding (Codex's positional
 /// argument, Claude's queued input). A resumed thread's agent is the daemon's to check.
+/// Why Claude's `lossy_text` refuses a prompt (C1 D16).
+const CLAUDE_COMMAND: &str = "Claude runs a prompt that starts with `!` as a shell command and \
+one that starts with `/` (after leading white space) as a slash command, so it is not sent; \
+type it through attach";
+
 fn admit_prompt(agent: Option<Agent>, prompt: Option<&str>, err: &mut dyn Write) -> bool {
     let Some(text) = prompt else {
         return true;
@@ -441,6 +446,9 @@ fn admit_prompt(agent: Option<Agent>, prompt: Option<&str>, err: &mut dyn Write)
             .unwrap_or_default();
         let at = r.at.map(|a| format!(" at byte {a}")).unwrap_or_default();
         say(err, &format!("the prompt is refused: {reason}{at}"));
+        if a == Agent::Claude && r.reason == RejectReason::LossyText {
+            say(err, CLAUDE_COMMAND);
+        }
         return false;
     }
     true
@@ -621,6 +629,10 @@ impl Client<'_> {
                         .and_then(|v| v.as_str().map(str::to_owned))
                         .unwrap_or_default();
                     say(err, &format!("the prompt is refused: {reason}"));
+                    // The thread's agent is not known here: the explanation names Claude.
+                    if r == RejectReason::LossyText && claude_command_at(&args.text).is_some() {
+                        say(err, &format!("for a Claude thread: {CLAUDE_COMMAND}"));
+                    }
                     return ExitCode::Failed;
                 }
                 ExitCode::Ok

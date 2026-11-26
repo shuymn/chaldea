@@ -133,10 +133,13 @@ fn check_path(p: Path, purpose: Purpose, t: &str) -> Result<(), Rejection> {
     if empty {
         return reject(RejectReason::EmptyPrompt, None);
     }
-    // 4. Claude runs a prompt starting with `!` as a shell command and one starting with `/`
-    // as a slash command (C1 D16).
-    if p == Path::ClaudePaste && purpose == Purpose::Send && t.starts_with(['!', '/']) {
-        return reject(RejectReason::LossyText, Some(0));
+    // 4. Claude runs a prompt as a shell command when its first scalar, DEL and C1 aside, is
+    // `!`, and as a slash command when it starts with `/` after Claude's trim (C1 D16).
+    if p == Path::ClaudePaste
+        && purpose == Purpose::Send
+        && let Some(at) = claude_command_at(t)
+    {
+        return reject(RejectReason::LossyText, Some(at));
     }
     if p == Path::WinKeys {
         // 5. Codex on Windows trims both ends.
@@ -242,9 +245,33 @@ pub fn prompt_matches(agent: Agent, encoding: InputEncoding, text: &str, recorde
 
 /// `t` without the scalars Claude drops from a pasted prompt: DEL and the C1 controls.
 fn claude_kept(t: &str) -> String {
-    t.chars()
-        .filter(|c| !matches!(u32::from(*c), 0x7F..=0x9F))
-        .collect()
+    t.chars().filter(|&c| !is_del_or_c1(c)).collect()
+}
+
+fn is_del_or_c1(c: char) -> bool {
+    matches!(u32::from(c), 0x7F..=0x9F)
+}
+
+/// Where in `t` Claude 2.1.331 would see a command, DEL and C1 aside (C1 D16): a `!` as the
+/// first scalar (its bash mode tests the paste untrimmed), or a `/` as the first scalar that
+/// JavaScript's `trim` keeps (it trims the prompt before looking up a slash command).
+/// JavaScript's white space is Unicode `White_Space` without U+0085 (a C1 control, dropped
+/// here) and with U+FEFF. A Claude `send` of such a text is `LossyText` at this offset.
+#[must_use]
+pub fn claude_command_at(t: &str) -> Option<usize> {
+    let mut kept = t.char_indices().filter(|&(_, c)| !is_del_or_c1(c));
+    match kept.next()? {
+        (at, '!' | '/') => Some(at),
+        (_, c) if !is_js_space(c) => None,
+        _ => match kept.find(|&(_, c)| !is_js_space(c))? {
+            (at, '/') => Some(at),
+            _ => None,
+        },
+    }
+}
+
+fn is_js_space(c: char) -> bool {
+    c.is_whitespace() || c == '\u{feff}'
 }
 
 /// Claude's large-paste wrapper, exactly
@@ -741,29 +768,60 @@ mod tests {
         }
     }
 
-    /// C1 D16: a Claude `send` starting with `!` or `/` is refused before any write; an attach
-    /// paste, another first character, and Codex keep them.
+    /// C1 D16: a Claude `send` is refused where Claude 2.1.331 would see a command: `!` as the
+    /// first scalar other than DEL and C1 (bash mode tests the paste untrimmed, so ` !ls` is a
+    /// prompt), `/` as the first scalar JavaScript's `trim` keeps. An attach paste, another
+    /// character, and Codex keep them.
     #[test]
     fn claude_command_prefix_rejected() {
+        let refused = [
+            ("!ls", 0),
+            ("/review", 0),
+            ("/", 0),
+            ("!", 0),
+            (" /clear", 1),
+            ("\n/clear", 1),
+            ("\r\n\t/clear", 3),
+            ("\u{3000}/clear", 3),
+            ("\u{feff}/clear", 3),
+            ("\u{7f}/review", 1),
+            ("\u{85}/review", 2),
+            ("\u{7f}!ls", 1),
+            ("\u{80} \u{9f}/x", 5),
+            ("/日本語", 0),
+        ];
         for os in [HostOs::Macos, HostOs::Windows] {
-            for t in ["!ls", "/review", "/", "!"] {
+            for (t, at) in refused {
                 assert_eq!(
                     encode(Agent::Claude, os, t, Purpose::Send).err(),
                     Some(Rejection {
                         reason: RejectReason::LossyText,
-                        at: Some(0)
+                        at: Some(at)
                     }),
                     "{t:?}"
                 );
                 assert!(encode(Agent::Claude, os, t, Purpose::AttachPaste).is_ok());
-                assert!(encode(Agent::Codex, HostOs::Macos, t, Purpose::Send).is_ok());
+                // Codex refuses DEL and C1 on its own (rule 2).
+                if !t.chars().any(is_del_or_c1) {
+                    assert!(encode(Agent::Codex, HostOs::Macos, t, Purpose::Send).is_ok());
+                }
             }
-            for t in [" /review", "\n!ls", "a /b", "#zz", "?x"] {
+            for t in [
+                " !ls",
+                "\n!ls",
+                "a /b",
+                "#zz",
+                "?x",
+                "日本語の文 /x",
+                "\u{ff0f}review",
+                "\u{ff01}ls",
+                "\u{200b}/x",
+            ] {
                 assert!(encode(Agent::Claude, os, t, Purpose::Send).is_ok(), "{t:?}");
             }
         }
         assert_eq!(
-            expected_prompt(Agent::Claude, BracketedPaste, "/review"),
+            expected_prompt(Agent::Claude, BracketedPaste, " /clear"),
             None
         );
     }

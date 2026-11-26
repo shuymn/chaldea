@@ -748,3 +748,25 @@ fn unconfirmed_text() {
 }
 
 mod preview;
+
+/// C1 D16: a Claude first prompt refused as `lossy_text` is explained as a command Claude
+/// would run; another reason is not.
+#[test]
+fn claude_command_explained() {
+    let mut err = Vec::new();
+    assert!(!super::admit_prompt(
+        Some(chaldea_core::ids::Agent::Claude),
+        Some(" /clear"),
+        &mut err
+    ));
+    let text = String::from_utf8(err).unwrap();
+    assert!(text.contains("lossy_text at byte 1"), "{text}");
+    assert!(text.contains("slash command"), "{text}");
+    let mut err = Vec::new();
+    assert!(!super::admit_prompt(
+        Some(chaldea_core::ids::Agent::Claude),
+        Some("a\u{1b}b"),
+        &mut err
+    ));
+    assert!(!String::from_utf8(err).unwrap().contains("slash command"));
+}

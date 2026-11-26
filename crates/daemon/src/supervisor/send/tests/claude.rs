@@ -495,13 +495,14 @@ async fn corpus_prompts_ack() {
     rig.stop().await;
 }
 
-/// C1 D16: the two captured prompts Claude ran as commands (README "Prompt corpus") are
-/// refused at `send` (`rejected`, `lossy_text`) with zero bytes written.
+/// C1 D16: the two captured prompts Claude ran as commands (README "Prompt corpus"), and a
+/// slash command after a space, which Claude trims, are refused at `send` (`rejected`,
+/// `lossy_text`) with zero bytes written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn command_prefix_refused() {
     let rig = claude_rig().await;
     let live = bound(&rig).await;
-    for text in ["!echo corpus", "/zzexample corpus"] {
+    for text in ["!echo corpus", "/zzexample corpus", " /clear"] {
         let r = rig.send_text(&live, text).await;
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
         let v: Value = serde_json::from_slice(&r.body).unwrap();
