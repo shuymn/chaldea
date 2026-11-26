@@ -511,7 +511,10 @@ pub(crate) async fn events_socket(s: UpgradedSocket) {
 
     let mut st = SocketState::default();
     let mut read: Option<InFlightRead> = None;
-    let mut idle_at = tokio::time::Instant::now() + wcfg.idle_timeout;
+    // The idle period starts once `hello`'s send completed (until then its send deadline
+    // bounds the socket), and every inbound frame restarts it.
+    let mut hello_pending = matches!(out, Out::Sending(..));
+    let mut idle_at = (!hello_pending).then(|| tokio::time::Instant::now() + wcfg.idle_timeout);
     let mut next_heads_at = tokio::time::Instant::now() + wcfg.heads_interval;
     loop {
         if read.is_none()
@@ -548,7 +551,7 @@ pub(crate) async fn events_socket(s: UpgradedSocket) {
             () = shutdown.wait() => Ev::Shutdown,
             () = pending_opt(send_deadline.map(socket_timer)) => Ev::Dropped,
             () = pending_opt(read_timer.map(socket_timer)) => Ev::Dropped,
-            () = socket_timer(idle_at) => Ev::Dropped,
+            () = pending_opt(idle_at.map(socket_timer)) => Ev::Dropped,
             _ = nudge.changed() => Ev::Nudge,
             () = socket_timer(next_heads_at) => Ev::Tick,
             j = pending_opt(read.as_mut().map(|r| &mut r.handle)) => Ev::Read(j),
@@ -586,11 +589,15 @@ pub(crate) async fn events_socket(s: UpgradedSocket) {
                 if r.is_err() {
                     return;
                 }
+                if hello_pending {
+                    hello_pending = false;
+                    idle_at = Some(tokio::time::Instant::now() + wcfg.idle_timeout);
+                }
                 out = Out::Free(sink);
                 continue;
             }
             Ev::Inbound(m) => {
-                idle_at = tokio::time::Instant::now() + wcfg.idle_timeout;
+                idle_at = Some(tokio::time::Instant::now() + wcfg.idle_timeout);
                 match m {
                     Some(Ok(Message::Text(t))) => {
                         match parse_subscribe(t.as_str(), wcfg.max_subscriptions) {

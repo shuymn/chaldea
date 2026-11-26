@@ -255,9 +255,58 @@ async fn socket_gone(srv: &TestServer, base: usize) {
 }
 
 /// The idle deadline fires while a send and a read are both pending: the socket is dropped
-/// with neither released.
+/// with neither released. The held send is a `stream_advanced` after `hello`, whose sent
+/// completion starts the idle period.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_deadlines_fire_during_a_pending_send_and_read() {
+    let srv = TestServer::start_with(Mounts::mvp(), |c: &mut HttpConfig| {
+        c.ws.idle_timeout = Duration::from_millis(300);
+        c.ws.heads_interval = Duration::from_secs(600);
+    })
+    .await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let t = ThreadId::from_u128(0x7002);
+    srv.append(vec![registered(t, false)]).await;
+    let stream = StreamId::Thread(t);
+    let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
+    let s = shared(&srv);
+    let base = srv.server.tasks();
+    let mut ws = srv.ws_with(&ticket).await.expect("a 101");
+    assert!(matches!(
+        ws.next().await,
+        Some(WsServerMessage::Hello { .. })
+    ));
+    ws.subscribe(&[stream]).await;
+    let old = srv.store.read(move |tx| tx.head(stream, 0)).head_seq;
+    assert_eq!(
+        ws.next().await,
+        Some(WsServerMessage::Heads {
+            heads: vec![e(stream, old)]
+        })
+    );
+    // A `stream_advanced` send held at the gate.
+    let (reached, _send_held) = s.faults.arm_socket_send_gate();
+    srv.append(vec![raw_unknown(stream, "advance", Content::text("x"))])
+        .await;
+    wait("the send reached the gate", reached).await;
+    // A subscribe's read held.
+    let (read_entered, _read_held) = hold_next_read(&srv);
+    ws.subscribe(&[stream]).await;
+    entered(&read_entered).await;
+    let at = Instant::now();
+    socket_gone(&srv, base).await;
+    assert!(
+        at.elapsed() < Duration::from_secs(2),
+        "the idle deadline, not the read deadline"
+    );
+    srv.stop().await;
+}
+
+/// No idle deadline runs while `hello`'s send is pending: a socket whose `hello` is held
+/// past `idle_timeout` stays until the send is released, then is dropped by the idle
+/// deadline counted from that send.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_period_starts_after_hello() {
     let srv = TestServer::start_with(Mounts::mvp(), |c: &mut HttpConfig| {
         c.ws.idle_timeout = Duration::from_millis(300);
         c.ws.heads_interval = Duration::from_secs(600);
@@ -267,20 +316,23 @@ async fn control_deadlines_fire_during_a_pending_send_and_read() {
     let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
     let s = shared(&srv);
     let base = srv.server.tasks();
-    // `hello`'s send held at the gate, after the startup read.
-    let (reached, _send_held) = s.faults.arm_socket_send_gate();
+    let (reached, held) = s.faults.arm_socket_send_gate();
     let mut ws = srv.ws_with(&ticket).await.expect("a 101");
-    wait("the send reached the gate", reached).await;
-    // A subscribe's read held.
-    let (read_entered, _read_held) = hold_next_read(&srv);
-    ws.subscribe(&[A]).await;
-    entered(&read_entered).await;
-    let at = Instant::now();
-    socket_gone(&srv, base).await;
-    assert!(
-        at.elapsed() < Duration::from_secs(2),
-        "the idle deadline, not the read deadline"
+    wait("hello is held", reached).await;
+    // Three idle periods with `hello` held: the socket stays.
+    waits::pause(Duration::from_millis(900)).await;
+    assert_eq!(s.sockets.held(), 1, "no idle deadline before hello is sent");
+    held.send(()).unwrap();
+    assert!(matches!(
+        ws.next().await,
+        Some(WsServerMessage::Hello { .. })
+    ));
+    assert_eq!(
+        (ws.next().await, ws.closed),
+        (None, Some(None)),
+        "dropped by the idle deadline, no close frame"
     );
+    socket_gone(&srv, base).await;
     srv.stop().await;
 }
 
