@@ -68,12 +68,7 @@ pub fn kill_recorded(identities: &[ProcessIdentity], deadline: Instant) -> Orpha
         // No native backend: nothing is read or signalled.
         let me = std::process::id();
         let (fates, _) = prepare(identities, |id| accept(id, me, 0, u32::MAX));
-        OrphanReport {
-            fates: fates
-                .into_iter()
-                .map(|(id, f)| (id, f.unwrap_or(Fate::NotRead)))
-                .collect(),
-        }
+        OrphanReport { fates }
     }
 }
 
@@ -86,8 +81,9 @@ fn accept(id: &ProcessIdentity, me: u32, reserved: u32, max_pid: u32) -> Option<
     id.start_time.parse::<u64>().ok()
 }
 
-/// The identities in input order without repeats, each `Some(Invalid)` when `valid` refuses
-/// it; and the indices of the valid ones with their parsed start.
+/// The identities in input order without repeats, each `Invalid` when `valid` refuses it and
+/// `NotRead` until observed otherwise; and the indices of the valid ones with their parsed
+/// start.
 #[allow(
     clippy::type_complexity,
     reason = "a local pair: the report's rows and the work list"
@@ -95,8 +91,8 @@ fn accept(id: &ProcessIdentity, me: u32, reserved: u32, max_pid: u32) -> Option<
 fn prepare(
     identities: &[ProcessIdentity],
     valid: impl Fn(&ProcessIdentity) -> Option<u64>,
-) -> (Vec<(ProcessIdentity, Option<Fate>)>, Vec<(usize, u32, u64)>) {
-    let mut rows: Vec<(ProcessIdentity, Option<Fate>)> = Vec::new();
+) -> (Vec<(ProcessIdentity, Fate)>, Vec<(usize, u32, u64)>) {
+    let mut rows: Vec<(ProcessIdentity, Fate)> = Vec::new();
     let mut work = Vec::new();
     for id in identities {
         if rows.iter().any(|(r, _)| r == id) {
@@ -105,9 +101,9 @@ fn prepare(
         match valid(id) {
             Some(start) => {
                 work.push((rows.len(), id.pid, start));
-                rows.push((id.clone(), None));
+                rows.push((id.clone(), Fate::NotRead));
             }
-            None => rows.push((id.clone(), Some(Fate::Invalid))),
+            None => rows.push((id.clone(), Fate::Invalid)),
         }
     }
     (rows, work)
@@ -164,21 +160,19 @@ pub(crate) mod unix {
         }
     }
 
-    /// The last read of an unresolved identity.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Last {
-        None,
-        /// Live with the recorded start.
-        Live,
-        Refused,
-    }
-
     struct Target {
         row: usize,
         pid: u32,
         start: u64,
-        resolved: Option<Fate>,
-        last: Last,
+        /// What the last read showed: `NotRead` before any, `Alive` (the recorded start
+        /// live) or `Unreadable` while unresolved, `Gone` or `Replaced` once resolved.
+        fate: Fate,
+    }
+
+    impl Target {
+        fn resolved(&self) -> bool {
+            matches!(self.fate, Fate::Gone | Fate::Replaced)
+        }
     }
 
     struct Loop<'a, O: OrphanOs> {
@@ -212,13 +206,13 @@ pub(crate) mod unix {
         fn observe(&self, t: &mut Target) -> Option<bool> {
             let r = self.read(t.pid)?;
             match r {
-                Lookup::Gone | Lookup::Zombie(_) => t.resolved = Some(Fate::Gone),
+                Lookup::Gone | Lookup::Zombie(_) => t.fate = Fate::Gone,
                 Lookup::Live(p) if p.start == t.start => {
-                    t.last = Last::Live;
+                    t.fate = Fate::Alive;
                     return Some(true);
                 }
-                Lookup::Live(_) => t.resolved = Some(Fate::Replaced),
-                Lookup::Unreadable => t.last = Last::Refused,
+                Lookup::Live(_) => t.fate = Fate::Replaced,
+                Lookup::Unreadable => t.fate = Fate::Unreadable,
             }
             Some(false)
         }
@@ -226,7 +220,7 @@ pub(crate) mod unix {
         /// A round: each unresolved target read, and signalled only when that read showed the
         /// recorded start, with only the clock check in between.
         fn round(&self, targets: &mut [Target], sig: Sig) {
-            for t in targets.iter_mut().filter(|t| t.resolved.is_none()) {
+            for t in targets.iter_mut().filter(|t| !t.resolved()) {
                 match self.observe(t) {
                     None => return,
                     Some(true) => {
@@ -245,7 +239,7 @@ pub(crate) mod unix {
         fn poll(&self, targets: &mut [Target], until: Instant) {
             let until = until.min(self.deadline);
             loop {
-                if targets.iter().all(|t| t.resolved.is_some()) {
+                if targets.iter().all(Target::resolved) {
                     return;
                 }
                 let now = self.os.now();
@@ -253,7 +247,7 @@ pub(crate) mod unix {
                     return;
                 }
                 self.os.sleep(STEP.min(until - now));
-                for t in targets.iter_mut().filter(|t| t.resolved.is_none()) {
+                for t in targets.iter_mut().filter(|t| !t.resolved()) {
                     if self.observe(t).is_none() {
                         return;
                     }
@@ -276,8 +270,7 @@ pub(crate) mod unix {
                 row,
                 pid,
                 start,
-                resolved: None,
-                last: Last::None,
+                fate: Fate::NotRead,
             })
             .collect();
         let l = Loop { os, deadline };
@@ -296,18 +289,9 @@ pub(crate) mod unix {
             }
         }
         for t in &targets {
-            rows[t.row].1 = Some(t.resolved.unwrap_or(match t.last {
-                Last::None => Fate::NotRead,
-                Last::Live => Fate::Alive,
-                Last::Refused => Fate::Unreadable,
-            }));
+            rows[t.row].1 = t.fate;
         }
-        OrphanReport {
-            fates: rows
-                .into_iter()
-                .map(|(id, f)| (id, f.unwrap_or(Fate::NotRead)))
-                .collect(),
-        }
+        OrphanReport { fates: rows }
     }
 }
 
@@ -329,9 +313,16 @@ pub(crate) mod windows {
     struct HeldTarget<H> {
         row: usize,
         handle: H,
-        fate: Option<Fate>,
+        /// `NotRead` before any wait, `Alive` after a wait that timed out, and `Gone` or
+        /// `WaitFailed` once a wait ended it.
+        fate: Fate,
+    }
+
+    impl<H> HeldTarget<H> {
         /// A wait ended (signalled or failed): no further wait on this handle.
-        done: bool,
+        fn done(&self) -> bool {
+            matches!(self.fate, Fate::Gone | Fate::WaitFailed)
+        }
     }
 
     pub(crate) fn kill_recorded<O: ProcessOs>(
@@ -342,29 +333,21 @@ pub(crate) mod windows {
     ) -> OrphanReport {
         let (mut rows, work) = prepare(identities, |id| accept(id, me, SYSTEM_PID, u32::MAX));
         let mut held: Vec<HeldTarget<O::Held>> = Vec::new();
-        let mut cut = false;
         for (row, pid, start) in work {
-            if cut {
-                rows[row].1 = Some(Fate::NotRead);
-                continue;
-            }
+            // A cut open leaves it and every later row `NotRead`.
             rows[row].1 = match open_verified(os, pid, start, deadline) {
                 Opened::Held(handle) => {
                     held.push(HeldTarget {
                         row,
                         handle,
-                        fate: None,
-                        done: false,
+                        fate: Fate::NotRead,
                     });
-                    None
+                    continue;
                 }
-                Opened::Gone => Some(Fate::Gone),
-                Opened::Stale => Some(Fate::Replaced),
-                Opened::Unverifiable => Some(Fate::Unreadable),
-                Opened::Cut => {
-                    cut = true;
-                    Some(Fate::NotRead)
-                }
+                Opened::Gone => Fate::Gone,
+                Opened::Stale => Fate::Replaced,
+                Opened::Unverifiable => Fate::Unreadable,
+                Opened::Cut => break,
             };
         }
         for t in &held {
@@ -373,38 +356,27 @@ pub(crate) mod windows {
             }
             let _ = os.terminate(&t.handle);
         }
-        while held.iter().any(|t| !t.done) {
+        while held.iter().any(|t| !t.done()) {
             let mut waited = false;
-            for t in held.iter_mut().filter(|t| !t.done) {
+            for t in held.iter_mut().filter(|t| !t.done()) {
                 let Some(wait) = budget(os, deadline, STEP) else {
                     break;
                 };
                 waited = true;
-                match os.signalled(&t.handle, wait) {
-                    Ok(true) => {
-                        t.fate = Some(Fate::Gone);
-                        t.done = true;
-                    }
-                    Ok(false) => t.fate = Some(Fate::Alive),
-                    Err(_) => {
-                        t.fate = Some(Fate::WaitFailed);
-                        t.done = true;
-                    }
-                }
+                t.fate = match os.signalled(&t.handle, wait) {
+                    Ok(true) => Fate::Gone,
+                    Ok(false) => Fate::Alive,
+                    Err(_) => Fate::WaitFailed,
+                };
             }
             if !waited {
                 break;
             }
         }
         for t in held {
-            rows[t.row].1 = Some(t.fate.unwrap_or(Fate::NotRead));
+            rows[t.row].1 = t.fate;
         }
-        OrphanReport {
-            fates: rows
-                .into_iter()
-                .map(|(id, f)| (id, f.unwrap_or(Fate::NotRead)))
-                .collect(),
-        }
+        OrphanReport { fates: rows }
     }
 }
 
