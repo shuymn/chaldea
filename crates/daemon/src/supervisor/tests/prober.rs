@@ -318,7 +318,8 @@ async fn never_confirms() {
 
 /// PR10a2-CL-6 `shutdown`: admission closed at `prober_start`: no call; closed while the
 /// prober waits for a slot: no further admit and no call; a task held at `probe_queued` while
-/// admission closes: no call, no evidence, the participant `Clean`; a `kill_recorded` parked
+/// admission closes: no call, no evidence, the participant `Clean`; a task held inside its
+/// start under admission's mutex while shutdown begins: it signals and records; a `kill_recorded` parked
 /// inside its signal sequence past the participant's `end`: `LeftRunning`, and `Clean` when
 /// released before `end`; a probe that panicked earlier: a later shutdown `Clean`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -418,6 +419,30 @@ async fn shutdown_boundary() {
     );
     queued.go();
     assert!(script.calls().is_empty());
+    rig.srv.stop().await;
+
+    // Held inside its start, under admission's mutex: `close_admission` waits for it, so the
+    // probe started before admission closed and signals, and records its evidence.
+    let (store, ids6) = crashed(1).await;
+    let script = Script::new(Fate::Gone);
+    let rig = probing(store, HostOs::Macos, &script).await;
+    rig.clock.resume();
+    let starting = rig.pauses.arm(Pause::ProbeStarting);
+    let records = prober::run(rig.sup.clone()).await;
+    starting.wait();
+    assert!(
+        rig.sup.tracker.mutex_held(),
+        "the start mark is set under admission's mutex"
+    );
+    let end = rig.sup.now() + Duration::from_secs(5);
+    let participant = tokio::spawn(shutdown(rig.sup.clone(), end));
+    starting.go();
+    assert_eq!(participant.await.unwrap(), ParticipantEnd::Clean);
+    for r in records {
+        r.await.unwrap();
+    }
+    assert_eq!(script.calls().len(), 1);
+    assert_eq!(evidence(&rig, ids6[0].0).len(), 1);
     rig.srv.stop().await;
 
     // Parked inside the signal sequence: past `end`, then released before `end`.

@@ -155,6 +155,8 @@ pub enum Pause {
     ProberStart,
     /// A probe's blocking task once started, before it reads admission (blocking).
     ProbeQueued,
+    /// A probe's start, under the tracker's mutex, before its start mark (blocking).
+    ProbeStarting,
     /// A probe's blocking task after `kill_recorded` returned (blocking).
     ProbeTask,
     /// A VT snapshot's task before it copies the screen (blocking; unit tests only).

@@ -167,10 +167,12 @@ pub(crate) async fn run(sup: Arc<Supervisor>) -> Vec<JoinHandle<()>> {
             let _slot = permit;
             let _admission = admission;
             s.pauses().blocking(Pause::ProbeQueued);
-            if !s.tracker.accepting() {
-                return None;
-            }
-            on_start.store(true, Ordering::SeqCst);
+            // The start mark is set under admission's mutex: a probe either started before
+            // admission closed or never starts.
+            s.tracker.while_accepting(|| {
+                s.pauses().blocking(Pause::ProbeStarting);
+                on_start.store(true, Ordering::SeqCst);
+            })?;
             let report = (s.cfg.kill_recorded)(std::slice::from_ref(&target), s.real(deadline));
             s.pauses().blocking(Pause::ProbeTask);
             Some(report)
@@ -198,7 +200,7 @@ struct Probe {
     launch: LaunchId,
     identity: ProcessIdentity,
     attempt: Uuid,
-    /// Set by the blocking task right before `kill_recorded`, apart from the join: a task the
+    /// Set by the blocking task under admission's mutex before `kill_recorded`, apart from the join: a task the
     /// join did not answer in time made an OS call only when this is set.
     started: Arc<AtomicBool>,
     /// `deadline + PROBE_JOIN_GRACE`, and its timer.
