@@ -321,8 +321,8 @@ fn preview_interrupted_by_a_bad_page() {
     }
 }
 
-/// 20 probe events after a `daemon_restart` exit put the exit on page two; an epoch change
-/// or a 500 between the pages interrupts the scan.
+/// 20 probe events after a `daemon_restart` exit put the exit on page two; an epoch change,
+/// a page of another stream, or a 500 between the pages interrupts the scan.
 #[test]
 fn preview_interrupted_between_pages() {
     let mut s = Stream::default();
@@ -339,9 +339,22 @@ fn preview_interrupted_between_pages() {
     }
     let epoch: Hook = Box::new(|n, b, l, s: &Stream| (n == 1).then(|| ok(s.page(b, l, "ep-2"))));
     let failed: Hook = Box::new(|n, _, _, _| (n == 1).then(|| Reply::Json(500, error("internal"))));
+    let other: Hook = Box::new(|n, b, l, s: &Stream| {
+        (n == 1).then(|| {
+            ok(s.page(b, l, "ep-1").replace(
+                &format!("\"thread:{T}\""),
+                &format!("\"thread:{}\"", chaldea_core::ids::ThreadId::from_u128(0x8)),
+            ))
+        })
+    });
     // The control: both pages read, complete.
     let control: Hook = Box::new(|_, _, _, _| None);
-    for (hook, complete) in [(control, true), (epoch, false), (failed, false)] {
+    for (hook, complete) in [
+        (control, true),
+        (epoch, false),
+        (other, false),
+        (failed, false),
+    ] {
         let mut d = Daemon::new(
             summary(Some(ExitReason::DaemonRestart), false, Some(PID)),
             s.clone(),
