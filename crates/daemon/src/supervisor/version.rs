@@ -3,8 +3,9 @@
 //! tracker, a deadline). The child runs in its own process tree (`host::own_tree`: a process
 //! group, or a job it joins before running), and its stdout is an anonymous temporary file,
 //! not a pipe, so no read can block and a descendant holding stdout never delays the probe.
-//! Once the child exits, its whole tree is killed before the file is read, at an offset, so
-//! nothing writes the file after the read; every other end kills the tree too. One deadline
+//! Once the child's exit is seen, the whole tree's kill is requested and the child reaped
+//! before the file is read, at an offset; a descendant outside the tree, or a write still in
+//! flight, can change what is read (C1 §3). Every other end kills the tree too. One deadline
 //! covers the child's exit, the read, and the result's adoption. A nonzero exit, output over
 //! [`MAX_OUTPUT`], or the deadline gives `None` at once; the launch proceeds.
 
@@ -126,7 +127,7 @@ pub(crate) fn probe(sup: &Supervisor, argv: &[OsString], deadline: Instant) -> O
             return None;
         }
         if before(sup, deadline, || c.exited(tree))? {
-            // The tree goes before the read: no descendant writes the file after it.
+            // The tree's kill is requested before the read, so its descendants stop writing.
             tree.kill();
             if !c.try_reap()?.success() {
                 return None;
