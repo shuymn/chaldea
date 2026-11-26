@@ -542,12 +542,17 @@ fn stop_outcomes() {
     assert_eq!(code, ExitCode::Ok, "{err}");
 }
 
-/// The daemon's prompt checks run first, with their reason, and nothing is sent.
+/// The daemon's prompt checks run first, in the agent's first-prompt encoding, with their
+/// reason, and nothing is sent.
 #[test]
 fn prompt_checked_first() {
     let stub = Stub::start(vec![]);
     for (agent, prompt, want) in [
-        (chaldea_core::ids::Agent::Claude, "hi", "Claude prompt"),
+        (
+            chaldea_core::ids::Agent::Claude,
+            "a\u{1b}b",
+            "control_character at byte 1",
+        ),
         (chaldea_core::ids::Agent::Codex, "  ", "empty_prompt"),
         (
             chaldea_core::ids::Agent::Codex,
@@ -620,4 +625,40 @@ fn durations() {
     assert!(super::duration("m").is_err());
     assert!(super::duration("18446744073709551615s").is_err());
     assert!(super::duration("18446744073709551615h").is_err());
+}
+
+/// `chaldea key`'s tokens: names in the wire's spelling, or one printable character.
+#[test]
+fn key_tokens() {
+    use chaldea_core::input::key::KeyToken;
+    assert_eq!(super::key_token("enter"), Ok(KeyToken::Enter));
+    assert_eq!(super::key_token("ctrl_c"), Ok(KeyToken::CtrlC));
+    assert_eq!(super::key_token("y"), Ok(KeyToken::Char('y')));
+    assert!(super::key_token("yes").is_err());
+    assert!(super::key_token("\u{1b}").is_err());
+}
+
+/// `chaldea send` prints the input; a text the daemon rejected exits 1 with its reason.
+#[test]
+fn send_prints_the_input() {
+    let input = chaldea_core::ids::InputId::from_u128(9);
+    let queued = serde_json::to_string(&chaldea_core::command::SendResult {
+        input_id: input,
+        state: chaldea_core::input::InputState::Queued,
+        reject_reason: None,
+    })
+    .unwrap();
+    let rejected = serde_json::to_string(&chaldea_core::command::SendResult {
+        input_id: input,
+        state: chaldea_core::input::InputState::Rejected,
+        reject_reason: Some(chaldea_core::input::RejectReason::EmptyPrompt),
+    })
+    .unwrap();
+    let stub = Stub::start(vec![ok(queued), ok(rejected)]);
+    let (code, out, err) = run(&stub, |c, o, e| c.send(T, "hi".into(), o, e));
+    assert_eq!(code, ExitCode::Ok, "{err}");
+    assert!(out.contains("queued"), "{out}");
+    let (code, _, err) = run(&stub, |c, o, e| c.send(T, "  ".into(), o, e));
+    assert_eq!(code, ExitCode::Failed);
+    assert!(err.contains("empty_prompt"), "{err}");
 }

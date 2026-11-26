@@ -4,11 +4,11 @@ import type { InputId } from "./InputId";
 import type { InputReason } from "./InputReason";
 import type { InputState } from "./InputState";
 
-export type InputStateChanged = { input_id: InputId, from: InputState, to: InputState, reason: InputReason, 
+export type InputStateChanged = { input_id: InputId, from: InputState, to: InputState, reason: InputReason,
 /**
  * The thread stream's head when `sending` was recorded.
  */
-sent_after_seq: number | null, 
+sent_after_seq: number | null,
 /**
  * Set when a person or thread caused the change (cancel, resolve).
  */

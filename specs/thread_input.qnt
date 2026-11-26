@@ -14,10 +14,12 @@
  *   which order, and with which guards. Its guards are the obligations PR 10 implements.
  *
  * Abstracted: stream positions are one monotonic counter `seq`; the PTY writer is a list
- * of counted writes per launch (its position is the list length) instead of the PR 2
- * writer's `last_started` counters and `Basis`; prompt text is abstract (a hook names
- * the in-flight inputs whose expected form it equals); time, including the settle
- * interval, is explicit nondeterministic actions.
+ * of writes per launch with their origin classes (its counted position is the number of
+ * writes of the adapter's counted classes) instead of the PR 2 writer's `last_started`
+ * counters and `Basis`; prompt text is abstract (a hook names the inputs of the launch
+ * whose expected form it equals); time, including the settle interval and the write
+ * stall, is explicit nondeterministic actions; hook actions are atomic, so the daemon's
+ * hook fence is a daemon guard (docs/design/supervisor-send.md §7).
  * Not modelled: the writer lock and the concrete `Basis`, timer durations, sid scans and
  * descendant kills, worktree and close races (PR 10); the prompt size limit, which
  * refuses before any input exists; `vt_snapshot_taken` at a gate timeout, an output with
@@ -259,8 +261,15 @@ module thread_input {
   // Supervisor layer: model state
   // ---------------------------------------------------------------------------
 
-  // Who wrote to the launch's PTY, in writer order. Every origin here is counted.
+  // Who wrote to the launch's PTY, in writer order, and the writer's origin classes.
   type Origin = WInput(int) | WHuman | WReply
+  type OriginClass = ClassInput | ClassHuman | ClassReply
+  pure val ALL_CLASSES: Set[OriginClass] = Set(ClassInput, ClassHuman, ClassReply)
+  pure def classOf(o: Origin): OriginClass = match o {
+    | WInput(_) => ClassInput
+    | WHuman => ClassHuman
+    | WReply => ClassReply
+  }
   // A card key carries the launch and card it was sent from (mvp §2.10:336: refused once
   // that card is no longer open).
   type HumanOrigin = Attach | Key | CardKey({ launch: int, card: int })
@@ -277,6 +286,9 @@ module thread_input {
     needsBracketedPaste: bool,
     // A Codex launch after a CLI upgrade expects `Hooks need review` (mvp §2.7).
     upgraded: bool,
+    // The origin classes the basis and attribution count (docs/design/pty-runtime.md §2.3
+    // "Basis"): all three for every adapter.
+    counted: Set[OriginClass],
   }
 
   // The facts of a matching `UserPromptSubmit` for one input, taken at the hook's intake
@@ -287,11 +299,16 @@ module thread_input {
     uniqueMatch: bool,
     dispatched: bool,
     noInterveningWrite: bool,
+    // The whole unit was written and its completion ran before the intake.
+    writtenAtIntake: bool,
+    // No input of the launch whose text matches left flight without a hook ack.
+    noEarlierMatch: bool,
+    // No gate-closing human write after the last turn start when the gate opened.
+    noCompetingSubmission: bool,
   }
 
-  // The pending-candidate slot of a `sending` input: a dispatched match is kept with its
-  // intake facts and applied once `sent` is recorded.
-  type Candidate = NoCandidate | HasCandidate(AckRecord)
+  // What the writer reported for a dispatched unit.
+  type WriterResult = WriterPending | WriterWritten | WriterIncomplete
 
   // A `Stop` hook, identified by its launch, the turn it belongs to, and its intake order.
   type StopRef = { launch: int, turn: int, id: int }
@@ -316,7 +333,15 @@ module thread_input {
     // Writer position of the dispatch: the 0-based index in `writer`, 0 for a positional
     // prompt, anchored by `launch_started` (mvp §2.3 "Ack").
     writePos: int,
-    candidate: Candidate,
+    // The writer's result for the unit (`writerDone`); a positional prompt is written.
+    writeDone: WriterResult,
+    // The unit may still write: from `open` until `writerDone`, a zero-byte refusal, or the
+    // launch's exit (docs/design/supervisor-send.md SB15).
+    unitRunning: bool,
+    // The completion job applied the writer's result (`outcome`).
+    recorded: bool,
+    // `open` saw a gate-closing human write after the last turn start (§2.5 "competing").
+    competing: bool,
   }
 
   // The gate evidence of the current launch (mvp §2.1 "Projections").
@@ -340,7 +365,8 @@ module thread_input {
   type CardState = CardIsOpen | CardRan | CardSuperseded | CardExpired
   type Card = { launch: int, turn: int, state: CardState }
 
-  // A hook of an unbound launch, buffered with the facts of its intake (mvp §2.9 "Binding").
+  // A hook of an unbound launch, buffered with its candidates and the facts of its intake
+  // (mvp §2.9 "Binding").
   type BufferedHook =
     | BufPrompt({ matches: Set[int], facts: int -> AckRecord })
     | BufStop(int)
@@ -356,12 +382,15 @@ module thread_input {
     sameTurnOk: bool,
     otherInFlight: bool,
     pasteOk: bool,
+    // No counted write since the evidence's basis, and no running unit of the launch.
+    basisCurrent: bool,
+    unitRunning: bool,
   }
 
   // The raw facts at the dispatch boundary of an input, before the write: the invariant
   // re-derives the recheck from them instead of reading the guard's view.
   type DispatchRecord = {
-    writerLength: int,
+    countedLength: int,
     admittedBasis: int,
     sameLaunch: bool,
     bound: bool,
@@ -446,7 +475,10 @@ module thread_input {
     | Send(int)
     | OpenGate(int)
     | Dispatch(int)
-    | Outcome({ id: int, completed: bool })
+    | WriterDone({ id: int, ok: bool })
+    | Outcome(int)
+    | WriteStalled(int)
+    | DispatchFenced(int)
     | WindowExpired(int)
     | GateTimeout(int)
     | CancelInput(int)
@@ -500,13 +532,15 @@ module thread_input {
     bracketedPasteOn: false,
   }
 
-  pure val CLAUDE: LaunchConfig = { adapter: Claude, mode: StopSettle, needsBracketedPaste: true, upgraded: false }
+  pure val CLAUDE: LaunchConfig = {
+    adapter: Claude, mode: StopSettle, needsBracketedPaste: true, upgraded: false, counted: ALL_CLASSES,
+  }
 
   /// A launch configuration: Claude always uses bracketed paste and has no hook review;
   /// Codex uses it on macOS and not on Windows (`win_keys`, mvp §2.7).
   pure def config(a: Adapter, m: ReadinessMode, bp: bool, upgraded: bool): LaunchConfig =
     if (a == Claude) { ...CLAUDE, mode: m }
-    else { adapter: a, mode: m, needsBracketedPaste: bp, upgraded: upgraded }
+    else { adapter: a, mode: m, needsBracketedPaste: bp, upgraded: upgraded, counted: ALL_CLASSES }
 
   pure def initialState(task: bool): State = {
     thread: { process: Exited, turn: TurnUnknown, task: if (task) TaskActive else TaskNone, attention: Set() },
@@ -570,29 +604,53 @@ module thread_input {
       inFlight: inFlightIds(s).exclude(Set(id)).size() > 0,
     }
 
-  /// No counted write other than the input's own started after its write position.
-  pure def noOtherWriteAfter(s: State, id: int): bool =
-    val pos = s.inputs.get(id).writePos
-    s.writer.indices().forall(j => j < pos or s.writer[j] == WInput(id))
+  /// The launch's counted writer position: its writes of the adapter's counted classes.
+  pure def countedLen(s: State): int =
+    s.writer.foldl(0, (n, o) => if (s.cfg.counted.contains(classOf(o))) n + 1 else n)
 
-  /// The facts of a hook matching `id` at its intake, the hook's seq being `hookSeq`.
-  pure def intakeFacts(s: State, id: int, matches: Set[int], hookSeq: int): AckRecord =
+  /// A unit of the current launch may still write.
+  pure def unitRunningIn(s: State): bool =
+    s.inputs.keys().exists(id => s.inputs.get(id).launch == s.launch and s.inputs.get(id).unitRunning)
+
+  /// No counted write other than the input's own started after its write position; for a
+  /// positional prompt, VT replies do not count (docs/design/supervisor-send.md SB5).
+  pure def noOtherWriteAfter(s: State, id: int): bool =
+    val i = s.inputs.get(id)
+    s.writer.indices().forall(j => or {
+      j < i.writePos,
+      s.writer[j] == WInput(id),
+      not(s.cfg.counted.contains(classOf(s.writer[j]))),
+      i.positional and s.writer[j] == WReply,
+    })
+
+  /// The input left flight without a hook ack: the owner resolved it.
+  pure def resolvedByOwner(s: State, id: int): bool =
+    stateOf(s, id) == Dismissed or (stateOf(s, id) == Acked and not(s.ackRecords.keys().contains(id)))
+
+  /// The facts of a hook at its intake for the in-flight candidate `id`, the hook's seq
+  /// being `hookSeq`; `matches` are every input of the launch whose text it matches and
+  /// `candidates` the in-flight ones among them.
+  pure def intakeFacts(s: State, id: int, matches: Set[int], candidates: Set[int], hookSeq: int): AckRecord =
     val i = s.inputs.get(id)
     {
       sameLaunch: i.launch == s.launch,
       afterAttempt: hookSeq > i.sentAfterSeq,
-      uniqueMatch: matches.size() == 1,
+      uniqueMatch: candidates.size() == 1,
       dispatched: i.dispatched,
       noInterveningWrite: noOtherWriteAfter(s, id),
+      writtenAtIntake: i.writeDone == WriterWritten,
+      noEarlierMatch: matches.forall(m => not(resolvedByOwner(s, m))),
+      noCompetingSubmission: not(i.competing),
     }
 
-  pure def attributable(r: AckRecord): bool =
-    r.sameLaunch and r.afterAttempt and r.uniqueMatch and r.dispatched and r.noInterveningWrite
+  pure def attributable(r: AckRecord): bool = and {
+    r.sameLaunch, r.afterAttempt, r.uniqueMatch, r.dispatched, r.noInterveningWrite,
+    r.writtenAtIntake, r.noEarlierMatch, r.noCompetingSubmission,
+  }
 
   /// Whether the launch's adapter and readiness mode can produce this evidence kind
-  /// (mvp §2.3 `readiness_evidence` modes, §2.7). Model assumption: under `none` Claude's
-  /// `SessionStart` is no evidence either (§2.3:173 "only `chaldea ready`"), although
-  /// §2.7:303 lists it before the after-turn mode; PR 10 decides.
+  /// (mvp §2.3 `readiness_evidence` modes, §2.7): under `none` Claude's `SessionStart` is
+  /// no evidence either (docs/design/supervisor-send.md SB2).
   pure def kindAllowed(c: LaunchConfig, ev: Evidence): bool = match ev {
     | SessionStart => c.adapter == Claude and c.mode != OwnerOnly
     | StopSettled => c.mode == StopSettle
@@ -653,7 +711,8 @@ module thread_input {
   pure def newInput(state: InState, launch: int, positional: bool): Input = {
     state: state, launch: launch, positional: positional, sentAfterSeq: 0,
     attemptSeq: 0, lastWriteBefore: 0, admittedBasis: 0,
-    dispatched: false, writePos: 0, candidate: NoCandidate,
+    dispatched: false, writePos: 0, writeDone: WriterPending, unitRunning: false, recorded: false,
+    competing: false,
   }
 
   /// An attributed ack, recording the intake facts it was decided on.
@@ -667,7 +726,7 @@ module thread_input {
       if (has(acc.st, id)
           and (launch == 0 or acc.st.inputs.get(id).launch == launch)
           and Set(Queued, Sending, Sent).contains(stateOf(acc.st, id)))
-        stp(setInput(acc, id, i => { ...i, candidate: NoCandidate }), id, ii)
+        stp(acc, id, ii)
       else acc)
 
   /// Open cards of the current launch close (mvp §2.10): superseded by `Stop`, an
@@ -681,7 +740,10 @@ module thread_input {
 
   pure def exitLaunch(o: Out, reason: ExitReason, deathConfirmed: bool, ii: InputInput, launch: int): Out =
     val o1 = red(bump(o), ExitedBy(reason))
-    val o2 = recoverInputs(closeCards(invalidate(o1), CardExpired), launch, ii)
+    // The exit seals the session: no unit of the launch writes any more.
+    val o1b = withState(o1, s => { ...s, inputs: s.inputs.keys().mapBy(id =>
+      if (s.inputs.get(id).launch == launch) { ...s.inputs.get(id), unitRunning: false } else s.inputs.get(id)) })
+    val o2 = recoverInputs(closeCards(invalidate(o1b), CardExpired), launch, ii)
     // Buffered hooks of a launch that can no longer bind become `raw_unknown` (mvp §2.9).
     withState(o2, s => { ...s, deathConfirmed: deathConfirmed, buffer: [] })
 
@@ -689,27 +751,24 @@ module thread_input {
     range(1, MAX_INPUTS + 1).foldl(0, (acc, id) => if (acc == 0 and not(has(s, id))) id else acc)
 
   /// A bound `UserPromptSubmit` (`user_message`) with its ack attribution (mvp §2.3 "Ack"),
-  /// from the facts of its intake. A unique match that has not dispatched is a
-  /// `user_message` without `input_id`; a dispatched one acks a `sent` or `unconfirmed`
-  /// input, or is kept as the candidate of a `sending` one.
-  pure def applyPrompt(o: Out, matches: Set[int], facts: int -> AckRecord): Out =
+  /// from the facts of its intake for its in-flight candidates. An attributable record
+  /// acks a `sent` or `unconfirmed` input, and a `sending` one whose unit was written
+  /// before the intake (`sent`, then `acked`, in the hook's job); a `sending` input with a
+  /// record that is not attributable is left unchanged.
+  pure def applyPrompt(o: Out, candidates: Set[int], facts: int -> AckRecord): Out =
     val o1 = red(bump(o), PromptSubmitted)
     val o2 = closeCards(invalidate(withState(o1, s => {
       ...s, turnNo: s.turnNo + 1, gp: { ...s.gp, lastTurnStart: s.seq },
     })), CardSuperseded)
-    if (matches.size() != 1) o2 else {
-      val id = matches.fold(0, (a, b) => b)
+    if (candidates.size() != 1) o2 else {
+      val id = candidates.fold(0, (a, b) => b)
       val r = facts.get(id)
       val cur = stateOf(o2.st, id)
       // A buffered hook is applied at promotion; an input that left flight since its
       // intake is no longer a candidate.
-      if (not(r.dispatched) or not(isInFlight(cur))) o2
+      if (not(isInFlight(cur))) o2
       else if (cur == Sending)
-        setInput(o2, id, i => { ...i, candidate: match i.candidate {
-          | NoCandidate => HasCandidate(r)
-          // A second dispatched match for one input: ambiguous.
-          | HasCandidate(prev) => HasCandidate({ ...prev, uniqueMatch: false })
-        } })
+        if (attributable(r)) ackWith(bump(stp(o2, id, WriteCompleted)), id, r) else o2
       else if (attributable(r)) ackWith(o2, id, r)
       else if (cur == Sent) bump(stp(o2, id, AckNotAttributable))
       else o2
@@ -841,7 +900,9 @@ module thread_input {
     val o2 = range(1, MAX_INPUTS + 1).foldl(o1, (acc, id) =>
       if (has(acc.st, id) and acc.st.inputs.get(id).positional and acc.st.inputs.get(id).launch == st.launch
           and stateOf(acc.st, id) == Sending)
-        stp(setInput(acc, id, i => { ...i, dispatched: true, writePos: 0, sentAfterSeq: acc.st.seq }), id, WriteCompleted)
+        stp(setInput(acc, id, i => { ...i,
+          dispatched: true, writePos: 0, sentAfterSeq: acc.st.seq, writeDone: WriterWritten, recorded: true,
+        }), id, WriteCompleted)
       else acc)
     commit(Spawn, o2),
   }
@@ -930,33 +991,43 @@ module thread_input {
   /// `stop` names the `Stop` a settle completion was started for.
   action ready(ev: Evidence, stop: int): bool = all {
     readyAllowed(st, ev, stop),
-    commit(Ready({ kind: ev, stop: stop }), applyReady(start(st), ev, st.writer.length(), evidenceTurnOf(st, ev))),
+    commit(Ready({ kind: ev, stop: stop }), applyReady(start(st), ev, countedLen(st), evidenceTurnOf(st, ev))),
   }
+
+  /// Whether `chaldea ready` is taken: refused with `unit_running` while a unit of the
+  /// launch may still write (docs/design/supervisor-send.md SB15).
+  pure def ownerReadyAllowed(s: State): bool = s.launch > 0 and not(unitRunningIn(s))
 
   /// `chaldea ready`: accepted only for the current bound launch; otherwise refused,
   /// writing nothing (mvp §2.3 "Gate").
   action ownerReady: bool = all {
-    st.launch > 0,
+    ownerReadyAllowed(st),
     commit(OwnerReady,
-      if (alive(st) and st.gp.bound) applyReady(start(st), OwnerAsserted, st.writer.length(), st.turnNo)
+      if (alive(st) and st.gp.bound) applyReady(start(st), OwnerAsserted, countedLen(st), st.turnNo)
       else start(st)),
   }
 
+  /// `matches`: inputs of the current launch, in any state, whose text the prompt matches.
   pure def matchable(s: State, matches: Set[int]): bool =
-    matches.forall(id => has(s, id) and s.inputs.get(id).launch == s.launch and isInFlight(stateOf(s, id)))
+    matches.forall(id => has(s, id) and s.inputs.get(id).launch == s.launch)
+
+  /// The ack candidates of a prompt: its matches still in flight.
+  pure def candidatesOf(s: State, matches: Set[int]): Set[int] =
+    matches.filter(id => isInFlight(stateOf(s, id)))
 
   pure def factsNow(s: State, matches: Set[int]): int -> AckRecord =
-    matches.mapBy(id => intakeFacts(s, id, matches, s.seq + 1))
+    val c = candidatesOf(s, matches)
+    c.mapBy(id => intakeFacts(s, id, matches, c, s.seq + 1))
 
-  /// A bound `UserPromptSubmit`. `matches` is the set of in-flight inputs of the current
-  /// launch whose expected form equals the prompt: a nondeterministic choice standing for
-  /// the text match.
+  /// A bound `UserPromptSubmit`. `matches` is the set of inputs of the current launch
+  /// whose expected form equals the prompt: a nondeterministic choice standing for the
+  /// text match.
   action prompt(matches: Set[int]): bool = all {
     alive(st),
     st.hooksLive,
     st.gp.bound,
     matchable(st, matches),
-    commit(Prompt(matches), applyPrompt(start(st), matches, factsNow(st, matches))),
+    commit(Prompt(matches), applyPrompt(start(st), candidatesOf(st, matches), factsNow(st, matches))),
   }
 
   /// Hooks of an unbound live launch are buffered with their intake facts (mvp §2.9).
@@ -967,7 +1038,7 @@ module thread_input {
     st.buffer.length() < 3,
     matchable(st, matches),
     commit(BufferPrompt(matches), start({ ...st,
-      buffer: st.buffer.append(BufPrompt({ matches: matches, facts: factsNow(st, matches) })),
+      buffer: st.buffer.append(BufPrompt({ matches: candidatesOf(st, matches), facts: factsNow(st, matches) })),
       bufferedStop: 0,
     })),
   }
@@ -999,7 +1070,7 @@ module thread_input {
       | _ => false
     },
     commit(BufferReady({ kind: ev, stop: stop }), start({ ...st,
-      buffer: st.buffer.append(BufReady({ kind: ev, basis: st.writer.length(), stop: stop })),
+      buffer: st.buffer.append(BufReady({ kind: ev, basis: countedLen(st), stop: stop })),
       bufferedStop: 0,
     })),
   }
@@ -1055,14 +1126,23 @@ module thread_input {
     }),
   }
 
+  /// Whether `open(id)` is enabled: the gate is open, no counted write started since the
+  /// evidence's basis (docs/design/supervisor-send.md SB3), and no unit of the launch may
+  /// still write (SB15).
+  pure def openAllowed(s: State, id: int): bool = and {
+    has(s, id),
+    stateOf(s, id) == Queued,
+    s.inputs.get(id).launch == s.launch,
+    gate(gateView(s)) == Open,
+    countedLen(s) == s.gp.basis,
+    not(unitRunningIn(s)),
+  }
+
   /// The gate opened and the attempt, with the stream head, was persisted (mvp §2.3
   /// "States"); `input_state_changed` to `sending` advances the last write (§2.1:115). The
-  /// attempt keeps the basis of the evidence it relied on.
+  /// attempt keeps the basis of the evidence it relied on, and its unit runs from here.
   action open(id: int): bool = all {
-    has(st, id),
-    stateOf(st, id) == Queued,
-    st.inputs.get(id).launch == st.launch,
-    gate(gateView(st)) == Open,
+    openAllowed(st, id),
     // Recorded from the state itself, not from the guard's view.
     val g = st.gp
     val laterTurn = g.lastTurnStart != 0 and g.lastHumanWrite < g.lastTurnStart and g.lastTurnStart < g.readinessSeq
@@ -1076,9 +1156,12 @@ module thread_input {
       otherInFlight: INPUT_IDS.exists(o => has(st, o) and st.inputs.get(o).launch == st.launch
         and Set(Sending, Sent, Unconfirmed).contains(stateOf(st, o))),
       pasteOk: not(g.needsBracketedPaste) or g.bracketedPasteOn,
+      basisCurrent: countedLen(st) == g.basis,
+      unitRunning: unitRunningIn(st),
     }
     val o1 = setInput(start(st), id, i => { ...i,
       sentAfterSeq: st.seq, attemptSeq: st.seq + 1, lastWriteBefore: st.gp.lastWrite, admittedBasis: st.gp.basis,
+      unitRunning: true, competing: g.lastHumanWrite > g.lastTurnStart,
     })
     val o2 = bump(stp(o1, id, GateOpened(st.seq)))
     commit(OpenGate(id), withState(o2, s => { ...s,
@@ -1090,24 +1173,39 @@ module thread_input {
   /// Whether the writer's revalidation before the first byte passes (mvp §2.3 "Writer
   /// revalidation"; docs/design/pty-runtime.md §2.3 "Basis"): no counted write since the
   /// admitted basis, the input's launch is current, and the whole gate, without the
-  /// input's own attempt, is open.
+  /// input's own attempt, is open. The daemon holds it through the open job's gate, the
+  /// hook fence, and the writer's checks (docs/design/supervisor-send.md §2.3, §7).
   pure def recheckPasses(s: State, id: int): bool = and {
     s.inputs.get(id).launch == s.launch,
-    s.writer.length() == s.inputs.get(id).admittedBasis,
+    countedLen(s) == s.inputs.get(id).admittedBasis,
     gate(recheckView(s, id)) == Open,
+  }
+
+  /// A zero-byte attempt: `sending` -> `cancelled`, the unit ended, and the launch's last
+  /// write set back to the one before the attempt when no later write moved it
+  /// (docs/design/supervisor-send.md SB1, §2.9 E1).
+  pure def zeroByte(o: Out, id: int): Out =
+    val i = o.st.inputs.get(id)
+    val o1 = bump(stp(setInput(o, id, x => { ...x, unitRunning: false }), id, RecheckFailed))
+    withState(o1, s => { ...s, gp: { ...s.gp,
+      lastWrite: if (s.gp.lastWrite == i.attemptSeq) i.lastWriteBefore else s.gp.lastWrite } })
+
+  pure def undispatched(s: State, id: int): bool = and {
+    has(s, id),
+    stateOf(s, id) == Sending,
+    not(s.inputs.get(id).positional),
+    not(s.inputs.get(id).dispatched),
+    s.inputs.get(id).unitRunning,
   }
 
   /// Passing the recheck dispatches text and submit as one unit; failing it cancels the
   /// input with zero bytes.
   action dispatch(id: int): bool = all {
-    has(st, id),
-    stateOf(st, id) == Sending,
-    not(st.inputs.get(id).positional),
-    not(st.inputs.get(id).dispatched),
+    undispatched(st, id),
     if (recheckPasses(st, id)) {
       val i = st.inputs.get(id)
       val rec = {
-        writerLength: st.writer.length(),
+        countedLength: countedLen(st),
         admittedBasis: i.admittedBasis,
         sameLaunch: i.launch == st.launch,
         bound: st.gp.bound,
@@ -1130,27 +1228,46 @@ module thread_input {
       commit(Dispatch(id), withState(o1, s => { ...s,
         writer: w, writeCount: incr(st.writeCount, id), dispatchRecords: s.dispatchRecords.put(id, rec),
       }))
-    } else commit(Dispatch(id), bump(stp(start(st), id, RecheckFailed))),
+    } else commit(Dispatch(id), zeroByte(start(st), id)),
   }
 
-  /// The write's outcome: completed (`sent`, then the pending candidate is evaluated) or
-  /// unknown (`unconfirmed`; the candidate is dropped).
-  action outcome(id: int, completed: bool): bool = all {
+  /// A zero-byte refusal with no state cause: the hook fence moved (`FenceMoved`), the
+  /// dispatch deadline passed (`Expired`), or the worker cancelled the queued unit.
+  action dispatchFenced(id: int): bool = all {
+    undispatched(st, id),
+    commit(DispatchFenced(id), zeroByte(start(st), id)),
+  }
+
+  /// The writer's record of a dispatched unit: written whole (`ok`) or incomplete; the
+  /// unit ends. No event: the completion job (`outcome`) applies it.
+  action writerDone(id: int, ok: bool): bool = all {
+    has(st, id),
+    st.inputs.get(id).dispatched,
+    st.inputs.get(id).unitRunning,
+    commit(WriterDone({ id: id, ok: ok }), setInput(start(st), id, i => { ...i,
+      writeDone: if (ok) WriterWritten else WriterIncomplete, unitRunning: false })),
+  }
+
+  /// The completion job: `sent` for a written unit, `unconfirmed` for an incomplete one;
+  /// an input that already left `sending` (acked by a hook, stalled, exited) changes nothing.
+  action outcome(id: int): bool = all {
+    has(st, id),
+    st.inputs.get(id).writeDone != WriterPending,
+    not(st.inputs.get(id).recorded),
+    val o1 = setInput(start(st), id, i => { ...i, recorded: true })
+    commit(Outcome(id), if (stateOf(st, id) != Sending) o1
+      else bump(stp(o1, id, if (st.inputs.get(id).writeDone == WriterWritten) WriteCompleted else WriteOutcomeUnknown))),
+  }
+
+  /// A dispatched unit with no writer record `WRITE_STALL` after its first permission: the
+  /// input becomes `unconfirmed`, and the unit keeps running (docs/design/supervisor-send.md
+  /// SB15).
+  action writeStalled(id: int): bool = all {
     has(st, id),
     stateOf(st, id) == Sending,
     st.inputs.get(id).dispatched,
-    not(st.inputs.get(id).positional),
-    val c = st.inputs.get(id).candidate
-    val o1 = setInput(bump(start(st)), id, i => { ...i, candidate: NoCandidate })
-    val o2 = if (not(completed)) stp(o1, id, WriteOutcomeUnknown)
-      else {
-        val o3 = stp(o1, id, WriteCompleted)
-        match c {
-          | NoCandidate => o3
-          | HasCandidate(r) => if (attributable(r)) ackWith(o3, id, r) else bump(stp(o3, id, AckNotAttributable))
-        }
-      }
-    commit(Outcome({ id: id, completed: completed }), o2),
+    st.inputs.get(id).unitRunning,
+    commit(WriteStalled(id), bump(stp(start(st), id, WriteOutcomeUnknown))),
   }
 
   /// The ack window expired; suspended for a positional prompt while a startup cause is
@@ -1334,18 +1451,22 @@ module thread_input {
       send(id),
       open(id),
       dispatch(id),
+      dispatchFenced(id),
       nondet c = Bool.oneOf()
-      outcome(id, c),
+      writerDone(id, c),
+      outcome(id),
+      writeStalled(id),
       windowExpired(id),
     }
   }
 
-  // Hooks: a prompt that matches an in-flight input, a buffered hook of an unbound launch,
-  // and approval cards with their keys.
+  // Hooks: a prompt that matches inputs of the launch, a buffered hook of an unbound
+  // launch, and approval cards with their keys.
   action hookStep = any {
     all {
       inFlightIds(st).size() > 0,
-      nondet ms = inFlightIds(st).powerset().exclude(Set(Set())).oneOf()
+      val ids = st.inputs.keys().filter(id => st.inputs.get(id).launch == st.launch)
+      nondet ms = ids.powerset().filter(m => m.exists(id => isInFlight(stateOf(st, id)))).oneOf()
       any { prompt(ms), bufferPrompt(ms) },
     },
     bufferStop,
@@ -1410,7 +1531,7 @@ module thread_input {
   action rawReadyUnbound(ev: Evidence): bool = all {
     alive(st),
     not(st.gp.bound),
-    commit(RawReadyUnbound(ev), applyReady(start(st), ev, st.writer.length(), st.turnNo)),
+    commit(RawReadyUnbound(ev), applyReady(start(st), ev, countedLen(st), st.turnNo)),
   }
 
   pure val RAW_INPUTS: Set[StateInput] = Set(
@@ -1445,10 +1566,12 @@ module thread_input {
   /// with evidence newer than every write and not of the same turn as a gate-closing human
   /// write, no other in-flight input of the launch, and bracketed paste on where needed.
   /// The positional prompt (§2.3:186) has no record.
+  /// With docs/design/supervisor-send.md SB3 and SB15: no counted write since the
+  /// evidence's basis, and no running unit of the launch.
   val sendingOnlyThroughOpenGate = st.sendRecords.keys().forall(id => {
     val r = st.sendRecords.get(id)
     r.bound and r.running and r.idle and r.evidenceSeq > r.lastWrite and r.sameTurnOk
-      and not(r.otherInFlight) and r.pasteOk
+      and not(r.otherInFlight) and r.pasteOk and r.basisCurrent and not(r.unitRunning)
   })
 
   /// mvp §2.3:171-177, docs/design/pty-runtime.md §2.3 "Basis": at the first byte, the
@@ -1461,7 +1584,7 @@ module thread_input {
     val laterTurn = r.lastTurnStart > r.lastHumanWrite and r.readinessSeq > r.lastTurnStart
     and {
       r.sameLaunch,
-      r.writerLength == r.admittedBasis,
+      r.countedLength == r.admittedBasis,
       r.bound,
       r.process == Running,
       r.readinessSeq > 0,
@@ -1547,17 +1670,34 @@ module thread_input {
 
   /// mvp §2.3:182, CL-7: every `AckAttributed` the step fed has a record of its intake
   /// facts, and every record is of the same launch, after the attempt, a unique match, a
-  /// dispatched write, with no other counted write after it.
+  /// dispatched write completed before the intake, with no other counted write after it,
+  /// no earlier match the owner resolved, and no competing submission.
   val ackOnlyWhenAttributable = and {
     st.ackRecords.keys().forall(id => {
       val r = st.ackRecords.get(id)
-      r.sameLaunch and r.afterAttempt and r.uniqueMatch and r.dispatched and r.noInterveningWrite
+      and {
+        r.sameLaunch, r.afterAttempt, r.uniqueMatch, r.dispatched, r.noInterveningWrite,
+        r.writtenAtIntake, r.noEarlierMatch, r.noCompetingSubmission,
+      }
     }),
     last.calls.indices().forall(j => match last.calls[j].kind {
       | Step(c) => (c.input == AckAttributed and last.calls[j].ok) implies st.ackRecords.keys().contains(c.id)
       | _ => true
     }),
   }
+
+  /// docs/design/supervisor-send.md §2.5: no hook ack over a gate-closing human write
+  /// after the last turn start when the gate opened.
+  val noAckOverCompetingSubmission = st.ackRecords.keys().forall(id => st.ackRecords.get(id).noCompetingSubmission)
+
+  /// docs/design/supervisor-send.md §2.5: no hook ack when an input of the launch whose
+  /// text matches left flight without a hook ack (`dismissed`, or `acked` by the owner).
+  val noAckOverEarlierMatch = st.ackRecords.keys().forall(id => st.ackRecords.get(id).noEarlierMatch)
+
+  /// docs/design/supervisor-send.md SB15: at most one unit of a launch may write, so no
+  /// input opens or dispatches while another's unit runs, a stalled one included.
+  val noDispatchWhileUnitRunning = 1.to(MAX_LAUNCHES).forall(l =>
+    st.inputs.keys().filter(id => st.inputs.get(id).launch == l and st.inputs.get(id).unitRunning).size() <= 1)
 
   /// mvp §2.9:323, §8 "Also decided", CL-18: every reservation the reducer accepted came
   /// after the previous launch's death was confirmed.
@@ -1645,6 +1785,9 @@ module thread_input {
     restartRecovers,
     exitedLaunchHasNoPendingInput,
     ackOnlyWhenAttributable,
+    noAckOverCompetingSubmission,
+    noAckOverEarlierMatch,
+    noDispatchWhileUnitRunning,
     reservedOnlyAfterDeath,
     resumeBlockedOnlyWhileDeathUnconfirmed,
     exitedTurnUnknown,

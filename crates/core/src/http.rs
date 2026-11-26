@@ -103,6 +103,18 @@ pub enum ErrorCode {
     PromptTooLarge,
     /// 504: a stop could not take its launch and re-read it in time; nothing changed.
     LaunchBusy,
+    /// 409: the thread's current launch is not live for `send`, `ready`, or `key`.
+    NoLiveLaunch,
+    /// 409: `ready` for a launch with no bound session.
+    NotBound,
+    /// 409: a card key whose card is not open in the launch.
+    CardClosed,
+    /// 409: the key unit wrote zero bytes; a retry may succeed.
+    KeyNotWritten,
+    /// 409: `input_resolve` of an input not `unconfirmed`, `input_cancel` of one not `queued`.
+    InputState,
+    /// 409: `ready` while an input unit of the launch may still write.
+    UnitRunning,
 }
 
 /// The body of every rejection the daemon decides. `retry_after` is whole seconds and

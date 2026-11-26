@@ -1,0 +1,94 @@
+{
+  "$defs": {
+    "InputId": {
+      "description": "One prompt sent through `chaldea send`, the PWA, or `surface_action` (§2.3).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "InputState": {
+      "oneOf": [
+        {
+          "enum": [
+            "queued",
+            "sending",
+            "sent",
+            "acked",
+            "rejected",
+            "cancelled",
+            "dismissed"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "unconfirmed",
+          "description": "May have reached the CLI; never resent.",
+          "type": "string"
+        }
+      ]
+    },
+    "RejectReason": {
+      "description": "Why an input was rejected with zero bytes written.",
+      "oneOf": [
+        {
+          "enum": [
+            "empty_prompt"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "control_character",
+          "description": "ESC or a C0 control other than TAB, CR, LF.",
+          "type": "string"
+        },
+        {
+          "const": "lossy_text",
+          "description": "Text the adapter's encoding cannot carry without loss.",
+          "type": "string"
+        },
+        {
+          "const": "leading_trailing_whitespace",
+          "description": "Codex on Windows trims it (§8 D6).",
+          "type": "string"
+        },
+        {
+          "const": "tab",
+          "description": "Codex on Windows takes TAB as its queue key (§8 D6).",
+          "type": "string"
+        },
+        {
+          "const": "spawn_failed",
+          "description": "The spawn of a positional first prompt was confirmed not to have started.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The success body of `send`: the input, `queued` or `rejected` with its reason.",
+  "properties": {
+    "input_id": {
+      "$ref": "#/$defs/InputId"
+    },
+    "reject_reason": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RejectReason"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "`null` unless `state` is `rejected`."
+    },
+    "state": {
+      "$ref": "#/$defs/InputState"
+    }
+  },
+  "required": [
+    "input_id",
+    "state",
+    "reject_reason"
+  ],
+  "title": "SendResult",
+  "type": "object"
+}

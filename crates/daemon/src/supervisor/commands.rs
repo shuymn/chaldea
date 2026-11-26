@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chaldea_core::adapter::{HostOs, capabilities};
 use chaldea_core::auth::{Action, Grant, ThreadGraph, grant, may_act_on_thread};
 use chaldea_core::canonical::CanonicalJson;
 use chaldea_core::command::{CloseArgs, CloseResult, ResumeArgs, SpawnArgs, StopArgs};
@@ -14,7 +15,7 @@ use chaldea_core::http::ErrorCode;
 use chaldea_core::ids::{Actor, Agent, CommandId, InputId, LaunchId, ThreadId};
 use chaldea_core::input::MAX_PROMPT_BYTES;
 use chaldea_core::input::encode::{Purpose, check};
-use chaldea_core::payload::{InputEncoding, SourceKind, ThreadClosed};
+use chaldea_core::payload::{SourceKind, ThreadClosed};
 use futures_util::future::BoxFuture;
 use serde::Serialize;
 use serde_json::value::RawValue;
@@ -34,7 +35,7 @@ use super::ops::{
 use super::record::{JobOf, Recorded, record};
 use super::{COMMAND_DEADLINE, Pause, STOP_REPORT, Supervisor};
 
-fn parse<T: serde::de::DeserializeOwned + Serialize>(
+pub(crate) fn parse<T: serde::de::DeserializeOwned + Serialize>(
     args: &RawValue,
 ) -> Result<(T, CanonicalJson), ApiError> {
     let a: T = serde_json::from_str(args.get()).map_err(|_| ApiError::bad_args())?;
@@ -42,23 +43,25 @@ fn parse<T: serde::de::DeserializeOwned + Serialize>(
     Ok((a, n))
 }
 
-/// Prompt admission (design §2.2, C1) for `agent`: a Claude prompt is `bad_args`, then the
-/// size, then `check` for Codex's positional prompt.
-fn admit_prompt(agent: Agent, prompt: Option<&str>) -> Result<(), ApiError> {
+/// Prompt admission (design §2.2, C1; send §2.2) for `agent` on `os`: the size, then `check`
+/// in the row's first-prompt encoding (Codex's positional argument, Claude's queued input).
+fn admit_prompt(agent: Agent, os: HostOs, prompt: Option<&str>) -> Result<(), ApiError> {
     let Some(text) = prompt else {
         return Ok(());
     };
-    if agent == Agent::Claude {
-        return Err(ApiError::bad_args());
-    }
     if text.len() > MAX_PROMPT_BYTES {
         return Err(code(ErrorCode::PromptTooLarge));
     }
-    check(Agent::Codex, InputEncoding::Positional, Purpose::Send, text)
-        .map_err(|_| code(ErrorCode::PromptRejected))
+    check(
+        agent,
+        capabilities(agent, os).first_prompt(),
+        Purpose::Send,
+        text,
+    )
+    .map_err(|_| code(ErrorCode::PromptRejected))
 }
 
-fn caller(auth: &Authorized) -> Actor {
+pub(crate) fn caller(auth: &Authorized) -> Actor {
     match (auth.kind, auth.thread) {
         (TokenKind::Agent, Some(t)) => Actor::Thread(t),
         _ => Actor::Human,
@@ -67,7 +70,7 @@ fn caller(auth: &Authorized) -> Actor {
 
 /// The target-scope check (design §2.2 "Target scope first"): before any other read of the
 /// thread; a refusal is `deny_for`.
-fn target(
+pub(crate) fn target(
     tx: &WriteTx<'_>,
     auth: &Authorized,
     action: Action,
@@ -87,7 +90,7 @@ fn target(
     r.thread(t)?.ok_or_else(|| refused(ApiError::not_found()))
 }
 
-fn run_op(
+pub(crate) fn run_op(
     sup: &Arc<Supervisor>,
     fut: impl std::future::Future<Output = EffectOutcome> + Send + 'static,
 ) -> BoxFuture<'static, EffectOutcome> {
@@ -115,7 +118,7 @@ impl CommandHandler for SpawnHandler {
 
     fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError> {
         let (a, normalized) = parse::<SpawnArgs>(args)?;
-        admit_prompt(a.agent, a.prompt.as_deref())?;
+        admit_prompt(a.agent, self.0.host_os, a.prompt.as_deref())?;
         let thread = ThreadId(Uuid::new_v4());
         let launch = LaunchId(Uuid::new_v4());
         let input_id = a.prompt.as_ref().map(|_| InputId(Uuid::new_v4()));
@@ -182,6 +185,7 @@ impl CommandHandler for ResumeHandler {
 
     fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError> {
         let (a, normalized) = parse::<ResumeArgs>(args)?;
+        let os = self.0.host_os;
         let launch = LaunchId(Uuid::new_v4());
         let input_id = a.prompt.as_ref().map(|_| InputId(Uuid::new_v4()));
         let token = mint_token();
@@ -191,7 +195,7 @@ impl CommandHandler for ResumeHandler {
                 // The prompt's checks need the thread's agent, so they run here, in CL-1's
                 // order (a Claude prompt first); a refusal rolls back the receipt with the job.
                 let t = target(tx, auth, Action::Resume, a.thread_id)?;
-                admit_prompt(t.agent, a.prompt.as_deref()).map_err(refused)?;
+                admit_prompt(t.agent, os, a.prompt.as_deref()).map_err(refused)?;
                 Ok(Intent::Pending(EffectRun::new(LaunchReq {
                     command_id: ctx.command_id(),
                     thread: a.thread_id,

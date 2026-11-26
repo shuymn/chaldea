@@ -8,7 +8,43 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::ids::Agent;
-use crate::payload::InputEncoding;
+use crate::input::key::KeyToken;
+use crate::payload::{InputEncoding, ReadinessEvidence};
+
+/// Which hook evidence opens a row's gate besides `chaldea ready`
+/// (`docs/design/supervisor-send.md` §2.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReadinessMode {
+    /// A `Stop` settled for the settle interval.
+    StopSettle,
+    /// The adapter's post-decision hook.
+    PostDecision,
+    /// Only `chaldea ready`.
+    OwnerOnly,
+}
+
+/// The keys that move a dialog's selection without answering it, on every row.
+const CARD_NAV_KEYS: [KeyToken; 4] = [
+    KeyToken::Up,
+    KeyToken::Down,
+    KeyToken::Left,
+    KeyToken::Right,
+];
+
+/// Whether `kind` counts as readiness evidence for `agent` under `mode`: `session_start`
+/// only for Claude and not under `OwnerOnly`, `stop_settled` only under `StopSettle`,
+/// `post_decision` only under `PostDecision`, `owner_asserted` always.
+#[must_use]
+pub fn evidence_allowed(agent: Agent, mode: ReadinessMode, kind: ReadinessEvidence) -> bool {
+    match kind {
+        ReadinessEvidence::SessionStart => {
+            agent == Agent::Claude && mode != ReadinessMode::OwnerOnly
+        }
+        ReadinessEvidence::StopSettled => mode == ReadinessMode::StopSettle,
+        ReadinessEvidence::PostDecision => mode == ReadinessMode::PostDecision,
+        ReadinessEvidence::OwnerAsserted => true,
+    }
+}
 
 /// The OS of the host a daemon runs on. The daemon maps `std::env::consts::OS` to it once at
 /// startup with [`HostOs::from_os_str`]; `core` never reads the host OS itself.
@@ -134,6 +170,19 @@ impl Capabilities {
     pub fn submit_delay(&self) -> Duration {
         self.submit_delay
     }
+
+    /// The hook evidence that opens this row's gate: `StopSettle` on every row.
+    #[must_use]
+    pub fn readiness_mode(&self) -> ReadinessMode {
+        ReadinessMode::StopSettle
+    }
+
+    /// The keys that move a dialog's selection without answering it: the four arrows on
+    /// every row.
+    #[must_use]
+    pub fn card_nav_keys(&self) -> &'static [KeyToken] {
+        &CARD_NAV_KEYS
+    }
 }
 
 /// Every row, in the order `(Claude, Macos)`, `(Claude, Windows)`, `(Codex, Macos)`,
@@ -244,6 +293,34 @@ mod tests {
             serde_json::from_str::<HostOs>(r#""windows""#).unwrap(),
             HostOs::Windows
         );
+    }
+
+    /// Each evidence kind under each mode (the model's `kindAllowed`).
+    #[test]
+    fn evidence_by_mode() {
+        use ReadinessEvidence as E;
+        use ReadinessMode as M;
+        for agent in AGENTS {
+            for mode in [M::StopSettle, M::PostDecision, M::OwnerOnly] {
+                assert_eq!(
+                    evidence_allowed(agent, mode, E::SessionStart),
+                    agent == Agent::Claude && mode != M::OwnerOnly
+                );
+                assert_eq!(
+                    evidence_allowed(agent, mode, E::StopSettled),
+                    mode == M::StopSettle
+                );
+                assert_eq!(
+                    evidence_allowed(agent, mode, E::PostDecision),
+                    mode == M::PostDecision
+                );
+                assert!(evidence_allowed(agent, mode, E::OwnerAsserted));
+            }
+        }
+        for r in &CAPABILITIES {
+            assert_eq!(r.readiness_mode(), M::StopSettle);
+            assert_eq!(r.card_nav_keys(), &CARD_NAV_KEYS);
+        }
     }
 
     #[test]

@@ -736,6 +736,91 @@ fn golden_round_trip_for_close_results() {
     }
 }
 
+/// The send-side commands' args and results (supervisor-send §2.2): every result field
+/// present, `null` where the design says so.
+#[test]
+fn golden_round_trip_for_send_commands() {
+    use chaldea_core::command::{
+        InputCancelArgs, InputCommandResult, InputResolveArgs, KeyArgs, KeyOutcome, KeyResult,
+        ReadyArgs, ReadyResult, SendArgs, SendResult,
+    };
+    use chaldea_core::input::key::KeyToken;
+    use chaldea_core::input::{InputState, RejectReason};
+    use chaldea_core::payload::InputOrigin;
+    round_trip(
+        "commands/send_args",
+        &SendArgs {
+            thread_id: THREAD,
+            text: "\u{65e5}\u{672c}\u{8a9e} \u{1f600}".into(),
+            origin: Some(InputOrigin::Pwa),
+        },
+    );
+    round_trip(
+        "commands/send_result_queued",
+        &SendResult {
+            input_id: INPUT,
+            state: InputState::Queued,
+            reject_reason: None,
+        },
+    );
+    round_trip(
+        "commands/send_result_rejected",
+        &SendResult {
+            input_id: INPUT,
+            state: InputState::Rejected,
+            reject_reason: Some(RejectReason::ControlCharacter),
+        },
+    );
+    round_trip(
+        "commands/ready_args",
+        &ReadyArgs {
+            thread_id: THREAD,
+            expected_launch_id: Some(LAUNCH),
+        },
+    );
+    round_trip("commands/ready_result", &ReadyResult { launch_id: LAUNCH });
+    round_trip(
+        "commands/key_args",
+        &KeyArgs {
+            thread_id: THREAD,
+            launch_id: LAUNCH,
+            keys: vec![KeyToken::Down, KeyToken::Char('1'), KeyToken::Enter],
+            approval_id: Some(APPROVAL),
+        },
+    );
+    for (name, outcome, bytes) in [
+        ("written", KeyOutcome::Written, Some(3)),
+        ("incomplete", KeyOutcome::Incomplete, Some(1)),
+        ("pending", KeyOutcome::Pending, None),
+    ] {
+        round_trip(
+            &format!("commands/key_result_{name}"),
+            &KeyResult {
+                outcome,
+                bytes_written: bytes,
+            },
+        );
+    }
+    round_trip(
+        "commands/input_resolve_args",
+        &InputResolveArgs {
+            input_id: INPUT,
+            delivered: true,
+        },
+    );
+    round_trip(
+        "commands/input_cancel_args",
+        &InputCancelArgs { input_id: INPUT },
+    );
+    round_trip(
+        "commands/input_command_result",
+        &InputCommandResult {
+            input_id: INPUT,
+            state: InputState::Cancelled,
+        },
+    );
+}
+
 // ---- forward-compatible decoding ---------------------------------------------------------------
 
 /// A replay page whose first event comes from an agent and a source kind this reader does

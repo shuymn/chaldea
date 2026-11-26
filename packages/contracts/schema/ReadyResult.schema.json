@@ -1,0 +1,21 @@
+{
+  "$defs": {
+    "LaunchId": {
+      "description": "A launch: one process lifetime of a thread.",
+      "format": "uuid",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The success body of `ready`.",
+  "properties": {
+    "launch_id": {
+      "$ref": "#/$defs/LaunchId"
+    }
+  },
+  "required": [
+    "launch_id"
+  ],
+  "title": "ReadyResult",
+  "type": "object"
+}

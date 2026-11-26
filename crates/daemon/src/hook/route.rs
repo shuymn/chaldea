@@ -14,7 +14,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
 use super::HookConfig;
-use super::adapter::{AcceptedHook, BindingRule, HookAdapter, HookEvent, Interpretation};
+use super::adapter::{AcceptedHook, BindingRule, HookAdapter, HookEvent, Interpretation, TurnMark};
 use super::ancestry::{Chain, eligible};
 use super::buffer::{self, Meta};
 use super::intake::IntakeFacts;
@@ -128,10 +128,10 @@ fn hook_events(
     let mut first = first;
     let mut out = Vec::with_capacity(events.len());
     for e in events {
-        if e.name.starts_with("bind") || !taken.insert(e.name) {
+        if e.name.starts_with("bind") || !taken.insert(e.name.clone()) {
             return Err(super::refused_internal());
         }
-        let key = first.take().unwrap_or_else(|| derived_key(emit, e.name));
+        let key = first.take().unwrap_or_else(|| derived_key(emit, &e.name));
         out.push(envelope(thread, l, key, e.event, e.annex, e.blobs));
     }
     Ok(out)
@@ -168,6 +168,9 @@ pub(crate) struct Delivery {
     pub(crate) pid_wait_expired: bool,
     pub(crate) adapter: Arc<dyn HookAdapter>,
     pub(crate) cfg: HookConfig,
+    /// Read right after the job's SQLite `COMMIT` (a `CommitStamp`): the commit instant its
+    /// turn marks carry.
+    pub(crate) clock: Arc<dyn crate::http::MonotonicClock>,
 }
 
 /// The routing a delivery is recorded with.
@@ -200,11 +203,37 @@ fn unparseable(truncated: bool) -> Decision {
     }
 }
 
+/// What the job committed: the delivery's reply and the turn marks of the deliveries it
+/// interpreted (its own and, in a binding job, each promoted one), by receipt ordinal.
+#[derive(Debug, Clone)]
+pub(crate) struct Ran {
+    pub(crate) reply: HookReply,
+    pub(crate) marks: Vec<(u64, TurnMark)>,
+    /// The clock right after the job's SQLite `COMMIT`.
+    pub(crate) at: crate::store::CommitStamp,
+}
+
 /// The job: §2.7 steps 1–7.
 pub(crate) fn run(
     d: &Delivery,
     tx: &mut WriteTx<'_>,
     auth: Option<&Authorized>,
+) -> Result<Ran, JobError> {
+    let mut marks = Vec::new();
+    let reply = run_marking(d, tx, auth, &mut marks)?;
+    let clock = d.clock.clone();
+    Ok(Ran {
+        reply,
+        marks,
+        at: tx.commit_stamp(move || clock.now()),
+    })
+}
+
+fn run_marking(
+    d: &Delivery,
+    tx: &mut WriteTx<'_>,
+    auth: Option<&Authorized>,
+    marks: &mut Vec<(u64, TurnMark)>,
 ) -> Result<HookReply, JobError> {
     let (Some(thread), Some(launch)) = (auth.and_then(|a| a.thread), auth.and_then(|a| a.launch))
     else {
@@ -269,7 +298,8 @@ pub(crate) fn run(
                 .unwrap_or(0);
             let json = json.as_ref().ok_or_else(super::refused_internal)?;
             let hook = accepted(d, thread, &l, h, json, binding_ordinal);
-            let interpretation = d.adapter.interpret(&tx.read(), &hook)?;
+            let (interpretation, mark) = d.adapter.interpret(&tx.read(), &hook)?;
+            marks.push((d.ordinal, mark));
             match interpretation {
                 Interpretation::Events(events) => NewRouting::Appended(hook_events(
                     thread,
@@ -370,7 +400,7 @@ pub(crate) fn run(
     buffer::promote_unbound(tx, launch, later)?;
     // 6. Bind.
     if bind {
-        bind_and_promote(d, tx, thread, launch, json.as_ref())?;
+        bind_and_promote(d, tx, thread, launch, json.as_ref(), marks)?;
     }
     Ok(reply)
 }
@@ -492,6 +522,7 @@ fn bind_and_promote(
     thread: ThreadId,
     launch: LaunchId,
     json: Option<&serde_json::Value>,
+    marks: &mut Vec<(u64, TurnMark)>,
 ) -> Result<(), JobError> {
     let Head::Hook(h) = &d.head else {
         return Err(super::refused_internal());
@@ -504,7 +535,8 @@ fn bind_and_promote(
         .ok_or_else(super::refused_internal)?;
     let session = l.session_id.clone().ok_or_else(super::refused_internal)?;
     let hook = accepted(d, thread, &l, h, json, d.ordinal);
-    let interpretation = d.adapter.interpret(&tx.read(), &hook)?;
+    let (interpretation, mark) = d.adapter.interpret(&tx.read(), &hook)?;
+    marks.push((d.ordinal, mark));
     let events = match interpretation {
         Interpretation::Events(events) => hook_events(thread, &l, emit, None, events)?,
         Interpretation::Raw(reason) => vec![raw_event(
@@ -527,13 +559,18 @@ fn bind_and_promote(
             .launch(launch)?
             .ok_or_else(super::refused_internal)?;
         let emit_b = b.emit_id;
-        let to = promotion(d, tx, thread, &l, &session, rule, b)?;
+        let ordinal = b.receipt_ordinal;
+        let (to, mark) = promotion(d, tx, thread, &l, &session, rule, b)?;
+        if let Some(m) = mark {
+            marks.push((ordinal, m));
+        }
         tx.hook_delivery_promote(launch, emit_b, to)?;
     }
     Ok(())
 }
 
-/// The promotion table (§2.7) for one buffered delivery of the just-bound launch.
+/// The promotion table (§2.7) for one buffered delivery of the just-bound launch, with its
+/// turn mark when it was interpreted.
 fn promotion(
     d: &Delivery,
     tx: &WriteTx<'_>,
@@ -542,20 +579,23 @@ fn promotion(
     session: &str,
     rule: BindingRule,
     b: crate::store::BufferedDelivery,
-) -> Result<Promotion, JobError> {
+) -> Result<(Promotion, Option<TurnMark>), JobError> {
     use RawUnknownReason as R;
     let emit = b.emit_id;
     let body = b.hook.body;
-    let raw_of = |reason, content_type, body| -> Result<Promotion, JobError> {
-        Ok(Promotion::RawUnknown(raw_event(
-            thread,
-            l,
-            hook_key(emit),
-            reason,
-            content_type,
-            body,
+    let raw_of = |reason, content_type, body| -> Result<(Promotion, Option<TurnMark>), JobError> {
+        Ok((
+            Promotion::RawUnknown(raw_event(
+                thread,
+                l,
+                hook_key(emit),
+                reason,
+                content_type,
+                body,
+                None,
+            )?),
             None,
-        )?))
+        ))
     };
     let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return raw_of(R::Unparseable, OCTET, body);
@@ -587,14 +627,12 @@ fn promotion(
         binding_ordinal: d.ordinal,
         promoted: true,
     };
-    match d.adapter.interpret(&tx.read(), &hook)? {
-        Interpretation::Events(events) => Ok(Promotion::Appended(hook_events(
-            thread,
-            l,
-            emit,
-            Some(hook_key(emit)),
-            events,
-        )?)),
-        Interpretation::Raw(reason) => raw_of(reason, JSON, body),
-    }
+    let (interpretation, mark) = d.adapter.interpret(&tx.read(), &hook)?;
+    let promoted = match interpretation {
+        Interpretation::Events(events) => {
+            Promotion::Appended(hook_events(thread, l, emit, Some(hook_key(emit)), events)?)
+        }
+        Interpretation::Raw(reason) => raw_of(reason, JSON, body)?.0,
+    };
+    Ok((promoted, Some(mark)))
 }

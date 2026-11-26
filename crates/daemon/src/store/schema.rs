@@ -12,11 +12,11 @@ pub(crate) const APPLICATION_ID: i32 = 0x4348_4C44;
 /// How `project::apply` interprets events on the current DDL. A change of interpretation
 /// without a DDL change bumps it; `open` then rebuilds the projections, and a process with
 /// another value refuses to write (§2.2 step 4).
-pub(crate) const PROJECTION_VERSION: u32 = 1;
+pub(crate) const PROJECTION_VERSION: u32 = 2;
 
 /// Ordered migration scripts; `MIGRATIONS[i]` brings `user_version` from `i` to `i + 1`.
 /// Any physical DDL change, projection tables included, is a new migration.
-pub(crate) const MIGRATIONS: &[&str] = &[V1, V2];
+pub(crate) const MIGRATIONS: &[&str] = &[V1, V2, V3];
 
 /// SHA-256 (lowercase hex) of the schema dump of each version (`open::schema_fingerprint`),
 /// in the order of `MIGRATIONS`. `schema_tests::shipped_fingerprints_match_the_migrations`
@@ -24,6 +24,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[V1, V2];
 pub(crate) const FINGERPRINTS: &[&str] = &[
     "497e99858728fa92c32e3f3468a3a0e2f478cc662b76c48e96ce913daf9f405a",
     "1299d9c3158a9ad1da9751087819a6d97649461cc02437724af82db703bca8a7",
+    "3718d8fce2faf13eb827f086c6c412e54c372c0477288b28da95ed1cc8e46706",
 ];
 
 const V1: &str = r#"
@@ -452,4 +453,12 @@ CREATE TRIGGER events_session_bound_once BEFORE INSERT ON events WHEN NEW.kind =
      OR NEW.launch_id IS NOT (SELECT launch_id FROM events WHERE stream_id = NEW.stream_id AND kind = 'launch_reserved'
                               ORDER BY seq DESC LIMIT 1);
 END;
+"#;
+
+/// An input's attempt (`docs/design/supervisor-send.md` §2.9 E1): the seq of its move to
+/// `sending` and the launch's `last_write_seq` before it, so a zero-byte attempt
+/// (`sending → cancelled`) gives the launch its earlier write position back.
+const V3: &str = r#"
+ALTER TABLE proj_inputs ADD COLUMN attempt_seq INTEGER;
+ALTER TABLE proj_inputs ADD COLUMN last_write_before INTEGER;
 "#;

@@ -45,7 +45,6 @@ pub(crate) type Ops = Arc<tokio::sync::Mutex<Option<TrackedSession>>>;
 pub(crate) type OpGuard = OwnedMutexGuard<Option<TrackedSession>>;
 
 /// One launch the daemon may still own a process of.
-#[allow(dead_code, reason = "`agent` and `caps` are 10b's")]
 pub(crate) struct LiveLaunch {
     pub thread_id: ThreadId,
     pub launch_id: LaunchId,
@@ -211,9 +210,40 @@ impl LiveLaunch {
         .in_time()
     }
 
+    /// One VT snapshot by `deadline` (supervisor clock), never waiting for the op lock
+    /// (send §2.9 D2): a blocking task that, once running and before `deadline`, takes the op
+    /// lock with one `try_lock`, takes the session's screen, releases the lock, and copies the
+    /// screen with the session's own deadline; the join is awaited with `settle_before` until
+    /// `deadline`. `None`: past the deadline, the op lock held, no session, the VT failed or
+    /// its lock not taken in time, or no answer in time.
+    pub(crate) async fn snapshot_before(
+        &self,
+        sup: &Supervisor,
+        deadline: Instant,
+    ) -> Option<chaldea_pty_runtime::Snapshot> {
+        let ops = self.ops.clone();
+        let real = sup.real(deadline);
+        #[cfg(test)]
+        let pauses = sup.cfg.pauses.clone();
+        let task = sup.rt.spawn_blocking(move || {
+            if Instant::now() >= real {
+                return None;
+            }
+            // The op lock only while the screen is taken: the copy waits for the VT lock
+            // without holding up a stop.
+            let screen = ops.try_lock().ok()?.as_ref()?.screen();
+            #[cfg(test)]
+            pauses.blocking(super::Pause::SnapshotCopy);
+            screen.snapshot(real).ok()
+        });
+        settle_before(|| sup.now(), deadline, sup.timer(deadline), task)
+            .await
+            .in_time()?
+            .ok()?
+    }
+
     /// Takes the op lock by `deadline` (supervisor clock) and runs `f` inline; `f` must not
     /// block.
-    #[allow(dead_code, reason = "10b's sends use it")]
     pub(crate) async fn with_session<R>(
         &self,
         sup: &Supervisor,
@@ -233,7 +263,6 @@ impl LiveLaunch {
 
 impl Supervisor {
     /// Never waits: for the hook intake path (design §2.11 "Observation").
-    #[allow(dead_code, reason = "10b's IntakeProbe reads it")]
     pub(crate) fn observe(&self, launch: LaunchId) -> LaunchObservation {
         let Some(map) = self.live.try_lock() else {
             return LaunchObservation::Unobservable;

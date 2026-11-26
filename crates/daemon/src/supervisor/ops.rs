@@ -18,8 +18,8 @@ use chaldea_core::ids::{Actor, Agent, CommandId, IdempotencyKey, InputId, Launch
 use chaldea_core::input::{InputInput, InputState, RejectReason};
 use chaldea_core::launch::{LaunchInput, plan};
 use chaldea_core::payload::{
-    ExitReason, FailedStart, InputCreated, InputEncoding, InputInitialState, InputOrigin,
-    LaunchReserved, LaunchStarted, SourceKind, ThreadRegistered, ThreadRole, WorktreeState,
+    ExitReason, FailedStart, InputCreated, InputInitialState, InputOrigin, LaunchReserved,
+    LaunchStarted, SourceKind, ThreadRegistered, ThreadRole, WorktreeState,
 };
 use chaldea_core::state::{AttentionCause, ProcessState, StateInput, ThreadState};
 use chaldea_pty_runtime::{
@@ -402,7 +402,7 @@ fn reservation_job(
             thread_id: thread,
             launch_id: launch,
             resume_session,
-            prompt: prompt.clone(),
+            prompt: prompt.clone().filter(|_| agent == Agent::Codex),
             worktree_id: prev
                 .as_ref()
                 .and_then(|p: &LaunchRow| p.worktree_id.clone()),
@@ -434,6 +434,9 @@ fn reservation_job(
             },
             lid,
         )?;
+        // Codex's prompt is its positional argument, `sending` until the start job; Claude's
+        // is a queued input the send side writes once the gate opens (send §2.9 D3).
+        let positional = input_id.filter(|_| agent == Agent::Codex);
         if let (Some(text), Some(id)) = (&prompt, input_id) {
             let prepared = crate::store::prepare_content(
                 text.as_bytes().to_vec(),
@@ -445,9 +448,13 @@ fn reservation_job(
                 TypedEvent::InputCreated(InputCreated {
                     input_id: id,
                     launch_id: lid,
-                    initial_state: InputInitialState::Sending,
+                    initial_state: if positional.is_some() {
+                        InputInitialState::Sending
+                    } else {
+                        InputInitialState::Queued
+                    },
                     text: prepared.content,
-                    encoding: InputEncoding::Positional,
+                    encoding: capabilities(agent, sup2.host_os).first_prompt(),
                     origin: InputOrigin::Cli,
                     created_by: caller,
                 }),
@@ -464,7 +471,7 @@ fn reservation_job(
             agent,
             capabilities(agent, sup2.host_os),
             lp.manual,
-            input_id,
+            positional,
         ));
         let guard = entry
             .ops
@@ -472,6 +479,7 @@ fn reservation_job(
             .try_lock_owned()
             .map_err(|_| refusal("a new slot's lock is free"))?;
         sup2.live.lock().insert(launch, entry.clone());
+        sup2.send_launch(&entry);
         Ok(Ok((
             Reserved {
                 agent,

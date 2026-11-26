@@ -70,9 +70,9 @@ async fn prompt_admission() {
         ),
         (
             "spawn",
-            json!({ "agent": "claude", "cwd": cwd, "prompt": "hi" }),
+            json!({ "agent": "claude", "cwd": cwd, "prompt": "a\u{1b}b" }),
             400,
-            "bad_args",
+            "prompt_rejected",
         ),
         (
             "resume",
@@ -84,7 +84,7 @@ async fn prompt_admission() {
             "resume",
             json!({ "thread_id": ct, "expected_launch_id": cl, "prompt": big }),
             400,
-            "bad_args",
+            "prompt_too_large",
         ),
     ];
     for (name, args, status, want) in cases {

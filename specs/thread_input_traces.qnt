@@ -14,7 +14,9 @@
 module thread_input_traces {
   import thread_input.* from "./thread_input"
 
-  pure val CODEX: LaunchConfig = { adapter: CodexPositional, mode: StopSettle, needsBracketedPaste: false, upgraded: true }
+  pure val CODEX: LaunchConfig = {
+    adapter: CodexPositional, mode: StopSettle, needsBracketedPaste: false, upgraded: true, counted: ALL_CLASSES,
+  }
   pure val CODEX_MANUAL: LaunchConfig = { ...CODEX, adapter: CodexManual }
   pure val CLAUDE_POST_DECISION: LaunchConfig = { ...CLAUDE, mode: PostDecisionMode }
 
@@ -56,39 +58,183 @@ module thread_input_traces {
       // The projection counts the input's own attempt as the last write and in flight.
       .expect(last.gate == Closed(WriteAfterEvidence))
       .then(dispatch(1))
-      .then(outcome(1, true))
+      .then(writerDone(1, true))
+      .then(outcome(1))
       .then(prompt(Set(1)))
       .expect(stateOf(st, 1) == Acked)
       .then(turnStop)
       .then(settle)
       .expect(last.gate == Open)
 
-  /// mvp §2.3 "Ack": an ack arriving while `sending` is kept and applied once `sent`.
+  /// docs/design/supervisor-send.md SB4: a hook taken in while the input is `sending`,
+  /// after its unit was written, acks it in the hook's job; the completion job that
+  /// follows changes nothing.
   run trace_ack_while_sending =
+    readyLaunch
+      .then(send(1))
+      .then(open(1))
+      .then(dispatch(1))
+      .then(writerDone(1, true))
+      .then(prompt(Set(1)))
+      .expect(stateOf(st, 1) == Acked)
+      .then(outcome(1))
+      .expect(last.calls == [] and stateOf(st, 1) == Acked)
+
+  /// SB4: a hook taken in before the unit's record is not attributable; the input stays
+  /// `sending`, becomes `sent`, and its ack window expires.
+  run trace_prompt_before_write_done =
     readyLaunch
       .then(send(1))
       .then(open(1))
       .then(dispatch(1))
       .then(prompt(Set(1)))
       .expect(stateOf(st, 1) == Sending)
-      .then(outcome(1, true))
-      .expect(stateOf(st, 1) == Acked)
+      .then(writerDone(1, true))
+      .then(outcome(1))
+      .expect(stateOf(st, 1) == Sent)
+      .then(windowExpired(1))
+      .expect(stateOf(st, 1) == Unconfirmed)
 
-  /// mvp §2.3 "Ack": a same-text hook before the input dispatched is a `user_message`; it
-  /// leaves no candidate, so the hook after the dispatch acks the input.
+  /// SB4: an incomplete unit is never acked; its completion makes it `unconfirmed`.
+  run trace_incomplete_never_acked =
+    readyLaunch
+      .then(send(1))
+      .then(open(1))
+      .then(dispatch(1))
+      .then(writerDone(1, false))
+      .then(prompt(Set(1)))
+      .expect(stateOf(st, 1) == Sending and st.ackRecords == Map())
+      .then(outcome(1))
+      .expect(stateOf(st, 1) == Unconfirmed)
+
+  /// mvp §2.3 "Ack": a same-text hook before the input dispatched is a `user_message` and
+  /// acks nothing, so the hook after the written dispatch acks the input.
   run trace_undispatched_match_ignored =
     readyLaunch
       .then(send(1))
       .then(open(1))
       .then(prompt(Set(1)))
-      .expect(st.inputs.get(1).candidate == NoCandidate)
+      .expect(stateOf(st, 1) == Sending and st.ackRecords == Map())
       .then(turnStop)
       .then(settle)
       .then(dispatch(1))
       .expect(st.inputs.get(1).dispatched)
+      .then(writerDone(1, true))
       .then(prompt(Set(1)))
-      .then(outcome(1, true))
       .expect(stateOf(st, 1) == Acked)
+
+  /// docs/design/supervisor-send.md §2.5: an attach write after the last turn start when
+  /// the gate opened is a competing submission, so the matching hook is not attributable
+  /// (`trace_send_ack` is the clean control).
+  run trace_competing_human_submission =
+    readyLaunch
+      .then(humanWrite(Attach))
+      .then(ownerReady)
+      .then(send(1))
+      .then(open(1))
+      .expect(st.inputs.get(1).competing)
+      .then(dispatch(1))
+      .then(writerDone(1, true))
+      .then(outcome(1))
+      .then(prompt(Set(1)))
+      .expect(stateOf(st, 1) == Unconfirmed)
+
+  /// §2.5: an earlier input the owner dismissed whose text matches makes the hook not
+  /// attributable; a later hook matching only the in-flight input acks it.
+  run trace_earlier_dismissed_match_not_acked =
+    readyLaunch
+      .then(send(1))
+      .then(open(1))
+      .then(dispatch(1))
+      .then(writerDone(1, true))
+      .then(outcome(1))
+      .then(windowExpired(1))
+      .then(resolveInput(1, false))
+      .then(ownerReady)
+      .then(send(2))
+      .then(open(2))
+      .then(dispatch(2))
+      .then(writerDone(2, true))
+      .then(outcome(2))
+      .then(prompt(Set(1, 2)))
+      .expect(stateOf(st, 2) == Unconfirmed)
+      .then(prompt(Set(2)))
+      .expect(stateOf(st, 2) == Acked)
+
+  /// docs/design/supervisor-send.md SB3: a VT reply after the evidence's basis is a
+  /// counted write with no event; the gate's projection is open, yet the input stays
+  /// `queued` with zero writes.
+  run trace_stale_basis_keeps_queued =
+    readyLaunch
+      .then(vtReply)
+      .then(send(1))
+      .expect(last.gate == Open and not(openAllowed(st, 1)))
+      .expect(stateOf(st, 1) == Queued and st.writeCount == Map())
+
+  /// docs/design/supervisor-send.md SB5: a VT reply after the dispatch of an input written
+  /// through the PTY makes its hook not attributable (`trace_positional_vt_reply_acked`
+  /// is the positional contrast).
+  run trace_reply_after_dispatch_not_attributable =
+    readyLaunch
+      .then(send(1))
+      .then(open(1))
+      .then(dispatch(1))
+      .then(writerDone(1, true))
+      .then(outcome(1))
+      .then(vtReply)
+      .then(prompt(Set(1)))
+      .expect(stateOf(st, 1) == Unconfirmed)
+
+  /// docs/design/supervisor-send.md SB1: a zero-byte attempt gives the launch its write
+  /// position back, so the gate stays as it was and the next input opens.
+  run trace_zero_byte_attempt_reopens =
+    readyLaunch
+      .then(send(1))
+      .then(open(1))
+      .then(dispatchFenced(1))
+      .expect(stateOf(st, 1) == Cancelled and st.writer == [])
+      .then(send(2))
+      .then(open(2))
+      .expect(stateOf(st, 2) == Sending)
+
+  /// docs/design/supervisor-send.md SB15: a stalled unit shows its input `unconfirmed`;
+  /// while the unit may still write, `chaldea ready` is refused and the next input stays
+  /// `queued`, also after the owner dismissed the stalled one; the unit's record ends the
+  /// wait, and new evidence opens the gate.
+  run trace_stall_keeps_gate_blocked =
+    readyLaunch
+      .then(send(1))
+      .then(open(1))
+      .then(dispatch(1))
+      .then(writeStalled(1))
+      .expect(stateOf(st, 1) == Unconfirmed)
+      .then(resolveInput(1, false))
+      .then(send(2))
+      .expect(not(ownerReadyAllowed(st)) and not(openAllowed(st, 2)))
+      .then(writerDone(1, true))
+      .expect(not(openAllowed(st, 2)) and last.gate == Closed(WriteAfterEvidence))
+      .then(ownerReady)
+      .then(open(2))
+      .expect(stateOf(st, 2) == Sending)
+
+  /// SB15: with new evidence the gate's projection is open, yet the next input stays
+  /// `queued` while the stalled unit may still write (the daemon also takes no evidence
+  /// while a unit runs, a stronger rule the model leaves out); its record lets it open.
+  run trace_stall_blocks_open_gate =
+    readyLaunch
+      .then(send(1))
+      .then(open(1))
+      .then(dispatch(1))
+      .then(writeStalled(1))
+      .then(resolveInput(1, false))
+      .then(prompt(Set()))
+      .then(turnStop)
+      .then(settle)
+      .then(send(2))
+      .expect(last.gate == Open and not(openAllowed(st, 2)))
+      .then(writerDone(1, true))
+      .then(open(2))
+      .expect(stateOf(st, 2) == Sending)
 
   /// mvp §2.3: a `key` write after the input's write makes the ack non-attributable; the
   /// input is resolved by the owner. Evidence of the same turn as an attach write does not
@@ -98,7 +244,8 @@ module thread_input_traces {
       .then(send(1))
       .then(open(1))
       .then(dispatch(1))
-      .then(outcome(1, true))
+      .then(writerDone(1, true))
+      .then(outcome(1))
       .then(humanWrite(Key))
       .then(prompt(Set(1)))
       .expect(stateOf(st, 1) == Unconfirmed and st.thread.attention.contains(InputUnconfirmed(1)))
@@ -157,7 +304,8 @@ module thread_input_traces {
 
   /// mvp §2.3, §2.4 "Restart", §2.9: a restart turns `sending` into `unconfirmed` and
   /// `queued` into `cancelled`; the resume is refused until death is confirmed; the
-  /// earlier launch's `unconfirmed` input does not block the new launch's gate.
+  /// earlier launch's `unconfirmed` input does not block the new launch's gate; a stalled
+  /// input whose unit then completed is acked by a later hook.
   run trace_restart_and_resume =
     readyLaunch
       .then(send(1))
@@ -179,8 +327,9 @@ module thread_input_traces {
       .then(send(3))
       .then(open(3))
       .then(dispatch(3))
-      .then(outcome(3, false))
+      .then(writeStalled(3))
       .expect(stateOf(st, 3) == Unconfirmed)
+      .then(writerDone(3, true))
       .then(prompt(Set(3)))
       .expect(stateOf(st, 3) == Acked and stateOf(st, 1) == Unconfirmed)
 
@@ -190,7 +339,8 @@ module thread_input_traces {
       .then(send(1))
       .then(open(1))
       .then(dispatch(1))
-      .then(outcome(1, true))
+      .then(writerDone(1, true))
+      .then(outcome(1))
       .then(windowExpired(1))
       .expect(stateOf(st, 1) == Unconfirmed)
       .then(send(2))
@@ -281,17 +431,19 @@ module thread_input_traces {
       .then(dispatch(1))
       .expect(stateOf(st, 1) == Cancelled and st.writer == [WHuman])
 
-  /// Refused: a VT reply after the admitted basis, then newer owner evidence; the recheck
-  /// keeps the basis the send relied on and cancels with zero bytes.
+  /// Refused: a VT reply after the admitted basis; the recheck keeps the basis the send
+  /// relied on and cancels with zero bytes, and the next input stays `queued` until new
+  /// evidence, although the gate's projection is open again.
   run trace_refused_recheck_reply_after_basis =
     readyLaunch
       .then(send(1))
       .then(open(1))
       .then(vtReply)
-      .then(ownerReady)
-      .expect(gate(recheckView(st, 1)) == Open)
+      .expect(gate(recheckView(st, 1)) == Open and not(recheckPasses(st, 1)))
       .then(dispatch(1))
       .expect(stateOf(st, 1) == Cancelled and st.writer == [WReply])
+      .then(send(2))
+      .expect(last.gate == Open and not(openAllowed(st, 2)) and stateOf(st, 2) == Queued)
 
   /// Refused: a Codex interrupt is not a `Stop`, so no settle evidence of that turn
   /// exists and the gate stays closed (mvp §2.3:173, :175).
@@ -407,7 +559,8 @@ module thread_input_traces {
       .then(send(1))
       .then(open(1))
       .then(dispatch(1))
-      .then(outcome(1, true))
+      .then(writerDone(1, true))
+      .then(outcome(1))
       .then(ownerReady)
       .expect(last.gate == Closed(InputInFlight))
       .then(send(2))
@@ -421,7 +574,8 @@ module thread_input_traces {
       .then(send(2))
       .then(open(2))
       .then(dispatch(2))
-      .then(outcome(2, true))
+      .then(writerDone(2, true))
+      .then(outcome(2))
       .then(send(3))
       .then(interrupt)
       .expect(st.thread.turn == TurnUnknown)
@@ -441,20 +595,6 @@ module thread_input_traces {
       .expect(not(st.deathConfirmed) and not(st.thread.attention.contains(ResumeBlocked)))
       .then(raw(Reserved(true)))
       .expect(st.thread.process == Starting and not(reservedOnlyAfterDeath))
-
-  /// Hole b: `sending` -> `cancelled` on a failed recheck writes zero bytes, but the
-  /// attempt already advanced the last write (mvp §2.1:115), so the gate stays closed
-  /// (`WriteAfterEvidence`) with no write since the evidence.
-  run trace_hole_b_recheck_keeps_gate_closed =
-    readyLaunch
-      .then(send(1))
-      .then(open(1))
-      .then(decset(false))
-      .then(dispatch(1))
-      .expect(stateOf(st, 1) == Cancelled)
-      .then(decset(true))
-      .then(send(2))
-      .expect(last.gate == Closed(WriteAfterEvidence) and st.writer.length() == st.gp.basis)
 
   /// Hole c: the reducer raises a startup cause in any process state; one raised while
   /// `exited` survives `Reserved` into the next launch (state.rs:369-371, :278-291).
@@ -491,14 +631,25 @@ module thread_input_traces {
       .then(raw(ApprovalsAllResolved))
       .expect(st.thread.turn == TurnRunning and not(openCardsAwaitApproval))
 
-  /// Finding: a VT reply after `launch_started` is a counted write after the positional
-  /// prompt's anchor, so its ack is never attributable (mvp §2.3:182 with the default
-  /// counted classes, docs/design/pty-runtime.md §2.3 "Basis").
-  run trace_finding_positional_vt_reply =
+  /// docs/design/supervisor-send.md SB5: a VT reply after `launch_started` does not count
+  /// against the positional prompt's anchor, so its hook acks it.
+  run trace_positional_vt_reply_acked =
     initWith(true)
       .then(reserve(CODEX))
       .then(spawn)
       .then(vtReply)
+      .then(sessionStartHook)
+      .then(bind)
+      .then(prompt(Set(1)))
+      .expect(stateOf(st, 1) == Acked)
+
+  /// SB5: an attach write after `launch_started` makes the positional prompt's hook not
+  /// attributable.
+  run trace_positional_attach_not_attributable =
+    initWith(true)
+      .then(reserve(CODEX))
+      .then(spawn)
+      .then(humanWrite(Attach))
       .then(sessionStartHook)
       .then(bind)
       .then(prompt(Set(1)))

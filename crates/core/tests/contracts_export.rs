@@ -24,7 +24,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chaldea_core::MAX_SAFE_INTEGER;
-use chaldea_core::command::{CloseResult, StopResult};
+use chaldea_core::command::{
+    CloseResult, InputCancelArgs, InputCommandResult, InputResolveArgs, KeyArgs, KeyResult,
+    ReadyArgs, ReadyResult, SendArgs, SendResult, StopResult,
+};
 use chaldea_core::event::{EventEnvelope, GenericEvent, TypedEvent};
 use chaldea_core::http::{
     CommandRequest, ErrorBody, PairCodeResponse, PairRequest, PairResponse, ThreadsResponse,
@@ -80,6 +83,26 @@ fn export_schema<T: JsonSchema>(dir: &Path) {
     fs::write(dir.join(format!("{name}.schema.json")), text).expect("write schema");
 }
 
+/// Drops the spaces ts-rs leaves at the end of a line (before a field's doc comment), so the
+/// committed files pass `git diff --check`.
+fn trim_line_ends(dir: &Path) {
+    for entry in fs::read_dir(dir).expect("read ts dir") {
+        let path = entry.expect("ts dir entry").path();
+        let text = fs::read_to_string(&path).expect("read ts file");
+        let trimmed: String = text
+            .split_inclusive('\n')
+            .map(|l| {
+                let body = l.strip_suffix('\n').unwrap_or(l);
+                let end = if l.ends_with('\n') { "\n" } else { "" };
+                format!("{}{end}", body.trim_end_matches([' ', '\t']))
+            })
+            .collect();
+        if trimmed != text {
+            fs::write(&path, trimmed).expect("write ts file");
+        }
+    }
+}
+
 /// Writes every generated file under `out/ts` and `out/schema`.
 fn generate(out: &Path) -> (PathBuf, PathBuf) {
     let ts = out.join("ts");
@@ -106,6 +129,16 @@ fn generate(out: &Path) -> (PathBuf, PathBuf) {
     export_ts::<WorktreesResponse>(&cfg);
     export_ts::<StopResult>(&cfg);
     export_ts::<CloseResult>(&cfg);
+    export_ts::<SendArgs>(&cfg);
+    export_ts::<SendResult>(&cfg);
+    export_ts::<ReadyArgs>(&cfg);
+    export_ts::<ReadyResult>(&cfg);
+    export_ts::<KeyArgs>(&cfg);
+    export_ts::<KeyResult>(&cfg);
+    export_ts::<InputResolveArgs>(&cfg);
+    export_ts::<InputCancelArgs>(&cfg);
+    export_ts::<InputCommandResult>(&cfg);
+    trim_line_ends(&ts);
 
     export_schema::<EventEnvelope>(&schema);
     export_schema::<TypedEvent>(&schema);
@@ -123,6 +156,15 @@ fn generate(out: &Path) -> (PathBuf, PathBuf) {
     export_schema::<WorktreesResponse>(&schema);
     export_schema::<StopResult>(&schema);
     export_schema::<CloseResult>(&schema);
+    export_schema::<SendArgs>(&schema);
+    export_schema::<SendResult>(&schema);
+    export_schema::<ReadyArgs>(&schema);
+    export_schema::<ReadyResult>(&schema);
+    export_schema::<KeyArgs>(&schema);
+    export_schema::<KeyResult>(&schema);
+    export_schema::<InputResolveArgs>(&schema);
+    export_schema::<InputCancelArgs>(&schema);
+    export_schema::<InputCommandResult>(&schema);
 
     (ts, schema)
 }
@@ -251,6 +293,14 @@ fn nullable_result_fields_are_required() {
             "CloseResult: {f} not required"
         );
     }
+    let send = required(serde_json::to_value(schemars::schema_for!(SendResult)).unwrap());
+    for f in ["input_id", "state", "reject_reason"] {
+        assert!(send.iter().any(|r| r == f), "SendResult: {f} not required");
+    }
+    let key = required(serde_json::to_value(schemars::schema_for!(KeyResult)).unwrap());
+    for f in ["outcome", "bytes_written"] {
+        assert!(key.iter().any(|r| r == f), "KeyResult: {f} not required");
+    }
 }
 
 /// No success type of the launch commands has a top-level `code` property: a client decodes
@@ -263,6 +313,13 @@ fn success_schemas_have_no_code() {
         ("ResumeResult", schemars::schema_for!(ResumeResult)),
         ("StopResult", schemars::schema_for!(StopResult)),
         ("CloseResult", schemars::schema_for!(CloseResult)),
+        ("SendResult", schemars::schema_for!(SendResult)),
+        ("ReadyResult", schemars::schema_for!(ReadyResult)),
+        ("KeyResult", schemars::schema_for!(KeyResult)),
+        (
+            "InputCommandResult",
+            schemars::schema_for!(InputCommandResult),
+        ),
     ] {
         let v = serde_json::to_value(schema).unwrap();
         let props = v["properties"].as_object().expect("an object schema");

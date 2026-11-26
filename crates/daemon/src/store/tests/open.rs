@@ -59,7 +59,7 @@ fn projection_version_change_rebuilds() {
     append_one(&s, 1).unwrap();
     shutdown_checked(&s);
     let path = dir.path().join("chaldea.db");
-    for version in [2, 1] {
+    for version in [3, 2] {
         // Tamper with a projection row, so only a rebuild restores it.
         raw(&path)
             .execute("UPDATE proj_threads SET cwd = '/tampered'", [])
@@ -93,7 +93,7 @@ fn stale_projection_version_cannot_write() {
     let new = open_with(
         dir.path(),
         Faults {
-            projection_version: Some(2),
+            projection_version: Some(3),
             ..Faults::default()
         },
     )
@@ -104,7 +104,7 @@ fn stale_projection_version_cannot_write() {
         matches!(
             r,
             Err(WriteError::Failed(StoreError::ProjectionVersion {
-                code: 1,
+                code: 2,
                 ..
             }))
         ),

@@ -1,0 +1,47 @@
+{
+  "$defs": {
+    "KeyOutcome": {
+      "description": "What a `key` request knew of its unit when it replied.",
+      "oneOf": [
+        {
+          "const": "written",
+          "description": "Every byte was written and the `human_write` committed.",
+          "type": "string"
+        },
+        {
+          "const": "incomplete",
+          "description": "Some bytes may have reached the CLI; the `human_write` committed.",
+          "type": "string"
+        },
+        {
+          "const": "pending",
+          "description": "No recorded outcome was known at the reply; the daemon records it later.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The success body of `key`.",
+  "properties": {
+    "bytes_written": {
+      "description": "`null` for `pending`.",
+      "format": "uint64",
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "outcome": {
+      "$ref": "#/$defs/KeyOutcome"
+    }
+  },
+  "required": [
+    "outcome",
+    "bytes_written"
+  ],
+  "title": "KeyResult",
+  "type": "object"
+}

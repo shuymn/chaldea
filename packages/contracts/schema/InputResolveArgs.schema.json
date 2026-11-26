@@ -1,0 +1,27 @@
+{
+  "$defs": {
+    "InputId": {
+      "description": "One prompt sent through `chaldea send`, the PWA, or `surface_action` (§2.3).",
+      "format": "uuid",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The arguments of `input_resolve`.",
+  "properties": {
+    "delivered": {
+      "description": "`true`: the owner saw it delivered (`acked`); `false`: `dismissed`.",
+      "type": "boolean"
+    },
+    "input_id": {
+      "$ref": "#/$defs/InputId"
+    }
+  },
+  "required": [
+    "input_id",
+    "delivered"
+  ],
+  "title": "InputResolveArgs",
+  "type": "object"
+}

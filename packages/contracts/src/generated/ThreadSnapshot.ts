@@ -13,15 +13,15 @@ import type { WorktreeChanged } from "./WorktreeChanged";
 /**
  * A thread's projection plus its latest events (§2.4).
  */
-export type ThreadSnapshot = { thread: ThreadInfo, launch: LaunchInfo | null, session: SessionInfo | null, gate: GateEvidence, 
+export type ThreadSnapshot = { thread: ThreadInfo, launch: LaunchInfo | null, session: SessionInfo | null, gate: GateEvidence,
 /**
  * Inputs not yet terminal.
  */
-inputs: Array<InputInfo>, open_approvals: Array<ApprovalRequested>, worktree: WorktreeChanged | null, surfaces: Array<SurfaceUpdate>, 
+inputs: Array<InputInfo>, open_approvals: Array<ApprovalRequested>, worktree: WorktreeChanged | null, surfaces: Array<SurfaceUpdate>,
 /**
  * The latest `vt_snapshot_taken`, while an attention cause is active or a card is open.
  */
-vt_snapshot: VtSnapshotTaken | null, 
+vt_snapshot: VtSnapshotTaken | null,
 /**
  * The last `SNAPSHOT_RECENT_EVENTS` events of the stream.
  */

@@ -10,9 +10,9 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, MutexGuard, Weak};
+use std::sync::{Arc, MutexGuard, OnceLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use crate::origin::{ClassSet, OriginClass, ReplyKind, WriteOrigin};
@@ -73,6 +73,8 @@ pub struct Guard {
     pub bracketed_paste: Option<u64>,
     /// The daemon's gate or card recheck.
     pub recheck: Option<Recheck>,
+    /// Refuse unless the caller's word still holds the value it read.
+    pub fence: Option<Fence>,
 }
 
 impl Guard {
@@ -84,7 +86,24 @@ impl Guard {
             basis: None,
             bracketed_paste: None,
             recheck: None,
+            fence: None,
         }
+    }
+}
+
+/// A word the caller advances on events the writer cannot see: the writer refuses
+/// [`Refusal::FenceMoved`] when `word` no longer equals `expect`, checked before the recheck
+/// and again at the dispatch boundary under the queue lock, as the last check before the
+/// unit's first write permission.
+#[derive(Debug, Clone)]
+pub struct Fence {
+    pub word: Arc<AtomicU64>,
+    pub expect: u64,
+}
+
+impl Fence {
+    fn moved(&self) -> bool {
+        self.word.load(Ordering::Acquire) != self.expect
     }
 }
 
@@ -95,6 +114,7 @@ impl fmt::Debug for Guard {
             .field("basis", &self.basis)
             .field("bracketed_paste", &self.bracketed_paste)
             .field("recheck", &self.recheck.is_some())
+            .field("fence", &self.fence)
             .finish()
     }
 }
@@ -176,11 +196,18 @@ pub enum Refusal {
     Closed,
     ChildExited,
     InputBroken,
-    BasisUnknown { basis: u64, head: u64 },
-    WriteSinceBasis { seq: u64 },
+    BasisUnknown {
+        basis: u64,
+        head: u64,
+    },
+    WriteSinceBasis {
+        seq: u64,
+    },
     BracketedPasteChanged,
     Recheck(String),
     RecheckPanicked,
+    /// The guard's fence word moved after the caller read it.
+    FenceMoved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +238,7 @@ pub struct LogTruncated {
 pub struct WriteTicket {
     shared: Weak<Shared>,
     id: u64,
+    started: Arc<OnceLock<Instant>>,
 }
 
 impl WriteTicket {
@@ -228,6 +256,33 @@ impl WriteTicket {
         };
         fired.fire(&sh);
         cancelled
+    }
+
+    /// [`WriteTicket::cancel`] without waiting for the queue lock: `None` while another
+    /// thread holds it (the writer at its dispatch boundary, for one).
+    #[must_use = "Some(false) means the unit already dispatched or was settled"]
+    pub fn try_cancel(&self) -> Option<bool> {
+        let Some(sh) = self.shared.upgrade() else {
+            return Some(false);
+        };
+        let mut fired = Fired::default();
+        let cancelled = {
+            let mut q = match sh.q.try_lock() {
+                Ok(q) => q,
+                Err(TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(TryLockError::WouldBlock) => return None,
+            };
+            q.cancel(self.id, &mut fired)
+        };
+        fired.fire(&sh);
+        Some(cancelled)
+    }
+
+    /// The instant of the unit's first write permission, once granted; read without the
+    /// queue lock.
+    #[must_use]
+    pub fn started_at(&self) -> Option<Instant> {
+        self.started.get().copied()
     }
 }
 
@@ -271,6 +326,8 @@ struct Queued {
     done: Completion,
     submitted_at: Instant,
     bytes: usize,
+    /// The ticket's cell for the first permission's instant.
+    started: Arc<OnceLock<Instant>>,
 }
 
 pub(crate) struct PendingReply {
@@ -538,6 +595,7 @@ impl Shared {
         let id = q.next_id;
         q.next_id += 1;
         q.user_bytes += bytes;
+        let started = Arc::new(OnceLock::new());
         q.user.push_back(Queued {
             id,
             unit,
@@ -545,12 +603,14 @@ impl Shared {
             done,
             submitted_at: Instant::now(),
             bytes,
+            started: started.clone(),
         });
         drop(q);
         self.cv.notify_all();
         Ok(WriteTicket {
             shared: Arc::downgrade(self),
             id,
+            started,
         })
     }
 
@@ -611,6 +671,9 @@ fn pre_check(q: &Queue, f: Facts, guard: &Guard, seq: u64) -> Option<Refusal> {
         if !v.modes.bracketed_paste || v.bracketed_paste_epoch != epoch {
             return Some(Refusal::BracketedPasteChanged);
         }
+    }
+    if guard.fence.as_ref().is_some_and(Fence::moved) {
+        return Some(Refusal::FenceMoved);
     }
     None
 }
@@ -755,6 +818,7 @@ fn write_next_unit(sh: &Shared, input: &mut dyn Write) {
         guard,
         done,
         submitted_at,
+        started,
         ..
     } = item;
     let class = unit.origin.class();
@@ -784,6 +848,7 @@ fn write_next_unit(sh: &Shared, input: &mut dyn Write) {
         not_after,
         bracketed_paste,
         recheck,
+        fence,
         ..
     } = guard;
     if let Some(recheck) = recheck {
@@ -812,20 +877,29 @@ fn write_next_unit(sh: &Shared, input: &mut dyn Write) {
             return;
         }
     }
-    // Dispatch boundary: the first write call's permission. The deadline is part of it,
-    // decided here under the queue lock.
+    // Dispatch boundary: the first write call's permission. The deadline and the fence are
+    // part of it, decided here under the queue lock.
     crate::probe!(sh, Dispatching);
-    if Instant::now() >= not_after {
-        q.settle_slot(WriteOutcome::NotStarted(Refusal::Expired), &mut fired);
+    let last = if Instant::now() >= not_after {
+        Some(Refusal::Expired)
+    } else if fence.as_ref().is_some_and(Fence::moved) {
+        Some(Refusal::FenceMoved)
+    } else {
+        None
+    };
+    if let Some(r) = last {
+        q.settle_slot(WriteOutcome::NotStarted(r), &mut fired);
         drop(q);
         fired.fire(sh);
         return;
     }
     let pos = q.input_pos;
+    let at = Instant::now();
     if let Some(s) = q.slot.as_mut() {
-        s.record.started_at = Some(Instant::now());
+        s.record.started_at = Some(at);
         s.record.byte_start = pos;
     }
+    let _ = started.set(at);
     q.last_started[class.index()] = seq;
     drop(q);
     write_parts(sh, input, seq, &unit.parts);

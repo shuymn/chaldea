@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use chaldea_core::ids::LaunchId;
+
+use super::adapter::TurnMark;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
@@ -14,20 +16,107 @@ use tokio::sync::Notify;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IntakeFacts(pub serde_json::Value);
 
-/// Supplies a hook's intake facts.
+/// Supplies a hook's intake facts and learns when the intake is finished.
 pub trait IntakeProbe: Send + Sync + 'static {
-    /// The facts at this hook's intake, or `None` (no session yet). Non-blocking: it runs
-    /// under the intake mutex.
-    fn facts(&self, launch: LaunchId) -> Option<IntakeFacts>;
+    /// The facts at the intake of the hook with receipt ordinal `ordinal`, or `None` (no
+    /// session yet). It runs under the intake mutex; an implementation waits on nothing but
+    /// short sections with no await, I/O, or other lock inside them, and that wait has no
+    /// deadline of its own (the send side's: its launch map's write section, one launch
+    /// constructed and inserted or one removed).
+    fn facts(&self, launch: LaunchId, ordinal: u64) -> Option<IntakeFacts>;
+
+    /// The intake `ordinal` of `launch` is finished: its job committed with `marks` (its own
+    /// delivery's and, in a binding job, each promoted delivery's, by receipt ordinal) at
+    /// `committed_at` (the clock read right after a successful SQLite `COMMIT`), or decided
+    /// nothing (`marks` empty and no instant: rolled back, refused, or never submitted).
+    /// Called at most once per intake through its [`IntakeGuard`], and never for an intake
+    /// whose job's outcome stays unknown. It waits only as [`IntakeProbe::facts`] may: on short
+    /// sections with no await, I/O, or other lock inside them, with no deadline of its own.
+    fn finished(
+        &self,
+        launch: LaunchId,
+        ordinal: u64,
+        marks: &[(u64, TurnMark)],
+        committed_at: Option<Instant>,
+    ) {
+        let _ = (launch, ordinal, marks, committed_at);
+    }
 }
 
-/// The default probe until PR 10: no facts.
+/// The default probe: no facts.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoIntakeFacts;
 
 impl IntakeProbe for NoIntakeFacts {
-    fn facts(&self, _launch: LaunchId) -> Option<IntakeFacts> {
+    fn facts(&self, _launch: LaunchId, _ordinal: u64) -> Option<IntakeFacts> {
         None
+    }
+}
+
+/// Finishes one intake exactly once (supervisor-send §2.9 P2): owned by the hook request
+/// from its intake, then by the write observer from its registration. Dropped before its
+/// job was submitted, it finishes with no marks; after a reply that decides the job
+/// (committed, rolled back, refused) it finishes with the committed marks or none; after
+/// `CommitUnknown` or `WriterGone`, or dropped after the submission without a reply (the
+/// observer aborted at shutdown), it leaves the intake unfinished.
+pub struct IntakeGuard {
+    probe: Arc<dyn IntakeProbe>,
+    launch: LaunchId,
+    ordinal: u64,
+    /// `Store::submit` accepted the job.
+    submitted: bool,
+    /// Finished, or left unfinished on purpose.
+    done: bool,
+}
+
+impl std::fmt::Debug for IntakeGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IntakeGuard")
+            .field("launch", &self.launch)
+            .field("ordinal", &self.ordinal)
+            .field("submitted", &self.submitted)
+            .finish_non_exhaustive()
+    }
+}
+
+impl IntakeGuard {
+    pub(crate) fn new(probe: Arc<dyn IntakeProbe>, launch: LaunchId, ordinal: u64) -> Self {
+        IntakeGuard {
+            probe,
+            launch,
+            ordinal,
+            submitted: false,
+            done: false,
+        }
+    }
+
+    /// The job was submitted: from now on only its reply finishes the intake.
+    pub(crate) fn submitted(&mut self) {
+        self.submitted = true;
+    }
+
+    /// The writer's answer: committed with `marks` at the job's instant, or `None` for a
+    /// reply that decided nothing; `unknown` for an outcome that stays unknown (the intake
+    /// stays unfinished).
+    pub(crate) fn replied(
+        mut self,
+        committed: Option<(&[(u64, TurnMark)], Instant)>,
+        unknown: bool,
+    ) {
+        self.done = true;
+        if !unknown {
+            let (marks, at) = committed.map_or((&[][..], None), |(m, at)| (m, Some(at)));
+            self.probe.finished(self.launch, self.ordinal, marks, at);
+        }
+    }
+}
+
+impl Drop for IntakeGuard {
+    fn drop(&mut self) {
+        if !self.done && !self.submitted {
+            self.done = true;
+            self.probe.finished(self.launch, self.ordinal, &[], None);
+        }
     }
 }
 
@@ -97,16 +186,17 @@ impl Drop for IntakeTicket {
 }
 
 impl IntakeOrder {
-    /// The next ordinal of `l` (an absent entry starts at `stored_max + 1`), `probe`'s facts,
-    /// and the intake instant from `now` (the pid wait's origin), in one critical section, so
-    /// receipt order, the order of intake facts, and the pid wait's start agree.
+    /// The next ordinal of `l` (an absent entry starts at `stored_max + 1`), `probe`'s facts
+    /// with the intake's [`IntakeGuard`], and the intake instant from `now` (the pid wait's
+    /// origin), in one critical section, so receipt order, the order of intake facts, and the
+    /// pid wait's start agree.
     pub fn intake(
         self: &Arc<Self>,
         l: LaunchId,
         stored_max: u64,
-        probe: &dyn IntakeProbe,
+        probe: &Arc<dyn IntakeProbe>,
         now: impl FnOnce() -> Instant,
-    ) -> (IntakeTicket, Option<IntakeFacts>, Instant) {
+    ) -> (IntakeTicket, Option<IntakeFacts>, IntakeGuard, Instant) {
         #[cfg(test)]
         run_once(&self.before_lock);
         let mut map = self.launches.lock().unwrap_or_else(PoisonError::into_inner);
@@ -118,7 +208,8 @@ impl IntakeOrder {
         let ordinal = e.next;
         e.next = e.next.saturating_add(1);
         e.pending.insert(ordinal);
-        let facts = probe.facts(l);
+        let facts = probe.facts(l, ordinal);
+        let guard = IntakeGuard::new(probe.clone(), l, ordinal);
         let at = now();
         drop(map);
         (
@@ -128,6 +219,7 @@ impl IntakeOrder {
                 order: self.clone(),
             },
             facts,
+            guard,
             at,
         )
     }

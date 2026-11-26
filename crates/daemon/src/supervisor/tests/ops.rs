@@ -105,6 +105,7 @@ async fn pending_after_one_poll(fut: &mut std::pin::Pin<&mut impl std::future::F
 async fn report_before_a_late_join() {
     use crate::supervisor::ops::{KillTask, await_kill};
     let rig = Rig::new().await;
+    rig.clock.resume();
     let sup = rig.sup.clone();
     let (tx, first) = tokio::sync::oneshot::channel();
     let (release, held) = tokio::sync::oneshot::channel::<()>();

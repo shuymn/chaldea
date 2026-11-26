@@ -4,7 +4,7 @@ import type { ApprovalId } from "./ApprovalId";
 import type { Content } from "./Content";
 import type { LaunchId } from "./LaunchId";
 
-export type ApprovalRequested = { approval_id: ApprovalId, launch_id: LaunchId, turn_ref: string | null, tool_name: string, tool_input: Content, 
+export type ApprovalRequested = { approval_id: ApprovalId, launch_id: LaunchId, turn_ref: string | null, tool_name: string, tool_input: Content,
 /**
  * Present only when exactly one `PreToolUse` of the same turn matches (§2.10).
  */

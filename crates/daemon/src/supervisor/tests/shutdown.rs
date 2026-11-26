@@ -21,6 +21,7 @@ async fn owned_close() {
         (KillBehavior::Ignore, false, ParticipantEnd::LeftRunning),
     ] {
         let rig = Rig::new().await;
+        rig.clock.resume();
         rig.pty.script_next(FakeScript {
             kill,
             ..FakeScript::default()
@@ -101,13 +102,17 @@ async fn close_stop_after_admission() {
     let store = rig.srv.store.store().clone();
     let closing =
         std::thread::spawn(move || store.shutdown(Instant::now() + Duration::from_secs(20)));
+    // Only `Closed` says admission closed: the polls themselves fill the writer queue
+    // (`QueueFull`) while the shutdown thread has not yet begun.
     rig.until("admission closed", || {
         let job: crate::http::Job<()> = Box::new(|_| Ok(()));
-        rig.srv
-            .store
-            .store()
-            .submit(Instant::now() + Duration::from_secs(5), job)
-            .is_err()
+        matches!(
+            rig.srv
+                .store
+                .store()
+                .submit(Instant::now() + Duration::from_secs(5), job),
+            Err(crate::store::SubmitError::Closed)
+        )
     })
     .await;
     held.go();
@@ -186,6 +191,7 @@ async fn release_rule() {
             c.close_bounds.join = Duration::from_millis(300);
         })
         .await;
+        rig.clock.resume();
         rig.pty.script_next(script);
         let (t, l) = rig.spawn_codex(None).await;
         let r = rig.cmd("stop", &json!({ "thread_id": t })).await;
@@ -222,6 +228,7 @@ async fn release_rule() {
         ),
     ] {
         let rig = Rig::new().await;
+        rig.clock.resume();
         rig.pty.script_next(FakeScript {
             fail: Some(fail),
             ..FakeScript::default()
@@ -239,6 +246,7 @@ async fn release_rule() {
         c.program = Some(Arc::new(|_| None));
     })
     .await;
+    rig.clock.resume();
     let cwd = rig.cwd.path().to_string_lossy().into_owned();
     let r = rig
         .cmd("spawn", &json!({ "agent": "codex", "cwd": cwd }))
@@ -298,6 +306,7 @@ async fn tracker() {
         };
         // Before `Session::spawn`.
         let rig = Rig::new().await;
+        rig.clock.resume();
         let held = rig.pauses.arm(Pause::BeforeSpawn);
         let cwd = rig.cwd.path().to_string_lossy().into_owned();
         let reply = super::support::http::spawn_send(
@@ -319,6 +328,7 @@ async fn tracker() {
         rig.srv.stop().await;
         // A natural exit's session out of its slot.
         let rig = Rig::new().await;
+        rig.clock.resume();
         let (_t, _l) = rig.spawn_codex(None).await;
         let child = rig.pty.take_child().unwrap();
         let held = rig.pauses.arm(Pause::ExitTookSession);
@@ -335,6 +345,7 @@ async fn tracker() {
         rig.srv.stop().await;
         // A sealed stop's kill task before its start.
         let rig = Rig::new().await;
+        rig.clock.resume();
         let (t, _l) = rig.spawn_codex(None).await;
         let held = rig.pauses.arm(Pause::KillTaskStart);
         let reply = super::support::http::spawn_send(&rig.srv, &stop_req(&rig, t));
@@ -364,6 +375,7 @@ async fn publish_vs_admission() {
         (Pause::InPublish, Pause::ShutdownCloseEnd),
     ] {
         let rig = Rig::new().await;
+        rig.clock.resume();
         let held = rig.pauses.arm(at);
         let closed_by = rig.pauses.arm(closer);
         let cwd = rig.cwd.path().to_string_lossy().into_owned();
@@ -462,6 +474,7 @@ async fn git_spawn_stalled() {
     use crate::supervisor::Pause;
     use crate::supervisor::workspace::common_dir;
     let rig = Rig::new().await;
+    rig.clock.resume();
     let (_t, l) = rig.spawn_codex(None).await;
     let dir = tempfile::tempdir().unwrap();
     let held = rig.pauses.arm(Pause::GitAfterAdmit);
@@ -499,6 +512,7 @@ async fn git_reaped() {
             c.git = super::workspace::sleeping_git();
         })
         .await;
+        rig.clock.resume();
         let created = if in_left {
             rig.pauses.arm_panic(Pause::GitAfterCreate)
         } else {
@@ -536,6 +550,7 @@ async fn git_reaped() {
         c.git = super::workspace::sleeping_git();
     })
     .await;
+    rig.clock.resume();
     let created = rig.pauses.arm_panic(Pause::GitAfterCreate);
     let (sup, cwd) = (rig.sup.clone(), dir.path().to_path_buf());
     let probe =
@@ -576,6 +591,8 @@ async fn git_late_handoff() {
             c.git = super::workspace::sleeping_git();
         })
         .await;
+        // Running: the probe ends only at its deadline, while git still sleeps.
+        rig.clock.resume();
         let created = if panics {
             rig.pauses.arm_panic(Pause::GitAfterCreate)
         } else {
@@ -619,6 +636,7 @@ async fn unwind_with_an_open_session() {
         Pause::BeforePublish,
     ] {
         let rig = Rig::new().await;
+        rig.clock.resume();
         rig.pty.script_next(FakeScript {
             kill: KillBehavior::Panic,
             ..FakeScript::default()

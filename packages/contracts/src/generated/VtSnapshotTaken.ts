@@ -3,7 +3,7 @@ import type { Content } from "./Content";
 import type { VtCursor } from "./VtCursor";
 import type { VtModes } from "./VtModes";
 
-export type VtSnapshotTaken = { 
+export type VtSnapshotTaken = {
 /**
  * A JSON array of exactly `rows` rows, top to bottom, each an array of at most
  * `cols` cell strings, left to right. `""` is the second cell of a wide character and
