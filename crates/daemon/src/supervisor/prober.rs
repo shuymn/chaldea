@@ -127,12 +127,15 @@ pub(crate) async fn run(sup: Arc<Supervisor>) {
             Some(report)
         });
         // 3.5: a task of its own awaits the join and records the evidence.
+        // The join's timer is set at dispatch, with the blocking task.
+        let cutoff = deadline + PROBE_JOIN_GRACE;
         let probe = Probe {
             thread: l.thread_id,
             launch: l.launch_id,
             identity,
             attempt,
-            deadline,
+            cutoff,
+            timer: sup.timer(cutoff),
         };
         sup.rt.spawn(record_probe(sup.clone(), probe, join));
     }
@@ -144,15 +147,16 @@ struct Probe {
     launch: LaunchId,
     identity: ProcessIdentity,
     attempt: Uuid,
-    deadline: std::time::Instant,
+    /// `deadline + PROBE_JOIN_GRACE`, and its timer.
+    cutoff: std::time::Instant,
+    timer: tokio::time::Instant,
 }
 
 /// §2.3 step 3.5: the join awaited until `deadline + PROBE_JOIN_GRACE`; a late report is
 /// still an observation; an elapsed join or a panic is `not_read` with `result_not_received`;
 /// a task cancelled at shutdown before its OS work records nothing.
 async fn record_probe(sup: Arc<Supervisor>, p: Probe, join: JoinHandle<Option<OrphanReport>>) {
-    let cutoff = p.deadline + PROBE_JOIN_GRACE;
-    let settled = settle_before(|| sup.now(), cutoff, sup.timer(cutoff), join).await;
+    let settled = settle_before(|| sup.now(), p.cutoff, p.timer, join).await;
     let (fates, received) = match settled {
         Settled::InTime(Ok(Some(r))) | Settled::Late(Ok(Some(r))) => (r.fates, true),
         Settled::InTime(Ok(None)) | Settled::Late(Ok(None)) => return,
