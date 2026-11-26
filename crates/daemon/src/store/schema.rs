@@ -16,7 +16,7 @@ pub(crate) const PROJECTION_VERSION: u32 = 3;
 
 /// Ordered migration scripts; `MIGRATIONS[i]` brings `user_version` from `i` to `i + 1`.
 /// Any physical DDL change, projection tables included, is a new migration.
-pub(crate) const MIGRATIONS: &[&str] = &[V1, V2, V3];
+pub(crate) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 /// SHA-256 (lowercase hex) of the schema dump of each version (`open::schema_fingerprint`),
 /// in the order of `MIGRATIONS`. `schema_tests::shipped_fingerprints_match_the_migrations`
@@ -25,6 +25,7 @@ pub(crate) const FINGERPRINTS: &[&str] = &[
     "497e99858728fa92c32e3f3468a3a0e2f478cc662b76c48e96ce913daf9f405a",
     "1299d9c3158a9ad1da9751087819a6d97649461cc02437724af82db703bca8a7",
     "3718d8fce2faf13eb827f086c6c412e54c372c0477288b28da95ed1cc8e46706",
+    "812afa9db6c910459f2847a71b531792e3a5c13ce95883a8d4fc08e255048920",
 ];
 
 const V1: &str = r#"
@@ -461,4 +462,120 @@ END;
 const V3: &str = r#"
 ALTER TABLE proj_inputs ADD COLUMN attempt_seq INTEGER;
 ALTER TABLE proj_inputs ADD COLUMN last_write_before INTEGER;
+"#;
+
+/// The bytes of one `large_blob_parts` row at most (an internal limit; `length(data)`'s
+/// `CHECK` in [`V4`] spells the same number).
+pub(crate) const PART_BYTES: usize = 4 * 1024 * 1024;
+
+/// Values above `MAX_BLOB_BYTES` (`docs/design/event-store.md` §2.4, §2.5): one blob stored
+/// as ordered parts under its whole content's SHA-256. Part 0 holds at least the bytes the
+/// preview reads (1027), so the preview check reads one part. A ref is accepted only for a
+/// blob whose parts are complete, and a referenced blob takes no more parts. An empty
+/// partial index on `data` makes SQLite's incremental BLOB I/O (`sqlite3_blob_open`, which
+/// bypasses `UPDATE` triggers) refuse to open a part for writing, at no read cost. Every typed
+/// reference of an event is satisfied by a `blob_refs` or a `large_blob_refs` row.
+const V4: &str = r#"
+CREATE TABLE large_blobs (
+  sha256     TEXT PRIMARY KEY CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+  size       INTEGER NOT NULL CHECK (size > 67108864 AND size <= 9007199254740991),
+  part_count INTEGER NOT NULL CHECK (part_count >= 2)
+) STRICT;
+
+CREATE TABLE large_blob_parts (
+  sha256     TEXT NOT NULL REFERENCES large_blobs (sha256),
+  part_index INTEGER NOT NULL CHECK (part_index >= 0),
+  data       BLOB NOT NULL CHECK (length(data) > 0 AND length(data) <= 4194304
+                                  AND (part_index > 0 OR length(data) >= 1027)),
+  PRIMARY KEY (sha256, part_index)
+) STRICT;
+
+CREATE INDEX large_blob_parts_no_blob_write ON large_blob_parts (data) WHERE 0;
+
+CREATE TABLE large_blob_refs (
+  stream_id  TEXT NOT NULL,
+  sha256     TEXT NOT NULL REFERENCES large_blobs (sha256),
+  media_type TEXT NOT NULL CHECK (length(media_type) > 0),
+  PRIMARY KEY (stream_id, sha256, media_type)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX large_blob_refs_sha256 ON large_blob_refs (sha256);
+
+CREATE TRIGGER large_blobs_no_update BEFORE UPDATE ON large_blobs
+BEGIN
+  SELECT RAISE(ROLLBACK, 'large_blobs_no_update: large blobs are immutable');
+END;
+
+CREATE TRIGGER large_blobs_no_delete BEFORE DELETE ON large_blobs
+BEGIN
+  SELECT RAISE(ROLLBACK, 'large_blobs_no_delete: large blobs are permanent');
+END;
+
+CREATE TRIGGER large_blob_parts_no_update BEFORE UPDATE ON large_blob_parts
+BEGIN
+  SELECT RAISE(ROLLBACK, 'large_blob_parts_no_update: blob parts are immutable');
+END;
+
+CREATE TRIGGER large_blob_parts_no_delete BEFORE DELETE ON large_blob_parts
+BEGIN
+  SELECT RAISE(ROLLBACK, 'large_blob_parts_no_delete: blob parts are permanent');
+END;
+
+CREATE TRIGGER large_blob_refs_no_update BEFORE UPDATE ON large_blob_refs
+BEGIN
+  SELECT RAISE(ROLLBACK, 'large_blob_refs_no_update: blob refs are immutable');
+END;
+
+CREATE TRIGGER large_blob_refs_no_delete BEFORE DELETE ON large_blob_refs
+BEGIN
+  SELECT RAISE(ROLLBACK, 'large_blob_refs_no_delete: blob refs are permanent');
+END;
+
+CREATE TRIGGER large_blob_parts_sealed BEFORE INSERT ON large_blob_parts
+WHEN EXISTS (SELECT 1 FROM large_blob_refs WHERE sha256 = NEW.sha256)
+BEGIN
+  SELECT RAISE(ROLLBACK, 'large_blob_parts_sealed: a referenced blob takes no more parts');
+END;
+
+CREATE TRIGGER large_blob_refs_complete BEFORE INSERT ON large_blob_refs
+BEGIN
+  SELECT RAISE(ROLLBACK, 'large_blob_refs_complete: the blob''s parts are missing, out of order, or of another total length')
+  WHERE NOT EXISTS (
+    SELECT 1 FROM large_blobs AS b
+    WHERE b.sha256 = NEW.sha256
+      AND (SELECT count(*), min(part_index), max(part_index), sum(length(data))
+           FROM large_blob_parts WHERE sha256 = NEW.sha256)
+          IS (b.part_count, 0, b.part_count - 1, b.size));
+END;
+
+DROP TRIGGER events_blob_refs;
+CREATE TRIGGER events_blob_refs AFTER INSERT ON events
+BEGIN
+  SELECT RAISE(ROLLBACK, 'events_blob_refs: a typed blob reference has no blob_refs or large_blob_refs row')
+  WHERE EXISTS (
+    SELECT 1 FROM (
+      SELECT json_extract(NEW.payload, p.path || '.blob.sha256') AS sha,
+             json_extract(NEW.payload, p.path || '.blob.media_type') AS media_type
+      FROM (SELECT '$.prompt' AS path WHERE NEW.kind = 'user_message'
+            UNION ALL SELECT '$.text' WHERE NEW.kind IN ('assistant_message', 'input_created')
+            UNION ALL SELECT '$.input' WHERE NEW.kind = 'tool_activity'
+            UNION ALL SELECT '$.output' WHERE NEW.kind = 'tool_activity'
+            UNION ALL SELECT '$.tool_input' WHERE NEW.kind = 'approval_requested'
+            UNION ALL SELECT '$.body' WHERE NEW.kind = 'mailbox_message'
+            UNION ALL SELECT '$.grid' WHERE NEW.kind = 'vt_snapshot_taken'
+            UNION ALL SELECT '$.raw' WHERE NEW.kind = 'raw_unknown') AS p
+      WHERE json_type(NEW.payload, p.path || '.blob') IS 'object'
+      UNION ALL
+      SELECT json_extract(t.value, '$.blob.sha256'), json_extract(t.value, '$.blob.media_type')
+      FROM json_tree(NEW.payload, '$.components') AS t
+      WHERE NEW.kind = 'surface_update' AND t.key IS 'grid' AND t.type IS 'object'
+        AND json_type(t.value, '$.blob') IS 'object'
+        AND json_extract(NEW.payload, t.path || '.type') IS 'vt_snapshot'
+        AND t.fullkey NOT GLOB '*.action.args*'
+    ) AS r
+    WHERE NOT EXISTS (SELECT 1 FROM blob_refs
+                      WHERE stream_id = NEW.stream_id AND sha256 IS r.sha AND media_type IS r.media_type)
+      AND NOT EXISTS (SELECT 1 FROM large_blob_refs
+                      WHERE stream_id = NEW.stream_id AND sha256 IS r.sha AND media_type IS r.media_type)
+  );
+END;
 "#;

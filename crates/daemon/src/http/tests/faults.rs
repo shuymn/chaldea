@@ -16,6 +16,8 @@ type Gate = (oneshot::Sender<()>, oneshot::Receiver<()>);
 pub(crate) struct Points {
     /// Polls of request bodies by the application, since the server started.
     pub(crate) body_polls: AtomicUsize,
+    /// Large blob response bodies that ended with an error (`blobs::PartsBody`).
+    pub(crate) blob_body_errors: AtomicUsize,
     /// Run once, on the blocking thread, before a store read starts: after skipping the
     /// given number of reads.
     pub(crate) before_read: Mutex<Option<(usize, Hook)>>,
