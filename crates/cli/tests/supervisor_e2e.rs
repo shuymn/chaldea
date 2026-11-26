@@ -902,30 +902,67 @@ fn a29_child_suspended() {
 
 /// PR10a2-CL-3 on Windows: a spawn whose job assignment and then termination fail ends
 /// `spawn_failed` with its suspended child alive and recorded in `failed_start`; after a
-/// crash, the next start's probe signals that child by its recorded identity and records it
-/// `gone`, with this run as `probe_run`. Daemon 1 is held at `prober_start`, so only daemon
-/// 2 probes.
+/// crash, the child is still alive with that identity when the next start reaches its probe,
+/// and that probe signals it by its recorded identity and records it `gone`, with this run
+/// as `probe_run`. Daemon 1 runs in a kill-on-close job the test owns from before it starts,
+/// so its child is in that job too, and is held at `prober_start`, so only daemon 2 probes.
 #[cfg(windows)]
 fn assign_failure_child_probed() {
-    use chaldea_pty_runtime::fake;
+    use std::os::windows::process::CommandExt;
+
+    use chaldea_pty_runtime::fake::{self, TestJob};
+    use chaldea_pty_runtime::host::JobLimits;
     use chaldea_pty_runtime::process::{Lookup, lookup};
     use support::faults::WINDOWS_FAULT;
+
+    /// `CREATE_SUSPENDED` (`winbase.h`).
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+    /// Ends the failed start's child by its recorded identity when the test ends, a failed
+    /// assertion included.
+    struct EndChild(u32, String);
+
+    impl Drop for EndChild {
+        fn drop(&mut self) {
+            if lookup(self.0) != Lookup::Gone && !fake::kill_verified(self.0, &self.1) {
+                eprintln!("the failed start's child {} was not ended", self.0);
+            }
+        }
+    }
 
     let labels = Labels::new();
     let d = state();
     let cwd = tempfile::tempdir().unwrap();
     let args = ["--mode", "sleeper", "--max-life-secs", "120"];
+    let mut argv = vec![fake_cli().to_string_lossy().into_owned()];
+    argv.extend(args.iter().map(|a| (*a).to_owned()));
+    argv.push("--".to_owned());
+    let json = serde_json::to_string(&argv).unwrap();
+    let job = TestJob::new(JobLimits {
+        kill_on_close: true,
+        breakaway_ok: false,
+        silent_breakaway_ok: false,
+    })
+    .unwrap();
     let gate = Gate::new();
-    let (mut d1, port) = daemon_with(
+    let run = run_args(&d.path);
+    let run: Vec<&str> = run.iter().map(String::as_str).collect();
+    let mut c = cmd(
         &labels,
         &d.path,
-        &args,
+        &run,
         &[
+            (AGENT_PROGRAM, OsStr::new(&json)),
             (WINDOWS_FAULT, OsStr::new("assign_terminate_denied")),
             (SUPERVISOR_PAUSE, OsStr::new("prober_start")),
             (SUPERVISOR_GATE, gate.path().as_os_str()),
         ],
     );
+    c.creation_flags(CREATE_SUSPENDED);
+    let mut d1 = Proc::spawn(&mut c);
+    job.assign(d1.pid()).unwrap();
+    assert!(fake::resume_process(d1.pid()).unwrap() >= 1);
+    let port = d1.serving();
     assert!(gate.reached(WAIT), "daemon 1 held before its probe");
     let token = chaldea_daemon::lifecycle::read_owner_token(&d.path).unwrap();
     let (_, v, err) = agent(
@@ -952,15 +989,23 @@ fn assign_failure_child_probed() {
         .as_str()
         .unwrap()
         .to_owned();
-    match lookup(child) {
-        Lookup::Live(e) => assert_eq!(e.identity.start_time, start),
-        other => panic!("the failed start's child before the crash: {other:?}"),
-    }
+    let _end = EndChild(child, start.clone());
+    assert!(
+        job.contains(child).unwrap(),
+        "the child is in the test's job"
+    );
     d1.child.kill().unwrap();
     let _ = d1.wait();
     gate.waiter_killed();
-    let (mut d2, port) = daemon(&labels, &d.path, &args);
+    // Daemon 2, held before its probe: the child outlived daemon 1 with its recorded start.
+    let gate = Gate::new();
+    let (mut d2, port) = held_at_probe(&labels, &d.path, &args, &gate);
     let instance = support::serving_record(&d.path).instance;
+    match lookup(child) {
+        Lookup::Live(e) => assert_eq!(e.identity.start_time, start),
+        other => panic!("the failed start's child before the probe: {other:?}"),
+    }
+    gate.release();
     let probes = |port| -> Vec<Value> {
         envelopes(port, &token, &t)
             .into_iter()
@@ -984,7 +1029,4 @@ fn assign_failure_child_probed() {
     );
     assert_eq!(lookup(child), Lookup::Gone);
     assert_eq!(d2.stop_and_wait(&d.path), 0, "{}", d2.stderr());
-    if lookup(child) != Lookup::Gone {
-        fake::kill_verified(child, &start);
-    }
 }
