@@ -101,6 +101,8 @@ pub(crate) enum End {
     TooLarge,
     /// A request bound to one daemon run found another run serving.
     Restarted,
+    /// A response read from the bound run, after which discovery found no daemon serving.
+    Stopped,
 }
 
 /// Why a command ended without its result.
@@ -139,7 +141,8 @@ impl Client<'_> {
 
     /// [`Client::exchange`] bound to the daemon run `run` when given: every attempt, a retry
     /// included, is sent only to that run, and a response is adopted only when discovery still
-    /// names that run after it was read; another run serving ends the exchange `Restarted`.
+    /// names that run after it was read; another run serving ends the exchange `Restarted`,
+    /// and none serving after a response ends it `Stopped`.
     fn exchange_in<T>(
         &self,
         cutoff: Instant,
@@ -178,12 +181,20 @@ impl Client<'_> {
                 Err(e) if client::is_body_too_large(&e) => Some(Err(End::TooLarge)),
                 Err(e) if transient(e.kind()) => None,
                 Err(e) => Some(Err(End::Fail(format!("the request failed: {e}")))),
-                Ok(r) => match decide(r) {
-                    Some(Ok(_)) if run.is_some() && !same_run(&(self.discover)()) => {
-                        Some(Err(End::Restarted))
+                Ok(r) => {
+                    let decided = decide(r);
+                    if run.is_some() && matches!(decided, Some(Ok(_))) {
+                        match (self.discover)() {
+                            Ok(Found::NotRunning | Found::NotYet) => {
+                                return Some(Err(End::Stopped));
+                            }
+                            Err(m) => return Some(Err(End::Fail(m))),
+                            found if !same_run(&found) => return Some(Err(End::Restarted)),
+                            Ok(Found::Port(..)) => {}
+                        }
                     }
-                    other => other,
-                },
+                    decided
+                }
             }
         });
         seen.unwrap_or(Err(End::Timeout))
@@ -296,6 +307,10 @@ fn ended(e: End, err: &mut dyn Write) -> ExitCode {
         }
         End::Restarted => {
             say(err, "the daemon restarted during the read");
+            ExitCode::Failed
+        }
+        End::Stopped => {
+            say(err, "the daemon stopped during the read");
             ExitCode::Failed
         }
     }

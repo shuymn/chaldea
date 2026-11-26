@@ -29,6 +29,7 @@ const NO_PROBE: &str = "The running daemon has not recorded a probe of this laun
 const NO_REPORT: &str = "No check report was recorded for this launch (it ended under a daemon version that did not record one).";
 const PROVEN: &str = "The launch's end was proven when it exited, so no check report was needed.";
 const RESTARTED: &str = "the daemon restarted during the read";
+const STOPPED: &str = "the daemon stopped during the read";
 
 /// A wire enum's text.
 fn wire<T: serde::Serialize>(v: &T) -> String {
@@ -151,6 +152,10 @@ impl Client<'_> {
                     scan.interrupted = Some(RESTARTED.into());
                     break;
                 }
+                Err(End::Stopped) => {
+                    scan.interrupted = Some(STOPPED.into());
+                    break;
+                }
             };
             let EventsResponse::Replay {
                 stream_id,
@@ -267,6 +272,9 @@ impl Client<'_> {
             }
             Err(End::Restarted) => {
                 scan.interrupted.get_or_insert_with(|| RESTARTED.into());
+            }
+            Err(End::Stopped) => {
+                scan.interrupted.get_or_insert_with(|| STOPPED.into());
             }
             Err(_) => {
                 scan.interrupted
