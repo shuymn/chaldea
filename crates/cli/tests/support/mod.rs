@@ -121,13 +121,19 @@ pub fn state() -> Dir {
     Dir { tmp, path }
 }
 
-/// `name` in the OS temp directory, opened (created if absent) for a test's file lock: shared
-/// by every test process that resolves the same temp directory (`TMPDIR`; `TMP` or `TEMP` on
-/// Windows). Exclusive locks on it exclude each other per handle, between threads of one
-/// process as between processes (`flock` on Unix, `LockFileEx` on Windows).
+/// `name`, opened (created if absent) for a test's file lock, in one directory per account
+/// whatever the test's temp directory: on macOS the OS temp directory (`TMPDIR`, per account),
+/// on Windows `FOLDERID_LocalAppData` (the WMI lane of `scripts/windows-tests.ps1` sets its
+/// own `TEMP` and `TMP`, not the known folder). Exclusive locks on it exclude each other per
+/// handle, between threads of one process as between processes (`flock` on Unix, `LockFileEx`
+/// on Windows).
 #[must_use]
 pub fn lock_file(name: &str) -> std::fs::File {
-    let path = std::env::temp_dir().join(name);
+    #[cfg(windows)]
+    let base = chaldea_pty_runtime::host::default_state_base().unwrap();
+    #[cfg(not(windows))]
+    let base = std::env::temp_dir();
+    let path = base.join(name);
     // A regular file only: opening a FIFO for writing would wait for a reader.
     if let Ok(m) = std::fs::symlink_metadata(&path) {
         assert!(m.is_file(), "{} is not a regular file", path.display());
@@ -161,9 +167,11 @@ static RESERVATIONS: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
 /// killed). The probe's socket exists only under the spawn lock, so no child this process
 /// creates meanwhile inherits it.
 ///
-/// Limit: a process outside the protocol (any program, or a test run with another temp
-/// directory) can still bind a reserved port after the probe, before the daemon binds it or
-/// between its restarts; the daemon then fails `port_unavailable`.
+/// Limits: a process outside the protocol (any program, or a test run of an older revision)
+/// can still bind a reserved port after the probe, before the daemon binds it or between its
+/// restarts; the daemon then fails `port_unavailable`. A reservation is released only when its
+/// process exits, also for a test that already finished, so test processes running at once
+/// share the 200 ports of [`RESERVED`]; once every one is locked or bound, this panics.
 #[must_use]
 pub fn reserve_port() -> u16 {
     for p in RESERVED {
@@ -186,6 +194,37 @@ pub fn reserve_port() -> u16 {
         RESERVED.start(),
         RESERVED.end()
     );
+}
+
+/// The lock file of the port range's turn (see [`range_turn`]).
+const RANGE_LOCK: &str = "chaldea-test-port-range.lock";
+/// How long a test waits for the range's turn.
+const RANGE_WAIT: Duration = Duration::from_secs(600);
+
+/// Waits for the port range's turn and returns it; the turn ends when the returned file
+/// closes, on drop or at the process's exit. A test whose daemon chooses from the range
+/// (7373–7472) holds it from before the daemon starts until its stop is confirmed, so no other
+/// such test, in this process or another, starts or stops a daemon in between: a port of the
+/// range a test expects to be free stays so until its daemon binds. Every other daemon of
+/// these tests starts on a reserved port ([`reserve_port`]) or its saved one, except the
+/// Windows-only `daemon_windows`'s.
+#[must_use]
+pub fn range_turn() -> std::fs::File {
+    let end = Instant::now() + RANGE_WAIT;
+    let file = lock_file(RANGE_LOCK);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return file,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                assert!(
+                    Instant::now() < end,
+                    "no turn on {RANGE_LOCK} within {RANGE_WAIT:?}"
+                );
+                std::thread::sleep(POLL);
+            }
+            Err(std::fs::TryLockError::Error(e)) => panic!("{RANGE_LOCK}: {e}"),
+        }
+    }
 }
 
 /// The port [`reserve_port`] reserved for the state directory `dir`, reserved on the first

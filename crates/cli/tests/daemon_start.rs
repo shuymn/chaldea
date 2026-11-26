@@ -239,12 +239,21 @@ fn detach_path(stderr: &str) -> &'static str {
     }
 }
 
-/// PR8-CL-14: `ready` → the URL and pid on stdout, exit 0; the record agrees.
+/// PR8-CL-14: `ready` → the URL and pid on stdout, exit 0; the record agrees. The start, on a
+/// fresh state directory without `--port` (built without `faults::cmd`, which would add one),
+/// takes the default path: the child chooses from the range and saves that port. The range's
+/// turn is held from before the start until the stop is confirmed.
 fn reports_ready_url() {
+    let _range = support::range_turn();
     let labels = Labels::new();
     let d = state();
     let _stop = StopOnDrop(&labels, &d.path);
-    let (code, out, err) = start(&labels, &d.path, &[], &[]);
+    let mut p = Proc::spawn(
+        faults::chaldea(&labels, &[OsStr::new("--state-dir"), d.path.as_os_str()])
+            .args(["daemon", "start"]),
+    );
+    let code = p.code();
+    let (out, err) = (p.stdout(), p.stderr());
     eprintln!("reports_ready_url: path {}", detach_path(&err));
     assert_eq!(code, 0, "{out}{err}");
     let r = serving(&d.path);
@@ -258,6 +267,14 @@ fn reports_ready_url() {
     );
     assert_eq!(r.detached.as_deref(), Some(detach_path(&err)));
     let port = r.port.unwrap();
+    assert!(
+        chaldea_daemon::lifecycle::PORT_RANGE.contains(&port),
+        "{port}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(d.path.join(names::PORT)).unwrap(),
+        format!("{port}\n")
+    );
     assert_eq!(
         get_status(port, "/api/threads", Some(&token_of(&d.path))),
         200

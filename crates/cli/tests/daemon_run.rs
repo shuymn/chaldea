@@ -5,7 +5,6 @@
 mod support;
 
 use std::ffi::OsStr;
-use std::fs::{File, TryLockError};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -25,40 +24,12 @@ use support::{
 const FIRST: u16 = 7373;
 const LAST: u16 = 7472;
 
-/// Only [`first_port_from_the_range`] and [`taken_first_port_is_skipped`] let a daemon choose
-/// from the range; every other daemon of these tests, and of the other test binaries except the
-/// Windows-only `daemon_windows`, starts on a reserved port (`support::reserve_port`), or on
-/// its saved one. Every test takes this binary's turn, from before its daemon starts to after
-/// it stops, so no other `daemon_run` test, in this process or another, starts or stops a
-/// daemon in between: the first free port of the range that a test expects stays so until its
-/// daemon binds.
-///
-/// The turn is an exclusive lock on [`PORTS_LOCK`] (`support::lock_file`), taken through a
-/// handle of the test's own. Its scope: the `daemon_run` tests of every process that resolves
-/// the same temp directory. A daemon outside it (`daemon_windows`'s, a test run of an older
-/// revision, or any other program) can still take a port of the range in between.
-const PORTS_LOCK: &str = "chaldea-daemon-run-ports.lock";
-/// How long a test waits for its turn, from the start of [`serial`] to the lock.
-const PORTS_WAIT: Duration = Duration::from_secs(600);
-
-/// Waits for this test's turn (see [`PORTS_LOCK`]); the turn ends when the returned file
-/// closes, on drop or at the process's exit.
-fn serial() -> File {
-    let end = Instant::now() + PORTS_WAIT;
-    let file = support::lock_file(PORTS_LOCK);
-    loop {
-        match file.try_lock() {
-            Ok(()) => return file,
-            Err(TryLockError::WouldBlock) => {
-                assert!(
-                    Instant::now() < end,
-                    "no turn on {PORTS_LOCK} within {PORTS_WAIT:?}"
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(TryLockError::Error(e)) => panic!("{PORTS_LOCK}: {e}"),
-        }
-    }
+/// Every test takes the port range's turn (`support::range_turn`) for its whole run: only
+/// [`first_port_from_the_range`] and [`taken_first_port_is_skipped`] let a daemon choose from
+/// the range, and the others, which start on reserved or saved ports, run one at a time with
+/// them.
+fn serial() -> std::fs::File {
+    support::range_turn()
 }
 
 fn bindable(p: u16) -> bool {

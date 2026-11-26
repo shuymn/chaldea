@@ -717,7 +717,9 @@ pub fn cmd(
     c.args(args);
     let starts = matches!(args, ["daemon", "start" | "run", ..]);
     if starts
-        && !args.contains(&"--port")
+        && !args
+            .iter()
+            .any(|a| *a == "--port" || a.starts_with("--port="))
         && let Some(p) = super::own_port(dir)
     {
         c.args(["--port", &p.to_string()]);
