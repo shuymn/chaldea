@@ -9,13 +9,14 @@ use ts_rs::TS;
 
 use crate::adapter::HostOs;
 use crate::event::EventEnvelope;
+use crate::http::ErrorBody;
 use crate::ids::{
     Actor, Agent, Epoch, InputId, LaunchId, Open, StreamId, ThreadId, Timestamp, WorkspaceId,
 };
 use crate::input::InputState;
 use crate::payload::{
     ApprovalRequested, Content, ExitReason, InputEncoding, ReadinessEvidence, SurfaceUpdate,
-    ThreadRole, VtSnapshotTaken, WorktreeChanged,
+    ThreadRole, VtCursor, VtModes, VtSnapshotTaken, WorktreeChanged,
 };
 use crate::state::{AttentionCause, ProcessState, TaskState, TurnState};
 
@@ -418,4 +419,191 @@ pub enum WsServerMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsClientMessage {
     Subscribe { stream_ids: Vec<StreamId> },
+}
+
+// ---- the rescue read surface -------------------------------------------------------------------
+
+/// The largest serialized body of a [`ScreenResponse`]: half the CLI client's 1 MiB body limit.
+pub const SCREEN_MAX_BODY: usize = 512 * 1024;
+
+/// The body of `GET /api/threads/{thread_id}/screen`: the live screen of the thread's current
+/// launch, one text line per row. The daemon builds it with [`ScreenResponse::new`], which
+/// keeps the serialized body within [`SCREEN_MAX_BODY`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+pub struct ScreenResponse {
+    pub thread_id: ThreadId,
+    pub launch_id: LaunchId,
+    pub cols: u16,
+    pub rows: u16,
+    /// In cell coordinates (a wide character takes two columns).
+    pub cursor: VtCursor,
+    pub modes: VtModes,
+    /// Exactly `rows` lines, top to bottom: each row's cells without the second half of a
+    /// wide character, combining characters kept, trailing spaces trimmed.
+    pub lines: Vec<String>,
+    /// Some line was cut to keep the body within its bound.
+    pub truncated: bool,
+}
+
+/// The length of `c` inside a JSON string as `serde_json` writes it.
+fn escaped_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+        c if u32::from(c) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// `line` cut at a character boundary so that its JSON-escaped form is at most `share`
+/// bytes; `None` when it fits whole.
+fn cut_to(line: &str, share: usize) -> Option<usize> {
+    let mut used = 0;
+    for (i, c) in line.char_indices() {
+        used += escaped_char_len(c);
+        if used > share {
+            return Some(i);
+        }
+    }
+    None
+}
+
+impl ScreenResponse {
+    /// The response for a screen of `rows` rows whose lines are `lines` (padded with empty
+    /// lines or cut to `rows`). Its serialized body is at most [`SCREEN_MAX_BODY`]: the
+    /// response with `rows` empty lines is the fixed part, and the rest is shared evenly
+    /// among the rows' escaped contents; a row above its share is cut at a character
+    /// boundary (never inside an escape) and `truncated` is set.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per field of the response"
+    )]
+    pub fn new(
+        thread_id: ThreadId,
+        launch_id: LaunchId,
+        cols: u16,
+        rows: u16,
+        cursor: VtCursor,
+        modes: VtModes,
+        mut lines: Vec<String>,
+    ) -> ScreenResponse {
+        lines.resize_with(usize::from(rows), String::new);
+        let mut r = ScreenResponse {
+            thread_id,
+            launch_id,
+            cols,
+            rows,
+            cursor,
+            modes,
+            lines: vec![String::new(); usize::from(rows)],
+            // The longer literal, so the fixed part is not undercounted.
+            truncated: false,
+        };
+        let fixed = serde_json::to_vec(&r).map_or(SCREEN_MAX_BODY, |b| b.len());
+        let share = SCREEN_MAX_BODY
+            .saturating_sub(fixed)
+            .checked_div(usize::from(rows))
+            .unwrap_or(0);
+        for line in &mut lines {
+            if let Some(at) = cut_to(line, share) {
+                line.truncate(at);
+                r.truncated = true;
+            }
+        }
+        r.lines = lines;
+        r
+    }
+}
+
+/// The output of `chaldea inspect <thread> --json`. On success `snapshot` is set and
+/// `summary` is not; when the snapshot could not be read for its size or in time, `summary`
+/// is the thread's [`ThreadSummary`] instead (no attention causes, session, inputs, cards,
+/// or events). `screen` is the live screen of the launch the read showed; each error is the
+/// daemon's, or the client's own (`payload_too_large`, `request_timeout`, `internal`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS, JsonSchema)]
+pub struct InspectOutput {
+    pub thread_id: ThreadId,
+    pub snapshot: Option<ThreadSnapshot>,
+    pub summary: Option<ThreadSummary>,
+    pub screen: Option<ScreenResponse>,
+    pub snapshot_error: Option<ErrorBody>,
+    /// `launch_changed` when the screen is of another launch than the one read.
+    pub screen_error: Option<ErrorBody>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const T: ThreadId = ThreadId::from_u128(1);
+    const L: LaunchId = LaunchId::from_u128(2);
+
+    fn screen(rows: u16, lines: Vec<String>) -> ScreenResponse {
+        ScreenResponse::new(
+            T,
+            L,
+            80,
+            rows,
+            VtCursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            },
+            VtModes {
+                bracketed_paste: false,
+                alternate_screen: false,
+            },
+            lines,
+        )
+    }
+
+    #[test]
+    fn escaped_len_matches_serde() {
+        let mut cs: Vec<char> = (0u32..0x80).filter_map(char::from_u32).collect();
+        cs.extend(['é', '日', '\u{301}', '\u{2028}', '😀', '\u{7f}']);
+        for c in cs {
+            let s = serde_json::to_string(&c.to_string()).unwrap();
+            assert_eq!(escaped_char_len(c), s.len() - 2, "{c:?}");
+        }
+    }
+
+    /// C1-11: at `rows` = 4095 with escape-heavy rows, the body stays within the bound,
+    /// every row is kept, rows are cut on character boundaries, and `truncated` is set.
+    #[test]
+    fn screen_bound_at_max_rows() {
+        let rows = 4095;
+        let row = "\"\\\u{1}日\u{7}".repeat(200);
+        let r = screen(rows, vec![row.clone(); usize::from(rows)]);
+        let body = serde_json::to_vec(&r).unwrap();
+        assert!(body.len() <= SCREEN_MAX_BODY, "{}", body.len());
+        assert_eq!(r.lines.len(), usize::from(rows));
+        assert!(r.truncated);
+        for l in &r.lines {
+            assert!(row.starts_with(l.as_str()));
+            assert!(!l.is_empty());
+        }
+        let back: ScreenResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(back, r);
+    }
+
+    /// One row far above its share next to empty rows: cut, and only that row.
+    #[test]
+    fn screen_bound_one_long_row() {
+        let long = "x".repeat(SCREEN_MAX_BODY);
+        let r = screen(3, vec![String::new(), long, "ok".into()]);
+        assert!(serde_json::to_vec(&r).unwrap().len() <= SCREEN_MAX_BODY);
+        assert!(r.truncated);
+        assert_eq!((r.lines[0].as_str(), r.lines[2].as_str()), ("", "ok"));
+        assert!(r.lines[1].len() > SCREEN_MAX_BODY / 4);
+    }
+
+    /// A normal screen is whole, and the line count is `rows` whatever was given.
+    #[test]
+    fn screen_normal_untruncated() {
+        let r = screen(4, vec!["日本語".into(), "e\u{301}".into()]);
+        assert!(!r.truncated);
+        assert_eq!(r.lines, ["日本語", "e\u{301}", "", ""]);
+        let r = screen(1, vec!["a".into(), "b".into()]);
+        assert_eq!(r.lines, ["a"]);
+    }
 }
