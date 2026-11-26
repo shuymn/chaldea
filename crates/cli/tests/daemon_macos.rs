@@ -502,9 +502,12 @@ mod macos {
         };
         let calls = Calls::default();
         let seen = calls.clone();
+        // The stub's clock: a deadline at or before this instant has come, a later one has not,
+        // however long the steps between the calls take.
+        let t0 = Instant::now();
         let stub = move |args: &[&OsStr], deadline: Instant| {
             seen.borrow_mut().push((owned(args), deadline));
-            if Instant::now() >= deadline {
+            if deadline <= t0 {
                 return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
             }
             Ok(host::LaunchctlOutput {
@@ -526,14 +529,14 @@ mod macos {
             OsStr::new("print"),
             OsStr::new("gui/501/dev.chaldea.test.x"),
         ];
-        assert!(fault(&boot, Instant::now() + Duration::from_secs(60)).is_err());
+        assert!(fault(&boot, t0 + Duration::from_secs(60)).is_err());
         assert!(calls.borrow().is_empty(), "{:?}", calls.borrow());
-        let past = Instant::now();
+        let past = t0;
         assert!(fault(&print, past).is_err());
         assert_eq!(*calls.borrow(), [(owned(&print), past)]);
-        let lookup = Instant::now() + Duration::from_secs(7);
+        let lookup = t0 + Duration::from_secs(7);
         assert_eq!(fault(&print, lookup).unwrap().code, Some(113));
-        let again = Instant::now() + Duration::from_secs(9);
+        let again = t0 + Duration::from_secs(9);
         assert_eq!(fault(&print, again).unwrap().code, Some(113));
         assert_eq!(
             *calls.borrow(),
