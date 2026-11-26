@@ -911,13 +911,16 @@ pub(crate) async fn await_kill(sup: &Supervisor, k: KillTask) -> Proof {
     // Both waits are classified: the slot is read once, without waiting for its lock.
     let close = match &joined {
         Some(o) => CloseReceipt::InTime(o.kill.clone()),
-        None => CloseReceipt::NotReceived(
-            slot.try_lock()
-                .ok()
-                .and_then(|g| g.clone())
-                .filter(|(_, at)| *at < cutoff)
-                .map(|(r, _)| r),
-        ),
+        None => {
+            sup.pauses().at(Pause::KillReportRead).await;
+            CloseReceipt::NotReceived(
+                slot.try_lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .filter(|(_, at)| *at < cutoff)
+                    .map(|(r, _)| r),
+            )
+        }
     };
     Proof {
         report,

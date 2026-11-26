@@ -273,6 +273,7 @@ async fn recorded_late_close() {
         let (t, l) = rig.spawn_codex(None).await;
         let leader = super::prober_leader(&rig, l);
         let hold = rig.pauses.arm(hold_at);
+        let read = rig.pauses.arm(Pause::KillReportRead);
         let reply = super::support::http::spawn_send(
             &rig.srv,
             &rig.srv.command(
@@ -285,6 +286,10 @@ async fn recorded_late_close() {
         hold.wait();
         rig.clock.advance(crate::supervisor::PROOF_CUTOFF);
         hold.go();
+        // The stop reads the slot only after the kill task has published its report.
+        read.wait();
+        assert!(rig.pauses.passed(Pause::BeforeCloseBy), "{hold_at:?}");
+        read.go();
         let r = reply.await.unwrap();
         assert_eq!(body(&r)["death_confirmed"], false);
         let p = checked(&rig, t, l, "process").expect("close evidence");
