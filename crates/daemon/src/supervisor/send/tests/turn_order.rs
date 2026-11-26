@@ -178,8 +178,9 @@ async fn start_commits_first() {
 }
 
 /// The `Stop` commits before its turn's start. With `observer_held`, the `Stop`'s observer
-/// is held in `finished` until the start's job ran: the watermark is the writer's, not the
-/// observer's. Returns the input and the turn-start basis before the start.
+/// is held once its ticket answered, before it reads the answer, until the start's job ran:
+/// the watermark is the writer's, not the observer's. Returns the input and the turn-start
+/// basis before the start.
 async fn stop_before_start(rig: &SRig, live: &Live, observer_held: bool) -> (InputId, Option<u64>) {
     let p = sent(rig, live, "P").await;
     let before = rig.launch(live.l).last_turn_start_seq;
@@ -191,21 +192,20 @@ async fn stop_before_start(rig: &SRig, live: &Live, observer_held: bool) -> (Inp
     )
     .await;
     if observer_held {
-        let (entered, go, point) = gate_point();
-        set(&rig.sl(live).hooks.finished, point);
+        let faults = crate::http::tests::shared(&rig.srv);
         let req = rig.hook_of(live, "Stop", &json!({})).req(&rig.srv);
-        let stop = rig
+        let (stop, go) = rig
             .worker_parked(live, async {
+                let (answered, go) = faults.faults.arm_ticket_answer_gate();
                 let reply = spawn_send(&rig.srv, &req);
-                entered.await.unwrap();
-                Pending(reply)
+                answered.await.unwrap();
+                (Pending(reply), go)
             })
-            .await
-            .0;
+            .await;
         assert_eq!(start.finish().await.status, 200);
         assert_eq!(turn(rig, live), TurnState::Unknown, "observer held");
         go.send(()).unwrap();
-        assert_eq!(stop.await.unwrap().status, 200);
+        assert_eq!(stop.0.await.unwrap().status, 200);
     } else {
         rig.hook(live, "Stop", &json!({})).await;
         assert_eq!(start.finish().await.status, 200);

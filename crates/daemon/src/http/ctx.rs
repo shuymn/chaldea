@@ -227,6 +227,8 @@ async fn run_write_releasing<R: Send + 'static>(
     }
     #[cfg(test)]
     let ticket = shared.faults.signal_ticket_park(ticket);
+    #[cfg(test)]
+    let ticket = shared.faults.hold_ticket_answer(ticket);
     let result = await_ticket(ticket, shared.sink.as_ref(), after_ok).await;
     #[cfg(test)]
     if matches!(result, Err(WriteFailure::Write(WriteError::Expired))) {
