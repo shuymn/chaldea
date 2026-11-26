@@ -25,7 +25,7 @@ pub(crate) const FINGERPRINTS: &[&str] = &[
     "497e99858728fa92c32e3f3468a3a0e2f478cc662b76c48e96ce913daf9f405a",
     "1299d9c3158a9ad1da9751087819a6d97649461cc02437724af82db703bca8a7",
     "3718d8fce2faf13eb827f086c6c412e54c372c0477288b28da95ed1cc8e46706",
-    "b1b8dcc70a71b58813934be9e9c147d6a08d964d565df055d4ab3ea4497cca0b",
+    "a59b97806457167fd9a375e446bb474e95269109f03511eecbe256d20c1ea0f1",
 ];
 
 const V1: &str = r#"
@@ -471,7 +471,9 @@ pub(crate) const PART_BYTES: usize = 4 * 1024 * 1024;
 /// Values above `MAX_BLOB_BYTES` (`docs/design/event-store.md` §2.4, §2.5): one blob stored
 /// as ordered parts under its whole content's SHA-256. Part 0 holds at least the bytes the
 /// preview reads (1027), so the preview check reads one part. A ref is accepted only for a
-/// blob whose parts are complete, and a referenced blob takes no more parts. Every typed
+/// blob whose parts are complete, and a referenced blob takes no more parts. The parts table
+/// has no rowid, so SQLite's incremental BLOB I/O (`sqlite3_blob_open`, which bypasses
+/// `UPDATE` triggers) cannot open a part for writing. Every typed
 /// reference of an event is satisfied by a `blob_refs` or a `large_blob_refs` row.
 const V4: &str = r#"
 CREATE TABLE large_blobs (
@@ -486,7 +488,7 @@ CREATE TABLE large_blob_parts (
   data       BLOB NOT NULL CHECK (length(data) > 0 AND length(data) <= 4194304
                                   AND (part_index > 0 OR length(data) >= 1027)),
   PRIMARY KEY (sha256, part_index)
-) STRICT;
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE large_blob_refs (
   stream_id  TEXT NOT NULL,

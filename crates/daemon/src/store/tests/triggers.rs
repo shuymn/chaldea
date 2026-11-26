@@ -931,6 +931,21 @@ fn small_parts(sha: &str, indexes: &[i64]) -> String {
         .collect()
 }
 
+/// Parts `indexes` of `sha`, each of `PART_BYTES` but the last listed, which is 1 byte: 17
+/// indexes sum to `MAX_BLOB_BYTES + 1`.
+fn full_parts(sha: &str, indexes: &[i64]) -> String {
+    let last = indexes.last().copied();
+    indexes
+        .iter()
+        .map(|i| {
+            let len = if Some(*i) == last { 1 } else { 4_194_304 };
+            format!(
+                "INSERT INTO large_blob_parts (sha256, part_index, data) VALUES ('{sha}', {i}, zeroblob({len}));"
+            )
+        })
+        .collect()
+}
+
 fn large_ref(sha: &str) -> String {
     format!(
         "INSERT INTO large_blob_refs (stream_id, sha256, media_type) VALUES ('host', '{sha}', 'text/plain')"
@@ -938,7 +953,8 @@ fn large_ref(sha: &str) -> String {
 }
 
 /// Large blobs (§2.4 v4): a ref only to a blob whose parts are complete (each condition
-/// alone breaks it), no part after a ref, no change or delete of any of the three tables,
+/// alone breaks it), no part after a ref, no change or delete of any of the three tables nor
+/// an incremental BLOB write handle on a part,
 /// the size and part bounds as `CHECK`s, and `events_blob_refs` satisfied by a large ref.
 #[test]
 fn large_blob_triggers() {
@@ -959,38 +975,55 @@ fn large_blob_triggers() {
         r = large_ref(&full),
     ))
     .unwrap();
+    // A committed part cannot be opened for incremental BLOB I/O, which would bypass the
+    // `UPDATE` trigger: the table has no rowid.
+    let open = c.blob_open(rusqlite::MAIN_DB, "large_blob_parts", "data", 1, false);
+    let err = open.err().expect("a part opened for writing");
+    assert!(err.to_string().contains("without rowid"), "{err}");
     let size = 67_108_865;
-    let (d, e, f, g) = (
+    let (d, e, f, g, h) = (
         "d".repeat(64),
         "e".repeat(64),
         "f".repeat(64),
         "9".repeat(64),
+        "8".repeat(64),
     );
     let all: Vec<i64> = (0..17).collect();
-    let incomplete: [(&str, String); 4] = [
+    // Each subcase but the length one has parts summing to `size`, so only its target
+    // condition fails. `min(part_index) = 0` cannot fail alone: with `count = part_count`,
+    // unique indexes, every index >= 0, and `max = part_count - 1`, it follows.
+    let incomplete: [(&str, String); 5] = [
         (
-            "a missing part",
+            "a missing part (count)",
             format!(
                 "{}{}",
-                large_blob(&d, size, 17),
-                small_parts(&d, &all[..16])
+                large_blob(&d, size, 18),
+                full_parts(&d, &(0..18).filter(|i| *i != 8).collect::<Vec<_>>())
             ),
         ),
         (
-            "a wrong length sum",
-            format!("{}{}", large_blob(&e, size, 17), small_parts(&e, &all)),
+            "an index past the last part (max)",
+            format!(
+                "{}{}",
+                large_blob(&e, size, 17),
+                full_parts(&e, &[&all[..16], &[17]].concat())
+            ),
         ),
         (
-            "a gap in the indexes",
+            "no part 0 (min, and so max)",
             format!(
                 "{}{}",
                 large_blob(&f, size, 17),
-                small_parts(&f, &[&all[..16], &[17]].concat())
+                full_parts(&f, &(1..18).collect::<Vec<_>>())
             ),
+        ),
+        (
+            "a wrong length sum (sum)",
+            format!("{}{}", large_blob(&h, size, 17), small_parts(&h, &all)),
         ),
         ("no blob", String::new()),
     ];
-    for ((what, setup), sha) in incomplete.into_iter().zip([&d, &e, &f, &g]) {
+    for ((what, setup), sha) in incomplete.into_iter().zip([&d, &e, &f, &h, &g]) {
         let m = assert_rolls_back(&c, what, |c| {
             c.execute_batch(&setup)?;
             c.execute(&large_ref(sha), [])
