@@ -188,16 +188,13 @@ pub(crate) fn exit_in(
 }
 
 /// `launch:<L>:evidence:spawn_failed` and `launch:<L>:evidence:close`: written at most once
-/// per launch, as `launch:<L>:exited` is. A probe's key carries its attempt id
-/// (`super::prober`).
-pub(crate) fn evidence_key(
-    launch: LaunchId,
-    source: EvidenceSource,
-) -> chaldea_core::ids::IdempotencyKey {
+/// per launch, as `launch:<L>:exited` is. An exit plan carries no probe's evidence: the
+/// prober writes its own, keyed with its attempt id (`super::prober`).
+fn evidence_key(launch: LaunchId, source: EvidenceSource) -> chaldea_core::ids::IdempotencyKey {
     let name = match source {
         EvidenceSource::SpawnFailed => "spawn_failed",
         EvidenceSource::Close => "close",
-        EvidenceSource::Probe => "probe",
+        EvidenceSource::Probe => unreachable!("an exit plan carries no probe's evidence"),
     };
     launch_key(launch, &format!("evidence:{name}"))
 }
