@@ -359,7 +359,7 @@ A keeps the model's results for every ordering in which the completion precedes 
 
 ### 5.1 Purpose Layer: Acceptance Criteria
 
-Until PR 13 and PR 14 configure real CLIs' hooks, no real CLI binds (sup SD14, L-4), so on real CLIs 10b can show only the paths that need no hook: refusals, queuing, the gate timeout, keys, and the input commands. Rows marked "PR 13/14" are checked by FakeCli now and on real CLIs by those PRs. Windows runs every FakeCli check in CI.
+Until PR 14 configures Codex's hooks, no real Codex launch binds (sup SD14, L-4), so on real Codex 10b can show only the paths that need no hook: refusals, queuing, the gate timeout, keys, and the input commands. Rows marked "PR 13/14" are checked by FakeCli now and on real CLIs by those PRs. Windows runs every FakeCli check in CI.
 
 | ID | Criterion (EARS) | Source | Scene | Observable result / failure | Real-CLI check |
 |---|---|---|---|---|---|
@@ -408,8 +408,8 @@ Until PR 13 and PR 14 configure real CLIs' hooks, no real CLI binds (sup SD14, L
 | L-1 | A hook taken in between an open job and its unit's first permission cancels the send with zero bytes; the window's length is not measured. | SB7 | the owner sees `cancelled`, with zero bytes written, and sends again; nothing reaches a dialog it was not meant for. |
 | L-2 | After a gate-closing human write with no later turn start, a send opened by `ready` ends `unconfirmed` even when the CLI submitted it. | mvp §2.3 "unknown history"; B2 | the owner sees `unconfirmed` and resolves it; the alternative risks acking a human's submission as the send. |
 | L-3 | A write between `chaldea ready` and its basis sample is inside the basis. | SB6 | only the owner can write such keys (`key` and attach are owner-only), and the assertion is theirs. |
-| L-4 | Until PR 13 and PR 14 configure real CLIs' hooks, no real CLI binds, so `ready` is refused and every `send` waits and times out. | sup SD14, L-4 | the path is tested end to end with FakeCli and `FakeDecoder`; keys work now. |
-| L-5 | Claude's matching accepts every subset of its known transforms until PR 13's captures. | input-encoders D4 | a lenient match acks only an input whose text equals the prompt up to those transforms; two matches ack none. |
+| L-4 | Until PR 14 configures Codex's hooks, no real Codex launch binds, so `ready` is refused and every Codex `send` waits and times out. | sup SD14, L-4 | the path is tested end to end with FakeCli and `FakeDecoder`, and Claude's with FakeCli and its own decoder (C1); keys work now. |
+| L-5 | Claude's matching accepts only the forms captured from 2.1.331; a version that records a prompt otherwise leaves its inputs `unconfirmed` until new captures. | input-encoders D4; C1 D8 | it fails closed: the owner sees `unconfirmed` and resolves it, and nothing is resent. |
 | L-6 | The writer's completion and the CLI's hook are not ordered: a hook taken in after the unit's last byte was accepted but before its completion ran acks nothing, so that input ends `unconfirmed`. | SB4 | it fails closed: the owner sees `unconfirmed` and resolves it, and no input is acked without proof that its whole write completed; nothing is resent. |
 | L-7 | `SETTLE` (2 s) is not measured on real CLIs. | SB12; mvp D8 | internal default, an adapter row value; PR 12 measures it (P-7); a user `Stop` hook that blocks longer is mvp D8's known race. |
 | L-8 | That ConPTY delivers `key`'s VT bytes (arrows, Escape) to Codex on Windows as the same keys is not run on a real host. | §2.6; OpenConsole's input parser (input-encoders §2.5 rule 2) | FakePty checks the bytes; a key that does not arrive leaves the screen unchanged and is visible to the owner, who uses attach (PR 11); PR 15 runs it on the real host. |

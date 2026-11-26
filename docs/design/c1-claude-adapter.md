@@ -38,14 +38,15 @@ After T2 at M1: P-12 and P-16 through the key bar, and the external agent's inte
 | D5 | A launch keeps its first binding across `/clear` and in-session `/resume`. | Following the new session (rebinding, migration). |
 | D6 | Claude keeps binding rule `SessionId`. | `Ancestry` (unverified on real hosts). |
 | D7 | A caught decoder panic is `raw_unknown` `schema_mismatch`; only pure parsing runs in the recovered region. | A new reason `decoder_panic`. |
-| D8 | Expected prompt forms are fixed from captures; `prompt_matches` narrows to them. | Keeping every transform subset. |
+| D8 | Expected prompt forms are fixed from captures; `prompt_matches` narrows to them, the wrapped form only above the smallest wrapped size measured (more than 4,096 bytes). | Keeping every transform subset. |
 | D9 | No VT snapshot when a card opens. | Recording one (`interpret` is data only). |
 | D10 | Continuity is a SHA-256 of the read prefix, verified in full at every open and by `file_id` and size each poll. | The last 4 KiB (misses prefix rewrites); full re-hash per poll (O(n²)). |
-| D11 | The CLI version comes from a bounded `claude --version` per launch. | `null` (arch §2 wants the version). |
+| D11 | The CLI version comes from `claude --version` per launch: one 5 s deadline over exit and output, stdout in an anonymous temporary file capped at 4 KiB; a failure, an exit other than 0, or the cap records `null`. | `null` (arch §2 wants the version). |
 | D12 | `GET /api/adapters` gains no readiness column. | A field no client acts on. |
 | D13 | `open_regular` lives in `pty-runtime`, Windows FFI in `windows::sys`. | `cfg` code in the daemon. |
 | D14 | Values over 64 MiB are one blob in internal ordered parts under one `BlobRef`, served by `/api/blobs`; the producer spools them to a temporary file in fixed-size buffers, and the writer inserts the parts from that handle with the event, refs, and cursor in one transaction. | Truncation (a second exception to verbatim `raw_unknown`); halting the tailer. |
 | D15 | A `PostToolUse` resolves a card `ran` only when received after the turn watermark and the card, with exactly one equal open card; a card received below the watermark is closed at open. No other card rule. | Counting the turn's calls. |
+| D16 | A Claude prompt starting with `!` (a shell command) or `/` (a slash command) is refused before any write at `send` and `spawn --prompt`, as mvp D6's `rejected` `lossy_text`; the owner types them through attach. | Sending them (no `UserPromptSubmit`: the input could only end `unconfirmed`). |
 
 The PRs bring canonical text in line with code: C1a mvp §2.5 (screen route), §2.3 (`input resolve --outcome`, mode `none` vs `OwnerOnly`); C1b mvp §2.7, §2.10, hook-ingest row 13, supervisor-send §2.5, PR10b-CL-13, CL-23, L-13, arch §2; C1c1 event-store §2.4–§2.5; C1c2 mvp §2.1 cursor rules.
 
@@ -56,7 +57,7 @@ The PRs bring canonical text in line with code: C1a mvp §2.5 (screen route), §
 | `SessionStart` before the trust prompt is answered. | M1 P-12. | If seen, Claude rows switch to `OwnerOnly`; `input_gate_timeout` asks for `ready`. |
 | Readiness missing at bind without intake facts. | `inspect`. | Gate closed; the owner runs `ready`. |
 | `--resume` starts a new session id. | M1 P-18. | Nothing is written to an unbound launch; a new thread recovers. |
-| Windows hook shell rejects the command. | M2. | Fix is the settings string; macOS unaffected. |
+| Windows hook shell rejects the command (`shell: "powershell"`, the `&` call form). | M2. | Fix is the settings string; macOS unaffected. |
 | After `/clear` the thread follows the old session (D5). | `foreign_session`. | A send lands `unconfirmed`, never resent. |
 | A denied card stays open until the boundary; a later equal call without a card marks it `ran`. | M1 P-16. | Only the label is wrong; no byte is written. |
 | **L-13 after C1.** Card order is receipt order, not firing order. A turn's `UserPromptSubmit` received after its `PermissionRequest` and committed first closes a legitimate card at open. A dialog answered through attach, followed by a late `PermissionRequest` first taken in above the watermark, leaves an open card for a dialog that ended, and its card key can reach the composer. | The screen. | The owner sees `card_closed`, or an open card the screen contradicts, and answers through attach (T1, T2). |
@@ -67,7 +68,7 @@ The PRs bring canonical text in line with code: C1a mvp §2.5 (screen route), §
 ## 4. PR split
 
 1. **C1a: read surface** (D1, D2; C1-11, C1-12). Beside C1b.
-2. **C1b: hooks** (D3–D9, D11, D15; C1-1 to C1-7, C1-13, C1-14, hook halves of C1-4 and C1-10). Settings first, then fixture capture, then the decoder.
+2. **C1b: hooks** (D3–D9, D11, D15, D16; C1-1 to C1-7, C1-13, C1-14, hook halves of C1-4 and C1-10). Settings first, then fixture capture, then the decoder.
 3. **C1c1: large blobs** (D14 store side). Independent.
 4. **C1c2: tailer** (D10, D13, D14 producer side; C1-8, C1-9, tailer halves of C1-4 and C1-10). After C1c1.
 

@@ -87,6 +87,7 @@ Each prompt was sent by `chaldea send` as one bracketed paste (DECSET 2004 on).
 | `corpus-bang` | `!echo corpus` | no `UserPromptSubmit`: Claude ran it as a shell command, then a `Stop` |
 | `corpus-hash` | `#zz corpus` | unchanged |
 
-So a prompt below the large-paste size is recorded as `tab4(nfc(remove DEL and C1(trim_end(lf(t)))))`,
-and a larger one as the wrapper around `tab4(trim_end(lf(t)))`. Spike C-1 (2.1.326, Windows)
-saw decomposed entries composed, which agrees with the first form.
+So a prompt is recorded as `tab4(nfc(trim_end(remove DEL and C1(lf(t)))))`, and one whose
+`lf(t)` exceeds 4,096 bytes (the smallest wrapped paste measured is 4 KiB + 1, spike A-6) may be
+recorded as the wrapper around `tab4(trim_end(lf(t)))`. Spike C-1 (2.1.326, Windows) saw
+decomposed entries composed, which agrees with the first form.
