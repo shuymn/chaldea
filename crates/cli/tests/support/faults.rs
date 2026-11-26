@@ -636,12 +636,17 @@ fn is_service_print(args: &[&OsStr]) -> bool {
 ///   daemon's readiness; a lookup that does not answer absent registers nothing.
 /// - `all-timeout`: `bootstrap` and every service lookup wait for their deadline and time out.
 pub fn launchctl_fault(kind: String) -> Launchctl {
+    launchctl_fault_over(kind, Box::new(host::launchctl))
+}
+
+/// [`launchctl_fault`] over `real` instead of `host::launchctl` (a test's recording stub).
+pub fn launchctl_fault_over(kind: String, real: Launchctl) -> Launchctl {
     // The arguments of a `bootstrap` that `bootstrap-timeout-register-later` has yet to run.
     let deferred: std::cell::Cell<Option<Vec<OsString>>> = std::cell::Cell::new(None);
     Box::new(move |args: &[&OsStr], deadline: Instant| {
-        let op = args.first().map(|a| a.to_string_lossy().into_owned());
+        let op = args.first().and_then(|a| a.to_str());
         let service_print = is_service_print(args);
-        let result = match (kind.as_str(), op.as_deref()) {
+        let result = match (kind.as_str(), op) {
             ("probe-timeout", Some("print")) if args.len() == 2 && !service_print => {
                 sleep_until(deadline);
                 Err(timed_out())
@@ -652,7 +657,7 @@ pub fn launchctl_fault(kind: String) -> Launchctl {
                 stderr: "Bootstrap failed: 5: Input/output error (injected)".to_owned(),
             }),
             ("bootstrap-late", Some("bootstrap")) => {
-                let r = host::launchctl(args, deadline);
+                let r = real(args, deadline);
                 eprintln!("fault: real bootstrap -> {:?}", r.as_ref().map(|o| o.code));
                 sleep_until(deadline);
                 Err(timed_out())
@@ -662,12 +667,12 @@ pub fn launchctl_fault(kind: String) -> Launchctl {
                 Err(timed_out())
             }
             ("bootstrap-timeout-register-later", Some("print")) if service_print => {
-                let lookup = host::launchctl(args, deadline);
+                let lookup = real(args, deadline);
                 // 113: `launchctl print` found no such service.
                 let absent = lookup.as_ref().is_ok_and(|o| o.code == Some(113));
                 if absent && let Some(owned) = deferred.take() {
                     let refs: Vec<&OsStr> = owned.iter().map(OsString::as_os_str).collect();
-                    let r = host::launchctl(&refs, deadline);
+                    let r = real(&refs, deadline);
                     eprintln!("fault: late bootstrap -> {:?}", r.as_ref().map(|o| o.code));
                 }
                 lookup
@@ -680,7 +685,7 @@ pub fn launchctl_fault(kind: String) -> Launchctl {
                 sleep_until(deadline);
                 Err(timed_out())
             }
-            _ => host::launchctl(args, deadline),
+            _ => real(args, deadline),
         };
         if service_print {
             eprintln!(

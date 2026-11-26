@@ -38,7 +38,7 @@ mod macos {
     use super::support::runner::Case;
     use super::support::{Proc, get_status, report, run_helper, state, token_of};
 
-    pub(super) const CASES: [Case; 13] = [
+    pub(super) const CASES: [Case; 14] = [
         Case {
             name: "inherited_signal_state_is_reset",
             run: inherited_signal_state_is_reset,
@@ -70,6 +70,10 @@ mod macos {
         Case {
             name: "timed_out_lookup_registers_nothing",
             run: timed_out_lookup_registers_nothing,
+        },
+        Case {
+            name: "deferred_bootstrap_takes_the_lookup_deadline",
+            run: deferred_bootstrap_takes_the_lookup_deadline,
         },
         Case {
             name: "completed_bootstrap_failure_is_final",
@@ -418,9 +422,31 @@ mod macos {
         stop(&labels, &d.path);
     }
 
+    /// Boots out its label when the test unwinds, whatever the domain listing says.
+    struct BootoutOnUnwind<'a>(&'a str);
+
+    impl Drop for BootoutOnUnwind<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let code = Labels::bootout(self.0);
+                eprintln!("test cleanup: booted out {} ({code:?})", self.0);
+            }
+        }
+    }
+
+    /// `launchctl print <service>`'s exit code (0 registered, 113 absent).
+    fn lookup_code(service: &str) -> Option<i32> {
+        host::launchctl(
+            &[OsStr::new("print"), OsStr::new(service)],
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap()
+        .code
+    }
+
     /// The `bootstrap-timeout-register-later` fault registers its job only from a lookup that
-    /// answered absent, within that lookup's deadline: a timed-out lookup registers nothing,
-    /// and the next lookup that answers absent registers the job.
+    /// answered absent: a timed-out lookup registers nothing, and the next lookup that answers
+    /// absent registers the job (against the real launchd).
     fn timed_out_lookup_registers_nothing() {
         require_gui();
         let labels = Labels::new();
@@ -430,6 +456,7 @@ mod macos {
             .unwrap()
             .as_millis();
         let label = format!("{}{now}-{}", labels.prefix, uuid::Uuid::new_v4());
+        let _bootout = BootoutOnUnwind(&label);
         let plist = write_job_plist(&label, plists.path(), &[OsStr::new("/usr/bin/true")], &[]);
         let target = host::gui_domain_target();
         let service = format!("{target}/{label}");
@@ -454,12 +481,68 @@ mod macos {
             timed_out.map(|o| o.code).map_err(|e| e.kind()),
             Err(std::io::ErrorKind::TimedOut)
         );
-        assert!(!labels.present().contains(&label), "{label} was registered");
+        assert_eq!(lookup_code(&service), Some(113), "{label} was registered");
         let absent = fault(&print, within()).unwrap();
         assert_eq!(absent.code, Some(113), "{absent:?}");
-        assert!(
-            labels.present().contains(&label),
-            "{label} was not registered"
+        assert_eq!(lookup_code(&service), Some(0), "{label} was not registered");
+        assert_eq!(
+            Labels::bootout(&label),
+            Some(0),
+            "{label} was not booted out"
+        );
+    }
+
+    /// The `bootstrap-timeout-register-later` fault's deferred `bootstrap` runs once, after the
+    /// first lookup that answered absent, with that lookup's deadline and the original
+    /// arguments; a timed-out lookup runs nothing (a recording stub, no launchd).
+    fn deferred_bootstrap_takes_the_lookup_deadline() {
+        type Calls = std::rc::Rc<std::cell::RefCell<Vec<(Vec<String>, Instant)>>>;
+        let owned = |a: &[&OsStr]| -> Vec<String> {
+            a.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+        };
+        let calls = Calls::default();
+        let seen = calls.clone();
+        let stub = move |args: &[&OsStr], deadline: Instant| {
+            seen.borrow_mut().push((owned(args), deadline));
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+            Ok(host::LaunchctlOutput {
+                code: Some(if args[0] == "print" { 113 } else { 0 }),
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        };
+        let fault = faults::launchctl_fault_over(
+            "bootstrap-timeout-register-later".to_owned(),
+            Box::new(stub),
+        );
+        let boot = [
+            OsStr::new("bootstrap"),
+            OsStr::new("gui/501"),
+            OsStr::new("/work/job.plist"),
+        ];
+        let print = [
+            OsStr::new("print"),
+            OsStr::new("gui/501/dev.chaldea.test.x"),
+        ];
+        assert!(fault(&boot, Instant::now() + Duration::from_secs(60)).is_err());
+        assert!(calls.borrow().is_empty(), "{:?}", calls.borrow());
+        let past = Instant::now();
+        assert!(fault(&print, past).is_err());
+        assert_eq!(*calls.borrow(), [(owned(&print), past)]);
+        let lookup = Instant::now() + Duration::from_secs(7);
+        assert_eq!(fault(&print, lookup).unwrap().code, Some(113));
+        let again = Instant::now() + Duration::from_secs(9);
+        assert_eq!(fault(&print, again).unwrap().code, Some(113));
+        assert_eq!(
+            *calls.borrow(),
+            [
+                (owned(&print), past),
+                (owned(&print), lookup),
+                (owned(&boot), lookup),
+                (owned(&print), again),
+            ]
         );
     }
 
