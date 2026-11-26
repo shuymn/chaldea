@@ -94,6 +94,6 @@ Each prompt was sent by `chaldea send` as one bracketed paste (DECSET 2004 on).
 
 So a prompt is recorded as `tab4(nfc(trim_end(remove DEL and C1(lf(t)))))`, or, when Claude
 folds the paste, as the wrapper around `tab4(trim_end(lf(t)))`. Claude folds a paste of more than
-800 characters or of more newlines than `min(rows − 10, 2)` (its paste handler), so an 801-byte
+800 UTF-16 code units or of more newlines than `max(0, min(rows − 10, 2))` (its paste handler), so an 801-byte
 paste is wrapped too; a three-line paste (two newlines) was not. Spike C-1 (2.1.326, Windows) saw
 decomposed entries composed, which agrees with the first form.
