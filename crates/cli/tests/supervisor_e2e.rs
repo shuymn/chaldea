@@ -799,8 +799,12 @@ fn a29_child_suspended() {
     let labels = Labels::new();
     let d = state();
     let cwd = tempfile::tempdir().unwrap();
+    // FakeCli under the agent's image name, so the child's image is the one PR 21 looks for.
+    let bin = tempfile::tempdir().unwrap();
+    let codex = bin.path().join("codex.exe");
+    std::fs::copy(fake_cli(), &codex).unwrap();
     let args = ["--mode", "sleeper", "--max-life-secs", "120"];
-    let mut argv = vec![fake_cli().to_string_lossy().into_owned()];
+    let mut argv = vec![codex.to_string_lossy().into_owned()];
     argv.extend(args.iter().map(|a| (*a).to_owned()));
     argv.push("--".to_owned());
     let json = serde_json::to_string(&argv).unwrap();
@@ -851,14 +855,40 @@ fn a29_child_suspended() {
     gate.waiter_killed();
     drop(conn);
     let (mut d2, port) = daemon(&labels, &d.path, &args);
-    let (_, events) = thread_events(port, &token);
+    let (t, events) = thread_events(port, &token);
     let exited = &events.iter().find(|(k, _)| k == "launch_exited").unwrap().1;
     assert_eq!(exited["reason"], "unknown_after_crash");
     assert_eq!(exited["death_confirmed"], false);
-    assert!(fake::suspend_count(child).unwrap() >= 1, "the child runs");
+    let suspended = fake::suspend_count(child).unwrap() >= 1;
+    assert!(suspended, "the child runs");
     assert!(
         job.contains(child).unwrap(),
         "the child is in the test's job"
+    );
+    // PR 21's predicate on the real child: its image, its creation time, and the
+    // reservation's `recorded_at`; the running daemon holds no job of it.
+    let all = envelopes(port, &token, &t);
+    let reserved = of_kind(&all, "launch_reserved")[0]["recorded_at"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let reserved_ms = chaldea_core::launch::stamp_ms(&reserved).expect("a recorded_at stamp");
+    let image = fake::image_path(child).unwrap();
+    let created: u64 = fake::identify(child)
+        .unwrap()
+        .expect("the child's identity")
+        .start_time
+        .parse()
+        .unwrap();
+    let process = chaldea_core::launch::A29Process {
+        suspended,
+        in_daemon_job: false,
+        image_path: &image.to_string_lossy(),
+        created_filetime: created,
+    };
+    assert!(
+        chaldea_core::launch::a29_candidate(chaldea_core::ids::Agent::Codex, reserved_ms, &process),
+        "{image:?} created {created}, reserved {reserved}"
     );
     assert_eq!(d2.stop_and_wait(&d.path), 0, "{}", d2.stderr());
     // Closing the kill-on-close job ends the child the test caused.
@@ -867,6 +897,7 @@ fn a29_child_suspended() {
         chaldea_pty_runtime::process::lookup(child),
         chaldea_pty_runtime::process::Lookup::Gone
     )));
+    drop(bin);
 }
 
 /// PR10a2-CL-3 on Windows: a spawn whose job assignment and then termination fail ends

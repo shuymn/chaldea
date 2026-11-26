@@ -225,6 +225,48 @@ fn hex(bytes: &[u8]) -> String {
 /// 100 ns intervals between 1601-01-01 (the `FILETIME` epoch) and 1970-01-01.
 const FILETIME_UNIX_OFFSET: u64 = 116_444_736_000_000_000;
 
+/// Milliseconds since the Unix epoch of a `recorded_at` stamp `YYYY-MM-DDTHH:MM:SS.mmmZ`
+/// (`ids::Timestamp`), the reservation instant [`a29_candidate`] takes; `None` for any other
+/// text or a stamp before 1970.
+#[must_use]
+pub fn stamp_ms(stamp: &str) -> Option<u64> {
+    let b = stamp.as_bytes();
+    let seps = [
+        (4, b'-'),
+        (7, b'-'),
+        (10, b'T'),
+        (13, b':'),
+        (16, b':'),
+        (19, b'.'),
+        (23, b'Z'),
+    ];
+    if b.len() != 24 || seps.iter().any(|&(i, c)| b[i] != c) {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let s = &b[from..to];
+        if !s.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(s).ok()?.parse().ok()
+    };
+    let (y, m, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, sec, ms) = (num(11, 13)?, num(14, 16)?, num(17, 19)?, num(20, 23)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 59 {
+        return None;
+    }
+    // Days from the civil date (Howard Hinnant's algorithm), proleptic Gregorian.
+    let yy = if m <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let total = ((days * 24 + h) * 60 + mi) * 60 + sec;
+    u64::try_from(total * 1000 + ms).ok()
+}
+
 /// A process PR 21's finder considers for an A29 launch
 /// (`docs/design/supervisor-recovery.md` §2.6), as the finder read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,9 +318,24 @@ mod tests {
     /// PR10a2-CL-10 `launch::a29_candidate_rules`.
     #[test]
     fn a29_candidate_rules() {
-        use super::{A29Process, a29_candidate};
+        use super::{A29Process, a29_candidate, stamp_ms};
         // 2026-11-26T00:00:00.123Z in Unix milliseconds, and the same instant as a FILETIME.
         let at_ms: u64 = 1_795_651_200_123;
+        assert_eq!(stamp_ms("2026-11-26T00:00:00.123Z"), Some(at_ms));
+        assert_eq!(stamp_ms("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(
+            stamp_ms("2024-02-29T23:59:59.999Z"),
+            Some(1_709_251_199_999)
+        );
+        for bad in [
+            "2026-11-26T00:00:00Z",
+            "2026-11-26 00:00:00.123Z",
+            "2026-13-26T00:00:00.123Z",
+            "1969-12-31T23:59:59.999Z",
+            "2026-11-26T00:00:00.12xZ",
+        ] {
+            assert_eq!(stamp_ms(bad), None, "{bad}");
+        }
         let ft = |ms: u64, extra_100ns: u64| (ms * 10_000) + 116_444_736_000_000_000 + extra_100ns;
         let p = |path, created, suspended, in_daemon_job| A29Process {
             suspended,

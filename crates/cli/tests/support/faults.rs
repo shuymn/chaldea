@@ -394,10 +394,12 @@ pub fn enter_if_chaldea() {
                 cfg.runtime =
                     with_windows_fault(cfg.runtime.clone(), WindowsFault::AssignTerminateDenied);
             }
+            // One gate holds the spawning thread until the test kills the helper: the
+            // backend's gate waits as long as the test gate's waiter does.
             #[cfg(windows)]
             if let Some(dir) = env_path(A29_GATE) {
-                use chaldea_pty_runtime::fake::{WindowsFault, gate, with_windows_fault};
-                let (g, control) = gate();
+                use chaldea_pty_runtime::fake::{WindowsFault, gate_within, with_windows_fault};
+                let (g, control) = gate_within(GATE_MAX);
                 cfg.runtime =
                     with_windows_fault(cfg.runtime.clone(), WindowsFault::RejectJobList(Some(g)));
                 std::thread::spawn(move || {

@@ -95,6 +95,8 @@ pub struct Gate {
     /// The created process's pid when the gate passed one.
     reached: Sender<Option<u32>>,
     open: Receiver<()>,
+    /// How long the backend waits for `open`.
+    bound: Duration,
 }
 
 /// The test's end of a gate.
@@ -107,12 +109,20 @@ pub struct GateControl {
 /// A new gate: the backend gets [`Gate`], the test keeps [`GateControl`].
 #[must_use]
 pub fn gate() -> (Gate, GateControl) {
+    gate_within(HOOK_WAIT)
+}
+
+/// [`gate`] whose backend waits for `open` up to `bound` instead of `HOOK_WAIT`, for a test
+/// that ends the waiting process at the gate.
+#[must_use]
+pub fn gate_within(bound: Duration) -> (Gate, GateControl) {
     let (rt, rr) = mpsc::channel();
     let (ot, or) = mpsc::channel();
     (
         Gate {
             reached: rt,
             open: or,
+            bound,
         },
         GateControl {
             reached: rr,
@@ -143,7 +153,7 @@ impl GateControl {
 }
 
 impl Gate {
-    /// Signals `reached` and waits for `open` (at most `HOOK_WAIT`); a timeout or a dropped
+    /// Signals `reached` and waits for `open` (at most the gate's bound); a timeout or a dropped
     /// sender records `gate_abandoned` and continues.
     pub(crate) fn pass(&self) {
         self.pass_with(None);
@@ -156,7 +166,7 @@ impl Gate {
 
     fn pass_with(&self, pid: Option<u32>) {
         let _ = self.reached.send(pid);
-        if self.open.recv_timeout(HOOK_WAIT).is_err() {
+        if self.open.recv_timeout(self.bound).is_err() {
             with_report(|r| r.gate_abandoned = true);
         }
     }

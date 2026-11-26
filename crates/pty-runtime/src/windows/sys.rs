@@ -1333,6 +1333,32 @@ pub(crate) fn resume_process_threads(pid: u32) -> io::Result<usize> {
     }
 }
 
+/// The full Win32 image path of the process `pid` (`QueryFullProcessImageNameW`).
+#[cfg(feature = "fake")]
+pub(crate) fn image_path(pid: u32) -> io::Result<PathBuf> {
+    use windows_sys::Win32::System::Threading::{
+        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    };
+    let p = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let mut buf = vec![0u16; 32_768];
+    let mut n = len_u32(buf.len());
+    // SAFETY: `p` is an open process handle; `n` holds the buffer's length in units and
+    // receives the written length.
+    let ok = unsafe {
+        QueryFullProcessImageNameW(
+            p.as_raw_handle(),
+            PROCESS_NAME_WIN32,
+            buf.as_mut_ptr(),
+            &raw mut n,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(usize::try_from(n).unwrap_or(0));
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf)))
+}
+
 /// The smallest previous suspend count over the threads of the process `pid`, each thread
 /// suspended once and resumed at once (`SuspendThread`, `ResumeThread`): at least 1 when
 /// every thread was suspended. An error when the process has no thread.

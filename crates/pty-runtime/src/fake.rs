@@ -970,7 +970,7 @@ pub fn unix_writer_polls() -> u64 {
 
 #[cfg(windows)]
 pub use crate::windows::hooks::{
-    FaultReport, Gate, GateControl, OutputProbe, TraceEntry, Watch, WindowsFault, gate,
+    FaultReport, Gate, GateControl, OutputProbe, TraceEntry, Watch, WindowsFault, gate, gate_within,
 };
 
 /// Injects `f` into the next native spawn on the calling thread.
@@ -1417,6 +1417,16 @@ pub fn resume_process(pid: u32) -> io::Result<usize> {
 #[cfg(windows)]
 pub fn suspend_count(pid: u32) -> io::Result<u32> {
     crate::windows::sys::suspend_count(pid)
+}
+
+/// The full image path of the process `pid` (`QueryFullProcessImageNameW`, Windows).
+///
+/// # Errors
+///
+/// The process cannot be opened or queried.
+#[cfg(windows)]
+pub fn image_path(pid: u32) -> io::Result<std::path::PathBuf> {
+    crate::windows::sys::image_path(pid)
 }
 
 /// A runtime that injects `fault` into the first native spawn it runs, on the spawning thread
