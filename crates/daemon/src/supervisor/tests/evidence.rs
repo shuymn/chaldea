@@ -121,6 +121,12 @@ async fn recorded_failed_starts() {
             json!([]),
             json!(["no_identity", "tree_unproven"]),
         ),
+        // No leader identity, and a kill report naming a survivor: the survivor is kept.
+        (
+            started_then_failed(None, unresolved(Some(report(false, vec![other.clone()])))),
+            json!([{ "pid": 78, "start_time": "s78", "observed": "unresolved" }]),
+            json!(["no_identity", "tree_unproven"]),
+        ),
         (
             started_then_failed(Some(id("st")), unresolved(Some(report(true, vec![])))),
             json!([{ "pid": 77, "start_time": "st", "observed": "gone" }]),

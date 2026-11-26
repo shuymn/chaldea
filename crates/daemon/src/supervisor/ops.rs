@@ -597,7 +597,8 @@ fn unresolved<'a>(
 
 /// The `spawn_failed` evidence of a `StartedThenFailed` whose cleanup is unresolved: with an
 /// identity, `gone` when the cleanup's kill proved the tree dead, else the identity and the
-/// report's survivors, one per pid, `unresolved`.
+/// report's survivors, one per pid, `unresolved`; without one, `no_identity` (the leader's)
+/// and the report's survivors, `unresolved`.
 pub(crate) fn spawn_failed_evidence(
     launch: LaunchId,
     identity: Option<&ProcessIdentity>,
@@ -608,7 +609,7 @@ pub(crate) fn spawn_failed_evidence(
     let identities = match identity {
         None => {
             unchecked.push(Unchecked::NoIdentity);
-            Vec::new()
+            unresolved(kill.iter().flat_map(|k| k.survivors.iter()))
         }
         Some(id) if proved => vec![super::prober::observation(id, Observed::Gone)],
         Some(id) => {
