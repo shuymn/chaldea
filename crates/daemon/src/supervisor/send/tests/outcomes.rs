@@ -73,7 +73,25 @@ async fn outcomes() {
     let paste_len = u64::try_from(b"\x1b[200~partial\x1b[201~".len()).unwrap();
     live.child
         .fail_writes_after(paste_len, std::io::ErrorKind::BrokenPipe);
+    let sl = rig.sl(&live);
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    set(&sl.hooks.record_job, move || {
+        let _ = entered_tx.send(());
+        let _ = wait.recv_timeout(Duration::from_secs(30));
+    });
     let id = rig.send(&live, text).await;
+    // Before its record the unit still runs.
+    crate::store::tests::support::http::reached(entered).await;
+    assert!(
+        sl.state()
+            .running
+            .as_ref()
+            .is_some_and(|r| r.input_id == id),
+        "the unit runs until its record"
+    );
+    assert_eq!(rig.input(id).state, InputState::Sending);
+    go.send(()).unwrap();
     rig.until_input(id, InputState::Unconfirmed).await;
     assert!(
         rig.thread(live.t)
@@ -82,10 +100,9 @@ async fn outcomes() {
             .contains(&AttentionCause::InputUnconfirmed { input_id: id })
     );
     assert_eq!(moves(&rig, &live, id).last().unwrap().1, "unconfirmed");
-    assert!(
-        rig.sl(&live).state().running.is_none(),
-        "the record ended the unit"
-    );
+    // The worker clears `running` after the completion job commits the input's move.
+    rig.until("the record ended the unit", || sl.state().running.is_none())
+        .await;
     rig.stop().await;
 
     // Busy: the op lock taken between the open job and the submit.
@@ -125,14 +142,20 @@ async fn write_stall() {
     let hold = live.child.hold_writes();
     let id = rig.send(&live, "stalled").await;
     assert!(hold.wait_entered(Instant::now() + Duration::from_secs(10)));
+    // The writer may enter the held write before the worker stores the ticket.
+    let sl = rig.sl(&live);
+    rig.until("the ticket shows the permission", || {
+        sl.state().running.as_ref().is_some_and(|r| {
+            r.input_id == id
+                && r.ticket
+                    .as_ref()
+                    .and_then(chaldea_pty_runtime::WriteTicket::started_at)
+                    .is_some()
+        })
+    })
+    .await;
     rig.clock.stop();
     let t0 = rig.sup.now();
-    let started = rig.sl(&live).state().running.as_ref().and_then(|r| {
-        r.ticket
-            .as_ref()
-            .and_then(chaldea_pty_runtime::WriteTicket::started_at)
-    });
-    assert!(started.is_some(), "the ticket shows the permission");
     // The first pass after the bound shows it; none before.
     tick_at(&rig, &live, t0).await;
     assert_eq!(rig.input(id).state, InputState::Sending);
@@ -155,10 +178,8 @@ async fn write_stall() {
     rig.pass(&live).await;
     assert_eq!(rig.input(second).state, InputState::Queued);
     drop(hold);
-    rig.until("the record ended the unit", || {
-        rig.sl(&live).state().running.is_none()
-    })
-    .await;
+    rig.until("the record ended the unit", || sl.state().running.is_none())
+        .await;
     rig.pass(&live).await;
     assert_eq!(rig.input(id).state, InputState::Dismissed, "left as it was");
     assert_eq!(

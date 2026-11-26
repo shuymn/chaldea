@@ -6,13 +6,13 @@ mod support;
 
 use chaldea_daemon::lifecycle::LockProbe;
 use rustix::process::Signal;
-use support::{Proc, lock_state, run_cmd, state, term};
+use support::{Proc, lock_state, reserve_port, run_cmd, state, term};
 
 #[test]
 fn term_int_hup() {
     for sig in [Signal::TERM, Signal::INT, Signal::HUP] {
         let dir = state();
-        let mut d = Proc::spawn(&mut run_cmd(&dir.path, None));
+        let mut d = Proc::spawn(&mut run_cmd(&dir.path, Some(reserve_port())));
         d.serving();
         term(d.pid(), sig);
         assert_eq!(d.code(), 0, "{sig:?}: {}", d.stderr());

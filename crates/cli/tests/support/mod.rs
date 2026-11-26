@@ -121,6 +121,137 @@ pub fn state() -> Dir {
     Dir { tmp, path }
 }
 
+/// `name`, opened (created if absent) for a test's file lock, in one directory per account
+/// whatever the test's temp directory: on macOS the OS temp directory (`TMPDIR`, per account),
+/// on Windows `FOLDERID_LocalAppData` (the WMI lane of `scripts/windows-tests.ps1` sets its
+/// own `TEMP` and `TMP`, not the known folder). Exclusive locks on it exclude each other per
+/// handle, between threads of one process as between processes (`flock` on Unix, `LockFileEx`
+/// on Windows).
+#[must_use]
+pub fn lock_file(name: &str) -> std::fs::File {
+    #[cfg(windows)]
+    let base = chaldea_pty_runtime::host::default_state_base().unwrap();
+    #[cfg(not(windows))]
+    let base = std::env::temp_dir();
+    let path = base.join(name);
+    // A regular file only: opening a FIFO for writing would wait for a reader.
+    if let Ok(m) = std::fs::symlink_metadata(&path) {
+        assert!(m.is_file(), "{} is not a regular file", path.display());
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert!(file.metadata().unwrap().is_file(), "{}", path.display());
+    file
+}
+
+/// The ports [`reserve_port`] hands out: outside the design's range (7373–7472), which a
+/// daemon started without `--port` or a saved port scans, and outside 7473–7672, which older
+/// revisions of these tests chose from without a lock; below the dynamic port range of macOS
+/// and Windows (49152–65535 by default), so the OS does not hand one to an outgoing
+/// connection.
+const RESERVED: std::ops::RangeInclusive<u16> = 7700..=7899;
+
+/// The lock files of this process's reserved ports, held until it exits.
+static RESERVATIONS: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
+
+/// A port for a daemon's `--port` that no other test of this protocol, in this process or
+/// another, gives its daemon until this process exits, so it stays this test's across the
+/// daemon's restarts on its saved port. A test holds an exclusive lock on
+/// `chaldea-test-port-<p>.lock` (see [`lock_file`]) for each port it reserves and skips ports
+/// locked by another; a port is taken only if it also binds, which skips one a process
+/// outside the protocol holds now (such as a daemon left running by a test process that was
+/// killed). The probe's socket exists only under the spawn lock, so no child this process
+/// creates meanwhile inherits it.
+///
+/// Limits, of this and of [`range_turn`]: a process outside the protocol (any program, a test
+/// run of a revision before these locks, or on macOS one with another `TMPDIR`, whose lock
+/// files are other files) can still bind a reserved port after the probe, before the daemon
+/// binds it or between its restarts, or a port of the range during a turn; the daemon then
+/// fails `port_unavailable`. A reservation is released only when its process exits, also for
+/// a test that already finished, so test processes running at once share the 200 ports of
+/// [`RESERVED`]; once every one is locked or bound, this panics. A test whose stop fails
+/// releases its turn as it unwinds, without its daemon's exit confirmed (it is failing
+/// already).
+#[must_use]
+pub fn reserve_port() -> u16 {
+    for p in RESERVED {
+        let file = lock_file(&format!("chaldea-test-port-{p}.lock"));
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => continue,
+            Err(std::fs::TryLockError::Error(e)) => panic!("port {p}'s lock: {e}"),
+        }
+        let binds = chaldea_pty_runtime::with_spawn_lock(|| {
+            std::net::TcpListener::bind(("127.0.0.1", p)).is_ok()
+        });
+        if binds {
+            RESERVATIONS.lock().unwrap().push(file);
+            return p;
+        }
+    }
+    panic!(
+        "no port of {}–{} is free to reserve",
+        RESERVED.start(),
+        RESERVED.end()
+    );
+}
+
+/// The lock file of the port range's turn (see [`range_turn`]).
+const RANGE_LOCK: &str = "chaldea-test-port-range.lock";
+/// How long a test waits for the range's turn.
+const RANGE_WAIT: Duration = Duration::from_secs(600);
+
+/// Waits for the port range's turn and returns it; the turn ends when the returned file
+/// closes, on drop or at the process's exit. A test whose daemon chooses from the range
+/// (7373–7472) holds it from before the daemon starts until its stop is confirmed, so no other
+/// such test, in this process or another, starts or stops a daemon in between: a port of the
+/// range a test expects to be free stays so until its daemon binds. Every other daemon of
+/// these tests starts on a reserved port ([`reserve_port`]) or its saved one, except the
+/// Windows-only `daemon_windows`'s. Its limits are stated at [`reserve_port`].
+#[must_use]
+pub fn range_turn() -> std::fs::File {
+    let end = Instant::now() + RANGE_WAIT;
+    let file = lock_file(RANGE_LOCK);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return file,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                assert!(
+                    Instant::now() < end,
+                    "no turn on {RANGE_LOCK} within {RANGE_WAIT:?}"
+                );
+                std::thread::sleep(POLL);
+            }
+            Err(std::fs::TryLockError::Error(e)) => panic!("{RANGE_LOCK}: {e}"),
+        }
+    }
+}
+
+/// The port [`reserve_port`] reserved for the state directory `dir`, reserved on the first
+/// call for it, so every start on one directory (concurrent ones included) gets the same port.
+#[must_use]
+pub fn dir_port(dir: &Path) -> u16 {
+    static PORTS: Mutex<Vec<(PathBuf, u16)>> = Mutex::new(Vec::new());
+    let mut ports = PORTS.lock().unwrap();
+    if let Some((_, p)) = ports.iter().find(|(d, _)| d == dir) {
+        return *p;
+    }
+    let p = reserve_port();
+    ports.push((dir.to_owned(), p));
+    p
+}
+
+/// `--port` for a daemon start on `dir` whose port choice is not under test: the directory's
+/// reserved port ([`dir_port`]) while it has no saved port; none (the saved port) after it.
+#[must_use]
+pub fn own_port(dir: &Path) -> Option<u16> {
+    (!dir.join(chaldea_daemon::lifecycle::names::PORT).exists()).then(|| dir_port(dir))
+}
+
 /// `chaldea <args>` with `CHALDEA_STATE_DIR` removed unless `env` sets it.
 #[must_use]
 pub fn chaldea(args: &[&str], env: &[(&str, &OsStr)]) -> Command {
