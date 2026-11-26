@@ -432,8 +432,9 @@ fn render(
             .is_some_and(|s| !s.is_empty()),
         _ => false,
     };
-    // A confirmed launch is no candidate (RD1), so its missing probe says nothing.
-    if probed && unconfirmed && !this_run_probe {
+    // A confirmed launch (by the summary or by an event the scan read) is no candidate
+    // (RD1), so its missing probe says nothing.
+    if probed && unconfirmed && confirmation.is_none() && !this_run_probe {
         let _ = writeln!(o, "{NO_PROBE}");
     }
     match reason {
