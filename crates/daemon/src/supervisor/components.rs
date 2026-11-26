@@ -88,7 +88,10 @@ impl Components for SupervisorComponents {
             sup.rt.spawn(sup.clone().tick_loop());
         }
         sup.start_send_driver();
-        sup.rt.spawn(super::prober::run(sup.clone()));
+        let prober = super::prober::run(sup.clone());
+        sup.rt.spawn(async move {
+            drop(prober.await);
+        });
     }
 }
 

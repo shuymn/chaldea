@@ -292,7 +292,7 @@ async fn shutdown_boundary() {
     held.wait();
     rig.sup.tracker.close_admission();
     held.go();
-    run.await.unwrap();
+    assert!(run.await.unwrap().is_empty());
     assert!(script.calls().is_empty());
     assert_eq!(rig.sup.tracker.count(), 0);
     rig.srv.stop().await;
@@ -313,7 +313,7 @@ async fn shutdown_boundary() {
     tokio::task::yield_now().await;
     rig.sup.tracker.close_admission();
     drop(all);
-    run.await.unwrap();
+    assert!(run.await.unwrap().is_empty());
     assert!(script.calls().is_empty());
     assert_eq!(rig.sup.tracker.count(), 0);
     assert!(evidence(&rig, ids2[0].0).is_empty());
@@ -325,7 +325,7 @@ async fn shutdown_boundary() {
     let rig = probing(store, HostOs::Macos, &script).await;
     rig.clock.resume();
     let queued = rig.pauses.arm(Pause::ProbeQueued);
-    prober::run(rig.sup.clone()).await;
+    let records = prober::run(rig.sup.clone()).await;
     queued.wait();
     let end = rig.sup.now() + Duration::from_secs(5);
     let participant = tokio::spawn(shutdown(rig.sup.clone(), end));
@@ -333,6 +333,9 @@ async fn shutdown_boundary() {
         .await;
     queued.go();
     assert_eq!(participant.await.unwrap(), ParticipantEnd::Clean);
+    for r in records {
+        r.await.unwrap();
+    }
     assert!(script.calls().is_empty());
     assert!(evidence(&rig, ids3[0].0).is_empty());
     rig.srv.stop().await;
@@ -412,7 +415,7 @@ async fn bounded() {
     // One parked task ends: the fifth starts; then all.
     script.parking.store(false, Ordering::SeqCst);
     script.park.open();
-    run.await.unwrap();
+    drop(run.await.unwrap());
     rig.until("six probes", || script.calls().len() == 6).await;
     rig.until("six recorded", || recorded() == 6).await;
     rig.until("every slot back", || {

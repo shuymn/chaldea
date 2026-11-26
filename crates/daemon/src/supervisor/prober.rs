@@ -54,12 +54,14 @@ fn candidate(l: &LaunchRow) -> bool {
     l.exit_reason == Some(ExitReason::DaemonRestart) && !l.death_confirmed && l.pid.is_some()
 }
 
-/// The prober (§2.3 steps 1–4): returns once every candidate's task is spawned.
-pub(crate) async fn run(sup: Arc<Supervisor>) {
+/// The prober (§2.3 steps 1–4): returns once every candidate's task is spawned, with the
+/// record tasks' handles (the daemon drops them; tests await them).
+pub(crate) async fn run(sup: Arc<Supervisor>) -> Vec<JoinHandle<()>> {
+    let mut records = Vec::new();
     // Step 1.
     sup.pauses().at(Pause::ProberStart).await;
     if !sup.tracker.accepting() {
-        return;
+        return records;
     }
     // Step 2: one read transaction, bounded by `PROBE_READ`.
     let until = sup.now() + PROBE_READ;
@@ -79,7 +81,7 @@ pub(crate) async fn run(sup: Arc<Supervisor>) {
         Some(Ok(Ok(rows))) => rows,
         other => {
             tracing::warn!(read = ?other.map(|r| r.map(|r| r.map(|v| v.len()))), "the restart prober read no candidates in time; the next start reads again");
-            return;
+            return records;
         }
     };
     let candidates: Vec<LaunchRow> = rows.into_iter().filter(candidate).collect();
@@ -97,11 +99,11 @@ pub(crate) async fn run(sup: Arc<Supervisor>) {
                 ?left,
                 "no probe slot in time; the next start probes these launches"
             );
-            return;
+            return records;
         };
         // 3.2: admission, atomic with shutdown's close of it.
         let Some(token) = sup.tracker.admit() else {
-            return;
+            return records;
         };
         let admission = ProbeAdmission::new(token);
         // 3.3.
@@ -137,8 +139,9 @@ pub(crate) async fn run(sup: Arc<Supervisor>) {
             cutoff,
             timer: sup.timer(cutoff),
         };
-        sup.rt.spawn(record_probe(sup.clone(), probe, join));
+        records.push(sup.rt.spawn(record_probe(sup.clone(), probe, join)));
     }
+    records
 }
 
 /// One probe's facts for its record.

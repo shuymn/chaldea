@@ -1238,3 +1238,33 @@ async fn receipt_from_10a1() {
     );
     rig.srv.stop().await;
 }
+
+/// PR10a2-CL-8, the op's re-read: a plain stop admitted while the launch runs, held at its
+/// start while the launch exits unconfirmed and the owner asserts it, answers
+/// `already_exited` with `confirmed_within_deadline: false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn assume_dead_before_the_reread() {
+    let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
+        c.kill_budget = Duration::from_millis(200);
+    })
+    .await;
+    rig.clock.resume();
+    rig.pty.script_next(FakeScript {
+        kill: KillBehavior::Unconfirmed,
+        ..FakeScript::default()
+    });
+    let (t, l) = rig.spawn_codex(None).await;
+    let held = rig.pauses.arm(Pause::StopStart);
+    let reply = stop_with(&rig, t);
+    held.wait();
+    rig.pty.take_child().unwrap().fail_wait();
+    rig.until("the exit", || rig.launch(l).exit_reason.is_some())
+        .await;
+    let r = rig.cmd("stop", &assert_args(t, l)).await;
+    assert_eq!(json(&r)["outcome"], "asserted");
+    held.go();
+    let v = json(&reply.await.unwrap());
+    assert_eq!(v["outcome"], "already_exited", "{v}");
+    assert_eq!(v["confirmed_within_deadline"], false, "{v}");
+    rig.srv.stop().await;
+}
