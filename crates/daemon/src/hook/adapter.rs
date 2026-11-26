@@ -93,15 +93,33 @@ impl TurnMark {
     }
 }
 
-/// The turn watermark a job's next interpretation sees: `committed`, raised by the turn
-/// boundaries the job interpreted before it.
-#[must_use]
-pub(crate) fn job_watermark(committed: u64, marks: &[(u64, TurnMark)]) -> u64 {
-    marks
-        .iter()
-        .filter(|(_, m)| m.is_boundary())
-        .map(|(o, _)| *o)
-        .fold(committed, u64::max)
+/// The turn marks a job interpreted, by receipt ordinal, and the turn watermark its next
+/// interpretation sees: `committed`, raised by each turn boundary as it is added.
+#[derive(Debug)]
+pub(crate) struct JobMarks {
+    pub(crate) marks: Vec<(u64, TurnMark)>,
+    watermark: u64,
+}
+
+impl JobMarks {
+    pub(crate) fn new(committed: u64) -> JobMarks {
+        JobMarks {
+            marks: Vec::new(),
+            watermark: committed,
+        }
+    }
+
+    pub(crate) fn push(&mut self, ordinal: u64, mark: TurnMark) {
+        if mark.is_boundary() {
+            self.watermark = self.watermark.max(ordinal);
+        }
+        self.marks.push((ordinal, mark));
+    }
+
+    #[must_use]
+    pub(crate) fn watermark(&self) -> u64 {
+        self.watermark
+    }
 }
 
 /// What `interpret` decided.

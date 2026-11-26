@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 
 use super::evidence::{advance, count, settle_rig};
 use super::gate::set;
-use super::human::{key, outcome};
+use super::human::{card_hook, key, outcome};
 use super::{Live, SRig};
 use crate::hook::TurnMark;
 use crate::store::test_faults::CommitFault;
@@ -69,14 +69,6 @@ async fn hold(rig: &SRig, live: &Live, hook: Hook, park: bool) -> Held {
 
 fn prompt(text: &str) -> Value {
     json!({ "prompt": text })
-}
-
-fn card_hook(rig: &SRig, live: &Live, tool_use: &str) -> Hook {
-    rig.hook_of(
-        live,
-        "PermissionRequest",
-        &json!({ "tool_name": "Bash", "tool_input": { "command": "ls" }, "tool_use_id": tool_use }),
-    )
 }
 
 pub(super) fn turn(rig: &SRig, live: &Live) -> TurnState {

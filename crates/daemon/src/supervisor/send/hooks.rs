@@ -276,9 +276,7 @@ impl Events {
 
 impl SupervisorHooks {
     fn mode(&self, agent: Agent) -> ReadinessMode {
-        self.side
-            .mode
-            .unwrap_or_else(|| capabilities(agent, self.host_os).readiness_mode())
+        self.side.mode(capabilities(agent, self.host_os))
     }
 
     /// Hook evidence of `kind` is recorded: the row allows it, the delivery's facts are

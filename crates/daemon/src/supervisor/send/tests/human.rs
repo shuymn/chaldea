@@ -15,6 +15,7 @@ use super::gate::set;
 use super::{Live, SRig};
 use crate::store::test_faults::CommitFault;
 use crate::supervisor::send::SETTLE;
+use crate::supervisor::tests::support::hook::Hook;
 
 /// `key` as the owner: the status and the body.
 pub(super) async fn key(
@@ -40,13 +41,18 @@ fn not_written(r: &(u16, Value)) -> bool {
     r.0 == 409 && r.1["code"] == json!("key_not_written")
 }
 
-/// A `PermissionRequest` through the hook route; returns the card it opened.
-async fn card(rig: &SRig, live: &Live, tool_use_id: &str) -> ApprovalId {
-    let h = rig.hook_of(
+/// A `PermissionRequest` of `live` for `Bash` `ls` with `tool_use_id`.
+pub(super) fn card_hook(rig: &SRig, live: &Live, tool_use_id: &str) -> Hook {
+    rig.hook_of(
         live,
         "PermissionRequest",
         &json!({ "tool_name": "Bash", "tool_input": { "command": "ls" }, "tool_use_id": tool_use_id }),
-    );
+    )
+}
+
+/// A `PermissionRequest` through the hook route; returns the card it opened.
+async fn card(rig: &SRig, live: &Live, tool_use_id: &str) -> ApprovalId {
+    let h = card_hook(rig, live, tool_use_id);
     assert_eq!(rig.post_for(live, &h).await.status, 200);
     ApprovalId(h.emit)
 }
@@ -299,11 +305,7 @@ async fn card_committed_after_later_stop() {
     rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "t" }))
         .await;
     let (got, release) = rig.ingest.points.arm_job(rig.next_ordinal(&live));
-    let h = rig.hook_of(
-        &live,
-        "PermissionRequest",
-        &json!({ "tool_name": "Bash", "tool_input": { "command": "ls" }, "tool_use_id": "t1" }),
-    );
+    let h = card_hook(&rig, &live, "t1");
     let reply = crate::supervisor::tests::support::http::spawn_send(&rig.srv, &h.req(&rig.srv));
     got.await.unwrap();
     // The later `Stop` commits and finishes first; the card's job then commits.
@@ -335,11 +337,7 @@ async fn card_committed_after_later_stop() {
     // Control: the next turn's card, taken in after its start.
     rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "u" }))
         .await;
-    let h = rig.hook_of(
-        &live,
-        "PermissionRequest",
-        &json!({ "tool_name": "Bash", "tool_input": { "command": "ls" }, "tool_use_id": "t2" }),
-    );
+    let h = card_hook(&rig, &live, "t2");
     assert_eq!(rig.post_for(&live, &h).await.status, 200);
     let id = ApprovalId(h.emit);
     assert_eq!(outcome(&rig, id), None, "open in the store");

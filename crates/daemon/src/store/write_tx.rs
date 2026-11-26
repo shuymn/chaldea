@@ -284,9 +284,9 @@ impl<'c> WriteTx<'c> {
     ) -> CommitStamp {
         let stamp = CommitStamp::default();
         let slot = stamp.0.clone();
-        self.after_commit.push(Box::new(move || {
+        self.after_commit(move || {
             let _ = slot.set(now());
-        }));
+        });
         stamp
     }
 
