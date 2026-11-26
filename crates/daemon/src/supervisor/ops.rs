@@ -630,19 +630,12 @@ pub(crate) fn spawn_failed_evidence(
     }
 }
 
-/// The `spawn_failed` evidence of a `Session::spawn` that panicked: nothing was returned.
+/// The `spawn_failed` evidence of a `Session::spawn` that panicked: nothing was returned,
+/// so that of a failed start with neither identity nor report, its result not received.
 pub(crate) fn spawn_panic_evidence(launch: LaunchId) -> LaunchEvidence {
-    LaunchEvidence {
-        launch_id: launch,
-        source: EvidenceSource::SpawnFailed,
-        identities: Vec::new(),
-        unchecked: vec![
-            Unchecked::NoIdentity,
-            Unchecked::TreeUnproven,
-            Unchecked::ResultNotReceived,
-        ],
-        probe_run: None,
-    }
+    let mut e = spawn_failed_evidence(launch, None, None);
+    e.unchecked.push(Unchecked::ResultNotReceived);
+    e
 }
 
 /// The `close` evidence of an owned close that did not prove the tree dead: the kept
