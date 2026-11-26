@@ -154,10 +154,6 @@ pub(crate) struct Fired {
 pub(crate) struct TurnLog(pub BTreeMap<u64, (TurnMark, Instant)>);
 
 impl TurnLog {
-    fn boundary(m: &TurnMark) -> bool {
-        matches!(m, TurnMark::Start | TurnMark::End { .. })
-    }
-
     /// Inserts a mark, then drops the entries below the boundary under the current turn's
     /// start.
     pub(crate) fn insert(&mut self, ordinal: u64, mark: TurnMark, at: Instant) {
@@ -173,7 +169,7 @@ impl TurnLog {
                 .0
                 .range(..t)
                 .rev()
-                .find(|(_, (m, _))| Self::boundary(m))
+                .find(|(_, (m, _))| m.is_boundary())
                 .map(|(o, _)| *o)
         {
             self.0 = self.0.split_off(&b);
@@ -192,7 +188,7 @@ impl TurnLog {
             .0
             .range(..s)
             .rev()
-            .filter(|(_, (m, _))| Self::boundary(m));
+            .filter(|(_, (m, _))| m.is_boundary());
         let (_, (start, _)) = below.next()?;
         if *start != TurnMark::Start {
             return None;
