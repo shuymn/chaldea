@@ -314,7 +314,17 @@ impl Coordinator {
     async fn remove_record(&mut self, dir: &std::path::Path) -> Result<(), Crashed> {
         let path = dir.join(names::RECORD);
         let path = path.as_path();
-        let end = Instant::now() + RECORD_REMOVAL;
+        #[cfg(test)]
+        let budget = self
+            .faults
+            .record_removal
+            .lock()
+            .ok()
+            .and_then(|w| *w)
+            .unwrap_or(RECORD_REMOVAL);
+        #[cfg(not(test))]
+        let budget = RECORD_REMOVAL;
+        let end = Instant::now() + budget;
         // Why the last attempt failed; once the budget is spent it is the warning.
         let mut failed: Option<String> = None;
         loop {
@@ -367,11 +377,15 @@ impl Coordinator {
                 return Err(Crashed);
             }
             if Instant::now() >= end {
-                self.log.warn(&format!(
-                    "the discovery record {} was left in place: its removal did not start within {} ms",
-                    path.display(),
-                    RECORD_REMOVAL.as_millis()
-                ));
+                // An earlier refusal or failed re-read says more than the budget's end.
+                match &failed {
+                    Some(why) => self.log.warn(why),
+                    None => self.log.warn(&format!(
+                        "the discovery record {} was left in place: its removal did not start within {} ms",
+                        path.display(),
+                        RECORD_REMOVAL.as_millis()
+                    )),
+                }
                 return Ok(());
             }
             #[cfg(test)]

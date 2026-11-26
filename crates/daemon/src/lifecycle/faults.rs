@@ -228,6 +228,8 @@ pub(crate) struct Faults {
     pub(crate) record_verify_fails: AtomicU32,
     /// The wait between removal attempts instead of 50 ms.
     pub(crate) record_retry: Mutex<Option<Duration>>,
+    /// The record removal's budget instead of 500 ms.
+    pub(crate) record_removal: Mutex<Option<Duration>>,
     /// The `stopping` rewrite's budget instead of 500 ms (still within HTTP's).
     pub(crate) stopping_rewrite: Mutex<Option<Duration>>,
     /// The wait between removal attempts was first polled.

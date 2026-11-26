@@ -346,6 +346,8 @@ fn record_removal_is_retried() {
     for (fails, removed) in [(2, true), (u32::MAX, false)] {
         let dir = state();
         let faults = Arc::new(Faults::default());
+        // Long enough that a late retry wake on a loaded host still retries.
+        *faults.record_removal.lock().unwrap() = Some(Duration::from_secs(5));
         faults.record_remove_fails.store(fails, Ordering::SeqCst);
         let run = start(
             foreground(&dir.path, Some(hold_port())),
@@ -387,6 +389,8 @@ fn record_verify_failure_is_retried() {
     for (fails, removed) in [(1, true), (u32::MAX, false)] {
         let dir = state();
         let faults = Arc::new(Faults::default());
+        // Long enough that a late retry wake on a loaded host still retries.
+        *faults.record_removal.lock().unwrap() = Some(Duration::from_secs(5));
         let run = start(
             foreground(&dir.path, Some(hold_port())),
             TestComponents::default(),
@@ -570,6 +574,47 @@ fn no_unlink_after_the_record_budget() {
     assert_eq!(r.code.code(), 0, "{}", log.text());
     assert!(dir.path.join(names::RECORD).exists(), "{}", log.text());
     assert!(log.text().contains("was left in place"), "{}", log.text());
+}
+
+/// PR8-CL-23: a removal refused once whose next attempt reaches the unlink only after the
+/// budget (paused there) is logged with its refusal, not as a removal that never started.
+#[test]
+fn refused_removal_past_the_budget_names_the_refusal() {
+    use std::sync::atomic::Ordering;
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    faults.record_remove_fails.store(u32::MAX, Ordering::SeqCst);
+    // Room for a slow test thread between the two parks.
+    *faults.record_removal.lock().unwrap() = Some(Duration::from_secs(2));
+    let retry = faults.park(Point::RecordRetry);
+    let run = start(
+        foreground(&dir.path, Some(hold_port())),
+        TestComponents::default(),
+        faults.clone(),
+    );
+    run.serving();
+    run.stop();
+    assert!(retry.wait_reached(WAIT));
+    // The next attempt holds after its re-read until the budget has ended.
+    let verified = faults.park(Point::AfterRecordVerify);
+    retry.release();
+    assert!(verified.wait_reached(WAIT));
+    std::thread::sleep(Duration::from_millis(2100));
+    verified.release();
+    let log = run.log.clone();
+    let r = run.join();
+    assert_eq!(r.code.code(), 0, "{}", log.text());
+    assert!(dir.path.join(names::RECORD).exists(), "{}", log.text());
+    assert!(
+        log.text().contains("could not be removed"),
+        "{}",
+        log.text()
+    );
+    assert!(
+        !log.text().contains("did not start within"),
+        "{}",
+        log.text()
+    );
 }
 
 /// PR8-CL-23: the record says `stopping` before HTTP shuts down. The rewrite has a
