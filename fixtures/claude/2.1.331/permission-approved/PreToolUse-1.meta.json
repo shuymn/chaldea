@@ -1,0 +1,18 @@
+{
+  "fact": "other",
+  "events": [
+    {
+      "kind": "tool_activity",
+      "phase": "started",
+      "tool_name": "Bash",
+      "tool_use_id": "toolu_01RjUNGaAoUWQrsqqtuTbxPr",
+      "turn_ref": "0387df45-e9a7-4a54-bb40-f5082d25df0a",
+      "input": {
+        "command": "printf c1b > c1b-approved.txt",
+        "description": "Write c1b to a file"
+      },
+      "output": null
+    }
+  ],
+  "route": "interpret"
+}

@@ -1,0 +1,11 @@
+{
+  "fact": {
+    "prompt_submitted": {
+      "prompt": "Use the Agent tool to start one general-purpose subagent whose only task is to use the Bash tool to run exactly: printf sub > c1b-sub.txt . Do nothing else yourself."
+    }
+  },
+  "events": [],
+  "sent": "Use the Agent tool to start one general-purpose subagent whose only task is to use the Bash tool to run exactly: printf sub > c1b-sub.txt . Do nothing else yourself.",
+  "expected_prompt": "Use the Agent tool to start one general-purpose subagent whose only task is to use the Bash tool to run exactly: printf sub > c1b-sub.txt . Do nothing else yourself.",
+  "route": "interpret"
+}

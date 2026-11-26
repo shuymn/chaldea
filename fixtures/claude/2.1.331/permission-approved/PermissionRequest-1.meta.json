@@ -1,0 +1,14 @@
+{
+  "fact": {
+    "card_opened": {
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "printf c1b > c1b-approved.txt",
+        "description": "Write c1b to a file"
+      },
+      "turn_ref": "0387df45-e9a7-4a54-bb40-f5082d25df0a"
+    }
+  },
+  "events": [],
+  "route": "interpret"
+}
