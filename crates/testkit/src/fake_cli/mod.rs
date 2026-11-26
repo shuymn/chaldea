@@ -7,6 +7,7 @@
 //!                  [--escape-orphan] [--orphan-keeps-tty] [--out <path>] [--emit-output]
 //!                  [--validate-input <n>] [--emitter <path>] [--agent <claude|codex>]
 //!                  [--session-id <id>] [--nested] [--nested-child] [--script <json>]
+//!                  [--session-start-gate <path>]
 //!                  [--version-text <text>] [--version-exit <n>] [--version-sleep-ms <n>]
 //!                  [--version-flood <n>] [--version-linger-ms <n>] [--version-descendant]
 //!                  [--version-descendant-writes] [--version-pidfile <path>]
@@ -16,6 +17,8 @@
 //!
 //! `--emitter`, `--agent`, `--session-id`, `--nested`, `--nested-child`, and `--script` are
 //! the hook emission of `docs/design/hook-ingest.md` §2.14 (`echo` and `hooks`).
+//! `--session-start-gate` holds `echo`'s `SessionStart` until its file exists (60 s at most,
+//! then exit 1), so a test can let it in only once the launch is published.
 //!
 //! An unknown mode or flag exits 2. After `--` come the arguments the daemon appends for its
 //! agent (`report-process` records them with the rest of its argv;
@@ -96,6 +99,8 @@ pub(crate) struct Opts {
     pub(crate) session_id: Option<String>,
     /// `echo --emitter`: also start a nested FakeCli that emits another session's hooks.
     pub(crate) nested: bool,
+    /// `echo --emitter`: emit the `SessionStart` only once this file exists.
+    pub(crate) session_start_gate: Option<std::path::PathBuf>,
     /// `echo`: run as that nested FakeCli.
     pub(crate) nested_child: bool,
     /// `hooks`: the steps, a JSON array.
@@ -130,6 +135,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
         agent: "codex".to_owned(),
         session_id: None,
         nested: false,
+        session_start_gate: None,
         nested_child: false,
         script: None,
         print_version: false,
@@ -181,6 +187,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
             "--agent" => o.agent = value()?,
             "--session-id" => o.session_id = Some(value()?),
             "--nested" => o.nested = true,
+            "--session-start-gate" => o.session_start_gate = Some(value()?.into()),
             "--nested-child" => o.nested_child = true,
             "--script" => o.script = Some(value()?),
             "--version-text" => o.version.text = value()?,

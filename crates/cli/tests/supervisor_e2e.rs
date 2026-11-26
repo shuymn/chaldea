@@ -218,6 +218,8 @@ fn decoder_panic() {
     for at in ["in_parse", "after_parse"] {
         let d = state();
         let cwd = tempfile::tempdir().unwrap();
+        let gate = SessionGate::new();
+        let [flag, path] = gate.args();
         let (mut daemon, port) = daemon_with(
             &labels,
             &d.path,
@@ -230,6 +232,8 @@ fn decoder_panic() {
                 "claude",
                 "--max-life-secs",
                 "120",
+                &flag,
+                &path,
             ],
             &[(CLAUDE_DECODER_PANIC, OsStr::new(at))],
         );
@@ -245,6 +249,7 @@ fn decoder_panic() {
             ],
         );
         assert_eq!(code, 0, "{at}: {err}");
+        gate.open();
         let t = v["thread_id"].as_str().unwrap().to_owned();
         let l = v["launch_id"].as_str().unwrap().to_owned();
         let token = chaldea_daemon::lifecycle::read_owner_token(&d.path).unwrap();
@@ -284,6 +289,42 @@ fn decoder_panic() {
 }
 
 // ---- C1: Claude launches of FakeCli through the real emitter ----
+
+/// FakeCli's `--session-start-gate` file. A launch is published before its `spawn` or `resume`
+/// answers, so a `SessionStart` let in after that answer is taken in with intake facts; one
+/// taken in before the publication has none and records no readiness (sup §2.11
+/// "Observation"), which FakeCli, emitting at once, would otherwise race.
+struct SessionGate {
+    dir: tempfile::TempDir,
+}
+
+impl SessionGate {
+    fn new() -> SessionGate {
+        SessionGate {
+            dir: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    fn path(&self) -> PathBuf {
+        self.dir.path().join("open")
+    }
+
+    /// The FakeCli flag and its value.
+    fn args(&self) -> [String; 2] {
+        [
+            "--session-start-gate".to_owned(),
+            self.path().to_string_lossy().into_owned(),
+        ]
+    }
+
+    fn open(&self) {
+        std::fs::write(self.path(), b"").unwrap();
+    }
+
+    fn close(&self) {
+        std::fs::remove_file(self.path()).unwrap();
+    }
+}
 
 /// Every JSON line FakeCli processes send to `report`, from every connection, on a channel.
 fn reports(report: TcpListener) -> std::sync::mpsc::Receiver<Value> {
@@ -410,12 +451,24 @@ fn claude_hooks_bind() {
     let d = state();
     let cwd = tempfile::tempdir().unwrap();
     let emitter = env!("CARGO_BIN_EXE_chaldea");
+    let gate = SessionGate::new();
+    let [flag, path] = gate.args();
     let (mut daemon, port, rx) = claude_daemon(
         &labels,
         &d.path,
-        &["--mode", "echo", "--emitter", emitter, "--agent", "claude"],
+        &[
+            "--mode",
+            "echo",
+            "--emitter",
+            emitter,
+            "--agent",
+            "claude",
+            &flag,
+            &path,
+        ],
     );
     let (t, l) = spawn_claude(&labels, &d.path, cwd.path(), None);
+    gate.open();
     let hello = next_report(&rx, "hello", |v| v["event"] == "hello");
     assert_eq!(
         argv_after(&hello, "--session-id").as_deref(),
@@ -451,19 +504,33 @@ fn claude_resume_rebinds() {
     let d = state();
     let cwd = tempfile::tempdir().unwrap();
     let emitter = env!("CARGO_BIN_EXE_chaldea");
+    let gate = SessionGate::new();
+    let [flag, path] = gate.args();
     let (mut daemon, port, rx) = claude_daemon(
         &labels,
         &d.path,
-        &["--mode", "echo", "--emitter", emitter, "--agent", "claude"],
+        &[
+            "--mode",
+            "echo",
+            "--emitter",
+            emitter,
+            "--agent",
+            "claude",
+            &flag,
+            &path,
+        ],
     );
     let (t, l) = spawn_claude(&labels, &d.path, cwd.path(), None);
+    gate.open();
     emitted_ok(&rx, "SessionStart");
     let token = chaldea_daemon::lifecycle::read_owner_token(&d.path).unwrap();
     events_of(port, &token, &t, "readiness_observed", 1);
     let (code, _, err) = agent(&labels, &d.path, &["stop", &t]);
     assert_eq!(code, 0, "{err}");
+    gate.close();
     let (code, v, err) = agent(&labels, &d.path, &["resume", &t]);
     assert_eq!(code, 0, "{err}");
+    gate.open();
     let l2 = v["launch_id"].as_str().unwrap().to_owned();
     assert_ne!(l2, l);
     let hello = next_report(&rx, "the resumed hello", |v| {
