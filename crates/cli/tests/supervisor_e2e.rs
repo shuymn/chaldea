@@ -290,10 +290,13 @@ fn decoder_panic() {
 
 // ---- C1: Claude launches of FakeCli through the real emitter ----
 
-/// FakeCli's `--session-start-gate` file. A launch is published before its `spawn` or `resume`
-/// answers, so a `SessionStart` let in after that answer is taken in with intake facts; one
-/// taken in before the publication has none and records no readiness (sup §2.11
-/// "Observation"), which FakeCli, emitting at once, would otherwise race.
+/// The file that holds FakeCli's first `SessionStart` (`echo --session-start-gate`, or a
+/// `hooks` script's first `wait_file` step) until the test opens it. A launch is published
+/// before its `spawn` or `resume` answers, so opening it after that answer puts the launch's
+/// publication before the hook's intake; FakeCli, emitting at once, would otherwise race it,
+/// and a hook taken in before the publication has no intake facts and records no readiness
+/// (sup §2.11 "Observation"). A lock contended at the intake can still leave the facts missing
+/// (supervisor-send L-12).
 struct SessionGate {
     dir: tempfile::TempDir,
 }
@@ -600,7 +603,9 @@ fn claude_session_switch() {
     let cwd = tempfile::tempdir().unwrap();
     let emitter = env!("CARGO_BIN_EXE_chaldea");
     let other = "11111111-1111-4111-8111-111111111111";
+    let gate = SessionGate::new();
     let script = serde_json::json!([
+        { "wait_file": gate.path() },
         { "emit": { "hook_event_name": "SessionStart", "session_id": "$SESSION", "transcript_path": null, "source": "startup" } },
         { "emit": { "hook_event_name": "SessionStart", "session_id": other, "transcript_path": null, "source": "clear" } },
         { "emit": { "hook_event_name": "UserPromptSubmit", "session_id": other, "prompt": "other" } },
@@ -622,13 +627,14 @@ fn claude_session_switch() {
         ],
     );
     let (t, l) = spawn_claude(&labels, &d.path, cwd.path(), None);
+    gate.open();
     let hello = next_report(&rx, "hello", |v| v["event"] == "hello");
     assert_eq!(
         argv_after(&hello, "--session-id").as_deref(),
         Some(l.as_str()),
         "{hello}"
     );
-    for step in 0..4 {
+    for step in 1..5 {
         let v = next_report(&rx, &format!("emitted step {step}"), |v| {
             v["event"] == "emitted" && v["step"] == step
         });
