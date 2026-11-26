@@ -82,7 +82,7 @@ async fn outcomes() {
     });
     let id = rig.send(&live, text).await;
     // Before its record the unit still runs.
-    entered.await.unwrap();
+    crate::store::tests::support::http::reached(entered).await;
     assert!(
         sl.state()
             .running
@@ -178,10 +178,8 @@ async fn write_stall() {
     rig.pass(&live).await;
     assert_eq!(rig.input(second).state, InputState::Queued);
     drop(hold);
-    rig.until("the record ended the unit", || {
-        rig.sl(&live).state().running.is_none()
-    })
-    .await;
+    rig.until("the record ended the unit", || sl.state().running.is_none())
+        .await;
     rig.pass(&live).await;
     assert_eq!(rig.input(id).state, InputState::Dismissed, "left as it was");
     assert_eq!(
