@@ -793,8 +793,8 @@ fn a29_child_suspended() {
         silent_breakaway_ok: false,
     })
     .unwrap();
-    let run = run_args(&d.path);
-    let run: Vec<&str> = run.iter().map(String::as_str).collect();
+    // `cmd` gives a `daemon run` without `--port` this state dir's reserved port.
+    let run = ["daemon", "run"];
     let mut c = cmd(
         &labels,
         &d.path,
@@ -923,8 +923,8 @@ fn assign_failure_child_probed() {
     })
     .unwrap();
     let gate = Gate::new();
-    let run = run_args(&d.path);
-    let run: Vec<&str> = run.iter().map(String::as_str).collect();
+    // `cmd` gives a `daemon run` without `--port` this state dir's reserved port.
+    let run = ["daemon", "run"];
     let mut c = cmd(
         &labels,
         &d.path,
