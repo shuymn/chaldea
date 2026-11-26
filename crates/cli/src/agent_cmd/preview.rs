@@ -360,7 +360,7 @@ fn render(
     if let Some(f) = exited.as_ref().and_then(|x| x.failed_start.as_ref()) {
         let _ = writeln!(
             o,
-            "identity recorded at the failed start, not checked since: pid {}, start time {}",
+            "identity recorded at the failed start: pid {}, start time {}",
             f.pid,
             f.start_time.as_deref().unwrap_or("not recorded")
         );

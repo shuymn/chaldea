@@ -571,9 +571,7 @@ fn preview_missing_lines() {
     assert_eq!(code, ExitCode::Ok, "{out}");
     assert!(out.contains("recorded identity: none"), "{out}");
     assert!(
-        out.contains(
-            "identity recorded at the failed start, not checked since: pid 77, start time st-77"
-        ),
+        out.contains("identity recorded at the failed start: pid 77, start time st-77"),
         "{out}"
     );
     assert!(out.contains(NO_REPORT), "{out}");
