@@ -8,6 +8,10 @@ the workspace is `/work/c1b-ws`, the home directory `/work/profile`, Claude's te
 directory `/work/tmp/claude/`. The capture folder's `.claude/settings.json` set
 `permissions.defaultMode` to `default`, so tool calls asked for permission.
 
+`corpus-wrapped-small` was captured later the same way, except that the daemon decoded Claude's
+hooks: its `UserPromptSubmit` body is the stdin of an extra command hook the capture folder's
+settings added, which saved it to a file; the daemon recorded the same prompt.
+
 Each `<Event>-<n>.meta.json` holds, from the captures and independent of the decoder: `fact`
 (what the hook says), `events` (the adapter's own events, `tool_activity` here), `route`
 (`bind`, `interpret`, or `foreign_session`, as the daemon routed it), and for a
@@ -20,7 +24,7 @@ Each `<Event>-<n>.meta.json` holds, from the captures and independent of the dec
 |---|---|---|
 | `untrusted-folder` | spawn in a folder never trusted; the trust dialog answered "Yes" | nothing until the answer; `SessionStart` (`startup`) about 110 ms after it |
 | `plain-turn` | spawn in the trusted folder, one prompt | `SessionStart` (`startup`), `UserPromptSubmit`, `Stop` |
-| `corpus-*` | one corpus prompt each (below) | `UserPromptSubmit`, `Stop`; `corpus-bang`: `Stop` only |
+| `corpus-*` | one corpus prompt each (below) | `UserPromptSubmit`, `Stop`; `corpus-bang`: `Stop` only; `corpus-wrapped-small`: `UserPromptSubmit` only (below) |
 | `permission-approved` | a Bash call, the dialog answered with Enter | `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `Stop` |
 | `permission-denied` | a Bash call, the dialog answered with Escape | `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, then nothing |
 | `subagent` | an Agent tool call whose subagent ran Bash (approved) | `UserPromptSubmit`, `PreToolUse` and `PostToolUse` (Agent), `Stop`, then the subagent's `PreToolUse`, `PermissionRequest`, `PostToolUse` (Bash), then `UserPromptSubmit` (`<task-notification>`), `Stop` |
@@ -81,13 +85,15 @@ Each prompt was sent by `chaldea send` as one bracketed paste (DECSET 2004 on).
 | `corpus-ends` | LF, two spaces, `both ends`, two spaces, LF | LF, two spaces, `both ends`: trailing whitespace removed, leading kept |
 | `corpus-tab` | `a` TAB `b` | `a`, four spaces, `b` |
 | `corpus-wrapped` | 300 lines of `e` U+0301 TAB `か` U+3099 ` line` LF (4800 bytes) | the large-paste wrapper around the lines with each TAB as four spaces, the marks **not** composed, and the last LF removed |
+| `corpus-wrapped-small` | 801 `y` | the wrapper around the 801 `y`s |
 | `corpus-del` | `a` DEL `b` | `ab` |
 | `corpus-c1` | `a` U+0080 `b` U+009F `c` | `abc` |
 | `/zzexample corpus` (no files) | leading `/` | no hook: Claude ran it as an unknown command |
 | `corpus-bang` | `!echo corpus` | no `UserPromptSubmit`: Claude ran it as a shell command, then a `Stop` |
 | `corpus-hash` | `#zz corpus` | unchanged |
 
-So a prompt is recorded as `tab4(nfc(trim_end(remove DEL and C1(lf(t)))))`, and one whose
-`lf(t)` exceeds 4,096 bytes (the smallest wrapped paste measured is 4 KiB + 1, spike A-6) may be
-recorded as the wrapper around `tab4(trim_end(lf(t)))`. Spike C-1 (2.1.326, Windows) saw
+So a prompt is recorded as `tab4(nfc(trim_end(remove DEL and C1(lf(t)))))`, or, when Claude
+folds the paste, as the wrapper around `tab4(trim_end(lf(t)))`. Claude folds a paste of more than
+800 characters or of more newlines than `min(rows − 10, 2)` (its paste handler), so an 801-byte
+paste is wrapped too; a three-line paste (two newlines) was not. Spike C-1 (2.1.326, Windows) saw
 decomposed entries composed, which agrees with the first form.
