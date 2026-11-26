@@ -182,31 +182,42 @@ pub const CLAUDE_HOOK_EVENTS: [&str; 6] = [
     "PostToolUse",
 ];
 
-/// The command a Claude hook runs: `<emitter> hook-emit claude`, the emitter's path
-/// single-quoted for a POSIX shell (`'` written `'\''`). Claude runs hooks in `sh` on macOS
-/// and in Git Bash on Windows, where the path's backslashes become forward slashes.
+/// The command a Claude hook runs: `<emitter> hook-emit claude`. On macOS Claude runs it in
+/// `sh`: the path single-quoted for a POSIX shell (`'` written `'\''`). On Windows the
+/// settings set `shell` to `powershell` ([`claude_settings`]), with or without Git Bash: the
+/// call operator `&` and the path single-quoted for PowerShell, each single quotation mark
+/// (`'`, U+2018–U+201B) doubled.
 #[must_use]
 pub fn claude_hook_command(emitter: &str, host_os: HostOs) -> String {
-    let path = match host_os {
-        HostOs::Macos => emitter.to_owned(),
-        HostOs::Windows => emitter.replace('\\', "/"),
-    };
-    format!("'{}' hook-emit claude", path.replace('\'', "'\\''"))
+    match host_os {
+        HostOs::Macos => format!("'{}' hook-emit claude", emitter.replace('\'', "'\\''")),
+        HostOs::Windows => {
+            let mut path = String::with_capacity(emitter.len());
+            for c in emitter.chars() {
+                if matches!(c, '\'' | '\u{2018}'..='\u{201b}') {
+                    path.push(c);
+                }
+                path.push(c);
+            }
+            format!("& '{path}' hook-emit claude")
+        }
+    }
 }
 
 /// The settings file's bytes: [`CLAUDE_HOOK_EVENTS`], each with one command hook running
-/// [`claude_hook_command`], and nothing else.
+/// [`claude_hook_command`] (on Windows with `"shell": "powershell"`), and nothing else.
 #[must_use]
 pub fn claude_settings(emitter: &str, host_os: HostOs) -> Vec<u8> {
-    let command = claude_hook_command(emitter, host_os);
+    let mut hook = serde_json::json!({
+        "type": "command",
+        "command": claude_hook_command(emitter, host_os),
+    });
+    if host_os == HostOs::Windows {
+        hook["shell"] = "powershell".into();
+    }
     let hooks: serde_json::Map<String, serde_json::Value> = CLAUDE_HOOK_EVENTS
         .iter()
-        .map(|e| {
-            (
-                (*e).to_owned(),
-                serde_json::json!([{ "hooks": [{ "type": "command", "command": command }] }]),
-            )
-        })
+        .map(|e| ((*e).to_owned(), serde_json::json!([{ "hooks": [hook] }])))
         .collect();
     let mut out =
         serde_json::to_vec_pretty(&serde_json::json!({ "hooks": hooks })).unwrap_or_default();
@@ -589,16 +600,20 @@ mod tests {
     /// running the emitter with `hook-emit claude`.
     #[test]
     fn claude_settings_content() {
-        for (os, exe, command) in [
+        for (os, exe, hook) in [
             (
                 HostOs::Macos,
                 "/work/bin/chaldea",
-                "'/work/bin/chaldea' hook-emit claude",
+                serde_json::json!({ "type": "command", "command": "'/work/bin/chaldea' hook-emit claude" }),
             ),
             (
                 HostOs::Windows,
                 r"C:\work\bin\chaldea.exe",
-                "'C:/work/bin/chaldea.exe' hook-emit claude",
+                serde_json::json!({
+                    "type": "command",
+                    "command": r"& 'C:\work\bin\chaldea.exe' hook-emit claude",
+                    "shell": "powershell",
+                }),
             ),
         ] {
             let v: serde_json::Value = serde_json::from_slice(&claude_settings(exe, os)).unwrap();
@@ -619,11 +634,7 @@ mod tests {
                 ]
             );
             for (name, entries) in hooks {
-                assert_eq!(
-                    entries,
-                    &serde_json::json!([{ "hooks": [{ "type": "command", "command": command }] }]),
-                    "{name}"
-                );
+                assert_eq!(entries, &serde_json::json!([{ "hooks": [hook] }]), "{name}");
             }
         }
     }
@@ -645,12 +656,17 @@ mod tests {
             (
                 HostOs::Windows,
                 r"C:\Program Files\it's\chaldea.exe",
-                r"'C:/Program Files/it'\''s/chaldea.exe' hook-emit claude",
+                r"& 'C:\Program Files\it''s\chaldea.exe' hook-emit claude",
+            ),
+            (
+                HostOs::Windows,
+                "C:\\work\\a\u{2019}b $x `y\\chaldea.exe",
+                "& 'C:\\work\\a\u{2019}\u{2019}b $x `y\\chaldea.exe' hook-emit claude",
             ),
             (
                 HostOs::Windows,
                 r"\\server\share\a b\chaldea.exe",
-                "'//server/share/a b/chaldea.exe' hook-emit claude",
+                r"& '\\server\share\a b\chaldea.exe' hook-emit claude",
             ),
         ] {
             assert_eq!(claude_hook_command(exe, os), want, "{exe}");

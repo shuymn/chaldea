@@ -746,8 +746,8 @@ async fn early_hook_pid_wait() {
     rig.srv.stop().await;
 }
 
-/// C1-1: a POSIX shell (Claude's hook shell; Git Bash on Windows is one) runs the settings
-/// file's quoted emitter path as one word.
+/// C1-1: `sh` (Claude's hook shell on macOS) runs the settings file's quoted emitter path as
+/// one word.
 #[cfg(unix)]
 #[test]
 fn claude_hook_command_in_sh() {

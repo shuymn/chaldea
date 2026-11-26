@@ -623,6 +623,52 @@ fn one_id_attempts(reqs: &[Req]) -> Vec<String> {
         .collect()
 }
 
+// ---- C1-1: the Claude hook command in Claude's hook shell ----
+
+/// The settings file's hook command, run as Claude's hook shell runs it on this host (`sh -c`
+/// on macOS; on Windows the settings choose PowerShell, run here with `-Command`), starts the
+/// emitter copied to a directory whose name holds a space, quotation marks, and `$`, and its
+/// request reaches the hook URL.
+#[test]
+fn claude_hook_command_runs_in_hook_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("it's \u{2019}q $HOME dir");
+    std::fs::create_dir(&sub).unwrap();
+    let exe = sub.join(std::path::Path::new(EMITTER).file_name().unwrap());
+    std::fs::copy(EMITTER, &exe).unwrap();
+    let host = if cfg!(windows) {
+        chaldea_core::adapter::HostOs::Windows
+    } else {
+        chaldea_core::adapter::HostOs::Macos
+    };
+    let command = chaldea_core::launch::claude_hook_command(exe.to_str().unwrap(), host);
+    let mut c = if cfg!(windows) {
+        let mut c = Command::new("powershell.exe");
+        c.args(["-NoProfile", "-NonInteractive", "-Command", &command]);
+        c
+    } else {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", &command]);
+        c
+    };
+    let stub = Stub::start(&[Reply::Status(200)]);
+    c.env_remove(URL).env_remove(TOKEN).env_remove(THREAD);
+    for (k, v) in full_env(&stub.url()) {
+        c.env(k, v);
+    }
+    let r = run(&mut c, Stdin::Bytes(PAYLOAD.to_vec()));
+    assert_eq!(
+        r.code,
+        Some(0),
+        "{command}: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let reqs = stub.settled();
+    assert_eq!(reqs.len(), 1, "{command}: {reqs:?}");
+    assert_eq!(reqs[0].one("X-Chaldea-Agent"), "claude");
+    assert_eq!(reqs[0].body, PAYLOAD);
+}
+
 // ---- PR9-CL-23 and PR9-CL-24 ----
 
 #[test]
