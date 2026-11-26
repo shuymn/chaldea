@@ -759,6 +759,7 @@ async fn submit(
                     &mut st,
                     Some(RunningUnit {
                         input_id: input,
+                        recorded: Arc::new(AtomicBool::new(false)),
                         ticket: None,
                         submitted_at: now,
                         stalled: false,

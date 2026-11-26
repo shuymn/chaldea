@@ -2,6 +2,7 @@
 //! completion applied to its input, each human unit's `human_write`, in `record.seq` order.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chaldea_core::event::TypedEvent;
 use chaldea_core::ids::{IdempotencyKey, InputId, LaunchId, StreamId, ThreadId};
@@ -57,12 +58,14 @@ pub(crate) fn move_input(
 /// The completion job of an input unit's record: `Written` → `sent`, `NotStarted` →
 /// `cancelled`, `Incomplete` → `unconfirmed`, only for an input still `sending` of a launch
 /// with no exit; with the clock right after the job's SQLite `COMMIT` (the instant the ack
-/// window starts from).
+/// window starts from). The same step sets the running unit's `recorded`, so a hook taken in
+/// after the record committed sees the unit ended (send §2.3 step 4).
 fn completion_job(
     sup: &Supervisor,
     sl: &SendLaunch,
     rec: &WriteRecord,
     input: InputId,
+    recorded: Option<Arc<AtomicBool>>,
 ) -> JobOf<(bool, CommitStamp)> {
     let (thread, launch) = (sl.thread_id, sl.launch_id);
     let by = match &rec.outcome {
@@ -76,6 +79,9 @@ fn completion_job(
     let clock = sup.cfg.clock.clone();
     Arc::new(move |tx| {
         let moved = move_input(tx, thread, launch, input, InputState::Sending, &by, &cause)?;
+        if let Some(r) = recorded.clone() {
+            tx.after_commit(move || r.store(true, Ordering::Release));
+        }
         let clock = clock.clone();
         Ok((moved, tx.commit_stamp(move || clock.now())))
     })
@@ -165,9 +171,16 @@ pub(crate) async fn apply_records(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>) {
             kept.push(f);
             continue;
         }
+        let recorded = sl
+            .state()
+            .running
+            .as_ref()
+            .filter(|r| r.input_id == id)
+            .map(|r| r.recorded.clone());
         #[cfg(test)]
         super::run_hook(&sl.hooks.record_job);
-        match record(sup, completion_job(sup, sl, &f.record, id), false).await {
+        let job = completion_job(sup, sl, &f.record, id, recorded);
+        match record(sup, job, false).await {
             Recorded::Done((moved, at)) => {
                 #[cfg(test)]
                 super::run_hook(&sl.hooks.after_record);

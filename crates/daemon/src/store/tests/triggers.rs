@@ -910,3 +910,217 @@ fn session_bound_once() {
         "an unbound launch after the next reservation",
     );
 }
+
+/// A large blob of `size` bytes declared with `part_count` parts.
+fn large_blob(sha: &str, size: i64, part_count: i64) -> String {
+    format!(
+        "INSERT INTO large_blobs (sha256, size, part_count) VALUES ('{sha}', {size}, {part_count});"
+    )
+}
+
+/// Parts `indexes` of `sha`: part 0 of 1027 bytes, every other of 1 byte.
+fn small_parts(sha: &str, indexes: &[i64]) -> String {
+    indexes
+        .iter()
+        .map(|i| {
+            let len = if *i == 0 { 1027 } else { 1 };
+            format!(
+                "INSERT INTO large_blob_parts (sha256, part_index, data) VALUES ('{sha}', {i}, zeroblob({len}));"
+            )
+        })
+        .collect()
+}
+
+/// Parts `indexes` of `sha`, each of `PART_BYTES` but the last listed, which is 1 byte: 17
+/// indexes sum to `MAX_BLOB_BYTES + 1`.
+fn full_parts(sha: &str, indexes: &[i64]) -> String {
+    let last = indexes.last().copied();
+    indexes
+        .iter()
+        .map(|i| {
+            let len = if Some(*i) == last { 1 } else { 4_194_304 };
+            format!(
+                "INSERT INTO large_blob_parts (sha256, part_index, data) VALUES ('{sha}', {i}, zeroblob({len}));"
+            )
+        })
+        .collect()
+}
+
+fn large_ref(sha: &str) -> String {
+    format!(
+        "INSERT INTO large_blob_refs (stream_id, sha256, media_type) VALUES ('host', '{sha}', 'text/plain')"
+    )
+}
+
+/// Large blobs (§2.4 v4): a ref only to a blob whose parts are complete (each condition
+/// alone breaks it), no part after a ref, no change or delete of any of the three tables nor
+/// an incremental BLOB write handle on a part,
+/// the size and part bounds as `CHECK`s, and `events_blob_refs` satisfied by a large ref.
+#[test]
+fn large_blob_triggers() {
+    let mut s = TestStore::new();
+    s.shutdown();
+    let c = raw(&s.path());
+    let full = "c".repeat(64);
+    // A complete blob of MAX_BLOB_BYTES + 1 bytes: 16 parts of 4 MiB and one of 1 byte.
+    c.execute_batch(&format!(
+        "BEGIN;
+         {blob}
+         WITH RECURSIVE i(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM i WHERE n < 15)
+         INSERT INTO large_blob_parts (sha256, part_index, data) SELECT '{full}', n, zeroblob(4194304) FROM i;
+         INSERT INTO large_blob_parts (sha256, part_index, data) VALUES ('{full}', 16, zeroblob(1));
+         {r};
+         COMMIT;",
+        blob = large_blob(&full, 67_108_865, 17),
+        r = large_ref(&full),
+    ))
+    .unwrap();
+    // A committed part opens for incremental BLOB I/O only to read: writing through it would
+    // bypass the `UPDATE` trigger, and the empty index on `data` refuses that.
+    let row: i64 = c
+        .query_row(
+            &format!(
+                "SELECT rowid FROM large_blob_parts WHERE sha256 = '{full}' AND part_index = 0"
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(
+        c.blob_open(rusqlite::MAIN_DB, "large_blob_parts", "data", row, true)
+            .unwrap(),
+    );
+    let open = c.blob_open(rusqlite::MAIN_DB, "large_blob_parts", "data", row, false);
+    let err = open.err().expect("a part opened for writing");
+    assert!(
+        err.to_string()
+            .contains("cannot open indexed column for writing"),
+        "{err}"
+    );
+    let size = 67_108_865;
+    let (d, e, f, g, h) = (
+        "d".repeat(64),
+        "e".repeat(64),
+        "f".repeat(64),
+        "9".repeat(64),
+        "8".repeat(64),
+    );
+    let all: Vec<i64> = (0..17).collect();
+    // Each subcase but the length one has parts summing to `size`, so only its target
+    // condition fails. `min(part_index) = 0` cannot fail alone: with `count = part_count`,
+    // unique indexes, every index >= 0, and `max = part_count - 1`, it follows.
+    let incomplete: [(&str, String); 5] = [
+        (
+            "a missing part (count)",
+            format!(
+                "{}{}",
+                large_blob(&d, size, 18),
+                full_parts(&d, &(0..18).filter(|i| *i != 8).collect::<Vec<_>>())
+            ),
+        ),
+        (
+            "an index past the last part (max)",
+            format!(
+                "{}{}",
+                large_blob(&e, size, 17),
+                full_parts(&e, &[&all[..16], &[17]].concat())
+            ),
+        ),
+        (
+            "no part 0 (min, and so max)",
+            format!(
+                "{}{}",
+                large_blob(&f, size, 17),
+                full_parts(&f, &(1..18).collect::<Vec<_>>())
+            ),
+        ),
+        (
+            "a wrong length sum (sum)",
+            format!("{}{}", large_blob(&h, size, 17), small_parts(&h, &all)),
+        ),
+        ("no blob", String::new()),
+    ];
+    for ((what, setup), sha) in incomplete.into_iter().zip([&d, &e, &f, &h, &g]) {
+        let m = assert_rolls_back(&c, what, |c| {
+            c.execute_batch(&setup)?;
+            c.execute(&large_ref(sha), [])
+        });
+        assert!(m.contains("large_blob_refs_complete"), "{what}: {m}");
+    }
+    let m = assert_rolls_back(&c, "a part after a ref", |c| {
+        c.execute(
+            &format!("INSERT INTO large_blob_parts (sha256, part_index, data) VALUES ('{full}', 17, zeroblob(1))"),
+            [],
+        )
+    });
+    assert!(m.contains("large_blob_parts_sealed"), "{m}");
+    for (sql, trigger) in [
+        (
+            "UPDATE large_blobs SET part_count = 18",
+            "large_blobs_no_update",
+        ),
+        ("DELETE FROM large_blobs", "large_blobs_no_delete"),
+        (
+            "UPDATE large_blob_parts SET data = zeroblob(2) WHERE part_index = 16",
+            "large_blob_parts_no_update",
+        ),
+        (
+            "DELETE FROM large_blob_parts WHERE part_index = 16",
+            "large_blob_parts_no_delete",
+        ),
+        (
+            "UPDATE large_blob_refs SET media_type = 'x'",
+            "large_blob_refs_no_update",
+        ),
+        ("DELETE FROM large_blob_refs", "large_blob_refs_no_delete"),
+    ] {
+        let m = assert_rolls_back(&c, sql, |c| c.execute(sql, []));
+        assert!(m.contains(trigger), "{sql}: {m}");
+    }
+    for (what, sql) in [
+        (
+            "a size at the in-memory cap",
+            large_blob(&d, 67_108_864, 17),
+        ),
+        (
+            "a size above MAX_SAFE_INTEGER",
+            large_blob(&d, 9_007_199_254_740_992, 17),
+        ),
+        ("one part", large_blob(&d, size, 1)),
+    ] {
+        assert_statement_fails(&c, what, |c| c.execute(sql.trim_end_matches(';'), []));
+    }
+    // Part bounds, on a blob without refs.
+    c.execute_batch(&large_blob(&d, size, 17)).unwrap();
+    for (what, i, len) in [
+        ("part 0 below the preview read", 0, 1026),
+        ("a part above PART_BYTES", 1, 4_194_305),
+        ("an empty part", 1, 0),
+        ("a negative index", -1, 1),
+    ] {
+        assert_statement_fails(&c, what, |c| {
+            c.execute(
+                &format!("INSERT INTO large_blob_parts (sha256, part_index, data) VALUES ('{d}', {i}, zeroblob({len}))"),
+                [],
+            )
+        });
+    }
+    // events_blob_refs: a typed reference with a large ref passes; one without a ref of its
+    // stream and type, or to an unknown hash, is refused.
+    let raw_ref = |key: &str, sha: &str, media: &str| {
+        RawEvent::new(
+            "host",
+            key,
+            "raw_unknown",
+            &format!(r#"{{"raw":{{"blob":{{"sha256":"{sha}","media_type":"{media}"}}}}}}"#),
+        )
+    };
+    raw_ref("ok", &full, "text/plain").insert(&c).unwrap();
+    for (what, sha, media) in [
+        ("another type", full.as_str(), "x"),
+        ("an unknown hash", g.as_str(), "text/plain"),
+    ] {
+        let m = assert_rolls_back(&c, what, |c| raw_ref(what, sha, media).insert(c));
+        assert!(m.contains("events_blob_refs"), "{what}: {m}");
+    }
+}

@@ -81,13 +81,16 @@ where
     }
 
     fn reply(self: Box<Self>, outcome: Result<(), WriteError>) {
-        let this = *self;
-        let result = match (outcome, this.out) {
+        let TypedJob { f, out, reply, .. } = *self;
+        // A job that did not run is dropped before its reply, so whatever it owns (a blob
+        // spool file) is released once the caller has the reply.
+        drop(f);
+        let result = match (outcome, out) {
             (Ok(()), Some(r)) => Ok(r),
             (Ok(()), None) => Err(WriteError::Panicked),
             (Err(e), _) => Err(e),
         };
-        let _ = this.reply.send(result);
+        let _ = reply.send(result);
     }
 }
 
@@ -96,7 +99,8 @@ where
 pub(crate) struct Faults {
     /// Makes the next commit fail as named.
     pub(crate) commit: Mutex<Option<CommitFault>>,
-    /// Panics the writer thread outside any job, before it takes the next one.
+    /// Unwinds the writer thread outside any job, before it takes the next one, without
+    /// running the panic hook.
     pub(crate) panic_outside_job: AtomicBool,
     /// Fails `open` after step 5.
     pub(crate) fail_open_after_init: AtomicBool,
@@ -275,7 +279,10 @@ impl WriterCtx {
     fn run(mut self) -> WriterExit {
         loop {
             if self.faults.panic_outside_job.swap(false, Ordering::SeqCst) {
-                panic!("injected writer panic outside a job");
+                // Unwinds without the panic hook: a test's hook (std's default one prints a
+                // backtrace under a process-wide lock) would delay the queue's drop, and with it
+                // every pending ticket's `WriterGone`, by as long as the hook takes.
+                std::panic::resume_unwind(Box::new("injected writer panic outside a job"));
             }
             let Ok(job) = self.rx.recv() else {
                 break;

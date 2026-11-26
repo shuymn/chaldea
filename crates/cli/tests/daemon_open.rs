@@ -7,7 +7,7 @@ mod support;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-use support::{Proc, WAIT, chaldea, run_cmd, run_to_exit, state};
+use support::{Proc, WAIT, chaldea, reserve_port, run_cmd, run_to_exit, state};
 
 /// `POST /api/pair` with a matching `Origin` and `{"code": …}`: the status.
 fn pair(port: u16, code: &str) -> u16 {
@@ -28,7 +28,7 @@ fn pair(port: u16, code: &str) -> u16 {
 #[test]
 fn print_url_pairs_once() {
     let d = state();
-    let mut daemon = Proc::spawn(&mut run_cmd(&d.path, None));
+    let mut daemon = Proc::spawn(&mut run_cmd(&d.path, Some(reserve_port())));
     let port = daemon.serving();
     let (code, out, err) = run_to_exit(
         chaldea(&[], &[])
