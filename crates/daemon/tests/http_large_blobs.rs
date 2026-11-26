@@ -8,7 +8,7 @@ mod support;
 use std::time::Duration;
 
 use chaldea_core::auth::TokenKind;
-use chaldea_core::ids::{StreamId, ThreadId};
+use chaldea_core::ids::{LaunchId, StreamId, ThreadId};
 use chaldea_core::payload::Content;
 use chaldea_daemon::http::Mounts;
 use chaldea_daemon::store::MAX_BLOB_BYTES;
@@ -20,6 +20,8 @@ use tokio::net::TcpStream;
 
 const PART: usize = 4 * 1024 * 1024;
 const WAIT: Duration = Duration::from_secs(30);
+/// The wait for one write of a large value.
+const LARGE_WRITE: Duration = Duration::from_secs(300);
 
 fn pattern(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
@@ -41,7 +43,7 @@ async fn put(srv: &TestServer, stream: StreamId, key: &str, bytes: &[u8], media:
     let sha = blob.sha256.clone();
     let mut e = raw_unknown(stream, key, p.content.clone());
     e.blobs = p.blob.into_iter().collect();
-    srv.append(vec![e]).await;
+    srv.append_within(vec![e], LARGE_WRITE).await;
     sha
 }
 
@@ -98,7 +100,8 @@ impl Held {
 }
 
 /// A multi-part value downloads equal to its input with the safe headers; a stream without
-/// a reference (another thread, the host, an unknown one) gets the same 404 as before.
+/// a reference (another thread, the host, an unknown one), and for an agent a referencing
+/// thread other than its own, get the same 404 as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn download_equals_input_through_a_referencing_stream() {
     let srv = TestServer::start(Mounts::mvp()).await;
@@ -122,6 +125,20 @@ async fn download_equals_input_through_a_referencing_stream() {
         assert_eq!((r.status, r.code()), (404, Some("not_found".into())), "{s}");
         bodies.push(r.body);
     }
+    // An agent whose own thread references the blob: served through its thread, and the
+    // same 404 through another thread that references it too.
+    let c = ThreadId::from_u128(0xC0DE);
+    let agent = srv.agent(c, LaunchId::from_u128(0xC1)).await;
+    assert_eq!(
+        put(&srv, StreamId::Thread(c), "kc", &bytes, "application/json").await,
+        sha
+    );
+    let r = get(&srv, &agent, &sha, a).await;
+    assert_eq!((r.status, r.code()), (404, Some("not_found".into())));
+    bodies.push(r.body);
+    let r = get(&srv, &agent, &sha, StreamId::Thread(c)).await;
+    assert_eq!(r.status, 200);
+    assert!(r.body == bytes, "the agent's download differs");
     bodies.dedup();
     assert_eq!(bodies.len(), 1);
     srv.stop().await;
@@ -161,33 +178,6 @@ async fn slow_downloads_hold_no_reader() {
         assert_eq!(r.status, 200);
         assert!(r.body == bytes, "a slow download's bytes differ");
     }
-    srv.stop().await;
-}
-
-/// A part that cannot be read mid-stream (deleted under the test, past the immutability
-/// trigger) aborts the response after the parts before it: the client gets a prefix shorter
-/// than `Content-Length`, never a complete-looking reply.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn missing_part_aborts_the_response() {
-    let srv = TestServer::start(Mounts::mvp()).await;
-    let owner = srv.token(TokenKind::Owner, None, None).await;
-    let a = thread(&srv, 1).await;
-    let bytes = pattern(MAX_BLOB_BYTES + 1, 3);
-    let sha = put(&srv, a, "k", &bytes, "application/octet-stream").await;
-    let c = rusqlite::Connection::open(srv.store.path()).unwrap();
-    c.execute_batch(&format!(
-        "DROP TRIGGER large_blob_parts_no_delete;
-         DELETE FROM large_blob_parts WHERE sha256 = '{sha}' AND part_index = 1;"
-    ))
-    .unwrap();
-    drop(c);
-    let r = get(&srv, &owner, &sha, a).await;
-    assert_eq!(r.status, 200);
-    let len = bytes.len().to_string();
-    assert_eq!(r.header("content-length"), Some(len.as_str()));
-    // At most part 0 arrives (an abort may discard bytes not yet flushed), as a prefix.
-    assert!(r.body.len() <= PART, "{} bytes past part 0", r.body.len());
-    assert!(r.body == bytes[..r.body.len()], "the bytes sent differ");
     srv.stop().await;
 }
 

@@ -2,8 +2,9 @@
 //! readable stream, the `blob_refs` or `large_blob_refs` row, the admission of a blob slot,
 //! and the bytes (a blob in `blobs`) or the size and part count (a large blob). The slot's
 //! permit moves into the response body and is freed with it. A large blob's body reads each
-//! immutable part in its own short read, so across network waits it holds the slot and one
-//! part, never a reader connection.
+//! immutable part in its own short read, bounded by its own deadline and by the server's
+//! shutdown, so across network waits it holds the slot and one part, never a reader
+//! connection.
 
 use std::fmt;
 use std::future::Future;
@@ -16,15 +17,14 @@ use axum::http::{HeaderValue, Request, Response, StatusCode, header};
 use chaldea_core::auth::Action;
 use hyper::body::{Frame, SizeHint};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::task::JoinHandle;
 
 use super::Shared;
-use super::ctx::{ReadCtx, spawn_read};
+use super::ctx::{ReadCtx, read_until};
 use super::error::ApiError;
 use super::guard::path_param;
 use super::scope::ReadScope;
 use super::sync_api::{params, store, stream_id};
-use crate::store::{BlobDownload, LargeBlob, ReadError};
+use crate::store::{BlobDownload, LargeBlob};
 
 /// The frames a blob body yields, copied from the buffer it owns.
 const FRAME_BYTES: usize = 64 * 1024;
@@ -91,11 +91,32 @@ impl fmt::Display for PartError {
 
 impl std::error::Error for PartError {}
 
-type PartRead = JoinHandle<Result<Option<Vec<u8>>, ReadError>>;
+/// One part's read: its bytes, or why the body must fail.
+type PartRead = Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>>;
 
-/// A large blob's body: its parts in order, each fetched by its own short read when the
-/// previous one is sent. It holds the slot, at most one part, and at most one read in
-/// flight; dropping it releases the slot (a read in flight finishes on its own).
+/// Reads part `index` in one short read, cut off at the request deadline's length from now
+/// (a read not returned by then fails the body), or ended at once by the server's shutdown.
+fn read_part(shared: Arc<Shared>, sha: Arc<str>, index: u64) -> PartRead {
+    let mut shutdown = shared.shutdown_signal();
+    Box::pin(async move {
+        let deadline = shared.cfg.clock.now() + shared.cfg.short_deadline;
+        let read = read_until(&shared, deadline, move |tx| tx.large_blob_part(&sha, index));
+        tokio::select! {
+            biased;
+            () = shutdown.wait() => Err("the server is shutting down".to_owned()),
+            r = read => match r {
+                Ok(Some(data)) => Ok(data),
+                Ok(None) => Err(format!("part {index} is missing")),
+                Err(e) => Err(format!("part {index}: {e:?}")),
+            },
+        }
+    })
+}
+
+/// A large blob's body: its parts in order, each fetched by its own short read
+/// ([`read_part`]) when the previous one is sent. It holds the slot, at most one part, and at
+/// most one read in flight; dropping it releases the slot (a read in flight finishes on its
+/// own).
 struct PartsBody {
     shared: Arc<Shared>,
     sha: Arc<str>,
@@ -127,6 +148,11 @@ impl PartsBody {
     }
 
     fn fail(&mut self, why: String) -> Poll<Option<Result<Frame<Bytes>, PartError>>> {
+        #[cfg(test)]
+        self.shared
+            .faults
+            .blob_body_errors
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.failed = true;
         self.pending = None;
         self.buf = Bytes::new();
@@ -160,29 +186,24 @@ impl hyper::body::Body for PartsBody {
                 return self.fail(format!("the parts end {left} bytes short"));
             }
             if self.pending.is_none() {
-                let (sha, index) = (self.sha.clone(), self.next);
-                let deadline = self.shared.cfg.clock.now() + self.shared.cfg.short_deadline;
-                self.pending = Some(spawn_read(&self.shared, deadline, move |tx| {
-                    tx.large_blob_part(&sha, index)
-                }));
+                let read = read_part(self.shared.clone(), self.sha.clone(), self.next);
+                self.pending = Some(read);
             }
             let Some(pending) = self.pending.as_mut() else {
                 continue;
             };
-            let read = ready!(Pin::new(pending).poll(cx));
+            let read = ready!(pending.as_mut().poll(cx));
             self.pending = None;
             let index = self.next;
             match read {
-                Ok(Ok(Some(data))) if !data.is_empty() && data.len() as u64 <= self.left => {
+                Ok(data) if !data.is_empty() && data.len() as u64 <= self.left => {
                     self.next += 1;
                     self.buf = Bytes::from(data);
                 }
-                Ok(Ok(Some(data))) => {
+                Ok(data) => {
                     return self.fail(format!("part {index} has {} bytes", data.len()));
                 }
-                Ok(Ok(None)) => return self.fail(format!("part {index} is missing")),
-                Ok(Err(e)) => return self.fail(format!("part {index}: {e}")),
-                Err(e) => return self.fail(format!("part {index}: {e}")),
+                Err(why) => return self.fail(why),
             }
         }
     }
@@ -269,9 +290,11 @@ mod tests {
     use crate::http::tests::shared;
     use crate::http::tests::support::http::TestServer;
     use crate::store::MAX_BLOB_BYTES;
+    use crate::store::tests::support::waits;
     use chaldea_core::ids::StreamId;
     use chaldea_core::payload::Content;
     use http_body_util::BodyExt;
+    use std::time::Duration;
 
     /// Stores a value of `MAX_BLOB_BYTES + 1` bytes on the host stream; returns its hash
     /// and the bytes.
@@ -289,7 +312,7 @@ mod tests {
         let mut e =
             crate::http::tests::support::raw_unknown(StreamId::Host, "k", p.content.clone());
         e.blobs = p.blob.into_iter().collect();
-        srv.append(vec![e]).await;
+        srv.append_within(vec![e], Duration::from_secs(300)).await;
         (sha, bytes)
     }
 
@@ -358,7 +381,7 @@ mod tests {
 
     /// A store shut down mid-body fails the body at its next part.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn parts_body_fails_on_shutdown() {
+    async fn parts_body_fails_when_the_store_closes() {
         let mut srv = TestServer::start(Mounts::mvp()).await;
         let (sha, _) = put_large(&srv).await;
         let slots = Arc::new(Semaphore::new(1));
@@ -373,6 +396,121 @@ mod tests {
         drop(b);
         srv.shutdown_http(std::time::Instant::now() + std::time::Duration::from_secs(10))
             .await;
+    }
+
+    /// Holds the next store read (part 0's) until the returned sender drops; `entered` is
+    /// told once the read is held.
+    fn hold_next_read(
+        srv: &TestServer,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        shared(srv).faults.arm_before_read(0, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(20));
+        });
+        (release_tx, entered_rx)
+    }
+
+    /// A part read that has not returned by its deadline fails the body; it does not wait
+    /// for the read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parts_body_fails_when_a_read_outlasts_its_deadline() {
+        let srv = TestServer::start_with(Mounts::mvp(), |c| {
+            c.short_deadline = Duration::from_millis(300);
+        })
+        .await;
+        let (sha, _) = put_large(&srv).await;
+        let slots = Arc::new(Semaphore::new(1));
+        let (release, _entered) = hold_next_read(&srv);
+        let (got, err, b) = waits::bounded(
+            Duration::from_secs(10),
+            drain(body(&srv, &sha, &slots), usize::MAX),
+        )
+        .await
+        .expect("the body failed while its read was held");
+        assert!(got.is_empty());
+        assert!(err.is_some_and(|e| e.contains("part 0")), "part 0 fails");
+        drop(b);
+        drop(release);
+        srv.stop().await;
+    }
+
+    /// The server's shutdown fails a body whose part read is in flight, long before the
+    /// read's deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parts_body_fails_on_server_shutdown() {
+        let srv = TestServer::start_with(Mounts::mvp(), |c| {
+            c.short_deadline = Duration::from_secs(60);
+        })
+        .await;
+        let (sha, _) = put_large(&srv).await;
+        let slots = Arc::new(Semaphore::new(1));
+        let (release, entered) = hold_next_read(&srv);
+        let draining = tokio::spawn(drain(body(&srv, &sha, &slots), usize::MAX));
+        waits::bounded(Duration::from_secs(10), entered)
+            .await
+            .expect("the part read started")
+            .unwrap();
+        shared(&srv).shutdown.send_replace(true);
+        let (got, err, b) = waits::bounded(Duration::from_secs(10), draining)
+            .await
+            .expect("the body failed at the shutdown")
+            .unwrap();
+        assert!(got.is_empty());
+        assert!(
+            err.is_some_and(|e| e.contains("shutting down")),
+            "the shutdown ends it"
+        );
+        drop(b);
+        drop(release);
+        srv.stop().await;
+    }
+
+    /// Over a real connection, a part missing mid-stream aborts the response: the client
+    /// gets a prefix shorter than `Content-Length`, and the body ended with an error, not an
+    /// early end that hyper would also cut short.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_part_aborts_a_real_response() {
+        let srv = TestServer::start(Mounts::mvp()).await;
+        let owner = srv
+            .token(chaldea_core::auth::TokenKind::Owner, None, None)
+            .await;
+        let (sha, bytes) = put_large(&srv).await;
+        let c = rusqlite::Connection::open(srv.store.path()).unwrap();
+        c.execute_batch(&format!(
+            "DROP TRIGGER large_blob_parts_no_delete;
+             DELETE FROM large_blob_parts WHERE sha256 = '{sha}' AND part_index = 1;"
+        ))
+        .unwrap();
+        drop(c);
+        let r = srv
+            .send(
+                &srv.req("GET", &format!("/api/blobs/{sha}?stream_id=host"))
+                    .bearer(&owner),
+            )
+            .await;
+        assert_eq!(r.status, 200);
+        let len = bytes.len().to_string();
+        assert_eq!(r.header("content-length"), Some(len.as_str()));
+        assert!(
+            r.body.len() <= 4 * 1024 * 1024,
+            "{} bytes past part 0",
+            r.body.len()
+        );
+        assert!(r.body == bytes[..r.body.len()], "the bytes sent differ");
+        assert_eq!(
+            shared(&srv)
+                .faults
+                .blob_body_errors
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the body ended with an error"
+        );
+        srv.stop().await;
     }
 
     #[test]
