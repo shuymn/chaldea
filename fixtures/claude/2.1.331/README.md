@@ -4,7 +4,7 @@ Captured on macOS from a real `claude` 2.1.331 launched by the daemon with its
 `claude-settings.json` in place and no decoder (`NoDecoder`), so every hook was kept as
 `raw_unknown` with its exact bytes. Each `<Event>-<n>.json` is one hook body exported from
 `GET /api/events`, numbered per event in receipt order within its case. Paths are scrubbed:
-the workspace is `/work/c1b-ws`, the home directory `/work/home`, Claude's temporary
+the workspace is `/work/c1b-ws`, the home directory `/work/profile`, Claude's temporary
 directory `/work/tmp/claude/`. The capture folder's `.claude/settings.json` set
 `permissions.defaultMode` to `default`, so tool calls asked for permission.
 
