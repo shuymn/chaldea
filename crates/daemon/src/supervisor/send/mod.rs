@@ -129,6 +129,11 @@ pub(crate) struct Dispatch {
 /// The launch's running input unit: set before `submit`, cleared by its record.
 pub(crate) struct RunningUnit {
     pub input_id: InputId,
+    /// Set on the store writer right after the `COMMIT` of the unit's completion job, before
+    /// its reply and the writer's next job: from then on the intake probe reports the unit
+    /// ended, though the worker clears `running` only once it applies the reply (send §2.3
+    /// step 4).
+    pub recorded: Arc<AtomicBool>,
     pub ticket: Option<WriteTicket>,
     pub submitted_at: Instant,
     /// The write stall was shown (`unconfirmed`).

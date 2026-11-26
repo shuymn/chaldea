@@ -121,9 +121,6 @@ fn replacement_does_not_confuse_completion() {
     ));
     assert!(gate.reached(WAIT), "{}", s.stderr());
     assert_eq!(first.code(), 0, "{}", first.stderr());
-    // The next daemon picks a free port from the range: the first one's saved port may be
-    // taken by another test by now.
-    std::fs::remove_file(d.path.join(names::PORT)).unwrap();
     let mut second = foreground(&labels, &d.path, &[]);
     gate.release();
     assert_eq!(s.code(), 0, "{}{}", s.stdout(), s.stderr());

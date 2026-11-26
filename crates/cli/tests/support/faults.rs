@@ -655,7 +655,7 @@ impl ShutdownParticipant for HeldShutdown {
     }
 }
 
-type Launchctl = Box<dyn Fn(&[&OsStr], Instant) -> std::io::Result<LaunchctlOutput>>;
+pub type Launchctl = Box<dyn Fn(&[&OsStr], Instant) -> std::io::Result<LaunchctlOutput>>;
 
 fn timed_out() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::TimedOut, "injected timeout")
@@ -675,14 +675,24 @@ fn is_service_print(args: &[&OsStr]) -> bool {
 /// - `probe-timeout`: `print gui/<uid>` waits for its deadline and times out.
 /// - `bootstrap-refused`: `bootstrap` exits 5 without registering anything.
 /// - `bootstrap-late`: the real `bootstrap`, then a wait for its deadline and a timeout.
-/// - `bootstrap-timeout-register-later`: `bootstrap` waits for its deadline and times out; the
-///   real one runs 1 s later.
+/// - `bootstrap-timeout-register-later`: `bootstrap` times out at once without registering
+///   anything; the first service lookup after it that answers absent (113) runs the real
+///   `bootstrap` within that lookup's deadline, so the next lookup finds the job. The order is
+///   set by the lookups, not by time, and the start keeps nearly its whole deadline for the
+///   daemon's readiness; a lookup that does not answer absent registers nothing.
 /// - `all-timeout`: `bootstrap` and every service lookup wait for their deadline and time out.
-fn launchctl_fault(kind: String) -> Launchctl {
+pub fn launchctl_fault(kind: String) -> Launchctl {
+    launchctl_fault_over(kind, Box::new(host::launchctl))
+}
+
+/// [`launchctl_fault`] over `real` instead of `host::launchctl` (a test's recording stub).
+pub fn launchctl_fault_over(kind: String, real: Launchctl) -> Launchctl {
+    // The arguments of a `bootstrap` that `bootstrap-timeout-register-later` has yet to run.
+    let deferred: std::cell::Cell<Option<Vec<OsString>>> = std::cell::Cell::new(None);
     Box::new(move |args: &[&OsStr], deadline: Instant| {
-        let op = args.first().map(|a| a.to_string_lossy().into_owned());
+        let op = args.first().and_then(|a| a.to_str());
         let service_print = is_service_print(args);
-        let result = match (kind.as_str(), op.as_deref()) {
+        let result = match (kind.as_str(), op) {
             ("probe-timeout", Some("print")) if args.len() == 2 && !service_print => {
                 sleep_until(deadline);
                 Err(timed_out())
@@ -693,21 +703,25 @@ fn launchctl_fault(kind: String) -> Launchctl {
                 stderr: "Bootstrap failed: 5: Input/output error (injected)".to_owned(),
             }),
             ("bootstrap-late", Some("bootstrap")) => {
-                let r = host::launchctl(args, deadline);
+                let r = real(args, deadline);
                 eprintln!("fault: real bootstrap -> {:?}", r.as_ref().map(|o| o.code));
                 sleep_until(deadline);
                 Err(timed_out())
             }
             ("bootstrap-timeout-register-later", Some("bootstrap")) => {
-                let owned: Vec<OsString> = args.iter().map(|a| (*a).to_owned()).collect();
-                std::thread::spawn(move || {
-                    sleep_until(deadline + Duration::from_secs(1));
-                    let refs: Vec<&OsStr> = owned.iter().map(OsString::as_os_str).collect();
-                    let r = host::launchctl(&refs, Instant::now() + Duration::from_secs(10));
-                    eprintln!("fault: late bootstrap -> {:?}", r.as_ref().map(|o| o.code));
-                });
-                sleep_until(deadline);
+                deferred.set(Some(args.iter().map(|a| (*a).to_owned()).collect()));
                 Err(timed_out())
+            }
+            ("bootstrap-timeout-register-later", Some("print")) if service_print => {
+                let lookup = real(args, deadline);
+                // 113: `launchctl print` found no such service.
+                let absent = lookup.as_ref().is_ok_and(|o| o.code == Some(113));
+                if absent && let Some(owned) = deferred.take() {
+                    let refs: Vec<&OsStr> = owned.iter().map(OsString::as_os_str).collect();
+                    let r = real(&refs, deadline);
+                    eprintln!("fault: late bootstrap -> {:?}", r.as_ref().map(|o| o.code));
+                }
+                lookup
             }
             ("all-timeout", Some("bootstrap")) => {
                 sleep_until(deadline);
@@ -717,7 +731,7 @@ fn launchctl_fault(kind: String) -> Launchctl {
                 sleep_until(deadline);
                 Err(timed_out())
             }
-            _ => host::launchctl(args, deadline),
+            _ => real(args, deadline),
         };
         if service_print {
             eprintln!(
@@ -749,7 +763,10 @@ pub fn chaldea(labels: &Labels, args: &[&OsStr]) -> std::process::Command {
 }
 
 /// `chaldea --state-dir <dir> <args…>` (this binary with test seams), `env` set after the
-/// fault entry's own variables.
+/// fault entry's own variables. `daemon start` and `daemon run` without `--port` get
+/// `super::own_port(dir)`: no test of these binaries is about the choice from the range, so
+/// their daemons stay off it, where `daemon_run`'s tests of that choice expect a port to be
+/// free, and a restart on the saved port finds its port still the test's.
 pub fn cmd(
     labels: &Labels,
     dir: &Path,
@@ -758,6 +775,15 @@ pub fn cmd(
 ) -> std::process::Command {
     let mut c = chaldea(labels, &[OsStr::new("--state-dir"), dir.as_os_str()]);
     c.args(args);
+    let starts = matches!(args, ["daemon", "start" | "run", ..]);
+    if starts
+        && !args
+            .iter()
+            .any(|a| *a == "--port" || a.starts_with("--port="))
+        && let Some(p) = super::own_port(dir)
+    {
+        c.args(["--port", &p.to_string()]);
+    }
     for (k, v) in env {
         c.env(k, v);
     }

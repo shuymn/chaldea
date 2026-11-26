@@ -239,12 +239,21 @@ fn detach_path(stderr: &str) -> &'static str {
     }
 }
 
-/// PR8-CL-14: `ready` → the URL and pid on stdout, exit 0; the record agrees.
+/// PR8-CL-14: `ready` → the URL and pid on stdout, exit 0; the record agrees. The start, on a
+/// fresh state directory without `--port` (built without `faults::cmd`, which would add one),
+/// takes the default path: the child chooses from the range and saves that port. The range's
+/// turn is held from before the start until the stop is confirmed.
 fn reports_ready_url() {
+    let _range = support::range_turn();
     let labels = Labels::new();
     let d = state();
     let _stop = StopOnDrop(&labels, &d.path);
-    let (code, out, err) = start(&labels, &d.path, &[], &[]);
+    let mut p = Proc::spawn(
+        faults::chaldea(&labels, &[OsStr::new("--state-dir"), d.path.as_os_str()])
+            .args(["daemon", "start"]),
+    );
+    let code = p.code();
+    let (out, err) = (p.stdout(), p.stderr());
     eprintln!("reports_ready_url: path {}", detach_path(&err));
     assert_eq!(code, 0, "{out}{err}");
     let r = serving(&d.path);
@@ -258,6 +267,14 @@ fn reports_ready_url() {
     );
     assert_eq!(r.detached.as_deref(), Some(detach_path(&err)));
     let port = r.port.unwrap();
+    assert!(
+        chaldea_daemon::lifecycle::PORT_RANGE.contains(&port),
+        "{port}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(d.path.join(names::PORT)).unwrap(),
+        format!("{port}\n")
+    );
     assert_eq!(
         get_status(port, "/api/threads", Some(&token_of(&d.path))),
         200
@@ -640,9 +657,6 @@ fn stopped_after_ready_is_not_reported_started() {
         &d.path,
         &[(DEADLINE_MS, OsStr::new(HELD_DEADLINE))],
     );
-    // The next daemon picks a free port from the range: the stopped one's saved port may be
-    // taken by another test by now.
-    std::fs::remove_file(d.path.join(names::PORT)).unwrap();
     let (code, out, err) = start(
         &labels,
         &d.path,
@@ -938,7 +952,9 @@ fn child_receives_the_resolved_dir() {
     let d: Dir = state();
     let _stop = StopOnDrop(&labels, &d.path);
     let mut c = faults::chaldea(&labels, &[OsStr::new("--state-dir"), OsStr::new("state")]);
-    c.args(["daemon", "start"]).current_dir(d.tmp.path());
+    let port = support::reserve_port().to_string();
+    c.args(["daemon", "start", "--port", &port])
+        .current_dir(d.tmp.path());
     let mut p = Proc::spawn(&mut c);
     assert_eq!(p.code(), 0, "{}{}", p.stdout(), p.stderr());
     let r = serving(&d.path);
