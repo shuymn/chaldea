@@ -230,48 +230,7 @@ const FILETIME_UNIX_OFFSET: u64 = 116_444_736_000_000_000;
 /// text, a day the month does not have, or a stamp before 1970.
 #[must_use]
 pub fn stamp_ms(stamp: &str) -> Option<u64> {
-    let b = stamp.as_bytes();
-    let seps = [
-        (4, b'-'),
-        (7, b'-'),
-        (10, b'T'),
-        (13, b':'),
-        (16, b':'),
-        (19, b'.'),
-        (23, b'Z'),
-    ];
-    if b.len() != 24 || seps.iter().any(|&(i, c)| b[i] != c) {
-        return None;
-    }
-    let num = |from: usize, to: usize| -> Option<i64> {
-        let s = &b[from..to];
-        if !s.iter().all(u8::is_ascii_digit) {
-            return None;
-        }
-        std::str::from_utf8(s).ok()?.parse().ok()
-    };
-    let (y, m, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
-    let (h, mi, sec, ms) = (num(11, 13)?, num(14, 16)?, num(17, 19)?, num(20, 23)?);
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let month_days = match m {
-        2 if leap => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    };
-    if !(1..=12).contains(&m) || !(1..=month_days).contains(&d) || h > 23 || mi > 59 || sec > 59 {
-        return None;
-    }
-    // Days from the civil date (Howard Hinnant's algorithm), proleptic Gregorian.
-    let yy = if m <= 2 { y - 1 } else { y };
-    let era = yy.div_euclid(400);
-    let yoe = yy - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    let total = ((days * 24 + h) * 60 + mi) * 60 + sec;
-    u64::try_from(total * 1000 + ms).ok()
+    u64::try_from(crate::ids::stamp_millis(stamp)?).ok()
 }
 
 /// A process PR 21's finder considers for an A29 launch

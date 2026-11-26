@@ -2,7 +2,7 @@
 //! bounds, expiry, and `resolve_unbindable`. A launch's buffer is its deliveries with
 //! routing `buffered`; nothing else holds it.
 
-use chaldea_core::ids::{LaunchId, ThreadId};
+use chaldea_core::ids::{LaunchId, ThreadId, stamp_millis};
 use chaldea_core::payload::RawUnknownReason;
 use serde::{Deserialize, Serialize};
 
@@ -115,7 +115,8 @@ pub(crate) fn expire_in(
     let Some(earliest) = &summary.earliest_received_at else {
         return Ok((0, summary));
     };
-    let (Some(now), Some(oldest)) = (millis(&tx.recorded_at().0), millis(&earliest.0)) else {
+    let (Some(now), Some(oldest)) = (stamp_millis(&tx.recorded_at().0), stamp_millis(&earliest.0))
+    else {
         return Ok((0, summary));
     };
     let ttl = i64::try_from(cfg.buffer_ttl.as_millis()).unwrap_or(i64::MAX);
@@ -144,61 +145,6 @@ pub fn resolve_unbindable(tx: &mut WriteTx<'_>, launch: LaunchId) -> Result<usiz
     drain_unbound(tx, launch)
 }
 
-/// Milliseconds since the Unix epoch of a store stamp `YYYY-MM-DDTHH:MM:SS.mmmZ`
-/// (`core::ids::Timestamp`); `None` for any other text.
-pub(crate) fn millis(stamp: &str) -> Option<i64> {
-    let b = stamp.as_bytes();
-    if b.len() != 24 {
-        return None;
-    }
-    let sep = [
-        (4, b'-'),
-        (7, b'-'),
-        (10, b'T'),
-        (13, b':'),
-        (16, b':'),
-        (19, b'.'),
-        (23, b'Z'),
-    ];
-    if sep.iter().any(|&(i, c)| b[i] != c) {
-        return None;
-    }
-    let num = |from: usize, to: usize| -> Option<i64> {
-        let s = &b[from..to];
-        if !s.iter().all(u8::is_ascii_digit) {
-            return None;
-        }
-        std::str::from_utf8(s).ok()?.parse().ok()
-    };
-    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
-    let (h, mi, s, ms) = (num(11, 13)?, num(14, 16)?, num(17, 19)?, num(20, 23)?);
-    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || s > 59 {
-        return None;
-    }
-    let days = days_from_civil(y, mo, d);
-    Some((((days * 24 + h) * 60 + mi) * 60 + s) * 1000 + ms)
-}
-
-fn days_in_month(y: i64, m: i64) -> i64 {
-    match m {
-        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
-}
-
-/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,40 +168,5 @@ mod tests {
         original.intake = None;
         let stored = serde_json::to_string(&original).unwrap();
         assert_eq!(Meta::parse(&stored).unwrap().intake, None);
-    }
-
-    /// The stamp format and its boundaries.
-    #[test]
-    fn timestamp() {
-        assert_eq!(millis("1970-01-01T00:00:00.000Z"), Some(0));
-        assert_eq!(millis("1970-01-01T00:00:01.001Z"), Some(1001));
-        assert_eq!(millis("2000-03-01T00:00:00.000Z"), Some(951_868_800_000));
-        assert_eq!(millis("2024-02-29T23:59:59.999Z"), Some(1_709_251_199_999));
-        assert_eq!(
-            millis("2026-11-22T00:00:30.000Z").unwrap()
-                - millis("2026-11-22T00:00:00.000Z").unwrap(),
-            30_000
-        );
-        // Across a year boundary.
-        assert_eq!(
-            millis("2027-01-01T00:00:00.000Z").unwrap()
-                - millis("2026-12-31T23:59:59.999Z").unwrap(),
-            1
-        );
-        for bad in [
-            "",
-            "2026-11-22T00:00:00Z",
-            "2026-11-22T00:00:00.000",
-            "2026-11-22 00:00:00.000Z",
-            "2026-13-01T00:00:00.000Z",
-            "2026-02-29T00:00:00.000Z",
-            "2026-11-22T24:00:00.000Z",
-            "2026-11-22T00:60:00.000Z",
-            "2026-11-22T00:00:60.000Z",
-            "2026-11-22T00:00:00.+00Z",
-            "+026-11-22T00:00:00.000Z",
-        ] {
-            assert_eq!(millis(bad), None, "{bad}");
-        }
     }
 }
