@@ -623,6 +623,27 @@ fn preview_missing_lines() {
     assert!(out.contains(NO_REPORT), "{out}");
     // A prober candidate (RD1): the running-daemon line too.
     assert!(out.contains(NO_PROBE), "{out}");
+    // The same launch after the owner's assertion is no candidate either: no running-daemon
+    // line.
+    let mut s = Stream::default();
+    s.reserved();
+    s.exited(
+        "spawn_failed",
+        Some(json!({ "pid": 77, "start_time": "st-77" })),
+    );
+    s.push(
+        "launch_death_confirmed",
+        Some(L),
+        json!({ "launch_id": L, "method": "owner_asserted" }),
+    );
+    let stub = Daemon::new(summary(Some(ExitReason::SpawnFailed), true, None), s).start();
+    let (code, out, _) = preview(&stub);
+    assert_eq!(code, ExitCode::Ok, "{out}");
+    assert!(
+        out.contains("death: confirmed (method: owner_asserted)"),
+        "{out}"
+    );
+    assert!(!out.contains(NO_PROBE), "{out}");
     // A failed start recorded without a start time is no candidate: no running-daemon line.
     let mut s = Stream::default();
     s.reserved();
