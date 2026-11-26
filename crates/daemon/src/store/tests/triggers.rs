@@ -975,11 +975,28 @@ fn large_blob_triggers() {
         r = large_ref(&full),
     ))
     .unwrap();
-    // A committed part cannot be opened for incremental BLOB I/O, which would bypass the
-    // `UPDATE` trigger: the table has no rowid.
-    let open = c.blob_open(rusqlite::MAIN_DB, "large_blob_parts", "data", 1, false);
+    // A committed part opens for incremental BLOB I/O only to read: writing through it would
+    // bypass the `UPDATE` trigger, and the empty index on `data` refuses that.
+    let row: i64 = c
+        .query_row(
+            &format!(
+                "SELECT rowid FROM large_blob_parts WHERE sha256 = '{full}' AND part_index = 0"
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(
+        c.blob_open(rusqlite::MAIN_DB, "large_blob_parts", "data", row, true)
+            .unwrap(),
+    );
+    let open = c.blob_open(rusqlite::MAIN_DB, "large_blob_parts", "data", row, false);
     let err = open.err().expect("a part opened for writing");
-    assert!(err.to_string().contains("without rowid"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("cannot open indexed column for writing"),
+        "{err}"
+    );
     let size = 67_108_865;
     let (d, e, f, g, h) = (
         "d".repeat(64),

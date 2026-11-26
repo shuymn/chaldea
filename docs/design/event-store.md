@@ -441,7 +441,8 @@ CREATE TABLE large_blob_parts (                     -- PART_BYTES = 4 MiB; part 
   data       BLOB NOT NULL CHECK (length(data) > 0 AND length(data) <= 4194304
                                   AND (part_index > 0 OR length(data) >= 1027)),
   PRIMARY KEY (sha256, part_index)
-) STRICT, WITHOUT ROWID;                            -- no rowid: sqlite3_blob_open, which bypasses UPDATE triggers, cannot open a part
+) STRICT;
+CREATE INDEX large_blob_parts_no_blob_write ON large_blob_parts (data) WHERE 0;  -- empty; sqlite3_blob_open, which bypasses UPDATE triggers, cannot open an indexed column for writing
 CREATE TABLE large_blob_refs (                      -- as blob_refs
   stream_id  TEXT NOT NULL, sha256 TEXT NOT NULL REFERENCES large_blobs (sha256),
   media_type TEXT NOT NULL CHECK (length(media_type) > 0),
