@@ -37,12 +37,12 @@ Two layers in one module:
 **Model assumptions** (not fixed by the contract):
 
 - Inputs are created only while the launch is `starting` or `running`; `launch_exited` has reason `stopped` exactly when a stop was accepted; the session timer also runs while `stopping`.
-- Only hooks of the launch's selected session enter the model. Selecting it is PR 9's check: hooks of another session become `raw_unknown` (`foreign_session`, mvp §2.9:325).
-- Hooks follow the adapter: `Interrupt` only for Codex (mvp §2.2:135, §2.7:301); a manual Codex launch fires none until a human starts the first turn through attach (`manualFirstTurn`; mvp §2.7:303).
-- A post-decision signal is its own entry for the current turn and may arrive at any point after the turn started, before or after the daemon takes in the turn's `Stop`. The CLI emits it only after every `Stop` hook decided (mvp §2.3:173), so this over-approximates; PR 12 checks that such a signal exists and its order, and PR 13–14 attribute it on the adapter side if one is adopted.
-- A bound `UserPromptSubmit` supersedes the open cards, as the `PromptSubmitted` comment in `state.rs` says; mvp §2.10:335 lists only `Stop` and an interrupt, and PR 13–14 adds it.
+- Only hooks of the launch's selected session enter the model. Selecting it is PR 9's check: hooks of another session become `raw_unknown` (`foreign_session`, mvp §2.9).
+- Hooks follow the adapter: `Interrupt` only for Codex (mvp §2.2, §2.7); a manual Codex launch fires none until a human starts the first turn through attach (`manualFirstTurn`; mvp §2.7).
+- A post-decision signal is its own entry for the current turn and may arrive at any point after the turn started, before or after the daemon takes in the turn's `Stop`. The CLI emits it only after every `Stop` hook decided (mvp §2.3), so this over-approximates; PR 12 checks that such a signal exists and its order, and PR 13–14 attribute it on the adapter side if one is adopted.
+- A bound `UserPromptSubmit` supersedes the open cards, as the `PromptSubmitted` comment in `state.rs` says; mvp §2.10 lists only `Stop` and an interrupt, and PR 13–14 adds it.
 
-Under `none`, Claude's `SessionStart` is no evidence either (mvp §2.3:173 "only `chaldea ready`"; `docs/design/supervisor-send.md` SB2).
+Under `none`, Claude's `SessionStart` is no evidence either (mvp §2.3 "only `chaldea ready`"; `docs/design/supervisor-send.md` SB2).
 
 **Not modelled.** The PTY writer lock and the concrete `Basis` (the daemon uses `last_started` per class), the hook fence, timer durations, the restart sid scan and descendant kills, worktree and close races, the prompt size limit (it refuses before any input exists), and the `vt_snapshot_taken` of a gate timeout (an output with no state). Ack expiry, settle completion, the write stall, and buffered promotion are modelled abstractly (`windowExpired`, `ready(StopSettled, stop)`, `writeStalled`, `bind`). The daemon's settle rule takes a subset of the settles the model allows, except in the accepted gap L-11 of `docs/design/supervisor-send.md`, where the model, which names a `Stop`'s turn, refuses a settle the daemon takes.
 
@@ -53,10 +53,10 @@ Under `none`, Claude's `SessionStart` is no evidence either (mvp §2.3:173 "only
 | `st.thread` | the three axes and the attention set (`ThreadState`) | mvp §2.2 |
 | `st.seq` | the thread stream's head | mvp §2.1 "Streams" |
 | `st.launch`, `cfg`, `deathConfirmed`, `sessionStartSeen`, `turnNo`, `hooksLive` | current launch and its configuration; its (or the last launch's) death confirmed; its `SessionStart` arrived; turns started in it; its hooks fire | mvp §2.7, §2.9 |
-| `st.evidenceCandidate`, `stopCount` | the signal that may become readiness evidence: Claude's `SessionStart`, or a `Stop` identified by launch, turn, and intake order; any later hook of the launch invalidates it | mvp §2.3:173 |
-| `st.gp` | gate evidence of the current launch: bound and its seq, readiness seq, kind, basis, launch and turn, last write, last gate-closing human write, last turn start, bracketed paste needed and on | mvp §2.1:115 |
+| `st.evidenceCandidate`, `stopCount` | the signal that may become readiness evidence: Claude's `SessionStart`, or a `Stop` identified by launch, turn, and intake order; any later hook of the launch invalidates it | mvp §2.3 |
+| `st.gp` | gate evidence of the current launch: bound and its seq, readiness seq, kind, basis, launch and turn, last write, last gate-closing human write, last turn start, bracketed paste needed and on | mvp §2.1 |
 | `st.writer` | writes of the current launch with their origin classes, in writer order | docs/design/pty-runtime.md §2.3 |
-| `st.buffer`, `bufferedStop` | hooks of an unbound launch with their intake facts; the buffered `Stop` a settle completion may still name | mvp §2.9:325 |
+| `st.buffer`, `bufferedStop` | hooks of an unbound launch with their intake facts; the buffered `Stop` a settle completion may still name | mvp §2.9 |
 | `st.inputs` | per input: state, launch, positional, `sent_after_seq`, its attempt's seq, last write before it and admitted basis, dispatched, write position, the writer's result for its unit, whether the unit may still write, whether the completion job applied the result, and whether `open` saw a competing human write | mvp §2.3; `docs/design/supervisor-send.md` §2.3, §2.5 |
 | `st.cards` | per card: launch, turn, open / ran / superseded / expired | mvp §2.10 |
 | `st.sendCount`, `writeCount`, `sendRecords`, `dispatchRecords`, `ackRecords`, `ownerDelivered`, `cardKeys`, `reservations` | history the invariants read: facts recorded where they happen | — |
@@ -67,26 +67,26 @@ Under `none`, Claude's `SessionStart` is no evidence either (mvp §2.3:173 "only
 
 | Action | Contract | Source |
 |---|---|---|
-| `reserve(cfg)` | only after `exited` with death confirmed; resets the gate projection, writer, and buffer; a positional prompt is created `sending` | mvp §2.9:323, §2.3:186 |
-| `reserveRefused` | death unconfirmed: raise `resume_blocked`; the reducer then refuses `Reserved` | mvp §2.9:326 |
-| `confirmDeath` | `launch_death_confirmed` | mvp §2.1:84 |
-| `spawn` / `spawnFail` / `spawnStartedThenFailed(dc)` | `launch_started` moves the positional prompt to `sent` with `sent_after_seq` = its seq; a spawn that never started rejects it; a process that started and then failed exits the launch `spawn_failed` with no `launch_started`, the positional prompt `unconfirmed` through `LaunchExited`, and death confirmed exactly when the cleanup was (`dc`) | mvp §2.3:186; `docs/design/supervisor.md` §2.3 |
-| `manualFirstTurn` | a human starts a manual Codex launch's first turn through attach (an attach write); its hooks fire from then on | mvp §2.7:303 |
-| `sessionStartHook`, `bind` | the launch's `SessionStart` arrives and invalidates pending candidates; binding records `session_bound` (a turn start), makes Claude's `SessionStart` the evidence candidate, and promotes the buffered hooks in intake order with their intake facts | mvp §2.1:115, §2.7, §2.9:325 |
-| `bufferPrompt`, `bufferStop`, `bufferReady(ev, stop)` | hooks of an unbound live launch, buffered; a settle completion only for the buffered `Stop` it names while no later hook arrived; promotion applies it only if that `Stop` is then the current turn's candidate, and keeps an unsettled `Stop` as the candidate only if it was still live at intake | mvp §2.9:325 |
-| `ready(ev, stop)` | evidence of the current bound live launch, of a kind its adapter and mode produce: `SessionStart` backed by Claude's own; a settle completion only for the `Stop` it names, of the current launch and turn, with no later hook since; a post-decision signal on its own entry once a turn started | mvp §2.3:171-173, §2.7 |
-| `ownerReady` | `chaldea ready`: disabled while a unit of the launch may still write (`unit_running`); the bound launch only; otherwise refused, writing nothing | mvp §2.3:171; `docs/design/supervisor-send.md` SB15 |
-| `prompt(matches)` | bound `UserPromptSubmit`: turn start, supersedes cards, invalidates the evidence candidate; ack attribution from the hook's intake facts for its one in-flight candidate (unique candidate, same launch, after the attempt, dispatched, written before the intake, no other counted write after it (VT replies do not count for a positional prompt), no matching input the owner resolved, no competing submission); an attributable record acks a `sent` or `unconfirmed` input, and a `sending` one (`sent`, then `acked`); otherwise a `sent` input becomes `unconfirmed` and the others are unchanged | mvp §2.3:182; docs/design/pty-runtime.md §2.3 "Ack attribution"; `docs/design/supervisor-send.md` §2.5 |
-| `humanWrite(o)` | `attach` and `key` set the last write and last human write; a card key carries its launch and card and sets the last write only; one whose card is not open in the current launch is refused, writing nothing | mvp §2.1:115, §2.3:174, §2.10:336 |
+| `reserve(cfg)` | only after `exited` with death confirmed; resets the gate projection, writer, and buffer; a positional prompt is created `sending` | mvp §2.9, §2.3 |
+| `reserveRefused` | death unconfirmed: raise `resume_blocked`; the reducer then refuses `Reserved` | mvp §2.9 |
+| `confirmDeath` | `launch_death_confirmed` | mvp §2.1 |
+| `spawn` / `spawnFail` / `spawnStartedThenFailed(dc)` | `launch_started` moves the positional prompt to `sent` with `sent_after_seq` = its seq; a spawn that never started rejects it; a process that started and then failed exits the launch `spawn_failed` with no `launch_started`, the positional prompt `unconfirmed` through `LaunchExited`, and death confirmed exactly when the cleanup was (`dc`) | mvp §2.3; `docs/design/supervisor.md` §2.3 |
+| `manualFirstTurn` | a human starts a manual Codex launch's first turn through attach (an attach write); its hooks fire from then on | mvp §2.7 |
+| `sessionStartHook`, `bind` | the launch's `SessionStart` arrives and invalidates pending candidates; binding records `session_bound` (a turn start), makes Claude's `SessionStart` the evidence candidate, and promotes the buffered hooks in intake order with their intake facts | mvp §2.1, §2.7, §2.9 |
+| `bufferPrompt`, `bufferStop`, `bufferReady(ev, stop)` | hooks of an unbound live launch, buffered; a settle completion only for the buffered `Stop` it names while no later hook arrived; promotion applies it only if that `Stop` is then the current turn's candidate, and keeps an unsettled `Stop` as the candidate only if it was still live at intake | mvp §2.9 |
+| `ready(ev, stop)` | evidence of the current bound live launch, of a kind its adapter and mode produce: `SessionStart` backed by Claude's own; a settle completion only for the `Stop` it names, of the current launch and turn, with no later hook since; a post-decision signal on its own entry once a turn started | mvp §2.3, §2.7 |
+| `ownerReady` | `chaldea ready`: disabled while a unit of the launch may still write (`unit_running`); the bound launch only; otherwise refused, writing nothing | mvp §2.3; `docs/design/supervisor-send.md` SB15 |
+| `prompt(matches)` | bound `UserPromptSubmit`: turn start, supersedes cards, invalidates the evidence candidate; ack attribution from the hook's intake facts for its one in-flight candidate (unique candidate, same launch, after the attempt, dispatched, written before the intake, no other counted write after it (VT replies do not count for a positional prompt), no matching input the owner resolved, no competing submission); an attributable record acks a `sent` or `unconfirmed` input, and a `sending` one (`sent`, then `acked`); otherwise a `sent` input becomes `unconfirmed` and the others are unchanged | mvp §2.3; docs/design/pty-runtime.md §2.3 "Ack attribution"; `docs/design/supervisor-send.md` §2.5 |
+| `humanWrite(o)` | `attach` and `key` set the last write and last human write; a card key carries its launch and card and sets the last write only; one whose card is not open in the current launch is refused, writing nothing | mvp §2.1, §2.3, §2.10 |
 | `vtReply` | a counted write with no event | docs/design/pty-runtime.md §2.5 |
-| `send`, `open` | `queued`; the gate opens when, beyond `gate`, no counted write started since the evidence's basis and no unit of the launch may still write; `sending` advances the last write, the attempt keeps the basis the gate opened on, records whether a gate-closing human write follows the last turn start, and starts its unit | mvp §2.3:163-181; `docs/design/supervisor-send.md` SB3, SB15 |
-| `dispatch`, `dispatchFenced` | the writer's recheck: no counted write since the admitted basis, the input's launch current, and the whole gate open on a view without the input's own attempt; else, or on a refusal with no state cause (the fence moved, the deadline passed, a cancel), `cancelled` with zero bytes, the unit ended, and the last write set back to the one before the attempt when no later write moved it | mvp §2.3:177; docs/design/pty-runtime.md §2.3 "Basis"; `docs/design/supervisor-send.md` SB1 |
-| `writerDone(id, ok)`, `outcome(id)`, `writeStalled(id)` | the writer's record of a dispatched unit (written or incomplete) ends the unit; the completion job then makes a `sending` input `sent` or `unconfirmed` and changes nothing for one that left `sending`; a dispatched unit with no record becomes `unconfirmed`, its unit still running | mvp §2.3:182-183; `docs/design/supervisor-send.md` SB4, SB15 |
+| `send`, `open` | `queued`; the gate opens when, beyond `gate`, no counted write started since the evidence's basis and no unit of the launch may still write; `sending` advances the last write, the attempt keeps the basis the gate opened on, records whether a gate-closing human write follows the last turn start, and starts its unit | mvp §2.3; `docs/design/supervisor-send.md` SB3, SB15 |
+| `dispatch`, `dispatchFenced` | the writer's recheck: no counted write since the admitted basis, the input's launch current, and the whole gate open on a view without the input's own attempt; else, or on a refusal with no state cause (the fence moved, the deadline passed, a cancel), `cancelled` with zero bytes, the unit ended, and the last write set back to the one before the attempt when no later write moved it | mvp §2.3; docs/design/pty-runtime.md §2.3 "Basis"; `docs/design/supervisor-send.md` SB1 |
+| `writerDone(id, ok)`, `outcome(id)`, `writeStalled(id)` | the writer's record of a dispatched unit (written or incomplete) ends the unit; the completion job then makes a `sending` input `sent` or `unconfirmed` and changes nothing for one that left `sending`; a dispatched unit with no record becomes `unconfirmed`, its unit still running | mvp §2.3; `docs/design/supervisor-send.md` SB4, SB15 |
 | `windowExpired`, `gateTimeout`, `cancelInput`, `rejectInput`, `resolveInput` | the remaining input transitions; the window of a positional prompt is suspended while a startup cause is active | mvp §2.3 |
-| `stop`, `exit(reason, dc)`, `restart` | stop; exit ends the launch's units, recovers its inputs, and expires its cards; restart exits the open launch with death unconfirmed and recovers every input; buffered hooks of a launch that can no longer bind are dropped (`raw_unknown`) | mvp §2.3:183, §2.4:214, §2.9:325-326 |
-| `stopOfTurn(t)` (`turnStop` for the current turn), `interrupt` | the current turn's `Stop` supersedes the cards and becomes the evidence candidate; a late `Stop` of the previous turn ends nothing and leaves a candidate of its own turn, which backs no evidence; Codex's interrupt supersedes the cards and invalidates the candidate | mvp §2.2:135, §2.10:335 |
+| `stop`, `exit(reason, dc)`, `restart` | stop; exit ends the launch's units, recovers its inputs, and expires its cards; restart exits the open launch with death unconfirmed and recovers every input; buffered hooks of a launch that can no longer bind are dropped (`raw_unknown`) | mvp §2.3, §2.4, §2.9 |
+| `stopOfTurn(t)` (`turnStop` for the current turn), `interrupt` | the current turn's `Stop` supersedes the cards and becomes the evidence candidate; a late `Stop` of the previous turn ends nothing and leaves a candidate of its own turn, which backs no evidence; Codex's interrupt supersedes the cards and invalidates the candidate | mvp §2.2, §2.10 |
 | `cardOpen(c)`, `cardResolve(c)`, `lateResolve(c)` | a card of the current turn; resolving the last open card of the turn feeds `ApprovalsAllResolved`; a resolution of a closed card feeds nothing; each invalidates the evidence candidate | mvp §2.10 |
-| `sessionTimer`, `stall` | `session_start_timeout` for a non-manual live launch that is unbound (a `SessionStart` that does not bind, such as `foreign_session`, does not stop it); `startup_stall` for an upgraded Codex launch before binding | mvp §2.2:142-143, §2.7 |
+| `sessionTimer`, `stall` | `session_start_timeout` for a non-manual live launch that is unbound (a `SessionStart` that does not bind, such as `foreign_session`, does not stop it); `startup_stall` for an upgraded Codex launch before binding | mvp §2.2, §2.7 |
 | `setTask`, `decset` | `task_set`; DECSET 2004 | mvp §2.2, §2.3 |
 | `raw(i)`, `rawReadyUnbound(ev)` | reducer inputs with no supervisor guard; `stepUnguarded` adds them | §3 |
 | `rawStep(id, ii)` | an input step with no guard, for deterministic replay coverage of a rejected step in a named trace | §4 |
@@ -98,39 +98,39 @@ All are checked by `pnpm run simulate` (§5). Each reads facts recorded where th
 | Invariant | Statement | Source |
 |---|---|---|
 | `sendingAtMostOnce` | an input enters `sending` at most once | CL-4; `input.rs:3-4` |
-| `writtenAtMostOnce` | an input's text is dispatched at most once | arch §4.3; mvp §2.3:183 |
-| `sendingOnlyThroughOpenGate` | `sending` through the gate only when bound, running, idle, evidence newer than the last write and not of the same turn as a gate-closing human write, no other in-flight input of the launch, bracketed paste on where needed, no counted write since the evidence's basis, and no running unit of the launch (the positional prompt is exempt); recorded from the state, not from the guard's view | mvp §2.3:171, :174; CL-5; `docs/design/supervisor-send.md` SB3, SB15 |
-| `dispatchOnlyThroughRecheck` | every dispatched input passed the recheck at its first byte, re-derived from the facts the dispatch recorded rather than from the guard's view: the same launch, no counted write since the admitted basis, and each gate condition with the input's own attempt not counted as a write | mvp §2.3:171-177 |
-| `oneInFlightPerLaunch` | at most one in-flight input per launch | mvp §2.3:171 |
-| `earlierLaunchesNeverBlock` | the gate equals the gate with `in_flight` counted over the current launch's inputs only | mvp §2.3:171; CL-6 |
-| `terminalStatesImmutable` | terminal input states never change | mvp §2.3:185; `input.rs:36-46` |
-| `neverResent` | nothing leads from `sending`/`sent`/`unconfirmed` back to `queued`/`sending`; `unconfirmed` leaves only to `acked` or `dismissed` | arch §4.3; mvp §2.3:183 |
-| `unconfirmedAttentionIff` | `input_unconfirmed(id)` iff that input is `unconfirmed` | mvp §2.2:144 |
-| `gateTimeoutOnlyWhileQueued` | `input_gate_timeout(id)` only while that input is `queued` | mvp §2.2:145 |
-| `noStartupCauseAfterBindOrExit` | no startup cause once bound or exited | mvp §2.2:142-143 |
-| `stallOnlyForUpgradedCodex` | `startup_stall` only for an upgraded Codex launch | mvp §2.2:143, §2.7 |
-| `openCardsAwaitApproval` | while a card of the current launch is open the turn is `awaiting_approval` | mvp §2.10:333-336 |
-| `lateResolutionChangesNothing` | a resolution after `Stop`, interrupt, prompt, or exit leaves `ThreadState` unchanged (it can still invalidate pending readiness) | mvp §2.10:335 |
-| `restartRecovers` | a restart turns `sending`/`sent` into `unconfirmed` and `queued` into `cancelled` | mvp §2.4:214; CL-6 |
-| `exitedLaunchHasNoPendingInput` | after exit no input is `queued`, `sending`, or `sent` | mvp §2.3:183, :185 |
-| `ackOnlyWhenAttributable` | every `AckAttributed` fed has a record of the hook's intake facts, and every record shows all eight (same launch, after the attempt, unique candidate, dispatched, no other counted write after it, written before the intake, no matching input the owner resolved, no competing submission), checked directly rather than through the guard's `attributable` | mvp §2.3:182; CL-7 |
+| `writtenAtMostOnce` | an input's text is dispatched at most once | arch §4.3; mvp §2.3 |
+| `sendingOnlyThroughOpenGate` | `sending` through the gate only when bound, running, idle, evidence newer than the last write and not of the same turn as a gate-closing human write, no other in-flight input of the launch, bracketed paste on where needed, no counted write since the evidence's basis, and no running unit of the launch (the positional prompt is exempt); recorded from the state, not from the guard's view | mvp §2.3; CL-5; `docs/design/supervisor-send.md` SB3, SB15 |
+| `dispatchOnlyThroughRecheck` | every dispatched input passed the recheck at its first byte, re-derived from the facts the dispatch recorded rather than from the guard's view: the same launch, no counted write since the admitted basis, and each gate condition with the input's own attempt not counted as a write | mvp §2.3 |
+| `oneInFlightPerLaunch` | at most one in-flight input per launch | mvp §2.3 |
+| `earlierLaunchesNeverBlock` | the gate equals the gate with `in_flight` counted over the current launch's inputs only | mvp §2.3; CL-6 |
+| `terminalStatesImmutable` | terminal input states never change | mvp §2.3; `input.rs:36-46` |
+| `neverResent` | nothing leads from `sending`/`sent`/`unconfirmed` back to `queued`/`sending`; `unconfirmed` leaves only to `acked` or `dismissed` | arch §4.3; mvp §2.3 |
+| `unconfirmedAttentionIff` | `input_unconfirmed(id)` iff that input is `unconfirmed` | mvp §2.2 |
+| `gateTimeoutOnlyWhileQueued` | `input_gate_timeout(id)` only while that input is `queued` | mvp §2.2 |
+| `noStartupCauseAfterBindOrExit` | no startup cause once bound or exited | mvp §2.2 |
+| `stallOnlyForUpgradedCodex` | `startup_stall` only for an upgraded Codex launch | mvp §2.2, §2.7 |
+| `openCardsAwaitApproval` | while a card of the current launch is open the turn is `awaiting_approval` | mvp §2.10 |
+| `lateResolutionChangesNothing` | a resolution after `Stop`, interrupt, prompt, or exit leaves `ThreadState` unchanged (it can still invalidate pending readiness) | mvp §2.10 |
+| `restartRecovers` | a restart turns `sending`/`sent` into `unconfirmed` and `queued` into `cancelled` | mvp §2.4; CL-6 |
+| `exitedLaunchHasNoPendingInput` | after exit no input is `queued`, `sending`, or `sent` | mvp §2.3 |
+| `ackOnlyWhenAttributable` | every `AckAttributed` fed has a record of the hook's intake facts, and every record shows all eight (same launch, after the attempt, unique candidate, dispatched, no other counted write after it, written before the intake, no matching input the owner resolved, no competing submission), checked directly rather than through the guard's `attributable` | mvp §2.3; CL-7 |
 | `noAckOverCompetingSubmission` | no hook ack of an input whose gate opened after a gate-closing human write following the last turn start | `docs/design/supervisor-send.md` §2.5 |
 | `noAckOverEarlierMatch` | no hook ack when an input of the launch whose text matches left flight without a hook ack (`dismissed`, or `acked` by the owner) | `docs/design/supervisor-send.md` §2.5 |
 | `noDispatchWhileUnitRunning` | at most one unit of a launch may write, so no input opens or dispatches while another's unit runs, a stalled one included | `docs/design/supervisor-send.md` SB15 |
-| `reservedOnlyAfterDeath` | every reservation the reducer accepted came after the previous launch's death was confirmed | mvp §2.9:323; CL-18 |
-| `resumeBlockedOnlyWhileDeathUnconfirmed` | `resume_blocked` only while exited with death unconfirmed | mvp §2.2:146 |
-| `exitedTurnUnknown` | an exited launch's turn is `unknown` | mvp §2.2:135 |
+| `reservedOnlyAfterDeath` | every reservation the reducer accepted came after the previous launch's death was confirmed | mvp §2.9; CL-18 |
+| `resumeBlockedOnlyWhileDeathUnconfirmed` | `resume_blocked` only while exited with death unconfirmed | mvp §2.2 |
+| `exitedTurnUnknown` | an exited launch's turn is `unknown` | mvp §2.2 |
 | `taskOnlyByTaskSet` | the task axis changes only on `task_set` | CL-2 |
-| `gateEvidenceIsBound` | gate evidence is of the bound launch, after its binding | mvp §2.3:171, §2.9:325 |
-| `openGateEvidenceOfCurrentTurn` | an open gate rests on evidence of the current launch and turn, of a kind the launch's adapter and mode produce per `EVIDENCE_TABLE`, written out apart from the guard's `kindAllowed` | mvp §2.3:171-173, §2.7 |
-| `ackedHasCause` | an input is `acked` only through an attributable intake record or the owner resolving it as delivered | mvp §2.3:182-184 |
-| `cardKeysOnlyToOpenCards` | every card key the writer accepted came from a card open in the current launch | mvp §2.10:336 |
-| `interruptedOnlyForCodex` | `Interrupted` is fed only for a Codex launch | mvp §2.2:135, §2.7:301 |
+| `gateEvidenceIsBound` | gate evidence is of the bound launch, after its binding | mvp §2.3, §2.9 |
+| `openGateEvidenceOfCurrentTurn` | an open gate rests on evidence of the current launch and turn, of a kind the launch's adapter and mode produce per `EVIDENCE_TABLE`, written out apart from the guard's `kindAllowed` | mvp §2.3, §2.7 |
+| `ackedHasCause` | an input is `acked` only through an attributable intake record or the owner resolving it as delivered | mvp §2.3 |
+| `cardKeysOnlyToOpenCards` | every card key the writer accepted came from a card open in the current launch | mvp §2.10 |
+| `interruptedOnlyForCodex` | `Interrupted` is fed only for a Codex launch | mvp §2.2, §2.7 |
 | `supervisorInputsAccepted` | the supervisor feeds the reducers only inputs they accept; `ReserveRefused` ends with a refused `Reserved` | — |
 
 **Witnesses** (`witness*` in the spec; 12) count traces reaching any `acked` input, an attributed ack through the gate, a late ack, a failed recheck, a dismissal, a second launch, an attributed positional ack, `resume_blocked`, an open gate beside an earlier launch's `unconfirmed` input, a binding that promotes buffered hooks, a late card resolution beside an open card, and two open cards. `simulate` fails when one is never reached, so a model change that cuts coverage is caught.
 
-**Model results.** Every invariant holds over the CI simulation. With one in-flight input per launch and attribution limited to the same launch, "a prompt matching more than one input acks none" (mvp §2.3:182) is unreachable; a unit test of the matcher in PR 10 keeps it. The projection counts an input's own `sending` as the last write and as in flight, so the writer's recheck cannot be `gate()` on the projected view unchanged (`trace_send_ack` shows `WriteAfterEvidence` right after `open`).
+**Model results.** Every invariant holds over the CI simulation. With one in-flight input per launch and attribution limited to the same launch, "a prompt matching more than one input acks none" (mvp §2.3) is unreachable; a unit test of the matcher in PR 10 keeps it. The projection counts an input's own `sending` as the last write and as in flight, so the writer's recheck cannot be `gate()` on the projected view unchanged (`trace_send_ack` shows `WriteAfterEvidence` right after `open`).
 
 ## 3. Gaps the Traces Show
 
@@ -140,10 +140,10 @@ All are checked by `pnpm run simulate` (§5). Each reads facts recorded where th
 
 | Trace | What the reducers admit | Contract | Owner |
 |---|---|---|---|
-| `trace_hole_a_reserve_without_death` | after a restart, `Reserved` before any `resume_blocked`: `Exited` carries no death bit and `Reserved` checks only the attention flag (`state.rs:174`, `:278-288`) | mvp §2.9:323 | PR 10a1 |
-| `trace_hole_c_stale_startup_cause` | `AttentionRaised(StartupStall)` while `exited`, which then survives `Reserved` into the next launch (`state.rs:369-371`) | mvp §2.2:142-143 | PR 10a1 |
-| `trace_hole_d_unbound_readiness` | `ReadinessObserved` of an unbound Codex launch (`state.rs:333-336`); fed directly instead of buffered, it survives binding as gate evidence older than the binding | mvp §2.3:171, §2.9:325 | PR 9 |
-| `trace_finding_resolution_without_card_identity` | `ApprovalsAllResolved` carries no card identity: fed for card 1 after card 2 opened in the next turn, it ends the wait for card 2 (`state.rs:362-367`) | mvp §2.10:333-336 | PR 10, PR 13–14 |
+| `trace_hole_a_reserve_without_death` | after a restart, `Reserved` before any `resume_blocked`: `Exited` carries no death bit and `Reserved` checks only the attention flag (`state.rs:174`, `:278-288`) | mvp §2.9 | PR 10a1 |
+| `trace_hole_c_stale_startup_cause` | `AttentionRaised(StartupStall)` while `exited`, which then survives `Reserved` into the next launch (`state.rs:369-371`) | mvp §2.2 | PR 10a1 |
+| `trace_hole_d_unbound_readiness` | `ReadinessObserved` of an unbound Codex launch (`state.rs:333-336`); fed directly instead of buffered, it survives binding as gate evidence older than the binding | mvp §2.3, §2.9 | PR 9 |
+| `trace_finding_resolution_without_card_identity` | `ApprovalsAllResolved` carries no card identity: fed for card 1 after card 2 opened in the next turn, it ends the wait for card 2 (`state.rs:362-367`) | mvp §2.10 | PR 10, mvp C1, X1 |
 
 **Decided by PR 10b** (`docs/design/supervisor-send.md` §7):
 
@@ -334,7 +334,7 @@ Four rules of mvp §2.4 come from what the model needed; it implements them as w
 **Obligations handed on.**
 
 - **PR 7, reads and WebSocket**: http §6.2 PR7-CL-9–11 (one read per answer, the 404 for an unknown stream, snapshot contents) and PR7-CL-16 (`heads` for the latest subscribed set, refreshes, a commit announced by `stream_advanced` or `heads`); a `heads` frame omits streams that do not exist.
-- **PR 7, commands and receipts**: http §6.2 PR7-CL-8 (deadlines and 408) and PR7-CL-18–20 (receipts, the effect once with the receipt completed by the runner, fatal store outcomes reported). Liveness the model does not check: after the runner observed an intent committed with its effect pending, a healthy runner starts the effect and completes the receipt (with PR 17).
+- **PR 7, commands and receipts**: http §6.2 PR7-CL-8 (deadlines and 408) and PR7-CL-18–20 (receipts, the effect once with the receipt completed by the runner, fatal store outcomes reported). Liveness the model does not check: after the runner observed an intent committed with its effect pending, a healthy runner starts the effect and completes the receipt (PR 17's model, deferred).
 - **PR 8**: `receipts_mark_unknown_after_crash` at startup, before commands are accepted.
 - **PR 18**: the client rules of §7.1 with the epoch rule, F1, F2, and the backward resync; keep announced heads across a delivery (a `stream_advanced` or `heads` that arrives during a fetch); continue while `has_more` and page backward only while `has_more_before`; on a 404 for a followed stream (it is not in the current database, as after a database swap), stop following it: drop its copy, `subscribe` without it, and stop displaying it; retry a failed read (408, 503); refetch every followed stream on reconnect, and keep the intent to load history for a displayed stream across it: opening a socket discards a backward page not yet processed, so reissue the backward fetch from the current copy. Its fast-check reducer covers the `has_more` and reconnect cases.
 
@@ -385,6 +385,6 @@ Each invariant has a spec mutation that violates it, judged by the exit status o
 
 CI runs the four seeds and the named traces, so every mutation fails CI. `has_more` alone is not needed for convergence while `heads` refreshes run, so only its named trace guards it. Keeping the resync on an establishing forward page (`need` set from before the response) cannot be mutated observably: a forward page establishes only for a client without an epoch, which has no copy to page backward from.
 
-### 7.7 What PR 17 Still Covers
+### 7.7 What PR 17 Still Covers (deferred)
 
 Q-B checks the protocol with the store's guarantees assumed. A `stateright` model (PR 17, deferred) would check the Rust code where Q-B abstracts: the writer thread, the store's commit and crash behaviour (a crash during an append, `CommitUnknown` recovery), the socket loop's single `merge` and frame selection, the runner's effect and completion under real time (a heads refresh against the reply grace, the deadlines), crashes at every point of a command, the runner liveness of §7.4 (PR 7, commands and receipts), and retry after a lost response against the real handlers. PR 18's fast-check reducer checks the client rules of §7.1.

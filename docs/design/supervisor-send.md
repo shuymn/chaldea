@@ -1,6 +1,6 @@
 # Design: Supervisor, Send and Ack Side (MVP PR 10b)
 
-Status: design. Scope is the send and ack half of the PR 10 row of `docs/mvp-design.md` §4 (cited as "mvp §N"), called **PR 10b**: the `send`, `ready`, `key`, `input_resolve`, and `input_cancel` commands; the readiness gate and its evidence; the writer integration (`encode` at write time, the `WriteUnit`, the hook fence, the outcome mapping, `human_write`); ack attribution with `prompt_matches`; the real `IntakeProbe`; input-side attention and approval cards; and the send path's guards in `specs/thread_input.qnt`. It builds on the 10a1 design, `docs/design/supervisor.md` (cited as "sup §N"), through its §2.11 interfaces and the changes listed in §2.9 here.
+Status: implemented (#48) in `crates/daemon/src/supervisor/send` and `crates/core/src/input/key.rs`. Scope is the send and ack half of the PR 10 row of `docs/mvp-design.md` §4 (cited as "mvp §N"), called **PR 10b**: the `send`, `ready`, `key`, `input_resolve`, and `input_cancel` commands; the readiness gate and its evidence; the writer integration (`encode` at write time, the `WriteUnit`, the hook fence, the outcome mapping, `human_write`); ack attribution with `prompt_matches`; the real `IntakeProbe`; input-side attention and approval cards; and the send path's guards in `specs/thread_input.qnt`. It builds on the 10a1 design, `docs/design/supervisor.md` (cited as "sup §N"), through its §2.11 interfaces and the changes listed in §2.9 here.
 
 **What 10b decides and leaves.** 10b owns the daemon's `supervisor::send` module, a `core` key encoder, the hook adapter wrapper that turns decoded hooks into state, and the small changes to earlier seams that §2.9 lists (one writer guard in pty-runtime, the hook route's commit callback, the input projection). It leaves to PR 13 and PR 14 the hook configuration of real CLIs and the decoders that read their payloads (until then no real CLI binds, sup SD14), the readiness and resume columns of `GET /api/adapters`, session switches, and the approval correlation rule of mvp §2.10; to PR 11 attach and resizing (F5); to PR 18–19 the UI; to PR 10a2 crash recovery.
 
@@ -342,7 +342,7 @@ A keeps the model's results for every ordering in which the completion precedes 
 | F5 | PR 11 (SB11) |
 | X2 | §2.3 step 3; PR10b-CL-6 |
 
-**Handed on.** F5 to PR 11. Real-CLI hook configuration and decoders, approval correlation (mvp §2.10), session switches, and the readiness column of `GET /api/adapters`: PR 13, PR 14.
+**Handed on.** F5 to PR 11. Real-CLI hook configuration and decoders, the evidence that resolves an approval card (coarse in the MVP, mvp §2.10; `tool_use_id` correlation is deferred), session switches, and the readiness column of `GET /api/adapters`: PR 13, PR 14.
 
 ## 5. Purpose Layer and Plan Layer
 
