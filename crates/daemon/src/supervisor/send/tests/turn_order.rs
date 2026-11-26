@@ -282,6 +282,90 @@ async fn stop_first_without_settle() {
     rig.stop().await;
 }
 
+/// Requires the mark of the delivery with receipt ordinal `o` to be `End { settle }`.
+fn end_mark(rig: &SRig, live: &Live, o: u64, settle: bool) {
+    let sl = rig.sl(live);
+    let log = &sl.state().log.0;
+    assert!(
+        matches!(log.get(&o), Some((TurnMark::End { settle: s }, _)) if *s == settle),
+        "{log:?}"
+    );
+}
+
+/// A `Stop` taken in after a `Written` unit's record committed, while the worker has not
+/// yet applied the record's reply, sees the unit ended: it settles once its start acks the
+/// input, though that start commits after it, and the next send is written without `ready`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_after_the_record_settles() {
+    let (rig, live) = settle_rig().await;
+    rig.cmd_ok("ready", &json!({ "thread_id": live.t }), 200)
+        .await;
+    let sl = rig.sl(&live);
+    let (entered, go, point) = gate_point();
+    set(&sl.hooks.record_job, point);
+    let p = rig.send(&live, "P").await;
+    entered.await.unwrap();
+    // The worker is held in the record job, outside the state lock: no parking.
+    let start = hold(
+        &rig,
+        &live,
+        rig.hook_of(&live, "UserPromptSubmit", &prompt("P")),
+        false,
+    )
+    .await;
+    let (recorded, go_on, point) = gate_point();
+    set(&sl.hooks.after_record, point);
+    go.send(()).unwrap();
+    recorded.await.unwrap();
+    assert_eq!(rig.input(p).state, InputState::Sent);
+    let stop = rig.next_ordinal(&live);
+    assert_eq!(
+        rig.post(&rig.hook_of(&live, "Stop", &json!({})))
+            .await
+            .status,
+        200
+    );
+    assert_eq!(start.finish().await.status, 200);
+    assert_eq!(rig.input(p).state, InputState::Acked);
+    end_mark(&rig, &live, stop, true);
+    go_on.send(()).unwrap();
+    rig.pass(&live).await;
+    advance(&rig, &live, SETTLE).await;
+    assert_eq!(count(&rig, &live, "stop_settled"), 1);
+    let next = rig.send(&live, "next").await;
+    rig.until_input(next, InputState::Sent).await;
+    rig.stop().await;
+}
+
+/// A `Stop` taken in after an `Incomplete` unit's record committed, while the worker has not
+/// yet applied the record's reply, sees the unit ended and settles: the turn is `idle`
+/// again without `ready`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_after_an_incomplete_record_settles() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    rig.clock.stop();
+    let sl = rig.sl(&live);
+    let (recorded, go, point) = gate_point();
+    set(&sl.hooks.after_record, point);
+    let paste_len = u64::try_from(b"\x1b[200~partial\x1b[201~".len()).unwrap();
+    live.child
+        .fail_writes_after(paste_len, std::io::ErrorKind::BrokenPipe);
+    let p = rig.send(&live, "partial").await;
+    recorded.await.unwrap();
+    assert_eq!(rig.input(p).state, InputState::Unconfirmed);
+    rig.hook(&live, "UserPromptSubmit", &prompt("typed")).await;
+    let stop = rig.next_ordinal(&live);
+    rig.hook(&live, "Stop", &json!({})).await;
+    end_mark(&rig, &live, stop, true);
+    go.send(()).unwrap();
+    rig.pass(&live).await;
+    advance(&rig, &live, SETTLE).await;
+    assert_eq!(count(&rig, &live, "stop_settled"), 1);
+    assert_eq!(turn(&rig, &live), TurnState::Idle);
+    rig.stop().await;
+}
+
 /// TO-2b: a human write before a stale start stays in the turn the `Stop` ended. The
 /// settle's evidence is of that turn, so it does not reopen the gate after the write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

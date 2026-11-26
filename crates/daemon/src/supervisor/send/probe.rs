@@ -114,7 +114,11 @@ impl IntakeProbe for SupervisorProbe {
             v: 1,
             reference,
             last_started,
-            running: st.running.is_some(),
+            // A unit whose record committed has ended for the intake, in the writer's order.
+            running: st
+                .running
+                .as_ref()
+                .is_some_and(|r| !r.recorded.load(Ordering::Acquire)),
             human_running: st.human_unsettled > 0,
             inflight,
         };
