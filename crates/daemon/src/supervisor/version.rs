@@ -1,13 +1,15 @@
 //! The CLI version (C1 D11): `<program> --version` once per Claude spawn or resume, before the
 //! reservation, as the workspace probe runs git (a [`TrackedChild`] under the spawn lock, the
-//! tracker, a deadline). One bound covers the child's exit and the read of its stdout, which
-//! is read while the child runs, at most [`MAX_OUTPUT`] bytes. Any failure or timeout gives
-//! `None`; the launch proceeds.
+//! tracker, a deadline). The child's stdout is an anonymous temporary file, not a pipe, so no
+//! read can block and nothing is left behind when the probe ends: a descendant holding stdout
+//! never delays it. One deadline covers the child's exit, the read of its output, and the
+//! result's adoption. A nonzero exit, output over [`MAX_OUTPUT`], or the deadline gives `None`
+//! at once (the child killed); the launch proceeds.
 
 use std::ffi::OsString;
-use std::io::Read;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,11 +18,11 @@ use chaldea_core::ids::Agent;
 use super::tracker::TrackedChild;
 use super::{Supervisor, lock};
 
-/// The probe's one bound, from its start: the child's exit and its stdout.
+/// The probe's one bound, from its start: the child's exit, its output, and the adoption.
 pub(crate) const VERSION_PROBE: Duration = Duration::from_secs(5);
-/// The most stdout read; the rest is never read.
-pub(crate) const MAX_OUTPUT: usize = 4096;
-/// The poll period of the child and its stdout.
+/// The most output a version answer may have; more ends the probe with `None`.
+pub(crate) const MAX_OUTPUT: u64 = 4096;
+/// The poll period of the child and its output.
 const POLL: Duration = Duration::from_millis(10);
 
 /// Version children killed at their deadline and not yet reaped, with their tokens: reaped by
@@ -78,58 +80,56 @@ pub(crate) fn parse(out: &[u8]) -> Option<String> {
     ok.then(|| word.to_owned())
 }
 
+/// `f`'s result when observed before `deadline` (supervisor clock, mapped to real time at each call).
+fn before<T>(sup: &Supervisor, deadline: Instant, f: impl FnOnce() -> T) -> Option<T> {
+    chaldea_pty_runtime::host::observed_before(sup.real(deadline), f)
+}
+
 /// `argv --version` bounded by `deadline` (supervisor clock): the parsed version when the
-/// child exited 0 and its stdout reached its end (or [`MAX_OUTPUT`]) before the deadline.
+/// child exited 0 with at most [`MAX_OUTPUT`] bytes of output, all before the deadline.
 pub(crate) fn probe(sup: &Supervisor, argv: &[OsString], deadline: Instant) -> Option<String> {
     let (program, lead) = argv.split_first()?;
+    let mut out = tempfile::tempfile().ok()?;
     let mut cmd = Command::new(program);
     cmd.args(lead)
         .arg("--version")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
-        .stdout(Stdio::piped());
+        .stdout(Stdio::from(out.try_clone().ok()?));
     chaldea_pty_runtime::host::no_console_window(&mut cmd);
-    let real_deadline = sup.real(deadline);
-    let child = TrackedChild::spawn(&mut cmd, &sup.tracker, real_deadline, sup.pauses())?.ok()?;
+    let child =
+        TrackedChild::spawn(&mut cmd, &sup.tracker, sup.real(deadline), sup.pauses())?.ok()?;
+    // The command holds the child's handle to the file: drop it, so only the child keeps it.
+    drop(cmd);
     let mut held = Held {
         left: sup.version_left.clone(),
         child: Some(child),
     };
     let c = held.child.as_mut()?;
-    // Read while the child runs: a child that fills the pipe never blocks on it, and the read
-    // ends at the pipe's end or the cap, whichever comes first.
-    let (tx, rx) = mpsc::channel();
-    let stdout = c.take_stdout()?;
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.take(MAX_OUTPUT as u64).read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-    let mut exited = None;
-    let mut out = None;
     loop {
         if !sup.tracker.accepting() {
             return None;
         }
-        if exited.is_none() {
-            exited = chaldea_pty_runtime::host::observed_before(real_deadline, || c.try_reap())?;
-        }
-        if out.is_none() {
-            match rx.try_recv() {
-                Ok(b) => out = Some(b),
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => return None,
-            }
-        }
-        if let (Some(status), Some(bytes)) = (&exited, &out) {
-            if !status.success() {
+        if let Some(status) = before(sup, deadline, || c.try_reap())? {
+            if !status.success() || out.metadata().ok()?.len() > MAX_OUTPUT {
                 return None;
             }
-            return parse(bytes);
+            let text = read_head(&mut out)?;
+            return before(sup, deadline, || parse(&text))?;
         }
-        chaldea_pty_runtime::host::observed_before(real_deadline, || ())?;
-        std::thread::sleep(POLL);
+        if out.metadata().ok()?.len() > MAX_OUTPUT {
+            return None;
+        }
+        before(sup, deadline, || std::thread::sleep(POLL))?;
     }
+}
+
+/// The file's first [`MAX_OUTPUT`] bytes.
+fn read_head(f: &mut File) -> Option<Vec<u8>> {
+    f.seek(SeekFrom::Start(0)).ok()?;
+    let mut buf = Vec::new();
+    f.take(MAX_OUTPUT).read_to_end(&mut buf).ok()?;
+    Some(buf)
 }
 
 impl Supervisor {
@@ -143,8 +143,7 @@ impl Supervisor {
         let deadline = self.now() + VERSION_PROBE;
         let s = self.clone();
         let task = self.rt.spawn_blocking(move || probe(&s, &argv, deadline));
-        let wait = deadline + Duration::from_secs(1);
-        crate::deadline::settle_before(|| self.now(), wait, self.timer(wait), task)
+        crate::deadline::settle_before(|| self.now(), deadline, self.timer(deadline), task)
             .await
             .in_time()
             .and_then(Result::ok)

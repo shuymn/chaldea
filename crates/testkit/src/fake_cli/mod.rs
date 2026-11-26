@@ -7,6 +7,8 @@
 //!                  [--escape-orphan] [--orphan-keeps-tty] [--out <path>] [--emit-output]
 //!                  [--validate-input <n>] [--emitter <path>] [--agent <claude|codex>]
 //!                  [--session-id <id>] [--nested] [--nested-child] [--script <json>]
+//!                  [--version-text <text>] [--version-exit <n>] [--version-sleep-ms <n>]
+//!                  [--version-flood <n>] [--version-linger-ms <n>] [--version-descendant]
 //!                  [-- <launch argument>...]
 //! ```
 //!
@@ -15,10 +17,10 @@
 //!
 //! An unknown mode or flag exits 2. After `--` come the arguments the daemon appends for its
 //! agent (`report-process` records them with the rest of its argv;
-//! `docs/design/pty-windows.md` §2.8): a `--version` there prints `0.0.0 (FakeCli)` and exits 0
-//! (the daemon's version probe), and without `--session-id` before `--`, the value of a
-//! `--session-id` or `--resume` there is the session id (a Claude launch's own). The rest are
-//! ignored.
+//! `docs/design/pty-windows.md` §2.8): a `--version` there answers as the `--version-*` flags
+//! say (`version`; the daemon's version probe), and without `--session-id` before `--`, the
+//! value of a `--session-id` or `--resume` there is the session id (a Claude launch's own). The
+//! rest are ignored.
 
 mod attachable;
 mod banner;
@@ -29,6 +31,7 @@ mod report_process;
 mod sleeper;
 mod spawn_tree;
 mod term;
+mod version;
 mod watch;
 
 use std::ffi::OsString;
@@ -95,8 +98,10 @@ pub(crate) struct Opts {
     pub(crate) nested_child: bool,
     /// `hooks`: the steps, a JSON array.
     pub(crate) script: Option<String>,
-    /// `--version` after `--`: print a version and exit.
+    /// `--version` after `--`: answer as [`version`] does, not as the mode.
     pub(crate) print_version: bool,
+    /// The `--version-*` flags.
+    pub(crate) version: version::VersionOpts,
 }
 
 fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
@@ -126,6 +131,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
         nested_child: false,
         script: None,
         print_version: false,
+        version: version::VersionOpts::default(),
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -175,6 +181,20 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
             "--nested" => o.nested = true,
             "--nested-child" => o.nested_child = true,
             "--script" => o.script = Some(value()?),
+            "--version-text" => o.version.text = value()?,
+            "--version-exit" => {
+                o.version.exit = value()?.parse().map_err(|e| format!("{flag}: {e}"))?;
+            }
+            "--version-sleep-ms" => {
+                o.version.sleep_ms = value()?.parse().map_err(|e| format!("{flag}: {e}"))?;
+            }
+            "--version-flood" => {
+                o.version.flood = value()?.parse().map_err(|e| format!("{flag}: {e}"))?;
+            }
+            "--version-linger-ms" => {
+                o.version.linger_ms = value()?.parse().map_err(|e| format!("{flag}: {e}"))?;
+            }
+            "--version-descendant" => o.version.descendant = true,
             "--" => {
                 let rest: Vec<String> = it.by_ref().collect();
                 o.print_version = rest.iter().any(|a| a == "--version");
@@ -203,8 +223,7 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> i32 {
         }
     };
     if o.print_version {
-        println!("0.0.0 (FakeCli)");
-        return 0;
+        return version::run(&o.version);
     }
     if let Some(secs) = o.max_life_secs {
         std::thread::spawn(move || {

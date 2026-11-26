@@ -573,6 +573,34 @@ async fn resume_rebinds() {
     rig.stop().await;
 }
 
+/// D11: a hook kept as `raw_unknown` carries the launch's probed CLI version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn version_in_raw_unknown() {
+    let rig = SRig::with(|c| {
+        c.decoders = Decoders {
+            claude: Arc::new(ClaudeDecoder::default()),
+            codex: Arc::new(FakeDecoder),
+        };
+        let argv = crate::supervisor::tests::version::fake_program(&[
+            "--version-text",
+            "2.1.331 (Claude Code)",
+        ]);
+        c.program = Some(Arc::new(move |_| Some(argv.clone())));
+    })
+    .await;
+    let live = bound(&rig).await;
+    let f = fixture("clear", "SessionStart-1");
+    let other = f.json["session_id"].as_str().unwrap().to_owned();
+    post(&rig, &live, &hook_with(&rig, &live, &f, &other)).await;
+    let raws = rig.of_kind(live.t, "raw_unknown");
+    assert_eq!(raws.len(), 1);
+    assert_eq!(
+        (raws[0]["reason"].clone(), raws[0]["cli_version"].clone()),
+        (json!("foreign_session"), json!("2.1.331"))
+    );
+    rig.stop().await;
+}
+
 /// C1-6: a Claude input not acknowledged in its ack window ends `unconfirmed`, raises its
 /// attention, and is never written again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

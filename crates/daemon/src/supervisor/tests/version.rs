@@ -1,36 +1,48 @@
 //! The CLI version probe (C1 D11): `claude --version` before the reservation, its version in
-//! `launch_started` and in hook `raw_unknown` events; a failure or timeout records `null`.
+//! `launch_started` and on the launch row; a failure, an exit other than 0, output over the
+//! cap, or the deadline records `null`. The child is FakeCli answering `--version` (both
+//! OSes), and the deadline is passed on the rig's stopped clock, not in real time.
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chaldea_core::ids::{LaunchId, ThreadId};
 use serde_json::json;
 
 use super::{Rig, json as body};
-use crate::supervisor::version::{VERSION_PROBE, probe};
+use crate::store::tests::support::waits;
+use crate::supervisor::version::{MAX_OUTPUT, VERSION_PROBE, probe};
 
-/// A shell running `script`: the probe appends `--version`, which becomes `$0` (POSIX) or an
-/// ignored trailing word (`cmd /c echo`).
-fn shell(script: &str) -> Vec<OsString> {
-    if cfg!(windows) {
-        let comspec = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
-        vec![comspec, "/d".into(), "/c".into(), script.into()]
-    } else {
-        vec!["/bin/sh".into(), "-c".into(), script.into()]
-    }
+/// FakeCli, built by `cargo test --workspace` (testkit's binary) next to the test binaries'
+/// `deps/` directory.
+pub(crate) fn fake_cli() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let dir = exe.parent().unwrap().parent().unwrap();
+    let p = dir.join(format!("chaldea-fake-cli{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        p.is_file(),
+        "{} is missing: build with cargo test --workspace",
+        p.display()
+    );
+    p
 }
 
-const PRINT_VERSION: &str = if cfg!(windows) {
-    "echo 2.1.331 (Claude Code)"
-} else {
-    "echo '2.1.331 (Claude Code)'"
-};
+const CLAUDE_VERSION: &str = "2.1.331 (Claude Code)";
 
-async fn rig_running(script: &'static str) -> Rig {
+/// FakeCli `sleeper` with `flags`, ending in `--` so the probe's `--version` follows it.
+pub(crate) fn fake_program(flags: &[&str]) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = vec![fake_cli().into(), "--mode".into(), "sleeper".into()];
+    argv.extend(flags.iter().map(OsString::from));
+    argv.push("--".into());
+    argv
+}
+
+async fn rig_running(flags: &'static [&'static str]) -> Rig {
     Rig::with(chaldea_core::adapter::HostOs::Macos, move |c| {
-        c.program = Some(Arc::new(move |_| Some(shell(script))));
+        let argv = fake_program(flags);
+        c.program = Some(Arc::new(move |_| Some(argv.clone())));
     })
     .await
 }
@@ -49,107 +61,181 @@ async fn spawn(rig: &Rig, agent: &str) -> (ThreadId, LaunchId) {
     )
 }
 
-fn started_version(rig: &Rig, t: ThreadId) -> serde_json::Value {
+fn started_versions(rig: &Rig, t: ThreadId) -> Vec<serde_json::Value> {
     rig.events(t)
         .into_iter()
-        .find(|(k, _)| k == "launch_started")
+        .filter(|(k, _)| k == "launch_started")
         .map(|(_, p)| p["cli_version"].clone())
-        .unwrap()
+        .collect()
+}
+
+#[test]
+fn probe_bound_is_five_seconds() {
+    assert_eq!(VERSION_PROBE, Duration::from_secs(5));
+    assert_eq!(MAX_OUTPUT, 4096);
 }
 
 /// A Claude launch records the probe's version in `launch_started` and on its launch row
-/// (where hook `raw_unknown` events take it from); a Codex launch records `null`.
+/// (where hook `raw_unknown` events take it from), at spawn and again at resume; a Codex
+/// launch records `null`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn version_recorded() {
-    let rig = rig_running(PRINT_VERSION).await;
+    let rig = rig_running(&["--version-text", CLAUDE_VERSION]).await;
     let (t, l) = spawn(&rig, "claude").await;
-    assert_eq!(started_version(&rig, t), json!("2.1.331"));
+    assert_eq!(started_versions(&rig, t), [json!("2.1.331")]);
     assert_eq!(rig.launch(l).cli_version.as_deref(), Some("2.1.331"));
+    rig.bind(t, l, &l.to_string()).await;
+    let r = rig.cmd("stop", &json!({ "thread_id": t })).await;
+    assert_eq!(r.status, 200);
+    let r = rig
+        .cmd(
+            "resume",
+            &json!({ "thread_id": t, "expected_launch_id": l }),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let l2: LaunchId = serde_json::from_value(body(&r)["launch_id"].clone()).unwrap();
+    assert_eq!(
+        started_versions(&rig, t),
+        [json!("2.1.331"), json!("2.1.331")]
+    );
+    assert_eq!(rig.launch(l2).cli_version.as_deref(), Some("2.1.331"));
     let (t, l) = spawn(&rig, "codex").await;
-    assert_eq!(started_version(&rig, t), json!(null));
+    assert_eq!(started_versions(&rig, t), [json!(null)]);
     assert_eq!(rig.launch(l).cli_version, None);
     rig.srv.stop().await;
 }
 
-/// A probe that cannot run, or exits nonzero, records `null` and the launch proceeds.
+/// A probe that cannot run, or exits other than 0, records `null` and the launch proceeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn version_failure_is_null() {
     // The rig's program does not exist on the host.
     let rig = Rig::new().await;
     let (t, _) = spawn(&rig, "claude").await;
-    assert_eq!(started_version(&rig, t), json!(null));
+    assert_eq!(started_versions(&rig, t), [json!(null)]);
     rig.srv.stop().await;
-    let rig = rig_running("exit 3").await;
+    let rig = rig_running(&["--version-text", CLAUDE_VERSION, "--version-exit", "3"]).await;
     let (t, _) = spawn(&rig, "claude").await;
-    assert_eq!(started_version(&rig, t), json!(null));
+    assert_eq!(started_versions(&rig, t), [json!(null)]);
     rig.srv.stop().await;
 }
 
-/// A rig whose supervisor reads the system clock, so the probe's bound passes in real time.
-async fn rig_real_time() -> Rig {
-    Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
-        c.clock = Arc::new(crate::http::SystemMonotonic);
-    })
-    .await
-}
-
-/// Runs the probe directly with `script`, returning its version and how long it took.
-async fn timed(rig: &Rig, script: &str) -> (Option<String>, Duration) {
-    let argv = shell(script);
-    let start = Instant::now();
+/// Runs the probe of FakeCli with `flags` on the rig's stopped clock, its deadline
+/// [`VERSION_PROBE`] ahead; `at_spawn` runs once the child is tracked.
+async fn probed(rig: &Rig, flags: &[&str], at_spawn: impl FnOnce()) -> Option<String> {
+    rig.clock.stop();
+    let argv = fake_program(flags);
     let sup = rig.sup.clone();
-    let v = tokio::task::spawn_blocking(move || probe(&sup, &argv, sup.now() + VERSION_PROBE))
-        .await
-        .unwrap();
-    (v, start.elapsed())
+    let deadline = sup.now() + VERSION_PROBE;
+    let mut task = tokio::task::spawn_blocking(move || probe(&sup, &argv, deadline));
+    rig.until("the probe's child is tracked", || {
+        rig.sup.tracker.count() == 1
+    })
+    .await;
+    at_spawn();
+    // Real time bounds only a hang: on the stopped clock the deadline passes only when moved.
+    // At the bound, the clock is moved past the deadline so the probe ends and the test fails
+    // rather than waiting for the child.
+    let Ok(v) = waits::bounded(Duration::from_secs(30), &mut task).await else {
+        rig.clock.advance(VERSION_PROBE);
+        panic!("the probe did not return before its deadline");
+    };
+    v.unwrap()
 }
 
-/// A child that does not exit by the bound gives `None` at the bound, killed and reaped.
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn version_timeout() {
-    let rig = rig_real_time().await;
-    let (v, took) = timed(&rig, "sleep 30").await;
-    assert_eq!(v, None);
-    assert!(
-        took >= VERSION_PROBE && took < VERSION_PROBE + Duration::from_secs(3),
-        "{took:?}"
-    );
-    rig.until("the killed probe is reaped", || {
+/// The child gone and its token released: nothing of the probe is left.
+async fn nothing_left(rig: &Rig) {
+    rig.until("the probe's child is reaped", || {
         rig.sup.version_left.reap();
         rig.sup.version_left.is_empty() && rig.sup.tracker.count() == 0
     })
     .await;
+}
+
+/// A child that does not exit gives `None` once the deadline passes (the clock moved to it),
+/// killed and reaped; before that, nothing returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn version_timeout() {
+    let rig = Rig::new().await;
+    let v = probed(&rig, &["--version-sleep-ms", "600000"], || {
+        rig.clock.advance(VERSION_PROBE);
+    })
+    .await;
+    assert_eq!(v, None);
+    nothing_left(&rig).await;
     rig.srv.stop().await;
 }
 
-/// A descendant holding stdout after the child exited does not extend the bound: `None` at
-/// the bound, not when the descendant ends.
-#[cfg(unix)]
+/// A descendant holding stdout after the child exited 0 does not delay the probe: the
+/// version, on a clock that never reaches the deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn version_descendant_holds_stdout() {
-    let rig = rig_real_time().await;
-    let (v, took) = timed(&rig, "(sleep 30 &); echo '2.1.331 (Claude Code)'").await;
-    assert_eq!(v, None);
-    assert!(
-        took >= VERSION_PROBE && took < VERSION_PROBE + Duration::from_secs(3),
-        "{took:?}"
-    );
-    rig.srv.stop().await;
-}
-
-/// Stdout is read while the child runs, at most 4 KiB: a child printing far more than a pipe
-/// holds neither blocks nor delays the probe.
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn version_output_capped() {
-    let rig = rig_real_time().await;
-    let (v, took) = timed(
+    let rig = Rig::new().await;
+    let v = probed(
         &rig,
-        "echo '2.1.331 (Claude Code)'; head -c 1048576 /dev/zero | tr '\\0' x; exit 0",
+        &["--version-text", CLAUDE_VERSION, "--version-descendant"],
+        || {},
     )
     .await;
     assert_eq!(v.as_deref(), Some("2.1.331"));
-    assert!(took < VERSION_PROBE, "{took:?}");
+    nothing_left(&rig).await;
+    rig.srv.stop().await;
+}
+
+/// An exit other than 0 gives `None` at once, a descendant holding stdout included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn version_nonzero_exit_is_immediate() {
+    let rig = Rig::new().await;
+    let v = probed(
+        &rig,
+        &[
+            "--version-text",
+            CLAUDE_VERSION,
+            "--version-exit",
+            "3",
+            "--version-descendant",
+        ],
+        || {},
+    )
+    .await;
+    assert_eq!(v, None);
+    nothing_left(&rig).await;
+    rig.srv.stop().await;
+}
+
+/// Output of exactly [`MAX_OUTPUT`] bytes gives the version; one byte more gives `None`, as
+/// does far more, and so does a child still running past the cap, none waiting for the
+/// deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn version_output_capped() {
+    let rig = Rig::new().await;
+    // The text and its newline, then `x`s.
+    let fill = usize::try_from(MAX_OUTPUT).unwrap() - CLAUDE_VERSION.len() - 1;
+    let at_cap = fill.to_string();
+    let over = (fill + 1).to_string();
+    // A child still running past the cap (it lingers 600 s) gives `None` too.
+    for (flood, linger, want) in [
+        (at_cap.as_str(), "0", Some("2.1.331")),
+        (over.as_str(), "0", None),
+        ("1048576", "0", None),
+        (over.as_str(), "600000", None),
+    ] {
+        let v = probed(
+            &rig,
+            &[
+                "--version-text",
+                CLAUDE_VERSION,
+                "--version-flood",
+                flood,
+                "--version-linger-ms",
+                linger,
+            ],
+            || {},
+        )
+        .await;
+        assert_eq!(v.as_deref(), want, "{flood} {linger}");
+        nothing_left(&rig).await;
+        rig.clock.resume();
+    }
     rig.srv.stop().await;
 }
