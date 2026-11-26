@@ -456,6 +456,29 @@ fn preview_bound_to_one_run() {
             "{switch}: {out}{err}"
         );
     }
+    // Discovery not able to tell after a response (starting, stopping, a record not
+    // readable yet): the read ends, naming neither a stop nor a restart.
+    for switch in [2, 4, 6] {
+        let calls = AtomicUsize::new(0);
+        let discover = || {
+            if calls.fetch_add(1, Ordering::SeqCst) < switch {
+                Ok(Found::Port(port, RUN.to_owned()))
+            } else {
+                Ok(Found::NotYet)
+            }
+        };
+        let (code, out, err) = run_with(&stub, &discover, |c, o, e| c.preview(T, o, e));
+        assert_eq!(code, ExitCode::Failed, "{switch}: {out}{err}");
+        assert!(
+            out.contains(super::super::UNVERIFIED) || err.contains(super::super::UNVERIFIED),
+            "{switch}: {out}{err}"
+        );
+        assert!(
+            !format!("{out}{err}").contains("stopped during")
+                && !format!("{out}{err}").contains("restarted"),
+            "{switch}: {out}{err}"
+        );
+    }
     // In the same run: complete, labelled this run, no missing-probe line.
     let mut s = Stream::default();
     s.reserved();

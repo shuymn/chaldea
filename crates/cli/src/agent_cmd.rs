@@ -59,6 +59,9 @@ const CONFIRMED_LATE: &str = "The process ended, but its end was not confirmed w
 /// whether the owner's assertion confirmed it.
 const ALREADY_EXITED_LATE: &str = "The process had already ended, but this stop did not confirm its end within 5 s (its end may have been confirmed by the owner's assertion).";
 
+/// Why a read bound to one run ended when discovery could not re-check that run.
+pub(crate) const UNVERIFIED: &str = "the daemon could not be found serving again after the read";
+
 /// Where the daemon is, as one attempt sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Found {
@@ -101,8 +104,11 @@ pub(crate) enum End {
     TooLarge,
     /// A request bound to one daemon run found another run serving.
     Restarted,
-    /// A response read from the bound run, after which discovery found no daemon serving.
+    /// A response read from the bound run, after which discovery found no daemon running.
     Stopped,
+    /// A response read from the bound run, after which discovery could not tell whether it
+    /// still serves (starting, stopping, or a record not readable yet).
+    Unverified,
 }
 
 /// Why a command ended without its result.
@@ -185,9 +191,8 @@ impl Client<'_> {
                     let decided = decide(r);
                     if run.is_some() && matches!(decided, Some(Ok(_))) {
                         match (self.discover)() {
-                            Ok(Found::NotRunning | Found::NotYet) => {
-                                return Some(Err(End::Stopped));
-                            }
+                            Ok(Found::NotRunning) => return Some(Err(End::Stopped)),
+                            Ok(Found::NotYet) => return Some(Err(End::Unverified)),
                             Err(m) => return Some(Err(End::Fail(m))),
                             found if !same_run(&found) => return Some(Err(End::Restarted)),
                             Ok(Found::Port(..)) => {}
@@ -311,6 +316,10 @@ fn ended(e: End, err: &mut dyn Write) -> ExitCode {
         }
         End::Stopped => {
             say(err, "the daemon stopped during the read");
+            ExitCode::Failed
+        }
+        End::Unverified => {
+            say(err, UNVERIFIED);
             ExitCode::Failed
         }
     }

@@ -156,6 +156,10 @@ impl Client<'_> {
                     scan.interrupted = Some(STOPPED.into());
                     break;
                 }
+                Err(End::Unverified) => {
+                    scan.interrupted = Some(super::UNVERIFIED.into());
+                    break;
+                }
             };
             let EventsResponse::Replay {
                 stream_id,
@@ -275,6 +279,10 @@ impl Client<'_> {
             }
             Err(End::Stopped) => {
                 scan.interrupted.get_or_insert_with(|| STOPPED.into());
+            }
+            Err(End::Unverified) => {
+                scan.interrupted
+                    .get_or_insert_with(|| super::UNVERIFIED.into());
             }
             Err(_) => {
                 scan.interrupted
