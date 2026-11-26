@@ -11,16 +11,21 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use support::faults::{
-    AGENT_PROGRAM, FAKE_PTY_HOLD_WAITER, Gate, Labels, SUPERVISOR_GATE, SUPERVISOR_PAUSE, cmd,
+    AGENT_PROGRAM, CLAUDE_DECODER_PANIC, FAKE_PTY_HOLD_WAITER, Gate, Labels, SUPERVISOR_GATE,
+    SUPERVISOR_PAUSE, cmd,
 };
 use support::runner::{Case, main as run_cases};
-use support::{Proc, WAIT, request_complete, run_to_exit, state};
+use support::{Proc, WAIT, request_complete, run_to_exit, state, wait_for};
 
 fn main() {
     run_cases(&[
         Case {
             name: "wait_until_exited",
             run: wait_until_exited,
+        },
+        Case {
+            name: "decoder_panic",
+            run: decoder_panic,
         },
         Case {
             name: "banner_changes_nothing",
@@ -178,6 +183,77 @@ fn wait_until_exited() {
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("the launch exited"), "{err}");
     assert_eq!(daemon.stop_and_wait(&d.path), 0, "{}", daemon.stderr());
+}
+
+/// The `raw_unknown` reasons of thread `t`.
+fn raw_reasons(port: u16, token: &str, t: &str) -> Vec<String> {
+    of_kind(&envelopes(port, token, t), "raw_unknown")
+        .iter()
+        .map(|e| e["payload"]["reason"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// C1-4 under the production panic hook, with FakeCli `echo` emitting Claude's hooks through
+/// the real emitter: a panic in the Claude decoder's payload parser keeps the
+/// `UserPromptSubmit` as `raw_unknown` `schema_mismatch` and the daemon keeps serving until
+/// stopped (exit 0); a panic in the decoder after its parser returned stops the daemon.
+fn decoder_panic() {
+    let labels = Labels::new();
+    for at in ["in_parse", "after_parse"] {
+        let d = state();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut daemon, port) = daemon_with(
+            &labels,
+            &d.path,
+            &[
+                "--mode",
+                "echo",
+                "--emitter",
+                env!("CARGO_BIN_EXE_chaldea"),
+                "--agent",
+                "claude",
+                "--max-life-secs",
+                "120",
+            ],
+            &[(CLAUDE_DECODER_PANIC, OsStr::new(at))],
+        );
+        let (code, v, err) = agent(
+            &labels,
+            &d.path,
+            &[
+                "spawn",
+                "--agent",
+                "claude",
+                "--cwd",
+                &cwd.path().to_string_lossy(),
+            ],
+        );
+        assert_eq!(code, 0, "{at}: {err}");
+        let t = v["thread_id"].as_str().unwrap().to_owned();
+        let token = chaldea_daemon::lifecycle::read_owner_token(&d.path).unwrap();
+        assert!(
+            wait_for(|| !of_kind(&envelopes(port, &token, &t), "readiness_observed").is_empty()),
+            "{at}: bound by its SessionStart: {:?}",
+            envelopes(port, &token, &t)
+        );
+        let (code, _, err) = agent(&labels, &d.path, &["send", &t, "hello"]);
+        assert_eq!(code, 0, "{at}: {err}");
+        if at == "in_parse" {
+            assert!(
+                wait_for(|| raw_reasons(port, &token, &t) == ["schema_mismatch"]),
+                "{:?}",
+                raw_reasons(port, &token, &t)
+            );
+            let (status, body) = request_complete(port, "GET", "/api/threads", &token, None);
+            assert_eq!(status, 200, "still serving: {body}");
+            assert!(daemon.stderr().contains("panic in"), "{}", daemon.stderr());
+            assert_eq!(daemon.stop_and_wait(&d.path), 0, "{}", daemon.stderr());
+        } else {
+            let status = daemon.wait_within(WAIT);
+            assert!(!status.success(), "{status:?}: {}", daemon.stderr());
+            assert!(daemon.stderr().contains("panic"), "{}", daemon.stderr());
+        }
+    }
 }
 
 /// The thread's events with what differs between runs removed: ids, stamps, positions, and

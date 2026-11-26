@@ -7,14 +7,18 @@
 //!                  [--escape-orphan] [--orphan-keeps-tty] [--out <path>] [--emit-output]
 //!                  [--validate-input <n>] [--emitter <path>] [--agent <claude|codex>]
 //!                  [--session-id <id>] [--nested] [--nested-child] [--script <json>]
-//!                  [-- <ignored argument>...]
+//!                  [-- <launch argument>...]
 //! ```
 //!
 //! `--emitter`, `--agent`, `--session-id`, `--nested`, `--nested-child`, and `--script` are
 //! the hook emission of `docs/design/hook-ingest.md` §2.14 (`echo` and `hooks`).
 //!
-//! An unknown mode or flag exits 2. Arguments after `--` are ignored (`report-process`
-//! records them with the rest of its argv; `docs/design/pty-windows.md` §2.8).
+//! An unknown mode or flag exits 2. After `--` come the arguments the daemon appends for its
+//! agent (`report-process` records them with the rest of its argv;
+//! `docs/design/pty-windows.md` §2.8): a `--version` there prints `0.0.0 (FakeCli)` and exits 0
+//! (the daemon's version probe), and without `--session-id` before `--`, the value of a
+//! `--session-id` or `--resume` there is the session id (a Claude launch's own). The rest are
+//! ignored.
 
 mod attachable;
 mod banner;
@@ -91,6 +95,8 @@ pub(crate) struct Opts {
     pub(crate) nested_child: bool,
     /// `hooks`: the steps, a JSON array.
     pub(crate) script: Option<String>,
+    /// `--version` after `--`: print a version and exit.
+    pub(crate) print_version: bool,
 }
 
 fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
@@ -119,6 +125,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
         nested: false,
         nested_child: false,
         script: None,
+        print_version: false,
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -168,7 +175,17 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
             "--nested" => o.nested = true,
             "--nested-child" => o.nested_child = true,
             "--script" => o.script = Some(value()?),
-            "--" => break,
+            "--" => {
+                let rest: Vec<String> = it.by_ref().collect();
+                o.print_version = rest.iter().any(|a| a == "--version");
+                if o.session_id.is_none() {
+                    o.session_id = rest
+                        .windows(2)
+                        .find(|w| w[0] == "--session-id" || w[0] == "--resume")
+                        .map(|w| w[1].clone());
+                }
+                break;
+            }
             f => return Err(format!("unknown flag {f}")),
         }
     }
@@ -185,6 +202,10 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> i32 {
             return 2;
         }
     };
+    if o.print_version {
+        println!("0.0.0 (FakeCli)");
+        return 0;
+    }
     if let Some(secs) = o.max_life_secs {
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(secs));
