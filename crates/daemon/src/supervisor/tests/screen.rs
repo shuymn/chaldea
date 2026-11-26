@@ -180,21 +180,14 @@ async fn typed_outcomes() {
     // Reserved, not yet published: the live entry has no session.
     let armed = rig.pauses.arm(Pause::AfterReserve);
     let cwd = rig.cwd.path().to_string_lossy().into_owned();
-    let spawn = {
-        let req = rig.srv.command(
-            "spawn",
-            &rig.owner,
-            super::cid(),
-            &json!({ "agent": "codex", "cwd": cwd }).to_string(),
-        );
-        let port = rig.srv.port;
-        tokio::spawn(async move { support::http::send(port, &req.bytes()).await })
-    };
-    let reached = armed.reached;
-    tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(20)))
-        .await
-        .unwrap()
-        .unwrap();
+    let req = rig.srv.command(
+        "spawn",
+        &rig.owner,
+        super::cid(),
+        &json!({ "agent": "codex", "cwd": cwd }).to_string(),
+    );
+    let spawn = support::http::spawn_send(&rig.srv, &req);
+    tokio::task::block_in_place(|| armed.wait());
     let pending: ThreadId = rig
         .srv
         .store
@@ -295,12 +288,6 @@ async fn exit_recorded() {
     rig.srv.stop().await;
 }
 
-/// Waits (20 s at most) until `armed` is reached, off the runtime's workers.
-async fn reached(armed: &super::Armed) {
-    let rx = &armed.reached;
-    tokio::task::block_in_place(|| rx.recv_timeout(Duration::from_secs(20)).unwrap());
-}
-
 /// C1-11: once a stop or an exit has taken the session out of its slot, the screen is 409
 /// `no_live_launch` before the exit is recorded, though the op lock is still held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -317,7 +304,7 @@ async fn detached_session() {
         &json!({ "thread_id": t }).to_string(),
     );
     let stop = support::http::spawn_send(&rig.srv, &req);
-    reached(&armed).await;
+    tokio::task::block_in_place(|| armed.wait());
     assert!(rig.launch(l).exit_reason.is_none(), "not yet recorded");
     assert_eq!(
         get(&rig, &path(t), Some(&rig.owner)).await.outcome(),
@@ -336,7 +323,7 @@ async fn detached_session() {
             code: Some(0),
             signal: None,
         });
-    reached(&armed).await;
+    tokio::task::block_in_place(|| armed.wait());
     assert!(rig.launch(l).exit_reason.is_none(), "not yet recorded");
     assert_eq!(
         get(&rig, &path(t), Some(&rig.owner)).await.outcome(),
@@ -368,7 +355,7 @@ async fn snapshot_deadline() {
     let t0 = rig.sup.now();
     let copy = rig.pauses.arm(Pause::SnapshotCopy);
     let reply = get_owner(&rig);
-    reached(&copy).await;
+    tokio::task::block_in_place(|| copy.wait());
     assert_eq!(
         *entry.snapshot_deadline.lock().unwrap(),
         Some(t0 + Duration::from_millis(250))
@@ -383,10 +370,10 @@ async fn snapshot_deadline() {
     let read = rig.pauses.arm(Pause::ScreenRead);
     let copy = rig.pauses.arm(Pause::SnapshotCopy);
     let reply = get_owner(&rig);
-    reached(&read).await;
+    tokio::task::block_in_place(|| read.wait());
     rig.clock.advance(Duration::from_millis(1_900));
     read.go();
-    reached(&copy).await;
+    tokio::task::block_in_place(|| copy.wait());
     assert_eq!(
         *entry.snapshot_deadline.lock().unwrap(),
         Some(t0 + Duration::from_secs(2))

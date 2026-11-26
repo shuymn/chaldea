@@ -250,7 +250,7 @@ pub static ROUTES: &[RouteSpec] = {
             10,
         ),
         get(
-            "/api/threads/{thread_id}/screen",
+            crate::supervisor::SCREEN_PATH,
             M::Read,
             O::AbsentOrMatching,
             C::Bearer(READERS),

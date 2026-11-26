@@ -16,7 +16,7 @@ use chaldea_core::sync::{
 };
 use chaldea_daemon::lifecycle::ExitCode;
 
-use super::{Client, End, Req, print, say};
+use super::{Client, End, Req, print, say, wire};
 
 /// The cutoff of each of the three reads, above the daemon's 5 s read deadline so that its
 /// own 408 arrives first.
@@ -63,14 +63,6 @@ enum SnapshotRead {
     Failed(ErrorBody, String),
 }
 
-/// A wire enum's text.
-fn wire<T: serde::Serialize>(v: &T) -> String {
-    serde_json::to_value(v)
-        .ok()
-        .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned))
-        .unwrap_or_default()
-}
-
 /// An attention cause: its kind, then its other fields as `name value`.
 fn cause(c: &AttentionCause) -> String {
     let Ok(serde_json::Value::Object(m)) = serde_json::to_value(c) else {
@@ -85,15 +77,15 @@ fn cause(c: &AttentionCause) -> String {
 
 /// `s` with control characters escaped, so daemon text cannot drive the terminal.
 fn visible(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_control() {
-                c.escape_default().to_string()
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
+    let mut v = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            v.extend(c.escape_default());
+        } else {
+            v.push(c);
+        }
+    }
+    v
 }
 
 /// The last concrete failure a read retried past: what it reports when its cutoff passes.

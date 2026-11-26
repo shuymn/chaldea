@@ -325,6 +325,14 @@ fn code(r: &Response) -> Option<ErrorCode> {
         .map(|b| b.code)
 }
 
+/// A wire value's text: a string as itself, any other value as JSON.
+fn wire<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned))
+        .unwrap_or_default()
+}
+
 fn code_name(r: &Response) -> String {
     code(r)
         .and_then(|c| serde_json::to_value(c).ok())

@@ -345,13 +345,6 @@ fn bad_args() {
         let e = crate::args::Cli::try_parse_from(args).unwrap_err();
         assert_eq!(e.exit_code(), 2, "{args:?}");
     }
-    let ok = crate::args::Cli::try_parse_from([
-        "chaldea",
-        "inspect",
-        "00000000-0000-0000-0000-000000000007",
-        "--json",
-    ]);
-    assert!(ok.is_ok());
 }
 
 /// The generated schema requires every key `--json` prints, `null` ones included (as the

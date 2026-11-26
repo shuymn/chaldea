@@ -52,6 +52,7 @@ use crate::store::Store;
 pub use components::SupervisorComponents;
 pub(crate) use exit::ExitStep;
 pub(crate) use live::LiveLaunch;
+pub(crate) use screen::SCREEN_PATH;
 pub(crate) use tick::TickStep;
 
 use live::LiveMap;
