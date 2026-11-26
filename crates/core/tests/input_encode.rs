@@ -75,6 +75,8 @@ enum W {
     Ok(&'static str),
     /// Accepted as a positional argument (no PTY bytes).
     Argv,
+    /// Accepted; the bytes are pinned elsewhere.
+    Large,
     Err(RejectReason, Option<usize>),
 }
 
@@ -114,6 +116,7 @@ impl From<W> for Want {
         match w {
             W::Ok(b) => Want::Bytes(b.as_bytes().to_vec()),
             W::Err(reason, at) => Want::Err(reason, at),
+            W::Large => Want::Large,
             W::Argv => panic!("no PTY bytes for a positional prompt"),
         }
     }
@@ -479,21 +482,21 @@ static CORPUS: &[Entry] = &[
         id: "f_slash_first",
         text: T::Lit("/review の件"),
         golden: Derived,
-        claude: O::Ok(p!("/review の件")),
+        claude: O::Split(W::Err(LossyText, Some(0)), W::Ok(p!("/review の件"))),
         codex_paste: O::Ok(p!("/review の件")),
         win_keys: O::Ok(concat!("/review ", r!(12398), r!(20214))),
         positional: W::Argv,
-        expected: [E::Text, E::Text, E::Text, E::Text],
+        expected: [E::No, E::Text, E::Text, E::Text],
     },
     Entry {
         id: "f_bang_first",
         text: T::Lit("!ls は実行しない"),
         golden: Derived,
-        claude: O::Ok(p!("!ls は実行しない")),
+        claude: O::Split(W::Err(LossyText, Some(0)), W::Ok(p!("!ls は実行しない"))),
         codex_paste: O::Ok(p!("!ls は実行しない")),
         win_keys: O::Ok(concat!("!ls ", r!(12399), r!(23455), r!(34892), r!(12375), r!(12394), r!(12356))),
         positional: W::Argv,
-        expected: [E::Text, E::Text, E::Text, E::Text],
+        expected: [E::No, E::Text, E::Text, E::Text],
     },
     Entry {
         id: "f_question_first",
@@ -1499,21 +1502,21 @@ static CORPUS: &[Entry] = &[
         id: "zzexample_1000",
         text: T::Gen(zzexample_1000),
         golden: Derived,
-        claude: O::Large,
+        claude: O::Split(W::Err(LossyText, Some(0)), W::Large),
         codex_paste: O::Large,
         win_keys: O::Large,
         positional: W::Argv,
-        expected: [E::Text, E::Text, E::Text, E::Text],
+        expected: [E::No, E::Text, E::Text, E::Text],
     },
     Entry {
         id: "zzexample_1001",
         text: T::Gen(zzexample_1001),
         golden: Derived,
-        claude: O::Large,
+        claude: O::Split(W::Err(LossyText, Some(0)), W::Large),
         codex_paste: O::Large,
         win_keys: O::Large,
         positional: W::Argv,
-        expected: [E::Text, E::Text, E::Text, E::Text],
+        expected: [E::No, E::Text, E::Text, E::Text],
     },
     Entry {
         id: "image_relative",
@@ -1529,11 +1532,11 @@ static CORPUS: &[Entry] = &[
         id: "image_absolute",
         text: T::Lit("/work/diagram.png"),
         golden: Derived,
-        claude: O::Ok(p!("/work/diagram.png")),
+        claude: O::Split(W::Err(LossyText, Some(0)), W::Ok(p!("/work/diagram.png"))),
         codex_paste: O::Ok(p!("/work/diagram.png")),
         win_keys: O::Ok("/work/diagram.png"),
         positional: W::Argv,
-        expected: [E::Text, E::Text, E::Text, E::Text],
+        expected: [E::No, E::Text, E::Text, E::Text],
     },
     Entry {
         id: "image_file_url",
@@ -1843,7 +1846,7 @@ fn corpus_goldens() {
                     e.id
                 );
             }
-            w @ W::Ok(_) => panic!("{}: positional {w:?}", e.id),
+            w @ (W::Ok(_) | W::Large) => panic!("{}: positional {w:?}", e.id),
         }
         let encodings = [
             (Agent::Claude, BracketedPaste),

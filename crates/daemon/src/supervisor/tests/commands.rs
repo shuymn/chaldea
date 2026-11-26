@@ -74,6 +74,19 @@ async fn prompt_admission() {
             400,
             "prompt_rejected",
         ),
+        // C1 D16: Claude runs a leading `!` or `/` as a command.
+        (
+            "spawn",
+            json!({ "agent": "claude", "cwd": cwd, "prompt": "!echo corpus" }),
+            400,
+            "prompt_rejected",
+        ),
+        (
+            "resume",
+            json!({ "thread_id": ct, "expected_launch_id": cl, "prompt": "/zzexample corpus" }),
+            400,
+            "prompt_rejected",
+        ),
         (
             "resume",
             json!({ "thread_id": t, "expected_launch_id": l, "prompt": "a\u{7}" }),

@@ -133,8 +133,13 @@ fn check_path(p: Path, purpose: Purpose, t: &str) -> Result<(), Rejection> {
     if empty {
         return reject(RejectReason::EmptyPrompt, None);
     }
+    // 4. Claude runs a prompt starting with `!` as a shell command and one starting with `/`
+    // as a slash command (C1 D16).
+    if p == Path::ClaudePaste && purpose == Purpose::Send && t.starts_with(['!', '/']) {
+        return reject(RejectReason::LossyText, Some(0));
+    }
     if p == Path::WinKeys {
-        // 4. Codex on Windows trims both ends.
+        // 5. Codex on Windows trims both ends.
         if t.starts_with(char::is_whitespace) {
             return reject(RejectReason::LeadingTrailingWhitespace, Some(0));
         }
@@ -144,7 +149,7 @@ fn check_path(p: Path, purpose: Purpose, t: &str) -> Result<(), Rejection> {
                 Some(t.trim_end().len()),
             );
         }
-        // 5. Codex on Windows takes TAB as its queue key.
+        // 6. Codex on Windows takes TAB as its queue key.
         if let Some(at) = t.find('\t') {
             return reject(RejectReason::Tab, Some(at));
         }
@@ -726,6 +731,33 @@ mod tests {
         ] {
             assert!(!claude_matches(text, &recorded), "{why}: {recorded:?}");
         }
+    }
+
+    /// C1 D16: a Claude `send` starting with `!` or `/` is refused before any write; an attach
+    /// paste, another first character, and Codex keep them.
+    #[test]
+    fn claude_command_prefix_rejected() {
+        for os in [HostOs::Macos, HostOs::Windows] {
+            for t in ["!ls", "/review", "/", "!"] {
+                assert_eq!(
+                    encode(Agent::Claude, os, t, Purpose::Send).err(),
+                    Some(Rejection {
+                        reason: RejectReason::LossyText,
+                        at: Some(0)
+                    }),
+                    "{t:?}"
+                );
+                assert!(encode(Agent::Claude, os, t, Purpose::AttachPaste).is_ok());
+                assert!(encode(Agent::Codex, HostOs::Macos, t, Purpose::Send).is_ok());
+            }
+            for t in [" /review", "\n!ls", "a /b", "#zz", "?x"] {
+                assert!(encode(Agent::Claude, os, t, Purpose::Send).is_ok(), "{t:?}");
+            }
+        }
+        assert_eq!(
+            expected_prompt(Agent::Claude, BracketedPaste, "/review"),
+            None
+        );
     }
 
     #[test]

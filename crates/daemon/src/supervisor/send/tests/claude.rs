@@ -424,6 +424,29 @@ async fn corpus_prompts_ack() {
     rig.stop().await;
 }
 
+/// C1 D16: the two captured prompts Claude ran as commands (README "Prompt corpus") are
+/// refused at `send` (`rejected`, `lossy_text`) with zero bytes written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn command_prefix_refused() {
+    let rig = claude_rig().await;
+    let live = bound(&rig).await;
+    for text in ["!echo corpus", "/zzexample corpus"] {
+        let r = rig.send_text(&live, text).await;
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(
+            (v["state"].clone(), v["reject_reason"].clone()),
+            (json!("rejected"), json!("lossy_text")),
+            "{text}"
+        );
+        let id: InputId = serde_json::from_value(v["input_id"].clone()).unwrap();
+        assert_eq!(rig.input(id).state, InputState::Rejected);
+    }
+    rig.pass(&live).await;
+    assert!(live.child.input().is_empty(), "no byte");
+    rig.stop().await;
+}
+
 /// C1-2: the captured `SessionStart` binds the launch and, with intake facts, records
 /// `session_start` readiness; without them it binds and records none, so a send waits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
