@@ -227,7 +227,7 @@ const FILETIME_UNIX_OFFSET: u64 = 116_444_736_000_000_000;
 
 /// Milliseconds since the Unix epoch of a `recorded_at` stamp `YYYY-MM-DDTHH:MM:SS.mmmZ`
 /// (`ids::Timestamp`), the reservation instant [`a29_candidate`] takes; `None` for any other
-/// text or a stamp before 1970.
+/// text, a day the month does not have, or a stamp before 1970.
 #[must_use]
 pub fn stamp_ms(stamp: &str) -> Option<u64> {
     let b = stamp.as_bytes();
@@ -252,7 +252,14 @@ pub fn stamp_ms(stamp: &str) -> Option<u64> {
     };
     let (y, m, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
     let (h, mi, sec, ms) = (num(11, 13)?, num(14, 16)?, num(17, 19)?, num(20, 23)?);
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 59 {
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let month_days = match m {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=12).contains(&m) || !(1..=month_days).contains(&d) || h > 23 || mi > 59 || sec > 59 {
         return None;
     }
     // Days from the civil date (Howard Hinnant's algorithm), proleptic Gregorian.
@@ -327,12 +334,21 @@ mod tests {
             stamp_ms("2024-02-29T23:59:59.999Z"),
             Some(1_709_251_199_999)
         );
+        assert_eq!(stamp_ms("2000-02-29T00:00:00.000Z"), Some(951_782_400_000));
+        assert_eq!(
+            stamp_ms("2026-12-31T00:00:00.000Z"),
+            Some(1_798_675_200_000)
+        );
         for bad in [
             "2026-11-26T00:00:00Z",
             "2026-11-26 00:00:00.123Z",
             "2026-13-26T00:00:00.123Z",
             "1969-12-31T23:59:59.999Z",
             "2026-11-26T00:00:00.12xZ",
+            "2026-02-29T00:00:00.000Z",
+            "2026-02-30T00:00:00.000Z",
+            "2026-04-31T00:00:00.000Z",
+            "2100-02-29T00:00:00.000Z",
         ] {
             assert_eq!(stamp_ms(bad), None, "{bad}");
         }
