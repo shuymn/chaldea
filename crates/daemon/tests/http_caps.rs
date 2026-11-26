@@ -37,37 +37,32 @@ async fn quiet(tune: impl FnOnce(&mut HttpConfig)) -> TestServer {
     .await
 }
 
-/// How long [`StoppedTimers`] holds tokio's clock at most: a guard that turns a hang into
-/// the test's own timeouts, longer than every server timer it holds (the sockets' 75 s
-/// idle deadline the longest).
+/// How long [`stopped_timers`] holds tokio's clock at most: a wall-clock watchdog,
+/// independent of the timers it holds, that fails a phase which has not ended by then.
 const STOPPED_TIMERS_GUARD: Duration = Duration::from_secs(120);
 
-/// Tokio's clock stopped on this test's current-thread runtime, which also runs the
-/// server: no timer of the server's or the test's fires until [`StoppedTimers::run`].
-/// Paused time alone auto-advances to the next timer whenever the runtime waits on I/O;
-/// a blocking task waiting for the release keeps it from doing so (tokio's `pause`,
-/// "Preventing auto-advance").
-struct StoppedTimers {
-    release: std::sync::mpsc::Sender<()>,
-    blocking: tokio::task::JoinHandle<()>,
-}
-
-impl StoppedTimers {
-    fn stop() -> Self {
-        let (release, released) = std::sync::mpsc::channel::<()>();
-        let blocking = tokio::task::spawn_blocking(move || {
-            let _ = released.recv_timeout(STOPPED_TIMERS_GUARD);
-        });
-        tokio::time::pause();
-        StoppedTimers { release, blocking }
-    }
-
-    /// Lets the clock run on real time again, from where it stopped.
-    async fn run(self) {
-        tokio::time::resume();
-        drop(self.release);
-        self.blocking.await.unwrap();
-    }
+/// Runs `phase` with tokio's clock stopped on this test's current-thread runtime, which
+/// also runs the server: no timer of the server's or the test's fires during it, and the
+/// clock runs on real time again afterwards, from where it stopped. Paused time alone
+/// auto-advances to the next timer whenever the runtime waits on I/O; a blocking task
+/// waiting for the release keeps it from doing so (tokio's `pause`, "Preventing
+/// auto-advance"). That task ends at [`STOPPED_TIMERS_GUARD`], which fails the test
+/// before the clock can advance under `phase`.
+async fn stopped_timers<T>(phase: impl Future<Output = T>) -> T {
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let mut guard = tokio::task::spawn_blocking(move || {
+        let _ = released.recv_timeout(STOPPED_TIMERS_GUARD);
+    });
+    tokio::time::pause();
+    let out = tokio::select! {
+        biased;
+        _ = &mut guard => panic!("the phase with tokio's clock stopped outlasted {STOPPED_TIMERS_GUARD:?}"),
+        out = phase => out,
+    };
+    tokio::time::resume();
+    drop(release);
+    guard.await.unwrap();
+    out
 }
 
 /// Tickets held at once, and per token.
@@ -168,21 +163,23 @@ async fn close_and_reopen(srv: &TestServer, mut ws: WsClient, token: &str) {
 async fn sockets_cap(srv: &TestServer) {
     // No socket is dropped at its idle deadline before the refusals, however long the
     // upgrades take.
-    let timers = StoppedTimers::stop();
-    let (max, per) = (SOCKETS, SOCKETS_PER_TOKEN);
-    let mut tokens = Vec::new();
-    let mut open = Vec::new();
-    for _ in 0..max / per {
-        let tok = srv.token(TokenKind::Owner, None, None).await;
-        open.push(sockets(srv, &tok, per).await);
-        // The token's 17th.
-        assert_eq!(upgrade_status(srv, &tok).await, 503);
-        tokens.push(tok);
-    }
-    // The 129th, by a token holding none.
-    let fresh = srv.token(TokenKind::Owner, None, None).await;
-    assert_eq!(upgrade_status(srv, &fresh).await, 503);
-    timers.run().await;
+    let (tokens, mut open) = stopped_timers(async {
+        let (max, per) = (SOCKETS, SOCKETS_PER_TOKEN);
+        let mut tokens = Vec::new();
+        let mut open = Vec::new();
+        for _ in 0..max / per {
+            let tok = srv.token(TokenKind::Owner, None, None).await;
+            open.push(sockets(srv, &tok, per).await);
+            // The token's 17th.
+            assert_eq!(upgrade_status(srv, &tok).await, 503);
+            tokens.push(tok);
+        }
+        // The 129th, by a token holding none.
+        let fresh = srv.token(TokenKind::Owner, None, None).await;
+        assert_eq!(upgrade_status(srv, &fresh).await, 503);
+        (tokens, open)
+    })
+    .await;
     let ws = open[0].pop().unwrap();
     close_and_reopen(srv, ws, &tokens[0]).await;
 }
@@ -376,13 +373,15 @@ async fn blob_slot_frees_after_a_stalled_client() {
     let srv = quiet(|c| c.write_stall_timeout = Duration::from_millis(500)).await;
     let req = big_blob(&srv).await;
     let base = srv.server.tasks();
-    let timers = StoppedTimers::stop();
-    let mut held = Vec::new();
-    for _ in 0..BLOB_SLOTS {
-        held.push(stalled_download(&srv, &req).await);
-    }
-    busy(&srv.send(&req).await);
-    timers.run().await;
+    let held = stopped_timers(async {
+        let mut held = Vec::new();
+        for _ in 0..BLOB_SLOTS {
+            held.push(stalled_download(&srv, &req).await);
+        }
+        busy(&srv.send(&req).await);
+        held
+    })
+    .await;
     let until = Instant::now() + Duration::from_secs(20);
     let r = loop {
         let r = srv.send(&req).await;
