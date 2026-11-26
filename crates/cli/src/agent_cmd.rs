@@ -95,6 +95,10 @@ pub(crate) struct Client<'a> {
     pub token: String,
     pub now: &'a dyn Fn() -> Instant,
     pub period: Duration,
+    /// An error a test injects in place of the request to this path, at the request's
+    /// boundary (unit tests only).
+    #[cfg(test)]
+    pub fault: &'a dyn Fn(&str) -> Option<io::ErrorKind>,
 }
 
 /// Why an exchange ended without a response to adopt.
@@ -198,13 +202,19 @@ impl Client<'_> {
                 Err(m) => return Some(Err(End::Fail(m))),
             };
             let token = Some(self.token.as_str());
-            let r = match req {
+            let send = || match req {
                 Req::Get(path) => client::request(port, "GET", path, token, cutoff),
                 Req::GetUpTo(path, max) => {
                     client::request_up_to(port, "GET", path, token, cutoff, *max)
                 }
                 Req::Post(path, body) => client::post_json(port, path, token, body, cutoff),
             };
+            #[cfg(test)]
+            let send = || {
+                let (Req::Get(path) | Req::GetUpTo(path, _) | Req::Post(path, _)) = req;
+                (self.fault)(path).map_or_else(send, |kind| Err(io::Error::from(kind)))
+            };
+            let r = send();
             if let Err(e) = &r {
                 note(e);
             }
@@ -856,6 +866,8 @@ fn connect<'a>(
             token,
             now,
             period: PERIOD,
+            #[cfg(test)]
+            fault: &|_| None,
         }),
         Err(m) => {
             say(&mut io::stderr(), &m);

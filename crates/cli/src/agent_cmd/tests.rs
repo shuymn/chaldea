@@ -43,8 +43,8 @@ enum Reply {
     Hold(mpsc::Receiver<()>),
     /// A head with this status and `Content-Length`, then the end of the connection.
     Head(u16, usize),
-    /// Answers nothing for this many real milliseconds, then ends the connection.
-    Stall(u64),
+    /// Moves the test clock forward by `ms`, then answers with the inner reply.
+    After(u64, Box<Reply>),
 }
 
 /// The stub server and the test clock (real time plus a skew the stub can add).
@@ -158,9 +158,9 @@ fn answer(c: &mut std::net::TcpStream, reply: Reply, skew: &AtomicU64) {
             let _ = rx.recv_timeout(Duration::from_secs(20));
             return;
         }
-        Reply::Stall(ms) => {
-            std::thread::sleep(Duration::from_millis(ms));
-            return;
+        Reply::After(ms, inner) => {
+            skew.fetch_add(ms, Ordering::SeqCst);
+            return answer(c, *inner, skew);
         }
         Reply::Head(st, len) => {
             let _ = write!(
@@ -219,12 +219,23 @@ fn run_with(
     discover: &dyn Fn() -> Result<Found, String>,
     f: impl FnOnce(&Client<'_>, &mut Vec<u8>, &mut Vec<u8>) -> ExitCode,
 ) -> (ExitCode, String, String) {
+    run_faulty(stub, discover, &|_| None, f)
+}
+
+/// [`run_with`] with `fault` injecting request errors at the request boundary.
+fn run_faulty(
+    stub: &Stub,
+    discover: &dyn Fn() -> Result<Found, String>,
+    fault: &dyn Fn(&str) -> Option<std::io::ErrorKind>,
+    f: impl FnOnce(&Client<'_>, &mut Vec<u8>, &mut Vec<u8>) -> ExitCode,
+) -> (ExitCode, String, String) {
     let now = stub.now();
     let c = Client {
         discover,
         token: "chdo_test".to_owned(),
         now: &now,
         period: Duration::from_millis(1),
+        fault,
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = f(&c, &mut out, &mut err);
@@ -719,6 +730,7 @@ fn wait_timeout_past_the_last_instant() {
         token: "chdo_test".to_owned(),
         now: &now,
         period: Duration::from_millis(1),
+        fault: &|_| None,
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = c.wait(T, Until::Exited, timeout, &mut out, &mut err);

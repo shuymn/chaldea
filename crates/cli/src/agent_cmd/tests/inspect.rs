@@ -2,7 +2,8 @@
 
 use std::path::Path;
 
-use std::time::{Duration, Instant};
+use std::io::ErrorKind;
+use std::time::Duration;
 
 use chaldea_core::ids::{
     Actor, Agent, ApprovalId, Epoch, InputId, LaunchId, Open, StreamId, WorkspaceId,
@@ -21,7 +22,8 @@ use clap::Parser;
 use serde_json::{Value, json};
 
 use super::{
-    Client, Found, L, OTHER, RUN, Reply, Seen, Stub, T, error, ok, run, run_with, running,
+    Client, Found, L, OTHER, RUN, Reply, Seen, Stub, T, error, ok, run, run_faulty, run_with,
+    running,
 };
 
 const SNAPSHOT_PATH: &str =
@@ -197,7 +199,7 @@ recent events: 1
   3 launch_started
 screen: 80x3, cursor 0,6
 | 日本語
-| 
+|\x20
 | > \\u{1b}x
 "
     );
@@ -381,12 +383,13 @@ fn schema_requires_every_key() {
 
 /// A read whose budget runs out after concrete failures reports the last one: the daemon's
 /// `busy` body (the snapshot then falls back to the summary), or `internal` for a peer that
-/// closes before answering (the snapshot then fails, exit 1).
+/// closes before answering (the snapshot then fails, exit 1). The stub moves the test clock
+/// past each read's cutoff.
 #[test]
 fn last_failure_at_the_cutoff() {
     // The snapshot: busy until the budget is spent, then a summary.
-    let busy = || Reply::Late(2_000, 503, r#"{"code":"busy","retry_after":1}"#.to_owned());
-    let s = stub(busy, busy);
+    let slow = || Reply::Late(2_000, 503, r#"{"code":"busy","retry_after":1}"#.to_owned());
+    let s = stub(slow, slow);
     let (code, out, err) = run(&s, |c, o, e| {
         c.inspect_within(T, true, Duration::from_secs(5), o, e)
     });
@@ -403,75 +406,58 @@ fn last_failure_at_the_cutoff() {
     );
 
     // Closed before answering, until the budget is spent.
-    let s = Stub::serve(200, |_| Reply::Eof);
-    let (code, out, err) = run(&s, |c, o, e| {
-        c.inspect_within(T, true, Duration::from_millis(300), o, e)
-    });
+    let closed = || Reply::After(20_000, Box::new(Reply::Eof));
+    let s = Stub::serve(20, move |_| closed());
+    let (code, out, err) = run(&s, inspect(true));
     assert_eq!(code, ExitCode::Failed);
     assert!(err.contains("the request failed"), "{err}");
     assert_eq!(checked(&out)["snapshot_error"]["code"], "internal");
+    assert_eq!(paths(&s), [SNAPSHOT_PATH]);
 
     // The screen alone closed before answering: `internal`.
-    let s = stub(|| ok(snapshot()), || Reply::Eof);
-    let (code, out, _) = run(&s, |c, o, e| {
-        c.inspect_within(T, true, Duration::from_millis(300), o, e)
-    });
+    let s = stub(|| ok(snapshot()), closed);
+    let (code, out, _) = run(&s, inspect(true));
     assert_eq!(code, ExitCode::Ok);
     assert_eq!(checked(&out)["screen_error"]["code"], "internal");
 }
 
-/// Runs `f` on a client whose polling clock is 10 s behind the socket's: a socket timeout at
-/// the cutoff arrives while polling still has time left.
-fn run_lagging(
+/// Runs `f` against `stub` with `fault` failing requests at their boundary.
+fn run_failing(
     stub: &Stub,
+    fault: &dyn Fn(&str) -> Option<ErrorKind>,
     f: impl FnOnce(&Client<'_>, &mut Vec<u8>, &mut Vec<u8>) -> ExitCode,
 ) -> (ExitCode, String, String) {
-    const LAG: Duration = Duration::from_secs(10);
     let port = stub.port;
-    let discover = move || Ok(Found::Port(port, RUN.to_owned()));
-    let now = || Instant::now().checked_sub(LAG).unwrap_or_else(Instant::now);
-    let c = Client {
-        discover: &discover,
-        token: "chdo_test".to_owned(),
-        now: &now,
-        period: Duration::from_millis(1),
-    };
-    let (mut out, mut err) = (Vec::new(), Vec::new());
-    let code = f(&c, &mut out, &mut err);
-    (
-        code,
-        String::from_utf8(out).unwrap(),
-        String::from_utf8(err).unwrap(),
+    run_faulty(
+        stub,
+        &move || Ok(Found::Port(port, RUN.to_owned())),
+        fault,
+        f,
     )
 }
 
 /// An I/O timeout of the snapshot request falls back to the summary (exit 0); one of the
-/// summary request exits 4. The socket times out while the polling clock is before its
-/// cutoff, so only the request's own timeout ends each read.
+/// summary request exits 4. Each timeout comes while the polling clock is before its cutoff,
+/// so only the request's own timeout ends each read.
 #[test]
 fn socket_timeouts() {
-    // Each read's cutoff on the lagging clock is 12 s ahead: 2 s of real time. The stub
-    // answers one connection at a time, so the stalled snapshot (3 s) must end within the
-    // summary's own 2 s.
-    let within = Duration::from_secs(12);
-    let s = Stub::serve(20, |s: &Seen| match s.path.as_str() {
-        SNAPSHOT_PATH => Reply::Stall(3_000),
-        SUMMARY_PATH => ok(running()),
-        _ => ok(screen(L)),
-    });
-    let (code, out, err) = run_lagging(&s, |c, o, e| c.inspect_within(T, true, within, o, e));
+    let s = stub(|| ok(snapshot()), || ok(screen(L)));
+    let fault = |p: &str| (p == SNAPSHOT_PATH).then_some(ErrorKind::TimedOut);
+    let (code, out, err) = run_failing(&s, &fault, inspect(true));
     assert_eq!(code, ExitCode::Ok, "{err}");
+    assert_eq!(paths(&s), [SUMMARY_PATH, SCREEN_PATH]);
     let v = checked(&out);
     assert_eq!(v["snapshot_error"]["code"], "request_timeout");
     assert_eq!(v["summary"]["thread_id"], T.to_string());
 
-    let s = Stub::serve(20, |s: &Seen| match s.path.as_str() {
-        SNAPSHOT_PATH => Reply::Json(408, error("request_timeout")),
-        SUMMARY_PATH => Reply::Stall(3_000),
-        _ => ok(screen(L)),
-    });
-    let (code, _, err) = run_lagging(&s, |c, o, e| c.inspect_within(T, false, within, o, e));
+    let s = stub(
+        || Reply::Json(408, error("request_timeout")),
+        || ok(screen(L)),
+    );
+    let fault = |p: &str| (p == SUMMARY_PATH).then_some(ErrorKind::TimedOut);
+    let (code, _, err) = run_failing(&s, &fault, inspect(false));
     assert_eq!(code, ExitCode::Timeout, "{err}");
+    assert_eq!(paths(&s), [SNAPSHOT_PATH]);
 }
 
 /// A replay answer to the snapshot read is `internal` (exit 1), and the summary is not read.
@@ -494,16 +480,24 @@ fn replay_is_refused() {
     assert_eq!(checked(&out)["snapshot_error"]["code"], "internal");
 }
 
-/// A request that times out at the cutoff after an earlier attempt failed in transport keeps
-/// that failure: `internal`, exit 1, no summary read.
+/// A request that times out after an earlier attempt failed in transport keeps that failure:
+/// `internal`, exit 1, no summary read.
 #[test]
 fn timeout_keeps_the_earlier_failure() {
-    let s = Stub::start(vec![Reply::Eof, Reply::Stall(3_000)]);
-    let (code, out, err) = run_lagging(&s, |c, o, e| {
-        c.inspect_within(T, true, Duration::from_secs(12), o, e)
-    });
+    let s = stub(|| ok(snapshot()), || ok(screen(L)));
+    let attempts = std::cell::Cell::new(0);
+    let fault = |_: &str| {
+        attempts.set(attempts.get() + 1);
+        Some(if attempts.get() == 1 {
+            ErrorKind::UnexpectedEof
+        } else {
+            ErrorKind::TimedOut
+        })
+    };
+    let (code, out, err) = run_failing(&s, &fault, inspect(true));
     assert_eq!(code, ExitCode::Failed, "{err}");
     assert!(err.contains("the request failed"), "{err}");
     assert_eq!(checked(&out)["snapshot_error"]["code"], "internal");
-    assert_eq!(paths(&s), [SNAPSHOT_PATH, SNAPSHOT_PATH]);
+    assert_eq!(attempts.get(), 2);
+    assert!(paths(&s).is_empty());
 }
