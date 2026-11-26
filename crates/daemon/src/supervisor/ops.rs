@@ -980,12 +980,7 @@ pub(crate) async fn stop_launch(
         if !l.death_confirmed {
             return Err(done_code(ErrorCode::DeathUnconfirmed));
         }
-        // An owner's assertion is not a stop's proof: no timed confirmation stands on it.
-        let asserted = l.death_method.as_deref() == Some(OWNER_ASSERTED);
-        return Ok(already_exited(
-            req.launch,
-            !asserted && read_at <= req.request_start + STOP_REPORT,
-        ));
+        return Ok(already_exited(req.launch, &l, read_at, req.request_start));
     }
     let (Some(entry), Some(mut guard)) = (entry, guard) else {
         // An open launch with no slot: its op ended without recording; the next start
@@ -1068,12 +1063,21 @@ impl Supervisor {
     }
 }
 
-pub(crate) fn already_exited(launch: LaunchId, within: bool) -> StopResult {
+/// A plain stop's answer for an exited launch whose death `row` confirms, read at `read_at`
+/// for a request that started at `request_start`: confirmed within the deadline only when
+/// read by then and not by the owner's assertion, which is not a stop's proof (mvp P-3).
+pub(crate) fn already_exited(
+    launch: LaunchId,
+    row: &LaunchRow,
+    read_at: Instant,
+    request_start: Instant,
+) -> StopResult {
+    let asserted = row.death_method.as_deref() == Some(OWNER_ASSERTED);
     StopResult {
         launch_id: launch,
         outcome: StopOutcome::AlreadyExited,
         death_confirmed: true,
-        confirmed_within_deadline: within,
+        confirmed_within_deadline: !asserted && read_at <= request_start + STOP_REPORT,
         exit_code: None,
         signal: None,
     }

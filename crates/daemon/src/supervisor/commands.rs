@@ -36,7 +36,7 @@ use super::ops::{
     stop_launch, stop_op,
 };
 use super::record::{JobOf, Recorded, record};
-use super::{COMMAND_DEADLINE, Pause, STOP_REPORT, Supervisor};
+use super::{COMMAND_DEADLINE, Pause, Supervisor};
 
 pub(crate) fn parse<T: serde::de::DeserializeOwned + Serialize>(
     args: &RawValue,
@@ -268,10 +268,8 @@ impl CommandHandler for StopHandler {
                     if !row.death_confirmed {
                         return Err(refused(code(ErrorCode::DeathUnconfirmed)));
                     }
-                    // An owner's assertion is not a stop's proof (mvp P-3).
-                    let asserted = row.death_method.as_deref() == Some(OWNER_ASSERTED);
-                    let within = !asserted && ctx.job_start() <= ctx.request_start() + STOP_REPORT;
-                    return Ok(Intent::Completed(ok(&already_exited(l, within))));
+                    let r = already_exited(l, &row, ctx.job_start(), ctx.request_start());
+                    return Ok(Intent::Completed(ok(&r)));
                 }
                 Ok(Intent::Pending(EffectRun::new(StopReq {
                     command_id: ctx.command_id(),
