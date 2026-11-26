@@ -340,6 +340,46 @@ async fn shutdown_boundary() {
     assert!(evidence(&rig, ids3[0].0).is_empty());
     rig.srv.stop().await;
 
+    // Held at `probe_queued` while admission closes and past the join's cutoff, the store
+    // still open: the record step reads that the probe never started and records nothing,
+    // before and after the task is released.
+    let (store, ids4) = crashed(1).await;
+    let script = Script::new(Fate::Gone);
+    let rig = probing(store, HostOs::Macos, &script).await;
+    rig.clock.resume();
+    let queued = rig.pauses.arm(Pause::ProbeQueued);
+    let records = prober::run(rig.sup.clone()).await;
+    queued.wait();
+    rig.sup.tracker.close_admission();
+    // The record tasks end at the join's cutoff (`PROBE_BUDGET + PROBE_JOIN_GRACE`).
+    for r in records {
+        r.await.unwrap();
+    }
+    assert!(evidence(&rig, ids4[0].0).is_empty());
+    queued.go();
+    rig.until("the queued task returned", || rig.sup.tracker.count() == 0)
+        .await;
+    assert!(script.calls().is_empty());
+    assert!(evidence(&rig, ids4[0].0).is_empty());
+    rig.srv.stop().await;
+
+    // Held at `probe_queued` through the participant's end: its token is still held.
+    let (store, _) = crashed(1).await;
+    let script = Script::new(Fate::Gone);
+    let rig = probing(store, HostOs::Macos, &script).await;
+    rig.clock.resume();
+    let queued = rig.pauses.arm(Pause::ProbeQueued);
+    prober::run(rig.sup.clone()).await;
+    queued.wait();
+    let end = rig.sup.now() + Duration::from_millis(300);
+    assert_eq!(
+        shutdown(rig.sup.clone(), end).await,
+        ParticipantEnd::LeftRunning
+    );
+    queued.go();
+    assert!(script.calls().is_empty());
+    rig.srv.stop().await;
+
     // Parked inside the signal sequence: past `end`, then released before `end`.
     for (release_first, want) in [
         (false, ParticipantEnd::LeftRunning),

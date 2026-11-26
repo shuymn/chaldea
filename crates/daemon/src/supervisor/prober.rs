@@ -8,6 +8,7 @@
 //! exactly while it can signal (§2.1 rule 3).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chaldea_core::adapter::HostOs;
 use chaldea_core::event::TypedEvent;
@@ -117,6 +118,8 @@ pub(crate) async fn run(sup: Arc<Supervisor>) -> Vec<JoinHandle<()>> {
         // 3.4: the blocking task owns the permit and the admission.
         let s = sup.clone();
         let target = identity.clone();
+        let started = Arc::new(AtomicBool::new(false));
+        let on_start = started.clone();
         let join = sup.rt.spawn_blocking(move || {
             let _slot = permit;
             let _admission = admission;
@@ -124,6 +127,7 @@ pub(crate) async fn run(sup: Arc<Supervisor>) -> Vec<JoinHandle<()>> {
             if !s.tracker.accepting() {
                 return None;
             }
+            on_start.store(true, Ordering::SeqCst);
             let report = (s.cfg.kill_recorded)(std::slice::from_ref(&target), s.real(deadline));
             s.pauses().blocking(Pause::ProbeTask);
             Some(report)
@@ -136,6 +140,7 @@ pub(crate) async fn run(sup: Arc<Supervisor>) -> Vec<JoinHandle<()>> {
             launch: l.launch_id,
             identity,
             attempt,
+            started,
             cutoff,
             timer: sup.timer(cutoff),
         };
@@ -150,14 +155,18 @@ struct Probe {
     launch: LaunchId,
     identity: ProcessIdentity,
     attempt: Uuid,
+    /// Set by the blocking task right before `kill_recorded`, apart from the join: a task the
+    /// join did not answer in time made an OS call only when this is set.
+    started: Arc<AtomicBool>,
     /// `deadline + PROBE_JOIN_GRACE`, and its timer.
     cutoff: std::time::Instant,
     timer: tokio::time::Instant,
 }
 
 /// §2.3 step 3.5: the join awaited until `deadline + PROBE_JOIN_GRACE`; a late report is
-/// still an observation; an elapsed join or a panic is `not_read` with `result_not_received`;
-/// a task cancelled at shutdown before its OS work records nothing.
+/// still an observation; a started probe whose join elapsed or that panicked is `not_read`
+/// with `result_not_received`; a probe that had not started its OS work (cancelled at
+/// shutdown, or not yet run when its join elapsed) records nothing.
 async fn record_probe(sup: Arc<Supervisor>, p: Probe, join: JoinHandle<Option<OrphanReport>>) {
     let settled = settle_before(|| sup.now(), p.cutoff, p.timer, join).await;
     let (fates, received) = match settled {
@@ -165,6 +174,10 @@ async fn record_probe(sup: Arc<Supervisor>, p: Probe, join: JoinHandle<Option<Or
         Settled::InTime(Ok(None)) | Settled::Late(Ok(None)) => return,
         Settled::InTime(Err(e)) | Settled::Late(Err(e)) if e.is_cancelled() => return,
         Settled::InTime(Err(_)) | Settled::Late(Err(_)) | Settled::Elapsed => {
+            if !p.started.load(Ordering::SeqCst) {
+                tracing::warn!(launch = %p.launch, "the probe had not started when its join ended; nothing recorded, the next start probes again");
+                return;
+            }
             (vec![(p.identity.clone(), Fate::NotRead)], false)
         }
     };
