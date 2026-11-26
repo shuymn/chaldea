@@ -4,12 +4,12 @@
 //! else suspended + assign + resume, else no launch), and a tree kill by job termination
 //! plus the verified recorded descendants of each call.
 
-mod child;
+pub(crate) mod child;
 pub(crate) mod cmdline;
 mod control;
 #[cfg(any(test, feature = "fake"))]
 pub(crate) mod hooks;
-mod kill;
+pub(crate) mod kill;
 pub(crate) mod process;
 #[allow(unsafe_code)]
 pub(crate) mod sys;
@@ -222,17 +222,17 @@ impl Inject {
 
     /// The point right after a native create returned a process (lock released), before
     /// anything else can assign it: passes the gate of `AfterCreate` (either branch) or of
-    /// `RejectJobList(Some(_))` (the suspended branch).
+    /// `RejectJobList(Some(_))` (the suspended branch, its signal carrying `pid`).
     #[allow(clippy::unused_self, reason = "no gates outside test and fake builds")]
-    fn after_create(&self, suspended: bool) {
+    fn after_create(&self, suspended: bool, pid: u32) {
         #[cfg(any(test, feature = "fake"))]
         match &self.fault {
             Some(hooks::WindowsFault::AfterCreate(g)) => g.pass(),
-            Some(hooks::WindowsFault::RejectJobList(Some(g))) if suspended => g.pass(),
+            Some(hooks::WindowsFault::RejectJobList(Some(g))) if suspended => g.pass_pid(pid),
             _ => {}
         }
         #[cfg(not(any(test, feature = "fake")))]
-        let _ = suspended;
+        let _ = (suspended, pid);
     }
 
     /// The previous suspend count to classify: the real one, or the scripted
@@ -821,8 +821,8 @@ impl WindowsPty {
         #[cfg(test)]
         self.hooks.on(&tests::Stage::BeforeUnlock { stage: 5 });
         drop(guard);
-        if r.is_ok() {
-            inject.after_create(suspended);
+        if let Ok(c) = &r {
+            inject.after_create(suspended, c.pid);
         }
         r
     }

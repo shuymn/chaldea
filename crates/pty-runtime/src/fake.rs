@@ -1404,6 +1404,56 @@ pub fn resume_process(pid: u32) -> io::Result<usize> {
     crate::windows::sys::resume_process_threads(pid)
 }
 
+/// The smallest previous suspend count over the threads of the process `pid` (each thread is
+/// suspended and resumed once to read it): at least 1 when every thread is suspended
+/// (Windows).
+///
+/// # Errors
+///
+/// The thread snapshot, an open, or a suspend failed, or the process has no thread.
+#[cfg(windows)]
+pub fn suspend_count(pid: u32) -> io::Result<u32> {
+    crate::windows::sys::suspend_count(pid)
+}
+
+/// A runtime that injects `fault` into the first native spawn it runs, on the spawning thread
+/// ([`windows_inject_next`]), then runs `native` (Windows).
+#[cfg(windows)]
+#[must_use]
+pub fn with_windows_fault(
+    native: std::sync::Arc<dyn PtyRuntime>,
+    fault: WindowsFault,
+) -> std::sync::Arc<dyn PtyRuntime> {
+    std::sync::Arc::new(FaultRuntime {
+        native,
+        fault: Mutex::new(Some(fault)),
+    })
+}
+
+#[cfg(windows)]
+struct FaultRuntime {
+    native: std::sync::Arc<dyn PtyRuntime>,
+    fault: Mutex<Option<WindowsFault>>,
+}
+
+#[cfg(windows)]
+impl sealed::Sealed for FaultRuntime {}
+
+#[cfg(windows)]
+impl PtyRuntime for FaultRuntime {
+    fn spawn(&self, spec: &SpawnSpec, output: DrainSink) -> Result<SpawnedPty, SpawnError> {
+        let fault = self
+            .fault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(f) = fault {
+            windows_inject_next(f);
+        }
+        self.native.spawn(spec, output)
+    }
+}
+
 /// Sets `HANDLE_FLAG_INHERIT` on `h`, so a child created with handle inheritance and no handle
 /// list (std's spawn) inherits it (Windows).
 ///

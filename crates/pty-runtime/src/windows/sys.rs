@@ -1333,6 +1333,46 @@ pub(crate) fn resume_process_threads(pid: u32) -> io::Result<usize> {
     }
 }
 
+/// The smallest previous suspend count over the threads of the process `pid`, each thread
+/// suspended once and resumed at once (`SuspendThread`, `ResumeThread`): at least 1 when
+/// every thread was suspended. An error when the process has no thread.
+#[cfg(feature = "fake")]
+pub(crate) fn suspend_count(pid: u32) -> io::Result<u32> {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, SuspendThread, THREAD_SUSPEND_RESUME};
+    // SAFETY: plain call; the result is checked (INVALID_HANDLE_VALUE) before wrapping.
+    let snap = owned(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) })?;
+    let mut e = THREADENTRY32 {
+        dwSize: len_u32(size_of::<THREADENTRY32>()),
+        ..THREADENTRY32::default()
+    };
+    let mut least: Option<u32> = None;
+    // SAFETY: the snapshot handle is borrowed and valid; `e` is a local with `dwSize` set.
+    let mut ok = unsafe { Thread32First(raw(&snap), &raw mut e) };
+    while ok != 0 {
+        if e.th32OwnerProcessID == pid {
+            // SAFETY: plain call; the result is checked before wrapping.
+            let t = owned(unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, e.th32ThreadID) })?;
+            // SAFETY: the thread handle is borrowed and valid.
+            let n = unsafe { SuspendThread(raw(&t)) };
+            if n == u32::MAX {
+                return Err(io::Error::last_os_error());
+            }
+            resume(&t)?;
+            least = Some(least.map_or(n, |l| l.min(n)));
+        }
+        // SAFETY: as for `Thread32First`.
+        ok = unsafe { Thread32Next(raw(&snap), &raw mut e) };
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() != Some(ERROR_NO_MORE_FILES) {
+        return Err(err);
+    }
+    least.ok_or_else(|| io::Error::other("the process has no thread"))
+}
+
 /// `ShellExecuteExW` with the `open` verb on `url`, `SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI`
 /// (L21), after `CoInitializeEx` as the shell requires.
 pub(crate) fn shell_open(url: &str) -> io::Result<()> {

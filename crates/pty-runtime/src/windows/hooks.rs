@@ -92,14 +92,15 @@ impl WindowsFault {
 /// The backend's end of a gate.
 #[derive(Debug)]
 pub struct Gate {
-    reached: Sender<()>,
+    /// The created process's pid when the gate passed one.
+    reached: Sender<Option<u32>>,
     open: Receiver<()>,
 }
 
 /// The test's end of a gate.
 #[derive(Debug)]
 pub struct GateControl {
-    reached: Receiver<()>,
+    reached: Receiver<Option<u32>>,
     open: Sender<()>,
 }
 
@@ -127,6 +128,14 @@ impl GateControl {
         self.reached.recv_timeout(timeout).is_ok()
     }
 
+    /// Waits until the backend reached the gate; the created process's pid when the gate
+    /// carries one (`RejectJobList(Some(_))`'s suspended create), `None` otherwise or at
+    /// `timeout`.
+    #[must_use]
+    pub fn wait_reached_pid(&self, timeout: Duration) -> Option<u32> {
+        self.reached.recv_timeout(timeout).ok().flatten()
+    }
+
     /// Lets the backend continue.
     pub fn open(self) {
         let _ = self.open.send(());
@@ -137,7 +146,16 @@ impl Gate {
     /// Signals `reached` and waits for `open` (at most `HOOK_WAIT`); a timeout or a dropped
     /// sender records `gate_abandoned` and continues.
     pub(crate) fn pass(&self) {
-        let _ = self.reached.send(());
+        self.pass_with(None);
+    }
+
+    /// [`Gate::pass`], its `reached` signal carrying the created process's pid.
+    pub(crate) fn pass_pid(&self, pid: u32) {
+        self.pass_with(Some(pid));
+    }
+
+    fn pass_with(&self, pid: Option<u32>) {
+        let _ = self.reached.send(pid);
         if self.open.recv_timeout(HOOK_WAIT).is_err() {
             with_report(|r| r.gate_abandoned = true);
         }

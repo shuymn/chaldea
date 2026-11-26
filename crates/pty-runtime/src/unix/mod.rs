@@ -4,7 +4,7 @@
 
 mod child;
 mod io;
-mod kill;
+pub(crate) mod kill;
 #[allow(unsafe_code)]
 pub(crate) mod sys;
 pub(crate) mod table;
