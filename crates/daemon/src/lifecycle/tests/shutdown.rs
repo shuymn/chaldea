@@ -572,6 +572,45 @@ fn no_unlink_after_the_record_budget() {
     assert!(log.text().contains("was left in place"), "{}", log.text());
 }
 
+/// PR8-CL-23: a removal refused once whose next attempt reaches the unlink only after the
+/// budget (paused there) is logged with its refusal, not as a removal that never started.
+#[test]
+fn refused_removal_past_the_budget_names_the_refusal() {
+    use std::sync::atomic::Ordering;
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    faults.record_remove_fails.store(u32::MAX, Ordering::SeqCst);
+    let retry = faults.park(Point::RecordRetry);
+    let run = start(
+        foreground(&dir.path, Some(hold_port())),
+        TestComponents::default(),
+        faults.clone(),
+    );
+    run.serving();
+    run.stop();
+    assert!(retry.wait_reached(WAIT));
+    // The next attempt holds after its re-read until the budget has ended.
+    let verified = faults.park(Point::AfterRecordVerify);
+    retry.release();
+    assert!(verified.wait_reached(WAIT));
+    std::thread::sleep(Duration::from_millis(600));
+    verified.release();
+    let log = run.log.clone();
+    let r = run.join();
+    assert_eq!(r.code.code(), 0, "{}", log.text());
+    assert!(dir.path.join(names::RECORD).exists(), "{}", log.text());
+    assert!(
+        log.text().contains("could not be removed"),
+        "{}",
+        log.text()
+    );
+    assert!(
+        !log.text().contains("did not start within"),
+        "{}",
+        log.text()
+    );
+}
+
 /// PR8-CL-23: the record says `stopping` before HTTP shuts down. The rewrite has a
 /// test-set budget of `WAIT` (and the run a shutdown budget long enough to hold it), so a
 /// slow write or a held rewrite does not run out of time; `stalled_stopping_rewrite_does_not_hold_http`

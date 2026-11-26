@@ -367,11 +367,15 @@ impl Coordinator {
                 return Err(Crashed);
             }
             if Instant::now() >= end {
-                self.log.warn(&format!(
-                    "the discovery record {} was left in place: its removal did not start within {} ms",
-                    path.display(),
-                    RECORD_REMOVAL.as_millis()
-                ));
+                // An earlier refusal or failed re-read says more than the budget's end.
+                match &failed {
+                    Some(why) => self.log.warn(why),
+                    None => self.log.warn(&format!(
+                        "the discovery record {} was left in place: its removal did not start within {} ms",
+                        path.display(),
+                        RECORD_REMOVAL.as_millis()
+                    )),
+                }
                 return Ok(());
             }
             #[cfg(test)]
