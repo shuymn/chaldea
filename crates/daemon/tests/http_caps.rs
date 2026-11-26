@@ -37,6 +37,39 @@ async fn quiet(tune: impl FnOnce(&mut HttpConfig)) -> TestServer {
     .await
 }
 
+/// How long [`StoppedTimers`] holds tokio's clock at most: a guard that turns a hang into
+/// the test's own timeouts, longer than every server timer it holds (the sockets' 75 s
+/// idle deadline the longest).
+const STOPPED_TIMERS_GUARD: Duration = Duration::from_secs(120);
+
+/// Tokio's clock stopped on this test's current-thread runtime, which also runs the
+/// server: no timer of the server's or the test's fires until [`StoppedTimers::run`].
+/// Paused time alone auto-advances to the next timer whenever the runtime waits on I/O;
+/// a blocking task waiting for the release keeps it from doing so (tokio's `pause`,
+/// "Preventing auto-advance").
+struct StoppedTimers {
+    release: std::sync::mpsc::Sender<()>,
+    blocking: tokio::task::JoinHandle<()>,
+}
+
+impl StoppedTimers {
+    fn stop() -> Self {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let blocking = tokio::task::spawn_blocking(move || {
+            let _ = released.recv_timeout(STOPPED_TIMERS_GUARD);
+        });
+        tokio::time::pause();
+        StoppedTimers { release, blocking }
+    }
+
+    /// Lets the clock run on real time again, from where it stopped.
+    async fn run(self) {
+        tokio::time::resume();
+        drop(self.release);
+        self.blocking.await.unwrap();
+    }
+}
+
 /// Tickets held at once, and per token.
 const TICKETS: usize = 1024;
 const TICKETS_PER_TOKEN: usize = 32;
@@ -48,6 +81,8 @@ const SUBSCRIPTIONS: usize = 1024;
 const MESSAGE_BYTES: usize = 64 * 1024;
 
 async fn tickets_cap(srv: &TestServer) {
+    // No ticket expires, and so none is pruned, however long the fill takes.
+    srv.clock.stop();
     let mut tokens = Vec::new();
     for _ in 0..TICKETS / TICKETS_PER_TOKEN {
         tokens.push(srv.token(TokenKind::Owner, None, None).await);
@@ -76,6 +111,8 @@ async fn tickets_cap(srv: &TestServer) {
 }
 
 async fn pair_codes_cap(srv: &TestServer) {
+    // No code expires, and so none is pruned, however long the fill takes.
+    srv.clock.stop();
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let mut codes = Vec::new();
     for _ in 0..PAIR_CODES {
@@ -129,6 +166,9 @@ async fn close_and_reopen(srv: &TestServer, mut ws: WsClient, token: &str) {
 }
 
 async fn sockets_cap(srv: &TestServer) {
+    // No socket is dropped at its idle deadline before the refusals, however long the
+    // upgrades take.
+    let timers = StoppedTimers::stop();
     let (max, per) = (SOCKETS, SOCKETS_PER_TOKEN);
     let mut tokens = Vec::new();
     let mut open = Vec::new();
@@ -142,6 +182,7 @@ async fn sockets_cap(srv: &TestServer) {
     // The 129th, by a token holding none.
     let fresh = srv.token(TokenKind::Owner, None, None).await;
     assert_eq!(upgrade_status(srv, &fresh).await, 503);
+    timers.run().await;
     let ws = open[0].pop().unwrap();
     close_and_reopen(srv, ws, &tokens[0]).await;
 }
@@ -295,7 +336,7 @@ async fn socket_frame_caps(srv: &TestServer) {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn each_cap_at_its_boundary() {
     // A server per cap: a full ticket table would refuse the other cases' tickets.
     let srv = quiet(|_| {}).await;
@@ -325,18 +366,23 @@ async fn oversized_message_closes_with_1009() {
 }
 
 /// The blob slots' cap: all four held by clients that never read past the head (the last
-/// allowed), a download is refused with 503 `busy` while they hold them (the first refused); their connections end at the write stall, before the
-/// whole body was sent; and the next download acquires a slot and completes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// allowed), a download is refused with 503 `busy` while they hold them (the first
+/// refused); their connections end at the write stall, before the whole body was sent;
+/// and the next download acquires a slot and completes. The slots are taken and the
+/// refused download sent with tokio's clock stopped, so no write stall ends a held
+/// connection before the refusal, however long those steps take.
+#[tokio::test]
 async fn blob_slot_frees_after_a_stalled_client() {
     let srv = quiet(|c| c.write_stall_timeout = Duration::from_millis(500)).await;
     let req = big_blob(&srv).await;
     let base = srv.server.tasks();
+    let timers = StoppedTimers::stop();
     let mut held = Vec::new();
     for _ in 0..BLOB_SLOTS {
         held.push(stalled_download(&srv, &req).await);
     }
     busy(&srv.send(&req).await);
+    timers.run().await;
     let until = Instant::now() + Duration::from_secs(20);
     let r = loop {
         let r = srv.send(&req).await;
