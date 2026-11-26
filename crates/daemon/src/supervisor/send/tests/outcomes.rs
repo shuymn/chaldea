@@ -82,10 +82,11 @@ async fn outcomes() {
             .contains(&AttentionCause::InputUnconfirmed { input_id: id })
     );
     assert_eq!(moves(&rig, &live, id).last().unwrap().1, "unconfirmed");
-    assert!(
-        rig.sl(&live).state().running.is_none(),
-        "the record ended the unit"
-    );
+    // The worker clears `running` after the completion job commits the input's move.
+    rig.until("the record ended the unit", || {
+        rig.sl(&live).state().running.is_none()
+    })
+    .await;
     rig.stop().await;
 
     // Busy: the op lock taken between the open job and the submit.
