@@ -121,6 +121,62 @@ pub fn state() -> Dir {
     Dir { tmp, path }
 }
 
+/// `name` in the OS temp directory, opened (created if absent) for a test's file lock: shared
+/// by every test process that resolves the same temp directory (`TMPDIR`; `TMP` or `TEMP` on
+/// Windows). Exclusive locks on it exclude each other per handle, between threads of one
+/// process as between processes (`flock` on Unix, `LockFileEx` on Windows).
+#[must_use]
+pub fn lock_file(name: &str) -> std::fs::File {
+    let path = std::env::temp_dir().join(name);
+    // A regular file only: opening a FIFO for writing would wait for a reader.
+    if let Ok(m) = std::fs::symlink_metadata(&path) {
+        assert!(m.is_file(), "{} is not a regular file", path.display());
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert!(file.metadata().unwrap().is_file(), "{}", path.display());
+    file
+}
+
+/// The ports [`reserve_port`] hands out: above the design's range (7373–7472), which a daemon
+/// started without `--port` or a saved port scans, and below the dynamic port range of macOS
+/// and Windows, so neither a scanning daemon nor an outgoing connection takes one.
+const RESERVED: std::ops::RangeInclusive<u16> = 7473..=7672;
+
+/// The lock files of this process's reserved ports, held until it exits.
+static RESERVATIONS: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
+
+/// A port for a daemon's `--port` that no other test, in this process or another, gives its
+/// daemon until this process exits, so it stays this test's across the daemon's restarts on
+/// its saved port. A test holds an exclusive lock on `chaldea-test-port-<p>.lock` (see
+/// [`lock_file`]) for each port it reserves and skips ports locked by another; a port is taken
+/// only if it also binds, which skips one a process outside the protocol holds (such as a
+/// daemon left running by a test process that was killed).
+#[must_use]
+pub fn reserve_port() -> u16 {
+    for p in RESERVED {
+        let file = lock_file(&format!("chaldea-test-port-{p}.lock"));
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => continue,
+            Err(std::fs::TryLockError::Error(e)) => panic!("port {p}'s lock: {e}"),
+        }
+        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+            RESERVATIONS.lock().unwrap().push(file);
+            return p;
+        }
+    }
+    panic!(
+        "no port of {}–{} is free to reserve",
+        RESERVED.start(),
+        RESERVED.end()
+    );
+}
+
 /// `chaldea <args>` with `CHALDEA_STATE_DIR` removed unless `env` sets it.
 #[must_use]
 pub fn chaldea(args: &[&str], env: &[(&str, &OsStr)]) -> Command {

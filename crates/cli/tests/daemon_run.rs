@@ -5,7 +5,7 @@
 mod support;
 
 use std::ffi::OsStr;
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -25,19 +25,17 @@ use support::{
 const FIRST: u16 = 7373;
 const LAST: u16 = 7472;
 
-/// Every daemon of these tests chooses its port from the range (no test picks a port that it
-/// then releases), so the tests run one at a time, in this process and across processes: a
-/// port a test expects to be the first free one, or its own saved port, is not taken by
-/// another test's daemon in between. The daemon takes only a port number (`--port`, the
-/// saved port, or the range), never a bound listener, so a port of the range cannot be
-/// reserved for one test.
+/// A daemon of these tests chooses its port from the range only where the test is about that
+/// choice (or about what it takes no port for); every other test gives its state directory's
+/// first start a reserved port (`support::reserve_port`), which stays the test's across its
+/// restarts on the saved port. The tests run one at a time, in this process and across
+/// processes, so the first free port of the range that a test expects is not taken by a
+/// daemon of another of these tests in between.
 ///
-/// The turn is an exclusive lock on [`PORTS_LOCK`] in the OS temp directory, taken through
-/// a handle of the test's own. Such locks exclude each other per handle, between threads of
-/// one process as between processes (`flock` on Unix, `LockFileEx` on Windows). Its scope:
-/// the `daemon_run` tests of every process that resolves the same temp directory
-/// (`TMPDIR`; `TMP` or `TEMP` on Windows). Other binaries whose daemons choose ports from
-/// the range, such as `daemon_stop`, do not take it.
+/// The turn is an exclusive lock on [`PORTS_LOCK`] (`support::lock_file`), taken through a
+/// handle of the test's own. Its scope: the `daemon_run` tests of every process that resolves
+/// the same temp directory. Other binaries whose daemons choose ports from the range, such as
+/// `daemon_stop`, do not take it.
 const PORTS_LOCK: &str = "chaldea-daemon-run-ports.lock";
 /// How long a test waits for its turn, from the start of [`serial`] to the lock.
 const PORTS_WAIT: Duration = Duration::from_secs(600);
@@ -46,30 +44,18 @@ const PORTS_WAIT: Duration = Duration::from_secs(600);
 /// closes, on drop or at the process's exit.
 fn serial() -> File {
     let end = Instant::now() + PORTS_WAIT;
-    let path = std::env::temp_dir().join(PORTS_LOCK);
-    // A regular file only: opening a FIFO for writing would wait for a reader.
-    if let Ok(m) = std::fs::symlink_metadata(&path) {
-        assert!(m.is_file(), "{} is not a regular file", path.display());
-    }
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .unwrap();
-    assert!(file.metadata().unwrap().is_file(), "{}", path.display());
+    let file = support::lock_file(PORTS_LOCK);
     loop {
         match file.try_lock() {
             Ok(()) => return file,
             Err(TryLockError::WouldBlock) => {
                 assert!(
                     Instant::now() < end,
-                    "no turn on {} within {PORTS_WAIT:?}",
-                    path.display()
+                    "no turn on {PORTS_LOCK} within {PORTS_WAIT:?}"
                 );
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(TryLockError::Error(e)) => panic!("{}: {e}", path.display()),
+            Err(TryLockError::Error(e)) => panic!("{PORTS_LOCK}: {e}"),
         }
     }
 }
@@ -85,17 +71,23 @@ fn first_free_in_range() -> u16 {
         .expect("a free port in the range")
 }
 
-/// Starts a daemon on `dir`, which chooses its port, and waits for it to serve.
+/// `--port` for a start on `dir`: a reserved port on its first start, none (the saved port)
+/// after it.
+fn own_port(dir: &Path) -> Option<u16> {
+    (!dir.join(names::PORT).exists()).then(support::reserve_port)
+}
+
+/// Starts a daemon on `dir` (on [`own_port`]) and waits for it to serve.
 fn serve(dir: &Path) -> (Proc, u16) {
-    let p = Proc::spawn(&mut run_cmd(dir, None));
+    let p = Proc::spawn(&mut run_cmd(dir, own_port(dir)));
     let port = p.serving();
     (p, port)
 }
 
-/// Starts, serves, and stops a daemon on `dir` (a state directory with a database, a token, and
-/// a saved port).
-fn serve_once(dir: &Path, port: Option<u16>) -> u16 {
-    let mut p = Proc::spawn(&mut run_cmd(dir, port));
+/// Starts, serves, and stops a daemon on `dir` (on [`own_port`]), leaving a state directory
+/// with a database, a token, and a saved port.
+fn serve_once(dir: &Path) -> u16 {
+    let mut p = Proc::spawn(&mut run_cmd(dir, own_port(dir)));
     let got = p.serving();
     assert_eq!(p.stop_and_wait(dir), 0, "{}", p.stderr());
     got
@@ -165,7 +157,7 @@ fn serving_pid(dir: &Path) -> Option<u32> {
 fn in_progress_receipt_becomes_unknown() {
     let _s = serial();
     let dir = state();
-    serve_once(&dir.path, None);
+    serve_once(&dir.path);
     let cmd = CommandId::from_u128(0x5000_0000_0000_0000_0000_0000_0000_0001);
     let token = TokenId::from_u128(0x6000_0000_0000_0000_0000_0000_0000_0001);
     let store = open_store(&dir.path);
@@ -178,7 +170,7 @@ fn in_progress_receipt_becomes_unknown() {
     );
     close_store(&store);
 
-    serve_once(&dir.path, None);
+    serve_once(&dir.path);
     let store = open_store(&dir.path);
     let status = store
         .read(Instant::now() + support::WAIT, |tx| tx.receipt(cmd))
@@ -255,7 +247,7 @@ fn issues_owner_token() {
 fn keeps_a_valid_token_across_restart() {
     let _s = serial();
     let dir = state();
-    serve_once(&dir.path, None);
+    serve_once(&dir.path);
     let t1 = token_of(&dir.path);
     let (mut d, port) = serve(&dir.path);
     assert_eq!(token_of(&dir.path), t1);
@@ -272,7 +264,7 @@ fn keeps_a_valid_token_across_restart() {
 fn reissues_a_revoked_token() {
     let _s = serial();
     let dir = state();
-    serve_once(&dir.path, None);
+    serve_once(&dir.path);
     let t1 = token_of(&dir.path);
     let store = open_store(&dir.path);
     let secret = t1.clone();
@@ -337,7 +329,7 @@ fn refuses_a_valid_token_with_wrong_permissions() {
     let _s = serial();
     // A token a daemon issued, copied into a fresh state directory without a database.
     let issued = state();
-    serve_once(&issued.path, None);
+    serve_once(&issued.path);
     let bytes = std::fs::read(issued.path.join(names::OWNER_TOKEN)).unwrap();
     let dir = state();
     marked_dir(&dir.path);
@@ -391,20 +383,20 @@ fn taken_first_port_is_skipped() {
 fn same_port_after_restart() {
     let _s = serial();
     let dir = state();
-    let first = serve_once(&dir.path, None);
+    let first = serve_once(&dir.path);
     let mut d = Proc::spawn(&mut run_cmd(&dir.path, None));
     assert_eq!(d.serving(), first);
     assert_eq!(d.stop_and_wait(&dir.path), 0);
 }
 
 /// An explicit `--port` through the real bind: with saved port X, `--port Y` (a port another
-/// daemon chose and released) serves on Y, saves Y, and says to re-pair.
+/// daemon served on and released) serves on Y, saves Y, and says to re-pair.
 #[test]
 fn explicit_port_is_served_and_saved() {
     let _s = serial();
     let (a, b) = (state(), state());
     let (mut first, x) = serve(&a.path);
-    let y = serve_once(&b.path, None);
+    let y = serve_once(&b.path);
     assert_eq!(first.stop_and_wait(&a.path), 0, "{}", first.stderr());
     assert_ne!(x, y);
     let mut d = Proc::spawn(&mut run_cmd(&a.path, Some(y)));
@@ -422,7 +414,7 @@ fn explicit_port_is_served_and_saved() {
 fn failed_override_keeps_the_saved_port() {
     let _s = serial();
     let dir = state();
-    let saved = serve_once(&dir.path, None);
+    let saved = serve_once(&dir.path);
     let taken = TcpListener::bind("127.0.0.1:0").unwrap();
     let q = taken.local_addr().unwrap().port();
     let (code, _out, err) = run_to_exit(&mut run_cmd(&dir.path, Some(q)));
@@ -435,7 +427,7 @@ fn failed_override_keeps_the_saved_port() {
 fn taken_saved_port_is_reported() {
     let _s = serial();
     let dir = state();
-    let saved = serve_once(&dir.path, None);
+    let saved = serve_once(&dir.path);
     let _taken = TcpListener::bind((Ipv4Addr::LOCALHOST, saved)).unwrap();
     let os_error = TcpListener::bind((Ipv4Addr::LOCALHOST, saved))
         .unwrap_err()
