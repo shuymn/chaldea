@@ -1618,9 +1618,7 @@ pub fn check_model(r: &ReadTx<'_>, m: &Model) -> Result<(), String> {
 /// The bytes of a blob input, for tests that build blob content by hand.
 #[must_use]
 pub fn blob_input(data: &[u8]) -> BlobInput {
-    BlobInput {
-        data: data.to_vec(),
-    }
+    BlobInput::Bytes(data.to_vec())
 }
 
 /// Inserts one event row with raw SQL into the closed store at `path` (the store's checks

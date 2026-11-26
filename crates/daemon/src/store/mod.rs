@@ -15,6 +15,7 @@ mod project;
 mod readers;
 mod rows;
 mod schema;
+mod spool;
 mod write_tx;
 mod writer;
 
@@ -66,10 +67,12 @@ pub use error::{OpenError, ProjectionError, ReadError, StoreError};
 pub(crate) use readers::launch_reads;
 pub use readers::{Page, ReadTx};
 pub use rows::{
-    ApprovalRow, Binding, BlobBody, BufferedDelivery, BufferedHook, BufferedSummary, HookDelivery,
-    HookDeliveryLookup, HookReply, InputRow, LaunchRow, ProjectionDiff, RebuildReport, Routing,
-    SchemaInfo, SurfaceRow, ThreadRow, TokenKind, TokenRow, TranscriptCursor, WorktreeRow,
+    ApprovalRow, Binding, BlobBody, BlobDownload, BufferedDelivery, BufferedHook, BufferedSummary,
+    HookDelivery, HookDeliveryLookup, HookReply, InputRow, LargeBlob, LaunchRow, ProjectionDiff,
+    RebuildReport, Routing, SchemaInfo, SurfaceRow, ThreadRow, TokenKind, TokenRow,
+    TranscriptCursor, WorktreeRow,
 };
+pub use spool::{BlobSpool, SPOOL_FILE_PREFIX, SpooledBlob};
 pub use write_tx::{
     Appended, BlobInput, CommitStamp, CursorPos, NewEvent, NewGeneration, NewHookDelivery,
     NewRouting, NewToken, Promotion, ReadPos, TokenSelector, TranscriptBatch, TranscriptLine,
@@ -459,6 +462,23 @@ impl Store {
     #[must_use]
     pub fn paths(&self) -> StorePaths {
         self.inner.paths.clone()
+    }
+
+    /// A spool for one value of unknown length, its temporary file in the state directory
+    /// (the database's directory), never `TMPDIR` (§2.5).
+    ///
+    /// # Errors
+    ///
+    /// The file could not be created.
+    pub fn blob_spool(&self) -> std::io::Result<BlobSpool> {
+        let dir = self
+            .inner
+            .paths
+            .db
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        BlobSpool::create(dir)
     }
 
     /// Queues a write job. Fails at once, without waiting, when the queue is full, closed,
