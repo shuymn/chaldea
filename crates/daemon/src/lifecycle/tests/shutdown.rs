@@ -346,6 +346,8 @@ fn record_removal_is_retried() {
     for (fails, removed) in [(2, true), (u32::MAX, false)] {
         let dir = state();
         let faults = Arc::new(Faults::default());
+        // Long enough that a late retry wake on a loaded host still retries.
+        *faults.record_removal.lock().unwrap() = Some(Duration::from_secs(5));
         faults.record_remove_fails.store(fails, Ordering::SeqCst);
         let run = start(
             foreground(&dir.path, Some(hold_port())),
@@ -387,6 +389,8 @@ fn record_verify_failure_is_retried() {
     for (fails, removed) in [(1, true), (u32::MAX, false)] {
         let dir = state();
         let faults = Arc::new(Faults::default());
+        // Long enough that a late retry wake on a loaded host still retries.
+        *faults.record_removal.lock().unwrap() = Some(Duration::from_secs(5));
         let run = start(
             foreground(&dir.path, Some(hold_port())),
             TestComponents::default(),
@@ -580,6 +584,8 @@ fn refused_removal_past_the_budget_names_the_refusal() {
     let dir = state();
     let faults = Arc::new(Faults::default());
     faults.record_remove_fails.store(u32::MAX, Ordering::SeqCst);
+    // Room for a slow test thread between the two parks.
+    *faults.record_removal.lock().unwrap() = Some(Duration::from_secs(2));
     let retry = faults.park(Point::RecordRetry);
     let run = start(
         foreground(&dir.path, Some(hold_port())),
@@ -593,7 +599,7 @@ fn refused_removal_past_the_budget_names_the_refusal() {
     let verified = faults.park(Point::AfterRecordVerify);
     retry.release();
     assert!(verified.wait_reached(WAIT));
-    std::thread::sleep(Duration::from_millis(600));
+    std::thread::sleep(Duration::from_millis(2100));
     verified.release();
     let log = run.log.clone();
     let r = run.join();
