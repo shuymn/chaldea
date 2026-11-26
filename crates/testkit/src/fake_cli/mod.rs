@@ -257,6 +257,7 @@ pub(crate) fn hello(o: &Opts, raw: bool) -> Reporter {
         "mode": o.mode.name(),
         "role": role,
         "pid": std::process::id(),
+        "argv": std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>(),
         "raw": raw,
         "fds": fds,
     });

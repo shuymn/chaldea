@@ -11,6 +11,9 @@
 //! | `{ "nested": [<step>, …] }` | a nested FakeCli `hooks` with those steps, inheriting the environment; waits for it |
 //! | `{ "wait_file": "<path>" }` | waits until the file exists, at most [`WAIT_FILE`] |
 //!
+//! Each `$SESSION` in the script is first replaced by the session id (`--session-id`, or the
+//! launch's own after `--`).
+//!
 //! Reports: `emitted` per emitter run (`step`, `code` or null when it did not exit by its
 //! deadline, `elapsed_ms`, `stdout_len`, `stderr_len`, each null when that pipe did not close
 //! by the deadline plus the reap); `nested` per nested run (`step`, `code`); `wait_file`
@@ -42,8 +45,11 @@ pub(crate) fn run(o: &Opts) -> i32 {
     let Some(emitter) = o.emitter.as_deref() else {
         return 2;
     };
-    let Some(Ok(Value::Array(steps))) = o.script.as_deref().map(serde_json::from_str::<Value>)
-    else {
+    let script = o
+        .script
+        .as_deref()
+        .map(|s| s.replace("$SESSION", o.session_id.as_deref().unwrap_or_default()));
+    let Some(Ok(Value::Array(steps))) = script.as_deref().map(serde_json::from_str::<Value>) else {
         rep.send(&json!({"event": "script_error"}));
         return 2;
     };
