@@ -384,9 +384,10 @@ mod macos {
         stop(&labels, &d.path);
     }
 
-    /// PR8-CL-13: `bootstrap` times out and the job registers only 1 s into the reserve: the
-    /// first lookups answer absent, a later one present, and the start proceeds to a verdict
-    /// instead of exiting 1.
+    /// PR8-CL-13: `bootstrap` times out and the job registers only after the first lookup
+    /// answered absent: a later lookup answers present, and the start proceeds to a verdict
+    /// instead of exiting 1. The fault orders the registration by the lookups, not by time, so
+    /// the daemon's readiness keeps nearly the whole deadline, as in any start.
     fn timeout_then_absent_then_present() {
         require_gui();
         let labels = Labels::new();

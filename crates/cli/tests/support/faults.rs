@@ -629,10 +629,14 @@ fn is_service_print(args: &[&OsStr]) -> bool {
 /// - `probe-timeout`: `print gui/<uid>` waits for its deadline and times out.
 /// - `bootstrap-refused`: `bootstrap` exits 5 without registering anything.
 /// - `bootstrap-late`: the real `bootstrap`, then a wait for its deadline and a timeout.
-/// - `bootstrap-timeout-register-later`: `bootstrap` waits for its deadline and times out; the
-///   real one runs 1 s later.
+/// - `bootstrap-timeout-register-later`: `bootstrap` times out at once without registering
+///   anything; the first service lookup after it answers (absent), then the real `bootstrap`
+///   runs, so the next lookup finds the job. The order is set by the lookups, not by time,
+///   and the start keeps nearly its whole deadline for the daemon's readiness.
 /// - `all-timeout`: `bootstrap` and every service lookup wait for their deadline and time out.
 fn launchctl_fault(kind: String) -> Launchctl {
+    // The arguments of a `bootstrap` that `bootstrap-timeout-register-later` has yet to run.
+    let deferred: std::cell::RefCell<Option<Vec<OsString>>> = std::cell::RefCell::new(None);
     Box::new(move |args: &[&OsStr], deadline: Instant| {
         let op = args.first().map(|a| a.to_string_lossy().into_owned());
         let service_print = is_service_print(args);
@@ -653,15 +657,17 @@ fn launchctl_fault(kind: String) -> Launchctl {
                 Err(timed_out())
             }
             ("bootstrap-timeout-register-later", Some("bootstrap")) => {
-                let owned: Vec<OsString> = args.iter().map(|a| (*a).to_owned()).collect();
-                std::thread::spawn(move || {
-                    sleep_until(deadline + Duration::from_secs(1));
+                *deferred.borrow_mut() = Some(args.iter().map(|a| (*a).to_owned()).collect());
+                Err(timed_out())
+            }
+            ("bootstrap-timeout-register-later", Some("print")) if service_print => {
+                let lookup = host::launchctl(args, deadline);
+                if let Some(owned) = deferred.borrow_mut().take() {
                     let refs: Vec<&OsStr> = owned.iter().map(OsString::as_os_str).collect();
                     let r = host::launchctl(&refs, Instant::now() + Duration::from_secs(10));
                     eprintln!("fault: late bootstrap -> {:?}", r.as_ref().map(|o| o.code));
-                });
-                sleep_until(deadline);
-                Err(timed_out())
+                }
+                lookup
             }
             ("all-timeout", Some("bootstrap")) => {
                 sleep_until(deadline);
