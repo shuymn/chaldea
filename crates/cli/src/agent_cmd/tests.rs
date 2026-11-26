@@ -770,8 +770,13 @@ fn claude_command_explained() {
     ));
     assert!(!String::from_utf8(err).unwrap().contains("slash command"));
     // `resume`: the daemon's `prompt_rejected` carries no reason, so the explanation is
-    // named for a Claude thread and printed only for a text Claude would run.
-    for (prompt, explained) in [(" /clear", true), ("a\u{1b}b", false)] {
+    // named for a Claude thread and printed only for a text the shared check refuses as
+    // `lossy_text` (`"/clear\u{1b}"` is `control_character` first).
+    for (prompt, explained) in [
+        (" /clear", true),
+        ("a\u{1b}b", false),
+        ("/clear\u{1b}", false),
+    ] {
         let stub = Stub::start(vec![
             ok(exited_l()),
             Reply::Json(400, error("prompt_rejected")),

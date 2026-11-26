@@ -249,8 +249,7 @@ fn is_del_or_c1(c: char) -> bool {
 /// JavaScript's `trim` keeps (it trims the prompt before looking up a slash command).
 /// JavaScript's white space is Unicode `White_Space` without U+0085 (a C1 control, dropped
 /// here) and with U+FEFF. A Claude `send` of such a text is `LossyText` at this offset.
-#[must_use]
-pub fn claude_command_at(t: &str) -> Option<usize> {
+fn claude_command_at(t: &str) -> Option<usize> {
     let mut kept = t.char_indices().filter(|&(_, c)| !is_del_or_c1(c));
     match kept.next()? {
         (at, '!' | '/') => Some(at),

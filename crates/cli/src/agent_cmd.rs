@@ -16,7 +16,7 @@ use chaldea_core::command::{
 };
 use chaldea_core::http::{ErrorBody, ErrorCode};
 use chaldea_core::ids::{Agent, ApprovalId, CommandId, InputId, LaunchId, ThreadId};
-use chaldea_core::input::encode::{Purpose, check, claude_command_at};
+use chaldea_core::input::encode::{Purpose, check};
 use chaldea_core::input::key::KeyToken;
 use chaldea_core::input::{MAX_PROMPT_BYTES, RejectReason};
 use chaldea_core::payload::{ExitReason, InputEncoding};
@@ -422,9 +422,17 @@ one that starts with `/` (after leading white space) as a slash command, so it i
 type it through attach";
 
 /// The D16 explanation where the thread's agent is not known (`send`, `resume`): named for a
-/// Claude thread, printed when `text` is one Claude would run as a command.
+/// Claude thread, printed when the shared check refuses `text` for Claude as `lossy_text`, so
+/// an earlier rule (a control character) takes precedence as it does at `spawn --prompt`.
 fn claude_command_hint(text: &str, err: &mut dyn Write) {
-    if claude_command_at(text).is_some() {
+    if check(
+        Agent::Claude,
+        InputEncoding::BracketedPaste,
+        Purpose::Send,
+        text,
+    )
+    .is_err_and(|r| r.reason == RejectReason::LossyText)
+    {
         say(err, &format!("for a Claude thread: {CLAUDE_COMMAND}"));
     }
 }
