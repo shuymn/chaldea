@@ -64,6 +64,8 @@ pub struct FakeScript {
     /// The child's `wait_timeout` blocks until [`FakeChild::release_waiter`], so a close
     /// returns with `pty-wait` abandoned.
     pub hold_waiter: bool,
+    /// `spawn` panics (a fault of the backend's own code).
+    pub panic_spawn: bool,
 }
 
 /// What the fake child observed, in order.
@@ -253,6 +255,7 @@ impl PtyRuntime for FakePty {
     fn spawn(&self, spec: &SpawnSpec, output: DrainSink) -> Result<SpawnedPty, SpawnError> {
         lock(&self.inner.specs).push(spec.clone());
         let script = lock(&self.inner.next).take().unwrap_or_default();
+        assert!(!script.panic_spawn, "injected spawn panic");
         if let Some(e) = script.fail {
             return Err(e);
         }

@@ -1,5 +1,6 @@
 //! `SupervisorComponents` (design §2.9 "Components"): the restart reconcilers, the
-//! `Supervisor` with its four handlers, the shutdown participant, the mounts, and the tick.
+//! `Supervisor` with its four handlers, the shutdown participant, the mounts, the tick, and
+//! the restart prober (`docs/design/supervisor-recovery.md` §2.3).
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -68,6 +69,7 @@ impl Components for SupervisorComponents {
             ctx.store.clone(),
             ctx.sink.clone(),
             ctx.port,
+            ctx.instance.clone(),
         );
         self.sup = Some(sup.clone());
         Built {
@@ -86,6 +88,7 @@ impl Components for SupervisorComponents {
             sup.rt.spawn(sup.clone().tick_loop());
         }
         sup.start_send_driver();
+        sup.rt.spawn(super::prober::run(sup.clone()));
     }
 }
 
@@ -97,6 +100,7 @@ pub(crate) fn new_supervisor(
     store: Store,
     sink: Arc<dyn crate::http::LifecycleSink>,
     port: u16,
+    instance: String,
 ) -> Arc<Supervisor> {
     Arc::new(Supervisor {
         host_os,
@@ -111,6 +115,8 @@ pub(crate) fn new_supervisor(
         window: OnceLock::new(),
         send,
         rt: tokio::runtime::Handle::current(),
+        instance,
+        probe_slots: Arc::new(tokio::sync::Semaphore::new(super::PROBE_SLOTS)),
     })
 }
 

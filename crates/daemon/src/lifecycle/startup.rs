@@ -653,6 +653,7 @@ pub(crate) async fn run(mut cx: StartupCtx) -> Started {
         sink: sink.clone(),
         port,
         state_dir: dir.clone(),
+        instance: cx.instance.clone(),
     });
     st.participants = built.participants;
     let server = HttpServer::new(

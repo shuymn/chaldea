@@ -23,6 +23,7 @@ mod events;
 mod exit;
 mod live;
 mod ops;
+pub(crate) mod prober;
 pub(crate) mod record;
 mod restart;
 pub mod send;
@@ -39,7 +40,8 @@ use std::time::{Duration, Instant};
 
 use chaldea_core::adapter::{HostOs, ReadinessMode};
 use chaldea_core::ids::{Agent, LaunchId, ThreadId};
-use chaldea_pty_runtime::{CloseBounds, PtyRuntime, PtySize};
+use chaldea_pty_runtime::orphan::OrphanReport;
+use chaldea_pty_runtime::{CloseBounds, ProcessIdentity, PtyRuntime, PtySize};
 use futures_util::future::BoxFuture;
 
 use crate::hook::HookConfig;
@@ -77,6 +79,14 @@ pub(crate) const EXIT_ROUND: Duration = Duration::from_secs(10);
 pub(crate) const EXIT_TOTAL: Duration = Duration::from_secs(60);
 /// The commands' request budget.
 pub(crate) const COMMAND_DEADLINE: Duration = Duration::from_secs(30);
+/// The restart prober (`docs/design/supervisor-recovery.md` §2.3): one probe's deadline, the
+/// grace its join gets after it, the probes run at once, the candidate read's bound, and the
+/// slot wait's.
+pub(crate) const PROBE_BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const PROBE_JOIN_GRACE: Duration = Duration::from_secs(1);
+pub(crate) const PROBE_SLOTS: usize = 4;
+pub(crate) const PROBE_READ: Duration = Duration::from_secs(10);
+pub(crate) const SLOT_WAIT: Duration = Duration::from_secs(30);
 
 /// A point where a test holds the supervisor (design §6 "Host speed"). The daemon's own
 /// configuration has no pauses; only a component built by a test sets one.
@@ -139,6 +149,12 @@ pub enum Pause {
     GitShutdownReap,
     /// The shutdown git step after reading the slot (async).
     GitShutdownRead,
+    /// The restart prober at its start, before it reads admission (async).
+    ProberStart,
+    /// A probe's blocking task once started, before it reads admission (blocking).
+    ProbeQueued,
+    /// A probe's blocking task after `kill_recorded` returned (blocking).
+    ProbeTask,
     /// A VT snapshot's task before it copies the screen (blocking; unit tests only).
     #[cfg(test)]
     SnapshotCopy,
@@ -168,6 +184,11 @@ impl Pauses for NoPauses {}
 /// The program and its leading arguments for an agent; `None` when it is not found.
 #[doc(hidden)]
 pub type ProgramFn = Arc<dyn Fn(Agent) -> Option<Vec<OsString>> + Send + Sync>;
+
+/// The unowned kill of recorded identities: `chaldea_pty_runtime::orphan::kill_recorded`
+/// outside tests, its deadline in real time.
+#[doc(hidden)]
+pub type KillRecordedFn = Arc<dyn Fn(&[ProcessIdentity], Instant) -> OrphanReport + Send + Sync>;
 
 /// The supervisor's settings. [`SupervisorConfig::default`] is the daemon's.
 pub struct SupervisorConfig {
@@ -213,6 +234,9 @@ pub struct SupervisorConfig {
     /// Whether each launch's send worker and the driver run (unit tests that drive no send
     /// turn them off).
     pub(crate) send_workers: bool,
+    /// The restart prober's OS work (`docs/design/supervisor-recovery.md` §2.3).
+    #[doc(hidden)]
+    pub kill_recorded: KillRecordedFn,
 }
 
 impl Default for SupervisorConfig {
@@ -236,6 +260,7 @@ impl Default for SupervisorConfig {
             decoder: Arc::new(send::NoDecoder),
             readiness_mode: None,
             send_workers: true,
+            kill_recorded: Arc::new(chaldea_pty_runtime::orphan::kill_recorded),
         }
     }
 }
@@ -267,6 +292,10 @@ pub(crate) struct Supervisor {
     pub(crate) send: Arc<send::SendSide>,
     /// The runtime ops run on (the daemon's).
     pub(crate) rt: tokio::runtime::Handle,
+    /// This daemon run's instance UUID (`BuildCtx.instance`): a probe's `probe_run`.
+    pub(crate) instance: String,
+    /// The restart prober's concurrency slots (`PROBE_SLOTS`).
+    pub(crate) probe_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl Supervisor {

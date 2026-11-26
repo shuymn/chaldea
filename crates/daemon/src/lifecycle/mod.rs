@@ -180,6 +180,8 @@ pub struct BuildCtx {
     pub sink: Arc<dyn LifecycleSink>,
     pub port: u16,
     pub state_dir: PathBuf,
+    /// This run's instance UUID, as the discovery record carries it.
+    pub instance: String,
 }
 
 /// What the components built: the HTTP mounts, the command handlers, and the shutdown
