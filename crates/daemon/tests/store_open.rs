@@ -131,7 +131,7 @@ END;
 PRAGMA user_version = 3;
 "#;
 
-/// A schema version above the binary's is refused.
+/// A schema version above the binary's is refused before the file changes.
 #[test]
 fn refuses_newer_schema() {
     let mut s = TestStore::new();
@@ -140,6 +140,7 @@ fn refuses_newer_schema() {
         .unwrap()
         .execute_batch("PRAGMA user_version = 99")
         .unwrap();
+    let before = std::fs::read(s.path()).unwrap();
     let r = open(&s.path());
     assert!(
         matches!(
@@ -152,6 +153,7 @@ fn refuses_newer_schema() {
         "{:?}",
         r.err()
     );
+    assert_eq!(std::fs::read(s.path()).unwrap(), before);
 }
 
 /// A dropped trigger is a changed schema, named in the error.

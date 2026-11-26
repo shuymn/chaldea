@@ -7,7 +7,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use chaldea_core::MAX_SAFE_INTEGER;
 use chaldea_core::payload::{BlobRef, Content};
@@ -29,7 +29,8 @@ pub const SPOOL_FILE_PREFIX: &str = "chaldea-spool-";
 /// A temporary file this process created and owns: closed, then removed, when dropped.
 struct SpoolFile {
     path: PathBuf,
-    file: Mutex<Option<File>>,
+    /// Taken only by `Drop`.
+    file: Option<Mutex<File>>,
 }
 
 impl SpoolFile {
@@ -43,28 +44,27 @@ impl SpoolFile {
         let file = chaldea_pty_runtime::host::create_private_file(&path)?;
         Ok(SpoolFile {
             path,
-            file: Mutex::new(Some(file)),
+            file: Some(Mutex::new(file)),
         })
     }
 
+    fn lock(&self) -> io::Result<MutexGuard<'_, File>> {
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("the spool file is closed"))?;
+        Ok(super::lock(file))
+    }
+
     fn with<T>(&self, f: impl FnOnce(&mut File) -> io::Result<T>) -> io::Result<T> {
-        let mut slot = self.file.lock().unwrap_or_else(PoisonError::into_inner);
-        match slot.as_mut() {
-            Some(file) => f(file),
-            None => Err(io::Error::other("the spool file is closed")),
-        }
+        f(&mut *self.lock()?)
     }
 }
 
 impl Drop for SpoolFile {
     fn drop(&mut self) {
         // Closed first: Windows does not remove a file with an open handle.
-        drop(
-            self.file
-                .get_mut()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take(),
-        );
+        drop(self.file.take());
         if let Err(e) = std::fs::remove_file(&self.path) {
             tracing::warn!(path = %self.path.display(), error = %e, "removing a blob spool file failed");
         }
@@ -267,21 +267,14 @@ impl SpooledBlob {
         mut each: impl FnMut(u64, &[u8]) -> Result<(), StoreError>,
     ) -> Result<(String, u64), StoreError> {
         let io = |e: io::Error| StoreError::from(ContentError::Spool(e.to_string()));
-        let mut slot = self
-            .file
-            .file
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let file = slot
-            .as_mut()
-            .ok_or_else(|| io(io::Error::other("the spool file is closed")))?;
+        let mut file = self.file.lock().map_err(io)?;
         file.seek(SeekFrom::Start(0)).map_err(io)?;
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; PART_BYTES];
         let mut total = 0u64;
         let mut index = 0u64;
         loop {
-            let n = fill(file, &mut buf).map_err(io)?;
+            let n = fill(&mut file, &mut buf).map_err(io)?;
             if n == 0 {
                 break;
             }

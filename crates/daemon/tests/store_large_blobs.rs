@@ -10,10 +10,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use chaldea_core::ids::StreamId;
-use chaldea_core::payload::Content;
+use chaldea_core::payload::{Content, INLINE_LIMIT_BYTES};
 use chaldea_daemon::store::{
     BlobDownload, BlobInput, ContentError, LargeBlob, MAX_BLOB_BYTES, Prepared, SPOOL_FILE_PREFIX,
-    StoreError, WriteError,
+    StoreError, WriteError, prepare_content,
 };
 use futures_util::FutureExt as _;
 use rusqlite::{Connection, OpenFlags};
@@ -235,7 +235,8 @@ fn large_snapshot(s: &TestStore) -> Vec<String> {
 
 /// A spooled input for `bytes` whose file then has its first byte changed (its hash still
 /// claims `bytes`), and the content of the changed bytes, whose preview the changed head
-/// matches.
+/// matches (a preview reads only the head, so a blob of the changed head's first bytes has
+/// the same one).
 fn changed_head(s: &TestStore, bytes: &[u8]) -> (Prepared, Content) {
     let p = spooled(s, bytes, TEXT);
     let Some(BlobInput::Spooled(input)) = &p.blob else {
@@ -247,13 +248,13 @@ fn changed_head(s: &TestStore, bytes: &[u8]) -> (Prepared, Content) {
         .unwrap();
     f.write_all(b"Z").unwrap();
     drop(f);
-    let mut changed = bytes.to_vec();
+    let mut changed = bytes[..=INLINE_LIMIT_BYTES].to_vec();
     changed[0] = b'Z';
     let Content::Blob {
         preview,
         preview_lossy,
         ..
-    } = spooled(s, &changed, TEXT).content
+    } = prepare_content(changed, TEXT).unwrap().content
     else {
         panic!("a blob")
     };

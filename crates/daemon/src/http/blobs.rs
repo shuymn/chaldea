@@ -185,13 +185,10 @@ impl hyper::body::Body for PartsBody {
                 let left = self.left;
                 return self.fail(format!("the parts end {left} bytes short"));
             }
-            if self.pending.is_none() {
-                let read = read_part(self.shared.clone(), self.sha.clone(), self.next);
-                self.pending = Some(read);
-            }
-            let Some(pending) = self.pending.as_mut() else {
-                continue;
-            };
+            let this = &mut *self;
+            let pending = this
+                .pending
+                .get_or_insert_with(|| read_part(this.shared.clone(), this.sha.clone(), this.next));
             let read = ready!(pending.as_mut().poll(cx));
             self.pending = None;
             let index = self.next;

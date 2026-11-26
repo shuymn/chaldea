@@ -185,27 +185,3 @@ fn in_time_shutdown_checkpoints_after_readers() {
         .collect();
     assert_eq!(marks, order);
 }
-
-/// A binary whose migrations end at v3 refuses a v4 file before changing it (§2.8 step 3).
-#[test]
-fn a_v3_binary_refuses_a_v4_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = open_with(dir.path(), Faults::default()).unwrap();
-    shutdown_checked(&store);
-    let path = dir.path().join("chaldea.db");
-    let before = std::fs::read(&path).unwrap();
-    let c = raw(&path);
-    assert_eq!(
-        crate::store::open::classify(&c, 4).unwrap(),
-        crate::store::open::Found::Ours { user_version: 4 }
-    );
-    match crate::store::open::classify(&c, 3) {
-        Err(crate::store::OpenError::NewerSchema {
-            found: 4,
-            supported: 3,
-        }) => {}
-        other => panic!("{other:?}"),
-    }
-    drop(c);
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-}

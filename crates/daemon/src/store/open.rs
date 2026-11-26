@@ -101,14 +101,13 @@ fn expect_pragma(conn: &Connection, name: &str, want: i64) -> Result<(), OpenErr
 
 /// What step 3 found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Found {
+enum Found {
     Fresh,
     Ours { user_version: u32 },
 }
 
-/// Step 3: read-only checks of an existing file, in one read transaction, by a binary
-/// whose migrations reach `supported`.
-pub(crate) fn classify(conn: &Connection, supported: u32) -> Result<Found, OpenError> {
+/// Step 3: read-only checks of an existing file, in one read transaction.
+fn classify(conn: &Connection) -> Result<Found, OpenError> {
     conn.execute_batch("BEGIN DEFERRED")?;
     let result = (|| {
         // Fixed at creation; an empty file reports the encoding it will be created with.
@@ -128,6 +127,7 @@ pub(crate) fn classify(conn: &Connection, supported: u32) -> Result<Found, OpenE
             });
         }
         let user_version = user_version(conn)?;
+        let supported = supported_version();
         if user_version > supported {
             return Err(OpenError::NewerSchema {
                 found: user_version,
@@ -363,7 +363,7 @@ pub(crate) fn open(cfg: StoreConfig, faults: Arc<Faults>) -> Result<Store, OpenE
     // 2. Writer connection.
     let conn = connect(&path, Role::Writer, cfg.busy_timeout)?;
     // 3. Read-only checks, before any change.
-    let found = classify(&conn, supported_version())?;
+    let found = classify(&conn)?;
     // 4. WAL.
     let mode: String = conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {

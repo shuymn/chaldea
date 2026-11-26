@@ -142,15 +142,8 @@ pub struct NewHookDelivery {
     pub routing: NewRouting,
 }
 
-/// The bytes of one blob an event stores.
-#[derive(Clone, Copy)]
-enum BlobData<'a> {
-    Bytes(&'a [u8]),
-    Spooled(&'a SpooledBlob),
-}
-
 /// `(sha256, data)` of the blobs an event stores.
-type BlobRows<'a> = Vec<(String, BlobData<'a>)>;
+type BlobRows<'a> = Vec<(String, &'a BlobInput)>;
 /// `(sha256, media_type, large)` of the blob references an event records; `large` names
 /// `large_blob_refs`.
 type RefRows = Vec<(String, String, bool)>;
@@ -429,14 +422,14 @@ impl<'c> WriteTx<'c> {
         }
         // Blob inputs: the store computes each in-memory hash itself, and a spooled one's
         // as it inserts the parts (step 3).
-        let mut inputs: Vec<(String, BlobData<'r>, bool)> = Vec::new();
+        let mut inputs: Vec<(String, &'r BlobInput, bool)> = Vec::new();
         for b in &row.blobs {
             match b {
                 BlobInput::Bytes(data) => {
                     if data.len() > MAX_BLOB_BYTES {
                         return Err(ContentError::TooLarge(data.len() as u64).into());
                     }
-                    inputs.push((sha256_hex(data), BlobData::Bytes(data), false));
+                    inputs.push((sha256_hex(data), b, false));
                 }
                 BlobInput::Spooled(s) => {
                     if s.size() <= MAX_BLOB_BYTES as u64 {
@@ -446,7 +439,7 @@ impl<'c> WriteTx<'c> {
                         ))
                         .into());
                     }
-                    inputs.push((s.sha256().to_owned(), BlobData::Spooled(s), false));
+                    inputs.push((s.sha256().to_owned(), b, false));
                 }
             }
         }
@@ -479,12 +472,12 @@ impl<'c> WriteTx<'c> {
                             }
                             large
                         }
-                        (None, Some(BlobData::Bytes(data))) => {
+                        (None, Some(BlobInput::Bytes(data))) => {
                             let head = &data[..data.len().min(PREVIEW_READ_BYTES)];
                             check_against(blob, preview, *preview_lossy, data.len() as u64, head)?;
                             false
                         }
-                        (None, Some(BlobData::Spooled(s))) => {
+                        (None, Some(BlobInput::Spooled(s))) => {
                             let head = s.head().map_err(|e| ContentError::Spool(e.to_string()))?;
                             check_against(blob, preview, *preview_lossy, s.size(), &head)?;
                             true
@@ -656,13 +649,13 @@ impl<'c> WriteTx<'c> {
         // 3. Blobs and refs.
         for (sha, data) in &blobs {
             match data {
-                BlobData::Bytes(data) => {
+                BlobInput::Bytes(data) => {
                     self.conn.execute(
                         "INSERT INTO blobs (sha256, size, data) VALUES (?1, ?2, ?3) ON CONFLICT (sha256) DO NOTHING",
                         rusqlite::params![sha, super::rows::sql_len(data.len()), data],
                     )?;
                 }
-                BlobData::Spooled(s) => self.insert_large_blob(sha, s)?,
+                BlobInput::Spooled(s) => self.insert_large_blob(sha, s)?,
             }
         }
         for (sha, media_type, large) in &refs {
