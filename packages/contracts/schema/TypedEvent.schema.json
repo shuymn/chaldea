@@ -1700,7 +1700,7 @@
         },
         {
           "const": "unrecorded_job_and_outside_job",
-          "description": "Windows probe: members of the old job without a recorded identity, and processes\noutside the job.",
+          "description": "Windows probe: processes without a recorded identity, members of the old job and\nprocesses outside it.",
           "type": "string"
         },
         {
@@ -1710,7 +1710,7 @@
         },
         {
           "const": "no_identity",
-          "description": "No identity was recorded for the launch.",
+          "description": "No identity was recorded for the launch's leader.",
           "type": "string"
         },
         {

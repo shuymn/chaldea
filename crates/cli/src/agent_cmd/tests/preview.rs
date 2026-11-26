@@ -575,6 +575,17 @@ fn preview_missing_lines() {
         "{out}"
     );
     assert!(out.contains(NO_REPORT), "{out}");
+    // A prober candidate (RD1): the running-daemon line too.
+    assert!(out.contains(NO_PROBE), "{out}");
+    // A failed start recorded without a start time is no candidate: no running-daemon line.
+    let mut s = Stream::default();
+    s.reserved();
+    s.exited("spawn_failed", Some(json!({ "pid": 77 })));
+    let stub = Daemon::new(summary(Some(ExitReason::SpawnFailed), false, None), s).start();
+    let (code, out, _) = preview(&stub);
+    assert_eq!(code, ExitCode::Ok, "{out}");
+    assert!(out.contains(NO_REPORT), "{out}");
+    assert!(!out.contains(NO_PROBE), "{out}");
     // unknown_after_crash: the scan reaches the reservation; its agent and recorded_at.
     let mut s = Stream::default();
     s.pad(2);
@@ -614,6 +625,49 @@ fn preview_missing_lines() {
         out.contains("The launch's end was proven when it exited, so no check report was needed."),
         "{out}"
     );
+}
+
+/// A failed start's recorded child: its `spawn_failed` evidence without a leader identity,
+/// then this run's probe of the child on Windows. The scope lines speak of what has no
+/// recorded identity, the leader for `no_identity`; the running-daemon line is gone.
+#[test]
+fn preview_failed_start_probed() {
+    let child = json!([{ "pid": 77, "start_time": "st-77", "observed": "unresolved" }]);
+    let gone = json!([{ "pid": 77, "start_time": "st-77", "observed": "gone" }]);
+    let mut s = Stream::default();
+    s.reserved();
+    s.exited(
+        "spawn_failed",
+        Some(json!({ "pid": 77, "start_time": "st-77" })),
+    );
+    s.evidence(
+        "spawn_failed",
+        None,
+        &child,
+        &json!(["no_identity", "tree_unproven"]),
+    );
+    s.evidence(
+        "probe",
+        Some(RUN),
+        &gone,
+        &json!(["unrecorded_job_and_outside_job"]),
+    );
+    let stub = Daemon::new(summary(Some(ExitReason::SpawnFailed), false, None), s).start();
+    let (code, out, _) = preview(&stub);
+    assert_eq!(code, ExitCode::Ok, "{out}");
+    assert!(!out.contains(NO_PROBE), "{out}");
+    assert!(out.contains(" probe (this daemon run)"), "{out}");
+    assert!(
+        out.contains("  not covered: no process identity was recorded for the launch's leader\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "  not covered: processes without a recorded identity were not checked: members of the old job (ended when the old daemon exited, not observed) and processes outside the job\n"
+        ),
+        "{out}"
+    );
+    assert!(out.ends_with(&format!("{}\n", confirm_line())), "{out}");
 }
 
 /// No launch, or a launch not exited: printed, exit 0, no page read.

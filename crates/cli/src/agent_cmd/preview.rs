@@ -52,12 +52,12 @@ fn meaning(u: Unchecked) -> &'static str {
             "members of the old session without a recorded identity were not checked"
         }
         Unchecked::UnrecordedJobAndOutsideJob => {
-            "members of the old job without a recorded identity (ended when the old daemon exited, not observed) and processes outside the job were not checked"
+            "processes without a recorded identity were not checked: members of the old job (ended when the old daemon exited, not observed) and processes outside the job"
         }
         Unchecked::TreeUnproven => {
             "the kill did not prove the process tree dead: processes it did not list may exist"
         }
-        Unchecked::NoIdentity => "no process identity was recorded for the launch",
+        Unchecked::NoIdentity => "no process identity was recorded for the launch's leader",
         Unchecked::CleanupUnreleased => {
             "the tree was proven dead, but the cleanup of the failed start did not complete"
         }
@@ -405,10 +405,21 @@ fn render(
     let this_run_probe = evidence.iter().any(|(_, p)| {
         p.source == EvidenceSource::Probe && p.probe_run.as_deref() == Some(instance)
     });
+    // The prober's candidates (RD1): a `daemon_restart` leader, and a failed start's child
+    // recorded with a start time.
+    let probed = match reason {
+        ExitReason::DaemonRestart => true,
+        ExitReason::SpawnFailed => exited
+            .as_ref()
+            .and_then(|x| x.failed_start.as_ref())
+            .and_then(|f| f.start_time.as_deref())
+            .is_some_and(|s| !s.is_empty()),
+        _ => false,
+    };
+    if probed && !this_run_probe {
+        let _ = writeln!(o, "{NO_PROBE}");
+    }
     match reason {
-        ExitReason::DaemonRestart if !this_run_probe => {
-            let _ = writeln!(o, "{NO_PROBE}");
-        }
         ExitReason::Stopped | ExitReason::Exit | ExitReason::SpawnFailed
             if complete && evidence.is_empty() =>
         {

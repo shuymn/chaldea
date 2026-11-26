@@ -297,12 +297,12 @@ impl Observed {
 pub enum Unchecked {
     /// macOS probe: members of the old session without a recorded identity.
     UnrecordedSessionMembers,
-    /// Windows probe: members of the old job without a recorded identity, and processes
-    /// outside the job.
+    /// Windows probe: processes without a recorded identity, members of the old job and
+    /// processes outside it.
     UnrecordedJobAndOutsideJob,
     /// The owned kill did not prove the tree dead.
     TreeUnproven,
-    /// No identity was recorded for the launch.
+    /// No identity was recorded for the launch's leader.
     NoIdentity,
     /// The tree was proven dead, but the backend's cleanup of a failed start did not complete.
     CleanupUnreleased,
