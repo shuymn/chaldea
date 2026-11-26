@@ -655,7 +655,7 @@ impl crate::supervisor::send::HookDecoder for HoldStop {
 async fn stop_after_outcome_unknown() {
     let hold = Arc::new(HoldStop(std::sync::Mutex::new(None)));
     let h2 = hold.clone();
-    let rig = SRig::with(move |c| c.decoder = h2).await;
+    let rig = SRig::with(move |c| c.decoders = crate::supervisor::send::Decoders::all(h2)).await;
     let live = rig.bound(Agent::Codex).await;
     rig.clock.stop();
     rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "p" }))

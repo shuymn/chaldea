@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use chaldea_core::ids::{Agent, ApprovalId, InputId, StreamId};
 use chaldea_core::input::InputState;
+use chaldea_core::payload::ApprovalOutcome;
 use chaldea_core::state::TurnState;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
@@ -78,7 +79,7 @@ fn card_hook(rig: &SRig, live: &Live, tool_use: &str) -> Hook {
     )
 }
 
-fn turn(rig: &SRig, live: &Live) -> TurnState {
+pub(super) fn turn(rig: &SRig, live: &Live) -> TurnState {
     rig.thread(live.t).state.turn
 }
 
@@ -336,10 +337,11 @@ async fn stale_stop_keeps_the_turn_and_cards() {
     rig.stop().await;
 }
 
-/// L-13 case f: a card committed after a higher `Stop`, then the stale start below both.
-/// The card folds as without the start, and the start changes nothing. The outcome is
-/// CL-13's: `ready` succeeds while the turn stays `awaiting_approval`, and a key for the
-/// card is written.
+/// L-13 case f, C1-7: `Start(1)`, `Card(2)`, `Stop(3)` committed 3, 2, 1. The card was taken
+/// in below the committed `Stop`, so it is closed at open (`approval_requested` and
+/// `approval_resolved` `superseded` in one job, no `ApprovalOpened`): the turn never shows
+/// `awaiting_approval`, the stale start changes nothing, and the card's key answers
+/// `card_closed` with no byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn card_between_stale_start_and_stop() {
     let rig = SRig::new().await;
@@ -353,21 +355,22 @@ async fn card_between_stale_start_and_stop() {
     .await;
     let card = hold(&rig, &live, card_hook(&rig, &live, "t1"), true).await;
     rig.hook(&live, "Stop", &json!({})).await;
+    let after_stop = turn(&rig, &live);
     let id = ApprovalId(card.hook.emit);
     assert_eq!(card.finish().await.status, 200);
-    assert_eq!(turn(&rig, &live), TurnState::AwaitingApproval);
+    assert_eq!(outcome(&rig, id), Some(ApprovalOutcome::Superseded));
+    assert_eq!(turn(&rig, &live), after_stop);
     assert_eq!(start.finish().await.status, 200);
-    assert_eq!(turn(&rig, &live), TurnState::AwaitingApproval);
-    assert_eq!(outcome(&rig, id), None, "open");
-    rig.cmd_ok("ready", &json!({ "thread_id": live.t }), 200)
-        .await;
-    assert_eq!(turn(&rig, &live), TurnState::AwaitingApproval);
+    assert_eq!(turn(&rig, &live), after_stop);
+    assert!(!rig.sl(&live).state().cards.contains_key(&id));
+    let n = live.child.input().len();
     let r = key(&rig, &live, &["enter"], Some(id)).await;
     assert_eq!(
-        (r.0, r.1["outcome"].clone()),
-        (200, json!("written")),
+        (r.0, r.1["code"].clone()),
+        (409, json!("card_closed")),
         "{r:?}"
     );
+    assert_eq!(live.child.input().len(), n, "no byte");
     rig.stop().await;
 }
 

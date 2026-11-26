@@ -288,8 +288,10 @@ async fn card_basis_dropped_at_resolution() {
     rig.stop().await;
 }
 
-/// PR10b-CL-13: a card whose hook was taken in before a `Stop` but committed after it is open
-/// in the store, and its basis stays: a card key for it is written.
+/// PR10b-CL-13, C1-7: a card whose hook was taken in before a `Stop` but committed after it
+/// is closed at open (`superseded`, no `ApprovalOpened`, no memory entry): its key answers
+/// `card_closed` with no byte. Control: a card taken in after its turn's start stays open and
+/// its key is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn card_committed_after_later_stop() {
     let rig = SRig::new().await;
@@ -308,6 +310,37 @@ async fn card_committed_after_later_stop() {
     rig.hook(&live, "Stop", &json!({})).await;
     release.send(()).unwrap();
     assert_eq!(reply.await.unwrap().status, 200);
+    let id = ApprovalId(h.emit);
+    assert_eq!(
+        outcome(&rig, id),
+        Some(ApprovalOutcome::Superseded),
+        "closed at open"
+    );
+    assert!(
+        !rig.sl(&live).state().cards.contains_key(&id),
+        "no memory entry"
+    );
+    assert_ne!(
+        crate::supervisor::send::tests::turn_order::turn(&rig, &live),
+        chaldea_core::state::TurnState::AwaitingApproval
+    );
+    let n = live.child.input().len();
+    let r = key(&rig, &live, &["enter"], Some(id)).await;
+    assert_eq!(
+        (r.0, r.1["code"].clone()),
+        (409, json!("card_closed")),
+        "{r:?}"
+    );
+    assert_eq!(live.child.input().len(), n, "no byte");
+    // Control: the next turn's card, taken in after its start.
+    rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "u" }))
+        .await;
+    let h = rig.hook_of(
+        &live,
+        "PermissionRequest",
+        &json!({ "tool_name": "Bash", "tool_input": { "command": "ls" }, "tool_use_id": "t2" }),
+    );
+    assert_eq!(rig.post_for(&live, &h).await.status, 200);
     let id = ApprovalId(h.emit);
     assert_eq!(outcome(&rig, id), None, "open in the store");
     let r = key(&rig, &live, &["enter"], Some(id)).await;

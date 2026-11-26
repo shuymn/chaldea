@@ -231,10 +231,10 @@ pub struct SupervisorConfig {
     pub(crate) tick_steps: Vec<Arc<dyn TickStep>>,
     /// Whether the tick task runs (tests drive [`Supervisor::tick`] themselves).
     pub(crate) tick_task: bool,
-    /// The hook decoder of the send side (send §2.5): the daemon's decodes nothing until
-    /// an adapter PR adds one; tests pass `FakeDecoder`.
+    /// Each agent's hook decoder (send §2.5): `ClaudeDecoder` for Claude, `NoDecoder` for
+    /// Codex until its adapter; tests pass `FakeDecoder` for both.
     #[doc(hidden)]
-    pub decoder: Arc<dyn send::HookDecoder>,
+    pub decoders: send::Decoders,
     /// The readiness mode of every row, when a unit test overrides the capability table's.
     pub(crate) readiness_mode: Option<ReadinessMode>,
     /// Whether each launch's send worker and the driver run (unit tests that drive no send
@@ -266,7 +266,7 @@ impl Default for SupervisorConfig {
             exit_steps: Vec::new(),
             tick_steps: Vec::new(),
             tick_task: true,
-            decoder: Arc::new(send::NoDecoder),
+            decoders: send::Decoders::mvp(),
             readiness_mode: None,
             send_workers: true,
             kill_recorded: Arc::new(chaldea_pty_runtime::orphan::kill_recorded),

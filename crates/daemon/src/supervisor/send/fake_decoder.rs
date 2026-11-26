@@ -9,8 +9,8 @@ use crate::store::{ReadTx, StoreError};
 
 /// Maps `hook_event_name` to a fact: `SessionStart`, `UserPromptSubmit` (`prompt`),
 /// `Stop`, `Interrupt`, `PostDecision`, `PermissionRequest` (`tool_name`, `tool_input`,
-/// `tool_use_id` as the correlation), `PostToolUse` (`tool_use_id`); anything else is
-/// `Other`.
+/// `tool_use_id` as the correlation), `PostToolUse` (`tool_name`, `tool_input`,
+/// `tool_use_id`); anything else is `Other`.
 #[doc(hidden)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FakeDecoder;
@@ -43,9 +43,10 @@ impl HookDecoder for FakeDecoder {
                 correlation: s("tool_use_id")
                     .map(|tool_use_id| ApprovalCorrelation { tool_use_id }),
             },
-            "PostToolUse" => match s("tool_use_id") {
-                Some(tool_use_id) => HookFact::CardEvidence { tool_use_id },
-                None => HookFact::Other,
+            "PostToolUse" => HookFact::CardEvidence {
+                tool_name: s("tool_name").unwrap_or_default(),
+                tool_input: j.get("tool_input").cloned().unwrap_or_default(),
+                tool_use_id: s("tool_use_id"),
             },
             _ => HookFact::Other,
         };

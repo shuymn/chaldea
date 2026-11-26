@@ -56,7 +56,7 @@ pub use process::prepare_process;
 pub use ready::{ReadyOpener, ReadyWriter, early_fail_line, host_ready_opener};
 pub use state_dir::{STATE_DIR_ENV, resolve as resolve_state_dir, set_marker_pause};
 
-pub(crate) use panic::TaskKindGuard;
+pub(crate) use panic::{TaskKindGuard, recoverable};
 
 /// The files of the state directory (design §2.4).
 pub mod names {
