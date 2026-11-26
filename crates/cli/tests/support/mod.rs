@@ -167,11 +167,15 @@ static RESERVATIONS: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
 /// killed). The probe's socket exists only under the spawn lock, so no child this process
 /// creates meanwhile inherits it.
 ///
-/// Limits: a process outside the protocol (any program, or a test run of an older revision)
-/// can still bind a reserved port after the probe, before the daemon binds it or between its
-/// restarts; the daemon then fails `port_unavailable`. A reservation is released only when its
-/// process exits, also for a test that already finished, so test processes running at once
-/// share the 200 ports of [`RESERVED`]; once every one is locked or bound, this panics.
+/// Limits, of this and of [`range_turn`]: a process outside the protocol (any program, a test
+/// run of a revision before these locks, or on macOS one with another `TMPDIR`, whose lock
+/// files are other files) can still bind a reserved port after the probe, before the daemon
+/// binds it or between its restarts, or a port of the range during a turn; the daemon then
+/// fails `port_unavailable`. A reservation is released only when its process exits, also for
+/// a test that already finished, so test processes running at once share the 200 ports of
+/// [`RESERVED`]; once every one is locked or bound, this panics. A test whose stop fails
+/// releases its turn as it unwinds, without its daemon's exit confirmed (it is failing
+/// already).
 #[must_use]
 pub fn reserve_port() -> u16 {
     for p in RESERVED {
@@ -207,7 +211,7 @@ const RANGE_WAIT: Duration = Duration::from_secs(600);
 /// such test, in this process or another, starts or stops a daemon in between: a port of the
 /// range a test expects to be free stays so until its daemon binds. Every other daemon of
 /// these tests starts on a reserved port ([`reserve_port`]) or its saved one, except the
-/// Windows-only `daemon_windows`'s.
+/// Windows-only `daemon_windows`'s. Its limits are stated at [`reserve_port`].
 #[must_use]
 pub fn range_turn() -> std::fs::File {
     let end = Instant::now() + RANGE_WAIT;
