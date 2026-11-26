@@ -4,7 +4,7 @@
 //! hands the writer the file, which inserts it as ordered parts.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -38,14 +38,9 @@ impl SpoolFile {
             "{SPOOL_FILE_PREFIX}{}.tmp",
             uuid::Uuid::new_v4().simple()
         ));
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let file = opts.open(&path)?;
+        // Owner-only like the state directory's other files (mode 0600; on Windows a
+        // protected DACL), created new and never through a link.
+        let file = chaldea_pty_runtime::host::create_private_file(&path)?;
         Ok(SpoolFile {
             path,
             file: Mutex::new(Some(file)),
@@ -129,7 +124,11 @@ impl BlobSpool {
             .ok()
             .and_then(|n| self.size.checked_add(n))
             .filter(|n| *n <= MAX_SAFE_INTEGER)
-            .ok_or_else(|| io::Error::other(ContentError::TooLarge(u64::MAX)))?;
+            .ok_or_else(|| {
+                io::Error::other(ContentError::TooLarge(
+                    self.size.saturating_add(bytes.len() as u64),
+                ))
+            })?;
         self.hasher.update(bytes);
         if self.head.len() < PREVIEW_READ_BYTES {
             let take = (PREVIEW_READ_BYTES - self.head.len()).min(bytes.len());
