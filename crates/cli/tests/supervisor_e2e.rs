@@ -634,6 +634,8 @@ fn claude_session_switch() {
         Some(l.as_str()),
         "{hello}"
     );
+    let waited = next_report(&rx, "wait_file step 0", |v| v["event"] == "wait_file");
+    assert_eq!(waited["found"], true, "the gate expired: {waited}");
     for step in 1..5 {
         let v = next_report(&rx, &format!("emitted step {step}"), |v| {
             v["event"] == "emitted" && v["step"] == step
