@@ -3,7 +3,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -43,6 +43,8 @@ enum Reply {
     Hold(mpsc::Receiver<()>),
     /// A head with this status and `Content-Length`, then the end of the connection.
     Head(u16, usize),
+    /// Answers nothing for this many real milliseconds, then ends the connection.
+    Stall(u64),
 }
 
 /// The stub server and the test clock (real time plus a skew the stub can add).
@@ -50,6 +52,16 @@ struct Stub {
     port: u16,
     seen: Arc<Mutex<Vec<Seen>>>,
     skew: Arc<AtomicU64>,
+    /// Set on drop: the listener thread returns at its next connection.
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Stub {
+    /// Stops the listener thread: sets `stop`, then wakes its `accept` with one connection.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+    }
 }
 
 impl Stub {
@@ -58,19 +70,28 @@ impl Stub {
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let skew = Arc::new(AtomicU64::new(0));
-        let (s, k) = (seen.clone(), skew.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (s, k, st) = (seen.clone(), skew.clone(), stop.clone());
         std::thread::spawn(move || {
             for reply in script {
                 let Ok((mut c, _)) = listener.accept() else {
                     return;
                 };
+                if st.load(Ordering::SeqCst) {
+                    return;
+                }
                 if let Some(req) = read_request(&mut c) {
                     s.lock().unwrap().push(req);
                 }
                 answer(&mut c, reply, &k);
             }
         });
-        Stub { port, seen, skew }
+        Stub {
+            port,
+            seen,
+            skew,
+            stop,
+        }
     }
 
     /// A stub that answers each of up to `max` connections with `handler` of its request.
@@ -79,12 +100,16 @@ impl Stub {
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let skew = Arc::new(AtomicU64::new(0));
-        let (s, k) = (seen.clone(), skew.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (s, k, st) = (seen.clone(), skew.clone(), stop.clone());
         std::thread::spawn(move || {
             for _ in 0..max {
                 let Ok((mut c, _)) = listener.accept() else {
                     return;
                 };
+                if st.load(Ordering::SeqCst) {
+                    return;
+                }
                 let Some(req) = read_request(&mut c) else {
                     continue;
                 };
@@ -93,7 +118,12 @@ impl Stub {
                 answer(&mut c, reply, &k);
             }
         });
-        Stub { port, seen, skew }
+        Stub {
+            port,
+            seen,
+            skew,
+            stop,
+        }
     }
 
     fn now(&self) -> impl Fn() -> Instant + '_ {
@@ -126,6 +156,10 @@ fn answer(c: &mut std::net::TcpStream, reply: Reply, skew: &AtomicU64) {
         Reply::Eof => return,
         Reply::Hold(rx) => {
             let _ = rx.recv_timeout(Duration::from_secs(20));
+            return;
+        }
+        Reply::Stall(ms) => {
+            std::thread::sleep(Duration::from_millis(ms));
             return;
         }
         Reply::Head(st, len) => {

@@ -1,8 +1,12 @@
 //! `chaldea spawn`, `resume`, `stop`, `close`, and `wait` (docs/design/supervisor.md §2.2,
-//! SD16), `send`, `ready`, `key`, `input resolve`, and `input cancel`
-//! (docs/design/supervisor-send.md §2.2), and `inspect` (C1 D2): each command is one `POST /api/commands/{name}` with one `command_id`, sent again
-//! unchanged on a transport failure, `408`, `503`, or `409 in_progress` until one cutoff; the
-//! reads are `GET /api/threads/{thread_id}` under the same rules.
+//! SD16), and `send`, `ready`, `key`, `input resolve`, and `input cancel`
+//! (docs/design/supervisor-send.md §2.2): each command is one `POST /api/commands/{name}` with one
+//! `command_id`, sent again unchanged on a transport failure, `408`, `503`, or `409 in_progress`
+//! until one cutoff; the reads are `GET /api/threads/{thread_id}` under the same rules.
+//!
+//! `inspect` (C1 D2) sends no command: it reads the thread's snapshot with one
+//! `GET /api/events`, its summary only when the snapshot cannot be read, then
+//! `GET /api/threads/{thread_id}/screen`.
 
 use std::cell::Cell;
 use std::io::{self, Write};
@@ -159,6 +163,20 @@ impl Client<'_> {
         run: Option<&str>,
         decide: &mut dyn FnMut(Response) -> Option<Result<T, End>>,
     ) -> Result<T, End> {
+        self.exchange_noting(cutoff, req, daemon_required, run, &|_| {}, decide)
+    }
+
+    /// [`Client::exchange_in`] that shows `note` every request error before it is classified
+    /// (sent again, or ending the exchange).
+    fn exchange_noting<T>(
+        &self,
+        cutoff: Instant,
+        req: &Req<'_>,
+        daemon_required: bool,
+        run: Option<&str>,
+        note: &dyn Fn(&io::Error),
+        decide: &mut dyn FnMut(Response) -> Option<Result<T, End>>,
+    ) -> Result<T, End> {
         let same_run = |found: &Result<Found, String>| match (run, found) {
             (None, _) => true,
             (Some(r), Ok(Found::Port(_, i))) => i == r,
@@ -187,6 +205,9 @@ impl Client<'_> {
                 }
                 Req::Post(path, body) => client::post_json(port, path, token, body, cutoff),
             };
+            if let Err(e) = &r {
+                note(e);
+            }
             match r {
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => Some(Err(End::Timeout)),
                 Err(e) if client::is_body_too_large(&e) => Some(Err(End::TooLarge)),

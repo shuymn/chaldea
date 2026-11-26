@@ -2,8 +2,9 @@
 //! `GET /api/events` read through the `cursor_ahead` fallback, or its summary when the
 //! snapshot is too large or not built in time, then the live screen of the launch read.
 
+use std::cell::RefCell;
 use std::fmt::Write as _;
-use std::io::Write;
+use std::io::{self, Write};
 use std::time::Duration;
 
 use chaldea_core::MAX_SAFE_INTEGER;
@@ -95,18 +96,53 @@ fn visible(s: &str) -> String {
         .collect()
 }
 
+/// The last concrete failure a read retried past: what it reports when its cutoff passes.
+#[derive(Default)]
+struct Retried(RefCell<Option<Last>>);
+
+enum Last {
+    /// The daemon's `503` body.
+    Daemon(ErrorBody),
+    /// A connection refused, reset, or closed before the response was complete.
+    Transport(String),
+}
+
+impl Retried {
+    /// Notes a request error. A timeout comes only at the cutoff (the request's own deadline),
+    /// so it keeps what an earlier attempt failed with; any other error replaces it.
+    fn note(&self, e: &io::Error) {
+        if e.kind() != io::ErrorKind::TimedOut {
+            *self.0.borrow_mut() = Some(Last::Transport(format!("the request failed: {e}")));
+        }
+    }
+
+    fn busy(&self, body: &[u8]) {
+        *self.0.borrow_mut() = Some(Last::Daemon(daemon_error(body)));
+    }
+
+    fn take(&self) -> Option<Last> {
+        self.0.borrow_mut().take()
+    }
+}
+
 impl Client<'_> {
-    fn snapshot_read(&self, t: ThreadId) -> SnapshotRead {
+    fn snapshot_read(&self, t: ThreadId, within: Duration) -> SnapshotRead {
         let path = format!(
             "/api/events?stream_id={}&after_seq={MAX_SAFE_INTEGER}",
             StreamId::Thread(t)
         );
-        let r = self.exchange(
-            self.cutoff(READ_CUTOFF),
+        let retried = Retried::default();
+        let r = self.exchange_noting(
+            self.cutoff(within),
             &Req::GetUpTo(&path, SNAPSHOT_MAX_BODY),
             true,
+            None,
+            &|e| retried.note(e),
             &mut |r| match r.status {
-                503 => None,
+                503 => {
+                    retried.busy(&r.body);
+                    None
+                }
                 200 => Some(Ok(
                     match serde_json::from_slice::<EventsResponse>(&r.body) {
                         Ok(EventsResponse::Snapshot {
@@ -134,10 +170,17 @@ impl Client<'_> {
                 ))),
             },
         );
-        match r {
-            Ok(read) => read,
-            Err(e @ (End::TooLarge | End::Timeout)) => SnapshotRead::Fallback(client_error(&e)),
-            Err(e) => SnapshotRead::Failed(client_error(&e), end_message(&e)),
+        match (r, retried.take()) {
+            (Ok(read), _) => read,
+            // Out of time after a busy answer: still not built in time.
+            (Err(End::Timeout), Some(Last::Daemon(e))) => SnapshotRead::Fallback(e),
+            (Err(End::Timeout), Some(Last::Transport(m))) => {
+                SnapshotRead::Failed(error(ErrorCode::Internal), m)
+            }
+            (Err(e @ (End::TooLarge | End::Timeout)), _) => {
+                SnapshotRead::Fallback(client_error(&e))
+            }
+            (Err(e), _) => SnapshotRead::Failed(client_error(&e), end_message(&e)),
         }
     }
 
@@ -146,20 +189,32 @@ impl Client<'_> {
         &self,
         t: ThreadId,
         expected: Option<LaunchId>,
+        within: Duration,
     ) -> Result<ScreenResponse, ErrorBody> {
         let path = format!("/api/threads/{t}/screen");
-        let r = self.exchange(
-            self.cutoff(READ_CUTOFF),
+        let retried = Retried::default();
+        let r = self.exchange_noting(
+            self.cutoff(within),
             &Req::Get(&path),
             true,
+            None,
+            &|e| retried.note(e),
             &mut |r| match r.status {
-                503 => None,
+                503 => {
+                    retried.busy(&r.body);
+                    None
+                }
                 200 => Some(Ok(serde_json::from_slice::<ScreenResponse>(&r.body)
                     .map_err(|_| error(ErrorCode::Internal)))),
                 _ => Some(Ok(Err(daemon_error(&r.body)))),
             },
         );
-        let screen = r.unwrap_or_else(|e| Err(client_error(&e)))?;
+        let screen = match (r, retried.take()) {
+            (Ok(r), _) => r,
+            (Err(End::Timeout), Some(Last::Daemon(e))) => Err(e),
+            (Err(End::Timeout), Some(Last::Transport(_))) => Err(error(ErrorCode::Internal)),
+            (Err(e), _) => Err(client_error(&e)),
+        }?;
         if Some(screen.launch_id) == expected {
             Ok(screen)
         } else {
@@ -176,6 +231,18 @@ impl Client<'_> {
         out: &mut dyn Write,
         err: &mut dyn Write,
     ) -> ExitCode {
+        self.inspect_within(t, json, READ_CUTOFF, out, err)
+    }
+
+    /// [`Client::inspect`] with `within` as each read's cutoff.
+    pub(crate) fn inspect_within(
+        &self,
+        t: ThreadId,
+        json: bool,
+        within: Duration,
+        out: &mut dyn Write,
+        err: &mut dyn Write,
+    ) -> ExitCode {
         let mut o = InspectOutput {
             thread_id: t,
             snapshot: None,
@@ -184,7 +251,7 @@ impl Client<'_> {
             snapshot_error: None,
             screen_error: None,
         };
-        let launch: Option<LaunchId> = match self.snapshot_read(t) {
+        let launch: Option<LaunchId> = match self.snapshot_read(t, within) {
             SnapshotRead::Read(s) => {
                 let l = s.launch.as_ref().map(|l| l.launch_id);
                 o.snapshot = Some(*s);
@@ -197,7 +264,7 @@ impl Client<'_> {
             }
             SnapshotRead::Fallback(e) => {
                 o.snapshot_error = Some(e);
-                match self.summary(self.cutoff(READ_CUTOFF), t) {
+                match self.summary(self.cutoff(within), t) {
                     Ok(s) => {
                         let l = s.launch.as_ref().map(|l| l.launch_id);
                         o.summary = Some(s);
@@ -215,7 +282,7 @@ impl Client<'_> {
                 }
             }
         };
-        match self.screen_read(t, launch) {
+        match self.screen_read(t, launch, within) {
             Ok(s) => o.screen = Some(s),
             Err(e) => o.screen_error = Some(e),
         }
