@@ -371,6 +371,7 @@ fn corpus() -> Vec<(&'static str, String)> {
             "corpus-wrapped",
             "e\u{301}\t\u{304b}\u{3099} line\n".repeat(300),
         ),
+        ("corpus-wrapped-small", "y".repeat(801)),
         lit("corpus-del", "a\u{7f}b"),
         lit("corpus-c1", "a\u{80}b\u{9f}c"),
         lit("corpus-hash", "#zz corpus"),
@@ -392,16 +393,20 @@ fn sent_prompts() -> Vec<(String, String, String)> {
         .collect()
 }
 
-/// C1-5: each captured prompt is `prompt_matches` its sent text; below the large-paste size
-/// it equals `expected_prompt` literally. No sent text matches another case's recorded form.
+/// C1-5: each captured prompt is `prompt_matches` its sent text, the two wrapped ones (4,800
+/// bytes, and 801 bytes, which Claude folds by its length in characters) included; the others
+/// equal `expected_prompt` literally. No sent text matches another case's recorded form.
 #[test]
 fn captured_prompt_forms() {
     let p = InputEncoding::BracketedPaste;
     let all = sent_prompts();
-    assert!(all.iter().any(|(c, ..)| c == "corpus-wrapped"));
+    let wrapped = ["corpus-wrapped", "corpus-wrapped-small"];
+    for w in wrapped {
+        assert!(all.iter().any(|(c, ..)| c == w), "{w}");
+    }
     for (case, sent, recorded) in &all {
         assert!(prompt_matches(Agent::Claude, p, sent, recorded), "{case}");
-        if case != "corpus-wrapped" {
+        if !wrapped.contains(&case.as_str()) {
             assert_eq!(
                 expected_prompt(Agent::Claude, p, sent).as_deref(),
                 Some(recorded.as_str()),
