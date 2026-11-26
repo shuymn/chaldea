@@ -582,6 +582,58 @@ async fn session_start_binds() {
     rig.stop().await;
 }
 
+/// A `SessionStart` taken in after the child was created and before the launch was published
+/// (a CLI that emits it at once) has no intake facts (sup §2.11 "Observation": creation begun
+/// and unpublished is `Unobservable`): it binds the launch, records no readiness, and, with no
+/// event of its own, is kept as `raw_unknown` `unknown_event`, so a send waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_start_before_publication() {
+    let rig = claude_rig().await;
+    let held = rig.pauses.arm(crate::supervisor::Pause::BeforePublish);
+    let args = json!({ "agent": "claude", "cwd": rig.cwd.path().to_string_lossy() });
+    let spawn = crate::supervisor::tests::support::http::spawn_send(
+        &rig.srv,
+        &rig.srv.command(
+            "spawn",
+            &rig.owner,
+            crate::supervisor::tests::cid(),
+            &args.to_string(),
+        ),
+    );
+    held.wait();
+    let (t, l) = rig.srv.store.read(|r| {
+        let t = r.threads()?.pop().unwrap();
+        Ok((t.thread_id, t.current_launch_id.unwrap()))
+    });
+    let live = rig.adopt(t, l, Agent::Claude);
+    let sl = rig.sl(&live);
+    let hook = own(&rig, &live, &fixture("plain-turn", "SessionStart-1"));
+    let post = crate::supervisor::tests::support::http::spawn_send(&rig.srv, &hook.req(&rig.srv));
+    rig.until("the SessionStart taken in", || {
+        sl.latest_intake.load(std::sync::atomic::Ordering::SeqCst) > 0
+    })
+    .await;
+    held.go();
+    assert_eq!(spawn.await.unwrap().status, 200);
+    assert_eq!(post.await.unwrap().status, 200);
+    assert_eq!(
+        rig.thread(live.t).session_id.as_deref(),
+        Some(live.session.as_str())
+    );
+    assert!(
+        rig.launch(live.l).readiness.is_none(),
+        "{:?}",
+        rig.kinds(live.t)
+    );
+    assert_eq!(raw_reasons(&rig, &live), ["unknown_event"]);
+    rig.paste(&live, true).await;
+    let id = rig.send(&live, "waits").await;
+    rig.pass(&live).await;
+    assert_eq!(rig.input(id).state, InputState::Queued);
+    assert!(live.child.input().is_empty(), "no byte");
+    rig.stop().await;
+}
+
 /// C1-14 (D5): `/clear` and an in-session `/resume` start another session; its hooks are
 /// `foreign_session` and the launch keeps its binding, so its own session's hooks still
 /// count. `/compact` keeps the session: interpreted, and not evidence again.
