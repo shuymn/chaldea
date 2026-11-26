@@ -3,6 +3,8 @@
 //! nor the cards, and its prompt does not move the turn-start basis; it still records its
 //! `user_message` and acks.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use chaldea_core::ids::{Agent, ApprovalId, InputId, StreamId};
@@ -18,6 +20,7 @@ use super::human::{key, outcome};
 use super::{Live, SRig};
 use crate::hook::TurnMark;
 use crate::store::test_faults::CommitFault;
+use crate::supervisor::live::LaunchObservation;
 use crate::supervisor::send::SETTLE;
 use crate::supervisor::tests::support::hook::Hook;
 use crate::supervisor::tests::support::http::{Reply, spawn_send};
@@ -170,8 +173,7 @@ async fn start_commits_first() {
         delivery_seq(&rig, &live, start)
     );
     rig.hook(&live, "Stop", &json!({})).await;
-    advance(&rig, &live, SETTLE).await;
-    assert_eq!(count(&rig, &live, "stop_settled"), 1);
+    settles(&rig, &live).await;
     let next = rig.send(&live, "next").await;
     rig.until_input(next, InputState::Sent).await;
     rig.stop().await;
@@ -223,12 +225,7 @@ async fn stop_commits_first() {
     for observer_held in [false, true] {
         let (rig, live) = settle_rig().await;
         stop_before_start(&rig, &live, observer_held).await;
-        advance(&rig, &live, SETTLE).await;
-        assert_eq!(
-            count(&rig, &live, "stop_settled"),
-            1,
-            "observer held: {observer_held}"
-        );
+        settles(&rig, &live).await;
         let next = rig.send(&live, "next").await;
         rig.until_input(next, InputState::Sent).await;
         rig.stop().await;
@@ -292,14 +289,24 @@ fn end_mark(rig: &SRig, live: &Live, o: u64, settle: bool) {
     );
 }
 
+/// Moves the stopped clock `SETTLE` forward once, then wakes passes until one `stop_settled`
+/// is recorded: a pass that could not observe the launch keeps the candidate for the next.
+async fn settles(rig: &SRig, live: &Live) {
+    rig.clock.advance(SETTLE);
+    let end = Instant::now() + Duration::from_secs(10);
+    while count(rig, live, "stop_settled") == 0 {
+        assert!(Instant::now() < end, "the Stop settled");
+        rig.pass(live).await;
+    }
+    assert_eq!(count(rig, live, "stop_settled"), 1);
+}
+
 /// A `Stop` taken in after a `Written` unit's record committed, while the worker has not
 /// yet applied the record's reply, sees the unit ended: it settles once its start acks the
 /// input, though that start commits after it, and the next send is written without `ready`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stop_after_the_record_settles() {
     let (rig, live) = settle_rig().await;
-    rig.cmd_ok("ready", &json!({ "thread_id": live.t }), 200)
-        .await;
     let sl = rig.sl(&live);
     let (entered, go, point) = gate_point();
     set(&sl.hooks.record_job, point);
@@ -329,9 +336,7 @@ async fn stop_after_the_record_settles() {
     assert_eq!(rig.input(p).state, InputState::Acked);
     end_mark(&rig, &live, stop, true);
     go_on.send(()).unwrap();
-    rig.pass(&live).await;
-    advance(&rig, &live, SETTLE).await;
-    assert_eq!(count(&rig, &live, "stop_settled"), 1);
+    settles(&rig, &live).await;
     let next = rig.send(&live, "next").await;
     rig.until_input(next, InputState::Sent).await;
     rig.stop().await;
@@ -359,21 +364,17 @@ async fn stop_after_an_incomplete_record_settles() {
     rig.hook(&live, "Stop", &json!({})).await;
     end_mark(&rig, &live, stop, true);
     go.send(()).unwrap();
-    rig.pass(&live).await;
-    advance(&rig, &live, SETTLE).await;
-    assert_eq!(count(&rig, &live, "stop_settled"), 1);
+    settles(&rig, &live).await;
     assert_eq!(turn(&rig, &live), TurnState::Idle);
     rig.stop().await;
 }
 
 /// A `Stop` whose intake read its facts before a `Written` unit's record committed keeps the
 /// unit running, though the record commits before the intake's observation ends: its facts
-/// are those of the fence advance, so it never settles.
+/// are read before the fence advance, so it never settles.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn record_during_intake_keeps_running() {
     let (rig, live) = settle_rig().await;
-    rig.cmd_ok("ready", &json!({ "thread_id": live.t }), 200)
-        .await;
     let sl = rig.sl(&live);
     let (entered, go, point) = gate_point();
     set(&sl.hooks.record_job, point);
@@ -381,15 +382,26 @@ async fn record_during_intake_keeps_running() {
     entered.await.unwrap();
     let recorded = sl.state().running.as_ref().unwrap().recorded.clone();
     // Runs in place of the `Stop`'s observation, after its fence advance: the record
-    // commits there.
+    // commits there, and the launch is observed, so the facts are present.
+    let observed = Arc::new(AtomicBool::new(false));
+    let o = observed.clone();
     *crate::supervisor::send::lock(&sl.hooks.observe) = Some(Box::new(move |sup, l| {
         go.send(()).unwrap();
         let end = Instant::now() + Duration::from_secs(10);
-        while !recorded.load(std::sync::atomic::Ordering::Acquire) {
-            assert!(Instant::now() < end, "the record committed");
+        while !recorded.load(Ordering::Acquire) && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(1));
         }
-        sup.observe(l)
+        loop {
+            let seen = sup.observe(l);
+            if matches!(seen, LaunchObservation::Started { .. }) {
+                o.store(recorded.load(Ordering::Acquire), Ordering::SeqCst);
+                return seen;
+            }
+            if Instant::now() >= end {
+                return seen;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }));
     let stop = rig.next_ordinal(&live);
     assert_eq!(
@@ -397,6 +409,10 @@ async fn record_during_intake_keeps_running() {
             .await
             .status,
         200
+    );
+    assert!(
+        observed.load(Ordering::SeqCst),
+        "the record committed and the launch was observed during the intake"
     );
     end_mark(&rig, &live, stop, false);
     rig.until_input(p, InputState::Sent).await;
@@ -430,8 +446,7 @@ async fn stale_start_keeps_the_basis() {
     assert!(human < delivery_seq(&rig, &live, ordinal).unwrap());
     assert_eq!(rig.launch(live.l).last_turn_start_seq, before);
     assert!(before.unwrap() < human);
-    advance(&rig, &live, SETTLE).await;
-    assert_eq!(count(&rig, &live, "stop_settled"), 1);
+    settles(&rig, &live).await;
     stays_queued(&rig, &live).await;
     rig.stop().await;
 }
