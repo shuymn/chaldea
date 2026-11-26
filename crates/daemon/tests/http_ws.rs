@@ -21,6 +21,8 @@ use support::http::{DEADLINE, HEADS_INTERVAL, TestServer, WS_WAIT, eventually, h
 use support::waits;
 use support::{raw_unknown, registered, registered_under, reserved, started};
 use tokio_tungstenite::tungstenite::Error as WsError;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocket};
 
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -599,25 +601,47 @@ async fn idle_socket_dropped() {
     .await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let ticket = srv.ticket(&owner, "events").await.unwrap();
-    let base = srv.server.tasks();
-    // Not read, so the client library answers no ping.
-    let mut ws = srv.ws_with(&ticket).await.unwrap();
-    eventually(WS_WAIT, "the socket task started", || {
-        srv.server.tasks() > base
-    })
-    .await;
-    eventually(WS_WAIT, "the idle socket dropped", || {
-        srv.server.tasks() <= base
-    })
-    .await;
+    // A raw client reads the connection to its end and answers no ping.
+    let r = srv
+        .send(&srv.ws_handshake(&format!("/api/ws?ticket={ticket}")))
+        .await;
+    assert_eq!(r.status, 101, "{r:?}");
     // Dropped, not closed: the frames sent before it, then the end without a close frame.
-    let (code, before) = ws.until_closed().await;
-    assert_eq!(code, None);
-    assert!(matches!(
-        before.first(),
-        Some(WsServerMessage::Hello { .. })
-    ));
+    let frames = server_frames(&r.body);
+    assert!(
+        matches!(
+            frames.first(),
+            Some(WsMessage::Text(t))
+                if matches!(serde_json::from_str(t.as_str()), Ok(WsServerMessage::Hello { .. }))
+        ),
+        "{frames:?}"
+    );
+    assert!(
+        !frames.iter().any(|m| matches!(m, WsMessage::Close(_))),
+        "{frames:?}"
+    );
     srv.stop().await;
+}
+
+/// The messages of the server's frames in `bytes`, up to their end.
+fn server_frames(bytes: &[u8]) -> Vec<WsMessage> {
+    /// Reads `bytes`; drops what the client would write (the pongs).
+    struct Replay<'a>(&'a [u8]);
+    impl std::io::Read for Replay<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.0, buf)
+        }
+    }
+    impl std::io::Write for Replay<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut ws = WebSocket::from_raw_socket(Replay(bytes), Role::Client, None);
+    std::iter::from_fn(|| ws.read().ok()).collect()
 }
 
 // ---- subscribes racing commits ------------------------------------------------------------
