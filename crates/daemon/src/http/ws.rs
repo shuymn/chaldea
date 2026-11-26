@@ -512,7 +512,7 @@ pub(crate) async fn events_socket(s: UpgradedSocket) {
     let mut st = SocketState::default();
     let mut read: Option<InFlightRead> = None;
     // The idle period starts once `hello`'s send completed (until then its send deadline
-    // bounds the socket), and every inbound frame restarts it.
+    // bounds the socket), and every inbound frame after that restarts it.
     let mut hello_pending = matches!(out, Out::Sending(..));
     let mut idle_at = (!hello_pending).then(|| tokio::time::Instant::now() + wcfg.idle_timeout);
     let mut next_heads_at = tokio::time::Instant::now() + wcfg.heads_interval;
@@ -597,7 +597,9 @@ pub(crate) async fn events_socket(s: UpgradedSocket) {
                 continue;
             }
             Ev::Inbound(m) => {
-                idle_at = Some(tokio::time::Instant::now() + wcfg.idle_timeout);
+                if !hello_pending {
+                    idle_at = Some(tokio::time::Instant::now() + wcfg.idle_timeout);
+                }
                 match m {
                     Some(Ok(Message::Text(t))) => {
                         match parse_subscribe(t.as_str(), wcfg.max_subscriptions) {

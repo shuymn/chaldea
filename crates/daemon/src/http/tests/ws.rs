@@ -302,9 +302,10 @@ async fn control_deadlines_fire_during_a_pending_send_and_read() {
     srv.stop().await;
 }
 
-/// No idle deadline runs while `hello`'s send is pending: a socket whose `hello` is held
-/// past `idle_timeout` stays until the send is released, then is dropped by the idle
-/// deadline counted from that send.
+/// No idle deadline runs while `hello`'s send is pending, and an inbound frame then does not
+/// start one: a socket whose `hello` is held past `idle_timeout`, with a subscribe taken in
+/// meanwhile, stays until the send is released, then is dropped by the idle deadline counted
+/// from that send.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_period_starts_after_hello() {
     let srv = TestServer::start_with(Mounts::mvp(), |c: &mut HttpConfig| {
@@ -319,6 +320,11 @@ async fn idle_period_starts_after_hello() {
     let (reached, held) = s.faults.arm_socket_send_gate();
     let mut ws = srv.ws_with(&ticket).await.expect("a 101");
     wait("hello is held", reached).await;
+    // A subscribe taken in (its read entered, not held) while `hello` is held.
+    let (read_entered, release) = hold_next_read(&srv);
+    drop(release);
+    ws.subscribe(&[A]).await;
+    entered(&read_entered).await;
     // Three idle periods with `hello` held: the socket stays.
     waits::pause(Duration::from_millis(900)).await;
     assert_eq!(s.sockets.held(), 1, "no idle deadline before hello is sent");
@@ -326,6 +332,10 @@ async fn idle_period_starts_after_hello() {
     assert!(matches!(
         ws.next().await,
         Some(WsServerMessage::Hello { .. })
+    ));
+    assert!(matches!(
+        ws.next().await,
+        Some(WsServerMessage::Heads { .. })
     ));
     assert_eq!(
         (ws.next().await, ws.closed),
