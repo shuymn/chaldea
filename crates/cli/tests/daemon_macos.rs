@@ -38,7 +38,7 @@ mod macos {
     use super::support::runner::Case;
     use super::support::{Proc, get_status, report, run_helper, state, token_of};
 
-    pub(super) const CASES: [Case; 12] = [
+    pub(super) const CASES: [Case; 13] = [
         Case {
             name: "inherited_signal_state_is_reset",
             run: inherited_signal_state_is_reset,
@@ -66,6 +66,10 @@ mod macos {
         Case {
             name: "timeout_then_absent_then_present",
             run: timeout_then_absent_then_present,
+        },
+        Case {
+            name: "timed_out_lookup_registers_nothing",
+            run: timed_out_lookup_registers_nothing,
         },
         Case {
             name: "completed_bootstrap_failure_is_final",
@@ -414,6 +418,51 @@ mod macos {
         stop(&labels, &d.path);
     }
 
+    /// The `bootstrap-timeout-register-later` fault registers its job only from a lookup that
+    /// answered absent, within that lookup's deadline: a timed-out lookup registers nothing,
+    /// and the next lookup that answers absent registers the job.
+    fn timed_out_lookup_registers_nothing() {
+        require_gui();
+        let labels = Labels::new();
+        let plists = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let label = format!("{}{now}-{}", labels.prefix, uuid::Uuid::new_v4());
+        let plist = write_job_plist(&label, plists.path(), &[OsStr::new("/usr/bin/true")], &[]);
+        let target = host::gui_domain_target();
+        let service = format!("{target}/{label}");
+        let fault = faults::launchctl_fault("bootstrap-timeout-register-later".to_owned());
+        let within = || Instant::now() + Duration::from_secs(10);
+        let boot = fault(
+            &[
+                OsStr::new("bootstrap"),
+                OsStr::new(&target),
+                plist.as_os_str(),
+            ],
+            within(),
+        );
+        assert_eq!(
+            boot.map(|o| o.code).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::TimedOut)
+        );
+        let print = [OsStr::new("print"), OsStr::new(&service)];
+        // A deadline that has come: the lookup times out without running.
+        let timed_out = fault(&print, Instant::now());
+        assert_eq!(
+            timed_out.map(|o| o.code).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::TimedOut)
+        );
+        assert!(!labels.present().contains(&label), "{label} was registered");
+        let absent = fault(&print, within()).unwrap();
+        assert_eq!(absent.code, Some(113), "{absent:?}");
+        assert!(
+            labels.present().contains(&label),
+            "{label} was not registered"
+        );
+    }
+
     /// PR8-CL-13: `bootstrap` and every label lookup time out: exit 4 naming the label and its
     /// `bootout`, no `setsid` fallback.
     fn indeterminate_submission_times_out() {
@@ -438,9 +487,14 @@ mod macos {
         assert_no_daemon(&d.path);
     }
 
-    /// Submits a one-shot job running `program` with `args` (the program first) and `env`
-    /// under `label`, and waits until it ran and finished.
-    fn submit_finished_job(label: &str, dir: &Path, args: &[&OsStr], env: &[(&str, &str)]) {
+    /// Writes `<dir>/<label>.plist`, a one-shot job running `program` with `args` (the program
+    /// first) and `env` under `label`, and returns its path.
+    fn write_job_plist(
+        label: &str,
+        dir: &Path,
+        args: &[&OsStr],
+        env: &[(&str, &str)],
+    ) -> std::path::PathBuf {
         let plist = dir.join(format!("{label}.plist"));
         let xml = |s: &str| {
             s.replace('&', "&amp;")
@@ -462,6 +516,13 @@ mod macos {
             ),
         )
         .unwrap();
+        plist
+    }
+
+    /// Submits a one-shot job running `program` with `args` (the program first) and `env`
+    /// under `label`, and waits until it ran and finished.
+    fn submit_finished_job(label: &str, dir: &Path, args: &[&OsStr], env: &[(&str, &str)]) {
+        let plist = write_job_plist(label, dir, args, env);
         let target = host::gui_domain_target();
         let o = host::launchctl(
             &[
