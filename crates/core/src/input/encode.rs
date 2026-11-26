@@ -208,12 +208,17 @@ pub fn expected_prompt(agent: Agent, encoding: InputEncoding, text: &str) -> Opt
     })
 }
 
+/// Claude wraps a paste of more than this many bytes (`lf(t)`): the smallest wrapped paste
+/// measured is 4 KiB + 1 (spike A-6); none of 1 KiB or less was wrapped.
+pub const CLAUDE_WRAPPED_ABOVE: usize = 4096;
+
 /// Whether a recorded `UserPromptSubmit.prompt` acknowledges a sent `text`: for Claude, the
 /// form Claude 2.1.331 records (`fixtures/claude/2.1.331/README.md`), either
-/// [`expected_prompt`] or, for a paste large enough to be wrapped, the wrapper around the
-/// text's line ends as LF, trailing whitespace removed, and each TAB as four spaces, with no
-/// NFC (DEL and C1 removed or kept: the captures cover neither in a wrapped paste); for Codex,
-/// exactly [`expected_prompt`]. `false` whenever `expected_prompt` is `None`.
+/// [`expected_prompt`] or, for a text whose `lf` form exceeds [`CLAUDE_WRAPPED_ABOVE`] bytes,
+/// the wrapper around the text's line ends as LF, trailing whitespace removed, and each TAB as
+/// four spaces, with no NFC (DEL and C1 removed or kept: the captures cover neither in a
+/// wrapped paste); for Codex, exactly [`expected_prompt`]. `false` whenever `expected_prompt`
+/// is `None`.
 #[must_use]
 pub fn prompt_matches(agent: Agent, encoding: InputEncoding, text: &str, recorded: &str) -> bool {
     let Some(expected) = expected_prompt(agent, encoding, text) else {
@@ -226,6 +231,9 @@ pub fn prompt_matches(agent: Agent, encoding: InputEncoding, text: &str, recorde
         return false;
     }
     let base = lf(text);
+    if base.len() <= CLAUDE_WRAPPED_ABOVE {
+        return false;
+    }
     let Some(body) = strip_paste_wrapper(recorded) else {
         return false;
     };
@@ -672,61 +680,61 @@ mod tests {
         prompt_matches(Agent::Claude, BracketedPaste, text, recorded)
     }
 
-    /// C1-5 (D8): Claude's forms as captured from 2.1.331: a small paste recorded with LF
-    /// line ends, DEL and C1 removed, trailing whitespace removed, NFC, and each TAB as four
-    /// spaces; a wrapped paste with the same except NFC.
+    /// `s` with `@` replaced by [`CLAUDE_WRAPPED_ABOVE`] `y`s: a text large enough to be
+    /// wrapped.
+    fn big(s: &str) -> String {
+        s.replace('@', &"y".repeat(CLAUDE_WRAPPED_ABOVE))
+    }
+
+    /// C1-5 (D8): Claude's forms as captured from 2.1.331: a paste recorded with LF line ends,
+    /// DEL and C1 removed, trailing whitespace removed, NFC, and each TAB as four spaces; a
+    /// wrapped one with the same except NFC.
     #[test]
     fn claude_captured_forms() {
-        let text = "\n a\tb\u{fa19}e\u{301}\u{7f}\u{80}  \r\n";
-        let small = "\n a    b\u{795e}\u{e9}";
+        let text = &big("\n a@\tb\u{fa19}e\u{301}\u{7f}\u{80}  \r\n");
+        let small = &big("\n a@    b\u{795e}\u{e9}");
         assert_eq!(
             expected_prompt(Agent::Claude, BracketedPaste, text).as_deref(),
-            Some(small)
+            Some(small.as_str())
         );
         assert!(claude_matches(text, small));
-        let body = "\n a    b\u{fa19}e\u{301}";
+        let body = &big("\n a@    b\u{fa19}e\u{301}");
         assert!(claude_matches(text, &wrap("4500", body)));
         // The captures cover no DEL or C1 in a wrapped paste: kept is accepted too.
         assert!(claude_matches(
             text,
-            &wrap("4500", "\n a    b\u{fa19}e\u{301}\u{7f}\u{80}")
+            &wrap("4500", &big("\n a@    b\u{fa19}e\u{301}\u{7f}\u{80}"))
         ));
     }
 
     /// C1-5 (D8): each transform the captures did not show is refused.
     #[test]
     fn claude_dropped_transforms() {
-        let text = "\n a\tb\u{fa19}e\u{301}\u{7f}\u{80}  \r\n";
+        let text = &big("\n a@\tb\u{fa19}e\u{301}\u{7f}\u{80}  \r\n");
         for (why, recorded) in [
-            ("TAB left unexpanded", "\n a\tb\u{795e}\u{e9}".to_owned()),
-            (
-                "no NFC in a small paste",
-                "\n a    b\u{fa19}e\u{301}".to_owned(),
-            ),
+            ("TAB left unexpanded", big("\n a@\tb\u{795e}\u{e9}")),
+            ("no NFC in a small paste", big("\n a@    b\u{fa19}e\u{301}")),
             (
                 "DEL and C1 kept in a small paste",
-                "\n a    b\u{795e}\u{e9}\u{7f}\u{80}".to_owned(),
+                big("\n a@    b\u{795e}\u{e9}\u{7f}\u{80}"),
             ),
             (
                 "trailing whitespace kept",
-                "\n a    b\u{795e}\u{e9}  \n".to_owned(),
+                big("\n a@    b\u{795e}\u{e9}  \n"),
             ),
-            (
-                "leading whitespace trimmed",
-                "a    b\u{795e}\u{e9}".to_owned(),
-            ),
-            ("CR kept", "\n a    b\u{795e}\u{e9}\r".to_owned()),
+            ("leading whitespace trimmed", big("a@    b\u{795e}\u{e9}")),
+            ("CR kept", big("\n a@    b\u{795e}\u{e9}\r")),
             (
                 "NFC inside the wrapper",
-                wrap("4500", "\n a    b\u{795e}\u{e9}"),
+                wrap("4500", &big("\n a@    b\u{795e}\u{e9}")),
             ),
             (
                 "TAB unexpanded inside the wrapper",
-                wrap("4500", "\n a\tb\u{fa19}e\u{301}"),
+                wrap("4500", &big("\n a@\tb\u{fa19}e\u{301}")),
             ),
             (
                 "trailing whitespace kept inside the wrapper",
-                wrap("4500", "\n a    b\u{fa19}e\u{301}  \n"),
+                wrap("4500", &big("\n a@    b\u{fa19}e\u{301}  \n")),
             ),
         ] {
             assert!(!claude_matches(text, &recorded), "{why}: {recorded:?}");
@@ -762,23 +770,48 @@ mod tests {
 
     #[test]
     fn claude_mismatches() {
-        assert!(claude_matches("abc", &wrap("a-1_Z", "abc")));
+        let abc = big("@abc");
+        assert!(claude_matches(&abc, &wrap("a-1_Z", &abc)));
         let cases = [
-            ("a\tb", "a  b".to_owned()),
-            ("\u{e9}", "e\u{301}".to_owned()),
+            ("a\tb".to_owned(), "a  b".to_owned()),
+            ("\u{e9}".to_owned(), "e\u{301}".to_owned()),
             (
-                "abc",
-                "\n\n<pasted_content id=\"a1\">\nabc\n</pasted_content id=\"b2\">\n".to_owned(),
+                abc.clone(),
+                format!("\n\n<pasted_content id=\"a1\">\n{abc}\n</pasted_content id=\"b2\">\n"),
             ),
-            ("abc", wrap("", "abc")),
-            ("abc", wrap("a b", "abc")),
-            ("abc", wrap("a1", "ab")),
-            ("a\nb", "a\rb".to_owned()),
-            (" a ", "a".to_owned()),
+            (abc.clone(), wrap("", &abc)),
+            (abc.clone(), wrap("a b", &abc)),
+            (abc.clone(), wrap("a1", &big("@ab"))),
+            ("a\nb".to_owned(), "a\rb".to_owned()),
+            (" a ".to_owned(), "a".to_owned()),
         ];
         for (text, recorded) in cases {
-            assert!(!claude_matches(text, &recorded), "{text:?} {recorded:?}");
+            assert!(!claude_matches(&text, &recorded), "{text:?} {recorded:?}");
         }
+    }
+
+    /// D8: the wrapped form is accepted only for a text whose `lf` form exceeds
+    /// [`CLAUDE_WRAPPED_ABOVE`] bytes, as measured (4 KiB + 1 wrapped); below, only the
+    /// unwrapped form.
+    #[test]
+    fn claude_wrapper_boundary() {
+        let at = "y".repeat(CLAUDE_WRAPPED_ABOVE);
+        let over = "y".repeat(CLAUDE_WRAPPED_ABOVE + 1);
+        assert!(!claude_matches(&at, &wrap("1", &at)));
+        assert!(claude_matches(&at, &at));
+        assert!(claude_matches(&over, &wrap("1", &over)));
+        assert!(claude_matches(&over, &over));
+        // `lf` counts: a CRLF is one byte.
+        let crlf = format!("{}\r\n", "y".repeat(CLAUDE_WRAPPED_ABOVE - 1));
+        assert!(!claude_matches(
+            &crlf,
+            &wrap("1", &crlf[..CLAUDE_WRAPPED_ABOVE - 1])
+        ));
+        let crlf = format!("{}\r\n", "y".repeat(CLAUDE_WRAPPED_ABOVE));
+        assert!(claude_matches(
+            &crlf,
+            &wrap("1", &crlf[..CLAUDE_WRAPPED_ABOVE])
+        ));
     }
 
     #[test]
