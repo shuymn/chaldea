@@ -1,6 +1,6 @@
-//! `echo`: enables bracketed paste, then reports every stdin chunk as hex; with
-//! `--validate-input <n>` it reads exactly `n` bytes instead and reports whether byte `i` is
-//! `b'a' + (i % 26)`.
+//! `echo`: enables bracketed paste and reports `bracketed_paste_on`, then reports every stdin
+//! chunk as hex; with `--validate-input <n>` it reads exactly `n` bytes instead and reports
+//! whether byte `i` is `b'a' + (i % 26)`.
 //!
 //! With `--emitter <path>` (`docs/design/hook-ingest.md` §2.14) it also runs the emitter as a
 //! CLI's hooks do: a `SessionStart` at start (session `--session-id`, else a random UUID),
@@ -46,6 +46,7 @@ pub(crate) fn run(o: &Opts) -> i32 {
     let mut out = std::io::stdout();
     let _ = out.write_all(b"\x1b[?2004h");
     let _ = out.flush();
+    rep.send(&json!({"event": "bracketed_paste_on"}));
     let mut stdin = std::io::stdin().lock();
     if let Some(n) = o.validate_input {
         let (read, ok) = validate(&mut stdin, n);

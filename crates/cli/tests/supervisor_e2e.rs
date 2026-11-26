@@ -486,8 +486,10 @@ fn claude_resume_rebinds() {
 }
 
 /// C1-13: a Claude launch whose CLI never sends `SessionStart` (FakeCli `echo` with DECSET
-/// 2004 on and no emitter) carries `session_start_timeout`, and its first prompt is never
-/// written: FakeCli reports no input.
+/// 2004 on and no emitter) carries `session_start_timeout`, and its first prompt never enters
+/// the write path. The daemon is its own process here, so its 20 s passes in real time; the
+/// version on a controlled clock, with the daemon's own view of DECSET 2004 and the PTY's
+/// bytes, is `stall_before_session_start` (daemon unit tests).
 fn claude_stall() {
     let labels = Labels::new();
     let d = state();
@@ -495,6 +497,9 @@ fn claude_stall() {
     let (mut daemon, port, rx) = claude_daemon(&labels, &d.path, &["--mode", "echo"]);
     let (t, _) = spawn_claude(&labels, &d.path, cwd.path(), Some("first"));
     next_report(&rx, "hello", |v| v["event"] == "hello");
+    next_report(&rx, "DECSET 2004 written", |v| {
+        v["event"] == "bracketed_paste_on"
+    });
     let token = chaldea_daemon::lifecycle::read_owner_token(&d.path).unwrap();
     // The timeout is 20 s from the launch's start; the tick raises it.
     let end = std::time::Instant::now() + std::time::Duration::from_secs(45);
@@ -508,10 +513,14 @@ fn claude_stall() {
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    while let Ok(v) = rx.try_recv() {
-        assert_ne!(v["event"], "input", "a byte was written: {v}");
-    }
-    assert!(of_kind(&envelopes(port, &token, &t), "user_message").is_empty());
+    // The write path moves an input to `sending` before its first byte (mvp §2.3): the first
+    // prompt still `queued`, with no state change, wrote nothing.
+    let evs = envelopes(port, &token, &t);
+    let created = of_kind(&evs, "input_created");
+    assert_eq!(created.len(), 1, "{evs:?}");
+    assert_eq!(created[0]["payload"]["initial_state"], "queued");
+    assert!(of_kind(&evs, "input_state_changed").is_empty(), "{evs:?}");
+    assert!(of_kind(&evs, "user_message").is_empty());
     assert_eq!(daemon.stop_and_wait(&d.path), 0, "{}", daemon.stderr());
 }
 
