@@ -492,13 +492,13 @@ Head, page, snapshot, and `as_of_seq` come from that one read transaction (store
 **`GET /api/blobs/{sha256}?stream_id=`.** `sha256` must be 64 lowercase hex and `stream_id` present and valid (no other parameter), else 400 `bad_query`. One read, in this order in one snapshot:
 
 1. readable stream, else 404;
-2. `ReadTx::blob_ref_exists(stream, sha256) -> Result<bool, StoreError>`, a new store read method over `blob_refs` (no schema change); `false` → 404 with the same body, whether or not a slot is free;
+2. `ReadTx::blob_ref_exists(stream, sha256) -> Result<bool, StoreError>`, a store read method over `blob_refs` and `large_blob_refs`; `false` → 404 with the same body, whether or not a slot is free;
 3. admission: `try_acquire_owned` on `blob_slots` (non-blocking; none free → 503 `busy` with `retry_after`);
-4. `ReadTx::blob(stream, sha256)` loads the bytes and the agreed download type, in the same snapshot, so it finds the reference step 2 found.
+4. `ReadTx::blob_download(stream, sha256)` loads, in the same snapshot, so it finds the reference step 2 found, the agreed download type and either the bytes (a `blobs` blob) or the size and part count (a large blob, store §2.5).
 
-Response: 200, `Content-Type` = the store's download type if it is exactly `text/plain; charset=utf-8` or `application/json`, else `application/octet-stream` (mvp §2.5), `Content-Length`, `X-Content-Type-Options: nosniff`, `Content-Disposition: attachment`, `Cache-Control: no-store`; no `Range`, no `ETag`. The permit moves into the response body, which yields the bytes as copied 64 KiB frames from the buffer it owns, so the buffer and the permit are freed together when hyper drops the body (sent, connection ended, write stall, shutdown).
+Response: 200, `Content-Type` = the store's download type if it is exactly `text/plain; charset=utf-8` or `application/json`, else `application/octet-stream` (mvp §2.5), `Content-Length`, `X-Content-Type-Options: nosniff`, `Content-Disposition: attachment`, `Cache-Control: no-store`; no `Range`, no `ETag`. The permit moves into the response body, which yields the bytes as copied 64 KiB frames from the buffer it owns, so the buffer and the permit are freed together when hyper drops the body (sent, connection ended, write stall, shutdown). A large blob's body yields its parts in order, each read in its own short read when the previous one is sent (`ReadTx::large_blob_part`; see "What admission bounds").
 
-**What admission bounds.** At most `blob_slots` (4) blob bodies, each at most 64 MiB (store §2.5), are held by responses at once, plus hyper's per-connection write buffers. Admission does not bound event pages, snapshots, or lists; their size follows mvp §2.4's limits, and a client that stops reading any reply is cut off by `ConnIo`'s write stall. A streaming blob reader (`rusqlite` `blob` feature) stays a later, schema-free change.
+**What admission bounds.** At most `blob_slots` (4) blob bodies are held by responses at once, plus hyper's per-connection write buffers: a `blobs` blob whole (at most 64 MiB, store §2.5), a large blob as one 4 MiB part at a time. A large blob's body sets `Content-Length` to the whole size from the admitting read, then fetches each immutable part with its own short `Store::read` when the previous part is sent, so across network waits it holds the slot and one part, never a reader connection; a part missing or unreadable mid-stream, or a store shut down, ends the body with an error and hyper aborts the connection, never ending it short as if complete. Admission does not bound event pages, snapshots, or lists; their size follows mvp §2.4's limits, and a client that stops reading any reply is cut off by `ConnIo`'s write stall.
 
 ### 2.8 Commands and Receipts
 
@@ -758,7 +758,7 @@ Every later PR that adds a route, a command, a token use, or a WebSocket purpose
 | Commit notification receiver | each socket at start | the store's broadcast (1024) | dropped with its socket; `Lagged` → heads resync; `Closed` → close |
 | Tickets | `POST /api/ws-ticket` | 1024 total, 32 per token, 30 s | redemption, expiry purge on insert, daemon exit |
 | Pair codes | `POST /api/pair-codes` | 8, 60 s | redemption, purge on insert, daemon exit |
-| Blob body and permit | `GET /api/blobs` | `blob_slots` (4), ≤ 64 MiB each | body dropped by hyper (sent, connection ended, write stall, shutdown) |
+| Blob body and permit | `GET /api/blobs` | `blob_slots` (4), ≤ 64 MiB each (a large blob: one 4 MiB part) | body dropped by hyper (sent, connection ended, write stall, shutdown) |
 
 **Endings.**
 

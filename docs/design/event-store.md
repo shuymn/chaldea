@@ -51,12 +51,13 @@ crates/daemon/Cargo.toml                    # chaldea-daemon (lib only in PR 6);
 crates/daemon/src/lib.rs                    # pub mod store; crate doc: the store rules of §2.1
 crates/daemon/src/store/mod.rs              # Store, StoreConfig, Clock, IdSource, WriteTicket, Committed, errors
 crates/daemon/src/store/open.rs             # open sequence, connection setup, header checks, migrations, fingerprints
-crates/daemon/src/store/schema.rs           # MIGRATIONS (v1 DDL), shipped fingerprints per version, PROJECTION_VERSION
+crates/daemon/src/store/schema.rs           # MIGRATIONS (v1 DDL to v4), shipped fingerprints per version, PROJECTION_VERSION, PART_BYTES
 crates/daemon/src/store/writer.rs           # writer thread, job queue, deadlines, poisoning, failed state, shutdown
 crates/daemon/src/store/readers.rs          # read-only connection pool, ReadTx, Page
 crates/daemon/src/store/write_tx.rs         # WriteTx: append, transcript batch, receipts, hook deliveries, tokens, rebuild
 crates/daemon/src/store/append.rs           # NewEvent → row; idempotency comparison; envelope assembly
 crates/daemon/src/store/content.rs          # prepare_content, the typed Content walker, blob validation, preview
+crates/daemon/src/store/spool.rs            # BlobSpool, SpooledBlob: values above MAX_BLOB_BYTES in a state-directory file
 crates/daemon/src/store/annex.rs            # EventAnnex, WriteBasis, CountedClass
 crates/daemon/src/store/project.rs          # apply(&mut ProjectionTx, &StoredEvent); compare_projections
 crates/daemon/src/store/rows.rs             # internal row types and snapshot assembly
@@ -239,7 +240,10 @@ pub struct NewEvent {
     pub annex: Option<EventAnnex>,            // internal, never on the wire (§2.6)
     pub blobs: Vec<BlobInput>,                // the bytes of every blob its Content fields reference that is not stored yet
 }
-pub struct BlobInput { pub data: Vec<u8> }   // the media type is the referencing Content's
+pub enum BlobInput {                          // the media type is the referencing Content's
+    Bytes(Vec<u8>),                           // at most MAX_BLOB_BYTES, in memory; stored in `blobs`
+    Spooled(SpooledBlob),                     // above it, in a spool file (§2.5); stored as `large_blob_parts`
+}
 pub enum Appended { New(EventEnvelope), Existing(EventEnvelope) }
 ```
 
@@ -247,7 +251,7 @@ pub enum Appended { New(EventEnvelope), Existing(EventEnvelope) }
 
 1. **Boundary checks.** The source is first made canonical: an `Open::Unknown` string that spells a known value (`"transcript"`, `"hook"`, an agent name) becomes that value, because both are the same stored string and a reader of the row sees the known value; dispatch, the duplicate check, the projection, and the returned envelope all use the canonical source. Then `source.kind` is not `transcript` and the kind is not `transcript_generation` (those go through `append_transcript`, so no transcript event bypasses the binding and cursor checks). Then `validate_event`, the one validation step every path that stores an event runs (`append`, `append_transcript` for each line, hook delivery and promotion): the typed `Content` fields are valid and every blob they reference is in `blobs` or in this event's `BlobInput`s, with matching hash, size, and preview (§2.5); the annex has the form its kind requires (§2.6).
 2. **Idempotency.** Look up `(stream_id, idempotency_key)`. If a row exists, compare every producer-supplied field: `kind`, `thread_id`, `launch_id`, `command_id`, `source`, `annex`, `payload` (as JSON values), and the time: `occurred_at: None` matches a row stored without a source time (`occurred_explicit = 0`), whatever its value; `Some(t)` matches a row with `occurred_explicit = 1` and `occurred_at = t`. All equal: the result is `Existing(stored)`, carrying the first insert's `event_id`, `seq`, and `recorded_at`; no row, no projection change. Any difference: error `KeyConflict { stream_id, key, field }` (CL-10: a replayed source never creates a second event; a key reused for a different event is a producer bug and must not pass as a retry). Earlier events of the same batch count, so a batch that repeats a key gets `Existing` for the repeat.
-3. **Blobs and refs.** Insert each `BlobInput` the event references: the store computes SHA-256 and size from the bytes itself (`INSERT … ON CONFLICT(sha256) DO NOTHING`), so no caller can store bytes under another content's hash. Then insert a `blob_refs` row `(stream_id, sha256, media_type)` for each typed reference, with the media type its `Content` declares (`ON CONFLICT DO NOTHING`; the foreign key still refuses a missing blob, S11).
+3. **Blobs and refs.** Insert each `BlobInput` the event references: the store computes SHA-256 and size from the bytes itself (`INSERT … ON CONFLICT(sha256) DO NOTHING`), so no caller can store bytes under another content's hash. A `Spooled` input whose hash is already in `large_blobs` is reused (refs only); otherwise the store inserts its `large_blobs` row and then its parts from the spool file in order, through one `PART_BYTES` buffer, hashing what it inserts, and before the event row checks that the SHA-256 and length of the inserted bytes equal the reference's and that the stored parts are contiguous from 0 with that total length; any mismatch is `ContentError::BlobMismatch` and the job rolls back with nothing advanced. Then insert a `blob_refs` row (a `large_blob_refs` row for a large blob) `(stream_id, sha256, media_type)` for each typed reference, with the media type its `Content` declares (`ON CONFLICT DO NOTHING`; the foreign key still refuses a missing blob, S11).
 4. **Row.** Insert the row with `seq` and `cum_bytes` computed in the `INSERT` from the stream's last row, `RETURNING global_seq, seq, cum_bytes`; the triggers re-check order, membership, and refs (§2.4; `events_blob_refs` refuses the row if a typed reference has no ref from step 3). `event_id` comes from `IdSource`, `recorded_at` from the job.
 5. **Projection.** Call `project::apply` (§2.6). Its errors (`ProjectionError`: a referenced row missing, a compare-and-set that matched no row) poison the job.
 
@@ -396,7 +400,7 @@ Triggers on `events` (each `RAISE(ROLLBACK, '<name>: …')`, S4):
 | `events_global_order` | `AFTER INSERT` | `NEW.global_seq IS NOT (SELECT max(global_seq) FROM events)`: an explicit `global_seq` below an existing one; the store never names the column, so SQLite assigns max + 1 |
 | `events_generation` | `BEFORE INSERT WHEN NEW.kind = 'transcript_generation'` | `NEW.tr_generation IS NOT` the stream's highest `tr_generation` of a `transcript_generation` + 1 (1 when none); `NEW.launch_id IS NOT` the `launch_id` of the stream's latest `launch_reserved` (the thread's current launch), or `NEW.tr_path IS NOT` the `transcript_path` of that launch's latest `session_bound` (none or a `null` path refuses) |
 | `events_transcript_line` | `BEFORE INSERT WHEN NEW.src_kind = 'transcript' AND NEW.kind <> 'transcript_generation'` | a line whose `tr_generation`, `tr_path`, or `tr_file_id` `IS NOT` the stream's latest `transcript_generation`; whose `launch_id IS NOT` the stream's latest `launch_reserved`'s, or whose `tr_path IS NOT` the `transcript_path` of that launch's latest `session_bound`; or whose `tr_offset_end` is not positive (the generation marker sits at 0, so the first line ends past it) or not greater than every earlier `tr_offset_end` of that generation |
-| `events_blob_refs` | `AFTER INSERT` | an event with a blob reference at a typed path (table below) that has no `blob_refs` row `(NEW.stream_id, sha256, media_type)`; the store inserts the refs before the event row (§2.3 step 3) |
+| `events_blob_refs` | `AFTER INSERT` | an event with a blob reference at a typed path (table below) that has neither a `blob_refs` nor (v4) a `large_blob_refs` row `(NEW.stream_id, sha256, media_type)`; the store inserts the refs before the event row (§2.3 step 3) |
 
 Typed `Content` paths (from `core::payload`; the walker in `content.rs` matches every `TypedEvent` variant without a wildcard, so a new kind with a `Content` field does not compile until it is listed):
 
@@ -424,6 +428,26 @@ CREATE TABLE blob_refs (                            -- one row per stream and de
   media_type TEXT NOT NULL CHECK (length(media_type) > 0),
   PRIMARY KEY (stream_id, sha256, media_type)
 ) STRICT, WITHOUT ROWID;
+
+-- v4: a value above MAX_BLOB_BYTES, as ordered parts under its whole content's SHA-256
+CREATE TABLE large_blobs (
+  sha256     TEXT PRIMARY KEY CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+  size       INTEGER NOT NULL CHECK (size > 67108864 AND size <= 9007199254740991),  -- disjoint from blobs
+  part_count INTEGER NOT NULL CHECK (part_count >= 2)
+) STRICT;
+CREATE TABLE large_blob_parts (                     -- PART_BYTES = 4 MiB; part 0 holds the 1027 bytes the preview reads
+  sha256     TEXT NOT NULL REFERENCES large_blobs (sha256),
+  part_index INTEGER NOT NULL CHECK (part_index >= 0),
+  data       BLOB NOT NULL CHECK (length(data) > 0 AND length(data) <= 4194304
+                                  AND (part_index > 0 OR length(data) >= 1027)),
+  PRIMARY KEY (sha256, part_index)
+) STRICT;
+CREATE TABLE large_blob_refs (                      -- as blob_refs
+  stream_id  TEXT NOT NULL, sha256 TEXT NOT NULL REFERENCES large_blobs (sha256),
+  media_type TEXT NOT NULL CHECK (length(media_type) > 0),
+  PRIMARY KEY (stream_id, sha256, media_type)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX large_blob_refs_sha256 ON large_blob_refs (sha256);
 
 CREATE TABLE command_receipts (
   command_id     TEXT PRIMARY KEY,
@@ -468,7 +492,9 @@ Immutability triggers on the other tables (all `RAISE(ROLLBACK)`):
 | Table | Update | Delete |
 |---|---|---|
 | `meta` | refused for `epoch` and `created_at`; only `projection_version` may change | refused |
-| `blobs`, `blob_refs` | refused | refused |
+| `blobs`, `blob_refs`, `large_blobs`, `large_blob_parts`, `large_blob_refs` | refused | refused |
+| `large_blob_refs` insert | `BEFORE INSERT` (`large_blob_refs_complete`): the blob's parts are not complete, that is `(count, min(part_index), max(part_index), sum(length(data)))` `IS NOT (part_count, 0, part_count - 1, size)` (or there is no `large_blobs` row) | — |
+| `large_blob_parts` insert | `BEFORE INSERT` (`large_blob_parts_sealed`): the blob already has a ref, so no part is added after a referenced blob committed | — |
 | `command_receipts` | only `status` from `in_progress` to `completed` or `unknown_after_crash`, with the columns the `CHECK` requires; `command_id`, `token_id`, `request_sha256`, `created_at` unchanged | refused |
 | `hook_deliveries` | only `routing` from `buffered` to `appended` or `raw_unknown`, setting `stream_id`, `seq` and clearing the pending columns; key, both ordinals, reply, `received_at` unchanged | refused |
 | `tokens` | only `revoked_at` from `NULL`; every other column unchanged | refused |
@@ -490,7 +516,7 @@ With `recursive_triggers=ON` the delete triggers also refuse `REPLACE` on these 
 
 State columns carry `CHECK (x IN (…))` with the core enum values; flags `CHECK (x IN (0, 1))`; foreign keys tie launches, inputs, approvals, and cursors to `proj_threads`. Projection tables have no immutability triggers: rebuild clears and rewrites them.
 
-**Migrations and projection versions.** `schema::MIGRATIONS` is an ordered list of SQL scripts; v1 is the schema above, v2 adds the trigger `events_session_bound_once` (PR 9, hook-ingest §2.12): a `session_bound` needs a non-`NULL` launch that is the stream's latest `launch_reserved`, with no earlier `session_bound` of that launch in the stream, and v3 adds `proj_inputs.attempt_seq` and `last_write_before` (PR 10b, `docs/design/supervisor-send.md` §2.9 E1) with `PROJECTION_VERSION` 2, so a v2 database rebuilds its projections on open. `PROJECTION_VERSION` 3 has a `user_message` carrying the `Prompt { superseded: true }` annex leave its launch's `last_turn_start_seq` (`docs/design/supervisor-send.md` §2.4 "Turn boundaries in receipt order"); no event stored by an earlier version carries that annex, so the rebuild on open gives the same rows. Each script runs in its own `BEGIN IMMEDIATE` transaction that also sets `PRAGMA user_version` (S8), so a crash leaves the previous version. Any physical DDL change, projection tables included, is a migration. v1 is the DDL as this PR merges it: no binary that writes a database exists before PR 8's daemon, and databases created by review builds of this PR are test fixtures, so v1 changed in place until the merge and is frozen from then on, with its fingerprint; every later physical change is v2 or above. `meta.projection_version` covers only a change in how `apply` interprets events on the same DDL; `open` rebuilds when the stored value differs from the code's, in either direction (a downgrade rebuilds too). Because two processes of different versions can have the file open (PR 8's lock covers one daemon, not a doctor or an older binary), every write job reads `meta.projection_version` after taking the lock and refuses when it differs from its own (§2.2 step 4): once one version rebuilt, a process with another `apply` cannot write.
+**Migrations and projection versions.** `schema::MIGRATIONS` is an ordered list of SQL scripts; v1 is the schema above, v2 adds the trigger `events_session_bound_once` (PR 9, hook-ingest §2.12): a `session_bound` needs a non-`NULL` launch that is the stream's latest `launch_reserved`, with no earlier `session_bound` of that launch in the stream, and v3 adds `proj_inputs.attempt_seq` and `last_write_before` (PR 10b, `docs/design/supervisor-send.md` §2.9 E1) with `PROJECTION_VERSION` 2, so a v2 database rebuilds its projections on open, and v4 adds `large_blobs`, `large_blob_parts`, `large_blob_refs`, their triggers, and an `events_blob_refs` recreated to accept either ref table (C1c1, `docs/design/c1-claude-adapter.md` D14; no table is rebuilt, and the new tables are not projections, so `PROJECTION_VERSION` stays and rebuild leaves them alone). `PROJECTION_VERSION` 3 has a `user_message` carrying the `Prompt { superseded: true }` annex leave its launch's `last_turn_start_seq` (`docs/design/supervisor-send.md` §2.4 "Turn boundaries in receipt order"); no event stored by an earlier version carries that annex, so the rebuild on open gives the same rows. Each script runs in its own `BEGIN IMMEDIATE` transaction that also sets `PRAGMA user_version` (S8), so a crash leaves the previous version. Any physical DDL change, projection tables included, is a migration. v1 is the DDL as this PR merges it: no binary that writes a database exists before PR 8's daemon, and databases created by review builds of this PR are test fixtures, so v1 changed in place until the merge and is frozen from then on, with its fingerprint; every later physical change is v2 or above. `meta.projection_version` covers only a change in how `apply` interprets events on the same DDL; `open` rebuilds when the stored value differs from the code's, in either direction (a downgrade rebuilds too). Because two processes of different versions can have the file open (PR 8's lock covers one daemon, not a doctor or an older binary), every write job reads `meta.projection_version` after taking the lock and refuses when it differs from its own (§2.2 step 4): once one version rebuilt, a process with another `apply` cannot write.
 
 ### 2.5 `Content` and Blobs
 
@@ -498,18 +524,25 @@ State columns carry `CHECK (x IN (…))` with the core enum values; flags `CHECK
 pub struct Prepared { pub content: Content, pub blob: Option<BlobInput> }
 pub fn prepare_content(bytes: Vec<u8>, media_type: &str) -> Result<Prepared, ContentError>;  // ContentError::TooLarge
 pub const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
+
+impl Store { pub fn blob_spool(&self) -> io::Result<BlobSpool>; }   // its file in the state directory
+impl BlobSpool {                                                    // also io::Write
+    pub fn append(&mut self, bytes: &[u8]) -> io::Result<()>;
+    pub fn finish(self, media_type: &str) -> io::Result<Prepared>;  // Bytes or inline at or below MAX_BLOB_BYTES, Spooled above
+}
 ```
 
 - **Inline** when `bytes.len() <= core::payload::INLINE_LIMIT_BYTES` (65 536): `encoding: utf8` with the text when the bytes are valid UTF-8, else `encoding: base64` (standard alphabet, padded). The limit applies to the content's bytes, not the encoded form.
 - **Blob** above it: `sha256` = lowercase hex SHA-256 of the bytes, `size`, `media_type`, `preview`, `preview_lossy`.
 - **Preview** (mvp §2.1 as clarified by this PR). Decode `bytes[..min(len, 1024)]` as UTF-8, replacing each invalid sequence with U+FFFD and setting `preview_lossy`. If the window ends inside a sequence that is incomplete only because of the window (`Utf8Error::error_len() == None` at the end), look at up to 3 bytes past byte 1024: if they complete a valid scalar, that scalar is left out of the preview and does not set `preview_lossy`; if they do not (or the content ends), the partial sequence is invalid, is replaced with U+FFFD, and sets `preview_lossy`. A U+FFFD present in the content itself is valid UTF-8 and does not set it. Reason: the flag tells a reader that the preview misrepresents the content; a character cut only by the window misrepresents nothing, and Japanese text (AGENTS.md invariant 4) would otherwise be flagged lossy on most large blobs.
 - **Store boundary** (`append`, `append_transcript`, promotion). For every typed `Content` field of the event (the walker of §2.4): an `Inline` value must be at most 65 536 bytes (for `base64`, after decoding; the decoded bytes must be valid base64 and must not be valid UTF-8, so each content has one form); a `Blob` value must match a blob that is either in this event's `BlobInput`s or already stored, with equal `sha256`, `size`, preview, and `preview_lossy` (recomputed from the stored or given bytes), and a non-empty `media_type`. Any mismatch is `ContentError`. SHA-256 of a stored blob is computed by the store from the bytes (§2.3 step 3); this rule rests on Rust, because SQLite has no built-in hash function (§2.1). `BlobInput`s are matched by the hash of their bytes: several inputs with equal bytes (two separately prepared references, under different media types) are all used by any reference to that hash, and the body is inserted once. Every `BlobInput` must be referenced by the event; an unreferenced one is refused.
-- **Size bound.** Above `MAX_BLOB_BYTES` (64 MiB) `prepare_content` returns `TooLarge` and the store refuses the event. This is an internal limit: a producer that hits it loses the event and its full text unless it stores something else (a `raw_unknown` with a truncated preview, its own choice); PR 9's 4 MiB body limit and PR 13's line bound keep their producers below it. The bound and `size > 65 536` are also `CHECK`s on `blobs`.
-- **Storage** in `blobs`, inside the event's transaction: the blob, the event, and its refs commit together or not at all; no file outside the database can be orphaned, half-written, or held by another Windows process.
+- **Size bound.** A blob has no size cap beyond `MAX_SAFE_INTEGER` bytes (`BlobRef.size` on the wire). `MAX_BLOB_BYTES` (64 MiB) bounds a value held in memory and one `blobs` row: above it `prepare_content` returns `TooLarge`, and a producer of a value of unknown or larger size spools it instead. The bound and `size > 65 536` are `CHECK`s on `blobs`; `size > 67 108 864` and `size <= 2^53 − 1` are `CHECK`s on `large_blobs`, so a hash is in at most one of the two tables.
+- **Spooling** (D14). `Store::blob_spool` creates a temporary file the producer owns in the state directory (never `TMPDIR`); `append` fills a 64 KiB buffer and writes it to the file, computing the whole SHA-256, the size, and the first 1027 bytes for the preview as it goes, so the producer never holds the value in memory. `finish` returns, at or below `MAX_BLOB_BYTES`, what `prepare_content` returns for the bytes read back; above it a `Content::Blob` with that hash, size, and preview and a `BlobInput::Spooled` that owns the file handle. The file is closed and then removed (closing first, for Windows) when the last owner drops: after the job's append, whether it commits or rolls back, or with a job that never runs, before its reply. A spool file left by a process crash stays in the state directory; nothing removes it.
+- **Storage** in `blobs` (at most `MAX_BLOB_BYTES`) or as `large_blob_parts` (above it, `PART_BYTES` = 4 MiB each, in order), inside the event's transaction: the blob, the event, and its refs commit together or not at all; no file outside the database can be orphaned, half-written, or held by another Windows process. Completeness of a large blob is enforced in SQL as well as in Rust: a ref is refused for a blob whose parts are incomplete, and a referenced blob takes no more parts (§2.4).
 - **Refs.** The store writes `(stream_id, sha256, media_type)` for each typed blob reference, with the type its `Content` declares, using `INSERT … ON CONFLICT DO NOTHING`: a repeat in the same event or a later event of the stream is skipped, and the foreign key still refuses a missing blob (S11). `events_blob_refs` refuses an event whose typed reference has no ref, and only typed paths count, so a `{"blob": …}` object in `SurfaceAction.args` neither aborts an event nor grants a stream read access to a blob.
 - **Media type.** The body is shared by SHA-256; the media type belongs to each reference. Every event keeps the type its `Content` declared (in its payload and in its `blob_refs` row), and no event is ever refused because the same bytes were stored under another type: a 70 KiB JSON document can be a `text/plain; charset=utf-8` prompt in one thread and an `application/json` tool input in another, and both events and the full bytes are kept. The download type for `(stream_id, sha256)` is the type of that stream's refs when they all agree, else `application/octet-stream`; it does not depend on insertion order, and PR 7 then applies mvp §2.5's serving rule (only `text/plain; charset=utf-8` and `application/json` are served as stored).
-- **Deletion.** None in the MVP: events are immutable, so every reference is permanent, and no unreferenced blob can be stored.
-- **Reads.** `ReadTx::blob(stream_id, sha256)` returns the bytes and the download type above only when the stream has a ref to `sha256`. `ReadTx::blob_ref_exists(stream_id, sha256)` answers the same ref check without loading the bytes; PR 7 calls it before admitting a blob download. The whole blob is read into memory (at most 64 MiB); a streaming reader (`rusqlite`'s `blob` feature) can be added by PR 7 without a schema change.
+- **Deletion.** None in the MVP, for either table: events are immutable, so every reference is permanent, and no unreferenced blob can be stored. There is no blob garbage collection.
+- **Reads.** `ReadTx::blob(stream_id, sha256)` returns the whole bytes and the download type above only when the stream has a ref to `sha256` in either ref table (a large blob is read whole into memory). `ReadTx::blob_ref_exists(stream_id, sha256)` answers the same ref check without loading the bytes; PR 7 calls it before admitting a blob download. `ReadTx::blob_download` returns what a download serves: a `blobs` blob's bytes, or a large blob's download type, size, and part count; `ReadTx::large_blob_part(sha256, index)` reads one part, so a download reads each part in its own short read transaction.
 
 ### 2.6 Projections, Annex, and Rebuild
 
@@ -615,6 +648,8 @@ impl ReadTx<'_> {
     pub fn transcript_cursor(&self, t: ThreadId) -> Result<Option<TranscriptCursor>, StoreError>;
     pub fn blob(&self, s: StreamId, sha256: &str) -> Result<Option<BlobBody>, StoreError>;
     pub fn blob_ref_exists(&self, s: StreamId, sha256: &str) -> Result<bool, StoreError>;
+    pub fn blob_download(&self, s: StreamId, sha256: &str) -> Result<Option<BlobDownload>, StoreError>;  // Whole(BlobBody) | Parts(LargeBlob { media_type, size, part_count })
+    pub fn large_blob_part(&self, sha256: &str, index: u64) -> Result<Option<Vec<u8>>, StoreError>;
     pub fn receipt(&self, c: CommandId) -> Result<Option<CommandReceipt>, StoreError>;   // core::command::CommandReceipt
     pub fn token_by_hash(&self, sha256: &[u8; 32]) -> Result<Option<TokenRow>, StoreError>;
     pub fn hook_delivery(&self, l: LaunchId, emit: Uuid) -> Result<Option<HookDelivery>, StoreError>;
@@ -751,6 +786,8 @@ Every later PR that reads or writes the store, and what it uses. None needs a st
 | Reply oneshot | `submit` | one per job | the writer replies once; a dropped sender is `WriterGone` |
 | `Committed` broadcast | `open` | 1024 messages | the owning `shutdown` drops the store's sender outside the intake locks and then publishes the close; the writer thread drops its own before publishing its report; then each receiver gets `Closed` once it has drained the notifications still buffered for it; a lagging receiver gets `Lagged` first, then the rest, then `Closed` |
 | Read transaction | `read` | one per call | `f` returns |
+| Spool file `chaldea-spool-<uuid>.tmp` | `Store::blob_spool` | one per spooled value; disk only, a 64 KiB buffer in memory | closed, then removed, when its last owner drops (`finish` at or below the cap, the job's append, a job that never runs, or a spool dropped unfinished); a process crash leaves it |
+| Part buffer | `append` of a `Spooled` input | one `PART_BYTES` (4 MiB) buffer per spooled input being inserted | the insert returns |
 
 `journal_size_limit` is the size SQLite truncates the WAL back to after a checkpoint resets it, not a cap: a long read transaction can let the WAL grow past it. A backup copies the database through SQLite (the backup API or `VACUUM INTO`) or copies all three files with the store shut down; a copy of a live `.db` file alone can miss committed transactions still in the WAL.
 
