@@ -5,9 +5,10 @@
 mod support;
 
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use support::faults::{
@@ -25,6 +26,10 @@ fn main() {
         Case {
             name: "banner_changes_nothing",
             run: banner_changes_nothing,
+        },
+        Case {
+            name: "inspect_reads_thread",
+            run: inspect_reads_thread,
         },
         Case {
             name: "stop_kills_tree",
@@ -155,6 +160,80 @@ fn wait_until_exited() {
     );
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("the launch exited"), "{err}");
+    assert_eq!(daemon.stop_and_wait(&d.path), 0, "{}", daemon.stderr());
+}
+
+/// C1-12: `chaldea inspect` through the binary, with the owner token read from the state
+/// directory: the snapshot and the live screen of the same launch (exit 0), a plain output
+/// that ends with the screen, and an unknown thread (exit 1).
+fn inspect_reads_thread() {
+    let labels = Labels::new();
+    let d = state();
+    let cwd = tempfile::tempdir().unwrap();
+    let report = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("127.0.0.1:{}", report.local_addr().unwrap().port());
+    let (mut daemon, _) = daemon(
+        &labels,
+        &d.path,
+        &[
+            "--mode",
+            "banner",
+            "--report",
+            &addr,
+            "--max-life-secs",
+            "120",
+        ],
+    );
+    let t = spawn_codex(&labels, &d.path, cwd.path());
+    // FakeCli's report connection, within `WAIT`.
+    report.set_nonblocking(true).unwrap();
+    let end = Instant::now() + WAIT;
+    let conn = loop {
+        match report.accept() {
+            Ok((c, _)) => break c,
+            Err(e) if e.kind() == ErrorKind::WouldBlock && Instant::now() < end => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("FakeCli opened no report connection: {e}"),
+        }
+    };
+    conn.set_nonblocking(false).unwrap();
+    conn.set_read_timeout(Some(WAIT)).unwrap();
+    let written = BufReader::new(conn)
+        .lines()
+        .any(|l| l.is_ok_and(|l| l.contains("banner_written")));
+    assert!(written, "FakeCli wrote its output");
+    let (code, v, err) = agent(&labels, &d.path, &["inspect", &t, "--json"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(v["thread_id"], t.as_str(), "{v}");
+    assert_eq!(v["snapshot"]["thread"]["thread_id"], t.as_str(), "{v}");
+    assert_eq!(
+        (&v["summary"], &v["snapshot_error"]),
+        (&Value::Null, &Value::Null)
+    );
+    assert_eq!(v["screen_error"], Value::Null, "{v}");
+    assert_eq!(
+        v["screen"]["launch_id"], v["snapshot"]["launch"]["launch_id"],
+        "{v}"
+    );
+    let rows = v["screen"]["rows"].as_u64().unwrap();
+    assert_eq!(v["screen"]["lines"].as_array().unwrap().len() as u64, rows);
+    let (code, out, err) = run_to_exit(&mut cmd(&labels, &d.path, &["inspect", &t], &[]));
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.starts_with(&format!("thread {t}: process running")),
+        "{out}"
+    );
+    assert!(out.contains("\nscreen: "), "{out}");
+    let (code, _, err) = agent(
+        &labels,
+        &d.path,
+        &["inspect", "00000000-0000-0000-0000-00000000dead"],
+    );
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("no such thread"), "{err}");
+    let (code, _, _) = agent(&labels, &d.path, &["stop", &t]);
+    assert_eq!(code, 0);
     assert_eq!(daemon.stop_and_wait(&d.path), 0, "{}", daemon.stderr());
 }
 

@@ -259,6 +259,9 @@ fn command(cli: Cli, seams: &mut Seams) -> ExitCode {
         Command::Close { thread, stop } => {
             agent_cmd::run(&state_dir, agent_cmd::Verb::Close { thread, stop })
         }
+        Command::Inspect { thread, json } => {
+            agent_cmd::run(&state_dir, agent_cmd::Verb::Inspect { thread, json })
+        }
         Command::Wait {
             thread,
             until,

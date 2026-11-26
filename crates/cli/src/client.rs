@@ -10,7 +10,7 @@ use std::time::Instant;
 
 pub use chaldea_daemon::lifecycle::Discovery;
 
-/// The largest response body read.
+/// The largest response body read unless a request states its own.
 const MAX_BODY: usize = 1024 * 1024;
 /// The largest response head read.
 const MAX_HEAD: usize = 64 * 1024;
@@ -70,8 +70,24 @@ pub fn request(
     token: Option<&str>,
     deadline: Instant,
 ) -> io::Result<Response> {
+    request_up_to(port, method, path, token, deadline, MAX_BODY)
+}
+
+/// [`request`] whose response body may be up to `max_body` bytes.
+///
+/// # Errors
+///
+/// As [`request`].
+pub fn request_up_to(
+    port: u16,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    deadline: Instant,
+    max_body: usize,
+) -> io::Result<Response> {
     let mut s = send(port, method, path, token, None, deadline)?;
-    read_response(|buf| read_some(&mut s, buf, deadline), deadline)
+    read_response_up_to(|buf| read_some(&mut s, buf, deadline), deadline, max_body)
 }
 
 /// A `POST` as [`request`] sends one, with `body` as its JSON body (`Content-Type:
@@ -212,6 +228,15 @@ fn read_response(
     read: impl FnMut(&mut Vec<u8>) -> io::Result<()>,
     deadline: Instant,
 ) -> io::Result<Response> {
+    read_response_up_to(read, deadline, MAX_BODY)
+}
+
+/// [`read_response`] with a body of at most `max_body` bytes.
+fn read_response_up_to(
+    read: impl FnMut(&mut Vec<u8>) -> io::Result<()>,
+    deadline: Instant,
+    max_body: usize,
+) -> io::Result<Response> {
     let mut buf = Vec::new();
     let mut read = checked(read, deadline);
     let (status, head_end) = read_head(&mut read, &mut buf)?;
@@ -227,7 +252,7 @@ fn read_response(
         })
         .flatten()
         .ok_or_else(|| protocol("no Content-Length"))?;
-    if length > MAX_BODY {
+    if length > max_body {
         return Err(io::Error::new(io::ErrorKind::InvalidData, BodyTooLarge));
     }
     let start = head_end + 4;
@@ -240,7 +265,7 @@ fn read_response(
     })
 }
 
-/// The error of a response whose `Content-Length` is above the 1 MiB the client reads.
+/// The error of a response whose `Content-Length` is above what the request reads.
 #[derive(Debug)]
 struct BodyTooLarge;
 
@@ -252,8 +277,8 @@ impl std::fmt::Display for BodyTooLarge {
 
 impl std::error::Error for BodyTooLarge {}
 
-/// Whether `e` is a request's error for a response body above the client's 1 MiB limit (an
-/// `InvalidData` error like every other protocol error, told apart by its source).
+/// Whether `e` is a request's error for a response body above its limit (an `InvalidData`
+/// error like every other protocol error, told apart by its source).
 #[must_use]
 pub fn is_body_too_large(e: &io::Error) -> bool {
     e.get_ref()

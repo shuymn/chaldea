@@ -3,7 +3,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -41,6 +41,10 @@ enum Reply {
     Eof,
     /// Answers nothing until the test releases it (or 20 s).
     Hold(mpsc::Receiver<()>),
+    /// A head with this status and `Content-Length`, then the end of the connection.
+    Head(u16, usize),
+    /// Moves the test clock forward by `ms`, then answers with the inner reply.
+    After(u64, Box<Reply>),
 }
 
 /// The stub server and the test clock (real time plus a skew the stub can add).
@@ -48,6 +52,16 @@ struct Stub {
     port: u16,
     seen: Arc<Mutex<Vec<Seen>>>,
     skew: Arc<AtomicU64>,
+    /// Set on drop: the listener thread returns at its next connection.
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Stub {
+    /// Stops the listener thread: sets `stop`, then wakes its `accept` with one connection.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+    }
 }
 
 impl Stub {
@@ -56,19 +70,28 @@ impl Stub {
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let skew = Arc::new(AtomicU64::new(0));
-        let (s, k) = (seen.clone(), skew.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (s, k, st) = (seen.clone(), skew.clone(), stop.clone());
         std::thread::spawn(move || {
             for reply in script {
                 let Ok((mut c, _)) = listener.accept() else {
                     return;
                 };
+                if st.load(Ordering::SeqCst) {
+                    return;
+                }
                 if let Some(req) = read_request(&mut c) {
                     s.lock().unwrap().push(req);
                 }
                 answer(&mut c, reply, &k);
             }
         });
-        Stub { port, seen, skew }
+        Stub {
+            port,
+            seen,
+            skew,
+            stop,
+        }
     }
 
     /// A stub that answers each of up to `max` connections with `handler` of its request.
@@ -77,12 +100,16 @@ impl Stub {
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let skew = Arc::new(AtomicU64::new(0));
-        let (s, k) = (seen.clone(), skew.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (s, k, st) = (seen.clone(), skew.clone(), stop.clone());
         std::thread::spawn(move || {
             for _ in 0..max {
                 let Ok((mut c, _)) = listener.accept() else {
                     return;
                 };
+                if st.load(Ordering::SeqCst) {
+                    return;
+                }
                 let Some(req) = read_request(&mut c) else {
                     continue;
                 };
@@ -91,7 +118,12 @@ impl Stub {
                 answer(&mut c, reply, &k);
             }
         });
-        Stub { port, seen, skew }
+        Stub {
+            port,
+            seen,
+            skew,
+            stop,
+        }
     }
 
     fn now(&self) -> impl Fn() -> Instant + '_ {
@@ -124,6 +156,17 @@ fn answer(c: &mut std::net::TcpStream, reply: Reply, skew: &AtomicU64) {
         Reply::Eof => return,
         Reply::Hold(rx) => {
             let _ = rx.recv_timeout(Duration::from_secs(20));
+            return;
+        }
+        Reply::After(ms, inner) => {
+            skew.fetch_add(ms, Ordering::SeqCst);
+            return answer(c, *inner, skew);
+        }
+        Reply::Head(st, len) => {
+            let _ = write!(
+                c,
+                "HTTP/1.1 {st} X\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+            );
             return;
         }
     };
@@ -176,12 +219,23 @@ fn run_with(
     discover: &dyn Fn() -> Result<Found, String>,
     f: impl FnOnce(&Client<'_>, &mut Vec<u8>, &mut Vec<u8>) -> ExitCode,
 ) -> (ExitCode, String, String) {
+    run_faulty(stub, discover, &|_| None, f)
+}
+
+/// [`run_with`] with `fault` injecting request errors at the request boundary.
+fn run_faulty(
+    stub: &Stub,
+    discover: &dyn Fn() -> Result<Found, String>,
+    fault: &dyn Fn(&str) -> Option<std::io::ErrorKind>,
+    f: impl FnOnce(&Client<'_>, &mut Vec<u8>, &mut Vec<u8>) -> ExitCode,
+) -> (ExitCode, String, String) {
     let now = stub.now();
     let c = Client {
         discover,
         token: "chdo_test".to_owned(),
         now: &now,
         period: Duration::from_millis(1),
+        fault,
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = f(&c, &mut out, &mut err);
@@ -676,6 +730,7 @@ fn wait_timeout_past_the_last_instant() {
         token: "chdo_test".to_owned(),
         now: &now,
         period: Duration::from_millis(1),
+        fault: &|_| None,
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = c.wait(T, Until::Exited, timeout, &mut out, &mut err);
@@ -747,4 +802,5 @@ fn unconfirmed_text() {
     );
 }
 
+mod inspect;
 mod preview;

@@ -1,0 +1,108 @@
+{
+  "$defs": {
+    "LaunchId": {
+      "description": "A launch: one process lifetime of a thread.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "ThreadId": {
+      "description": "A thread: one agent conversation across all its launches.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "VtCursor": {
+      "properties": {
+        "col": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "row": {
+          "description": "Zero-based cell coordinates in the grid.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "visible": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "row",
+        "col",
+        "visible"
+      ],
+      "type": "object"
+    },
+    "VtModes": {
+      "properties": {
+        "alternate_screen": {
+          "type": "boolean"
+        },
+        "bracketed_paste": {
+          "description": "DECSET 2004.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "bracketed_paste",
+        "alternate_screen"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The body of `GET /api/threads/{thread_id}/screen`: the live screen of the thread's current\nlaunch, one text line per row. The daemon builds it with [`ScreenResponse::new`], which\nkeeps the serialized body within [`SCREEN_MAX_BODY`].",
+  "properties": {
+    "cols": {
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "cursor": {
+      "$ref": "#/$defs/VtCursor",
+      "description": "In cell coordinates (a wide character takes two columns)."
+    },
+    "launch_id": {
+      "$ref": "#/$defs/LaunchId"
+    },
+    "lines": {
+      "description": "Exactly `rows` lines, top to bottom: each row's cells without the second half of a\nwide character, combining characters kept, trailing spaces trimmed.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "modes": {
+      "$ref": "#/$defs/VtModes"
+    },
+    "rows": {
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "thread_id": {
+      "$ref": "#/$defs/ThreadId"
+    },
+    "truncated": {
+      "description": "Some line was cut to keep the body within its bound.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "thread_id",
+    "launch_id",
+    "cols",
+    "rows",
+    "cursor",
+    "modes",
+    "lines",
+    "truncated"
+  ],
+  "title": "ScreenResponse",
+  "type": "object"
+}
