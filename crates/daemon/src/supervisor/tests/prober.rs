@@ -316,6 +316,61 @@ async fn never_confirms() {
     rig.srv.stop().await;
 }
 
+/// PR10a2-CL-3: a failed start's recorded child that `orphan::kill_recorded` refuses (pid 0)
+/// is a candidate like any other: the real loop is called with it, makes no OS call, and the
+/// evidence records it `invalid`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refused_identity_recorded_invalid() {
+    use chaldea_pty_runtime::fake::FakeScript;
+    let rig = Rig::new().await;
+    let refused = ProcessIdentity {
+        pid: 0,
+        start_time: "1".to_owned(),
+        group: String::new(),
+    };
+    rig.pty.script_next(FakeScript {
+        fail: Some(chaldea_pty_runtime::SpawnError::StartedThenFailed {
+            stage: "s",
+            error: std::io::Error::other("x"),
+            identity: Some(refused.clone()),
+            cleanup: chaldea_pty_runtime::Cleanup::Unresolved {
+                kill: None,
+                close: None,
+                drain_abandoned: false,
+            },
+        }),
+        ..FakeScript::default()
+    });
+    let cwd = rig.cwd.path().to_string_lossy().into_owned();
+    let r = rig
+        .cmd("spawn", &json!({ "agent": "codex", "cwd": cwd }))
+        .await;
+    assert_eq!(body(&r)["outcome"], "spawn_failed");
+    let t: ThreadId = serde_json::from_value(body(&r)["thread_id"].clone()).unwrap();
+    let (_, store) = rig.srv.into_store(Duration::from_secs(10)).await;
+    drop(rig.sup);
+    super::restart::restart_all(&store);
+    let calls: Arc<Mutex<Vec<Vec<ProcessIdentity>>>> = Arc::default();
+    let seen = calls.clone();
+    let real: KillRecordedFn = Arc::new(move |ids, deadline| {
+        seen.lock().unwrap().push(ids.to_vec());
+        chaldea_pty_runtime::orphan::kill_recorded(ids, deadline)
+    });
+    let rig = Rig::on(store, HostOs::Macos, move |c| c.kill_recorded = real).await;
+    rig.clock.resume();
+    for h in prober::run(rig.sup.clone()).await {
+        h.await.unwrap();
+    }
+    assert_eq!(*calls.lock().unwrap(), vec![vec![refused]]);
+    let ev = evidence(&rig, t);
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_eq!(
+        ev[0]["identities"],
+        json!([{ "pid": 0, "start_time": "1", "observed": "invalid" }])
+    );
+    rig.srv.stop().await;
+}
+
 /// PR10a2-CL-6 `shutdown`: admission closed at `prober_start`: no call; closed while the
 /// prober waits for a slot: no further admit and no call; a task held at `probe_queued` while
 /// admission closes: no call, no evidence, the participant `Clean`; a task held inside its

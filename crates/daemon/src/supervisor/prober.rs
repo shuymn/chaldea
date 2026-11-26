@@ -59,9 +59,10 @@ struct Target {
 }
 
 /// The prober's candidates, read in one transaction (§2.3 step 2): every launch exited with
-/// death unconfirmed that has a usable recorded identity: a `daemon_restart` launch's leader
-/// from `launch_started`, and a `spawn_failed` launch's child from its `launch_exited`'s
-/// `failed_start` when that names both a pid and a start time.
+/// death unconfirmed that has a recorded identity: a `daemon_restart` launch's leader from
+/// `launch_started`, and a `spawn_failed` launch's child from its `launch_exited`'s
+/// `failed_start` when that names both a pid and a start time. Nothing more is validated
+/// here: an identity `kill_recorded` refuses is recorded `invalid`.
 fn targets(r: &ReadTx<'_>, rows: Vec<LaunchRow>) -> Result<Vec<Target>, StoreError> {
     let mut out = Vec::new();
     for l in rows {
