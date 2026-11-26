@@ -606,14 +606,14 @@ async fn session_start_before_publication() {
         Ok((t.thread_id, t.current_launch_id.unwrap()))
     });
     let live = rig.adopt(t, l, Agent::Claude);
-    let sl = rig.sl(&live);
     let hook = own(&rig, &live, &fixture("plain-turn", "SessionStart-1"));
+    // The intake (its ordinal, facts, and the pid wait's origin) has ended, its facts sampled
+    // while the launch is unpublished, before the publication is let go.
+    let (after_intake, go_on) = rig.ingest.points.arm_intake(1);
     let post = crate::supervisor::tests::support::http::spawn_send(&rig.srv, &hook.req(&rig.srv));
-    rig.until("the SessionStart taken in", || {
-        sl.latest_intake.load(std::sync::atomic::Ordering::SeqCst) > 0
-    })
-    .await;
+    crate::supervisor::tests::support::http::reached(after_intake).await;
     held.go();
+    go_on.send(()).unwrap();
     assert_eq!(spawn.await.unwrap().status, 200);
     assert_eq!(post.await.unwrap().status, 200);
     assert_eq!(
