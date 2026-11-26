@@ -482,3 +482,62 @@ async fn stale_start_rebuilds() {
     assert_eq!(rig.input(p).state, InputState::Acked);
     rig.stop().await;
 }
+
+/// An exit step that refuses, so the exit job rolls back and the exit stays unrecorded.
+struct RefuseExit;
+
+impl crate::supervisor::exit::ExitStep for RefuseExit {
+    fn in_exit_job(
+        &self,
+        _tx: &mut crate::store::WriteTx<'_>,
+        _exit: &crate::supervisor::exit::ExitFacts,
+    ) -> Result<(), crate::store::StoreError> {
+        Err(crate::store::StoreError::Constraint(
+            "refused by the test".into(),
+        ))
+    }
+}
+
+/// A launch whose exit job rolled back leaves the live map, and its send side with it, while
+/// the store still holds it live: a start held across that, below a committed `Stop`, still
+/// changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_start_after_unrecorded_exit() {
+    let rig = SRig::with(|c| c.exit_steps.push(std::sync::Arc::new(RefuseExit))).await;
+    let live = rig.bound(Agent::Codex).await;
+    rig.clock.stop();
+    let before = rig.launch(live.l).last_turn_start_seq;
+    let start = hold(
+        &rig,
+        &live,
+        rig.hook_of(&live, "UserPromptSubmit", &prompt("p")),
+        true,
+    )
+    .await;
+    rig.hook(&live, "Stop", &json!({})).await;
+    assert_eq!(turn(&rig, &live), TurnState::Unknown);
+    live.child.exit(chaldea_pty_runtime::ChildExit {
+        code: Some(0),
+        signal: None,
+    });
+    let sl = rig.sl(&live);
+    rig.until("the launch left the live map", || {
+        rig.sup.entry(live.l).is_none()
+    })
+    .await;
+    // The worker leaves at its next pass.
+    sl.wake.notify_one();
+    rig.until("the send side is gone", || {
+        rig.sup.send.launch(live.l).is_none()
+    })
+    .await;
+    assert_eq!(
+        rig.launch(live.l).exit_reason,
+        None,
+        "the exit is unrecorded"
+    );
+    assert_eq!(start.finish().await.status, 200);
+    assert_eq!(turn(&rig, &live), TurnState::Unknown);
+    assert_eq!(rig.launch(live.l).last_turn_start_seq, before);
+    rig.stop().await;
+}

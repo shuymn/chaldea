@@ -239,7 +239,13 @@ impl HookAdapter for SupervisorHooks {
         &self,
         launch: LaunchId,
     ) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
-        self.side.launch(launch).map(|sl| sl.turn_watermark.clone())
+        // The send side exists from the reservation job until the launch left the live map,
+        // whether or not its exit job committed. Without it no boundary is folded: every
+        // one counts as stale (§2.4 "Turn boundaries in receipt order").
+        Some(self.side.launch(launch).map_or_else(
+            || std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            |sl| sl.turn_watermark.clone(),
+        ))
     }
 
     fn interpret(
