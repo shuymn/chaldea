@@ -323,7 +323,7 @@ pub struct BufferedDelivery { pub emit_id: Uuid, pub receipt_ordinal: u64, pub r
 
 `hook_delivery_record`: if `(launch_id, emit_id)` exists, returns `Replay` with the stored first reply and the current routing, and changes nothing. Otherwise it appends the routing's events (if any), takes the launch's next commit ordinal (computed in the `INSERT`, checked gapless by trigger), and inserts the row with the reply, both ordinals, the routing, and for a terminal routing the `(stream_id, seq)` of its first event. Two orders are kept because they can differ: the **receipt ordinal** is the order in which the daemon received the requests, assigned by PR 9 at intake (per launch, increasing, unique by `UNIQUE (launch_id, receipt_ordinal)`; gaps are allowed for requests that never recorded a delivery), and is the order mvp §2.9 requires for buffered hooks; the **commit ordinal** is the order the record jobs committed, kept for audit. A launch never outlives a daemon run (restart ends every open launch, mvp §2.9), so PR 9's per-launch counter can live in memory. `hook_delivery_promote` takes the final events from the caller: PR 9 reads `buffered_deliveries(launch)` (in receipt order) in the binding job, after `session_bound`, decides each delivery's events against the current projections in that order, and calls `hook_delivery_promote` for each, in that order, in the same job. Promotion appends the events, sets the routing to `appended` or `raw_unknown` with `(stream_id, seq)`, and clears `pending_body` and `pending_meta`. The trigger allows only `buffered → appended | raw_unknown`, with `stream_id` and `seq` set and the pending columns cleared, and never changes the first reply, either ordinal, key, or `received_at`; terminal rows reference `events (stream_id, seq)` by foreign key. The caller replies only after the ticket resolves `Ok`, so the first reply is durable before the response (§2.9).
 
-**Tokens.** `token_insert` stores `{ token_id, kind, sha256, thread_id, launch_id, created_at }`, where `kind` is `chaldea_core::auth::TokenKind`, which the store re-exports as `rows::TokenKind`; `token_revoke` sets `revoked_at` for one token, a launch's tokens, or a thread's tokens, returning the count. A trigger allows only `revoked_at` from `NULL` to a value. Issuance, hashing of secrets, and comparison are PR 7's; the reservation of mvp §2.9 inserts the launch's hook and agent token hashes in the job that appends `launch_reserved`. PR 20 may add a scope column for extension tokens in a later migration.
+**Tokens.** `token_insert` stores `{ token_id, kind, sha256, thread_id, launch_id, created_at }`, where `kind` is `chaldea_core::auth::TokenKind`, which the store re-exports as `rows::TokenKind`; `token_revoke` sets `revoked_at` for one token, a launch's tokens, or a thread's tokens, returning the count. A trigger allows only `revoked_at` from `NULL` to a value. Issuance, hashing of secrets, and comparison are PR 7's; the reservation of mvp §2.9 inserts the launch's hook and agent token hashes in the job that appends `launch_reserved`. PR 20 (deferred) may add a scope column for extension tokens in a later migration.
 
 **Rebuild and verify** (§2.6).
 
@@ -577,7 +577,7 @@ The `CHECK` of §2.4 reads these paths: `$.readiness.launch_id`, a non-negative 
 
 **Comparison** (`compare_projections(maintained, rebuilt) -> ProjectionDiff`, used by `verify_projections` and the tests). Every column of every `proj_*` row must be equal, except `proj_transcript_cursors.read_offset` and `read_continuity`, where it requires the rebuilt `read_offset = event_offset` and `read_continuity = event_continuity` exactly, with `event_offset` and `event_continuity` equal between the two and the maintained `read_offset ≥ event_offset`. This is mvp §2.1's only permitted rewind: the rebuilt cursor reads from the end of the last stored event, so the tailer re-reads only the suffix after it (bytes that produced no event, such as a partial line or skipped records); every stored line lies before the rebuilt `read_offset`, and a batch resubmitting one is refused (`BadBatch`, lines start at the read offset) rather than deduplicated.
 
-`verify_projections` dumps every `proj_*` table, rebuilds inside a `SAVEPOINT`, dumps again, rolls back to the savepoint, and returns `compare_projections`. Both hold the write lock for a full replay; they run at open after a projection version change, or on demand (PR 21).
+`verify_projections` dumps every `proj_*` table, rebuilds inside a `SAVEPOINT`, dumps again, rolls back to the savepoint, and returns `compare_projections`. Both hold the write lock for a full replay; they run at open after a projection version change, or on demand (PR 21, deferred).
 
 ### 2.7 Read Operations (`ReadTx`)
 
@@ -647,7 +647,7 @@ impl ReadTx<'_> {
 
 **What `open` promises.** Every `OpenError` from steps 1–3 is returned before Chaldea changes the file. SQLite itself may still write on open, independently of Chaldea: it rolls back a hot rollback journal left by a crashed writer on first read, and it creates or recovers `-wal` and `-shm` for a database already in WAL mode. `open` never deletes a file, including one it created in step 1: between its create and its failure another opener may have initialized the same file and committed to it, and on macOS an unlink succeeds even while that opener holds it. A failed open can therefore leave an empty or uninitialized file; the next `open` classifies it as fresh in step 3 and initializes it under the lock in step 5, which re-checks that nobody initialized it meanwhile. The store never renames, repairs, or recreates a database. The epoch is written only in step 5 for a fresh file, so it is created once per database; its row is immutable by trigger.
 
-Corruption found later (`SQLITE_CORRUPT`) puts the writer in the failed state (§2.2); `integrity_check` is offered to the doctor (PR 21), not run at open, since it reads the whole file.
+Corruption found later (`SQLITE_CORRUPT`) puts the writer in the failed state (§2.2); `integrity_check` is offered to the doctor (PR 21, deferred), not run at open, since it reads the whole file.
 
 ### 2.9 Durability
 
@@ -728,13 +728,13 @@ Every later PR that reads or writes the store, and what it uses. None needs a st
 | 10 | gate inputs, send path | `read`: `thread`, `launch` (gate evidence, `write_basis`), `inputs`; `append(input_state_changed)` with the compare-and-set of `apply` |
 | 10 | readiness write basis | `NewEvent::annex = Readiness { write_basis }` on `readiness_observed` |
 | 10 | restart | `read`: `open_launches`, `inputs(… queued, sending, sent)`; `append(launch_exited, input_state_changed, status_changed)` |
-| 12 fixtures | captured events for `doctor capture` | `read`: `events_after`, `events_of_kind` |
+| 12 fixtures (`doctor capture` deferred; hand-captured fixtures are mvp C1, X1) | captured events for `doctor capture` | `read`: `events_after`, `events_of_kind` |
 | 13 / 14 tailers | binding, cursor, generation, batches, rewind after rebuild, continuity | `read`: `transcript_cursor`, `thread`, `launch`; `submit`: `append_transcript` |
 | 14 | Codex assistant text from `Stop` | `append` |
 | 16 worktrees, mailbox, task | exclusion against reservations; mailbox listing; task changes | one job: `read().worktree`, `launches_using_worktree`, `append(worktree_changed)`; `events_of_kind(mailbox_message)`; `append(task_set, status_changed)` |
-| 17 `stateright` | the store's atomicity and gapless order as model assumptions | the guarantees of §2.1 and §2.9, cited by claim id |
-| 20 extensions | `POST /events` surfaces with the stored scope check | one job: `read().surface`, `append(surface_update)` |
-| 21 doctor | integrity, schema version, projection check, file sizes | `read`: `integrity_check`, `schema_info`; `submit`: `verify_projections`; `Store::paths` |
+| 17 `stateright` (deferred) | the store's atomicity and gapless order as model assumptions | the guarantees of §2.1 and §2.9, cited by claim id |
+| 20 extensions (deferred) | `POST /events` surfaces with the stored scope check | one job: `read().surface`, `append(surface_update)` |
+| 21 doctor (deferred) | integrity, schema version, projection check, file sizes | `read`: `integrity_check`, `schema_info`; `submit`: `verify_projections`; `Store::paths` |
 
 ## 5. Resource Paths
 
@@ -861,7 +861,7 @@ plus the `workspace` job green on both runners with `store_open::long_path_vfs_i
 
 **D9. Receipts, hook deliveries, and tokens are kept forever in the MVP.** Deletion needs retention rules (a receipt deleted while a client may still retry would re-run the command) that no MVP PR owns; a later migration can add them and must keep mvp §2.4's receipt semantics.
 
-**D10. `open` refuses before it changes anything, never deletes, and never repairs.** Not a database, not UTF-8, foreign, newer schema, or changed schema: an error with the file as found (apart from what SQLite itself does on open, §2.8). A failed first open may leave an uninitialized file, which the next open reuses. Corruption at run time stops writes. Integrity checks are the doctor's.
+**D10. `open` refuses before it changes anything, never deletes, and never repairs.** Not a database, not UTF-8, foreign, newer schema, or changed schema: an error with the file as found (apart from what SQLite itself does on open, §2.8). A failed first open may leave an uninitialized file, which the next open reuses. Corruption at run time stops writes. Integrity checks are the doctor's (deferred, mvp §4 "Deferred").
 
 **D11. `Content` previews leave out a valid character cut by the 1 KiB window** without setting `preview_lossy`, and replace every invalid sequence, including one at the boundary, with U+FFFD and set it (§2.5). mvp §2.1 and the `core::payload::Content::Blob` doc comment say so; no type changes and no stored value existed before. Rejected: decoding exactly the first 1024 bytes lossily, under which most Japanese text above 64 KiB would be flagged lossy because of where the window ends.
 

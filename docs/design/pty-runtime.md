@@ -130,7 +130,7 @@ pub enum Cleanup { Confirmed, Unresolved { kill: Option<KillReport>, close: Opti
 - `PtyChild::wait_timeout` never blocks past `timeout` (Windows `WaitForSingleObject(timeout)`; macOS `waitid(WNOWAIT)` polling; the backend owns reaping) and must not hold a lock `kill_tree` needs.
 - `kill_tree` is the PR 3 / PR 4 tree kill (`killpg` HUP→TERM→KILL plus `getsid` scan; job termination) applied also to every identity in `extra` that is still alive with the same start time, and returns by its deadline; `tree_dead: false` with survivors when it could not prove death. The caller passes its full list of recorded descendants on every call (the first stop, a retry after a busy report or `tree_dead: false`, and `close` after an earlier `kill`). What a backend keeps across calls is internal margin that the full-list rule makes invisible to the caller (`docs/design/pty-unix.md` §2.5, `docs/design/pty-windows.md` §2.5). `method` names how the kill ran: `unix_*` on macOS (`unix_busy` when another kill of the same child held the kill state past `lock_by`); `windows_job`, `windows_job_incomplete` (the job's member list may be incomplete), or `windows_busy` (another kill of the same child held the kill state past `lock_by`) on Windows, and `windows_process` for the process-only kill of a failed spawn. A busy call, and a call made at or after `deadline`, make no OS call. `attempt` is `Signalled` when this call signalled or terminated anything, `AlreadyDead` when the tree was proven dead without that, and `NotAttempted` otherwise (busy, expired, or, on macOS, ownership lost before any signal). `proved_at` is read right after the proving read, so a proof from the last observation started before the deadline can carry an instant past it.
 - `PtyControl::close` returns by the caller's deadline even when the OS close blocks (Windows: `ClosePseudoConsole` on a close worker started before the pseudoconsole exists, since some builds block until output is read; `docs/design/pty-windows.md` §2.3). `CloseReport::elapsed` is `Some` when the close operation returned; a hung close shows as `elapsed: None` and `Released::control == false`.
-- `evidence` carries what doctor and the real-host runs record (Windows: `job_branch` = `job_list` or `suspended`, `conpty_module`, and `job_list_error` when the job-list attempt failed and the suspended branch ran).
+- `evidence` carries what the doctor (deferred) and the real-host runs record (Windows: `job_branch` = `job_list` or `suspended`, `conpty_module`, and `job_list_error` when the job-list attempt failed and the suspended branch ran).
 - Every `unsafe` block lives in `unix::sys` or `windows::sys` (D7).
 
 ### 2.2 `Session`
@@ -250,8 +250,8 @@ pub enum Part {
 
 pub enum WriteOrigin {
     Input { input_id: InputId },            // send path (PR 10): text, pause, submit as one unit
-    Attach,                                 // chaldea attach (PR 11)
-    Key,                                    // owner `key`, keypad, `surface_action send_key` (PR 10, 19, 20)
+    Attach,                                 // the attach WebSocket (PR 11)
+    Key,                                    // owner `key`, keypad (PR 10, 19); `surface_action send_key` (PR 20, deferred)
     CardKey { approval_id: ApprovalId },    // key from an open approval card (mvp §8 D1)
     VtReply { kind: ReplyKind },            // the VT responder (§2.5); never submitted by callers
 }
@@ -396,7 +396,7 @@ pub struct TermModes {
 
 **Snapshot budget.** `snapshot(deadline)` and `subscribe(sink, deadline)` take the VT lock with `try_lock` until `deadline` and copy the grid, checking the deadline before each row; past the deadline, during the wait or the copy, or after a VT panic, they return `VtUnavailable`.
 
-**Grid encoding (D9).** `to_payload` gives `VtSnapshotTaken { grid, cols, rows, cursor: VtCursor { row, col, visible }, modes: VtModes { bracketed_paste, alternate_screen } }` with `grid = Content::text(json)`. The A2UI `vt_snapshot` component carries the same encoding under the same rules.
+**Grid encoding (D9).** `to_payload` gives `VtSnapshotTaken { grid, cols, rows, cursor: VtCursor { row, col, visible }, modes: VtModes { bracketed_paste, alternate_screen } }` with `grid = Content::text(json)`. The deferred A2UI `vt_snapshot` component would carry the same encoding under the same rules.
 
 - The JSON is an array of exactly `rows` arrays, one per screen row, top to bottom; each holds at most `cols` strings, one per cell, left to right.
 - `""` means a `WideTail` and nothing else; it must directly follow a `WideLead`. A `Single` or `WideLead` string is never empty; a blank cell is `" "`.
@@ -499,12 +499,12 @@ Every MVP path where bytes reach the PTY or PTY output is consumed:
 | Codex positional first prompt | 10, 14 | No PTY write: it is in `SpawnSpec::argv`, anchored at the `last_started` the launch published (§2.3); `SpawnError` tells whether it may have run. |
 | Attach typing and recognised pastes | 11 | `Attach` units; a paste is one unit without submit, refused before admission above the prompt limit; queued behind any input unit, never inside it; `QueueFull` is returned to the attach client. |
 | Attach screen and size | 11 | `subscribe` gives a diagnostic snapshot plus gapless bytes after it and reports `Lagged`; the repaint mechanism is PR 11's. `resize` follows the attach client's size; resizing during a unit is PR 11 policy. |
-| Raw `key`, keypad, `surface_action send_key` | 10, 19, 20 | `Key` units with a recheck (process running, owner). Arrow encoding reads `modes().app_cursor`; a recheck can refuse when the mode changed since encoding. |
-| Approval card keys | 10, 19 | `CardKey { approval_id }` whose `Guard` has the hook fence and a `basis` at the human writer position of the card's observation, with the `app_cursor` recheck; the effect reads the card open first (409 `card_closed` otherwise, mvp §2.10); class `Human`, mapped to `card_key`, which does not close the gate. |
+| Raw `key` command, keypad, `surface_action send_key` (PR 20, deferred) | 10, 19, 20 | `Key` units with a recheck (process running, owner). Arrow encoding reads `modes().app_cursor`; a recheck can refuse when the mode changed since encoding. mvp T2's key bar, for keys not bound to a card, uses either this path or the attach path above (`Attach` units); T2's design chooses. |
+| Approval card keys (every card-bound key, the key bar's included, whatever its transport) | 10, 19 | `CardKey { approval_id }` whose `Guard` has the hook fence and a `basis` at the human writer position of the card's observation, with the `app_cursor` recheck; the effect reads the card open first (409 `card_closed` otherwise, mvp §2.10); class `Human`, mapped to `card_key`, which does not close the gate. |
 | VT responder | 2 | `VtReply` writes in the reply lane, one write each, at unit boundaries (§2.5); class `Reply`, counted by default. |
-| Gate timeout, attention, approval card snapshot | 10, 13 | `snapshot(deadline).to_payload()` → `vt_snapshot_taken`; `CloseOutcome::final_snapshot` after teardown. |
+| Gate timeout, attention; an approval card snapshot if C1's design records one | 10, 13 | `snapshot(deadline).to_payload()` → `vt_snapshot_taken`; `CloseOutcome::final_snapshot` after teardown. |
 | Gate's DECSET 2004 condition | 10 | `ModeView` before the decision, `Guard::bracketed_paste` and the dispatch boundary at the writer. |
-| Doctor PTY round trip | 21 | A `Session` over the native backend: VT query (responder record), paste echo (`Input` or `Key` unit), tree kill; `evidence` carries the ConPTY module. |
+| Doctor PTY round trip (deferred) | 21 | A `Session` over the native backend: VT query (responder record), paste echo (`Input` or `Key` unit), tree kill; `evidence` carries the ConPTY module. |
 | Thread state | all | No API turns output into state input: output reaches only the VT, sinks, and snapshots (invariant 1). |
 
 ## 5. Resource Paths
@@ -613,7 +613,7 @@ deps="$(cargo tree -p chaldea-pty-runtime -e normal --prefix none)" && ! grep -E
 
 **D2. No tokio; callbacks bridge to the daemon.** Blocking PTY ends, one-thread writer arbitration, and runtime-free tests; checked in CI. Rejected: tokio in the crate, as Codex's `utils/pty` does (§2 threading model).
 
-**D3. The crate records; the daemon decides what counts.** Every write carries its origin and class, including VT replies (`Reply`). Which classes close the gate or make an ack ambiguous is the daemon's per-adapter policy, passed as `Basis::counted` and applied to `last_started`; the default counts every class, so mvp §2.3's "last write of any origin" holds literally. Exempting replies for an adapter needs evidence that the CLI consumes them separately (PR 12 captures, the P-13 query log) and is added as an adapter capability.
+**D3. The crate records; the daemon decides what counts.** Every write carries its origin and class, including VT replies (`Reply`). Which classes close the gate or make an ack ambiguous is the daemon's per-adapter policy, passed as `Basis::counted` and applied to `last_started`; the default counts every class, so mvp §2.3's "last write of any origin" holds literally. Exempting replies for an adapter needs evidence that the CLI consumes them separately (PR 12 captures, the query log of P-13, a deferred real-host row) and is added as an adapter capability.
 
 **D4. Replies only at unit boundaries.** A unit's bytes stay one contiguous span, and no reply lands between a prompt and its submit. The cost: a reply becomes eligible only in the next batch after the unit in progress, so a blocked write delays it as long as it blocks; a CLI that waits for a reply during that time waits that long.
 
@@ -629,7 +629,7 @@ deps="$(cargo tree -p chaldea-pty-runtime -e normal --prefix none)" && ! grep -E
 
 ## Related Text in Other Documents
 
-- `docs/mvp-design.md` §2.1 `vt_snapshot_taken` and §2.8 `vt_snapshot` state the grid encoding (D9); §2.3 states the prompt limit (D8).
+- `docs/mvp-design.md` §2.1 `vt_snapshot_taken` and the deferred §2.8 `vt_snapshot` component state the grid encoding (D9); §2.3 states the prompt limit (D8).
 - `docs/mvp-design.md` §3 spike table: the drain is lifted without its hold, the session's sink passed into spawn (§2.4); the `unsafe_code` carve-out of D7.
 - `docs/mvp-design.md` §4 PR 10 obligations: the readiness basis and the ack candidate rule (§2.3).
 - `docs/architecture.md` §4.5: the trait seals spawn and OS differences; the session built on it provides the operations.
