@@ -55,7 +55,7 @@ The PRs bring canonical text in line with code: C1a mvp §2.5 (screen route), §
 | Risk | Detection | Limit, and why the purpose holds |
 |---|---|---|
 | `SessionStart` before the trust prompt is answered. | M1 P-12. | If seen, Claude rows switch to `OwnerOnly`; `input_gate_timeout` asks for `ready`. |
-| Readiness missing at bind without intake facts. | `inspect`. | Gate closed; the owner runs `ready`. |
+| Readiness missing at bind without intake facts: a `SessionStart` taken in while a lock is contended, or before the launch is published (within the window right after spawn; supervisor-send L-12). | `inspect`; `input_gate_timeout`. | Nothing is misdelivered: the gate stays closed until readiness evidence or the owner's `ready`. |
 | `--resume` starts a new session id. | M1 P-18. | Nothing is written to an unbound launch; a new thread recovers. |
 | Windows hook shell rejects the command (`shell: "powershell"`, the `&` call form). | M2. | Fix is the settings string; macOS unaffected. |
 | An emitter path that literally contains `${CLAUDE_PROJECT_DIR}` is rewritten by Claude before PowerShell runs the hook. | `SessionStart` never arrives (`session_start_timeout`). | Not fixed: such a path is not a real install location; moving the binary fixes it. |
