@@ -88,11 +88,50 @@ fn refuses_foreign_rollback_journal_database() {
     assert!(!PathBuf::from(wal).exists());
 }
 
-/// Undoes schema v3 (the two `proj_inputs` columns), so a v3 database reads as v2.
+/// Undoes schema v3 (the two `proj_inputs` columns), so a v3 database reads as v2. Runs
+/// after [`V4_DOWN`].
 const V3_DOWN: &str = "ALTER TABLE proj_inputs DROP COLUMN last_write_before; \
      ALTER TABLE proj_inputs DROP COLUMN attempt_seq;";
 
-/// A schema version above the binary's is refused.
+/// Undoes schema v4 (the large-blob tables and the `events_blob_refs` that reads them), so
+/// a v4 database without large blobs reads as v3: v1's trigger text, byte for byte.
+const V4_DOWN: &str = r#"
+DROP TABLE large_blob_refs;
+DROP TABLE large_blob_parts;
+DROP TABLE large_blobs;
+DROP TRIGGER events_blob_refs;
+CREATE TRIGGER events_blob_refs AFTER INSERT ON events
+BEGIN
+  SELECT RAISE(ROLLBACK, 'events_blob_refs: a typed blob reference has no blob_refs row')
+  WHERE EXISTS (
+    SELECT 1 FROM (
+      SELECT json_extract(NEW.payload, p.path || '.blob.sha256') AS sha,
+             json_extract(NEW.payload, p.path || '.blob.media_type') AS media_type
+      FROM (SELECT '$.prompt' AS path WHERE NEW.kind = 'user_message'
+            UNION ALL SELECT '$.text' WHERE NEW.kind IN ('assistant_message', 'input_created')
+            UNION ALL SELECT '$.input' WHERE NEW.kind = 'tool_activity'
+            UNION ALL SELECT '$.output' WHERE NEW.kind = 'tool_activity'
+            UNION ALL SELECT '$.tool_input' WHERE NEW.kind = 'approval_requested'
+            UNION ALL SELECT '$.body' WHERE NEW.kind = 'mailbox_message'
+            UNION ALL SELECT '$.grid' WHERE NEW.kind = 'vt_snapshot_taken'
+            UNION ALL SELECT '$.raw' WHERE NEW.kind = 'raw_unknown') AS p
+      WHERE json_type(NEW.payload, p.path || '.blob') IS 'object'
+      UNION ALL
+      SELECT json_extract(t.value, '$.blob.sha256'), json_extract(t.value, '$.blob.media_type')
+      FROM json_tree(NEW.payload, '$.components') AS t
+      WHERE NEW.kind = 'surface_update' AND t.key IS 'grid' AND t.type IS 'object'
+        AND json_type(t.value, '$.blob') IS 'object'
+        AND json_extract(NEW.payload, t.path || '.type') IS 'vt_snapshot'
+        AND t.fullkey NOT GLOB '*.action.args*'
+    ) AS r
+    WHERE NOT EXISTS (SELECT 1 FROM blob_refs
+                      WHERE stream_id = NEW.stream_id AND sha256 IS r.sha AND media_type IS r.media_type)
+  );
+END;
+PRAGMA user_version = 3;
+"#;
+
+/// A schema version above the binary's is refused before the file changes.
 #[test]
 fn refuses_newer_schema() {
     let mut s = TestStore::new();
@@ -101,18 +140,20 @@ fn refuses_newer_schema() {
         .unwrap()
         .execute_batch("PRAGMA user_version = 99")
         .unwrap();
+    let before = std::fs::read(s.path()).unwrap();
     let r = open(&s.path());
     assert!(
         matches!(
             r,
             Err(OpenError::NewerSchema {
                 found: 99,
-                supported: 3
+                supported: 4
             })
         ),
         "{:?}",
         r.err()
     );
+    assert_eq!(std::fs::read(s.path()).unwrap(), before);
 }
 
 /// A dropped trigger is a changed schema, named in the error.
@@ -125,7 +166,7 @@ fn refuses_altered_schema() {
         .execute_batch("DROP TRIGGER events_no_update")
         .unwrap();
     match open(&s.path()) {
-        Err(OpenError::SchemaMismatch { version: 3, names }) => {
+        Err(OpenError::SchemaMismatch { version: 4, names }) => {
             assert!(names.contains(&"events_no_update".to_owned()), "{names:?}");
         }
         other => panic!("{:?}", other.err()),
@@ -177,7 +218,7 @@ fn sqlite_version_is_bundled() {
     )]
     let info = s.read(|r| r.schema_info());
     assert_eq!(info.sqlite_version, "3.54.1");
-    assert_eq!(info.user_version, 3);
+    assert_eq!(info.user_version, 4);
     assert_eq!(info.application_id, 0x4348_4C44);
 }
 
@@ -499,6 +540,85 @@ fn shutdown_closes_commit_notifications_with_a_live_clone() {
     ));
 }
 
+/// [`support::http::dump`] without v4's tables, which a reopened database gains empty.
+fn dump_without_v4(path: &Path) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+    let mut dump = support::http::dump(path);
+    for (name, rows) in &dump {
+        if name.starts_with("large_blob") {
+            assert!(rows.is_empty(), "{name} gained rows");
+        }
+    }
+    dump.retain(|(name, _)| !name.starts_with("large_blob"));
+    dump
+}
+
+/// A v3 database with blobs and refs opens as v4 with every row unchanged and every blob
+/// readable through its referencing stream, and with v4's tables and triggers in force
+/// (`docs/design/event-store.md` §2.4).
+#[test]
+fn v3_upgrades_to_v4() {
+    use chaldea_core::payload::Content;
+    use chaldea_daemon::store::prepare_content;
+    use support::raw_unknown;
+
+    let mut s = TestStore::new();
+    let t = thread(1);
+    s.append(vec![registered(t, false)]).unwrap();
+    let stream = StreamId::Thread(t);
+    let mut blobs = Vec::new();
+    for (i, media) in ["text/plain; charset=utf-8", "application/json"]
+        .into_iter()
+        .enumerate()
+    {
+        let bytes = vec![b'a' + u8::try_from(i).unwrap(); 70_000];
+        let p = prepare_content(bytes.clone(), media).unwrap();
+        let Content::Blob { blob, .. } = &p.content else {
+            panic!("a blob")
+        };
+        blobs.push((blob.sha256.clone(), bytes, media));
+        let mut e = raw_unknown(stream, &format!("blob:{i}"), p.content.clone());
+        e.blobs = p.blob.into_iter().collect();
+        s.append(vec![e]).unwrap();
+    }
+    s.shutdown();
+    Connection::open(s.path())
+        .unwrap()
+        .execute_batch(V4_DOWN)
+        .unwrap();
+    let before = support::http::dump(&s.path());
+
+    s.reopen();
+    assert_eq!(dump_without_v4(&s.path()), before, "a v3 row changed");
+    assert_eq!(s.read(|r| Ok(r.schema_info()?.user_version)), 4);
+    for (sha, bytes, media) in blobs {
+        let (exists, body) =
+            s.read(move |r| Ok((r.blob_ref_exists(stream, &sha)?, r.blob(stream, &sha)?)));
+        assert!(exists);
+        let body = body.expect("readable");
+        assert_eq!((body.data, body.media_type.as_str()), (bytes, media));
+    }
+    let diff = s.run(|tx| Ok(tx.verify_projections()?)).unwrap();
+    assert!(diff.is_empty(), "{diff:?}");
+    // v4's ref trigger is in force: a ref to a blob without parts is refused.
+    s.shutdown();
+    let c = Connection::open(s.path()).unwrap();
+    c.execute_batch(&format!(
+        "INSERT INTO large_blobs (sha256, size, part_count) VALUES ('{sha}', 67108865, 17)",
+        sha = "b".repeat(64)
+    ))
+    .unwrap();
+    let r = c.execute_batch(&format!(
+        "INSERT INTO large_blob_refs (stream_id, sha256, media_type) VALUES ('host', '{sha}', 'x')",
+        sha = "b".repeat(64)
+    ));
+    assert!(
+        r.unwrap_err()
+            .to_string()
+            .contains("large_blob_refs_complete"),
+        "the ref trigger"
+    );
+}
+
 /// A v1 store (a v2 store without the v2 trigger, at `user_version` 1, which the v1
 /// fingerprint accepts) opens as v2 with every row unchanged, consistent projections, and
 /// the trigger in force (`docs/design/hook-ingest.md` §2.12).
@@ -550,14 +670,14 @@ fn v1_upgrades_to_v2() {
     Connection::open(s.path())
         .unwrap()
         .execute_batch(&format!(
-            "DROP TRIGGER events_session_bound_once; {V3_DOWN} PRAGMA user_version = 1"
+            "{V4_DOWN} DROP TRIGGER events_session_bound_once; {V3_DOWN} PRAGMA user_version = 1"
         ))
         .unwrap();
     let before = support::http::dump(&s.path());
 
     s.reopen();
-    assert_eq!(support::http::dump(&s.path()), before, "a v1 row changed");
-    assert_eq!(s.read(|r| Ok(r.schema_info()?.user_version)), 3);
+    assert_eq!(dump_without_v4(&s.path()), before, "a v1 row changed");
+    assert_eq!(s.read(|r| Ok(r.schema_info()?.user_version)), 4);
     let diff = s.run(|tx| Ok(tx.verify_projections()?)).unwrap();
     assert!(diff.is_empty(), "{diff:?}");
     // The v2 trigger is in force: a second binding of l1 is refused.
@@ -663,7 +783,7 @@ fn v2_upgrades_to_v3() {
     Connection::open(s.path())
         .unwrap()
         .execute_batch(&format!(
-            "{V3_DOWN} PRAGMA user_version = 2; \
+            "{V4_DOWN} {V3_DOWN} PRAGMA user_version = 2; \
              UPDATE meta SET value = '1' WHERE key = 'projection_version'; \
              UPDATE proj_launches SET last_write_seq = 999"
         ))
@@ -676,7 +796,7 @@ fn v2_upgrades_to_v3() {
     let info = s.read(|r| r.schema_info());
     assert_eq!(
         (info.user_version, info.projection_version.as_str()),
-        (3, "3")
+        (4, "3")
     );
     let diff = s.run(|tx| Ok(tx.verify_projections()?)).unwrap();
     assert!(diff.is_empty(), "{diff:?}");

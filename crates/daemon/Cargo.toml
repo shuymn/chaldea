@@ -42,6 +42,8 @@ tracing-subscriber.workspace = true
 # The `host` test helpers (links, ACL grants, signal state).
 chaldea-pty-runtime = { path = "../pty-runtime", features = ["fake"] }
 proptest.workspace = true
+# Tests that a part of a large blob cannot be opened for incremental BLOB writes.
+rusqlite = { workspace = true, features = ["blob"] }
 # Paused-clock tests (the runtime features are normal dependencies above).
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true

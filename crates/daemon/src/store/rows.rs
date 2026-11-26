@@ -138,6 +138,24 @@ pub struct BlobBody {
     pub media_type: String,
 }
 
+/// A large blob's download facts for the stream that read them; its bytes are read part by
+/// part ([`super::ReadTx::large_blob_part`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LargeBlob {
+    /// As [`BlobBody::media_type`].
+    pub media_type: String,
+    pub size: u64,
+    pub part_count: u64,
+}
+
+/// What a blob download serves: the whole bytes of a blob in `blobs`, or a large blob's
+/// facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobDownload {
+    Whole(BlobBody),
+    Parts(LargeBlob),
+}
+
 /// The token kinds are `core::auth`'s, the one definition the HTTP guard and the store share.
 pub use chaldea_core::auth::TokenKind;
 

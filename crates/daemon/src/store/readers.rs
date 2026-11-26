@@ -27,10 +27,10 @@ use super::append::{EVENT_COLUMNS, RawRow};
 use super::error::{ReadError, StoreError};
 use super::lock;
 use super::rows::{
-    ApprovalRow, BlobBody, BufferedDelivery, BufferedHook, BufferedSummary, HookDelivery,
-    HookReply, InputRow, LaunchRow, Routing, SchemaInfo, SurfaceRow, ThreadRow, TokenKind,
-    TokenRow, TranscriptCursor, WorktreeRow, command_result, enum_text, opt_u64, opt_uuid,
-    parse_enum, parse_json, parse_uuid, to_i64, to_u64,
+    ApprovalRow, BlobBody, BlobDownload, BufferedDelivery, BufferedHook, BufferedSummary,
+    HookDelivery, HookReply, InputRow, LargeBlob, LaunchRow, Routing, SchemaInfo, SurfaceRow,
+    ThreadRow, TokenKind, TokenRow, TranscriptCursor, WorktreeRow, command_result, enum_text,
+    opt_u64, opt_uuid, parse_enum, parse_json, parse_uuid, to_i64, to_u64,
 };
 
 /// [`ReadTx::binding_receipt_ordinal`]'s query: the binding is searched within the thread's
@@ -1104,8 +1104,8 @@ impl<'a> ReadTx<'a> {
         self.guard(|| self.cursor_row(t))
     }
 
-    /// Whether the stream has a `blob_refs` row for the blob (the download check of
-    /// `GET /api/blobs`, decided before any blob body is loaded).
+    /// Whether the stream has a `blob_refs` or `large_blob_refs` row for the blob (the
+    /// download check of `GET /api/blobs`, decided before any blob body is loaded).
     ///
     /// # Errors
     ///
@@ -1113,44 +1113,129 @@ impl<'a> ReadTx<'a> {
     pub fn blob_ref_exists(&self, s: StreamId, sha256: &str) -> Result<bool, StoreError> {
         self.guard(|| {
             sql(self.conn.query_row(
-                "SELECT EXISTS (SELECT 1 FROM blob_refs WHERE stream_id = ?1 AND sha256 = ?2)",
+                "SELECT EXISTS (SELECT 1 FROM blob_refs WHERE stream_id = ?1 AND sha256 = ?2)
+                     OR EXISTS (SELECT 1 FROM large_blob_refs WHERE stream_id = ?1 AND sha256 = ?2)",
                 [s.to_string(), sha256.to_owned()],
                 |r| r.get(0),
             ))
         })
     }
 
-    /// The blob's bytes, only when the stream has a ref to it, with the stream's agreed
-    /// media type or `application/octet-stream`.
+    /// The stream's download type from the refs in `table`: their type when they all
+    /// agree, else `application/octet-stream`; `None` without a ref.
+    fn download_type(
+        &self,
+        table: &str,
+        s: StreamId,
+        sha256: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let types: Vec<String> = self.rows(
+            &format!(
+                "SELECT DISTINCT media_type FROM {table} WHERE stream_id = ?1 AND sha256 = ?2"
+            ),
+            [s.to_string(), sha256.to_owned()],
+            |r| r.get(0),
+        )?;
+        Ok(match types.as_slice() {
+            [] => None,
+            [one] => Some(one.clone()),
+            _ => Some("application/octet-stream".to_owned()),
+        })
+    }
+
+    /// What a download of the blob serves, only when the stream has a ref to it: the bytes
+    /// of a blob in `blobs`, or a large blob's size and part count. Both with the stream's
+    /// agreed media type or `application/octet-stream`.
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub fn blob_download(
+        &self,
+        s: StreamId,
+        sha256: &str,
+    ) -> Result<Option<BlobDownload>, StoreError> {
+        self.guard(|| {
+            if let Some(media_type) = self.download_type("blob_refs", s, sha256)? {
+                let data: Option<Vec<u8>> = sql(self
+                    .conn
+                    .query_row("SELECT data FROM blobs WHERE sha256 = ?1", [sha256], |r| {
+                        r.get(0)
+                    })
+                    .optional())?;
+                return Ok(data.map(|data| BlobDownload::Whole(BlobBody { data, media_type })));
+            }
+            let Some(media_type) = self.download_type("large_blob_refs", s, sha256)? else {
+                return Ok(None);
+            };
+            let row: Option<(i64, i64)> = sql(self
+                .conn
+                .query_row(
+                    "SELECT size, part_count FROM large_blobs WHERE sha256 = ?1",
+                    [sha256],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional())?;
+            row.map(|(size, part_count)| {
+                Ok(BlobDownload::Parts(LargeBlob {
+                    media_type,
+                    size: to_u64(size)?,
+                    part_count: to_u64(part_count)?,
+                }))
+            })
+            .transpose()
+        })
+    }
+
+    /// One part of a large blob, by index (refs are permanent and parts immutable, so a
+    /// download reads each part in its own short read).
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub fn large_blob_part(&self, sha256: &str, index: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        self.guard(|| self.part_row(sha256, index))
+    }
+
+    fn part_row(&self, sha256: &str, index: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        sql(self
+            .conn
+            .query_row(
+                "SELECT data FROM large_blob_parts WHERE sha256 = ?1 AND part_index = ?2",
+                rusqlite::params![sha256, to_i64(index)?],
+                |r| r.get(0),
+            )
+            .optional())
+    }
+
+    /// The blob's whole bytes, only when the stream has a ref to it, with the stream's
+    /// agreed media type or `application/octet-stream`. A large blob is read whole into
+    /// memory; a download reads it part by part instead ([`ReadTx::blob_download`]).
     ///
     /// # Errors
     ///
     /// A store error.
     pub fn blob(&self, s: StreamId, sha256: &str) -> Result<Option<BlobBody>, StoreError> {
-        self.guard(|| {
-            let types: Vec<String> = self.rows(
-                "SELECT DISTINCT media_type FROM blob_refs WHERE stream_id = ?1 AND sha256 = ?2",
-                [s.to_string(), sha256.to_owned()],
-                |r| r.get(0),
-            )?;
-            if types.is_empty() {
-                return Ok(None);
-            }
-            let data: Option<Vec<u8>> = sql(self
-                .conn
-                .query_row("SELECT data FROM blobs WHERE sha256 = ?1", [sha256], |r| {
-                    r.get(0)
-                })
-                .optional())?;
-            Ok(data.map(|data| BlobBody {
-                data,
-                media_type: if types.len() == 1 {
-                    types[0].clone()
-                } else {
-                    "application/octet-stream".to_owned()
-                },
-            }))
-        })
+        match self.blob_download(s, sha256)? {
+            None => Ok(None),
+            Some(BlobDownload::Whole(body)) => Ok(Some(body)),
+            Some(BlobDownload::Parts(large)) => self.guard(|| {
+                let mut data = Vec::new();
+                for index in 0..large.part_count {
+                    let part = self
+                        .part_row(sha256, index)?
+                        .ok_or_else(|| StoreError::decode("a large blob's part is missing"))?;
+                    data.extend_from_slice(&part);
+                }
+                if data.len() as u64 != large.size {
+                    return Err(StoreError::decode("a large blob's parts are incomplete"));
+                }
+                Ok(Some(BlobBody {
+                    data,
+                    media_type: large.media_type,
+                }))
+            }),
+        }
     }
 
     /// # Errors
