@@ -286,9 +286,13 @@ async fn recorded_late_close() {
         hold.wait();
         rig.clock.advance(crate::supervisor::PROOF_CUTOFF);
         hold.go();
-        // The stop reads the slot only after the kill task has published its report.
+        // The stop reads the slot only after the kill task has published its report: the
+        // reader is held until the kill task reaches the point after its publication.
         read.wait();
-        assert!(rig.pauses.passed(Pause::BeforeCloseBy), "{hold_at:?}");
+        rig.until("the kill task published its report", || {
+            rig.pauses.passed(Pause::BeforeCloseBy)
+        })
+        .await;
         read.go();
         let r = reply.await.unwrap();
         assert_eq!(body(&r)["death_confirmed"], false);
