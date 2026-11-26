@@ -92,32 +92,10 @@ fn daemon_with(labels: &Labels, dir: &Path, args: &[&str], env: &[(&str, &OsStr)
     let json = serde_json::to_string(&argv).unwrap();
     let mut all = vec![(AGENT_PROGRAM, OsStr::new(&json))];
     all.extend_from_slice(env);
-    let run = run_args(dir);
-    let run: Vec<&str> = run.iter().map(String::as_str).collect();
-    let p = Proc::spawn(&mut cmd(labels, dir, &run, &all));
+    // `cmd` gives the first start the directory's reserved port; a restart takes the saved one.
+    let p = Proc::spawn(&mut cmd(labels, dir, &["daemon", "run"], &all));
     let port = p.serving();
     (p, port)
-}
-
-/// `daemon run`, with a port of this state directory's own on its first start: the cases run
-/// in parallel, so a first start that scanned the shared range could take the port a crashed
-/// daemon of another case left free, and that case's restart, which must reuse its saved port,
-/// would end `port_unavailable`. Ports come from above the range, one per state directory,
-/// skipping any that is bound.
-fn run_args(dir: &Path) -> Vec<String> {
-    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(7473);
-    let mut args = vec!["daemon".to_owned(), "run".to_owned()];
-    if dir.join("port").exists() {
-        return args;
-    }
-    loop {
-        let p = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        assert!(p < 7673, "no free test port above the range");
-        if TcpListener::bind(("127.0.0.1", p)).is_ok() {
-            args.extend(["--port".to_owned(), p.to_string()]);
-            return args;
-        }
-    }
 }
 
 /// `chaldea --state-dir <dir> <args>`: its exit code and stdout as JSON (or `Null`).

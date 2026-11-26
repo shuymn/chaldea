@@ -717,7 +717,10 @@ pub fn chaldea(labels: &Labels, args: &[&OsStr]) -> std::process::Command {
 }
 
 /// `chaldea --state-dir <dir> <args…>` (this binary with test seams), `env` set after the
-/// fault entry's own variables.
+/// fault entry's own variables. `daemon start` and `daemon run` without `--port` get
+/// `super::own_port(dir)`: no test of these binaries is about the choice from the range, so
+/// their daemons stay off it, where `daemon_run`'s tests of that choice expect a port to be
+/// free, and a restart on the saved port finds its port still the test's.
 pub fn cmd(
     labels: &Labels,
     dir: &Path,
@@ -726,6 +729,15 @@ pub fn cmd(
 ) -> std::process::Command {
     let mut c = chaldea(labels, &[OsStr::new("--state-dir"), dir.as_os_str()]);
     c.args(args);
+    let starts = matches!(args, ["daemon", "start" | "run", ..]);
+    if starts
+        && !args
+            .iter()
+            .any(|a| *a == "--port" || a.starts_with("--port="))
+        && let Some(p) = super::own_port(dir)
+    {
+        c.args(["--port", &p.to_string()]);
+    }
     for (k, v) in env {
         c.env(k, v);
     }
