@@ -14,8 +14,8 @@ Canonical design reference: `docs/architecture.md`.
   1. **Sync Seam**: `stream_id + after_seq`, snapshot recovery, `command_id` idempotency, notify-then-pull WS live notifications.
   2. **Ingest & Event Store Seam**: SQLite append-only events (`schema_version`), 3-axis state (`process` / `turn` / `task`), generation+offset atomic transcript ingestion.
   3. **Agent Control & Adapter Seam**: `chaldea spawn / send / wait / stop / mailbox`, input state machine (`queued -> sending -> sent -> acked / unconfirmed`), adapter capability table, worktree ownership (short base path support for Windows MSVC).
-  4. **Extension & Rescue Seam**: CLI hooks injected per launch (fixed command + env injection); external agents on the PC diagnose and intervene through `GET /api/threads/{id}/screen`, `chaldea inspect`, the existing commands, and `skills/chaldea-rescue/SKILL.md`. One-shot JSON hooks and a built-in Rescue UI with A2UI are deferred.
-  5. **PTY Seam**: `PtyRuntime` trait in `crates/pty-runtime` encapsulating own macOS POSIX PTY (rustix + `Command`/`pre_exec`) and own `windows-sys` ConPTY backends (child joins a kill-on-close job at creation via `PROC_THREAD_ATTRIBUTE_JOB_LIST`), `alacritty_terminal` headless VT responder, process-tree cleanup (Job Object / `setsid`+pgid), crash-only `--resume` recovery, and an attach WebSocket feeding the PWA's web terminal view (ghostty-web).
+  4. **Extension & Rescue Seam**: One-shot JSON hooks (fixed command + env injection), emergency VT keypad, dedicated Rescue Agent token + scoped A2UI (`Host | Workspace | Thread`).
+  5. **PTY Seam**: `PtyRuntime` trait in `crates/pty-runtime` encapsulating own macOS POSIX PTY (rustix + `Command`/`pre_exec`) and own `windows-sys` ConPTY backends (child joins a kill-on-close job at creation via `PROC_THREAD_ATTRIBUTE_JOB_LIST`), `alacritty_terminal` headless VT responder, process-tree cleanup (Job Object / `setsid`+pgid), crash-only `--resume` recovery, and native `chaldea attach`.
 
 ## Design Assets
 
