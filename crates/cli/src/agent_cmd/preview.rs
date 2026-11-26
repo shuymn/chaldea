@@ -12,7 +12,7 @@ use chaldea_core::MAX_SAFE_INTEGER;
 use chaldea_core::event::{EventEnvelope, TypedEvent};
 use chaldea_core::ids::{Epoch, LaunchId, StreamId, ThreadId};
 use chaldea_core::payload::{
-    EvidenceSource, ExitReason, LaunchEvidence, Observed, ObservedClass, Unchecked,
+    EvidenceSource, ExitReason, LaunchEvidence, OWNER_ASSERTED, Observed, ObservedClass, Unchecked,
 };
 use chaldea_core::sync::{EventsResponse, LaunchInfo};
 use chaldea_daemon::lifecycle::ExitCode;
@@ -27,6 +27,8 @@ const FIRST_LIMIT: usize = 16;
 
 const NO_PROBE: &str = "The running daemon has not recorded a probe of this launch: it may still be running, or it was skipped (see the daemon log).";
 const NO_REPORT: &str = "No check report was recorded for this launch (it ended under a daemon version that did not record one).";
+const PROVEN: &str = "The launch's end was proven when it exited, so no check report was needed.";
+const RESTARTED: &str = "the daemon restarted during the read";
 
 /// A wire enum's text.
 fn wire<T: serde::Serialize>(v: &T) -> String {
@@ -89,30 +91,37 @@ impl Client<'_> {
         .unwrap_or(Err(End::Timeout))
     }
 
-    /// One backward page of `stream`.
+    /// One backward page of `stream`, read from the daemon run `run`.
     fn page(
         &self,
         cutoff: std::time::Instant,
+        run: &str,
         stream: StreamId,
         before: u64,
         limit: usize,
     ) -> Result<EventsResponse, End> {
         let path = format!("/api/events?stream_id={stream}&before_seq={before}&limit={limit}");
-        self.exchange(cutoff, &Req::Get(&path), true, &mut |r| match r.status {
-            408 | 503 => None,
-            200 => Some(
-                serde_json::from_slice::<EventsResponse>(&r.body)
-                    .map_err(|e| End::Fail(format!("the events page is not readable: {e}"))),
-            ),
-            s => Some(Err(End::Fail(format!(
-                "the daemon answered the events read with {s} {}",
-                code_name(&r)
-            )))),
-        })
+        self.exchange_in(
+            cutoff,
+            &Req::Get(&path),
+            true,
+            Some(run),
+            &mut |r| match r.status {
+                408 | 503 => None,
+                200 => Some(
+                    serde_json::from_slice::<EventsResponse>(&r.body)
+                        .map_err(|e| End::Fail(format!("the events page is not readable: {e}"))),
+                ),
+                s => Some(Err(End::Fail(format!(
+                    "the daemon answered the events read with {s} {}",
+                    code_name(&r)
+                )))),
+            },
+        )
     }
 
-    /// The backward scan of §2.5 step 2 for launch `l` of thread `t`.
-    fn scan(&self, cutoff: std::time::Instant, t: ThreadId, l: &LaunchInfo) -> Scan {
+    /// The backward scan of §2.5 step 2 for launch `l` of thread `t`, from the run `run`.
+    fn scan(&self, cutoff: std::time::Instant, run: &str, t: ThreadId, l: &LaunchInfo) -> Scan {
         let stream = StreamId::Thread(t);
         let to_reserved = l.exit_reason == Some(ExitReason::UnknownAfterCrash);
         let mut scan = Scan::default();
@@ -120,7 +129,7 @@ impl Client<'_> {
         let mut limit = FIRST_LIMIT;
         let mut epoch: Option<Epoch> = None;
         loop {
-            let resp = match self.page(cutoff, stream, before, limit) {
+            let resp = match self.page(cutoff, run, stream, before, limit) {
                 Ok(r) => r,
                 Err(End::TooLarge) if limit > 1 => {
                     limit /= 2;
@@ -136,6 +145,10 @@ impl Client<'_> {
                 }
                 Err(End::Fail(m)) => {
                     scan.interrupted = Some(m);
+                    break;
+                }
+                Err(End::Restarted) => {
+                    scan.interrupted = Some(RESTARTED.into());
                     break;
                 }
             };
@@ -214,7 +227,8 @@ impl Client<'_> {
             Ok((_, i)) => i,
             Err(e) => return super::ended(e, err),
         };
-        let summary = match self.summary(cutoff, t) {
+        let summary = match self.summary_until(cutoff, t, true, Some(&instance), &|_| Some(Ok(())))
+        {
             Ok(s) => s,
             Err(e) => return super::ended(e, err),
         };
@@ -231,23 +245,18 @@ impl Client<'_> {
             return ExitCode::Ok;
         };
         // Step 2.
-        let mut scan = self.scan(cutoff, t, &l);
-        // The re-check: the same serving run and the same launch, exit, and death state.
-        let again = self
-            .serving(cutoff)
-            .and_then(|(_, i)| self.summary(cutoff, t).map(|s| (i, s)));
+        let mut scan = self.scan(cutoff, &instance, t, &l);
+        // The re-check, from the same serving run: the same launch, exit, and death state.
+        let again = self.summary_until(cutoff, t, true, Some(&instance), &|_| Some(Ok(())));
         // Whether `L` is still current and unconfirmed, as far as the re-check read.
         let mut unconfirmed = !l.death_confirmed;
         match again {
-            Ok((i, s)) => {
+            Ok(s) => {
                 let now = s.launch.as_ref();
                 if now.is_some_and(|m| m.launch_id == l.launch_id && m.death_confirmed) {
                     unconfirmed = false;
                 }
-                if i != instance {
-                    scan.interrupted
-                        .get_or_insert_with(|| "the daemon restarted during the read".into());
-                } else if !now.is_some_and(|m| {
+                if !now.is_some_and(|m| {
                     m.launch_id == l.launch_id
                         && m.exit_reason == l.exit_reason
                         && m.death_confirmed == l.death_confirmed
@@ -255,6 +264,9 @@ impl Client<'_> {
                     scan.interrupted
                         .get_or_insert_with(|| "the launch changed during the read".into());
                 }
+            }
+            Err(End::Restarted) => {
+                scan.interrupted.get_or_insert_with(|| RESTARTED.into());
             }
             Err(_) => {
                 scan.interrupted
@@ -400,7 +412,12 @@ fn render(
         ExitReason::Stopped | ExitReason::Exit | ExitReason::SpawnFailed
             if complete && evidence.is_empty() =>
         {
-            let _ = writeln!(o, "{NO_REPORT}");
+            // Evidence is recorded only for an exit whose end was not proven.
+            let proven = exited.as_ref().is_some_and(|x| x.death_confirmed)
+                || confirmation
+                    .as_ref()
+                    .is_some_and(|(_, _, m)| m != OWNER_ASSERTED);
+            let _ = writeln!(o, "{}", if proven { PROVEN } else { NO_REPORT });
         }
         ExitReason::UnknownAfterCrash => {
             let reserved = typed.iter().find_map(|(e, d)| match d {
@@ -428,10 +445,17 @@ fn render(
         );
     }
     if unconfirmed && confirmation.is_none() {
-        let _ = writeln!(
-            o,
-            "To confirm that this launch has ended: chaldea stop {t} --assume-dead --launch {launch}"
-        );
+        if complete {
+            let _ = writeln!(
+                o,
+                "To confirm that this launch has ended: chaldea stop {t} --assume-dead --launch {launch}"
+            );
+        } else {
+            let _ = writeln!(
+                o,
+                "Run `chaldea stop {t} --assume-dead` again to read the evidence before confirming that this launch has ended."
+            );
+        }
     }
     o
 }

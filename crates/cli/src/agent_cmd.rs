@@ -99,6 +99,8 @@ pub(crate) enum End {
     Fail(String),
     /// A response body over the client's limit (`client::is_body_too_large`).
     TooLarge,
+    /// A request bound to one daemon run found another run serving.
+    Restarted,
 }
 
 /// Why a command ended without its result.
@@ -132,8 +134,31 @@ impl Client<'_> {
         daemon_required: bool,
         decide: &mut dyn FnMut(Response) -> Option<Result<T, End>>,
     ) -> Result<T, End> {
+        self.exchange_in(cutoff, req, daemon_required, None, decide)
+    }
+
+    /// [`Client::exchange`] bound to the daemon run `run` when given: every attempt, a retry
+    /// included, is sent only to that run, and a response is adopted only when discovery still
+    /// names that run after it was read; another run serving ends the exchange `Restarted`.
+    fn exchange_in<T>(
+        &self,
+        cutoff: Instant,
+        req: &Req<'_>,
+        daemon_required: bool,
+        run: Option<&str>,
+        decide: &mut dyn FnMut(Response) -> Option<Result<T, End>>,
+    ) -> Result<T, End> {
+        let same_run = |found: &Result<Found, String>| match (run, found) {
+            (None, _) => true,
+            (Some(r), Ok(Found::Port(_, i))) => i == r,
+            (Some(_), _) => false,
+        };
         let seen = poll_until_with(&Cell::new(cutoff), self.period, self.now, || {
-            let port = match (self.discover)() {
+            let found = (self.discover)();
+            if run.is_some() && matches!(found, Ok(Found::Port(..))) && !same_run(&found) {
+                return Some(Err(End::Restarted));
+            }
+            let port = match found {
                 Ok(Found::Port(p, _)) => p,
                 Ok(Found::NotRunning) if daemon_required => {
                     return Some(Err(End::Fail(
@@ -153,7 +178,12 @@ impl Client<'_> {
                 Err(e) if client::is_body_too_large(&e) => Some(Err(End::TooLarge)),
                 Err(e) if transient(e.kind()) => None,
                 Err(e) => Some(Err(End::Fail(format!("the request failed: {e}")))),
-                Ok(r) => decide(r),
+                Ok(r) => match decide(r) {
+                    Some(Ok(_)) if run.is_some() && !same_run(&(self.discover)()) => {
+                        Some(Err(End::Restarted))
+                    }
+                    other => other,
+                },
             }
         });
         seen.unwrap_or(Err(End::Timeout))
@@ -166,13 +196,15 @@ impl Client<'_> {
         cutoff: Instant,
         t: ThreadId,
         daemon_required: bool,
+        run: Option<&str>,
         cond: &dyn Fn(&ThreadSummary) -> Option<Result<(), End>>,
     ) -> Result<ThreadSummary, End> {
         let path = format!("/api/threads/{t}");
-        self.exchange(
+        self.exchange_in(
             cutoff,
             &Req::Get(&path),
             daemon_required,
+            run,
             &mut |r| match r.status {
                 408 | 503 => None,
                 200 => match serde_json::from_slice::<ThreadSummary>(&r.body) {
@@ -192,7 +224,7 @@ impl Client<'_> {
 
     /// One summary.
     fn summary(&self, cutoff: Instant, t: ThreadId) -> Result<ThreadSummary, End> {
-        self.summary_until(cutoff, t, true, &|_| Some(Ok(())))
+        self.summary_until(cutoff, t, true, None, &|_| Some(Ok(())))
     }
 
     /// One command: its decoded result, or why it ended without one.
@@ -260,6 +292,10 @@ fn ended(e: End, err: &mut dyn Write) -> ExitCode {
         }
         End::TooLarge => {
             say(err, "the daemon's response is larger than the client reads");
+            ExitCode::Failed
+        }
+        End::Restarted => {
+            say(err, "the daemon restarted during the read");
             ExitCode::Failed
         }
     }
@@ -678,7 +714,7 @@ impl Client<'_> {
                 None
             }
         };
-        match self.summary_until(at, t, false, &cond) {
+        match self.summary_until(at, t, false, None, &cond) {
             Ok(s) => {
                 print(out, &s);
                 ExitCode::Ok

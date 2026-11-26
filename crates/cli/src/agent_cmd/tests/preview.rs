@@ -232,6 +232,12 @@ fn pages(stub: &Stub) -> Vec<(u64, usize)> {
         .collect()
 }
 
+fn rerun_line() -> String {
+    format!(
+        "Run `chaldea stop {T} --assume-dead` again to read the evidence before confirming that this launch has ended."
+    )
+}
+
 fn confirm_line() -> String {
     format!("To confirm that this launch has ended: chaldea stop {T} --assume-dead --launch {L}")
 }
@@ -317,7 +323,9 @@ fn preview_interrupted_by_a_bad_page() {
             out.contains("The history could not be read completely ("),
             "{out}"
         );
-        assert!(out.ends_with(&format!("{}\n", confirm_line())), "{out}");
+        // An interrupted read offers no confirmation, only a new read.
+        assert!(!out.contains("--launch"), "{out}");
+        assert!(out.ends_with(&format!("{}\n", rerun_line())), "{out}");
     }
 }
 
@@ -396,23 +404,35 @@ fn preview_bound_to_one_run() {
         s,
     )
     .start();
-    let calls = AtomicUsize::new(0);
     let port = stub.port;
-    // Step 1's discovery and its summary read, then the page: run-1; the re-check: run-2.
-    let discover = || {
-        let instance = if calls.fetch_add(1, Ordering::SeqCst) < 3 {
-            RUN
-        } else {
-            "run-2"
+    // Discovery runs once for step 1, and before and after each adopted request: the summary,
+    // the page, and the re-check's summary (7 in all). A second run serving from any of
+    // them on interrupts the preview, the last one (between the re-check's request and its
+    // adoption) included.
+    for switch in 1..7 {
+        let calls = AtomicUsize::new(0);
+        let discover = || {
+            let instance = if calls.fetch_add(1, Ordering::SeqCst) < switch {
+                RUN
+            } else {
+                "run-2"
+            };
+            Ok(Found::Port(port, instance.to_owned()))
         };
-        Ok(Found::Port(port, instance.to_owned()))
-    };
-    let (code, out, _) = run_with(&stub, &discover, |c, o, e| c.preview(T, o, e));
-    assert_eq!(code, ExitCode::Failed, "{out}");
-    assert!(
-        out.contains("(the daemon restarted during the read)"),
-        "{out}"
-    );
+        let sent = stub.gets();
+        let (code, out, err) = run_with(&stub, &discover, |c, o, e| c.preview(T, o, e));
+        assert_eq!(code, ExitCode::Failed, "{switch}: {out}{err}");
+        if switch == 1 {
+            // Another run serves before the first request: nothing is sent to it.
+            assert_eq!(stub.gets(), sent, "{out}{err}");
+        }
+        assert!(
+            out.contains("(the daemon restarted during the read)")
+                || err.contains("the daemon restarted during the read"),
+            "{switch}: {out}{err}"
+        );
+        assert!(calls.load(Ordering::SeqCst) >= switch);
+    }
     // In the same run: complete, labelled this run, no missing-probe line.
     let mut s = Stream::default();
     s.reserved();
@@ -573,6 +593,29 @@ fn preview_missing_lines() {
         "{out}"
     );
     assert!(out.ends_with(&format!("{}\n", confirm_line())), "{out}");
+    // A stop whose end was proven: no evidence, and no "no report" line.
+    let mut s = Stream::default();
+    s.reserved();
+    s.started();
+    s.push(
+        "launch_exited",
+        Some(L),
+        json!({ "launch_id": L, "code": null, "signal": 9,
+                "reason": "stopped", "death_confirmed": true }),
+    );
+    s.push(
+        "launch_death_confirmed",
+        Some(L),
+        json!({ "launch_id": L, "method": "session_scan" }),
+    );
+    let stub = Daemon::new(summary(Some(ExitReason::Stopped), true, Some(PID)), s).start();
+    let (code, out, _) = preview(&stub);
+    assert_eq!(code, ExitCode::Ok, "{out}");
+    assert!(!out.contains(NO_REPORT), "{out}");
+    assert!(
+        out.contains("The launch's end was proven when it exited, so no check report was needed."),
+        "{out}"
+    );
 }
 
 /// No launch, or a launch not exited: printed, exit 0, no page read.
