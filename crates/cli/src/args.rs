@@ -119,6 +119,18 @@ pub enum Command {
         #[arg(long)]
         stop: bool,
     },
+    /// Show a thread's state, attention, launch, session, inputs, open cards, recent events,
+    /// and live screen.
+    ///
+    /// Exits 0 when the thread's state was read (a missing screen included), 1 when it could
+    /// not be read, and 4 when its summary read did not finish in time.
+    Inspect {
+        #[arg(value_parser = crate::agent_cmd::thread_id)]
+        thread: ThreadId,
+        /// Print one JSON object (`InspectOutput`).
+        #[arg(long)]
+        json: bool,
+    },
     /// Wait until a thread's process exits, its turn is idle, or it needs attention.
     Wait {
         #[arg(value_parser = crate::agent_cmd::thread_id)]

@@ -1,6 +1,6 @@
 //! `chaldea spawn`, `resume`, `stop`, `close`, and `wait` (docs/design/supervisor.md §2.2,
-//! SD16), and `send`, `ready`, `key`, `input resolve`, and `input cancel`
-//! (docs/design/supervisor-send.md §2.2): each command is one `POST /api/commands/{name}` with one `command_id`, sent again
+//! SD16), `send`, `ready`, `key`, `input resolve`, and `input cancel`
+//! (docs/design/supervisor-send.md §2.2), and `inspect` (C1 D2): each command is one `POST /api/commands/{name}` with one `command_id`, sent again
 //! unchanged on a transport failure, `408`, `503`, or `409 in_progress` until one cutoff; the
 //! reads are `GET /api/threads/{thread_id}` under the same rules.
 
@@ -128,6 +128,8 @@ impl From<End> for CommandEnd {
 /// A request to send, the same bytes on every attempt.
 enum Req<'a> {
     Get(&'a str),
+    /// A `GET` whose response body may be up to this many bytes.
+    GetUpTo(&'a str, usize),
     Post(&'a str, &'a [u8]),
 }
 
@@ -180,6 +182,9 @@ impl Client<'_> {
             let token = Some(self.token.as_str());
             let r = match req {
                 Req::Get(path) => client::request(port, "GET", path, token, cutoff),
+                Req::GetUpTo(path, max) => {
+                    client::request_up_to(port, "GET", path, token, cutoff, *max)
+                }
                 Req::Post(path, body) => client::post_json(port, path, token, body, cutoff),
             };
             match r {
@@ -886,6 +891,10 @@ pub(crate) enum Verb {
         until: Until,
         timeout: Duration,
     },
+    Inspect {
+        thread: ThreadId,
+        json: bool,
+    },
 }
 
 /// Runs `verb` against the daemon serving `dir`.
@@ -964,9 +973,11 @@ pub(crate) fn run(dir: &Path, verb: Verb) -> ExitCode {
             until,
             timeout,
         } => c.wait(thread, until, timeout, out, err),
+        Verb::Inspect { thread, json } => c.inspect(thread, json, out, err),
     }
 }
 
+mod inspect;
 mod preview;
 
 #[cfg(test)]

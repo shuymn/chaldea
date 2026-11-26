@@ -41,6 +41,8 @@ enum Reply {
     Eof,
     /// Answers nothing until the test releases it (or 20 s).
     Hold(mpsc::Receiver<()>),
+    /// A head with this status and `Content-Length`, then the end of the connection.
+    Head(u16, usize),
 }
 
 /// The stub server and the test clock (real time plus a skew the stub can add).
@@ -124,6 +126,13 @@ fn answer(c: &mut std::net::TcpStream, reply: Reply, skew: &AtomicU64) {
         Reply::Eof => return,
         Reply::Hold(rx) => {
             let _ = rx.recv_timeout(Duration::from_secs(20));
+            return;
+        }
+        Reply::Head(st, len) => {
+            let _ = write!(
+                c,
+                "HTTP/1.1 {st} X\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+            );
             return;
         }
     };
@@ -747,4 +756,5 @@ fn unconfirmed_text() {
     );
 }
 
+mod inspect;
 mod preview;
