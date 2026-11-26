@@ -410,8 +410,8 @@ Every MVP place that kills processes, reads pids, or spawns children:
 | Daemon process rules | 8, 10 | The spawn rule of §2.1 and the ownership precondition of §2.4; loss is detected (`ECHILD` or a start mismatch → `WaitFailed` or the ownership-lost kill). |
 | Daemon spawns of git and one-shot hooks | 6, 16, 20 | Not PTY children. They are created inside `with_spawn_lock` (§2.1) and waited for by exact pid (§2.4). They cannot inherit a PTY fd or a wake pipe (close-on-exec from creation, or created under the lock). |
 | Worktree removal in-use check | 16 | Stays out: it reads launch state, never processes. |
-| Rescue | 20 | Stays out: it acts through `surface_action stop`, the stop path above. |
-| Doctor: FakeCli tree kill | 21 | `native()` + `Session` + FakeCli; how the shipped binary gets FakeCli is PR 21's choice. |
+| Rescue (deferred) | 20 | Stays out: it acts through `surface_action stop`, the stop path above. |
+| Doctor: FakeCli tree kill (deferred) | 21 | `native()` + `Session` + FakeCli; how the shipped binary gets FakeCli is PR 21's choice. |
 | Windows tree kill (job + recorded descendants) | 4 | Shares the `extra` rule, the caller's full-list obligation, `KillReport`, and testkit (`docs/design/pty-windows.md`). |
 | FakeCli's own children | 3 | testkit only; every sleeper takes `--max-life-secs`; tests hold a `Cleanup`. |
 | Spike watchdog and emergency kill | — | None: the emergency kill is `stop` (`docs/design/supervisor.md` SD15). |

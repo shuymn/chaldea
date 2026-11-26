@@ -417,8 +417,8 @@ Every MVP place on Windows that kills processes, holds handles or pids, or creat
 | Parent kill-on-close job check | 8 | Stays out. Nesting needs no breakaway (CL-27); a parent job that refused nesting would make `spawn` fail without an uncontained running child, which only injection reaches (A13, CL-6). |
 | Daemon spawns of git and one-shot hooks | 6, 16, 20 | Not PTY children; created inside `with_spawn_lock` with `CREATE_NO_WINDOW` (prior-art row 9). They cannot inherit a handle of this backend (none is inheritable outside `CreatePseudoConsole`, which runs under the lock). |
 | Worktree removal in-use check | 16 | Reads launch state. **Note for PR 16:** `tree_dead` on Windows means no job member runs and the leader and held extras have exited; another member's file handles can be released a little later (W7), so a removal right after stop can see a sharing violation, which PR 16's `uncertain`/retry path must absorb. |
-| Rescue | 20 | Acts through `surface_action stop`, the stop path. |
-| Doctor: FakeCli tree kill, ConPTY module check | 21 | `native()` + `Session` + FakeCli; `Session::evidence()` gives `job_branch` and `conpty_module`. |
+| Rescue (deferred) | 20 | Acts through `surface_action stop`, the stop path. |
+| Doctor: FakeCli tree kill, ConPTY module check (deferred) | 21 | `native()` + `Session` + FakeCli; `Session::evidence()` gives `job_branch` and `conpty_module`. |
 | FakeCli attach paste tests on `windows-latest` | 14 | FakeCli raw console mode (`--raw`, `echo`) under ConPTY (§2.8). |
 | FakeCli's own children and test cleanup | 3, 4 | `--max-life-secs`; `Cleanup::kill_with(fake::kill_verified)`; the session's job kills its members on drop. |
 

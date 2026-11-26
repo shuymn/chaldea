@@ -2,7 +2,7 @@
 
 Status: Q-A (issue #13, target 2) and Q-B, the Sync Seam (target 1), implemented in `specs/`. Cited as "mvp §N" for `docs/mvp-design.md`, "http §N" for `docs/design/http-surface.md`, "store §N" for `docs/design/event-store.md`.
 
-**Roles.** Quint checks the design-stage contract under interleavings: what the daemon may feed the reducers, in which order, and what must then hold. It does not check the Rust code; `proptest` (`crates/core/tests/input_step.rs`, `state_reduce.rs`) checks each reducer alone, and the `stateright` model of PR 17 checks the sync code. Q-A's value is the coupled model: `ThreadState`, the gate projection, several inputs across two launches, approval cards, and attention, together. Q-B's is the Sync Seam protocol before its code exists (§7). The trace bridge (§4, §7.5) ties the specs to the code: committed Quint traces replay against the real `core` functions.
+**Roles.** Quint checks the design-stage contract under interleavings: what the daemon may feed the reducers, in which order, and what must then hold. It does not check the Rust code; `proptest` (`crates/core/tests/input_step.rs`, `state_reduce.rs`) checks each reducer alone, and a `stateright` model of the sync code (PR 17) is deferred (mvp §4 "Deferred"). Q-A's value is the coupled model: `ThreadState`, the gate projection, several inputs across two launches, approval cards, and attention, together. Q-B's is the Sync Seam protocol before its code exists (§7). The trace bridge (§4, §7.5) ties the specs to the code: committed Quint traces replay against the real `core` functions.
 
 | File | What |
 |---|---|
@@ -201,7 +201,7 @@ The `specs` job of `ci.yml` (`ubuntu-latest`, mise pinned in `mise-action`) inst
   - **10a2** (`docs/design/supervisor-recovery.md`) owns `confirmDeath`'s site: the `stop` intent with `assume_dead`, the owner's confirmation of a launch exited with death unconfirmed. No guard changes: the restart prober and `launch_evidence` change no state and stay outside the model. `trace_repeated_restart_then_assert` states that a second restart changes nothing the assertion depends on.
 - **PR 13–14** correlate card resolutions and card keys by `approval_id` (the card finding).
 - **PR 7, 8, 18** implement what Q-B states; §7.4 lists the obligations it hands them.
-- **PR 17**'s `stateright` model checks the Rust sync code; Q-B checks the contract it implements (§7.7).
+- **PR 17** (deferred): a `stateright` model would check the Rust sync code; Q-B checks the contract it implements (§7.7).
 - **Phase 2 relay**: §7.1 says where it plugs into Q-B.
 
 ## 7. Q-B: Sync Seam
@@ -387,4 +387,4 @@ CI runs the four seeds and the named traces, so every mutation fails CI. `has_mo
 
 ### 7.7 What PR 17 Still Covers
 
-Q-B checks the protocol with the store's guarantees assumed. PR 17's `stateright` model checks the Rust code where Q-B abstracts: the writer thread, the store's commit and crash behaviour (a crash during an append, `CommitUnknown` recovery), the socket loop's single `merge` and frame selection, the runner's effect and completion under real time (a heads refresh against the reply grace, the deadlines), crashes at every point of a command, the runner liveness of §7.4 (PR 7, commands and receipts), and retry after a lost response against the real handlers. PR 18's fast-check reducer checks the client rules of §7.1.
+Q-B checks the protocol with the store's guarantees assumed. A `stateright` model (PR 17, deferred) would check the Rust code where Q-B abstracts: the writer thread, the store's commit and crash behaviour (a crash during an append, `CommitUnknown` recovery), the socket loop's single `merge` and frame selection, the runner's effect and completion under real time (a heads refresh against the reply grace, the deadlines), crashes at every point of a command, the runner liveness of §7.4 (PR 7, commands and receipts), and retry after a lost response against the real handlers. PR 18's fast-check reducer checks the client rules of §7.1.

@@ -241,10 +241,10 @@ pub(crate) fn build_router(mounts: &[Mount], state: AppState) -> Router;  // the
 | `GET /api/threads/{thread_id}` | Read | AbsentOrMatching | Bearer(owner, agent, rescue) | `ReadStream` | 10 |
 | `GET /api/worktrees` | Read | AbsentOrMatching | Bearer(owner, agent, rescue) | `ReadWorktrees` | 7 |
 | `GET /api/adapters` | Read | AbsentOrMatching | Bearer(owner, agent, rescue) | `ReadAdapters` | 10 |
-| `GET /api/doctor` | Read | AbsentOrMatching | Bearer(owner, rescue) | `ReadDoctor` | 21 |
+| `GET /api/doctor` | Read | AbsentOrMatching | Bearer(owner, rescue) | `ReadDoctor` | 21 (deferred) |
 | `POST /api/commands/{name}` | Write | AbsentOrMatching | Bearer(owner, agent) | ByCommandName | 7 seam; each command its PR |
 | `POST /hook` | Write | MustBeAbsent | Bearer(hook) | — | 9 |
-| `POST /events` | Write | MustBeAbsent | Bearer(owner, rescue, extension) | `PostEvents` | 20 |
+| `POST /events` | Write | MustBeAbsent | Bearer(owner, rescue, extension) | `PostEvents` | 20 (deferred) |
 
 **Read routes cannot write; write routes cannot time out by dropping.** Only a spec whose `mount` is `Write` can be mounted with `Mount::write` (each `Mount` constructor checks the spec's kind), the guard dispatches on the typed endpoint and constructs `WriteCtx` only in its write arm, and it wraps only read handlers in `until_deadline` (`deadline::settle_before`: a `timeout_at(deadline)`, then one clock sample after the handler's future is dropped) → 408 (H6 is why write routes are not). The store handle is private to `ctx.rs`, so a handler reaches the store only through `ReadCtx` or `WriteCtx`. The two memory-only routes are read mounts: a 408 there leaves at most an unreturned ticket or code that expires unused.
 
@@ -400,7 +400,7 @@ pub enum Grant {
     ParentAndChildren,      // mailbox send: recipient is the parent or a child
     OwnWorktree,            // worktree remove: owner_thread_id == the token's thread, no flags
     ExtensionScope,         // POST /events: the token's configured scope (PR 20)
-    SurfaceScopeContains,   // surface_action: the surface's scope contains the target (PR 20)
+    SurfaceScopeContains,   // surface_action: the surface's scope contains the target (PR 20, deferred)
 }
 pub struct CommandSpec { pub name: &'static str, pub action: Action, pub owner_pr: u8 }
 pub static MVP_COMMANDS: &[CommandSpec];   // spawn, resume, send, ready, key, stop, close, input_resolve, input_cancel,
@@ -615,7 +615,7 @@ The request waits on the `watch` until `deadline + write_reply_grace` and replie
 
 **Receipt visibility.** `check_receipt` returns `Conflict` for another token before looking at status (`crates/core/src/command.rs`), and `Conflict` has one body, so another token learns nothing about the command's state or result. It does learn that the `command_id` is taken (the same request with a fresh id would proceed); `command_id`s are random UUIDs chosen by their sender, so this reveals only that someone guessed an id in use. T3 Code's receipts (`persistence/Migrations/055_OrchestrationV2.ts:42-50`) key by `command_id` with no token or request hash; Chaldea adds both (mvp §2.4).
 
-**What PR 7 completes end to end.** No mvp command: each needs its owning PR's state machine (PR 10: `spawn`, `resume`, `send`, `ready`, `key`, `stop`, `close`, `input_resolve`, `input_cancel`; PR 16: `task_set`, `mailbox_send`, `worktree_remove`; PR 20: `surface_action`; PR 21: `doctor_run`). PR 7's tests register test-only handlers under test-only names through a test registry (`CommandRegistry::mvp_plus(TEST_COMMANDS)`) and a test `CommandSpec` table, both in `tests/support/commands.rs`, so the handlers exist only in test code: `test_counter` (an intent counter that appends one event; an optional target thread checked against the `task set` grant), `test_completed` (completed in the intent job, with a status and an error code the arguments may name, or a body that is not JSON or holds an out-of-range number; its `prepare` refuses one text with 408), `test_slow_effect` (a `Pending` intent whose effect resolves only when the test releases its barrier, can revoke its caller, and answers a status outside the result set or panics by its tag), `test_refuse` (a refusing, panicking, or writing and effect-less `Pending` intent, refusals with any code and status, and a transient `busy` one), `test_worktree_remove` (an `OwnWorktree` check), and `test_long_deadline` (a budget of its own, 30 s).
+**What PR 7 completes end to end.** No mvp command: each needs its owning PR's state machine (PR 10: `spawn`, `resume`, `send`, `ready`, `key`, `stop`, `close`, `input_resolve`, `input_cancel`; PR 16: `task_set`, `mailbox_send`; deferred (mvp §4 "Deferred"): `worktree_remove`, PR 20's `surface_action`, PR 21's `doctor_run`). PR 7's tests register test-only handlers under test-only names through a test registry (`CommandRegistry::mvp_plus(TEST_COMMANDS)`) and a test `CommandSpec` table, both in `tests/support/commands.rs`, so the handlers exist only in test code: `test_counter` (an intent counter that appends one event; an optional target thread checked against the `task set` grant), `test_completed` (completed in the intent job, with a status and an error code the arguments may name, or a body that is not JSON or holds an out-of-range number; its `prepare` refuses one text with 408), `test_slow_effect` (a `Pending` intent whose effect resolves only when the test releases its barrier, can revoke its caller, and answers a status outside the result set or panics by its tag), `test_refuse` (a refusing, panicking, or writing and effect-less `Pending` intent, refusals with any code and status, and a transient `busy` one), `test_worktree_remove` (an `OwnWorktree` check), and `test_long_deadline` (a budget of its own, 30 s).
 
 ### 2.9 Status Mapping and the Error-Body Boundary
 
@@ -737,10 +737,10 @@ Every later PR that adds a route, a command, a token use, or a WebSocket purpose
 | 10 supervisor (designed as 10a1, `docs/design/supervisor.md`; 10b; and 10a2) | `spawn`, `resume`, `send`, `ready`, `key`, `stop`, `close`, `input_resolve`, `input_cancel`; agent and hook tokens; `GET /api/adapters`; `GET /api/threads/{thread_id}` | `CommandHandler`, `CommandEffect` (a bounded terminal result; a negative result means the work cannot happen later), `TokenService::{mint, new_token, revoke}`, the `after_ok` nudge, `Mount::read`, and the seams for writes outside a request (§2.11: `write_with`, `mint_token`, the completion policy, `RevocationNudge`) | Guard (kind and action per command name), receipt, identity, runner, mapping, object-scope functions, `deny_for` |
 | 11 attach | `GET /api/attach/{thread}` socket bytes | `Mount::upgrade`, `AttachGrant` | ticket purpose `attach:<thread>`, owner-only at issue and redeem, single use, a registered socket task |
 | 16 agent control | `task_set`, `mailbox_send`, `worktree_remove` | `CommandHandler` | `SelfAndDirectChildren`, `ParentAndChildren`, `OwnWorktree`, `CreatedBySelf` grants |
-| 17 `stateright` | the Sync model | — | the replay rules (§2.7) and the receipt and runner rules (§2.8), cited by claim id |
+| 17 `stateright` (deferred) | the Sync model | — | the replay rules (§2.7) and the receipt and runner rules (§2.8), cited by claim id |
 | 18 PWA | `/`, `/assets/*`; pairing; ticket and events client | `Mount::read` | pair flow, `ws-ticket`, `/api/ws`, `/api/events`, the public bodies (§8 D13), the subscription rule (§2.6). Requirements on PR 18: a reducer that treats every `heads` frame as the heads known to the socket for the subscription set at the frame's selection (§8 D15), and no reliance on connection reuse (§2.2) |
-| 20 extensions | `POST /events`, `surface_action`, extension tokens with a scope, rescue | `Mount::write`, `CommandHandler`, `TokenService` | kind check, `ExtensionScope`/`SurfaceScopeContains` grants, `ObjectScope::stored_surface`; the scope column is a v2 migration (store §2.4) |
-| 21 doctor | `doctor_run`, `GET /api/doctor` | `CommandHandler`, `Mount::read` | owner and rescue read, owner run |
+| 20 extensions (deferred) | `POST /events`, `surface_action`, extension tokens with a scope, rescue | `Mount::write`, `CommandHandler`, `TokenService` | kind check, `ExtensionScope`/`SurfaceScopeContains` grants, `ObjectScope::stored_surface`; the scope column is a v2 migration (store §2.4) |
+| 21 doctor (deferred) | `doctor_run`, `GET /api/doctor` | `CommandHandler`, `Mount::read` | owner and rescue read, owner run |
 
 ## 5. Resource Paths
 

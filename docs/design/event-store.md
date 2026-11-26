@@ -728,13 +728,13 @@ Every later PR that reads or writes the store, and what it uses. None needs a st
 | 10 | gate inputs, send path | `read`: `thread`, `launch` (gate evidence, `write_basis`), `inputs`; `append(input_state_changed)` with the compare-and-set of `apply` |
 | 10 | readiness write basis | `NewEvent::annex = Readiness { write_basis }` on `readiness_observed` |
 | 10 | restart | `read`: `open_launches`, `inputs(… queued, sending, sent)`; `append(launch_exited, input_state_changed, status_changed)` |
-| 12 fixtures | captured events for `doctor capture` | `read`: `events_after`, `events_of_kind` |
+| 12 fixtures (deferred) | captured events for `doctor capture` | `read`: `events_after`, `events_of_kind` |
 | 13 / 14 tailers | binding, cursor, generation, batches, rewind after rebuild, continuity | `read`: `transcript_cursor`, `thread`, `launch`; `submit`: `append_transcript` |
 | 14 | Codex assistant text from `Stop` | `append` |
 | 16 worktrees, mailbox, task | exclusion against reservations; mailbox listing; task changes | one job: `read().worktree`, `launches_using_worktree`, `append(worktree_changed)`; `events_of_kind(mailbox_message)`; `append(task_set, status_changed)` |
-| 17 `stateright` | the store's atomicity and gapless order as model assumptions | the guarantees of §2.1 and §2.9, cited by claim id |
-| 20 extensions | `POST /events` surfaces with the stored scope check | one job: `read().surface`, `append(surface_update)` |
-| 21 doctor | integrity, schema version, projection check, file sizes | `read`: `integrity_check`, `schema_info`; `submit`: `verify_projections`; `Store::paths` |
+| 17 `stateright` (deferred) | the store's atomicity and gapless order as model assumptions | the guarantees of §2.1 and §2.9, cited by claim id |
+| 20 extensions (deferred) | `POST /events` surfaces with the stored scope check | one job: `read().surface`, `append(surface_update)` |
+| 21 doctor (deferred) | integrity, schema version, projection check, file sizes | `read`: `integrity_check`, `schema_info`; `submit`: `verify_projections`; `Store::paths` |
 
 ## 5. Resource Paths
 
