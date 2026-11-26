@@ -27,7 +27,7 @@ use crate::supervisor::tests::support::http::{Reply, spawn_send};
 struct Pending(JoinHandle<Reply>);
 
 /// A hook held before its job, its intake ended.
-struct Held {
+pub(super) struct Held {
     ordinal: u64,
     hook: Hook,
     reply: JoinHandle<Reply>,
@@ -36,7 +36,7 @@ struct Held {
 
 impl Held {
     /// Releases the job and returns the hook's reply.
-    async fn finish(self) -> Reply {
+    pub(super) async fn finish(self) -> Reply {
         self.release.send(()).unwrap();
         self.reply.await.unwrap()
     }
@@ -44,7 +44,7 @@ impl Held {
 
 /// Posts `hook` and holds it before its job, once its intake ended. With `park`, the send
 /// worker is parked through the intake so the intake reads the send side's facts.
-async fn hold(rig: &SRig, live: &Live, hook: Hook, park: bool) -> Held {
+pub(super) async fn hold(rig: &SRig, live: &Live, hook: Hook, park: bool) -> Held {
     let ordinal = rig.next_ordinal(live);
     let (got, release) = rig.ingest.points.arm_job(ordinal);
     let req = hook.req(&rig.srv);
@@ -479,7 +479,7 @@ async fn stale_start_rebuilds() {
 }
 
 /// An exit step that refuses, so the exit job rolls back and the exit stays unrecorded.
-struct RefuseExit;
+pub(super) struct RefuseExit;
 
 impl crate::supervisor::exit::ExitStep for RefuseExit {
     fn in_exit_job(

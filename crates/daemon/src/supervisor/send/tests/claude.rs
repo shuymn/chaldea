@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use super::human::{key, outcome};
 use super::outcomes::tick_at;
 use super::{Live, SRig};
-use crate::supervisor::send::claude::{Activity, ClaudeDecoder, Parsed, activity_event, parse};
+use crate::supervisor::send::claude::{Activity, ClaudeDecoder, Parsed, parse};
 use crate::supervisor::send::fake_decoder::FakeDecoder;
 use crate::supervisor::send::{ACK_WINDOW, Decoders, HookFact};
 use crate::supervisor::tests::support::hook::Hook;
@@ -151,44 +151,71 @@ fn inline_json(c: &Content) -> Value {
     }
 }
 
-/// C1-3: every fixture decodes to its recorded fact and events, through `parse` and through
-/// the decoder (its recovered region), and the event the decoder stores carries them; no
-/// registered event decodes to `Other` without an event.
-#[test]
-fn fixtures_decode() {
+/// The `tool_activity` event `e` as a fixture meta writes it.
+fn event_json(e: &crate::hook::HookEvent) -> Value {
+    let TypedEvent::ToolActivity(t) = &e.event else {
+        panic!("not a tool_activity: {:?}", e.event);
+    };
+    assert_eq!(e.name, "tool_activity");
+    json!({
+        "kind": "tool_activity",
+        "phase": t.phase,
+        "tool_name": t.tool_name,
+        "tool_use_id": t.tool_use_id,
+        "turn_ref": t.turn_ref,
+        "input": inline_json(&t.input),
+        "output": t.output.as_ref().map(inline_json),
+    })
+}
+
+/// C1-3: every fixture, through `HookDecoder::decode` with a launch row and a read
+/// transaction of the store, gives its recorded fact and events; `parse` alone gives the
+/// same, and no registered event decodes to `Other` without an event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fixtures_decode() {
+    use crate::supervisor::send::HookDecoder;
+    let rig = claude_rig().await;
+    let (live, _) = rig.spawn(Agent::Claude, None).await;
+    let launch = rig.launch(live.l);
     let decoder = ClaudeDecoder::default();
     for f in fixtures() {
         let at = format!("{}/{}", f.case, f.event);
-        let Parsed::Read { fact, activity } = parse(&f.event, &f.json) else {
-            panic!("{at}: malformed");
+        let body = serde_json::to_vec(&f.json).unwrap();
+        let hook = crate::hook::AcceptedHook {
+            thread: live.t,
+            launch: &launch,
+            emit_id: uuid::Uuid::new_v4(),
+            receipt_ordinal: 1,
+            event_name: &f.event,
+            session_id: &live.session,
+            json: &f.json,
+            body: &body,
+            intake: None,
+            attempt: Some(1),
+            intake_reliable: true,
+            binding_ordinal: 1,
+            promoted: false,
+            turn_watermark: 0,
         };
+        let (fact, events) = rig.srv.store.read(|tx| decoder.decode(tx, &hook));
         assert_eq!(fact_json(&fact), f.meta["fact"], "{at}");
-        let events: Vec<Value> = activity.iter().map(activity_json).collect();
-        assert_eq!(Value::Array(events), f.meta["events"], "{at}");
+        let events: Vec<Value> = events.iter().map(event_json).collect();
+        assert_eq!(Value::Array(events.clone()), f.meta["events"], "{at}");
         assert!(
-            fact != HookFact::Other || activity.is_some(),
+            fact != HookFact::Other || !events.is_empty(),
             "{at}: a registered event read as nothing"
         );
+        let Parsed::Read { fact: p, activity } = parse(&f.event, &f.json) else {
+            panic!("{at}: malformed");
+        };
+        assert_eq!(p, fact, "{at}");
         assert_eq!(
-            decoder.read(&f.event, &f.json),
-            (fact, activity.clone()),
+            Value::Array(activity.iter().map(activity_json).collect()),
+            Value::Array(events),
             "{at}"
         );
-        if let Some(a) = activity {
-            let e = activity_event(a.clone()).unwrap();
-            assert_eq!(e.name, "tool_activity");
-            let TypedEvent::ToolActivity(t) = e.event else {
-                panic!("{at}: {:?}", e.event);
-            };
-            assert_eq!(
-                (t.phase, &t.tool_name, &t.tool_use_id, &t.turn_ref),
-                (a.phase, &a.tool_name, &a.tool_use_id, &a.turn_ref),
-                "{at}"
-            );
-            assert_eq!(inline_json(&t.input), a.input, "{at}");
-            assert_eq!(t.output.as_ref().map(inline_json), a.output, "{at}");
-        }
     }
+    rig.stop().await;
 }
 
 /// C1-3: a registered hook missing a field its fact needs is `schema_mismatch`; an
@@ -214,7 +241,8 @@ fn malformed_hooks() {
 
 /// The fixtures stay publishable and consistent: no home directory, user temp directory, or
 /// token; each body has its meta and the reverse; every body is a registered event named as
-/// its file; metas carry only their keys; a recorded prompt is its meta's expected form.
+/// its file; metas carry only their keys; a recorded prompt is its meta's expected form, and
+/// every sent prompt is one of [`corpus`].
 #[test]
 fn fixture_hygiene() {
     const BANNED: [&str; 8] = [
@@ -297,13 +325,56 @@ fn fixture_hygiene() {
             "{at}"
         );
         if prompt {
-            assert!(
-                f.meta["sent"].is_string() || f.meta["sent"].is_null(),
-                "{at}"
-            );
             assert_eq!(f.json["prompt"], f.meta["expected_prompt"], "{at}");
+            match f.meta["sent"].as_str() {
+                Some(sent) => assert!(
+                    corpus().iter().any(|(c, t)| *c == f.case && *t == sent),
+                    "{at}: {sent:?} is not a corpus prompt"
+                ),
+                // Only the subagent's completion, which Claude generated, has no sent text.
+                None => {
+                    assert_eq!(at, "subagent/UserPromptSubmit", "{at}");
+                    let p = f.json["prompt"].as_str().unwrap();
+                    assert!(p.starts_with("<task-notification>"), "{at}: {p:?}");
+                }
+            }
         }
     }
+}
+
+/// Every prompt the captures sent, by case: synthetic instructions and the corpus of the
+/// README, written here independently of the fixtures.
+fn corpus() -> Vec<(&'static str, String)> {
+    let lit = |c: &'static str, t: &str| (c, t.to_owned());
+    vec![
+        lit("plain-turn", "Reply with exactly the word ok."),
+        lit("clear", "Reply with exactly the word cleared."),
+        lit("resume-in-session", "Reply with exactly the word resumed."),
+        lit("resume", "Reply with exactly the word again."),
+        lit(
+            "permission-approved",
+            "Use the Bash tool to run exactly this command and nothing else: printf c1b > c1b-approved.txt",
+        ),
+        lit(
+            "permission-denied",
+            "Use the Bash tool to run exactly this command and nothing else: printf c1b > c1b-denied.txt",
+        ),
+        lit(
+            "subagent",
+            "Use the Agent tool to start one general-purpose subagent whose only task is to use \
+             the Bash tool to run exactly: printf sub > c1b-sub.txt . Do nothing else yourself.",
+        ),
+        lit("corpus-fa19", "\u{fa19}"),
+        lit("corpus-ends", "\n  both ends  \n"),
+        lit("corpus-tab", "a\tb"),
+        (
+            "corpus-wrapped",
+            "e\u{301}\t\u{304b}\u{3099} line\n".repeat(300),
+        ),
+        lit("corpus-del", "a\u{7f}b"),
+        lit("corpus-c1", "a\u{80}b\u{9f}c"),
+        lit("corpus-hash", "#zz corpus"),
+    ]
 }
 
 /// The captured prompts: `(case, sent, recorded)` for every `UserPromptSubmit` the daemon sent.
@@ -760,12 +831,13 @@ async fn coarse_refusals() {
     assert_eq!(outcome(&rig, c), None, "below the card");
     rig.stop().await;
 
-    // Two equal cards: neither resolves.
+    // Two equal cards, one denied with Escape: the other call's evidence resolves neither.
     let rig = claude_rig().await;
     let live = bound(&rig).await;
     start(&rig, &live, "t1").await;
     let (pr, done) = turn_hooks("t1");
     let (a, b) = (open(&rig, &live, &pr).await, open(&rig, &live, &pr).await);
+    assert_eq!(key(&rig, &live, &["escape"], Some(a)).await.0, 200);
     post(&rig, &live, &own(&rig, &live, &done)).await;
     assert_eq!(
         (outcome(&rig, a), outcome(&rig, b)),
@@ -775,8 +847,51 @@ async fn coarse_refusals() {
     rig.stop().await;
 }
 
+/// C1-7 (D15): with the send side gone (the launch left the live map, its exit job refused,
+/// so the store still holds it live and the card open), the turn watermark reads `u64::MAX`:
+/// an equal `PostToolUse` taken in after the card and committed then resolves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_send_side_resolves_nothing() {
+    let rig = SRig::with(|c| {
+        c.decoders = Decoders {
+            claude: Arc::new(ClaudeDecoder::default()),
+            codex: Arc::new(FakeDecoder),
+        };
+        c.exit_steps.push(Arc::new(super::turn_order::RefuseExit));
+    })
+    .await;
+    let live = bound(&rig).await;
+    rig.clock.stop();
+    start(&rig, &live, "t1").await;
+    let (pr, done) = turn_hooks("t1");
+    let c = open(&rig, &live, &pr).await;
+    let held = super::turn_order::hold(&rig, &live, own(&rig, &live, &done), true).await;
+    live.child.exit(chaldea_pty_runtime::ChildExit {
+        code: Some(0),
+        signal: None,
+    });
+    let sl = rig.sl(&live);
+    rig.until("the launch left the live map", || {
+        rig.sup.entry(live.l).is_none()
+    })
+    .await;
+    sl.wake.notify_one();
+    rig.until("the send side is gone", || {
+        rig.sup.send.launch(live.l).is_none()
+    })
+    .await;
+    assert_eq!(
+        rig.launch(live.l).exit_reason,
+        None,
+        "the exit is unrecorded"
+    );
+    assert_eq!(held.finish().await.status, 200);
+    assert_eq!(outcome(&rig, c), None);
+    rig.stop().await;
+}
+
 /// C1-7: two cards of different calls resolve one at a time; the turn leaves
-/// `awaiting_approval` only with the last.
+/// `awaiting_approval` only with the last, back to `running`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cards_resolve_in_turn() {
     let rig = claude_rig().await;
@@ -800,7 +915,10 @@ async fn cards_resolve_in_turn() {
     assert!(awaiting(&rig), "one card still open");
     post(&rig, &live, &own(&rig, &live, &done1)).await;
     assert_eq!(outcome(&rig, a), Some(ApprovalOutcome::Ran));
-    assert!(!awaiting(&rig));
+    assert_eq!(
+        super::turn_order::turn(&rig, &live),
+        chaldea_core::state::TurnState::Running
+    );
     rig.stop().await;
 }
 

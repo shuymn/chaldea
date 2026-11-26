@@ -1,5 +1,5 @@
 //! `FakeDecoder` (send §6): a [`HookDecoder`] over FakeCli's payloads, for tests only. The
-//! daemon never installs it; tests pass it through `SupervisorConfig::decoder`.
+//! daemon never installs it; tests pass it through `SupervisorConfig::decoders`.
 
 use chaldea_core::payload::ApprovalCorrelation;
 
