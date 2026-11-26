@@ -2,10 +2,12 @@
 //! `Supervisor` with its four handlers, the shutdown participant, the mounts, the tick, and
 //! the restart prober (`docs/design/supervisor-recovery.md` §2.3).
 
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use chaldea_core::adapter::HostOs;
+use chaldea_core::launch::{CLAUDE_SETTINGS_FILE, claude_settings};
 use futures_util::future::BoxFuture;
 
 use crate::deadline::settle_before;
@@ -60,8 +62,37 @@ impl Components for SupervisorComponents {
         ]
     }
 
+    /// `claude-settings.json` (C1 D3): the hooks of `claude_settings`, run by this
+    /// executable.
+    fn state_files(&mut self, dir: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("the daemon's own executable cannot be read: {e}"))?;
+        let exe = exe.to_str().ok_or_else(|| {
+            format!(
+                "the daemon's executable path is not UTF-8: {}",
+                exe.display()
+            )
+        })?;
+        let path = dir.join(CLAUDE_SETTINGS_FILE);
+        if path.to_str().is_none() {
+            return Err(format!(
+                "the Claude settings path is not UTF-8: {}",
+                path.display()
+            ));
+        }
+        Ok(vec![(
+            CLAUDE_SETTINGS_FILE,
+            claude_settings(exe, self.host_os),
+        )])
+    }
+
     fn build(&mut self, ctx: &BuildCtx) -> Built {
-        let cfg = self.cfg.take().unwrap_or_default();
+        let mut cfg = self.cfg.take().unwrap_or_default();
+        cfg.claude_settings = ctx
+            .state_dir
+            .join(CLAUDE_SETTINGS_FILE)
+            .to_string_lossy()
+            .into_owned();
         let sup = new_supervisor(
             self.host_os,
             cfg,

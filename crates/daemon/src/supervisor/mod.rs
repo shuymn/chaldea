@@ -242,6 +242,9 @@ pub struct SupervisorConfig {
     /// The restart prober's OS work (`docs/design/supervisor-recovery.md` §2.3).
     #[doc(hidden)]
     pub kill_recorded: KillRecordedFn,
+    /// The Claude settings file every Claude launch passes as `--settings`: set by
+    /// `SupervisorComponents::build` to `<state_dir>/claude-settings.json`.
+    pub(crate) claude_settings: String,
 }
 
 impl Default for SupervisorConfig {
@@ -266,6 +269,7 @@ impl Default for SupervisorConfig {
             readiness_mode: None,
             send_workers: true,
             kill_recorded: Arc::new(chaldea_pty_runtime::orphan::kill_recorded),
+            claude_settings: chaldea_core::launch::CLAUDE_SETTINGS_FILE.to_owned(),
         }
     }
 }

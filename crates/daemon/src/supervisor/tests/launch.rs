@@ -313,6 +313,14 @@ async fn env_and_session_args() {
         !a2.iter().any(|a| *a == l2.to_string()),
         "the launch id is not a session"
     );
+    // C1-1: both carry the daemon's settings file.
+    for a in [&a1, &a2] {
+        assert!(
+            a.windows(2)
+                .any(|w| w == ["--settings", "/work/state/claude-settings.json"]),
+            "{a:?}"
+        );
+    }
     rig.srv.stop().await;
 }
 
@@ -736,4 +744,27 @@ async fn early_hook_pid_wait() {
     assert_eq!(raw.reason, RawUnknownReason::Unbound);
     assert_eq!(rig.launch(l).session_id, None);
     rig.srv.stop().await;
+}
+
+/// C1-1: a POSIX shell (Claude's hook shell; Git Bash on Windows is one) runs the settings
+/// file's quoted emitter path as one word.
+#[cfg(unix)]
+#[test]
+fn claude_hook_command_in_sh() {
+    let exe = "/work/my tools/it's \"x\" $HOME `id`/chaldea";
+    let cmd = chaldea_core::launch::claude_hook_command(exe, chaldea_core::adapter::HostOs::Macos);
+    // `printf` in place of the emitter: each word on its own line.
+    let script = format!("set -- {cmd}; printf '%s\\n' \"$@\"");
+    let mut c = std::process::Command::new("/bin/sh");
+    c.args(["-c", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped());
+    let out = crate::lifecycle::spawn_locked(&mut c)
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!("{exe}\nhook-emit\nclaude\n")
+    );
 }

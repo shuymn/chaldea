@@ -420,6 +420,7 @@ fn reservation_job(
             key_has_prefix: chaldea_pty_runtime::env_key_has_prefix,
             port: sup2.port,
             hook_token: secret.clone(),
+            claude_settings: sup2.cfg.claude_settings.clone(),
         });
         let rkey = launch_key(launch, "reserved");
         let lid = Some(launch);

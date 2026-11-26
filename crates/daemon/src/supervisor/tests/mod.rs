@@ -218,6 +218,7 @@ pub(crate) fn config(
                 .map(|id| (id.clone(), chaldea_pty_runtime::orphan::Fate::NotRead))
                 .collect(),
         }),
+        claude_settings: "/work/state/claude-settings.json".to_owned(),
     }
 }
 
