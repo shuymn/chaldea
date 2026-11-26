@@ -13,7 +13,9 @@ use sha2::{Digest, Sha256};
 
 use super::write_tx::BlobInput;
 
-/// The largest blob the store keeps (an internal limit).
+/// The largest blob the store keeps in one `blobs` row, and the largest value
+/// [`prepare_content`] takes in memory (an internal limit). A larger value is spooled
+/// ([`super::spool::BlobSpool`]) and stored as ordered parts.
 pub const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 
 /// A prepared `Content` and, for a blob, the bytes to pass with the event.
@@ -26,7 +28,7 @@ pub struct Prepared {
 /// A `Content` value or blob input that breaks §2.5's rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentError {
-    /// Above `MAX_BLOB_BYTES`.
+    /// Bytes in memory above `MAX_BLOB_BYTES`, or a blob above `MAX_SAFE_INTEGER`.
     TooLarge(u64),
     /// Inline content above 64 KiB (after decoding, for base64).
     InlineTooLarge(usize),
@@ -47,12 +49,14 @@ pub enum ContentError {
     },
     /// A blob input that no typed reference of the event names.
     UnreferencedBlob(String),
+    /// A spooled blob's file could not be read.
+    Spool(String),
 }
 
 impl fmt::Display for ContentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ContentError::TooLarge(n) => write!(f, "{n} bytes is above the 64 MiB blob limit"),
+            ContentError::TooLarge(n) => write!(f, "{n} bytes is above the blob limit"),
             ContentError::InlineTooLarge(n) => {
                 write!(f, "inline content of {n} bytes is above 64 KiB")
             }
@@ -66,6 +70,7 @@ impl fmt::Display for ContentError {
                 write!(f, "blob {sha256}: {field} does not match the bytes")
             }
             ContentError::UnreferencedBlob(s) => write!(f, "blob input {s} is not referenced"),
+            ContentError::Spool(e) => write!(f, "spooled blob: {e}"),
         }
     }
 }
@@ -74,10 +79,14 @@ impl std::error::Error for ContentError {}
 
 /// Lowercase hex SHA-256.
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
+/// Lowercase hex of a digest.
+pub(crate) fn hex(digest: &[u8]) -> String {
     use std::fmt::Write;
-    let digest = Sha256::digest(bytes);
-    let mut s = String::with_capacity(64);
-    for b in &digest {
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest {
         let _ = write!(s, "{b:02x}");
     }
     s
@@ -88,7 +97,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 ///
 /// # Errors
 ///
-/// `TooLarge` above [`MAX_BLOB_BYTES`].
+/// `TooLarge` above [`MAX_BLOB_BYTES`]: such a value is spooled instead.
 pub fn prepare_content(bytes: Vec<u8>, media_type: &str) -> Result<Prepared, ContentError> {
     if bytes.len() > MAX_BLOB_BYTES {
         return Err(ContentError::TooLarge(bytes.len() as u64));
@@ -121,7 +130,7 @@ pub fn prepare_content(bytes: Vec<u8>, media_type: &str) -> Result<Prepared, Con
     };
     Ok(Prepared {
         content,
-        blob: Some(BlobInput { data: bytes }),
+        blob: Some(BlobInput::Bytes(bytes)),
     })
 }
 
@@ -251,7 +260,8 @@ pub(crate) fn check_inline(inline: &str, encoding: Encoding) -> Result<(), Conte
     Ok(())
 }
 
-/// Checks a blob reference's own fields (hash form, size bounds, media type).
+/// Checks a blob reference's own fields (hash form, size bounds, media type). A size above
+/// `MAX_BLOB_BYTES` is a large blob; the caller checks it against the spooled or stored one.
 pub(crate) fn check_blob_ref(r: &BlobRef) -> Result<(), ContentError> {
     if r.sha256.len() != 64
         || !r
@@ -267,7 +277,7 @@ pub(crate) fn check_blob_ref(r: &BlobRef) -> Result<(), ContentError> {
     if r.size <= INLINE_LIMIT_BYTES as u64 {
         return Err(ContentError::BlobTooSmall(r.size));
     }
-    if r.size > MAX_BLOB_BYTES as u64 {
+    if r.size > chaldea_core::MAX_SAFE_INTEGER {
         return Err(ContentError::TooLarge(r.size));
     }
     Ok(())

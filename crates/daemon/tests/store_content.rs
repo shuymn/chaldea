@@ -11,7 +11,7 @@ use chaldea_core::payload::{
     SurfaceScope, SurfaceUpdate, ToolActivity, ToolPhase,
 };
 use chaldea_daemon::store::{
-    ContentError, NewEvent, Prepared, StoreError, WriteError, prepare_content,
+    BlobInput, ContentError, NewEvent, Prepared, StoreError, WriteError, prepare_content,
 };
 use support::{TestStore, blob_input, event, raw_unknown, thread};
 
@@ -93,7 +93,7 @@ fn boundary_inline_and_blob() {
                     assert_eq!(blob.size, n as u64);
                     assert_eq!(blob.media_type, TEXT);
                     assert_eq!(*preview_lossy, binary);
-                    assert_eq!(p.blob.as_ref().unwrap().data, bytes);
+                    assert_eq!(p.blob, Some(BlobInput::Bytes(bytes.clone())));
                 }
                 (c, _) => panic!("{n} bytes binary {binary}: {c:?}"),
             }
@@ -185,7 +185,9 @@ fn store_refuses_bad_content() {
         e.blobs = blobs.iter().map(|b| blob_input(b)).collect();
         e
     };
-    let bytes = big.blob.clone().unwrap().data;
+    let Some(BlobInput::Bytes(bytes)) = big.blob.clone() else {
+        panic!("an in-memory blob")
+    };
     let edit = |f: &dyn Fn(&mut BlobRef, &mut String, &mut bool)| {
         let Content::Blob {
             mut blob,

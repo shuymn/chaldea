@@ -290,6 +290,20 @@ impl TestServer {
             .unwrap();
     }
 
+    /// Appends events in one job, waiting up to `within` for the writer's answer instead of
+    /// the client wait: a write of a value of 64 MiB and more, under load, can outlast it.
+    pub async fn append_within(&self, events: Vec<NewEvent>, within: Duration) {
+        let ticket = self
+            .store
+            .store()
+            .submit(Instant::now() + within, move |tx| Ok(tx.append(events)?))
+            .unwrap();
+        waits::bounded(within, ticket)
+            .await
+            .expect("the writer answered within the wait")
+            .unwrap();
+    }
+
     /// Inserts a token of `kind` and returns its secret.
     pub async fn token(
         &self,

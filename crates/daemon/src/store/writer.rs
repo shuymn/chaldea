@@ -81,13 +81,16 @@ where
     }
 
     fn reply(self: Box<Self>, outcome: Result<(), WriteError>) {
-        let this = *self;
-        let result = match (outcome, this.out) {
+        let TypedJob { f, out, reply, .. } = *self;
+        // A job that did not run is dropped before its reply, so whatever it owns (a blob
+        // spool file) is released once the caller has the reply.
+        drop(f);
+        let result = match (outcome, out) {
             (Ok(()), Some(r)) => Ok(r),
             (Ok(()), None) => Err(WriteError::Panicked),
             (Err(e), _) => Err(e),
         };
-        let _ = this.reply.send(result);
+        let _ = reply.send(result);
     }
 }
 
