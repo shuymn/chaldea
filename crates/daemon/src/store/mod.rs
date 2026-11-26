@@ -496,20 +496,32 @@ impl Store {
         let shared = &self.inner.shared;
         let (tx, rx) = oneshot::channel();
         let job: JobBox = Box::new(TypedJob::new(not_after, job, tx));
-        // Admission is decided under the sender lock, which the writer holds while it
-        // publishes the failed state.
-        let guard = lock(&shared.sender);
-        // Retirement sets `failed` under this same lock, so one check decides.
-        if shared.failed.load(Ordering::SeqCst) {
-            return Err(SubmitError::Failed);
-        }
-        let Some(sender) = guard.as_ref() else {
-            return Err(SubmitError::Closed);
+        // A refused job is dropped only after the sender lock is released: dropping it can
+        // close and remove a blob spool file, which must not stall other submits or
+        // shutdown. (`job` is declared before `guard`, so an early return drops it last.)
+        let sent = {
+            // Admission is decided under the sender lock, which the writer holds while it
+            // publishes the failed state.
+            let guard = lock(&shared.sender);
+            // Retirement sets `failed` under this same lock, so one check decides.
+            if shared.failed.load(Ordering::SeqCst) {
+                return Err(SubmitError::Failed);
+            }
+            let Some(sender) = guard.as_ref() else {
+                return Err(SubmitError::Closed);
+            };
+            sender.try_send(job)
         };
-        match sender.try_send(job) {
+        match sent {
             Ok(()) => Ok(WriteTicket(rx)),
-            Err(TrySendError::Full(_)) => Err(SubmitError::QueueFull),
-            Err(TrySendError::Disconnected(_)) => Err(SubmitError::Closed),
+            Err(TrySendError::Full(refused)) => {
+                drop(refused);
+                Err(SubmitError::QueueFull)
+            }
+            Err(TrySendError::Disconnected(refused)) => {
+                drop(refused);
+                Err(SubmitError::Closed)
+            }
         }
     }
 

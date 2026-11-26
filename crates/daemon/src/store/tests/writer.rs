@@ -2,7 +2,7 @@
 //! and a writer blocked past the shutdown deadline (PR6-CL-4, CL-15, CL-22).
 
 use std::sync::atomic::Ordering;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use chaldea_core::ids::StreamId;
@@ -298,4 +298,62 @@ fn writer_blocked_past_the_deadline() {
     job.blocking_wait().unwrap();
     let r = s.shutdown(Instant::now() + Duration::from_secs(20));
     assert!(r.writer_exited, "{r:?}");
+}
+
+/// Records, when dropped, whether the store's sender lock was free.
+struct LockProbe {
+    store: Store,
+    free: Arc<std::sync::Mutex<Option<bool>>>,
+}
+
+impl Drop for LockProbe {
+    fn drop(&mut self) {
+        let free = self.store.inner.shared.sender.try_lock().is_ok();
+        *self.free.lock().unwrap() = Some(free);
+    }
+}
+
+/// A job refused because the queue is full is dropped after `submit` released the sender
+/// lock, so whatever it owns (a blob spool file closed and removed on drop) cannot stall
+/// other submits or shutdown.
+#[test]
+fn a_refused_job_is_dropped_outside_the_sender_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = super::support::config(
+        dir.path().join("chaldea.db"),
+        super::support::FixedClock::new(super::support::T0),
+    );
+    cfg.writer_queue = 1;
+    let s = crate::store::open::open(cfg, Arc::new(Faults::default())).unwrap();
+    // Hold the writer, then fill the one queue slot.
+    let (entered_tx, entered_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let held = s
+        .submit(soon(), move |_tx| {
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            Ok(())
+        })
+        .unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let queued = s.submit(soon(), |_tx| Ok(())).unwrap();
+    let free = Arc::new(std::sync::Mutex::new(None));
+    let probe = LockProbe {
+        store: s.clone(),
+        free: free.clone(),
+    };
+    let r = s.submit(soon(), move |_tx| {
+        let _probe = probe;
+        Ok(())
+    });
+    assert!(matches!(r, Err(SubmitError::QueueFull)));
+    assert_eq!(
+        *free.lock().unwrap(),
+        Some(true),
+        "dropped under the sender lock"
+    );
+    drop(release_tx);
+    held.blocking_wait().unwrap();
+    queued.blocking_wait().unwrap();
+    shutdown_checked(&s);
 }
