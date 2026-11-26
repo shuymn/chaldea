@@ -303,6 +303,30 @@ fn deadline_before_any_wait() {
     assert!(!os.calls().iter().any(|c| matches!(c, C::Signalled(..))));
 }
 
+/// The deadline passing between two terminations: the second handle is not terminated, and
+/// neither is waited on.
+#[test]
+fn deadline_before_terminate() {
+    let os = Os::new();
+    os.add(100, live(1));
+    os.add(101, live(2));
+    os.cost.set(Duration::from_millis(30));
+    assert_eq!(
+        os.run(&[id(100, "1"), id(101, "2")], Duration::from_millis(75)),
+        [Fate::NotRead, Fate::NotRead]
+    );
+    assert_eq!(
+        os.calls(),
+        [
+            C::Open(100),
+            C::Ctime(100),
+            C::Open(101),
+            C::Ctime(101),
+            C::Terminate(100)
+        ]
+    );
+}
+
 /// pid 0, 4, the daemon's own, an empty or unparsable start: `Invalid`, no call; a duplicate
 /// is one entry.
 #[test]

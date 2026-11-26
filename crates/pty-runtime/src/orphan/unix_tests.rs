@@ -289,6 +289,19 @@ fn deadline_between_the_two_calls_of_a_read() {
     assert_eq!(sim.calls(), [C::Info(P)]);
 }
 
+/// The deadline passing during a read that showed the recorded start: no signal follows it.
+#[test]
+fn deadline_after_a_matching_read() {
+    let sim = Sim::new();
+    sim.add(P, &[], R::Live(START), None);
+    sim.info_cost.set(Duration::from_millis(60));
+    assert_eq!(
+        run(&sim, &[leader()], Duration::from_millis(50)),
+        [Fate::Alive]
+    );
+    assert_eq!(sim.calls(), [C::Info(P)]);
+}
+
 /// Every sleep is clipped to the time left: none ends after the deadline, and the last
 /// ends exactly at it.
 #[test]
