@@ -570,7 +570,6 @@ async fn revoke_after_waiter_left_still_nudges() {
         || srv.server.tasks() == 2,
     )
     .await;
-    let base = srv.server.tasks();
     let revoking = {
         let srv = srv.clone();
         tokio::spawn(async move {
@@ -585,7 +584,7 @@ async fn revoke_after_waiter_left_still_nudges() {
     };
     // The write observer is registered once the job is submitted; the caller then leaves.
     eventually(WS_WAIT, "the write observer registered", || {
-        srv.server.tasks() > base
+        srv.server.tasks() > 2
     })
     .await;
     revoking.abort();
