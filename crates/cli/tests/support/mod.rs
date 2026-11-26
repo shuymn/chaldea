@@ -142,20 +142,28 @@ pub fn lock_file(name: &str) -> std::fs::File {
     file
 }
 
-/// The ports [`reserve_port`] hands out: above the design's range (7373–7472), which a daemon
-/// started without `--port` or a saved port scans, and below the dynamic port range of macOS
-/// and Windows, so neither a scanning daemon nor an outgoing connection takes one.
-const RESERVED: std::ops::RangeInclusive<u16> = 7473..=7672;
+/// The ports [`reserve_port`] hands out: outside the design's range (7373–7472), which a
+/// daemon started without `--port` or a saved port scans, and outside 7473–7672, which older
+/// revisions of these tests chose from without a lock; below the dynamic port range of macOS
+/// and Windows (49152–65535 by default), so the OS does not hand one to an outgoing
+/// connection.
+const RESERVED: std::ops::RangeInclusive<u16> = 7700..=7899;
 
 /// The lock files of this process's reserved ports, held until it exits.
 static RESERVATIONS: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
 
-/// A port for a daemon's `--port` that no other test, in this process or another, gives its
-/// daemon until this process exits, so it stays this test's across the daemon's restarts on
-/// its saved port. A test holds an exclusive lock on `chaldea-test-port-<p>.lock` (see
-/// [`lock_file`]) for each port it reserves and skips ports locked by another; a port is taken
-/// only if it also binds, which skips one a process outside the protocol holds (such as a
-/// daemon left running by a test process that was killed).
+/// A port for a daemon's `--port` that no other test of this protocol, in this process or
+/// another, gives its daemon until this process exits, so it stays this test's across the
+/// daemon's restarts on its saved port. A test holds an exclusive lock on
+/// `chaldea-test-port-<p>.lock` (see [`lock_file`]) for each port it reserves and skips ports
+/// locked by another; a port is taken only if it also binds, which skips one a process
+/// outside the protocol holds now (such as a daemon left running by a test process that was
+/// killed). The probe's socket exists only under the spawn lock, so no child this process
+/// creates meanwhile inherits it.
+///
+/// Limit: a process outside the protocol (any program, or a test run with another temp
+/// directory) can still bind a reserved port after the probe, before the daemon binds it or
+/// between its restarts; the daemon then fails `port_unavailable`.
 #[must_use]
 pub fn reserve_port() -> u16 {
     for p in RESERVED {
@@ -165,7 +173,10 @@ pub fn reserve_port() -> u16 {
             Err(std::fs::TryLockError::WouldBlock) => continue,
             Err(std::fs::TryLockError::Error(e)) => panic!("port {p}'s lock: {e}"),
         }
-        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+        let binds = chaldea_pty_runtime::with_spawn_lock(|| {
+            std::net::TcpListener::bind(("127.0.0.1", p)).is_ok()
+        });
+        if binds {
             RESERVATIONS.lock().unwrap().push(file);
             return p;
         }
@@ -175,6 +186,27 @@ pub fn reserve_port() -> u16 {
         RESERVED.start(),
         RESERVED.end()
     );
+}
+
+/// The port [`reserve_port`] reserved for the state directory `dir`, reserved on the first
+/// call for it, so every start on one directory (concurrent ones included) gets the same port.
+#[must_use]
+pub fn dir_port(dir: &Path) -> u16 {
+    static PORTS: Mutex<Vec<(PathBuf, u16)>> = Mutex::new(Vec::new());
+    let mut ports = PORTS.lock().unwrap();
+    if let Some((_, p)) = ports.iter().find(|(d, _)| d == dir) {
+        return *p;
+    }
+    let p = reserve_port();
+    ports.push((dir.to_owned(), p));
+    p
+}
+
+/// `--port` for a daemon start on `dir` whose port choice is not under test: the directory's
+/// reserved port ([`dir_port`]) while it has no saved port; none (the saved port) after it.
+#[must_use]
+pub fn own_port(dir: &Path) -> Option<u16> {
+    (!dir.join(chaldea_daemon::lifecycle::names::PORT).exists()).then(|| dir_port(dir))
 }
 
 /// `chaldea <args>` with `CHALDEA_STATE_DIR` removed unless `env` sets it.

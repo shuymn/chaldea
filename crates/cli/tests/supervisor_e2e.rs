@@ -14,7 +14,7 @@ use support::faults::{
     AGENT_PROGRAM, FAKE_PTY_HOLD_WAITER, Gate, Labels, SUPERVISOR_GATE, SUPERVISOR_PAUSE, cmd,
 };
 use support::runner::{Case, main as run_cases};
-use support::{Proc, WAIT, request_complete, reserve_port, run_to_exit, state};
+use support::{Proc, WAIT, request_complete, run_to_exit, state};
 
 fn main() {
     run_cases(&[
@@ -92,24 +92,10 @@ fn daemon_with(labels: &Labels, dir: &Path, args: &[&str], env: &[(&str, &OsStr)
     let json = serde_json::to_string(&argv).unwrap();
     let mut all = vec![(AGENT_PROGRAM, OsStr::new(&json))];
     all.extend_from_slice(env);
-    let run = run_args(dir);
-    let run: Vec<&str> = run.iter().map(String::as_str).collect();
-    let p = Proc::spawn(&mut cmd(labels, dir, &run, &all));
+    // `cmd` gives the first start the directory's reserved port; a restart takes the saved one.
+    let p = Proc::spawn(&mut cmd(labels, dir, &["daemon", "run"], &all));
     let port = p.serving();
     (p, port)
-}
-
-/// `daemon run`, with a port of this state directory's own on its first start
-/// (`support::reserve_port`): the cases run in parallel, as may other test processes, so a
-/// first start that scanned the shared range could take the port a crashed daemon of another
-/// case left free, and that case's restart, which must reuse its saved port, would end
-/// `port_unavailable`.
-fn run_args(dir: &Path) -> Vec<String> {
-    let mut args = vec!["daemon".to_owned(), "run".to_owned()];
-    if !dir.join("port").exists() {
-        args.extend(["--port".to_owned(), reserve_port().to_string()]);
-    }
-    args
 }
 
 /// `chaldea --state-dir <dir> <args>`: its exit code and stdout as JSON (or `Null`).

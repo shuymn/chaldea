@@ -640,9 +640,6 @@ fn stopped_after_ready_is_not_reported_started() {
         &d.path,
         &[(DEADLINE_MS, OsStr::new(HELD_DEADLINE))],
     );
-    // The next daemon picks a free port from the range: the stopped one's saved port may be
-    // taken by another test by now.
-    std::fs::remove_file(d.path.join(names::PORT)).unwrap();
     let (code, out, err) = start(
         &labels,
         &d.path,
@@ -938,7 +935,9 @@ fn child_receives_the_resolved_dir() {
     let d: Dir = state();
     let _stop = StopOnDrop(&labels, &d.path);
     let mut c = faults::chaldea(&labels, &[OsStr::new("--state-dir"), OsStr::new("state")]);
-    c.args(["daemon", "start"]).current_dir(d.tmp.path());
+    let port = support::reserve_port().to_string();
+    c.args(["daemon", "start", "--port", &port])
+        .current_dir(d.tmp.path());
     let mut p = Proc::spawn(&mut c);
     assert_eq!(p.code(), 0, "{}{}", p.stdout(), p.stderr());
     let r = serving(&d.path);

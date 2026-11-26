@@ -17,25 +17,26 @@ use chaldea_daemon::lifecycle::{LockProbe, STATE_DIR_ENV, names};
 use chaldea_daemon::store::TokenSelector;
 use chaldea_pty_runtime::host::{self, EntryKind, Privacy};
 use support::{
-    Proc, chaldea, close_store, get_status, listing, lock_state, marked_dir, open_store, run_cmd,
-    run_to_exit, serving_record, state, token_of, wait_for, write_private,
+    Proc, chaldea, close_store, get_status, listing, lock_state, marked_dir, open_store, own_port,
+    run_cmd, run_to_exit, serving_record, state, token_of, wait_for, write_private,
 };
 
 /// The design's port range (§2.6), restated.
 const FIRST: u16 = 7373;
 const LAST: u16 = 7472;
 
-/// A daemon of these tests chooses its port from the range only where the test is about that
-/// choice (or about what it takes no port for); every other test gives its state directory's
-/// first start a reserved port (`support::reserve_port`), which stays the test's across its
-/// restarts on the saved port. The tests run one at a time, in this process and across
-/// processes, so the first free port of the range that a test expects is not taken by a
-/// daemon of another of these tests in between.
+/// Only [`first_port_from_the_range`] and [`taken_first_port_is_skipped`] let a daemon choose
+/// from the range; every other daemon of these tests, and of the other test binaries except the
+/// Windows-only `daemon_windows`, starts on a reserved port (`support::reserve_port`), or on
+/// its saved one. Every test takes this binary's turn, from before its daemon starts to after
+/// it stops, so no other `daemon_run` test, in this process or another, starts or stops a
+/// daemon in between: the first free port of the range that a test expects stays so until its
+/// daemon binds.
 ///
 /// The turn is an exclusive lock on [`PORTS_LOCK`] (`support::lock_file`), taken through a
 /// handle of the test's own. Its scope: the `daemon_run` tests of every process that resolves
-/// the same temp directory. Other binaries whose daemons choose ports from the range, such as
-/// `daemon_stop`, do not take it.
+/// the same temp directory. A daemon outside it (`daemon_windows`'s, a test run of an older
+/// revision, or any other program) can still take a port of the range in between.
 const PORTS_LOCK: &str = "chaldea-daemon-run-ports.lock";
 /// How long a test waits for its turn, from the start of [`serial`] to the lock.
 const PORTS_WAIT: Duration = Duration::from_secs(600);
@@ -71,26 +72,19 @@ fn first_free_in_range() -> u16 {
         .expect("a free port in the range")
 }
 
-/// `--port` for a start on `dir`: a reserved port on its first start, none (the saved port)
-/// after it.
-fn own_port(dir: &Path) -> Option<u16> {
-    (!dir.join(names::PORT).exists()).then(support::reserve_port)
-}
-
-/// Starts a daemon on `dir` (on [`own_port`]) and waits for it to serve.
+/// Starts a daemon on `dir` (on `support::own_port`) and waits for it to serve.
 fn serve(dir: &Path) -> (Proc, u16) {
     let p = Proc::spawn(&mut run_cmd(dir, own_port(dir)));
     let port = p.serving();
     (p, port)
 }
 
-/// Starts, serves, and stops a daemon on `dir` (on [`own_port`]), leaving a state directory
-/// with a database, a token, and a saved port.
+/// [`serve`], then stops the daemon, leaving a state directory with a database, a token, and a
+/// saved port.
 fn serve_once(dir: &Path) -> u16 {
-    let mut p = Proc::spawn(&mut run_cmd(dir, own_port(dir)));
-    let got = p.serving();
+    let (mut p, port) = serve(dir);
     assert_eq!(p.stop_and_wait(dir), 0, "{}", p.stderr());
-    got
+    port
 }
 
 fn saved_port(dir: &Path) -> String {
@@ -500,7 +494,12 @@ fn flag_overrides_env() {
         chaldea(&[], &[(STATE_DIR_ENV, b.path.as_os_str())])
             .arg("--state-dir")
             .arg(&a.path)
-            .args(["daemon", "run"]),
+            .args([
+                "daemon",
+                "run",
+                "--port",
+                &support::reserve_port().to_string(),
+            ]),
     );
     d.serving();
     assert_eq!(serving_record(&a.path).pid, d.pid());
@@ -513,7 +512,12 @@ fn env_only_selects_the_dir() {
     let _s = serial();
     let b = state();
     let mut d = Proc::spawn(&mut chaldea(
-        &["daemon", "run"],
+        &[
+            "daemon",
+            "run",
+            "--port",
+            &support::reserve_port().to_string(),
+        ],
         &[(STATE_DIR_ENV, OsStr::new(&b.path))],
     ));
     d.serving();
