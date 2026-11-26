@@ -127,7 +127,7 @@ pub(crate) fn probe(sup: &Supervisor, argv: &[OsString], deadline: Instant) -> O
             return None;
         }
         if before(sup, deadline, || c.exited(tree))? {
-            // The tree's kill is requested before the read, so its descendants stop writing.
+            // Request the tree's kill and reap the parent before the read.
             tree.kill();
             if !c.try_reap()?.success() {
                 return None;
