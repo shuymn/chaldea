@@ -1,4 +1,5 @@
-//! `echo`: enables bracketed paste and reports `bracketed_paste_on`, then reports every stdin
+//! `echo`: enables bracketed paste and, once that write and its flush succeed, reports
+//! `bracketed_paste_on`; then it reports every stdin
 //! chunk as hex; with `--validate-input <n>` it reads exactly `n` bytes instead and reports
 //! whether byte `i` is `b'a' + (i % 26)`.
 //!
@@ -44,9 +45,13 @@ pub(crate) fn run(o: &Opts) -> i32 {
     let raw = super::enter_raw(o, true);
     let rep = super::hello(o, raw);
     let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x1b[?2004h");
-    let _ = out.flush();
-    rep.send(&json!({"event": "bracketed_paste_on"}));
+    if out
+        .write_all(b"\x1b[?2004h")
+        .and_then(|()| out.flush())
+        .is_ok()
+    {
+        rep.send(&json!({"event": "bracketed_paste_on"}));
+    }
     let mut stdin = std::io::stdin().lock();
     if let Some(n) = o.validate_input {
         let (read, ok) = validate(&mut stdin, n);
