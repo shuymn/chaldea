@@ -1,0 +1,46 @@
+{
+  "$defs": {
+    "InputId": {
+      "description": "One prompt sent through `chaldea send`, the PWA, or `surface_action` (§2.3).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "InputState": {
+      "oneOf": [
+        {
+          "enum": [
+            "queued",
+            "sending",
+            "sent",
+            "acked",
+            "rejected",
+            "cancelled",
+            "dismissed"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "unconfirmed",
+          "description": "May have reached the CLI; never resent.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The success body of `input_resolve` and `input_cancel`.",
+  "properties": {
+    "input_id": {
+      "$ref": "#/$defs/InputId"
+    },
+    "state": {
+      "$ref": "#/$defs/InputState"
+    }
+  },
+  "required": [
+    "input_id",
+    "state"
+  ],
+  "title": "InputCommandResult",
+  "type": "object"
+}

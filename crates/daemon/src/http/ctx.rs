@@ -39,6 +39,16 @@ pub(crate) type AfterOk = Box<dyn FnOnce() + Send>;
 /// (hook-ingest §2.3 `write_then`).
 pub(crate) type Release = Box<dyn std::any::Any + Send>;
 
+/// What a write's observer tells about its job (`write_then`'s `on_reply`,
+/// supervisor-send §2.9 P2): `submitted` once `Store::submit` accepted the job, then
+/// `replied` with the writer's answer. Dropped without `replied` when the job was not
+/// submitted (registration or submission refused, deadline passed) or when the observer was
+/// aborted before the answer; the implementation tells the two apart by `submitted`.
+pub(crate) trait OnReply<R>: Send + 'static {
+    fn submitted(&mut self);
+    fn replied(self: Box<Self>, r: &Result<R, WriteFailure>);
+}
+
 /// One `Store::read` in `spawn_blocking`, with the pool's wait ending at `deadline` and the
 /// result awaited until `deadline` and no longer (design §2.3 "one cutoff"). A store outcome
 /// taken before the cutoff maps through §2.9; a read not returned by it is 408, and so is any
@@ -185,16 +195,18 @@ pub(crate) async fn run_write<R: Send + 'static>(
     job: Job<R>,
     after_ok: Option<AfterOk>,
 ) -> Result<R, WriteFailure> {
-    run_write_releasing(shared, not_after, job, after_ok, None).await
+    run_write_releasing(shared, not_after, job, after_ok, None, None).await
 }
 
-/// [`run_write`] that drops `release` as soon as `Store::submit` returns.
+/// [`run_write`] that drops `release` as soon as `Store::submit` returns and tells
+/// `on_reply` of the submission and the answer.
 async fn run_write_releasing<R: Send + 'static>(
     shared: &Shared,
     not_after: Instant,
     job: Job<R>,
     after_ok: Option<AfterOk>,
     release: Option<Release>,
+    mut on_reply: Option<Box<dyn OnReply<R>>>,
 ) -> Result<R, WriteFailure> {
     #[cfg(test)]
     shared.faults.write_submitted(not_after);
@@ -210,12 +222,18 @@ async fn run_write_releasing<R: Send + 'static>(
         move || drop(release),
     )
     .map_err(WriteFailure::Submit)?;
+    if let Some(o) = on_reply.as_mut() {
+        o.submitted();
+    }
     #[cfg(test)]
     let ticket = shared.faults.signal_ticket_park(ticket);
     let result = await_ticket(ticket, shared.sink.as_ref(), after_ok).await;
     #[cfg(test)]
     if matches!(result, Err(WriteFailure::Write(WriteError::Expired))) {
         shared.faults.write_expired();
+    }
+    if let Some(o) = on_reply {
+        o.replied(&result);
     }
     result
 }
@@ -301,7 +319,7 @@ pub(crate) fn observe_write<R: Send + 'static>(
     job: Job<R>,
     after_ok: Option<AfterOk>,
 ) -> Result<oneshot::Receiver<Result<R, WriteFailure>>, Closing> {
-    observe_write_releasing(shared, not_after, job, after_ok, None)
+    observe_write_releasing(shared, not_after, job, after_ok, None, None)
 }
 
 /// [`observe_write`] whose observer owns `release` from its registration: a refused or
@@ -312,11 +330,12 @@ fn observe_write_releasing<R: Send + 'static>(
     job: Job<R>,
     after_ok: Option<AfterOk>,
     release: Option<Release>,
+    on_reply: Option<Box<dyn OnReply<R>>>,
 ) -> Result<oneshot::Receiver<Result<R, WriteFailure>>, Closing> {
     let (tx, rx) = oneshot::channel();
     let s = shared.clone();
     shared.registry.spawn(TaskKind::Write, async move {
-        let r = run_write_releasing(&s, not_after, job, after_ok, release).await;
+        let r = run_write_releasing(&s, not_after, job, after_ok, release, on_reply).await;
         let _ = tx.send(r);
     })?;
     Ok(rx)
@@ -333,7 +352,7 @@ pub(crate) async fn await_write<R: Send + 'static>(
     job: Job<R>,
     after_ok: Option<AfterOk>,
 ) -> Result<R, ApiError> {
-    await_write_releasing(shared, deadline, job, after_ok, None).await
+    await_write_releasing(shared, deadline, job, after_ok, None, None).await
 }
 
 /// [`await_write`] whose observer drops `release` once `Store::submit` returned (or with
@@ -345,6 +364,7 @@ async fn await_write_releasing<R: Send + 'static>(
     job: Job<R>,
     after_ok: Option<AfterOk>,
     release: Option<Release>,
+    on_reply: Option<Box<dyn OnReply<R>>>,
 ) -> Result<R, ApiError> {
     if shared.passed(deadline) {
         return Err(ApiError::request_timeout());
@@ -352,7 +372,7 @@ async fn await_write_releasing<R: Send + 'static>(
     // The reply cutoff is set before the job is submitted.
     let reply_by = deadline + shared.cfg.write_reply_grace;
     let cutoff = shared.timer(reply_by);
-    let rx = observe_write_releasing(shared, deadline, job, after_ok, release)
+    let rx = observe_write_releasing(shared, deadline, job, after_ok, release, on_reply)
         .map_err(|_| ApiError::shutting_down())?;
     #[cfg(test)]
     shared.faults.before_cutoff_wait(|| !rx.is_empty()).await;
@@ -509,14 +529,16 @@ impl WriteCtx {
         &self,
         job: impl FnOnce(&mut WriteTx<'_>, Option<&Authorized>) -> Result<R, JobError> + Send + 'static,
     ) -> Result<R, ApiError> {
-        self.write_releasing(job, None).await
+        self.write_releasing(job, None, None).await
     }
 
     /// [`WriteCtx::write`] with `release`, which the observer drops as soon as
     /// `Store::submit` for the job returns, success or failure; a refused registration, or
     /// an observer aborted before its first poll, drops it too. Ownership passes to the
     /// observer at registration, so a client that disconnects afterwards no longer holds it
-    /// (hook-ingest §2.3).
+    /// (hook-ingest §2.3). `on_reply`, owned by the observer from its registration as
+    /// `release` is, learns of the submission and, after the writer's answer, of the result,
+    /// whether or not the request is still waiting for it.
     ///
     /// # Errors
     ///
@@ -525,14 +547,16 @@ impl WriteCtx {
         &self,
         job: impl FnOnce(&mut WriteTx<'_>, Option<&Authorized>) -> Result<R, JobError> + Send + 'static,
         release: Release,
+        on_reply: Option<Box<dyn OnReply<R>>>,
     ) -> Result<R, ApiError> {
-        self.write_releasing(job, Some(release)).await
+        self.write_releasing(job, Some(release), on_reply).await
     }
 
     async fn write_releasing<R: Send + 'static>(
         &self,
         job: impl FnOnce(&mut WriteTx<'_>, Option<&Authorized>) -> Result<R, JobError> + Send + 'static,
         release: Option<Release>,
+        on_reply: Option<Box<dyn OnReply<R>>>,
     ) -> Result<R, ApiError> {
         let sha = self.principal.as_ref().map(|p| p.token_sha256);
         await_write_releasing(
@@ -544,6 +568,7 @@ impl WriteCtx {
             }),
             None,
             release,
+            on_reply,
         )
         .await
     }

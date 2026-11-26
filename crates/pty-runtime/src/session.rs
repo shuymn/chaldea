@@ -755,16 +755,16 @@ impl Session {
 
     /// Copies the screen, taking the VT lock with `try_lock` until `deadline`.
     pub fn snapshot(&self, deadline: Instant) -> Result<Snapshot, VtUnavailable> {
-        if self.sh.vt_failed.load(Ordering::Acquire) {
-            return Err(VtUnavailable);
+        self.screen().snapshot(deadline)
+    }
+
+    /// The session's screen, to copy without the session (and without whatever lock the
+    /// caller holds the session under).
+    #[must_use]
+    pub fn screen(&self) -> Screen {
+        Screen {
+            sh: self.sh.clone(),
         }
-        let st = try_lock_until(&self.sh.vt, deadline).ok_or(VtUnavailable)?;
-        if self.sh.vt_failed.load(Ordering::Acquire) {
-            return Err(VtUnavailable);
-        }
-        st.vt
-            .snapshot(st.output_offset, deadline)
-            .ok_or(VtUnavailable)
     }
 
     /// A diagnostic snapshot plus every output byte after its offset, then one `End`.
@@ -1073,6 +1073,34 @@ fn waiter_main(sh: &Shared, child: &dyn PtyChild, stop: &AtomicBool) {
     }));
     if r.is_err() {
         sh.publish_wait_failed("waiter panicked".into());
+    }
+}
+
+/// A session's screen, copied without the session: it outlives the session and shows the
+/// screen as the session last parsed it.
+pub struct Screen {
+    sh: Arc<Shared>,
+}
+
+impl fmt::Debug for Screen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Screen").finish_non_exhaustive()
+    }
+}
+
+impl Screen {
+    /// Copies the screen, taking the VT lock with `try_lock` until `deadline`.
+    pub fn snapshot(&self, deadline: Instant) -> Result<Snapshot, VtUnavailable> {
+        if self.sh.vt_failed.load(Ordering::Acquire) {
+            return Err(VtUnavailable);
+        }
+        let st = try_lock_until(&self.sh.vt, deadline).ok_or(VtUnavailable)?;
+        if self.sh.vt_failed.load(Ordering::Acquire) {
+            return Err(VtUnavailable);
+        }
+        st.vt
+            .snapshot(st.output_offset, deadline)
+            .ok_or(VtUnavailable)
     }
 }
 

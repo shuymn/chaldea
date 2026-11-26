@@ -3,7 +3,7 @@
 /**
  * Where in a transcript an event's line ended.
  */
-export type TranscriptPos = { generation: number, path: string, file_id: string, 
+export type TranscriptPos = { generation: number, path: string, file_id: string,
 /**
  * Byte offset just after the line.
  */

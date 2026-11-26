@@ -3,7 +3,7 @@ import type { ApprovalId } from "./ApprovalId";
 import type { HumanWriteOrigin } from "./HumanWriteOrigin";
 import type { LaunchId } from "./LaunchId";
 
-export type HumanWrite = { launch_id: LaunchId, origin: HumanWriteOrigin, 
+export type HumanWrite = { launch_id: LaunchId, origin: HumanWriteOrigin,
 /**
  * Set for `card_key`.
  */

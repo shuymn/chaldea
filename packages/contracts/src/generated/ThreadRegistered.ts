@@ -4,7 +4,7 @@ import type { ThreadId } from "./ThreadId";
 import type { ThreadRole } from "./ThreadRole";
 import type { WorkspaceId } from "./WorkspaceId";
 
-export type ThreadRegistered = { thread_id: ThreadId, agent: Agent, cwd: string, workspace_id: WorkspaceId, parent_thread_id: ThreadId | null, role: ThreadRole, 
+export type ThreadRegistered = { thread_id: ThreadId, agent: Agent, cwd: string, workspace_id: WorkspaceId, parent_thread_id: ThreadId | null, role: ThreadRole,
 /**
  * The task given at spawn; `task_state` starts `active` when present, else `none`.
  */

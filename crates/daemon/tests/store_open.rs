@@ -88,6 +88,10 @@ fn refuses_foreign_rollback_journal_database() {
     assert!(!PathBuf::from(wal).exists());
 }
 
+/// Undoes schema v3 (the two `proj_inputs` columns), so a v3 database reads as v2.
+const V3_DOWN: &str = "ALTER TABLE proj_inputs DROP COLUMN last_write_before; \
+     ALTER TABLE proj_inputs DROP COLUMN attempt_seq;";
+
 /// A schema version above the binary's is refused.
 #[test]
 fn refuses_newer_schema() {
@@ -103,7 +107,7 @@ fn refuses_newer_schema() {
             r,
             Err(OpenError::NewerSchema {
                 found: 99,
-                supported: 2
+                supported: 3
             })
         ),
         "{:?}",
@@ -121,7 +125,7 @@ fn refuses_altered_schema() {
         .execute_batch("DROP TRIGGER events_no_update")
         .unwrap();
     match open(&s.path()) {
-        Err(OpenError::SchemaMismatch { version: 2, names }) => {
+        Err(OpenError::SchemaMismatch { version: 3, names }) => {
             assert!(names.contains(&"events_no_update".to_owned()), "{names:?}");
         }
         other => panic!("{:?}", other.err()),
@@ -173,7 +177,7 @@ fn sqlite_version_is_bundled() {
     )]
     let info = s.read(|r| r.schema_info());
     assert_eq!(info.sqlite_version, "3.54.1");
-    assert_eq!(info.user_version, 2);
+    assert_eq!(info.user_version, 3);
     assert_eq!(info.application_id, 0x4348_4C44);
 }
 
@@ -545,13 +549,15 @@ fn v1_upgrades_to_v2() {
     s.shutdown();
     Connection::open(s.path())
         .unwrap()
-        .execute_batch("DROP TRIGGER events_session_bound_once; PRAGMA user_version = 1")
+        .execute_batch(&format!(
+            "DROP TRIGGER events_session_bound_once; {V3_DOWN} PRAGMA user_version = 1"
+        ))
         .unwrap();
     let before = support::http::dump(&s.path());
 
     s.reopen();
     assert_eq!(support::http::dump(&s.path()), before, "a v1 row changed");
-    assert_eq!(s.read(|r| Ok(r.schema_info()?.user_version)), 2);
+    assert_eq!(s.read(|r| Ok(r.schema_info()?.user_version)), 3);
     let diff = s.run(|tx| Ok(tx.verify_projections()?)).unwrap();
     assert!(diff.is_empty(), "{diff:?}");
     // The v2 trigger is in force: a second binding of l1 is refused.
@@ -560,4 +566,119 @@ fn v1_upgrades_to_v2() {
         matches!(&r, Err(WriteError::RolledBack(StoreError::Constraint(m))) if m.contains("session_bound")),
         "{r:?}"
     );
+}
+
+/// PR10b-CL-22 (supervisor-send §2.9 E1): a v2 database, whose projections predate the
+/// zero-byte attempt rule, opens as v3 with projections equal to a replay of its events: a
+/// zero-byte attempt gives the launch its write position back, one followed by a
+/// `human_write` does not.
+#[test]
+fn v2_upgrades_to_v3() {
+    use chaldea_core::event::TypedEvent;
+    use chaldea_core::ids::{Actor, LaunchId};
+    use chaldea_core::input::{InputInput, InputReason, InputState};
+    use chaldea_core::payload::{
+        Content, HumanWrite, HumanWriteOrigin, InputCreated, InputEncoding, InputInitialState,
+        InputOrigin, InputStateChanged,
+    };
+    use support::{bound_thread, event, input, launch};
+
+    let mut s = TestStore::new();
+    let (t, l) = (thread(1), launch(1));
+    bound_thread(&s, t, l, None);
+    let stream = StreamId::Thread(t);
+    let created = |i| {
+        event(
+            stream,
+            &format!("created:{i}"),
+            TypedEvent::InputCreated(InputCreated {
+                input_id: i,
+                launch_id: Some(l),
+                initial_state: InputInitialState::Queued,
+                text: Content::text("hi"),
+                encoding: InputEncoding::BracketedPaste,
+                origin: InputOrigin::Cli,
+                created_by: Actor::Human,
+            }),
+        )
+    };
+    let moved = |i, n: &str, from, to, by: InputInput| {
+        event(
+            stream,
+            &format!("moved:{i}:{n}"),
+            TypedEvent::InputStateChanged(InputStateChanged {
+                input_id: i,
+                from,
+                to,
+                reason: InputReason::from(&by),
+                sent_after_seq: None,
+                by: None,
+            }),
+        )
+    };
+    let human = |n: &str, l: LaunchId| {
+        event(
+            stream,
+            &format!("human:{n}"),
+            TypedEvent::HumanWrite(HumanWrite {
+                launch_id: l,
+                origin: HumanWriteOrigin::Key,
+                approval_id: None,
+            }),
+        )
+    };
+    let (a, b) = (input(1), input(2));
+    let open = |i| {
+        moved(
+            i,
+            "open",
+            InputState::Queued,
+            InputState::Sending,
+            InputInput::GateOpened { sent_after_seq: 0 },
+        )
+    };
+    let cancel = |i| {
+        moved(
+            i,
+            "cancel",
+            InputState::Sending,
+            InputState::Cancelled,
+            InputInput::RecheckFailed,
+        )
+    };
+    s.append(vec![created(a), open(a), cancel(a)]).unwrap();
+    let last = |s: &TestStore| s.read(move |r| Ok(r.launch(l)?.unwrap().last_write_seq));
+    assert_eq!(last(&s), None, "a zero-byte attempt restores the position");
+    let hw = s.append(vec![created(b), open(b), human("1", l)]).unwrap();
+    let human_seq = hw[2].envelope().seq;
+    s.append(vec![cancel(b)]).unwrap();
+    assert_eq!(
+        last(&s),
+        Some(human_seq),
+        "a later write keeps its position"
+    );
+    s.shutdown();
+    // The v2 file: no attempt columns, projection version 1, and the launch's position as
+    // v2's rule left it (moved by the attempt).
+    Connection::open(s.path())
+        .unwrap()
+        .execute_batch(&format!(
+            "{V3_DOWN} PRAGMA user_version = 2; \
+             UPDATE meta SET value = '1' WHERE key = 'projection_version'; \
+             UPDATE proj_launches SET last_write_seq = 999"
+        ))
+        .unwrap();
+    s.reopen();
+    #[allow(
+        clippy::redundant_closure_for_method_calls,
+        reason = "the method path is not general over the lifetime"
+    )]
+    let info = s.read(|r| r.schema_info());
+    assert_eq!(
+        (info.user_version, info.projection_version.as_str()),
+        (3, "2")
+    );
+    let diff = s.run(|tx| Ok(tx.verify_projections()?)).unwrap();
+    assert!(diff.is_empty(), "{diff:?}");
+    assert_eq!(last(&s), Some(human_seq));
 }

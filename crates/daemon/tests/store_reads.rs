@@ -267,8 +267,8 @@ fn lookups_smoke() {
         assert_eq!(r.worktrees()?.len(), 1);
         assert_eq!(r.buffered_launches()?, vec![l]);
         let info = r.schema_info()?;
-        assert_eq!((info.application_id, info.user_version), (0x4348_4C44, 2));
-        assert_eq!(info.projection_version, "1");
+        assert_eq!((info.application_id, info.user_version), (0x4348_4C44, 3));
+        assert_eq!(info.projection_version, "2");
         assert!(r.integrity_check(10)?.is_empty());
         Ok(())
     });

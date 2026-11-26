@@ -5,7 +5,7 @@ import type { SurfaceAction } from "./SurfaceAction";
 /**
  * The minimal A2UI catalog.
  */
-export type Component = { "type": "text", text: string, } | { "type": "markdown", markdown: string, } | { "type": "vt_snapshot", 
+export type Component = { "type": "text", text: string, } | { "type": "markdown", markdown: string, } | { "type": "vt_snapshot",
 /**
  * The grid in the `vt_snapshot_taken` encoding.
  */

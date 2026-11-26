@@ -104,6 +104,19 @@ impl ThreadJob {
         self.pending.push(e);
     }
 
+    /// An event on the thread's stream with its annex.
+    pub(crate) fn push_annex(
+        &mut self,
+        key: IdempotencyKey,
+        event: TypedEvent,
+        launch: Option<LaunchId>,
+        annex: crate::store::EventAnnex,
+    ) {
+        let mut e = self.event(StreamId::Thread(self.thread), key, event, launch);
+        e.annex = Some(annex);
+        self.pending.push(e);
+    }
+
     /// An event on the host stream (`thread_registered`, `thread_closed`).
     pub(crate) fn push_host(&mut self, key: IdempotencyKey, event: TypedEvent) {
         let e = self.event(StreamId::Host, key, event, None);
@@ -138,7 +151,7 @@ impl ThreadJob {
     }
 
     /// Moves `input` by `by`, keyed under `cause`; `unconfirmed` also raises
-    /// `input_unconfirmed` for it.
+    /// `input_unconfirmed` for it, and leaving `queued` clears its `input_gate_timeout`.
     ///
     /// # Errors
     ///
@@ -168,7 +181,33 @@ impl ThreadJob {
         if to == InputState::Unconfirmed {
             self.raise_unconfirmed(cause, id, launch)?;
         }
+        if input.state == InputState::Queued {
+            self.left_queued(cause, id, launch)?;
+        }
         Ok(())
+    }
+
+    /// Clears `input_gate_timeout(id)` when raised: the input left `queued` (mvp §2.2).
+    ///
+    /// # Errors
+    ///
+    /// The reducer's refusal, as a job refusal.
+    pub(crate) fn left_queued(
+        &mut self,
+        cause: &IdempotencyKey,
+        id: InputId,
+        launch: Option<LaunchId>,
+    ) -> Result<(), JobError> {
+        let c = AttentionCause::InputGateTimeout { input_id: id };
+        if !self.raised(c) {
+            return Ok(());
+        }
+        self.apply(
+            cause,
+            &format!("gate_cleared:{id}"),
+            &StateInput::AttentionCleared(c),
+            launch,
+        )
     }
 
     fn raise_unconfirmed(

@@ -385,14 +385,29 @@ pub(crate) fn apply(p: &mut ProjectionTx<'_>, e: &StoredEvent) -> Result<(), Sto
                     .into());
                 };
                 p.exec_one(
-                    "input launch",
-                    "UPDATE proj_inputs SET launch_id = ?1 WHERE input_id = ?2",
-                    [launch.clone(), c.input_id.to_string()],
+                    "input attempt",
+                    "UPDATE proj_inputs SET launch_id = ?1, attempt_seq = ?2,
+                       last_write_before = (SELECT last_write_seq FROM proj_launches
+                                            WHERE launch_id = ?1 AND thread_id = ?3)
+                     WHERE input_id = ?4",
+                    rusqlite::params![launch, seq, thread, c.input_id.to_string()],
                 )?;
                 p.exec_one(
                     "input write",
                     "UPDATE proj_launches SET last_write_seq = ?1 WHERE launch_id = ?2 AND thread_id = ?3",
                     rusqlite::params![seq, launch, thread],
+                )?;
+            }
+            // A zero-byte attempt (only `RecheckFailed` leads from `sending` to `cancelled`)
+            // gives the launch its write position back while no later write moved it.
+            if c.from == InputState::Sending && c.to == InputState::Cancelled {
+                p.exec(
+                    "UPDATE proj_launches SET last_write_seq = (SELECT last_write_before FROM proj_inputs
+                                                               WHERE input_id = ?1)
+                     WHERE thread_id = ?2
+                       AND launch_id = (SELECT launch_id FROM proj_inputs WHERE input_id = ?1)
+                       AND last_write_seq IS (SELECT attempt_seq FROM proj_inputs WHERE input_id = ?1)",
+                    rusqlite::params![c.input_id.to_string(), thread],
                 )?;
             }
         }

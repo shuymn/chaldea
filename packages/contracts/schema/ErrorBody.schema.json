@@ -157,6 +157,36 @@
           "const": "launch_busy",
           "description": "504: a stop could not take its launch and re-read it in time; nothing changed.",
           "type": "string"
+        },
+        {
+          "const": "no_live_launch",
+          "description": "409: the thread's current launch is not live for `send`, `ready`, or `key`.",
+          "type": "string"
+        },
+        {
+          "const": "not_bound",
+          "description": "409: `ready` for a launch with no bound session.",
+          "type": "string"
+        },
+        {
+          "const": "card_closed",
+          "description": "409: a card key whose card is not open in the launch.",
+          "type": "string"
+        },
+        {
+          "const": "key_not_written",
+          "description": "409: the key unit wrote zero bytes; a retry may succeed.",
+          "type": "string"
+        },
+        {
+          "const": "input_state",
+          "description": "409: `input_resolve` of an input not `unconfirmed`, `input_cancel` of one not `queued`.",
+          "type": "string"
+        },
+        {
+          "const": "unit_running",
+          "description": "409: `ready` while an input unit of the launch may still write.",
+          "type": "string"
         }
       ]
     }

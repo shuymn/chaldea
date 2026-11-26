@@ -18,7 +18,7 @@ use chaldea_core::payload::{
 use chaldea_core::state::{StateInput, ThreadState, reduce};
 use chaldea_daemon::hook::{
     AcceptedHook, BindingRule, HookAdapter, HookConfig, HookEvent, HookIngest, HookSeams,
-    IntakeFacts, IntakeProbe, Interpretation, MvpHooks, ProcessProbe,
+    IntakeFacts, IntakeProbe, Interpretation, MvpHooks, ProcessProbe, TurnMark,
 };
 use chaldea_daemon::http::{HttpConfig, Mounts};
 use chaldea_daemon::store::{
@@ -269,7 +269,7 @@ pub struct Facts {
 }
 
 impl IntakeProbe for Facts {
-    fn facts(&self, _launch: LaunchId) -> Option<IntakeFacts> {
+    fn facts(&self, _launch: LaunchId, _ordinal: u64) -> Option<IntakeFacts> {
         let k = self.n.fetch_add(1, Ordering::SeqCst) + 1;
         if self.null.load(Ordering::SeqCst) {
             return Some(IntakeFacts(serde_json::Value::Null));
@@ -351,7 +351,7 @@ fn text(s: &str) -> Content {
 fn hook_event(event: TypedEvent, name: &'static str) -> HookEvent {
     HookEvent {
         event,
-        name,
+        name: name.into(),
         annex: None,
         blobs: Vec::new(),
     }
@@ -371,6 +371,16 @@ impl HookAdapter for TestAdapter {
     }
 
     fn interpret(
+        &self,
+        tx: &ReadTx<'_>,
+        hook: &AcceptedHook<'_>,
+    ) -> Result<(Interpretation, TurnMark), StoreError> {
+        Ok((self.decide(tx, hook)?, TurnMark::Other))
+    }
+}
+
+impl TestAdapter {
+    fn decide(
         &self,
         tx: &ReadTx<'_>,
         hook: &AcceptedHook<'_>,
@@ -433,7 +443,7 @@ impl HookAdapter for TestAdapter {
                             evidence: ReadinessEvidence::StopSettled,
                             by: Actor::Daemon,
                         }),
-                        name: "readiness",
+                        name: "readiness".into(),
                         annex: Some(EventAnnex::Readiness(WriteBasis {
                             launch_id: hook.launch.launch_id,
                             position,

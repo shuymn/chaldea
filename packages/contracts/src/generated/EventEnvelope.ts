@@ -13,15 +13,15 @@ import type { Timestamp } from "./Timestamp";
  * One stored event. `kind` is an open set and `payload` stays raw until it is decoded
  * by kind.
  */
-export type EventEnvelope = { stream_id: StreamId, 
+export type EventEnvelope = { stream_id: StreamId,
 /**
  * Per stream, gapless, from 1.
  */
-seq: number, event_id: EventId, schema_version: number, idempotency_key: IdempotencyKey, kind: EventKindTag, thread_id: ThreadId | null, launch_id: LaunchId | null, command_id: CommandId | null, source: Source, 
+seq: number, event_id: EventId, schema_version: number, idempotency_key: IdempotencyKey, kind: EventKindTag, thread_id: ThreadId | null, launch_id: LaunchId | null, command_id: CommandId | null, source: Source,
 /**
  * Source time, or `recorded_at` when the source states none.
  */
-occurred_at: Timestamp, 
+occurred_at: Timestamp,
 /**
  * Append time.
  */

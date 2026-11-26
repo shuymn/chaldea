@@ -106,6 +106,11 @@ impl SkewClock {
         });
     }
 
+    /// Lets the clock run again (the real clock plus the offset), ending a freeze or a stop.
+    pub fn resume(&self) {
+        *self.held.lock().unwrap() = None;
+    }
+
     /// Moves a stopped clock's reading `by` forward: a deadline the new reading reaches has
     /// passed (its real instant is before the real stop instant), and later ones still never
     /// pass.

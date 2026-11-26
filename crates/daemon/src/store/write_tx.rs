@@ -199,6 +199,19 @@ struct TranscriptJob {
     continued: bool,
 }
 
+/// An instant the writer reads right after the job's `COMMIT` succeeded, before it replies;
+/// empty when the job did not commit. Made by [`WriteTx::commit_stamp`].
+#[derive(Debug, Clone, Default)]
+pub struct CommitStamp(std::sync::Arc<std::sync::OnceLock<std::time::Instant>>);
+
+impl CommitStamp {
+    /// The instant, once the job committed.
+    #[must_use]
+    pub fn get(&self) -> Option<std::time::Instant> {
+        self.0.get().copied()
+    }
+}
+
 /// The job's transaction. Every method runs inside it; the first error poisons it, and
 /// every later call returns that error without touching SQLite.
 pub struct WriteTx<'c> {
@@ -210,6 +223,7 @@ pub struct WriteTx<'c> {
     heads: BTreeMap<StreamId, u64>,
     transcripts: HashMap<ThreadId, TranscriptJob>,
     task_causes: Vec<TaskCause>,
+    after_commit: Vec<Box<dyn FnOnce() + Send>>,
 }
 
 /// The source as a reader of the stored row sees it: an unknown string that spells a known
@@ -254,11 +268,30 @@ impl<'c> WriteTx<'c> {
             heads: BTreeMap::new(),
             transcripts: HashMap::new(),
             task_causes: Vec::new(),
+            after_commit: Vec::new(),
         }
     }
 
     pub(crate) fn take_poison(&mut self) -> Option<StoreError> {
         self.poison.get_mut().take()
+    }
+
+    /// A stamp the writer fills with `now()` right after this job's `COMMIT` succeeded,
+    /// before its reply is sent; never filled when the job rolls back.
+    pub fn commit_stamp(
+        &mut self,
+        now: impl FnOnce() -> std::time::Instant + Send + 'static,
+    ) -> CommitStamp {
+        let stamp = CommitStamp::default();
+        let slot = stamp.0.clone();
+        self.after_commit.push(Box::new(move || {
+            let _ = slot.set(now());
+        }));
+        stamp
+    }
+
+    pub(crate) fn take_after_commit(&mut self) -> Vec<Box<dyn FnOnce() + Send>> {
+        std::mem::take(&mut self.after_commit)
     }
 
     pub(crate) fn take_heads(&mut self) -> Vec<StreamHeadEntry> {

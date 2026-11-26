@@ -290,14 +290,26 @@ impl WriteCtx {
         -> Result<R, ApiError>;     // no reply by then → 503 `outcome_unknown` (never `in_progress`: no receipt)
     /// `write` whose observer drops `release` as soon as `Store::submit` returns (or with the observer, refused
     /// or aborted before it submitted); a client that disconnects after registration no longer holds it.
+    /// `on_reply`, owned by the observer from its registration as `release` is, hears the submission
+    /// (`submitted`) and, after the writer's answer, the result (`replied`), whether or not the request
+    /// still waits for it; an observer aborted after the submission calls neither again.
     pub(crate) async fn write_then<R: Send + 'static>(&self, job: impl FnOnce(&mut WriteTx<'_>, Option<&Authorized>)
-        -> Result<R, JobError> + Send + 'static, release: Box<dyn Any + Send>) -> Result<R, ApiError>;
+        -> Result<R, JobError> + Send + 'static, release: Box<dyn Any + Send>,
+        on_reply: Option<Box<dyn OnReply<R>>>) -> Result<R, ApiError>;
     /// One read cut off at `by` instead of the request deadline, strictly: a ready result is classified by the
     /// one clock sample taken when the wait returns it, and one taken at or after `by` is 408 whatever it is,
     /// reader-pool exhaustion included (no 503 `busy` at the cutoff).
     pub(crate) async fn read_by<R: Send + 'static>(&self, by: Instant, f: impl FnOnce(&ReadTx<'_>)
         -> Result<R, StoreError> + Send + 'static) -> Result<R, ApiError>;
     pub(crate) fn commits(&self) -> broadcast::Receiver<Committed>;   // the store's commit notifications from now on
+}
+/// `write_then`'s `on_reply`, told by the write's observer: `submitted` once `Store::submit` accepted the job,
+/// then `replied` with the writer's answer. Dropped without `replied` when the job was not submitted
+/// (registration or submission refused, deadline passed) or when the observer was aborted before the answer;
+/// the implementation tells the two apart by `submitted`.
+pub(crate) trait OnReply<R>: Send + 'static {
+    fn submitted(&mut self);
+    fn replied(self: Box<Self>, r: &Result<R, WriteFailure>);
 }
 /// The one submit-and-observe path: submits, owns and awaits the ticket (the writer answers every accepted
 /// job, store §5), reports a fatal outcome to `LifecycleSink`, and runs `after_ok` on success (e.g. the
@@ -561,8 +573,9 @@ The guard resolves `{name}` (404, 403, 501) through the server's registry, which
 | `request_timeout`, `in_progress`, `conflict`, `unknown_after_crash`, `outcome_unknown` | 408, 409, 409, 409, 503 | the runner and the request path (the deadline, the receipt, an outcome not known) |
 | `disk_full`, `store_failed` | 503 | the store's state, through the runner's mapping |
 | `thread_closed`, `launch_changed`, `launch_live`, `death_unconfirmed`, `worktree_unavailable`, `no_session` | 409 | handlers (the launch commands' refusals, `docs/design/supervisor.md` §2.2) |
-| `prompt_rejected`, `prompt_too_large` | 400 | handlers (the launch commands' prompt checks) |
-| `launch_busy` | 504 | handlers (a stop that could not take its launch in time; nothing changed) |
+| `prompt_rejected`, `prompt_too_large` | 400 | handlers (the launch commands' prompt checks; `prompt_too_large` also `send`'s) |
+| `launch_busy` | 504 | handlers (a stop that could not take its launch in time, or a `ready` that could not sample the launch's session in time; nothing changed) |
+| `no_live_launch`, `not_bound`, `card_closed`, `key_not_written`, `input_state`, `unit_running` | 409 | handlers (the send-side commands' refusals, `docs/design/supervisor-send.md` §2.2) |
 
 The table governs every non-2xx reply a handler produces; the runner's and the guard's own replies follow the reply table below and §2.9. A client must decode `ErrorBody` only from a non-2xx status (§2.9); a 2xx body is the command's own typed result, whose schema its owning PR defines, and the runner checks only that it is JSON, since reading it for an error-shaped member would make the runner interpret data it does not own. An owning PR's success schema therefore has no top-level `code` member, which that PR's own contract drift test checks. In a handler reply, `retry_after` is present exactly where the table gives it (on `busy`) and omitted everywhere else, never `null` (§2.9); the runner's own `in_progress` and `outcome_unknown` carry it as the reply table below says. A **refusal** (an `ApiError`) is answered as it is only when its code is a handler code at that code's status, with `retry_after` exactly where the table gives it; a refusal that is not an `ApiError` is 500 `internal`. No handler code needs a header the runner does not send (`Allow` belongs to `method_not_allowed`, `WWW-Authenticate` to `unauthorized`). A **result** is stored and replayed byte for byte, so it must be one the reply path sends unchanged and one that means the same on every replay: a success (2xx except 204 and 205: hyper sends 204 without a body, and 205 must have none) whose body parses as JSON; or an `ErrorBody` (only `code` and `retry_after`, once each, every value one `serde_json::Value` holds) whose code is a handler code at exactly the result's status, with `retry_after` exactly where the table gives it, other than 503 (a replayed result would tell a client to retry it forever). Anything that does not parse is refused, never passed. A reply that fails its check is a programming error of its handler and becomes 500 `internal`: a refusal or a `prepare` error with nothing written, a result stored (`receipt_complete`) and replayed as 500 (in the intent job for `Completed`, on the runner for an effect's result). Codes of a command's own outcome (such as `card_closed`, or the 504 of an effect whose work ran out of its own time) are added to `ErrorCode` by the owning PR and classified in this table at their status; until then a reply naming one is 500. The runner is the only writer of command results: a receipt row written any other way is outside this guarantee.
 

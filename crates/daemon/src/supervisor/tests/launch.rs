@@ -523,6 +523,7 @@ async fn wait_failed() {
             c.kill_budget = std::time::Duration::from_millis(300);
         })
         .await;
+        rig.clock.resume();
         rig.pty.script_next(FakeScript {
             kill,
             ..FakeScript::default()
@@ -619,6 +620,9 @@ async fn early_session_start(
     use chaldea_core::ids::Agent;
     use chaldea_pty_runtime::process::AncestryEnd;
     let (rig, chains, ingest) = Rig::with_chains(|_| {}).await;
+    if !stop_clock {
+        rig.clock.resume();
+    }
     let job = hold_job.then(|| ingest.points.arm_job(1));
     let held = rig.pauses.arm(Pause::BeforeStartJob);
     let cwd = rig.cwd.path().to_string_lossy().into_owned();
@@ -665,9 +669,6 @@ async fn early_session_start(
         "SessionStart",
         "s",
     );
-    if stop_clock {
-        rig.clock.stop();
-    }
     let reply = super::support::http::spawn_send(&rig.srv, &hook.req(&rig.srv));
     rig.until("the hook is in its pid wait", || {
         crate::http::tests::shared(&rig.srv)

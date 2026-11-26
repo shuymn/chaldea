@@ -16,7 +16,7 @@ use chaldea_pty_runtime::{ProcessIdentity, WriteRecord};
 
 use crate::store::{JobError, StoreError, WriteTx};
 
-use super::events::{ThreadJob, launch_key, refusal, seq_of, thread_row};
+use super::events::{ThreadJob, launch_key, refusal, thread_row};
 
 /// A step 10b (and later PRs) add to every exit job, before 10a1's sweep.
 pub(crate) trait ExitStep: Send + Sync {
@@ -32,13 +32,9 @@ pub(crate) trait ExitStep: Send + Sync {
 
 /// What the exit job recorded, as the steps see it.
 #[derive(Debug, Clone)]
-#[allow(dead_code, reason = "read by 10b's exit steps")]
 pub(crate) struct ExitFacts {
     pub thread_id: ThreadId,
     pub launch_id: LaunchId,
-    pub reason: ExitReason,
-    pub death_confirmed: bool,
-    pub exited_seq: u64,
     pub restart: bool,
     /// The launch's `settled`; empty at restart.
     pub sealed: Vec<WriteRecord>,
@@ -163,14 +159,10 @@ pub(crate) fn exit_in(
     {
         job.step_input(&key, &row, by, None, lid)?;
     }
-    let appended = job.flush(tx)?;
-    let exited_seq = seq_of(&appended, &key)?;
+    job.flush(tx)?;
     let facts = ExitFacts {
         thread_id: plan.thread,
         launch_id: plan.launch,
-        reason: plan.reason,
-        death_confirmed: plan.death_confirmed,
-        exited_seq,
         restart: plan.restart,
         sealed: plan.sealed.clone(),
     };

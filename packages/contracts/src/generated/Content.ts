@@ -5,13 +5,13 @@ import type { Encoding } from "./Encoding";
 /**
  * Every payload field that can be large: inline text or bytes, or a blob reference.
  */
-export type Content = { inline: string, encoding: Encoding, } | { blob: BlobRef, 
+export type Content = { inline: string, encoding: Encoding, } | { blob: BlobRef,
 /**
  * The first `PREVIEW_LIMIT_BYTES` bytes decoded as UTF-8, each invalid
  * sequence replaced by U+FFFD. A valid character that crosses the limit is left
  * out, not replaced.
  */
-preview: string, 
+preview: string,
 /**
  * True when any invalid sequence was replaced; a character left out at the
  * limit does not set it.

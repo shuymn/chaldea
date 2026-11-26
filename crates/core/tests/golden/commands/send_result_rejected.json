@@ -1,0 +1,5 @@
+{
+  "input_id": "01930000-0000-7000-8000-000000000020",
+  "reject_reason": "control_character",
+  "state": "rejected"
+}

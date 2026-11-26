@@ -1,0 +1,45 @@
+{
+  "$defs": {
+    "InputOrigin": {
+      "enum": [
+        "cli",
+        "pwa",
+        "surface_action"
+      ],
+      "type": "string"
+    },
+    "ThreadId": {
+      "description": "A thread: one agent conversation across all its launches.",
+      "format": "uuid",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The arguments of `send`.",
+  "properties": {
+    "origin": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/InputOrigin"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The client's claim of where the text came from; `cli` when absent. Informational."
+    },
+    "text": {
+      "type": "string"
+    },
+    "thread_id": {
+      "$ref": "#/$defs/ThreadId"
+    }
+  },
+  "required": [
+    "thread_id",
+    "text"
+  ],
+  "title": "SendArgs",
+  "type": "object"
+}

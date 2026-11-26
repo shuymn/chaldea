@@ -71,8 +71,9 @@ pub use rows::{
     SchemaInfo, SurfaceRow, ThreadRow, TokenKind, TokenRow, TranscriptCursor, WorktreeRow,
 };
 pub use write_tx::{
-    Appended, BlobInput, CursorPos, NewEvent, NewGeneration, NewHookDelivery, NewRouting, NewToken,
-    Promotion, ReadPos, TokenSelector, TranscriptBatch, TranscriptLine, WriteTx,
+    Appended, BlobInput, CommitStamp, CursorPos, NewEvent, NewGeneration, NewHookDelivery,
+    NewRouting, NewToken, Promotion, ReadPos, TokenSelector, TranscriptBatch, TranscriptLine,
+    WriteTx,
 };
 
 use readers::Pool;

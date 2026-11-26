@@ -8,7 +8,7 @@ import type { ThreadRole } from "./ThreadRole";
 import type { TurnState } from "./TurnState";
 import type { WorkspaceId } from "./WorkspaceId";
 
-export type ThreadInfo = { thread_id: ThreadId, agent: Agent | string, cwd: string, workspace_id: WorkspaceId, parent_thread_id: ThreadId | null, role: ThreadRole, closed: boolean, process_state: ProcessState, turn_state: TurnState, task_state: TaskState, 
+export type ThreadInfo = { thread_id: ThreadId, agent: Agent | string, cwd: string, workspace_id: WorkspaceId, parent_thread_id: ThreadId | null, role: ThreadRole, closed: boolean, process_state: ProcessState, turn_state: TurnState, task_state: TaskState,
 /**
  * Sorted.
  */

@@ -1,0 +1,87 @@
+{
+  "$defs": {
+    "ApprovalId": {
+      "description": "One approval card (§2.10).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "KeyToken": {
+      "description": "One key of a `key` request: a name (`\"enter\"`) or one printable ASCII character\n(`{ \"char\": \"y\" }`).",
+      "oneOf": [
+        {
+          "enum": [
+            "enter",
+            "escape",
+            "tab",
+            "backspace",
+            "ctrl_c",
+            "up",
+            "down",
+            "right",
+            "left"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One printable ASCII scalar, `' '` to `'~'`.",
+          "properties": {
+            "char": {
+              "maxLength": 1,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "char"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "LaunchId": {
+      "description": "A launch: one process lifetime of a thread.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "ThreadId": {
+      "description": "A thread: one agent conversation across all its launches.",
+      "format": "uuid",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The arguments of `key`: 1 to `MAX_KEYS` tokens; with `approval_id`, every token before\nthe last is a navigation key of the row.",
+  "properties": {
+    "approval_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "keys": {
+      "items": {
+        "$ref": "#/$defs/KeyToken"
+      },
+      "type": "array"
+    },
+    "launch_id": {
+      "$ref": "#/$defs/LaunchId"
+    },
+    "thread_id": {
+      "$ref": "#/$defs/ThreadId"
+    }
+  },
+  "required": [
+    "thread_id",
+    "launch_id",
+    "keys"
+  ],
+  "title": "KeyArgs",
+  "type": "object"
+}

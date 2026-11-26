@@ -17,7 +17,7 @@
 //! 7. **Startup causes for the current, started, unbound launch only.**
 
 mod adapters;
-mod commands;
+pub(crate) mod commands;
 mod components;
 mod events;
 mod exit;
@@ -25,6 +25,7 @@ mod live;
 mod ops;
 pub(crate) mod record;
 mod restart;
+pub mod send;
 mod tick;
 mod tracker;
 pub(crate) mod workspace;
@@ -36,7 +37,7 @@ use std::ffi::OsString;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use chaldea_core::adapter::HostOs;
+use chaldea_core::adapter::{HostOs, ReadinessMode};
 use chaldea_core::ids::{Agent, LaunchId, ThreadId};
 use chaldea_pty_runtime::{CloseBounds, PtyRuntime, PtySize};
 use futures_util::future::BoxFuture;
@@ -138,6 +139,9 @@ pub enum Pause {
     GitShutdownReap,
     /// The shutdown git step after reading the slot (async).
     GitShutdownRead,
+    /// A VT snapshot's task before it copies the screen (blocking; unit tests only).
+    #[cfg(test)]
+    SnapshotCopy,
 }
 
 /// The test seam of [`Pause`]: the daemon's own is [`NoPauses`].
@@ -200,6 +204,15 @@ pub struct SupervisorConfig {
     pub(crate) tick_steps: Vec<Arc<dyn TickStep>>,
     /// Whether the tick task runs (tests drive [`Supervisor::tick`] themselves).
     pub(crate) tick_task: bool,
+    /// The hook decoder of the send side (send §2.5): the daemon's decodes nothing until
+    /// an adapter PR adds one; tests pass `FakeDecoder`.
+    #[doc(hidden)]
+    pub decoder: Arc<dyn send::HookDecoder>,
+    /// The readiness mode of every row, when a unit test overrides the capability table's.
+    pub(crate) readiness_mode: Option<ReadinessMode>,
+    /// Whether each launch's send worker and the driver run (unit tests that drive no send
+    /// turn them off).
+    pub(crate) send_workers: bool,
 }
 
 impl Default for SupervisorConfig {
@@ -220,6 +233,9 @@ impl Default for SupervisorConfig {
             exit_steps: Vec::new(),
             tick_steps: Vec::new(),
             tick_task: true,
+            decoder: Arc::new(send::NoDecoder),
+            readiness_mode: None,
+            send_workers: true,
         }
     }
 }
@@ -247,6 +263,8 @@ pub(crate) struct Supervisor {
     pub(crate) git: Arc<GitSlot>,
     pub(crate) nudge: OnceLock<RevocationNudge>,
     pub(crate) window: OnceLock<Window>,
+    /// The send and ack side (send §2.1).
+    pub(crate) send: Arc<send::SendSide>,
     /// The runtime ops run on (the daemon's).
     pub(crate) rt: tokio::runtime::Handle,
 }
@@ -280,7 +298,6 @@ impl Supervisor {
 
     /// The entry of `launch` when its thread is `thread` (design §2.11 "Lookup by
     /// generation").
-    #[allow(dead_code, reason = "10b's sends look launches up")]
     pub(crate) fn live(&self, thread: ThreadId, launch: LaunchId) -> Option<Arc<LiveLaunch>> {
         self.live
             .lock()

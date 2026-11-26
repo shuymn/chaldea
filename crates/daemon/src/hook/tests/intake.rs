@@ -9,7 +9,7 @@ use chaldea_core::payload::RawUnknownReason;
 use super::support::hook::{Hook, HookServer, direct};
 use super::support::http::{TestServer, connect, write};
 use super::{WAIT, ok, reached, reached_sync};
-use crate::hook::{IntakeOrder, NoIntakeFacts};
+use crate::hook::{IntakeOrder, IntakeProbe, NoIntakeFacts};
 use crate::http::tests::shared;
 use crate::http::{ApiError, Mounts, WriteCtx};
 use crate::store::Routing;
@@ -17,6 +17,10 @@ use crate::store::tests::support::waits;
 
 fn l() -> LaunchId {
     LaunchId::from_u128(1)
+}
+
+fn none() -> Arc<dyn IntakeProbe> {
+    Arc::new(NoIntakeFacts)
 }
 
 /// Whether `earlier_released` for `t` resolves within `within`.
@@ -36,7 +40,7 @@ async fn resolves(
 fn intake_samples_under_the_lock() {
     let order = Arc::new(IntakeOrder::default());
     let o = order.clone();
-    let (_, _, at) = order.intake(l(), 0, &NoIntakeFacts, || {
+    let (_, _, _, at) = order.intake(l(), 0, &none(), || {
         assert!(o.locked(), "the clock was sampled outside the intake lock");
         Instant::now()
     });
@@ -50,9 +54,9 @@ fn intake_samples_under_the_lock() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn intake_order() {
     let order = Arc::new(IntakeOrder::default());
-    let (t1, _, _) = order.intake(l(), 7, &NoIntakeFacts, Instant::now);
-    let (t2, _, _) = order.intake(l(), 0, &NoIntakeFacts, Instant::now);
-    let (t3, _, _) = order.intake(l(), 0, &NoIntakeFacts, Instant::now);
+    let (t1, _, _, _) = order.intake(l(), 7, &none(), Instant::now);
+    let (t2, _, _, _) = order.intake(l(), 0, &none(), Instant::now);
+    let (t3, _, _, _) = order.intake(l(), 0, &none(), Instant::now);
     assert_eq!((t1.ordinal(), t2.ordinal(), t3.ordinal()), (8, 9, 10));
     // The lowest never waits.
     assert!(resolves(&order, &t1, WAIT).await);
@@ -65,8 +69,8 @@ async fn intake_order() {
 
     // A release between the check and the await: the future already observes it.
     let order = Arc::new(IntakeOrder::default());
-    let (a, _, _) = order.intake(l(), 0, &NoIntakeFacts, Instant::now);
-    let (b, _, _) = order.intake(l(), 0, &NoIntakeFacts, Instant::now);
+    let (a, _, _, _) = order.intake(l(), 0, &none(), Instant::now);
+    let (b, _, _, _) = order.intake(l(), 0, &none(), Instant::now);
     let a = Arc::new(std::sync::Mutex::new(Some(a)));
     let a2 = a.clone();
     *order.between_check_and_await.lock().unwrap() = Some(Box::new(move || {
@@ -97,12 +101,13 @@ async fn release_points() {
     // Success: released when `submit` returns, not when the job runs.
     let (srv, ctx) = server_and_ctx().await;
     let order = Arc::new(IntakeOrder::default());
-    let (t, _, _) = order.intake(l(), 0, &NoIntakeFacts, Instant::now);
+    let (t, _, _, _) = order.intake(l(), 0, &none(), Instant::now);
     let release_writer = srv.hold_writer().await;
     let (gate, open) = shared(&srv).faults.arm_submit_gate();
     let ctx = Arc::new(ctx);
     let c = ctx.clone();
-    let write = tokio::spawn(async move { c.write_then(|_tx, _a| Ok(()), Box::new(t)).await });
+    let write =
+        tokio::spawn(async move { c.write_then(|_tx, _a| Ok(()), Box::new(t), None).await });
     reached(gate).await;
     assert!(order.is_pending(l(), 1), "released before submission");
     open.send(()).unwrap();
@@ -119,11 +124,11 @@ async fn release_points() {
 
     // Failure: the store refuses the submission.
     let (srv, ctx) = server_and_ctx().await;
-    let (t, _, _) = order.intake(l(), 0, &NoIntakeFacts, Instant::now);
+    let (t, _, _, _) = order.intake(l(), 0, &none(), Instant::now);
     let ordinal = t.ordinal();
     srv.store.store().shutdown(Instant::now() + WAIT);
     assert_eq!(
-        ctx.write_then(|_tx, _a| Ok(()), Box::new(t)).await,
+        ctx.write_then(|_tx, _a| Ok(()), Box::new(t), None).await,
         Err(ApiError::shutting_down())
     );
     assert!(
@@ -135,11 +140,11 @@ async fn release_points() {
 
     // Registry refusal: the observer is never registered.
     let (mut srv, ctx) = server_and_ctx().await;
-    let (t, _, _) = order.intake(l(), 0, &NoIntakeFacts, Instant::now);
+    let (t, _, _, _) = order.intake(l(), 0, &none(), Instant::now);
     let ordinal = t.ordinal();
     srv.shutdown_http(Instant::now() + WAIT).await;
     assert_eq!(
-        ctx.write_then(|_tx, _a| Ok(()), Box::new(t)).await,
+        ctx.write_then(|_tx, _a| Ok(()), Box::new(t), None).await,
         Err(ApiError::shutting_down())
     );
     assert!(

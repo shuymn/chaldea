@@ -3,7 +3,7 @@ import type { Agent } from "./Agent";
 import type { SourceKind } from "./SourceKind";
 import type { TranscriptPos } from "./TranscriptPos";
 
-export type Source = { kind: SourceKind | string, agent: Agent | string | null, cli_version: string | null, 
+export type Source = { kind: SourceKind | string, agent: Agent | string | null, cli_version: string | null,
 /**
  * Set only for `kind: transcript`.
  */
