@@ -5,9 +5,10 @@
 mod support;
 
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use support::faults::{
@@ -206,7 +207,19 @@ fn inspect_reads_thread() {
         ],
     );
     let t = spawn_codex(&labels, &d.path, cwd.path());
-    let (conn, _) = report.accept().unwrap();
+    // FakeCli's report connection, within `WAIT`.
+    report.set_nonblocking(true).unwrap();
+    let end = Instant::now() + WAIT;
+    let conn = loop {
+        match report.accept() {
+            Ok((c, _)) => break c,
+            Err(e) if e.kind() == ErrorKind::WouldBlock && Instant::now() < end => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("FakeCli opened no report connection: {e}"),
+        }
+    };
+    conn.set_nonblocking(false).unwrap();
     conn.set_read_timeout(Some(WAIT)).unwrap();
     let written = BufReader::new(conn)
         .lines()
