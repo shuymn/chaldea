@@ -366,6 +366,43 @@ async fn stop_after_an_incomplete_record_settles() {
     rig.stop().await;
 }
 
+/// A `Stop` whose intake read its facts before a `Written` unit's record committed keeps the
+/// unit running, though the record commits before the intake's observation ends: its facts
+/// are those of the fence advance, so it never settles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn record_during_intake_keeps_running() {
+    let (rig, live) = settle_rig().await;
+    rig.cmd_ok("ready", &json!({ "thread_id": live.t }), 200)
+        .await;
+    let sl = rig.sl(&live);
+    let (entered, go, point) = gate_point();
+    set(&sl.hooks.record_job, point);
+    let p = rig.send(&live, "P").await;
+    entered.await.unwrap();
+    let recorded = sl.state().running.as_ref().unwrap().recorded.clone();
+    // Runs in place of the `Stop`'s observation, after its fence advance: the record
+    // commits there.
+    *crate::supervisor::send::lock(&sl.hooks.observe) = Some(Box::new(move |sup, l| {
+        go.send(()).unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        while !recorded.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(Instant::now() < end, "the record committed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        sup.observe(l)
+    }));
+    let stop = rig.next_ordinal(&live);
+    assert_eq!(
+        rig.post(&rig.hook_of(&live, "Stop", &json!({})))
+            .await
+            .status,
+        200
+    );
+    end_mark(&rig, &live, stop, false);
+    rig.until_input(p, InputState::Sent).await;
+    rig.stop().await;
+}
+
 /// TO-2b: a human write before a stale start stays in the turn the `Stop` ended. The
 /// settle's evidence is of that turn, so it does not reopen the gate after the write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

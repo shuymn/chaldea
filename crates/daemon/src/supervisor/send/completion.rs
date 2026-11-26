@@ -171,14 +171,14 @@ pub(crate) async fn apply_records(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>) {
             kept.push(f);
             continue;
         }
-        #[cfg(test)]
-        super::run_hook(&sl.hooks.record_job);
         let recorded = sl
             .state()
             .running
             .as_ref()
             .filter(|r| r.input_id == id)
             .map(|r| r.recorded.clone());
+        #[cfg(test)]
+        super::run_hook(&sl.hooks.record_job);
         let job = completion_job(sup, sl, &f.record, id, recorded);
         match record(sup, job, false).await {
             Recorded::Done((moved, at)) => {

@@ -72,14 +72,20 @@ pub(crate) struct SupervisorProbe {
 impl IntakeProbe for SupervisorProbe {
     fn facts(&self, launch: LaunchId, ordinal: u64) -> Option<IntakeFacts> {
         let sl = self.side.launch(launch)?;
-        // One observation point (send §2.5): the launch's state is held across the read of
-        // the dispatch's `written` and the fence advance, and a completion publishes
-        // `written` under the same state, so it is either before this intake or after it.
+        // One observation point (send §2.5): the launch's state is held across the reads of
+        // the dispatch's `written` and the running unit, and the fence advance. A completion
+        // publishes `written` under the same state, so it is either before this intake or
+        // after it; a record that commits after the read leaves the unit running for it.
         let st = sl.try_state();
         let written = st
             .as_ref()
             .and_then(|st| st.dispatch.as_ref())
             .is_some_and(|d| d.written.load(Ordering::Acquire));
+        let running = st.as_ref().is_some_and(|st| {
+            st.running
+                .as_ref()
+                .is_some_and(|r| !r.recorded.load(Ordering::Acquire))
+        });
         #[cfg(test)]
         super::run_hook(&sl.hooks.after_written_read);
         sl.latest_intake.store(ordinal, Ordering::SeqCst);
@@ -114,11 +120,7 @@ impl IntakeProbe for SupervisorProbe {
             v: 1,
             reference,
             last_started,
-            // A unit whose record committed has ended for the intake, in the writer's order.
-            running: st
-                .running
-                .as_ref()
-                .is_some_and(|r| !r.recorded.load(Ordering::Acquire)),
+            running,
             human_running: st.human_unsettled > 0,
             inflight,
         };
