@@ -1,21 +1,21 @@
 # Chaldea
 
-PTY-launched AI coding agent client and multi-host control plane for macOS / Windows hosts and Android remote access.
+PTY-launched AI coding agent client and multi-host control plane for macOS and native Windows hosts (localhost-only MVP; Android remote access is Phase 2).
 
-**Status**: In progress. The workspace currently contains `crates/core` (contracts), `crates/pty-runtime` (PTY runtime with own macOS and Windows ConPTY backends), and `crates/testkit`; the daemon, CLI, and PWA are not implemented yet. See `docs/mvp-design.md` and issue #2 for the plan and remaining work.
+**Status**: In progress. Implemented: `crates/core`, `crates/pty-runtime`, `crates/testkit`, `crates/daemon`, and `crates/cli` (daemon, supervisor with launch/stop/close/restart and crash recovery, send/ack path, and hook ingest), plus the Quint specs under `specs/`. Not yet implemented: the Claude and Codex adapters, the PWA (`packages/web`), and the web terminal view. See `docs/mvp-design.md` §4 for the milestone order (C1–T2 = M1, X1–X2 = M2, O1 = M3) and issue #2.
 
 ## Design Summary
 
 Canonical design reference: `docs/architecture.md`.
 
 - **Execution model**: Interactive CLI agents (Claude Code, Codex CLI, etc.) launched inside daemon-owned PTYs — no ACP lock-in, no PTY screen-scraping for state.
-- **Core stack**: Rust Sans-IO workspace (`crates/core`, `crates/pty-runtime`, `crates/daemon`) + SQLite append-only event store + React/TypeScript single PWA (`packages/web`) + Phase 2 Cloudflare Workers & Durable Objects relay (`packages/relay`).
+- **Core stack**: Rust Sans-IO workspace (`crates/core`, `crates/pty-runtime`, `crates/daemon`) + SQLite append-only event store + React/TypeScript single PWA (`packages/web`, whose web terminal view uses prebuilt libghostty-vt WASM via ghostty-web — no `xterm.js`, no Zig in the Rust build) + Phase 2 Cloudflare Workers & Durable Objects relay (`packages/relay`).
 - **5 Seams**:
   1. **Sync Seam**: `stream_id + after_seq`, snapshot recovery, `command_id` idempotency, notify-then-pull WS live notifications.
   2. **Ingest & Event Store Seam**: SQLite append-only events (`schema_version`), 3-axis state (`process` / `turn` / `task`), generation+offset atomic transcript ingestion.
   3. **Agent Control & Adapter Seam**: `chaldea spawn / send / wait / stop / mailbox`, input state machine (`queued -> sending -> sent -> acked / unconfirmed`), adapter capability table, worktree ownership (short base path support for Windows MSVC).
-  4. **Extension & Rescue Seam**: One-shot JSON hooks (fixed command + env injection), emergency VT keypad, dedicated Rescue Agent token + scoped A2UI (`Host | Workspace | Thread`).
-  5. **PTY Seam**: `PtyRuntime` trait in `crates/pty-runtime` encapsulating own macOS POSIX PTY (rustix + `Command`/`pre_exec`) and own `windows-sys` ConPTY backends (child joins a kill-on-close job at creation via `PROC_THREAD_ATTRIBUTE_JOB_LIST`), `alacritty_terminal` headless VT responder, process-tree cleanup (Job Object / `setsid`+pgid), crash-only `--resume` recovery, and native `chaldea attach`.
+  4. **Extension & Rescue Seam**: CLI hooks injected per launch (fixed command + env vars for Codex) delivered by `chaldea hook-emit`. Rescue is an external-agent surface: an agent on the PC diagnoses through `GET /api/threads/{id}/screen` and `chaldea inspect <thread> [--json]`, intervenes with the existing commands, and follows `skills/chaldea-rescue/SKILL.md`. A built-in Rescue UI, A2UI (`surface_update` / `surface_action`), and one-shot JSON hooks (`before_spawn`, `after_close`, `attention`) are deferred.
+  5. **PTY Seam**: `PtyRuntime` trait in `crates/pty-runtime` encapsulating own macOS POSIX PTY (rustix + `Command`/`pre_exec`) and own `windows-sys` ConPTY backends (child joins a kill-on-close job at creation via `PROC_THREAD_ATTRIBUTE_JOB_LIST`), `alacritty_terminal` headless VT responder, process-tree cleanup (Job Object / `setsid`+pgid), and crash-only `--resume` recovery. Terminal access is the web terminal view in `packages/web` (prebuilt libghostty-vt WASM, ghostty-web first) over the attach WebSocket, never a state source; a native `chaldea attach` CLI is deferred.
 
 ## Design Assets
 
