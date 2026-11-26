@@ -369,6 +369,15 @@ pub struct AdapterInfo {
 /// The body of `GET /api/threads/{thread_id}`: fixed-size facts of one thread, whatever its
 /// history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+#[schemars(extend("required" = [
+    "thread_id",
+    "closed",
+    "process_state",
+    "turn_state",
+    "task_state",
+    "attention_count",
+    "launch"
+]))]
 pub struct ThreadSummary {
     pub thread_id: ThreadId,
     pub closed: bool,
@@ -521,6 +530,14 @@ impl ScreenResponse {
 /// or events). `screen` is the live screen of the launch the read showed; each error is the
 /// daemon's, or the client's own (`payload_too_large`, `request_timeout`, `internal`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS, JsonSchema)]
+#[schemars(extend("required" = [
+    "thread_id",
+    "snapshot",
+    "summary",
+    "screen",
+    "snapshot_error",
+    "screen_error"
+]))]
 pub struct InspectOutput {
     pub thread_id: ThreadId,
     pub snapshot: Option<ThreadSnapshot>,

@@ -1366,7 +1366,8 @@
         "process_state",
         "turn_state",
         "task_state",
-        "attention_count"
+        "attention_count",
+        "launch"
       ],
       "type": "object"
     },
@@ -1626,7 +1627,12 @@
     }
   },
   "required": [
-    "thread_id"
+    "thread_id",
+    "snapshot",
+    "summary",
+    "screen",
+    "snapshot_error",
+    "screen_error"
   ],
   "title": "InspectOutput",
   "type": "object"
