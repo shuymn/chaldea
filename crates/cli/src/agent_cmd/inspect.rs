@@ -108,12 +108,10 @@ enum Last {
 }
 
 impl Retried {
-    /// Notes a request error. A timeout comes only at the cutoff (the request's own deadline),
-    /// so it keeps what an earlier attempt failed with; any other error replaces it.
+    /// Notes a transport failure the read sent its request again after. Nothing else is
+    /// noted: a timeout comes only at the cutoff, and a body over the limit ends the read.
     fn note(&self, e: &io::Error) {
-        if e.kind() != io::ErrorKind::TimedOut {
-            *self.0.borrow_mut() = Some(Last::Transport(format!("the request failed: {e}")));
-        }
+        *self.0.borrow_mut() = Some(Last::Transport(format!("the request failed: {e}")));
     }
 
     fn busy(&self, body: &[u8]) {

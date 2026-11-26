@@ -381,6 +381,11 @@ fn schema_requires_every_key() {
     assert!(!schema().is_valid(&w), "summary.launch may be left out");
 }
 
+/// A busy answer, as the daemon sends it while the snapshot is not built.
+fn busy() -> Reply {
+    Reply::Json(503, r#"{"code":"busy","retry_after":1}"#.to_owned())
+}
+
 /// A read whose budget runs out after concrete failures reports the last one: the daemon's
 /// `busy` body (the snapshot then falls back to the summary), or `internal` for a peer that
 /// closes before answering (the snapshot then fails, exit 1). The stub moves the test clock
@@ -419,6 +424,30 @@ fn last_failure_at_the_cutoff() {
     let (code, out, _) = run(&s, inspect(true));
     assert_eq!(code, ExitCode::Ok);
     assert_eq!(checked(&out)["screen_error"]["code"], "internal");
+}
+
+/// A body over the cap that arrives at the cutoff after a busy answer is not a transport
+/// failure: the snapshot falls back to the summary with the busy body, exit 0.
+#[test]
+fn too_large_at_the_cutoff_after_busy() {
+    let s = Stub::start(vec![
+        busy(),
+        Reply::After(20_000, Box::new(Reply::Head(200, 16 * 1024 * 1024 + 1))),
+        ok(running()),
+        ok(screen(L)),
+    ]);
+    let (code, out, err) = run(&s, inspect(true));
+    assert_eq!(code, ExitCode::Ok, "{err}");
+    assert_eq!(
+        paths(&s),
+        [SNAPSHOT_PATH, SNAPSHOT_PATH, SUMMARY_PATH, SCREEN_PATH]
+    );
+    let v = checked(&out);
+    assert_eq!(
+        v["snapshot_error"],
+        json!({ "code": "busy", "retry_after": 1 })
+    );
+    assert_eq!(v["summary"]["thread_id"], T.to_string());
 }
 
 /// Runs `f` against `stub` with `fault` failing requests at their boundary.

@@ -170,8 +170,8 @@ impl Client<'_> {
         self.exchange_noting(cutoff, req, daemon_required, run, &|_| {}, decide)
     }
 
-    /// [`Client::exchange_in`] that shows `note` every request error before it is classified
-    /// (sent again, or ending the exchange).
+    /// [`Client::exchange_in`] that shows `note` each transport failure it sends the request
+    /// again after.
     fn exchange_noting<T>(
         &self,
         cutoff: Instant,
@@ -215,13 +215,13 @@ impl Client<'_> {
                 (self.fault)(path).map_or_else(send, |kind| Err(io::Error::from(kind)))
             };
             let r = send();
-            if let Err(e) = &r {
-                note(e);
-            }
             match r {
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => Some(Err(End::Timeout)),
                 Err(e) if client::is_body_too_large(&e) => Some(Err(End::TooLarge)),
-                Err(e) if transient(e.kind()) => None,
+                Err(e) if transient(e.kind()) => {
+                    note(&e);
+                    None
+                }
                 Err(e) => Some(Err(End::Fail(format!("the request failed: {e}")))),
                 Ok(r) => {
                     let decided = decide(r);
