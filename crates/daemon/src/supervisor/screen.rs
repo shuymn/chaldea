@@ -68,6 +68,8 @@ impl ReadHandler for ReadScreen {
             let summary = readable_summary(&ctx, t).await?;
             let no_live = || ApiError::new(StatusCode::CONFLICT, ErrorCode::NoLiveLaunch);
             let sup = sup.upgrade().ok_or_else(ApiError::shutting_down)?;
+            #[cfg(test)]
+            sup.pauses().at(super::Pause::ScreenRead).await;
             // A launch whose exit is recorded has no screen, even while its session is still
             // in its slot.
             let entry = summary
@@ -92,19 +94,4 @@ pub(crate) fn mount(sup: Weak<Supervisor>) -> Mount {
     let route =
         spec(&Method::GET, SCREEN_PATH).unwrap_or_else(|| panic!("GET {SCREEN_PATH} is in ROUTES"));
     Mount::read(route, ReadScreen(sup))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// C1-11: the snapshot never waits past the request's deadline.
-    #[test]
-    fn deadline_is_clamped() {
-        let now = Instant::now();
-        let late = now + Duration::from_secs(5);
-        assert_eq!(snapshot_deadline(now, late), now + SNAPSHOT_WAIT);
-        let near = now + Duration::from_millis(100);
-        assert_eq!(snapshot_deadline(now, near), near);
-    }
 }

@@ -199,7 +199,7 @@ pub(crate) async fn shutdown(sup: Arc<Supervisor>, end: Instant) -> ParticipantE
         // Steps 4–5: each locked slot that still holds a session.
         let closes = entries.iter().zip(locks).filter_map(|(e, g)| {
             let mut g = g?;
-            let tracked = g.take()?;
+            let tracked = e.take_session(&mut g)?;
             let s = sup.clone();
             let e = e.clone();
             Some(async move {

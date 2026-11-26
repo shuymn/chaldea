@@ -49,13 +49,31 @@ async fn screen_until(
     }
 }
 
-/// A case of [`token_matrix`]: its name, token, path, status, and code.
+/// A case of [`token_matrix`]: its name, token, path, status, and error code.
 type Case<'a> = (&'a str, Option<&'a str>, String, u16, Option<&'a str>);
+
+/// Sends each case and checks its status, its whole body (an error body is exactly its
+/// code; a screen is the thread's), and `Cache-Control: no-store`.
+async fn check(rig: &Rig, t: ThreadId, cases: Vec<Case<'_>>) {
+    for (name, token, p, status, code) in cases {
+        let r = get(rig, &p, token).await;
+        let what = format!("{name}: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.status, status, "{what}");
+        match code {
+            Some(c) => assert_eq!(body(&r), json!({ "code": c }), "{what}"),
+            None => {
+                let s: ScreenResponse = serde_json::from_slice(&r.body).unwrap();
+                assert_eq!(s.thread_id, t, "{what}");
+            }
+        }
+        assert_eq!(r.header("cache-control"), Some("no-store"), "{name}");
+    }
+}
 
 /// CL-15: owner and rescue read every thread, an agent its self+ only (another thread is
 /// the same 404 as a missing one), hook and extension tokens are refused, and no token is
 /// 401. Unknown and malformed ids are 404, a query is 400 `bad_query`, and every answer
-/// carries `Cache-Control: no-store`.
+/// carries `Cache-Control: no-store`. No refused request reaches the live lookup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn token_matrix() {
     let rig = Rig::new().await;
@@ -73,18 +91,7 @@ async fn token_matrix() {
     let rescue = rig.srv.token(TokenKind::Rescue, None, None).await;
     let hook = rig.srv.token(TokenKind::Hook, Some(t), Some(l)).await;
     let ext = rig.srv.token(TokenKind::Extension, None, None).await;
-    let cases: [Case<'_>; 13] = [
-        ("owner", Some(&rig.owner), path(t), 200, None),
-        ("rescue", Some(&rescue), path(t), 200, None),
-        ("agent self", Some(&agent), path(t), 200, None),
-        // A descendant passes the read check; it has no launch.
-        (
-            "agent child",
-            Some(&agent),
-            path(child),
-            409,
-            Some("no_live_launch"),
-        ),
+    let refused: Vec<Case<'_>> = vec![
         (
             "agent other",
             Some(&other_agent),
@@ -123,6 +130,16 @@ async fn token_matrix() {
             400,
             Some("bad_query"),
         ),
+    ];
+    check(&rig, t, refused).await;
+    assert!(
+        !rig.pauses.passed(Pause::ScreenRead),
+        "a refused request reached the live lookup"
+    );
+    let admitted: Vec<Case<'_>> = vec![
+        ("owner", Some(&rig.owner), path(t), 200, None),
+        ("rescue", Some(&rescue), path(t), 200, None),
+        ("agent self", Some(&agent), path(t), 200, None),
         (
             "empty query",
             Some(&rig.owner),
@@ -131,16 +148,17 @@ async fn token_matrix() {
             None,
         ),
     ];
-    for (name, token, p, status, code) in cases {
-        let r = get(&rig, &p, token).await;
-        assert_eq!(
-            (r.status, r.code().as_deref()),
-            (status, code),
-            "{name}: {}",
-            String::from_utf8_lossy(&r.body)
-        );
-        assert_eq!(r.header("cache-control"), Some("no-store"), "{name}");
-    }
+    check(&rig, t, admitted).await;
+    assert!(rig.pauses.passed(Pause::ScreenRead));
+    // A descendant passes the read check; it has no launch.
+    let child_case: Vec<Case<'_>> = vec![(
+        "agent child",
+        Some(&agent),
+        path(child),
+        409,
+        Some("no_live_launch"),
+    )];
+    check(&rig, child, child_case).await;
     rig.srv.stop().await;
 }
 
@@ -274,5 +292,108 @@ async fn exit_recorded() {
         get(&rig, &path(t), Some(&rig.owner)).await.outcome(),
         (409, Some("no_live_launch".to_owned()))
     );
+    rig.srv.stop().await;
+}
+
+/// Waits (20 s at most) until `armed` is reached, off the runtime's workers.
+async fn reached(armed: &super::Armed) {
+    let rx = &armed.reached;
+    tokio::task::block_in_place(|| rx.recv_timeout(Duration::from_secs(20)).unwrap());
+}
+
+/// C1-11: once a stop or an exit has taken the session out of its slot, the screen is 409
+/// `no_live_launch` before the exit is recorded, though the op lock is still held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn detached_session() {
+    let rig = Rig::new().await;
+    let no_live = (409, Some("no_live_launch".to_owned()));
+    // A stop, between its seal and its `StopRequested` write.
+    let (t, l) = rig.spawn_codex(None).await;
+    let armed = rig.pauses.arm(Pause::StopAfterSeal);
+    let req = rig.srv.command(
+        "stop",
+        &rig.owner,
+        super::cid(),
+        &json!({ "thread_id": t }).to_string(),
+    );
+    let stop = support::http::spawn_send(&rig.srv, &req);
+    reached(&armed).await;
+    assert!(rig.launch(l).exit_reason.is_none(), "not yet recorded");
+    assert_eq!(
+        get(&rig, &path(t), Some(&rig.owner)).await.outcome(),
+        no_live
+    );
+    armed.go();
+    assert_eq!(stop.await.unwrap().status, 200);
+
+    // The launch's own exit, after the exit op took the session.
+    let (t, l) = rig.spawn_codex(None).await;
+    let armed = rig.pauses.arm(Pause::ExitTookSession);
+    rig.pty
+        .take_child()
+        .unwrap()
+        .exit(chaldea_pty_runtime::ChildExit {
+            code: Some(0),
+            signal: None,
+        });
+    reached(&armed).await;
+    assert!(rig.launch(l).exit_reason.is_none(), "not yet recorded");
+    assert_eq!(
+        get(&rig, &path(t), Some(&rig.owner)).await.outcome(),
+        no_live
+    );
+    armed.go();
+    rig.until("the exit is recorded", || {
+        rig.launch(l).exit_reason.is_some()
+    })
+    .await;
+    rig.srv.stop().await;
+}
+
+/// C1-11: the snapshot waits at most 250 ms of the request's time, and never past the
+/// request's deadline (the test server's 2 s). With time left, a copy not done by 250 ms is
+/// 503 `busy`; a request with 100 ms left takes that as the snapshot's deadline and ends
+/// 408 at it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_deadline() {
+    let rig = Rig::new().await;
+    let (t, l) = rig.spawn_codex(None).await;
+    let entry = rig.sup.entry(l).unwrap();
+    let get_owner = |rig: &Rig| {
+        let req = rig.srv.req("GET", &path(t)).bearer(&rig.owner);
+        support::http::spawn_send(&rig.srv, &req)
+    };
+
+    // Time left: the snapshot's deadline is 250 ms after the request began.
+    let t0 = rig.sup.now();
+    let copy = rig.pauses.arm(Pause::SnapshotCopy);
+    let reply = get_owner(&rig);
+    reached(&copy).await;
+    assert_eq!(
+        *entry.snapshot_deadline.lock().unwrap(),
+        Some(t0 + Duration::from_millis(250))
+    );
+    rig.clock.advance(Duration::from_millis(250));
+    copy.go();
+    let r = reply.await.unwrap();
+    assert_eq!(r.outcome(), (503, Some("busy".to_owned())));
+
+    // 100 ms left when the handler takes the snapshot's deadline: that is the request's.
+    let t0 = rig.sup.now();
+    let read = rig.pauses.arm(Pause::ScreenRead);
+    let copy = rig.pauses.arm(Pause::SnapshotCopy);
+    let reply = get_owner(&rig);
+    reached(&read).await;
+    rig.clock.advance(Duration::from_millis(1_900));
+    read.go();
+    reached(&copy).await;
+    assert_eq!(
+        *entry.snapshot_deadline.lock().unwrap(),
+        Some(t0 + Duration::from_secs(2))
+    );
+    rig.clock.advance(Duration::from_millis(100));
+    copy.go();
+    let r = reply.await.unwrap();
+    assert_eq!(r.outcome(), (408, Some("request_timeout".to_owned())));
     rig.srv.stop().await;
 }

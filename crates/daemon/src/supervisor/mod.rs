@@ -164,6 +164,10 @@ pub enum Pause {
     /// A VT snapshot's task before it copies the screen (blocking; unit tests only).
     #[cfg(test)]
     SnapshotCopy,
+    /// The screen route after the thread read check, before the live lookup and the
+    /// snapshot's deadline (unit tests only).
+    #[cfg(test)]
+    ScreenRead,
 }
 
 /// The test seam of [`Pause`]: the daemon's own is [`NoPauses`].

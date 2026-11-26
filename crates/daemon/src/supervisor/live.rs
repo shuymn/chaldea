@@ -58,6 +58,9 @@ pub(crate) struct LiveLaunch {
     creation_started: AtomicBool,
     /// Set with the stop's seal, under the op lock.
     stop_requested: AtomicBool,
+    /// Set under the op lock when the session leaves its slot for good: a reader that finds
+    /// the lock held then knows there is no session to read.
+    detached: Arc<AtomicBool>,
     published: OnceLock<Published>,
     committed: OnceLock<CommittedStart>,
     /// The records of every seal of this launch.
@@ -66,6 +69,9 @@ pub(crate) struct LiveLaunch {
     /// passed on every kill and close. Empty in the MVP.
     extra: Mutex<Vec<ProcessIdentity>>,
     pub(crate) ops: Ops,
+    /// The deadline of the last `snapshot_before` (unit tests only).
+    #[cfg(test)]
+    pub(crate) snapshot_deadline: Mutex<Option<Instant>>,
 }
 
 /// What the publication set (design §2.3 step 5).
@@ -146,11 +152,14 @@ impl LiveLaunch {
             positional,
             creation_started: AtomicBool::new(false),
             stop_requested: AtomicBool::new(false),
+            detached: Arc::new(AtomicBool::new(false)),
             published: OnceLock::new(),
             committed: OnceLock::new(),
             settled: Mutex::new(Vec::new()),
             extra: Mutex::new(Vec::new()),
             ops: Arc::new(tokio::sync::Mutex::new(None)),
+            #[cfg(test)]
+            snapshot_deadline: Mutex::new(None),
         }
     }
 
@@ -218,6 +227,12 @@ impl LiveLaunch {
     pub(crate) fn seal_for_stop(&self, guard: &mut OpGuard) -> Option<TrackedSession> {
         self.seal(guard);
         self.stop_requested.store(true, Ordering::SeqCst);
+        self.take_session(guard)
+    }
+
+    /// Takes the session out of its slot for good, marking the launch detached first.
+    pub(crate) fn take_session(&self, guard: &mut OpGuard) -> Option<TrackedSession> {
+        self.detached.store(true, Ordering::SeqCst);
         guard.take()
     }
 
@@ -239,11 +254,16 @@ impl LiveLaunch {
     /// screen with the session's own deadline; the join is awaited with `settle_before` until
     /// `deadline`.
     pub(crate) async fn snapshot_before(&self, sup: &Supervisor, deadline: Instant) -> Snapshot {
+        #[cfg(test)]
+        {
+            *lock(&self.snapshot_deadline) = Some(deadline);
+        }
         // Not yet published: the spawn may hold the op lock, and there is no session to read.
         if self.published().is_none() {
             return Snapshot::NoSession;
         }
         let ops = self.ops.clone();
+        let detached = self.detached.clone();
         let real = sup.real(deadline);
         #[cfg(test)]
         let pauses = sup.cfg.pauses.clone();
@@ -254,6 +274,8 @@ impl LiveLaunch {
             // The op lock only while the screen is taken: the copy waits for the VT lock
             // without holding up a stop.
             let screen = match ops.try_lock() {
+                // Held by the op that took the session out (a stop, an exit, the shutdown).
+                Err(_) if detached.load(Ordering::SeqCst) => return Snapshot::NoSession,
                 Err(_) => return Snapshot::Busy,
                 Ok(slot) => match slot.as_ref() {
                     None => return Snapshot::NoSession,
