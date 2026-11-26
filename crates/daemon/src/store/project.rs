@@ -455,6 +455,7 @@ pub(crate) fn apply(p: &mut ProjectionTx<'_>, e: &StoredEvent) -> Result<(), Sto
             )?;
         }
         TypedEvent::MailboxMessage(_)
+        | TypedEvent::LaunchEvidence(_)
         | TypedEvent::AssistantMessage(_)
         | TypedEvent::ToolActivity(_)
         | TypedEvent::VtSnapshotTaken(_)

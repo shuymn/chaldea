@@ -3,4 +3,4 @@
 /**
  * How a stop ended.
  */
-export type StopOutcome = "stopped" | "already_exited";
+export type StopOutcome = "stopped" | "already_exited" | "asserted";

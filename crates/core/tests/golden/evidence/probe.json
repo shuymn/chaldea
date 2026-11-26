@@ -1,0 +1,51 @@
+{
+  "identities": [
+    {
+      "observed": "gone",
+      "pid": 1,
+      "start_time": null
+    },
+    {
+      "observed": "replaced",
+      "pid": 2,
+      "start_time": "2000"
+    },
+    {
+      "observed": "alive",
+      "pid": 3,
+      "start_time": null
+    },
+    {
+      "observed": "unresolved",
+      "pid": 4,
+      "start_time": "4000"
+    },
+    {
+      "observed": "unreadable",
+      "pid": 5,
+      "start_time": null
+    },
+    {
+      "observed": "not_read",
+      "pid": 6,
+      "start_time": "6000"
+    },
+    {
+      "observed": "wait_failed",
+      "pid": 7,
+      "start_time": null
+    },
+    {
+      "observed": "invalid",
+      "pid": 8,
+      "start_time": "8000"
+    }
+  ],
+  "launch_id": "01930000-0000-7000-8000-000000000010",
+  "probe_run": "0193bbbb-0000-4000-8000-000000000001",
+  "source": "probe",
+  "unchecked": [
+    "unrecorded_session_members",
+    "unrecorded_job_and_outside_job"
+  ]
+}

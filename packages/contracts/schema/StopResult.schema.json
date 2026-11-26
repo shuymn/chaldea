@@ -17,6 +17,11 @@
           "const": "already_exited",
           "description": "The launch had already exited with its death confirmed.",
           "type": "string"
+        },
+        {
+          "const": "asserted",
+          "description": "The owner's assertion confirmed the launch's end, now or earlier; only for a request\nwith `assume_dead`.",
+          "type": "string"
         }
       ]
     }

@@ -136,6 +136,20 @@ pub struct StopArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub expected_launch_id: Option<LaunchId>,
+    /// The owner's assertion that the exited launch `expected_launch_id` has ended
+    /// (`docs/design/supervisor-recovery.md` §2.5): an owner token only, with
+    /// `expected_launch_id`. Omitted when false, so a plain stop keeps its canonical form.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[ts(as = "Option<bool>", optional)]
+    pub assume_dead: bool,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes a reference"
+)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The arguments of `close`.
@@ -183,6 +197,9 @@ pub enum StopOutcome {
     Stopped,
     /// The launch had already exited with its death confirmed.
     AlreadyExited,
+    /// The owner's assertion confirmed the launch's end, now or earlier; only for a request
+    /// with `assume_dead`.
+    Asserted,
 }
 
 /// The success body of `stop` (`docs/design/supervisor.md` §2.2). Every field is always
@@ -319,4 +336,41 @@ pub struct InputCancelArgs {
 pub struct InputCommandResult {
     pub input_id: InputId,
     pub state: InputState,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PR10a2-CL-8 `command::stop_args_canonical`: `assume_dead: false` serializes without the
+    /// key, so a plain stop's canonical arguments are 10a1's; `true` is a key of its own.
+    #[test]
+    fn stop_args_canonical() {
+        let t = ThreadId::from_u128(7);
+        let l = LaunchId::from_u128(1);
+        let plain = StopArgs {
+            thread_id: t,
+            expected_launch_id: Some(l),
+            assume_dead: false,
+        };
+        let v = serde_json::to_value(&plain).unwrap();
+        assert!(v.get("assume_dead").is_none(), "{v}");
+        let ten_a1 = serde_json::json!({ "thread_id": t, "expected_launch_id": l });
+        assert_eq!(
+            CanonicalJson::of(&plain).unwrap(),
+            CanonicalJson::of(&ten_a1).unwrap()
+        );
+        let back: StopArgs = serde_json::from_value(ten_a1).unwrap();
+        assert_eq!(back, plain);
+        let asserted = StopArgs {
+            assume_dead: true,
+            ..plain.clone()
+        };
+        let v = serde_json::to_value(&asserted).unwrap();
+        assert_eq!(v["assume_dead"], serde_json::json!(true));
+        assert_ne!(
+            request_identity("stop", &CanonicalJson::of(&plain).unwrap()),
+            request_identity("stop", &CanonicalJson::of(&asserted).unwrap())
+        );
+    }
 }

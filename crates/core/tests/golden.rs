@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chaldea_core::command::{CloseResult, StopOutcome, StopResult};
+use chaldea_core::command::{CloseResult, StopArgs, StopOutcome, StopResult};
 use chaldea_core::event::{
     EventEnvelope, GenericEvent, GenericReason, Source, TranscriptPos, TypedEvent,
 };
@@ -29,13 +29,14 @@ use chaldea_core::ids::{
 use chaldea_core::input::{InputReason, InputState, RejectReason};
 use chaldea_core::payload::{
     ApprovalCorrelation, ApprovalOutcome, ApprovalRequested, ApprovalResolved, AssistantMessage,
-    BlobRef, Component, Content, Encoding, ExitReason, HumanWrite, HumanWriteOrigin, InputCreated,
-    InputEncoding, InputInitialState, InputOrigin, InputStateChanged, LaunchDeathConfirmed,
-    LaunchExited, LaunchReserved, LaunchStarted, MailboxMessage, RawUnknown, RawUnknownReason,
+    BlobRef, Component, Content, Encoding, EvidenceSource, ExitReason, HumanWrite,
+    HumanWriteOrigin, IdentityObservation, InputCreated, InputEncoding, InputInitialState,
+    InputOrigin, InputStateChanged, LaunchDeathConfirmed, LaunchEvidence, LaunchExited,
+    LaunchReserved, LaunchStarted, MailboxMessage, Observed, RawUnknown, RawUnknownReason,
     ReadinessEvidence, ReadinessObserved, SessionBound, SourceKind, SurfaceAction,
     SurfaceActionKind, SurfaceScope, SurfaceUpdate, TaskSet, ThreadClosed, ThreadRegistered,
-    ThreadRole, ToolActivity, ToolPhase, TranscriptGeneration, UserMessage, VtCursor, VtModes,
-    VtSnapshotTaken, WorktreeChanged, WorktreeState,
+    ThreadRole, ToolActivity, ToolPhase, TranscriptGeneration, Unchecked, UserMessage, VtCursor,
+    VtModes, VtSnapshotTaken, WorktreeChanged, WorktreeState,
 };
 use chaldea_core::state::{
     AttentionCause, ProcessState, StatusCause, StatusChanged, TaskState, TurnState,
@@ -440,6 +441,20 @@ fn samples() -> Vec<(StreamId, TypedEvent)> {
                 },
             }),
         ),
+        (
+            thread,
+            TypedEvent::LaunchEvidence(LaunchEvidence {
+                launch_id: LAUNCH,
+                source: EvidenceSource::Probe,
+                identities: vec![IdentityObservation {
+                    pid: 4242,
+                    start_time: Some("1763804700".to_owned()),
+                    observed: Observed::Gone,
+                }],
+                unchecked: vec![Unchecked::UnrecordedJobAndOutsideJob],
+                probe_run: Some("0193bbbb-0000-4000-8000-000000000001".to_owned()),
+            }),
+        ),
     ]
 }
 
@@ -698,6 +713,10 @@ fn golden_round_trip_for_stop_results() {
         (
             "already_exited_on_reread",
             stop(StopOutcome::AlreadyExited, true, false, None, None),
+        ),
+        (
+            "asserted",
+            stop(StopOutcome::Asserted, true, false, None, None),
         ),
     ] {
         round_trip(&format!("commands/stop_result_{name}"), &value);
@@ -1009,4 +1028,80 @@ fn stream_id_and_actor_have_one_spelling() {
         Ok(Actor::Thread(THREAD))
     );
     assert!(Actor::from_str("owner").is_err());
+}
+
+/// `launch_evidence` with every `source`, `observed`, and `unchecked` value, and `null` for an
+/// unrecorded start and for `probe_run` (supervisor-recovery §2.4).
+#[test]
+fn golden_round_trip_for_launch_evidence_values() {
+    let all = [
+        Observed::Gone,
+        Observed::Replaced,
+        Observed::Alive,
+        Observed::Unresolved,
+        Observed::Unreadable,
+        Observed::NotRead,
+        Observed::WaitFailed,
+        Observed::Invalid,
+    ];
+    for (name, source, unchecked, probe_run) in [
+        (
+            "spawn_failed",
+            EvidenceSource::SpawnFailed,
+            vec![Unchecked::NoIdentity, Unchecked::ResultNotReceived],
+            None,
+        ),
+        (
+            "close",
+            EvidenceSource::Close,
+            vec![
+                Unchecked::TreeUnproven,
+                Unchecked::CleanupUnreleased,
+                Unchecked::ResultNotReceived,
+            ],
+            None,
+        ),
+        (
+            "probe",
+            EvidenceSource::Probe,
+            vec![
+                Unchecked::UnrecordedSessionMembers,
+                Unchecked::UnrecordedJobAndOutsideJob,
+            ],
+            Some("0193bbbb-0000-4000-8000-000000000001".to_owned()),
+        ),
+    ] {
+        let value = LaunchEvidence {
+            launch_id: LAUNCH,
+            source,
+            identities: all
+                .iter()
+                .zip(1u32..)
+                .map(|(o, pid)| IdentityObservation {
+                    pid,
+                    start_time: (pid % 2 == 0).then(|| format!("{pid}000")),
+                    observed: *o,
+                })
+                .collect(),
+            unchecked,
+            probe_run,
+        };
+        round_trip(&format!("evidence/{name}"), &value);
+    }
+}
+
+/// `StopArgs`: a plain stop has no `assume_dead` key (10a1's form); an assertion has it
+/// `true` (supervisor-recovery §2.5 "Wire").
+#[test]
+fn golden_round_trip_for_stop_args() {
+    for (name, assume_dead) in [("plain", false), ("assume_dead", true)] {
+        round_trip(
+            &format!("commands/stop_args_{name}"),
+            &StopArgs {
+                thread_id: THREAD,
+                expected_launch_id: Some(LAUNCH),
+                assume_dead,
+            },
+        );
+    }
 }

@@ -453,6 +453,7 @@ impl Client<'_> {
         let args = StopArgs {
             thread_id: t,
             expected_launch_id: None,
+            assume_dead: false,
         };
         match self.command::<_, StopResult>(cutoff, "stop", &args) {
             Ok(v) => {

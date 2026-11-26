@@ -222,9 +222,134 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// 100 ns intervals between 1601-01-01 (the `FILETIME` epoch) and 1970-01-01.
+const FILETIME_UNIX_OFFSET: u64 = 116_444_736_000_000_000;
+
+/// A process PR 21's finder considers for an A29 launch
+/// (`docs/design/supervisor-recovery.md` §2.6), as the finder read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct A29Process<'a> {
+    /// Every thread of the process is suspended.
+    pub suspended: bool,
+    /// The process is in a job the running daemon holds.
+    pub in_daemon_job: bool,
+    /// The process's image path.
+    pub image_path: &'a str,
+    /// The process's creation time as a `FILETIME` (100 ns intervals since 1601-01-01 UTC).
+    pub created_filetime: u64,
+}
+
+/// Whether `p` may be the suspended child an A29 crash left for a launch of `agent` reserved
+/// at `reserved_at_ms` (the `launch_reserved` event's `recorded_at`, milliseconds since the
+/// Unix epoch): suspended; in no job the running daemon holds (it may be in another); its
+/// image file name, compared without case, is the agent's executable name with `.exe`; and
+/// its creation time, truncated to milliseconds, is not before the reservation. A candidate
+/// is never a death proof.
+#[must_use]
+pub fn a29_candidate(agent: Agent, reserved_at_ms: u64, p: &A29Process<'_>) -> bool {
+    let name = p
+        .image_path
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(p.image_path);
+    let exe = match agent {
+        Agent::Claude => "claude.exe",
+        Agent::Codex => "codex.exe",
+    };
+    let Some(created_ms) = p
+        .created_filetime
+        .checked_sub(FILETIME_UNIX_OFFSET)
+        .map(|t| t / 10_000)
+    else {
+        return false;
+    };
+    p.suspended
+        && !p.in_daemon_job
+        && name.eq_ignore_ascii_case(exe)
+        && created_ms >= reserved_at_ms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PR10a2-CL-10 `launch::a29_candidate_rules`.
+    #[test]
+    fn a29_candidate_rules() {
+        use super::{A29Process, a29_candidate};
+        // 2026-11-26T00:00:00.123Z in Unix milliseconds, and the same instant as a FILETIME.
+        let at_ms: u64 = 1_795_651_200_123;
+        let ft = |ms: u64, extra_100ns: u64| (ms * 10_000) + 116_444_736_000_000_000 + extra_100ns;
+        let p = |path, created, suspended, in_daemon_job| A29Process {
+            suspended,
+            in_daemon_job,
+            image_path: path,
+            created_filetime: created,
+        };
+        let codex = r"C:\work\bin\codex.exe";
+        // The same millisecond, with sub-millisecond time after it: accepted.
+        assert!(a29_candidate(
+            Agent::Codex,
+            at_ms,
+            &p(codex, ft(at_ms, 9_999), true, false)
+        ));
+        assert!(a29_candidate(
+            Agent::Codex,
+            at_ms,
+            &p(codex, ft(at_ms, 0), true, false)
+        ));
+        // One millisecond earlier: refused.
+        assert!(!a29_candidate(
+            Agent::Codex,
+            at_ms,
+            &p(codex, ft(at_ms - 1, 9_999), true, false)
+        ));
+        // The image name without case, with `.exe`.
+        assert!(a29_candidate(
+            Agent::Codex,
+            at_ms,
+            &p(r"D:\x\Codex.EXE", ft(at_ms, 0), true, false)
+        ));
+        assert!(a29_candidate(
+            Agent::Claude,
+            at_ms,
+            &p("claude.exe", ft(at_ms, 0), true, false)
+        ));
+        assert!(!a29_candidate(
+            Agent::Codex,
+            at_ms,
+            &p(r"C:\work\node.exe", ft(at_ms, 0), true, false)
+        ));
+        assert!(!a29_candidate(
+            Agent::Codex,
+            at_ms,
+            &p(r"C:\work\codex", ft(at_ms, 0), true, false)
+        ));
+        assert!(!a29_candidate(
+            Agent::Claude,
+            at_ms,
+            &p(codex, ft(at_ms, 0), true, false)
+        ));
+        // In another job (not one the daemon holds): accepted; in a daemon job: refused.
+        assert!(a29_candidate(
+            Agent::Codex,
+            at_ms,
+            &p(codex, ft(at_ms, 0), true, false)
+        ));
+        assert!(!a29_candidate(
+            Agent::Codex,
+            at_ms,
+            &p(codex, ft(at_ms, 0), true, true)
+        ));
+        // A running process: refused.
+        assert!(!a29_candidate(
+            Agent::Codex,
+            at_ms,
+            &p(codex, ft(at_ms, 0), false, false)
+        ));
+        // A creation time before the Unix epoch: refused.
+        assert!(!a29_candidate(Agent::Codex, 0, &p(codex, 5, true, false)));
+    }
 
     const LAUNCH: LaunchId = LaunchId::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
     const THREAD: ThreadId = ThreadId::from_u128(7);
