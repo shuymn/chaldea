@@ -6,8 +6,7 @@ mod support;
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use chaldea_core::ids::StreamId;
@@ -16,6 +15,7 @@ use chaldea_daemon::store::{
     BlobDownload, BlobInput, ContentError, LargeBlob, MAX_BLOB_BYTES, Prepared, SPOOL_FILE_PREFIX,
     StoreError, WriteError,
 };
+use futures_util::FutureExt as _;
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 use support::{TestStore, raw_unknown, registered, thread};
@@ -390,34 +390,46 @@ fn unused_spools_leave_no_file() {
     assert_eq!(spool_files(&s).len(), 1);
     // The writer's clock runs ahead, so the job expires in the queue.
     s.clock.lead(Duration::from_secs(60));
-    let dropped = Arc::new(AtomicBool::new(false));
-    let ticket = s
+    let (entered_tx, entered) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let mut ticket = s
         .store()
         .submit(Instant::now(), {
             let e = carrying(StreamId::Host, "late", p);
-            let slow = SlowDrop(dropped.clone());
+            let blocked = BlockedDrop {
+                entered: entered_tx,
+                release: release_rx,
+            };
             move |tx| {
-                let _slow = slow;
+                let _blocked = blocked;
                 Ok(tx.append(vec![e])?)
             }
         })
         .unwrap();
-    assert!(matches!(ticket.blocking_wait(), Err(WriteError::Expired)));
-    // Observed as the reply arrives: the job, slow to drop, was dropped before it.
+    entered
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the expired job was not dropped");
+    // The job's drop is under way: the reply waits for it.
     assert!(
-        dropped.load(Ordering::SeqCst),
+        (&mut ticket).now_or_never().is_none(),
         "the reply came before the drop"
     );
+    release.send(()).unwrap();
+    assert!(matches!(ticket.blocking_wait(), Err(WriteError::Expired)));
     assert!(spool_files(&s).is_empty());
     s.clock.lead(Duration::ZERO);
 }
 
-/// A value whose drop takes 300 ms, then sets its flag.
-struct SlowDrop(Arc<AtomicBool>);
+/// A value whose drop reports that it began, then blocks until released (or until the
+/// releasing side is gone).
+struct BlockedDrop {
+    entered: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
 
-impl Drop for SlowDrop {
+impl Drop for BlockedDrop {
     fn drop(&mut self) {
-        std::thread::sleep(Duration::from_millis(300));
-        self.0.store(true, Ordering::SeqCst);
+        let _ = self.entered.send(());
+        let _ = self.release.recv();
     }
 }
