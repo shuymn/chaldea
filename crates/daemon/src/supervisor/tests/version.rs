@@ -1,7 +1,9 @@
 //! The CLI version probe (C1 D11): `claude --version` before the reservation, its version in
 //! `launch_started` and on the launch row; a failure, an exit other than 0, output over the
-//! cap, or the deadline records `null`. The child is FakeCli answering `--version` (both
-//! OSes), and the deadline is passed on the rig's stopped clock, not in real time.
+//! cap, or the deadline records `null`; the child's whole tree is gone when the probe returns.
+//! The child is FakeCli answering `--version` (both OSes), held at a start gate until the test
+//! has seen it tracked, and the deadline is passed on the rig's stopped clock, not in real
+//! time.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -121,10 +123,16 @@ async fn version_failure_is_null() {
 }
 
 /// Runs the probe of FakeCli with `flags` on the rig's stopped clock, its deadline
-/// [`VERSION_PROBE`] ahead; `at_spawn` runs once the child is tracked.
+/// [`VERSION_PROBE`] ahead. The child waits at its gate (`--version-gate`), so it stays tracked
+/// until the test has seen it: then the gate opens and `at_spawn` runs.
 async fn probed(rig: &Rig, flags: &[&str], at_spawn: impl FnOnce()) -> Option<String> {
     rig.clock.stop();
-    let argv = fake_program(flags);
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("gate");
+    let gate_arg = gate.to_string_lossy().into_owned();
+    let mut all = flags.to_vec();
+    all.extend(["--version-gate", &gate_arg]);
+    let argv = fake_program(&all);
     let sup = rig.sup.clone();
     let deadline = sup.now() + VERSION_PROBE;
     let mut task = tokio::task::spawn_blocking(move || probe(&sup, &argv, deadline));
@@ -132,6 +140,7 @@ async fn probed(rig: &Rig, flags: &[&str], at_spawn: impl FnOnce()) -> Option<St
         rig.sup.tracker.count() == 1
     })
     .await;
+    std::fs::write(&gate, b"").unwrap();
     at_spawn();
     // Real time bounds only a hang: on the stopped clock the deadline passes only when moved.
     // At the bound, the clock is moved past the deadline so the probe ends and the test fails
@@ -152,6 +161,46 @@ async fn nothing_left(rig: &Rig) {
     .await;
 }
 
+/// A pid file FakeCli writes once its descendant started (`--version-pidfile`).
+struct Pidfile(tempfile::TempDir);
+
+impl Pidfile {
+    fn new() -> Self {
+        Pidfile(tempfile::tempdir().unwrap())
+    }
+
+    fn arg(&self) -> String {
+        self.0.path().join("pid").to_string_lossy().into_owned()
+    }
+
+    /// Waits (real time, at most 30 s) until FakeCli wrote the pid.
+    fn wait(&self) {
+        let end = std::time::Instant::now() + Duration::from_secs(30);
+        while std::fs::read_to_string(self.0.path().join("pid")).map_or(true, |t| t.is_empty()) {
+            assert!(
+                std::time::Instant::now() < end,
+                "no descendant pid within 30 s"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The descendant's pid: FakeCli wrote it, so the descendant started.
+    fn pid(&self) -> u32 {
+        let text = std::fs::read_to_string(self.0.path().join("pid"))
+            .expect("FakeCli started its descendant and wrote its pid");
+        text.trim().parse().unwrap()
+    }
+}
+
+/// The descendant with pid `pid` has ended (the probe killed the child's tree).
+async fn descendant_gone(rig: &Rig, pid: u32) {
+    rig.until("the probe's descendant is gone", || {
+        matches!(chaldea_pty_runtime::host::process_identity(pid), Ok(None))
+    })
+    .await;
+}
+
 /// A child that does not exit gives `None` once the deadline passes (the clock moved to it),
 /// killed and reaped; before that, nothing returns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -166,18 +215,80 @@ async fn version_timeout() {
     rig.srv.stop().await;
 }
 
+/// A child still running at the deadline, with a descendant, gives `None`, its whole tree
+/// killed: the deadline passes (the clock moved) once the descendant has started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn version_timeout_kills_tree() {
+    let rig = Rig::new().await;
+    let pids = Pidfile::new();
+    let v = probed(
+        &rig,
+        &[
+            "--version-text",
+            CLAUDE_VERSION,
+            "--version-descendant",
+            "--version-pidfile",
+            &pids.arg(),
+            "--version-linger-ms",
+            "600000",
+        ],
+        || {
+            pids.wait();
+            rig.clock.advance(VERSION_PROBE);
+        },
+    )
+    .await;
+    assert_eq!(v, None);
+    descendant_gone(&rig, pids.pid()).await;
+    nothing_left(&rig).await;
+    rig.srv.stop().await;
+}
+
 /// A descendant holding stdout after the child exited 0 does not delay the probe: the
-/// version, on a clock that never reaches the deadline.
+/// version, on a clock that never reaches the deadline, and the descendant killed with the
+/// child's tree.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn version_descendant_holds_stdout() {
     let rig = Rig::new().await;
+    let pids = Pidfile::new();
     let v = probed(
         &rig,
-        &["--version-text", CLAUDE_VERSION, "--version-descendant"],
+        &[
+            "--version-text",
+            CLAUDE_VERSION,
+            "--version-descendant",
+            "--version-pidfile",
+            &pids.arg(),
+        ],
         || {},
     )
     .await;
     assert_eq!(v.as_deref(), Some("2.1.331"));
+    descendant_gone(&rig, pids.pid()).await;
+    nothing_left(&rig).await;
+    rig.srv.stop().await;
+}
+
+/// A descendant that keeps writing stdout after the child exited 0 is killed before the read:
+/// the version, and the descendant gone once the probe returned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn version_descendant_writing_is_killed() {
+    let rig = Rig::new().await;
+    let pids = Pidfile::new();
+    let v = probed(
+        &rig,
+        &[
+            "--version-text",
+            CLAUDE_VERSION,
+            "--version-descendant-writes",
+            "--version-pidfile",
+            &pids.arg(),
+        ],
+        || {},
+    )
+    .await;
+    assert_eq!(v.as_deref(), Some("2.1.331"));
+    descendant_gone(&rig, pids.pid()).await;
     nothing_left(&rig).await;
     rig.srv.stop().await;
 }
@@ -186,6 +297,7 @@ async fn version_descendant_holds_stdout() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn version_nonzero_exit_is_immediate() {
     let rig = Rig::new().await;
+    let pids = Pidfile::new();
     let v = probed(
         &rig,
         &[
@@ -194,11 +306,14 @@ async fn version_nonzero_exit_is_immediate() {
             "--version-exit",
             "3",
             "--version-descendant",
+            "--version-pidfile",
+            &pids.arg(),
         ],
         || {},
     )
     .await;
     assert_eq!(v, None);
+    descendant_gone(&rig, pids.pid()).await;
     nothing_left(&rig).await;
     rig.srv.stop().await;
 }

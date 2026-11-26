@@ -1,19 +1,22 @@
 //! The CLI version (C1 D11): `<program> --version` once per Claude spawn or resume, before the
 //! reservation, as the workspace probe runs git (a [`TrackedChild`] under the spawn lock, the
-//! tracker, a deadline). The child's stdout is an anonymous temporary file, not a pipe, so no
-//! read can block and nothing is left behind when the probe ends: a descendant holding stdout
-//! never delays it. One deadline covers the child's exit, the read of its output, and the
-//! result's adoption. A nonzero exit, output over [`MAX_OUTPUT`], or the deadline gives `None`
-//! at once (the child killed); the launch proceeds.
+//! tracker, a deadline). The child runs in its own process tree (`host::own_tree`: a process
+//! group, or a job it joins before running), and its stdout is an anonymous temporary file,
+//! not a pipe, so no read can block and a descendant holding stdout never delays the probe.
+//! Once the child exits, its whole tree is killed before the file is read, at an offset, so
+//! nothing writes the file after the read; every other end kills the tree too. One deadline
+//! covers the child's exit, the read, and the result's adoption. A nonzero exit, output over
+//! [`MAX_OUTPUT`], or the deadline gives `None` at once; the launch proceeds.
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chaldea_core::ids::Agent;
+use chaldea_pty_runtime::host::ProcessTree;
 
 use super::tracker::TrackedChild;
 use super::{Supervisor, lock};
@@ -44,11 +47,14 @@ impl VersionLeft {
     }
 }
 
-/// Owns the child; its drop, on every path including a panic, kills an unreaped child and
-/// moves it with its token into [`VersionLeft`].
+/// Owns the child and its tree; its drop, on every path including a panic, kills the tree of
+/// an unreaped child (its group id still its own), then the child, and moves the child with its
+/// token into [`VersionLeft`] when it cannot be reaped at once. Dropping the tree closes a
+/// Windows job, which kills what is left in it.
 struct Held {
     left: Arc<VersionLeft>,
     child: Option<TrackedChild>,
+    tree: Option<ProcessTree>,
 }
 
 impl Drop for Held {
@@ -58,6 +64,9 @@ impl Drop for Held {
         };
         if c.reaped() {
             return;
+        }
+        if let Some(t) = &self.tree {
+            t.kill();
         }
         c.kill();
         if c.try_reap().is_none() {
@@ -89,14 +98,14 @@ fn before<T>(sup: &Supervisor, deadline: Instant, f: impl FnOnce() -> T) -> Opti
 /// child exited 0 with at most [`MAX_OUTPUT`] bytes of output, all before the deadline.
 pub(crate) fn probe(sup: &Supervisor, argv: &[OsString], deadline: Instant) -> Option<String> {
     let (program, lead) = argv.split_first()?;
-    let mut out = tempfile::tempfile().ok()?;
+    let out = tempfile::tempfile().ok()?;
     let mut cmd = Command::new(program);
     cmd.args(lead)
         .arg("--version")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .stdout(Stdio::from(out.try_clone().ok()?));
-    chaldea_pty_runtime::host::no_console_window(&mut cmd);
+    chaldea_pty_runtime::host::own_tree(&mut cmd);
     let child =
         TrackedChild::spawn(&mut cmd, &sup.tracker, sup.real(deadline), sup.pauses())?.ok()?;
     // The command holds the child's handle to the file: drop it, so only the child keeps it.
@@ -104,17 +113,28 @@ pub(crate) fn probe(sup: &Supervisor, argv: &[OsString], deadline: Instant) -> O
     let mut held = Held {
         left: sup.version_left.clone(),
         child: Some(child),
+        tree: None,
     };
-    let c = held.child.as_mut()?;
+    // On Windows the child waits suspended until it is in its job; a failure leaves it to
+    // `Held`, which kills it.
+    held.tree = Some(held.child.as_ref()?.adopt_tree()?.ok()?);
+    let (Some(c), Some(tree)) = (held.child.as_mut(), held.tree.as_ref()) else {
+        return None;
+    };
     loop {
         if !sup.tracker.accepting() {
             return None;
         }
-        if let Some(status) = before(sup, deadline, || c.try_reap())? {
-            if !status.success() || out.metadata().ok()?.len() > MAX_OUTPUT {
+        if before(sup, deadline, || c.exited(tree))? {
+            // The tree goes before the read: no descendant writes the file after it.
+            tree.kill();
+            if !c.try_reap()?.success() {
                 return None;
             }
-            let text = read_head(&mut out)?;
+            let text = read_head(&out)?;
+            if text.len() > usize::try_from(MAX_OUTPUT).ok()? {
+                return None;
+            }
             return before(sup, deadline, || parse(&text))?;
         }
         if out.metadata().ok()?.len() > MAX_OUTPUT {
@@ -124,12 +144,29 @@ pub(crate) fn probe(sup: &Supervisor, argv: &[OsString], deadline: Instant) -> O
     }
 }
 
-/// The file's first [`MAX_OUTPUT`] bytes.
-fn read_head(f: &mut File) -> Option<Vec<u8>> {
-    f.seek(SeekFrom::Start(0)).ok()?;
-    let mut buf = Vec::new();
-    f.take(MAX_OUTPUT).read_to_end(&mut buf).ok()?;
+/// The file's first [`MAX_OUTPUT`] + 1 bytes (fewer at its end), each read at its offset.
+fn read_head(f: &File) -> Option<Vec<u8>> {
+    let mut buf = vec![0; usize::try_from(MAX_OUTPUT).ok()? + 1];
+    let mut n = 0;
+    while n < buf.len() {
+        let k = read_at(f, &mut buf[n..], u64::try_from(n).ok()?).ok()?;
+        if k == 0 {
+            break;
+        }
+        n += k;
+    }
+    buf.truncate(n);
     Some(buf)
+}
+
+#[cfg(unix)]
+fn read_at(f: &File, buf: &mut [u8], at: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(f, buf, at)
+}
+
+#[cfg(windows)]
+fn read_at(f: &File, buf: &mut [u8], at: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(f, buf, at)
 }
 
 impl Supervisor {

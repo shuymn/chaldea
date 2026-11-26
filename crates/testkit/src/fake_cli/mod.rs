@@ -9,6 +9,8 @@
 //!                  [--session-id <id>] [--nested] [--nested-child] [--script <json>]
 //!                  [--version-text <text>] [--version-exit <n>] [--version-sleep-ms <n>]
 //!                  [--version-flood <n>] [--version-linger-ms <n>] [--version-descendant]
+//!                  [--version-descendant-writes] [--version-pidfile <path>]
+//!                  [--version-gate <path>]
 //!                  [-- <launch argument>...]
 //! ```
 //!
@@ -195,6 +197,10 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
                 o.version.linger_ms = value()?.parse().map_err(|e| format!("{flag}: {e}"))?;
             }
             "--version-descendant" => o.version.descendant = true,
+            "--version-descendant-writes" => o.version.descendant_writes = true,
+            "--version-trickle" => o.version.trickle = true,
+            "--version-pidfile" => o.version.pidfile = Some(value()?.into()),
+            "--version-gate" => o.version.gate = Some(value()?.into()),
             "--" => {
                 let rest: Vec<String> = it.by_ref().collect();
                 o.print_version = rest.iter().any(|a| a == "--version");

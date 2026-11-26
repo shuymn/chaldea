@@ -24,6 +24,7 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -36,9 +37,9 @@ use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHan
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, GetProcessTimes,
-    InitializeProcThreadAttributeList, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    InitializeProcThreadAttributeList, OpenProcess, OpenThread, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, THREAD_SUSPEND_RESUME, TerminateProcess,
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
@@ -177,6 +178,15 @@ pub(crate) const KILL_ON_JOB_CLOSE: u32 = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 pub(crate) fn assign(job: &OwnedHandle, process: &OwnedHandle) -> io::Result<()> {
     // SAFETY: both handles are borrowed and valid.
     if unsafe { AssignProcessToJobObject(raw(job), raw(process)) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// [`assign`] for a process handle another owner holds (a `std::process::Child`).
+pub(crate) fn assign_borrowed(job: &OwnedHandle, process: BorrowedHandle<'_>) -> io::Result<()> {
+    // SAFETY: both handles are borrowed and valid for the call.
+    if unsafe { AssignProcessToJobObject(raw(job), raw(&process)) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -635,6 +645,40 @@ pub(crate) fn process_snapshot() -> io::Result<Vec<SnapshotEntry>> {
     let err = io::Error::last_os_error();
     if err.raw_os_error() == Some(ERROR_NO_MORE_FILES) {
         Ok(out)
+    } else {
+        Err(err)
+    }
+}
+
+/// Resumes every thread of process `pid` once, through one
+/// `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)`: for a child created with `CREATE_SUSPENDED`,
+/// its primary thread. The number of threads resumed.
+pub(crate) fn resume_threads(pid: u32) -> io::Result<u32> {
+    // SAFETY: plain call; the result is checked (INVALID_HANDLE_VALUE) before wrapping.
+    let snap = owned(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) })?;
+    let mut e = THREADENTRY32 {
+        dwSize: len_u32(size_of::<THREADENTRY32>()),
+        ..THREADENTRY32::default()
+    };
+    let mut resumed = 0;
+    // SAFETY: the snapshot handle is borrowed and valid; `e` is a local with `dwSize` set.
+    let mut ok = unsafe { Thread32First(raw(&snap), &raw mut e) };
+    while ok != 0 {
+        if e.th32OwnerProcessID == pid {
+            // SAFETY: plain call; the result is checked before wrapping.
+            let thread = owned(unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, e.th32ThreadID) })?;
+            // SAFETY: the thread handle is borrowed and valid.
+            if unsafe { ResumeThread(raw(&thread)) } == u32::MAX {
+                return Err(io::Error::last_os_error());
+            }
+            resumed += 1;
+        }
+        // SAFETY: as for `Thread32First`.
+        ok = unsafe { Thread32Next(raw(&snap), &raw mut e) };
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(ERROR_NO_MORE_FILES) {
+        Ok(resumed)
     } else {
         Err(err)
     }
