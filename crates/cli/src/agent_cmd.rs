@@ -1,8 +1,12 @@
 //! `chaldea spawn`, `resume`, `stop`, `close`, and `wait` (docs/design/supervisor.md §2.2,
 //! SD16), and `send`, `ready`, `key`, `input resolve`, and `input cancel`
-//! (docs/design/supervisor-send.md §2.2): each command is one `POST /api/commands/{name}` with one `command_id`, sent again
-//! unchanged on a transport failure, `408`, `503`, or `409 in_progress` until one cutoff; the
-//! reads are `GET /api/threads/{thread_id}` under the same rules.
+//! (docs/design/supervisor-send.md §2.2): each command is one `POST /api/commands/{name}` with one
+//! `command_id`, sent again unchanged on a transport failure, `408`, `503`, or `409 in_progress`
+//! until one cutoff; the reads are `GET /api/threads/{thread_id}` under the same rules.
+//!
+//! `inspect` (C1 D2) sends no command: it reads the thread's snapshot with one
+//! `GET /api/events`, its summary only when the snapshot cannot be read, then
+//! `GET /api/threads/{thread_id}/screen`.
 
 use std::cell::Cell;
 use std::io::{self, Write};
@@ -91,6 +95,10 @@ pub(crate) struct Client<'a> {
     pub token: String,
     pub now: &'a dyn Fn() -> Instant,
     pub period: Duration,
+    /// An error a test injects in place of the request to this path, at the request's
+    /// boundary (unit tests only).
+    #[cfg(test)]
+    pub fault: &'a dyn Fn(&str) -> Option<io::ErrorKind>,
 }
 
 /// Why an exchange ended without a response to adopt.
@@ -128,6 +136,8 @@ impl From<End> for CommandEnd {
 /// A request to send, the same bytes on every attempt.
 enum Req<'a> {
     Get(&'a str),
+    /// A `GET` whose response body may be up to this many bytes.
+    GetUpTo(&'a str, usize),
     Post(&'a str, &'a [u8]),
 }
 
@@ -157,6 +167,20 @@ impl Client<'_> {
         run: Option<&str>,
         decide: &mut dyn FnMut(Response) -> Option<Result<T, End>>,
     ) -> Result<T, End> {
+        self.exchange_noting(cutoff, req, daemon_required, run, &|_| {}, decide)
+    }
+
+    /// [`Client::exchange_in`] that shows `note` each transport failure it sends the request
+    /// again after.
+    fn exchange_noting<T>(
+        &self,
+        cutoff: Instant,
+        req: &Req<'_>,
+        daemon_required: bool,
+        run: Option<&str>,
+        note: &dyn Fn(&io::Error),
+        decide: &mut dyn FnMut(Response) -> Option<Result<T, End>>,
+    ) -> Result<T, End> {
         let same_run = |found: &Result<Found, String>| match (run, found) {
             (None, _) => true,
             (Some(r), Ok(Found::Port(_, i))) => i == r,
@@ -178,14 +202,26 @@ impl Client<'_> {
                 Err(m) => return Some(Err(End::Fail(m))),
             };
             let token = Some(self.token.as_str());
-            let r = match req {
+            let send = || match req {
                 Req::Get(path) => client::request(port, "GET", path, token, cutoff),
+                Req::GetUpTo(path, max) => {
+                    client::request_up_to(port, "GET", path, token, cutoff, *max)
+                }
                 Req::Post(path, body) => client::post_json(port, path, token, body, cutoff),
             };
+            #[cfg(test)]
+            let send = || {
+                let (Req::Get(path) | Req::GetUpTo(path, _) | Req::Post(path, _)) = req;
+                (self.fault)(path).map_or_else(send, |kind| Err(io::Error::from(kind)))
+            };
+            let r = send();
             match r {
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => Some(Err(End::Timeout)),
                 Err(e) if client::is_body_too_large(&e) => Some(Err(End::TooLarge)),
-                Err(e) if transient(e.kind()) => None,
+                Err(e) if transient(e.kind()) => {
+                    note(&e);
+                    None
+                }
                 Err(e) => Some(Err(End::Fail(format!("the request failed: {e}")))),
                 Ok(r) => {
                     let decided = decide(r);
@@ -287,6 +323,14 @@ fn code(r: &Response) -> Option<ErrorCode> {
     serde_json::from_slice::<ErrorBody>(&r.body)
         .ok()
         .map(|b| b.code)
+}
+
+/// A wire value's text: a string as itself, any other value as JSON.
+fn wire<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned))
+        .unwrap_or_default()
 }
 
 fn code_name(r: &Response) -> String {
@@ -830,6 +874,8 @@ fn connect<'a>(
             token,
             now,
             period: PERIOD,
+            #[cfg(test)]
+            fault: &|_| None,
         }),
         Err(m) => {
             say(&mut io::stderr(), &m);
@@ -885,6 +931,10 @@ pub(crate) enum Verb {
         thread: ThreadId,
         until: Until,
         timeout: Duration,
+    },
+    Inspect {
+        thread: ThreadId,
+        json: bool,
     },
 }
 
@@ -964,9 +1014,11 @@ pub(crate) fn run(dir: &Path, verb: Verb) -> ExitCode {
             until,
             timeout,
         } => c.wait(thread, until, timeout, out, err),
+        Verb::Inspect { thread, json } => c.inspect(thread, json, out, err),
     }
 }
 
+mod inspect;
 mod preview;
 
 #[cfg(test)]

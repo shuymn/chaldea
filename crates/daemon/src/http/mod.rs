@@ -66,7 +66,7 @@ pub use upgrade::{ShutdownSignal, UpgradeGrant, UpgradedSocket};
 pub(crate) use auth::{TOKEN_PREFIX, has_secret_form, verify_in_read};
 pub(crate) use ctx::{OnReply, until_deadline};
 pub(crate) use error::refused;
-pub(crate) use sync_api::{json, no_query};
+pub(crate) use sync_api::{json, no_query, readable_summary, thread_in_path};
 // The seams for components that write without a request (the supervisor's ops).
 pub(crate) use {
     auth::mint_token,

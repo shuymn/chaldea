@@ -1144,7 +1144,7 @@ pub(crate) async fn exit_op(
         return;
     }
     entry.seal(&guard);
-    let Some(tracked) = guard.take() else {
+    let Some(tracked) = entry.take_session(&mut guard) else {
         return;
     };
     let unwound = UnrecordedOnUnwind { sup: &sup, launch };

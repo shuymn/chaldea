@@ -250,6 +250,14 @@ pub static ROUTES: &[RouteSpec] = {
             10,
         ),
         get(
+            crate::supervisor::SCREEN_PATH,
+            M::Read,
+            O::AbsentOrMatching,
+            C::Bearer(READERS),
+            A::Fixed(Action::ReadStream),
+            13,
+        ),
+        get(
             "/api/worktrees",
             M::Read,
             O::AbsentOrMatching,

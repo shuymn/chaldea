@@ -33,7 +33,9 @@ use chaldea_core::http::{
     CommandRequest, ErrorBody, PairCodeResponse, PairRequest, PairResponse, ThreadsResponse,
     WorktreesResponse, WsTicketRequest, WsTicketResponse,
 };
-use chaldea_core::sync::{EventsResponse, WsClientMessage, WsServerMessage};
+use chaldea_core::sync::{
+    EventsResponse, InspectOutput, ScreenResponse, WsClientMessage, WsServerMessage,
+};
 use schemars::JsonSchema;
 use serde_json::Value;
 use ts_rs::{Config, TS};
@@ -138,6 +140,8 @@ fn generate(out: &Path) -> (PathBuf, PathBuf) {
     export_ts::<InputResolveArgs>(&cfg);
     export_ts::<InputCancelArgs>(&cfg);
     export_ts::<InputCommandResult>(&cfg);
+    export_ts::<ScreenResponse>(&cfg);
+    export_ts::<InspectOutput>(&cfg);
     trim_line_ends(&ts);
 
     export_schema::<EventEnvelope>(&schema);
@@ -165,6 +169,8 @@ fn generate(out: &Path) -> (PathBuf, PathBuf) {
     export_schema::<InputResolveArgs>(&schema);
     export_schema::<InputCancelArgs>(&schema);
     export_schema::<InputCommandResult>(&schema);
+    export_schema::<ScreenResponse>(&schema);
+    export_schema::<InspectOutput>(&schema);
 
     (ts, schema)
 }

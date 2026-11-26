@@ -284,6 +284,7 @@ dependencies = [
  "chaldea-daemon",
  "chaldea-pty-runtime",
  "clap",
+ "jsonschema",
  "rustix",
  "serde",
  "serde_json",

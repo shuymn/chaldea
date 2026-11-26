@@ -208,6 +208,15 @@ const INVENTORY: &[Row] = &[
         404,
         Some("not_found"),
     ),
+    row(
+        "GET",
+        "/api/threads/{thread_id}/screen",
+        "/api/threads/00000000-0000-0000-0000-000000000001/screen",
+        Read,
+        AbsentOrMatching,
+        Cred::Bearer(READ_KINDS),
+        Some(Action::ReadStream),
+    ),
     reaches(
         row(
             "GET",

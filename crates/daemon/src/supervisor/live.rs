@@ -58,6 +58,9 @@ pub(crate) struct LiveLaunch {
     creation_started: AtomicBool,
     /// Set with the stop's seal, under the op lock.
     stop_requested: AtomicBool,
+    /// Set under the op lock when the session leaves its slot for good: a reader that finds
+    /// the lock held then knows there is no session to read.
+    detached: Arc<AtomicBool>,
     published: OnceLock<Published>,
     committed: OnceLock<CommittedStart>,
     /// The records of every seal of this launch.
@@ -66,6 +69,9 @@ pub(crate) struct LiveLaunch {
     /// passed on every kill and close. Empty in the MVP.
     extra: Mutex<Vec<ProcessIdentity>>,
     pub(crate) ops: Ops,
+    /// The deadline of the last `snapshot_before` (unit tests only).
+    #[cfg(test)]
+    pub(crate) snapshot_deadline: Mutex<Option<Instant>>,
 }
 
 /// What the publication set (design §2.3 step 5).
@@ -90,6 +96,29 @@ pub(crate) enum SessionError {
     Gone,
     /// The lock was not taken by the deadline.
     Busy,
+}
+
+/// What [`LiveLaunch::snapshot_before`] got.
+#[derive(Debug)]
+pub(crate) enum Snapshot {
+    Taken(chaldea_pty_runtime::Snapshot),
+    /// No session in the slot: not yet published, or gone (exit recorded or being recorded).
+    NoSession,
+    /// Past the deadline, the op lock held, the VT lock not taken in time, or no answer in
+    /// time.
+    Busy,
+    /// The VT failed (or the copy panicked): no snapshot will be taken.
+    VtFailed,
+}
+
+impl Snapshot {
+    /// The snapshot, if one was taken.
+    pub(crate) fn taken(self) -> Option<chaldea_pty_runtime::Snapshot> {
+        match self {
+            Snapshot::Taken(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,11 +152,14 @@ impl LiveLaunch {
             positional,
             creation_started: AtomicBool::new(false),
             stop_requested: AtomicBool::new(false),
+            detached: Arc::new(AtomicBool::new(false)),
             published: OnceLock::new(),
             committed: OnceLock::new(),
             settled: Mutex::new(Vec::new()),
             extra: Mutex::new(Vec::new()),
             ops: Arc::new(tokio::sync::Mutex::new(None)),
+            #[cfg(test)]
+            snapshot_deadline: Mutex::new(None),
         }
     }
 
@@ -195,6 +227,12 @@ impl LiveLaunch {
     pub(crate) fn seal_for_stop(&self, guard: &mut OpGuard) -> Option<TrackedSession> {
         self.seal(guard);
         self.stop_requested.store(true, Ordering::SeqCst);
+        self.take_session(guard)
+    }
+
+    /// Takes the session out of its slot for good, marking the launch detached first.
+    pub(crate) fn take_session(&self, guard: &mut OpGuard) -> Option<TrackedSession> {
+        self.detached.store(true, Ordering::SeqCst);
         guard.take()
     }
 
@@ -214,32 +252,53 @@ impl LiveLaunch {
     /// (send §2.9 D2): a blocking task that, once running and before `deadline`, takes the op
     /// lock with one `try_lock`, takes the session's screen, releases the lock, and copies the
     /// screen with the session's own deadline; the join is awaited with `settle_before` until
-    /// `deadline`. `None`: past the deadline, the op lock held, no session, the VT failed or
-    /// its lock not taken in time, or no answer in time.
-    pub(crate) async fn snapshot_before(
-        &self,
-        sup: &Supervisor,
-        deadline: Instant,
-    ) -> Option<chaldea_pty_runtime::Snapshot> {
+    /// `deadline`.
+    pub(crate) async fn snapshot_before(&self, sup: &Supervisor, deadline: Instant) -> Snapshot {
+        #[cfg(test)]
+        {
+            *lock(&self.snapshot_deadline) = Some(deadline);
+        }
+        // Not yet published: the spawn may hold the op lock, and there is no session to read.
+        if self.published().is_none() {
+            return Snapshot::NoSession;
+        }
         let ops = self.ops.clone();
+        let detached = self.detached.clone();
         let real = sup.real(deadline);
         #[cfg(test)]
         let pauses = sup.cfg.pauses.clone();
         let task = sup.rt.spawn_blocking(move || {
             if Instant::now() >= real {
-                return None;
+                return Snapshot::Busy;
             }
             // The op lock only while the screen is taken: the copy waits for the VT lock
             // without holding up a stop.
-            let screen = ops.try_lock().ok()?.as_ref()?.screen();
+            let screen = match ops.try_lock() {
+                // Held by the op that took the session out (a stop, an exit, the shutdown).
+                Err(_) if detached.load(Ordering::SeqCst) => return Snapshot::NoSession,
+                Err(_) => return Snapshot::Busy,
+                Ok(slot) => match slot.as_ref() {
+                    None => return Snapshot::NoSession,
+                    Some(s) => s.screen(),
+                },
+            };
             #[cfg(test)]
             pauses.blocking(super::Pause::SnapshotCopy);
-            screen.snapshot(real).ok()
+            match screen.snapshot(real) {
+                Ok(s) => Snapshot::Taken(s),
+                Err(_) if screen.vt_failed() => Snapshot::VtFailed,
+                Err(_) => Snapshot::Busy,
+            }
         });
-        settle_before(|| sup.now(), deadline, sup.timer(deadline), task)
+        match settle_before(|| sup.now(), deadline, sup.timer(deadline), task)
             .await
-            .in_time()?
-            .ok()?
+            .in_time()
+        {
+            Some(Ok(s)) => s,
+            None => Snapshot::Busy,
+            // The task panicked.
+            Some(Err(_)) => Snapshot::VtFailed,
+        }
     }
 
     /// Takes the op lock by `deadline` (supervisor clock) and runs `f` inline; `f` must not
