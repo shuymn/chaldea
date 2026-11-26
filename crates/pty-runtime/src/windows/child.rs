@@ -126,7 +126,11 @@ struct RealJobOs<'a> {
     in_kill: &'a Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
-impl ProcessOs for RealJobOs<'_> {
+/// The process calls over the real OS, with no job handle: the owned engine's through
+/// [`RealJobOs`], and the orphan loop's (`orphan::kill_recorded`).
+pub(crate) struct RealProcessOs;
+
+impl ProcessOs for RealProcessOs {
     type Held = OwnedHandle;
 
     fn now(&self) -> Instant {
@@ -155,6 +159,34 @@ impl ProcessOs for RealJobOs<'_> {
 
     fn terminate(&self, h: &OwnedHandle) -> io::Result<()> {
         sys::terminate_process(h, KILL_CODE)
+    }
+}
+
+impl ProcessOs for RealJobOs<'_> {
+    type Held = OwnedHandle;
+
+    fn now(&self) -> Instant {
+        RealProcessOs.now()
+    }
+
+    fn sleep(&self, d: Duration) {
+        RealProcessOs.sleep(d);
+    }
+
+    fn open_process(&self, pid: u32, access: Access) -> io::Result<OwnedHandle> {
+        RealProcessOs.open_process(pid, access)
+    }
+
+    fn creation_time(&self, h: &OwnedHandle) -> io::Result<u64> {
+        RealProcessOs.creation_time(h)
+    }
+
+    fn signalled(&self, h: &OwnedHandle, wait: Duration) -> io::Result<bool> {
+        RealProcessOs.signalled(h, wait)
+    }
+
+    fn terminate(&self, h: &OwnedHandle) -> io::Result<()> {
+        RealProcessOs.terminate(h)
     }
 }
 

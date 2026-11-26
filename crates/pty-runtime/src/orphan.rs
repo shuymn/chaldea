@@ -57,7 +57,7 @@ pub fn kill_recorded(identities: &[ProcessIdentity], deadline: Instant) -> Orpha
     #[cfg(windows)]
     {
         windows::kill_recorded(
-            &windows::RealProcessOs,
+            &crate::windows::child::RealProcessOs,
             identities,
             std::process::id(),
             deadline,
@@ -122,6 +122,7 @@ pub(crate) mod unix {
 
     use super::{Fate, OrphanReport, STEP, accept, prepare};
     use crate::backend::ProcessIdentity;
+    use crate::unix::child::{pid_of, signal_of};
     use crate::unix::kill::Sig;
     use crate::unix::sys::BsdInfo;
     use crate::unix::table::{Lookup, classify};
@@ -149,16 +150,8 @@ pub(crate) mod unix {
         }
 
         fn kill(&self, pid: u32, sig: Sig) {
-            let sig = match sig {
-                Sig::Hup => rustix::process::Signal::HUP,
-                Sig::Term => rustix::process::Signal::TERM,
-                Sig::Kill => rustix::process::Signal::KILL,
-            };
-            if let Some(p) = i32::try_from(pid)
-                .ok()
-                .and_then(rustix::process::Pid::from_raw)
-            {
-                let _ = rustix::process::kill_process(p, sig);
+            if let Ok(p) = pid_of(pid) {
+                let _ = rustix::process::kill_process(p, signal_of(sig));
             }
         }
 
@@ -331,49 +324,6 @@ pub(crate) mod windows {
 
     /// The System process.
     const SYSTEM_PID: u32 = 4;
-
-    /// The real calls, with no job handle.
-    #[cfg(windows)]
-    pub(crate) struct RealProcessOs;
-
-    #[cfg(windows)]
-    impl ProcessOs for RealProcessOs {
-        type Held = std::os::windows::io::OwnedHandle;
-
-        fn now(&self) -> Instant {
-            Instant::now()
-        }
-
-        fn sleep(&self, d: std::time::Duration) {
-            std::thread::sleep(d);
-        }
-
-        fn open_process(
-            &self,
-            pid: u32,
-            access: crate::windows::kill::Access,
-        ) -> std::io::Result<Self::Held> {
-            let mask = match access {
-                crate::windows::kill::Access::Kill => crate::windows::KILL_SYNC,
-                crate::windows::kill::Access::Wait => crate::windows::QUERY_SYNC,
-            };
-            crate::windows::sys::open_process(pid, mask)
-        }
-
-        fn creation_time(&self, h: &Self::Held) -> std::io::Result<u64> {
-            use std::os::windows::io::AsHandle;
-            crate::windows::sys::creation_time(h.as_handle())
-        }
-
-        fn signalled(&self, h: &Self::Held, wait: std::time::Duration) -> std::io::Result<bool> {
-            use std::os::windows::io::AsHandle;
-            crate::windows::sys::wait_floor(h.as_handle(), wait)
-        }
-
-        fn terminate(&self, h: &Self::Held) -> std::io::Result<()> {
-            crate::windows::sys::terminate_process(h, crate::windows::child::KILL_CODE)
-        }
-    }
 
     /// A held handle and the last wait's result on it.
     struct HeldTarget<H> {

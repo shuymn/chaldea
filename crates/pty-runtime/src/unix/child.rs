@@ -40,7 +40,7 @@ impl ChildOs for RealChildOs {
     }
 }
 
-fn pid_of(pid: u32) -> io::Result<Pid> {
+pub(crate) fn pid_of(pid: u32) -> io::Result<Pid> {
     i32::try_from(pid)
         .ok()
         .and_then(Pid::from_raw)
@@ -252,7 +252,7 @@ struct RealOs<'a> {
     own: &'a Ownership,
 }
 
-fn signal_of(sig: Sig) -> Signal {
+pub(crate) fn signal_of(sig: Sig) -> Signal {
     match sig {
         Sig::Hup => Signal::HUP,
         Sig::Term => Signal::TERM,

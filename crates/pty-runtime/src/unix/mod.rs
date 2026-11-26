@@ -2,7 +2,7 @@
 //! `std::process::Command` with a minimal `pre_exec` under the process-wide spawn lock,
 //! a nonblocking master, and a tree kill over libproc.
 
-mod child;
+pub(crate) mod child;
 mod io;
 pub(crate) mod kill;
 #[allow(unsafe_code)]
