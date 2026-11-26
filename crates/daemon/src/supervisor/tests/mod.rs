@@ -16,6 +16,7 @@ pub(crate) mod restart;
 mod shutdown;
 mod stop;
 mod tick;
+mod version;
 mod workspace;
 
 use std::collections::HashMap;

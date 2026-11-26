@@ -29,6 +29,7 @@ mod restart;
 pub mod send;
 mod tick;
 mod tracker;
+pub(crate) mod version;
 pub(crate) mod workspace;
 
 #[cfg(test)]
@@ -305,6 +306,8 @@ pub(crate) struct Supervisor {
     pub(crate) instance: String,
     /// The restart prober's concurrency slots (`PROBE_SLOTS`).
     pub(crate) probe_slots: Arc<tokio::sync::Semaphore>,
+    /// Version probes killed at their deadline and not yet reaped (C1 D11).
+    pub(crate) version_left: Arc<version::VersionLeft>,
 }
 
 impl Supervisor {

@@ -147,9 +147,19 @@ pub(crate) async fn launch_op(sup: Arc<Supervisor>, req: LaunchReq) -> EffectOut
         }
         workspace = Some(super::workspace::workspace_of(&sup, &path).await);
     }
+    // The CLI version (C1 D11), before the reservation: a spawn's agent is its request's, a
+    // resume's its thread's.
+    let agent = match &req.kind {
+        LaunchKind::Spawn { agent, .. } => Some(*agent),
+        LaunchKind::Resume { .. } => thread_agent(&sup, req.thread).await,
+    };
+    let cli_version = match agent {
+        Some(a) => sup.cli_version(a).await,
+        None => None,
+    };
     // Step 2: the slot, its op lock taken by this op.
     // Step 3: the reservation job (it builds the plan from the thread it reads).
-    let job = reservation_job(&sup, &req, workspace);
+    let job = reservation_job(&sup, &req, workspace, cli_version);
     let reserved = match record(&sup, job, false).await {
         Recorded::Done(Ok((r, entry_guard))) => (r, entry_guard),
         Recorded::Done(Err(c)) => {
@@ -274,7 +284,7 @@ pub(crate) async fn launch_op(sup: Arc<Supervisor>, req: LaunchReq) -> EffectOut
     }
     sup.pauses().at(Pause::BeforeStartJob).await;
     // Step 6: the start job.
-    let started = start_job(&sup, &req, &identity, r.upgraded);
+    let started = start_job(&sup, &req, &identity, r.upgraded, entry.cli_version.clone());
     let seq = match outcome_of(record(&sup, started, false).await) {
         Ok(seq) => seq,
         Err(o) => return o,
@@ -286,6 +296,24 @@ pub(crate) async fn launch_op(sup: Arc<Supervisor>, req: LaunchReq) -> EffectOut
     });
     drop(guard);
     launch_result(&req, LaunchOutcome::Started)
+}
+
+/// The thread's agent from a read bounded by 1 s; `None` when not read in time or absent
+/// (the reservation job decides the refusal).
+async fn thread_agent(sup: &Arc<Supervisor>, thread: ThreadId) -> Option<Agent> {
+    let deadline = sup.now() + Duration::from_secs(1);
+    let store = sup.store.clone();
+    let real = sup.real(deadline);
+    let read = sup
+        .rt
+        .spawn_blocking(move || store.read(real, |r| r.thread(thread)));
+    match settle_before(|| sup.now(), deadline, sup.timer(deadline), read)
+        .await
+        .in_time()
+    {
+        Some(Ok(Ok(Some(t)))) => Some(t.agent),
+        _ => None,
+    }
 }
 
 fn launch_result(req: &LaunchReq, outcome: LaunchOutcome) -> EffectOutcome {
@@ -311,6 +339,7 @@ fn reservation_job(
     sup: &Arc<Supervisor>,
     req: &LaunchReq,
     workspace: Option<chaldea_core::ids::WorkspaceId>,
+    cli_version: Option<String>,
 ) -> JobOf<Result<(Reserved, (Arc<LiveLaunch>, OpGuard)), ErrorCode>> {
     let sup2 = sup.clone();
     let thread = req.thread;
@@ -475,14 +504,16 @@ fn reservation_job(
         job.flush(tx)?;
         tx.token_insert(token.clone())?;
         // The slot, its op lock taken, exists before this job's commit is visible.
-        let entry = Arc::new(LiveLaunch::new(
+        let mut entry = LiveLaunch::new(
             thread,
             launch,
             agent,
             capabilities(agent, sup2.host_os),
             lp.manual,
             positional,
-        ));
+        );
+        entry.cli_version = cli_version.clone().filter(|_| agent == Agent::Claude);
+        let entry = Arc::new(entry);
         let guard = entry
             .ops
             .clone()
@@ -510,6 +541,7 @@ fn start_job(
     req: &LaunchReq,
     id: &ProcessIdentity,
     upgraded: bool,
+    cli_version: Option<String>,
 ) -> JobOf<u64> {
     let sup2 = sup.clone();
     let thread = req.thread;
@@ -520,7 +552,7 @@ fn start_job(
         sup2.pauses().blocking(Pause::InStartJob);
         let t = thread_row(tx, thread)?;
         let mut job = ThreadJob::new(thread, t.agent, t.state, SourceKind::Process, None);
-        let (key, seq) = started_in(tx, &mut job, launch, &id, input)?;
+        let (key, seq) = started_in(tx, &mut job, launch, &id, input, cli_version.clone())?;
         let lid = Some(launch);
         if upgraded && t.agent == Agent::Codex && !job.raised(AttentionCause::StartupStall) {
             job.apply(
@@ -545,6 +577,7 @@ pub(crate) fn started_in(
     launch: LaunchId,
     id: &ProcessIdentity,
     input: Option<InputId>,
+    cli_version: Option<String>,
 ) -> Result<(IdempotencyKey, u64), JobError> {
     let key = launch_key(launch, "started");
     let lid = Some(launch);
@@ -555,7 +588,7 @@ pub(crate) fn started_in(
             pid: id.pid,
             start_time: id.start_time.clone(),
             pgid_or_job: id.group.clone(),
-            cli_version: None,
+            cli_version,
         }),
         lid,
     );
@@ -1250,7 +1283,7 @@ pub(crate) async fn close_and_record(
         tracing::warn!(launch = %entry.launch_id, survivors = ?o.kill.survivors, "shutdown close left survivors");
     }
     let mut plan = ExitPlan::new(entry.thread_id, entry.launch_id, ExitReason::Stopped);
-    plan.start = Some((identity, entry.positional));
+    plan.start = Some((identity, entry.positional, entry.cli_version.clone()));
     plan.stop_first = true;
     plan.death_confirmed = proving(&o.kill);
     plan.method = plan.death_confirmed.then(|| o.kill.method.clone());

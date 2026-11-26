@@ -151,6 +151,7 @@ pub(crate) fn new_supervisor(
         rt: tokio::runtime::Handle::current(),
         instance,
         probe_slots: Arc::new(tokio::sync::Semaphore::new(super::PROBE_SLOTS)),
+        version_left: Arc::default(),
     })
 }
 
@@ -254,7 +255,8 @@ async fn git_step(sup: &Arc<Supervisor>, end: Instant) {
         let reap = sup.rt.spawn_blocking(move || {
             s.pauses().blocking(Pause::GitShutdownReap);
             git.reap_left();
-            git.idle()
+            s.version_left.reap();
+            git.idle() && s.version_left.is_empty()
         });
         // A reap that answers after `end` is not waited for: the step ends with it.
         let Some(reaped) = settle_before(|| sup.now(), end, sup.timer(end), reap)

@@ -54,6 +54,9 @@ pub(crate) struct LiveLaunch {
     pub manual: bool,
     /// The launch's positional input, if it has one.
     pub positional: Option<InputId>,
+    /// The CLI version the probe read before the reservation (C1 D11), recorded by
+    /// `launch_started`.
+    pub cli_version: Option<String>,
     /// Set before `Session::spawn`; never cleared.
     creation_started: AtomicBool,
     /// Set with the stop's seal, under the op lock.
@@ -121,6 +124,7 @@ impl LiveLaunch {
             caps,
             manual,
             positional,
+            cli_version: None,
             creation_started: AtomicBool::new(false),
             stop_requested: AtomicBool::new(false),
             published: OnceLock::new(),
