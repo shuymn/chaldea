@@ -147,7 +147,7 @@ Every field is always present (`payload.rs`'s rule); an identity's empty `start_
 | `close` | the exit job of a stop, a natural exit, the participant, or a late creation whose death is unconfirmed (`ops.rs:731-741`, `:1092`) | the kept report's survivors (below), each `unresolved` (possibly none) | `tree_unproven`; and `result_not_received` when the close's receipt is `NotReceived` | `launch:<L>:evidence:close` |
 | `probe` | the prober's record job (§2.3) | the probed identity (a `daemon_restart` leader or a failed start's recorded child) with its `Fate` (`not_read` on a result not received) | `unrecorded_session_members` (macOS) or `unrecorded_job_and_outside_job` (Windows); `result_not_received` when so | `launch:<L>:evidence:probe:<attempt>` |
 
-**Which report a `close` keeps** (sol r1 M3, r2 M5; Neon r1 LOW). `ops::Proof` (`ops.rs:749-776`) keeps only a proving report today. It gains `close: CloseReceipt` (new), `InTime(KillReport)` (the close's `CloseOutcome.kill`, its join received before the cutoff) or `NotReceived(Option<KillReport>)`; `result_not_received` is written exactly for `NotReceived`. The `Option` is the last non-proving `kill_by` report the kill task published (the reports 10a1 logs at `ops.rs:731-733`): the task writes it with its publication instant, read on the supervisor clock while it holds the slot, into a slot under a `std::sync::Mutex` held only for the copy and that read (`Pause::KillReportPublish` precedes the write), and the op, once both waits are classified, reads the slot with one `try_lock` and keeps the report only if it was published before the cutoff (a held lock or a later report → `None`). The participant's and a late creation's close (`ops.rs:1068-1100`) build no `Proof`: their evidence comes from the `CloseOutcome` received by `close_end`, and a close not received by then records no exit (sup §2.9 class 3), so no evidence.
+**Which report a `close` keeps** (sol r1 M3, r2 M5; Neon r1 LOW). `ops::Proof` holds `close: CloseReceipt`: `InTime(KillReport)` (the close's `CloseOutcome.kill`, its join received before the cutoff) or `NotReceived(Option<KillReport>)`; `result_not_received` is written exactly for `NotReceived`. The `Option` is the last non-proving `kill_by` report the kill task published: the task moves it, with its publication instant read on the supervisor clock while it holds the slot, into a slot under a `std::sync::Mutex` held only for that write (`Pause::KillReportPublish` precedes it), and the op, once both waits are classified, passes `Pause::KillReportRead` and takes the report from the slot with one `try_lock`, only if it was published before the cutoff (a held lock or a later report → `None`). The participant's and a late creation's close build no `Proof`: their evidence comes from the `CloseOutcome` received by `close_end`, and a close not received by then records no exit (sup §2.9 class 3), so no evidence.
 
 The first two sources are written at most once per launch, as `launch:<L>:exited` is: `exit_in` writes nothing for a launch that already exited (`exit.rs:102-104`), and `ExitPlan.evidence` rides that job. A probe's attempt id is a server-minted UUID, never a client value, so no client `command_id` shares its namespace; a key reused with other content is `KeyConflict` (`write_tx.rs:487-515`), which the fixed payload of a retried job never produces.
 
@@ -348,23 +348,16 @@ Guard-to-test row added to sup §7's table:
 |---|---|---|
 | `confirmDeath`: exited, unconfirmed | the `stop` intent with `assume_dead` (§2.5) | PR10a2-CL-8 |
 
-## 8. Proposed Canonical-Doc Changes
+## 8. Canonical Documents
 
-Not applied here.
+The canonical documents state this design's public parts:
 
-- **mvp §2.1, event table**: the kind `launch_evidence` (§2.4); `launch_death_confirmed`'s method `owner_asserted`. **"Idempotency keys"**: process lifecycle `launch:<launch_id>:evidence:<spawn_failed|close|probe:<attempt>>`, the attempt a UUID the daemon mints.
-- **mvp §2.4 / §2.5**: `StopArgs.assume_dead` (owner only, with `expected_launch_id`; omitted when false), `StopOutcome` `asserted` (only for `assume_dead` requests; a plain stop of an asserted launch answers `already_exited` with `confirmed_within_deadline: false`), `chaldea stop --assume-dead [--launch]` and the preview, the new `death_unconfirmed` text.
-- **mvp §2.9 "Daemon restart"**: "`launch_death_confirmed { method }` follows once the old tree is proven dead, which the old-tree check and the owner's confirmation after a crash decide (PR 10a2 …)" → in each start that reaches its probe the daemon signals by verified identity the recorded leader of every unconfirmed `daemon_restart` launch and the recorded child of every unconfirmed `spawn_failed` launch whose `failed_start` names a pid and a start time and records `launch_evidence`; such a launch's death is confirmed only by the owner (`owner_asserted`), after reading the evidence; the probe unlocks nothing.
-- **mvp §4, PR 10 bullet**: "The restart scan of a launch's session by recorded sid with `launch.start_time ≤ start ≤ restart_now` is designed by 10a2" → the restart prober of `docs/design/supervisor-recovery.md` (identity-only, RD10).
-- **mvp §4, PR 15 / 23 bullet**: "P-18 survivor list with the macOS containment limit reported" → "P-18 identity-matched witnesses recorded before the crash and read after the probe: every recorded identity dead; each survivor within P-18's exception and named by the launch's unchecked scope; inconclusive when a witness cannot be identified or the launch had no identity".
-- **mvp §6.1, P-3**: an owner assertion is not a stop's proof: a plain stop of a launch confirmed by `owner_asserted` answers `already_exited` with `confirmed_within_deadline: false`.
-- **mvp §6.1, P-18** (owner decision 2026-11-26, option (b)): "… no surviving old process except the documented macOS containment limit (a `setsid` grandchild whose parent exited, spike §4.6) and, after a crash, processes of the old launch for which no usable `(pid, start_time)` was ever recorded (on macOS, members of the old session that survived the hangup and an A2 child; on Windows, processes outside the launch job without a recorded identity: A29's suspended child and descendants outside the job), which the launch's evidence reports as unchecked scope; a recorded identity alive after the restart, the child of an unconfirmed assignment failure included, is a failure, reported in the evidence …"; Pass/Fail: "Pass: equal history; every recorded identity dead after the probe; each survivor within the exception and named by the unchecked scope. Fail: lost or duplicate events; a recorded identity alive; a survivor outside the exception; resume fails. Inconclusive: a witness that cannot be identified; a launch without an identity."
-- **sup §2.2** (the `death_unconfirmed` CLI text; the `StopResult` table: a plain stop of a launch confirmed by `owner_asserted` answers `already_exited` with `confirmed_within_deadline: false`, and the CLI's late line names that case), **§2.4 "Unconfirmed launches"** ("10a1 has no rule that confirms such a launch" → the owner's assertion, `docs/design/supervisor-recovery.md` §2.5), **§2.12** (a pointer here), **§4** rows A1, A2, A28, A29, F1 (→ this document), **§5.3** L-1 and L-2 (→ this document's L-1, L-2, and RD9).
-- **pty-runtime.md §2.2 and §4**: `orphan::kill_recorded`. **pty-unix.md §4 and pty-windows.md §4**, rows "Daemon restart": `orphan::kill_recorded`, a verified-identity loop with no engine rounds; pty-windows §2.5: `ProcessOs` split out of `JobOs`. **pty-windows.md §2.2 "Crash window"**: what PR 21's finder receives and its candidate conditions (§2.6, `launch::a29_candidate`).
-- **event-store.md**: `launch_evidence` among the kinds whose projection is a no-op.
-- **daemon-lifecycle.md §2.14**: `BuildCtx.instance`; `SupervisorComponents::attach` starts the restart prober; each probe holds a tracker token while it can signal, so such a probe at the participant's end keeps the instance lock held.
-- **formal-specs §6**: 10a2's bullet names the assertion intent as `confirmDeath`'s site, no guard change, and the new trace.
-- **AGENTS.md**: none.
+- [`docs/mvp-design.md`](../mvp-design.md): §2.1 (the kind `launch_evidence`, the method `owner_asserted`, the evidence idempotency keys), §2.4 and §2.5 (`StopArgs.assume_dead`, `StopOutcome` `asserted`, `chaldea stop --assume-dead [--launch]` and its preview, the `death_unconfirmed` text), §2.9 "Daemon restart" (the restart probe; a launch's death confirmed only by the owner), §4's PR 10 and PR 15 / 23 bullets (the prober; P-18's witnesses), and §6.1 P-3 and P-18 (an assertion is not a stop's proof; RD9's exception and verdicts).
+- [`docs/design/supervisor.md`](supervisor.md): §2.2 (the `death_unconfirmed` text; a plain stop of an asserted launch), §2.4 "Unconfirmed launches", §2.12, §4 rows A1, A2, A28, A29, and F1, and §5.3 L-1 and L-2.
+- [`pty-runtime.md`](pty-runtime.md) §2.2 and §4, and the "Daemon restart" rows of [`pty-unix.md`](pty-unix.md) §4 and [`pty-windows.md`](pty-windows.md) §4: `orphan::kill_recorded`; pty-windows §2.5 (`ProcessOs` apart from `JobOs`) and §2.2 "Crash window" (what PR 21's finder receives, `launch::a29_candidate`).
+- [`event-store.md`](event-store.md): `launch_evidence` among the kinds whose projection is a no-op.
+- [`daemon-lifecycle.md`](daemon-lifecycle.md) §2.14: `BuildCtx.instance`; `attach` starts the restart prober; a probe's tracker token at the participant's end.
+- [`formal-specs.md`](formal-specs.md) §6: the assertion intent as `confirmDeath`'s site, no guard change, and the trace of §7.
 
 ## 9. Findings
 
@@ -377,19 +370,19 @@ Not applied here.
 | sol r3 bullets (key namespaces; fixture without a live control; A29 pid, outer job, executable; record retry vs new probe; assertion vs missing evidence) | RD5; CL-4's macOS control; §2.6, CL-10; §2.3 "Evidence write"; §2.5 preview, L-9 |
 | Neon r3 #3, #4, LOW | RD7; §2.6 and `launch::a29_candidate`; §2.3 step 3.5 |
 | sol r1 H1 (probes across shutdown) | §2.1 rule 3; §2.3 step 3.2, 3.4, "Shutdown"; RD3; CL-6; L-10 |
-| sol r1 H2 + owner (b) (P-18 judged apart; exception; witnesses; PR 15/23 line) | RD9; P-4; L-1, L-2; §8 P-18 and PR 15/23 bullets |
+| sol r1 H2 + owner (b) (P-18 judged apart; exception; witnesses; PR 15/23 line) | RD9; P-4; L-1, L-2; mvp §6.1 P-18 and §4 PR 15 / 23 (§8) |
 | sol r1 M1, Neon r1 LOW (`assume_dead` canonical form) | §2.5 "Wire"; RD6; CL-8 `receipt_from_10a1`, `command::stop_args_canonical` |
 | sol r1 M2, Neon r1 H1 (stream id, page size, epoch, complete vs interrupted) | §2.5 preview step 2; RD7; CL-9 |
 | sol r1 M3, Neon r1 M3, Neon r1 LOWs (`failed_start`; legacy rows; spawn panic; leader dedupe; empty start; which close report; `Proof`) | §2.4 sources and "Which report a `close` keeps"; §2.5 preview step 3; L-7; CL-7, CL-9 |
 | sol r1 M4 (freshness; missing current-run evidence; assertion race; crash points) | `probe_run`, RD4; §2.5 preview step 3; §1 goal and P-1 wording; §2.3 "Assertion during a probe"; CL-4 `crash_points` |
-| sol r1 M5 (`already_exited` after an assertion) | §2.5 "A confirmed launch's result"; RD6; P-3; §8 P-3; CL-8 |
+| sol r1 M5 (`already_exited` after an assertion) | §2.5 "A confirmed launch's result"; RD6; P-3; mvp §6.1 P-3 (§8); CL-8 |
 | sol r1 M6, Neon r1 H2, M5 (deadline between calls; exhaustive classes; `pid > i32::MAX`; Windows waits; `ProcessOs`) | §2.2; RD10; CL-1, CL-2 |
 | sol r1 M7 (admitted evidence write; `CommitUnknown`) | §2.3 "Evidence write"; §2.7; CL-5 |
 | sol r1 M8, Neon r1 M4 (sealed `PtyRuntime`; outer job; deterministic rules) | `fake::with_windows_fault`; `TestJob` before the helper spawns; `launch::a29_candidate`; CL-10 |
 | sol r1 M9 (history, close and resume guards, worktree, `no_session`) | P-1; CL-4 (history, inputs); CL-6, CL-8; §2.5 (PR 16's check) |
 | Neon r1 M6 (Windows invalid cases; `Late` join; panicking probe) | CL-2; CL-5 |
 | Neon r1 M7 (`unchecked` emptiness; envelope) | §2.4 code and "Envelope"; CL-7 |
-| sol r2 H1 (recorded Windows child in the exception; inconclusive) | header; RD9; P-4; L-2; §8 P-18 and PR 15/23 |
+| sol r2 H1 (recorded Windows child in the exception; inconclusive) | header; RD9; P-4; L-2; mvp §6.1 P-18 and §4 PR 15 / 23 (§8) |
 | sol r2 M1 (probe token after a panic) | §2.1 rule 3; §2.3 step 3.4 (`ProbeAdmission`); RD3; CL-6; L-10 |
 | sol r2 M2, Neon r2 LOW 2 (run binding; stream; state re-check) | `probe_run` = `instance`, RD4; §2.5 preview steps 1–3; CL-9 |
 | sol r2 M3 (recorded identity; "no report" only when complete; oversize fixture; page two) | §2.5 preview step 3; CL-9 |
@@ -402,6 +395,6 @@ Not applied here.
 | sol code r1 M2 (a cancelled queued probe recorded) | §2.3 steps 3.5 and "Shutdown"; CL-6 |
 | sol code r1 M3, M4 (survivors without an identity; a report published after the cutoff) | §2.4 `spawn_failed` row and "Which report a `close` keeps"; CL-7 |
 | sol code r1 LOWs (deadline after a read and before a terminate; A29 gate) | CL-1, CL-2, CL-10 |
-| sol code r1 M5 (a failed start's recorded child not probed after a restart) | RD1 B; §2.3 step 2 and "What the prober does not do"; RD9; CL-3; L-2, L-7, L-8; §8 mvp §2.9 |
+| sol code r1 M5 (a failed start's recorded child not probed after a restart) | RD1 B; §2.3 step 2 and "What the prober does not do"; RD9; CL-3; L-2, L-7, L-8; mvp §2.9 (§8) |
 | sol r2 LOWs (Windows wait pacing; L-6; Windows scope name; "every start"; CL-4 wording) | §2.2 Windows; L-6; `unrecorded_job_and_outside_job`; §1, CL-3, L-8, §8; CL-4 |
 | r1 LOWs (identity trust; CL-11; `launch_id` in `StopResult`; `content.rs`; source links; duplicates; between-slots shutdown) | §2.1 "Identity trust", L-4; CL-11 folded into CL-2 and CL-4; §2.5 "Wire"; files list; §4 `mvp:442`; CL-1, CL-2; CL-6 |

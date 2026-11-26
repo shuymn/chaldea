@@ -297,7 +297,8 @@ fn assume_dead_preview() {
 }
 
 /// A response that is not the body-limit error is not retried smaller: a malformed page and a
-/// 500 end the scan interrupted (exit 1, no "no report" line, the command still printed).
+/// 500 end the scan interrupted (exit 1, no "no report" line, no confirmation command, and
+/// the line to run the preview again).
 #[test]
 fn preview_interrupted_by_a_bad_page() {
     for bad in [ok("{".to_owned()), Reply::Json(500, error("internal"))] {
