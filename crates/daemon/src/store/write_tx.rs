@@ -451,6 +451,8 @@ impl<'c> WriteTx<'c> {
             }
         }
         let mut refs: RefRows = Vec::new();
+        // Hashes already stored: their inputs are used but not inserted (refs only).
+        let mut reused: Vec<String> = Vec::new();
         for c in contents(&row.event) {
             match c {
                 Content::Inline { inline, encoding } => check_inline(inline, *encoding)?,
@@ -460,31 +462,35 @@ impl<'c> WriteTx<'c> {
                     preview_lossy,
                 } => {
                     check_blob_ref(blob)?;
-                    // Inputs are matched by hash: equal hashes are equal bytes, so a reference
-                    // uses every input of its hash, and the body is inserted once below.
-                    let mut supplied = None;
+                    // Inputs are matched by hash, so a reference uses every input of its hash.
+                    // It is checked against the bytes it will name: a stored blob of its hash
+                    // (then no input is inserted), else the first input of its hash, the one
+                    // inserted below.
+                    let mut first = None;
                     for i in inputs.iter_mut().filter(|i| i.0 == blob.sha256) {
                         i.2 = true;
-                        supplied = Some(i.1);
+                        first.get_or_insert(i.1);
                     }
-                    let large = match supplied {
-                        Some(BlobData::Bytes(data)) => {
+                    let large = match (self.stored_blob_head(&blob.sha256)?, first) {
+                        (Some((size, head, large)), _) => {
+                            check_against(blob, preview, *preview_lossy, size, &head)?;
+                            if !reused.contains(&blob.sha256) {
+                                reused.push(blob.sha256.clone());
+                            }
+                            large
+                        }
+                        (None, Some(BlobData::Bytes(data))) => {
                             let head = &data[..data.len().min(PREVIEW_READ_BYTES)];
                             check_against(blob, preview, *preview_lossy, data.len() as u64, head)?;
                             false
                         }
-                        Some(BlobData::Spooled(s)) => {
+                        (None, Some(BlobData::Spooled(s))) => {
                             let head = s.head().map_err(|e| ContentError::Spool(e.to_string()))?;
                             check_against(blob, preview, *preview_lossy, s.size(), &head)?;
                             true
                         }
-                        None => {
-                            let Some((size, head, large)) = self.stored_blob_head(&blob.sha256)?
-                            else {
-                                return Err(ContentError::BlobNotFound(blob.sha256.clone()).into());
-                            };
-                            check_against(blob, preview, *preview_lossy, size, &head)?;
-                            large
+                        (None, None) => {
+                            return Err(ContentError::BlobNotFound(blob.sha256.clone()).into());
                         }
                     };
                     let r = (blob.sha256.clone(), blob.media_type.clone(), large);
@@ -499,7 +505,7 @@ impl<'c> WriteTx<'c> {
             if !used {
                 return Err(ContentError::UnreferencedBlob(sha).into());
             }
-            if !blobs.iter().any(|(s, _)| *s == sha) {
+            if !reused.contains(&sha) && !blobs.iter().any(|(s, _)| *s == sha) {
                 blobs.push((sha, data));
             }
         }
@@ -536,19 +542,11 @@ impl<'c> WriteTx<'c> {
             .transpose()
     }
 
-    /// Inserts a spooled blob as ordered parts, unless a blob of its hash is stored (then
-    /// only refs are written). The parts are read from the spool file in one buffer; the
-    /// SHA-256 and length of what was inserted, and the stored parts' indexes and total
-    /// length, must match the blob's, or the job fails.
+    /// Inserts a spooled blob, not stored yet (`validate_event` leaves out a stored hash), as
+    /// ordered parts. The parts are read from the spool file in one buffer; the SHA-256 and
+    /// length of what was inserted, and the stored parts' indexes and total length, must
+    /// match the blob's, or the job fails.
     fn insert_large_blob(&self, sha: &str, s: &SpooledBlob) -> Result<(), StoreError> {
-        let stored: bool = self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM large_blobs WHERE sha256 = ?1)",
-            [sha],
-            |r| r.get(0),
-        )?;
-        if stored {
-            return Ok(());
-        }
         let mismatch = |field| -> StoreError {
             ContentError::BlobMismatch {
                 sha256: sha.to_owned(),

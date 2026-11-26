@@ -6,6 +6,9 @@ mod support;
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use chaldea_core::ids::StreamId;
 use chaldea_core::payload::Content;
@@ -185,7 +188,132 @@ fn multi_part_value_round_trips_and_is_reused() {
     // Readable only through a referencing stream.
     let d = digest.clone();
     assert!(!s.read(move |r| r.blob_ref_exists(StreamId::Host, &d)));
-    assert!(s.read(move |r| r.blob(StreamId::Host, &digest)).is_none());
+    let d = digest.clone();
+    assert!(s.read(move |r| r.blob(StreamId::Host, &d)).is_none());
+    // Rebuilding and verifying the projections leave the large-blob tables alone.
+    let before = large_snapshot(&s);
+    s.run(|tx| Ok(tx.rebuild_projections()?)).unwrap();
+    let diff = s.run(|tx| Ok(tx.verify_projections()?)).unwrap();
+    assert!(diff.is_empty(), "{diff:?}");
+    assert_eq!(large_snapshot(&s), before);
+    let body = s
+        .read(move |r| r.blob(StreamId::Thread(a), &digest))
+        .unwrap();
+    assert!(body.data == bytes, "the bytes differ after the rebuild");
+}
+
+/// Every row of the large-blob tables, each part as its index, length, and SHA-256.
+fn large_snapshot(s: &TestStore) -> Vec<String> {
+    let c = Connection::open_with_flags(s.path(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let mut out = Vec::new();
+    for sql in [
+        "SELECT sha256 || '|' || size || '|' || part_count FROM large_blobs ORDER BY 1",
+        "SELECT stream_id || '|' || sha256 || '|' || media_type FROM large_blob_refs ORDER BY 1",
+    ] {
+        let mut stmt = c.prepare(sql).unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        out.extend(rows.map(Result::unwrap));
+    }
+    let mut stmt = c
+        .prepare("SELECT sha256, part_index, data FROM large_blob_parts ORDER BY 1, 2")
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| {
+            let data: Vec<u8> = r.get(2)?;
+            Ok(format!(
+                "{}|{}|{}|{}",
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                data.len(),
+                hex(&data)
+            ))
+        })
+        .unwrap();
+    out.extend(rows.map(Result::unwrap));
+    out
+}
+
+/// A spooled input for `bytes` whose file then has its first byte changed (its hash still
+/// claims `bytes`), and the content of the changed bytes, whose preview the changed head
+/// matches.
+fn changed_head(s: &TestStore, bytes: &[u8]) -> (Prepared, Content) {
+    let p = spooled(s, bytes, TEXT);
+    let Some(BlobInput::Spooled(input)) = &p.blob else {
+        panic!("spooled")
+    };
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(input.path())
+        .unwrap();
+    f.write_all(b"Z").unwrap();
+    drop(f);
+    let mut changed = bytes.to_vec();
+    changed[0] = b'Z';
+    let Content::Blob {
+        preview,
+        preview_lossy,
+        ..
+    } = spooled(s, &changed, TEXT).content
+    else {
+        panic!("a blob")
+    };
+    let Content::Blob { blob, .. } = p.content.clone() else {
+        panic!("a blob")
+    };
+    (
+        p,
+        Content::Blob {
+            blob,
+            preview,
+            preview_lossy,
+        },
+    )
+}
+
+fn preview_refused(r: Result<Vec<chaldea_daemon::store::Appended>, WriteError>) {
+    match r {
+        Err(WriteError::RolledBack(StoreError::Content(ContentError::BlobMismatch {
+            field: "preview",
+            ..
+        }))) => {}
+        other => panic!("expected a preview mismatch, got {other:?}"),
+    }
+}
+
+/// A reference to a stored large blob is checked against the stored bytes, not against a
+/// spooled input of the same hash whose head differs: the stored blob is what it names.
+#[test]
+fn reuse_checks_the_stored_blob() {
+    let s = TestStore::new();
+    let bytes = pattern(MAX_BLOB_BYTES + 1, 6);
+    s.append(vec![carrying(
+        StreamId::Host,
+        "first",
+        spooled(&s, &bytes, TEXT),
+    )])
+    .unwrap();
+    let (p, content) = changed_head(&s, &bytes);
+    let mut e = raw_unknown(StreamId::Host, "second", content);
+    e.blobs = p.blob.into_iter().collect();
+    preview_refused(s.append(vec![e]));
+    assert_eq!(head(&s, StreamId::Host), 1);
+    assert_eq!(large_rows(&s), (1, 17, 1));
+}
+
+/// Several inputs of one hash: the reference is checked against the first, the one
+/// inserted, so a later input with another head cannot vouch for the preview.
+#[test]
+fn one_input_per_hash_is_checked_and_inserted() {
+    let s = TestStore::new();
+    let bytes = pattern(MAX_BLOB_BYTES + 1, 7);
+    let good = spooled(&s, &bytes, TEXT);
+    let (bad, content) = changed_head(&s, &bytes);
+    let mut e = raw_unknown(StreamId::Host, "both", content);
+    e.blobs = vec![good.blob.unwrap(), bad.blob.unwrap()];
+    preview_refused(s.append(vec![e]));
+    assert_eq!(head(&s, StreamId::Host), 0);
+    assert_eq!(large_rows(&s), (0, 0, 0));
+    assert!(spool_files(&s).is_empty());
 }
 
 /// A spool file changed after `finish`: the bytes no longer hash to the reference (the
@@ -260,18 +388,36 @@ fn unused_spools_leave_no_file() {
     assert!(spool_files(&s).is_empty());
     let p = spooled(&s, &pattern(MAX_BLOB_BYTES + 1, 2), TEXT);
     assert_eq!(spool_files(&s).len(), 1);
+    // The writer's clock runs ahead, so the job expires in the queue.
+    s.clock.lead(Duration::from_secs(60));
+    let dropped = Arc::new(AtomicBool::new(false));
     let ticket = s
         .store()
-        .submit(
-            std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_secs(1))
-                .unwrap(),
-            {
-                let e = carrying(StreamId::Host, "late", p);
-                move |tx| Ok(tx.append(vec![e])?)
-            },
-        )
+        .submit(Instant::now(), {
+            let e = carrying(StreamId::Host, "late", p);
+            let slow = SlowDrop(dropped.clone());
+            move |tx| {
+                let _slow = slow;
+                Ok(tx.append(vec![e])?)
+            }
+        })
         .unwrap();
     assert!(matches!(ticket.blocking_wait(), Err(WriteError::Expired)));
+    // Observed as the reply arrives: the job, slow to drop, was dropped before it.
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the reply came before the drop"
+    );
     assert!(spool_files(&s).is_empty());
+    s.clock.lead(Duration::ZERO);
+}
+
+/// A value whose drop takes 300 ms, then sets its flag.
+struct SlowDrop(Arc<AtomicBool>);
+
+impl Drop for SlowDrop {
+    fn drop(&mut self) {
+        std::thread::sleep(Duration::from_millis(300));
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
