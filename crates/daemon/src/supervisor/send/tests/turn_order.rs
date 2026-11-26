@@ -23,7 +23,8 @@ use crate::store::test_faults::CommitFault;
 use crate::supervisor::live::LaunchObservation;
 use crate::supervisor::send::SETTLE;
 use crate::supervisor::tests::support::hook::Hook;
-use crate::supervisor::tests::support::http::{Reply, spawn_send};
+use crate::supervisor::tests::support::http::{Reply, reached, spawn_send};
+use crate::supervisor::tests::support::waits;
 
 /// A request's reply handle, carried out of a future that must not await it.
 struct Pending(JoinHandle<Reply>);
@@ -244,7 +245,7 @@ async fn stop_first_without_settle() {
     let (entered, go, point) = gate_point();
     set(&sl.hooks.record_job, point);
     let p = rig.send(&live, "P").await;
-    entered.await.unwrap();
+    reached(entered).await;
     assert_eq!(rig.input(p).state, InputState::Sending);
     // The worker is held in the record job, outside the state lock: no parking.
     let start = hold(
@@ -258,14 +259,7 @@ async fn stop_first_without_settle() {
     let r = rig.post(&rig.hook_of(&live, "Stop", &json!({}))).await;
     assert_eq!(r.status, 200);
     assert_eq!(start.finish().await.status, 200);
-    assert!(
-        matches!(
-            sl.state().log.0.get(&stop),
-            Some((TurnMark::End { settle: false }, _))
-        ),
-        "{:?}",
-        sl.state().log.0
-    );
+    end_mark(&rig, &live, stop, false);
     assert_eq!(turn(&rig, &live), TurnState::Unknown);
     assert_eq!(rig.input(p).state, InputState::Acked);
     go.send(()).unwrap();
@@ -293,11 +287,13 @@ fn end_mark(rig: &SRig, live: &Live, o: u64, settle: bool) {
 /// is recorded: a pass that could not observe the launch keeps the candidate for the next.
 async fn settles(rig: &SRig, live: &Live) {
     rig.clock.advance(SETTLE);
-    let end = Instant::now() + Duration::from_secs(10);
-    while count(rig, live, "stop_settled") == 0 {
-        assert!(Instant::now() < end, "the Stop settled");
-        rig.pass(live).await;
-    }
+    waits::bounded(Duration::from_secs(10), async {
+        while count(rig, live, "stop_settled") == 0 {
+            rig.pass(live).await;
+        }
+    })
+    .await
+    .expect("the Stop settled within 10 s");
     assert_eq!(count(rig, live, "stop_settled"), 1);
 }
 
@@ -311,7 +307,7 @@ async fn stop_after_the_record_settles() {
     let (entered, go, point) = gate_point();
     set(&sl.hooks.record_job, point);
     let p = rig.send(&live, "P").await;
-    entered.await.unwrap();
+    reached(entered).await;
     // The worker is held in the record job, outside the state lock: no parking.
     let start = hold(
         &rig,
@@ -323,7 +319,7 @@ async fn stop_after_the_record_settles() {
     let (recorded, go_on, point) = gate_point();
     set(&sl.hooks.after_record, point);
     go.send(()).unwrap();
-    recorded.await.unwrap();
+    reached(recorded).await;
     assert_eq!(rig.input(p).state, InputState::Sent);
     let stop = rig.next_ordinal(&live);
     assert_eq!(
@@ -357,7 +353,7 @@ async fn stop_after_an_incomplete_record_settles() {
     live.child
         .fail_writes_after(paste_len, std::io::ErrorKind::BrokenPipe);
     let p = rig.send(&live, "partial").await;
-    recorded.await.unwrap();
+    reached(recorded).await;
     assert_eq!(rig.input(p).state, InputState::Unconfirmed);
     rig.hook(&live, "UserPromptSubmit", &prompt("typed")).await;
     let stop = rig.next_ordinal(&live);
@@ -379,7 +375,7 @@ async fn record_during_intake_keeps_running() {
     let (entered, go, point) = gate_point();
     set(&sl.hooks.record_job, point);
     let p = rig.send(&live, "P").await;
-    entered.await.unwrap();
+    reached(entered).await;
     let recorded = sl.state().running.as_ref().unwrap().recorded.clone();
     // Runs in place of the `Stop`'s observation, after its fence advance: the record
     // commits there, and the launch is observed, so the facts are present.

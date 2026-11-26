@@ -90,6 +90,7 @@ impl IntakeProbe for SupervisorProbe {
         super::run_hook(&sl.hooks.after_written_read);
         sl.latest_intake.store(ordinal, Ordering::SeqCst);
         fence_advance(&sl.fence);
+        let st = st?;
         let sup = self.sup.upgrade()?;
         #[cfg(test)]
         let observed = match super::lock(&sl.hooks.observe).take() {
@@ -106,7 +107,6 @@ impl IntakeProbe for SupervisorProbe {
             LaunchObservation::Reserved => (0, [0; 3]),
             LaunchObservation::Unobservable => return None,
         };
-        let st = st?;
         let inflight = st.dispatch.as_ref().map(|d| {
             let at = last_started[OriginClass::Input.index()];
             Inflight {
