@@ -8,7 +8,9 @@ use chaldea_core::MAX_SAFE_INTEGER;
 use chaldea_core::auth::Action;
 use chaldea_core::http::{ThreadsResponse, WorktreesResponse};
 use chaldea_core::ids::{Epoch, StreamId, ThreadId};
-use chaldea_core::sync::{EventsQuery, EventsResponse, ReplayPlan, StreamSnapshot, decide_replay};
+use chaldea_core::sync::{
+    EventsQuery, EventsResponse, ReplayPlan, StreamSnapshot, ThreadSummary, decide_replay,
+};
 use serde::Serialize;
 
 use super::ctx::ReadCtx;
@@ -230,28 +232,40 @@ pub(crate) async fn thread_summary(
     req: Request<Body>,
 ) -> Result<Response<Body>, ApiError> {
     no_query(&req)?;
-    // The canonical form only, as a thread stream id spells it.
-    let t: ThreadId = match path_param(THREAD_PATH, req.uri().path(), "thread_id")
+    let t = thread_in_path(THREAD_PATH, &req)?;
+    json(&readable_summary(&ctx, t).await?)
+}
+
+/// The `{thread_id}` of `req`'s path under `template`, in the canonical form only, as a
+/// thread stream id spells it; else 404.
+pub(crate) fn thread_in_path(template: &str, req: &Request<Body>) -> Result<ThreadId, ApiError> {
+    match path_param(template, req.uri().path(), "thread_id")
         .and_then(|p| format!("thread:{p}").parse().ok())
     {
-        Some(StreamId::Thread(t)) => t,
-        _ => return Err(ApiError::not_found()),
-    };
-    let summary = ctx
-        .read(move |tx, auth| {
-            let scope = ReadScope::of(tx, auth, Action::ReadStream).map_err(store)?;
-            if !scope
-                .readable_stream(tx, StreamId::Thread(t))
-                .map_err(store)?
-            {
-                return Err(ApiError::not_found());
-            }
-            tx.thread_summary(t)
-                .map_err(store)?
-                .ok_or_else(ApiError::not_found)
-        })
-        .await?;
-    json(&summary)
+        Some(StreamId::Thread(t)) => Ok(t),
+        _ => Err(ApiError::not_found()),
+    }
+}
+
+/// The summary of thread `t`, authorized as `GET /api/events` authorizes its stream: a
+/// thread the token cannot read and a missing thread are one 404.
+pub(crate) async fn readable_summary(
+    ctx: &ReadCtx,
+    t: ThreadId,
+) -> Result<ThreadSummary, ApiError> {
+    ctx.read(move |tx, auth| {
+        let scope = ReadScope::of(tx, auth, Action::ReadStream).map_err(store)?;
+        if !scope
+            .readable_stream(tx, StreamId::Thread(t))
+            .map_err(store)?
+        {
+            return Err(ApiError::not_found());
+        }
+        tx.thread_summary(t)
+            .map_err(store)?
+            .ok_or_else(ApiError::not_found)
+    })
+    .await
 }
 
 /// The path of [`thread_summary`].

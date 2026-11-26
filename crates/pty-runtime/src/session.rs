@@ -1102,6 +1102,12 @@ impl Screen {
             .snapshot(st.output_offset, deadline)
             .ok_or(VtUnavailable)
     }
+
+    /// Whether the session's VT has failed: no snapshot will ever be taken again.
+    #[must_use]
+    pub fn vt_failed(&self) -> bool {
+        self.sh.vt_failed.load(Ordering::Acquire)
+    }
 }
 
 /// Reads the writer's dispatch positions without the session: a clone of the session's

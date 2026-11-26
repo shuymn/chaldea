@@ -250,6 +250,14 @@ pub static ROUTES: &[RouteSpec] = {
             10,
         ),
         get(
+            "/api/threads/{thread_id}/screen",
+            M::Read,
+            O::AbsentOrMatching,
+            C::Bearer(READERS),
+            A::Fixed(Action::ReadStream),
+            13,
+        ),
+        get(
             "/api/worktrees",
             M::Read,
             O::AbsentOrMatching,

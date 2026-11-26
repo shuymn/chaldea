@@ -26,6 +26,7 @@ mod ops;
 pub(crate) mod prober;
 pub(crate) mod record;
 mod restart;
+mod screen;
 pub mod send;
 mod tick;
 mod tracker;
