@@ -117,6 +117,62 @@ string_id!(
     /// RFC 3339 UTC with millisecond precision, e.g. `2026-11-22T09:45:00.123Z`.
     Timestamp
 );
+/// Milliseconds since the Unix epoch of a store stamp `YYYY-MM-DDTHH:MM:SS.mmmZ`
+/// ([`Timestamp`]), negative before 1970; `None` for any other text or a day its month lacks.
+#[must_use]
+pub fn stamp_millis(stamp: &str) -> Option<i64> {
+    let b = stamp.as_bytes();
+    if b.len() != 24 {
+        return None;
+    }
+    let sep = [
+        (4, b'-'),
+        (7, b'-'),
+        (10, b'T'),
+        (13, b':'),
+        (16, b':'),
+        (19, b'.'),
+        (23, b'Z'),
+    ];
+    if sep.iter().any(|&(i, c)| b[i] != c) {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let s = &b[from..to];
+        if !s.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(s).ok()?.parse().ok()
+    };
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, s, ms) = (num(11, 13)?, num(14, 16)?, num(17, 19)?, num(20, 23)?);
+    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || s > 59 {
+        return None;
+    }
+    let days = days_from_civil(y, mo, d);
+    Some((((days * 24 + h) * 60 + mi) * 60 + s) * 1000 + ms)
+}
+
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 string_id!(
     /// Derived from the canonical path of the repository's common git directory,
     /// or of the cwd outside git (§2.1).
@@ -345,3 +401,49 @@ string_form!(
     "Actor",
     format!("^(human|daemon|thread:{UUID_PATTERN})$")
 );
+
+#[cfg(test)]
+mod tests {
+    use super::stamp_millis;
+
+    /// The stamp format and its boundaries.
+    #[test]
+    fn timestamp() {
+        assert_eq!(stamp_millis("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(stamp_millis("1970-01-01T00:00:01.001Z"), Some(1001));
+        assert_eq!(
+            stamp_millis("2000-03-01T00:00:00.000Z"),
+            Some(951_868_800_000)
+        );
+        assert_eq!(
+            stamp_millis("2024-02-29T23:59:59.999Z"),
+            Some(1_709_251_199_999)
+        );
+        assert_eq!(
+            stamp_millis("2026-11-22T00:00:30.000Z").unwrap()
+                - stamp_millis("2026-11-22T00:00:00.000Z").unwrap(),
+            30_000
+        );
+        // Across a year boundary.
+        assert_eq!(
+            stamp_millis("2027-01-01T00:00:00.000Z").unwrap()
+                - stamp_millis("2026-12-31T23:59:59.999Z").unwrap(),
+            1
+        );
+        for bad in [
+            "",
+            "2026-11-22T00:00:00Z",
+            "2026-11-22T00:00:00.000",
+            "2026-11-22 00:00:00.000Z",
+            "2026-13-01T00:00:00.000Z",
+            "2026-02-29T00:00:00.000Z",
+            "2026-11-22T24:00:00.000Z",
+            "2026-11-22T00:60:00.000Z",
+            "2026-11-22T00:00:60.000Z",
+            "2026-11-22T00:00:00.+00Z",
+            "+026-11-22T00:00:00.000Z",
+        ] {
+            assert_eq!(stamp_millis(bad), None, "{bad}");
+        }
+    }
+}

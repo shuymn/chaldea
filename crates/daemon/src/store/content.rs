@@ -201,6 +201,7 @@ pub(crate) fn contents(e: &TypedEvent) -> Vec<&Content> {
         | TypedEvent::LaunchStarted(_)
         | TypedEvent::LaunchExited(_)
         | TypedEvent::LaunchDeathConfirmed(_)
+        | TypedEvent::LaunchEvidence(_)
         | TypedEvent::SessionBound(_)
         | TypedEvent::TranscriptGeneration(_)
         | TypedEvent::ReadinessObserved(_)

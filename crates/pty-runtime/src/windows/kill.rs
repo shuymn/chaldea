@@ -43,22 +43,28 @@ pub(crate) enum PidList {
     TooSmall,
 }
 
-/// What the kill engine needs from the OS; each method is one OS call.
-pub(crate) trait JobOs {
+/// The process calls the kill engine and the unowned kill (`crate::orphan`) share; each
+/// method is one OS call, and none names a job.
+pub(crate) trait ProcessOs {
     type Held;
     fn now(&self) -> Instant;
     fn sleep(&self, d: Duration);
-    fn terminate_job(&self) -> io::Result<()>;
-    fn active_processes(&self) -> io::Result<u32>;
-    fn job_pids(&self, capacity: usize) -> io::Result<PidList>;
     fn open_process(&self, pid: u32, access: Access) -> io::Result<Self::Held>;
     fn creation_time(&self, h: &Self::Held) -> io::Result<u64>;
-    fn in_job(&self, h: &Self::Held) -> io::Result<bool>;
     /// A zero wait polls; the engine passes whole milliseconds.
     fn signalled(&self, h: &Self::Held, wait: Duration) -> io::Result<bool>;
     /// One termination call; its result is never proof (the proof rounds observe the
     /// handle's signal).
     fn terminate(&self, h: &Self::Held) -> io::Result<()>;
+}
+
+/// What the kill engine needs from the OS besides [`ProcessOs`]: the launch job's calls;
+/// each method is one OS call.
+pub(crate) trait JobOs: ProcessOs {
+    fn terminate_job(&self) -> io::Result<()>;
+    fn active_processes(&self) -> io::Result<u32>;
+    fn job_pids(&self, capacity: usize) -> io::Result<PidList>;
+    fn in_job(&self, h: &Self::Held) -> io::Result<bool>;
 }
 
 /// The leader: its identity and the handle the child holds.
@@ -103,12 +109,12 @@ fn code(e: &io::Error) -> Option<i32> {
     e.raw_os_error()
 }
 
-fn expired(os: &impl JobOs, deadline: Instant) -> bool {
+pub(crate) fn expired(os: &impl ProcessOs, deadline: Instant) -> bool {
     os.now() >= deadline
 }
 
 /// `min(STEP, deadline − now)`; nothing when the deadline has passed.
-fn pace(os: &impl JobOs, deadline: Instant) {
+pub(crate) fn pace(os: &impl ProcessOs, deadline: Instant) {
     let left = deadline.saturating_duration_since(os.now());
     let d = STEP.min(left);
     if !d.is_zero() {
@@ -119,7 +125,7 @@ fn pace(os: &impl JobOs, deadline: Instant) {
 /// A handle wait of at most `cap` within the deadline, from one clock read, floored to
 /// whole milliseconds: `None` when the deadline has passed (no call), a zero wait (a poll)
 /// when less than 1 ms remains.
-fn budget(os: &impl JobOs, deadline: Instant, cap: Duration) -> Option<Duration> {
+pub(crate) fn budget(os: &impl ProcessOs, deadline: Instant, cap: Duration) -> Option<Duration> {
     let now = os.now();
     if now >= deadline {
         return None;
@@ -132,7 +138,7 @@ fn budget(os: &impl JobOs, deadline: Instant, cap: Duration) -> Option<Duration>
 
 /// Opens `pid` and checks its creation time on that same handle, checking the clock before
 /// each call.
-pub(crate) fn open_verified<O: JobOs>(
+pub(crate) fn open_verified<O: ProcessOs>(
     os: &O,
     pid: u32,
     start: u64,
@@ -822,7 +828,7 @@ mod tests {
         io::Error::from_raw_os_error(code)
     }
 
-    impl JobOs for Os {
+    impl ProcessOs for Os {
         type Held = H;
 
         fn now(&self) -> Instant {
@@ -842,6 +848,74 @@ mod tests {
             }
         }
 
+        fn open_process(&self, pid: u32, access: Access) -> io::Result<H> {
+            self.call(C::Open(pid, access));
+            let procs = self.procs.borrow();
+            let Some(p) = procs.get(&pid).filter(|p| self.alive(p)) else {
+                return Err(e(ERROR_INVALID_PARAMETER));
+            };
+            if let Some(c) = p.open_error {
+                return Err(e(c));
+            }
+            if access == Access::Kill && p.deny_kill_access {
+                return Err(e(ERROR_ACCESS_DENIED));
+            }
+            Ok(H {
+                pid,
+                start: p.start,
+                access,
+                drop_cost: p.close_cost.map(|d| (self.now.clone(), d)),
+            })
+        }
+
+        fn creation_time(&self, h: &H) -> io::Result<u64> {
+            self.call(C::Times(h.pid));
+            if self
+                .procs
+                .borrow()
+                .get(&h.pid)
+                .is_some_and(|p| p.times_error)
+            {
+                return Err(e(ERROR_ACCESS_DENIED));
+            }
+            Ok(h.start)
+        }
+
+        fn signalled(&self, h: &H, wait: Duration) -> io::Result<bool> {
+            self.call(C::Signalled(h.pid, wait));
+            if !self.live(h.pid, h.start) {
+                return Ok(true);
+            }
+            let dies = self
+                .procs
+                .borrow()
+                .get(&h.pid)
+                .and_then(|p| p.dies_at)
+                .filter(|t| *t <= self.now.get() + wait);
+            if let Some(t) = dies {
+                self.now.set(t);
+                return Ok(true);
+            }
+            self.now.set(self.now.get() + wait);
+            Ok(false)
+        }
+
+        fn terminate(&self, h: &H) -> io::Result<()> {
+            self.call(C::Terminate(h.pid));
+            if h.access != Access::Kill {
+                return Err(e(ERROR_ACCESS_DENIED));
+            }
+            if let Some(p) = self.procs.borrow_mut().get_mut(&h.pid)
+                && p.start == h.start
+                && !p.immortal
+            {
+                p.alive = false;
+            }
+            Ok(())
+        }
+    }
+
+    impl JobOs for Os {
         fn terminate_job(&self) -> io::Result<()> {
             self.call(C::TerminateJob);
             if self.terminate_job_error.get() {
@@ -888,39 +962,6 @@ mod tests {
             Ok(PidList::Complete(v))
         }
 
-        fn open_process(&self, pid: u32, access: Access) -> io::Result<H> {
-            self.call(C::Open(pid, access));
-            let procs = self.procs.borrow();
-            let Some(p) = procs.get(&pid).filter(|p| self.alive(p)) else {
-                return Err(e(ERROR_INVALID_PARAMETER));
-            };
-            if let Some(c) = p.open_error {
-                return Err(e(c));
-            }
-            if access == Access::Kill && p.deny_kill_access {
-                return Err(e(ERROR_ACCESS_DENIED));
-            }
-            Ok(H {
-                pid,
-                start: p.start,
-                access,
-                drop_cost: p.close_cost.map(|d| (self.now.clone(), d)),
-            })
-        }
-
-        fn creation_time(&self, h: &H) -> io::Result<u64> {
-            self.call(C::Times(h.pid));
-            if self
-                .procs
-                .borrow()
-                .get(&h.pid)
-                .is_some_and(|p| p.times_error)
-            {
-                return Err(e(ERROR_ACCESS_DENIED));
-            }
-            Ok(h.start)
-        }
-
         fn in_job(&self, h: &H) -> io::Result<bool> {
             self.call(C::InJob(h.pid));
             Ok(self
@@ -928,39 +969,6 @@ mod tests {
                 .borrow()
                 .get(&h.pid)
                 .is_some_and(|p| p.start == h.start && p.in_job))
-        }
-
-        fn signalled(&self, h: &H, wait: Duration) -> io::Result<bool> {
-            self.call(C::Signalled(h.pid, wait));
-            if !self.live(h.pid, h.start) {
-                return Ok(true);
-            }
-            let dies = self
-                .procs
-                .borrow()
-                .get(&h.pid)
-                .and_then(|p| p.dies_at)
-                .filter(|t| *t <= self.now.get() + wait);
-            if let Some(t) = dies {
-                self.now.set(t);
-                return Ok(true);
-            }
-            self.now.set(self.now.get() + wait);
-            Ok(false)
-        }
-
-        fn terminate(&self, h: &H) -> io::Result<()> {
-            self.call(C::Terminate(h.pid));
-            if h.access != Access::Kill {
-                return Err(e(ERROR_ACCESS_DENIED));
-            }
-            if let Some(p) = self.procs.borrow_mut().get_mut(&h.pid)
-                && p.start == h.start
-                && !p.immortal
-            {
-                p.alive = false;
-            }
-            Ok(())
         }
     }
 

@@ -6,7 +6,7 @@ use std::os::windows::io::{AsHandle, OwnedHandle};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::kill::{self, Access, JobOs, KillState, Leader, PidList};
+use super::kill::{self, Access, JobOs, KillState, Leader, PidList, ProcessOs};
 use super::sys;
 use super::wait::{self, MAX_CHUNK_MS};
 use crate::backend::{ChildExit, KillReport, ProcessIdentity, PtyChild};
@@ -126,7 +126,11 @@ struct RealJobOs<'a> {
     in_kill: &'a Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
-impl JobOs for RealJobOs<'_> {
+/// The process calls over the real OS, with no job handle: the owned engine's through
+/// [`RealJobOs`], and the orphan loop's (`orphan::kill_recorded`).
+pub(crate) struct RealProcessOs;
+
+impl ProcessOs for RealProcessOs {
     type Held = OwnedHandle;
 
     fn now(&self) -> Instant {
@@ -137,6 +141,56 @@ impl JobOs for RealJobOs<'_> {
         std::thread::sleep(d);
     }
 
+    fn open_process(&self, pid: u32, access: Access) -> io::Result<OwnedHandle> {
+        let mask = match access {
+            Access::Kill => super::KILL_SYNC,
+            Access::Wait => super::QUERY_SYNC,
+        };
+        sys::open_process(pid, mask)
+    }
+
+    fn creation_time(&self, h: &OwnedHandle) -> io::Result<u64> {
+        sys::creation_time(h.as_handle())
+    }
+
+    fn signalled(&self, h: &OwnedHandle, wait: Duration) -> io::Result<bool> {
+        sys::wait_floor(h.as_handle(), wait)
+    }
+
+    fn terminate(&self, h: &OwnedHandle) -> io::Result<()> {
+        sys::terminate_process(h, KILL_CODE)
+    }
+}
+
+impl ProcessOs for RealJobOs<'_> {
+    type Held = OwnedHandle;
+
+    fn now(&self) -> Instant {
+        RealProcessOs.now()
+    }
+
+    fn sleep(&self, d: Duration) {
+        RealProcessOs.sleep(d);
+    }
+
+    fn open_process(&self, pid: u32, access: Access) -> io::Result<OwnedHandle> {
+        RealProcessOs.open_process(pid, access)
+    }
+
+    fn creation_time(&self, h: &OwnedHandle) -> io::Result<u64> {
+        RealProcessOs.creation_time(h)
+    }
+
+    fn signalled(&self, h: &OwnedHandle, wait: Duration) -> io::Result<bool> {
+        RealProcessOs.signalled(h, wait)
+    }
+
+    fn terminate(&self, h: &OwnedHandle) -> io::Result<()> {
+        RealProcessOs.terminate(h)
+    }
+}
+
+impl JobOs for RealJobOs<'_> {
     fn terminate_job(&self) -> io::Result<()> {
         #[cfg(test)]
         if let Some(f) = self
@@ -160,27 +214,7 @@ impl JobOs for RealJobOs<'_> {
         sys::job_pids(self.job, capacity)
     }
 
-    fn open_process(&self, pid: u32, access: Access) -> io::Result<OwnedHandle> {
-        let mask = match access {
-            Access::Kill => super::KILL_SYNC,
-            Access::Wait => super::QUERY_SYNC,
-        };
-        sys::open_process(pid, mask)
-    }
-
-    fn creation_time(&self, h: &OwnedHandle) -> io::Result<u64> {
-        sys::creation_time(h.as_handle())
-    }
-
     fn in_job(&self, h: &OwnedHandle) -> io::Result<bool> {
         sys::in_job(h, self.job)
-    }
-
-    fn signalled(&self, h: &OwnedHandle, wait: Duration) -> io::Result<bool> {
-        sys::wait_floor(h.as_handle(), wait)
-    }
-
-    fn terminate(&self, h: &OwnedHandle) -> io::Result<()> {
-        sys::terminate_process(h, KILL_CODE)
     }
 }

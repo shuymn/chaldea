@@ -9,13 +9,16 @@ use std::time::Duration;
 use chaldea_core::adapter::{HostOs, capabilities};
 use chaldea_core::auth::{Action, Grant, ThreadGraph, grant, may_act_on_thread};
 use chaldea_core::canonical::CanonicalJson;
-use chaldea_core::command::{CloseArgs, CloseResult, ResumeArgs, SpawnArgs, StopArgs};
+use chaldea_core::command::{
+    CloseArgs, CloseResult, ResumeArgs, SpawnArgs, StopArgs, StopOutcome, StopResult,
+};
 use chaldea_core::event::TypedEvent;
 use chaldea_core::http::ErrorCode;
 use chaldea_core::ids::{Actor, Agent, CommandId, InputId, LaunchId, ThreadId};
 use chaldea_core::input::MAX_PROMPT_BYTES;
 use chaldea_core::input::encode::{Purpose, check};
-use chaldea_core::payload::{SourceKind, ThreadClosed};
+use chaldea_core::payload::{LaunchDeathConfirmed, OWNER_ASSERTED, SourceKind, ThreadClosed};
+use chaldea_core::state::StateInput;
 use futures_util::future::BoxFuture;
 use serde::Serialize;
 use serde_json::value::RawValue;
@@ -27,13 +30,13 @@ use crate::http::{
 };
 use crate::store::{JobError, LaunchRow, ThreadRow, TokenKind, TokenSelector, WriteTx};
 
-use super::events::{ThreadJob, command_key, refusal};
+use super::events::{ThreadJob, command_key, launch_key, refusal};
 use super::ops::{
     LaunchKind, LaunchReq, StopReq, already_exited, code, launch_op, ok, refused_result,
     stop_launch, stop_op,
 };
 use super::record::{JobOf, Recorded, record};
-use super::{COMMAND_DEADLINE, Pause, STOP_REPORT, Supervisor};
+use super::{COMMAND_DEADLINE, Pause, Supervisor};
 
 pub(crate) fn parse<T: serde::de::DeserializeOwned + Serialize>(
     args: &RawValue,
@@ -238,10 +241,16 @@ impl CommandHandler for StopHandler {
 
     fn prepare(&self, args: &RawValue) -> Result<Prepared, ApiError> {
         let (a, normalized) = parse::<StopArgs>(args)?;
+        if a.assume_dead && a.expected_launch_id.is_none() {
+            return Err(ApiError::bad_args());
+        }
         Ok(Prepared {
             normalized,
             intent: Box::new(move |tx, auth, ctx| {
                 let t = target(tx, auth, Action::Stop, a.thread_id)?;
+                if a.assume_dead && auth.kind != TokenKind::Owner {
+                    return Err(refused(ApiError::forbidden()));
+                }
                 let Some(l) = t.current_launch_id else {
                     return Err(refused(ApiError::not_found()));
                 };
@@ -252,12 +261,15 @@ impl CommandHandler for StopHandler {
                     .read()
                     .launch(l)?
                     .ok_or_else(|| refusal("the current launch has no row"))?;
+                if a.assume_dead {
+                    return assert_dead(tx, &t, &row, ctx.command_id()).map(Intent::Completed);
+                }
                 if row.exit_reason.is_some() {
                     if !row.death_confirmed {
                         return Err(refused(code(ErrorCode::DeathUnconfirmed)));
                     }
-                    let within = ctx.job_start() <= ctx.request_start() + STOP_REPORT;
-                    return Ok(Intent::Completed(ok(&already_exited(l, within))));
+                    let r = already_exited(l, &row, ctx.job_start(), ctx.request_start());
+                    return Ok(Intent::Completed(ok(&r)));
                 }
                 Ok(Intent::Pending(EffectRun::new(StopReq {
                     command_id: ctx.command_id(),
@@ -272,6 +284,50 @@ impl CommandHandler for StopHandler {
     fn effect(&self) -> Option<&dyn CommandEffect> {
         Some(self)
     }
+}
+
+/// The owner's assertion (`docs/design/supervisor-recovery.md` §2.5) for the current launch
+/// `l` of `t`, in the intent's own job: a running launch is `launch_live`; an unconfirmed one
+/// gets `launch_death_confirmed { method: owner_asserted }` with `DeathConfirmed`; a
+/// confirmed one is answered `asserted` with nothing written.
+fn assert_dead(
+    tx: &mut WriteTx<'_>,
+    t: &ThreadRow,
+    l: &LaunchRow,
+    cid: CommandId,
+) -> Result<chaldea_core::command::CommandResult, JobError> {
+    if l.exit_reason.is_none() {
+        return Err(refused(code(ErrorCode::LaunchLive)));
+    }
+    let launch = l.launch_id;
+    if !l.death_confirmed {
+        let mut job = ThreadJob::new(
+            t.thread_id,
+            t.agent,
+            t.state.clone(),
+            SourceKind::Command,
+            Some(cid),
+        );
+        let key = launch_key(launch, "death_confirmed");
+        job.push(
+            key.clone(),
+            TypedEvent::LaunchDeathConfirmed(LaunchDeathConfirmed {
+                launch_id: launch,
+                method: OWNER_ASSERTED.to_owned(),
+            }),
+            Some(launch),
+        );
+        job.apply(&key, "death", &StateInput::DeathConfirmed, Some(launch))?;
+        job.flush(tx)?;
+    }
+    Ok(ok(&StopResult {
+        launch_id: launch,
+        outcome: StopOutcome::Asserted,
+        death_confirmed: true,
+        confirmed_within_deadline: false,
+        exit_code: None,
+        signal: None,
+    }))
 }
 
 impl CommandEffect for StopHandler {

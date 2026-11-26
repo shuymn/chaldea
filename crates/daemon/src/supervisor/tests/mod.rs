@@ -4,10 +4,12 @@
 mod adapters;
 mod close;
 mod commands;
+mod evidence;
 mod exit;
 mod launch;
 mod live;
 mod ops;
+mod prober;
 mod race;
 mod reserve;
 pub(crate) mod restart;
@@ -209,6 +211,13 @@ pub(crate) fn config(
         decoder: Arc::new(crate::supervisor::send::fake_decoder::FakeDecoder),
         readiness_mode: None,
         send_workers: false,
+        // No OS work: every identity is reported not read. The prober tests script it.
+        kill_recorded: Arc::new(|ids, _| chaldea_pty_runtime::orphan::OrphanReport {
+            fates: ids
+                .iter()
+                .map(|id| (id.clone(), chaldea_pty_runtime::orphan::Fate::NotRead))
+                .collect(),
+        }),
     }
 }
 
@@ -283,7 +292,15 @@ impl Rig {
         let mut cfg = config(&pty, &clock, &pauses);
         tune(&mut cfg);
         let side = crate::supervisor::send::install(&mut cfg);
-        let sup = new_supervisor(host, cfg, side, store.store().clone(), sink.clone(), 0);
+        let sup = new_supervisor(
+            host,
+            cfg,
+            side,
+            store.store().clone(),
+            sink.clone(),
+            0,
+            Uuid::new_v4().to_string(),
+        );
         sup.start_send_driver();
         let srv = TestServer::start_parts(
             store,
@@ -395,6 +412,16 @@ impl Rig {
     /// Waits (10 s at most) until `cond` holds.
     pub(crate) async fn until(&self, what: &str, cond: impl FnMut() -> bool) {
         support::http::eventually(Duration::from_secs(10), what, cond).await;
+    }
+}
+
+/// The leader identity the launch row of `l` records.
+pub(crate) fn prober_leader(rig: &Rig, l: LaunchId) -> chaldea_pty_runtime::ProcessIdentity {
+    let row = rig.launch(l);
+    chaldea_pty_runtime::ProcessIdentity {
+        pid: row.pid.unwrap(),
+        start_time: row.start_time.unwrap_or_default(),
+        group: row.pgid_or_job.unwrap_or_default(),
     }
 }
 

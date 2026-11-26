@@ -16,10 +16,10 @@ use crate::ids::{
 };
 use crate::payload::{
     ApprovalRequested, ApprovalResolved, AssistantMessage, HumanWrite, InputCreated,
-    InputStateChanged, LaunchDeathConfirmed, LaunchExited, LaunchReserved, LaunchStarted,
-    MailboxMessage, RawUnknown, ReadinessObserved, SessionBound, SourceKind, SurfaceUpdate,
-    TaskSet, ThreadClosed, ThreadRegistered, ToolActivity, TranscriptGeneration, UserMessage,
-    VtSnapshotTaken, WorktreeChanged,
+    InputStateChanged, LaunchDeathConfirmed, LaunchEvidence, LaunchExited, LaunchReserved,
+    LaunchStarted, MailboxMessage, RawUnknown, ReadinessObserved, SessionBound, SourceKind,
+    SurfaceUpdate, TaskSet, ThreadClosed, ThreadRegistered, ToolActivity, TranscriptGeneration,
+    UserMessage, VtSnapshotTaken, WorktreeChanged,
 };
 use crate::state::StatusChanged;
 
@@ -199,6 +199,7 @@ event_kinds! {
     VtSnapshotTaken(VtSnapshotTaken) = "vt_snapshot_taken",
     WorktreeChanged(WorktreeChanged) = "worktree_changed",
     RawUnknown(RawUnknown) = "raw_unknown",
+    LaunchEvidence(LaunchEvidence) = "launch_evidence",
 }
 
 impl TypedEvent {

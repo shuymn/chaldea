@@ -935,3 +935,336 @@ async fn drop_never_confirms() {
     );
     rig.srv.stop().await;
 }
+
+/// The `launch_death_confirmed` events of thread `t`.
+fn confirmations(rig: &Rig, t: chaldea_core::ids::ThreadId) -> Vec<serde_json::Value> {
+    rig.events(t)
+        .into_iter()
+        .filter(|(k, _)| k == "launch_death_confirmed")
+        .map(|(_, p)| p)
+        .collect()
+}
+
+fn resume_blocked(rig: &Rig, t: chaldea_core::ids::ThreadId) -> bool {
+    rig.thread(t)
+        .state
+        .attention
+        .contains(&chaldea_core::state::AttentionCause::ResumeBlocked)
+}
+
+fn assert_args(
+    t: chaldea_core::ids::ThreadId,
+    l: chaldea_core::ids::LaunchId,
+) -> serde_json::Value {
+    json!({ "thread_id": t, "expected_launch_id": l, "assume_dead": true })
+}
+
+/// PR10a2-CL-8 `assume_dead`: an agent token whose plain stop of its child passes the target
+/// scope is 403 `forbidden`; no `expected_launch_id` is 400 `bad_args`; a stale id
+/// `launch_changed`; a running launch `launch_live`. Each unconfirmed reason is `asserted`
+/// with one `owner_asserted` event and `resume_blocked` cleared; before it `resume` and
+/// `close` answer `death_unconfirmed`, after it `close` succeeds and `resume` passes the
+/// death check (a bound launch reserves, an unbound `unknown_after_crash` launch answers
+/// `no_session`); a plain stop then answers `already_exited` and a repeated assertion
+/// `asserted`, both `confirmed_within_deadline: false`, with no event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn assume_dead() {
+    use crate::store::TokenKind;
+    let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
+        c.kill_budget = Duration::from_millis(200);
+    })
+    .await;
+    rig.clock.resume();
+    // The refusals.
+    let (tr, lr) = rig.spawn_codex(None).await;
+    let r = rig
+        .cmd("stop", &json!({ "thread_id": tr, "assume_dead": true }))
+        .await;
+    assert_eq!(
+        (r.status, json(&r)["code"].clone()),
+        (400, json!("bad_args"))
+    );
+    let stale = chaldea_core::ids::LaunchId(uuid::Uuid::new_v4());
+    let r = rig.cmd("stop", &assert_args(tr, stale)).await;
+    assert_eq!(json(&r)["code"], "launch_changed");
+    let r = rig.cmd("stop", &assert_args(tr, lr)).await;
+    assert_eq!(
+        (r.status, json(&r)["code"].clone()),
+        (409, json!("launch_live"))
+    );
+    let agent = rig.srv.token(TokenKind::Agent, Some(tr), Some(lr)).await;
+    let cwd = rig.cwd.path().to_string_lossy().into_owned();
+    let r = rig
+        .cmd_as(
+            &agent,
+            "spawn",
+            super::cid(),
+            &json!({ "agent": "codex", "cwd": cwd }),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let (tc, lc): (chaldea_core::ids::ThreadId, chaldea_core::ids::LaunchId) = (
+        serde_json::from_value(json(&r)["thread_id"].clone()).unwrap(),
+        serde_json::from_value(json(&r)["launch_id"].clone()).unwrap(),
+    );
+    let r = rig
+        .cmd_as(&agent, "stop", super::cid(), &assert_args(tc, lc))
+        .await;
+    assert_eq!(
+        (r.status, json(&r)["code"].clone()),
+        (403, json!("forbidden"))
+    );
+    let r = rig
+        .cmd_as(&agent, "stop", super::cid(), &json!({ "thread_id": tc }))
+        .await;
+    assert_eq!(r.status, 200, "the plain stop passes the target scope");
+
+    // One launch per unconfirmed reason.
+    rig.pty.script_next(FakeScript {
+        kill: KillBehavior::Unconfirmed,
+        ..FakeScript::default()
+    });
+    let (ts, ls) = rig.spawn_codex(None).await;
+    let r = rig.cmd("stop", &json!({ "thread_id": ts })).await;
+    assert_eq!(json(&r)["death_confirmed"], false);
+    rig.pty.script_next(FakeScript {
+        kill: KillBehavior::Unconfirmed,
+        ..FakeScript::default()
+    });
+    let (te, le) = rig.spawn_codex(None).await;
+    rig.pty.take_child().unwrap().fail_wait();
+    rig.until("the exit", || rig.launch(le).exit_reason.is_some())
+        .await;
+    rig.pty.script_next(FakeScript {
+        fail: Some(chaldea_pty_runtime::SpawnError::StartedThenFailed {
+            stage: "s",
+            error: std::io::Error::other("x"),
+            identity: None,
+            cleanup: chaldea_pty_runtime::Cleanup::Unresolved {
+                kill: None,
+                close: None,
+                drain_abandoned: false,
+            },
+        }),
+        ..FakeScript::default()
+    });
+    let r = rig
+        .cmd("spawn", &json!({ "agent": "codex", "cwd": cwd }))
+        .await;
+    let (tf, lf): (chaldea_core::ids::ThreadId, chaldea_core::ids::LaunchId) = (
+        serde_json::from_value(json(&r)["thread_id"].clone()).unwrap(),
+        serde_json::from_value(json(&r)["launch_id"].clone()).unwrap(),
+    );
+    let (tb, lb) = rig.spawn_codex(None).await;
+    rig.bind(tb, lb, "session-b").await;
+    let held = rig.pauses.arm(Pause::BeforeSpawn);
+    let pending = spawn_send(
+        &rig.srv,
+        &rig.srv.command(
+            "spawn",
+            &rig.owner,
+            super::cid(),
+            &json!({ "agent": "codex", "cwd": cwd }).to_string(),
+        ),
+    );
+    held.wait();
+    super::restart::restart_all(&rig.srv.store);
+    held.go();
+    let _ = pending.await;
+    let tu = rig
+        .srv
+        .store
+        .read(|r| {
+            Ok(r.threads()?
+                .into_iter()
+                .map(|t| t.thread_id)
+                .collect::<Vec<_>>())
+        })
+        .into_iter()
+        .find(|t| ![tr, tc, ts, te, tf, tb].contains(t))
+        .unwrap();
+    let lu = rig.thread(tu).current_launch_id.unwrap();
+    use chaldea_core::payload::ExitReason;
+    let cases = [
+        (ts, ls, ExitReason::Stopped),
+        (te, le, ExitReason::Exit),
+        (tf, lf, ExitReason::SpawnFailed),
+        (tb, lb, ExitReason::DaemonRestart),
+        (tu, lu, ExitReason::UnknownAfterCrash),
+    ];
+    for (t, l, reason) in cases {
+        let row = rig.launch(l);
+        assert_eq!(row.exit_reason, Some(reason));
+        assert!(!row.death_confirmed, "{reason:?}");
+        for (name, args) in [
+            ("resume", json!({ "thread_id": t, "expected_launch_id": l })),
+            ("close", json!({ "thread_id": t, "expected_launch_id": l })),
+        ] {
+            let r = rig.cmd(name, &args).await;
+            assert_eq!(json(&r)["code"], "death_unconfirmed", "{reason:?} {name}");
+        }
+        assert!(resume_blocked(&rig, t), "{reason:?}");
+        let r = rig.cmd("stop", &assert_args(t, l)).await;
+        assert_eq!(r.status, 200, "{reason:?}");
+        assert_eq!(
+            json(&r),
+            json!({ "launch_id": l, "outcome": "asserted", "death_confirmed": true,
+                    "confirmed_within_deadline": false, "exit_code": null, "signal": null }),
+            "{reason:?}"
+        );
+        assert_eq!(
+            confirmations(&rig, t),
+            [json!({ "launch_id": l, "method": "owner_asserted" })],
+            "{reason:?}"
+        );
+        assert!(!resume_blocked(&rig, t), "{reason:?}");
+        assert!(rig.launch(l).death_confirmed);
+        let events = rig.events(t).len();
+        let r = rig.cmd("stop", &json!({ "thread_id": t })).await;
+        assert_eq!(json(&r)["outcome"], "already_exited", "{reason:?}");
+        assert_eq!(json(&r)["confirmed_within_deadline"], false, "{reason:?}");
+        let r = rig.cmd("stop", &assert_args(t, l)).await;
+        assert_eq!(json(&r)["outcome"], "asserted", "{reason:?}");
+        assert_eq!(json(&r)["confirmed_within_deadline"], false, "{reason:?}");
+        assert_eq!(rig.events(t).len(), events, "{reason:?}: nothing written");
+        match reason {
+            ExitReason::DaemonRestart => {
+                let r = rig
+                    .cmd(
+                        "resume",
+                        &json!({ "thread_id": t, "expected_launch_id": l }),
+                    )
+                    .await;
+                assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                assert_ne!(
+                    rig.thread(t).current_launch_id,
+                    Some(l),
+                    "a launch reserved"
+                );
+            }
+            ExitReason::UnknownAfterCrash => {
+                let r = rig
+                    .cmd(
+                        "resume",
+                        &json!({ "thread_id": t, "expected_launch_id": l }),
+                    )
+                    .await;
+                assert_eq!(json(&r)["code"], "no_session");
+            }
+            _ => {
+                let r = rig
+                    .cmd("close", &json!({ "thread_id": t, "expected_launch_id": l }))
+                    .await;
+                assert_eq!(
+                    r.status,
+                    200,
+                    "{reason:?}: {}",
+                    String::from_utf8_lossy(&r.body)
+                );
+            }
+        }
+    }
+    rig.srv.stop().await;
+}
+
+/// PR10a2-CL-8 `one_confirmation`: two assertions with different `command_id`s released
+/// together through a parked writer: one event, both `asserted`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_confirmation() {
+    let rig = Rig::new().await;
+    rig.clock.resume();
+    rig.pty.script_next(FakeScript {
+        kill: KillBehavior::Unconfirmed,
+        ..FakeScript::default()
+    });
+    let (t, l) = rig.spawn_codex(None).await;
+    rig.cmd("stop", &json!({ "thread_id": t })).await;
+    let writer = rig.srv.hold_writer().await;
+    let send = || {
+        spawn_send(
+            &rig.srv,
+            &rig.srv.command(
+                "stop",
+                &rig.owner,
+                super::cid(),
+                &assert_args(t, l).to_string(),
+            ),
+        )
+    };
+    let (a, b) = (send(), send());
+    drop(writer);
+    for r in [a.await.unwrap(), b.await.unwrap()] {
+        assert_eq!(
+            json(&r)["outcome"],
+            "asserted",
+            "{}",
+            String::from_utf8_lossy(&r.body)
+        );
+    }
+    assert_eq!(confirmations(&rig, t).len(), 1);
+    rig.srv.stop().await;
+}
+
+/// PR10a2-CL-8 `receipt_from_10a1`: a plain `stop` keeps 10a1's canonical arguments, so its
+/// stored receipt carries 10a1's request identity and replays with the same `command_id` and
+/// body; the same body with `assume_dead: true` is 409 `conflict`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receipt_from_10a1() {
+    use chaldea_core::canonical::CanonicalJson;
+    use chaldea_core::command::request_identity;
+    let rig = Rig::new().await;
+    let (t, l) = rig.stopped_bound().await;
+    let id = super::cid();
+    let plain = json!({ "thread_id": t, "expected_launch_id": l });
+    let first = rig.cmd_as(&rig.owner, "stop", id, &plain).await;
+    assert_eq!(first.status, 200);
+    let receipt = rig.srv.receipt(id).unwrap();
+    assert_eq!(
+        receipt.request_sha256,
+        request_identity("stop", &CanonicalJson::of(&plain).unwrap()),
+        "10a1's canonical arguments"
+    );
+    let again = rig.cmd_as(&rig.owner, "stop", id, &plain).await;
+    assert_eq!(
+        (again.status, again.body.clone()),
+        (first.status, first.body.clone())
+    );
+    let mut asserted = plain.clone();
+    asserted["assume_dead"] = json!(true);
+    let r = rig.cmd_as(&rig.owner, "stop", id, &asserted).await;
+    assert_eq!(
+        (r.status, json(&r)["code"].clone()),
+        (409, json!("conflict"))
+    );
+    rig.srv.stop().await;
+}
+
+/// PR10a2-CL-8, the op's re-read: a plain stop admitted while the launch runs, held at its
+/// start while the launch exits unconfirmed and the owner asserts it, answers
+/// `already_exited` with `confirmed_within_deadline: false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn assume_dead_before_the_reread() {
+    let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
+        c.kill_budget = Duration::from_millis(200);
+    })
+    .await;
+    rig.clock.resume();
+    rig.pty.script_next(FakeScript {
+        kill: KillBehavior::Unconfirmed,
+        ..FakeScript::default()
+    });
+    let (t, l) = rig.spawn_codex(None).await;
+    let held = rig.pauses.arm(Pause::StopStart);
+    let reply = stop_with(&rig, t);
+    held.wait();
+    rig.pty.take_child().unwrap().fail_wait();
+    rig.until("the exit", || rig.launch(l).exit_reason.is_some())
+        .await;
+    let r = rig.cmd("stop", &assert_args(t, l)).await;
+    assert_eq!(json(&r)["outcome"], "asserted");
+    held.go();
+    let v = json(&reply.await.unwrap());
+    assert_eq!(v["outcome"], "already_exited", "{v}");
+    assert_eq!(v["confirmed_within_deadline"], false, "{v}");
+    rig.srv.stop().await;
+}

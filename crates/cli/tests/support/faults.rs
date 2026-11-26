@@ -49,9 +49,17 @@ pub const AS_CHALDEA: &str = "CHALDEA_TEST_AS_CHALDEA";
 /// leading arguments: `daemon run` builds `SupervisorComponents` with it.
 pub const AGENT_PROGRAM: &str = "CHALDEA_TEST_AGENT_PROGRAM";
 /// With [`AGENT_PROGRAM`]: the supervisor holds at this pause point (`after_reserve`,
-/// `after_spawn`) on the gate at [`SUPERVISOR_GATE`].
+/// `after_spawn`, `prober_start`) on the gate at [`SUPERVISOR_GATE`].
 pub const SUPERVISOR_PAUSE: &str = "CHALDEA_TEST_SUPERVISOR_PAUSE";
 pub const SUPERVISOR_GATE: &str = "CHALDEA_TEST_SUPERVISOR_GATE";
+/// Windows: the native runtime's first spawn takes `RejectJobList` with a gate; at its
+/// suspended create the child's pid is written to `pid` in this test gate's directory, which
+/// is then waited at (`docs/design/supervisor-recovery.md` §5.2 PR10a2-CL-10).
+pub const A29_GATE: &str = "CHALDEA_TEST_A29_GATE";
+/// Windows, `assign_terminate_denied`: the native runtime's first spawn takes
+/// `WindowsFault::AssignTerminateDenied`, so it fails with its suspended child alive outside
+/// any launch job and recorded in `failed_start`.
+pub const WINDOWS_FAULT: &str = "CHALDEA_TEST_WINDOWS_FAULT";
 /// With [`AGENT_PROGRAM`], set: the supervisor runs on `FakePty`, its first child's waiter
 /// held, so a close of it abandons `pty-wait` and its token stays counted.
 pub const FAKE_PTY_HOLD_WAITER: &str = "CHALDEA_TEST_FAKE_PTY_HOLD_WAITER";
@@ -367,6 +375,7 @@ pub fn enter_if_chaldea() {
                 let at = match at.as_str() {
                     "after_reserve" => chaldea_daemon::supervisor::Pause::AfterReserve,
                     "after_spawn" => chaldea_daemon::supervisor::Pause::AfterSpawn,
+                    "prober_start" => chaldea_daemon::supervisor::Pause::ProberStart,
                     other => panic!("unknown supervisor pause {other}"),
                 };
                 cfg.pauses = std::sync::Arc::new(GatePause { at, dir });
@@ -378,6 +387,28 @@ pub fn enter_if_chaldea() {
                     ..chaldea_pty_runtime::fake::FakeScript::default()
                 });
                 cfg.runtime = std::sync::Arc::new(pty);
+            }
+            #[cfg(windows)]
+            if std::env::var(WINDOWS_FAULT).as_deref() == Ok("assign_terminate_denied") {
+                use chaldea_pty_runtime::fake::{WindowsFault, with_windows_fault};
+                cfg.runtime =
+                    with_windows_fault(cfg.runtime.clone(), WindowsFault::AssignTerminateDenied);
+            }
+            // One gate holds the spawning thread until the test kills the helper: the
+            // backend's gate waits as long as the test gate's waiter does.
+            #[cfg(windows)]
+            if let Some(dir) = env_path(A29_GATE) {
+                use chaldea_pty_runtime::fake::{WindowsFault, gate_within, with_windows_fault};
+                let (g, control) = gate_within(GATE_MAX);
+                cfg.runtime =
+                    with_windows_fault(cfg.runtime.clone(), WindowsFault::RejectJobList(Some(g)));
+                std::thread::spawn(move || {
+                    if let Some(pid) = control.wait_reached_pid(GATE_MAX) {
+                        std::fs::write(dir.join("pid"), pid.to_string()).unwrap();
+                        wait_at(&dir);
+                    }
+                    drop(control);
+                });
             }
             Box::new(chaldea_daemon::supervisor::SupervisorComponents::new(
                 host, cfg,

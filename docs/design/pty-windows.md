@@ -126,7 +126,7 @@ struct WindowsPty { #[cfg(any(test, feature = "fake"))] hooks: hooks::Hooks }   
 
 `spawn` has no deadline of its own: it waits for `SPAWN_LOCK`, and `CreatePseudoConsole` and `CreateProcessW` are synchronous kernel32 calls without a handshake. A failure after stage 6 builds the child is always `StartedThenFailed` released by the teardown, whose order is kill → input → close → drain. The two orders differ: `release_early`, with no process, closes the pseudoconsole first and drops the input after it (close → input → drain → job), while the teardown attempts the kill and drops the input before it closes the pseudoconsole. The teardown **attempts** the kill before releasing I/O; when the kill cannot prove death by its deadline, input and the pseudoconsole are still released and the result is `Unresolved` with the kill report (`backend.rs:283-291`).
 
-**Crash window (PR 10).** If the daemon dies between a suspended `CreateProcessW` and `AssignProcessToJobObject`, the suspended child is in no Chaldea job, so the daemon's exit does not kill it, and no `launch_started` names it. It never runs (its only thread is suspended), but it holds a pid and its image until something terminates it. The job-list branch has no such window. Recorded under "Related Text" as a PR 10 obligation.
+**Crash window (PR 10).** If the daemon dies between a suspended `CreateProcessW` and `AssignProcessToJobObject`, the suspended child is in no Chaldea job, so the daemon's exit does not kill it, and no `launch_started` names it. It never runs (its only thread is suspended), but it holds a pid and its image until something terminates it. The job-list branch has no such window. The launch is recorded `unknown_after_crash`, and PR 21's finder receives, for each such launch with death unconfirmed on a Windows host, the launch id, the agent from its `launch_reserved`, and that event's `recorded_at`; a process is a candidate when `launch::a29_candidate` holds: it is suspended, in no job the running daemon holds (it may be in another job), its image file name, compared without case and with `.exe`, is the agent's executable name, and its creation time, truncated to milliseconds, is not before `recorded_at` (`docs/design/supervisor-recovery.md` §2.6). A candidate is never a death proof; the launch is confirmed by the owner's assertion.
 
 ### 2.3 Input, Output, Control
 
@@ -176,20 +176,23 @@ struct WindowsChild {
 ```rust
 impl PtyChild for WindowsChild { fn kill_tree(&self, extra: &[ProcessIdentity], lock_by: Instant, deadline: Instant) -> KillReport; }
 
-pub(crate) trait JobOs {                       // the real one wraps sys; tests script it with a synthetic clock
+pub(crate) trait ProcessOs {                   // per-process calls; `orphan::kill_recorded` uses only these
+    type Held;
     fn now(&self) -> Instant;
     fn sleep(&self, d: Duration);
+    fn open_process(&self, pid: u32, access: Access) -> io::Result<Self::Held>;  // one OpenProcess
+    fn creation_time(&self, h: &Self::Held) -> io::Result<u64>;                // one GetProcessTimes
+    fn signalled(&self, h: &Self::Held, wait: Duration) -> io::Result<bool>;   // one WaitForSingleObject; a zero wait polls
+    fn terminate(&self, h: &Self::Held) -> io::Result<()>;                     // one TerminateProcess; its result is never proof
+}
+pub(crate) trait JobOs: ProcessOs {            // the launch job's calls; the real one wraps sys; tests script both with a synthetic clock
     fn terminate_job(&self) -> io::Result<()>;
     fn active_processes(&self) -> io::Result<u32>;
     fn job_pids(&self, capacity: usize) -> io::Result<PidList>;          // one QueryInformationJobObject; survivor report only
-    fn open_process(&self, pid: u32, access: Access) -> io::Result<Held>;  // one OpenProcess
-    fn creation_time(&self, h: &Held) -> io::Result<u64>;                // one GetProcessTimes
-    fn in_job(&self, h: &Held) -> io::Result<bool>;                      // one IsProcessInJob
-    fn signalled(&self, h: &Held, wait: Duration) -> io::Result<bool>;   // one WaitForSingleObject; a zero wait polls
-    fn terminate(&self, h: &Held) -> io::Result<()>;                     // one TerminateProcess; its result is never proof
+    fn in_job(&self, h: &Self::Held) -> io::Result<bool>;                // one IsProcessInJob
 }
-// kill.rs helpers over JobOs, each checking the clock before every call it makes:
-fn open_verified(os: &impl JobOs, id: &ProcessIdentity, deadline: Instant) -> Opened;           // open, access fallback, creation time
+// kill.rs helpers, each checking the clock before every call it makes:
+fn open_verified(os: &impl ProcessOs, id: &ProcessIdentity, deadline: Instant) -> Opened;       // open, access fallback, creation time
 fn member_identity(os: &impl JobOs, pid: u32, deadline: Instant) -> Option<ProcessIdentity>;   // open, in_job, creation time
 fn list_members(os: &impl JobOs, deadline: Instant) -> Option<Vec<u32>>;                       // job_pids with TooSmall doubling
 pub(crate) enum PidList { Complete(Vec<u32>), TooSmall }
@@ -409,7 +412,7 @@ Every MVP place on Windows that kills processes, holds handles or pids, or creat
 | `Session::kill`, `Session::close` step 2, `SpawnedPty` teardown | 2 | `WindowsChild::kill_tree`. |
 | `chaldea stop`, `close --stop`, `resume` death check | 10 | The supervisor calls `Session::kill_by` with the full list, retrying only busy reports, then `Session::close_by`; death is confirmed by the first full-list proving report the op accepts before the kill's submission + 12 s, from `kill_by` or as `CloseOutcome.kill`, whose method becomes `launch_death_confirmed.method`; without one, `death_confirmed: false` (`docs/design/supervisor.md` §2.3 Stop). The caller passes its full list of recorded descendants on every call (§2.5). |
 | Recorded descendants (`extra`) | 10 | The identity format of §2.1. `extra` is trusted input: the daemon passes only identities it can prove belong to the launch (PR 10's containment evidence and own spawn records, never hook-emitter ancestry, `docs/design/hook-ingest.md` D10), and passes all of them on every call. Outside-job descendants of an extra are not found by the backend; the daemon names every process it records. The public lookup (PR3 D7) arrives with PR 9 (`pty_runtime::process`), which uses it only for hook binding. |
-| Daemon restart: old-tree check | 10 | Stays out. The job handle is unnamed and not inheritable, so the daemon's exit closes it and `KILL_ON_JOB_CLOSE` terminates every member; that is a termination mechanism, not a proof, so PR 10 still confirms death by verified identity (open, creation time), and handles the suspended-create crash window (§2.2). |
+| Daemon restart: old-tree check | 10 | The job handle is unnamed and not inheritable, so the daemon's exit closes it and `KILL_ON_JOB_CLOSE` terminates every member; that is a termination mechanism, not a proof. After a restart `orphan::kill_recorded` (pty-runtime §2.2; `docs/design/supervisor-recovery.md`) opens each recorded identity with `open_verified` over `ProcessOs` and terminates the verified handles, a verified-identity loop with no engine rounds; the suspended-create crash window is §2.2. |
 | Daemon process rules | 8, 10 | The spawn rule (every child under `with_spawn_lock`; this backend's `CreatePseudoConsole` and each `CreateProcessW` under it, §2.1) and the handle rule (no `CloseHandle` on a handle the code did not open). |
 | Parent kill-on-close job check | 8 | Stays out. Nesting needs no breakaway (CL-27); a parent job that refused nesting would make `spawn` fail without an uncontained running child, which only injection reaches (A13, CL-6). |
 | Daemon spawns of git and one-shot hooks | 6, 16, 20 | Not PTY children; created inside `with_spawn_lock` with `CREATE_NO_WINDOW` (prior-art row 9). They cannot inherit a handle of this backend (none is inheritable outside `CreatePseudoConsole`, which runs under the lock). |

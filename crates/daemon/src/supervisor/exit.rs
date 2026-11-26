@@ -1,5 +1,6 @@
 //! The exit job (design §2.11 "Exit job order"): `launch_exited` with the reducer's
-//! `Exited` (and `launch_death_confirmed` with its method), the registered [`ExitStep`]s in
+//! `Exited` (and `launch_death_confirmed` with its method, or the `launch_evidence` of a death
+//! left unconfirmed, `docs/design/supervisor-recovery.md` §2.4), the registered [`ExitStep`]s in
 //! order, 10a1's input sweep, then `buffer::resolve_unbindable`. The restart reconciler runs
 //! the same steps with `restart: true`.
 
@@ -9,7 +10,8 @@ use chaldea_core::event::TypedEvent;
 use chaldea_core::ids::{InputId, LaunchId, ThreadId};
 use chaldea_core::input::{InputInput, InputState};
 use chaldea_core::payload::{
-    ExitReason, FailedStart, LaunchDeathConfirmed, LaunchExited, SourceKind,
+    EvidenceSource, ExitReason, FailedStart, LaunchDeathConfirmed, LaunchEvidence, LaunchExited,
+    SourceKind,
 };
 use chaldea_core::state::{ProcessState, StateInput};
 use chaldea_pty_runtime::{ProcessIdentity, WriteRecord};
@@ -63,6 +65,9 @@ pub(crate) struct ExitPlan {
     pub start: Option<(ProcessIdentity, Option<InputId>)>,
     /// The positional input's own move, before the steps (a spawn failure).
     pub positional: Option<(InputId, InputInput)>,
+    /// What an owned close or a failed start could not prove, appended right after
+    /// `launch_exited` (`spawn_failed` or `close` evidence).
+    pub evidence: Option<LaunchEvidence>,
 }
 
 impl ExitPlan {
@@ -81,6 +86,7 @@ impl ExitPlan {
             stop_first: false,
             start: None,
             positional: None,
+            evidence: None,
         }
     }
 }
@@ -133,6 +139,13 @@ pub(crate) fn exit_in(
         }),
         lid,
     );
+    if let Some(ev) = &plan.evidence {
+        job.push(
+            evidence_key(plan.launch, ev.source),
+            TypedEvent::LaunchEvidence(ev.clone()),
+            lid,
+        );
+    }
     job.apply(
         &key,
         "exited",
@@ -172,6 +185,18 @@ pub(crate) fn exit_in(
     sweep(tx, plan.thread, Some(plan.launch), plan.restart, &key)?;
     crate::hook::resolve_unbindable(tx, plan.launch)?;
     Ok(Some(facts))
+}
+
+/// `launch:<L>:evidence:spawn_failed` and `launch:<L>:evidence:close`: written at most once
+/// per launch, as `launch:<L>:exited` is. An exit plan carries no probe's evidence: the
+/// prober writes its own, keyed with its attempt id (`super::prober`).
+fn evidence_key(launch: LaunchId, source: EvidenceSource) -> chaldea_core::ids::IdempotencyKey {
+    let name = match source {
+        EvidenceSource::SpawnFailed => "spawn_failed",
+        EvidenceSource::Close => "close",
+        EvidenceSource::Probe => unreachable!("an exit plan carries no probe's evidence"),
+    };
+    launch_key(launch, &format!("evidence:{name}"))
 }
 
 /// 10a1's input sweep: the thread's inputs still `queued`, `sending`, or `sent`, of

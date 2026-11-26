@@ -197,8 +197,117 @@ impl<'de> Deserialize<'de> for FailedStart {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
 pub struct LaunchDeathConfirmed {
     pub launch_id: LaunchId,
-    /// How death was proven, e.g. a session scan or a job query.
+    /// How death was proven, e.g. a session scan or a job query; [`OWNER_ASSERTED`] when the
+    /// owner confirmed it (`chaldea stop --assume-dead --launch`).
     pub method: String,
+}
+
+/// The `launch_death_confirmed.method` of the owner's assertion
+/// (`docs/design/supervisor-recovery.md` §2.5).
+pub const OWNER_ASSERTED: &str = "owner_asserted";
+
+/// One check of an exited launch whose death is unconfirmed
+/// (`docs/design/supervisor-recovery.md` §2.4): what it observed of each recorded identity it
+/// covered and what it did not cover. It changes no state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+pub struct LaunchEvidence {
+    pub launch_id: LaunchId,
+    pub source: EvidenceSource,
+    /// Each recorded identity the check covered, one per pid.
+    pub identities: Vec<IdentityObservation>,
+    /// What the check did not cover; never empty.
+    pub unchecked: Vec<Unchecked>,
+    /// The probing daemon run's instance UUID; `null` for the other sources.
+    pub probe_run: Option<String>,
+}
+
+/// Which check recorded a [`LaunchEvidence`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSource {
+    /// A failed start whose cleanup was not confirmed.
+    SpawnFailed,
+    /// An owned close that did not prove the tree dead.
+    Close,
+    /// The restart prober's check of an earlier run's launch.
+    Probe,
+}
+
+/// One recorded identity and what the check observed of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+pub struct IdentityObservation {
+    pub pid: u32,
+    /// `null` when the start was not recorded.
+    pub start_time: Option<String>,
+    pub observed: Observed,
+}
+
+/// What a check observed of one identity: dead (`gone`, `replaced`), alive (`alive`), or not
+/// observed (every other value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Observed {
+    /// A read showed the pid gone or a zombie, its handle was signalled, or a proving kill
+    /// report covered it.
+    Gone,
+    /// The pid holds a process with another start.
+    Replaced,
+    /// The last read before the deadline showed the recorded start, or the last wait on its
+    /// handle returned unsignalled.
+    Alive,
+    /// A kill report listed it as a survivor.
+    Unresolved,
+    /// The last read was refused.
+    Unreadable,
+    /// No read or wait before the deadline, or the check's result did not reach the daemon in
+    /// time.
+    NotRead,
+    /// The last wait on its handle failed.
+    WaitFailed,
+    /// Never read or signalled: not a valid identity.
+    Invalid,
+}
+
+/// The class of an [`Observed`] value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObservedClass {
+    Dead,
+    Alive,
+    NotObserved,
+}
+
+impl Observed {
+    #[must_use]
+    pub fn class(self) -> ObservedClass {
+        match self {
+            Observed::Gone | Observed::Replaced => ObservedClass::Dead,
+            Observed::Alive => ObservedClass::Alive,
+            Observed::Unresolved
+            | Observed::Unreadable
+            | Observed::NotRead
+            | Observed::WaitFailed
+            | Observed::Invalid => ObservedClass::NotObserved,
+        }
+    }
+}
+
+/// What a check did not cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Unchecked {
+    /// macOS probe: members of the old session without a recorded identity.
+    UnrecordedSessionMembers,
+    /// Windows probe: processes without a recorded identity, members of the old job and
+    /// processes outside it.
+    UnrecordedJobAndOutsideJob,
+    /// The owned kill did not prove the tree dead.
+    TreeUnproven,
+    /// No identity was recorded for the launch's leader.
+    NoIdentity,
+    /// The tree was proven dead, but the backend's cleanup of a failed start did not complete.
+    CleanupUnreleased,
+    /// The check's result did not reach the daemon by its cutoff.
+    ResultNotReceived,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]

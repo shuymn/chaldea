@@ -18,8 +18,9 @@ use chaldea_core::ids::{Actor, Agent, CommandId, IdempotencyKey, InputId, Launch
 use chaldea_core::input::{InputInput, InputState, RejectReason};
 use chaldea_core::launch::{LaunchInput, plan};
 use chaldea_core::payload::{
-    ExitReason, FailedStart, InputCreated, InputInitialState, InputOrigin, LaunchReserved,
-    LaunchStarted, SourceKind, ThreadRegistered, ThreadRole, WorktreeState,
+    EvidenceSource, ExitReason, FailedStart, InputCreated, InputInitialState, InputOrigin,
+    LaunchEvidence, LaunchReserved, LaunchStarted, OWNER_ASSERTED, Observed, SourceKind,
+    ThreadRegistered, ThreadRole, Unchecked, WorktreeState,
 };
 use chaldea_core::state::{AttentionCause, ProcessState, StateInput, ThreadState};
 use chaldea_pty_runtime::{
@@ -202,8 +203,14 @@ pub(crate) async fn launch_op(sup: Arc<Supervisor>, req: LaunchReq) -> EffectOut
             identity, cleanup, ..
         })) => {
             let confirmed = matches!(cleanup, Cleanup::Confirmed);
+            let mut evidence = None;
             if let Cleanup::Unresolved { kill, close, .. } = &cleanup {
                 tracing::warn!(launch = %req.launch, ?kill, ?close, "spawn cleanup unresolved");
+                evidence = Some(spawn_failed_evidence(
+                    req.launch,
+                    identity.as_ref(),
+                    kill.as_ref(),
+                ));
             }
             let failed_start = (!confirmed)
                 .then_some(identity)
@@ -221,6 +228,7 @@ pub(crate) async fn launch_op(sup: Arc<Supervisor>, req: LaunchReq) -> EffectOut
                 SpawnFailure::StartedThenFailed {
                     confirmed,
                     failed_start,
+                    evidence,
                 },
             )
             .await;
@@ -235,6 +243,7 @@ pub(crate) async fn launch_op(sup: Arc<Supervisor>, req: LaunchReq) -> EffectOut
                 SpawnFailure::StartedThenFailed {
                     confirmed: false,
                     failed_start: None,
+                    evidence: Some(spawn_panic_evidence(req.launch)),
                 },
             )
             .await;
@@ -566,7 +575,87 @@ enum SpawnFailure {
     StartedThenFailed {
         confirmed: bool,
         failed_start: Option<FailedStart>,
+        /// The `spawn_failed` evidence when the cleanup is unresolved.
+        evidence: Option<LaunchEvidence>,
     },
+}
+
+// ---- evidence (`docs/design/supervisor-recovery.md` §2.4) ---------------------------------
+
+/// Each identity of `ids` once, by pid, as `unresolved`.
+fn unresolved<'a>(
+    ids: impl IntoIterator<Item = &'a ProcessIdentity>,
+) -> Vec<chaldea_core::payload::IdentityObservation> {
+    let mut out: Vec<chaldea_core::payload::IdentityObservation> = Vec::new();
+    for id in ids {
+        if !out.iter().any(|o| o.pid == id.pid) {
+            out.push(super::prober::observation(id, Observed::Unresolved));
+        }
+    }
+    out
+}
+
+/// The `spawn_failed` evidence of a `StartedThenFailed` whose cleanup is unresolved: with an
+/// identity, `gone` when the cleanup's kill proved the tree dead, else the identity and the
+/// report's survivors, one per pid, `unresolved`; without one, `no_identity` (the leader's)
+/// and the report's survivors, `unresolved`.
+pub(crate) fn spawn_failed_evidence(
+    launch: LaunchId,
+    identity: Option<&ProcessIdentity>,
+    kill: Option<&KillReport>,
+) -> LaunchEvidence {
+    let proved = kill.is_some_and(proving);
+    let mut unchecked = Vec::new();
+    let identities = match identity {
+        None => {
+            unchecked.push(Unchecked::NoIdentity);
+            unresolved(kill.iter().flat_map(|k| k.survivors.iter()))
+        }
+        Some(id) if proved => vec![super::prober::observation(id, Observed::Gone)],
+        Some(id) => {
+            unresolved(std::iter::once(id).chain(kill.iter().flat_map(|k| k.survivors.iter())))
+        }
+    };
+    unchecked.push(if proved {
+        Unchecked::CleanupUnreleased
+    } else {
+        Unchecked::TreeUnproven
+    });
+    LaunchEvidence {
+        launch_id: launch,
+        source: EvidenceSource::SpawnFailed,
+        identities,
+        unchecked,
+        probe_run: None,
+    }
+}
+
+/// The `spawn_failed` evidence of a `Session::spawn` that panicked: nothing was returned,
+/// so that of a failed start with neither identity nor report, its result not received.
+pub(crate) fn spawn_panic_evidence(launch: LaunchId) -> LaunchEvidence {
+    let mut e = spawn_failed_evidence(launch, None, None);
+    e.unchecked.push(Unchecked::ResultNotReceived);
+    e
+}
+
+/// The `close` evidence of an owned close that did not prove the tree dead: the kept
+/// report's survivors, `unresolved`; `result_not_received` exactly for `NotReceived`.
+pub(crate) fn close_evidence(launch: LaunchId, close: &CloseReceipt) -> LaunchEvidence {
+    let (report, received) = match close {
+        CloseReceipt::InTime(r) => (Some(r), true),
+        CloseReceipt::NotReceived(r) => (r.as_ref(), false),
+    };
+    let mut unchecked = vec![Unchecked::TreeUnproven];
+    if !received {
+        unchecked.push(Unchecked::ResultNotReceived);
+    }
+    LaunchEvidence {
+        launch_id: launch,
+        source: EvidenceSource::Close,
+        identities: unresolved(report.iter().flat_map(|r| r.survivors.iter())),
+        unchecked,
+        probe_run: None,
+    }
 }
 
 /// §2.3 step 6, the failure branches: `launch_exited { spawn_failed }` and the exit steps.
@@ -588,9 +677,11 @@ async fn spawn_failed(
         SpawnFailure::StartedThenFailed {
             confirmed,
             failed_start,
+            evidence,
         } => {
             plan.death_confirmed = confirmed;
             plan.failed_start = failed_start;
+            plan.evidence = evidence;
         }
     }
     plan.sealed = entry.settled();
@@ -661,12 +752,17 @@ pub(crate) fn proving(r: &KillReport) -> bool {
     r.tree_dead && matches!(r.attempt, KillAttempt::Signalled | KillAttempt::AlreadyDead)
 }
 
-/// A submitted kill task: the instant of its submission, its join handle, and the one-shot
-/// of its first proving report.
+/// The kill task's last non-proving `kill_by` report that listed survivors, with its
+/// publication instant on the supervisor clock; the mutex is held only for the copy.
+pub(crate) type ReportSlot = Arc<std::sync::Mutex<Option<(KillReport, Instant)>>>;
+
+/// A submitted kill task: the instant of its submission, its join handle, the one-shot of its
+/// first proving report, and its report slot.
 pub(crate) struct KillTask {
     submitted: Instant,
     join: JoinHandle<CloseOutcome>,
     first: oneshot::Receiver<KillReport>,
+    slot: ReportSlot,
 }
 
 #[cfg(test)]
@@ -681,6 +777,7 @@ impl KillTask {
             submitted,
             join,
             first,
+            slot: ReportSlot::default(),
         }
     }
 }
@@ -695,16 +792,19 @@ pub(crate) fn submit_kill(
     let s = sup.clone();
     let extra = entry.extra();
     let launch = entry.launch_id;
+    let slot = ReportSlot::default();
+    let published = slot.clone();
     // The cutoff's origin, read before the task exists, so no task start precedes it.
     let submitted = sup.now();
     sup.pauses().blocking(Pause::KillSubmitted);
     let join = sup
         .rt
-        .spawn_blocking(move || kill_task(&s, launch, tracked, &extra, tx));
+        .spawn_blocking(move || kill_task(&s, launch, tracked, &extra, tx, &published));
     KillTask {
         submitted,
         join,
         first,
+        slot,
     }
 }
 
@@ -714,6 +814,7 @@ fn kill_task(
     tracked: TrackedSession,
     extra: &[ProcessIdentity],
     tx: oneshot::Sender<KillReport>,
+    slot: &ReportSlot,
 ) -> CloseOutcome {
     let start = sup.now();
     let kill_end = start + sup.cfg.kill_budget;
@@ -728,10 +829,16 @@ fn kill_task(
             let _ = tx.send(r);
             break;
         }
+        let busy = r.is_busy();
         if !r.tree_dead && !r.survivors.is_empty() {
             tracing::warn!(%launch, survivors = ?r.survivors, "kill left survivors");
+            sup.pauses().blocking(Pause::KillReportPublish);
+            // The publication time is read while the slot is held, so a reader that finds the
+            // report finds it published at or before that time.
+            let mut published = super::lock(slot);
+            *published = Some((r, sup.now()));
         }
-        if !(r.is_busy() && sup.now() < kill_end) {
+        if !(busy && sup.now() < kill_end) {
             break;
         }
     }
@@ -749,16 +856,40 @@ fn kill_task(
 pub(crate) struct Proof {
     pub report: Option<KillReport>,
     pub exit: Option<ChildExit>,
+    /// The close's report as the op received it, for `close` evidence.
+    pub close: CloseReceipt,
+}
+
+/// The report a `close` evidence keeps (`docs/design/supervisor-recovery.md` §2.4).
+#[derive(Debug, Clone)]
+pub(crate) enum CloseReceipt {
+    /// The close's `CloseOutcome.kill`, its join received before the cutoff.
+    InTime(KillReport),
+    /// The join was not received in time: the last non-proving `kill_by` report the kill
+    /// task published before the cutoff, if any.
+    NotReceived(Option<KillReport>),
+}
+
+impl Default for CloseReceipt {
+    fn default() -> Self {
+        CloseReceipt::NotReceived(None)
+    }
 }
 
 /// §2.3 Stop step 5: the one-shot and the join, each through `settle_before` against the
 /// kill's submission + 12 s; a value counts only when received before it.
 pub(crate) async fn await_kill(sup: &Supervisor, k: KillTask) -> Proof {
-    let cutoff = k.submitted + PROOF_CUTOFF;
+    let KillTask {
+        submitted,
+        join,
+        first,
+        slot,
+    } = k;
+    let cutoff = submitted + PROOF_CUTOFF;
     let now = || sup.now();
     let (first, joined) = tokio::join!(
-        settle_before(now, cutoff, sup.timer(cutoff), k.first),
-        settle_before(now, cutoff, sup.timer(cutoff), k.join),
+        settle_before(now, cutoff, sup.timer(cutoff), first),
+        settle_before(now, cutoff, sup.timer(cutoff), join),
     );
     let first = first.in_time().and_then(Result::ok);
     let joined = match joined {
@@ -770,9 +901,23 @@ pub(crate) async fn await_kill(sup: &Supervisor, k: KillTask) -> Proof {
         Settled::Late(_) | Settled::Elapsed => None,
     };
     let report = first.or_else(|| joined.as_ref().map(|o| o.kill.clone()).filter(proving));
+    // Both waits are classified: the slot is read once, without waiting for its lock.
+    let close = match &joined {
+        Some(o) => CloseReceipt::InTime(o.kill.clone()),
+        None => {
+            sup.pauses().at(Pause::KillReportRead).await;
+            CloseReceipt::NotReceived(
+                slot.try_lock()
+                    .ok()
+                    .and_then(|mut g| g.take_if(|(_, at)| *at < cutoff))
+                    .map(|(r, _)| r),
+            )
+        }
+    };
     Proof {
         report,
         exit: joined.and_then(|o| o.exit),
+        close,
     }
 }
 
@@ -827,10 +972,7 @@ pub(crate) async fn stop_launch(
         if !l.death_confirmed {
             return Err(done_code(ErrorCode::DeathUnconfirmed));
         }
-        return Ok(already_exited(
-            req.launch,
-            read_at <= req.request_start + STOP_REPORT,
-        ));
+        return Ok(already_exited(req.launch, &l, read_at, req.request_start));
     }
     let (Some(entry), Some(mut guard)) = (entry, guard) else {
         // An open launch with no slot: its op ended without recording; the next start
@@ -877,6 +1019,9 @@ pub(crate) async fn stop_launch(
     let mut plan = ExitPlan::new(thread, launch, ExitReason::Stopped);
     plan.stop_first = true;
     plan.death_confirmed = proof.report.is_some();
+    if !plan.death_confirmed {
+        plan.evidence = Some(close_evidence(launch, &proof.close));
+    }
     plan.method = proof.report.as_ref().map(|r| r.method.clone());
     plan.code = proof.exit.and_then(|x| x.code);
     plan.signal = proof.exit.and_then(|x| x.signal);
@@ -910,12 +1055,21 @@ impl Supervisor {
     }
 }
 
-pub(crate) fn already_exited(launch: LaunchId, within: bool) -> StopResult {
+/// A plain stop's answer for an exited launch whose death `row` confirms, read at `read_at`
+/// for a request that started at `request_start`: confirmed within the deadline only when
+/// read by then and not by the owner's assertion, which is not a stop's proof (mvp P-3).
+pub(crate) fn already_exited(
+    launch: LaunchId,
+    row: &LaunchRow,
+    read_at: Instant,
+    request_start: Instant,
+) -> StopResult {
+    let asserted = row.death_method.as_deref() == Some(OWNER_ASSERTED);
     StopResult {
         launch_id: launch,
         outcome: StopOutcome::AlreadyExited,
         death_confirmed: true,
-        confirmed_within_deadline: within,
+        confirmed_within_deadline: !asserted && read_at <= request_start + STOP_REPORT,
         exit_code: None,
         signal: None,
     }
@@ -999,6 +1153,9 @@ pub(crate) async fn exit_op(
     let proof = await_kill(&sup, k).await;
     let mut plan = ExitPlan::new(thread, launch, ExitReason::Exit);
     plan.death_confirmed = proof.report.is_some();
+    if !plan.death_confirmed {
+        plan.evidence = Some(close_evidence(launch, &proof.close));
+    }
     plan.method = proof.report.as_ref().map(|r| r.method.clone());
     plan.code = exit.and_then(|x| x.code);
     plan.signal = exit.and_then(|x| x.signal);
@@ -1096,6 +1253,12 @@ pub(crate) async fn close_and_record(
     plan.stop_first = true;
     plan.death_confirmed = proving(&o.kill);
     plan.method = plan.death_confirmed.then(|| o.kill.method.clone());
+    if !plan.death_confirmed {
+        plan.evidence = Some(close_evidence(
+            entry.launch_id,
+            &CloseReceipt::InTime(o.kill.clone()),
+        ));
+    }
     plan.code = o.exit.and_then(|x| x.code);
     plan.signal = o.exit.and_then(|x| x.signal);
     plan.sealed = entry.settled();

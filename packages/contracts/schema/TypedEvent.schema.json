@@ -397,6 +397,26 @@
       ],
       "type": "string"
     },
+    "EvidenceSource": {
+      "description": "Which check recorded a [`LaunchEvidence`].",
+      "oneOf": [
+        {
+          "const": "spawn_failed",
+          "description": "A failed start whose cleanup was not confirmed.",
+          "type": "string"
+        },
+        {
+          "const": "close",
+          "description": "An owned close that did not prove the tree dead.",
+          "type": "string"
+        },
+        {
+          "const": "probe",
+          "description": "The restart prober's check of an earlier run's launch.",
+          "type": "string"
+        }
+      ]
+    },
     "ExitReason": {
       "oneOf": [
         {
@@ -477,6 +497,32 @@
           "type": "string"
         }
       ]
+    },
+    "IdentityObservation": {
+      "description": "One recorded identity and what the check observed of it.",
+      "properties": {
+        "observed": {
+          "$ref": "#/$defs/Observed"
+        },
+        "pid": {
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_time": {
+          "description": "`null` when the start was not recorded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "pid",
+        "observed"
+      ],
+      "type": "object"
     },
     "InputCreated": {
       "properties": {
@@ -789,13 +835,52 @@
           "$ref": "#/$defs/LaunchId"
         },
         "method": {
-          "description": "How death was proven, e.g. a session scan or a job query.",
+          "description": "How death was proven, e.g. a session scan or a job query; [`OWNER_ASSERTED`] when the\nowner confirmed it (`chaldea stop --assume-dead --launch`).",
           "type": "string"
         }
       },
       "required": [
         "launch_id",
         "method"
+      ],
+      "type": "object"
+    },
+    "LaunchEvidence": {
+      "description": "One check of an exited launch whose death is unconfirmed\n(`docs/design/supervisor-recovery.md` §2.4): what it observed of each recorded identity it\ncovered and what it did not cover. It changes no state.",
+      "properties": {
+        "identities": {
+          "description": "Each recorded identity the check covered, one per pid.",
+          "items": {
+            "$ref": "#/$defs/IdentityObservation"
+          },
+          "type": "array"
+        },
+        "launch_id": {
+          "$ref": "#/$defs/LaunchId"
+        },
+        "probe_run": {
+          "description": "The probing daemon run's instance UUID; `null` for the other sources.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/EvidenceSource"
+        },
+        "unchecked": {
+          "description": "What the check did not cover; never empty.",
+          "items": {
+            "$ref": "#/$defs/Unchecked"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "launch_id",
+        "source",
+        "identities",
+        "unchecked"
       ],
       "type": "object"
     },
@@ -970,6 +1055,51 @@
       "description": "One mailbox message.",
       "format": "uuid",
       "type": "string"
+    },
+    "Observed": {
+      "description": "What a check observed of one identity: dead (`gone`, `replaced`), alive (`alive`), or not\nobserved (every other value).",
+      "oneOf": [
+        {
+          "const": "gone",
+          "description": "A read showed the pid gone or a zombie, its handle was signalled, or a proving kill\nreport covered it.",
+          "type": "string"
+        },
+        {
+          "const": "replaced",
+          "description": "The pid holds a process with another start.",
+          "type": "string"
+        },
+        {
+          "const": "alive",
+          "description": "The last read before the deadline showed the recorded start, or the last wait on its\nhandle returned unsignalled.",
+          "type": "string"
+        },
+        {
+          "const": "unresolved",
+          "description": "A kill report listed it as a survivor.",
+          "type": "string"
+        },
+        {
+          "const": "unreadable",
+          "description": "The last read was refused.",
+          "type": "string"
+        },
+        {
+          "const": "not_read",
+          "description": "No read or wait before the deadline, or the check's result did not reach the daemon in\ntime.",
+          "type": "string"
+        },
+        {
+          "const": "wait_failed",
+          "description": "The last wait on its handle failed.",
+          "type": "string"
+        },
+        {
+          "const": "invalid",
+          "description": "Never read or signalled: not a valid identity.",
+          "type": "string"
+        }
+      ]
     },
     "ProcessState": {
       "enum": [
@@ -1560,6 +1690,41 @@
       ],
       "type": "string"
     },
+    "Unchecked": {
+      "description": "What a check did not cover.",
+      "oneOf": [
+        {
+          "const": "unrecorded_session_members",
+          "description": "macOS probe: members of the old session without a recorded identity.",
+          "type": "string"
+        },
+        {
+          "const": "unrecorded_job_and_outside_job",
+          "description": "Windows probe: processes without a recorded identity, members of the old job and\nprocesses outside it.",
+          "type": "string"
+        },
+        {
+          "const": "tree_unproven",
+          "description": "The owned kill did not prove the tree dead.",
+          "type": "string"
+        },
+        {
+          "const": "no_identity",
+          "description": "No identity was recorded for the launch's leader.",
+          "type": "string"
+        },
+        {
+          "const": "cleanup_unreleased",
+          "description": "The tree was proven dead, but the backend's cleanup of a failed start did not complete.",
+          "type": "string"
+        },
+        {
+          "const": "result_not_received",
+          "description": "The check's result did not reach the daemon by its cutoff.",
+          "type": "string"
+        }
+      ]
+    },
     "UserMessage": {
       "properties": {
         "input_id": {
@@ -2114,6 +2279,22 @@
         },
         "payload": {
           "$ref": "#/$defs/RawUnknown"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "launch_evidence",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/LaunchEvidence"
         }
       },
       "required": [

@@ -37,6 +37,7 @@ mod env;
 pub mod host;
 mod limits;
 mod origin;
+pub mod orphan;
 pub mod process;
 mod session;
 mod snapshot;
@@ -54,7 +55,7 @@ mod windows;
 mod windows {
     #![allow(dead_code, reason = "only their unit tests run off Windows")]
     pub(crate) mod cmdline;
-    mod kill;
+    pub(crate) mod kill;
     mod process;
     mod wait;
 }

@@ -64,6 +64,8 @@ pub struct FakeScript {
     /// The child's `wait_timeout` blocks until [`FakeChild::release_waiter`], so a close
     /// returns with `pty-wait` abandoned.
     pub hold_waiter: bool,
+    /// `spawn` panics (a fault of the backend's own code).
+    pub panic_spawn: bool,
 }
 
 /// What the fake child observed, in order.
@@ -253,6 +255,7 @@ impl PtyRuntime for FakePty {
     fn spawn(&self, spec: &SpawnSpec, output: DrainSink) -> Result<SpawnedPty, SpawnError> {
         lock(&self.inner.specs).push(spec.clone());
         let script = lock(&self.inner.next).take().unwrap_or_default();
+        assert!(!script.panic_spawn, "injected spawn panic");
         if let Some(e) = script.fail {
             return Err(e);
         }
@@ -967,7 +970,7 @@ pub fn unix_writer_polls() -> u64 {
 
 #[cfg(windows)]
 pub use crate::windows::hooks::{
-    FaultReport, Gate, GateControl, OutputProbe, TraceEntry, Watch, WindowsFault, gate,
+    FaultReport, Gate, GateControl, OutputProbe, TraceEntry, Watch, WindowsFault, gate, gate_within,
 };
 
 /// Injects `f` into the next native spawn on the calling thread.
@@ -1402,6 +1405,66 @@ pub fn process_in_any_job(pid: u32) -> io::Result<bool> {
 #[cfg(windows)]
 pub fn resume_process(pid: u32) -> io::Result<usize> {
     crate::windows::sys::resume_process_threads(pid)
+}
+
+/// The smallest previous suspend count over the threads of the process `pid` (each thread is
+/// suspended and resumed once to read it): at least 1 when every thread is suspended
+/// (Windows).
+///
+/// # Errors
+///
+/// The thread snapshot, an open, or a suspend failed, or the process has no thread.
+#[cfg(windows)]
+pub fn suspend_count(pid: u32) -> io::Result<u32> {
+    crate::windows::sys::suspend_count(pid)
+}
+
+/// The full image path of the process `pid` (`QueryFullProcessImageNameW`, Windows).
+///
+/// # Errors
+///
+/// The process cannot be opened or queried.
+#[cfg(windows)]
+pub fn image_path(pid: u32) -> io::Result<std::path::PathBuf> {
+    crate::windows::sys::image_path(pid)
+}
+
+/// A runtime that injects `fault` into the first native spawn it runs, on the spawning thread
+/// ([`windows_inject_next`]), then runs `native` (Windows).
+#[cfg(windows)]
+#[must_use]
+pub fn with_windows_fault(
+    native: std::sync::Arc<dyn PtyRuntime>,
+    fault: WindowsFault,
+) -> std::sync::Arc<dyn PtyRuntime> {
+    std::sync::Arc::new(FaultRuntime {
+        native,
+        fault: Mutex::new(Some(fault)),
+    })
+}
+
+#[cfg(windows)]
+struct FaultRuntime {
+    native: std::sync::Arc<dyn PtyRuntime>,
+    fault: Mutex<Option<WindowsFault>>,
+}
+
+#[cfg(windows)]
+impl sealed::Sealed for FaultRuntime {}
+
+#[cfg(windows)]
+impl PtyRuntime for FaultRuntime {
+    fn spawn(&self, spec: &SpawnSpec, output: DrainSink) -> Result<SpawnedPty, SpawnError> {
+        let fault = self
+            .fault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(f) = fault {
+            windows_inject_next(f);
+        }
+        self.native.spawn(spec, output)
+    }
 }
 
 /// Sets `HANDLE_FLAG_INHERIT` on `h`, so a child created with handle inheritance and no handle

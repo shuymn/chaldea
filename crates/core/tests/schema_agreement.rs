@@ -99,6 +99,42 @@ fn payload_verdicts_agree() {
         ),
         ("payload as a string", "thread_closed", json!("x"), false),
         (
+            "launch_evidence with every field",
+            "launch_evidence",
+            json!({
+                "launch_id": UUID,
+                "source": "probe",
+                "identities": [{ "pid": 7, "start_time": null, "observed": "not_read" }],
+                "unchecked": ["unrecorded_job_and_outside_job", "result_not_received"],
+                "probe_run": UUID,
+            }),
+            true,
+        ),
+        (
+            "launch_evidence with an unknown observation",
+            "launch_evidence",
+            json!({
+                "launch_id": UUID,
+                "source": "close",
+                "identities": [{ "pid": 7, "start_time": "1", "observed": "survived" }],
+                "unchecked": ["tree_unproven"],
+                "probe_run": null,
+            }),
+            false,
+        ),
+        (
+            "launch_evidence with an unknown source",
+            "launch_evidence",
+            json!({
+                "launch_id": UUID,
+                "source": "stop",
+                "identities": [],
+                "unchecked": ["tree_unproven"],
+                "probe_run": null,
+            }),
+            false,
+        ),
+        (
             "u32 at its maximum",
             "launch_started",
             launch_started(&json!(4_294_967_295_u64)),

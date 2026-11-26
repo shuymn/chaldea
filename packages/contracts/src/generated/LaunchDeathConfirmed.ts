@@ -3,6 +3,7 @@ import type { LaunchId } from "./LaunchId";
 
 export type LaunchDeathConfirmed = { launch_id: LaunchId,
 /**
- * How death was proven, e.g. a session scan or a job query.
+ * How death was proven, e.g. a session scan or a job query; [`OWNER_ASSERTED`] when the
+ * owner confirmed it (`chaldea stop --assume-dead --launch`).
  */
 method: string, };

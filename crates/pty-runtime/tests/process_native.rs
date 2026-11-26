@@ -214,3 +214,57 @@ fn name_is_normalized() {
     assert_eq!(e.ppid, std::process::id());
     drop(c);
 }
+
+fn sleeper() -> Reaped {
+    let mut cmd = Command::new(fake_cli());
+    cmd.args(["--mode", "sleeper", "--max-life-secs", "60"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    Reaped(spawn(&mut cmd))
+}
+
+/// Whether the child has exited (reaped here, so a zombie does not count as live).
+fn exited(c: &mut Reaped, within: Duration) -> bool {
+    let end = Instant::now() + within;
+    loop {
+        if c.0.try_wait().unwrap().is_some() {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// PR10a2-CL-2 (and CL-1 on macOS): `orphan::kill_recorded` against test-owned FakeCli
+/// sleepers: two live identities → both `Gone` and ended; one with a wrong start →
+/// `Replaced`, never signalled and still running (the test ends it).
+#[test]
+fn orphan_native() {
+    use chaldea_pty_runtime::orphan::{Fate, kill_recorded};
+    let mut a = sleeper();
+    let mut b = sleeper();
+    let mut c = sleeper();
+    let ia = live(a.0.id()).identity;
+    let ib = live(b.0.id()).identity;
+    let mut ic = live(c.0.id()).identity;
+    let start: u64 = ic.start_time.parse().unwrap();
+    ic.start_time = (start + 1).to_string();
+    let r = kill_recorded(
+        &[ia.clone(), ib.clone(), ic.clone()],
+        Instant::now() + Duration::from_secs(5),
+    );
+    assert_eq!(
+        r.fates,
+        [(ia, Fate::Gone), (ib, Fate::Gone), (ic, Fate::Replaced)]
+    );
+    assert!(exited(&mut a, WAIT), "the first sleeper ended");
+    assert!(exited(&mut b, WAIT), "the second sleeper ended");
+    assert!(
+        c.0.try_wait().unwrap().is_none(),
+        "the wrong-start sleeper still runs"
+    );
+    drop(c);
+}

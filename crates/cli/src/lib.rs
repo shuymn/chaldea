@@ -246,7 +246,16 @@ fn command(cli: Cli, seams: &mut Seams) -> ExitCode {
         Command::Input {
             command: args::InputCommand::Cancel { input },
         } => agent_cmd::run(&state_dir, agent_cmd::Verb::InputCancel { input }),
-        Command::Stop { thread } => agent_cmd::run(&state_dir, agent_cmd::Verb::Stop { thread }),
+        Command::Stop {
+            thread,
+            assume_dead: false,
+            ..
+        } => agent_cmd::run(&state_dir, agent_cmd::Verb::Stop { thread }),
+        Command::Stop {
+            thread,
+            assume_dead: true,
+            launch,
+        } => agent_cmd::run(&state_dir, agent_cmd::Verb::AssumeDead { thread, launch }),
         Command::Close { thread, stop } => {
             agent_cmd::run(&state_dir, agent_cmd::Verb::Close { thread, stop })
         }

@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chaldea_core::ids::{Agent, ThreadId};
+use chaldea_core::ids::{Agent, LaunchId, ThreadId};
 use clap::{Parser, Subcommand};
 
 pub use crate::agent_cmd::Until;
@@ -96,9 +96,20 @@ pub enum Command {
     /// Exits 0 when the tree's end was confirmed within 5 s of the stop request the daemon
     /// accepted, 4 when it was confirmed later, and 1 when it could not be confirmed. A
     /// request retried after a refused attempt counts from the attempt the daemon accepted.
+    ///
+    /// With `--assume-dead`, an exited launch whose end could not be confirmed: without
+    /// `--launch`, print what was checked of the current launch and send nothing (exit 0, or
+    /// 1 when the history could not be read completely); with `--launch`, confirm as the
+    /// owner that its processes ended (exit 0).
     Stop {
         #[arg(value_parser = crate::agent_cmd::thread_id)]
         thread: ThreadId,
+        /// Review, or with `--launch` confirm, the end of the current launch's processes.
+        #[arg(long)]
+        assume_dead: bool,
+        /// The current launch's id, which the confirmation names.
+        #[arg(long, requires = "assume_dead", value_parser = crate::agent_cmd::launch_id)]
+        launch: Option<LaunchId>,
     },
     /// Close a thread whose agent CLI has ended.
     Close {

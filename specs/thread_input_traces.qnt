@@ -333,6 +333,20 @@ module thread_input_traces {
       .then(prompt(Set(3)))
       .expect(stateOf(st, 3) == Acked and stateOf(st, 1) == Unconfirmed)
 
+  /// supervisor-recovery RD1: a second restart before any assertion changes nothing the
+  /// owner's assertion depends on; the assertion (`confirmDeath`) clears `ResumeBlocked` and
+  /// a reservation follows.
+  run trace_repeated_restart_then_assert =
+    readyLaunch
+      .then(restart)
+      .then(restart)
+      .expect(st.thread.process == Exited and not(st.deathConfirmed))
+      .then(reserveRefused)
+      .expect(st.thread.attention.contains(ResumeBlocked))
+      .then(confirmDeath)
+      .expect(st.deathConfirmed and not(st.thread.attention.contains(ResumeBlocked)))
+      .then(reserve(CLAUDE))
+
   /// mvp §2.3: window expiry, then a late attributable ack; a gate timeout, then cancel.
   run trace_late_ack_and_gate_timeout =
     readyLaunch

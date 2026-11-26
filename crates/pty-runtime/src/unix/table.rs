@@ -34,7 +34,10 @@ pub(crate) fn lookup(pid: u32) -> Lookup {
 /// `PROC_PIDTBSDINFO` (arg 1) first; when it is refused, the short record, which another
 /// user's process allows, tells a zombie apart. Anything not established stays
 /// `Unreadable`.
-fn classify(info: Result<BsdInfo, i32>, short: impl FnOnce() -> Result<bool, i32>) -> Lookup {
+pub(crate) fn classify(
+    info: Result<BsdInfo, i32>,
+    short: impl FnOnce() -> Result<bool, i32>,
+) -> Lookup {
     match info {
         Ok(i) if i.zombie => Lookup::Zombie(i.start),
         Ok(i) => Lookup::Live(Proc {
