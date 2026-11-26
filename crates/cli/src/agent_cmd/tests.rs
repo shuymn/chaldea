@@ -20,6 +20,8 @@ use super::{Client, Found, Until};
 const T: ThreadId = ThreadId::from_u128(0x7);
 const L: LaunchId = LaunchId::from_u128(0x1);
 const OTHER: LaunchId = LaunchId::from_u128(0x2);
+/// The stub's serving `instance`.
+const RUN: &str = "run-1";
 
 /// One request as the stub read it.
 #[derive(Debug, Clone)]
@@ -63,23 +65,30 @@ impl Stub {
                 if let Some(req) = read_request(&mut c) {
                     s.lock().unwrap().push(req);
                 }
-                let (status, body) = match reply {
-                    Reply::Json(st, b) => (st, b),
-                    Reply::Late(ms, st, b) => {
-                        k.fetch_add(ms, Ordering::SeqCst);
-                        (st, b)
-                    }
-                    Reply::Eof => continue,
-                    Reply::Hold(rx) => {
-                        let _ = rx.recv_timeout(Duration::from_secs(20));
-                        continue;
-                    }
+                answer(&mut c, reply, &k);
+            }
+        });
+        Stub { port, seen, skew }
+    }
+
+    /// A stub that answers each of up to `max` connections with `handler` of its request.
+    fn serve(max: usize, handler: impl Fn(&Seen) -> Reply + Send + 'static) -> Stub {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let skew = Arc::new(AtomicU64::new(0));
+        let (s, k) = (seen.clone(), skew.clone());
+        std::thread::spawn(move || {
+            for _ in 0..max {
+                let Ok((mut c, _)) = listener.accept() else {
+                    return;
                 };
-                let _ = write!(
-                    c,
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
+                let Some(req) = read_request(&mut c) else {
+                    continue;
+                };
+                let reply = handler(&req);
+                s.lock().unwrap().push(req);
+                answer(&mut c, reply, &k);
             }
         });
         Stub { port, seen, skew }
@@ -103,6 +112,26 @@ impl Stub {
     fn gets(&self) -> usize {
         self.seen().iter().filter(|s| s.method == "GET").count()
     }
+}
+
+fn answer(c: &mut std::net::TcpStream, reply: Reply, skew: &AtomicU64) {
+    let (status, body) = match reply {
+        Reply::Json(st, b) => (st, b),
+        Reply::Late(ms, st, b) => {
+            skew.fetch_add(ms, Ordering::SeqCst);
+            (st, b)
+        }
+        Reply::Eof => return,
+        Reply::Hold(rx) => {
+            let _ = rx.recv_timeout(Duration::from_secs(20));
+            return;
+        }
+    };
+    let _ = write!(
+        c,
+        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
 }
 
 fn read_request(c: &mut std::net::TcpStream) -> Option<Seen> {
@@ -168,7 +197,7 @@ fn run(
     f: impl FnOnce(&Client<'_>, &mut Vec<u8>, &mut Vec<u8>) -> ExitCode,
 ) -> (ExitCode, String, String) {
     let port = stub.port;
-    run_with(stub, &move || Ok(Found::Port(port)), f)
+    run_with(stub, &move || Ok(Found::Port(port, RUN.to_owned())), f)
 }
 
 fn summary(
@@ -321,7 +350,7 @@ fn wait_cutoff() {
     let discover = || match calls.fetch_add(1, Ordering::SeqCst) {
         0 => Ok(Found::NotYet),
         1 => Ok(Found::NotRunning),
-        _ => Ok(Found::Port(port)),
+        _ => Ok(Found::Port(port, RUN.to_owned())),
     };
     let (code, out, _) = run_with(&stub, &discover, wait(Until::Exited, LONG));
     assert_eq!(code, ExitCode::Ok);
@@ -428,7 +457,8 @@ const GENERAL: &str = "The thread's last process could not be confirmed to have 
 const RESTART: &str = "The previous process of this thread could not be confirmed to have ended after the daemon restarted.";
 const STOPPED: &str =
     "The previous process of this thread could not be confirmed to have ended when it stopped.";
-const TAIL: &str = "This version cannot resume or close this thread. Its history is kept, and new threads can be started.";
+/// The tail, with `T` for the thread.
+const TAIL: &str = "To review what was checked, run `chaldea stop 00000000-0000-0000-0000-000000000007 --assume-dead`; once you have made sure its processes ended, confirm with `--launch <id>`. Its history is kept, and new threads can be started.";
 
 /// PR10a1-CL-37: `death_unconfirmed` prints the reason's line only when the read after the
 /// refusal shows the pinned launch exited unconfirmed; otherwise, and for `stop`, the general
@@ -478,7 +508,7 @@ fn death_unconfirmed_message() {
     }
     // `stop` pins no launch: the general line, with no read.
     let stub = Stub::start(vec![refusal()]);
-    let (code, _, err) = run(&stub, |c, o, e| c.stop(T, o, e));
+    let (code, _, err) = run(&stub, |c, o, e| c.stop(T, None, o, e));
     assert_eq!(code, ExitCode::Failed);
     assert_eq!(
         err.lines().collect::<Vec<_>>(),
@@ -518,7 +548,7 @@ fn stop_outcomes() {
     ] {
         let body = serde_json::to_string(&r).unwrap();
         let stub = Stub::start(vec![ok(body.clone())]);
-        let (got, out, err) = run(&stub, |c, o, e| c.stop(T, o, e));
+        let (got, out, err) = run(&stub, |c, o, e| c.stop(T, None, o, e));
         assert_eq!(got, code, "{r:?}");
         assert_eq!(out.trim(), body);
         assert_eq!(err.lines().collect::<Vec<_>>(), lines, "{r:?}");
@@ -526,6 +556,46 @@ fn stop_outcomes() {
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0].path, "/api/commands/stop");
         assert_eq!(posts[0].body["args"], serde_json::json!({ "thread_id": T }));
+    }
+    // The owner's assertion: its request, then `asserted` (exit 0) and an `already_exited`
+    // not confirmed in time (exit 4) as `docs/design/supervisor-recovery.md` §2.5 prints them.
+    let asserted = StopResult {
+        outcome: StopOutcome::Asserted,
+        signal: None,
+        ..stop_result(true, false)
+    };
+    let already = StopResult {
+        outcome: StopOutcome::AlreadyExited,
+        signal: None,
+        ..stop_result(true, false)
+    };
+    for (r, assume, code, line) in [
+        (
+            &asserted,
+            true,
+            ExitCode::Ok,
+            format!("chaldea: The owner confirmed that launch {L} has ended."),
+        ),
+        (
+            &already,
+            false,
+            ExitCode::Timeout,
+            "chaldea: The process had already ended, but this stop did not confirm its end within 5 s (its end may have been confirmed by the owner's assertion).".to_owned(),
+        ),
+    ] {
+        let body = serde_json::to_string(r).unwrap();
+        let stub = Stub::start(vec![ok(body.clone())]);
+        let launch = assume.then_some(L);
+        let (got, out, err) = run(&stub, |c, o, e| c.stop(T, launch, o, e));
+        assert_eq!(got, code, "{r:?}");
+        assert_eq!(out.trim(), body);
+        assert_eq!(err.lines().collect::<Vec<_>>(), [line], "{r:?}");
+        let want = if assume {
+            serde_json::json!({ "thread_id": T, "expected_launch_id": L, "assume_dead": true })
+        } else {
+            serde_json::json!({ "thread_id": T })
+        };
+        assert_eq!(stub.posts()[0].body["args"], want);
     }
     // `close --stop` whose inner stop was confirmed late.
     let stub = Stub::start(vec![
@@ -662,3 +732,19 @@ fn send_prints_the_input() {
     assert_eq!(code, ExitCode::Failed);
     assert!(err.contains("empty_prompt"), "{err}");
 }
+
+/// PR10a2-CL-9: the `death_unconfirmed` tail names the preview with the thread's id.
+#[test]
+fn unconfirmed_text() {
+    let stub = Stub::start(vec![Reply::Json(409, error("death_unconfirmed"))]);
+    let (code, _, err) = run(&stub, |c, o, e| c.stop(T, None, o, e));
+    assert_eq!(code, ExitCode::Failed);
+    assert_eq!(
+        err.lines().last().unwrap(),
+        format!(
+            "chaldea: To review what was checked, run `chaldea stop {T} --assume-dead`; once you have made sure its processes ended, confirm with `--launch <id>`. Its history is kept, and new threads can be started."
+        )
+    );
+}
+
+mod preview;

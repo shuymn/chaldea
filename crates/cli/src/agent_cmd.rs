@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use chaldea_core::command::{
     CloseArgs, CloseResult, InputCancelArgs, InputCommandResult, InputResolveArgs, KeyArgs,
     KeyOutcome, KeyResult, LaunchOutcome, ReadyArgs, ReadyResult, ResumeArgs, ResumeResult,
-    SendArgs, SendResult, SpawnArgs, SpawnResult, StopArgs, StopResult,
+    SendArgs, SendResult, SpawnArgs, SpawnResult, StopArgs, StopOutcome, StopResult,
 };
 use chaldea_core::http::{ErrorBody, ErrorCode};
 use chaldea_core::ids::{Agent, ApprovalId, CommandId, InputId, LaunchId, ThreadId};
@@ -50,15 +50,20 @@ const UNCONFIRMED: &str = "The thread's last process could not be confirmed to h
 const UNCONFIRMED_RESTART: &str = "The previous process of this thread could not be confirmed to have ended after the daemon restarted.";
 const UNCONFIRMED_STOPPED: &str =
     "The previous process of this thread could not be confirmed to have ended when it stopped.";
-const UNCONFIRMED_TAIL: &str = "This version cannot resume or close this thread. Its history is kept, and new threads can be started.";
+/// The tail of the `death_unconfirmed` lines; `<thread>` is the thread's id.
+const UNCONFIRMED_TAIL: &str = "To review what was checked, run `chaldea stop <thread> --assume-dead`; once you have made sure its processes ended, confirm with `--launch <id>`. Its history is kept, and new threads can be started.";
 /// The line of a stop whose death was confirmed after its 5 s, counted from the attempt the
 /// daemon accepted.
 const CONFIRMED_LATE: &str = "The process ended, but its end was not confirmed within 5 s of the stop request the daemon accepted.";
+/// The line of an `already_exited` stop not confirmed within its 5 s: the result does not say
+/// whether the owner's assertion confirmed it.
+const ALREADY_EXITED_LATE: &str = "The process had already ended, but this stop did not confirm its end within 5 s (its end may have been confirmed by the owner's assertion).";
 
 /// Where the daemon is, as one attempt sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Found {
-    Port(u16),
+    /// Serving: its port and its run's `instance`.
+    Port(u16, String),
     /// Starting, stopping, or not known yet: try again.
     NotYet,
     /// No daemon holds the lock.
@@ -70,7 +75,7 @@ fn found(d: Discovery) -> Result<Found, String> {
     match d {
         Discovery::Serving(r) => r
             .port
-            .map(Found::Port)
+            .map(|p| Found::Port(p, r.instance))
             .ok_or_else(|| "the daemon's record names no port".to_owned()),
         Discovery::NotRunning => Ok(Found::NotRunning),
         Discovery::Unknown | Discovery::Starting(_) | Discovery::Stopping(_) => Ok(Found::NotYet),
@@ -92,6 +97,8 @@ pub(crate) enum End {
     Timeout,
     /// The message to print.
     Fail(String),
+    /// A response body over the client's limit (`client::is_body_too_large`).
+    TooLarge,
 }
 
 /// Why a command ended without its result.
@@ -127,7 +134,7 @@ impl Client<'_> {
     ) -> Result<T, End> {
         let seen = poll_until_with(&Cell::new(cutoff), self.period, self.now, || {
             let port = match (self.discover)() {
-                Ok(Found::Port(p)) => p,
+                Ok(Found::Port(p, _)) => p,
                 Ok(Found::NotRunning) if daemon_required => {
                     return Some(Err(End::Fail(
                         "daemon not running; run `chaldea daemon start`".to_owned(),
@@ -143,6 +150,7 @@ impl Client<'_> {
             };
             match r {
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => Some(Err(End::Timeout)),
+                Err(e) if client::is_body_too_large(&e) => Some(Err(End::TooLarge)),
                 Err(e) if transient(e.kind()) => None,
                 Err(e) => Some(Err(End::Fail(format!("the request failed: {e}")))),
                 Ok(r) => decide(r),
@@ -250,6 +258,10 @@ fn ended(e: End, err: &mut dyn Write) -> ExitCode {
             say(err, &m);
             ExitCode::Failed
         }
+        End::TooLarge => {
+            say(err, "the daemon's response is larger than the client reads");
+            ExitCode::Failed
+        }
     }
 }
 
@@ -296,6 +308,7 @@ fn refused(status: u16, c: Option<ErrorCode>, err: &mut dyn Write) -> ExitCode {
 /// The `death_unconfirmed` lines (§2.2): the reason's line only when `summary` shows the
 /// `pinned` launch exited with death unconfirmed, the general line otherwise.
 fn unconfirmed(
+    t: ThreadId,
     pinned: Option<LaunchId>,
     summary: Option<&ThreadSummary>,
     err: &mut dyn Write,
@@ -312,19 +325,31 @@ fn unconfirmed(
         _ => UNCONFIRMED,
     };
     say(err, line);
-    say(err, UNCONFIRMED_TAIL);
+    say(err, &UNCONFIRMED_TAIL.replace("<thread>", &t.to_string()));
     ExitCode::Failed
 }
 
-/// How a stop's result ends the command (§2.2, SD20).
-fn stop_exit(r: &StopResult, err: &mut dyn Write) -> ExitCode {
-    if r.confirmed_within_deadline {
+/// How a stop's result ends the command (§2.2, SD20; `docs/design/supervisor-recovery.md`
+/// §2.5 for `asserted` and an `already_exited` not confirmed in time).
+fn stop_exit(t: ThreadId, r: &StopResult, err: &mut dyn Write) -> ExitCode {
+    if r.outcome == StopOutcome::Asserted {
+        say(
+            err,
+            &format!("The owner confirmed that launch {} has ended.", r.launch_id),
+        );
+        ExitCode::Ok
+    } else if r.confirmed_within_deadline {
         ExitCode::Ok
     } else if r.death_confirmed {
-        say(err, CONFIRMED_LATE);
+        let line = if r.outcome == StopOutcome::AlreadyExited {
+            ALREADY_EXITED_LATE
+        } else {
+            CONFIRMED_LATE
+        };
+        say(err, line);
         ExitCode::Timeout
     } else {
-        unconfirmed(None, None, err)
+        unconfirmed(t, None, None, err)
     }
 }
 
@@ -413,7 +438,7 @@ impl Client<'_> {
         err: &mut dyn Write,
     ) -> ExitCode {
         let s = self.summary(cutoff, t).ok();
-        unconfirmed(Some(pinned), s.as_ref(), err)
+        unconfirmed(t, Some(pinned), s.as_ref(), err)
     }
 
     pub(crate) fn resume(
@@ -448,20 +473,28 @@ impl Client<'_> {
         }
     }
 
-    pub(crate) fn stop(&self, t: ThreadId, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    /// `chaldea stop`; with `assume_dead`, the owner's assertion for launch `launch`
+    /// (`docs/design/supervisor-recovery.md` §2.5).
+    pub(crate) fn stop(
+        &self,
+        t: ThreadId,
+        assume_dead: Option<LaunchId>,
+        out: &mut dyn Write,
+        err: &mut dyn Write,
+    ) -> ExitCode {
         let cutoff = self.cutoff(COMMAND_CUTOFF);
         let args = StopArgs {
             thread_id: t,
-            expected_launch_id: None,
-            assume_dead: false,
+            expected_launch_id: assume_dead,
+            assume_dead: assume_dead.is_some(),
         };
         match self.command::<_, StopResult>(cutoff, "stop", &args) {
             Ok(v) => {
                 print(out, &v);
-                stop_exit(&v, err)
+                stop_exit(t, &v, err)
             }
             Err(CommandEnd::Refused(_, Some(ErrorCode::DeathUnconfirmed))) => {
-                unconfirmed(None, None, err)
+                unconfirmed(t, None, None, err)
             }
             Err(e) => not_done(e, err),
         }
@@ -487,7 +520,9 @@ impl Client<'_> {
         match self.command::<_, CloseResult>(cutoff, "close", &args) {
             Ok(v) => {
                 print(out, &v);
-                v.stop.as_ref().map_or(ExitCode::Ok, |s| stop_exit(s, err))
+                v.stop
+                    .as_ref()
+                    .map_or(ExitCode::Ok, |s| stop_exit(t, s, err))
             }
             Err(CommandEnd::Refused(_, Some(ErrorCode::DeathUnconfirmed))) => {
                 self.pinned_unconfirmed(cutoff, t, l, err)
@@ -711,6 +746,12 @@ pub(crate) fn input_id(s: &str) -> Result<InputId, String> {
         .map_err(|e| format!("not an input id: {e}"))
 }
 
+pub(crate) fn launch_id(s: &str) -> Result<LaunchId, String> {
+    uuid::Uuid::parse_str(s)
+        .map(LaunchId)
+        .map_err(|_| format!("`{s}` is not a launch id"))
+}
+
 pub(crate) fn thread_id(s: &str) -> Result<ThreadId, String> {
     uuid::Uuid::parse_str(s)
         .map(ThreadId)
@@ -770,6 +811,11 @@ pub(crate) enum Verb {
     },
     Stop {
         thread: ThreadId,
+    },
+    /// `stop --assume-dead`: the preview without a launch, the assertion with one.
+    AssumeDead {
+        thread: ThreadId,
+        launch: Option<LaunchId>,
     },
     Close {
         thread: ThreadId,
@@ -843,7 +889,15 @@ pub(crate) fn run(dir: &Path, verb: Verb) -> ExitCode {
             out,
             err,
         ),
-        Verb::Stop { thread } => c.stop(thread, out, err),
+        Verb::Stop { thread } => c.stop(thread, None, out, err),
+        Verb::AssumeDead {
+            thread,
+            launch: Some(l),
+        } => c.stop(thread, Some(l), out, err),
+        Verb::AssumeDead {
+            thread,
+            launch: None,
+        } => c.preview(thread, out, err),
         Verb::Close { thread, stop } => c.close(thread, stop, out, err),
         Verb::Wait {
             thread,
@@ -852,6 +906,8 @@ pub(crate) fn run(dir: &Path, verb: Verb) -> ExitCode {
         } => c.wait(thread, until, timeout, out, err),
     }
 }
+
+mod preview;
 
 #[cfg(test)]
 mod tests;

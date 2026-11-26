@@ -228,7 +228,7 @@ fn read_response(
         .flatten()
         .ok_or_else(|| protocol("no Content-Length"))?;
     if length > MAX_BODY {
-        return Err(protocol("the response body is too large"));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, BodyTooLarge));
     }
     let start = head_end + 4;
     while buf.len() < start + length {
@@ -238,6 +238,26 @@ fn read_response(
         status,
         body: buf[start..start + length].to_vec(),
     })
+}
+
+/// The error of a response whose `Content-Length` is above the 1 MiB the client reads.
+#[derive(Debug)]
+struct BodyTooLarge;
+
+impl std::fmt::Display for BodyTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the response body is too large")
+    }
+}
+
+impl std::error::Error for BodyTooLarge {}
+
+/// Whether `e` is a request's error for a response body above the client's 1 MiB limit (an
+/// `InvalidData` error like every other protocol error, told apart by its source).
+#[must_use]
+pub fn is_body_too_large(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<BodyTooLarge>)
 }
 
 fn protocol(what: &str) -> io::Error {
@@ -416,6 +436,48 @@ mod tests {
             StopSent::AccessDenied
         );
         assert!(s.alive());
+    }
+
+    /// PR10a2-CL-9 `body_too_large`: the predicate is true only for a response whose
+    /// `Content-Length` is above 1 MiB, not for another protocol error, a timeout, or an I/O
+    /// error.
+    #[test]
+    fn body_too_large() {
+        use std::time::{Duration, Instant};
+        let read = |head: &'static [u8]| {
+            super::read_response(
+                move |buf| {
+                    buf.extend_from_slice(head);
+                    Ok(())
+                },
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap_err()
+        };
+        let big = read(b"HTTP/1.1 200 OK\r\nContent-Length: 1048577\r\n\r\n");
+        assert!(super::is_body_too_large(&big), "{big}");
+        assert_eq!(big.kind(), std::io::ErrorKind::InvalidData);
+        for other in [
+            read(b"HTTP/1.1 200 OK\r\n\r\n"),
+            read(b"HTTX/9 200\r\nContent-Length: 2\r\n\r\n{}"),
+            super::protocol("the response body is too large"),
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "late"),
+            std::io::Error::other("x"),
+        ] {
+            assert!(!super::is_body_too_large(&other), "{other}");
+        }
+        let at_limit = super::read_response(
+            |buf| {
+                if buf.is_empty() {
+                    buf.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n");
+                } else {
+                    buf.resize(buf.len() + 1_048_576, b' ');
+                }
+                Ok(())
+            },
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert_eq!(at_limit.unwrap().body.len(), 1_048_576);
     }
 
     /// PR8-CL-24: a complete response whose last part is first read at or after the deadline
