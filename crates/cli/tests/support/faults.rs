@@ -56,6 +56,10 @@ pub const SUPERVISOR_GATE: &str = "CHALDEA_TEST_SUPERVISOR_GATE";
 /// suspended create the child's pid is written to `pid` in this test gate's directory, which
 /// is then waited at (`docs/design/supervisor-recovery.md` §5.2 PR10a2-CL-10).
 pub const A29_GATE: &str = "CHALDEA_TEST_A29_GATE";
+/// Windows, `assign_terminate_denied`: the native runtime's first spawn takes
+/// `WindowsFault::AssignTerminateDenied`, so it fails with its suspended child alive outside
+/// any launch job and recorded in `failed_start`.
+pub const WINDOWS_FAULT: &str = "CHALDEA_TEST_WINDOWS_FAULT";
 /// With [`AGENT_PROGRAM`], set: the supervisor runs on `FakePty`, its first child's waiter
 /// held, so a close of it abandons `pty-wait` and its token stays counted.
 pub const FAKE_PTY_HOLD_WAITER: &str = "CHALDEA_TEST_FAKE_PTY_HOLD_WAITER";
@@ -383,6 +387,12 @@ pub fn enter_if_chaldea() {
                     ..chaldea_pty_runtime::fake::FakeScript::default()
                 });
                 cfg.runtime = std::sync::Arc::new(pty);
+            }
+            #[cfg(windows)]
+            if std::env::var(WINDOWS_FAULT).as_deref() == Ok("assign_terminate_denied") {
+                use chaldea_pty_runtime::fake::{WindowsFault, with_windows_fault};
+                cfg.runtime =
+                    with_windows_fault(cfg.runtime.clone(), WindowsFault::AssignTerminateDenied);
             }
             #[cfg(windows)]
             if let Some(dir) = env_path(A29_GATE) {

@@ -169,6 +169,38 @@ async fn candidates() {
     let r = rig.cmd("stop", &json!({ "thread_id": ts })).await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert!(!rig.launch(ls).death_confirmed);
+    // F and G: failed starts with their cleanup unresolved; F's child has a usable recorded
+    // identity, G's has no start time.
+    let child = |start: &str| chaldea_pty_runtime::ProcessIdentity {
+        pid: if start.is_empty() { 92 } else { 91 },
+        start_time: start.to_owned(),
+        group: "g".to_owned(),
+    };
+    let failed = |id: chaldea_pty_runtime::ProcessIdentity| FakeScript {
+        fail: Some(chaldea_pty_runtime::SpawnError::StartedThenFailed {
+            stage: "s",
+            error: std::io::Error::other("x"),
+            identity: Some(id),
+            cleanup: chaldea_pty_runtime::Cleanup::Unresolved {
+                kill: None,
+                close: None,
+                drain_abandoned: false,
+            },
+        }),
+        ..FakeScript::default()
+    };
+    let cwd = rig.cwd.path().to_string_lossy().into_owned();
+    let mut spawn_failed = Vec::new();
+    for start in ["s91", ""] {
+        rig.pty.script_next(failed(child(start)));
+        let r = rig
+            .cmd("spawn", &json!({ "agent": "codex", "cwd": cwd }))
+            .await;
+        assert_eq!(body(&r)["outcome"], "spawn_failed");
+        spawn_failed
+            .push(serde_json::from_value::<ThreadId>(body(&r)["thread_id"].clone()).unwrap());
+    }
+    let (tf, tg) = (spawn_failed[0], spawn_failed[1]);
     let (_, store) = rig.srv.into_store(Duration::from_secs(10)).await;
     drop(rig.sup);
     // Start 1 reconciles A and K; its prober never runs (a crash). K is confirmed by the
@@ -209,7 +241,7 @@ async fn candidates() {
                 .collect::<Vec<_>>())
         })
         .into_iter()
-        .find(|t| ![ta, tk, ts, tb].contains(t))
+        .find(|t| ![ta, tk, ts, tb, tf, tg].contains(t))
         .unwrap();
     let lu = rig.thread(tu).current_launch_id.unwrap();
     assert_eq!(
@@ -223,22 +255,30 @@ async fn candidates() {
     let rig = probing(store, HostOs::Macos, &script).await;
     let (tl, _ll) = rig.spawn_codex(None).await;
     prober::run(rig.sup.clone()).await;
-    rig.until("two probes recorded", || {
-        evidence(&rig, ta).len() + evidence(&rig, tb).len() == 2
+    rig.until("three probes recorded", || {
+        [ta, tb, tf]
+            .iter()
+            .map(|t| evidence(&rig, *t).len())
+            .sum::<usize>()
+            == 3
     })
     .await;
     let mut calls = script.calls();
-    let mut want = vec![vec![leader(&rig, la)], vec![leader(&rig, lb)]];
+    let mut want = vec![
+        vec![leader(&rig, la)],
+        vec![leader(&rig, lb)],
+        vec![child("s91")],
+    ];
     calls.sort_by_key(|c| (c[0].pid, c[0].start_time.clone()));
     want.sort_by_key(|c| (c[0].pid, c[0].start_time.clone()));
     assert_eq!(calls, want);
-    for t in [ta, tb] {
+    for t in [ta, tb, tf] {
         let ev = evidence(&rig, t);
         assert_eq!(ev.len(), 1, "{t}");
         assert_eq!(ev[0]["probe_run"], json!(rig.sup.instance), "{t}");
         assert_eq!(ev[0]["source"], "probe");
     }
-    for t in [tk, ts, tu, tl] {
+    for t in [tk, ts, tu, tl, tg] {
         assert!(evidence(&rig, t).is_empty(), "{t}");
     }
     rig.srv.stop().await;

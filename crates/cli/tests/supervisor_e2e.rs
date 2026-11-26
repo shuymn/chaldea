@@ -56,6 +56,11 @@ fn main() {
             name: "a29_child_suspended",
             run: a29_child_suspended,
         },
+        #[cfg(windows)]
+        Case {
+            name: "assign_failure_child_probed",
+            run: assign_failure_child_probed,
+        },
     ]);
 }
 
@@ -862,4 +867,93 @@ fn a29_child_suspended() {
         chaldea_pty_runtime::process::lookup(child),
         chaldea_pty_runtime::process::Lookup::Gone
     )));
+}
+
+/// PR10a2-CL-3 on Windows: a spawn whose job assignment and then termination fail ends
+/// `spawn_failed` with its suspended child alive and recorded in `failed_start`; after a
+/// crash, the next start's probe signals that child by its recorded identity and records it
+/// `gone`, with this run as `probe_run`. Daemon 1 is held at `prober_start`, so only daemon
+/// 2 probes.
+#[cfg(windows)]
+fn assign_failure_child_probed() {
+    use chaldea_pty_runtime::fake;
+    use chaldea_pty_runtime::process::{Lookup, lookup};
+    use support::faults::WINDOWS_FAULT;
+
+    let labels = Labels::new();
+    let d = state();
+    let cwd = tempfile::tempdir().unwrap();
+    let args = ["--mode", "sleeper", "--max-life-secs", "120"];
+    let gate = Gate::new();
+    let (mut d1, port) = daemon_with(
+        &labels,
+        &d.path,
+        &args,
+        &[
+            (WINDOWS_FAULT, OsStr::new("assign_terminate_denied")),
+            (SUPERVISOR_PAUSE, OsStr::new("prober_start")),
+            (SUPERVISOR_GATE, gate.path().as_os_str()),
+        ],
+    );
+    assert!(gate.reached(WAIT), "daemon 1 held before its probe");
+    let token = chaldea_daemon::lifecycle::read_owner_token(&d.path).unwrap();
+    let (_, v, err) = agent(
+        &labels,
+        &d.path,
+        &[
+            "spawn",
+            "--agent",
+            "codex",
+            "--cwd",
+            &cwd.path().to_string_lossy(),
+        ],
+    );
+    let (t, events) = thread_events(port, &token);
+    let exited = &events
+        .iter()
+        .find(|(k, _)| k == "launch_exited")
+        .unwrap_or_else(|| panic!("{v} {err} {events:?}"))
+        .1;
+    assert_eq!(exited["reason"], "spawn_failed", "{exited}");
+    assert_eq!(exited["death_confirmed"], false);
+    let child = u32::try_from(exited["failed_start"]["pid"].as_u64().unwrap()).unwrap();
+    let start = exited["failed_start"]["start_time"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    match lookup(child) {
+        Lookup::Live(e) => assert_eq!(e.identity.start_time, start),
+        other => panic!("the failed start's child before the crash: {other:?}"),
+    }
+    d1.child.kill().unwrap();
+    let _ = d1.wait();
+    gate.waiter_killed();
+    let (mut d2, port) = daemon(&labels, &d.path, &args);
+    let instance = support::serving_record(&d.path).instance;
+    let probes = |port| -> Vec<Value> {
+        envelopes(port, &token, &t)
+            .into_iter()
+            .filter(|e| e["kind"] == "launch_evidence" && e["payload"]["source"] == "probe")
+            .map(|e| e["payload"].clone())
+            .collect()
+    };
+    assert!(
+        support::wait_for(|| !probes(port).is_empty()),
+        "the probe's evidence"
+    );
+    assert_eq!(
+        probes(port),
+        vec![serde_json::json!({
+            "launch_id": exited["launch_id"],
+            "source": "probe",
+            "identities": [{ "pid": child, "start_time": start, "observed": "gone" }],
+            "unchecked": ["unrecorded_job_and_outside_job"],
+            "probe_run": instance,
+        })]
+    );
+    assert_eq!(lookup(child), Lookup::Gone);
+    assert_eq!(d2.stop_and_wait(&d.path), 0, "{}", d2.stderr());
+    if lookup(child) != Lookup::Gone {
+        fake::kill_verified(child, &start);
+    }
 }

@@ -486,7 +486,7 @@ pub(crate) async fn record<R: Send + 'static>(sup: &Arc<Supervisor>, job: JobOf<
 
 PR 10a2's design is `docs/design/supervisor-recovery.md`.
 
-**What moves.** The restart probe of old processes (the recorded identities of `daemon_restart` launches, including those an earlier start recorded), launch evidence for the owner, `stop --assume-dead` and its preview, the evidence PR 21's finder receives for A29, the confirmation of every launch 10a1 leaves unconfirmed (§2.4), and mvp P-18's survivor policy, an owner decision taken when 10a2 is designed. 10a2 implements the owner decision of 2026-11-25 (header): a check that covers only recorded identities unlocks nothing; the owner confirms after reading the evidence.
+**What moves.** The restart probe of old processes (the recorded identities of `daemon_restart` launches, including those an earlier start recorded, and of the children of failed starts whose cleanup was unresolved), launch evidence for the owner, `stop --assume-dead` and its preview, the evidence PR 21's finder receives for A29, the confirmation of every launch 10a1 leaves unconfirmed (§2.4), and mvp P-18's survivor policy, an owner decision taken when 10a2 is designed. 10a2 implements the owner decision of 2026-11-25 (header): a check that covers only recorded identities unlocks nothing; the owner confirms after reading the evidence.
 
 **What 10a1 records for it.** All of it is in append-only events, so launches 10a1 marked stay readable across upgrades and repeated restarts, and a later restart changes none of them (§2.5):
 

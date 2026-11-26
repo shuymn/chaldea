@@ -1,7 +1,9 @@
 //! The restart prober (`docs/design/supervisor-recovery.md` §2.3): after `attach`, each start
 //! signals by verified identity the recorded leader of every unconfirmed `daemon_restart`
-//! launch, read from the store, and records what it observed as `launch_evidence`. A probe
-//! never confirms death and changes no state (§2.1 rule 1).
+//! launch and the recorded child of every unconfirmed `spawn_failed` launch whose
+//! `failed_start` names a pid and start time, read from the store, and records what it
+//! observed as `launch_evidence`. A probe never confirms death and changes no state (§2.1
+//! rule 1).
 //!
 //! Each probe's blocking task owns its concurrency slot and its tracker token
 //! ([`ProbeAdmission`]) until it ends, by a return, an unwind, or the pool dropping it unrun:
@@ -12,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use chaldea_core::adapter::HostOs;
 use chaldea_core::event::TypedEvent;
-use chaldea_core::ids::{LaunchId, ThreadId};
+use chaldea_core::ids::{LaunchId, StreamId, ThreadId};
 use chaldea_core::payload::{
     EvidenceSource, ExitReason, IdentityObservation, LaunchEvidence, Observed, SourceKind,
     Unchecked,
@@ -23,7 +25,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::deadline::{Settled, settle_before};
-use crate::store::LaunchRow;
+use crate::store::{LaunchRow, ReadTx, StoreError};
 
 use super::events::{ThreadJob, launch_key, thread_row};
 use super::record::{JobOf, Recorded, record};
@@ -49,10 +51,57 @@ impl Drop for ProbeAdmission {
     }
 }
 
-/// A launch the prober checks: exited `daemon_restart` by an earlier run, death unconfirmed,
-/// a pid recorded.
-fn candidate(l: &LaunchRow) -> bool {
-    l.exit_reason == Some(ExitReason::DaemonRestart) && !l.death_confirmed && l.pid.is_some()
+/// A launch the prober checks and the identity it signals.
+struct Target {
+    thread: ThreadId,
+    launch: LaunchId,
+    identity: ProcessIdentity,
+}
+
+/// The prober's candidates, read in one transaction (§2.3 step 2): every launch exited with
+/// death unconfirmed that has a usable recorded identity: a `daemon_restart` launch's leader
+/// from `launch_started`, and a `spawn_failed` launch's child from its `launch_exited`'s
+/// `failed_start` when that names both a pid and a start time.
+fn targets(r: &ReadTx<'_>, rows: Vec<LaunchRow>) -> Result<Vec<Target>, StoreError> {
+    let mut out = Vec::new();
+    for l in rows {
+        if l.death_confirmed {
+            continue;
+        }
+        let identity = match l.exit_reason {
+            Some(ExitReason::DaemonRestart) => l.pid.map(|pid| ProcessIdentity {
+                pid,
+                start_time: l.start_time.clone().unwrap_or_default(),
+                group: l.pgid_or_job.clone().unwrap_or_default(),
+            }),
+            Some(ExitReason::SpawnFailed) => {
+                let exited = r.event_by_key(
+                    StreamId::Thread(l.thread_id),
+                    &launch_key(l.launch_id, "exited"),
+                )?;
+                match exited.as_ref().map(TypedEvent::decode) {
+                    Some(Ok(TypedEvent::LaunchExited(x))) => x.failed_start.and_then(|f| {
+                        let start = f.start_time.filter(|s| !s.is_empty())?;
+                        Some(ProcessIdentity {
+                            pid: f.pid,
+                            start_time: start,
+                            group: f.pgid_or_job.unwrap_or_default(),
+                        })
+                    }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(identity) = identity {
+            out.push(Target {
+                thread: l.thread_id,
+                launch: l.launch_id,
+                identity,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// The prober (§2.3 steps 1–4): returns once every candidate's task is spawned, with the
@@ -69,23 +118,21 @@ pub(crate) async fn run(sup: Arc<Supervisor>) -> Vec<JoinHandle<()>> {
     let store = sup.store.clone();
     let wait = sup.real(until);
     let read = sup.rt.spawn_blocking(move || {
-        #[allow(
-            clippy::redundant_closure_for_method_calls,
-            reason = "the reader's lifetime is the closure's own"
-        )]
-        store.read(wait, |r| r.open_launches())
+        store.read(wait, |r| {
+            let rows = r.open_launches()?;
+            targets(r, rows)
+        })
     });
-    let rows = match settle_before(|| sup.now(), until, sup.timer(until), read)
+    let candidates = match settle_before(|| sup.now(), until, sup.timer(until), read)
         .await
         .in_time()
     {
-        Some(Ok(Ok(rows))) => rows,
+        Some(Ok(Ok(targets))) => targets,
         other => {
             tracing::warn!(read = ?other.map(|r| r.map(|r| r.map(|v| v.len()))), "the restart prober read no candidates in time; the next start reads again");
             return records;
         }
     };
-    let candidates: Vec<LaunchRow> = rows.into_iter().filter(candidate).collect();
     // Step 3.
     for (i, l) in candidates.iter().enumerate() {
         // 3.1: a slot; a permit settled late is dropped at once.
@@ -95,7 +142,7 @@ pub(crate) async fn run(sup: Arc<Supervisor>) -> Vec<JoinHandle<()>> {
             .await
             .in_time()
         else {
-            let left: Vec<LaunchId> = candidates[i..].iter().map(|l| l.launch_id).collect();
+            let left: Vec<LaunchId> = candidates[i..].iter().map(|l| l.launch).collect();
             tracing::warn!(
                 ?left,
                 "no probe slot in time; the next start probes these launches"
@@ -108,11 +155,7 @@ pub(crate) async fn run(sup: Arc<Supervisor>) -> Vec<JoinHandle<()>> {
         };
         let admission = ProbeAdmission::new(token);
         // 3.3.
-        let identity = ProcessIdentity {
-            pid: l.pid.unwrap_or_default(),
-            start_time: l.start_time.clone().unwrap_or_default(),
-            group: l.pgid_or_job.clone().unwrap_or_default(),
-        };
+        let identity = l.identity.clone();
         let attempt = Uuid::new_v4();
         let deadline = sup.now() + PROBE_BUDGET;
         // 3.4: the blocking task owns the permit and the admission.
@@ -136,8 +179,8 @@ pub(crate) async fn run(sup: Arc<Supervisor>) -> Vec<JoinHandle<()>> {
         // The join's timer is set at dispatch, with the blocking task.
         let cutoff = deadline + PROBE_JOIN_GRACE;
         let probe = Probe {
-            thread: l.thread_id,
-            launch: l.launch_id,
+            thread: l.thread,
+            launch: l.launch,
             identity,
             attempt,
             started,
