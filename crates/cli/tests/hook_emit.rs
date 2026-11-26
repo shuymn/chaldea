@@ -627,12 +627,12 @@ fn one_id_attempts(reqs: &[Req]) -> Vec<String> {
 
 /// The settings file's hook command, run as Claude's hook shell runs it on this host (`sh -c`
 /// on macOS; on Windows the settings choose PowerShell, run here with `-Command`), starts the
-/// emitter copied to a directory whose name holds a space, quotation marks, and `$`, and its
-/// request reaches the hook URL.
+/// emitter copied to a directory whose name holds a space, quotation marks, `$`, and backticks,
+/// and its request reaches the hook URL.
 #[test]
 fn claude_hook_command_runs_in_hook_shell() {
     let dir = tempfile::tempdir().unwrap();
-    let sub = dir.path().join("it's \u{2019}q $HOME dir");
+    let sub = dir.path().join("it's \u{2019}q $HOME `x` dir");
     std::fs::create_dir(&sub).unwrap();
     let exe = sub.join(std::path::Path::new(EMITTER).file_name().unwrap());
     std::fs::copy(EMITTER, &exe).unwrap();

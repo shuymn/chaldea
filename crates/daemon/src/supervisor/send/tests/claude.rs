@@ -14,6 +14,7 @@ use chaldea_core::input::InputState;
 use chaldea_core::input::encode::{Purpose, encode, expected_prompt, prompt_matches};
 use chaldea_core::payload::{ApprovalOutcome, Content, Encoding, InputEncoding};
 use serde_json::{Value, json};
+use sha2::Digest as _;
 
 use super::human::{key, outcome};
 use super::outcomes::tick_at;
@@ -331,11 +332,20 @@ fn fixture_hygiene() {
                     corpus().iter().any(|(c, t)| *c == f.case && *t == sent),
                     "{at}: {sent:?} is not a corpus prompt"
                 ),
-                // Only the subagent's completion, which Claude generated, has no sent text.
+                // Only the subagent's completion, which Claude generated, has no sent text:
+                // `sent` is `null`, and the body is the one captured.
                 None => {
+                    assert!(keys.contains(&"sent") && f.meta["sent"].is_null(), "{at}");
                     assert_eq!(at, "subagent/UserPromptSubmit", "{at}");
                     let p = f.json["prompt"].as_str().unwrap();
-                    assert!(p.starts_with("<task-notification>"), "{at}: {p:?}");
+                    assert_eq!(
+                        sha2::Sha256::digest(p.as_bytes())
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>(),
+                        SUBAGENT_NOTIFICATION_SHA256,
+                        "{at}: {p:?}"
+                    );
                 }
             }
         }
@@ -344,6 +354,11 @@ fn fixture_hygiene() {
 
 /// Every prompt the captures sent, by case: synthetic instructions and the corpus of the
 /// README, written here independently of the fixtures.
+/// The SHA-256 of the one generated prompt the captures hold: the `<task-notification>` of
+/// `subagent`'s completion (1,016 bytes).
+const SUBAGENT_NOTIFICATION_SHA256: &str =
+    "10809841b79e9eec15e8f50bc7c3f2a9999f6b99dd433b8a0d5c2f2a78cc72f4";
+
 fn corpus() -> Vec<(&'static str, String)> {
     let lit = |c: &'static str, t: &str| (c, t.to_owned());
     vec![
