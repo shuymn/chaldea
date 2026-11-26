@@ -357,10 +357,8 @@ async fn after_exit() {
     rig.until_input(id, InputState::Unconfirmed).await;
     let before = moves(&rig, &live, id);
     go.send(()).unwrap();
-    let sl = rig.sl(&live);
     rig.until("the worker ended", || rig.sup.send.launch(live.l).is_none())
         .await;
-    drop(sl);
     assert_eq!(moves(&rig, &live, id), before, "nothing changed");
     rig.stop().await;
 }
