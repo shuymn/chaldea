@@ -861,7 +861,7 @@ plus the `workspace` job green on both runners with `store_open::long_path_vfs_i
 
 **D9. Receipts, hook deliveries, and tokens are kept forever in the MVP.** Deletion needs retention rules (a receipt deleted while a client may still retry would re-run the command) that no MVP PR owns; a later migration can add them and must keep mvp §2.4's receipt semantics.
 
-**D10. `open` refuses before it changes anything, never deletes, and never repairs.** Not a database, not UTF-8, foreign, newer schema, or changed schema: an error with the file as found (apart from what SQLite itself does on open, §2.8). A failed first open may leave an uninitialized file, which the next open reuses. Corruption at run time stops writes. Integrity checks are the doctor's.
+**D10. `open` refuses before it changes anything, never deletes, and never repairs.** Not a database, not UTF-8, foreign, newer schema, or changed schema: an error with the file as found (apart from what SQLite itself does on open, §2.8). A failed first open may leave an uninitialized file, which the next open reuses. Corruption at run time stops writes. Integrity checks are the doctor's (deferred, mvp §4 "Deferred").
 
 **D11. `Content` previews leave out a valid character cut by the 1 KiB window** without setting `preview_lossy`, and replace every invalid sequence, including one at the boundary, with U+FFFD and set it (§2.5). mvp §2.1 and the `core::payload::Content::Blob` doc comment say so; no type changes and no stored value existed before. Rejected: decoding exactly the first 1024 bytes lossily, under which most Japanese text above 64 KiB would be flagged lossy because of where the window ends.
 

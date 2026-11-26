@@ -379,7 +379,7 @@ The canonical documents state this design's public parts:
 | sol r1 M6, Neon r1 H2, M5 (deadline between calls; exhaustive classes; `pid > i32::MAX`; Windows waits; `ProcessOs`) | §2.2; RD10; CL-1, CL-2 |
 | sol r1 M7 (admitted evidence write; `CommitUnknown`) | §2.3 "Evidence write"; §2.7; CL-5 |
 | sol r1 M8, Neon r1 M4 (sealed `PtyRuntime`; outer job; deterministic rules) | `fake::with_windows_fault`; `TestJob` before the helper spawns; `launch::a29_candidate`; CL-10 |
-| sol r1 M9 (history, close and resume guards, worktree, `no_session`) | P-1; CL-4 (history, inputs); CL-6, CL-8; §2.5 (PR 16's check) |
+| sol r1 M9 (history, close and resume guards, worktree, `no_session`) | P-1; CL-4 (history, inputs); CL-6, CL-8; §2.5 (the deferred removal's check) |
 | Neon r1 M6 (Windows invalid cases; `Late` join; panicking probe) | CL-2; CL-5 |
 | Neon r1 M7 (`unchecked` emptiness; envelope) | §2.4 code and "Envelope"; CL-7 |
 | sol r2 H1 (recorded Windows child in the exception; inconclusive) | header; RD9; P-4; L-2; mvp §6.1 P-18 and §4 "Dogfooding evidence" (§8) |
