@@ -154,10 +154,6 @@ pub(crate) struct Fired {
 pub(crate) struct TurnLog(pub BTreeMap<u64, (TurnMark, Instant)>);
 
 impl TurnLog {
-    fn boundary(m: &TurnMark) -> bool {
-        matches!(m, TurnMark::Start | TurnMark::End { .. })
-    }
-
     /// Inserts a mark, then drops the entries below the boundary under the current turn's
     /// start.
     pub(crate) fn insert(&mut self, ordinal: u64, mark: TurnMark, at: Instant) {
@@ -173,7 +169,7 @@ impl TurnLog {
                 .0
                 .range(..t)
                 .rev()
-                .find(|(_, (m, _))| Self::boundary(m))
+                .find(|(_, (m, _))| m.is_boundary())
                 .map(|(o, _)| *o)
         {
             self.0 = self.0.split_off(&b);
@@ -192,7 +188,7 @@ impl TurnLog {
             .0
             .range(..s)
             .rev()
-            .filter(|(_, (m, _))| Self::boundary(m));
+            .filter(|(_, (m, _))| m.is_boundary());
         let (_, (start, _)) = below.next()?;
         if *start != TurnMark::Start {
             return None;
@@ -287,6 +283,9 @@ pub(crate) struct SendLaunch {
     pub positional: Option<InputId>,
     pub fence: Arc<AtomicU64>,
     pub latest_intake: AtomicU64,
+    /// The highest receipt ordinal among the launch's committed turn boundaries (§2.4),
+    /// raised only by the store writer after a delivery job's `COMMIT`.
+    pub turn_watermark: Arc<AtomicU64>,
     /// Mirrors `state.running.is_some()` for jobs on the store writer.
     pub running_flag: AtomicBool,
     /// Mirrors `state.human_unsettled` for jobs on the store writer.
@@ -316,6 +315,7 @@ impl SendLaunch {
             positional: e.positional,
             fence: Arc::new(AtomicU64::new(0)),
             latest_intake: AtomicU64::new(0),
+            turn_watermark: Arc::new(AtomicU64::new(0)),
             running_flag: AtomicBool::new(false),
             human_flag: AtomicU32::new(0),
             state: Mutex::new(SendState::default()),
@@ -418,8 +418,9 @@ impl SendLaunch {
 
 /// The send side's shared parts: the launches, the decoder, and the driver's channel.
 pub(crate) struct SendSide {
-    /// Readers (the intake probe, commands, the driver) never wait on each other; a writer
-    /// holds it only for one insert or remove.
+    /// Readers (the intake probe, commands, the driver, and hook jobs on the store writer)
+    /// never wait on each other; a writer holds it only for one insert or remove. Nothing
+    /// holding it waits on the store writer.
     pub map: RwLock<HashMap<LaunchId, Arc<SendLaunch>>>,
     pub decoder: Arc<dyn HookDecoder>,
     /// The readiness mode of every row, when a test sets one.

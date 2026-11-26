@@ -17,7 +17,12 @@ use crate::store::test_faults::CommitFault;
 use crate::supervisor::send::SETTLE;
 
 /// `key` as the owner: the status and the body.
-async fn key(rig: &SRig, live: &Live, keys: &[&str], card: Option<ApprovalId>) -> (u16, Value) {
+pub(super) async fn key(
+    rig: &SRig,
+    live: &Live,
+    keys: &[&str],
+    card: Option<ApprovalId>,
+) -> (u16, Value) {
     let mut args = json!({ "thread_id": live.t, "launch_id": live.l, "keys": keys });
     if let Some(c) = card {
         args["approval_id"] = json!(c);
@@ -46,7 +51,7 @@ async fn card(rig: &SRig, live: &Live, tool_use_id: &str) -> ApprovalId {
     ApprovalId(h.emit)
 }
 
-fn outcome(rig: &SRig, id: ApprovalId) -> Option<ApprovalOutcome> {
+pub(super) fn outcome(rig: &SRig, id: ApprovalId) -> Option<ApprovalOutcome> {
     rig.srv
         .store
         .read(move |r| r.approval(id))

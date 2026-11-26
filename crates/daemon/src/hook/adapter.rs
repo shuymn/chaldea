@@ -2,9 +2,11 @@
 //! adapter's (PR 10, 13, 14); PR 9 decides only routing, binding, and selection.
 
 use std::borrow::Cow;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use chaldea_core::event::TypedEvent;
-use chaldea_core::ids::{Agent, ApprovalId, ThreadId};
+use chaldea_core::ids::{Agent, ApprovalId, LaunchId, ThreadId};
 use chaldea_core::payload::RawUnknownReason;
 use chaldea_pty_runtime::process::Ancestry;
 use uuid::Uuid;
@@ -22,7 +24,10 @@ pub enum BindingRule {
 }
 
 /// The meaning of selected hooks, decided inside the delivery or binding job. Data only:
-/// no blocking, network, PTY, supervisor, or channel handle.
+/// no blocking, network, PTY, or channel handle. The one supervisor value a job reads is the
+/// launch's turn watermark ([`HookAdapter::turn_watermark`]), taken once on the writer before
+/// `interpret` and raised only by the writer after `COMMIT`; `interpret` itself reads only its
+/// `ReadTx` and its [`AcceptedHook`].
 pub trait HookAdapter: Send + Sync + 'static {
     fn rule(&self, agent: Agent) -> BindingRule;
 
@@ -48,6 +53,15 @@ pub trait HookAdapter: Send + Sync + 'static {
         tx: &ReadTx<'_>,
         hook: &AcceptedHook<'_>,
     ) -> Result<(Interpretation, TurnMark), StoreError>;
+
+    /// The launch's turn watermark: the highest receipt ordinal among its committed turn
+    /// boundaries (supervisor-send §2.4), or `None` when the adapter keeps none. Called on the
+    /// store writer inside the job, so nothing that holds a lock this lookup takes may wait on
+    /// the writer.
+    fn turn_watermark(&self, launch: LaunchId) -> Option<Arc<AtomicU64>> {
+        let _ = launch;
+        None
+    }
 }
 
 /// What an interpreted hook tells the supervisor once its job committed
@@ -69,6 +83,25 @@ pub enum TurnMark {
     Resolved { approval_id: ApprovalId },
     /// Any other hook.
     Other,
+}
+
+impl TurnMark {
+    /// A turn boundary: a start or an end. Only boundaries raise the turn watermark.
+    #[must_use]
+    pub fn is_boundary(&self) -> bool {
+        matches!(self, TurnMark::Start | TurnMark::End { .. })
+    }
+}
+
+/// The turn watermark a job's next interpretation sees: `committed`, raised by the turn
+/// boundaries the job interpreted before it.
+#[must_use]
+pub(crate) fn job_watermark(committed: u64, marks: &[(u64, TurnMark)]) -> u64 {
+    marks
+        .iter()
+        .filter(|(_, m)| m.is_boundary())
+        .map(|(o, _)| *o)
+        .fold(committed, u64::max)
 }
 
 /// What `interpret` decided.
@@ -111,6 +144,9 @@ pub struct AcceptedHook<'a> {
     pub binding_ordinal: u64,
     /// Applied from the buffer in the binding job.
     pub promoted: bool,
+    /// The launch's turn watermark as this job sees it: the committed one, raised by the turn
+    /// boundaries interpreted earlier in the same job. A `Start` or `End` below it is stale.
+    pub turn_watermark: u64,
 }
 
 /// The emitter's ancestry, walked once per request on a blocking thread.

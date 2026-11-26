@@ -1,0 +1,543 @@
+//! Turn boundaries in receipt order (send §2.4): a `UserPromptSubmit` or `Stop` whose
+//! receipt ordinal is below a committed turn boundary of its launch changes neither the turn
+//! nor the cards, and its prompt does not move the turn-start basis; it still records its
+//! `user_message` and acks.
+
+use std::time::{Duration, Instant};
+
+use chaldea_core::ids::{Agent, ApprovalId, InputId, StreamId};
+use chaldea_core::input::InputState;
+use chaldea_core::state::TurnState;
+use serde_json::{Value, json};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+
+use super::evidence::{advance, count, settle_rig};
+use super::gate::set;
+use super::human::{key, outcome};
+use super::{Live, SRig};
+use crate::hook::TurnMark;
+use crate::store::test_faults::CommitFault;
+use crate::supervisor::send::SETTLE;
+use crate::supervisor::tests::support::hook::Hook;
+use crate::supervisor::tests::support::http::{Reply, spawn_send};
+
+/// A request's reply handle, carried out of a future that must not await it.
+struct Pending(JoinHandle<Reply>);
+
+/// A hook held before its job, its intake ended.
+struct Held {
+    ordinal: u64,
+    hook: Hook,
+    reply: JoinHandle<Reply>,
+    release: oneshot::Sender<()>,
+}
+
+impl Held {
+    /// Releases the job and returns the hook's reply.
+    async fn finish(self) -> Reply {
+        self.release.send(()).unwrap();
+        self.reply.await.unwrap()
+    }
+}
+
+/// Posts `hook` and holds it before its job, once its intake ended. With `park`, the send
+/// worker is parked through the intake so the intake reads the send side's facts.
+async fn hold(rig: &SRig, live: &Live, hook: Hook, park: bool) -> Held {
+    let ordinal = rig.next_ordinal(live);
+    let (got, release) = rig.ingest.points.arm_job(ordinal);
+    let req = hook.req(&rig.srv);
+    // The reply's handle is not awaited here: the request waits in its job's hold.
+    let taken_in = async {
+        let reply = spawn_send(&rig.srv, &req);
+        got.await.unwrap();
+        Pending(reply)
+    };
+    let Pending(reply) = if park {
+        rig.worker_parked(live, taken_in).await
+    } else {
+        taken_in.await
+    };
+    Held {
+        ordinal,
+        hook,
+        reply,
+        release,
+    }
+}
+
+fn prompt(text: &str) -> Value {
+    json!({ "prompt": text })
+}
+
+fn card_hook(rig: &SRig, live: &Live, tool_use: &str) -> Hook {
+    rig.hook_of(
+        live,
+        "PermissionRequest",
+        &json!({ "tool_name": "Bash", "tool_input": { "command": "ls" }, "tool_use_id": tool_use }),
+    )
+}
+
+fn turn(rig: &SRig, live: &Live) -> TurnState {
+    rig.thread(live.t).state.turn
+}
+
+/// The seqs of the thread's events of `kind`, in order.
+fn seqs(rig: &SRig, live: &Live, kind: &str) -> Vec<u64> {
+    let (t, kind) = (live.t, json!(kind));
+    rig.srv.store.read(move |r| {
+        Ok(r.events_after(StreamId::Thread(t), 0, 10_000)?
+            .events
+            .into_iter()
+            .filter(|e| serde_json::to_value(&e.kind).unwrap() == kind)
+            .map(|e| e.seq)
+            .collect())
+    })
+}
+
+/// The seq of the primary event of `live`'s delivery with receipt ordinal `ordinal`.
+fn delivery_seq(rig: &SRig, live: &Live, ordinal: u64) -> Option<u64> {
+    let l = live.l;
+    rig.srv.store.read(move |r| r.delivery_seq(l, ordinal))
+}
+
+/// Blocks a test point until released, off the runtime's threads; the receiver hears it
+/// entered.
+fn gate_point() -> (
+    oneshot::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+    impl FnOnce() + Send + 'static,
+) {
+    let (entered_tx, entered) = oneshot::channel();
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    (entered, go, move || {
+        let _ = entered_tx.send(());
+        tokio::task::block_in_place(|| {
+            let _ = wait.recv_timeout(Duration::from_secs(30));
+        });
+    })
+}
+
+/// After `ready`, sends `text` and waits until it is `sent` and its unit ended.
+async fn sent(rig: &SRig, live: &Live, text: &str) -> InputId {
+    rig.cmd_ok("ready", &json!({ "thread_id": live.t }), 200)
+        .await;
+    let id = rig.send(live, text).await;
+    rig.until_input(id, InputState::Sent).await;
+    let sl = rig.sl(live);
+    rig.until("the unit ended", || sl.state().running.is_none())
+        .await;
+    id
+}
+
+/// Requires the next send to stay `queued` through two passes, with no byte written.
+async fn stays_queued(rig: &SRig, live: &Live) -> InputId {
+    let id = rig.send(live, "queued-text").await;
+    rig.pass(live).await;
+    rig.pass(live).await;
+    assert_eq!(rig.input(id).state, InputState::Queued);
+    assert!(
+        !live
+            .child
+            .input()
+            .windows(b"queued-text".len())
+            .any(|w| w == b"queued-text"),
+        "no byte"
+    );
+    id
+}
+
+/// Requires `p` acked by the thread's last `user_message`, its `ack_seq` that event's seq.
+fn acked_by_last_message(rig: &SRig, live: &Live, p: InputId) {
+    let msgs = rig.of_kind(live.t, "user_message");
+    assert_eq!(msgs.last().unwrap()["input_id"], json!(p));
+    let row = rig.input(p);
+    assert_eq!(row.state, InputState::Acked);
+    assert_eq!(row.ack_seq, seqs(rig, live, "user_message").last().copied());
+}
+
+/// Control: the start commits before its `Stop`; one settle, and the next send is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn start_commits_first() {
+    let (rig, live) = settle_rig().await;
+    let p = sent(&rig, &live, "P").await;
+    let start = rig.next_ordinal(&live);
+    rig.hook(&live, "UserPromptSubmit", &prompt("P")).await;
+    assert_eq!(turn(&rig, &live), TurnState::Running);
+    acked_by_last_message(&rig, &live, p);
+    assert_eq!(
+        rig.launch(live.l).last_turn_start_seq,
+        delivery_seq(&rig, &live, start)
+    );
+    rig.hook(&live, "Stop", &json!({})).await;
+    advance(&rig, &live, SETTLE).await;
+    assert_eq!(count(&rig, &live, "stop_settled"), 1);
+    let next = rig.send(&live, "next").await;
+    rig.until_input(next, InputState::Sent).await;
+    rig.stop().await;
+}
+
+/// The `Stop` commits before its turn's start. With `observer_held`, the `Stop`'s observer
+/// is held once its ticket answered, before it reads the answer, until the start's job ran:
+/// the watermark is the writer's, not the observer's. Returns the input and the turn-start
+/// basis before the start.
+async fn stop_before_start(rig: &SRig, live: &Live, observer_held: bool) -> (InputId, Option<u64>) {
+    let p = sent(rig, live, "P").await;
+    let before = rig.launch(live.l).last_turn_start_seq;
+    let start = hold(
+        rig,
+        live,
+        rig.hook_of(live, "UserPromptSubmit", &prompt("P")),
+        true,
+    )
+    .await;
+    if observer_held {
+        let faults = crate::http::tests::shared(&rig.srv);
+        let req = rig.hook_of(live, "Stop", &json!({})).req(&rig.srv);
+        let (stop, go) = rig
+            .worker_parked(live, async {
+                let (answered, go) = faults.faults.arm_ticket_answer_gate();
+                let reply = spawn_send(&rig.srv, &req);
+                answered.await.unwrap();
+                (Pending(reply), go)
+            })
+            .await;
+        assert_eq!(start.finish().await.status, 200);
+        assert_eq!(turn(rig, live), TurnState::Unknown, "observer held");
+        go.send(()).unwrap();
+        assert_eq!(stop.0.await.unwrap().status, 200);
+    } else {
+        rig.hook(live, "Stop", &json!({})).await;
+        assert_eq!(start.finish().await.status, 200);
+    }
+    assert_eq!(turn(rig, live), TurnState::Unknown);
+    acked_by_last_message(rig, live, p);
+    assert_eq!(rig.launch(live.l).last_turn_start_seq, before);
+    (p, before)
+}
+
+/// TO-1: the stale start neither restarts the turn nor moves the basis; the `Stop`
+/// settles and the next send is written without `ready`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_commits_first() {
+    for observer_held in [false, true] {
+        let (rig, live) = settle_rig().await;
+        stop_before_start(&rig, &live, observer_held).await;
+        advance(&rig, &live, SETTLE).await;
+        assert_eq!(
+            count(&rig, &live, "stop_settled"),
+            1,
+            "observer held: {observer_held}"
+        );
+        let next = rig.send(&live, "next").await;
+        rig.until_input(next, InputState::Sent).await;
+        rig.stop().await;
+    }
+}
+
+/// A `Stop` taken in while its input's unit was recorded as `sending` keeps
+/// `settle: false` when its start commits after it: no settle, the next send waits for
+/// `ready`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_first_without_settle() {
+    let (rig, live) = settle_rig().await;
+    rig.cmd_ok("ready", &json!({ "thread_id": live.t }), 200)
+        .await;
+    let sl = rig.sl(&live);
+    let (entered, go, point) = gate_point();
+    set(&sl.hooks.record_job, point);
+    let p = rig.send(&live, "P").await;
+    entered.await.unwrap();
+    assert_eq!(rig.input(p).state, InputState::Sending);
+    // The worker is held in the record job, outside the state lock: no parking.
+    let start = hold(
+        &rig,
+        &live,
+        rig.hook_of(&live, "UserPromptSubmit", &prompt("P")),
+        false,
+    )
+    .await;
+    let stop = rig.next_ordinal(&live);
+    let r = rig.post(&rig.hook_of(&live, "Stop", &json!({}))).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(start.finish().await.status, 200);
+    assert!(
+        matches!(
+            sl.state().log.0.get(&stop),
+            Some((TurnMark::End { settle: false }, _))
+        ),
+        "{:?}",
+        sl.state().log.0
+    );
+    assert_eq!(turn(&rig, &live), TurnState::Unknown);
+    assert_eq!(rig.input(p).state, InputState::Acked);
+    go.send(()).unwrap();
+    rig.pass(&live).await;
+    advance(&rig, &live, SETTLE).await;
+    assert_eq!(count(&rig, &live, "stop_settled"), 0);
+    let q = stays_queued(&rig, &live).await;
+    rig.cmd_ok("ready", &json!({ "thread_id": live.t }), 200)
+        .await;
+    rig.until_input(q, InputState::Sent).await;
+    rig.stop().await;
+}
+
+/// TO-2b: a human write before a stale start stays in the turn the `Stop` ended. The
+/// settle's evidence is of that turn, so it does not reopen the gate after the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_start_keeps_the_basis() {
+    let (rig, live) = settle_rig().await;
+    let before = rig.launch(live.l).last_turn_start_seq;
+    let start = hold(
+        &rig,
+        &live,
+        rig.hook_of(&live, "UserPromptSubmit", &prompt("p")),
+        true,
+    )
+    .await;
+    rig.attach(&live, b"x").await.await.unwrap();
+    let sl = rig.sl(&live);
+    rig.until("the human write was recorded", || {
+        !seqs(&rig, &live, "human_write").is_empty() && sl.state().human_unsettled == 0
+    })
+    .await;
+    let human = seqs(&rig, &live, "human_write")[0];
+    rig.hook(&live, "Stop", &json!({})).await;
+    let ordinal = start.ordinal;
+    assert_eq!(delivery_seq(&rig, &live, ordinal), None, "not yet appended");
+    assert_eq!(start.finish().await.status, 200);
+    assert!(human < delivery_seq(&rig, &live, ordinal).unwrap());
+    assert_eq!(rig.launch(live.l).last_turn_start_seq, before);
+    assert!(before.unwrap() < human);
+    advance(&rig, &live, SETTLE).await;
+    assert_eq!(count(&rig, &live, "stop_settled"), 1);
+    stays_queued(&rig, &live).await;
+    rig.stop().await;
+}
+
+/// TO-2: a `Stop` committing after a newer start and a card opened in that turn ends
+/// neither: the turn stays `awaiting_approval`, the card open, and nothing settles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_stop_keeps_the_turn_and_cards() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    rig.clock.stop();
+    rig.hook(&live, "UserPromptSubmit", &prompt("t0")).await;
+    let stop = hold(&rig, &live, rig.hook_of(&live, "Stop", &json!({})), true).await;
+    rig.hook(&live, "UserPromptSubmit", &prompt("t1")).await;
+    let card = card_hook(&rig, &live, "t1");
+    assert_eq!(rig.post_for(&live, &card).await.status, 200);
+    assert_eq!(turn(&rig, &live), TurnState::AwaitingApproval);
+    assert_eq!(stop.finish().await.status, 200);
+    assert_eq!(turn(&rig, &live), TurnState::AwaitingApproval);
+    assert_eq!(outcome(&rig, ApprovalId(card.emit)), None, "open");
+    advance(&rig, &live, SETTLE).await;
+    assert_eq!(count(&rig, &live, "stop_settled"), 0);
+    rig.stop().await;
+}
+
+/// L-13 case f: a card committed after a higher `Stop`, then the stale start below both.
+/// The card folds as without the start, and the start changes nothing. The outcome is
+/// CL-13's: `ready` succeeds while the turn stays `awaiting_approval`, and a key for the
+/// card is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn card_between_stale_start_and_stop() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let start = hold(
+        &rig,
+        &live,
+        rig.hook_of(&live, "UserPromptSubmit", &prompt("t")),
+        true,
+    )
+    .await;
+    let card = hold(&rig, &live, card_hook(&rig, &live, "t1"), true).await;
+    rig.hook(&live, "Stop", &json!({})).await;
+    let id = ApprovalId(card.hook.emit);
+    assert_eq!(card.finish().await.status, 200);
+    assert_eq!(turn(&rig, &live), TurnState::AwaitingApproval);
+    assert_eq!(start.finish().await.status, 200);
+    assert_eq!(turn(&rig, &live), TurnState::AwaitingApproval);
+    assert_eq!(outcome(&rig, id), None, "open");
+    rig.cmd_ok("ready", &json!({ "thread_id": live.t }), 200)
+        .await;
+    assert_eq!(turn(&rig, &live), TurnState::AwaitingApproval);
+    let r = key(&rig, &live, &["enter"], Some(id)).await;
+    assert_eq!(
+        (r.0, r.1["outcome"].clone()),
+        (200, json!("written")),
+        "{r:?}"
+    );
+    rig.stop().await;
+}
+
+/// Boundaries promoted by the binding `SessionStart` raise the watermark: a start held
+/// across the binding, below a promoted `Stop`, is stale. The control promotes the start
+/// and its `Stop` in one job in receipt order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promoted_boundaries() {
+    let rig = SRig::new().await;
+    let (live, _) = rig.spawn(Agent::Codex, None).await;
+    rig.paste(&live, true).await;
+    let binding = hold(
+        &rig,
+        &live,
+        rig.hook_of(&live, "SessionStart", &json!({})),
+        true,
+    )
+    .await;
+    let start = hold(
+        &rig,
+        &live,
+        rig.hook_of(&live, "UserPromptSubmit", &prompt("p")),
+        true,
+    )
+    .await;
+    rig.hook(&live, "Stop", &json!({})).await;
+    assert_eq!(binding.finish().await.status, 200);
+    assert!(rig.launch(live.l).session_id.is_some(), "bound");
+    assert_eq!(turn(&rig, &live), TurnState::Unknown);
+    assert_eq!(start.finish().await.status, 200);
+    assert_eq!(turn(&rig, &live), TurnState::Unknown);
+    rig.stop().await;
+
+    // Ordered control: both buffered, promoted together.
+    let rig = SRig::new().await;
+    let (live, _) = rig.spawn(Agent::Codex, None).await;
+    rig.paste(&live, true).await;
+    let binding = hold(
+        &rig,
+        &live,
+        rig.hook_of(&live, "SessionStart", &json!({})),
+        true,
+    )
+    .await;
+    let start = rig.next_ordinal(&live);
+    rig.hook(&live, "UserPromptSubmit", &prompt("p")).await;
+    rig.hook(&live, "Stop", &json!({})).await;
+    assert_eq!(binding.finish().await.status, 200);
+    assert_eq!(turn(&rig, &live), TurnState::Unknown);
+    assert_eq!(
+        rig.launch(live.l).last_turn_start_seq,
+        delivery_seq(&rig, &live, start)
+    );
+    rig.stop().await;
+}
+
+/// TO-3: a boundary whose job rolls back raises nothing; the lower start then applies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rolled_back_boundary_raises_nothing() {
+    let (rig, live) = settle_rig().await;
+    let start = hold(
+        &rig,
+        &live,
+        rig.hook_of(&live, "UserPromptSubmit", &prompt("p")),
+        true,
+    )
+    .await;
+    let stop = rig.hook_of(&live, "Stop", &json!({}));
+    let r = rig
+        .worker_parked(&live, async {
+            *rig.srv.store.store().faults().commit.lock().unwrap() =
+                Some(CommitFault::BusyBeforeCommit);
+            rig.post(&stop).await
+        })
+        .await;
+    assert_eq!(
+        (r.status, crate::supervisor::tests::json(&r)["code"].clone()),
+        (503, json!("busy"))
+    );
+    let (l, emit) = (live.l, stop.emit);
+    assert!(
+        rig.srv
+            .store
+            .read(move |r| r.delivery_row(l, emit))
+            .is_none()
+    );
+    assert_eq!(start.finish().await.status, 200);
+    assert_eq!(turn(&rig, &live), TurnState::Running);
+    rig.stop().await;
+}
+
+/// The stale start's projection survives a rebuild: the basis stays before the start, and
+/// the input keeps its `ack_seq`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_start_rebuilds() {
+    let (rig, live) = settle_rig().await;
+    let (p, before) = stop_before_start(&rig, &live, false).await;
+    let ack = rig.input(p).ack_seq;
+    assert!(ack.is_some());
+    rig.srv
+        .store
+        .store()
+        .submit(Instant::now() + Duration::from_secs(5), |tx| {
+            tx.rebuild_projections()?;
+            Ok(())
+        })
+        .unwrap()
+        .await
+        .unwrap();
+    assert_eq!(rig.launch(live.l).last_turn_start_seq, before);
+    assert_eq!(rig.input(p).ack_seq, ack);
+    assert_eq!(rig.input(p).state, InputState::Acked);
+    rig.stop().await;
+}
+
+/// An exit step that refuses, so the exit job rolls back and the exit stays unrecorded.
+struct RefuseExit;
+
+impl crate::supervisor::exit::ExitStep for RefuseExit {
+    fn in_exit_job(
+        &self,
+        _tx: &mut crate::store::WriteTx<'_>,
+        _exit: &crate::supervisor::exit::ExitFacts,
+    ) -> Result<(), crate::store::StoreError> {
+        Err(crate::store::StoreError::Constraint(
+            "refused by the test".into(),
+        ))
+    }
+}
+
+/// A launch whose exit job rolled back leaves the live map, and its send side with it, while
+/// the store still holds it live: a start held across that, below a committed `Stop`, still
+/// changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_start_after_unrecorded_exit() {
+    let rig = SRig::with(|c| c.exit_steps.push(std::sync::Arc::new(RefuseExit))).await;
+    let live = rig.bound(Agent::Codex).await;
+    rig.clock.stop();
+    let before = rig.launch(live.l).last_turn_start_seq;
+    let start = hold(
+        &rig,
+        &live,
+        rig.hook_of(&live, "UserPromptSubmit", &prompt("p")),
+        true,
+    )
+    .await;
+    rig.hook(&live, "Stop", &json!({})).await;
+    assert_eq!(turn(&rig, &live), TurnState::Unknown);
+    live.child.exit(chaldea_pty_runtime::ChildExit {
+        code: Some(0),
+        signal: None,
+    });
+    let sl = rig.sl(&live);
+    rig.until("the launch left the live map", || {
+        rig.sup.entry(live.l).is_none()
+    })
+    .await;
+    // The worker leaves at its next pass.
+    sl.wake.notify_one();
+    rig.until("the send side is gone", || {
+        rig.sup.send.launch(live.l).is_none()
+    })
+    .await;
+    assert_eq!(
+        rig.launch(live.l).exit_reason,
+        None,
+        "the exit is unrecorded"
+    );
+    assert_eq!(start.finish().await.status, 200);
+    assert_eq!(turn(&rig, &live), TurnState::Unknown);
+    assert_eq!(rig.launch(live.l).last_turn_start_seq, before);
+    rig.stop().await;
+}

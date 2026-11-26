@@ -46,6 +46,9 @@ pub(crate) struct Points {
     pub(crate) first_park: Mutex<Option<oneshot::Sender<()>>>,
     /// Told the first time the next write observer's wait for its ticket parks.
     pub(crate) ticket_park: Mutex<Option<oneshot::Sender<()>>>,
+    /// Held once by the next write observer after its ticket answered, before the observer
+    /// reads the answer.
+    pub(crate) ticket_answer_gate: Mutex<Option<Gate>>,
     /// The upgrade steps recorded, in order.
     pub(crate) steps: Mutex<Vec<&'static str>>,
     /// Held once by a socket's next send before it writes.
@@ -426,6 +429,26 @@ impl Points {
             r
         })
         .await
+    }
+
+    pub(crate) fn arm_ticket_answer_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        arm(&self.ticket_answer_gate)
+    }
+
+    /// Awaits `fut`, the observer's ticket, then passes the answer gate if it was armed when
+    /// this observer began its wait.
+    pub(crate) async fn hold_ticket_answer<F: Future>(&self, fut: F) -> F::Output {
+        let gate = self
+            .ticket_answer_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let out = fut.await;
+        if let Some((reached, release)) = gate {
+            let _ = reached.send(());
+            let _ = waits::bounded(std::time::Duration::from_secs(20), release).await;
+        }
+        out
     }
 
     /// The returned receiver fires the first time the next registered socket task parks.

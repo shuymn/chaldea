@@ -676,7 +676,7 @@ fn v2_upgrades_to_v3() {
     let info = s.read(|r| r.schema_info());
     assert_eq!(
         (info.user_version, info.projection_version.as_str()),
-        (3, "2")
+        (3, "3")
     );
     let diff = s.run(|tx| Ok(tx.verify_projections()?)).unwrap();
     assert!(diff.is_empty(), "{diff:?}");

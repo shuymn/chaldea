@@ -82,8 +82,9 @@ impl HookDecoder for NoDecoder {
 /// The adapter: `MvpHooks`'s binding rules, the decoder's facts as state.
 pub(crate) struct SupervisorHooks {
     pub host_os: HostOs,
-    pub decoder: std::sync::Arc<dyn HookDecoder>,
-    pub mode: Option<ReadinessMode>,
+    /// The send side: the decoder, the test's readiness mode, and each launch's turn
+    /// watermark.
+    pub side: std::sync::Arc<super::SendSide>,
 }
 
 /// A delivery's events under construction, with the thread's state as they change it.
@@ -201,7 +202,8 @@ impl Events {
 
 impl SupervisorHooks {
     fn mode(&self, agent: Agent) -> ReadinessMode {
-        self.mode
+        self.side
+            .mode
             .unwrap_or_else(|| capabilities(agent, self.host_os).readiness_mode())
     }
 
@@ -233,12 +235,25 @@ impl HookAdapter for SupervisorHooks {
         MvpHooks.expected_session(tx, launch)
     }
 
+    fn turn_watermark(
+        &self,
+        launch: LaunchId,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
+        // The send side exists from the reservation job until the launch left the live map,
+        // whether or not its exit job committed. Without it no boundary is folded: every
+        // one counts as stale (§2.4 "Turn boundaries in receipt order").
+        Some(self.side.launch(launch).map_or_else(
+            || std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            |sl| sl.turn_watermark.clone(),
+        ))
+    }
+
     fn interpret(
         &self,
         tx: &ReadTx<'_>,
         hook: &AcceptedHook<'_>,
     ) -> Result<(Interpretation, TurnMark), StoreError> {
-        let (fact, extra) = self.decoder.decode(tx, hook)?;
+        let (fact, extra) = self.side.decoder.decode(tx, hook)?;
         let l = hook.launch;
         let thread = hook.thread;
         let Some(t) = tx.thread(thread)? else {
@@ -254,6 +269,10 @@ impl HookAdapter for SupervisorHooks {
             state: t.state,
             out: Vec::new(),
         };
+        // A turn boundary below the launch's turn watermark committed after a later boundary:
+        // its events stay, but it changes neither the turn, the cards, nor the turn-start
+        // basis (§2.4 "Turn boundaries in receipt order").
+        let stale = hook.receipt_ordinal < hook.turn_watermark;
         let mark = match fact {
             HookFact::SessionStart => {
                 // Only the binding `SessionStart` is evidence.
@@ -287,7 +306,7 @@ impl HookAdapter for SupervisorHooks {
                         prompt: prepared.content,
                         input_id: acked,
                     }),
-                    None,
+                    stale.then_some(EventAnnex::Prompt { superseded: true }),
                     prepared.blob.into_iter().collect(),
                 );
                 if let Some(mut x) = a.matched {
@@ -303,13 +322,17 @@ impl HookAdapter for SupervisorHooks {
                         (false, _) => {}
                     }
                 }
-                ev.apply("prompt", &StateInput::PromptSubmitted);
-                ev.close_cards(tx, thread)?;
+                if !stale {
+                    ev.apply("prompt", &StateInput::PromptSubmitted);
+                    ev.close_cards(tx, thread)?;
+                }
                 TurnMark::Start
             }
             HookFact::Stop => {
-                ev.apply("stop", &StateInput::TurnStopped);
-                ev.close_cards(tx, thread)?;
+                if !stale {
+                    ev.apply("stop", &StateInput::TurnStopped);
+                    ev.close_cards(tx, thread)?;
+                }
                 // A unit that ran to `Written` before the intake, with its input already acked
                 // by a hook (its own turn's `UserPromptSubmit`: `acked` with an `ack_seq`; an
                 // owner's resolution sets none), ended before this `Stop`; the settle waits for
@@ -327,8 +350,10 @@ impl HookAdapter for SupervisorHooks {
                 TurnMark::End { settle }
             }
             HookFact::Interrupt => {
-                ev.apply("interrupt", &StateInput::Interrupted);
-                ev.close_cards(tx, thread)?;
+                if !stale {
+                    ev.apply("interrupt", &StateInput::Interrupted);
+                    ev.close_cards(tx, thread)?;
+                }
                 TurnMark::End { settle: false }
             }
             HookFact::CardOpened {

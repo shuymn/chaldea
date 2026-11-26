@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use axum::body::Bytes;
 use chaldea_core::event::{Source, TypedEvent};
@@ -14,7 +15,9 @@ use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
 use super::HookConfig;
-use super::adapter::{AcceptedHook, BindingRule, HookAdapter, HookEvent, Interpretation, TurnMark};
+use super::adapter::{
+    AcceptedHook, BindingRule, HookAdapter, HookEvent, Interpretation, TurnMark, job_watermark,
+};
 use super::ancestry::{Chain, eligible};
 use super::buffer::{self, Meta};
 use super::intake::IntakeFacts;
@@ -220,7 +223,21 @@ pub(crate) fn run(
     auth: Option<&Authorized>,
 ) -> Result<Ran, JobError> {
     let mut marks = Vec::new();
-    let reply = run_marking(d, tx, auth, &mut marks)?;
+    // The launch's turn watermark, taken once on the writer; the job raises it after its
+    // `COMMIT` by the turn boundaries it interpreted (supervisor-send §2.4).
+    let cell = auth
+        .and_then(|a| a.launch)
+        .and_then(|l| d.adapter.turn_watermark(l));
+    let committed = cell.as_ref().map_or(0, |c| c.load(Ordering::Acquire));
+    let reply = run_marking(d, tx, auth, &mut marks, committed)?;
+    let raised = job_watermark(committed, &marks);
+    if let Some(cell) = cell
+        && raised > committed
+    {
+        tx.after_commit(move || {
+            cell.fetch_max(raised, Ordering::AcqRel);
+        });
+    }
     let clock = d.clock.clone();
     Ok(Ran {
         reply,
@@ -234,6 +251,7 @@ fn run_marking(
     tx: &mut WriteTx<'_>,
     auth: Option<&Authorized>,
     marks: &mut Vec<(u64, TurnMark)>,
+    committed: u64,
 ) -> Result<HookReply, JobError> {
     let (Some(thread), Some(launch)) = (auth.and_then(|a| a.thread), auth.and_then(|a| a.launch))
     else {
@@ -297,7 +315,8 @@ fn run_marking(
                 .binding_receipt_ordinal(thread, launch)?
                 .unwrap_or(0);
             let json = json.as_ref().ok_or_else(super::refused_internal)?;
-            let hook = accepted(d, thread, &l, h, json, binding_ordinal);
+            let wm = job_watermark(committed, marks);
+            let hook = accepted(d, thread, &l, h, json, binding_ordinal, wm);
             let (interpretation, mark) = d.adapter.interpret(&tx.read(), &hook)?;
             marks.push((d.ordinal, mark));
             match interpretation {
@@ -400,7 +419,7 @@ fn run_marking(
     buffer::promote_unbound(tx, launch, later)?;
     // 6. Bind.
     if bind {
-        bind_and_promote(d, tx, thread, launch, json.as_ref(), marks)?;
+        bind_and_promote(d, tx, thread, launch, json.as_ref(), marks, committed)?;
     }
     Ok(reply)
 }
@@ -412,6 +431,7 @@ fn accepted<'a>(
     h: &'a HookHead<'static>,
     json: &'a serde_json::Value,
     binding_ordinal: u64,
+    turn_watermark: u64,
 ) -> AcceptedHook<'a> {
     AcceptedHook {
         thread,
@@ -427,6 +447,7 @@ fn accepted<'a>(
         intake_reliable: d.headers.attempt == Some(1),
         binding_ordinal,
         promoted: false,
+        turn_watermark,
     }
 }
 
@@ -523,6 +544,7 @@ fn bind_and_promote(
     launch: LaunchId,
     json: Option<&serde_json::Value>,
     marks: &mut Vec<(u64, TurnMark)>,
+    committed: u64,
 ) -> Result<(), JobError> {
     let Head::Hook(h) = &d.head else {
         return Err(super::refused_internal());
@@ -534,7 +556,15 @@ fn bind_and_promote(
         .launch(launch)?
         .ok_or_else(super::refused_internal)?;
     let session = l.session_id.clone().ok_or_else(super::refused_internal)?;
-    let hook = accepted(d, thread, &l, h, json, d.ordinal);
+    let hook = accepted(
+        d,
+        thread,
+        &l,
+        h,
+        json,
+        d.ordinal,
+        job_watermark(committed, marks),
+    );
     let (interpretation, mark) = d.adapter.interpret(&tx.read(), &hook)?;
     marks.push((d.ordinal, mark));
     let events = match interpretation {
@@ -550,7 +580,6 @@ fn bind_and_promote(
         )?],
     };
     tx.append(events)?;
-    let rule = d.adapter.rule(l.agent);
     let buffered = tx.read().buffered_deliveries(launch)?;
     for b in buffered {
         // Re-read per promotion: earlier promotions may have changed the launch's row.
@@ -560,7 +589,8 @@ fn bind_and_promote(
             .ok_or_else(super::refused_internal)?;
         let emit_b = b.emit_id;
         let ordinal = b.receipt_ordinal;
-        let (to, mark) = promotion(d, tx, thread, &l, &session, rule, b)?;
+        let wm = job_watermark(committed, marks);
+        let (to, mark) = promotion(d, tx, thread, &l, &session, b, wm)?;
         if let Some(m) = mark {
             marks.push((ordinal, m));
         }
@@ -577,10 +607,11 @@ fn promotion(
     thread: ThreadId,
     l: &LaunchRow,
     session: &str,
-    rule: BindingRule,
     b: crate::store::BufferedDelivery,
+    turn_watermark: u64,
 ) -> Result<(Promotion, Option<TurnMark>), JobError> {
     use RawUnknownReason as R;
+    let rule = d.adapter.rule(l.agent);
     let emit = b.emit_id;
     let body = b.hook.body;
     let raw_of = |reason, content_type, body| -> Result<(Promotion, Option<TurnMark>), JobError> {
@@ -626,6 +657,7 @@ fn promotion(
         intake_reliable: meta.attempt == Some(1),
         binding_ordinal: d.ordinal,
         promoted: true,
+        turn_watermark,
     };
     let (interpretation, mark) = d.adapter.interpret(&tx.read(), &hook)?;
     let promoted = match interpretation {

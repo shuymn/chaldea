@@ -139,8 +139,7 @@ pub(crate) fn seams(sup: &Arc<Supervisor>) -> HookSeams {
     HookSeams {
         adapter: Arc::new(send::SupervisorHooks {
             host_os: sup.host_os,
-            decoder: sup.send.decoder.clone(),
-            mode: sup.send.mode,
+            side: sup.send.clone(),
         }),
         intake: Arc::new(send::SupervisorProbe {
             sup: Arc::downgrade(sup),

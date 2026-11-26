@@ -290,6 +290,13 @@ impl<'c> WriteTx<'c> {
         stamp
     }
 
+    /// Runs `f` on the writer right after this job's `COMMIT` succeeded, before its reply and
+    /// before the writer takes its next job; dropped when the job rolls back. `f` shall not
+    /// block, take a lock, or panic: it runs on the store writer.
+    pub(crate) fn after_commit(&mut self, f: impl FnOnce() + Send + 'static) {
+        self.after_commit.push(Box::new(f));
+    }
+
     pub(crate) fn take_after_commit(&mut self) -> Vec<Box<dyn FnOnce() + Send>> {
         std::mem::take(&mut self.after_commit)
     }
@@ -392,6 +399,11 @@ impl<'c> WriteTx<'c> {
             (TypedEvent::RawUnknown(_), Some(EventAnnex::Hook { .. }))
                 if matches!(row.source.kind, Open::Known(SourceKind::Hook)) => {}
             (_, Some(EventAnnex::Hook { .. })) => {
+                return Err(AnnexError::Unexpected(row.event.kind()).into());
+            }
+            (TypedEvent::UserMessage(_), Some(EventAnnex::Prompt { .. }))
+                if matches!(row.source.kind, Open::Known(SourceKind::Hook)) => {}
+            (_, Some(EventAnnex::Prompt { .. })) => {
                 return Err(AnnexError::Unexpected(row.event.kind()).into());
             }
             (_, Some(EventAnnex::Transcript(_))) if !is_transcript(&row.source) => {

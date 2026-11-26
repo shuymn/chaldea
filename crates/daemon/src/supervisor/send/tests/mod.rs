@@ -9,6 +9,7 @@ mod human;
 mod outcomes;
 mod probe;
 mod timers;
+mod turn_order;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

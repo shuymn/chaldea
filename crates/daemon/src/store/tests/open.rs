@@ -59,7 +59,8 @@ fn projection_version_change_rebuilds() {
     append_one(&s, 1).unwrap();
     shutdown_checked(&s);
     let path = dir.path().join("chaldea.db");
-    for version in [3, 2] {
+    let code = crate::store::schema::PROJECTION_VERSION;
+    for version in [code + 1, code] {
         // Tamper with a projection row, so only a rebuild restores it.
         raw(&path)
             .execute("UPDATE proj_threads SET cwd = '/tampered'", [])
@@ -90,10 +91,11 @@ fn stale_projection_version_cannot_write() {
     let dir = tempfile::tempdir().unwrap();
     let old = open_with(dir.path(), Faults::default()).unwrap();
     append_one(&old, 1).unwrap();
+    let code = crate::store::schema::PROJECTION_VERSION;
     let new = open_with(
         dir.path(),
         Faults {
-            projection_version: Some(3),
+            projection_version: Some(code + 1),
             ..Faults::default()
         },
     )
@@ -103,10 +105,7 @@ fn stale_projection_version_cannot_write() {
     assert!(
         matches!(
             r,
-            Err(WriteError::Failed(StoreError::ProjectionVersion {
-                code: 2,
-                ..
-            }))
+            Err(WriteError::Failed(StoreError::ProjectionVersion { code: c, .. })) if c == code
         ),
         "{r:?}"
     );
