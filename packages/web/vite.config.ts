@@ -21,6 +21,8 @@ export default defineConfig({
     // has modulepreload.
     modulePreload: { polyfill: false },
     sourcemap: false,
+    // One chunk, most of it the standalone validators of every wire schema.
+    chunkSizeWarningLimit: 1536,
     target: "es2023",
   },
   test: {

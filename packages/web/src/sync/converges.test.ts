@@ -9,7 +9,7 @@ import { problems } from "./check";
 import { threadId } from "./model/server";
 import { type Op, opArb, run, seeded, start, startArb } from "./ops";
 
-export const NUM_RUNS = 400;
+export const NUM_RUNS = 1000;
 
 describe("sync.converges", () => {
   test("random schedules, half from the seeded race, converge after quiesce", () => {

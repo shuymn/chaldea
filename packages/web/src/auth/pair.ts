@@ -16,7 +16,12 @@ export interface PairDeps {
 /** The code of a `#pair=<code>` fragment, or null. */
 export function pairCode(hash: string): string | null {
   const m = /^#pair=([^&]+)$/.exec(hash);
-  return m?.[1] ? decodeURIComponent(m[1]) : null;
+  if (!m?.[1]) return null;
+  try {
+    return decodeURIComponent(m[1]);
+  } catch {
+    return null;
+  }
 }
 
 /** Runs the pair flow when the page was opened from a link; resolves with the credential to use. */

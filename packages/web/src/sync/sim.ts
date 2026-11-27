@@ -56,6 +56,8 @@ export class Sim {
   readonly frames: { socket: number; msg: WsServerMessage }[] = [];
   readonly log: Effect[] = [];
   up = true;
+  /** Every frame but `hello` is lost: the client learns heads from its reads only. */
+  withholdHeads = false;
   /** The credential store: the generation stored, or null. */
   stored: string | null = "gen-1";
   private ticketN = 1;
@@ -231,6 +233,7 @@ export class Sim {
   deliverFrame(index = 0): boolean {
     const f = this.frames.splice(index, 1)[0];
     if (!f) return false;
+    if (this.withholdHeads && f.msg.type !== "hello") return true;
     if (this.conns.has(f.socket)) {
       this.dispatch({ type: "socketMessage", socket: f.socket, msg: f.msg });
     }
@@ -275,6 +278,36 @@ export class Sim {
     this.dispatch({ type: "credential", generation: this.stored });
   }
 
+  /** The id of the latest request in flight for `stream` in direction `dir`, if any. */
+  flight(stream: string, dir: "forward" | "backward"): number | undefined {
+    let found: number | undefined;
+    for (const [id, f] of this.flights) if (f.req.stream === stream && f.req.dir === dir) found = id;
+    return found;
+  }
+
+  /** Serves the latest request for `stream`/`dir` and returns the index of its answer. */
+  serveOne(stream: string, dir: "forward" | "backward"): number {
+    const id = this.flight(stream, dir);
+    if (id === undefined) throw new Error(`no ${dir} request for ${stream} in flight`);
+    this.serve(id);
+    return this.responses.length - 1;
+  }
+
+  /** Delivers the answer to request `id`. */
+  deliverId(id: number): void {
+    const i = this.responses.findIndex((d) => d.id === id);
+    if (i < 0) throw new Error(`no answer for ${id}`);
+    this.deliver(i);
+  }
+
+  /** Brings a socket up: ticket, open, and the server's first frames. */
+  connect(): void {
+    while (this.serveTicket());
+    while (this.open());
+    for (const id of [...this.conns.keys()]) while (this.socketStep(id));
+    while (this.deliverFrame());
+  }
+
   // ---- quiesce ---------------------------------------------------------------------------
 
   /**
@@ -283,7 +316,7 @@ export class Sim {
    * socket, due fetches, timeouts of lost requests, then up to two heads refreshes.
    */
   iters = 0;
-  quiesce(maxIterations = 60): void {
+  quiesce(maxIterations = 60, maxRefreshes = 2): void {
     this.up = true;
     let refreshes = 0;
     for (let i = 0; i < maxIterations; i++) {
@@ -306,7 +339,7 @@ export class Sim {
         this.dispatch({ type: "tick" });
         continue;
       }
-      if (refreshes < 2) {
+      if (refreshes < maxRefreshes) {
         refreshes += 1;
         this.refresh();
         continue;
