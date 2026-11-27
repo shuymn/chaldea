@@ -92,6 +92,6 @@ All reversible.
 - **Epochs**: a restored database keeping tokens and epoch shows only through `CursorAhead`.
 - **Limits**: history within the read limit is one action away; evicted storage costs one `chaldea open`; a snapshot can pass 16 MiB (e.g. 250 unresolved 64 KiB inputs, `payload.rs:18`, or a huge thread list); a back/forward return reloads the page (with the daemon down, the last view is lost).
 
-## 6. Proposed Canonical Edits
+## 6. Canonical Text
 
-mvp :234, :375, :409, :220 (headers, validators, D8, release, statuses); daemon-lifecycle :614 (the interactive check); formal-specs §7.4 (an empty database reaches browsers as 401).
+mvp §2.4 "Offline" (statuses), §2.5 route table (`/` headers), §3 (validators; "Tooling": the `web` job and the release command, D8); daemon-lifecycle §2.13 `chaldea open` step 2 (the page check); formal-specs §7.4 "PR 18" (an empty database reaches browsers as 401).

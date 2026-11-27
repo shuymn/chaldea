@@ -77,10 +77,6 @@ EARS. Red: `old` fails on `fb5f13a3`; `mut` fails under the named mutation; `kep
 | SF-12 | If an intake unwinds after the fence advance, it shall finish once without marks, releasing `pending` and the fence; before, only its ordinal. | `hook::tests::intake::panic_after_advance`, `panic_before_advance` | mut: guard armed early or late |
 | SF-13 | Kept: a record after the read leaves its unit running; an older fence word gets `FenceMoved`; facts-missing hooks fail closed (PR10b-CL-4, CL-11). | `record_during_intake_keeps_running`, `gate::fence`, facts-missing cases | kept |
 
-## 7. Proposed Canonical-Doc Edits
+## 7. Canonical Text
 
-1. supervisor-send §2.5 "Intake facts" (§3), §2.4 `stop_settled` (D7), §2.8 (D4), §2.3 (`SeqCst`), PR10b-CL-7 (SF-1, 3, 5, 8; the `SendMap` read stays the one wait with no own deadline).
-2. supervisor-send L-12, and PR10b-P-1's exception: "A hook has its facts missing when its launch was removed, when the final attempt (the first made at or after its facts deadline: `INTAKE_WAIT`, 500 ms, or the request deadline if sooner) of its `SendLaunch` mutex wait or of its position read fails, or when its observation, after the publication wait, still finds `L` unpublished once its creation started." 408s: a deadline already passed at the handler's last check, made immediately before its write observer registers, answers 408; after the registration hook-ingest §2.11 decides the reply.
-3. supervisor.md §2.11 "Observation", "Where 10b plugs in", code block, identifiers, SD12, PR10a1-CL-30, the hook-ingest "§4 PR 10 row" cross-reference: D1, D2.
-4. hook-ingest §2.3 step 5, §2.4 (D5, §3; `facts` takes `F`), §2.11 H6, §4 PR 10 row, §5 resource paths and "Waits" (the pid wait follows D6).
-5. pty-runtime §2.2 (`published_last_started` replaces `try_last_started_each`), §2.3 (D1), §2.7 (`Publishing`, `BetweenPositionLoads`), §5 waits.
+supervisor-send §2.3 (`SeqCst`), §2.4 `stop_settled` (D7), §2.5 "Intake facts" (§3), §2.8 (D4), L-12, PR10b-CL-7, PR10b-P-1; supervisor §2.11 "Observation", SD12, PR10a1-CL-30 (D1, D2); hook-ingest §2.3 step 5, §2.4 (D5, §3), §2.11 H6, §4 PR 10 row, §5 (D6); pty-runtime §2.2, §2.3 "Published positions" (D1), §2.7 (`Publishing`, `BetweenPositionLoads`), §5.
