@@ -1713,6 +1713,12 @@ mod tests {
                 std::thread::yield_now();
             }
             let mut s = lock(&pool.state);
+            // The reader comes back while the borrower waits.
+            assert!(pool.waits.load(std::sync::atomic::Ordering::Acquire) > 0);
+            assert!(
+                !waiter.is_finished(),
+                "the borrower ended before the reader came back"
+            );
             s.idle.push(Connection::open_in_memory().unwrap());
             s.open += 1;
             std::thread::sleep(
