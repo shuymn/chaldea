@@ -4,9 +4,9 @@
 import { readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
-import type { Request, Route } from "@playwright/test";
+import type { BrowserContext, Page, Request, Route } from "@playwright/test";
 
-import { expect, openLink, statusOf, test } from "./harness";
+import { type Daemon, expect, openLink, statusOf, test } from "./harness";
 
 const SPENT = "This link is spent or expired";
 
@@ -111,18 +111,54 @@ test("new_database_repairs", async ({ daemon, page }) => {
   await expect(page.getByText(SPENT)).toBeVisible({ timeout: 45_000 });
 });
 
-test("two_tabs", async ({ daemon, context }) => {
-  const tabA = await context.newPage();
-  // A's Authorization headers, in the order its requests were made.
-  const authA: string[] = [];
-  tabA.on("request", (r) => {
+/** A tab whose Authorization headers are recorded in request order. */
+async function tab(context: BrowserContext): Promise<{ page: Page; auth: string[] }> {
+  const page = await context.newPage();
+  const auth: string[] = [];
+  page.on("request", (r) => {
     const h = r.headers().authorization;
-    if (h) authA.push(h);
+    if (h) auth.push(h);
   });
-  await openLink(tabA, await daemon.pairUrl());
-  await expect(statusOf(tabA)).toHaveText("live");
-  const tokenA = authA.at(-1);
-  expect(tokenA !== undefined, "tab A made no authorized request").toBe(true);
+  return { page, auth };
+}
+
+/** Pairs `t` from a fresh link; the Authorization it then uses. */
+async function pair(daemon: Daemon, t: { page: Page; auth: string[] }): Promise<string> {
+  await openLink(t.page, await daemon.pairUrl());
+  await expect(statusOf(t.page)).toHaveText("live");
+  const h = t.auth.at(-1);
+  if (h === undefined) throw new Error("the tab made no authorized request");
+  return h;
+}
+
+test("two_tabs", async ({ daemon, context }) => {
+  // Tab A receives the other tabs' credential notices only when the test releases them, so
+  // its own 401 meets a newer stored generation first.
+  const a = await tab(context);
+  await a.page.addInitScript(() => {
+    const Native = window.BroadcastChannel;
+    const queue: (() => void)[] = [];
+    let hold = true;
+    (window as unknown as { __releaseNotices: () => void }).__releaseNotices = () => {
+      hold = false;
+      for (const f of queue.splice(0)) f();
+    };
+    window.BroadcastChannel = class extends Native {
+      override set onmessage(h: ((this: BroadcastChannel, e: MessageEvent) => unknown) | null) {
+        super.onmessage =
+          h === null
+            ? null
+            : (e: MessageEvent) => {
+                if (hold) queue.push(() => h.call(this, e));
+                else h.call(this, e);
+              };
+      }
+      override get onmessage() {
+        return super.onmessage;
+      }
+    };
+  });
+  const tokenA = await pair(daemon, a);
 
   // Hold A's next host read, made with generation A.
   let held: Route | null = null;
@@ -130,7 +166,7 @@ test("two_tabs", async ({ daemon, context }) => {
   const heldNow = new Promise<void>((ok) => {
     heldSeen = ok;
   });
-  await tabA.route(
+  await a.page.route(
     (u) => u.pathname === "/api/events" && u.searchParams.get("stream_id") === "host",
     async (route) => {
       if (held === null && route.request().headers().authorization === tokenA) {
@@ -144,43 +180,45 @@ test("two_tabs", async ({ daemon, context }) => {
   await daemon.spawnThread();
   await heldNow;
 
-  // Tab B pairs again: generation B is committed.
-  const tabB = await context.newPage();
-  const authB: string[] = [];
-  tabB.on("request", (r) => {
-    const h = r.headers().authorization;
-    if (h) authB.push(h);
-  });
-  await openLink(tabB, await daemon.pairUrl());
-  await expect(statusOf(tabB)).toHaveText("live");
-  const tokenB = authB.at(-1);
-  expect(tokenB !== undefined && tokenB !== tokenA, "tab B holds a new token").toBe(true);
+  // Tab B pairs again: generation B is committed, and A has not heard of it.
+  const b = await tab(context);
+  const tokenB = await pair(daemon, b);
+  expect(tokenB !== tokenA, "tab B holds a new token").toBe(true);
+  expect(a.auth.includes(tokenB), "tab A heard of B before its 401").toBe(false);
 
-  // A rereads the store and adopts B: its new requests carry B's token.
+  // The delayed 401 for generation A: its compare-and-delete finds B, deletes nothing,
+  // publishes nothing, and A adopts B without a prompt.
+  await (held as Route | null)?.fulfill({
+    status: 401,
+    contentType: "application/json",
+    body: '{"code":"unauthorized"}',
+  });
   await expect
-    .poll(() => authA.includes(tokenB!), { message: "tab A never used generation B", timeout: 15_000 })
+    .poll(() => a.auth.includes(tokenB), { message: "tab A never adopted generation B", timeout: 15_000 })
     .toBe(true);
-  await expect(statusOf(tabA)).toHaveText("live");
-
-  // The delayed 401 for generation A: it deletes nothing and prompts nowhere.
-  const route = held as Route | null;
-  await route?.fulfill({ status: 401, contentType: "application/json", body: '{"code":"unauthorized"}' }).catch(() => {});
-  await tabA.waitForTimeout(1_000);
-  for (const t of [tabA, tabB]) {
-    await expect(t.getByText(SPENT)).toHaveCount(0);
-    await expect(statusOf(t)).toHaveText("live");
+  await a.page.evaluate(() => (window as unknown as { __releaseNotices: () => void }).__releaseNotices());
+  await a.page.waitForTimeout(1_000);
+  for (const t of [a, b]) {
+    await expect(t.page.getByText(SPENT)).toHaveCount(0);
+    await expect(statusOf(t.page)).toHaveText("live");
   }
-  // B's credential is still stored: a reload of either tab stays paired.
-  await tabB.reload();
-  await expect(statusOf(tabB)).toHaveText("live");
-  await expect(tabB.getByText(SPENT)).toHaveCount(0);
-  const reloaded: string[] = [];
-  tabA.on("request", (r) => {
-    const h = r.headers().authorization;
-    if (h) reloaded.push(h);
-  });
-  await tabA.unrouteAll({ behavior: "ignoreErrors" });
-  await tabA.reload();
-  await expect(statusOf(tabA)).toHaveText("live");
-  expect(reloaded.every((h) => h === tokenB), "tab A reloaded with a token other than B's").toBe(true);
+
+  // Tab C pairs again: A and B reread on its notice and adopt C, retiring B's work.
+  const c = await tab(context);
+  const tokenC = await pair(daemon, c);
+  for (const [name, t] of [
+    ["A", a],
+    ["B", b],
+  ] as const) {
+    await expect
+      .poll(() => t.auth.includes(tokenC), { message: `tab ${name} never adopted generation C`, timeout: 15_000 })
+      .toBe(true);
+    await expect(statusOf(t.page)).toHaveText("live");
+  }
+
+  // C's credential is stored: a reload stays paired and uses it.
+  await b.page.reload();
+  await expect(statusOf(b.page)).toHaveText("live");
+  await expect(b.page.getByText(SPENT)).toHaveCount(0);
+  expect(b.auth.at(-1) === tokenC, "tab B reloaded with a token other than C's").toBe(true);
 });
