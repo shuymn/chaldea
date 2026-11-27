@@ -1,0 +1,411 @@
+{
+  "$defs": {
+    "AttachModes": {
+      "description": "The terminal modes `attached` carries, for the client's emulator.",
+      "properties": {
+        "alt_screen": {
+          "description": "DECSET 1049.",
+          "type": "boolean"
+        },
+        "app_cursor": {
+          "description": "DECCKM.",
+          "type": "boolean"
+        },
+        "app_keypad": {
+          "description": "DECKPAM.",
+          "type": "boolean"
+        },
+        "bracketed_paste": {
+          "description": "DECSET 2004.",
+          "type": "boolean"
+        },
+        "kitty_flags": {
+          "description": "The kitty keyboard flags, 5 bits.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "show_cursor": {
+          "description": "DECTCEM.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "bracketed_paste",
+        "alt_screen",
+        "show_cursor",
+        "app_cursor",
+        "app_keypad",
+        "kitty_flags"
+      ],
+      "type": "object"
+    },
+    "AttachReason": {
+      "description": "Why a paste or raw input was not written whole.",
+      "oneOf": [
+        {
+          "const": "prompt_too_large",
+          "description": "Paste text above `core::input::MAX_PROMPT_BYTES`.",
+          "type": "string"
+        },
+        {
+          "const": "bracketed_paste_off",
+          "description": "The adapter's paste needs DECSET 2004, off at encoding or changed by dispatch.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "Not dispatched by the unit's deadline.",
+          "type": "string"
+        },
+        {
+          "const": "queue_full",
+          "description": "The session's queue is full.",
+          "type": "string"
+        },
+        {
+          "const": "busy",
+          "description": "The launch's op lock was not taken in time.",
+          "type": "string"
+        },
+        {
+          "const": "incomplete",
+          "description": "Written in part.",
+          "type": "string"
+        },
+        {
+          "const": "not_written",
+          "description": "Not written, for any other reason.",
+          "type": "string"
+        },
+        {
+          "const": "paste_marker",
+          "description": "Raw input that would carry a complete bracketed-paste marker.",
+          "type": "string"
+        },
+        {
+          "const": "too_large",
+          "description": "A raw binary message above 64 KiB.",
+          "type": "string"
+        },
+        {
+          "const": "pending",
+          "description": "Raw input whose write is not known yet.",
+          "type": "string"
+        }
+      ]
+    },
+    "EndReason": {
+      "description": "Why a launch's output ended.",
+      "oneOf": [
+        {
+          "const": "eof",
+          "description": "The PTY's output reached EOF.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "Reading the PTY's output failed (the child may still run).",
+          "type": "string"
+        },
+        {
+          "const": "gone",
+          "description": "The launch's session left the daemon.",
+          "type": "string"
+        }
+      ]
+    },
+    "LaunchId": {
+      "description": "A launch: one process lifetime of a thread.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "PasteOutcome": {
+      "description": "A paste's outcome.",
+      "oneOf": [
+        {
+          "const": "written",
+          "description": "Every byte was written.",
+          "type": "string"
+        },
+        {
+          "const": "incomplete",
+          "description": "Some bytes were written, then the write failed (`bytes_written` says how many).",
+          "type": "string"
+        },
+        {
+          "const": "pending",
+          "description": "Whether it was written is not known yet; the socket submits nothing more until it is.",
+          "type": "string"
+        },
+        {
+          "const": "not_written",
+          "description": "Zero bytes written.",
+          "type": "string"
+        },
+        {
+          "const": "rejected",
+          "description": "Refused before it was queued, with zero bytes written.",
+          "type": "string"
+        }
+      ]
+    },
+    "PasteReason": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RejectReason"
+        },
+        {
+          "$ref": "#/$defs/AttachReason"
+        }
+      ],
+      "description": "A paste's reason: an encoder refusal or one of the attach reasons."
+    },
+    "RejectReason": {
+      "description": "Why an input was rejected with zero bytes written.",
+      "oneOf": [
+        {
+          "enum": [
+            "empty_prompt"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "control_character",
+          "description": "ESC or a C0 control other than TAB, CR, LF.",
+          "type": "string"
+        },
+        {
+          "const": "lossy_text",
+          "description": "Text the adapter's encoding cannot carry without loss, or that the CLI would\nreinterpret as a command instead of a prompt (Claude, C1 D16).",
+          "type": "string"
+        },
+        {
+          "const": "leading_trailing_whitespace",
+          "description": "Codex on Windows trims it (§8 D6).",
+          "type": "string"
+        },
+        {
+          "const": "tab",
+          "description": "Codex on Windows takes TAB as its queue key (§8 D6).",
+          "type": "string"
+        },
+        {
+          "const": "spawn_failed",
+          "description": "The spawn of a positional first prompt was confirmed not to have started.",
+          "type": "string"
+        }
+      ]
+    },
+    "ThreadId": {
+      "description": "A thread: one agent conversation across all its launches.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "VtCursor": {
+      "properties": {
+        "col": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "row": {
+          "description": "Zero-based cell coordinates in the grid.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "visible": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "row",
+        "col",
+        "visible"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Server to client on `GET /api/attach/{thread}`.",
+  "oneOf": [
+    {
+      "description": "The first frame: the screen at subscription; binary output follows gapless.",
+      "properties": {
+        "cols": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cursor": {
+          "$ref": "#/$defs/VtCursor"
+        },
+        "grid": {
+          "description": "The rows of cell strings, trailing blanks omitted (`docs/design/pty-runtime.md`\n§2.6); `null` when the whole frame would exceed its bound.",
+          "items": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "launch_id": {
+          "$ref": "#/$defs/LaunchId"
+        },
+        "modes": {
+          "$ref": "#/$defs/AttachModes"
+        },
+        "rows": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "thread_id": {
+          "$ref": "#/$defs/ThreadId"
+        },
+        "type": {
+          "const": "attached",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "thread_id",
+        "launch_id",
+        "cols",
+        "rows",
+        "cursor",
+        "modes"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "The PTY's size after a resize attempt; `ok: false` when it failed.",
+      "properties": {
+        "cols": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "rows": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "const": "size",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "cols",
+        "rows",
+        "ok"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "bytes_written": {
+          "description": "`null` on `pending`.",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "outcome": {
+          "$ref": "#/$defs/PasteOutcome"
+        },
+        "paste_id": {
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PasteReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`null` on `written` and `pending`."
+        },
+        "type": {
+          "const": "paste_result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "paste_id",
+        "outcome"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Raw input not written: its bytes (all of the unit's on `pending`).",
+      "properties": {
+        "bytes": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reason": {
+          "$ref": "#/$defs/AttachReason"
+        },
+        "type": {
+          "const": "input_dropped",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "bytes",
+        "reason"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "The last frame before close 4001.",
+      "properties": {
+        "launch_id": {
+          "$ref": "#/$defs/LaunchId"
+        },
+        "reason": {
+          "$ref": "#/$defs/EndReason"
+        },
+        "type": {
+          "const": "ended",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "launch_id",
+        "reason"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "AttachServerMessage"
+}

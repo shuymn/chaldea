@@ -10,6 +10,7 @@
 use std::fmt;
 
 pub mod adapter;
+pub mod attach;
 pub mod auth;
 pub mod canonical;
 pub mod command;
