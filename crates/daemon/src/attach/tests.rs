@@ -308,6 +308,7 @@ async fn paste_one_part_without_submit() {
     let live = rig.claude().await;
     let (mut c, _) = attach(&rig, &live).await;
     let before = live.child.input().len();
+    let writes = live.child.writes().len();
     c.json(json!({ "type": "paste", "paste_id": "p1", "text": "a\nb" }))
         .await;
     let Some(AttachServerMessage::PasteResult {
@@ -332,6 +333,43 @@ async fn paste_one_part_without_submit() {
         ("p1", PasteOutcome::Written, Some(want.len() as u64), None)
     );
     assert_eq!(live.child.input()[before..], want[..]);
+    // One part: one write call carries the whole text.
+    assert_eq!(live.child.writes()[writes..], [want]);
+    rig.stop().await;
+}
+
+/// T1-5 on a Codex row of a Windows host (`win_keys`, the host OS mapped, FakePty on every
+/// runner): the paste is written as the encoder's key records, one part, no submit, and
+/// answers `written`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paste_codex_win_keys() {
+    use chaldea_core::adapter::HostOs;
+    use chaldea_core::ids::Agent;
+    use chaldea_core::input::encode::{Purpose, encode};
+    let rig = SRig::on(HostOs::Windows, |_| {}).await;
+    let live = rig.bound(Agent::Codex).await;
+    let (mut c, _) = attach(&rig, &live).await;
+    let before = live.child.writes().len();
+    let text = "\u{3042}\u{1f642}\r\n\u{6b21}";
+    c.json(json!({ "type": "paste", "paste_id": "w", "text": text }))
+        .await;
+    let want = encode(Agent::Codex, HostOs::Windows, text, Purpose::AttachPaste)
+        .unwrap()
+        .text;
+    assert!(
+        !want.starts_with(b"\x1b[200~"),
+        "key records, not a bracketed paste"
+    );
+    assert_eq!(
+        c.text().await,
+        Some(AttachServerMessage::PasteResult {
+            paste_id: "w".into(),
+            outcome: PasteOutcome::Written,
+            bytes_written: Some(want.len() as u64),
+            reason: None,
+        })
+    );
+    assert_eq!(live.child.writes()[before..], [want]);
     rig.stop().await;
 }
 
@@ -383,6 +421,52 @@ async fn paste_refusals() {
     );
     assert_eq!(live.child.input().len(), before);
     assert_eq!(human_writes(&rig, &live), 0);
+    rig.stop().await;
+}
+
+/// T1-7: a thread resumed while its old socket is still open (its close frame held): a new
+/// socket attaches the new launch, its input reaches the new PTY only, and the old PTY's
+/// input is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_with_old_socket_held() {
+    let rig = SRig::new().await;
+    let old = rig.claude().await;
+    let shared = rig.srv.server.shared().clone();
+    let (mut a, _) = attach(&rig, &old).await;
+    let (reached, held) = shared.faults.arm_close_frame_gate();
+    rig.cmd_ok("stop", &json!({ "thread_id": old.t }), 200)
+        .await;
+    assert!(matches!(
+        a.text().await,
+        Some(AttachServerMessage::Ended { launch_id, .. }) if launch_id == old.l
+    ));
+    bounded(WS_WAIT, reached).await.unwrap().unwrap();
+    let r = rig
+        .cmd(
+            "resume",
+            &json!({ "thread_id": old.t, "expected_launch_id": old.l }),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+    let l: chaldea_core::ids::LaunchId = serde_json::from_value(v["launch_id"].clone()).unwrap();
+    let new = rig.adopt(old.t, l, chaldea_core::ids::Agent::Claude);
+    let old_input = old.child.input();
+    let (mut b, first) = attach(&rig, &new).await;
+    assert!(
+        matches!(first, AttachServerMessage::Attached { launch_id, .. } if launch_id == new.l),
+        "{first:?}"
+    );
+    let before = new.child.input().len();
+    a.binary(b"o").await;
+    b.binary(b"n").await;
+    rig.until("the new socket's input", || {
+        new.child.input()[before..] == *b"n"
+    })
+    .await;
+    assert_eq!(old.child.input(), old_input);
+    drop(held);
+    a.until_closed().await;
     rig.stop().await;
 }
 
