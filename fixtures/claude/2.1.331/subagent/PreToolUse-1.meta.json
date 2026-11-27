@@ -1,0 +1,19 @@
+{
+  "fact": "other",
+  "events": [
+    {
+      "kind": "tool_activity",
+      "phase": "started",
+      "tool_name": "Agent",
+      "tool_use_id": "toolu_01MQxXPaUjSVTcozxS3Adec4",
+      "turn_ref": "72b7e0da-bf7a-4ffb-bd07-74d7adb6e4c7",
+      "input": {
+        "description": "Write c1b-sub.txt",
+        "prompt": "Use the Bash tool to run exactly this command in the working directory /work/c1b-ws, and do nothing else:\n\nprintf sub > c1b-sub.txt\n\nReport whether it succeeded.",
+        "subagent_type": "general-purpose"
+      },
+      "output": null
+    }
+  ],
+  "route": "interpret"
+}

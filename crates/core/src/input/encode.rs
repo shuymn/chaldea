@@ -133,8 +133,16 @@ fn check_path(p: Path, purpose: Purpose, t: &str) -> Result<(), Rejection> {
     if empty {
         return reject(RejectReason::EmptyPrompt, None);
     }
+    // 4. Claude runs a prompt as a shell command when its first scalar, DEL and C1 aside, is
+    // `!`, and as a slash command when it starts with `/` after Claude's trim (C1 D16).
+    if p == Path::ClaudePaste
+        && purpose == Purpose::Send
+        && let Some(at) = claude_command_at(t)
+    {
+        return reject(RejectReason::LossyText, Some(at));
+    }
     if p == Path::WinKeys {
-        // 4. Codex on Windows trims both ends.
+        // 5. Codex on Windows trims both ends.
         if t.starts_with(char::is_whitespace) {
             return reject(RejectReason::LeadingTrailingWhitespace, Some(0));
         }
@@ -144,7 +152,7 @@ fn check_path(p: Path, purpose: Purpose, t: &str) -> Result<(), Rejection> {
                 Some(t.trim_end().len()),
             );
         }
-        // 5. Codex on Windows takes TAB as its queue key.
+        // 6. Codex on Windows takes TAB as its queue key.
         if let Some(at) = t.find('\t') {
             return reject(RejectReason::Tab, Some(at));
         }
@@ -196,7 +204,7 @@ pub fn expected_prompt(agent: Agent, encoding: InputEncoding, text: &str) -> Opt
     let p = path(agent, encoding, Purpose::Send)?;
     check_path(p, Purpose::Send, text).ok()?;
     Some(match p {
-        Path::ClaudePaste => tab4(&nfc(&lf(text))),
+        Path::ClaudePaste => tab4(&nfc(claude_kept(&lf(text)).trim_end())),
         Path::CodexPaste => lf(text).trim().to_owned(),
         Path::WinKeys => lf(&compose_marks(text)),
         Path::Positional => lf(text),
@@ -204,22 +212,57 @@ pub fn expected_prompt(agent: Agent, encoding: InputEncoding, text: &str) -> Opt
 }
 
 /// Whether a recorded `UserPromptSubmit.prompt` acknowledges a sent `text`: for Claude, the
-/// text with any subset of its TAB expansion and NFC, bare or inside its large-paste wrapper;
-/// for Codex, exactly [`expected_prompt`]. `false` whenever `expected_prompt` is `None`.
+/// form Claude 2.1.331 records (`fixtures/claude/2.1.331/README.md`), either
+/// [`expected_prompt`] or the wrapper around the text's line ends as LF, trailing whitespace
+/// removed, and each TAB as four spaces, with no NFC (DEL and C1 removed or kept: the captures cover neither in a
+/// wrapped paste); for Codex, exactly [`expected_prompt`]. `false` whenever `expected_prompt`
+/// is `None`.
 #[must_use]
 pub fn prompt_matches(agent: Agent, encoding: InputEncoding, text: &str, recorded: &str) -> bool {
     let Some(expected) = expected_prompt(agent, encoding, text) else {
         return false;
     };
+    if recorded == expected {
+        return true;
+    }
     if agent != Agent::Claude {
-        return recorded == expected;
+        return false;
     }
     let base = lf(text);
-    let composed = nfc(&base);
-    let body = strip_paste_wrapper(recorded);
-    [tab4(&base), tab4(&composed), composed, base]
-        .iter()
-        .any(|form| recorded == form || body == Some(form.as_str()))
+    let Some(body) = strip_paste_wrapper(recorded) else {
+        return false;
+    };
+    body == tab4(base.trim_end()) || body == tab4(claude_kept(&base).trim_end())
+}
+
+/// `t` without the scalars Claude drops from a pasted prompt: DEL and the C1 controls.
+fn claude_kept(t: &str) -> String {
+    t.chars().filter(|&c| !is_del_or_c1(c)).collect()
+}
+
+fn is_del_or_c1(c: char) -> bool {
+    matches!(u32::from(c), 0x7F..=0x9F)
+}
+
+/// Where in `t` Claude 2.1.331 would see a command, DEL and C1 aside (C1 D16): a `!` as the
+/// first scalar (its bash mode tests the paste untrimmed), or a `/` as the first scalar that
+/// JavaScript's `trim` keeps (it trims the prompt before looking up a slash command).
+/// JavaScript's white space is Unicode `White_Space` without U+0085 (a C1 control, dropped
+/// here) and with U+FEFF. A Claude `send` of such a text is `LossyText` at this offset.
+fn claude_command_at(t: &str) -> Option<usize> {
+    let mut kept = t.char_indices().filter(|&(_, c)| !is_del_or_c1(c));
+    match kept.next()? {
+        (at, '!' | '/') => Some(at),
+        (_, c) if !is_js_space(c) => None,
+        _ => match kept.find(|&(_, c)| !is_js_space(c))? {
+            (at, '/') => Some(at),
+            _ => None,
+        },
+    }
+}
+
+fn is_js_space(c: char) -> bool {
+    c.is_whitespace() || c == '\u{feff}'
 }
 
 /// Claude's large-paste wrapper, exactly
@@ -655,21 +698,122 @@ mod tests {
         prompt_matches(Agent::Claude, BracketedPaste, text, recorded)
     }
 
+    /// C1-5 (D8): Claude's forms as captured from 2.1.331: a paste recorded with LF line ends,
+    /// DEL and C1 removed, trailing whitespace removed, NFC, and each TAB as four spaces; a
+    /// wrapped one with the same except NFC, at any size.
     #[test]
-    fn claude_each_subset_matches() {
-        let text = "a\tb\u{fa19}e\u{301}";
-        for recorded in [
-            "a\tb\u{fa19}e\u{301}",
-            "a    b\u{fa19}e\u{301}",
-            "a\tb\u{795e}é",
-            "a    b\u{795e}é",
-        ] {
-            assert!(claude_matches(text, recorded), "{recorded:?}");
-            assert!(claude_matches(text, &wrap("p1", recorded)), "{recorded:?}");
-        }
+    fn claude_captured_forms() {
+        let text = "\n a\tb\u{fa19}e\u{301}\u{7f}\u{80}  \r\n";
+        let small = "\n a    b\u{795e}\u{e9}";
         assert_eq!(
             expected_prompt(Agent::Claude, BracketedPaste, text).as_deref(),
-            Some("a    b\u{795e}é")
+            Some(small)
+        );
+        assert!(claude_matches(text, small));
+        let body = "\n a    b\u{fa19}e\u{301}";
+        assert!(claude_matches(text, &wrap("4500", body)));
+        // The captures cover no DEL or C1 in a wrapped paste: kept is accepted too.
+        assert!(claude_matches(
+            text,
+            &wrap("4500", "\n a    b\u{fa19}e\u{301}\u{7f}\u{80}")
+        ));
+    }
+
+    /// C1-5 (D8): each transform the captures did not show is refused.
+    #[test]
+    fn claude_dropped_transforms() {
+        let text = "\n a\tb\u{fa19}e\u{301}\u{7f}\u{80}  \r\n";
+        for (why, recorded) in [
+            ("TAB left unexpanded", "\n a\tb\u{795e}\u{e9}".to_owned()),
+            (
+                "no NFC in a small paste",
+                "\n a    b\u{fa19}e\u{301}".to_owned(),
+            ),
+            (
+                "DEL and C1 kept in a small paste",
+                "\n a    b\u{795e}\u{e9}\u{7f}\u{80}".to_owned(),
+            ),
+            (
+                "trailing whitespace kept",
+                "\n a    b\u{795e}\u{e9}  \n".to_owned(),
+            ),
+            (
+                "leading whitespace trimmed",
+                "a    b\u{795e}\u{e9}".to_owned(),
+            ),
+            ("CR kept", "\n a    b\u{795e}\u{e9}\r".to_owned()),
+            (
+                "NFC inside the wrapper",
+                wrap("4500", "\n a    b\u{795e}\u{e9}"),
+            ),
+            (
+                "TAB unexpanded inside the wrapper",
+                wrap("4500", "\n a\tb\u{fa19}e\u{301}"),
+            ),
+            (
+                "trailing whitespace kept inside the wrapper",
+                wrap("4500", "\n a    b\u{fa19}e\u{301}  \n"),
+            ),
+        ] {
+            assert!(!claude_matches(text, &recorded), "{why}: {recorded:?}");
+        }
+    }
+
+    /// C1 D16: a Claude `send` is refused where Claude 2.1.331 would see a command: `!` as the
+    /// first scalar other than DEL and C1 (bash mode tests the paste untrimmed, so ` !ls` is a
+    /// prompt), `/` as the first scalar JavaScript's `trim` keeps. An attach paste, another
+    /// character, and Codex keep them.
+    #[test]
+    fn claude_command_prefix_rejected() {
+        let refused = [
+            ("!ls", 0),
+            ("/review", 0),
+            ("/", 0),
+            ("!", 0),
+            (" /clear", 1),
+            ("\n/clear", 1),
+            ("\r\n\t/clear", 3),
+            ("\u{3000}/clear", 3),
+            ("\u{feff}/clear", 3),
+            ("\u{7f}/review", 1),
+            ("\u{85}/review", 2),
+            ("\u{7f}!ls", 1),
+            ("\u{80} \u{9f}/x", 5),
+            ("/日本語", 0),
+        ];
+        for os in [HostOs::Macos, HostOs::Windows] {
+            for (t, at) in refused {
+                assert_eq!(
+                    encode(Agent::Claude, os, t, Purpose::Send).err(),
+                    Some(Rejection {
+                        reason: RejectReason::LossyText,
+                        at: Some(at)
+                    }),
+                    "{t:?}"
+                );
+                assert!(encode(Agent::Claude, os, t, Purpose::AttachPaste).is_ok());
+                // Codex refuses DEL and C1 on its own (rule 2).
+                if !t.chars().any(is_del_or_c1) {
+                    assert!(encode(Agent::Codex, HostOs::Macos, t, Purpose::Send).is_ok());
+                }
+            }
+            for t in [
+                " !ls",
+                "\n!ls",
+                "a /b",
+                "#zz",
+                "?x",
+                "日本語の文 /x",
+                "\u{ff0f}review",
+                "\u{ff01}ls",
+                "\u{200b}/x",
+            ] {
+                assert!(encode(Agent::Claude, os, t, Purpose::Send).is_ok(), "{t:?}");
+            }
+        }
+        assert_eq!(
+            expected_prompt(Agent::Claude, BracketedPaste, " /clear"),
+            None
         );
     }
 
@@ -692,6 +836,19 @@ mod tests {
         for (text, recorded) in cases {
             assert!(!claude_matches(text, &recorded), "{text:?} {recorded:?}");
         }
+    }
+
+    /// C1-5 (D8): Claude 2.1.331 folds a paste of more than 800 characters, or of more lines
+    /// than `min(rows - 10, 2)`, whatever its size in bytes, and records it wrapped: the
+    /// wrapper is accepted at any size, its body still exact.
+    #[test]
+    fn claude_wrapped_at_any_size() {
+        for text in ["a", "a\nb\nc", &"x".repeat(801)] {
+            assert!(claude_matches(text, &wrap("1", text)), "{text:?}");
+            assert!(claude_matches(text, text), "{text:?}");
+        }
+        assert!(!claude_matches("a\nb\nc", &wrap("1", "a\nb")));
+        assert!(!claude_matches("a\nb\nc", &wrap("1", " a\nb\nc")));
     }
 
     #[test]

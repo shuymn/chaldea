@@ -7,14 +7,25 @@
 //!                  [--escape-orphan] [--orphan-keeps-tty] [--out <path>] [--emit-output]
 //!                  [--validate-input <n>] [--emitter <path>] [--agent <claude|codex>]
 //!                  [--session-id <id>] [--nested] [--nested-child] [--script <json>]
-//!                  [-- <ignored argument>...]
+//!                  [--session-start-gate <path>]
+//!                  [--version-text <text>] [--version-exit <n>] [--version-sleep-ms <n>]
+//!                  [--version-flood <n>] [--version-linger-ms <n>] [--version-descendant]
+//!                  [--version-descendant-writes] [--version-pidfile <path>]
+//!                  [--version-gate <path>]
+//!                  [-- <launch argument>...]
 //! ```
 //!
 //! `--emitter`, `--agent`, `--session-id`, `--nested`, `--nested-child`, and `--script` are
 //! the hook emission of `docs/design/hook-ingest.md` §2.14 (`echo` and `hooks`).
+//! `--session-start-gate` holds `echo`'s `SessionStart` until its file exists (60 s at most,
+//! then exit 1), so a test can let it in only once the launch is published.
 //!
-//! An unknown mode or flag exits 2. Arguments after `--` are ignored (`report-process`
-//! records them with the rest of its argv; `docs/design/pty-windows.md` §2.8).
+//! An unknown mode or flag exits 2. After `--` come the arguments the daemon appends for its
+//! agent (`report-process` records them with the rest of its argv;
+//! `docs/design/pty-windows.md` §2.8): a `--version` there answers as the `--version-*` flags
+//! say (`version`; the daemon's version probe), and without `--session-id` before `--`, the
+//! value of a `--session-id` or `--resume` there is the session id (a Claude launch's own). The
+//! rest are ignored.
 
 mod attachable;
 mod banner;
@@ -25,6 +36,7 @@ mod report_process;
 mod sleeper;
 mod spawn_tree;
 mod term;
+mod version;
 mod watch;
 
 use std::ffi::OsString;
@@ -87,10 +99,16 @@ pub(crate) struct Opts {
     pub(crate) session_id: Option<String>,
     /// `echo --emitter`: also start a nested FakeCli that emits another session's hooks.
     pub(crate) nested: bool,
+    /// `echo --emitter`: emit the `SessionStart` only once this file exists.
+    pub(crate) session_start_gate: Option<std::path::PathBuf>,
     /// `echo`: run as that nested FakeCli.
     pub(crate) nested_child: bool,
     /// `hooks`: the steps, a JSON array.
     pub(crate) script: Option<String>,
+    /// `--version` after `--`: answer as [`version`] does, not as the mode.
+    pub(crate) print_version: bool,
+    /// The `--version-*` flags.
+    pub(crate) version: version::VersionOpts,
 }
 
 fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
@@ -117,8 +135,11 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
         agent: "codex".to_owned(),
         session_id: None,
         nested: false,
+        session_start_gate: None,
         nested_child: false,
         script: None,
+        print_version: false,
+        version: version::VersionOpts::default(),
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -166,9 +187,38 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Opts, String> {
             "--agent" => o.agent = value()?,
             "--session-id" => o.session_id = Some(value()?),
             "--nested" => o.nested = true,
+            "--session-start-gate" => o.session_start_gate = Some(value()?.into()),
             "--nested-child" => o.nested_child = true,
             "--script" => o.script = Some(value()?),
-            "--" => break,
+            "--version-text" => o.version.text = value()?,
+            "--version-exit" => {
+                o.version.exit = value()?.parse().map_err(|e| format!("{flag}: {e}"))?;
+            }
+            "--version-sleep-ms" => {
+                o.version.sleep_ms = value()?.parse().map_err(|e| format!("{flag}: {e}"))?;
+            }
+            "--version-flood" => {
+                o.version.flood = value()?.parse().map_err(|e| format!("{flag}: {e}"))?;
+            }
+            "--version-linger-ms" => {
+                o.version.linger_ms = value()?.parse().map_err(|e| format!("{flag}: {e}"))?;
+            }
+            "--version-descendant" => o.version.descendant = true,
+            "--version-descendant-writes" => o.version.descendant_writes = true,
+            "--version-trickle" => o.version.trickle = true,
+            "--version-pidfile" => o.version.pidfile = Some(value()?.into()),
+            "--version-gate" => o.version.gate = Some(value()?.into()),
+            "--" => {
+                let rest: Vec<String> = it.by_ref().collect();
+                o.print_version = rest.iter().any(|a| a == "--version");
+                if o.session_id.is_none() {
+                    o.session_id = rest
+                        .windows(2)
+                        .find(|w| w[0] == "--session-id" || w[0] == "--resume")
+                        .map(|w| w[1].clone());
+                }
+                break;
+            }
             f => return Err(format!("unknown flag {f}")),
         }
     }
@@ -185,6 +235,9 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> i32 {
             return 2;
         }
     };
+    if o.print_version {
+        return version::run(&o.version);
+    }
     if let Some(secs) = o.max_life_secs {
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(secs));
@@ -217,6 +270,7 @@ pub(crate) fn hello(o: &Opts, raw: bool) -> Reporter {
         "mode": o.mode.name(),
         "role": role,
         "pid": std::process::id(),
+        "argv": std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>(),
         "raw": raw,
         "fds": fds,
     });

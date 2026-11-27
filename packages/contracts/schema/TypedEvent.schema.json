@@ -1213,7 +1213,7 @@
         },
         {
           "const": "lossy_text",
-          "description": "Text the adapter's encoding cannot carry without loss.",
+          "description": "Text the adapter's encoding cannot carry without loss, or that the CLI would\nreinterpret as a command instead of a prompt (Claude, C1 D16).",
           "type": "string"
         },
         {

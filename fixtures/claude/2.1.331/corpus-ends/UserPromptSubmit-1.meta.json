@@ -1,0 +1,11 @@
+{
+  "fact": {
+    "prompt_submitted": {
+      "prompt": "\n  both ends"
+    }
+  },
+  "events": [],
+  "sent": "\n  both ends  \n",
+  "expected_prompt": "\n  both ends",
+  "route": "interpret"
+}

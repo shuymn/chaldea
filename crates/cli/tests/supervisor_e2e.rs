@@ -12,16 +12,37 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use support::faults::{
-    AGENT_PROGRAM, FAKE_PTY_HOLD_WAITER, Gate, Labels, SUPERVISOR_GATE, SUPERVISOR_PAUSE, cmd,
+    AGENT_PROGRAM, CLAUDE_DECODER_PANIC, FAKE_PTY_HOLD_WAITER, Gate, Labels, SUPERVISOR_GATE,
+    SUPERVISOR_PAUSE, cmd,
 };
 use support::runner::{Case, main as run_cases};
-use support::{Proc, WAIT, request_complete, run_to_exit, state};
+use support::{Proc, WAIT, request_complete, run_to_exit, state, wait_for};
 
 fn main() {
     run_cases(&[
         Case {
             name: "wait_until_exited",
             run: wait_until_exited,
+        },
+        Case {
+            name: "decoder_panic",
+            run: decoder_panic,
+        },
+        Case {
+            name: "claude_hooks_bind",
+            run: claude_hooks_bind,
+        },
+        Case {
+            name: "claude_resume_rebinds",
+            run: claude_resume_rebinds,
+        },
+        Case {
+            name: "claude_stall",
+            run: claude_stall,
+        },
+        Case {
+            name: "claude_session_switch",
+            run: claude_session_switch,
         },
         Case {
             name: "banner_changes_nothing",
@@ -160,6 +181,463 @@ fn wait_until_exited() {
     );
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("the launch exited"), "{err}");
+    assert_eq!(daemon.stop_and_wait(&d.path), 0, "{}", daemon.stderr());
+}
+
+/// The `raw_unknown` reasons of thread `t`.
+fn raw_reasons(port: u16, token: &str, t: &str) -> Vec<String> {
+    of_kind(&envelopes(port, token, t), "raw_unknown")
+        .iter()
+        .map(|e| e["payload"]["reason"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// C1-4 under the production panic hook, with FakeCli `echo` emitting Claude's hooks through
+/// the real emitter: a panic in the Claude decoder's payload parser keeps the
+/// `UserPromptSubmit` as `raw_unknown` `schema_mismatch` and the daemon keeps serving until
+/// stopped (exit 0); a panic in the decoder after its parser returned stops the daemon.
+fn decoder_panic() {
+    let labels = Labels::new();
+    for at in ["in_parse", "after_parse"] {
+        let d = state();
+        let cwd = tempfile::tempdir().unwrap();
+        let gate = SessionGate::new();
+        let [flag, path] = gate.args();
+        let (mut daemon, port) = daemon_with(
+            &labels,
+            &d.path,
+            &[
+                "--mode",
+                "echo",
+                "--emitter",
+                env!("CARGO_BIN_EXE_chaldea"),
+                "--agent",
+                "claude",
+                "--max-life-secs",
+                "120",
+                &flag,
+                &path,
+            ],
+            &[(CLAUDE_DECODER_PANIC, OsStr::new(at))],
+        );
+        let (code, v, err) = agent(
+            &labels,
+            &d.path,
+            &[
+                "spawn",
+                "--agent",
+                "claude",
+                "--cwd",
+                &cwd.path().to_string_lossy(),
+            ],
+        );
+        assert_eq!(code, 0, "{at}: {err}");
+        gate.open();
+        let t = v["thread_id"].as_str().unwrap().to_owned();
+        let l = v["launch_id"].as_str().unwrap().to_owned();
+        let token = chaldea_daemon::lifecycle::read_owner_token(&d.path).unwrap();
+        assert!(
+            wait_for(|| !of_kind(&envelopes(port, &token, &t), "readiness_observed").is_empty()),
+            "{at}: bound by its SessionStart: {:?}",
+            envelopes(port, &token, &t)
+        );
+        let (code, _, err) = agent(&labels, &d.path, &["send", &t, "hello"]);
+        assert_eq!(code, 0, "{at}: {err}");
+        if at == "in_parse" {
+            assert!(
+                wait_for(|| raw_reasons(port, &token, &t) == ["schema_mismatch"]),
+                "{:?}",
+                raw_reasons(port, &token, &t)
+            );
+            // The body FakeCli sent, kept byte for byte.
+            let sent = serde_json::json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": l,
+                "prompt": "hello",
+            })
+            .to_string();
+            let events = envelopes(port, &token, &t);
+            let raw = of_kind(&events, "raw_unknown")[0]["payload"]["raw"].clone();
+            assert_eq!(raw["inline"], sent.as_str(), "{raw}");
+            let (status, body) = request_complete(port, "GET", "/api/threads", &token, None);
+            assert_eq!(status, 200, "still serving: {body}");
+            assert_eq!(daemon.stop_and_wait(&d.path), 0, "{}", daemon.stderr());
+            assert!(daemon.stderr().contains("panic in"), "{}", daemon.stderr());
+        } else {
+            let status = daemon.wait_within(WAIT);
+            assert!(!status.success(), "{status:?}: {}", daemon.stderr());
+            assert!(daemon.stderr().contains("panic in"), "{}", daemon.stderr());
+        }
+    }
+}
+
+// ---- C1: Claude launches of FakeCli through the real emitter ----
+
+/// The file that holds FakeCli's first `SessionStart` (`echo --session-start-gate`, or a
+/// `hooks` script's first `wait_file` step) until the test opens it. A launch is published
+/// before its `spawn` or `resume` answers, so opening it after that answer puts the launch's
+/// publication before the hook's intake; FakeCli, emitting at once, would otherwise race it,
+/// and a hook taken in before the publication has no intake facts and records no readiness
+/// (sup §2.11 "Observation"). A lock contended at the intake can still leave the facts missing
+/// (supervisor-send L-12).
+struct SessionGate {
+    dir: tempfile::TempDir,
+}
+
+impl SessionGate {
+    fn new() -> SessionGate {
+        SessionGate {
+            dir: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    fn path(&self) -> PathBuf {
+        self.dir.path().join("open")
+    }
+
+    /// The FakeCli flag and its value.
+    fn args(&self) -> [String; 2] {
+        [
+            "--session-start-gate".to_owned(),
+            self.path().to_string_lossy().into_owned(),
+        ]
+    }
+
+    fn open(&self) {
+        std::fs::write(self.path(), b"").unwrap();
+    }
+
+    fn close(&self) {
+        std::fs::remove_file(self.path()).unwrap();
+    }
+}
+
+/// Every JSON line FakeCli processes send to `report`, from every connection, on a channel.
+fn reports(report: TcpListener) -> std::sync::mpsc::Receiver<Value> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for conn in report.incoming() {
+            let Ok(conn) = conn else { return };
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(conn).lines() {
+                    let Ok(line) = line else { return };
+                    if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                        let _ = tx.send(v);
+                    }
+                }
+            });
+        }
+    });
+    rx
+}
+
+/// The next report matching `pred` within [`WAIT`].
+fn next_report(
+    rx: &std::sync::mpsc::Receiver<Value>,
+    what: &str,
+    pred: impl Fn(&Value) -> bool,
+) -> Value {
+    let end = std::time::Instant::now() + WAIT;
+    loop {
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(v) if pred(&v) => return v,
+            Ok(_) => {}
+            Err(_) => panic!("no report {what} within {WAIT:?}"),
+        }
+    }
+}
+
+/// The value after `flag` in a `hello`'s argv.
+fn argv_after(hello: &Value, flag: &str) -> Option<String> {
+    let argv: Vec<&str> = hello["argv"]
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let i = argv.iter().position(|a| *a == flag)?;
+    argv.get(i + 1).map(|v| (*v).to_owned())
+}
+
+/// The `emitted` report of FakeCli's `event` hook, requiring the emitter to have exited 0.
+fn emitted_ok(rx: &std::sync::mpsc::Receiver<Value>, event: &str) {
+    let v = next_report(rx, &format!("emitted {event}"), |v| {
+        v["event"] == "emitted" && v["step"] == event
+    });
+    assert_eq!(v["code"], 0, "{v}");
+}
+
+/// A Claude launch's daemon: FakeCli with `mode_args`, reporting to a listener of its own.
+fn claude_daemon(
+    labels: &Labels,
+    dir: &Path,
+    mode_args: &[&str],
+) -> (Proc, u16, std::sync::mpsc::Receiver<Value>) {
+    let report = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("127.0.0.1:{}", report.local_addr().unwrap().port());
+    let mut args: Vec<&str> = mode_args.to_vec();
+    args.extend(["--report", &addr, "--max-life-secs", "120"]);
+    let (daemon, port) = daemon(labels, dir, &args);
+    (daemon, port, reports(report))
+}
+
+fn spawn_claude(labels: &Labels, dir: &Path, cwd: &Path, prompt: Option<&str>) -> (String, String) {
+    let cwd = cwd.to_string_lossy();
+    let mut args = vec!["spawn", "--agent", "claude", "--cwd", &cwd];
+    if let Some(p) = prompt {
+        args.extend(["--prompt", p]);
+    }
+    let (code, v, err) = agent(labels, dir, &args);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(v["outcome"], "started", "{v}");
+    (
+        v["thread_id"].as_str().unwrap().to_owned(),
+        v["launch_id"].as_str().unwrap().to_owned(),
+    )
+}
+
+/// Waits until thread `t` has `n` events of `kind`; returns them.
+fn events_of(port: u16, token: &str, t: &str, kind: &str, n: usize) -> Vec<Value> {
+    assert!(
+        wait_for(|| of_kind(&envelopes(port, token, t), kind).len() >= n),
+        "{n} {kind}: {:?}",
+        envelopes(port, token, t)
+    );
+    of_kind(&envelopes(port, token, t), kind)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+/// Sends `text` and waits for the `user_message` that acknowledged it.
+fn sent_and_acked(
+    labels: &Labels,
+    dir: &Path,
+    port: u16,
+    token: &str,
+    t: &str,
+    text: &str,
+    n: usize,
+) {
+    let (code, v, err) = agent(labels, dir, &["send", t, text]);
+    assert_eq!(code, 0, "{err}");
+    let input = v["input_id"].clone();
+    let msgs = events_of(port, token, t, "user_message", n);
+    let m = msgs.last().unwrap();
+    assert_eq!(m["payload"]["input_id"], input, "{m}");
+}
+
+/// C1-2: a Claude launch of FakeCli `echo` gets `--settings <state dir>/claude-settings.json`
+/// and `--session-id <launch>`; its `SessionStart`, through the real emitter (exit 0), binds
+/// the launch to that session with `session_start` readiness, and a sent prompt's
+/// `UserPromptSubmit` acknowledges it.
+fn claude_hooks_bind() {
+    let labels = Labels::new();
+    let d = state();
+    let cwd = tempfile::tempdir().unwrap();
+    let emitter = env!("CARGO_BIN_EXE_chaldea");
+    let gate = SessionGate::new();
+    let [flag, path] = gate.args();
+    let (mut daemon, port, rx) = claude_daemon(
+        &labels,
+        &d.path,
+        &[
+            "--mode",
+            "echo",
+            "--emitter",
+            emitter,
+            "--agent",
+            "claude",
+            &flag,
+            &path,
+        ],
+    );
+    let (t, l) = spawn_claude(&labels, &d.path, cwd.path(), None);
+    gate.open();
+    let hello = next_report(&rx, "hello", |v| v["event"] == "hello");
+    assert_eq!(
+        argv_after(&hello, "--session-id").as_deref(),
+        Some(l.as_str()),
+        "{hello}"
+    );
+    let settings = PathBuf::from(argv_after(&hello, "--settings").unwrap());
+    assert_eq!(
+        settings.canonicalize().unwrap(),
+        d.path.join("claude-settings.json").canonicalize().unwrap(),
+        "{hello}"
+    );
+    emitted_ok(&rx, "SessionStart");
+    let token = chaldea_daemon::lifecycle::read_owner_token(&d.path).unwrap();
+    let bound = events_of(port, &token, &t, "session_bound", 1);
+    assert_eq!(bound[0]["payload"]["session_id"], l.as_str());
+    let ready = events_of(port, &token, &t, "readiness_observed", 1);
+    assert_eq!(
+        ready[0]["payload"]["evidence"], "session_start",
+        "{}",
+        ready[0]
+    );
+    sent_and_acked(&labels, &d.path, port, &token, &t, "hello", 1);
+    emitted_ok(&rx, "UserPromptSubmit");
+    assert_eq!(daemon.stop_and_wait(&d.path), 0, "{}", daemon.stderr());
+}
+
+/// C1-10 (hook half): after a stop, `resume` starts FakeCli with `--resume <session>`; its
+/// `SessionStart` of that session binds the new launch, with readiness, and a sent prompt is
+/// acknowledged.
+fn claude_resume_rebinds() {
+    let labels = Labels::new();
+    let d = state();
+    let cwd = tempfile::tempdir().unwrap();
+    let emitter = env!("CARGO_BIN_EXE_chaldea");
+    let gate = SessionGate::new();
+    let [flag, path] = gate.args();
+    let (mut daemon, port, rx) = claude_daemon(
+        &labels,
+        &d.path,
+        &[
+            "--mode",
+            "echo",
+            "--emitter",
+            emitter,
+            "--agent",
+            "claude",
+            &flag,
+            &path,
+        ],
+    );
+    let (t, l) = spawn_claude(&labels, &d.path, cwd.path(), None);
+    gate.open();
+    emitted_ok(&rx, "SessionStart");
+    let token = chaldea_daemon::lifecycle::read_owner_token(&d.path).unwrap();
+    events_of(port, &token, &t, "readiness_observed", 1);
+    let (code, _, err) = agent(&labels, &d.path, &["stop", &t]);
+    assert_eq!(code, 0, "{err}");
+    gate.close();
+    let (code, v, err) = agent(&labels, &d.path, &["resume", &t]);
+    assert_eq!(code, 0, "{err}");
+    gate.open();
+    let l2 = v["launch_id"].as_str().unwrap().to_owned();
+    assert_ne!(l2, l);
+    let hello = next_report(&rx, "the resumed hello", |v| {
+        v["event"] == "hello" && argv_after(v, "--resume").is_some()
+    });
+    assert_eq!(
+        argv_after(&hello, "--resume").as_deref(),
+        Some(l.as_str()),
+        "{hello}"
+    );
+    assert_eq!(argv_after(&hello, "--session-id"), None, "{hello}");
+    emitted_ok(&rx, "SessionStart");
+    let bound = events_of(port, &token, &t, "session_bound", 2);
+    assert_eq!(bound[1]["payload"]["launch_id"], l2.as_str());
+    assert_eq!(bound[1]["payload"]["session_id"], l.as_str());
+    let ready = events_of(port, &token, &t, "readiness_observed", 2);
+    assert_eq!(ready[1]["payload"]["launch_id"], l2.as_str());
+    sent_and_acked(&labels, &d.path, port, &token, &t, "again", 1);
+    assert_eq!(daemon.stop_and_wait(&d.path), 0, "{}", daemon.stderr());
+}
+
+/// C1-13: a Claude launch whose CLI never sends `SessionStart` (FakeCli `echo` with DECSET
+/// 2004 on and no emitter) carries `session_start_timeout`, and its first prompt never enters
+/// the write path. The daemon is its own process here, so its 20 s passes in real time; the
+/// version on a controlled clock, with the daemon's own view of DECSET 2004 and the PTY's
+/// bytes, is `stall_before_session_start` (daemon unit tests).
+fn claude_stall() {
+    let labels = Labels::new();
+    let d = state();
+    let cwd = tempfile::tempdir().unwrap();
+    let (mut daemon, port, rx) = claude_daemon(&labels, &d.path, &["--mode", "echo"]);
+    let (t, _) = spawn_claude(&labels, &d.path, cwd.path(), Some("first"));
+    next_report(&rx, "hello", |v| v["event"] == "hello");
+    next_report(&rx, "DECSET 2004 written", |v| {
+        v["event"] == "bracketed_paste_on"
+    });
+    let token = chaldea_daemon::lifecycle::read_owner_token(&d.path).unwrap();
+    // The timeout is 20 s from the launch's start; the tick raises it.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    while !envelopes(port, &token, &t)
+        .iter()
+        .any(|e| e["payload"].to_string().contains("session_start_timeout"))
+    {
+        assert!(
+            std::time::Instant::now() < end,
+            "no session_start_timeout within 45 s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    // The write path moves an input to `sending` before its first byte (mvp §2.3): the first
+    // prompt still `queued`, with no state change, wrote nothing.
+    let evs = envelopes(port, &token, &t);
+    let created = of_kind(&evs, "input_created");
+    assert_eq!(created.len(), 1, "{evs:?}");
+    assert_eq!(created[0]["payload"]["initial_state"], "queued");
+    assert!(of_kind(&evs, "input_state_changed").is_empty(), "{evs:?}");
+    assert!(of_kind(&evs, "user_message").is_empty());
+    assert_eq!(daemon.stop_and_wait(&d.path), 0, "{}", daemon.stderr());
+}
+
+/// C1-14 (D5): FakeCli `hooks` binds its launch, then sends another session's `SessionStart`
+/// (`clear`) and `UserPromptSubmit`, then its own session's: the other session's are
+/// `foreign_session`, the binding stays, and the own prompt is a `user_message`.
+fn claude_session_switch() {
+    let labels = Labels::new();
+    let d = state();
+    let cwd = tempfile::tempdir().unwrap();
+    let emitter = env!("CARGO_BIN_EXE_chaldea");
+    let other = "11111111-1111-4111-8111-111111111111";
+    let gate = SessionGate::new();
+    let script = serde_json::json!([
+        { "wait_file": gate.path() },
+        { "emit": { "hook_event_name": "SessionStart", "session_id": "$SESSION", "transcript_path": null, "source": "startup" } },
+        { "emit": { "hook_event_name": "SessionStart", "session_id": other, "transcript_path": null, "source": "clear" } },
+        { "emit": { "hook_event_name": "UserPromptSubmit", "session_id": other, "prompt": "other" } },
+        { "emit": { "hook_event_name": "UserPromptSubmit", "session_id": "$SESSION", "prompt": "own" } },
+    ])
+    .to_string();
+    let (mut daemon, port, rx) = claude_daemon(
+        &labels,
+        &d.path,
+        &[
+            "--mode",
+            "hooks",
+            "--emitter",
+            emitter,
+            "--agent",
+            "claude",
+            "--script",
+            &script,
+        ],
+    );
+    let (t, l) = spawn_claude(&labels, &d.path, cwd.path(), None);
+    gate.open();
+    let hello = next_report(&rx, "hello", |v| v["event"] == "hello");
+    assert_eq!(
+        argv_after(&hello, "--session-id").as_deref(),
+        Some(l.as_str()),
+        "{hello}"
+    );
+    let waited = next_report(&rx, "wait_file step 0", |v| v["event"] == "wait_file");
+    assert_eq!(waited["found"], true, "the gate expired: {waited}");
+    for step in 1..5 {
+        let v = next_report(&rx, &format!("emitted step {step}"), |v| {
+            v["event"] == "emitted" && v["step"] == step
+        });
+        assert_eq!(v["code"], 0, "{v}");
+    }
+    let token = chaldea_daemon::lifecycle::read_owner_token(&d.path).unwrap();
+    let msgs = events_of(port, &token, &t, "user_message", 1);
+    assert_eq!(msgs.len(), 1, "{msgs:?}");
+    assert_eq!(msgs[0]["payload"]["prompt"]["inline"], "own", "{}", msgs[0]);
+    let events = envelopes(port, &token, &t);
+    let reasons: Vec<&Value> = of_kind(&events, "raw_unknown")
+        .iter()
+        .map(|e| &e["payload"]["reason"])
+        .collect();
+    assert_eq!(reasons, [&Value::from("foreign_session"); 2], "{events:?}");
+    let bound = of_kind(&events, "session_bound");
+    assert_eq!(bound.len(), 1, "{events:?}");
+    assert_eq!(bound[0]["payload"]["session_id"], l.as_str());
     assert_eq!(daemon.stop_and_wait(&d.path), 0, "{}", daemon.stderr());
 }
 

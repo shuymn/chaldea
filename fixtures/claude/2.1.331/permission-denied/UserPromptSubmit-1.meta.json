@@ -1,0 +1,11 @@
+{
+  "fact": {
+    "prompt_submitted": {
+      "prompt": "Use the Bash tool to run exactly this command and nothing else: printf c1b > c1b-denied.txt"
+    }
+  },
+  "events": [],
+  "sent": "Use the Bash tool to run exactly this command and nothing else: printf c1b > c1b-denied.txt",
+  "expected_prompt": "Use the Bash tool to run exactly this command and nothing else: printf c1b > c1b-denied.txt",
+  "route": "interpret"
+}

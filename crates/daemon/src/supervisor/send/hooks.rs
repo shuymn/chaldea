@@ -3,15 +3,17 @@
 //! only, inside the delivery or binding job.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use chaldea_core::adapter::{HostOs, ReadinessMode, capabilities, evidence_allowed};
+use chaldea_core::canonical::CanonicalJson;
 use chaldea_core::event::TypedEvent;
 use chaldea_core::ids::{Actor, Agent, ApprovalId, InputId, LaunchId, StreamId};
 use chaldea_core::input::{InputInput, InputReason, InputState, step};
 use chaldea_core::payload::InputStateChanged;
 use chaldea_core::payload::{
-    ApprovalCorrelation, ApprovalOutcome, ApprovalRequested, ApprovalResolved, RawUnknownReason,
-    ReadinessEvidence, ReadinessObserved, UserMessage,
+    ApprovalCorrelation, ApprovalOutcome, ApprovalRequested, ApprovalResolved, Content, Encoding,
+    RawUnknownReason, ReadinessEvidence, ReadinessObserved, UserMessage,
 };
 use chaldea_core::state::{AttentionCause, StateInput, ThreadState, reduce};
 use chaldea_pty_runtime::OriginClass;
@@ -22,8 +24,8 @@ use crate::hook::{
     AcceptedHook, BindingRule, HookAdapter, HookEvent, Interpretation, MvpHooks, TurnMark,
 };
 use crate::store::{
-    BlobInput, CountedClasses, EventAnnex, InputRow, LaunchRow, ReadTx, StoreError, WriteBasis,
-    prepare_content,
+    ApprovalRow, BlobInput, CountedClasses, EventAnnex, InputRow, LaunchRow, Prepared, ReadTx,
+    StoreError, WriteBasis, prepare_content,
 };
 
 /// What one hook says, as a decoder reads its payload.
@@ -42,10 +44,16 @@ pub enum HookFact {
         turn_ref: Option<String>,
         correlation: Option<ApprovalCorrelation>,
     },
-    /// A `PostToolUse`: the card whose correlation names it ran.
+    /// A `PostToolUse`: a correlated card with its `tool_use_id` ran, else the one open card
+    /// with its `tool_name` and canonical `tool_input` (§2.5 `CardEvidence`).
     CardEvidence {
-        tool_use_id: String,
+        tool_name: String,
+        tool_input: serde_json::Value,
+        tool_use_id: Option<String>,
     },
+    /// The decoder could not read the payload (a panic in its parser, or a field its fact
+    /// needs missing): the body is kept as `raw_unknown` `schema_mismatch`.
+    SchemaMismatch,
     Other,
 }
 
@@ -76,6 +84,72 @@ impl HookDecoder for NoDecoder {
         _hook: &AcceptedHook<'_>,
     ) -> Result<(HookFact, Vec<HookEvent>), StoreError> {
         Ok((HookFact::Other, Vec::new()))
+    }
+}
+
+/// The decoder of each agent (send §2.5 "Decoder seam"): `ClaudeDecoder` for Claude and
+/// `NoDecoder` for Codex by default; a test may pass one decoder for both.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct Decoders {
+    pub claude: Arc<dyn HookDecoder>,
+    pub codex: Arc<dyn HookDecoder>,
+}
+
+impl Decoders {
+    /// The daemon's: `ClaudeDecoder` and `NoDecoder`.
+    #[must_use]
+    pub fn mvp() -> Decoders {
+        Decoders {
+            claude: Arc::new(super::claude::ClaudeDecoder::default()),
+            codex: Arc::new(NoDecoder),
+        }
+    }
+
+    /// `d` for every agent.
+    #[must_use]
+    pub fn all(d: Arc<dyn HookDecoder>) -> Decoders {
+        Decoders {
+            claude: d.clone(),
+            codex: d,
+        }
+    }
+
+    #[must_use]
+    pub fn of(&self, agent: Agent) -> &Arc<dyn HookDecoder> {
+        match agent {
+            Agent::Claude => &self.claude,
+            Agent::Codex => &self.codex,
+        }
+    }
+}
+
+/// `c`'s `tool_input` as JSON: inline UTF-8, or its blob from `thread`'s stream; `None` when
+/// neither reads.
+fn card_input(
+    tx: &ReadTx<'_>,
+    thread: chaldea_core::ids::ThreadId,
+    c: &ApprovalRow,
+) -> Result<Option<serde_json::Value>, StoreError> {
+    let bytes = match &c.requested.tool_input {
+        Content::Inline {
+            inline,
+            encoding: Encoding::Utf8,
+        } => inline.as_bytes().to_vec(),
+        Content::Inline { .. } => return Ok(None),
+        Content::Blob { blob, .. } => match tx.blob(StreamId::Thread(thread), &blob.sha256)? {
+            Some(b) => b.data,
+            None => return Ok(None),
+        },
+    };
+    Ok(serde_json::from_slice(&bytes).ok())
+}
+
+/// Whether `a` and `b` have one canonical JSON form.
+fn same_json(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (CanonicalJson::of(a), CanonicalJson::of(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
     }
 }
 
@@ -202,9 +276,7 @@ impl Events {
 
 impl SupervisorHooks {
     fn mode(&self, agent: Agent) -> ReadinessMode {
-        self.side
-            .mode
-            .unwrap_or_else(|| capabilities(agent, self.host_os).readiness_mode())
+        self.side.mode(capabilities(agent, self.host_os))
     }
 
     /// Hook evidence of `kind` is recorded: the row allows it, the delivery's facts are
@@ -219,6 +291,43 @@ impl SupervisorHooks {
         let f = facts?;
         (evidence_allowed(l.agent, self.mode(l.agent), kind) && hook.intake_reliable && !f.running)
             .then(|| f.position())
+    }
+}
+
+impl SupervisorHooks {
+    /// The coarse rule (C1 D15): the one open card of the launch with an equal `tool_name` and
+    /// canonical `tool_input`, uncorrelated, when this `PostToolUse` was received above the
+    /// turn watermark and above that card's own delivery. Anything else resolves nothing; the
+    /// turn boundary closes the card.
+    fn coarse<'a>(
+        &self,
+        tx: &ReadTx<'_>,
+        hook: &AcceptedHook<'_>,
+        open: &'a [ApprovalRow],
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+    ) -> Result<Option<&'a ApprovalRow>, StoreError> {
+        if hook.receipt_ordinal <= hook.turn_watermark {
+            return Ok(None);
+        }
+        let mut equal = Vec::new();
+        for c in open {
+            if c.requested.tool_name == tool_name
+                && card_input(tx, hook.thread, c)?.is_some_and(|v| same_json(&v, tool_input))
+            {
+                equal.push(c);
+            }
+        }
+        let [c] = equal.as_slice() else {
+            return Ok(None);
+        };
+        if c.requested.correlation.is_some() {
+            return Ok(None);
+        }
+        let Some(card) = tx.hook_delivery(hook.launch.launch_id, c.approval_id.0)? else {
+            return Ok(None);
+        };
+        Ok((hook.receipt_ordinal > card.receipt_ordinal).then_some(*c))
     }
 }
 
@@ -253,8 +362,14 @@ impl HookAdapter for SupervisorHooks {
         tx: &ReadTx<'_>,
         hook: &AcceptedHook<'_>,
     ) -> Result<(Interpretation, TurnMark), StoreError> {
-        let (fact, extra) = self.side.decoder.decode(tx, hook)?;
         let l = hook.launch;
+        let (fact, extra) = self.side.decoders.of(l.agent).decode(tx, hook)?;
+        if fact == HookFact::SchemaMismatch {
+            return Ok((
+                Interpretation::Raw(RawUnknownReason::SchemaMismatch),
+                TurnMark::Other,
+            ));
+        }
         let thread = hook.thread;
         let Some(t) = tx.thread(thread)? else {
             return Ok((
@@ -363,10 +478,7 @@ impl HookAdapter for SupervisorHooks {
                 correlation,
             } => {
                 let approval_id = ApprovalId(hook.emit_id);
-                let input = serde_json::to_vec(&tool_input)
-                    .map_err(|e| StoreError::Decode(e.to_string()))?;
-                let prepared =
-                    prepare_content(input, "application/json").map_err(StoreError::Content)?;
+                let prepared = json_content(&tool_input)?;
                 ev.push_full(
                     "card",
                     TypedEvent::ApprovalRequested(ApprovalRequested {
@@ -380,27 +492,51 @@ impl HookAdapter for SupervisorHooks {
                     None,
                     prepared.blob.into_iter().collect(),
                 );
-                ev.apply("card", &StateInput::ApprovalOpened);
-                let human_at = facts
-                    .filter(|f| hook.intake_reliable && !f.human_running)
-                    .map(|f| f.at(OriginClass::Human));
-                TurnMark::Card {
-                    approval_id,
-                    human_at,
+                if hook.receipt_ordinal < hook.turn_watermark {
+                    // Taken in before a committed turn boundary: its turn already ended, so the
+                    // card is closed at open and keeps no memory entry (its key answers
+                    // `card_closed`).
+                    ev.push(
+                        format!("card:{approval_id}"),
+                        TypedEvent::ApprovalResolved(ApprovalResolved {
+                            approval_id,
+                            outcome: ApprovalOutcome::Superseded,
+                        }),
+                    );
+                    TurnMark::Other
+                } else {
+                    ev.apply("card", &StateInput::ApprovalOpened);
+                    let human_at = facts
+                        .filter(|f| hook.intake_reliable && !f.human_running)
+                        .map(|f| f.at(OriginClass::Human));
+                    TurnMark::Card {
+                        approval_id,
+                        human_at,
+                    }
                 }
             }
-            HookFact::CardEvidence { tool_use_id } => {
+            HookFact::CardEvidence {
+                tool_name,
+                tool_input,
+                tool_use_id,
+            } => {
                 let open: Vec<_> = tx
                     .open_approvals(thread)?
                     .into_iter()
                     .filter(|c| c.launch_id == l.launch_id)
                     .collect();
-                let hit = open.iter().find(|c| {
-                    c.requested
-                        .correlation
-                        .as_ref()
-                        .is_some_and(|k| k.tool_use_id == tool_use_id)
+                let correlated = tool_use_id.as_ref().and_then(|id| {
+                    open.iter().find(|c| {
+                        c.requested
+                            .correlation
+                            .as_ref()
+                            .is_some_and(|k| &k.tool_use_id == id)
+                    })
                 });
+                let hit = match correlated {
+                    Some(c) => Some(c),
+                    None => self.coarse(tx, hook, &open, &tool_name, &tool_input)?,
+                };
                 let mark = hit.map_or(TurnMark::Other, |c| TurnMark::Resolved {
                     approval_id: c.approval_id,
                 });
@@ -424,7 +560,7 @@ impl HookAdapter for SupervisorHooks {
                 }
                 TurnMark::Other
             }
-            HookFact::Other => TurnMark::Other,
+            HookFact::Other | HookFact::SchemaMismatch => TurnMark::Other,
         };
         let _ = StreamId::Thread(thread);
         let mut events = ev.out;
@@ -434,4 +570,10 @@ impl HookAdapter for SupervisorHooks {
         }
         Ok((Interpretation::Events(events), mark))
     }
+}
+
+/// `v` as JSON content: inline, or a blob over the inline limit.
+pub(super) fn json_content(v: &serde_json::Value) -> Result<Prepared, StoreError> {
+    let bytes = serde_json::to_vec(v).map_err(|e| StoreError::Decode(e.to_string()))?;
+    prepare_content(bytes, "application/json").map_err(StoreError::Content)
 }

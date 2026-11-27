@@ -38,14 +38,15 @@ After T2 at M1: P-12 and P-16 through the key bar, and the external agent's inte
 | D5 | A launch keeps its first binding across `/clear` and in-session `/resume`. | Following the new session (rebinding, migration). |
 | D6 | Claude keeps binding rule `SessionId`. | `Ancestry` (unverified on real hosts). |
 | D7 | A caught decoder panic is `raw_unknown` `schema_mismatch`; only pure parsing runs in the recovered region. | A new reason `decoder_panic`. |
-| D8 | Expected prompt forms are fixed from captures; `prompt_matches` narrows to them. | Keeping every transform subset. |
+| D8 | Expected prompt forms are fixed from captures; `prompt_matches` narrows to them, and accepts the wrapped form at any size when its body is exactly the sent text's (Claude 2.1.331 folds a paste of more than 800 UTF-16 code units, or of more newlines than `max(0, min(rows − 10, 2))`, whatever its size in bytes). | Keeping every transform subset; a size threshold (it refused real wrapped prompts below it). |
 | D9 | No VT snapshot when a card opens. | Recording one (`interpret` is data only). |
 | D10 | Continuity is a SHA-256 of the read prefix, verified in full at every open and by `file_id` and size each poll. | The last 4 KiB (misses prefix rewrites); full re-hash per poll (O(n²)). |
-| D11 | The CLI version comes from a bounded `claude --version` per launch. | `null` (arch §2 wants the version). |
+| D11 | The CLI version comes from `claude --version` per launch, run in its own process tree (a process group, or a job joined before it runs): one 5 s deadline over exit and output, stdout in an anonymous temporary file capped at 4 KiB, once the child's exit is seen, the whole tree's kill requested and the child reaped before the file is read (a limit, §3), and the tree killed on every other end; a failure, an exit other than 0, or the cap records `null`. | `null` (arch §2 wants the version). |
 | D12 | `GET /api/adapters` gains no readiness column. | A field no client acts on. |
 | D13 | `open_regular` lives in `pty-runtime`, Windows FFI in `windows::sys`. | `cfg` code in the daemon. |
 | D14 | Values over 64 MiB are one blob in internal ordered parts under one `BlobRef`, served by `/api/blobs`; the producer spools them to a temporary file in fixed-size buffers, and the writer inserts the parts from that handle with the event, refs, and cursor in one transaction. | Truncation (a second exception to verbatim `raw_unknown`); halting the tailer. |
 | D15 | A `PostToolUse` resolves a card `ran` only when received after the turn watermark and the card, with exactly one equal open card; a card received below the watermark is closed at open. No other card rule. | Counting the turn's calls. |
+| D16 | A Claude prompt that Claude 2.1.331 would run as a command is refused before any write at `send` and `spawn --prompt`, as mvp D6's `rejected` `lossy_text`: `!` as the first scalar other than DEL and C1 (bash mode tests the paste untrimmed), or `/` as the first scalar its trim keeps (the slash-command lookup trims). The owner types commands through attach. | Sending them (no `UserPromptSubmit`: the input could only end `unconfirmed`). |
 
 The PRs bring canonical text in line with code: C1a mvp §2.5 (screen route), §2.3 (`input resolve --outcome`, mode `none` vs `OwnerOnly`); C1b mvp §2.7, §2.10, hook-ingest row 13, supervisor-send §2.5, PR10b-CL-13, CL-23, L-13, arch §2; C1c1 event-store §2.4–§2.5; C1c2 mvp §2.1 cursor rules.
 
@@ -54,9 +55,12 @@ The PRs bring canonical text in line with code: C1a mvp §2.5 (screen route), §
 | Risk | Detection | Limit, and why the purpose holds |
 |---|---|---|
 | `SessionStart` before the trust prompt is answered. | M1 P-12. | If seen, Claude rows switch to `OwnerOnly`; `input_gate_timeout` asks for `ready`. |
-| Readiness missing at bind without intake facts. | `inspect`. | Gate closed; the owner runs `ready`. |
+| Readiness missing at bind without intake facts: a `SessionStart` taken in while a lock is contended, or before the `spawn`'s or `resume`'s launch is published (supervisor-send L-12). | `inspect`; `input_gate_timeout` when a send is still queued 60 s after the worker first sees it (a bound launch with no queued input raises no timeout). | Nothing is misdelivered: the gate stays closed until readiness evidence or the owner's `ready`. |
 | `--resume` starts a new session id. | M1 P-18. | Nothing is written to an unbound launch; a new thread recovers. |
-| Windows hook shell rejects the command. | M2. | Fix is the settings string; macOS unaffected. |
+| Windows hook shell rejects the command (`shell: "powershell"`, the `&` call form). | M2. | Fix is the settings string; macOS unaffected. |
+| An emitter path that literally contains `${CLAUDE_PROJECT_DIR}` is rewritten by Claude before PowerShell runs the hook. | `SessionStart` never arrives (`session_start_timeout`). | Not fixed: such a path is not a real install location; moving the binary fixes it. |
+| When Claude 2.1.331 does not fold the paste and the composer's text, trimmed, is exactly `exit`, `quit`, `:q`, `:q!`, `:wq`, or `:wq!`, Claude runs it as `/exit` (outside D16's `!` and `/`). A folded paste, such as `"exit\n\n\n"`, is checked as its placeholder and stays a prompt that can be acked. | The launch exits. | Not fixed: sending one ends the Claude session as it does in Claude's own TUI. `send` answers `queued`, then `launch_exited` is recorded and the input ends `unconfirmed`; nothing goes to another launch and nothing is resent. Refusing these words too would follow Claude's submit handler version by version. |
+| The version probe reads its output after requesting its tree's kill and reaping the parent (D11), so a descendant that left the process group or job, or a write still in flight when the read starts, can change the value read: the recorded `cli_version` can be another version string or `null`. | The recorded `cli_version`. | Not fixed: `cli_version` is diagnostic only and nothing decides on it; the order (exit seen, the tree's kill requested, the parent reaped, the file read) keeps the pid and group from reuse. |
 | After `/clear` the thread follows the old session (D5). | `foreign_session`. | A send lands `unconfirmed`, never resent. |
 | A denied card stays open until the boundary; a later equal call without a card marks it `ran`. | M1 P-16. | Only the label is wrong; no byte is written. |
 | **L-13 after C1.** Card order is receipt order, not firing order. A turn's `UserPromptSubmit` received after its `PermissionRequest` and committed first closes a legitimate card at open. A dialog answered through attach, followed by a late `PermissionRequest` first taken in above the watermark, leaves an open card for a dialog that ended, and its card key can reach the composer. | The screen. | The owner sees `card_closed`, or an open card the screen contradicts, and answers through attach (T1, T2). |
@@ -67,7 +71,7 @@ The PRs bring canonical text in line with code: C1a mvp §2.5 (screen route), §
 ## 4. PR split
 
 1. **C1a: read surface** (D1, D2; C1-11, C1-12). Beside C1b.
-2. **C1b: hooks** (D3–D9, D11, D15; C1-1 to C1-7, C1-13, C1-14, hook halves of C1-4 and C1-10). Settings first, then fixture capture, then the decoder.
+2. **C1b: hooks** (D3–D9, D11, D15, D16; C1-1 to C1-7, C1-13, C1-14, hook halves of C1-4 and C1-10). Settings first, then fixture capture, then the decoder.
 3. **C1c1: large blobs** (D14 store side). Independent.
 4. **C1c2: tailer** (D10, D13, D14 producer side; C1-8, C1-9, tailer halves of C1-4 and C1-10). After C1c1.
 

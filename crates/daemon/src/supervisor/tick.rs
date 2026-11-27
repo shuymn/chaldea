@@ -32,6 +32,7 @@ impl Supervisor {
     /// One tick at `now` (the seam tests drive).
     pub(crate) async fn tick(self: &Arc<Self>, now: Instant) {
         self.git.reap_left();
+        self.version_left.reap();
         let live = self.live.all();
         let mut jobs: Vec<Job> = Vec::new();
         for l in &live {

@@ -1,0 +1,11 @@
+{
+  "fact": {
+    "prompt_submitted": {
+      "prompt": "Reply with exactly the word again."
+    }
+  },
+  "events": [],
+  "sent": "Reply with exactly the word again.",
+  "expected_prompt": "Reply with exactly the word again.",
+  "route": "interpret"
+}

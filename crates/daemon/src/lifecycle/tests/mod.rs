@@ -189,9 +189,18 @@ pub(super) struct Running {
 }
 
 pub(super) fn start(cfg: DaemonConfig, comps: TestComponents, faults: Arc<Faults>) -> Running {
+    start_boxed(cfg, Box::new(comps), faults)
+}
+
+/// [`start`] with any components.
+pub(super) fn start_boxed(
+    cfg: DaemonConfig,
+    comps: Box<dyn super::Components>,
+    faults: Arc<Faults>,
+) -> Running {
     let log = TestLog::default();
     let (l, f) = (log.clone(), faults.clone());
-    let handle = std::thread::spawn(move || run_isolated(cfg, Box::new(comps), l, f));
+    let handle = std::thread::spawn(move || run_isolated(cfg, comps, l, f));
     Running {
         handle: Some(handle),
         faults,

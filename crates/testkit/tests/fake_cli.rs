@@ -390,6 +390,8 @@ fn validate_input_checks_the_pattern() {
         let mut f = l.accept(soon()).unwrap();
         std::io::Write::write_all(c.stdin.as_mut().unwrap(), &payload).unwrap();
         let ev = f.next_event(soon()).unwrap().unwrap();
+        assert_eq!(ev["event"], "bracketed_paste_on", "{ev}");
+        let ev = f.next_event(soon()).unwrap().unwrap();
         assert_eq!(ev["event"], "validated", "{ev}");
         assert_eq!(
             (&ev["bytes"], &ev["ok"]),
@@ -414,6 +416,8 @@ fn validate_input_checks_the_pattern() {
     let mut stdin = c.stdin.take().unwrap();
     std::io::Write::write_all(&mut stdin, b"abc").unwrap();
     drop(stdin);
+    let ev = f.next_event(soon()).unwrap().unwrap();
+    assert_eq!(ev["event"], "bracketed_paste_on", "{ev}");
     let ev = f.next_event(soon()).unwrap().unwrap();
     assert_eq!(
         (&ev["bytes"], &ev["ok"]),

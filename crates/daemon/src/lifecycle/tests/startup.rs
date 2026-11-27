@@ -936,3 +936,58 @@ fn foreground_in_a_job_warns_and_serves() {
     run.stop();
     assert_eq!(run.join().code.code(), 0);
 }
+
+fn supervisor_components() -> Box<dyn super::super::Components> {
+    let host = if cfg!(windows) {
+        chaldea_core::adapter::HostOs::Windows
+    } else {
+        chaldea_core::adapter::HostOs::Macos
+    };
+    Box::new(crate::supervisor::SupervisorComponents::new(
+        host,
+        crate::supervisor::SupervisorConfig::default(),
+    ))
+}
+
+/// C1-1: the supervisor's components write `claude-settings.json` by rename before serving,
+/// its hooks running this executable.
+#[test]
+fn claude_settings_written_before_serving() {
+    let dir = state();
+    let run = super::start_boxed(
+        foreground(&dir.path, Some(hold_port())),
+        supervisor_components(),
+        Arc::new(Faults::default()),
+    );
+    run.serving();
+    let host = if cfg!(windows) {
+        chaldea_core::adapter::HostOs::Windows
+    } else {
+        chaldea_core::adapter::HostOs::Macos
+    };
+    let exe = std::env::current_exe().unwrap();
+    assert_eq!(
+        std::fs::read(dir.path.join("claude-settings.json")).unwrap(),
+        chaldea_core::launch::claude_settings(exe.to_str().unwrap(), host)
+    );
+    run.stop();
+    assert_eq!(run.join().code.code(), 0);
+}
+
+/// C1-1: a failed write of the settings file fails the start with `state_dir`, before the
+/// port is saved or anything served.
+#[test]
+fn claude_settings_write_failure() {
+    let dir = state();
+    let faults = Arc::new(Faults::default());
+    faults.fail_replace("claude-settings.json", ReplaceStage::Write);
+    let run = super::start_boxed(
+        foreground(&dir.path, Some(hold_port())),
+        supervisor_components(),
+        faults,
+    );
+    let r = run.join();
+    assert_eq!((r.code.code(), r.reason), (1, Some(FailReason::StateDir)));
+    assert!(!dir.path.join("claude-settings.json").exists());
+    assert!(!dir.path.join(names::PORT).exists());
+}

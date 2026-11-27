@@ -1,0 +1,33 @@
+{
+  "fact": {
+    "card_evidence": {
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "printf sub > c1b-sub.txt",
+        "description": "Write \"sub\" to a file"
+      },
+      "tool_use_id": "toolu_01JtcnEDvhF96XnBVZ8oXZqP"
+    }
+  },
+  "events": [
+    {
+      "kind": "tool_activity",
+      "phase": "completed",
+      "tool_name": "Bash",
+      "tool_use_id": "toolu_01JtcnEDvhF96XnBVZ8oXZqP",
+      "turn_ref": "72b7e0da-bf7a-4ffb-bd07-74d7adb6e4c7",
+      "input": {
+        "command": "printf sub > c1b-sub.txt",
+        "description": "Write \"sub\" to a file"
+      },
+      "output": {
+        "stdout": "",
+        "stderr": "",
+        "interrupted": false,
+        "isImage": false,
+        "noOutputExpected": false
+      }
+    }
+  ],
+  "route": "interpret"
+}

@@ -1,0 +1,11 @@
+{
+  "fact": {
+    "prompt_submitted": {
+      "prompt": "Reply with exactly the word cleared."
+    }
+  },
+  "events": [],
+  "sent": "Reply with exactly the word cleared.",
+  "expected_prompt": "Reply with exactly the word cleared.",
+  "route": "foreign_session"
+}

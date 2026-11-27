@@ -25,7 +25,7 @@
 - Deferred features (`docs/mvp-design.md` §4 "Deferred"): a built-in Rescue UI with A2UI surfaces (`surface_update` / `surface_action`), one-shot extension hooks, a native `chaldea attach` CLI, `chaldea doctor`.
 
 ### Unavoidable Landmines (Self-Healing Seams)
-- **External CLI schema drift**: Persist `raw_unknown` + CLI version -> add to `fixtures/` contract corpus -> update adapter & verify.
+- **External CLI schema drift**: Persist `raw_unknown` + CLI version (a bounded `<cli> --version` per launch; `null` when it fails, exits other than 0, prints more than its cap, or times out) -> add to `fixtures/` contract corpus -> update adapter & verify.
 - **Unexpected TUI prompts (trust, login, update, sandbox network)**: `SessionStart` timeout / `unconfirmed` input raises attention -> a human clears it through the web terminal view and key bar, or an external agent diagnoses it through `chaldea inspect` and the rescue skill.
 - **OS runtime quirks (ConPTY, worktree locks)**: the real-host dogfooding checklist at each milestone (`docs/mvp-design.md` §6.1); a built-in `chaldea doctor` self-check is deferred.
 

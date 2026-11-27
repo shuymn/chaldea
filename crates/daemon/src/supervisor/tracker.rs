@@ -7,6 +7,7 @@ use std::process::{Child, Command, ExitStatus};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
+use chaldea_pty_runtime::host::ProcessTree;
 use chaldea_pty_runtime::{CloseBounds, CloseOutcome, ProcessIdentity, Session};
 use tokio::sync::Notify;
 
@@ -294,6 +295,22 @@ impl TrackedChild {
             t.release();
         }
         Some(status)
+    }
+
+    /// The child's [`ProcessTree`], its command prepared by `host::own_tree`; `None` once
+    /// reaped.
+    pub(crate) fn adopt_tree(&self) -> Option<io::Result<ProcessTree>> {
+        self.child
+            .as_ref()
+            .map(chaldea_pty_runtime::host::adopt_tree)
+    }
+
+    /// Whether the child exited, without reaping it on Unix ([`ProcessTree::exited`]); `true`
+    /// once reaped, `false` when the OS refused the query.
+    pub(crate) fn exited(&mut self, tree: &ProcessTree) -> bool {
+        self.child
+            .as_mut()
+            .is_none_or(|c| tree.exited(c).unwrap_or(false))
     }
 
     /// Whether the child was reaped.

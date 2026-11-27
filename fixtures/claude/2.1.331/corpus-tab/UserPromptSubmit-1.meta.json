@@ -1,0 +1,11 @@
+{
+  "fact": {
+    "prompt_submitted": {
+      "prompt": "a    b"
+    }
+  },
+  "events": [],
+  "sent": "a\tb",
+  "expected_prompt": "a    b",
+  "route": "interpret"
+}

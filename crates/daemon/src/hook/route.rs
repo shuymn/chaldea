@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use super::HookConfig;
 use super::adapter::{
-    AcceptedHook, BindingRule, HookAdapter, HookEvent, Interpretation, TurnMark, job_watermark,
+    AcceptedHook, BindingRule, HookAdapter, HookEvent, Interpretation, JobMarks, TurnMark,
 };
 use super::ancestry::{Chain, eligible};
 use super::buffer::{self, Meta};
@@ -222,15 +222,15 @@ pub(crate) fn run(
     tx: &mut WriteTx<'_>,
     auth: Option<&Authorized>,
 ) -> Result<Ran, JobError> {
-    let mut marks = Vec::new();
     // The launch's turn watermark, taken once on the writer; the job raises it after its
     // `COMMIT` by the turn boundaries it interpreted (supervisor-send §2.4).
     let cell = auth
         .and_then(|a| a.launch)
         .and_then(|l| d.adapter.turn_watermark(l));
     let committed = cell.as_ref().map_or(0, |c| c.load(Ordering::Acquire));
-    let reply = run_marking(d, tx, auth, &mut marks, committed)?;
-    let raised = job_watermark(committed, &marks);
+    let mut marks = JobMarks::new(committed);
+    let reply = run_marking(d, tx, auth, &mut marks)?;
+    let raised = marks.watermark();
     if let Some(cell) = cell
         && raised > committed
     {
@@ -241,7 +241,7 @@ pub(crate) fn run(
     let clock = d.clock.clone();
     Ok(Ran {
         reply,
-        marks,
+        marks: marks.marks,
         at: tx.commit_stamp(move || clock.now()),
     })
 }
@@ -250,8 +250,7 @@ fn run_marking(
     d: &Delivery,
     tx: &mut WriteTx<'_>,
     auth: Option<&Authorized>,
-    marks: &mut Vec<(u64, TurnMark)>,
-    committed: u64,
+    marks: &mut JobMarks,
 ) -> Result<HookReply, JobError> {
     let (Some(thread), Some(launch)) = (auth.and_then(|a| a.thread), auth.and_then(|a| a.launch))
     else {
@@ -315,10 +314,9 @@ fn run_marking(
                 .binding_receipt_ordinal(thread, launch)?
                 .unwrap_or(0);
             let json = json.as_ref().ok_or_else(super::refused_internal)?;
-            let wm = job_watermark(committed, marks);
-            let hook = accepted(d, thread, &l, h, json, binding_ordinal, wm);
+            let hook = accepted(d, thread, &l, h, json, binding_ordinal, marks.watermark());
             let (interpretation, mark) = d.adapter.interpret(&tx.read(), &hook)?;
-            marks.push((d.ordinal, mark));
+            marks.push(d.ordinal, mark);
             match interpretation {
                 Interpretation::Events(events) => NewRouting::Appended(hook_events(
                     thread,
@@ -419,7 +417,7 @@ fn run_marking(
     buffer::promote_unbound(tx, launch, later)?;
     // 6. Bind.
     if bind {
-        bind_and_promote(d, tx, thread, launch, json.as_ref(), marks, committed)?;
+        bind_and_promote(d, tx, thread, launch, json.as_ref(), marks)?;
     }
     Ok(reply)
 }
@@ -543,8 +541,7 @@ fn bind_and_promote(
     thread: ThreadId,
     launch: LaunchId,
     json: Option<&serde_json::Value>,
-    marks: &mut Vec<(u64, TurnMark)>,
-    committed: u64,
+    marks: &mut JobMarks,
 ) -> Result<(), JobError> {
     let Head::Hook(h) = &d.head else {
         return Err(super::refused_internal());
@@ -556,17 +553,9 @@ fn bind_and_promote(
         .launch(launch)?
         .ok_or_else(super::refused_internal)?;
     let session = l.session_id.clone().ok_or_else(super::refused_internal)?;
-    let hook = accepted(
-        d,
-        thread,
-        &l,
-        h,
-        json,
-        d.ordinal,
-        job_watermark(committed, marks),
-    );
+    let hook = accepted(d, thread, &l, h, json, d.ordinal, marks.watermark());
     let (interpretation, mark) = d.adapter.interpret(&tx.read(), &hook)?;
-    marks.push((d.ordinal, mark));
+    marks.push(d.ordinal, mark);
     let events = match interpretation {
         Interpretation::Events(events) => hook_events(thread, &l, emit, None, events)?,
         Interpretation::Raw(reason) => vec![raw_event(
@@ -589,10 +578,9 @@ fn bind_and_promote(
             .ok_or_else(super::refused_internal)?;
         let emit_b = b.emit_id;
         let ordinal = b.receipt_ordinal;
-        let wm = job_watermark(committed, marks);
-        let (to, mark) = promotion(d, tx, thread, &l, &session, b, wm)?;
+        let (to, mark) = promotion(d, tx, thread, &l, &session, b, marks.watermark())?;
         if let Some(m) = mark {
-            marks.push((ordinal, m));
+            marks.push(ordinal, m);
         }
         tx.hook_delivery_promote(launch, emit_b, to)?;
     }

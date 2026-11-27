@@ -76,7 +76,8 @@ pub fn blocks_gate(
 pub enum RejectReason {
     /// ESC or a C0 control other than TAB, CR, LF.
     ControlCharacter,
-    /// Text the adapter's encoding cannot carry without loss.
+    /// Text the adapter's encoding cannot carry without loss, or that the CLI would
+    /// reinterpret as a command instead of a prompt (Claude, C1 D16).
     LossyText,
     EmptyPrompt,
     /// Codex on Windows trims it (§8 D6).

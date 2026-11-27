@@ -12,6 +12,7 @@
 //! 6. **One owner per record**: the launch's worker applies every write completion.
 
 mod attribution;
+pub mod claude;
 mod commands;
 mod completion;
 mod driver;
@@ -38,9 +39,10 @@ use super::live::LiveLaunch;
 use super::{Supervisor, SupervisorConfig, lock};
 use crate::hook::TurnMark;
 
+pub use claude::ClaudeDecoder;
 pub(crate) use commands::register;
 pub(crate) use hooks::SupervisorHooks;
-pub use hooks::{HookDecoder, HookFact, NoDecoder};
+pub use hooks::{Decoders, HookDecoder, HookFact, NoDecoder};
 pub(crate) use probe::SupervisorProbe;
 
 /// A send unit's dispatch deadline: the writer refuses it with zero bytes after this.
@@ -421,13 +423,14 @@ impl SendLaunch {
     }
 }
 
-/// The send side's shared parts: the launches, the decoder, and the driver's channel.
+/// The send side's shared parts: the launches, the decoders, and the driver's channel.
 pub(crate) struct SendSide {
     /// Readers (the intake probe, commands, the driver, and hook jobs on the store writer)
     /// never wait on each other; a writer holds it only for one insert or remove. Nothing
     /// holding it waits on the store writer.
     pub map: RwLock<HashMap<LaunchId, Arc<SendLaunch>>>,
-    pub decoder: Arc<dyn HookDecoder>,
+    /// Each agent's decoder (send §2.5).
+    pub decoders: Decoders,
     /// The readiness mode of every row, when a test sets one.
     pub mode: Option<ReadinessMode>,
     pub ticks: tokio::sync::watch::Sender<Option<Instant>>,
@@ -460,7 +463,7 @@ impl SendSide {
 pub(crate) fn install(cfg: &mut SupervisorConfig) -> Arc<SendSide> {
     let side = Arc::new(SendSide {
         map: RwLock::new(HashMap::new()),
-        decoder: cfg.decoder.clone(),
+        decoders: cfg.decoders.clone(),
         mode: cfg.readiness_mode,
         ticks: tokio::sync::watch::channel(None).0,
     });
