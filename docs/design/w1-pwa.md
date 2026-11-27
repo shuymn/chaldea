@@ -32,8 +32,8 @@ A pure reducer `(State, Action) → (State, Effect[])` holds sync state.
 - **F1 both ways** (formal-specs:326): host owns membership and `closed`; a valid thread copy owns axes and attention; initial `task_state` comes from registration. Unfollowed rows label host values "last known" or "unavailable".
 - **Rules**: formal-specs §7.1, §7.4 (:224-240, :339). A thread 404 removes copy, selection, and row for the epoch; a `host` 404 is an error.
 - **Socket**: every `open` makes earlier requests older, resets announced heads, subscribes the full set, and makes streams and pending history due; callbacks bind to it. `hello` sets the socket's epoch only; heads count in the held epoch, merged by max for followed ids, omissions ignored (http D15). Only a current successful forward response sets the epoch; a backward resync waits for a later forward issue.
-- **Scheduling**: host, displayed, others; four reads at most, ticket outside; 10 s timeout (daemon 5 s).
-- **Failures**: forward 408, 503, and network errors stay due, backing off to 30 s (honouring `retry_after`). Bodies over 16 MiB are refused unparsed: pages retry smaller; a snapshot or event that large shows an error naming the limit. Other failures keep the last good copy and show a retry, never looping.
+- **Scheduling**: host, displayed, others; four reads at most, ticket outside; 10 s timeout.
+- **Failures**: forward 408, 503, and network errors stay due, backing off to 30 s (honouring `retry_after`). Bodies over 16 MiB are refused unparsed: pages retry smaller; a snapshot or event that large shows an error naming the limit. Other failures keep the last good copy and show a retry.
 - **Status** (mvp:220), by the forward reads of `host` and the selected thread: `connecting` first, `live` (`hello`, reads reach the daemon), `offline` (socket down, reads or ticket POST fail in transport), else `updates paused`; W2 locks input unless `live`. "Last synced" marks a current forward read completing catch-up of every followed stream not in error; outages keep it. State is in memory.
 
 ### 2.4 History Window
@@ -89,8 +89,8 @@ All reversible.
 
 - **Screen as state** (invariant 1): no action carries screen data; W1 never uses `/screen` or attach.
 - **Limit, one OS account**: same-origin script could read the token; the MVP trusts the account.
-- **Epochs**: a restored database may keep tokens and epoch, detectable only through `CursorAhead`.
-- **Limits**: unfollowed rows show "last known"; history within the read limit stays one action away; evicted storage costs one `chaldea open`; a snapshot can pass 16 MiB (e.g. 250 unresolved inputs at the 64 KiB inline limit, `payload.rs:18`, or a huge thread list).
+- **Epochs**: a restored database keeping tokens and epoch shows only through `CursorAhead`.
+- **Limits**: history within the read limit is one action away; evicted storage costs one `chaldea open`; a snapshot can pass 16 MiB (e.g. 250 unresolved 64 KiB inline inputs, `payload.rs:18`, or a huge thread list); a resume racing a notice may use the old token once (valid, or a 401).
 
 ## 6. Proposed Canonical Edits
 
