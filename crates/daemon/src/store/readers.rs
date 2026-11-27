@@ -1706,7 +1706,7 @@ mod tests {
         std::thread::scope(|sc| {
             let waiter = sc.spawn(|| pool.borrow(wait_until).map(drop));
             // Once the lock is taken after the wait was counted, the borrower waits; the
-            // reader comes back under the lock, which is held past the deadline.
+            // reader comes back under the lock, which is held until the deadline is reached.
             while pool.waits.load(std::sync::atomic::Ordering::Acquire) == 0
                 && !waiter.is_finished()
             {
