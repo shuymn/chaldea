@@ -44,7 +44,7 @@ The displayed thread has one contiguous window (2,000 events, 16 MiB serialized)
 
 The decoder mirrors `TypedEvent::decode` (`crates/core/src/event.rs:216-229`): `schema_version` above the Rust-exported `SCHEMA_VERSION` → `newer_schema`; unknown kind → `unknown_kind`; failing payload → `payload_invalid`; each renders as "unknown event" without failing a page (mvp:58). Validators are Ajv 2020 standalone code (CSP forbids `eval`) with explicit `uuid`, `date-time`, and integer formats.
 
-The list shows agent, cwd, axes, attention, closed; the timeline shows events in `seq` order as plain text (no Markdown), blobs as preview and size, never screen text. Layout is reversible.
+The list shows agent, cwd, axes, attention, closed; the timeline shows events in `seq` order as plain text (no Markdown), blobs as preview and size, never screen text.
 
 ## 3. Decisions
 
