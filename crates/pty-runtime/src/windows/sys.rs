@@ -1210,8 +1210,9 @@ pub(crate) fn file_links(h: BorrowedHandle<'_>) -> io::Result<u32> {
 
 /// What `open_regular` reads from an open handle: whether `GetFileType` says a disk file,
 /// its attributes, and its identity: the volume serial number and 128-bit file id of
-/// `FileIdInfo`, or, where the file system does not answer that class, the 32-bit serial and
-/// 64-bit file index of `GetFileInformationByHandle` (unique on NTFS, not on ReFS).
+/// `FileIdInfo`, or, where the file system does not answer that class
+/// (`file::file_id_class_unsupported`), the 32-bit serial and 64-bit file index of
+/// `GetFileInformationByHandle` (unique on NTFS, not on ReFS); any other error is returned.
 pub(crate) struct HandleFile {
     pub(crate) disk: bool,
     pub(crate) attributes: u32,
@@ -1265,6 +1266,10 @@ pub(crate) fn handle_file(h: BorrowedHandle<'_>) -> io::Result<HandleFile> {
             u128::from_le_bytes(ids.FileId.Identifier),
         )
     } else {
+        let e = io::Error::last_os_error();
+        if !crate::file::file_id_class_unsupported(e.raw_os_error()) {
+            return Err(e);
+        }
         (
             u64::from(info.dwVolumeSerialNumber),
             (u128::from(info.nFileIndexHigh) << 32) | u128::from(info.nFileIndexLow),

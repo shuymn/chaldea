@@ -85,6 +85,15 @@ impl RegularFile {
     pub fn size(&self) -> io::Result<u64> {
         Ok(self.file.metadata()?.len())
     }
+
+    /// The open file's last modification time, from its handle.
+    ///
+    /// # Errors
+    ///
+    /// The handle's query failed.
+    pub fn modified(&self) -> io::Result<std::time::SystemTime> {
+        self.file.metadata()?.modified()
+    }
 }
 
 impl Read for RegularFile {
@@ -111,16 +120,26 @@ pub fn open_regular(path: &Path) -> Result<RegularFile, OpenError> {
     imp::open_regular(path)
 }
 
+/// Whether a Windows error from `GetFileInformationByHandleEx(FileIdInfo)` says the file
+/// system does not answer that class (`ERROR_INVALID_FUNCTION`, `ERROR_NOT_SUPPORTED`,
+/// `ERROR_INVALID_PARAMETER`), so the 64-bit file index is used instead; any other error is
+/// an I/O error.
+#[cfg(any(windows, test))]
+pub(crate) fn file_id_class_unsupported(code: Option<i32>) -> bool {
+    matches!(code, Some(1 | 50 | 87))
+}
+
 /// Whether the Windows path `text` names the device or pipe namespace: `\\.\…`, the NT
 /// namespace `\??\…`, a verbatim `\\?\…` other than a drive (`\\?\C:\`) or a UNC share
 /// (`\\?\UNC\`), or the named-pipe share `pipe` of any server (`\\server\pipe\…`,
-/// `\\?\UNC\server\pipe\…`), with either separator and in any case.
+/// `\\?\UNC\server\pipe\…`), with either separator, repeated separators, and in any case.
 #[cfg(any(windows, test))]
 fn device_namespace(text: &str) -> bool {
     let text = text.replace('/', "\\").to_ascii_lowercase();
-    // The share of a UNC path's `server\share\…` part.
+    // The share of a UNC path's `server\share\…` part; Win32 collapses repeated separators.
     let pipe_share = |unc: &str| {
         unc.split('\\')
+            .filter(|c| !c.is_empty())
             .nth(1)
             .is_some_and(|share| share.trim_end_matches(['.', ' ']) == "pipe")
     };
@@ -131,8 +150,9 @@ fn device_namespace(text: &str) -> bool {
         if let Some(unc) = rest.strip_prefix("unc\\") {
             return pipe_share(unc);
         }
+        // A drive and its root: `C:\…`; a bare `C:` names the volume device.
         let b = rest.as_bytes();
-        return !(b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':');
+        return !(b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\');
     }
     text.strip_prefix("\\\\").is_some_and(pipe_share)
 }
@@ -257,6 +277,17 @@ mod tests {
     }
 
     #[test]
+    fn only_an_unsupported_class_falls_back_to_the_file_index() {
+        for code in [1, 50, 87] {
+            assert!(file_id_class_unsupported(Some(code)), "{code}");
+        }
+        // Access denied, an invalid handle, a lock violation, a network error, none.
+        for code in [Some(5), Some(6), Some(33), Some(64), Some(0), None] {
+            assert!(!file_id_class_unsupported(code), "{code:?}");
+        }
+    }
+
+    #[test]
     fn device_and_pipe_namespaces_are_refused() {
         let refused = [
             r"\\.\pipe\chaldea-none",
@@ -272,6 +303,10 @@ mod tests {
             r"\\?\UNC\server\pipe\x",
             r"\\?\unc\server\PiPe\x",
             "//?/UNC/server/pipe/x",
+            r"\\server\\pipe\x",
+            r"\\\server\pipe\x",
+            r"\\?\UNC\server\\pipe\x",
+            r"\\?\C:",
         ];
         for p in refused {
             assert!(device_namespace(p), "{p}");
