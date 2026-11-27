@@ -1353,6 +1353,58 @@ async fn envelope_tips_over() {
     assert!(!cutoff(1).await);
 }
 
+/// R-9, T1-2 at the production bound: one cell's long zero-width run brings `attached` to
+/// exactly 192 KiB, which keeps the grid; the same screen one byte larger gives
+/// `grid: null` within the bound; a run that alone is over the budget gives `grid: null`
+/// too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn production_cap_with_zero_width_run() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let max = rig.sup.cfg.attach.attached_max;
+    assert_eq!(max, 192 * 1024);
+    let (sink, rx) = chaldea_pty_runtime::channel_sink(1 << 20);
+    let e = rig.sup.entry(live.l).unwrap();
+    e.with_session(&rig.sup, rig.sup.now() + Duration::from_secs(1), |s| {
+        s.subscribe(sink, soon())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    // Clears the screen and writes `e` followed by `extra` bytes of the same cell's text:
+    // combining marks on `e`, two UTF-8 bytes each, one of three bytes when odd.
+    let screen = async |extra: usize| {
+        let mut piece = "\x1b[2J\x1b[He".to_owned();
+        let three = extra % 2;
+        piece.push_str(&"\u{20d0}".repeat(three));
+        piece.push_str(&"\u{301}".repeat((extra - 3 * three) / 2));
+        // A sequence the grid does not show ends the screen, so the wait is for all of it
+        // (a tail of marks would match any chunk the drain read).
+        piece.push_str("\x1b[?25h");
+        live.child.emit(piece.as_bytes());
+        SRig::delivered(&rx, b"\x1b[?25h").await;
+        attached_len(&rig, &live).await
+    };
+    let (base, _) = screen(0).await;
+    let (len, m) = screen(max - base).await;
+    assert_eq!(len, max);
+    assert!(grid_of(&m).is_some(), "kept at exactly the bound");
+    let (len, m) = screen(max - base + 1).await;
+    assert!(len <= max, "{len}");
+    assert!(
+        matches!(m, AttachServerMessage::Attached { grid: None, .. }),
+        "one byte over"
+    );
+    // A run that alone is far over the budget.
+    let (len, m) = screen(2 * max).await;
+    assert!(len <= max, "{len}");
+    assert!(matches!(
+        m,
+        AttachServerMessage::Attached { grid: None, .. }
+    ));
+    rig.stop().await;
+}
+
 /// R-9: a screen whose grid encodes above 256 KiB attaches with `grid: null` within the
 /// bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
