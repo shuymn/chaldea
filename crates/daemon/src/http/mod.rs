@@ -268,6 +268,8 @@ impl Shared {
     }
 
     pub(crate) fn nudge(&self) {
+        #[cfg(test)]
+        self.faults.publishing();
         self.revocations.send_modify(|n| *n = n.wrapping_add(1));
     }
 

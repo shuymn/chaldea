@@ -2978,6 +2978,10 @@ async fn nudge_after_snapshot_still_blocks_takeover() {
     entered(&at);
     rig.srv.revoke_quietly(&owner_c).await;
     let swaps = h.swaps.load(std::sync::atomic::Ordering::SeqCst);
+    let publishing = shared
+        .faults
+        .nudges_publishing
+        .load(std::sync::atomic::Ordering::SeqCst);
     let nudger = std::thread::spawn({
         let (shared, h) = (shared.clone(), h.clone());
         move || {
@@ -2985,26 +2989,30 @@ async fn nudge_after_snapshot_still_blocks_takeover() {
             h.swaps.load(std::sync::atomic::Ordering::SeqCst)
         }
     });
-    // Gives the publisher time to run if nothing holds it back. The result never depends on
-    // this wait: with the lock held the publisher cannot finish before the swap however long
-    // it waits; the wait only lets a broken serialization show.
-    tokio::task::block_in_place(|| {
-        let until = std::time::Instant::now() + Duration::from_millis(200);
-        while !nudger.is_finished() && std::time::Instant::now() < until {
-            std::thread::yield_now();
-        }
-    });
+    // The publisher has reached the nudge's lock (with the comparison's hold it waits).
+    rig.until("the publisher reached the lock", || {
+        shared
+            .faults
+            .nudges_publishing
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > publishing
+    })
+    .await;
     go.send(()).unwrap();
     let seen = tokio::task::block_in_place(|| nudger.join().unwrap());
     assert!(seen > swaps, "the nudge was published before the swap");
     let (ws, _) = bounded(WS_WAIT, connect).await.unwrap().unwrap().unwrap();
     let mut cl = Client { ws, closed: None };
-    let first = cl.text().await;
+    // Revoked as the operating socket: 1008, or dropped while its first send is in flight
+    // (with or without `attached` delivered).
+    let (code, texts) = cl.until_closed().await;
+    assert!(matches!(code, Some(1008) | None), "{code:?}");
     assert!(
-        matches!(first, Some(AttachServerMessage::Attached { .. })),
-        "{first:?}"
+        texts
+            .iter()
+            .all(|m| matches!(m, AttachServerMessage::Attached { .. })),
+        "{texts:?}"
     );
-    assert_eq!(cl.until_closed().await.0, Some(1008));
     assert_eq!(a.until_closed().await.0, Some(4003));
     rig.stop().await;
 }

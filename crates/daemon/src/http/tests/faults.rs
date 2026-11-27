@@ -75,6 +75,8 @@ pub(crate) struct Points {
     pub(crate) completion_pauses: Mutex<Vec<(std::time::Instant, std::time::Instant)>>,
     /// Connections whose first byte was read (the request origin recorded).
     pub(crate) first_bytes: AtomicUsize,
+    /// Revocation nudges about to be published (before the watch's lock).
+    pub(crate) nudges_publishing: AtomicUsize,
     /// Taken by the next receipt completion attempt, which holds it inside its job on the
     /// writer thread.
     pub(crate) completion_hold: Mutex<Option<WriterHold>>,
@@ -370,6 +372,10 @@ impl Points {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    pub(crate) fn publishing(&self) {
+        self.nudges_publishing.fetch_add(1, Ordering::SeqCst);
     }
 
     pub(crate) fn first_byte_read(&self) {
