@@ -465,3 +465,54 @@ impl IntakeOrder {
         lock(&e.state).pending.contains(&ordinal)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A claim whose request clock crosses the deadline at the claim takes no ordinal: the
+    /// clock is read after the claim, not before it.
+    #[test]
+    fn deadline_crosses_at_claim() {
+        /// Reads just before `deadline` while the cell is pending, and `deadline` after.
+        struct ClaimClock {
+            cell: Arc<AtomicU8>,
+            deadline: Instant,
+        }
+
+        impl MonotonicClock for ClaimClock {
+            fn now(&self) -> Instant {
+                if self.cell.load(Ordering::SeqCst) == PENDING {
+                    self.deadline - Duration::from_millis(1)
+                } else {
+                    self.deadline
+                }
+            }
+
+            fn real(&self, at: Instant) -> Instant {
+                at
+            }
+        }
+
+        let order = Arc::new(IntakeOrder::default());
+        let launch = LaunchId::from_u128(1);
+        let entry = order.entry(launch, 0);
+        let guard = entry.intake.clone().try_lock_owned().unwrap();
+        let cell = Arc::new(AtomicU8::new(PENDING));
+        let deadline = Instant::now();
+        let clock = ClaimClock {
+            cell: cell.clone(),
+            deadline,
+        };
+        let probe: Arc<dyn IntakeProbe> = Arc::new(NoIntakeFacts);
+
+        let result = order.start(
+            &entry, guard, &cell, &clock, deadline, launch, &probe, deadline,
+        );
+
+        assert!(matches!(result, Start::Expired));
+        assert_eq!(cell.load(Ordering::SeqCst), STARTED);
+        assert_eq!(order.next(launch), Some(1));
+        assert!(!order.is_pending(launch, 1));
+    }
+}

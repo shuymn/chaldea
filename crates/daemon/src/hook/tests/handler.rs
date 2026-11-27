@@ -606,6 +606,45 @@ async fn submitted_hook_cannot_reply_before_commit() {
     }
 }
 
+/// The handler's last deadline check is before its write observer registers (L-12): a
+/// request deadline that passes after the registration but before `Store::submit` is
+/// decided by the writer. The server's clock stands still; the observer is held at the
+/// submit gate while the clock is put past the deadline, so the job's `not_after` is past
+/// on submission, the writer answers J1 `Expired`, and the reply, inside the grace, is 408
+/// with nothing stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expiry_after_registration_before_submit_is_j1() {
+    use crate::http::{ApiError, MonotonicClock};
+
+    let h = HookServer::start().await;
+    h.srv.clock.stop();
+    let l = h.codex(1).await;
+    let hook = Hook::of(&l, "Stop", "s");
+    let ctx = write_ctx(&h, &l);
+    let deadline = ctx.deadline();
+    let s = shared(&h.srv);
+    let expired = s.faults.expired_writes();
+    let (registered, release) = s.faults.arm_submit_gate();
+    let response = h.ingest.clone().handle(ctx, request(&hook));
+    tokio::pin!(response);
+    tokio::select! {
+        biased;
+        _ = &mut response => panic!("the handler replied before submission"),
+        () = reached(registered) => {}
+    }
+    assert!(h.ingest.order.is_pending(l.launch, 1), "not submitted yet");
+    h.srv
+        .clock
+        .advance(deadline.duration_since(h.srv.clock.now()) + Duration::from_millis(1));
+    release.send(()).unwrap();
+    let reply = waits::bounded(WAIT, &mut response).await.unwrap();
+    assert_eq!(reply.err(), Some(ApiError::request_timeout()));
+    assert_eq!(s.faults.expired_writes(), expired + 1);
+    assert!(!h.ingest.order.is_pending(l.launch, 1));
+    assert!(h.delivery(l.launch, hook.emit).is_none());
+    h.stop().await;
+}
+
 /// A hook whose job passed `Store::submit` and whose client then disconnected is still
 /// decided by the writer: reached after its `not_after`, it expires and stores nothing
 /// (§2.13 "Best-effort delivery"). The empty job after it is a FIFO barrier. The server's
