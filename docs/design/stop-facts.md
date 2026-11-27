@@ -46,7 +46,7 @@ Also rejected: unbounded waits, test retries, worker-side repair (SB15).
 - **The intake point is step 6's section**; the ordinal orders the launch's hooks; a permission, completion, or record commit during steps 4–6 precedes it.
 - `set_running`, `written`, human registration, and the open job's recheck run under `SendState`; a record committing after the read leaves its unit running.
 - **A write permitted before an intake's first counter read is in its facts**: permission and publication share the odd section, and the reader retries while it is odd.
-  - A later permission is refused (the fence moved) or is a reply whose bytes follow publication, so it cannot have caused the hook.
+  - A later permission cannot have caused the hook: a hook-fenced write is refused (the fence moved), an attach write is fenced by its socket grant instead and its bytes follow the intake, and a reply's bytes follow publication.
   - `attribution::written_alone`, SB3's basis, and `human_at` miss no earlier write.
 
 ## 4. Hook Kinds M1 Needs
