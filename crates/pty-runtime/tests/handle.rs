@@ -342,3 +342,25 @@ fn close_steps_capped_at_end() {
     assert!(steps.iter().all(|at| *at <= end), "{steps:?} after {end:?}");
     assert!(out.abandoned.contains(&"pty-wait"), "{out:?}");
 }
+
+/// I-1: `close_by`'s explicit kill deadline is capped at the close's one end too: with
+/// zero budgets the end is the start, so the kill step makes no OS call however far off
+/// the caller's deadline is.
+#[test]
+fn close_by_kill_cannot_outlive_the_close_end() {
+    let Rig { session, child, .. } = rig();
+    let zero = std::time::Duration::ZERO;
+    let bounds = CloseBounds {
+        kill: zero,
+        input: zero,
+        close: zero,
+        drain: zero,
+        join: zero,
+    };
+    let _out = session.close_by(
+        &[],
+        Instant::now() + std::time::Duration::from_secs(3600),
+        bounds,
+    );
+    assert_eq!(child.signals(), 0);
+}

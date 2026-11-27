@@ -1071,7 +1071,7 @@ impl Session {
     }
 
     /// [`Session::close`] whose kill step waits only until the absolute `kill_deadline`
-    /// (also its `lock_by`) instead of `now + bounds.kill`, and reuses the last kill report
+    /// (also its `lock_by`), capped at the close's end, instead of `now + bounds.kill`, and reuses the last kill report
     /// when that proved the tree dead for the same `extra` list, empty or not. The other
     /// steps keep `bounds`.
     #[must_use = "the outcome says what was confirmed released"]
@@ -1129,7 +1129,15 @@ impl Session {
             (Some((k, _)), None) if k.tree_dead && extra.is_empty() => k,
             (Some((k, list)), Some(_)) if k.tree_dead && list == extra => k,
             (_, at) => {
-                let at = at.unwrap_or_else(|| step_by(&sh, bounds.kill, end));
+                // An explicit `close_by` deadline is capped at the end as every step is.
+                let at = match at {
+                    Some(at) => {
+                        let at = at.min(end);
+                        crate::probe_deadline!(sh, Step, at);
+                        at
+                    }
+                    None => step_by(&sh, bounds.kill, end),
+                };
                 self.child.kill_tree(extra, at, at)
             }
         };
