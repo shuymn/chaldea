@@ -521,6 +521,41 @@ async fn deadline_before_ordinal() {
     env.stop().await;
 }
 
+/// SF-9: the request deadline passing just before the start point's claim (the request
+/// clock read after it): the claim takes nothing, so a `UserPromptSubmit` is 408 with the
+/// launch's next ordinal, its fence word, and its `latest_intake` unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deadline_at_claim() {
+    use crate::supervisor::send::tests::SRig;
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let (w, latest, next) = (
+        sl.fence.load(Ordering::SeqCst),
+        sl.latest_intake.load(Ordering::SeqCst),
+        rig.ingest.order.next(live.l),
+    );
+    let clock = rig.clock.clone();
+    *rig.ingest.order.before_claim.lock().unwrap() =
+        Some(Box::new(move || clock.advance(Duration::from_secs(3600))));
+    let r = rig
+        .post(&rig.hook_of(
+            &live,
+            "UserPromptSubmit",
+            &serde_json::json!({ "prompt": "p" }),
+        ))
+        .await;
+    assert_eq!(r.status, 408, "{r:?}");
+    assert!(
+        rig.ingest.order.before_claim.lock().unwrap().is_none(),
+        "the claim was reached"
+    );
+    assert_eq!(rig.ingest.order.next(live.l), next, "no ordinal");
+    assert_eq!(sl.fence.load(Ordering::SeqCst), w, "the fence unchanged");
+    assert_eq!(sl.latest_intake.load(Ordering::SeqCst), latest);
+    rig.stop().await;
+}
+
 /// SF-9: a request dropped after its intake took the ordinal: the intake runs to its end and
 /// finishes once with no marks, releasing the ordinal; the ordinal is a gap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

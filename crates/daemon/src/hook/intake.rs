@@ -179,6 +179,9 @@ pub struct IntakeOrder {
     /// Run once at the start of the intake's blocking task, before its checks (tests only).
     #[cfg(test)]
     pub(crate) task_started: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Run once at the start point, under `state`, before the claim (tests only).
+    #[cfg(test)]
+    pub(crate) before_claim: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Run once right after the ordinal was taken, before the facts (tests only).
     #[cfg(test)]
     pub(crate) after_ordinal: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -263,7 +266,7 @@ impl Drop for CancelOnDrop {
 /// How the intake's blocking task ended.
 enum Start {
     Started(Taken),
-    /// The request deadline passed before the start point.
+    /// The request deadline had passed at the claim.
     Expired,
     /// The request was dropped before the start point.
     Cancelled,
@@ -362,15 +365,18 @@ impl IntakeOrder {
         // 4. The start point and the ordinal, under `state`.
         let ticket = {
             let mut st = lock(&e.state);
-            if clock.now() >= deadline {
-                cell.store(CANCELLED, Ordering::SeqCst);
-                return Start::Expired;
-            }
+            #[cfg(test)]
+            run_once(&self.before_claim);
+            // The claim, then the request clock: a claim that finds the deadline passed
+            // takes nothing, as a drop would, so only an in-time claim takes an ordinal.
             if cell
                 .compare_exchange(PENDING, STARTED, Ordering::SeqCst, Ordering::SeqCst)
                 .is_err()
             {
                 return Start::Cancelled;
+            }
+            if clock.now() >= deadline {
+                return Start::Expired;
             }
             let ordinal = st.next;
             st.next = st.next.saturating_add(1);
