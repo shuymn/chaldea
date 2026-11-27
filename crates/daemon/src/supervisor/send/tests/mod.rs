@@ -7,6 +7,7 @@ mod evidence;
 mod flow;
 mod gate;
 mod human;
+mod interval;
 mod outcomes;
 mod probe;
 mod timers;

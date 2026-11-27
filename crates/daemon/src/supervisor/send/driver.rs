@@ -677,6 +677,7 @@ fn refuse(sl: &SendLaunch, input: InputId) {
             outcome: WriteOutcome::NotStarted(chaldea_pty_runtime::Refusal::Closed),
         },
         report: None,
+        decided: super::Decided::default(),
     });
     sl.wake.notify_one();
 }

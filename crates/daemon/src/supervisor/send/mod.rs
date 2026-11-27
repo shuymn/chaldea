@@ -27,7 +27,7 @@ pub(crate) mod tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, TryLockError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use chaldea_core::adapter::{Capabilities, ReadinessMode};
@@ -149,10 +149,15 @@ pub(crate) enum KeyReport {
     NotStarted,
 }
 
+/// An attach record's `human_write` decision, set once by the first committed job that made
+/// it: the interval key it appended, or `None` when its interval already had its event.
+pub(crate) type Decided = Arc<OnceLock<Option<chaldea_core::ids::IdempotencyKey>>>;
+
 /// One completion the writer fired, with the key effect waiting for it, if any.
 pub(crate) struct Fired {
     pub record: WriteRecord,
     pub report: Option<oneshot::Sender<KeyReport>>,
+    pub decided: Decided,
 }
 
 /// The turn log (send §2.4 "Settle completion"): each interpreted hook's mark by receipt
@@ -228,7 +233,7 @@ pub(crate) struct SendState {
     /// Human records taken from the writer and not yet recorded, in `seq` order.
     pub held: Vec<Fired>,
     /// The records the exit job copied at its first attempt (send §2.3 "After exit").
-    pub exit_set: Option<Vec<WriteRecord>>,
+    pub exit_set: Option<Vec<(WriteRecord, Decided)>>,
 }
 
 /// Test points inside a launch's send side (send §6 "Host speed").
@@ -244,6 +249,8 @@ pub(crate) struct SendHooks {
     pub after_submit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs before each completion or human-write job.
     pub record_job: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs on the worker after a human record's job committed, before the record settles.
+    pub after_human_record: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs inside the settle job (on the store writer).
     pub settle_job: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs inside the open job (on the store writer).
@@ -375,6 +382,7 @@ impl SendLaunch {
             lock(&me.fired).push(Fired {
                 record: r.clone(),
                 report,
+                decided: Decided::default(),
             });
             me.outstanding.fetch_sub(1, Ordering::AcqRel);
             me.wake.notify_one();

@@ -12,7 +12,7 @@ use chaldea_pty_runtime::{WriteOrigin, WriteRecord};
 use super::super::events::{ThreadJob, thread_row};
 use super::super::exit::{ExitFacts, ExitStep};
 use super::completion::{human_write_in, report_of, settle_human};
-use super::{SendSide, lock};
+use super::{Decided, SendSide, lock};
 use crate::store::{JobError, StoreError, WriteTx};
 
 pub(crate) struct SendExitStep(pub(crate) Arc<SendSide>);
@@ -27,7 +27,7 @@ fn store_err(e: JobError) -> StoreError {
 impl SendExitStep {
     /// The human records the worker holds unrecorded, copied at the exit job's first attempt
     /// and the same on every retry.
-    fn exit_set(&self, exit: &ExitFacts) -> Vec<WriteRecord> {
+    fn exit_set(&self, exit: &ExitFacts) -> Vec<(WriteRecord, Decided)> {
         let Some(sl) = self.0.launch(exit.launch_id) else {
             return Vec::new();
         };
@@ -44,7 +44,12 @@ impl SendExitStep {
         }
         lock(&sl.fired).extend(inputs);
         if st.exit_set.is_none() {
-            st.exit_set = Some(st.held.iter().map(|f| f.record.clone()).collect());
+            st.exit_set = Some(
+                st.held
+                    .iter()
+                    .map(|f| (f.record.clone(), f.decided.clone()))
+                    .collect(),
+            );
         }
         st.exit_set.clone().unwrap_or_default()
     }
@@ -59,11 +64,12 @@ impl ExitStep for SendExitStep {
                 WriteOrigin::Input { input_id } => {
                     sealed_input(tx, exit, input_id, rec).map_err(store_err)?;
                 }
-                _ => human_write_in(tx, thread, launch, rec).map_err(store_err)?,
+                _ => human_write_in(tx, thread, launch, rec, &Decided::default())
+                    .map_err(store_err)?,
             }
         }
-        for rec in self.exit_set(exit) {
-            human_write_in(tx, thread, launch, &rec).map_err(store_err)?;
+        for (rec, decided) in self.exit_set(exit) {
+            human_write_in(tx, thread, launch, &rec, &decided).map_err(store_err)?;
         }
         // The launch's open cards expire.
         let cards: Vec<_> = tx
@@ -100,7 +106,7 @@ impl ExitStep for SendExitStep {
             return;
         };
         let set = sl.state().exit_set.take().unwrap_or_default();
-        for rec in set {
+        for (rec, _) in set {
             settle_human(&sl, rec.seq, report_of(&rec));
         }
         sl.wake.notify_one();
