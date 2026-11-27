@@ -68,7 +68,7 @@ crates/daemon/src/http/routes.rs     # RouteSpec, ROUTES, Mount, build_router (t
 crates/daemon/src/http/guard.rs      # OuterService (span, RequestStart, Host), GuardLayer (per route: method → … → size)
 crates/daemon/src/http/auth.rs       # Secret, TokenService, verify_secret_in / verify_hash_in, Principal, deny_for, ObjectScope
 crates/daemon/src/http/tickets.rs    # TicketStore, PairCodes (memory, single use)
-crates/daemon/src/http/ctx.rs        # ReadCtx, WriteCtx, run_write (the one submit-and-observe path), observe_write
+crates/daemon/src/http/ctx.rs        # ReadCtx, WriteCtx, run_write (the one submit-and-observe path), await_write
 crates/daemon/src/http/error.rs      # ApiError, codes, the store-outcome mapping, extractor-rejection mapping (§2.9)
 crates/daemon/src/http/scope.rs      # ReadScope: the streams, threads, and worktrees a token may read (§2.7)
 crates/daemon/src/http/sync_api.rs   # GET /api/events, /api/threads, /api/threads/{thread_id}, /api/worktrees
@@ -247,7 +247,7 @@ pub(crate) fn build_router(mounts: Mounts, shared: &Arc<Shared>) -> Router;  // 
 
 **Read routes cannot write; write routes cannot time out by dropping.** Only a spec whose `mount` is `Write` can be mounted with `Mount::write` (each `Mount` constructor checks the spec's kind), the guard dispatches on the typed endpoint and constructs `WriteCtx` only in its write arm, and it wraps only read handlers in `until_deadline` (`deadline::settle_before`: a `timeout_at(deadline)`, then one clock sample after the handler's future is dropped) → 408 (H6 is why write routes are not). The store handle is private to `ctx.rs`, so a handler reaches the store only through `ReadCtx` or `WriteCtx`. The two memory-only routes are read mounts: a 408 there leaves at most an unreturned ticket or code that expires unused.
 
-**Building the router.** `build_router` registers each mount's path with `route_service`, behind `GuardLayer::new(spec, shared).into_service(endpoint)`, so every method of the path reaches the guard, which compares it with the spec's method first and answers a wrong one itself with its `Allow` (no `MethodRouter`, so axum neither routes `HEAD` to a `GET` handler nor adds its own `Allow`, H11); it adds a router fallback for unknown paths. hyper sends no body for a `HEAD` response, so the `HEAD` 405 has the headers of a 405 and an empty body. `crates/daemon/clippy.toml` lists axum's `Router::route`, `route_service`, `nest`, `nest_service`, `merge`, `fallback`, and `fallback_service` under `disallowed-methods`; `build_router` carries the one `#[allow(clippy::disallowed_methods)]`. `build_router` refuses (panics at startup; tested) a mount whose spec is not in `ROUTES` and a `ROUTES` entry with no mount. Production `Mounts::mvp()` mounts every route, with 501 handlers for routes whose PR has not merged.
+**Building the router.** `build_router` registers each mount's path with `route_service`, behind `GuardLayer::new(spec, shared.clone()).into_service(endpoint)`, so every method of the path reaches the guard, which compares it with the spec's method first and answers a wrong one itself with its `Allow` (no `MethodRouter`, so axum neither routes `HEAD` to a `GET` handler nor adds its own `Allow`, H11); it adds a router fallback for unknown paths. hyper sends no body for a `HEAD` response, so the `HEAD` 405 has the headers of a 405 and an empty body. `crates/daemon/clippy.toml` lists axum's `Router::route`, `route_service`, `nest`, `nest_service`, `merge`, `fallback`, and `fallback_service` under `disallowed-methods`; `build_router` carries the one `#[allow(clippy::disallowed_methods)]`. `build_router` refuses (panics at startup; tested) a mount whose spec is not in `ROUTES` and a `ROUTES` entry with no mount. Production `Mounts::mvp()` mounts every route, with 501 handlers for routes whose PR has not merged.
 
 **Guard order** (mvp §2.5 "Order", "Rejections"):
 
@@ -284,7 +284,7 @@ impl ReadCtx {
 pub struct WriteCtx { principal: Option<Principal>, deadline: Instant, shared: Arc<Shared> }
 impl WriteCtx {
     pub async fn body_within(&self, body: Body, max: u64) -> Result<Bytes, ApiError>;   // 408 at the deadline, 413 over max
-    /// One non-command write through `observe_write`, its result awaited until `deadline + write_reply_grace`.
+    /// One non-command write through `await_write`, its result awaited until `deadline + write_reply_grace`.
     pub async fn write<R: Send + 'static>(&self, job: impl FnOnce(&mut WriteTx<'_>, Option<&Authorized>) -> Result<R, JobError> + Send + 'static)
         -> Result<R, ApiError>;     // no reply by then → 503 `outcome_unknown` (never `in_progress`: no receipt)
     /// `write` whose observer drops `release` as soon as `Store::submit` returns (or with the observer, refused
@@ -312,13 +312,13 @@ pub(crate) trait OnReply<R>: Send + 'static {
 }
 /// The one submit-and-observe path: submits, owns and awaits the ticket (the writer answers every accepted
 /// job, store §5), reports a fatal outcome to `LifecycleSink`, and runs `after_ok` on success (e.g. the
-/// revocation nudge). Called by an already registered task: an `observe_write` observer or a `CommandRunner`.
+/// revocation nudge). Called by an already registered task: a plain write's observer or a `CommandRunner`.
 pub(crate) async fn run_write<R: Send + 'static>(shared: &Shared, not_after: Instant, job: Job<R>, after_ok: Option<AfterOk>)
     -> Result<R, WriteFailure>;   // WriteFailure = WriteError | SubmitError
-/// For plain writes (`WriteCtx::write`, token revocation): registers one observer task running `run_write`
-/// and returns its result on a oneshot. Refused once closing.
-pub(crate) fn observe_write<R: Send + 'static>(shared: &Arc<Shared>, not_after: Instant, job: Job<R>, after_ok: Option<AfterOk>)
-    -> Result<oneshot::Receiver<Result<R, WriteFailure>>, Closing>;
+/// Plain writes (`WriteCtx::write`, token revocation): 408 past the deadline; else one registered observer task runs `run_write`
+/// and its reply is awaited until `deadline + write_reply_grace` (none by then, or one taken at or after it: 503 `outcome_unknown`); 503 `shutting_down` once closing.
+pub(crate) async fn await_write<R: Send + 'static>(shared: &Arc<Shared>, deadline: Instant, job: Job<R>, after_ok: Option<AfterOk>)
+    -> Result<R, ApiError>;
 ```
 
 **Typed failures survive the wrappers.** `Store::read`'s closure returns `Result<R, StoreError>`: a `StoreError` from the read itself or from the token lookup maps through §2.9 automatically. `ReadCtx` passes it a closure that returns `Ok(f(tx, &auth))`, and `f` returns `Result<R, ApiError>`, so `f` decides how its own store calls map (normally through §2.9) and an authorization or validation failure stays the `ApiError` `f` chose. `verify_hash_in` returns `AuthFailure::{Invalid, Store(StoreError)}`: `Invalid` (missing, revoked, malformed, agent launch not current, hook token without its launch of its thread) is 401, `Store` maps through §2.9; a failed lookup is never a 401. Write jobs return `JobError::Refused(ApiError)` for refusals and `JobError::Store` for store errors.
@@ -344,13 +344,13 @@ impl TokenService {
     pub fn verify_secret_in(tx: &ReadTx<'_>, secret: &str) -> Result<Authorized, AuthFailure>;   // parse, hash, verify_hash_in
     pub fn verify_hash_in(tx: &ReadTx<'_>, sha256: &[u8; 32]) -> Result<Authorized, AuthFailure>;
     pub async fn issue_owner(&self, issuer: Option<[u8; 32]>, deadline: Instant) -> Result<Secret, ApiError>;   // pairing, PR 8
-    pub async fn revoke(&self, which: TokenSelector, deadline: Instant) -> Result<u64, ApiError>;  // observe_write; nudges on commit
+    pub async fn revoke(&self, which: TokenSelector, deadline: Instant) -> Result<u64, ApiError>;  // await_write; nudges on commit
 }
 ```
 
 **`verify_hash_in`** (the one token check; step 4 and every read, write, and socket check run it): `token_by_hash`, constant-time equality, `revoked_at IS NULL`; for `agent`, also: the token's launch is its thread's `current_launch_id` and that launch has no `exit_reason` (mvp §2.5 "one launch" holds at use time even before PR 10 revokes); for `hook`, the token names a thread and a launch, and that launch is of that thread (hook-ingest §2.8); it need not be current, live, or bound, so late hooks are kept, and revocation ends it. `rescue` and `owner`: until revoked. `extension`: until revoked; its one-run lifetime is PR 20's revocation after the run (deferred). No `token_by_id` is needed: every later check has the hash.
 
-**Revocation nudges come from the observer.** `TokenService::revoke` passes the nudge as `after_ok` to `observe_write`, so it fires from the task that observes the commit, also when the request that asked for the revocation has gone. A command whose intent can revoke a token sets `CommandHandler::revokes`, and the runner passes the nudge as the intent job's `after_ok`. A component's own revoking jobs pass a `RevocationNudge`, taken from `HttpServer::revocation_nudge`, as the `after_ok` of `write_with` (§2.11). The nudge runs for every commit the writer acknowledged. A job whose commit outcome is unknown (`CommitUnknown`) gets no nudge, though its revocation may be visible: the write path (`run_write` and `write_with`) reports `CommitUnknown` to the lifecycle sink, which stops the daemon (daemon-lifecycle §2.8), and the shutdown closes every socket (§2.2 "Shutdown").
+**Revocation nudges come from the observer.** `TokenService::revoke` passes the nudge as `after_ok` to `await_write`, so it fires from the task that observes the commit, also when the request that asked for the revocation has gone. A command whose intent can revoke a token sets `CommandHandler::revokes`, and the runner passes the nudge as the intent job's `after_ok`. A component's own revoking jobs pass a `RevocationNudge`, taken from `HttpServer::revocation_nudge`, as the `after_ok` of `write_with` (§2.11). The nudge runs for every commit the writer acknowledged. A job whose commit outcome is unknown (`CommitUnknown`) gets no nudge, though its revocation may be visible: the write path (`run_write` and `write_with`) reports `CommitUnknown` to the lifecycle sink, which stops the daemon (daemon-lifecycle §2.8), and the shutdown closes every socket (§2.2 "Shutdown").
 
 | Credential | Lives in | Restart | Expiry enforced at | Single use decided by |
 |---|---|---|---|---|
@@ -641,7 +641,7 @@ The request waits on the `watch` until `deadline + write_reply_grace` and replie
 | Seam | Type | Used by |
 |---|---|---|
 | Listener and lifecycle | `HttpServer::new`, `serve(TcpListener)`, `ServeHandle::shutdown(deadline)`, `LifecycleSink` | PR 8 |
-| Token issuance and revocation | `TokenService::{mint, new_token, issue_owner, revoke}`, `nudge_revocation`, the `after_ok` of `run_write` / `observe_write` | PR 8 (owner token file), PR 10 (launch tokens), PR 16, PR 20 (deferred) |
+| Token issuance and revocation | `TokenService::{mint, new_token, issue_owner, revoke}`, `nudge_revocation`, the `after_ok` of `run_write` / `await_write` | PR 8 (owner token file), PR 10 (launch tokens), PR 16, PR 20 (deferred) |
 | Commands | `CommandHandler` (with `revokes`), `CommandEffect` (with its bounded-result obligation) and `EffectOutcome`, `CommandCtx::{request_start, job_start}`, `CommandRegistry::register`, `Prepared`, `Authorized`, `deny_for`, `ObjectScope` | PR 10, 16, and the deferred 20, 21 |
 | Writes outside a request | re-exported from `http` as `pub(crate) use`: `write_with(&Store, &dyn LifecycleSink, &dyn MonotonicClock, not_after, job, after_ok, on_submit)`, the body of `run_write` without the server, which calls `on_submit` synchronously right after `Store::submit` returns, before it examines the result, and reports fatal outcomes to the sink; `mint_token` (data only; `TokenService::mint` calls it); the completion policy (`COMPLETION_ATTEMPT`, `COMPLETION_BUDGET`, `BACKOFF_FIRST`, `BACKOFF_MAX`, `retryable`, `backoff_until`); `RevocationNudge` | PR 10 |
 | Hook route | `Mount::write` for `POST /hook` (spec in `ROUTES`), `WriteCtx` (`write_then`, `read_by`, `commits`); `Mounts::mvp` mounts it with `HookSeams::mvp`, `Mounts::mvp_with(hook_seams, extra_reads)` with the given seams and a component's read mounts | PR 9; PR 10, 13, 14 replace the seams |
@@ -750,7 +750,7 @@ Every later PR that adds a route, a command, a token use, or a WebSocket purpose
 | Connection task | accept loop, registered before serving | `max_connections` (128) permits, acquired before `accept`; one request each (`Connection: close`) | its response sent (hyper closes it); client close; `header_read_timeout` (EOF); write stall; graceful shutdown at the signal; abort requested at the shutdown deadline |
 | Request handler | hyper per request | one per connection | response; read mounts at their deadline (408); write mounts at their deadline, checked before their observer or runner registers, and once registered at `deadline + write_reply_grace`; connection end |
 | `spawn_blocking` read | `ReadCtx::read`, the guard's lookup, socket reads | the store's reader pool (4) and `wait_until` | `f` returns (not bounded by the store, store §5); the waiter stops at the deadline; at daemon shutdown the store abandons and reports it |
-| Plain write observer | `observe_write`, registered before it submits | one per plain write | the writer's reply (store §5: every accepted job is answered); abort requested at the shutdown deadline |
+| Plain write observer | `await_write`'s observer, registered before it submits | one per plain write | the writer's reply (store §5: every accepted job is answered); abort requested at the shutdown deadline |
 | Command runner | the command request, registered before it submits | one per command | its last write committed or failed; abort requested at the shutdown deadline (an `in_progress` receipt becomes `unknown_after_crash` at restart) |
 | Effect future | `CommandRunner` | one per synchronous command | its terminal result, within the bound its owning PR guarantees; dropped with the runner at the shutdown deadline (the receipt stays `in_progress` → `unknown_after_crash` at restart) |
 | Receipt completion | `CommandRunner` | attempts of ≤ 5 s admitted within 60 s; an admitted attempt is awaited to its reply | committed; no attempt admitted within the budget, or a terminal outcome → `ReceiptUncompleted` to `LifecycleSink` |
