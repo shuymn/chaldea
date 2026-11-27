@@ -90,7 +90,7 @@ All reversible.
 - **Screen as state** (invariant 1): no action carries screen data; W1 never uses `/screen` or attach.
 - **Limit, one OS account**: same-origin script could read the token; the MVP trusts the account.
 - **Epochs**: a restored database keeping tokens and epoch shows only through `CursorAhead`.
-- **Limits**: history within the read limit is one action away; evicted storage costs one `chaldea open`; a snapshot can pass 16 MiB (e.g. 250 unresolved 64 KiB inputs, `payload.rs:18`, or a huge thread list); a resume racing a notice may use the previous token until the notice is adopted (valid or 401).
+- **Limits**: history within the read limit is one action away; evicted storage costs one `chaldea open`; a snapshot can pass 16 MiB (e.g. 250 unresolved 64 KiB inputs, `payload.rs:18`, or a huge thread list); a back/forward return reloads the page (if the daemon is down then, the last view is not kept).
 
 ## 6. Proposed Canonical Edits
 
