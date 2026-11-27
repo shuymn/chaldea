@@ -1058,7 +1058,7 @@ fn park_sync(
     *slot.lock().unwrap() = Some(Box::new(move || {
         let _ = entered_tx.send(());
         tokio::task::block_in_place(|| {
-            let _ = wait.recv_timeout(Duration::from_secs(30));
+            let _ = wait.recv();
         });
     }));
     (entered, go)
@@ -1590,6 +1590,84 @@ async fn revoked_with_held_write() {
     rig.stop().await;
 }
 
+/// I-7: B's startup read succeeded and its subscription returns after B's token was
+/// revoked (nudged): B takes over only after a read started after that nudge answers. While
+/// that read is held, A still operates; then B closes 1008 without `attached`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_before_startup_takeover() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut a, _) = attach(&rig, &live).await;
+    let owner = rig.srv.token(TokenKind::Owner, None, None).await;
+    let (at, go) = park_sync(&hooks(&rig).subscribed);
+    let connect = tokio::spawn({
+        let ticket = rig
+            .srv
+            .ticket(&owner, &format!("attach:{}", live.t))
+            .await
+            .unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/api/attach/{}?ticket={ticket}",
+            rig.srv.port, live.t
+        );
+        tokio_tungstenite::connect_async(url)
+    });
+    entered(&at);
+    rig.srv.revoke(&owner).await;
+    let (entered_read, gos) = park_verify_reads(&rig, 1);
+    go.send(()).unwrap();
+    next_entered(&entered_read);
+    // The fresh read is held: A is still current and its input is written.
+    let before = live.child.input().len();
+    a.binary(b"z").await;
+    rig.until("A's input written", || {
+        live.child.input()[before..] == *b"z"
+    })
+    .await;
+    drop(gos);
+    let (ws, _) = bounded(WS_WAIT, connect).await.unwrap().unwrap().unwrap();
+    let mut b = Client { ws, closed: None };
+    assert_eq!(b.until_closed().await, (Some(1008), Vec::new()));
+    a.binary(b"y").await;
+    rig.until("A still operates", || {
+        live.child.input()[before..] == *b"zy"
+    })
+    .await;
+    rig.stop().await;
+}
+
+/// I-7: a binary frame whose send had not reached the transport when the revocation was
+/// detected is discarded: the peer gets the 1008 close and not the frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_send_discarded() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let owner = rig.srv.token(TokenKind::Owner, None, None).await;
+    let mut a = open_as(&rig, &owner, live.t).await.expect("a 101");
+    assert!(matches!(
+        a.text().await,
+        Some(AttachServerMessage::Attached { .. })
+    ));
+    let shared = rig.srv.server.shared().clone();
+    let (reached, held) = shared.faults.arm_socket_send_gate();
+    live.child.emit(b"secret");
+    bounded(WS_WAIT, reached).await.unwrap().unwrap();
+    rig.srv.revoke(&owner).await;
+    rig.until("the socket is closing", || {
+        shared.faults.steps().contains(&"socket close")
+    })
+    .await;
+    held.send(()).unwrap();
+    let mut binary = Vec::new();
+    while let Some(f) = a.next().await {
+        if let Frame::Binary(b) = f {
+            binary.extend(b);
+        }
+    }
+    assert_eq!((a.closed, binary), (Some(Some(1008)), Vec::new()));
+    rig.stop().await;
+}
+
 /// I-7: a revocation whose nudge is lost is found by the periodic verification.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revoked_lost_nudge() {
@@ -1602,6 +1680,7 @@ async fn revoked_lost_nudge() {
         Some(AttachServerMessage::Attached { .. })
     ));
     rig.srv.revoke_quietly(&owner).await;
+    hooks(&rig).tick();
     assert_eq!(a.until_closed().await.0, Some(1008));
     rig.stop().await;
 }
@@ -1623,7 +1702,7 @@ async fn revoked_at_startup() {
     let (go, wait) = std::sync::mpsc::channel::<()>();
     rig.srv.server.shared().faults.arm_before_read(2, move || {
         let _ = entered_tx.send(());
-        let _ = wait.recv_timeout(Duration::from_secs(30));
+        let _ = wait.recv();
     });
     let url = format!(
         "ws://127.0.0.1:{}/api/attach/{}?ticket={ticket}",
@@ -1736,7 +1815,7 @@ fn park_verify_reads(
         let tx = entered_tx.clone();
         v.push(Box::new(move || {
             let _ = tx.send(i);
-            let _ = wait.recv_timeout(Duration::from_secs(30));
+            let _ = wait.recv();
         }));
     }
     (entered, gos)
@@ -1760,6 +1839,7 @@ async fn revoked_read_parked_in_snapshot() {
         Some(AttachServerMessage::Attached { .. })
     ));
     let (entered, gos) = park_verify_reads(&rig, 1);
+    hooks(&rig).tick();
     next_entered(&entered);
     rig.srv.revoke(&owner).await;
     assert_eq!(a.until_closed().await.0, Some(1008));
@@ -1780,17 +1860,23 @@ async fn saturated_reads_drop_by_original_deadline() {
         a.text().await,
         Some(AttachServerMessage::Attached { .. })
     ));
-    let (entered, gos) = park_verify_reads(&rig, 4);
+    let (entered, gos) = park_verify_reads(&rig, 3);
+    let h = hooks(&rig);
+    h.tick();
     let first = next_entered(&entered);
+    h.tick();
     let second = next_entered(&entered);
     // The stale reads' deadline is the short deadline from now; fresh reads start later.
     let short = rig.srv.server.shared().cfg.short_deadline;
     rig.clock.advance(Duration::from_secs(1));
     rig.srv.revoke(&owner).await;
-    // Both stale reads answer `true`; fresh reads take their slots and park.
+    rig.until("the nudge found both slots taken", || {
+        h.saturated.load(std::sync::atomic::Ordering::SeqCst) == 1
+    })
+    .await;
+    // Both stale reads answer `true`; the nudge's fresh read takes a freed slot and parks.
     gos[first].send(()).unwrap();
     gos[second].send(()).unwrap();
-    next_entered(&entered);
     next_entered(&entered);
     rig.clock.advance(short - Duration::from_secs(1));
     let _p = poker(&rig);

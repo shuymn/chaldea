@@ -49,6 +49,10 @@ pub(crate) struct AttachConfig {
     pub gone_poll: Duration,
     /// The startup subscription's wait for the op lock and the VT lock.
     pub subscribe_wait: Duration,
+    /// The verification and ping tick in place of the server's `heads_interval` (tests
+    /// tick explicitly through [`AttachHooks::tick`]).
+    #[cfg(test)]
+    pub tick_every: Option<Duration>,
     /// Test points.
     #[cfg(test)]
     pub hooks: Arc<AttachHooks>,
@@ -66,6 +70,26 @@ pub(crate) struct AttachHooks {
     pub latched: std::sync::atomic::AtomicU64,
     /// Runs at the next unit's submission, before `with_session`, on the socket's task.
     pub submit: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Ticks requested by the test ([`AttachHooks::tick`]); every socket runs one tick per
+    /// request made after it started.
+    pub ticks: std::sync::atomic::AtomicU64,
+    /// Notified with each tick request.
+    pub tick_now: tokio::sync::Notify,
+    /// Ticks every socket has taken (its verification started), by every socket.
+    pub ticked: std::sync::atomic::AtomicU64,
+    /// Nudges or ticks that found both verification slots taken, by every socket.
+    pub saturated: std::sync::atomic::AtomicU64,
+    /// Runs on the blocking pool after the next startup subscription returned.
+    pub subscribed: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[cfg(test)]
+impl AttachHooks {
+    /// Asks every socket for one tick.
+    pub fn tick(&self) {
+        self.ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.tick_now.notify_waiters();
+    }
 }
 
 #[cfg(test)]
@@ -88,6 +112,8 @@ impl Default for AttachConfig {
             hold: Duration::from_millis(50),
             gone_poll: Duration::from_secs(1),
             subscribe_wait: Duration::from_millis(250),
+            #[cfg(test)]
+            tick_every: Some(Duration::from_secs(24 * 3600)),
             #[cfg(test)]
             hooks: Arc::default(),
         }

@@ -18,8 +18,8 @@ use chaldea_core::input::MAX_PROMPT_BYTES;
 use chaldea_core::input::encode::{Purpose, check, encode};
 use chaldea_core::payload::{InputEncoding, VtCursor};
 use chaldea_pty_runtime::{
-    Fence, Guard, PtySize, ScreenMeta, SessionHandle, SubscribeError, WriteOrigin, WriteTicket,
-    WriteUnit, grid_rows,
+    Fence, Guard, PtySize, ScreenMeta, SessionHandle, SubscribeError, Subscribed, SubscriptionId,
+    WriteOrigin, WriteTicket, WriteUnit, grid_rows,
 };
 use futures_util::StreamExt;
 use tokio::sync::oneshot;
@@ -29,10 +29,11 @@ use super::output::{OutBuf, Taken};
 use super::registry::{Candidate, LaunchAttach, Removed, Replaced};
 use super::{Attach, AttachConfig, paste_reason, refusal_reason, submit_reason};
 use crate::http::ws::{
-    Out, Sink, bad_utf8, before, close, code, pending_opt, send, socket_timer, too_big,
+    Out, Sink, bad_utf8, before, close, code, pending_opt, send_unless, socket_timer, too_big,
 };
 use crate::http::{
-    AuthFailure, Joined, TicketPurpose, UpgradedSocket, spawn_read, take_read, verify_hash_in,
+    AuthFailure, Joined, Shared, TicketPurpose, UpgradedSocket, spawn_read, take_read,
+    verify_hash_in,
 };
 use crate::store::{ReadTx, StoreError};
 use crate::supervisor::Supervisor;
@@ -195,6 +196,59 @@ impl Drop for Exit {
     }
 }
 
+/// The startup subscription until the takeover: on any other exit (the task aborted
+/// included) its sink stops and the subscription is removed, also when it registers late.
+struct Candidacy {
+    sup: Arc<Supervisor>,
+    handle: SessionHandle,
+    buf: Arc<OutBuf>,
+    pending: Option<tokio::task::JoinHandle<Result<Subscribed, SubscribeError>>>,
+    sub: Option<SubscriptionId>,
+}
+
+impl Drop for Candidacy {
+    fn drop(&mut self) {
+        self.buf.stop();
+        if let Some(id) = self.sub.take() {
+            unsubscribe(&self.sup, Some((self.handle.clone(), id)));
+        }
+        if let Some(j) = self.pending.take() {
+            let h = self.handle.clone();
+            let task = self.sup.rt.spawn(async move {
+                if let Ok(Ok(s)) = j.await {
+                    let _ = tokio::task::spawn_blocking(move || h.unsubscribe(s.id)).await;
+                }
+            });
+            drop(task);
+        }
+    }
+}
+
+/// Starts a verification read of `sha` with the short deadline.
+fn start_verify(
+    shared: &Arc<Shared>,
+    sha: [u8; 32],
+    cfg: &AttachConfig,
+    generation: u64,
+) -> Verifying {
+    let deadline = shared.cfg.clock.now() + shared.cfg.short_deadline;
+    #[cfg(not(test))]
+    let _ = cfg;
+    Verifying {
+        handle: spawn_read(
+            shared,
+            deadline,
+            verify_read(
+                sha,
+                #[cfg(test)]
+                cfg.hooks.clone(),
+            ),
+        ),
+        deadline,
+        generation,
+    }
+}
+
 /// What a unit carries.
 #[derive(Debug, Clone)]
 enum Unit {
@@ -260,6 +314,8 @@ enum Ev {
     Dropped,
     Nudge,
     Tick,
+    /// A tick the test asked for.
+    TestTick,
     Verified(usize, Joined<bool>),
     Sent(Sink, Result<(), axum::Error>),
     Inbound(Option<Result<Message, axum::Error>>),
@@ -574,32 +630,73 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
     };
     let sub_deadline = sup.real(sup.now() + cfg.subscribe_wait);
     let (h2, sink2, max) = (handle.clone(), buf.sink(), cfg.attached_max);
-    let mut subscribing = sup.rt.spawn_blocking(move || {
-        h2.subscribe(sink2, sub_deadline, |m| grid_budget(thread, launch, m, max))
-    });
-    let joined = tokio::select! {
-        biased;
-        () = shutdown.wait() => None,
-        j = &mut subscribing => Some(j),
-    };
-    let Some(joined) = joined else {
-        // The task may still register: its sink is stopped, and its subscription removed.
-        buf.stop();
-        let h = handle.clone();
-        sup.rt.spawn(async move {
-            if let Ok(Ok(s)) = subscribing.await {
-                let _ = tokio::task::spawn_blocking(move || h.unsubscribe(s.id)).await;
-            }
-        });
-        return close(&shared, out, &mut stream, code::AWAY, "shutting_down").await;
-    };
-    let subscribed = match joined {
-        Ok(Ok(s)) => s,
-        Ok(Err(SubscribeError::Closed)) => {
-            return close(&shared, out, &mut stream, no_live, "no_live_launch").await;
+    #[cfg(test)]
+    let hook = crate::supervisor::lock(&cfg.hooks.subscribed).take();
+    let subscribing = sup.rt.spawn_blocking(move || {
+        let r = h2.subscribe(sink2, sub_deadline, |m| grid_budget(thread, launch, m, max));
+        #[cfg(test)]
+        if let Some(f) = hook {
+            f();
         }
-        Ok(Err(SubscribeError::VtUnavailable | SubscribeError::TooManySubscribers)) | Err(_) => {
-            return close(&shared, out, &mut stream, close_code::BUSY, "busy").await;
+        r
+    });
+    let mut cand = Candidacy {
+        sup: sup.clone(),
+        handle: handle.clone(),
+        buf: buf.clone(),
+        pending: Some(subscribing),
+        sub: None,
+    };
+    // Verification stays active through startup (R-7): a nudge after the startup read starts
+    // a fresh read at once, and the candidate takes over only once the read started after
+    // the latest nudge answered that the token is valid.
+    let mut fresh: Option<Verifying> = None;
+    let mut joined = None;
+    let subscribed = loop {
+        if fresh.is_none()
+            && let Some(j) = joined.take()
+        {
+            break j;
+        }
+        let fresh_by = fresh.as_ref().map(|v| shared.timer(v.deadline));
+        let ev = tokio::select! {
+            biased;
+            () = shutdown.wait() => {
+                return close(&shared, out, &mut stream, code::AWAY, "shutting_down").await;
+            }
+            () = pending_opt(fresh_by.map(socket_timer)) => return,
+            j = pending_opt(fresh.as_mut().map(|v| &mut v.handle)) => Some(j),
+            _ = nudge.changed() => {
+                fresh = Some(start_verify(&shared, sha, &cfg, 0));
+                None
+            }
+            j = pending_opt(cand.pending.as_mut()), if joined.is_none() => {
+                cand.pending = None;
+                match j {
+                    Ok(Ok(s)) => {
+                        cand.sub = Some(s.id);
+                        joined = Some(s);
+                    }
+                    Ok(Err(SubscribeError::Closed)) => {
+                        return close(&shared, out, &mut stream, no_live, "no_live_launch").await;
+                    }
+                    Ok(Err(SubscribeError::VtUnavailable | SubscribeError::TooManySubscribers))
+                    | Err(_) => {
+                        return close(&shared, out, &mut stream, close_code::BUSY, "busy").await;
+                    }
+                }
+                None
+            }
+        };
+        if let Some(j) = ev {
+            let Some(v) = fresh.take() else { return };
+            match take_read(&shared, v.deadline, j) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return close(&shared, out, &mut stream, code::POLICY, "token_revoked").await;
+                }
+                Err(_) => return,
+            }
         }
     };
     let first = attached(
@@ -610,6 +707,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
         cfg.attached_max,
     );
     // The takeover: the candidate subscribed, so it becomes current.
+    cand.sub = None;
     let (granted, removed) = la.swap(Candidate {
         socket: me,
         sub: subscribed.id,
@@ -631,9 +729,17 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
         paste_on_2004: entry.caps.pty_encoding() == InputEncoding::BracketedPaste,
     };
 
+    // Set when the revocation is detected: a frame not yet handed to the transport is not
+    // sent after it.
+    let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut out = match out {
         Out::Free(sink) => Out::Sending(
-            send(&shared, sink, vec![Message::Text(first.into())]),
+            send_unless(
+                &shared,
+                sink,
+                vec![Message::Text(first.into())],
+                Some(cut.clone()),
+            ),
             tokio::time::Instant::now() + wcfg.send_timeout,
         ),
         o @ Out::Sending(..) => o,
@@ -661,7 +767,15 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
     let mut ended_sent = false;
     let mut ping_due = false;
     let mut idle_at: Option<tokio::time::Instant> = None;
-    let mut next_tick = tokio::time::Instant::now() + wcfg.heads_interval;
+    #[cfg(test)]
+    let tick_every = cfg.tick_every.unwrap_or(wcfg.heads_interval);
+    #[cfg(not(test))]
+    let tick_every = wcfg.heads_interval;
+    let mut next_tick = tokio::time::Instant::now() + tick_every;
+    #[cfg(test)]
+    let mut ticks_seen = cfg.hooks.ticks.load(std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(test))]
+    let mut ticks_seen = 0;
     let mut next_gone = sup.now() + cfg.gone_poll;
 
     loop {
@@ -687,22 +801,13 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
         // A fresh verification on a nudge or a tick, even with one read in flight.
         if verify_due && let Some(slot) = verifying.iter_mut().find(|v| v.is_none()) {
             verify_due = false;
-            let deadline = shared.cfg.clock.now() + shared.cfg.short_deadline;
-            *slot = Some(Verifying {
-                handle: spawn_read(
-                    &shared,
-                    deadline,
-                    verify_read(
-                        sha,
-                        #[cfg(test)]
-                        cfg.hooks.clone(),
-                    ),
-                ),
-                deadline,
-                generation,
-            });
+            *slot = Some(start_verify(&shared, sha, &cfg, generation));
         } else if verify_due && verify_by.is_none() {
             verify_by = verifying.iter().flatten().map(|v| v.deadline).min();
+            #[cfg(test)]
+            cfg.hooks
+                .saturated
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         // The next unit, when none is outstanding (D6).
         if outstanding.is_none() && ending.is_none() {
@@ -809,7 +914,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                     if let Some(d) = drain_at {
                         at = at.min(d);
                     }
-                    Out::Sending(send(&shared, sink, msgs), at)
+                    Out::Sending(send_unless(&shared, sink, msgs, Some(cut.clone())), at)
                 }
             }
             sending @ Out::Sending(..) => sending,
@@ -852,6 +957,10 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             () = pending_opt(send_deadline.map(socket_timer)) => Ev::Dropped,
             () = pending_opt(idle_at.map(socket_timer)) => Ev::Dropped,
             () = socket_timer(next_tick) => Ev::Tick,
+            n = test_tick(&cfg, ticks_seen) => {
+                ticks_seen = n;
+                Ev::TestTick
+            }
             sent = pending_opt(sending.zip(send_deadline).map(|(f, d)| before(d, f))) => match sent {
                 Some((sink, r)) => Ev::Sent(sink, r),
                 None => Ev::Dropped,
@@ -876,10 +985,20 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                 continue;
             }
             Ev::Tick => {
-                next_tick += wcfg.heads_interval;
+                next_tick += tick_every;
                 generation += 1;
                 verify_due = true;
                 ping_due = true;
+                continue;
+            }
+            Ev::TestTick => {
+                generation += 1;
+                verify_due = true;
+                ping_due = true;
+                #[cfg(test)]
+                cfg.hooks
+                    .ticked
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 continue;
             }
             Ev::Verified(i, j) => {
@@ -893,6 +1012,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                         continue;
                     }
                     Ok(false) => {
+                        cut.store(true, std::sync::atomic::Ordering::Release);
                         la.revoke(me);
                         (code::POLICY, "token_revoked")
                     }
@@ -1086,6 +1206,26 @@ async fn poked(cfg: &AttachConfig) {
     {
         let _ = cfg;
         std::future::pending::<()>().await;
+    }
+}
+
+/// Resolves with the test's tick count once it is past `seen`. Never resolves outside
+/// tests.
+async fn test_tick(cfg: &AttachConfig, seen: u64) -> u64 {
+    #[cfg(test)]
+    loop {
+        let mut n = pin!(cfg.hooks.tick_now.notified());
+        n.as_mut().enable();
+        let c = cfg.hooks.ticks.load(std::sync::atomic::Ordering::SeqCst);
+        if c > seen {
+            return c;
+        }
+        n.await;
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (cfg, seen);
+        std::future::pending().await
     }
 }
 
