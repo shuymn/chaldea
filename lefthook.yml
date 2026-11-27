@@ -82,15 +82,16 @@ pre-commit:
         - "specs/package.json"
         - "specs/pnpm-*.yaml"
       run: 'mise exec -- pnpm install --frozen-lockfile --silent && mise exec -- pnpm run --silent typecheck && mise exec -- pnpm run --silent traces:check'
-    # The web job of ci.yml (docs/design/w1-pwa.md §3 D8): the codegen, typecheck, and Vitest
-    # of packages/contracts (its `check`). Vitest reads the core golden cases too. No `root`:
-    # it would drop every staged file outside packages/contracts from the glob.
+    # The web job of ci.yml (docs/design/w1-pwa.md §3 D8) without its cargo build: the
+    # `check` of packages/contracts (codegen, typecheck, Vitest) and of packages/web (the
+    # same, then the Vite build). Vitest reads the core golden cases too. No `root`: it would
+    # drop every staged file outside one package from the glob.
     web-check:
       glob:
         - "packages/**"
         - "crates/core/tests/golden/**"
         - "pnpm-*.yaml"
-      run: 'mise exec -- pnpm install --frozen-lockfile --silent && mise exec -- pnpm -C packages/contracts run --silent check'
+      run: 'mise exec -- pnpm install --frozen-lockfile --silent && mise exec -- pnpm -C packages/contracts run --silent check && mise exec -- pnpm -C packages/web run --silent check'
 
 pre-push:
   commands:
