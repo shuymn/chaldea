@@ -100,6 +100,11 @@ pub(crate) struct AttachHooks {
     /// Runs on the socket's task before the select of the next turn whose terminal close is
     /// due.
     pub before_terminal: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs on the socket's task between the takeover's generation comparison and its swap,
+    /// with the nudge's lock held.
+    pub compared: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Takeovers done, by every socket (counted before the nudge's lock is released).
+    pub swaps: std::sync::atomic::AtomicU64,
     /// Runs on the socket's task when the next startup takeover is about to happen.
     pub before_swap: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs on the blocking pool after the next startup subscription returned.

@@ -2878,6 +2878,57 @@ async fn nudge_after_snapshot_still_blocks_takeover() {
     })
     .await;
     assert_eq!(closed, (Some(1008), Vec::new()));
+
+    // The comparison and the swap are one step against publication: a nudge published
+    // while C sits between them waits until C's swap is done (C is then revoked as the
+    // operating socket).
+    let h = hooks(&rig);
+    let shared = rig.srv.server.shared().clone();
+    let owner_c = rig.srv.token(TokenKind::Owner, None, None).await;
+    let (at, go) = park_sync(&h.compared);
+    let connect = tokio::spawn({
+        let ticket = rig
+            .srv
+            .ticket(&owner_c, &format!("attach:{}", live.t))
+            .await
+            .unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/api/attach/{}?ticket={ticket}",
+            rig.srv.port, live.t
+        );
+        tokio_tungstenite::connect_async(url)
+    });
+    entered(&at);
+    rig.srv.revoke_quietly(&owner_c).await;
+    let swaps = h.swaps.load(std::sync::atomic::Ordering::SeqCst);
+    let nudger = std::thread::spawn({
+        let (shared, h) = (shared.clone(), h.clone());
+        move || {
+            shared.nudge();
+            h.swaps.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    });
+    // Gives the publisher time to run if nothing holds it back. The result never depends on
+    // this wait: with the lock held the publisher cannot finish before the swap however long
+    // it waits; the wait only lets a broken serialization show.
+    tokio::task::block_in_place(|| {
+        let until = std::time::Instant::now() + Duration::from_millis(200);
+        while !nudger.is_finished() && std::time::Instant::now() < until {
+            std::thread::yield_now();
+        }
+    });
+    go.send(()).unwrap();
+    let seen = tokio::task::block_in_place(|| nudger.join().unwrap());
+    assert!(seen > swaps, "the nudge was published before the swap");
+    let (ws, _) = bounded(WS_WAIT, connect).await.unwrap().unwrap().unwrap();
+    let mut cl = Client { ws, closed: None };
+    let first = cl.text().await;
+    assert!(
+        matches!(first, Some(AttachServerMessage::Attached { .. })),
+        "{first:?}"
+    );
+    assert_eq!(cl.until_closed().await.0, Some(1008));
+    assert_eq!(a.until_closed().await.0, Some(4003));
     rig.stop().await;
 }
 

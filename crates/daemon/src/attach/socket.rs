@@ -757,6 +757,10 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             let _ = &mut before_swap_ran;
             let published = nudge.borrow();
             if *published == seen {
+                #[cfg(test)]
+                if let Some(f) = crate::supervisor::lock(&cfg.hooks.compared).take() {
+                    f();
+                }
                 let s = joined.take().unwrap_or_else(|| unreachable!());
                 cand.sub = None;
                 let (granted, removed) = la.swap(Candidate {
@@ -766,6 +770,10 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                     handle: handle.clone(),
                     replaced: replaced.clone(),
                 });
+                #[cfg(test)]
+                cfg.hooks
+                    .swaps
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 drop(published);
                 break (s, granted, removed);
             }
@@ -1069,12 +1077,17 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             // this turn's select together with the terminal close.
             let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
             tokio::task::block_in_place(|| {
-                while [v0.as_ref(), v1.as_ref()]
-                    .into_iter()
-                    .flatten()
-                    .any(|v| !v.handle.is_finished())
-                    && std::time::Instant::now() < until
-                {
+                let pending = || {
+                    [v0.as_ref(), v1.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .any(|v| !v.handle.is_finished())
+                };
+                while pending() {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "a released verification read did not finish"
+                    );
                     std::thread::yield_now();
                 }
             });
