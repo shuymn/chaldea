@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { named, withDaemon } from "./release-smoke.mjs";
+import { named, reap, start, withDaemon } from "./release-smoke.mjs";
 
 const SCRIPT = fileURLToPath(new URL("./release-smoke.mjs", import.meta.url));
 
@@ -101,4 +101,38 @@ setInterval(() => {}, 1000);
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
+});
+
+test("a failed kill is not taken for an exit", async () => {
+  const p = start(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+  await new Promise((ok) => p.child.once("spawn", ok));
+  const real = p.child.kill.bind(p.child);
+  // What Node does when a signal cannot be delivered: `error`, `false`, and no `exit`.
+  p.child.kill = () => {
+    p.child.emit("error", Object.assign(new Error("kill EPERM"), { code: "EPERM" }));
+    return false;
+  };
+  try {
+    await assert.rejects(reap(p, { ...fast, reap: 300 }), /could not be signalled/);
+    assert.equal(p.running(), true);
+  } finally {
+    p.child.kill = real;
+    await reap(p, fast);
+  }
+  assert.equal(p.running(), false);
+});
+
+test("named ignores HTML comments", () => {
+  assert.throws(
+    () => named('<!-- <script src="/assets/a.js"></script><link rel="stylesheet" href="/assets/a.css"> -->'),
+    /names no script/,
+  );
+  assert.deepEqual(
+    named(
+      '<!-- <script src="/assets/old.js"></script> --><script src="/assets/a.js"></script>' +
+        '<link rel="stylesheet" href="/assets/a.css"><!-- <link rel="stylesheet" href="/assets/old.css"> -->',
+    ),
+    ["/assets/a.js", "/assets/a.css"],
+  );
+  assert.throws(() => named('<script src="/assets/a.js"></script><link rel="stylesheet" href="/assets/a.css"><!-- open'));
 });

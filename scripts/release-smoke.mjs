@@ -46,13 +46,20 @@ const sleep = (ms) => new Promise((ok) => setTimeout(ok, ms));
 
 /**
  * Starts `cmd` and returns it with `ended`, which settles once on its exit or on a spawn
- * failure (which emits `error` and no `exit`), so every wait on it can end.
+ * failure (an `error` before `spawn`, with no `exit`), so every wait on it can end. An
+ * `error` after `spawn` is a signal that could not be delivered: the process still runs.
  */
 export function start(cmd, args, opts) {
   const child = spawn(cmd, args, opts);
+  let spawned = false;
   const ended = new Promise((ok) => {
+    child.once("spawn", () => {
+      spawned = true;
+    });
     child.once("exit", (code, signal) => ok({ code, signal, error: null }));
-    child.once("error", (error) => ok({ code: null, signal: null, error }));
+    child.on("error", (error) => {
+      if (!spawned) ok({ code: null, signal: null, error });
+    });
   });
   let done = false;
   void ended.then(() => {
@@ -77,7 +84,7 @@ async function within(p, ms) {
 /** Kills `p` if it still runs and waits for it within `WAITS.reap`; throws past that. */
 export async function reap(p, waits = WAITS) {
   if (!p.running()) return;
-  p.child.kill("SIGKILL");
+  if (!p.child.kill("SIGKILL")) fail(`process ${p.child.pid} could not be signalled; it may still run`);
   if ((await within(p, waits.reap)) === null) {
     fail(`process ${p.child.pid} was not reaped within ${waits.reap} ms of SIGKILL`);
   }
@@ -175,13 +182,16 @@ const ATTR = /\s+([a-z-]+)(?:="([^"<>]*)")?/g;
 
 /**
  * The `src` of every `<script>` and the `href` of every `<link rel="stylesheet">` in `html`.
- * Fails on a tag it cannot read, an inline script, any other `<link>`, or a page that names
- * no script or no stylesheet.
+ * Comments are skipped. Fails on a tag it cannot read, an inline script, any other `<link>`,
+ * an unterminated comment, or a page that names no script or no stylesheet.
  */
 export function named(html) {
   const scripts = [];
   const styles = [];
-  for (const m of html.matchAll(/<\s*\/?\s*(script|link)\b[^>]*>?/gi)) {
+  // Commented-out tags name nothing; an unterminated comment is a page the smoke cannot read.
+  const live = html.replace(/<!--[\s\S]*?-->/g, "");
+  if (live.includes("<!--")) fail("index.html has an unterminated comment");
+  for (const m of live.matchAll(/<\s*\/?\s*(script|link)\b[^>]*>?/gi)) {
     const text = m[0];
     if (text === "</script>") continue;
     const t = TAG.exec(text);
