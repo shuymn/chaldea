@@ -643,11 +643,12 @@ async fn stale_start_after_unrecorded_exit() {
     .await;
     rig.hook(&live, "Stop", &json!({})).await;
     assert_eq!(turn(&rig, &live), TurnState::Unknown);
+    // Taken before the exit: a pass after it may remove the send side.
+    let sl = rig.sl(&live);
     live.child.exit(chaldea_pty_runtime::ChildExit {
         code: Some(0),
         signal: None,
     });
-    let sl = rig.sl(&live);
     rig.until("the launch left the live map", || {
         rig.sup.entry(live.l).is_none()
     })
