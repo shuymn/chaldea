@@ -48,14 +48,15 @@ pub fn resolve(value: &OsStr, workspace: &Path) -> Result<PathBuf, String> {
     })
 }
 
-/// What a file at `rel` (relative to the dist root, either separator) becomes: its request
-/// path (`/` for `index.html`, else `/` and its `/`-joined components, a `\` separator
-/// becoming `/`) and type, or `None` when it is skipped.
+/// What a file at `rel` (relative to the dist root) becomes: its request path (`/` for
+/// `index.html`, else `/` and its native components joined with `/`, so a Windows `\`
+/// separator becomes `/`) and type, or `None` when it is skipped.
 ///
 /// # Errors
 ///
-/// When the path leaves the root, is not UTF-8, is outside `index.html` and `assets/`, has a
-/// type outside the allowlist, or a name with a character outside `A-Z a-z 0-9 . _ -`.
+/// When the path leaves the root, is not UTF-8, has a `\` in a name, is outside `index.html`
+/// and `assets/`, has a type outside the allowlist, or a name with a character outside
+/// `A-Z a-z 0-9 . _ -`.
 pub fn classify(rel: &Path) -> Result<Option<(String, &'static str)>, String> {
     let parts = parts(rel)?;
     let shown = parts.join("/");
@@ -95,8 +96,8 @@ pub fn classify(rel: &Path) -> Result<Option<(String, &'static str)>, String> {
         })
 }
 
-/// `rel`'s components as UTF-8 names; a `\` inside a name (a Windows separator read on
-/// another host) splits it too.
+/// `rel`'s native components as UTF-8 names. Outside Windows a `\` is part of a name, not a
+/// separator, and is refused, so no name can stand for a path elsewhere in the dist.
 fn parts(rel: &Path) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for c in rel.components() {
@@ -109,11 +110,13 @@ fn parts(rel: &Path) -> Result<Vec<String>, String> {
         let name = name
             .to_str()
             .ok_or_else(|| format!("{}: not UTF-8", rel.to_string_lossy()))?;
-        out.extend(
-            name.split('\\')
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned),
-        );
+        if name.contains('\\') {
+            return Err(format!(
+                "{}: a backslash in the name {name:?}",
+                rel.to_string_lossy()
+            ));
+        }
+        out.push(name.to_owned());
     }
     if out.is_empty() {
         return Err("an empty path".to_owned());
@@ -126,10 +129,20 @@ fn parts(rel: &Path) -> Result<Vec<String>, String> {
 ///
 /// # Errors
 ///
-/// When `root` is not a directory, has no `index.html`, holds a symlink, or holds a file
-/// [`classify`] refuses.
+/// When `root` is a symlink or not a directory, has no `index.html`, holds a symlink, holds a
+/// file [`classify`] refuses, or two files with one request path.
 pub fn collect(root: &Path) -> Result<(Vec<DistFile>, Vec<PathBuf>), String> {
+    // Without trailing separators (and `.`), so `lstat` reads the last component itself
+    // instead of following it.
+    let root: PathBuf = root.components().collect();
+    let root = root.as_path();
     let meta = fs::symlink_metadata(root).map_err(|e| format!("{}: {e}", root.display()))?;
+    if meta.is_symlink() {
+        return Err(format!(
+            "{}: a symlink (name the directory itself)",
+            root.display()
+        ));
+    }
     if !meta.is_dir() {
         return Err(format!("{}: not a directory", root.display()));
     }
@@ -139,8 +152,25 @@ pub fn collect(root: &Path) -> Result<(Vec<DistFile>, Vec<PathBuf>), String> {
     if !files.iter().any(|f| f.url == "/") {
         return Err(format!("{}: no index.html", root.display()));
     }
+    Ok((table(files)?, dirs))
+}
+
+/// `files` sorted by request path.
+///
+/// # Errors
+///
+/// When two files have one request path.
+pub fn table(mut files: Vec<DistFile>) -> Result<Vec<DistFile>, String> {
     files.sort_by(|a, b| a.url.cmp(&b.url));
-    Ok((files, dirs))
+    if let Some(w) = files.windows(2).find(|w| w[0].url == w[1].url) {
+        return Err(format!(
+            "{} and {} both serve {}: a request path appears twice",
+            w[0].source.display(),
+            w[1].source.display(),
+            w[0].url
+        ));
+    }
+    Ok(files)
 }
 
 fn walk(

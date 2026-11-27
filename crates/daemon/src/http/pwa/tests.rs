@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::dist::{DistFile, classify, collect, render, resolve};
+use super::dist::{DistFile, classify, collect, render, resolve, table};
 
 const JS: &str = "text/javascript; charset=utf-8";
 
@@ -59,13 +59,62 @@ fn classify_refuses_everything_else() {
     }
 }
 
-/// A `\` separator (a Windows path) becomes `/` in the request path.
+/// The request path joins the native components with `/`: on Windows a `\` separator
+/// becomes `/`.
 #[test]
-fn backslashes_become_slashes() {
+fn request_paths_join_native_components() {
     let url = |p: &str| classify(Path::new(p)).unwrap().unwrap().0;
-    assert_eq!(url(r"assets\a.js"), "/assets/a.js");
-    assert_eq!(url(r"assets\sub\b.js"), "/assets/sub/b.js");
     assert_eq!(url("assets/a.js"), "/assets/a.js");
+    assert_eq!(url("assets/sub/b.js"), "/assets/sub/b.js");
+    #[cfg(windows)]
+    {
+        assert_eq!(url(r"assets\a.js"), "/assets/a.js");
+        assert_eq!(url(r"assets\sub\b.js"), "/assets/sub/b.js");
+    }
+}
+
+/// Outside Windows a `\` is part of a file name, never a separator: refused.
+#[cfg(not(windows))]
+#[test]
+fn backslash_in_a_name_is_refused() {
+    for p in [r"assets\a.js", r"assets/sub\b.js", r"index\x.html"] {
+        let e = classify(Path::new(p)).expect_err(p);
+        assert!(e.contains("backslash"), "{p}: {e}");
+    }
+}
+
+/// A root-level file named `assets\app.js` next to `assets/app.js` fails the build instead of
+/// becoming a second `/assets/app.js`.
+#[cfg(not(windows))]
+#[test]
+fn collect_refuses_a_backslash_name_beside_its_twin() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path();
+    write(root, "index.html", b"x");
+    write(root, "assets/app.js", b"1");
+    write(root, r"assets\app.js", b"2");
+    let e = collect(root).unwrap_err();
+    assert!(e.contains("backslash"), "{e}");
+}
+
+/// Two files with one request path fail the table.
+#[test]
+fn duplicate_request_paths_are_refused() {
+    let file = |url: &str, source: &str| DistFile {
+        url: url.to_owned(),
+        content_type: JS,
+        source: PathBuf::from(source),
+    };
+    let ok = table(vec![file("/assets/b.js", "b"), file("/assets/a.js", "a")]).unwrap();
+    let urls: Vec<&str> = ok.iter().map(|f| f.url.as_str()).collect();
+    assert_eq!(urls, ["/assets/a.js", "/assets/b.js"]);
+    let e = table(vec![
+        file("/assets/a.js", "one"),
+        file("/assets/b.js", "b"),
+        file("/assets/a.js", "two"),
+    ])
+    .unwrap_err();
+    assert!(e.contains("/assets/a.js") && e.contains("twice"), "{e}");
 }
 
 fn write(root: &Path, rel: &str, bytes: &[u8]) {
@@ -118,6 +167,27 @@ fn collect_refuses_a_symlink() {
     std::os::unix::fs::symlink(root.join("elsewhere.js"), root.join("assets/a.js")).unwrap();
     fs::remove_file(root.join("elsewhere.js")).unwrap();
     assert!(collect(root).unwrap_err().contains("symlink"));
+}
+
+/// A dist root that is a symlink is refused, also when the value ends in a separator (which
+/// `lstat` would otherwise follow).
+#[cfg(unix)]
+#[test]
+fn collect_refuses_a_symlinked_root() {
+    let d = tempfile::tempdir().unwrap();
+    let valid = d.path().join("valid");
+    write(&valid, "index.html", b"x");
+    let link = d.path().join("link");
+    std::os::unix::fs::symlink(&valid, &link).unwrap();
+    collect(&valid).unwrap();
+    let mut slashed = link.clone().into_os_string();
+    slashed.push("/");
+    let mut dotted = link.clone().into_os_string();
+    dotted.push("//.");
+    for root in [link.into_os_string(), slashed, dotted] {
+        let e = collect(Path::new(&root)).unwrap_err();
+        assert!(e.contains("symlink"), "{}: {e}", root.to_string_lossy());
+    }
 }
 
 #[test]
