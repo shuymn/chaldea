@@ -16,7 +16,7 @@ pub(crate) const PROJECTION_VERSION: u32 = 3;
 
 /// Ordered migration scripts; `MIGRATIONS[i]` brings `user_version` from `i` to `i + 1`.
 /// Any physical DDL change, projection tables included, is a new migration.
-pub(crate) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
+pub(crate) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
 
 /// SHA-256 (lowercase hex) of the schema dump of each version (`open::schema_fingerprint`),
 /// in the order of `MIGRATIONS`. `schema_tests::shipped_fingerprints_match_the_migrations`
@@ -26,6 +26,7 @@ pub(crate) const FINGERPRINTS: &[&str] = &[
     "1299d9c3158a9ad1da9751087819a6d97649461cc02437724af82db703bca8a7",
     "3718d8fce2faf13eb827f086c6c412e54c372c0477288b28da95ed1cc8e46706",
     "812afa9db6c910459f2847a71b531792e3a5c13ce95883a8d4fc08e255048920",
+    "e1eaf3456bdce2a6f2b6e853605bbf845df78d56389893bfaef4af370565c84e",
 ];
 
 const V1: &str = r#"
@@ -578,4 +579,11 @@ BEGIN
                       WHERE stream_id = NEW.stream_id AND sha256 IS r.sha AND media_type IS r.media_type)
   );
 END;
+"#;
+
+/// The launch's latest input attempt, read by every attach `human_write` job
+/// (`docs/design/t1-attach.md` D11): an index over the launch's inputs instead of a scan of
+/// every input.
+const V5: &str = r#"
+CREATE INDEX proj_inputs_launch_attempt ON proj_inputs (launch_id, attempt_seq);
 "#;
