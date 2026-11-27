@@ -1,0 +1,10 @@
+{
+  "lines": 18,
+  "events": [
+    {
+      "kind": "assistant_message",
+      "text": "ok",
+      "occurred_at": "2026-11-26T12:30:31.281Z"
+    }
+  ]
+}

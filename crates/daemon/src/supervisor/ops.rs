@@ -512,6 +512,7 @@ fn reservation_job(
             .map_err(|_| refusal("a new slot's lock is free"))?;
         sup2.live.lock().insert(launch, entry.clone());
         sup2.send_launch(&entry);
+        sup2.tail_launch(thread, launch, agent);
         Ok(Ok((
             Reserved {
                 agent,

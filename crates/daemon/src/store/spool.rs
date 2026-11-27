@@ -153,6 +153,30 @@ impl BlobSpool {
         Ok(())
     }
 
+    /// Passes everything appended, in order, to `each` in pieces of at most
+    /// `SPOOL_BUFFER_BYTES`, read back through one buffer; the file is removed after.
+    ///
+    /// # Errors
+    ///
+    /// A file error, or `each`'s.
+    pub(crate) fn replay(
+        mut self,
+        each: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.flush_buf()?;
+        let mut buf = std::mem::take(&mut self.buf);
+        buf.resize(SPOOL_BUFFER_BYTES, 0);
+        let mut file = self.file.lock()?;
+        file.seek(SeekFrom::Start(0))?;
+        loop {
+            let n = fill(&mut file, &mut buf)?;
+            if n == 0 {
+                return Ok(());
+            }
+            each(&buf[..n])?;
+        }
+    }
+
     /// The prepared content of everything appended, with `media_type` for a blob.
     ///
     /// # Errors

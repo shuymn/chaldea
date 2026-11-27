@@ -241,7 +241,7 @@ fn malformed_hooks() {
 }
 
 /// The fixtures stay publishable and consistent: no home directory, user temp directory, or
-/// token; each body has its meta and the reverse; every body is a registered event named as
+/// token; each body (a hook's `.json`, a transcript's `.jsonl`) has its meta and the reverse; every body is a registered event named as
 /// its file; metas carry only their keys; a recorded prompt is its meta's expected form, and
 /// every sent prompt is one of [`corpus`].
 #[test]
@@ -282,10 +282,14 @@ fn fixture_hygiene() {
         let name = p.file_name().unwrap().to_str().unwrap();
         if let Some(stem) = name.strip_suffix(".meta.json") {
             assert!(
-                p.with_file_name(format!("{stem}.json")).is_file(),
+                p.with_file_name(format!("{stem}.json")).is_file()
+                    || p.with_file_name(format!("{stem}.jsonl")).is_file(),
                 "{p:?} has no body"
             );
-        } else if let Some(stem) = name.strip_suffix(".json") {
+        } else if let Some(stem) = name
+            .strip_suffix(".json")
+            .or_else(|| name.strip_suffix(".jsonl"))
+        {
             assert!(
                 p.with_file_name(format!("{stem}.meta.json")).is_file(),
                 "{p:?} has no meta"

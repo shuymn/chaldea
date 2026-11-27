@@ -39,7 +39,9 @@ pub struct WriteBasis {
     pub counted: CountedClasses,
 }
 
-/// Transcript continuity evidence, opaque to the store (PR 13 / 14 define it).
+/// Transcript continuity evidence, opaque to the store. The Claude tailer writes
+/// `sha256:<hex>` of the transcript's bytes before the position (`docs/design/c1-claude-adapter.md`
+/// D10).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Continuity(pub String);

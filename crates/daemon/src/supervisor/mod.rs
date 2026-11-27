@@ -54,7 +54,7 @@ pub use components::SupervisorComponents;
 pub(crate) use exit::ExitStep;
 pub(crate) use live::LiveLaunch;
 pub(crate) use screen::SCREEN_PATH;
-pub(crate) use tick::TickStep;
+pub(crate) use tick::{TickStep, tick_timer};
 
 use live::LiveMap;
 use tracker::Tracker;
@@ -170,6 +170,25 @@ pub enum Pause {
     /// snapshot's deadline (unit tests only).
     #[cfg(test)]
     ScreenRead,
+    /// A transcript tailer's store read, holding a reader (blocking; unit tests only).
+    #[cfg(test)]
+    TailerRead,
+    /// A transcript tailer after it read the mode, before its poll's blocking task (unit
+    /// tests only).
+    #[cfg(test)]
+    TailerPoll,
+    /// A transcript tailer's poll after its read, before its checks (blocking; unit tests
+    /// only).
+    #[cfg(test)]
+    TailerAfterRead,
+    /// The participant after it set the tailers' final mode, before it sets its timer for
+    /// joining them (async; unit tests only).
+    #[cfg(test)]
+    ShutdownTailJoin,
+    /// A participant cut before it joined the tailers, after it stopped them and before it
+    /// logs them (blocking; unit tests only).
+    #[cfg(test)]
+    TailsLeftStopped,
 }
 
 /// The test seam of [`Pause`]: the daemon's own is [`NoPauses`].
@@ -252,6 +271,8 @@ pub struct SupervisorConfig {
     /// The Claude settings file every Claude launch passes as `--settings`: set by
     /// `SupervisorComponents::build` to `<state_dir>/claude-settings.json`.
     pub(crate) claude_settings: String,
+    /// The transcript tailer's poll period (C1 D10; tests shorten it).
+    pub(crate) tail_poll: Duration,
 }
 
 impl Default for SupervisorConfig {
@@ -277,6 +298,7 @@ impl Default for SupervisorConfig {
             send_workers: true,
             kill_recorded: Arc::new(chaldea_pty_runtime::orphan::kill_recorded),
             claude_settings: chaldea_core::launch::CLAUDE_SETTINGS_FILE.to_owned(),
+            tail_poll: crate::transcript::TAIL_POLL,
         }
     }
 }
@@ -314,6 +336,8 @@ pub(crate) struct Supervisor {
     pub(crate) probe_slots: Arc<tokio::sync::Semaphore>,
     /// Version probes killed at their deadline and not yet reaped (C1 D11).
     pub(crate) version_left: version::VersionLeft,
+    /// The transcript tailers, by launch (C1 D10).
+    pub(crate) tailers: crate::transcript::Tailers,
 }
 
 impl Supervisor {
