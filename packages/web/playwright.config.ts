@@ -12,6 +12,8 @@ const mobile = { viewport: { width: 390, height: 844 } };
 
 export default defineConfig({
   testDir: "e2e",
+  // e2e/*.test.ts are the harness's own Vitest tests.
+  testMatch: "*.spec.ts",
   globalSetup: "./e2e/global-setup.ts",
   fullyParallel: true,
   forbidOnly: !!process.env.CI,

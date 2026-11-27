@@ -26,7 +26,7 @@ export default defineConfig({
     target: "es2023",
   },
   test: {
-    include: ["src/**/*.test.{ts,tsx}"],
+    include: ["src/**/*.test.{ts,tsx}", "e2e/**/*.test.ts"],
     environment: "node",
   },
 });

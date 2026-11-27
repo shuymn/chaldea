@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 import type { BrowserContext, Page, Request, Route } from "@playwright/test";
 
-import { type Daemon, expect, openLink, statusOf, test } from "./harness";
+import { type Daemon, expect, hasFragment, openLink, statusOf, test } from "./harness";
 
 const SPENT = "This link is spent or expired";
 
@@ -23,7 +23,7 @@ test("pair_once", async ({ daemon, browser, page }) => {
   await expect(page.locator("li[data-thread]")).toHaveCount(1);
   await expect(statusOf(page)).toHaveText("live");
   expect(fragmentAtExchange, "the fragment was still in the URL when /api/pair was sent").toBe(false);
-  expect(await page.evaluate(() => location.hash), "fragment left after pairing").toBe("");
+  expect(await hasFragment(page), "fragment left after pairing").toBe(false);
 
   // A reload of the paired page reads the stored credential.
   await page.reload();
@@ -36,7 +36,7 @@ test("pair_once", async ({ daemon, browser, page }) => {
     const p = await fresh.newPage();
     await openLink(p, url);
     await expect(p.getByText(SPENT)).toBeVisible();
-    expect(await p.evaluate(() => location.hash)).toBe("");
+    expect(await hasFragment(p), "fragment left on the spent link").toBe(false);
   } finally {
     await fresh.close();
   }
@@ -109,7 +109,44 @@ test("new_database_repairs", async ({ daemon, page }) => {
   // The new database knows no token: the page's next request gets 401, which clears the
   // credential and asks for a fresh link.
   await expect(page.getByText(SPENT)).toBeVisible({ timeout: 45_000 });
+  // The record is gone from IndexedDB, not only from the page's memory.
+  expect(await storedCredential(page), "a credential is still stored").toBe(false);
+
+  // A fresh link repairs the pairing, and it survives a reload.
+  await daemon.spawnThread();
+  await openLink(page, await daemon.pairUrl());
+  await expect(statusOf(page)).toHaveText("live");
+  await expect(page.locator("li[data-thread]")).toHaveCount(1);
+  expect(await storedCredential(page), "no credential stored after pairing").toBe(true);
+  await page.reload();
+  await expect(statusOf(page)).toHaveText("live");
+  await expect(page.getByText(SPENT)).toHaveCount(0);
+  await expect(page.locator("li[data-thread]")).toHaveCount(1);
 });
+
+/** Whether the page's origin holds a credential record (`chaldea/credential`, key `current`). */
+function storedCredential(page: Page): Promise<boolean> {
+  return page.evaluate(
+    () =>
+      new Promise<boolean>((ok, err) => {
+        const open = indexedDB.open("chaldea", 1);
+        open.onupgradeneeded = () => open.result.createObjectStore("credential");
+        open.onerror = () => err(new Error("IndexedDB did not open"));
+        open.onsuccess = () => {
+          const db = open.result;
+          const get = db.transaction("credential", "readonly").objectStore("credential").get("current");
+          get.onsuccess = () => {
+            db.close();
+            ok(get.result !== undefined);
+          };
+          get.onerror = () => {
+            db.close();
+            err(new Error("IndexedDB read failed"));
+          };
+        };
+      }),
+  );
+}
 
 /** A tab whose Authorization headers are recorded in request order. */
 async function tab(context: BrowserContext): Promise<{ page: Page; auth: string[] }> {
@@ -129,6 +166,23 @@ async function pair(daemon: Daemon, t: { page: Page; auth: string[] }): Promise<
   const h = t.auth.at(-1);
   if (h === undefined) throw new Error("the tab made no authorized request");
   return h;
+}
+
+/**
+ * Holds `page`'s host reads made with a given Authorization: `next(auth)` resolves with the
+ * first such request's route, held until the test answers it; every other read goes on.
+ */
+async function holdHostReads(page: Page): Promise<{ next: (auth: string) => Promise<Route> }> {
+  const waiting: { auth: string; take: (r: Route) => void }[] = [];
+  await page.route(
+    (u) => u.pathname === "/api/events" && u.searchParams.get("stream_id") === "host",
+    async (route) => {
+      const i = waiting.findIndex((w) => w.auth === route.request().headers().authorization);
+      if (i >= 0) waiting.splice(i, 1)[0]!.take(route);
+      else await route.continue();
+    },
+  );
+  return { next: (auth) => new Promise<Route>((take) => waiting.push({ auth, take })) };
 }
 
 test("two_tabs", async ({ daemon, context }) => {
@@ -161,24 +215,10 @@ test("two_tabs", async ({ daemon, context }) => {
   const tokenA = await pair(daemon, a);
 
   // Hold A's next host read, made with generation A.
-  let held: Route | null = null;
-  let heldSeen!: () => void;
-  const heldNow = new Promise<void>((ok) => {
-    heldSeen = ok;
-  });
-  await a.page.route(
-    (u) => u.pathname === "/api/events" && u.searchParams.get("stream_id") === "host",
-    async (route) => {
-      if (held === null && route.request().headers().authorization === tokenA) {
-        held = route;
-        heldSeen();
-      } else {
-        await route.continue();
-      }
-    },
-  );
+  const hold = await holdHostReads(a.page);
+  const heldA = hold.next(tokenA);
   await daemon.spawnThread();
-  await heldNow;
+  const routeA = await heldA;
 
   // Tab B pairs again: generation B is committed, and A has not heard of it.
   const b = await tab(context);
@@ -188,7 +228,7 @@ test("two_tabs", async ({ daemon, context }) => {
 
   // The delayed 401 for generation A: its compare-and-delete finds B, deletes nothing,
   // publishes nothing, and A adopts B without a prompt.
-  await (held as Route | null)?.fulfill({
+  await routeA.fulfill({
     status: 401,
     contentType: "application/json",
     body: '{"code":"unauthorized"}',
@@ -203,7 +243,11 @@ test("two_tabs", async ({ daemon, context }) => {
     await expect(statusOf(t.page)).toHaveText("live");
   }
 
-  // Tab C pairs again: A and B reread on its notice and adopt C, retiring B's work.
+  // Hold A's next host read under generation B, then tab C pairs again: A and B reread on
+  // its notice and adopt C, retiring B's work.
+  const heldB = hold.next(tokenB);
+  const { thread: real } = await daemon.spawnThread();
+  const routeB = await heldB;
   const c = await tab(context);
   const tokenC = await pair(daemon, c);
   for (const [name, t] of [
@@ -215,6 +259,31 @@ test("two_tabs", async ({ daemon, context }) => {
       .toBe(true);
     await expect(statusOf(t.page)).toHaveText("live");
   }
+  await expect(a.page.locator(`li[data-thread="${real}"]`)).toHaveCount(1);
+
+  // A's held generation-B read, answered after the adoption with a page that registers a
+  // phantom thread, changes nothing in A.
+  const res = await routeB.fetch();
+  const body = (await res.json()) as { mode: string; events?: Record<string, unknown>[] };
+  const registered = body.events?.find((e) => e.kind === "thread_registered");
+  expect(registered !== undefined, "the held page registers no thread").toBe(true);
+  const phantom = "00000000-0000-4000-8000-00000000f00d";
+  const last = body.events!.at(-1)!;
+  body.events!.push({
+    ...registered,
+    seq: (last.seq as number) + 1,
+    event_id: "00000000-0000-4000-8000-00000000f00e",
+    idempotency_key: "phantom",
+    thread_id: phantom,
+    payload: { ...(registered!.payload as object), thread_id: phantom, cwd: "/work/phantom" },
+  });
+  (body as { head_seq?: number }).head_seq = (last.seq as number) + 1;
+  await routeB.fulfill({ response: res, json: body });
+  await a.page.waitForTimeout(1_000);
+  await expect(a.page.locator(`li[data-thread="${phantom}"]`)).toHaveCount(0);
+  await expect(a.page.getByText("/work/phantom")).toHaveCount(0);
+  await expect(a.page.locator(`li[data-thread="${real}"]`)).toHaveCount(1);
+  await expect(statusOf(a.page)).toHaveText("live");
 
   // C's credential is stored: a reload stays paired and uses it.
   await b.page.reload();

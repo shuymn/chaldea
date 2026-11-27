@@ -65,13 +65,31 @@ test("offline_then_catch_up", async ({ daemon, page }) => {
   const before = await daemon.waitEvents(thread, (es) => es.some((e) => e.kind === "launch_death_confirmed"));
   const head = before.at(-1)!.seq;
 
+  // The socket passes through the test. Once `holding` is set, only `hello` reaches the
+  // page: `heads` and `stream_advanced` are dropped, so after the restart the page learns
+  // of new events only from the refetch its socket open schedules.
+  let holding = false;
+  let dropped = 0;
+  await page.routeWebSocket(/\/api\/ws(\?|$)/, (ws) => {
+    const server = ws.connectToServer();
+    ws.onMessage((m) => server.send(m));
+    server.onMessage((m) => {
+      if (holding && (typeof m !== "string" || (JSON.parse(m) as { type?: string }).type !== "hello")) {
+        dropped += 1;
+        return;
+      }
+      ws.send(m);
+    });
+  });
+
   await openLink(page, await daemon.pairUrl());
   await page.locator(`li[data-thread="${thread}"] button`).first().click();
   await untilShown(page, head);
   await expect(statusOf(page)).toHaveText("live");
   const shown = await shownSeqs(page);
-  expect(shown.length).toBeGreaterThan(0);
-  expect(Math.min(...shown)).toBeGreaterThan(1);
+  const lo = shown[0]!;
+  expect(lo).toBeGreaterThan(1);
+  expect(shown).toEqual(range(lo, head));
   const synced = await page.getByText(/^last synced /).textContent();
 
   // A stop seen from a quiescent page: the socket closes, the ticket POST fails in
@@ -82,71 +100,104 @@ test("offline_then_catch_up", async ({ daemon, page }) => {
   await expect(page.getByText(/^last synced /)).toHaveText(synced!);
   expect(await shownSeqs(page)).toEqual(shown);
 
-  // The page cannot reach the daemon again until the witness is committed.
+  // The page cannot reach the daemon again until the witness is committed and settled.
+  holding = true;
   await page.route("**/api/**", (route) => route.abort());
   await daemon.start();
   const { launch_id: resumed } = (await daemon.chaldea(["resume", thread])) as { launch_id: string };
-  const after = await daemon.waitEvents(thread, (es) =>
-    es.some((e) => e.kind === "launch_started" && e.launch_id === resumed),
+  await daemon.waitEvents(thread, (es) =>
+    es.some((e) => e.kind === "readiness_observed" && e.launch_id === resumed),
   );
-  const witness = after.find((e) => e.kind === "launch_started" && e.launch_id === resumed)!.seq;
+  // The durable range through the resumed launch: no new event for a second.
+  let durable = await daemon.events(thread);
+  for (let settled = false, tries = 0; !settled; tries++) {
+    if (tries === 20) throw new Error("the thread kept growing after the resume");
+    await page.waitForTimeout(1_000);
+    const again = await daemon.events(thread);
+    settled = again.length === durable.length;
+    durable = again;
+  }
+  const last = durable.at(-1)!.seq;
+  const witness = durable.find((e) => e.kind === "launch_started" && e.launch_id === resumed)!.seq;
   expect(witness).toBeGreaterThan(head);
   await expect(statusOf(page)).toHaveText("offline");
-  await page.unrouteAll({ behavior: "wait" });
+  await page.unroute("**/api/**");
 
-  // Catch-up: the witness appears, every row shown before appears exactly once, in order.
-  await expect(page.locator("main ol > li").filter({ has: page.getByText(`#${witness}`, { exact: true }) })).toHaveCount(1, {
-    timeout: 45_000,
-  });
+  // Catch-up through the reconnect's refetch: the rows are exactly the durable range from
+  // the window's first row through the resumed launch, each once and in order.
+  await expect
+    .poll(() => shownSeqs(page), { message: "rows after catch-up", timeout: 45_000 })
+    .toEqual(range(lo, last));
   await expect(statusOf(page)).toHaveText("live", { timeout: 45_000 });
   await expect(page.getByText(/^last synced /)).not.toHaveText(synced!);
-  const now = await shownSeqs(page);
-  for (const s of shown) expect(now.filter((x) => x === s), `#${s}`).toHaveLength(1);
-  for (let i = 1; i < now.length; i++) expect(now[i]!, "rows in seq order").toBeGreaterThan(now[i - 1]!);
+  expect(dropped, "the socket carried no frame to drop").toBeGreaterThan(0);
 
   // History before the window still loads.
   await page.getByRole("button", { name: "Older", exact: true }).click();
   await expect(page.locator("main ol > li").first().locator("span").first()).toHaveText("#1", { timeout: 20_000 });
+  expect(await shownSeqs(page)).toEqual(range(1, last));
 });
 
+/** `[from, from + 1, …, to]`. */
+function range(from: number, to: number): number[] {
+  return Array.from({ length: to - from + 1 }, (_, i) => from + i);
+}
+
 test("layout_390", async ({ daemon, page }) => {
-  // Long unbroken text in every field the list and the timeline show.
+  // Long unbroken text in every field the list and the timeline show, and a closed row.
   const cwd = join(daemon.root, `a-directory-name-without-any-break-${"x".repeat(120)}`);
   mkdirSync(cwd);
   const { thread } = await daemon.spawnThread({ cwd, prompt: `unbroken-${"y".repeat(300)}` });
   await daemon.waitEvents(thread, (es) => es.some((e) => e.kind === "user_message"));
+  const { thread: closed } = await daemon.spawnThread({ cwd: join(daemon.root, `closed-${"z".repeat(120)}`) });
+  await daemon.chaldea(["stop", closed]);
+  await daemon.chaldea(["close", closed]);
   await openLink(page, await daemon.pairUrl());
+  await expect(page.locator(`li[data-thread="${closed}"]`).getByText("closed", { exact: true })).toBeVisible();
   await page.locator(`li[data-thread="${thread}"] button`).first().click();
   await expect(page.locator("main ol").getByText(/^unbroken-/).first()).toBeVisible();
   await expect(statusOf(page)).toHaveText("live");
 
-  const width = page.viewportSize()!.width;
   const overflow = await page.evaluate(() => ({
     doc: document.documentElement.scrollWidth - document.documentElement.clientWidth,
     body: document.body.scrollWidth - document.body.clientWidth,
   }));
   expect(overflow, "horizontal scroll").toEqual({ doc: 0, body: 0 });
 
+  // Every field of the list rows and of the timeline, present.
   const row = page.locator(`li[data-thread="${thread}"]`);
-  const fields = [
-    page.locator("[data-status]"),
-    page.getByText(/^last synced /),
-    row.getByText("claude", { exact: true }),
-    row.getByText(cwd),
-    row.getByText(/ · task /),
-    page.getByRole("heading", { name: "Timeline" }).or(page.locator("#timeline-heading")),
-    page.getByRole("button", { name: "Older", exact: true }),
-    page.getByRole("button", { name: "Newer", exact: true }),
-    page.getByRole("button", { name: "Jump to latest" }),
-    page.locator("main ol > li").first(),
-    page.locator("main ol").getByText(/^unbroken-/).first(),
-  ];
-  for (const f of fields) {
-    await f.scrollIntoViewIfNeeded();
-    await expect(f).toBeVisible();
-    const box = await f.boundingBox();
-    expect(box, "a field without a box").not.toBeNull();
-    expect(box!.x, "a field starts left of the viewport").toBeGreaterThanOrEqual(0);
-    expect(box!.x + box!.width, "a field ends right of the viewport").toBeLessThanOrEqual(width);
+  await expect(row.getByText("claude", { exact: true })).toHaveCount(1);
+  await expect(row.getByText(cwd)).toHaveCount(1);
+  await expect(row.getByText(/ · task /)).toHaveCount(1);
+  for (const name of ["Older", "Newer", "Jump to latest"]) {
+    await expect(page.getByRole("button", { name, exact: true })).toHaveCount(1);
   }
+  const rows = page.locator("main ol > li");
+  const n = await rows.count();
+  expect(n).toBeGreaterThan(0);
+  for (const part of ["p:first-child > span:first-child", "time", "span.font-semibold"]) {
+    await expect(rows.locator(part), part).toHaveCount(n);
+  }
+
+  // Each of them, and each of their parts, lies inside the viewport and shows its whole
+  // content: no box past either edge, no block narrower than what it holds.
+  const clipped = await page.evaluate(() => {
+    const roots = [
+      ...document.querySelectorAll("[data-status], li[data-thread], #timeline-heading, [role='group'], main ol > li"),
+    ];
+    const bad: string[] = [];
+    for (const root of roots) {
+      for (const el of [root, ...root.querySelectorAll("*")]) {
+        const r = el.getBoundingClientRect();
+        const what = `${el.tagName.toLowerCase()} "${(el.textContent ?? "").slice(0, 30)}"`;
+        if (r.width === 0 || r.height === 0) bad.push(`${what}: no box`);
+        else if (r.left < 0 || r.right > innerWidth + 0.5) bad.push(`${what}: ${r.left}..${r.right} of ${innerWidth}`);
+        else if (getComputedStyle(el).display !== "inline" && el.scrollWidth > el.clientWidth + 1) {
+          bad.push(`${what}: ${el.scrollWidth} wide in ${el.clientWidth}`);
+        }
+      }
+    }
+    return bad;
+  });
+  expect(clipped).toEqual([]);
 });
