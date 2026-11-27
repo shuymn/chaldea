@@ -17,7 +17,7 @@ use chaldea_core::payload::{
 use chaldea_core::sync::{EventsResponse, LaunchInfo};
 use chaldea_daemon::lifecycle::ExitCode;
 
-use super::{Client, End, Found, Req, code_name};
+use super::{Client, End, Found, Req, code_name, wire};
 use crate::poll::poll_until_with;
 
 /// One cutoff for every request of the preview.
@@ -30,14 +30,6 @@ const NO_REPORT: &str = "No check report was recorded for this launch (it ended 
 const PROVEN: &str = "The launch's end was proven when it exited, so no check report was needed.";
 const RESTARTED: &str = "the daemon restarted during the read";
 const STOPPED: &str = "the daemon stopped during the read";
-
-/// A wire enum's text.
-fn wire<T: serde::Serialize>(v: &T) -> String {
-    serde_json::to_value(v)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_default()
-}
 
 fn class(o: Observed) -> &'static str {
     match o.class() {

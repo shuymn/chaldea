@@ -242,6 +242,7 @@ Stop\r\nAllow this command? [y/n]\r\n> \r\n",
             entry
                 .snapshot_before(&sup, sup.now() + Duration::from_secs(5))
                 .await
+                .taken()
                 .is_some_and(|s| {
                     s.lines
                         .iter()

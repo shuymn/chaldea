@@ -242,6 +242,7 @@ async fn gate_timeouts(
         let snap = entry
             .snapshot_before(sup, sup.now() + SAMPLE_WAIT)
             .await
+            .taken()
             .map(|s| s.to_payload());
         let (thread, launch) = (sl.thread_id, sl.launch_id);
         let job: JobOf<()> = Arc::new(move |tx| {

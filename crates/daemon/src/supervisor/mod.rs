@@ -26,6 +26,7 @@ mod ops;
 pub(crate) mod prober;
 pub(crate) mod record;
 mod restart;
+mod screen;
 pub mod send;
 mod tick;
 mod tracker;
@@ -52,6 +53,7 @@ use crate::store::Store;
 pub use components::SupervisorComponents;
 pub(crate) use exit::ExitStep;
 pub(crate) use live::LiveLaunch;
+pub(crate) use screen::SCREEN_PATH;
 pub(crate) use tick::TickStep;
 
 use live::LiveMap;
@@ -164,6 +166,10 @@ pub enum Pause {
     /// A VT snapshot's task before it copies the screen (blocking; unit tests only).
     #[cfg(test)]
     SnapshotCopy,
+    /// The screen route after the thread read check, before the live lookup and the
+    /// snapshot's deadline (unit tests only).
+    #[cfg(test)]
+    ScreenRead,
 }
 
 /// The test seam of [`Pause`]: the daemon's own is [`NoPauses`].

@@ -63,6 +63,8 @@ uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 chaldea-daemon = { path = "../daemon" }
+# `inspect --json` checked against the committed `InspectOutput` schema.
+jsonschema.workspace = true
 # The `host` test helpers (signal state, links, ACL grants, console events, the stop event).
 chaldea-pty-runtime = { path = "../pty-runtime", features = ["fake"] }
 tempfile.workspace = true

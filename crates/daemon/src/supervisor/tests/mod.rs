@@ -13,6 +13,7 @@ mod prober;
 mod race;
 mod reserve;
 pub(crate) mod restart;
+mod screen;
 mod shutdown;
 mod stop;
 mod tick;
@@ -239,7 +240,7 @@ impl Rig {
         host: HostOs,
         tune: impl FnOnce(&mut SupervisorConfig),
     ) -> Rig {
-        Rig::on_mounts(store, host, tune, |sup| mounts_with(host, seams(sup))).await
+        Rig::on_mounts(store, host, tune, |sup| mounts_with(sup, seams(sup))).await
     }
 
     /// A rig whose `/hook` walks the test's process chains instead of the OS's; also
@@ -273,7 +274,7 @@ impl Rig {
             };
             let ingest = crate::hook::HookIngest::new(crate::hook::HookConfig::default(), chained);
             *m.lock().unwrap() = Some(ingest.clone());
-            mounts_with(host, seams(sup)).with(ingest.mount())
+            mounts_with(sup, seams(sup)).with(ingest.mount())
         })
         .await;
         let ingest = made.lock().unwrap().take().unwrap();

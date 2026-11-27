@@ -25,7 +25,7 @@ use super::ops::close_and_record;
 use super::send::{self, SendSide};
 use super::tracker::Tracker;
 use super::workspace::GitSlot;
-use super::{Pause, Supervisor, SupervisorConfig, Window, adapters, restart};
+use super::{Pause, Supervisor, SupervisorConfig, Window, adapters, restart, screen};
 
 /// The components `chaldea daemon run` builds by default.
 pub struct SupervisorComponents {
@@ -104,7 +104,7 @@ impl Components for SupervisorComponents {
         );
         self.sup = Some(sup.clone());
         Built {
-            mounts: mounts_with(self.host_os, seams(&sup)),
+            mounts: mounts_with(&sup, seams(&sup)),
             commands: registry(&sup),
             participants: vec![Box::new(Participant(sup))],
         }
@@ -181,9 +181,15 @@ pub(crate) fn seams(sup: &Arc<Supervisor>) -> HookSeams {
     }
 }
 
-/// [`mounts`] over the given hook seams.
-pub(crate) fn mounts_with(host_os: HostOs, seams: HookSeams) -> Mounts {
-    Mounts::mvp_with(seams, vec![adapters::mount(host_os)])
+/// The mounts of `sup`'s reads over the given hook seams.
+pub(crate) fn mounts_with(sup: &Arc<Supervisor>, seams: HookSeams) -> Mounts {
+    Mounts::mvp_with(
+        seams,
+        vec![
+            adapters::mount(sup.host_os),
+            screen::mount(Arc::downgrade(sup)),
+        ],
+    )
 }
 
 /// The shutdown participant (design §2.9 "Shutdown").
@@ -225,7 +231,7 @@ pub(crate) async fn shutdown(sup: Arc<Supervisor>, end: Instant) -> ParticipantE
         // Steps 4–5: each locked slot that still holds a session.
         let closes = entries.iter().zip(locks).filter_map(|(e, g)| {
             let mut g = g?;
-            let tracked = g.take()?;
+            let tracked = e.take_session(&mut g)?;
             let s = sup.clone();
             let e = e.clone();
             Some(async move {
