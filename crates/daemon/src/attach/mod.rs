@@ -87,6 +87,8 @@ pub(crate) struct AttachHooks {
     pub retained_max: std::sync::atomic::AtomicU64,
     /// Loop turns that did not read frames (the watermark reached), by every socket.
     pub paused: std::sync::atomic::AtomicU64,
+    /// The registry's entries after its last change by a socket.
+    pub registry_len: std::sync::atomic::AtomicUsize,
     /// Gone polls run, by every socket.
     pub gone_polls: std::sync::atomic::AtomicU64,
     /// Runs on the blocking pool after the next startup subscription returned.

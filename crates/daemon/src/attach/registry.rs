@@ -171,9 +171,12 @@ impl Registry {
         self.next_socket.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    pub(crate) fn launch(&self, l: LaunchId) -> Arc<LaunchAttach> {
-        lock(&self.launches)
-            .entry(l)
+    /// `l`'s state, created when new. Entries of launches that are no longer live and have
+    /// no socket are retired first, so they do not accumulate.
+    pub(crate) fn launch(&self, l: LaunchId, live: impl Fn(LaunchId) -> bool) -> Arc<LaunchAttach> {
+        let mut map = lock(&self.launches);
+        map.retain(|k, la| *k == l || live(*k) || !la.idle());
+        map.entry(l)
             .or_insert_with(|| {
                 Arc::new(LaunchAttach {
                     word: Arc::new(AtomicU64::new(0)),
@@ -185,11 +188,14 @@ impl Registry {
             .clone()
     }
 
-    /// Forgets `l` once no socket operates it and its session is gone.
-    pub(crate) fn forget_if_idle(&self, l: LaunchId, live: bool) {
-        let mut map = lock(&self.launches);
-        if !live && map.get(&l).is_some_and(|la| la.idle()) {
-            map.remove(&l);
-        }
+    /// Retires every entry whose launch is no longer live and has no socket.
+    pub(crate) fn retire(&self, live: impl Fn(LaunchId) -> bool) {
+        lock(&self.launches).retain(|k, la| live(*k) || !la.idle());
+    }
+
+    /// The entries kept (tests).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        lock(&self.launches).len()
     }
 }

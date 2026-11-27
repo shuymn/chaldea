@@ -2047,6 +2047,30 @@ async fn aborted_startup_removes_late_subscription() {
     rig.stop().await;
 }
 
+/// A launch whose last socket left while it was live is retired once it ends: the next
+/// socket of another launch finds only its own entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registry_retires_ended_launch() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let rig = SRig::new().await;
+    let first = rig.claude().await;
+    let shared = rig.srv.server.shared().clone();
+    let (a, _) = attach(&rig, &first).await;
+    drop(a);
+    rig.until("the socket ended", || shared.sockets.held() == 0)
+        .await;
+    first.child.exit(chaldea_pty_runtime::ChildExit {
+        code: Some(0),
+        signal: None,
+    });
+    rig.until("the launch left", || rig.sup.entry(first.l).is_none())
+        .await;
+    let second = rig.claude().await;
+    let (_b, _) = attach(&rig, &second).await;
+    assert_eq!(hooks(&rig).registry_len.load(SeqCst), 1);
+    rig.stop().await;
+}
+
 /// I-7: a revocation whose nudge is lost is found by the periodic verification.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revoked_lost_nudge() {

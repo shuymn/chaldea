@@ -183,16 +183,19 @@ struct Exit {
     la: Arc<LaunchAttach>,
     buf: Arc<OutBuf>,
     socket: u64,
-    thread: ThreadId,
-    launch: LaunchId,
 }
 
 impl Drop for Exit {
     fn drop(&mut self) {
         self.buf.stop();
         unsubscribe(&self.sup, self.la.end(self.socket));
-        let live = self.sup.live(self.thread, self.launch).is_some();
-        self.a.reg.forget_if_idle(self.launch, live);
+        self.a.reg.retire(|l| self.sup.entry(l).is_some());
+        #[cfg(test)]
+        self.a
+            .cfg
+            .hooks
+            .registry_len
+            .store(self.a.reg.len(), std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -636,7 +639,11 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             return close(&shared, out, &mut stream, close_code::BUSY, "busy").await;
         }
     };
-    let la = a.reg.launch(launch);
+    let la = a.reg.launch(launch, |l| sup.entry(l).is_some());
+    #[cfg(test)]
+    cfg.hooks
+        .registry_len
+        .store(a.reg.len(), std::sync::atomic::Ordering::SeqCst);
     let me = a.reg.socket_id();
     let buf = OutBuf::new(cfg.out_max);
     let replaced = Arc::new(Replaced::default());
@@ -646,8 +653,6 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
         la: la.clone(),
         buf: buf.clone(),
         socket: me,
-        thread,
-        launch,
     };
     let sub_deadline = sup.real(sup.now() + cfg.subscribe_wait);
     let (h2, sink2, max) = (handle.clone(), buf.sink(), cfg.attached_max);
