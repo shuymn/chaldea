@@ -68,7 +68,7 @@ All reversible.
 | ID | Criterion (EARS) |
 |---|---|
 | W1-1 | When the owner runs `chaldea open` (browser cold and warm), the list shall appear with no fragment left; a spent link in a fresh profile shall ask for a fresh link (PR8-P-4). |
-| W1-2 | While a Claude thread runs, its followed row and timeline shall update live. |
+| W1-2 | While a Claude thread runs, its followed row and attached timeline shall update live. |
 | W1-3 | When the daemon stops, the page shall keep its content, show offline and the last sync time, and catch up after restart without duplicate or missing rows. |
 | W1-4 | At 390 × 844 CSS px, list and timeline shall show every field and control without horizontal scrolling. |
 
@@ -90,7 +90,7 @@ All reversible.
 - **Screen as state** (invariant 1): no action carries screen data; W1 never uses `/screen` or attach.
 - **Limit, one OS account**: same-origin script could read the token; the MVP trusts the account.
 - **Epochs**: a restored database may keep tokens and epoch, detectable only through `CursorAhead`.
-- **Limits**: unfollowed rows show "last known" until visible or selected (M1 runs few); all history stays one action away; evicted storage costs one `chaldea open`; a snapshot passes 16 MiB only with about 250 unresolved inputs at the 64 KiB inline limit (`payload.rs:18`), far beyond use.
+- **Limits**: unfollowed rows show "last known" until visible or selected; history within the read limit stays one action away; evicted storage costs one `chaldea open`; a snapshot passes 16 MiB only with many unresolved inputs (e.g. about 250 at the 64 KiB inline limit, `payload.rs:18`).
 
 ## 6. Proposed Canonical Edits
 
