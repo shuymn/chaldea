@@ -96,6 +96,8 @@ pub(crate) const SLOT_WAIT: Duration = Duration::from_secs(30);
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Pause {
+    /// A recorded job's backoff after a retryable failure, before its wait.
+    RecordBackoff,
     /// After the reservation committed, before the token and `Session::spawn`.
     AfterReserve,
     /// After taking the tracker token, before `Session::spawn` (on the op).

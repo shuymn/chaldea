@@ -1884,3 +1884,45 @@ async fn report_channel_lost() {
     );
     rig.stop().await;
 }
+
+/// R-3: an open job whose attempts end `Busy` until the completion budget is spent is a
+/// known non-admission: the lease is released, the input stays `queued` and opens on a
+/// later pass, and a resize proceeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn busy_budget_recovers() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let store = rig.srv.store.store().clone();
+    let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let a2 = armed.clone();
+    crate::supervisor::send::tests::set_hook(&sl.hooks.open_job, move || {
+        *store.faults().commit.lock().unwrap() =
+            Some(crate::store::test_faults::CommitFault::BusyBeforeCommit);
+        a2.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let id = rig.send(&live, "prompt").await;
+    rig.until("the open job backs off after its Busy attempt", || {
+        armed.load(std::sync::atomic::Ordering::SeqCst)
+            && rig.pauses.passed(crate::supervisor::Pause::RecordBackoff)
+    })
+    .await;
+    // The backoff waits on the stopped clock; past the budget the job is unrecorded.
+    assert!(sl.state().lease.is_some());
+    rig.clock
+        .advance(crate::http::COMPLETION_BUDGET + Duration::from_secs(1));
+    rig.until("the lease released", || sl.state().lease.is_none())
+        .await;
+    assert_eq!(rig.input(id).state, chaldea_core::input::InputState::Queued);
+    rig.pass(&live).await;
+    rig.until_input(id, chaldea_core::input::InputState::Sent)
+        .await;
+    // A resize proceeds once the unit's record released the lease.
+    rig.until("the unit recorded", || sl.state().running.is_none())
+        .await;
+    let (mut c, _) = attach(&rig, &live).await;
+    c.json(json!({ "type": "resize", "cols": 100, "rows": 30 }))
+        .await;
+    assert_eq!(size_frame(&mut c).await, (100, 30, true));
+    rig.stop().await;
+}

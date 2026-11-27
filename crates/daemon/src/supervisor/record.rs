@@ -95,8 +95,26 @@ pub(crate) async fn record<R: Send + 'static>(
         }
         let from = sup.now();
         let wake = (from + backoff).min(budget_end);
-        backoff_until(sup.timer(wake)).await;
+        backoff_to(sup, wake).await;
         backoff = (backoff * 2).min(BACKOFF_MAX);
+    }
+}
+
+/// How often a test build re-reads the supervisor's clock during a backoff.
+#[cfg(test)]
+const RECHECK: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Waits until the supervisor's clock reads `wake`, its timer recomputed from the clock on
+/// every iteration. On a real clock that is one sleep; a test build also re-reads the clock
+/// every [`RECHECK`], so a stopped test clock moved past `wake` ends the wait.
+async fn backoff_to(sup: &Supervisor, wake: std::time::Instant) {
+    #[cfg(test)]
+    sup.pauses().at(super::Pause::RecordBackoff).await;
+    while sup.now() < wake {
+        let at = sup.timer(wake);
+        #[cfg(test)]
+        let at = at.min(tokio::time::Instant::now() + RECHECK);
+        backoff_until(at).await;
     }
 }
 
