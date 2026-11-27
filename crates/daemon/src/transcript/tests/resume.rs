@@ -245,3 +245,37 @@ fn a_dropped_handle_needs_the_final_prefix_check_again() {
     assert_eq!(tail.stats.unverified, 1);
     drop(flaky.borrow_mut().take());
 }
+
+/// The final read reads half a line at the end it saw at its start, and Claude completes the
+/// line before the check: the bytes are not committed as `partial_line`, and the next batch
+/// stores the whole line with the cursor at its end.
+#[test]
+fn a_line_completed_during_the_final_read_is_stored_whole() {
+    let fx = Fx::new();
+    let one = assistant("one");
+    fx.write(one.as_bytes());
+    let mut tail = fx.tail();
+    fx.settle(&mut tail);
+    let two = assistant("two");
+    let (head, rest) = two.split_at(two.len() / 2);
+    fx.append(head.as_bytes());
+    fx.add(vec![support::exited(fx.t, fx.l)]);
+    let done = std::cell::Cell::new(false);
+    let be = TestBackend {
+        after_read: Box::new(|| {
+            if !done.replace(true) {
+                fx.append(rest.as_bytes());
+            }
+        }),
+        ..fx.backend()
+    };
+    assert!(matches!(fx.settle_with(&mut tail, &be), Step::End(_)));
+    assert_eq!(
+        shorts(&fx.events()),
+        ["generation:1", "text:one", "text:two"]
+    );
+    assert_eq!(
+        fx.cursor().unwrap().read_offset,
+        (one.len() + two.len()) as u64
+    );
+}

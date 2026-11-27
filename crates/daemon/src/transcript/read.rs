@@ -423,7 +423,7 @@ impl Tail {
             }
         }
         let start = open.pos;
-        let batch = match read_lines(
+        let mut batch = match read_lines(
             &mut open,
             &self.b,
             &self.dir,
@@ -439,6 +439,18 @@ impl Tail {
             }
         };
         be.after_read();
+        if let Some(f) = batch.fragment.take() {
+            match open.file.size() {
+                // The file goes on past the bytes without a newline: the line is still being
+                // written, and the next batch reads it whole.
+                Ok(size) if size > f.end => batch.more = true,
+                Ok(_) => batch.take(f),
+                Err(e) => {
+                    self.open = Some(open);
+                    return Err(e.into());
+                }
+            }
+        }
         match self.check(&open, batch.advance.max(start)) {
             Check::Same => {
                 // The tails before the read position and before the batch's advance, where
@@ -482,7 +494,9 @@ impl Tail {
         }
         if batch.lines.is_empty() && batch.advance == start {
             self.open = Some(open);
-            return Ok(if last {
+            return Ok(if batch.more {
+                Step::Again
+            } else if last {
                 Step::End("the launch exited and its transcript was read".into())
             } else {
                 Step::Wait
@@ -789,6 +803,28 @@ struct Batch {
     more: bool,
     /// The read reached the end of the file.
     eof: bool,
+    /// A final read's trailing bytes without a newline, kept out of the batch until the
+    /// file is seen to end with them.
+    fragment: Option<Fragment>,
+}
+
+/// A final read's trailing line without a newline: its `partial_line` event, its end, and the
+/// digest and tail through it.
+struct Fragment {
+    line: Option<TranscriptLine>,
+    end: u64,
+    digest: Sha256,
+    tail: Recent,
+}
+
+impl Batch {
+    /// Adds the fragment as the batch's last line.
+    fn take(&mut self, f: Fragment) {
+        self.lines.extend(f.line);
+        self.advance = f.end;
+        self.digest = f.digest;
+        self.recent.push(f.tail.bytes());
+    }
 }
 
 /// The handle's bytes from a position up to `left` more, through one buffer.
@@ -1008,6 +1044,7 @@ fn read_lines(
                 recent,
                 more: true,
                 eof: false,
+                fragment: None,
             });
         }
         let mut line_digest = digest.clone();
@@ -1037,36 +1074,49 @@ fn read_lines(
                     recent,
                     more: true,
                     eof: false,
+                    fragment: None,
                 });
             }
             Err(e) => return Err(e),
         };
         stats.peak_line_memory = stats.peak_line_memory.max(peak);
-        digest = line_digest;
-        recent.push(tail.bytes());
-        if newline {
-            recent.push(b"\n");
-        }
         let end = at + len + u64::from(newline);
-        if let Some((event, blob, occurred_at)) = event {
+        let line = event.map(|(event, blob, occurred_at)| {
             match &blob {
                 Some(BlobInput::Bytes(v)) => memory += v.len(),
                 Some(BlobInput::Spooled(_)) => spooled = true,
                 None => {}
             }
-            lines.push(TranscriptLine {
+            TranscriptLine {
                 offset_start: at,
                 offset_end: end,
                 event,
                 occurred_at,
-                continuity: continuity(&digest),
+                continuity: continuity(&line_digest),
                 blobs: blob.into_iter().collect(),
+            }
+        });
+        if !newline {
+            return Ok(Batch {
+                lines,
+                advance: at,
+                digest,
+                recent,
+                more: false,
+                eof: true,
+                fragment: Some(Fragment {
+                    line,
+                    end,
+                    digest: line_digest,
+                    tail,
+                }),
             });
         }
+        digest = line_digest;
+        recent.push(tail.bytes());
+        recent.push(b"\n");
+        lines.extend(line);
         at = end;
-        if !newline {
-            break;
-        }
     }
     Ok(Batch {
         lines,
@@ -1075,6 +1125,7 @@ fn read_lines(
         recent,
         more: false,
         eof: true,
+        fragment: None,
     })
 }
 
