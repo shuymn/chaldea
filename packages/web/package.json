@@ -1,0 +1,34 @@
+{
+  "name": "@chaldea/web",
+  "private": true,
+  "description": "Chaldea's PWA: pairing, the sync client, the thread list, and the timeline (docs/design/w1-pwa.md)",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "codegen": "pnpm -C ../contracts run codegen",
+    "typecheck": "pnpm run codegen && tsc --noEmit",
+    "test": "pnpm run codegen && vitest run",
+    "build": "pnpm run codegen && vite build",
+    "check": "pnpm run codegen && tsc --noEmit && vitest run && vite build"
+  },
+  "dependencies": {
+    "@chaldea/contracts": "workspace:*",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.3.5",
+    "@testing-library/react": "16.3.3",
+    "@types/node": "24.19.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.3.0",
+    "fake-indexeddb": "6.2.8",
+    "fast-check": "4.11.0",
+    "jsdom": "31.0.1",
+    "tailwindcss": "4.3.5",
+    "typescript": "7.0.2",
+    "vite": "8.3.8",
+    "vitest": "5.1.1"
+  }
+}
