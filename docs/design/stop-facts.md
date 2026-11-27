@@ -6,19 +6,19 @@ Narrows supervisor-send L-12.
 
 **Changes.** Probe, observation, `IntakeOrder::intake`, writer permission and positions, fence ordering, settle.
 
-**Unchanged.** Input state machine, attribution, fence-word layout and meaning, `TurnLog`, the turn watermark, Quint. PTY data stays write positions, never screen text.
+**Unchanged.** Input state machine, attribution, fence-word layout and meaning, `TurnLog`, turn watermark, Quint. PTY data stays write positions, never screen text.
 
 ## 2. Decisions
 
 | # | Decision | Rejected alternative |
 |---|---|---|
-| D1 | The writer publishes `last_started` in a sequence-counted cell; under its queue lock: counter odd (`wrapping_add`), the permission (deadline and fence, or a reply's dequeue), the changed position, counter even (a refusal or empty lane: even, no position). Counter and position accesses, `fence_advance`'s successful CAS, and `Fence::moved`'s final load are `SeqCst`. Readers accept a triple between equal even counter loads. `Dispatching` precedes the odd store; `Publishing` follows a granted permission. | A queue-lock wait; `Acquire`/`Release` (fence word and counter form a store-buffer pair). |
+| D1 | The writer publishes `last_started` in a sequence-counted cell; under its queue lock: counter odd, the permission (deadline and fence, or a reply's dequeue), the changed position, counter even (a refusal or empty lane: even, no position). Counter and position accesses, `fence_advance`'s successful CAS, and `Fence::moved`'s final load are `SeqCst`. Readers accept a triple between equal even counter loads. `Dispatching` precedes the odd store; `Publishing` follows a granted permission. | A queue-lock wait; `Acquire`/`Release` (fence word and counter form a store-buffer pair). |
 | D2 | `SendLaunch` holds its `Arc<LiveLaunch>`. One observation: `removed` → `Unobservable`; `Published` → a triple, re-checking `removed` before `Started`; `creation_started` → `Unobservable`; else `Reserved`. `Supervisor::remove` clones the entry, releases the map, sets `removed`, then removes the entry, nesting no lock with the map. | `detached` (unset on some removals; set during stops). |
 | D3 | Under `SendState` (waited for) the probe copies the facts, stores `latest_intake`, advances the fence, releases, then observes. | Holding it while observing; lock-free `SendState` (splits the point). |
 | D4 | Two deadlines (§3): the request deadline gates starting; the facts deadline `F` bounds waiting, never acceptance. `INTAKE_WAIT` = 500 ms: with the 1 s pid wait it leaves 300 ms of attempt 1's 1.8 s (a budget, not a guarantee), since a retry (`intake_reliable: false`) keeps no facts; waited sections are microseconds; C1b's early `SessionStart` came ~100 ms after spawn. | 1 s; a supervisor-clock `F` (a stopped test clock maps it a day ahead); time-based acceptance (order comes from the odd section and fence). |
 | D5 | Per launch: an async `intake` lock (owned guard, moved to the blocking pool for steps 4–8) and a `state` mutex (`next`, `pending`, `released`), the only lock ticket drops and `earlier_released` take; `state` and the outer map lookup hold short sections only. | One std mutex per launch; inline waiting. |
 | D6 | An intake waits for publication only while `creation_started`, unpublished, and not `removed`, before `SendState`, by polling the `Published` and `removed` atomics; the waiting side takes no lock. | `Unobservable` (loses the first `SessionStart`); a condvar (unbounded mutex re-acquire). |
-| D7 | Settle makes one D2 observation of `pass`'s entry, no deadline (`Unobservable` skips the pass until the next tick); the job's re-check refuses `removed`. | The map lock; `Published` alone (settles removed entries). |
+| D7 | Settle makes one D2 observation of `pass`'s entry, no deadline (`Unobservable` skips until the next tick); the job's re-check refuses `removed`. | The map lock; `Published` alone (settles removed entries). |
 
 Also rejected: unbounded waits, test retries, worker-side repair (SB15).
 
@@ -26,7 +26,7 @@ Also rejected: unbounded waits, test retries, worker-side repair (SB15).
 
 **Request deadline** (server clock), checked on entry, after the async guard before dispatch, and at the start point:
 - 408 before the start point takes no ordinal.
-- After it, the handler's timer can still answer 408 before routing; the closure finishes once with no marks, leaving an ordinal gap.
+- After it, the handler's timer can still answer 408 before routing; the closure finishes once without marks, leaving an ordinal gap.
 - `F` never causes 408.
 - Retries reuse the `emit_id`: newly recorded, `intake_reliable: false`; after a committed first delivery, its response replays.
 
@@ -35,9 +35,9 @@ Also rejected: unbounded waits, test retries, worker-side repair (SB15).
 - Facts are missing only when `removed`, or when a wait ends unpublished, without `SendState`, or with an inconsistent triple.
 
 **Start point (cancellation, unwind).** Each request has a start cell (`Pending`, `Started`, `Cancelled`).
-- Dropping the request future swaps `Pending` → `Cancelled`; the closure, under `state`, checks the request deadline and swaps `Pending` → `Started` immediately before reserving the ordinal.
-- **Cancelled first:** it releases the guard; no ordinal, `latest_intake`, or fence changes.
-- **Started first:** the intake runs to its end; a later drop finishes it once with no marks.
+- Dropping the request future swaps `Pending` → `Cancelled`; the closure, under `state`, claims (`Pending` → `Started`), then checks the request deadline, immediately before reserving the ordinal.
+- **Cancelled first or claimed late:** it releases the guard; no ordinal, `latest_intake`, or fence changes.
+- **In time:** the intake runs to its end; a later drop finishes it once with no marks.
 - The ticket is owned from the reservation and fence cleanup armed at the advance: an unwind after it finishes once with no marks; one before releases only the ordinal.
 
 **Steps.** (1) entry check; (2) async `intake` lock; (3) dispatch check; (4) start point, ordinal; (5) publication wait; (6) `SendState`; (7) observation; (8) `now()` (pid-wait origin). Without `SendState`: store `latest_intake`, advance the fence, `None`. Without observation: `None`.
@@ -65,13 +65,13 @@ EARS. Red: `old` fails on `fb5f13a3`; `mut` fails under the named mutation; `kep
 |---|---|---|---|
 | SF-1 | When a Claude `SessionStart` is taken in with the writer parked at `Dispatching`, the binding job shall record `session_start`. | `probe::session_start_beside_parked_writer` | old |
 | SF-2 | When a `Stop` is taken in under that park, the queued input shall send after `SETTLE`. | `human::same_turn_evidence_beside_parked_writer` | old |
-| SF-3 | If a reply was permitted before a `UserPromptSubmit`'s first counter read, its facts shall include the reply or be missing. | `ack::reply_permitted_before_intake` | old; mut: odd store after `Publishing` |
-| SF-4 | Readers shall never accept a mixed triple; retrying returns the new one. | pty `published_positions`, `…_stress` (arm64) | mut: no second counter load |
+| SF-3 | If a reply was permitted before a `UserPromptSubmit`'s first counter read, its facts shall include the reply or be missing. | `ack::reply_permitted_before_intake` | mut: odd store after `Publishing` |
+| SF-4 | Readers shall never accept a mixed triple; retrying returns the new one. | pty `published_positions`, `…_stress` (macOS CI) | mut: no second counter load |
 | SF-5 | While `SendState` is held until before `F`, the intake shall wait and return facts; past `F`, `None`; the fence advances once; a later completion is no fact. | `probe::state_wait`, `ack::completion_during_intake` | old |
 | SF-6 | A record committing during the `SendState` wait shall count before the intake point. | `turn_order::record_during_state_wait` | old |
 | SF-7 | While an intake waits, ticket drops, `earlier_released`, other launches, and timers proceed. | `hook::tests::intake::waiting_intake_blocks_nothing` | old |
 | SF-8 | When a hook arrives after creation and before publication, the intake shall wait until publication or removal (made after the wait began) or `F`. | `claude::session_start_before_publication` (old), `…_after_deadline` (kept), `live::observe_removed` (mut: `removed` ignored), `live::poll_sees_later_change` (mut: sleep straight to `F`) | per test |
-| SF-9 | If cancelled or expired before the start point, the intake shall take no ordinal; after it, a 408 or drop finishes it once. | `hook::tests::intake::drop_waiting_for_pool`, `deadline_before_ordinal`, `drop_after_ordinal`, `deadline_during_wait` | mut: start cell ignored; dispatch check removed (a pool task appears) |
+| SF-9 | If cancelled or expired before the start point, the intake shall take no ordinal; after it, a 408 or drop finishes it once. | `hook::tests::intake::drop_waiting_for_pool`, `deadline_before_ordinal`, `deadline_at_claim`, `drop_after_ordinal`, `deadline_during_wait` | mut: start cell ignored; dispatch check removed (a pool task appears); check before claim |
 | SF-10 | When a wait reaches `F`, it shall return within `F` plus one attempt, with facts if that attempt saw them; past `F` with request time left, 200. | `probe::pool_past_facts_deadline`, `probe::state_at_facts_deadline` (mut: no final attempt); `claude::published_at_facts_deadline` (kept) | per test |
 | SF-11 | While the writer is parked or the map held, a candidate shall settle; one removed before observation or job shall not. | `evidence::settle_beside_parked_writer` (old), `…_beside_held_map` (old), `…_after_removal` (kept), `…_removed_before_job` (old) | per test |
 | SF-12 | If an intake unwinds after the fence advance, it shall finish once without marks, releasing `pending` and the fence; before, only its ordinal. | `hook::tests::intake::panic_after_advance`, `panic_before_advance` | mut: guard armed early or late |
