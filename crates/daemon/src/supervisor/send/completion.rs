@@ -184,7 +184,7 @@ pub(crate) fn human_write_in(
 /// The report a key's effect gets for its unit's record.
 pub(crate) fn report_of(rec: &WriteRecord) -> KeyReport {
     match &rec.outcome {
-        WriteOutcome::NotStarted(_) => KeyReport::NotStarted,
+        WriteOutcome::NotStarted(r) => KeyReport::NotStarted(r.clone()),
         WriteOutcome::Written => KeyReport::Recorded {
             complete: true,
             bytes: rec.bytes_written,

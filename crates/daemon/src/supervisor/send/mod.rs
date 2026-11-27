@@ -141,12 +141,12 @@ pub(crate) struct RunningUnit {
 }
 
 /// What the worker reports to a key's effect once it decided the unit's record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KeyReport {
     /// The `human_write` committed.
     Recorded { complete: bool, bytes: u64 },
-    /// The unit wrote zero bytes.
-    NotStarted,
+    /// The unit wrote zero bytes, refused by the writer for this reason.
+    NotStarted(chaldea_pty_runtime::Refusal),
 }
 
 /// An attach record's `human_write` decision, set once by the first committed job that made
