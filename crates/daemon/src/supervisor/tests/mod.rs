@@ -252,13 +252,14 @@ impl Rig {
         Arc<support::hook::Chains>,
         Arc<crate::hook::HookIngest>,
     ) {
-        Rig::with_chains_on(HostOs::Macos, tune).await
+        Rig::with_chains_on(HostOs::Macos, tune, crate::hook::HookConfig::default()).await
     }
 
-    /// [`Rig::with_chains`] mapped to `host`.
+    /// [`Rig::with_chains`] mapped to `host`, its `/hook` on `hook`.
     pub(crate) async fn with_chains_on(
         host: HostOs,
         tune: impl FnOnce(&mut SupervisorConfig),
+        hook: crate::hook::HookConfig,
     ) -> (
         Rig,
         Arc<support::hook::Chains>,
@@ -272,7 +273,7 @@ impl Rig {
                 procs: c,
                 ..seams(sup)
             };
-            let ingest = crate::hook::HookIngest::new(crate::hook::HookConfig::default(), chained);
+            let ingest = crate::hook::HookIngest::new(hook, chained);
             *m.lock().unwrap() = Some(ingest.clone());
             mounts_with(sup, seams(sup)).with(ingest.mount())
         })

@@ -388,6 +388,11 @@ impl Env {
     async fn new() -> Env {
         let srv = TestServer::start(Mounts::mvp()).await;
         srv.clock.stop();
+        Env::on(srv)
+    }
+
+    /// On `srv`, with a request deadline 5 s from its clock's reading.
+    fn on(srv: TestServer) -> Env {
         let s = shared(&srv);
         let deadline = srv.clock.now() + Duration::from_secs(5);
         let counting = Arc::new(Counting::default());
@@ -579,18 +584,29 @@ async fn drop_after_ordinal() {
     env.stop().await;
 }
 
-/// SF-9: the request deadline passing while the probe waits: 408 once the probe returns, the
-/// intake finished once with no marks, and its ordinal a gap.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// SF-9: the request deadline passing while the probe waits: on tokio's paused time, moved
+/// past the deadline, the deadline's timer answers 408 while the probe is still held;
+/// released, the intake finishes once with no marks and its ordinal is a gap.
+#[tokio::test]
 async fn deadline_during_wait() {
-    let env = Env::new().await;
+    let srv = TestServer::start_with(Mounts::mvp(), |c| {
+        c.clock = Arc::new(crate::http::tests::TokioClock);
+    })
+    .await;
+    let env = Env::on(srv);
     let (entered, go, hold) = gate();
     *env.counting.latch.lock().unwrap() = Some(hold);
-    let req = env.spawn(l());
+    let mut req = env.spawn(l());
     reached_sync(entered).await;
-    env.srv.clock.advance(Duration::from_secs(6));
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::time::resume();
+    let r = waits::bounded(WAIT, &mut req)
+        .await
+        .expect("answered while the probe is held");
+    assert_eq!(r.unwrap(), Err(ApiError::request_timeout()));
+    assert!(env.finished().is_empty(), "the probe is still held");
     go.send(()).unwrap();
-    assert_eq!(req.await.unwrap(), Err(ApiError::request_timeout()));
     let c = env.counting.clone();
     super::support::http::eventually(WAIT, "finished", move || {
         !c.finished.lock().unwrap().is_empty()
@@ -598,7 +614,7 @@ async fn deadline_during_wait() {
     .await;
     assert_eq!(env.finished(), [(1, 0, false)]);
     let env = Env {
-        deadline: env.srv.clock.now() + Duration::from_secs(5),
+        deadline: env.s.cfg.clock.now() + Duration::from_secs(5),
         ..env
     };
     assert_eq!(env.spawn(l()).await.unwrap(), Ok(2), "a gap at 1");
@@ -607,14 +623,23 @@ async fn deadline_during_wait() {
 
 /// SF-12: an intake that unwinds after its fence advance (its observation panics) answers
 /// 500 and finishes once with no marks: its ordinal is released, so a later binding
-/// `SessionStart` is not held up, and the fence is quiet.
+/// `SessionStart` is not held up, and only its own open count is released: another
+/// intake's stays open until that one finishes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn panic_after_advance() {
+    use crate::supervisor::send::OPEN_MASK;
     use crate::supervisor::send::tests::SRig;
+    use crate::supervisor::send::tests::probe::{intake, probe_of, soon};
     let rig = SRig::new().await;
     let (live, _) = rig.spawn(chaldea_core::ids::Agent::Claude, None).await;
     rig.paste(&live, true).await;
     let sl = rig.sl(&live);
+    let (_, other) = intake(&probe_of(&rig), live.l, 0, soon());
+    assert_eq!(
+        sl.fence.load(Ordering::SeqCst) & OPEN_MASK,
+        1,
+        "one intake open"
+    );
     *crate::supervisor::lock(&sl.hooks.observe) =
         Some(Box::new(|_, _| panic!("the observation panicked")));
     let ord = rig.next_ordinal(&live);
@@ -630,9 +655,15 @@ async fn panic_after_advance() {
         !rig.ingest.order.is_pending(live.l, ord),
         "the ordinal released"
     );
+    assert_eq!(
+        sl.fence.load(Ordering::SeqCst) & OPEN_MASK,
+        1,
+        "finished once: the other intake still open"
+    );
+    drop(other);
     assert!(
         crate::supervisor::send::fence_quiet(sl.fence.load(Ordering::SeqCst)),
-        "finished: the fence is quiet"
+        "both finished: the fence is quiet"
     );
     rig.hook(&live, "SessionStart", &serde_json::json!({}))
         .await;

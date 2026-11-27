@@ -62,6 +62,9 @@ impl std::ops::Deref for SRig {
     }
 }
 
+/// An intake wait no test bound outlasts ([`SRig::with_intake_wait`]).
+pub(crate) const LONG_INTAKE_WAIT: Duration = Duration::from_secs(60);
+
 impl SRig {
     /// Stops the server.
     pub(crate) async fn stop(self) {
@@ -78,10 +81,35 @@ impl SRig {
 
     /// A rig with the send workers and driver running.
     pub(crate) async fn on(host: HostOs, tune: impl FnOnce(&mut SupervisorConfig)) -> SRig {
-        let (rig, chains, ingest) = Rig::with_chains_on(host, |c| {
-            c.send_workers = true;
-            tune(c);
-        })
+        SRig::build(host, tune, crate::hook::HookConfig::default()).await
+    }
+
+    /// A rig whose intakes wait up to `wait` for their facts: long enough that a wait the
+    /// test ends from another thread cannot reach its facts deadline first.
+    pub(crate) async fn with_intake_wait(
+        wait: Duration,
+        tune: impl FnOnce(&mut SupervisorConfig),
+    ) -> SRig {
+        let hook = crate::hook::HookConfig {
+            intake_wait: wait,
+            ..crate::hook::HookConfig::default()
+        };
+        SRig::build(HostOs::Macos, tune, hook).await
+    }
+
+    async fn build(
+        host: HostOs,
+        tune: impl FnOnce(&mut SupervisorConfig),
+        hook: crate::hook::HookConfig,
+    ) -> SRig {
+        let (rig, chains, ingest) = Rig::with_chains_on(
+            host,
+            |c| {
+                c.send_workers = true;
+                tune(c);
+            },
+            hook,
+        )
         .await;
         SRig {
             rig,

@@ -672,10 +672,13 @@ async fn stale_start_after_unrecorded_exit() {
 
 /// SF-6: a `Stop` whose intake waits for the launch's held state while the input unit's
 /// completion job commits counts the record before its intake point: the state released
-/// after the commit, its mark settles.
+/// after the commit, its mark settles. The facts deadline outlasts every bound here, so the
+/// wait cannot give up before the gated commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn record_during_state_wait() {
-    let (rig, live) = settle_rig().await;
+    let (rig, live) =
+        super::evidence::settle_on(SRig::with_intake_wait(super::LONG_INTAKE_WAIT, |_| {}).await)
+            .await;
     let sl = rig.sl(&live);
     let (entered, go, point) = gate_point();
     set(&sl.hooks.record_job, point);

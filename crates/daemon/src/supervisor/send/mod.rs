@@ -278,6 +278,10 @@ pub(crate) struct SendHooks {
             Box<dyn FnOnce(&LiveLaunch, Option<Instant>) -> super::live::LaunchObservation + Send>,
         >,
     >,
+    /// Given the facts the probe's `facts` built at one intake (on the intake's blocking
+    /// task).
+    #[allow(clippy::type_complexity, reason = "a one-shot test point")]
+    pub sampled: Mutex<Option<Box<dyn FnOnce(&probe::IntakeFactsV1) + Send>>>,
 }
 
 #[cfg(test)]

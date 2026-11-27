@@ -164,6 +164,10 @@ impl IntakeProbe for SupervisorProbe {
             human_running,
             inflight,
         };
+        #[cfg(test)]
+        if let Some(sampled) = super::lock(&sl.hooks.sampled).take() {
+            sampled(&facts);
+        }
         serde_json::to_value(&facts).ok().map(IntakeFacts)
     }
 

@@ -126,26 +126,27 @@ async fn held_spawn(
     (held, reply, entry)
 }
 
-/// Runs `entry.await_published` with a facts deadline 10 s away on its own thread, once it
-/// reported its first wait; returns how long the wait took.
+/// Runs `entry.await_published` on its own thread with a facts deadline an hour away, so
+/// within a test's bounds only a change it sees ends the wait. Returns the receivers of its
+/// first wait and of its end.
 fn waiting(
     entry: &Arc<LiveLaunch>,
-) -> (
-    std::sync::mpsc::Receiver<()>,
-    std::thread::JoinHandle<Duration>,
-) {
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Receiver<()>) {
     let (waiting_tx, waiting) = std::sync::mpsc::channel();
     *lock(&entry.hooks.publication_waiting) = Some(Box::new(move || {
         let _ = waiting_tx.send(());
     }));
+    let (ended_tx, ended) = std::sync::mpsc::channel();
     let e = entry.clone();
-    let h = std::thread::spawn(move || {
-        let t0 = Instant::now();
-        e.await_published(t0 + Duration::from_secs(10));
-        t0.elapsed()
+    std::thread::spawn(move || {
+        e.await_published(Instant::now() + Duration::from_secs(3600));
+        let _ = ended_tx.send(());
     });
-    (waiting, h)
+    (waiting, ended)
 }
+
+/// How long a test waits for a wait it ended to return.
+const ENDS: Duration = Duration::from_secs(30);
 
 /// SF-8 `observe` and the removal: a launch removed before its creation began is
 /// `Unobservable` with no wait; one whose spawn fails after creation began ends a
@@ -179,17 +180,16 @@ async fn observe_removed() {
     });
     let (held, reply, entry) = held_spawn(&rig, Pause::BeforeSpawn, "codex").await;
     assert!(entry.creation_started());
-    let (reported, h) = waiting(&entry);
+    let (reported, ended) = waiting(&entry);
     reported.recv_timeout(Duration::from_secs(10)).unwrap();
     held.go();
     assert_eq!(
         super::json(&reply.await.unwrap())["outcome"],
         "spawn_failed"
     );
-    assert!(
-        h.join().unwrap() < Duration::from_secs(5),
-        "no stall to the deadline"
-    );
+    ended
+        .recv_timeout(ENDS)
+        .expect("the wait ended on the removal, not at the facts deadline");
     assert!(entry.removed());
     assert_eq!(entry.observe(None), LaunchObservation::Unobservable);
     rig.srv.stop().await;
@@ -224,33 +224,27 @@ async fn observe_removed() {
     rig.srv.stop().await;
 }
 
-/// SF-8: a publication or a removal made after the publication wait began is seen promptly,
-/// well before the facts deadline.
+/// SF-8: a publication or a removal made after the publication wait began ends the wait,
+/// long before the facts deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn poll_sees_later_change() {
     // Published.
     let rig = Rig::new().await;
     let (held, reply, entry) = held_spawn(&rig, Pause::BeforePublish, "codex").await;
-    let (reported, h) = waiting(&entry);
+    let (reported, ended) = waiting(&entry);
     reported.recv_timeout(Duration::from_secs(10)).unwrap();
     held.go();
-    assert!(
-        h.join().unwrap() < Duration::from_secs(2),
-        "the publication was seen"
-    );
+    ended.recv_timeout(ENDS).expect("the publication was seen");
     assert!(entry.published().is_some());
     assert_eq!(reply.await.unwrap().status, 200);
     rig.srv.stop().await;
     // Removed.
     let rig = Rig::new().await;
     let (held, reply, entry) = held_spawn(&rig, Pause::BeforePublish, "codex").await;
-    let (reported, h) = waiting(&entry);
+    let (reported, ended) = waiting(&entry);
     reported.recv_timeout(Duration::from_secs(10)).unwrap();
     rig.sup.remove(entry.launch_id);
-    assert!(
-        h.join().unwrap() < Duration::from_secs(2),
-        "the removal was seen"
-    );
+    ended.recv_timeout(ENDS).expect("the removal was seen");
     held.go();
     let _ = reply.await.unwrap();
     rig.srv.stop().await;

@@ -14,13 +14,13 @@ use proptest::prelude::*;
 use serde_json::value::RawValue;
 
 use super::eventually;
-use super::shared;
 use super::support::commands::{CounterArgs, Probe, counter, slow_body};
 use super::support::http::{
     DEADLINE, TestServer, connect, host_events_of, parse, reached, reached_sync, read_to_end,
     settled, spawn_send, write,
 };
 use super::support::soon;
+use super::{TokioClock, shared};
 use crate::http::auth::sha256;
 use crate::http::commands::{Admitted, prepare_args, run};
 use crate::http::{
@@ -422,20 +422,6 @@ async fn effect_released_after_closing_completes() {
     );
     assert_eq!((probe.effects(), probe2.effects()), (1, 0));
     srv.stop().await;
-}
-
-/// The server's clock on tokio's time, which a test pauses and advances: the runner's
-/// budget checks and the timers it sets move together.
-struct TokioClock;
-
-impl MonotonicClock for TokioClock {
-    fn now(&self) -> Instant {
-        tokio::time::Instant::now().into_std()
-    }
-
-    fn real(&self, at: Instant) -> Instant {
-        at
-    }
 }
 
 /// A server on [`TokioClock`] whose `test_slow_effect` command has its effect resolved

@@ -441,13 +441,14 @@ fn captured_prompt_forms() {
 
 /// A rig whose Claude launches use `ClaudeDecoder` (Codex keeps `FakeDecoder`).
 async fn claude_rig() -> SRig {
-    SRig::with(|c| {
-        c.decoders = Decoders {
-            claude: Arc::new(ClaudeDecoder::default()),
-            codex: Arc::new(FakeDecoder),
-        };
-    })
-    .await
+    SRig::with(claude_decoders).await
+}
+
+fn claude_decoders(c: &mut crate::supervisor::SupervisorConfig) {
+    c.decoders = Decoders {
+        claude: Arc::new(ClaudeDecoder::default()),
+        codex: Arc::new(FakeDecoder),
+    };
 }
 
 /// A Claude launch, DECSET 2004 on, bound by the captured `SessionStart`.
@@ -613,9 +614,10 @@ async fn held_before_publish(
 /// SF-8: a `SessionStart` taken in after the child was created and before the launch was
 /// published (a CLI that emits it at once) waits for the publication: published while the
 /// intake waits, its facts are present, so it binds the launch and records `session_start`.
+/// The facts deadline outlasts every bound here, so the publication cannot outlive the wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_start_before_publication() {
-    let rig = claude_rig().await;
+    let rig = SRig::with_intake_wait(super::LONG_INTAKE_WAIT, claude_decoders).await;
     let (held, spawn, live) = held_before_publish(&rig).await;
     let entry = rig.sup.entry(live.l).unwrap();
     let (waiting_tx, waiting) = std::sync::mpsc::channel();
