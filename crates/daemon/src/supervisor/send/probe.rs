@@ -1,17 +1,17 @@
 //! `SupervisorProbe` (send §2.5 "Intake facts"): the hook intake's facts and the fence.
 
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, MutexGuard};
 use std::time::Instant;
 
 use chaldea_core::ids::{InputId, LaunchId};
 use chaldea_pty_runtime::OriginClass;
 use serde::{Deserialize, Serialize};
 
-use super::super::Supervisor;
 use super::super::live::LaunchObservation;
-use super::{SendSide, fence_advance, fence_release};
-use crate::hook::{IntakeFacts, IntakeProbe, TurnMark};
+use super::{SendLaunch, SendSide, SendState, fence_advance, fence_release};
+use crate::deadline::Backoff;
+use crate::hook::{IntakeFacts, IntakeGuard, IntakeProbe, TurnMark};
 
 /// The facts at a hook's intake, version 1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,46 +59,90 @@ impl IntakeFactsV1 {
     }
 }
 
-/// The real `IntakeProbe`. `facts` waits on nothing but its read of the send side's launch
-/// map, which may wait on a short write section (one `SendLaunch` constructed and inserted,
-/// or one removed; no await, I/O, or other lock inside it); `finished` also takes the
-/// launch's state mutex, held only for short sections of the same kind. Neither wait has a
-/// deadline of its own.
+/// The real `IntakeProbe` (send §2.5 "Intake facts"). `facts` runs on the intake's blocking
+/// task: it waits, by the facts deadline, for the launch's publication while its creation
+/// began, then for the launch's state; under the state it copies the send-side facts, stores
+/// `latest_intake`, and advances the fence (the intake point), releases it, and observes the
+/// launch with that deadline. Its one wait without a deadline of its own is the send side's
+/// launch map read, a short write section (one `SendLaunch` constructed and inserted, or one
+/// removed; no await, I/O, or other lock inside it); `finished` also takes the launch's state
+/// mutex, held only for short sections of the same kind.
 pub(crate) struct SupervisorProbe {
-    pub sup: Weak<Supervisor>,
     pub side: Arc<SendSide>,
 }
 
+/// The launch's state, retried until `f` (real time) with sleeps capped by the time left;
+/// the first attempt made at or after `f` is the last. `None` when every attempt found it
+/// held.
+fn state_until(sl: &SendLaunch, f: Instant) -> Option<MutexGuard<'_, SendState>> {
+    let mut backoff = Backoff::default();
+    loop {
+        let last = Instant::now() >= f;
+        #[cfg(test)]
+        if last {
+            super::run_hook(&sl.hooks.state_final_wake);
+        }
+        if let Some(st) = sl.try_state() {
+            return Some(st);
+        }
+        if last {
+            return None;
+        }
+        #[cfg(test)]
+        super::run_hook(&sl.hooks.state_contended);
+        backoff.wait(f.saturating_duration_since(Instant::now()));
+    }
+}
+
 impl IntakeProbe for SupervisorProbe {
-    fn facts(&self, launch: LaunchId, ordinal: u64) -> Option<IntakeFacts> {
+    fn facts(
+        &self,
+        launch: LaunchId,
+        ordinal: u64,
+        f: Instant,
+        arm: &IntakeGuard,
+    ) -> Option<IntakeFacts> {
         let sl = self.side.launch(launch)?;
-        // One observation point (send §2.5): the launch's state is held across the reads of
-        // the dispatch's `written` and the running unit, and the fence advance. A completion
-        // publishes `written` under the same state, so it is either before this intake or
-        // after it; a record that commits after the read leaves the unit running for it.
-        let st = sl.try_state();
-        let written = st
+        // Stores `latest_intake`, advances the fence, and arms the guard; under the state when
+        // the state was taken.
+        let advance = || {
+            sl.latest_intake.store(ordinal, Ordering::SeqCst);
+            fence_advance(&sl.fence);
+            arm.arm();
+        };
+        sl.entry.await_published(f);
+        let Some(st) = state_until(&sl, f) else {
+            advance();
+            return None;
+        };
+        // The intake point: the dispatch's `written`, the running unit, and the fence advance
+        // under the launch's state. A completion publishes `written` under the same state, so
+        // it is either before this intake or after it; a record that commits after the read
+        // leaves the unit running for it.
+        let running = st
+            .running
             .as_ref()
-            .and_then(|st| st.dispatch.as_ref())
-            .is_some_and(|d| d.written.load(Ordering::Acquire));
-        let running = st.as_ref().is_some_and(|st| {
-            st.running
-                .as_ref()
-                .is_some_and(|r| !r.recorded.load(Ordering::Acquire))
+            .is_some_and(|r| !r.recorded.load(Ordering::Acquire));
+        let human_running = st.human_unsettled > 0;
+        let dispatch = st.dispatch.as_ref().map(|d| {
+            (
+                d.input_id,
+                d.before,
+                d.competing,
+                d.written.load(Ordering::Acquire),
+            )
         });
         #[cfg(test)]
         super::run_hook(&sl.hooks.after_written_read);
-        sl.latest_intake.store(ordinal, Ordering::SeqCst);
-        fence_advance(&sl.fence);
-        let st = st?;
-        let sup = self.sup.upgrade()?;
+        advance();
+        drop(st);
         #[cfg(test)]
         let observed = match super::lock(&sl.hooks.observe).take() {
-            Some(f) => f(&sup, launch),
-            None => sup.observe(launch),
+            Some(o) => o(&sl.entry, Some(f)),
+            None => sl.entry.observe(Some(f)),
         };
         #[cfg(not(test))]
-        let observed = sup.observe(launch);
+        let observed = sl.entry.observe(Some(f));
         let (reference, last_started) = match observed {
             LaunchObservation::Started {
                 reference,
@@ -107,25 +151,28 @@ impl IntakeProbe for SupervisorProbe {
             LaunchObservation::Reserved => (0, [0; 3]),
             LaunchObservation::Unobservable => return None,
         };
-        let inflight = st.dispatch.as_ref().map(|d| {
+        let inflight = dispatch.map(|(input_id, before, competing, written)| {
             let at = last_started[OriginClass::Input.index()];
             Inflight {
-                input_id: d.input_id,
-                position: (at > d.before).then_some(at),
+                input_id,
+                position: (at > before).then_some(at),
                 written,
-                competing: d.competing,
+                competing,
             }
         });
-        let f = IntakeFactsV1 {
+        let facts = IntakeFactsV1 {
             v: 1,
             reference,
             last_started,
             running,
-            human_running: st.human_unsettled > 0,
+            human_running,
             inflight,
         };
-        drop(st);
-        serde_json::to_value(&f).ok().map(IntakeFacts)
+        #[cfg(test)]
+        if let Some(sampled) = super::lock(&sl.hooks.sampled).take() {
+            sampled(&facts);
+        }
+        serde_json::to_value(&facts).ok().map(IntakeFacts)
     }
 
     fn finished(

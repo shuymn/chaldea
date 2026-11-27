@@ -386,7 +386,14 @@ impl Supervisor {
         self.live.lock().get(&launch).cloned()
     }
 
+    /// Takes `launch` out of the live map, marking its entry removed first, so a holder of the
+    /// entry never sees it gone from the map with `removed` unset; the map is held by itself,
+    /// never with another lock.
     pub(crate) fn remove(&self, launch: LaunchId) {
+        let entry = self.live.lock().get(&launch).cloned();
+        if let Some(e) = entry {
+            e.mark_removed();
+        }
         self.live.lock().remove(&launch);
     }
 }

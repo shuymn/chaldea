@@ -176,7 +176,6 @@ pub(crate) fn seams(sup: &Arc<Supervisor>) -> HookSeams {
             side: sup.send.clone(),
         }),
         intake: Arc::new(send::SupervisorProbe {
-            sup: Arc::downgrade(sup),
             side: sup.send.clone(),
         }),
         ..HookSeams::mvp()

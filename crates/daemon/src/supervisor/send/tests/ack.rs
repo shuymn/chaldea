@@ -128,13 +128,15 @@ async fn ack_while_sending() {
     rig.stop().await;
 }
 
-/// PR10b-CL-7/8: the probe's one observation point orders a completion against the intake.
-/// A completion released while the intake holds the launch's state, after `written` was read
-/// and before the fence advance or after it, publishes `written` only once the intake is
-/// done: the hook's facts do not show the unit written, it names no `input_id`, and the
-/// input goes on to `sent`.
+/// PR10b-CL-7/8, SF-5: the probe's one observation point orders a completion against the
+/// intake. A completion released after `written` was read is no fact of the hook: released
+/// at the read, the intake still holds the launch's state, which the completion needs to
+/// publish `written`; released during the observation, the state already free, it publishes
+/// then. Either way the facts taken show the unit unwritten, the hook names no `input_id`,
+/// and the input goes on to `sent`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn completion_during_intake() {
+    use std::sync::atomic::Ordering::Acquire;
     for after_advance in [false, true] {
         let rig = SRig::new().await;
         let live = rig.claude().await;
@@ -148,40 +150,43 @@ async fn completion_during_intake() {
         submitted.await.unwrap();
         entered.await.unwrap();
         let written = sl.state().dispatch.as_ref().unwrap().written.clone();
-        let inside = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (w, i) = (written.clone(), inside.clone());
-        // Inside the intake: the completion is released and given time to publish.
-        let release = move || {
-            go.send(()).unwrap();
-            let until = Instant::now() + Duration::from_millis(500);
-            while Instant::now() < until {
-                if w.load(std::sync::atomic::Ordering::Acquire) {
-                    i.store(true, std::sync::atomic::Ordering::SeqCst);
-                    return;
-                }
-                std::thread::yield_now();
-            }
-        };
+        let (s2, w) = (sl.clone(), written.clone());
         if after_advance {
-            *crate::supervisor::send::lock(&sl.hooks.observe) = Some(Box::new(move |sup, l| {
-                release();
-                sup.observe(l)
+            *crate::supervisor::send::lock(&sl.hooks.observe) = Some(Box::new(move |e, f| {
+                assert!(
+                    s2.try_state().is_some(),
+                    "the state released before the observation"
+                );
+                go.send(()).unwrap();
+                let end = Instant::now() + Duration::from_secs(10);
+                while !w.load(Acquire) {
+                    assert!(Instant::now() < end, "the completion published");
+                    std::thread::yield_now();
+                }
+                e.observe(f)
             }));
         } else {
-            set(&sl.hooks.after_written_read, release);
+            set(&sl.hooks.after_written_read, move || {
+                assert!(s2.try_state().is_none(), "the intake holds the state");
+                go.send(()).unwrap();
+            });
         }
+        let (sampled_tx, sampled) = std::sync::mpsc::channel();
+        *crate::supervisor::send::lock(&sl.hooks.sampled) = Some(Box::new(move |f| {
+            let _ = sampled_tx.send(f.inflight.clone());
+        }));
         prompt(&rig, &live, "P").await;
         assert!(crate::supervisor::send::lock(&sl.hooks.observe).is_none());
         assert!(crate::supervisor::send::lock(&sl.hooks.after_written_read).is_none());
-        assert!(
-            !inside.load(std::sync::atomic::Ordering::SeqCst),
-            "the completion published inside the intake (after_advance: {after_advance})"
-        );
+        let inflight = sampled
+            .try_recv()
+            .expect("the facts")
+            .expect("the dispatch in the facts");
+        assert_eq!(inflight.input_id, id);
+        assert!(!inflight.written, "the facts show the unit unwritten");
         assert_eq!(last_ack(&rig, &live), None);
-        rig.until("the completion published", || {
-            written.load(std::sync::atomic::Ordering::Acquire)
-        })
-        .await;
+        rig.until("the completion published", || written.load(Acquire))
+            .await;
         resume.send(()).unwrap();
         rig.until_input(id, InputState::Sent).await;
         rig.stop().await;
@@ -440,17 +445,15 @@ async fn positional_anchor() {
                 prompt(&rig, &live, "first").await;
             }
             _ => {
-                // The live map held across the intake's observation only, by the request
-                // task itself: the runtime tasks that look a launch up never wait on it.
+                // The launch unobservable at the intake: facts missing.
                 let sl = rig.sl(&live);
-                *crate::supervisor::send::lock(&sl.hooks.observe) = Some(Box::new(|sup, l| {
-                    let _map = sup.live.lock();
-                    sup.observe(l)
+                *crate::supervisor::send::lock(&sl.hooks.observe) = Some(Box::new(|_, _| {
+                    crate::supervisor::live::LaunchObservation::Unobservable
                 }));
                 prompt(&rig, &live, "first").await;
                 assert!(
                     crate::supervisor::send::lock(&sl.hooks.observe).is_none(),
-                    "observed with the map held"
+                    "observed unobservable"
                 );
             }
         }
@@ -565,4 +568,93 @@ async fn matcher() {
         .await;
     assert_eq!(rig.input(id).state, InputState::Acked);
     rig.stop().await;
+}
+
+/// SF-3: a VT reply permitted (dequeued) before a `UserPromptSubmit`'s first read of the
+/// published positions is in its facts, or its facts are missing. With the writer parked in
+/// the reply's odd section: released while the intake's observation waits, the facts show the
+/// reply after the input, and the hook acks nothing; held past the facts deadline, the facts
+/// are missing and nothing is acked. Control: no reply, and the input is acked. Released, the
+/// facts deadline outlasts every bound here, so the writer's section cannot outlive the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reply_permitted_before_intake() {
+    use crate::supervisor::live::LaunchObservation;
+    use chaldea_pty_runtime::OriginClass;
+    for case in ["released", "held", "control"] {
+        let rig = if case == "released" {
+            SRig::with_intake_wait(super::LONG_INTAKE_WAIT, |_| {}).await
+        } else {
+            SRig::new().await
+        };
+        let live = rig.claude().await;
+        let id = rig.send(&live, "X").await;
+        rig.until_input(id, InputState::Sent).await;
+        let sl = rig.sl(&live);
+        let probe = rig.probe(&live).await;
+        let mut park = None;
+        if case != "control" {
+            let n = probe.count(ProbePoint::Publishing);
+            park = Some(probe.park(ProbePoint::Publishing));
+            live.child.emit(b"\x1b[6n");
+            let p = probe.clone();
+            assert!(
+                tokio::task::spawn_blocking(move || p.wait(
+                    ProbePoint::Publishing,
+                    n + 1,
+                    Instant::now() + Duration::from_secs(10)
+                ))
+                .await
+                .unwrap(),
+                "the reply's permission parked"
+            );
+        }
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let s2 = seen.clone();
+        let released = if case == "released" {
+            park.take()
+        } else {
+            None
+        };
+        *crate::supervisor::send::lock(&sl.hooks.observe) = Some(Box::new(move |e, f| {
+            if let Some(park) = released {
+                assert_eq!(
+                    e.observe(None),
+                    LaunchObservation::Unobservable,
+                    "the reply's odd section is open"
+                );
+                drop(park);
+            }
+            let o = e.observe(f);
+            *s2.lock().unwrap() = Some(o);
+            o
+        }));
+        prompt(&rig, &live, "X").await;
+        drop(park);
+        let seen = seen.lock().unwrap().take().expect("observed");
+        match case {
+            "released" => {
+                let LaunchObservation::Started { last_started, .. } = seen else {
+                    panic!("{seen:?}");
+                };
+                assert!(
+                    last_started[OriginClass::Reply.index()]
+                        > last_started[OriginClass::Input.index()],
+                    "the reply after the input: {last_started:?}"
+                );
+                assert_eq!(last_ack(&rig, &live), None);
+                assert_ne!(rig.input(id).state, InputState::Acked);
+            }
+            "held" => {
+                assert_eq!(seen, LaunchObservation::Unobservable, "facts missing");
+                assert_eq!(last_ack(&rig, &live), None);
+                assert_ne!(rig.input(id).state, InputState::Acked);
+            }
+            _ => {
+                assert!(matches!(seen, LaunchObservation::Started { .. }));
+                assert_eq!(last_ack(&rig, &live), Some(id));
+                assert_eq!(rig.input(id).state, InputState::Acked);
+            }
+        }
+        rig.stop().await;
+    }
 }

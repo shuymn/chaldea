@@ -1268,8 +1268,9 @@ fn seal_settles_unpermitted_units_once() {
     );
 }
 
-/// PR 10a1 `WriterObserver`: the per-class positions under one queue lock, `None` from the
-/// non-waiting read while the lock is held, and readable after the session is gone.
+/// PR 10a1 `WriterObserver`: the per-class positions under one queue lock, the same from the
+/// published read, which does not wait while the writer holds the lock, and readable after
+/// the session is gone.
 #[test]
 fn writer_observer_reads_positions() {
     use chaldea_pty_runtime::{ClassSet, OriginClass};
@@ -1298,8 +1299,8 @@ fn writer_observer_reads_positions() {
     seqs.sort_unstable();
     assert_eq!(seqs, [1, 2, 3], "each class has its own position: {each:?}");
     assert_eq!(obs.last_started(ClassSet::ALL), 3);
-    assert_eq!(obs.try_last_started_each(), Some(each));
-    // The writer parks with the queue lock held.
+    assert_eq!(obs.published_last_started(None), Some(each));
+    // The writer parks with the queue lock held, before the publication's odd section.
     let dispatched = r.session.probe().count(ProbePoint::Dispatching);
     let park = r.session.probe().park(ProbePoint::Dispatching);
     let p = submit(&r.session, key(b"x"), open());
@@ -1308,7 +1309,7 @@ fn writer_observer_reads_positions() {
             .probe()
             .wait(ProbePoint::Dispatching, dispatched + 1, soon())
     );
-    assert_eq!(obs.try_last_started_each(), None);
+    assert_eq!(obs.published_last_started(None), Some(each));
     park.release();
     assert_eq!(p.wait().seq, 4);
     let _ = r.session.close(&[], short_bounds());

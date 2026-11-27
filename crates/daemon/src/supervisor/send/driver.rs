@@ -384,7 +384,8 @@ async fn settle(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>, view: &View, now: I
     if !chaldea_core::adapter::evidence_allowed(sl.agent, mode, ReadinessEvidence::StopSettled) {
         return;
     }
-    let position = match sup.observe(sl.launch_id) {
+    // One attempt with no lock: a publication or a removal in progress skips this pass.
+    let position = match sl.entry.observe(None) {
         LaunchObservation::Started { last_started, .. } => {
             last_started.iter().copied().max().unwrap_or(0)
         }
@@ -395,8 +396,10 @@ async fn settle(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>, view: &View, now: I
     let job: JobOf<()> = Arc::new(move |tx| {
         #[cfg(test)]
         super::run_hook(&me.hooks.settle_job);
-        // An unrecorded unit keeps the candidate; a later pass decides it again.
-        if me.fence.load(Ordering::Acquire) != word
+        // An unrecorded unit keeps the candidate; a later pass decides it again. A launch
+        // removed since the observation settles nothing.
+        if me.entry.removed()
+            || me.fence.load(Ordering::Acquire) != word
             || me.running_flag.load(Ordering::SeqCst)
             || me.human_flag.load(Ordering::SeqCst) > 0
         {

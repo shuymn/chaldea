@@ -1264,3 +1264,94 @@ fn ticket_started_at_and_try_cancel() {
     assert_eq!(rec.started_at, Some(started));
     assert_eq!(r.child.input(), b"a");
 }
+
+/// pty-runtime §2.3 "Published positions": a read that fails while crossing its deadline (it
+/// loaded the first position, a publication followed, and the deadline passed while it was
+/// parked between its loads) is followed by the final read, which supplies the positions.
+#[test]
+fn published_positions_final_attempt() {
+    let r = rig();
+    let obs = r.session.observer();
+    let probe = r.session.probe();
+    // A reader whose first read starts at or after its deadline makes only that read; such
+    // a run says nothing and is tried again.
+    for _ in 0..5 {
+        let n = probe.count(ProbePoint::BetweenPositionLoads);
+        let park = probe.park(ProbePoint::BetweenPositionLoads);
+        let f = Instant::now() + Duration::from_millis(200);
+        let reader = {
+            let obs = obs.clone();
+            std::thread::spawn(move || obs.published_last_started(Some(f)))
+        };
+        assert!(probe.wait(ProbePoint::BetweenPositionLoads, n + 1, soon()));
+        if Instant::now() >= f {
+            park.release();
+            let _ = reader.join();
+            continue;
+        }
+        let i = submit(&r.session, unit(input_origin(1), vec![b("i")]), open()).wait();
+        while Instant::now() <= f {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        park.release();
+        assert_eq!(
+            reader.join().unwrap().map(|p| p[0]),
+            Some(i.seq),
+            "the final read's positions"
+        );
+        assert_eq!(
+            probe.count(ProbePoint::BetweenPositionLoads),
+            n + 2,
+            "one read after the failed one"
+        );
+        return;
+    }
+    panic!("no reader started its first read before its deadline");
+}
+
+/// SF-4 (pty-runtime §2.3 "Published positions"): a reader that loaded the first position
+/// before two publications retries and returns both new positions, never the mixed triple;
+/// while the writer is inside a permission's odd section one attempt (`None` deadline) and a
+/// short deadline both give `None`, and the new triple after it.
+#[test]
+fn published_positions() {
+    let r = rig();
+    let obs = r.session.observer();
+    let probe = r.session.probe();
+    let park = probe.park(ProbePoint::BetweenPositionLoads);
+    let reader = {
+        let obs = obs.clone();
+        std::thread::spawn(move || obs.published_last_started(Some(soon())))
+    };
+    assert!(probe.wait(ProbePoint::BetweenPositionLoads, 1, soon()));
+    // The reader holds the old input position; the writer publishes input, then human.
+    let i = submit(&r.session, unit(input_origin(1), vec![b("i")]), open()).wait();
+    let k = submit(&r.session, key(b"k"), open()).wait();
+    park.release();
+    let seen = reader.join().unwrap();
+    assert_eq!(
+        seen,
+        Some([i.seq, k.seq, 0]),
+        "the retry's triple, not a mix"
+    );
+
+    // Inside the odd section.
+    let n = probe.count(ProbePoint::Publishing);
+    let park = probe.park(ProbePoint::Publishing);
+    let p = submit(&r.session, key(b"x"), open());
+    assert!(probe.wait(ProbePoint::Publishing, n + 1, soon()));
+    assert_eq!(obs.published_last_started(None), None, "one attempt");
+    let short = Instant::now() + Duration::from_millis(20);
+    assert_eq!(
+        obs.published_last_started(Some(short)),
+        None,
+        "until the deadline"
+    );
+    assert!(
+        Instant::now() < short + Duration::from_secs(1),
+        "bounded by the deadline"
+    );
+    park.release();
+    let x = p.wait();
+    assert_eq!(obs.published_last_started(None), Some([i.seq, x.seq, 0]));
+}

@@ -381,31 +381,31 @@ impl Tail {
 
     fn read(&mut self, be: &dyn Backend, last: bool) -> Result<Step, Fail> {
         self.stopped()?;
-        if self.open.is_none() {
-            let f = match self.open_path()? {
-                Ok(f) => f,
-                Err(end) => return Ok(end),
-            };
-            if self.disproved.is_some() {
-                return self.new_generation(be, f);
-            }
-            let verified = self.verify(f);
-            if last && matches!(verified, Err(Fail::Stopped)) {
-                self.unverified("the final read stopped during the prefix check at its open");
-            }
-            match verified? {
-                Ok(mut open) => {
-                    open.checked = last;
-                    self.open = Some(open);
-                }
-                Err(f) => {
-                    self.disprove();
+        let mut open = match self.open.take() {
+            Some(open) => open,
+            None => {
+                let f = match self.open_path()? {
+                    Ok(f) => f,
+                    Err(end) => return Ok(end),
+                };
+                if self.disproved.is_some() {
                     return self.new_generation(be, f);
                 }
+                let verified = self.verify(f);
+                if last && matches!(verified, Err(Fail::Stopped)) {
+                    self.unverified("the final read stopped during the prefix check at its open");
+                }
+                match verified? {
+                    Ok(mut open) => {
+                        open.checked = last;
+                        open
+                    }
+                    Err(f) => {
+                        self.disprove();
+                        return self.new_generation(be, f);
+                    }
+                }
             }
-        }
-        let Some(mut open) = self.open.take() else {
-            return Ok(Step::Wait);
         };
         // The whole prefix is checked again once at the final read, and whenever the file's
         // modification time moved back; normal appends keep the light checks.
@@ -522,14 +522,14 @@ impl Tail {
                 Step::Wait
             });
         }
-        let Some(cursor) = self.cursor.clone() else {
+        let Some(expect) = self.cursor.as_ref().map(Cursor::pos) else {
             return Ok(Step::Wait);
         };
         let advance_to = ReadPos {
             read_offset: batch.advance,
             continuity: continuity(&batch.digest),
         };
-        let out = self.batch(Some(cursor.pos()), None, batch.lines, advance_to.clone());
+        let out = self.batch(Some(expect), None, batch.lines, advance_to.clone());
         if let Err(e) = self.stopped() {
             self.open = Some(open);
             return Err(e);
@@ -563,7 +563,7 @@ impl Tail {
                 self.open = Some(open);
                 Ok(if batch.more {
                     Step::Again
-                } else if last && batch.eof {
+                } else if last {
                     Step::End("the launch exited and its transcript was read".into())
                 } else {
                     Step::Wait
@@ -654,7 +654,8 @@ impl Tail {
         if c.path != self.b.path || c.file_id != f.id().as_str() || f.size()? < c.read_offset {
             return Ok(Err(f));
         }
-        let Some((digest, recent)) = self.hash_prefix(&mut f, c.read_offset)? else {
+        let mut recent = Recent::default();
+        let Some(digest) = self.hash_prefix(&mut f, c.read_offset, Some(&mut recent))? else {
             return Ok(Err(f));
         };
         if continuity(&digest) != c.continuity {
@@ -670,16 +671,20 @@ impl Tail {
         }))
     }
 
-    /// The digest of `f`'s first `len` bytes, read again, and their last [`TAIL_WINDOW`]
-    /// bytes; `None` when the file is shorter.
-    fn hash_prefix(&self, f: &mut RegularFile, len: u64) -> Result<Option<(Sha256, Recent)>, Fail> {
+    /// The digest of `f`'s first `len` bytes, read again, with the bytes also pushed to
+    /// `recent` when given; `None` when the file is shorter.
+    fn hash_prefix(
+        &self,
+        f: &mut RegularFile,
+        len: u64,
+        mut recent: Option<&mut Recent>,
+    ) -> Result<Option<Sha256>, Fail> {
         #[cfg(test)]
         if self.stop_at_prefix_check {
             self.stop.store(true, Ordering::Release);
         }
         f.seek(SeekFrom::Start(0))?;
         let mut digest = Sha256::new();
-        let mut recent = Recent::default();
         let mut buf = vec![0u8; CHUNK];
         let mut left = len;
         while left > 0 {
@@ -692,18 +697,20 @@ impl Tail {
                 Err(e) => return Err(e.into()),
             };
             digest.update(&buf[..n]);
-            recent.push(&buf[..n]);
+            if let Some(r) = recent.as_deref_mut() {
+                r.push(&buf[..n]);
+            }
             left -= n as u64;
         }
-        Ok(Some((digest, recent)))
+        Ok(Some(digest))
     }
 
     /// Whether the open file's bytes before the read position still have the digest read.
     fn prefix_holds(&self, open: &mut OpenFile) -> Result<bool, Fail> {
         let pos = open.pos;
         Ok(self
-            .hash_prefix(&mut open.file, pos)?
-            .is_some_and(|(d, _)| continuity(&d) == continuity(&open.digest)))
+            .hash_prefix(&mut open.file, pos, None)?
+            .is_some_and(|d| d.finalize() == open.digest.clone().finalize()))
     }
 
     /// Commits a new generation of `f` alone at offset 0.
@@ -822,8 +829,6 @@ struct Batch {
     recent: Recent,
     /// The batch closed at its bounds with more to read.
     more: bool,
-    /// The read reached the end of the file.
-    eof: bool,
     /// A final read's trailing bytes without a newline, kept out of the batch until the
     /// file is seen to end with them.
     fragment: Option<Fragment>,
@@ -855,7 +860,6 @@ struct Src<'a> {
     pos: usize,
     end: usize,
     left: u64,
-    eof: bool,
     be: &'a dyn Backend,
 }
 
@@ -864,17 +868,13 @@ impl Src<'_> {
         if self.pos < self.end {
             return Ok(true);
         }
-        if self.eof || self.left == 0 {
-            self.eof = true;
+        if self.left == 0 {
             return Ok(false);
         }
         let want = usize::try_from(self.left).map_or(self.buf.len(), |l| l.min(self.buf.len()));
         loop {
             match self.file.read(&mut self.buf[..want]) {
-                Ok(0) => {
-                    self.eof = true;
-                    return Ok(false);
-                }
+                Ok(0) => return Ok(false),
                 Ok(n) => {
                     self.pos = 0;
                     self.end = n;
@@ -921,8 +921,8 @@ fn next_line(
     at: u64,
 ) -> Result<Option<LineRead>, Fail> {
     let meter = Meter::default();
-    let mut raw = ByteAcc::new(dir.clone(), meter.clone());
-    let mut text = ByteAcc::new(dir.clone(), meter.clone());
+    let mut raw = ByteAcc::new(dir, &meter);
+    let mut text = ByteAcc::new(dir, &meter);
     let mut aside: Option<ByteAcc> = None;
     // `None` once the parser panicked.
     let mut parser = Some(LineParser::default());
@@ -952,7 +952,7 @@ fn next_line(
                 match e {
                     Emit::Text(v) => text.push(&v)?,
                     Emit::Aside(v) => aside
-                        .get_or_insert_with(|| ByteAcc::new(dir.clone(), meter.clone()))
+                        .get_or_insert_with(|| ByteAcc::new(dir, &meter))
                         .push(&v)?,
                     Emit::KeepAside => {
                         if let Some(a) = aside.take() {
@@ -1050,7 +1050,6 @@ fn read_lines(
         pos: 0,
         end: 0,
         left: size.saturating_sub(open.pos),
-        eof: false,
         be,
     };
     loop {
@@ -1064,7 +1063,6 @@ fn read_lines(
                 digest,
                 recent,
                 more: true,
-                eof: false,
                 fragment: None,
             });
         }
@@ -1094,7 +1092,6 @@ fn read_lines(
                     digest,
                     recent,
                     more: true,
-                    eof: false,
                     fragment: None,
                 });
             }
@@ -1124,7 +1121,6 @@ fn read_lines(
                 digest,
                 recent,
                 more: false,
-                eof: true,
                 fragment: Some(Fragment {
                     line,
                     end,
@@ -1145,13 +1141,12 @@ fn read_lines(
         digest,
         recent,
         more: false,
-        eof: true,
         fragment: None,
     })
 }
 
 /// A line kept verbatim.
-fn raw_event(b: &Binding, reason: RawUnknownReason, raw: ByteAcc) -> io::Result<LineEvent> {
+fn raw_event(b: &Binding, reason: RawUnknownReason, raw: ByteAcc<'_>) -> io::Result<LineEvent> {
     let content_type = match reason {
         RawUnknownReason::Unparseable | RawUnknownReason::PartialLine => OCTET,
         _ => JSON,

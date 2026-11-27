@@ -72,7 +72,10 @@ const COUNT_MAX: u64 = (1 << (64 - OPEN_BITS)) - 1;
 pub(crate) const FENCE_CLOSED: u64 = u64::MAX;
 
 /// One intake taken in: both counts up by one with one compare-and-swap; an add that would
-/// overflow either field closes the word instead. The closed word never changes.
+/// overflow either field closes the word instead. The closed word never changes. The
+/// successful swap is `SeqCst`: with the writer's `SeqCst` publication and fence load, either
+/// the writer's dispatch check sees this advance or the intake's later read of the published
+/// positions sees that dispatch (send §2.5 "Intake facts").
 pub(crate) fn fence_advance(word: &AtomicU64) {
     let mut cur = word.load(Ordering::Acquire);
     loop {
@@ -84,7 +87,7 @@ pub(crate) fn fence_advance(word: &AtomicU64) {
         } else {
             cur + (1 << OPEN_BITS) + 1
         };
-        match word.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+        match word.compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::Acquire) {
             Ok(_) => return,
             Err(seen) => cur = seen,
         }
@@ -292,6 +295,12 @@ pub(crate) struct SendHooks {
     /// Runs in the probe's `facts` after `written` was read, before the fence advance (the
     /// launch's state held).
     pub after_written_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs in the probe's `facts` each time its `try_lock` of the launch's state failed
+    /// before the facts deadline, before its sleep.
+    pub state_contended: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs in the probe's `facts` before its last `try_lock` of the launch's state, the first
+    /// made at or after the facts deadline.
+    pub state_final_wake: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs at the start of the probe's `finished` (on the write's observer), before the
     /// hook's turn marks are applied.
     pub finished: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -300,14 +309,18 @@ pub(crate) struct SendHooks {
     /// Runs on the worker after an input's completion job was recorded, before its result
     /// is applied.
     pub after_record: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    /// Takes the place of the probe's observation of the launch at one intake (on the
-    /// hook's request task, synchronously).
+    /// Takes the place of the probe's observation of the launch at one intake, given the
+    /// entry and the facts deadline (on the intake's blocking task).
     #[allow(clippy::type_complexity, reason = "a one-shot test point")]
     pub observe: Mutex<
         Option<
-            Box<dyn FnOnce(&super::Supervisor, LaunchId) -> super::live::LaunchObservation + Send>,
+            Box<dyn FnOnce(&LiveLaunch, Option<Instant>) -> super::live::LaunchObservation + Send>,
         >,
     >,
+    /// Given the facts the probe's `facts` built at one intake (on the intake's blocking
+    /// task).
+    #[allow(clippy::type_complexity, reason = "a one-shot test point")]
+    pub sampled: Mutex<Option<Box<dyn FnOnce(&probe::IntakeFactsV1) + Send>>>,
 }
 
 #[cfg(test)]
@@ -326,6 +339,8 @@ pub(crate) struct SendLaunch {
     pub agent: Agent,
     pub caps: &'static Capabilities,
     pub positional: Option<InputId>,
+    /// The launch's live entry: its observation and `removed` (send §2.5, §2.4).
+    pub entry: Arc<LiveLaunch>,
     pub fence: Arc<AtomicU64>,
     pub latest_intake: AtomicU64,
     /// The highest receipt ordinal among the launch's committed turn boundaries (§2.4),
@@ -368,13 +383,14 @@ pub(crate) struct SendLaunch {
 }
 
 impl SendLaunch {
-    fn new(e: &LiveLaunch) -> SendLaunch {
+    fn new(e: &Arc<LiveLaunch>) -> SendLaunch {
         SendLaunch {
             thread_id: e.thread_id,
             launch_id: e.launch_id,
             agent: e.agent,
             caps: e.caps,
             positional: e.positional,
+            entry: e.clone(),
             fence: Arc::new(AtomicU64::new(0)),
             latest_intake: AtomicU64::new(0),
             turn_watermark: Arc::new(AtomicU64::new(0)),
@@ -636,7 +652,7 @@ pub(crate) fn install(cfg: &mut SupervisorConfig) -> Arc<SendSide> {
 
 impl Supervisor {
     /// Creates `entry`'s send side and its worker once (the reservation job).
-    pub(crate) fn send_launch(self: &Arc<Self>, entry: &LiveLaunch) {
+    pub(crate) fn send_launch(self: &Arc<Self>, entry: &Arc<LiveLaunch>) {
         let mut map = self
             .send
             .map

@@ -2,30 +2,49 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use chaldea_core::ids::{Agent, LaunchId};
 use chaldea_core::input::InputState;
 use serde_json::json;
 
+use super::gate::set;
 use super::{Live, SRig};
 use crate::hook::{IntakeGuard, IntakeProbe};
 use crate::http::{OnReply, WriteFailure};
 use crate::store::{StoreError, WriteError};
 use crate::supervisor::send::probe::{IntakeFactsV1, SupervisorProbe};
 use crate::supervisor::send::{
-    FENCE_CLOSED, OPEN_BITS, OPEN_MASK, fence_advance, fence_quiet, fence_release,
+    FENCE_CLOSED, OPEN_BITS, OPEN_MASK, SendLaunch, fence_advance, fence_quiet, fence_release,
 };
 
-fn probe_of(rig: &SRig) -> Arc<dyn IntakeProbe> {
+pub(crate) fn probe_of(rig: &SRig) -> Arc<dyn IntakeProbe> {
     Arc::new(SupervisorProbe {
-        sup: Arc::downgrade(&rig.sup),
         side: rig.sup.send.clone(),
     })
 }
 
-/// PR10b-CL-7: the probe never waits; it advances the fence at every intake, answers `None`
-/// for an unknown or unobservable launch and for a contended `SendLaunch`, and the facts of
-/// §2.5 otherwise.
+/// A facts deadline far enough away for any wait the test does not hold.
+pub(crate) fn soon() -> Instant {
+    Instant::now() + Duration::from_secs(10)
+}
+
+/// One intake of `l` through `p` with the facts deadline `f`: its facts and its guard (armed
+/// when the intake was taken in; dropping it finishes the intake).
+pub(crate) fn intake(
+    p: &Arc<dyn IntakeProbe>,
+    l: LaunchId,
+    ordinal: u64,
+    f: Instant,
+) -> (Option<IntakeFactsV1>, IntakeGuard) {
+    let g = IntakeGuard::new(p.clone(), l, ordinal);
+    let facts = p.facts(l, ordinal, f, &g);
+    (IntakeFactsV1::parse(facts.as_ref()), g)
+}
+
+/// PR10b-CL-7: the probe advances the fence once at every intake and answers `None` for an
+/// unknown launch and for a `SendLaunch` held past the facts deadline (one attempt when it is
+/// already due), and the facts of §2.5 otherwise, the live map held or not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn probe() {
     let rig = SRig::new().await;
@@ -33,26 +52,16 @@ async fn probe() {
     let p = probe_of(&rig);
     let sl = rig.sl(&live);
     let word = |sl: &crate::supervisor::send::SendLaunch| sl.fence.load(Ordering::SeqCst);
-    // An unknown launch.
-    assert!(p.facts(LaunchId::from_u128(99), 1).is_none());
-    // Observed: the facts. The worker may hold the `SendLaunch` mutex for a moment after the
-    // launch bound; the probe answers `None` then, so a later intake asks again.
-    let mut ordinal = 10;
-    let mut seen = None;
-    rig.until("facts observed", || {
-        let w0 = word(&sl);
-        let f = p.facts(live.l, ordinal);
-        assert_eq!(word(&sl), w0 + (1 << OPEN_BITS) + 1, "advanced");
-        assert_eq!(sl.latest_intake.load(Ordering::SeqCst), ordinal);
-        seen = IntakeFactsV1::parse(f.as_ref());
-        if seen.is_none() {
-            p.finished(live.l, ordinal, &[], None);
-            ordinal += 1;
-        }
-        seen.is_some()
-    })
-    .await;
-    let f = seen.unwrap();
+    // An unknown launch: no fence, an unarmed guard.
+    let (f, g) = intake(&p, LaunchId::from_u128(99), 1, soon());
+    assert!(f.is_none());
+    drop(g);
+    // Observed: the facts.
+    let w0 = word(&sl);
+    let (f, g) = intake(&p, live.l, 10, soon());
+    assert_eq!(word(&sl), w0 + (1 << OPEN_BITS) + 1, "advanced");
+    assert_eq!(sl.latest_intake.load(Ordering::SeqCst), 10);
+    let f = f.expect("facts");
     let published = rig
         .sup
         .entry(live.l)
@@ -62,38 +71,31 @@ async fn probe() {
         .reference;
     assert_eq!(f.reference, published);
     assert!(!f.running && !f.human_running && f.inflight.is_none());
-    p.finished(live.l, ordinal, &[], None);
-    // The `SendLaunch` mutex held: `None` at once, the fence still advanced.
+    drop(g);
+    // The `SendLaunch` mutex held past a facts deadline already due: one attempt, `None`, the
+    // fence still advanced.
     {
         let _held = sl.state();
         let w = word(&sl);
-        assert!(p.facts(live.l, 11).is_none());
+        let (f, g) = intake(&p, live.l, 11, Instant::now());
+        assert!(f.is_none());
         assert_eq!(word(&sl), w + (1 << OPEN_BITS) + 1);
+        drop(g);
     }
-    p.finished(live.l, 11, &[], None);
-    // The live map held: unobservable, `None`.
+    // The live map held: the observation takes no lock, so the facts are present.
     {
         let _map = rig.sup.live.lock();
-        assert!(p.facts(live.l, 12).is_none());
+        let (f, g) = intake(&p, live.l, 12, soon());
+        assert!(f.is_some());
+        drop(g);
     }
-    p.finished(live.l, 12, &[], None);
     assert!(fence_quiet(word(&sl)));
     // A dispatched input shows in the facts.
     let id = rig.send(&live, "seen").await;
     rig.until_input(id, InputState::Sent).await;
-    // The worker may still hold the `SendLaunch` mutex or the writer's queue lock after its
-    // completion job; the probe answers `None` then, so a later intake asks again.
-    let mut ordinal = 13;
-    let mut seen = None;
-    rig.until("facts observed", || {
-        let f = p.facts(live.l, ordinal);
-        p.finished(live.l, ordinal, &[], None);
-        ordinal += 1;
-        seen = IntakeFactsV1::parse(f.as_ref());
-        seen.is_some()
-    })
-    .await;
-    let inflight = seen.unwrap().inflight.unwrap();
+    let (f, g) = intake(&p, live.l, 13, soon());
+    drop(g);
+    let inflight = f.expect("facts").inflight.unwrap();
     assert_eq!(inflight.input_id, id);
     assert!(inflight.written && inflight.position.is_some());
     rig.stop().await;
@@ -207,9 +209,8 @@ async fn fence_word() {
         let p = probe_of(&rig);
         let sl = rig.sl(&live);
         let ord = rig.next_ordinal(&live);
-        let _ = p.facts(live.l, ord);
-        let g = Box::new(IntakeGuard::new(p.clone(), live.l, ord));
-        path(g);
+        let (_, g) = intake(&p, live.l, ord, soon());
+        path(Box::new(g));
         assert_eq!(
             fence_quiet(sl.fence.load(Ordering::SeqCst)),
             finishes,
@@ -260,11 +261,132 @@ async fn probe_beside_map_reader() {
     let live = rig.claude().await;
     let p = probe_of(&rig);
     let held = rig.sup.send.map.read().unwrap();
-    let (l, p2) = (live.l, p.clone());
-    let h = std::thread::spawn(move || p2.facts(l, 50).is_some());
+    let l = live.l;
+    let h = std::thread::spawn(move || {
+        let (f, g) = intake(&p, l, 50, soon());
+        drop(g);
+        f.is_some()
+    });
     rig.until("the probe answered", || h.is_finished()).await;
     drop(held);
     assert!(h.join().unwrap());
-    p.finished(live.l, 50, &[], None);
+    rig.stop().await;
+}
+
+/// Holds `sl`'s state on its own thread until the returned sender is used or dropped.
+pub(super) fn hold_state(
+    sl: &Arc<SendLaunch>,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let (held_tx, held) = std::sync::mpsc::channel();
+    let (free, until) = std::sync::mpsc::channel::<()>();
+    let s2 = sl.clone();
+    let h = std::thread::spawn(move || {
+        let _st = s2.state();
+        held_tx.send(()).unwrap();
+        let _ = until.recv_timeout(Duration::from_secs(30));
+    });
+    held.recv().unwrap();
+    (free, h)
+}
+
+/// SF-1: a Claude `SessionStart` taken in with the PTY writer parked at its dispatch boundary
+/// (its queue lock held) has its facts: the binding job records `session_start`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_start_beside_parked_writer() {
+    let rig = SRig::new().await;
+    let (live, _) = rig.spawn(Agent::Claude, None).await;
+    rig.paste(&live, true).await;
+    let (park, _) = rig.writer_q_held(&live).await;
+    rig.hook(&live, "SessionStart", &json!({})).await;
+    drop(park);
+    assert_eq!(super::evidence::evidences(&rig, &live), ["session_start"]);
+    rig.stop().await;
+}
+
+/// SF-5: the probe waits for a held `SendLaunch` until the facts deadline: released after the
+/// probe's `try_lock` failed (the holder joined there), the facts; held past the deadline,
+/// `None`. The fence advances once either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn state_wait() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let p = probe_of(&rig);
+    let sl = rig.sl(&live);
+    let word = || sl.fence.load(Ordering::SeqCst);
+    // Released (the holder gone) while the probe waits; the worker parked, so no other
+    // holder takes the state before the next attempt.
+    let (f, g, w) = rig
+        .worker_parked(&live, async {
+            let (free, holder) = hold_state(&sl);
+            set(&sl.hooks.state_contended, move || {
+                free.send(()).unwrap();
+                holder.join().unwrap();
+            });
+            let w = word();
+            let (f, g) = intake(&p, live.l, 20, soon());
+            (f, g, w)
+        })
+        .await;
+    assert!(f.is_some(), "the facts after the release");
+    assert_eq!(word(), w + (1 << OPEN_BITS) + 1, "advanced once");
+    drop(g);
+    // Held past the facts deadline.
+    let (free, holder) = hold_state(&sl);
+    let w = word();
+    let (f, g) = intake(&p, live.l, 21, Instant::now() + Duration::from_millis(100));
+    assert!(f.is_none(), "facts missing");
+    assert_eq!(word(), w + (1 << OPEN_BITS) + 1, "advanced once");
+    free.send(()).unwrap();
+    holder.join().unwrap();
+    drop(g);
+    rig.stop().await;
+}
+
+/// SF-10: a wait for the launch's state that reaches the facts deadline makes one more
+/// attempt: released after the clock check selects that attempt and before its read, the
+/// facts are present.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn state_at_facts_deadline() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let p = probe_of(&rig);
+    let sl = rig.sl(&live);
+    // The worker parked first, so the final attempt meets no other holder.
+    let (f, g) = rig
+        .worker_parked(&live, async {
+            let (free, holder) = hold_state(&sl);
+            set(&sl.hooks.state_final_wake, move || {
+                free.send(()).unwrap();
+                holder.join().unwrap();
+            });
+            intake(&p, live.l, 20, Instant::now() + Duration::from_millis(50))
+        })
+        .await;
+    assert!(
+        super::super::lock(&sl.hooks.state_final_wake).is_none(),
+        "the final wake ran"
+    );
+    assert!(f.is_some(), "the final attempt took the state");
+    drop(g);
+    rig.stop().await;
+}
+
+/// SF-10: an intake whose blocking task starts past its facts deadline, the request deadline
+/// far away, still takes its ordinal and makes one attempt at each wait: an uncontended
+/// `SessionStart` has its facts (`session_start`) and the reply is 200.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pool_past_facts_deadline() {
+    let rig = SRig::new().await;
+    let (live, _) = rig.spawn(Agent::Claude, None).await;
+    rig.paste(&live, true).await;
+    *rig.ingest.order.task_started.lock().unwrap() =
+        Some(Box::new(|| std::thread::sleep(Duration::from_millis(700))));
+    let ord = rig.next_ordinal(&live);
+    // The worker parked through the intake, so its one attempt at the state meets no holder.
+    rig.worker_parked(&live, rig.hook(&live, "SessionStart", &json!({})))
+        .await;
+    assert!(rig.ingest.order.task_started.lock().unwrap().is_none());
+    assert_eq!(rig.sl(&live).latest_intake.load(Ordering::SeqCst), ord);
+    assert_eq!(super::evidence::evidences(&rig, &live), ["session_start"]);
     rig.stop().await;
 }

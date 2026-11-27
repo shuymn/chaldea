@@ -922,7 +922,8 @@ pub enum ProbePoint {
     /// The drain is about to parse a piece, with the VT lock held.
     PieceParsing,
     /// The writer is about to decide a unit's first write permission, with the queue lock
-    /// held: every check but the final deadline check has passed.
+    /// held: every check but the final deadline check has passed. Before the publication's
+    /// odd counter store.
     Dispatching,
     /// A resize holds the control lock, before its seal and fence check.
     ResizeLocked,
@@ -936,6 +937,11 @@ pub enum ProbePoint {
     CloseJoin,
     /// A subscription about to wait for the VT lock.
     Subscribing,
+    /// The writer granted a write permission (a unit's first, or a reply's dequeue), with the
+    /// queue lock held and the publication's counter odd, before the position store.
+    Publishing,
+    /// A reader of the published positions loaded the first position, before the others.
+    BetweenPositionLoads,
 }
 
 impl ProbePoint {
@@ -953,6 +959,8 @@ impl ProbePoint {
             ProbePoint::ReleaseControl => 9,
             ProbePoint::CloseJoin => 10,
             ProbePoint::Subscribing => 11,
+            ProbePoint::Publishing => 12,
+            ProbePoint::BetweenPositionLoads => 13,
         }
     }
 }
@@ -970,8 +978,8 @@ pub enum DeadlineSite {
 
 #[derive(Default)]
 struct ProbeState {
-    counts: [u64; 12],
-    armed: [Option<u64>; 12],
+    counts: [u64; 14],
+    armed: [Option<u64>; 14],
     released: Vec<u64>,
     next: u64,
     deadlines: Vec<(DeadlineSite, Instant)>,
