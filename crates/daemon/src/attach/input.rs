@@ -67,6 +67,23 @@ pub(crate) fn completes_marker(tail: &[u8], unit: &[u8]) -> bool {
     marker_from(&window, tail.len())
 }
 
+/// The marker rule's final decision over a unit's `frames` after `tail`, in write order:
+/// the bytes to write and the bytes of the frames refused (each whole).
+pub(crate) fn decide_frames(tail: &[u8], frames: &[Vec<u8>]) -> (Vec<u8>, usize) {
+    let mut tail = tail.to_vec();
+    let mut out = Vec::new();
+    let mut refused = 0;
+    for f in frames {
+        if completes_marker(&tail, f) {
+            refused += f.len();
+        } else {
+            out.extend_from_slice(f);
+            advance_tail(&mut tail, f);
+        }
+    }
+    (out, refused)
+}
+
 /// `tail` after `written`: its last [`TAIL`] bytes.
 pub(crate) fn advance_tail(tail: &mut Vec<u8>, written: &[u8]) {
     tail.extend_from_slice(written);
@@ -77,8 +94,13 @@ pub(crate) fn advance_tail(tail: &mut Vec<u8>, written: &[u8]) {
 /// One pending item, in arrival order: raw bytes are joined.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Item {
-    Raw(Vec<u8>),
-    Paste { id: String, text: String },
+    /// Raw frames joined for one unit, each kept whole: the marker rule's final decision
+    /// refuses a frame, not the unit.
+    Raw(Vec<Vec<u8>>),
+    Paste {
+        id: String,
+        text: String,
+    },
 }
 
 /// The socket's pending input: raw bytes joined for the next unit and paste texts.
@@ -95,9 +117,9 @@ impl Pending {
         }
         self.bytes += b.len();
         if let Some(Item::Raw(r)) = self.items.back_mut() {
-            r.extend_from_slice(b);
+            r.push(b.to_vec());
         } else {
-            self.items.push_back(Item::Raw(b.to_vec()));
+            self.items.push_back(Item::Raw(vec![b.to_vec()]));
         }
     }
 
@@ -110,7 +132,7 @@ impl Pending {
     pub(crate) fn next(&mut self) -> Option<Item> {
         let it = self.items.pop_front()?;
         self.bytes -= match &it {
-            Item::Raw(r) => r.len(),
+            Item::Raw(r) => r.iter().map(Vec::len).sum::<usize>(),
             Item::Paste { id, text } => id.len() + text.len(),
         };
         Some(it)
@@ -127,7 +149,7 @@ impl Pending {
         self.items
             .iter()
             .map(|i| match i {
-                Item::Raw(r) => r.len(),
+                Item::Raw(r) => r.iter().map(Vec::len).sum::<usize>(),
                 Item::Paste { id, text } => id.len() + text.len(),
             })
             .sum()

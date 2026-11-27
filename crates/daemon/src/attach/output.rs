@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use chaldea_core::attach::EndReason;
 use chaldea_pty_runtime::{Flow, OutputEnd, OutputEvent, OutputSink};
@@ -25,7 +26,13 @@ struct State {
     /// The first terminal event, latched once: the sink's lag or end, or the session gone.
     /// Nothing is buffered after it (the prefix is frozen under the same lock).
     ending: Option<Ending>,
+    /// When it latched (supervisor clock), from the latch hook.
+    latched_at: Option<Instant>,
 }
+
+/// Runs at the latch, under the buffer's lock: revokes the socket's grant and reads the
+/// clock the drain deadline counts from.
+pub(crate) type LatchHook = Box<dyn Fn() -> Option<Instant> + Send + Sync>;
 
 /// One socket's output.
 pub(crate) struct OutBuf {
@@ -34,6 +41,7 @@ pub(crate) struct OutBuf {
     /// The sink accepts bytes while set.
     pub active: Arc<AtomicBool>,
     max: usize,
+    on_latch: Mutex<Option<LatchHook>>,
 }
 
 /// What the buffer holds for the socket.
@@ -51,6 +59,7 @@ impl OutBuf {
             wake: Notify::new(),
             active: Arc::new(AtomicBool::new(true)),
             max,
+            on_latch: Mutex::new(None),
         })
     }
 
@@ -100,9 +109,16 @@ impl OutBuf {
         Taken::Bytes(st.data.drain(..n).collect())
     }
 
-    /// The latched terminal event.
-    pub(crate) fn ending(&self) -> Option<Ending> {
-        lock(&self.st).ending
+    /// The latched terminal event and when it latched (`None` before the latch hook was
+    /// set).
+    pub(crate) fn ending(&self) -> Option<(Ending, Option<Instant>)> {
+        let st = lock(&self.st);
+        st.ending.map(|e| (e, st.latched_at))
+    }
+
+    /// Sets the hook the latch runs (once the socket holds a grant).
+    pub(crate) fn on_latch(&self, f: LatchHook) {
+        *lock(&self.on_latch) = Some(f);
     }
 
     /// Latches `e` unless an event is latched already; the latched one.
@@ -115,6 +131,8 @@ impl OutBuf {
         if st.ending.is_none() {
             st.ending = Some(e);
             self.active.store(false, Ordering::Release);
+            // The grant moves with the latch, before any unit can be permitted after it.
+            st.latched_at = lock(&self.on_latch).as_ref().and_then(|f| f());
         }
         st.ending.unwrap_or(e)
     }

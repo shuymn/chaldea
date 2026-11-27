@@ -93,8 +93,15 @@ pub(crate) struct AttachHooks {
     pub registry_len: std::sync::atomic::AtomicUsize,
     /// Units whose report wait began (`Waiting`), by every socket.
     pub waiting: std::sync::atomic::AtomicU64,
+    /// Verification reads that finished their store read, by every socket.
+    pub verified: std::sync::atomic::AtomicU64,
     /// Gone polls run, by every socket.
     pub gone_polls: std::sync::atomic::AtomicU64,
+    /// Runs on the socket's task before the select of the next turn whose terminal close is
+    /// due.
+    pub before_terminal: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs on the socket's task when the next startup takeover is about to happen.
+    pub before_swap: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs on the blocking pool after the next startup subscription returned.
     pub subscribed: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// As `subscribed`, one per startup subscription, last first (when `subscribed` is

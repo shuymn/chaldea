@@ -302,5 +302,8 @@ pub(crate) fn settle_human(sl: &SendLaunch, seq: u64, report: KeyReport) {
     drop(st);
     if let Some(tx) = f.report {
         let _ = tx.send(report);
+        #[cfg(test)]
+        sl.reports_sent
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }

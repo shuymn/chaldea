@@ -333,18 +333,7 @@ struct InFlightRead {
 }
 
 /// Sends `msgs` as one send; held by the loop until it completes or its deadline passes.
-pub(crate) fn send(shared: &Arc<Shared>, sink: Sink, msgs: Vec<Message>) -> Sending {
-    send_unless(shared, sink, msgs, None)
-}
-
-/// [`send`] that discards `msgs` when `cut` is set before the first of them reaches the
-/// sink (the attach socket's revocation: an unsent frame is not sent after it).
-pub(crate) fn send_unless(
-    shared: &Arc<Shared>,
-    mut sink: Sink,
-    msgs: Vec<Message>,
-    cut: Option<Arc<std::sync::atomic::AtomicBool>>,
-) -> Sending {
+pub(crate) fn send(shared: &Arc<Shared>, mut sink: Sink, msgs: Vec<Message>) -> Sending {
     #[cfg(test)]
     let s = shared.clone();
     #[cfg(not(test))]
@@ -352,9 +341,6 @@ pub(crate) fn send_unless(
     Box::pin(async move {
         #[cfg(test)]
         s.faults.before_socket_send().await;
-        if cut.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
-            return (sink, Ok(()));
-        }
         let mut r = Ok(());
         for m in msgs {
             r = sink.feed(m).await;
@@ -363,6 +349,8 @@ pub(crate) fn send_unless(
             }
         }
         if r.is_ok() {
+            #[cfg(test)]
+            s.faults.before_socket_flush().await;
             r = sink.flush().await;
         }
         (sink, r)

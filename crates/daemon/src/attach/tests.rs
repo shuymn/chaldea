@@ -526,7 +526,7 @@ async fn paste_refusals() {
 /// input is unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resume_with_old_socket_held() {
-    let rig = SRig::new().await;
+    let rig = slow_sends(|_| {}).await;
     let old = rig.claude().await;
     let shared = rig.srv.server.shared().clone();
     let (mut a, _) = attach(&rig, &old).await;
@@ -748,14 +748,7 @@ async fn disconnect_moves_grant() {
 /// past the idle timeout drops the socket though the peer keeps pinging.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stuck_writer_idle_drop() {
-    let rig = SRig::on_http(
-        chaldea_core::adapter::HostOs::Macos,
-        |_| {},
-        |h| {
-            h.ws.idle_timeout = Duration::from_secs(2);
-        },
-    )
-    .await;
+    let rig = SRig::new().await;
     let live = rig.claude().await;
     let h = hooks(&rig);
     let (mut c, _) = attach(&rig, &live).await;
@@ -781,6 +774,10 @@ async fn stuck_writer_idle_drop() {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     });
+    // The idle timeout passes on the test clock after the pause was acknowledged.
+    rig.clock
+        .advance(rig.srv.server.shared().cfg.ws.idle_timeout);
+    let _p = poker(&rig);
     let ended = bounded(WS_WAIT, async {
         while let Some(Ok(m)) = rx.next().await {
             if matches!(m, WsMessage::Close(_)) {
@@ -1574,7 +1571,7 @@ async fn watermark_counts_ids_and_responses() {
     let live = rig.claude().await;
     let h = hooks(&rig);
     let watermark = rig.sup.cfg.attach.watermark as u64;
-    let id = "i".repeat(16 * 1024);
+    let id = "i".repeat(chaldea_core::attach::MAX_PASTE_ID_BYTES);
     // One message: its id twice (the frame and the echo) plus framing.
     let message = 2 * id.len() as u64 + 256;
     for rejected in [true, false] {
@@ -1588,7 +1585,8 @@ async fn watermark_counts_ids_and_responses() {
             assert!(hold.wait_entered(soon()));
         }
         let text = if rejected { "" } else { "t" };
-        for _ in 0..12 {
+        // Enough messages to pass the watermark by their ids and responses alone.
+        for _ in 0..(2 * rig.sup.cfg.attach.watermark / id.len()) {
             c.json(json!({ "type": "paste", "paste_id": id, "text": text }))
                 .await;
         }
@@ -1918,6 +1916,72 @@ async fn raw_settlement_does_not_spend_the_session_lock_budget() {
     rig.stop().await;
 }
 
+/// I-6: a frame whose refusal depends on a permitted, unsettled write is decided once that
+/// write's bytes are known: A's `xxxxx` is held in the backend after an Escape; B's
+/// `[200~` follows `xxxxx`, not the Escape, and is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receipt_filter_waits_for_permitted_predecessor() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut a, _) = attach(&rig, &live).await;
+    let before = live.child.input().len();
+    a.binary(b"\x1b").await;
+    rig.until("Escape written", || {
+        live.child.input()[before..] == *b"\x1b"
+    })
+    .await;
+    let hold = live.child.hold_writes();
+    a.binary(b"xxxxx").await;
+    assert!(hold.wait_entered(soon()));
+    let (mut b, _) = attach(&rig, &live).await;
+    assert_eq!(a.until_closed().await.0, Some(4003));
+    b.binary(b"[200~").await;
+    // The resize's answer: B handled the raw frame while A's write is still held.
+    b.json(json!({ "type": "resize", "cols": 100, "rows": 30 }))
+        .await;
+    assert_eq!(size_frame(&mut b).await, (100, 30, true));
+    drop(hold);
+    b.binary(b"q").await;
+    rig.until("the following key written", || {
+        live.child.input()[before..].ends_with(b"q")
+    })
+    .await;
+    assert_eq!(&live.child.input()[before..], b"\x1bxxxxx[200~q");
+    rig.stop().await;
+}
+
+/// I-6: a deferred refusal keeps frame boundaries: of frames joined while an earlier write
+/// is unsettled, only the one completing a marker is dropped; the others are written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_refusal_keeps_other_frames() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut c, _) = attach(&rig, &live).await;
+    let before = live.child.input().len();
+    let hold = live.child.hold_writes();
+    c.binary(b"\x1b").await;
+    assert!(hold.wait_entered(soon()));
+    c.binary(b"a").await;
+    c.binary(b"\x1b").await;
+    c.binary(b"[200~").await;
+    c.binary(b"b").await;
+    c.json(json!({ "type": "resize", "cols": 100, "rows": 30 }))
+        .await;
+    assert_eq!(size_frame(&mut c).await, (100, 30, true));
+    drop(hold);
+    assert_eq!(
+        c.text().await,
+        Some(AttachServerMessage::InputDropped {
+            bytes: 5,
+            reason: AttachReason::PasteMarker
+        })
+    );
+    rig.until("written", || live.child.input()[before..].ends_with(b"b"))
+        .await;
+    assert_eq!(&live.child.input()[before..], b"\x1ba\x1bb");
+    rig.stop().await;
+}
+
 /// I-4: a unit with no report by `not_after` + 1 s and not cancellable is `pending`; the
 /// socket submits nothing more until its report arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2130,9 +2194,13 @@ async fn late_report_is_pending() {
     entered(&at);
     rig.clock
         .advance(rig.sup.cfg.attach.unit_wait + crate::supervisor::send::READ_WAIT);
+    let reports = sl.reports_sent.load(std::sync::atomic::Ordering::SeqCst);
     drop(hold);
-    rig.until("the unit settled", || sl.state().human_unsettled == 0)
-        .await;
+    // The report itself is in the socket's channel, not only the unit settled.
+    rig.until("the report delivered", || {
+        sl.reports_sent.load(std::sync::atomic::Ordering::SeqCst) > reports
+    })
+    .await;
     go.send(()).unwrap();
     assert_eq!(
         c.text().await,
@@ -2419,6 +2487,59 @@ async fn resize_panic_releases_lease() {
     rig.stop().await;
 }
 
+/// T1-3: a resize answers the size it left, read before it releases the lease: another
+/// resize that takes the lease right after cannot change the first one's answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resize_result_sampled_under_lease() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let handle = rig
+        .sup
+        .entry(live.l)
+        .unwrap()
+        .with_session(
+            &rig.sup,
+            rig.sup.now() + Duration::from_secs(5),
+            chaldea_pty_runtime::Session::handle,
+        )
+        .await
+        .unwrap();
+    let fence = chaldea_pty_runtime::Fence {
+        word: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        expect: 0,
+    };
+    let newer = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let (at, go) = park_sync(&sl.hooks.after_resize_release);
+    let first = super::socket::resize(
+        sl.clone(),
+        handle.clone(),
+        fence.clone(),
+        1,
+        PtySize::new(100, 30).unwrap(),
+        false,
+        newer.clone(),
+    );
+    let first = tokio::spawn(first);
+    entered(&at);
+    // The lease is free: a second resize runs to completion meanwhile.
+    let second = super::socket::resize(
+        sl.clone(),
+        handle,
+        fence,
+        2,
+        PtySize::new(90, 20).unwrap(),
+        false,
+        newer,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second, (90, 20, true));
+    go.send(()).unwrap();
+    assert_eq!(first.await.unwrap().unwrap(), (100, 30, true));
+    rig.stop().await;
+}
+
 /// T1-3: a newer size replaces the nudge's second leg.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nudge_superseded() {
@@ -2557,11 +2678,13 @@ async fn revoked_before_startup_takeover() {
         tokio_tungstenite::connect_async(url)
     });
     entered(&at);
+    // Armed before the nudge: A's read and B's fresh read both park (in either order).
+    let (entered_read, gos) = park_verify_reads(&rig, 2);
     rig.srv.revoke(&owner).await;
-    let (entered_read, gos) = park_verify_reads(&rig, 1);
     go.send(()).unwrap();
     next_entered(&entered_read);
-    // The fresh read is held: A is still current and its input is written.
+    next_entered(&entered_read);
+    // B's fresh read is held: A is still current and its input is written.
     let before = live.child.input().len();
     a.binary(b"z").await;
     rig.until("A's input written", || {
@@ -2580,11 +2703,11 @@ async fn revoked_before_startup_takeover() {
     rig.stop().await;
 }
 
-/// I-7: a binary frame whose send had not reached the transport when the revocation was
-/// detected is discarded: the peer gets the 1008 close and not the frame.
+/// I-7: a binary frame whose send is in flight when the revocation is detected is never
+/// sent: the connection is dropped without a close frame.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revoked_send_discarded() {
-    let rig = SRig::new().await;
+    let rig = slow_sends(|_| {}).await;
     let live = rig.claude().await;
     let owner = rig.srv.token(TokenKind::Owner, None, None).await;
     let mut a = open_as(&rig, &owner, live.t).await.expect("a 101");
@@ -2597,18 +2720,16 @@ async fn revoked_send_discarded() {
     live.child.emit(b"secret");
     bounded(WS_WAIT, reached).await.unwrap().unwrap();
     rig.srv.revoke(&owner).await;
-    rig.until("the socket is closing", || {
-        shared.faults.steps().contains(&"socket close")
-    })
-    .await;
-    held.send(()).unwrap();
+    rig.until("the socket ended", || shared.sockets.held() == 0)
+        .await;
+    let _ = held.send(());
     let mut binary = Vec::new();
     while let Some(f) = a.next().await {
         if let Frame::Binary(b) = f {
             binary.extend(b);
         }
     }
-    assert_eq!((a.closed, binary), (Some(Some(1008)), Vec::new()));
+    assert_eq!((a.closed, binary), (Some(None), Vec::new()));
     rig.stop().await;
 }
 
@@ -2686,11 +2807,97 @@ async fn registry_retires_ended_launch() {
     rig.stop().await;
 }
 
-/// I-7: a revocation whose nudge is lost is found by the periodic verification (a tick the
-/// test asks for), while the launch writes output all along: verification goes first.
+/// I-7: a nudge published after the startup decision's last read and before the takeover
+/// still blocks it: the takeover compares the verified generation with the nudge's, so B
+/// verifies again and closes 1008, and A stays current.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn revoked_lost_nudge_under_load() {
-    let rig = SRig::new().await;
+async fn nudge_after_snapshot_still_blocks_takeover() {
+    let rig = slow_sends(|_| {}).await;
+    let live = rig.claude().await;
+    let (mut a, _) = attach(&rig, &live).await;
+    let owner = rig.srv.token(TokenKind::Owner, None, None).await;
+    let (at, go) = park_sync(&hooks(&rig).before_swap);
+    let connect = tokio::spawn({
+        let ticket = rig
+            .srv
+            .ticket(&owner, &format!("attach:{}", live.t))
+            .await
+            .unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/api/attach/{}?ticket={ticket}",
+            rig.srv.port, live.t
+        );
+        tokio_tungstenite::connect_async(url)
+    });
+    entered(&at);
+    rig.srv.revoke(&owner).await;
+    go.send(()).unwrap();
+    let (ws, _) = bounded(WS_WAIT, connect).await.unwrap().unwrap().unwrap();
+    let mut b = Client { ws, closed: None };
+    let closed = b.until_closed().await;
+    let before = live.child.input().len();
+    a.binary(b"q").await;
+    rig.until("A remains current", || {
+        live.child.input()[before..] == *b"q"
+    })
+    .await;
+    assert_eq!(closed, (Some(1008), Vec::new()));
+    rig.stop().await;
+}
+
+/// I-7: startup verification reads are capped at two: three nudges while the first two
+/// reads are held start no third read; the socket is held to the held reads' deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn startup_reads_capped() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let rig = slow_sends(|_| {}).await;
+    let live = rig.claude().await;
+    let h = hooks(&rig);
+    let (at, go) = park_sync(&h.subscribed);
+    let connect = tokio::spawn({
+        let ticket = rig
+            .srv
+            .ticket(&rig.owner, &format!("attach:{}", live.t))
+            .await
+            .unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/api/attach/{}?ticket={ticket}",
+            rig.srv.port, live.t
+        );
+        tokio_tungstenite::connect_async(url)
+    });
+    entered(&at);
+    let (reads, gos) = park_verify_reads(&rig, 3);
+    for _ in 0..2 {
+        let other = rig.srv.token(TokenKind::Rescue, None, None).await;
+        rig.srv.revoke(&other).await;
+        next_entered(&reads);
+    }
+    let saturated = h.saturated.load(SeqCst);
+    let other = rig.srv.token(TokenKind::Rescue, None, None).await;
+    rig.srv.revoke(&other).await;
+    rig.until("the third nudge found both reads taken", || {
+        h.saturated.load(SeqCst) > saturated
+    })
+    .await;
+    // The held reads' deadline passes: the socket drops without taking over.
+    rig.clock
+        .advance(rig.srv.server.shared().cfg.short_deadline);
+    let _p = poker(&rig);
+    go.send(()).unwrap();
+    let (ws, _) = bounded(WS_WAIT, connect).await.unwrap().unwrap().unwrap();
+    let mut b = Client { ws, closed: None };
+    assert_eq!(b.until_closed().await, (None, Vec::new()));
+    drop(gos);
+    rig.stop().await;
+}
+
+/// I-7: a frame already fed to the sink and not yet flushed when the revocation is
+/// detected is never sent: the attach connection is dropped, not closed through the same
+/// sink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_staged_frame_dropped() {
+    let rig = slow_sends(|_| {}).await;
     let live = rig.claude().await;
     let owner = rig.srv.token(TokenKind::Owner, None, None).await;
     let mut a = open_as(&rig, &owner, live.t).await.expect("a 101");
@@ -2698,22 +2905,62 @@ async fn revoked_lost_nudge_under_load() {
         a.text().await,
         Some(AttachServerMessage::Attached { .. })
     ));
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let load = {
-        let (child, stop) = (live.child.clone(), stop.clone());
-        std::thread::spawn(move || {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                child.emit(&[b'o'; 1024]);
-            }
+    let shared = rig.srv.server.shared().clone();
+    let (reached, held) = shared.faults.arm_socket_flush_gate();
+    live.child.emit(b"secret");
+    bounded(WS_WAIT, reached).await.unwrap().unwrap();
+    rig.srv.revoke(&owner).await;
+    rig.until("the socket ended", || shared.sockets.held() == 0)
+        .await;
+    let _ = held.send(());
+    let mut binary = Vec::new();
+    while let Some(f) = a.next().await {
+        if let Frame::Binary(b) = f {
+            binary.extend(b);
+        }
+    }
+    assert_eq!((a.closed, binary), (Some(None), Vec::new()));
+    rig.stop().await;
+}
+
+/// I-7: a revocation whose nudge is lost is found by the periodic verification (a tick the
+/// test asks for) while output is ready and its send is in flight: verification goes
+/// first, and the socket is dropped (its send may have staged a frame).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_lost_nudge_under_load() {
+    let rig = slow_sends(|_| {}).await;
+    let live = rig.claude().await;
+    let owner = rig.srv.token(TokenKind::Owner, None, None).await;
+    let mut a = open_as(&rig, &owner, live.t).await.expect("a 101");
+    assert!(matches!(
+        a.text().await,
+        Some(AttachServerMessage::Attached { .. })
+    ));
+    let shared = rig.srv.server.shared().clone();
+    let (sink, rx) = chaldea_pty_runtime::channel_sink(1 << 20);
+    rig.sup
+        .entry(live.l)
+        .unwrap()
+        .with_session(&rig.sup, rig.sup.now() + Duration::from_secs(1), |s| {
+            s.subscribe(sink, soon())
         })
-    };
-    a.next().await.expect("output under way");
+        .await
+        .unwrap()
+        .unwrap();
+    let (reached, held) = shared.faults.arm_socket_send_gate();
+    live.child.emit(&[b'o'; 1024]);
+    bounded(WS_WAIT, reached).await.unwrap().unwrap();
+    // More output ready behind the held send, below the lag budget.
+    let more = [b'p'; 32 * 1024];
+    live.child.emit(&more);
+    SRig::delivered(&rx, &more[more.len() - 8..]).await;
     rig.srv.revoke_quietly(&owner).await;
     hooks(&rig).tick();
-    let code = a.until_closed().await.0;
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    load.join().unwrap();
-    assert_eq!(code, Some(1008));
+    rig.until("the socket ended", || shared.sockets.held() == 0)
+        .await;
+    let _ = held.send(());
+    let (code, texts) = a.until_closed().await;
+    assert_eq!((code, texts), (None, Vec::new()));
     rig.stop().await;
 }
 
@@ -2780,6 +3027,132 @@ async fn drain_error_revokes_held_input() {
         .await;
     assert!(!live.child.input().contains(&b'\r'));
     assert_eq!(a.until_closed().await.0, Some(4001));
+    rig.stop().await;
+}
+
+/// I-8: the latch revokes the grant when the sink latches, not when the loop observes it:
+/// with the loop parked, a read error latches, and an Enter queued behind a held write is
+/// refused at its dispatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_error_fences_dispatch_before_socket_observes_it() {
+    use chaldea_pty_runtime::{OutputEnd, Received};
+    let rig = slow_sends(|_| {}).await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let (mut a, _) = attach(&rig, &live).await;
+    let watcher = rig.watch(&live).await;
+    let before = live.child.input().len();
+    let hold = live.child.hold_writes();
+    let other = rig.attach(&live, b"k").await;
+    assert!(hold.wait_entered(soon()));
+    a.binary(b"\r").await;
+    rig.until("Enter queued", || sl.state().human_unsettled == 2)
+        .await;
+    let h = hooks(&rig);
+    let (at, go) = park_sync(&h.sampled);
+    h.tick();
+    entered(&at);
+    live.child.fail_output(std::io::ErrorKind::Other);
+    assert!(matches!(
+        tokio::task::block_in_place(|| watcher.recv_timeout(WS_WAIT)),
+        Ok(Received::End(OutputEnd::Error(_)))
+    ));
+    drop(hold);
+    bounded(WS_WAIT, other).await.unwrap().unwrap();
+    rig.until("both writes settled", || sl.state().human_unsettled == 0)
+        .await;
+    let written = live.child.input()[before..].to_vec();
+    go.send(()).unwrap();
+    assert_eq!(written.as_slice(), b"k");
+    rig.stop().await;
+}
+
+/// I-7, I-8: close precedence: a revocation found in the same turn the terminal close
+/// is due beats it: 1008, not 4001.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revocation_beats_terminal_close() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let owner = rig.srv.token(TokenKind::Owner, None, None).await;
+    let mut a = open_as(&rig, &owner, live.t).await.expect("a 101");
+    assert!(matches!(
+        a.text().await,
+        Some(AttachServerMessage::Attached { .. })
+    ));
+    let h = hooks(&rig);
+    // The nudge's read (after the revocation, so it answers revoked) holds.
+    let (reads, gos) = park_verify_reads(&rig, 1);
+    rig.srv.revoke(&owner).await;
+    next_entered(&reads);
+    let (at, go) = park_sync(&h.before_terminal);
+    live.child.close_output();
+    assert!(matches!(
+        a.text().await,
+        Some(AttachServerMessage::Ended { .. })
+    ));
+    entered(&at);
+    // Both ready at the loop's next select: the read's answer (the loop waits for the
+    // released read to finish) and the terminal close.
+    drop(gos);
+    go.send(()).unwrap();
+    assert_eq!(a.until_closed().await.0, Some(1008));
+    rig.stop().await;
+}
+
+/// I-8: the drain deadline counts from the latch, not from the loop's observation of it:
+/// the output ends while the loop is parked, the clock passes the drain bound, and the
+/// resumed loop drops the socket with no `ended`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_deadline_from_latch() {
+    use chaldea_pty_runtime::{OutputEnd, Received};
+    let rig = slow_sends(|_| {}).await;
+    let live = rig.claude().await;
+    let (mut a, _) = attach(&rig, &live).await;
+    let watcher = rig.watch(&live).await;
+    let h = hooks(&rig);
+    let (at, go) = park_sync(&h.sampled);
+    h.tick();
+    entered(&at);
+    live.child.close_output();
+    assert!(matches!(
+        tokio::task::block_in_place(|| watcher.recv_timeout(WS_WAIT)),
+        Ok(Received::End(OutputEnd::Eof))
+    ));
+    rig.clock.advance(rig.sup.cfg.attach.drain);
+    go.send(()).unwrap();
+    assert_eq!(a.until_closed().await, (None, Vec::new()));
+    rig.stop().await;
+}
+
+/// I-7, I-8: verification stays polled while the terminal close waits: a revocation found
+/// before the close frame is sent drops the connection (the frame may be staged), never
+/// 4001.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_close_still_verifies_revocation() {
+    let rig = slow_sends(|_| {}).await;
+    let live = rig.claude().await;
+    let owner = rig.srv.token(TokenKind::Owner, None, None).await;
+    let mut a = open_as(&rig, &owner, live.t).await.expect("a 101");
+    assert!(matches!(
+        a.text().await,
+        Some(AttachServerMessage::Attached { .. })
+    ));
+    let shared = rig.srv.server.shared().clone();
+    let (close_at, hold_close) = shared.faults.arm_close_frame_gate();
+    live.child.close_output();
+    assert!(matches!(
+        a.text().await,
+        Some(AttachServerMessage::Ended { .. })
+    ));
+    bounded(WS_WAIT, close_at).await.unwrap().unwrap();
+    let (read_at, release) = park_verify_reads(&rig, 1);
+    rig.srv.revoke(&owner).await;
+    next_entered(&read_at);
+    drop(release);
+    rig.until("the socket ended", || shared.sockets.held() == 0)
+        .await;
+    drop(hold_close);
+    assert_eq!(a.until_closed().await, (None, Vec::new()));
     rig.stop().await;
 }
 

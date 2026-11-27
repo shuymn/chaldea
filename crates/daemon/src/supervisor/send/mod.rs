@@ -274,6 +274,8 @@ pub(crate) struct SendHooks {
     pub completion: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs between the open job's commit and the unit's submission (async-free).
     pub before_submit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs in an attach resize's blocking task right after it released the lease.
+    pub after_resize_release: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs right after `submit` returned (inside `with_session`).
     pub after_submit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs before each completion or human-write job.
@@ -356,6 +358,9 @@ pub(crate) struct SendLaunch {
     /// Times the worker went to sleep with no wake pending (tests poll it).
     #[cfg(test)]
     pub slept: AtomicU64,
+    /// Human reports handed to their waiters (tests poll it).
+    #[cfg(test)]
+    pub reports_sent: AtomicU64,
     /// The latest tick's instant (supervisor clock).
     pub tick: Mutex<Option<Instant>>,
     #[cfg(test)]
@@ -389,6 +394,8 @@ impl SendLaunch {
             passes: AtomicU64::new(0),
             #[cfg(test)]
             slept: AtomicU64::new(0),
+            #[cfg(test)]
+            reports_sent: AtomicU64::new(0),
             tick: Mutex::new(None),
             #[cfg(test)]
             hooks: SendHooks::default(),

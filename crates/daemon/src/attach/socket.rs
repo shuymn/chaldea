@@ -24,12 +24,12 @@ use chaldea_pty_runtime::{
 use futures_util::StreamExt;
 use tokio::sync::oneshot;
 
-use super::input::{Item, Pending, Verdict, advance_tail, completes_marker, filter};
+use super::input::{Item, Pending, Verdict, advance_tail, decide_frames, filter};
 use super::output::{Ending, OutBuf, Taken};
 use super::registry::{Candidate, LaunchAttach, Removed, Replaced};
 use super::{Attach, AttachConfig, paste_reason, refusal_reason, submit_reason};
 use crate::http::ws::{
-    Out, Sink, bad_utf8, before, close, code, pending_opt, send_unless, socket_timer, too_big,
+    Out, Sink, bad_utf8, before, close, code, pending_opt, send, socket_timer, too_big,
 };
 use crate::http::{
     AuthFailure, Joined, Shared, TicketPurpose, UpgradedSocket, spawn_read, take_read,
@@ -99,6 +99,9 @@ fn verify_read(
             if let Some(f) = hook {
                 f();
             }
+            hooks
+                .verified
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         r
     }
@@ -259,9 +262,20 @@ enum Unit {
     Paste(String),
 }
 
-/// A unit's submission, inside `with_session`: the ticket, the report, and the unit's
-/// dispatch deadline (supervisor clock), taken before the submission.
-type Submitted = Result<(WriteTicket, oneshot::Receiver<KeyReport>, Instant), Refused>;
+/// A unit's submission, inside `with_session`.
+type Submitted = Result<Submission, Refused>;
+
+/// A queued unit.
+struct Submission {
+    ticket: WriteTicket,
+    report: oneshot::Receiver<KeyReport>,
+    /// The unit's dispatch deadline (supervisor clock), taken before the submission.
+    not_after: Instant,
+    /// The bytes queued.
+    len: usize,
+    /// The bytes of raw frames the marker rule refused at the submission.
+    refused: usize,
+}
 
 /// Why a unit was not queued.
 #[derive(Debug, Clone, Copy)]
@@ -302,7 +316,8 @@ struct Verifying {
 type ResizeOut = (u16, u16, bool);
 
 /// A resize in flight.
-type Resizing = Pin<Box<dyn Future<Output = Result<ResizeOut, tokio::task::JoinError>> + Send>>;
+pub(super) type Resizing =
+    Pin<Box<dyn Future<Output = Result<ResizeOut, tokio::task::JoinError>> + Send>>;
 
 /// What woke the loop.
 enum Ev {
@@ -346,7 +361,7 @@ impl Writer {
     /// `paste` sampled before its encoding (D5).
     fn submit(
         &self,
-        bytes: Vec<u8>,
+        frames: Vec<Vec<u8>>,
         paste: Option<ModeView>,
     ) -> Pin<Box<dyn Future<Output = Submitted> + Send>> {
         let (sup, entry, sl, fence) = (
@@ -394,7 +409,7 @@ impl Writer {
                     sl: sl.clone(),
                     la: la.clone(),
                     fence: fence.clone(),
-                    bytes: bytes.clone(),
+                    frames: frames.clone(),
                     paste,
                     needs_2004,
                     not_after: sup.real(not_after),
@@ -405,7 +420,13 @@ impl Writer {
                 let by = (sup.now() + READ_WAIT).min(not_after);
                 let r = entry.with_session(&sup, by, move |s| unit.run(s)).await;
                 return match r {
-                    Ok(Ok(Some(ticket))) => Ok((ticket, rx, not_after)),
+                    Ok(Ok(Some((ticket, len, refused)))) => Ok(Submission {
+                        ticket,
+                        report: rx,
+                        not_after,
+                        len,
+                        refused,
+                    }),
                     Ok(Ok(None)) => continue,
                     Ok(Err(e)) => Err(e),
                     Err(SessionError::Busy) => Err(Refused::NotWritten(AttachReason::Busy)),
@@ -428,7 +449,7 @@ struct Submit {
     sl: Arc<SendLaunch>,
     la: Arc<LaunchAttach>,
     fence: Fence,
-    bytes: Vec<u8>,
+    frames: Vec<Vec<u8>>,
     paste: bool,
     /// The mode at encoding, for a paste on a bracketed-paste row.
     needs_2004: Option<ModeView>,
@@ -437,9 +458,13 @@ struct Submit {
 }
 
 impl Submit {
-    /// The ticket, or `None` when an earlier raw unit is unsettled again (another socket
-    /// submitted one meanwhile): the caller waits and retries.
-    fn run(self, s: &chaldea_pty_runtime::Session) -> Result<Option<WriteTicket>, Refused> {
+    /// The ticket with the bytes queued and the raw bytes refused, or `None` when an
+    /// earlier raw unit is unsettled again (another socket submitted one meanwhile): the
+    /// caller waits and retries.
+    fn run(
+        self,
+        s: &chaldea_pty_runtime::Session,
+    ) -> Result<Option<(WriteTicket, usize, usize)>, Refused> {
         if self.needs_2004.is_some_and(|m| !m.modes.bracketed_paste) {
             return Err(Refused::Rejected(AttachReason::BracketedPasteOff));
         }
@@ -450,31 +475,43 @@ impl Submit {
             recheck: None,
             fence: Some(self.fence),
         };
-        let unit = WriteUnit::bytes(WriteOrigin::Attach, self.bytes.clone());
         if self.paste {
+            let bytes = self.frames.concat();
+            let len = bytes.len();
             return self
                 .sl
-                .submit_human(s, unit, guard, Some(self.report))
-                .map(Some)
+                .submit_human(
+                    s,
+                    WriteUnit::bytes(WriteOrigin::Attach, bytes),
+                    guard,
+                    Some(self.report),
+                )
+                .map(|t| Some((t, len, 0)))
                 .map_err(|e| Refused::NotWritten(submit_reason(e)));
         }
         // The marker rule's final decision (R-6): every earlier raw unit settled, so the
-        // tail is what the PTY received before this unit.
-        {
+        // tail is what the PTY received before this unit; a frame that would complete a
+        // marker is refused whole, the others are written.
+        let bytes = {
             let mut m = crate::supervisor::lock(&self.la.marks);
             if m.unsettled > 0 {
                 return Ok(None);
             }
-            if completes_marker(&m.tail, &self.bytes) {
+            let (bytes, refused) = decide_frames(&m.tail, &self.frames);
+            if bytes.is_empty() {
                 return Err(Refused::NotWritten(AttachReason::PasteMarker));
             }
             m.unsettled += 1;
-        }
-        let (la, bytes) = (self.la.clone(), self.bytes);
+            (bytes, refused)
+        };
+        let (bytes, refused) = bytes;
+        let len = bytes.len();
+        let unit = WriteUnit::bytes(WriteOrigin::Attach, bytes.clone());
+        let la = self.la.clone();
         let settled: RecordHook = Box::new(move |r| la.raw_settled(&bytes, r.bytes_written));
         self.sl
             .submit_human_then(s, unit, guard, Some(self.report), Some(settled))
-            .map(Some)
+            .map(|t| Some((t, len, refused)))
             .map_err(|e| {
                 self.la.raw_unqueued();
                 Refused::NotWritten(submit_reason(e))
@@ -487,7 +524,7 @@ impl Submit {
 /// nudge on a socket's `first` resize, else nothing) and runs each under the socket's
 /// fence; it reads the result size, then releases the lease by its id, even after the
 /// socket ended.
-fn resize(
+pub(super) fn resize(
     sl: Arc<SendLaunch>,
     handle: SessionHandle,
     fence: Fence,
@@ -527,8 +564,11 @@ fn resize(
                     break;
                 }
             }
+            // The result is the size this resize left, read while it still holds the lease.
             let s = handle.size();
             drop(lease);
+            #[cfg(test)]
+            crate::supervisor::send::run_hook(&sl.hooks.after_resize_release);
             (s.cols(), s.rows(), ok)
         })
         .await
@@ -586,7 +626,8 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
     let wcfg = shared.cfg.ws.clone();
     // The nudge marked seen before the startup read: a revocation after the read fires it.
     let mut nudge = shared.revocations.subscribe();
-    nudge.borrow_and_update();
+    // The nudge generation the startup read verifies.
+    let mut seen = *nudge.borrow_and_update();
     let (sink, mut stream) = socket.split();
     let out = Out::Free(sink);
     let sha = grant.token_sha256;
@@ -679,29 +720,75 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
         pending: Some(subscribing),
         sub: None,
     };
-    // Verification stays active through startup (R-7): a nudge after the startup read starts
-    // a fresh read at once, and the candidate takes over only once the read started after
-    // the latest nudge answered that the token is valid.
-    let mut fresh: Option<Verifying> = None;
-    let mut joined = None;
-    let subscribed = loop {
-        if fresh.is_none()
-            && let Some(j) = joined.take()
-        {
-            break j;
+    // Verification stays active through startup (R-7). Every nudge counts one generation;
+    // a read verifies the generation it started at, at most two reads run at once, and a
+    // nudge that finds both taken drops the socket by their deadline unless a later read
+    // answers first. The takeover is the point of effect: it happens only with the latest
+    // generation verified, compared while the nudge cannot be published (under its lock).
+    let mut nudges: u64 = 0;
+    let mut verified: u64 = 0;
+    let mut reads: [Option<Verifying>; 2] = [None, None];
+    let mut due = false;
+    let mut verify_by: Option<Instant> = None;
+    let mut joined: Option<Subscribed> = None;
+    let mut before_swap_ran = false;
+    let (subscribed, granted, removed) = loop {
+        if due {
+            if let Some(slot) = reads.iter_mut().find(|r| r.is_none()) {
+                due = false;
+                *slot = Some(start_verify(&shared, sha, &cfg, nudges));
+            } else if verify_by.is_none() {
+                verify_by = reads.iter().flatten().map(|v| v.deadline).min();
+                #[cfg(test)]
+                cfg.hooks
+                    .saturated
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
         }
-        let fresh_by = fresh.as_ref().map(|v| shared.timer(v.deadline));
+        if joined.is_some() && verified == nudges && !due {
+            #[cfg(test)]
+            if !before_swap_ran {
+                before_swap_ran = true;
+                if let Some(f) = crate::supervisor::lock(&cfg.hooks.before_swap).take() {
+                    f();
+                }
+            }
+            #[cfg(not(test))]
+            let _ = &mut before_swap_ran;
+            let published = nudge.borrow();
+            if *published == seen {
+                let s = joined.take().unwrap_or_else(|| unreachable!());
+                cand.sub = None;
+                let (granted, removed) = la.swap(Candidate {
+                    socket: me,
+                    sub: s.id,
+                    active: buf.active.clone(),
+                    handle: handle.clone(),
+                    replaced: replaced.clone(),
+                });
+                drop(published);
+                break (s, granted, removed);
+            }
+            // A nudge was published since: the select below takes it.
+        }
+        let [r0, r1] = &mut reads;
+        let read_by = verifying_min(r0.as_ref(), r1.as_ref()).map(|d| shared.timer(d));
         let ev = tokio::select! {
             biased;
             () = shutdown.wait() => {
                 return close(&shared, out, &mut stream, code::AWAY, "shutting_down").await;
             }
-            () = pending_opt(fresh_by.map(socket_timer)) => return,
-            j = pending_opt(fresh.as_mut().map(|v| &mut v.handle)) => Some(j),
+            () = pending_opt(verify_by.map(|d| socket_timer(shared.timer(d)))) => return,
+            () = pending_opt(read_by.map(socket_timer)) => return,
             _ = nudge.changed() => {
-                fresh = Some(start_verify(&shared, sha, &cfg, 0));
+                seen = *nudge.borrow_and_update();
+                nudges += 1;
+                due = true;
                 None
             }
+            j = pending_opt(r0.as_mut().map(|v| &mut v.handle)) => Some((0, j)),
+            j = pending_opt(r1.as_mut().map(|v| &mut v.handle)) => Some((1, j)),
+            () = poked(&cfg) => None,
             j = pending_opt(cand.pending.as_mut()), if joined.is_none() => {
                 cand.pending = None;
                 match j {
@@ -720,10 +807,15 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                 None
             }
         };
-        if let Some(j) = ev {
-            let Some(v) = fresh.take() else { return };
+        if let Some((i, j)) = ev {
+            let Some(v) = reads[i].take() else { return };
             match take_read(&shared, v.deadline, j) {
-                Ok(true) => {}
+                Ok(true) => {
+                    verified = verified.max(v.generation);
+                    if verified == nudges {
+                        verify_by = None;
+                    }
+                }
                 Ok(false) => {
                     return close(&shared, out, &mut stream, code::POLICY, "token_revoked").await;
                 }
@@ -738,17 +830,17 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
         subscribed.lines.as_deref(),
         cfg.attached_max,
     );
-    // The takeover: the candidate subscribed, so it becomes current.
-    cand.sub = None;
-    let (granted, removed) = la.swap(Candidate {
-        socket: me,
-        sub: subscribed.id,
-        active: buf.active.clone(),
-        handle: handle.clone(),
-        replaced: replaced.clone(),
-    });
     unsubscribe(&sup, removed);
     let fence = la.fence(granted);
+    {
+        let (la, sup) = (Arc::downgrade(&la), Arc::downgrade(&sup));
+        buf.on_latch(Box::new(move || {
+            if let Some(la) = la.upgrade() {
+                la.revoke(me);
+            }
+            sup.upgrade().map(|s| s.now())
+        }));
+    }
     let writer = Writer {
         sup: sup.clone(),
         la: la.clone(),
@@ -761,17 +853,9 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
         paste_on_2004: entry.caps.pty_encoding() == InputEncoding::BracketedPaste,
     };
 
-    // Set when the revocation is detected: a frame not yet handed to the transport is not
-    // sent after it.
-    let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut out = match out {
         Out::Free(sink) => Out::Sending(
-            send_unless(
-                &shared,
-                sink,
-                vec![Message::Text(first.into())],
-                Some(cut.clone()),
-            ),
+            send(&shared, sink, vec![Message::Text(first.into())]),
             tokio::time::Instant::now() + wcfg.send_timeout,
         ),
         o @ Out::Sending(..) => o,
@@ -798,7 +882,8 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
     let mut ending: Option<(Ending, Instant)> = None;
     let mut ended_sent = false;
     let mut ping_due = false;
-    let mut idle_at: Option<tokio::time::Instant> = None;
+    // On the supervisor's clock, as the other socket timers.
+    let mut idle_at: Option<Instant> = None;
     #[cfg(test)]
     let tick_every = cfg.tick_every.unwrap_or(wcfg.heads_interval);
     #[cfg(not(test))]
@@ -827,9 +912,10 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             if let Some(f) = crate::supervisor::lock(&cfg.hooks.sampled).take() {
                 f();
             }
-            if let Some(e) = latched {
+            if let Some((e, at)) = latched {
                 la.revoke(me);
-                ending = Some((e, sup.now() + cfg.drain));
+                // The deadline counts from the latch itself.
+                ending = Some((e, at.unwrap_or_else(|| sup.now()) + cfg.drain));
                 #[cfg(test)]
                 cfg.hooks
                     .latched
@@ -852,7 +938,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
         if outstanding.is_none() && ending.is_none() {
             outstanding = match pending.next() {
                 Some(Item::Raw(b)) => Some(Outstanding {
-                    unit: Unit::Raw(b.len()),
+                    unit: Unit::Raw(b.iter().map(Vec::len).sum()),
                     phase: Phase::Submitting(writer.submit(b, None)),
                 }),
                 Some(Item::Paste { id, text }) => {
@@ -862,7 +948,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                     match writer.paste_bytes(&text) {
                         Ok(b) => Some(Outstanding {
                             unit: Unit::Paste(id),
-                            phase: Phase::Submitting(writer.submit(b, Some(modes))),
+                            phase: Phase::Submitting(writer.submit(vec![b], Some(modes))),
                         }),
                         Err(reason) => {
                             ctl.push_back(AttachServerMessage::PasteResult {
@@ -932,7 +1018,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                     if let Some(d) = drain_at {
                         at = at.min(d);
                     }
-                    Out::Sending(send_unless(&shared, sink, msgs, Some(cut.clone())), at)
+                    Out::Sending(send(&shared, sink, msgs), at)
                 }
             }
             sending @ Out::Sending(..) => sending,
@@ -974,6 +1060,25 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
         };
         let [v0, v1] = &mut verifying;
         let verify_timer = verifying_min(v0.as_ref(), v1.as_ref()).map(|d| shared.timer(d));
+        #[cfg(test)]
+        if terminal.is_some()
+            && let Some(f) = crate::supervisor::lock(&cfg.hooks.before_terminal).take()
+        {
+            f();
+            // The reads the test released have finished, so their answers are ready at
+            // this turn's select together with the terminal close.
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            tokio::task::block_in_place(|| {
+                while [v0.as_ref(), v1.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|v| !v.handle.is_finished())
+                    && std::time::Instant::now() < until
+                {
+                    std::thread::yield_now();
+                }
+            });
+        }
         let ev = tokio::select! {
             biased;
             () = shutdown.wait() => Ev::Shutdown,
@@ -985,7 +1090,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             () = replaced.wait() => Ev::Replaced,
             () = pending_opt(send_deadline.map(socket_timer)) => Ev::Dropped,
             () = pending_opt(drain_timer.map(socket_timer)) => Ev::Dropped,
-            () = pending_opt(idle_at.map(socket_timer)) => Ev::Dropped,
+            () = pending_opt(idle_at.map(|at| socket_timer(sup.timer(at)))) => Ev::Dropped,
             () = socket_timer(next_tick) => Ev::Tick,
             n = test_tick(&cfg, false, ticks_seen) => {
                 ticks_seen = n;
@@ -1017,15 +1122,37 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                 let Some(((code, why), (_, at))) = terminal.zip(ending) else {
                     return;
                 };
-                // The close frame too is sent only before the drain deadline (R-8).
+                // The close frame too is sent only before the drain deadline (R-8), and
+                // verification stays polled until the socket ends: a revocation found
+                // meanwhile drops the connection (the close frame may be staged).
                 let mut closing = pin!(close(&shared, out, &mut stream, code, why));
                 loop {
-                    tokio::select! {
+                    if verify_due && let Some(slot) = verifying.iter_mut().find(|v| v.is_none()) {
+                        verify_due = false;
+                        *slot = Some(start_verify(&shared, sha, &cfg, generation));
+                    }
+                    let [v0, v1] = &mut verifying;
+                    let read_by = verifying_min(v0.as_ref(), v1.as_ref()).map(|d| shared.timer(d));
+                    let read = tokio::select! {
                         biased;
                         () = shutdown.wait() => return,
+                        () = pending_opt(read_by.map(socket_timer)) => return,
+                        j = pending_opt(v0.as_mut().map(|v| &mut v.handle)) => Some((0, j)),
+                        j = pending_opt(v1.as_mut().map(|v| &mut v.handle)) => Some((1, j)),
+                        _ = nudge.changed() => {
+                            generation += 1;
+                            verify_due = true;
+                            None
+                        }
                         () = socket_timer(sup.timer(at)) => return,
-                        () = poked(&cfg) => {}
+                        () = poked(&cfg) => None,
                         () = &mut closing => return,
+                    };
+                    if let Some((i, j)) = read {
+                        let Some(v) = verifying[i].take() else { return };
+                        if !matches!(take_read(&shared, v.deadline, j), Ok(true)) {
+                            return;
+                        }
                     }
                 }
             }
@@ -1063,8 +1190,12 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                         continue;
                     }
                     Ok(false) => {
-                        cut.store(true, std::sync::atomic::Ordering::Release);
                         la.revoke(me);
+                        // A send in flight may have staged an application frame in the
+                        // sink: the connection is dropped rather than closed through it.
+                        if matches!(out, Out::Sending(..)) {
+                            return;
+                        }
                         (code::POLICY, "token_revoked")
                     }
                     Err(_) => return,
@@ -1075,7 +1206,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                     return;
                 }
                 if idle_at.is_none() {
-                    idle_at = Some(tokio::time::Instant::now() + wcfg.idle_timeout);
+                    idle_at = Some(sup.now() + wcfg.idle_timeout);
                 }
                 out = Out::Free(sink);
                 continue;
@@ -1105,14 +1236,30 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                     continue;
                 };
                 match r {
-                    Ok((ticket, rx, not_after)) => {
+                    Ok(Submission {
+                        ticket,
+                        report: rx,
+                        not_after,
+                        len,
+                        refused,
+                    }) => {
                         let by = not_after + READ_WAIT;
+                        if refused > 0 {
+                            ctl.push_back(AttachServerMessage::InputDropped {
+                                bytes: refused as u64,
+                                reason: AttachReason::PasteMarker,
+                            });
+                        }
+                        let unit = match o.unit {
+                            Unit::Raw(_) => Unit::Raw(len),
+                            u @ Unit::Paste(_) => u,
+                        };
                         #[cfg(test)]
                         cfg.hooks
                             .waiting
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         outstanding = Some(Outstanding {
-                            unit: o.unit,
+                            unit,
                             phase: Phase::Waiting { rx, ticket, by },
                         });
                     }
@@ -1175,7 +1322,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             }
             Ev::Inbound(m) => {
                 if idle_at.is_some() {
-                    idle_at = Some(tokio::time::Instant::now() + wcfg.idle_timeout);
+                    idle_at = Some(sup.now() + wcfg.idle_timeout);
                 }
                 match m {
                     Some(Ok(Message::Binary(b))) => {
@@ -1189,21 +1336,38 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                             });
                             continue;
                         }
-                        // With none of its own raw input in flight, the socket's view of
-                        // the tail is the launch's written tail; the final decision is made
-                        // at submission, in write order.
+                        // With no raw input of the launch in flight (none of this socket's
+                        // pending or outstanding, no unit unsettled), the written tail is
+                        // known and a refusal here is final. Otherwise the frame's refusal
+                        // is left to the submission, decided in write order.
                         let own = pending.has_raw()
-                            || !held.is_empty()
                             || matches!(&outstanding, Some(o) if matches!(o.unit, Unit::Raw(_)));
-                        if !own {
-                            proj.clone_from(&crate::supervisor::lock(&la.marks).tail);
-                        }
+                        let certain = !own && {
+                            let m = crate::supervisor::lock(&la.marks);
+                            let known = m.unsettled == 0;
+                            if known {
+                                proj.clone_from(&m.tail);
+                            }
+                            known
+                        };
                         match filter(&proj, &held, &b) {
-                            Verdict::Refused => {
+                            Verdict::Refused if certain => {
                                 ctl.push_back(AttachServerMessage::InputDropped {
                                     bytes: b.len() as u64,
                                     reason: AttachReason::PasteMarker,
                                 });
+                            }
+                            Verdict::Refused => {
+                                // In arrival order: the held partial first, then this frame,
+                                // each its own frame for the decision at submission.
+                                if !held.is_empty() {
+                                    let h = std::mem::take(&mut held);
+                                    hold_until = None;
+                                    advance_tail(&mut proj, &h);
+                                    pending.raw(&h);
+                                }
+                                advance_tail(&mut proj, &b);
+                                pending.raw(&b);
                             }
                             Verdict::Accepted { write, held: h } => {
                                 advance_tail(&mut proj, &write);

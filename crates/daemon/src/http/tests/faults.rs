@@ -55,6 +55,9 @@ pub(crate) struct Points {
     pub(crate) steps: Mutex<Vec<&'static str>>,
     /// Held once by a socket's next send before it writes.
     pub(crate) socket_send_gate: Mutex<Option<Gate>>,
+    /// Held once by a socket's next send after its frames were fed to the sink, before the
+    /// flush that hands them to the transport.
+    pub(crate) socket_flush_gate: Mutex<Option<Gate>>,
     /// Held once by a socket's next close frame before it is sent (inside the close's
     /// grace).
     pub(crate) close_frame_gate: Mutex<Option<Gate>>,
@@ -302,7 +305,16 @@ impl Points {
     }
 
     pub(crate) async fn before_socket_send(&self) {
-        pass(&self.socket_send_gate).await;
+        pass_held(&self.socket_send_gate).await;
+    }
+
+    /// Arms the socket flush gate, as [`Points::arm_removal_gate`].
+    pub(crate) fn arm_socket_flush_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        arm(&self.socket_flush_gate)
+    }
+
+    pub(crate) async fn before_socket_flush(&self) {
+        pass_held(&self.socket_flush_gate).await;
     }
 
     /// Arms the close frame gate, as [`Points::arm_removal_gate`].
@@ -311,7 +323,7 @@ impl Points {
     }
 
     pub(crate) async fn before_close_frame(&self) {
-        pass(&self.close_frame_gate).await;
+        pass_held(&self.close_frame_gate).await;
     }
 
     /// Arms the runner gate, as [`Points::arm_removal_gate`].
