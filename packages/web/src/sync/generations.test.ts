@@ -99,7 +99,13 @@ describe("sync.generations", () => {
     const host = sim.flight(HOST, "forward");
     if (host === undefined) throw new Error("no host read");
     sim.serve(host);
+    // A read issued between the socket's construction and its open is older too.
+    sim.dispatch({ type: "select", thread: threadId(1) });
+    const thread = sim.flight(T1, "forward");
+    if (thread === undefined) throw new Error("no thread read");
+    sim.serve(thread);
     sim.open();
+    deliverStale(sim, thread);
     deliverStale(sim, host);
     expect(sim.state.epoch).toBeNull();
     // The open made every followed stream due again.
