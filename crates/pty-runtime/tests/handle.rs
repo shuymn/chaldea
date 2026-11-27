@@ -6,17 +6,39 @@ mod common;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use chaldea_pty_runtime::fake::{FakeChild, FakeEvent, FakeScript, KillBehavior, ProbePoint};
+use chaldea_pty_runtime::fake::{
+    DeadlineSite, FakeChild, FakeEvent, FakeScript, KillBehavior, Probe, ProbePoint,
+};
 use chaldea_pty_runtime::{
     ChildExit, CloseBounds, Fence, Limits, PtySize, ResizeError, Resized, SessionEvent,
     SessionHandle, SubscribeError, grid_rows,
 };
 use common::*;
 
-/// The slack a bounded close may take past its budgets on a loaded runner.
-const SLACK: Duration = Duration::from_secs(1);
+/// The close's bound through its deadline seam, not the wall clock: it computed one end,
+/// `bounds.total()` from its start (between `before` and `after`), and every wait for the
+/// control lock ended by it. The close returning while the control is still held proves the
+/// waits honoured their deadlines.
+fn assert_one_end(probe: &Probe, before: Instant, after: Instant, bounds: CloseBounds) {
+    let noted = probe.deadlines();
+    let ends: Vec<Instant> = noted
+        .iter()
+        .filter(|(s, _)| *s == DeadlineSite::CloseEnd)
+        .map(|(_, at)| *at)
+        .collect();
+    assert_eq!(ends.len(), 1, "{noted:?}");
+    let end = ends[0];
+    assert!(end >= before + bounds.total() && end <= after + bounds.total());
+    let waits: Vec<Instant> = noted
+        .iter()
+        .filter(|(s, _)| *s == DeadlineSite::ControlWait)
+        .map(|(_, at)| *at)
+        .collect();
+    assert!(!waits.is_empty());
+    assert!(waits.iter().all(|w| *w <= end), "{noted:?}");
+}
 
 fn to() -> PtySize {
     PtySize::new(100, 30).unwrap()
@@ -78,6 +100,7 @@ fn close_with_resize_held() {
             ..
         } = rig_with(script, Limits::default(), 80, 24);
         let h = session.handle();
+        let probe = session.probe();
         let hold = child.hold_resizes();
         let resize = resize_in_thread(&h);
         assert!(hold.wait_entered(soon()), "{kind:?}");
@@ -101,8 +124,7 @@ fn close_with_resize_held() {
                 None
             }
         };
-        let took = t.elapsed();
-        assert!(took <= bounds.total() + SLACK, "{kind:?}: {took:?}");
+        assert_one_end(&probe, t, Instant::now(), bounds);
         if let Some(out) = &out {
             assert!(!out.released.control, "{kind:?}: {out:?}");
             assert_eq!(out.close.elapsed, None, "{kind:?}");
@@ -181,7 +203,7 @@ fn resize_handoff_closes_once() {
         let bounds = short_bounds();
         let t = Instant::now();
         let out = session.close(&[], bounds);
-        assert!(t.elapsed() <= bounds.total() + SLACK);
+        assert_one_end(&probe, t, Instant::now(), bounds);
         assert!(!out.released.control, "{point:?}: {out:?}");
         assert_eq!(control_closes(&child), 0);
         drop(park);
@@ -201,6 +223,8 @@ fn close_after_resize_closes_once() {
     let Rig { session, child, .. } = rig();
     let h = session.handle();
     assert_eq!(h.resize(to(), None).unwrap(), Resized::PtyAndVt);
+    // No close left the control to the resize: it keeps the control open.
+    assert_eq!(control_closes(&child), 0);
     let out = session.close(&[], CloseBounds::default());
     assert!(out.released.control);
     assert_eq!(control_closes(&child), 1);

@@ -934,12 +934,22 @@ impl ProbePoint {
     }
 }
 
+/// Where a close noted a deadline: its absolute end, and each wait for the control lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadlineSite {
+    /// The close's one absolute end, computed when the close starts.
+    CloseEnd,
+    /// A wait for the control lock (close step 4, the release guard).
+    ControlWait,
+}
+
 #[derive(Default)]
 struct ProbeState {
     counts: [u64; 8],
     armed: [Option<u64>; 8],
     released: Vec<u64>,
     next: u64,
+    deadlines: Vec<(DeadlineSite, Instant)>,
 }
 
 #[derive(Default)]
@@ -993,6 +1003,16 @@ impl Probe {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
+    }
+
+    pub(crate) fn note_deadline(&self, site: DeadlineSite, at: Instant) {
+        lock(&self.inner.st).deadlines.push((site, at));
+    }
+
+    /// The deadlines noted so far, in order.
+    #[must_use]
+    pub fn deadlines(&self) -> Vec<(DeadlineSite, Instant)> {
+        lock(&self.inner.st).deadlines.clone()
     }
 
     /// Occurrences of `p` so far.

@@ -542,6 +542,7 @@ impl Shared {
     /// the lock, unless it released it meanwhile: under the handoff lock, a last `try_lock`
     /// decides which.
     fn take_control(&self, deadline: Instant) -> Ctl {
+        crate::probe_deadline!(self, ControlWait, deadline);
         if let Some(mut g) = try_lock_until(&self.control, deadline) {
             return Ctl::Taken(g.take());
         }
@@ -1089,6 +1090,7 @@ impl Session {
         let t0 = Instant::now();
         // One absolute end for every lock wait, the backend close, and the cleanup.
         let end = deadline_in(bounds.total());
+        crate::probe_deadline!(self.sh, CloseEnd, end);
         let sh = self.sh.clone();
         let _release = Release {
             sh: &sh,

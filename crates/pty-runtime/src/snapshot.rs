@@ -468,3 +468,25 @@ pub fn decode_grid(grid: &str, cols: u16, rows: u16) -> Result<Vec<Line>, GridEr
     }
     Ok(lines)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{GridCell, cell_text};
+
+    /// D12: the copy of a cell's text stops inside a long zero-width run once the run
+    /// passes the room; it does not copy the run first.
+    #[test]
+    fn cell_text_stops_inside_zero_width_run() {
+        let mut cell = GridCell {
+            c: 'e',
+            ..GridCell::default()
+        };
+        for _ in 0..20_000 {
+            cell.push_zerowidth('\u{301}');
+        }
+        assert_eq!(cell_text(&cell, 4096), None);
+        let (text, len) = cell_text(&cell, usize::MAX).unwrap();
+        assert_eq!(text.chars().count(), 20_001);
+        assert_eq!(len, 1 + 20_000 * '\u{301}'.len_utf8());
+    }
+}

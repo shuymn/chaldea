@@ -74,6 +74,16 @@ macro_rules! probe {
 }
 pub(crate) use probe;
 
+/// Notes a deadline at a [`fake::DeadlineSite`]; nothing without the `fake` feature.
+macro_rules! probe_deadline {
+    ($sh:expr, $site:ident, $at:expr) => {
+        #[cfg(feature = "fake")]
+        $sh.probe
+            .note_deadline($crate::fake::DeadlineSite::$site, $at);
+    };
+}
+pub(crate) use probe_deadline;
+
 pub use backend::{
     ChildExit, Cleanup, CloseReport, DrainSink, KillAttempt, KillReport, MAX_DIMENSION,
     NeverStartedKind, ProcessIdentity, PtyChild, PtyControl, PtyRuntime, PtySize, SizeError,
