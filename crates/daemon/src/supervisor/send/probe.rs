@@ -113,19 +113,19 @@ impl IntakeProbe for SupervisorProbe {
         // under the launch's state. A completion publishes `written` under the same state, so
         // it is either before this intake or after it; a record that commits after the read
         // leaves the unit running for it.
-        let written = st
-            .dispatch
-            .as_ref()
-            .is_some_and(|d| d.written.load(Ordering::Acquire));
         let running = st
             .running
             .as_ref()
             .is_some_and(|r| !r.recorded.load(Ordering::Acquire));
         let human_running = st.human_unsettled > 0;
-        let dispatch = st
-            .dispatch
-            .as_ref()
-            .map(|d| (d.input_id, d.before, d.competing));
+        let dispatch = st.dispatch.as_ref().map(|d| {
+            (
+                d.input_id,
+                d.before,
+                d.competing,
+                d.written.load(Ordering::Acquire),
+            )
+        });
         #[cfg(test)]
         super::run_hook(&sl.hooks.after_written_read);
         sl.latest_intake.store(ordinal, Ordering::SeqCst);
@@ -147,7 +147,7 @@ impl IntakeProbe for SupervisorProbe {
             LaunchObservation::Reserved => (0, [0; 3]),
             LaunchObservation::Unobservable => return None,
         };
-        let inflight = dispatch.map(|(input_id, before, competing)| {
+        let inflight = dispatch.map(|(input_id, before, competing, written)| {
             let at = last_started[OriginClass::Input.index()];
             Inflight {
                 input_id,

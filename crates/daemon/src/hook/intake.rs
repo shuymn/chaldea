@@ -364,16 +364,12 @@ impl IntakeOrder {
             let mut st = lock(&e.state);
             if clock.now() >= deadline {
                 cell.store(CANCELLED, Ordering::SeqCst);
-                drop(st);
-                drop(g);
                 return Start::Expired;
             }
             if cell
                 .compare_exchange(PENDING, STARTED, Ordering::SeqCst, Ordering::SeqCst)
                 .is_err()
             {
-                drop(st);
-                drop(g);
                 return Start::Cancelled;
             }
             let ordinal = st.next;
