@@ -74,8 +74,9 @@ async fn stop_result() {
 }
 
 async fn stop_result_with(late: bool) {
+    // The clock stays stopped: the hold below spends no budget, and only `advance` makes
+    // the re-read late.
     let rig = Rig::new().await;
-    rig.clock.resume();
     let (t, l) = rig.spawn_codex(None).await;
     let child = rig.pty.take_child().unwrap();
     let start = rig.pauses.arm(Pause::StopStart);
@@ -98,7 +99,7 @@ async fn stop_result_with(late: bool) {
     })
     .await;
     if late {
-        rig.clock.skew(std::time::Duration::from_secs(6));
+        rig.clock.advance(std::time::Duration::from_secs(6));
     }
     start.go();
     let r = reply.await.unwrap();

@@ -717,6 +717,9 @@ async fn early_hook_pid_wait() {
     reached
         .await
         .expect("the hook reaches its job after the wait ran out");
+    // Only the pid wait needed time to pass. Stopped now, the clock keeps the hook's request
+    // deadline and reply cutoff from passing however slowly the host runs.
+    rig.clock.stop();
     assert_eq!(rig.launch(l).pid, None, "the wait ran out before the start");
     held.go();
     rig.until("the start committed", || rig.launch(l).pid.is_some())
