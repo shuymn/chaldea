@@ -103,11 +103,16 @@ impl IntakeProbe for SupervisorProbe {
         arm: &IntakeGuard,
     ) -> Option<IntakeFacts> {
         let sl = self.side.launch(launch)?;
-        sl.entry.await_published(f);
-        let Some(st) = state_until(&sl, f) else {
+        // Stores `latest_intake`, advances the fence, and arms the guard; under the state when
+        // the state was taken.
+        let advance = || {
             sl.latest_intake.store(ordinal, Ordering::SeqCst);
             fence_advance(&sl.fence);
             arm.arm();
+        };
+        sl.entry.await_published(f);
+        let Some(st) = state_until(&sl, f) else {
+            advance();
             return None;
         };
         // The intake point: the dispatch's `written`, the running unit, and the fence advance
@@ -129,9 +134,7 @@ impl IntakeProbe for SupervisorProbe {
         });
         #[cfg(test)]
         super::run_hook(&sl.hooks.after_written_read);
-        sl.latest_intake.store(ordinal, Ordering::SeqCst);
-        fence_advance(&sl.fence);
-        arm.arm();
+        advance();
         drop(st);
         #[cfg(test)]
         let observed = match super::lock(&sl.hooks.observe).take() {
