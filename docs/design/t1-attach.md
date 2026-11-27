@@ -1,10 +1,10 @@
 # Design: The Attach WebSocket (MVP T1)
 
-Row T1 of `docs/mvp-design.md` §4 (mvp:436, :475; CL-19's attach half, :613): the daemon side of `GET /api/attach/{thread}` (PR 11, M1) for T2's terminal view.
+T1 of `docs/mvp-design.md` §4 (mvp:436, :475; CL-19, :613): the daemon side of `GET /api/attach/{thread}` (PR 11) for T2.
 
 ## 1. Scope
 
-**Adds.** The attach handler and loop (`crates/daemon/src/attach/`), frames (`crates/core/src/attach.rs`, `ts-rs`), a pty-runtime `SessionHandle` and bounded close, a launch lease, an attach `human_write` interval, per-purpose inbound limits.
+**Adds.** The attach handler (`crates/daemon/src/attach/`), frames (`crates/core/src/attach.rs`), a pty-runtime `SessionHandle` and bounded close, the launch lease, the attach interval, per-purpose limits.
 
 **Does not add.** A client, `chaldea attach`, P-9, an SGR serializer (deferred, mvp:451-452, :462), commands, event kinds, or routes.
 
@@ -28,7 +28,7 @@ Admission is PR 7's: an owner-only `attach:<thread>` ticket, single use, 30 s (h
 
 **Close codes** (best effort). 4000 `no_live_launch`, 4001 `launch_ended` (after `ended`), 4002 `lagged`, 4003 `replaced`, 4004 `busy`; 1001 shutdown, 1003 malformed frame or size, 1007 invalid UTF-8, 1008 token revoked, 1009 over the limit.
 
-**Limits.** Inbound message: 6 × `MAX_PROMPT_BYTES` + 4 KiB for attach (any JSON escape of a 256 KiB paste), 64 KiB for `/api/ws`; raw frame 64 KiB; paste text 256 KiB; `paste_id` 128 bytes (longer: 1003 before any write, so a result can echo it); `attached` ≤ 192 KiB whole; queued output 1 MiB; drain 5 s; send 10 s per frame; idle 75 s.
+**Limits.** Inbound message: 6 × `MAX_PROMPT_BYTES` + 4 KiB for attach (any JSON escape of a 256 KiB paste), 64 KiB for `/api/ws`; raw frame 64 KiB; paste text 256 KiB; `paste_id` 128 bytes (longer: 1003, nothing written); `attached` ≤ 192 KiB whole; queued output 1 MiB; drain 5 s; send 10 s per frame; idle 75 s; candidacy 15 s from the upgrade, then 4004.
 
 ## 3. Decisions
 
@@ -40,7 +40,7 @@ Admission is PR 7's: an owner-only `attach:<thread>` ticket, single use, 30 s (h
 | D4 | Clipboard text arrives only as `paste`; T2 intercepts paste and suppresses ghostty-web's query replies. | Recognising pastes in raw input: unmarked pastes submit early on Codex for Windows. |
 | D5 | A paste on a bracketed-paste row needs DECSET 2004 on at encoding and dispatch. | Unwrapped text: CR newlines submit each line. |
 | D6 | One outstanding unit per socket; raw input joined; T2 holds submit and queue keys until `paste_result` and sends them only on `written`, else (or on disconnect) drops them. | One unit per frame: lost middle units, stale Enter after a failed paste. |
-| D7 | One launch lease orders resizes against sends; resizes run outside the op lock. | A flag beside `running`. |
+| D7 | One launch lease orders resizes against sends, outside the op lock. | A flag beside `running`. |
 | D8 | A lagging client gets the prefix, then 4002. | In-place resync. |
 | D9 | Raw input is written as sent; T2 notes typed non-ASCII may be lost on Codex for Windows; X2 decides keyed entry. | Keying raw input now. |
 | D10 | Inbound limits by ticket purpose. | Chunked paste frames. |
@@ -54,17 +54,17 @@ All are reversible except D4's public frame.
 | ID | Invariant | Test |
 |---|---|---|
 | I-1 | `Session::close` returns within one absolute deadline even while a resize holds the control, reporting it unreleased until closed; a resize starts only before seal. | pty `close_with_resize_held`, `resize_after_seal_refused` |
-| I-2 | Every unit and resize carries its socket's grant from takeover; replacement, revocation, disconnect, and launch end revoke it, so no unpermitted old write or resize reaches the PTY; permitted writes settle (pty-runtime §2.3). | `old_enter_after_disconnect_and_reattach`, `delayed_old_submission`, `old_resize_parked_before_backend`, `failed_candidate_keeps_current` |
+| I-2 | Every unit and resize carries its socket's grant from takeover; replacement, revocation, disconnect, and launch end revoke it: no unpermitted old write or resize reaches the PTY. | `old_enter_after_disconnect_and_reattach`, `delayed_old_submission`, `old_resize_parked_before_backend`, `failed_candidate_keeps_current` |
 | I-3 | Only the lease's holder, by acquisition id, submits or resizes; a known rollback or non-admission releases it; an indeterminate commit keeps it until exit; `stop` never waits for resize. | `resize_waits_for_opened_send`, `open_waits_for_resize`, `open_result_unrecorded`, `invalidation_races_conversion`, `stop_with_resize_held` |
-| I-4 | Pending input stays ≤ 64 KiB plus one validated message; after `pending` nothing more is submitted until that unit settles. | `crossing_paste_kept`, `max_paste_with_raw_outstanding`, `stuck_writer_after_pending` |
+| I-4 | Pending input stays ≤ 64 KiB plus one validated message; after `pending`, nothing more until that unit settles. | `crossing_paste_kept`, `max_paste_with_raw_outstanding`, `stuck_writer_after_pending` |
 | I-5 | `ready → key → attach` records `human_write { attach }`; `attach → card_key → attach` records it once; gate and ack decisions are unchanged. | `ready_key_attach_records`, `attach_card_key_attach_skips`, `typing_records_once`, `worker_exit_overlap` |
 | I-6 | No complete bracketed-paste marker reaches the PTY from raw input; a lone Escape is written at once. | `marker_split_at_every_position`, `lone_escape_immediate`, `dsr_answered_once`; T2: paste with 2004 off yields only `paste`, a rendered DSR yields no client frame |
-| I-7 | Revocation starts closing within one read deadline of the nudge (30 s plus one when lost) and cuts unpermitted writes. | `revoked_at_startup`, `revoked_read_parked_in_snapshot`, `revoked_lost_nudge_under_load`, `slot_with_cleanup_held` |
-| I-8 | The first terminal event wins and revokes the grant; `ended` is the last frame; nothing is sent after 5 s. | `drain_cutoff_drops`, `lag_then_gone_keeps_4002`, `lag_stalled_releases_slot` |
+| I-7 | Revocation ends the socket within §6's phase bounds and moves the grant: no new attach unit dispatches after. | `revoked_at_startup`, `revoked_read_parked_in_snapshot`, `revoked_lost_nudge_under_load`, `slot_with_cleanup_held` |
+| I-8 | The first terminal event wins and revokes the grant; `ended` is the last application frame; sends stop at the drain end (§6). | `drain_cutoff_drops`, `lag_then_gone_keeps_4002`, `lag_stalled_releases_slot` |
 
 ## 5. Acceptance Criteria
 
-FakePty on both runners (Codex `win_keys` on a Windows host row), through the production mount.
+FakePty on both runners, Codex `win_keys` on a Windows host row; production mount.
 
 | ID | Criterion (EARS) | Test |
 |---|---|---|
@@ -82,10 +82,9 @@ FakePty on both runners (Codex `win_keys` on a Windows host row), through the pr
 
 - Attach never feeds state (invariant 1).
 - Accepted: typed non-ASCII to Codex on Windows (D9); unpadded paste triggers (input-encoders D10); L-11's late `Stop` after an attach-started turn.
-- Accepted: redraw needs the CLI to honour resize; a sequence split at the snapshot renders wrong until then (D3).
-- Accepted: permitted writes settle after revocation.
-- Accepted (I-7): verification is per phase: ≤ 4 blocking reads per socket (2 startup reads may outlive takeover); the terminal close drops the saturation cutoff. A revoked socket ends ≤ 5 s after the nudge (10 s in the terminal close; lost nudge: plus the 30 s tick), writing nothing after.
-- Accepted (I-8): an end latched before takeover starts its 5 s at the first loop turn (drain end ≤ 10 s after the latch or a later startup nudge); a send in flight at the latch keeps its 10 s deadline, so one frame may follow the cutoff. Order and the terminal event hold.
+- Accepted: redraw needs the CLI to honour resize; a sequence split at the snapshot renders wrong until redrawn (D3).
+- Accepted (I-7): from the nudge, a revoked socket's slot is released ≤ 6 s while operating (5 s read, 1 s close grace), ≤ 10 s in the terminal close, ≤ 11.25 s at startup (startup read, 250 ms lock, fresh read, close grace; within the 15 s candidacy); a lost nudge adds the 30 s tick (operating). ≤ 4 blocking reads per socket. Dispatched units finish (pty-runtime §2.3); transport bytes may arrive.
+- Accepted (I-8): an end latched before takeover starts its 5 s at the first loop turn (drain end ≤ 10 s after the latch or a later startup nudge, ≤ 20 s after the upgrade). One send batch (an application frame, maybe a Ping), also one selected after the latch, may follow the cutoff within its 10 s. Order and the terminal event hold.
 
 ## 7. Canonical-Doc Edits
 
