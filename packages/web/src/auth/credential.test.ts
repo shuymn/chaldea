@@ -49,6 +49,34 @@ describe("credential.generation", () => {
     expect(posted).toEqual([]);
   });
 
+  test("a store queued after a 401's compare began survives it: compare and delete are one transaction", async () => {
+    const { make } = harness();
+    const tabA = make();
+    const tabB = make();
+    const a = await tabA.store("token-a");
+    await tabB.read();
+    // B's store starts the moment A's compare reads the record.
+    let storing: Promise<unknown> | null = null;
+    const original = FDBObjectStore.prototype.get;
+    const spy = vi.spyOn(FDBObjectStore.prototype, "get").mockImplementation(function (
+      this: IDBObjectStore,
+      key: IDBValidKey | IDBKeyRange,
+    ) {
+      const req = original.call(this, key);
+      storing ??= tabB.store("token-b");
+      return req;
+    });
+    let b: unknown;
+    try {
+      await tabA.clearIf(a.generation);
+      b = await storing;
+    } finally {
+      spy.mockRestore();
+    }
+    expect(storing).not.toBeNull();
+    expect(await tabA.read()).toEqual(b);
+  });
+
   test("a 401 of the stored generation deletes it and posts the clear after the commit", async () => {
     const { posted, make } = harness();
     const tab = make();
