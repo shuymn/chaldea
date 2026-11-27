@@ -231,7 +231,7 @@ The daemon listens on `127.0.0.1:<port>` only, on `axum` + `hyper` + `tower-http
 
 | Route | Origin | Credential | Object check |
 |---|---|---|---|
-| `GET /`, `/assets/*` (PWA) | — | none | serves no data; CSP `default-src 'self'`, `connect-src` own origins |
+| `GET /`, `/assets/*` (PWA) | — | none | serves no data: `/` is `index.html` with the CSP of `docs/design/w1-pwa.md` §2.1 (`default-src 'self'`, `connect-src 'self' ws://<Host>`, Trusted Types required), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and COOP `same-origin`; `/assets/*` an exact embedded file of an allowed type, else 404; every response `nosniff` and CORP `same-origin`, `/` and errors `no-store`, hashed assets `max-age=31536000, immutable`; both 501 in a build without the PWA |
 | `POST /api/pair-codes` | must be absent | `owner` Bearer | issues a single-use pair code (60 s) bound to the issuing token |
 | `POST /api/pair` | present and matching | single-use pair code | issues an `owner` token while the code's issuing token is valid |
 | `POST /api/ws-ticket` | absent or matching | Bearer | ticket bound to the token and a purpose (`events` or `attach:<thread>`) |
@@ -372,7 +372,7 @@ crates/pty-runtime/ # PtyRuntime trait, FakePty, unix (rustix PTY + `Command`/`p
 crates/daemon/      # tokio + axum + rusqlite: store, HTTP, hook ingest, transcript tailer, supervisor, git
 crates/cli/         # binary `chaldea`: client subcommands (`inspect` included), `daemon run`, `hook-emit`
 crates/testkit/     # publish = false: `chaldea-fake-cli` and fixture helpers (spike FakeCli modes)
-packages/contracts/ # generated TS (ts-rs) + JSON Schema (schemars) + validators
+packages/contracts/ # generated TS (ts-rs, `SCHEMA_VERSION` included) + JSON Schema (schemars); Ajv 2020 standalone validators generated from it (not committed) + the event decoder
 packages/web/       # React + TypeScript strict + Vite + Tailwind PWA, served by the daemon; ghostty-web terminal view
 skills/chaldea-rescue/ # SKILL.md for external rescue agents (T2)
 fixtures/           # real-CLI corpus: fixtures/<agent>/<cli-version>/<case>/
@@ -406,7 +406,7 @@ specs/              # Quint specs of the contracts, their committed ITF traces (
 | `src/fake_cli.rs` | `testkit` | PR 3 lifts `echo` (input reporting), `queries`, `attachable` (size and `SIGWINCH` reporting), `spawn-tree` (direct hellos), and `sleeper`; PR 4 adds the Windows console, `attachable` size polling, the `breakaway` role, `--emit-output`, and `--validate-input`, and the new `report-process` mode; `stall` and `banner` come with PR 10. A loopback report stream per process replaces `/witness`. |
 | `src/scenario/*`, `report.rs`, `cli.rs` | — | Not lifted. |
 
-**Tooling.** CI adds a `workspace` job (macOS + Windows): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, the contract drift check, the `core` dependency check; `lefthook.yml` mirrors it. Node and pnpm are in `mise.toml` for the Quint specs, whose `specs` job runs on `ubuntu-latest` (`docs/design/formal-specs.md` §5); W1 adds the JS job: typecheck, Vitest with fast-check, and Playwright.
+**Tooling.** CI adds a `workspace` job (macOS + Windows): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, the contract drift check, the `core` dependency check; `lefthook.yml` mirrors it. Node and pnpm are in `mise.toml` for the Quint specs, whose `specs` job runs on `ubuntu-latest` (`docs/design/formal-specs.md` §5); W1 adds a root pnpm workspace (`packages/contracts`, `packages/web`; `specs/` keeps its own) and the `web` job (`macos-latest`): the validator codegen, typecheck, Vitest with fast-check, and Playwright; `lefthook.yml` mirrors typecheck and Vitest when `packages/**` changes.
 
 ## 4. PR Plan
 
