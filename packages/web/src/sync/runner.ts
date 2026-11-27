@@ -40,6 +40,9 @@ export class Runner {
   private adoption: Promise<void> = Promise.resolve();
   private unlisten: (() => void) | null = null;
   private stopped = false;
+  /** Counts suspensions (and stop): a resume acts only for the suspension it started in. */
+  private suspension = 0;
+  private resuming: Promise<void> | null = null;
   /** Aborted by `stop`: boot and pairing run under it, so a late exchange is not applied. */
   private readonly lifetime = new AbortController();
   /** Generations refused with 401 whose delete failed: never used again by this page. */
@@ -73,31 +76,50 @@ export class Runner {
     await this.reread("report");
   }
 
-  /** Reads the store again after it failed. */
-  retryStorage(): Promise<void> {
-    return this.reread("report");
+  /** Reads the store again after it failed; a suspended page then resumes. */
+  async retryStorage(): Promise<void> {
+    const ok = await this.reread("report");
+    if (ok && this.state.suspended) await this.resume();
   }
 
   /**
    * Into the back-forward cache: the socket closes, reads and the ticket POST end, and
-   * timers stop; the state in memory stays for `resume`.
+   * timers stop; the state in memory stays for `resume`. A new suspension invalidates a
+   * resume still reconciling.
    */
   suspend(): void {
+    this.suspension += 1;
+    this.resuming = null;
     this.dispatch({ type: "suspend" });
     this.endTransport();
   }
 
   /**
    * Back from the cache: reconcile with the store first (a notice may have been missed
-   * while frozen), then reconnect and refetch, keeping what the page showed.
+   * while frozen), then reconnect and refetch, keeping what the page showed. A no-op
+   * unless suspended; duplicate calls for one suspension share one resume. If the store
+   * cannot be read, the page stays suspended and shows the storage error with Retry.
    */
-  async resume(): Promise<void> {
-    await this.reread("keep");
-    this.dispatch({ type: "resume" });
+  resume(): Promise<void> {
+    if (this.stopped || !this.state.suspended) return Promise.resolve();
+    if (this.resuming) return this.resuming;
+    const version = this.suspension;
+    const resuming = (async () => {
+      const ok = await this.reread("report");
+      // A suspend or stop since then invalidates this resume.
+      if (this.stopped || version !== this.suspension || !ok) return;
+      this.dispatch({ type: "resume" });
+    })().finally(() => {
+      if (this.resuming === resuming) this.resuming = null;
+    });
+    this.resuming = resuming;
+    return resuming;
   }
 
   /** Ends every request, socket, and timer, and stops listening; the runner does nothing after. */
   stop(): void {
+    this.suspension += 1;
+    this.resuming = null;
     this.stopped = true;
     this.lifetime.abort();
     this.unlisten?.();
@@ -132,9 +154,9 @@ export class Runner {
    * failure retires it. Notices, startup, Retry, and resume name no generation and
    * adopt what the store holds.
    */
-  private reread(onError: "keep" | "report", trigger?: string): Promise<void> {
-    this.adoption = this.adoption.then(async () => {
-      if (this.stopped) return;
+  private reread(onError: "keep" | "report", trigger?: string): Promise<boolean> {
+    const read = this.adoption.then(async (): Promise<boolean> => {
+      if (this.stopped) return false;
       let cred: Credential | null;
       let failed = false;
       try {
@@ -144,17 +166,19 @@ export class Runner {
         cred = null;
       }
       if (trigger !== undefined) {
-        if (this.cred?.generation !== trigger) return;
+        if (this.cred?.generation !== trigger) return !failed;
         this.adopt(cred);
-        return;
+        return !failed;
       }
       if (failed) {
         if (onError === "report") this.dispatch({ type: "storageFailed" });
-        return;
+        return false;
       }
       this.adopt(cred);
+      return true;
     });
-    return this.adoption;
+    this.adoption = read.then(() => undefined);
+    return read;
   }
 
   /** Adopts `cred`, unless it is a generation retired here after a failed delete. */

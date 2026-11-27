@@ -355,6 +355,79 @@ describe("runner", () => {
     r.stop();
   });
 
+  test("a suspend or stop during a pending resume keeps the page suspended with no transport", async () => {
+    for (const action of ["suspend", "stop"] as const) {
+      const store = fakeStore(A);
+      const { r, calls } = runner(store);
+      await r.start();
+      await vi.advanceTimersByTimeAsync(0);
+      r.suspend();
+      let finish: (c: Credential) => void = () => {};
+      store.read = () =>
+        new Promise<Credential>((resolve) => {
+          finish = resolve;
+        });
+      const mark = calls.length;
+      const pending = r.resume();
+      await vi.advanceTimersByTimeAsync(0);
+      r[action]();
+      finish(A);
+      await pending;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(calls.slice(mark)).toEqual([]);
+      expect(r.getState().suspended).toBe(true);
+      r.stop();
+    }
+  });
+
+  test("duplicate resumes for one suspension coalesce; a resume while not suspended is a no-op", async () => {
+    const store = fakeStore(A);
+    const { r, calls } = runner(store);
+    await r.start();
+    await vi.advanceTimersByTimeAsync(0);
+    r.suspend();
+    const reads = store.reads;
+    const mark = calls.length;
+    const first = r.resume();
+    const second = r.resume();
+    expect(second).toBe(first);
+    await first;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.reads).toBe(reads + 1);
+    expect(calls.slice(mark).filter((c) => c.path === "/api/ws-ticket")).toHaveLength(1);
+    const after = calls.length;
+    await r.resume();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.length).toBe(after);
+    expect(store.reads).toBe(reads + 1);
+    r.stop();
+  });
+
+  test("a resume whose store read fails stays suspended and shows the storage error; Retry resumes", async () => {
+    const store = fakeStore(A);
+    const { r, calls } = runner(store);
+    await r.start();
+    await vi.advanceTimersByTimeAsync(0);
+    r.suspend();
+    const read = store.read;
+    store.read = async () => {
+      throw new Error("storage unavailable");
+    };
+    const mark = calls.length;
+    await r.resume();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.slice(mark)).toEqual([]);
+    expect(r.getState().suspended).toBe(true);
+    expect(r.getState().storageFailed).toBe(true);
+    store.read = read;
+    await r.retryStorage();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(r.getState().suspended).toBe(false);
+    expect(r.getState().storageFailed).toBe(false);
+    expect(calls.slice(mark).some((c) => c.path === "/api/ws-ticket")).toBe(true);
+    r.stop();
+  });
+
   test("a 401 whose delete fails retires that generation; a newer one is still adopted", async () => {
     const store = fakeStore(A);
     let clears = 0;

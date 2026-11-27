@@ -239,6 +239,18 @@ describe("sync.status", () => {
     expect(sim.state.streams[T1]?.error).toBeNull();
   });
 
+  test("a second resume for one suspension does not clear a terminal error again", () => {
+    const sim = live();
+    sim.dispatch({ type: "suspend" });
+    sim.dispatch({ type: "resume" });
+    sim.quiesce();
+    const id = forwardRead(sim);
+    failWith(sim, id, { kind: "schema" });
+    const effects = sim.dispatch({ type: "resume" });
+    expect(sim.state.streams[T1]?.error).not.toBeNull();
+    expect(effects.filter((e) => e.type === "fetch")).toEqual([]);
+  });
+
   test("a failed history read shows on the window only; the page stays live (N1)", () => {
     const sim = live();
     sim.dispatch({ type: "older" });

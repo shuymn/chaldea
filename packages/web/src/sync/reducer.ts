@@ -191,6 +191,8 @@ class Step {
    * open does, terminal errors cleared included (a resume is a reconnect).
    */
   private resume(): void {
+    // Only a suspended page resumes; a duplicate changes nothing.
+    if (!this.s.suspended) return;
     this.s.suspended = false;
     this.s.socketAttempt = 0;
     this.s.socketRetryAt = 0;

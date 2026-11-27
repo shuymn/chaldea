@@ -56,6 +56,11 @@ describe("ui", () => {
     });
     expect(screen.queryByText(/Browser storage is unavailable/)).toBeNull();
     expect(screen.getByText(/This link is spent or expired/)).toBeTruthy();
+    // A resume whose store read fails shows the same recoverable state.
+    act(() => runner.suspend());
+    fail = true;
+    await act(() => runner.resume());
+    expect(screen.getByText(/Browser storage is unavailable/)).toBeTruthy();
     runner.stop();
   });
 
