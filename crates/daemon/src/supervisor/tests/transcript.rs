@@ -1,6 +1,7 @@
 //! The transcript tailer in the supervisor (C1 D10): one per Claude launch, reading from its
-//! binding; the final read after the exit, also at daemon shutdown; joined by the shutdown
-//! participant before the store shuts down, or reported as left running.
+//! binding; the final read after the exit, also at daemon shutdown (with a binding that came
+//! after admission closed, a poll begun across the close, and short retries); joined by the
+//! shutdown participant before the store shuts down, or reported as left running.
 
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,7 @@ use crate::lifecycle::ParticipantEnd;
 use crate::store::tests::support;
 use crate::supervisor::Pause;
 use crate::supervisor::components::shutdown;
-use crate::transcript::DROPPED_OFF_BLOCKING;
+use crate::transcript::{BATCH_LINES, DROPPED_OFF_BLOCKING, Mode};
 
 const LINE: &str =
     "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n";
@@ -183,4 +184,134 @@ async fn a_tailer_holding_a_reader_at_the_end_is_left_running() {
     let report = store.shutdown();
     assert!(report.readers_returned, "{report:?}");
     assert_eq!(report.readers_abandoned, 0);
+}
+
+/// The binding committed after admission closed and before the final read: the tailer,
+/// still waiting for its binding, reads it at the final read and stores the fragment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_binding_after_hold_is_read_at_the_final_read() {
+    let rig = rig().await;
+    let (t, l) = spawn_claude(&rig).await;
+    let files = tempfile::tempdir().unwrap();
+    let path = files.path().join("session.jsonl");
+    std::fs::write(&path, [LINE, "{\"type\""].concat()).unwrap();
+    let close = rig.pauses.arm(Pause::ShutdownCloseEnd);
+    let end = rig.sup.now() + Duration::from_secs(5);
+    let participant = tokio::spawn(shutdown(rig.sup.clone(), end));
+    let close = tokio::task::spawn_blocking(move || {
+        close.wait();
+        close
+    })
+    .await
+    .unwrap();
+    rig.srv
+        .append(vec![support::bound(
+            t,
+            l,
+            "s1",
+            Some(&path.to_string_lossy()),
+        )])
+        .await;
+    close.go();
+    assert_eq!(participant.await.unwrap(), ParticipantEnd::Clean);
+    assert_eq!(texts(&rig, t), ["ok", "raw:partial_line"]);
+    rig.srv.stop().await;
+}
+
+/// A final read that keeps failing (the file is missing) under the default poll period
+/// ends within the participant's default 2 s: its retries are short.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_final_read_ends_within_the_default_budget() {
+    let rig = Rig::with(HostOs::Macos, |_| {}).await;
+    rig.clock.resume();
+    let (t, l) = spawn_claude(&rig).await;
+    let files = tempfile::tempdir().unwrap();
+    let path = files.path().join("missing.jsonl");
+    rig.srv
+        .append(vec![support::bound(
+            t,
+            l,
+            "s1",
+            Some(&path.to_string_lossy()),
+        )])
+        .await;
+    let end = rig.sup.now() + Duration::from_secs(2);
+    assert_eq!(shutdown(rig.sup.clone(), end).await, ParticipantEnd::Clean);
+    assert!(rig.sup.tailers.launches().is_empty());
+    rig.srv.stop().await;
+}
+
+/// A poll that read `Run` before admission closed and starts its blocking task after: it
+/// reads nothing then, and the line is stored by the final read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_poll_starting_after_hold_waits_for_the_final_read() {
+    let rig = rig().await;
+    let (t, l) = spawn_claude(&rig).await;
+    let files = tempfile::tempdir().unwrap();
+    let path = files.path().join("session.jsonl");
+    std::fs::write(&path, "").unwrap();
+    rig.srv
+        .append(vec![support::bound(
+            t,
+            l,
+            "s1",
+            Some(&path.to_string_lossy()),
+        )])
+        .await;
+    rig.until("a poll ran", || rig.pauses.passed(Pause::TailerPoll))
+        .await;
+    let poll = rig.pauses.arm(Pause::TailerPoll);
+    std::fs::write(&path, LINE).unwrap();
+    let poll = tokio::task::spawn_blocking(move || {
+        poll.wait();
+        poll
+    })
+    .await
+    .unwrap();
+    rig.sup.tailers.set(Mode::Hold);
+    poll.go();
+    tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(300)))
+        .await
+        .unwrap();
+    assert!(texts(&rig, t).is_empty());
+    let end = rig.sup.now() + Duration::from_secs(5);
+    assert_eq!(shutdown(rig.sup.clone(), end).await, ParticipantEnd::Clean);
+    assert_eq!(texts(&rig, t), ["ok"]);
+    rig.srv.stop().await;
+}
+
+/// At the final read a launch whose exit is not stored ends the tailer after the poll, even
+/// when its batch closed with more to read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_final_read_without_a_stored_exit_ends_after_one_poll() {
+    let rig = rig().await;
+    let (t, l) = spawn_claude(&rig).await;
+    let files = tempfile::tempdir().unwrap();
+    let path = files.path().join("session.jsonl");
+    std::fs::write(&path, "").unwrap();
+    rig.srv
+        .append(vec![support::bound(
+            t,
+            l,
+            "s1",
+            Some(&path.to_string_lossy()),
+        )])
+        .await;
+    rig.until("a poll ran", || rig.pauses.passed(Pause::TailerPoll))
+        .await;
+    let poll = rig.pauses.arm(Pause::TailerPoll);
+    // The held poll read `Run`; the next one reads `Final`.
+    std::fs::write(&path, LINE.repeat(2 * BATCH_LINES + 10)).unwrap();
+    let poll = tokio::task::spawn_blocking(move || {
+        poll.wait();
+        poll
+    })
+    .await
+    .unwrap();
+    rig.sup.tailers.set(Mode::Final);
+    poll.go();
+    rig.until("the tailer ended", || rig.sup.tailers.launches().is_empty())
+        .await;
+    assert_eq!(texts(&rig, t).len(), 2 * BATCH_LINES);
+    rig.srv.stop().await;
 }

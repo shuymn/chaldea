@@ -173,6 +173,10 @@ pub enum Pause {
     /// A transcript tailer's store read, holding a reader (blocking; unit tests only).
     #[cfg(test)]
     TailerRead,
+    /// A transcript tailer after it read the mode, before its poll's blocking task (unit
+    /// tests only).
+    #[cfg(test)]
+    TailerPoll,
 }
 
 /// The test seam of [`Pause`]: the daemon's own is [`NoPauses`].

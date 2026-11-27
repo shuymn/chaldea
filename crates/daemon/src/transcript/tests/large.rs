@@ -7,8 +7,9 @@ use std::io::{BufWriter, Write};
 use chaldea_core::ids::StreamId;
 use sha2::{Digest, Sha256};
 
-use super::{Fx, assistant, shorts};
+use super::{Fx, TestBackend, assistant, shorts};
 use crate::store::{BlobDownload, MAX_BLOB_BYTES};
+use crate::transcript::acc::ReplayProbe;
 use crate::transcript::read::Step;
 
 /// Writes `n` bytes of `b` to `w` in pieces.
@@ -188,5 +189,76 @@ fn consecutive_lines_over_64_mib_need_one_spool_at_a_time() {
             "text:after".to_owned(),
         ]
     );
+    no_spools(&fx);
+}
+
+/// A batch closes after a line whose blob is spooled: the line before it and the spooled
+/// line commit together, the next line in another batch.
+#[test]
+fn a_batch_closes_after_a_spooled_line() {
+    let fx = Fx::new();
+    let n = MAX_BLOB_BYTES + 1;
+    {
+        let mut w = BufWriter::new(File::create(&fx.path).unwrap());
+        w.write_all(assistant("before").as_bytes()).unwrap();
+        fill(&mut w, b'x', n);
+        w.write_all(b"\n").unwrap();
+        w.write_all(assistant("after").as_bytes()).unwrap();
+        w.flush().unwrap();
+    }
+    let sizes = std::cell::RefCell::new(Vec::new());
+    let be = TestBackend {
+        before_commit: Box::new(|b| sizes.borrow_mut().push(b.lines.len())),
+        ..fx.backend()
+    };
+    let mut tail = fx.tail();
+    assert_eq!(fx.settle_with(&mut tail, &be), Step::Wait);
+    assert_eq!(*sizes.borrow(), [2, 1]);
+    no_spools(&fx);
+}
+
+/// A spool that cannot be created (no descriptor left): the lines before it commit, then
+/// every poll fails on the line and waits for the next period; nothing loops.
+#[test]
+fn a_spool_that_cannot_be_created_waits_for_the_next_poll() {
+    let fx = Fx::new();
+    let n = MAX_BLOB_BYTES + 1;
+    {
+        let mut w = BufWriter::new(File::create(&fx.path).unwrap());
+        w.write_all(assistant("before").as_bytes()).unwrap();
+        fill(&mut w, b'x', n);
+        w.write_all(b"\n").unwrap();
+        w.flush().unwrap();
+    }
+    let mut tail = fx.tail_with_spool_limit(0);
+    assert_eq!(tail.poll(&fx.backend()), Step::Again);
+    assert_eq!(tail.poll(&fx.backend()), Step::Again);
+    assert_eq!(tail.poll(&fx.backend()), Step::Wait);
+    assert_eq!(tail.poll(&fx.backend()), Step::Wait);
+    assert_eq!(shorts(&fx.events()), ["generation:1", "text:before"]);
+}
+
+/// The stop set while a spooled `text` read before its `type` is replayed: the replay ends
+/// at its next chunk, and nothing is stored.
+#[test]
+fn a_stop_during_a_replay_ends_it_at_the_next_chunk() {
+    let fx = Fx::new();
+    let n = MAX_BLOB_BYTES + 1;
+    {
+        let mut w = BufWriter::new(File::create(&fx.path).unwrap());
+        w.write_all(b"{\"type\":\"assistant\",\"message\":{\"content\":[{\"text\":\"")
+            .unwrap();
+        fill(&mut w, b'a', n);
+        w.write_all(b"\",\"type\":\"text\"}]}}\n").unwrap();
+        w.flush().unwrap();
+    }
+    let probe = ReplayProbe::default();
+    let p = probe.clone();
+    let mut tail = fx.tail_with(|d| d.replay = Some(p.clone()), probe.stop.clone());
+    // The generation first; the stop is set only by the replay.
+    assert_eq!(tail.poll(&fx.backend()), Step::Again);
+    assert_eq!(tail.poll(&fx.backend()), Step::End("stopped".into()));
+    assert_eq!(probe.chunks.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(shorts(&fx.events()), ["generation:1"]);
     no_spools(&fx);
 }

@@ -1,10 +1,13 @@
 //! C1-8, continuity (D10): a rewritten prefix, truncation, a replaced file, and a file that
-//! shrinks between the read and the commit each start a new generation.
+//! shrinks between the read and the commit each start a new generation; so do a same-inode
+//! rewrite found by the final read's prefix check or by a modification time moving back,
+//! and a break found by the check after a commit.
 
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 
-use super::{Fx, MODE, TestBackend, assistant, shorts};
+use super::{Flaky, Fx, MODE, TestBackend, assistant, shorts};
+use crate::store::tests::support;
 use crate::transcript::read::Step;
 
 /// Overwrites `at..` of the file in place (same file, same length).
@@ -195,7 +198,7 @@ fn a_break_during_a_commit_starts_a_generation_after_it() {
             fx.settle(&mut tail);
             fx.append(appended.as_bytes());
             let be = TestBackend {
-                before_commit: Box::new(|| {
+                before_commit: Box::new(|_| {
                     if replace {
                         let other = fx.files.path().join("other.jsonl");
                         std::fs::write(&other, b"").unwrap();
@@ -293,4 +296,131 @@ fn a_stale_cursor_verifies_the_prefix_again() {
             "text:two"
         ]
     );
+}
+
+/// A same-inode rewrite of the read bytes with the same length, then an append: the light
+/// checks of each poll pass, and the final read checks the prefix once and starts a new
+/// generation from 0.
+#[test]
+fn the_final_read_finds_a_same_inode_rewrite() {
+    let fx = Fx::new();
+    fx.write([assistant("one"), assistant("two")].concat().as_bytes());
+    let mut tail = fx.tail();
+    fx.settle(&mut tail);
+    overwrite(
+        &fx,
+        0,
+        [assistant("uno"), assistant("dos")].concat().as_bytes(),
+    );
+    fx.append(assistant("new").as_bytes());
+    assert_eq!(fx.settle(&mut tail), Step::Wait);
+    assert_eq!(
+        shorts(&fx.events()),
+        ["generation:1", "text:one", "text:two", "text:new"]
+    );
+    fx.add(vec![support::exited(fx.t, fx.l)]);
+    assert!(matches!(fx.settle(&mut tail), Step::End(_)));
+    assert_eq!(
+        shorts(&fx.events()),
+        [
+            "generation:1",
+            "text:one",
+            "text:two",
+            "text:new",
+            "generation:2",
+            "text:uno",
+            "text:dos",
+            "text:new"
+        ]
+    );
+}
+
+/// A modification time that moves back makes the next poll check the prefix: a same-length
+/// rewrite is found before the final read.
+#[test]
+fn a_modification_time_moving_back_checks_the_prefix() {
+    let fx = Fx::new();
+    fx.write(assistant("one").as_bytes());
+    let mut tail = fx.tail();
+    fx.settle(&mut tail);
+    overwrite(&fx, 0, assistant("One").as_bytes());
+    fx.append(assistant("two").as_bytes());
+    let past = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    OpenOptions::new()
+        .write(true)
+        .open(&fx.path)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+    assert_eq!(fx.settle(&mut tail), Step::Wait);
+    assert_eq!(
+        shorts(&fx.events()),
+        [
+            "generation:1",
+            "text:one",
+            "generation:2",
+            "text:One",
+            "text:two"
+        ]
+    );
+}
+
+/// The check after a commit fails to open the path (another file there, not readable yet):
+/// the tailer does not end on it but drops the handle; the poll after it fails the same
+/// way and waits (no immediate retry), and once the path opens the new file is verified and
+/// read as a new generation.
+#[test]
+fn a_failed_check_after_a_commit_opens_the_path_again() {
+    let fx = Fx::new();
+    fx.write(assistant("one").as_bytes());
+    let mut tail = fx.tail();
+    fx.settle(&mut tail);
+    fx.append(assistant("two").as_bytes());
+    fx.add(vec![support::exited(fx.t, fx.l)]);
+    let flaky = std::cell::RefCell::new(None);
+    let be = TestBackend {
+        before_commit: Box::new(|_| {
+            let other = fx.files.path().join("other.jsonl");
+            std::fs::write(&other, assistant("new")).unwrap();
+            std::fs::rename(&other, &fx.path).unwrap();
+            *flaky.borrow_mut() = Some(Flaky::new(&fx.path));
+        }),
+        ..fx.backend()
+    };
+    assert_eq!(tail.poll(&be), Step::Again);
+    assert_eq!(
+        shorts(&fx.events()),
+        ["generation:1", "text:one", "text:two"]
+    );
+    #[cfg(unix)]
+    assert_eq!(tail.poll(&fx.backend()), Step::Wait);
+    drop(flaky.borrow_mut().take());
+    assert!(matches!(fx.settle(&mut tail), Step::End(_)));
+    assert_eq!(
+        shorts(&fx.events()),
+        [
+            "generation:1",
+            "text:one",
+            "text:two",
+            "generation:2",
+            "text:new"
+        ]
+    );
+}
+
+/// The stop set after a poll's read and before its commit: nothing is written.
+#[test]
+fn a_stop_before_a_commit_writes_nothing() {
+    let fx = Fx::new();
+    fx.write(assistant("one").as_bytes());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tail = fx.tail_with(|_| {}, stop.clone());
+    fx.settle(&mut tail);
+    fx.append(assistant("two").as_bytes());
+    let be = TestBackend {
+        after_read: Box::new(|| stop.store(true, std::sync::atomic::Ordering::Release)),
+        ..fx.backend()
+    };
+    assert_eq!(tail.poll(&be), Step::End("stopped".into()));
+    assert_eq!(shorts(&fx.events()), ["generation:1", "text:one"]);
 }

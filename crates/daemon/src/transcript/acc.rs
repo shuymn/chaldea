@@ -6,6 +6,7 @@ use std::cell::Cell;
 use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::store::{BlobSpool, MAX_BLOB_BYTES, Prepared, prepare_content};
 
@@ -17,6 +18,17 @@ pub(crate) struct SpoolDir {
     /// descriptor table would (tests).
     #[cfg(test)]
     pub(crate) limit: Option<usize>,
+    /// Counts replayed chunks and sets a stop at each (tests).
+    #[cfg(test)]
+    pub(crate) replay: Option<ReplayProbe>,
+}
+
+/// What a test observes of a spool's replay.
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReplayProbe {
+    pub(crate) chunks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) stop: std::sync::Arc<AtomicBool>,
 }
 
 impl SpoolDir {
@@ -25,6 +37,8 @@ impl SpoolDir {
             path,
             #[cfg(test)]
             limit: None,
+            #[cfg(test)]
+            replay: None,
         }
     }
 
@@ -120,15 +134,26 @@ impl ByteAcc {
         Ok(())
     }
 
-    /// Moves everything `other` holds to the end of this one.
+    /// Moves everything `other` holds to the end of this one; a spool is replayed chunk by
+    /// chunk until `stop` is set.
     ///
     /// # Errors
     ///
-    /// A spool error.
-    pub(crate) fn append(&mut self, mut other: ByteAcc) -> io::Result<()> {
+    /// A spool error, or `stop` set during the replay.
+    pub(crate) fn append(&mut self, mut other: ByteAcc, stop: &AtomicBool) -> io::Result<()> {
         match other.spool.take() {
             None => self.push(&other.mem),
-            Some(s) => s.replay(&mut |b| self.push(b)),
+            Some(s) => s.replay(&mut |b| {
+                #[cfg(test)]
+                if let Some(p) = &self.dir.replay {
+                    p.chunks.fetch_add(1, Ordering::Relaxed);
+                    p.stop.store(true, Ordering::Release);
+                }
+                if stop.load(Ordering::Acquire) {
+                    return Err(io::Error::other("stopped"));
+                }
+                self.push(b)
+            }),
         }
     }
 

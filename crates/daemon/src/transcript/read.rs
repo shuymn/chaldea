@@ -11,8 +11,12 @@
 //! and starts a new generation at offset 0; reading starts again from 0. The same check runs
 //! again after each commit: a truncate or replace between the check and the commit is
 //! detected there (or at the next poll's check), the committed batch stays in history, and
-//! the next poll starts a new generation. A detected break is kept until a new generation is
-//! stored, so a failed generation commit does not let a later open continue the old one.
+//! the next poll starts a new generation; a check that cannot open the path drops the handle,
+//! so the next poll opens and verifies again. A rewrite in place that keeps the size is
+//! invisible to these checks: the whole prefix is read again once at the final read, and at
+//! a poll that sees the modification time move back. A detected break is kept until a new
+//! generation is stored, so a failed generation commit does not let a later open continue
+//! the old one. A stop is honoured at every chunk read or replayed and before every commit.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::Arc;
@@ -141,11 +145,13 @@ impl Cursor {
     }
 }
 
-/// The open handle and the running digest of `[0, pos)`.
+/// The open handle, the running digest of `[0, pos)`, and the latest modification time
+/// seen.
 struct OpenFile {
     file: RegularFile,
     digest: Sha256,
     pos: u64,
+    mtime: Option<std::time::SystemTime>,
 }
 
 /// Why a poll could not finish; it is retried at the next one.
@@ -195,8 +201,10 @@ pub(crate) struct Tail {
     /// is stored, the next open starts one whatever its continuity.
     disproved: Option<u64>,
     final_failures: u32,
-    /// The last poll's view had the launch's exit stored.
-    exited: bool,
+    /// The last poll's view: the launch's exit stored or not; `None` when the view failed.
+    exited: Option<bool>,
+    /// The final read checked the whole prefix against the cursor's digest.
+    prefix_checked: bool,
     /// The last failure logged, so a repeated one is logged once.
     last_failure: Option<String>,
     pub(crate) stats: Stats,
@@ -212,7 +220,8 @@ impl Tail {
             open: None,
             disproved: None,
             final_failures: 0,
-            exited: false,
+            exited: None,
+            prefix_checked: false,
             last_failure: None,
             stats: Stats::default(),
         }
@@ -222,9 +231,12 @@ impl Tail {
     pub(crate) fn poll(&mut self, be: &dyn Backend) -> Step {
         let view = match be.view(&self.b) {
             Ok(v) => v,
-            Err(e) => return self.failed(&Fail::Store(e), false),
+            Err(e) => {
+                self.exited = None;
+                return self.failed(&Fail::Store(e), false);
+            }
         };
-        self.exited = view.exited;
+        self.exited = Some(view.exited);
         if !view.current {
             return Step::End("the launch is no longer the bound one".into());
         }
@@ -253,8 +265,9 @@ impl Tail {
         }
     }
 
-    /// The last poll's view had the launch's exit stored (its read was a final read).
-    pub(crate) fn exited(&self) -> bool {
+    /// Whether the last poll's view had the launch's exit stored (its read was a final
+    /// read); `None` when the view could not be read.
+    pub(crate) fn exited(&self) -> Option<bool> {
         self.exited
     }
 
@@ -309,7 +322,10 @@ impl Tail {
                 return self.new_generation(be, f);
             }
             match self.verify(f)? {
-                Ok(open) => self.open = Some(open),
+                Ok(open) => {
+                    self.prefix_checked |= last;
+                    self.open = Some(open);
+                }
                 Err(f) => {
                     self.disprove();
                     return self.new_generation(be, f);
@@ -319,6 +335,29 @@ impl Tail {
         let Some(mut open) = self.open.take() else {
             return Ok(Step::Wait);
         };
+        // The whole prefix is checked again once at the final read, and whenever the file's
+        // modification time moved back; normal appends keep the light checks.
+        let mtime = open.file.modified().ok();
+        let moved_back = matches!((open.mtime, mtime), (Some(was), Some(now)) if now < was);
+        open.mtime = mtime.or(open.mtime);
+        if (last && !self.prefix_checked) || moved_back {
+            match self.prefix_holds(&mut open) {
+                Ok(true) => self.prefix_checked |= last,
+                Ok(false) => {
+                    drop(open);
+                    self.disprove();
+                    tracing::info!(thread = %self.b.thread_id, launch = %self.b.launch_id, moved_back, "the transcript's read prefix changed in place; a new generation starts");
+                    return self.restart(be);
+                }
+                Err(e) => {
+                    if matches!(e, Fail::Stopped) && last {
+                        tracing::warn!(thread = %self.b.thread_id, launch = %self.b.launch_id, "the final read stopped before its prefix check finished; the transcript's continuity is unverified");
+                    }
+                    self.open = Some(open);
+                    return Err(e);
+                }
+            }
+        }
         let start = open.pos;
         let batch = match read_lines(
             &mut open,
@@ -346,10 +385,7 @@ impl Tail {
                 drop(open);
                 self.disprove();
                 tracing::info!(thread = %self.b.thread_id, launch = %self.b.launch_id, replaced, size, "transcript continuity is disproved; a new generation starts");
-                return match self.open_path()? {
-                    Ok(f) => self.new_generation(be, f),
-                    Err(end) => Ok(end),
-                };
+                return self.restart(be);
             }
         }
         if batch.lines.is_empty() && batch.advance == start {
@@ -368,6 +404,10 @@ impl Tail {
             continuity: continuity(&batch.digest),
         };
         let out = self.batch(Some(cursor.pos()), None, batch.lines, advance_to.clone());
+        if let Err(e) = self.stopped() {
+            self.open = Some(open);
+            return Err(e);
+        }
         match be.commit(out) {
             Commit::Done => {
                 open.digest = batch.digest;
@@ -377,11 +417,20 @@ impl Tail {
                     c.continuity = advance_to.continuity;
                 }
                 // The check again: a truncate or replace after the one before the commit.
-                if let Check::Disproved { replaced, size } = self.check(&open, batch.advance) {
-                    self.stats.late += 1;
-                    self.disprove();
-                    tracing::info!(thread = %self.b.thread_id, launch = %self.b.launch_id, replaced, size, "transcript continuity broke while a batch was committed; the batch stays and a new generation starts");
-                    return Ok(Step::Again);
+                match self.check(&open, batch.advance) {
+                    Check::Same => {}
+                    Check::Disproved { replaced, size } => {
+                        self.stats.late += 1;
+                        self.disprove();
+                        tracing::info!(thread = %self.b.thread_id, launch = %self.b.launch_id, replaced, size, "transcript continuity broke while a batch was committed; the batch stays and a new generation starts");
+                        return Ok(Step::Again);
+                    }
+                    Check::Unknown(e) => {
+                        // Unproved either way: the next poll opens the path again and
+                        // verifies the prefix.
+                        tracing::info!(thread = %self.b.thread_id, launch = %self.b.launch_id, error = %e, "the check after a transcript commit failed; the file is opened and verified again");
+                        return Ok(Step::Again);
+                    }
                 }
                 self.open = Some(open);
                 Ok(if batch.more {
@@ -405,6 +454,14 @@ impl Tail {
         }
     }
 
+    /// Opens the path again and starts a new generation of the file there.
+    fn restart(&mut self, be: &dyn Backend) -> Result<Step, Fail> {
+        match self.open_path()? {
+            Ok(f) => self.new_generation(be, f),
+            Err(end) => Ok(end),
+        }
+    }
+
     /// Records that the stored generation's continuity is disproved.
     fn disprove(&mut self) {
         self.disproved = Some(self.cursor.as_ref().map_or(0, |c| c.generation));
@@ -422,10 +479,16 @@ impl Tail {
             // Refused before the first open, so not seen here.
             Err(OpenError::NotAbsolute | OpenError::DeviceNamespace) => false,
         };
-        match open.file.size() {
-            Ok(size) if same && size >= upto => Check::Same,
+        let size = open.file.size();
+        match size {
+            // Another file at the path is a break whatever the old handle says.
+            _ if !same => Check::Disproved {
+                replaced: true,
+                size: size.unwrap_or(0),
+            },
+            Ok(size) if size >= upto => Check::Same,
             Ok(size) => Check::Disproved {
-                replaced: !same,
+                replaced: false,
                 size,
             },
             Err(e) => Check::Unknown(e),
@@ -463,15 +526,31 @@ impl Tail {
         if c.path != self.b.path || c.file_id != f.id().as_str() || f.size()? < c.read_offset {
             return Ok(Err(f));
         }
+        let Some(digest) = self.hash_prefix(&mut f, c.read_offset)? else {
+            return Ok(Err(f));
+        };
+        if continuity(&digest) != c.continuity {
+            return Ok(Err(f));
+        }
+        Ok(Ok(OpenFile {
+            mtime: f.modified().ok(),
+            file: f,
+            digest,
+            pos: c.read_offset,
+        }))
+    }
+
+    /// The digest of `f`'s first `len` bytes, read again; `None` when the file is shorter.
+    fn hash_prefix(&self, f: &mut RegularFile, len: u64) -> Result<Option<Sha256>, Fail> {
         f.seek(SeekFrom::Start(0))?;
         let mut digest = Sha256::new();
         let mut buf = vec![0u8; CHUNK];
-        let mut left = c.read_offset;
+        let mut left = len;
         while left > 0 {
             self.stopped()?;
             let want = usize::try_from(left.min(CHUNK as u64)).unwrap_or(CHUNK);
             let n = match f.read(&mut buf[..want]) {
-                Ok(0) => return Ok(Err(f)),
+                Ok(0) => return Ok(None),
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e.into()),
@@ -479,18 +558,20 @@ impl Tail {
             digest.update(&buf[..n]);
             left -= n as u64;
         }
-        if continuity(&digest) != c.continuity {
-            return Ok(Err(f));
-        }
-        Ok(Ok(OpenFile {
-            file: f,
-            digest,
-            pos: c.read_offset,
-        }))
+        Ok(Some(digest))
+    }
+
+    /// Whether the open file's bytes before the read position still have the digest read.
+    fn prefix_holds(&self, open: &mut OpenFile) -> Result<bool, Fail> {
+        let pos = open.pos;
+        Ok(self
+            .hash_prefix(&mut open.file, pos)?
+            .is_some_and(|d| continuity(&d) == continuity(&open.digest)))
     }
 
     /// Commits a new generation of `f` alone at offset 0.
     fn new_generation(&mut self, be: &dyn Backend, f: RegularFile) -> Result<Step, Fail> {
+        self.stopped()?;
         let empty = continuity(&Sha256::new());
         let batch = self.batch(
             self.cursor.as_ref().map(Cursor::pos),
@@ -514,6 +595,7 @@ impl Tail {
                     continuity: empty,
                 });
                 self.open = Some(OpenFile {
+                    mtime: f.modified().ok(),
                     file: f,
                     digest: Sha256::new(),
                     pos: 0,
@@ -690,7 +772,13 @@ fn next_line(
                         .push(&v)?,
                     Emit::KeepAside => {
                         if let Some(a) = aside.take() {
-                            text.append(a)?;
+                            text.append(a, stop).map_err(|e| {
+                                if stop.load(Ordering::Acquire) {
+                                    Fail::Stopped
+                                } else {
+                                    e.into()
+                                }
+                            })?;
                         }
                     }
                     Emit::DropAside => aside = None,

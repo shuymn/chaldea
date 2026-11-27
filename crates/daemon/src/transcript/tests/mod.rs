@@ -32,13 +32,19 @@ use crate::store::{NewEvent, TranscriptBatch, TranscriptCursor};
 pub(crate) struct TestBackend<'a> {
     pub(crate) store: &'a TestStore,
     pub(crate) after_read: Box<dyn Fn() + 'a>,
-    pub(crate) before_commit: Box<dyn Fn() + 'a>,
+    pub(crate) before_commit: Box<dyn Fn(&TranscriptBatch) + 'a>,
     /// Generation commits still to fail as a full queue would.
     pub(crate) fail_generations: Cell<u32>,
+    /// Views still to fail as a store without a free reader would.
+    pub(crate) fail_views: Cell<u32>,
 }
 
 impl Backend for TestBackend<'_> {
     fn view(&self, b: &Binding) -> Result<View, String> {
+        if self.fail_views.get() > 0 {
+            self.fail_views.set(self.fail_views.get() - 1);
+            return Err("no reader (test)".into());
+        }
         let b = b.clone();
         self.store
             .store()
@@ -50,7 +56,7 @@ impl Backend for TestBackend<'_> {
 
     fn commit(&self, batch: TranscriptBatch) -> Commit {
         if batch.new_generation.is_none() {
-            (self.before_commit)();
+            (self.before_commit)(&batch);
         } else if self.fail_generations.get() > 0 {
             self.fail_generations.set(self.fail_generations.get() - 1);
             return Commit::Failed("queue full (test)".into());
@@ -119,17 +125,23 @@ impl Fx {
 
     /// A tailer whose state directory holds at most `limit` spool files at once.
     pub(crate) fn tail_with_spool_limit(&self, limit: usize) -> Tail {
-        let mut dir = SpoolDir::new(self.store.dir().to_owned());
-        dir.limit = Some(limit);
-        Tail::new(self.binding(self.l), dir, Arc::new(AtomicBool::new(false)))
+        self.tail_with(|d| d.limit = Some(limit), Arc::default())
+    }
+
+    /// A tailer with its spool directory set up by `dir` and the stop flag `stop`.
+    pub(crate) fn tail_with(&self, dir: impl FnOnce(&mut SpoolDir), stop: Arc<AtomicBool>) -> Tail {
+        let mut d = SpoolDir::new(self.store.dir().to_owned());
+        dir(&mut d);
+        Tail::new(self.binding(self.l), d, stop)
     }
 
     pub(crate) fn backend(&self) -> TestBackend<'_> {
         TestBackend {
             store: &self.store,
             after_read: Box::new(|| {}),
-            before_commit: Box::new(|| {}),
+            before_commit: Box::new(|_| {}),
             fail_generations: Cell::new(0),
+            fail_views: Cell::new(0),
         }
     }
 
@@ -254,4 +266,47 @@ pub(crate) const MODE: &str = "{\"type\":\"mode\",\"mode\":\"normal\"}\n";
 pub(crate) fn serving(store: &TestStore) {
     store.run(|_| Ok(())).unwrap();
     store.read(|r| r.thread(support::thread(1)).map(|_| ()));
+}
+
+/// Makes the tailer's next read fail while held: on Unix the path cannot be opened (mode
+/// 000), so the check before the commit fails with "permission denied"; on Windows another
+/// handle holds an exclusive lock, so a read fails with a lock violation.
+pub(crate) struct Flaky {
+    #[cfg(unix)]
+    path: std::path::PathBuf,
+    #[cfg(windows)]
+    _locked: std::fs::File,
+}
+
+impl Flaky {
+    pub(crate) fn new(path: &Path) -> Flaky {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            Flaky {
+                path: path.to_owned(),
+            }
+        }
+        #[cfg(windows)]
+        {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            f.lock().unwrap();
+            Flaky { _locked: f }
+        }
+    }
+}
+
+impl Drop for Flaky {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
 }

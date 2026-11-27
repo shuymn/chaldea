@@ -2,7 +2,7 @@
 //! flaky read), a resume that continues the generation, and a resume reserved before or
 //! during the final read.
 
-use super::{Fx, TestBackend, assistant, shorts};
+use super::{Flaky, Fx, TestBackend, assistant, shorts};
 use crate::store::tests::support;
 use crate::transcript::read::{FINAL_TRIES, Step};
 
@@ -30,49 +30,6 @@ fn exit_with_a_trailing_partial_line() {
     assert_eq!(fx.cursor().unwrap().read_offset, body.len() as u64);
 }
 
-/// Makes the tailer's next read fail while held: on Unix the path cannot be opened (mode
-/// 000), so the check before the commit fails with "permission denied"; on Windows another
-/// handle holds an exclusive lock, so a read fails with a lock violation.
-struct Flaky {
-    #[cfg(unix)]
-    path: std::path::PathBuf,
-    #[cfg(windows)]
-    _locked: std::fs::File,
-}
-
-impl Flaky {
-    fn new(fx: &Fx) -> Flaky {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fx.path, std::fs::Permissions::from_mode(0o000)).unwrap();
-            Flaky {
-                path: fx.path.clone(),
-            }
-        }
-        #[cfg(windows)]
-        {
-            let f = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&fx.path)
-                .unwrap();
-            f.lock().unwrap();
-            Flaky { _locked: f }
-        }
-    }
-}
-
-impl Drop for Flaky {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
-        }
-    }
-}
-
 /// A final read that fails is retried at the next poll; once it succeeds the rest is read.
 /// One that fails `FINAL_TRIES` polls in a row ends the tailer, the bytes left in the file.
 #[test]
@@ -83,7 +40,7 @@ fn a_flaky_final_read_is_retried_then_ended() {
     fx.settle(&mut tail);
     fx.append(assistant("two").as_bytes());
     fx.add(vec![support::exited(fx.t, fx.l)]);
-    let flaky = Flaky::new(&fx);
+    let flaky = Flaky::new(&fx.path);
     assert_eq!(tail.poll(&fx.backend()), Step::Wait);
     drop(flaky);
     assert!(matches!(fx.settle(&mut tail), Step::End(_)));
@@ -98,7 +55,7 @@ fn a_flaky_final_read_is_retried_then_ended() {
     fx.settle(&mut tail);
     fx.append(assistant("two").as_bytes());
     fx.add(vec![support::exited(fx.t, fx.l)]);
-    let _flaky = Flaky::new(&fx);
+    let _flaky = Flaky::new(&fx.path);
     for _ in 1..FINAL_TRIES {
         assert_eq!(tail.poll(&fx.backend()), Step::Wait);
     }
@@ -197,6 +154,31 @@ fn a_resume_reserved_before_the_final_read_ends_it() {
     ]);
     let mut next = fx.tail_of(l2);
     assert_eq!(fx.settle(&mut next), Step::Wait);
+    assert_eq!(
+        shorts(&fx.events()),
+        ["generation:1", "text:one", "text:two"]
+    );
+}
+
+/// A poll whose view fails says nothing about the exit (the driver retries a final read
+/// then); the next view finds the exit and the final read stores the rest.
+#[test]
+fn a_failed_view_leaves_the_exit_unknown() {
+    let fx = Fx::new();
+    fx.write(assistant("one").as_bytes());
+    let mut tail = fx.tail();
+    fx.settle(&mut tail);
+    assert_eq!(tail.exited(), Some(false));
+    fx.append(assistant("two").as_bytes());
+    fx.add(vec![support::exited(fx.t, fx.l)]);
+    let be = TestBackend {
+        fail_views: std::cell::Cell::new(1),
+        ..fx.backend()
+    };
+    assert_eq!(tail.poll(&be), Step::Wait);
+    assert_eq!(tail.exited(), None);
+    assert!(matches!(fx.settle(&mut tail), Step::End(_)));
+    assert_eq!(tail.exited(), Some(true));
     assert_eq!(
         shorts(&fx.events()),
         ["generation:1", "text:one", "text:two"]

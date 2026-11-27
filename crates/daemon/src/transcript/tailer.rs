@@ -2,9 +2,10 @@
 //! binding, then polls every [`TAIL_POLL`] until the launch exits (one final read), the
 //! binding moves on (`StaleBinding`), or the supervisor's shutdown participant ends it. At
 //! shutdown no poll starts once admission closes ([`Mode::Hold`]); after the participant has
-//! recorded the launches' exits each tailer makes its final read ([`Mode::Final`]) within the
+//! recorded the launches' exits each tailer reads its binding again if it had none and makes
+//! its final read ([`Mode::Final`]), a failed one retried every [`FINAL_RETRY`] within the
 //! participant's budget, and at the budget's end a read in progress stops at its next chunk
-//! ([`Mode::Stop`]). All file I/O and every store read run on a blocking task that the
+//! or before its next write ([`Mode::Stop`]). All file I/O and every store read run on a blocking task that the
 //! tailer's task awaits to its end, never on the store writer or under a launch's op lock;
 //! the tailer's state is dropped on such a task too. Batches reach the store as write jobs.
 
@@ -20,7 +21,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use super::acc::SpoolDir;
-use super::read::{Backend, Binding, Commit, Step, Tail, View};
+use super::read::{Backend, Binding, Commit, FINAL_TRIES, Step, Tail, View};
 use crate::store::{JobError, ReadTx, Store, StoreError, TranscriptBatch, WriteError};
 use crate::supervisor::Supervisor;
 
@@ -31,6 +32,9 @@ const READ_WAIT: Duration = Duration::from_secs(1);
 const WRITE_WAIT: Duration = Duration::from_secs(10);
 /// Immediate polls in a row before the tailer waits a period anyway.
 const MAX_AGAIN: u32 = 64;
+/// At shutdown, the wait before a failed final read (or binding read) is tried again,
+/// within the participant's budget.
+const FINAL_RETRY: Duration = Duration::from_millis(100);
 
 /// What every tailer does, set by the shutdown participant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +226,15 @@ impl Supervisor {
         )
     }
 
+    /// Waits [`FINAL_RETRY`] or a mode change (the participant's end sets `Stop`).
+    async fn final_wait(&self, mode: &mut watch::Receiver<Mode>) {
+        let timer = crate::supervisor::tick_timer(self.timer(self.now() + FINAL_RETRY));
+        tokio::select! {
+            () = timer => {}
+            _ = mode.changed() => {}
+        }
+    }
+
     /// Waits a period, a commit naming `thread` when `commits` is given, or a mode change.
     async fn tail_wait(
         &self,
@@ -272,23 +285,41 @@ async fn blocking<T: Send + 'static>(
 /// A tailer's task.
 async fn run(sup: Arc<Supervisor>, thread: ThreadId, launch: LaunchId) {
     let mut mode = sup.tailers.mode.subscribe();
-    // Wait for the binding.
+    // Wait for the binding; at shutdown it is read once more when the exits are recorded.
     let mut commits = sup.store.subscribe();
+    let mut final_tries = 0;
     let b = loop {
-        if *mode.borrow_and_update() != Mode::Run {
-            return finish(&sup, launch);
+        let m = *mode.borrow_and_update();
+        match m {
+            Mode::Run | Mode::Final => {}
+            Mode::Hold => {
+                if mode.changed().await.is_err() {
+                    return finish(&sup, launch);
+                }
+                continue;
+            }
+            Mode::Stop => return finish(&sup, launch),
         }
         let s = sup.clone();
         match blocking(&sup, move || read(&s, |r| bound(r, thread, launch))).await {
             Some(Ok(Bound::Yes(b))) => break b,
             Some(Ok(Bound::Never)) => return finish(&sup, launch),
-            Some(Ok(Bound::NotYet) | Err(_)) | None => {
-                if sup.entry(launch).is_none() {
-                    return finish(&sup, launch);
-                }
+            Some(Ok(Bound::NotYet)) if m == Mode::Final => return finish(&sup, launch),
+            Some(Ok(Bound::NotYet)) if sup.entry(launch).is_none() => {
+                return finish(&sup, launch);
             }
+            Some(Ok(Bound::NotYet) | Err(_)) | None => {}
         }
-        sup.tail_wait(thread, Some(&mut commits), &mut mode).await;
+        if m == Mode::Final {
+            // A failed read at shutdown is retried a few times, shortly.
+            final_tries += 1;
+            if final_tries >= FINAL_TRIES {
+                return finish(&sup, launch);
+            }
+            sup.final_wait(&mut mode).await;
+        } else {
+            sup.tail_wait(thread, Some(&mut commits), &mut mode).await;
+        }
     };
     drop(commits);
     tracing::info!(%thread, %launch, path = %b.path, "the transcript tailer starts");
@@ -311,28 +342,47 @@ async fn run(sup: Arc<Supervisor>, thread: ThreadId, launch: LaunchId) {
                 break;
             }
         }
+        #[cfg(test)]
+        sup.pauses().at(crate::supervisor::Pause::TailerPoll).await;
         let be = backend.clone();
+        let at_start = mode.clone();
         // A panic outside the line parser has already requested the daemon's stop.
         let Some((t, step)) = blocking(&sup, move || {
+            // A poll that would start once admission is closed waits for the final read.
+            if *at_start.borrow() == Mode::Hold {
+                return (t, None);
+            }
             let step = t.poll(&*be);
-            (t, step)
+            (t, Some(step))
         })
         .await
         else {
             break;
         };
-        let last = t.exited();
+        let exited = t.exited();
         tail = Some(t);
+        let Some(step) = step else { continue };
         match step {
-            Step::Again if again < MAX_AGAIN => {
-                again += 1;
-            }
             Step::End(why) => {
                 tracing::info!(%thread, %launch, why = %why, "the transcript tailer ends");
                 break;
             }
-            // At shutdown only a final read is retried.
-            Step::Again | Step::Wait if m == Mode::Final && !last => break,
+            // At shutdown only a final read goes on: with the exit stored, or after a view
+            // that failed (a few times).
+            _ if m == Mode::Final && exited == Some(false) => break,
+            Step::Again if m == Mode::Final => {}
+            Step::Wait if m == Mode::Final => {
+                if exited.is_none() {
+                    final_tries += 1;
+                    if final_tries >= FINAL_TRIES {
+                        break;
+                    }
+                }
+                sup.final_wait(&mut mode).await;
+            }
+            Step::Again if again < MAX_AGAIN => {
+                again += 1;
+            }
             Step::Again | Step::Wait => {
                 again = 0;
                 sup.tail_wait(thread, None, &mut mode).await;
