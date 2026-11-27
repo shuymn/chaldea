@@ -471,7 +471,7 @@
       "properties": {
         "last_human_write_seq": {
           "default": null,
-          "description": "The last human write that closes the gate (`attach` or `key`).",
+          "description": "The last human write that closes the gate (`attach` or `key`); for `attach`, the\nfirst write of its interval (one event per interval, `docs/design/t1-attach.md` I-5).",
           "format": "uint64",
           "maximum": 9007199254740991,
           "minimum": 0,

@@ -183,7 +183,8 @@ pub struct GateEvidence {
         deserialize_with = "crate::wire::opt_safe_u64"
     )]
     pub last_write_seq: Option<u64>,
-    /// The last human write that closes the gate (`attach` or `key`).
+    /// The last human write that closes the gate (`attach` or `key`); for `attach`, the
+    /// first write of its interval (one event per interval, `docs/design/t1-attach.md` I-5).
     #[serde(
         default,
         serialize_with = "crate::wire::ser_opt_safe_u64",
