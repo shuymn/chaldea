@@ -64,7 +64,7 @@ crates/daemon/src/store/readers.rs   # + ReadTx::blob_ref_exists (§2.7)
 crates/daemon/src/http/mod.rs        # HttpServer, HttpConfig, LifecycleSink, ServeHandle, HttpShutdownReport
 crates/daemon/src/http/registry.rs   # TaskRegistry: the one owner of every task that outlives a request (§2.2)
 crates/daemon/src/http/listener.rs   # accept loop, ConnIo (request origin, write stall), hyper http1 builder
-crates/daemon/src/http/routes.rs     # RouteSpec, ROUTES, Mount, build_router (the only Router::route call)
+crates/daemon/src/http/routes.rs     # RouteSpec, ROUTES, Mount, build_router (the only Router::route_service call)
 crates/daemon/src/http/guard.rs      # OuterService (span, RequestStart, Host), GuardLayer (per route: method → … → size)
 crates/daemon/src/http/auth.rs       # Secret, TokenService, verify_secret_in / verify_hash_in, Principal, deny_for, ObjectScope
 crates/daemon/src/http/tickets.rs    # TicketStore, PairCodes (memory, single use)
@@ -222,7 +222,7 @@ impl Mount {   // typed constructors; each panics at startup when `spec.mount` d
     pub fn write(spec: &'static RouteSpec, h: impl WriteHandler) -> Mount;     // gets WriteCtx; never wrapped in a dropping timeout
     pub fn upgrade(spec: &'static RouteSpec, h: impl UpgradeHandler) -> Mount; // gets an admitted upgrade (§2.6)
 }
-pub(crate) fn build_router(mounts: Mounts, shared: &Arc<Shared>) -> Router;  // the only Router::route call
+pub(crate) fn build_router(mounts: Mounts, shared: &Arc<Shared>) -> Router;  // the only Router::route_service call
 ```
 
 | Method, path | Mount | Origin | Credential (kinds) | Action | Handler PR |
@@ -247,7 +247,7 @@ pub(crate) fn build_router(mounts: Mounts, shared: &Arc<Shared>) -> Router;  // 
 
 **Read routes cannot write; write routes cannot time out by dropping.** Only a spec whose `mount` is `Write` can be mounted with `Mount::write` (each `Mount` constructor checks the spec's kind), the guard dispatches on the typed endpoint and constructs `WriteCtx` only in its write arm, and it wraps only read handlers in `until_deadline` (`deadline::settle_before`: a `timeout_at(deadline)`, then one clock sample after the handler's future is dropped) → 408 (H6 is why write routes are not). The store handle is private to `ctx.rs`, so a handler reaches the store only through `ReadCtx` or `WriteCtx`. The two memory-only routes are read mounts: a 408 there leaves at most an unreturned ticket or code that expires unused.
 
-**Building the router.** `build_router` registers each mount's path with `route_service`, behind `GuardLayer::new(spec)`, so every method of the path reaches the guard, which compares it with the spec's method first and answers a wrong one itself with its `Allow` (no `MethodRouter`, so axum neither routes `HEAD` to a `GET` handler nor adds its own `Allow`, H11); it adds a router fallback for unknown paths. hyper sends no body for a `HEAD` response, so the `HEAD` 405 has the headers of a 405 and an empty body. `crates/daemon/clippy.toml` lists axum's `Router::route`, `route_service`, `nest`, `nest_service`, `merge`, `fallback`, and `fallback_service` under `disallowed-methods`; `build_router` carries the one `#[allow(clippy::disallowed_methods)]`. `build_router` refuses (panics at startup; tested) a mount whose spec is not in `ROUTES` and a `ROUTES` entry with no mount. Production `Mounts::mvp()` mounts every route, with 501 handlers for routes whose PR has not merged.
+**Building the router.** `build_router` registers each mount's path with `route_service`, behind `GuardLayer::new(spec, shared).into_service(endpoint)`, so every method of the path reaches the guard, which compares it with the spec's method first and answers a wrong one itself with its `Allow` (no `MethodRouter`, so axum neither routes `HEAD` to a `GET` handler nor adds its own `Allow`, H11); it adds a router fallback for unknown paths. hyper sends no body for a `HEAD` response, so the `HEAD` 405 has the headers of a 405 and an empty body. `crates/daemon/clippy.toml` lists axum's `Router::route`, `route_service`, `nest`, `nest_service`, `merge`, `fallback`, and `fallback_service` under `disallowed-methods`; `build_router` carries the one `#[allow(clippy::disallowed_methods)]`. `build_router` refuses (panics at startup; tested) a mount whose spec is not in `ROUTES` and a `ROUTES` entry with no mount. Production `Mounts::mvp()` mounts every route, with 501 handlers for routes whose PR has not merged.
 
 **Guard order** (mvp §2.5 "Order", "Rejections"):
 
