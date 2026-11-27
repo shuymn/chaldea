@@ -51,7 +51,7 @@ FC: FakeCli/FakePty CI (macOS, Windows); M1: real Claude on macOS (Windows at M2
 | `SessionStart` before the trust prompt is answered. | M1 P-12. | If seen, Claude rows switch to `OwnerOnly`; `input_gate_timeout` asks for `ready`. |
 | No readiness at bind without intake facts (supervisor-send L-12). | `inspect`; `input_gate_timeout`. | The gate stays closed until evidence or `ready`. |
 | `--resume` starts a new session id. | M1 P-18. | Nothing reaches an unbound launch; a new thread recovers. |
-| The Windows hook shell rejects the command. | M2. | Fix the settings string. |
+| Windows hook shell rejects the command. | M2. | Fix the settings string. |
 | An emitter path containing `${CLAUDE_PROJECT_DIR}` is rewritten by Claude. | `session_start_timeout`. | Not fixed: no real install path has it. |
 | An unfolded paste trimmed to `exit`, `quit`, `:q`, `:q!`, `:wq`, or `:wq!` runs `/exit` (outside D16). | The launch exits. | Not fixed: Claude's TUI does the same; the input ends `unconfirmed`; refusing would track Claude's submit handler. |
 | An escaped descendant or late write can change the version read (D11). | `cli_version`. | Not fixed: diagnostic only. |
@@ -64,4 +64,4 @@ FC: FakeCli/FakePty CI (macOS, Windows); M1: real Claude on macOS (Windows at M2
 | File descriptors run out. | Tailer log. | Ingest stalls and retries; bytes stay in the file. |
 | Lenient forms where captures do not cover a transform. | C1-5. | Two candidates ack none. |
 | Memory per line. | — | Values over 64 MiB spool (D14); a line holds at most about 192 MiB plus fixed buffers and a one-bit-per-container tokenizer stack. |
-| A resume before the old tailer's final read. | Tailer log. | The next tailer reads from the cursor. |
+| A resume before the old tailer's final read, or a line growing through it. | Tailer log. | The next tailer reads from the cursor. A line still being written may be stored as `partial_line`. |
