@@ -55,6 +55,9 @@ pub(crate) struct Points {
     pub(crate) steps: Mutex<Vec<&'static str>>,
     /// Held once by a socket's next send before it writes.
     pub(crate) socket_send_gate: Mutex<Option<Gate>>,
+    /// Held once by a socket's next close frame before it is sent (inside the close's
+    /// grace).
+    pub(crate) close_frame_gate: Mutex<Option<Gate>>,
     /// While set, sockets drop the store's commit notifications.
     pub(crate) drop_notifications: AtomicBool,
     /// Held once by a command runner between its registration and its first submit.
@@ -300,6 +303,15 @@ impl Points {
 
     pub(crate) async fn before_socket_send(&self) {
         pass(&self.socket_send_gate).await;
+    }
+
+    /// Arms the close frame gate, as [`Points::arm_removal_gate`].
+    pub(crate) fn arm_close_frame_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        arm(&self.close_frame_gate)
+    }
+
+    pub(crate) async fn before_close_frame(&self) {
+        pass(&self.close_frame_gate).await;
     }
 
     /// Arms the runner gate, as [`Points::arm_removal_gate`].

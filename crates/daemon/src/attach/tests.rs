@@ -1619,7 +1619,10 @@ async fn drain_progresses_while_output_stalled() {
     let (reached, _held) = rig.srv.server.shared().faults.arm_socket_send_gate();
     live.child.emit(b"first");
     bounded(WS_WAIT, reached).await.unwrap().unwrap();
+    // The socket's buffer holds a piece it cannot send; later pieces still drain.
     let rx = rig.watch(&live).await;
+    live.child.emit(b"second");
+    SRig::delivered(&rx, b"second").await;
     live.child.emit(b"later bytes");
     SRig::delivered(&rx, b"later bytes").await;
     rig.stop().await;
@@ -1924,5 +1927,29 @@ async fn busy_budget_recovers() {
     c.json(json!({ "type": "resize", "cols": 100, "rows": 30 }))
         .await;
     assert_eq!(size_frame(&mut c).await, (100, 30, true));
+    rig.stop().await;
+}
+
+/// I-8: `ended` is the last application frame; a close frame stalled after it is not
+/// waited for past the close's grace: the socket ends without it and releases its slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_stalled_after_ended() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let shared = rig.srv.server.shared().clone();
+    let (mut c, _) = attach(&rig, &live).await;
+    let (reached, _held) = shared.faults.arm_close_frame_gate();
+    live.child.close_output();
+    assert_eq!(
+        c.text().await,
+        Some(AttachServerMessage::Ended {
+            launch_id: live.l,
+            reason: EndReason::Eof
+        })
+    );
+    bounded(WS_WAIT, reached).await.unwrap().unwrap();
+    rig.until("the slot released", || shared.sockets.held() == 0)
+        .await;
+    assert_eq!(c.until_closed().await, (None, Vec::new()));
     rig.stop().await;
 }

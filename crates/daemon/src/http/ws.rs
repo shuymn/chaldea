@@ -382,7 +382,12 @@ pub(crate) async fn close(
         code,
         reason: reason.into(),
     }));
-    if !matches!(before(until, sink.send(frame)).await, Some(Ok(()))) {
+    let sent = async {
+        #[cfg(test)]
+        shared.faults.before_close_frame().await;
+        sink.send(frame).await
+    };
+    if !matches!(before(until, sent).await, Some(Ok(()))) {
         return;
     }
     let _ = before(until, async {
