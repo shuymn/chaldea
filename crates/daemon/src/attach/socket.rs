@@ -1338,7 +1338,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                         }
                         // With no raw input of the launch in flight (none of this socket's
                         // pending or outstanding, no unit unsettled), the written tail is
-                        // known and a refusal here is final. Otherwise the frame's refusal
+                        // known and the rule applies here, final. Otherwise the whole frame
                         // is left to the submission, decided in write order.
                         let own = pending.has_raw()
                             || matches!(&outstanding, Some(o) if matches!(o.unit, Unit::Raw(_)));
@@ -1350,24 +1350,26 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                             }
                             known
                         };
+                        if !certain {
+                            // Deferred: the frame stays whole (no held split) until its
+                            // decision at submission, after any held partial in arrival
+                            // order; an accepted deferred frame is written whole.
+                            if !held.is_empty() {
+                                let h = std::mem::take(&mut held);
+                                hold_until = None;
+                                advance_tail(&mut proj, &h);
+                                pending.raw(&h);
+                            }
+                            advance_tail(&mut proj, &b);
+                            pending.raw(&b);
+                            continue;
+                        }
                         match filter(&proj, &held, &b) {
-                            Verdict::Refused if certain => {
+                            Verdict::Refused => {
                                 ctl.push_back(AttachServerMessage::InputDropped {
                                     bytes: b.len() as u64,
                                     reason: AttachReason::PasteMarker,
                                 });
-                            }
-                            Verdict::Refused => {
-                                // In arrival order: the held partial first, then this frame,
-                                // each its own frame for the decision at submission.
-                                if !held.is_empty() {
-                                    let h = std::mem::take(&mut held);
-                                    hold_until = None;
-                                    advance_tail(&mut proj, &h);
-                                    pending.raw(&h);
-                                }
-                                advance_tail(&mut proj, &b);
-                                pending.raw(&b);
                             }
                             Verdict::Accepted { write, held: h } => {
                                 advance_tail(&mut proj, &write);

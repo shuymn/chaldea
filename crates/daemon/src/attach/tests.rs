@@ -1950,6 +1950,42 @@ async fn receipt_filter_waits_for_permitted_predecessor() {
     rig.stop().await;
 }
 
+/// I-6: a deferred frame stays whole until its decision: B's `[200~ESC[` (decided after
+/// A's held Escape) is refused whole, so its trailing `ESC[` never reaches the PTY.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_refusal_drops_the_whole_original_frame() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut a, _) = attach(&rig, &live).await;
+    let before = live.child.input().len();
+    let hold = live.child.hold_writes();
+    a.binary(b"\x1b").await;
+    assert!(hold.wait_entered(soon()));
+    let (mut b, _) = attach(&rig, &live).await;
+    assert_eq!(a.until_closed().await.0, Some(4003));
+    b.binary(b"[200~\x1b[").await;
+    b.json(json!({ "type": "resize", "cols": 100, "rows": 30 }))
+        .await;
+    assert_eq!(size_frame(&mut b).await, (100, 30, true));
+    drop(hold);
+    let dropped = b.text().await;
+    b.binary(b"q").await;
+    rig.until("the next key reached the PTY", || {
+        live.child.input()[before..].ends_with(b"q")
+    })
+    .await;
+    let written = live.child.input()[before..].to_vec();
+    rig.stop().await;
+    assert_eq!(
+        dropped,
+        Some(AttachServerMessage::InputDropped {
+            bytes: 7,
+            reason: AttachReason::PasteMarker,
+        })
+    );
+    assert_eq!(written.as_slice(), b"\x1bq");
+}
+
 /// I-6: a deferred refusal keeps frame boundaries: of frames joined while an earlier write
 /// is unsettled, only the one completing a marker is dropped; the others are written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
