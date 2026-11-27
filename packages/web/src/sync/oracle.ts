@@ -12,7 +12,7 @@
 import type { EventEnvelope } from "@chaldea/contracts/generated/EventEnvelope";
 
 import type { Action } from "./effects";
-import type { State } from "./state";
+import { type State, threadStream } from "./state";
 
 const bytesOf = (e: EventEnvelope) => new TextEncoder().encode(JSON.stringify(e)).length;
 
@@ -72,7 +72,7 @@ export class WindowOracle {
         (req.dir === "forward" ? st.fwd : st.bwd) === a.id &&
         req.generation === before.generation;
       const body = a.result.body;
-      if (current && req.stream === `thread:${x.thread}` && body.mode === "replay" && body.epoch === before.epoch) {
+      if (current && req.stream === threadStream(x.thread) && body.mode === "replay" && body.epoch === before.epoch) {
         const cursor = st.copy?.cursor ?? 0;
         if (req.dir === "forward") {
           for (const e of body.events) {
@@ -107,7 +107,7 @@ export class WindowOracle {
     }
     if (this.expected?.id === wa.id) return;
     // A new window opens empty, attached, just above its thread's cursor.
-    const cursor = after.streams[`thread:${wa.thread}`]?.copy?.cursor;
+    const cursor = after.streams[threadStream(wa.thread)]?.copy?.cursor;
     if (wa.events.length !== 0 || cursor === undefined || wa.lo !== cursor + 1 || !wa.attached) {
       this.seen.push(`window ${wa.id} opened at ${wa.lo} with ${wa.events.length} events, cursor ${cursor}`);
     }

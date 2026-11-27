@@ -272,12 +272,11 @@ describe("sync.status", () => {
     expect(status(sim.state)).toBe("live");
   });
 
-  test("one failed background read with the socket down is not offline while the host read works", () => {
+  test("the selected thread's read failing with the socket down is updates paused while the host read works", () => {
     const sim = live();
     const id = forwardRead(sim);
     sim.restart();
-    sim.fail(id, { kind: "transport" });
-    sim.deliverId(id);
+    failWith(sim, id, { kind: "transport" });
     expect(status(sim.state)).toBe("updates paused");
   });
 
@@ -286,8 +285,7 @@ describe("sync.status", () => {
     sim.advance(2000);
     const before = sim.state.lastSyncedAt;
     const id = forwardRead(sim);
-    sim.fail(id, { kind: "status", status: 404, retryAfter: null });
-    sim.deliverId(id);
+    failWith(sim, id, { kind: "status", status: 404, retryAfter: null });
     expect(sim.state.gone[threadId(1)]).toBe(true);
     expect(sim.state.lastSyncedAt).toBe(before);
   });

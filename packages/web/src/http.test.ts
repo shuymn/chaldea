@@ -58,7 +58,7 @@ describe("http", () => {
     expect(await readEvents(async () => new Response(stream, { status: 200 }), req, "t", never, 1024)).toEqual({ kind: "oversize" });
   });
 
-  test("a timeout while reading an error body settles as a timeout, never as the status", async () => {
+  test("a timeout while reading an error body discards the status: a timeout for events, transport for the ticket", async () => {
     for (const status of [404, 401]) {
       const deadline = new AbortController();
       const spy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);

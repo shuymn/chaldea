@@ -9,6 +9,7 @@ import type { CredentialStore } from "../auth/credential";
 import { threadId } from "../sync/model/server";
 import { seeded } from "../sync/ops";
 import { Runner } from "../sync/runner";
+import { threadStream } from "../sync/state";
 import { App } from "./App";
 import { StatusBar } from "./StatusBar";
 import { SETTLE_MS, ThreadList } from "./ThreadList";
@@ -82,7 +83,7 @@ describe("ui", () => {
   test("a background stream error is visible on its row, with a retry", () => {
     const sim = live();
     const id = threadId(1);
-    const key = `thread:${id}`;
+    const key = threadStream(id);
     sim.dispatch({ type: "visible", threads: [id] });
     sim.quiesce();
     sim.server.message(id, 3);
@@ -108,7 +109,7 @@ describe("ui", () => {
     sim.quiesce();
     sim.server.message(id, 3);
     sim.connect();
-    const request = sim.flight(`thread:${id}`, "forward") ?? -1;
+    const request = sim.flight(threadStream(id), "forward") ?? -1;
     sim.fail(request, { kind: "transport" });
     sim.deliverId(request);
     render(<ThreadList state={sim.state} onSelect={noop} onVisible={noop} onRetry={noop} />);

@@ -22,14 +22,10 @@ export interface Flight {
 export interface Delivery {
   readonly id: number;
   readonly result: FetchResult;
-  /** The answer came from this database epoch (diagnostics). */
-  readonly epoch: string;
 }
 
 interface Conn {
-  readonly id: number;
   readonly server: ModelSocket;
-  opened: boolean;
 }
 
 export const TEST_CONFIG: Config = {
@@ -131,7 +127,7 @@ export class Sim {
     if (!f || f.lost) return false;
     this.flights.delete(id);
     if (!this.up) {
-      this.responses.push({ id, result: { kind: "transport" }, epoch: "" });
+      this.responses.push({ id, result: { kind: "transport" } });
       return true;
     }
     const r = f.req;
@@ -149,14 +145,14 @@ export class Sim {
     } else {
       result = { kind: "status", status: a.status, retryAfter: null };
     }
-    this.responses.push({ id, result, epoch: this.server.db.epoch });
+    this.responses.push({ id, result });
     return true;
   }
 
   /** Answers a request with a given failure (408, 503, transport, ...). */
   fail(id: number, result: FetchResult): boolean {
     if (!this.flights.delete(id)) return false;
-    this.responses.push({ id, result, epoch: "" });
+    this.responses.push({ id, result });
     return true;
   }
 
@@ -222,7 +218,7 @@ export class Sim {
       this.dispatch({ type: "socketClosed", socket: o.socket });
       return true;
     }
-    const conn: Conn = { id: o.socket, server: new ModelSocket(this.server), opened: true };
+    const conn: Conn = { server: new ModelSocket(this.server) };
     this.conns.set(o.socket, conn);
     this.dispatch({ type: "socketOpen", socket: o.socket });
     return true;
@@ -323,13 +319,11 @@ export class Sim {
    * 60 drain iterations (formal-specs §7.1 "Convergence"): responses, requests, the
    * socket, due fetches, timeouts of lost requests, then up to two heads refreshes.
    */
-  iters = 0;
   quiesce(maxIterations = 60, maxRefreshes = 2): void {
     this.up = true;
     let refreshes = 0;
     for (let i = 0; i < maxIterations; i++) {
       let progress = false;
-      this.iters = i;
       while (this.deliver()) progress = true;
       for (const id of [...this.flights.keys()]) progress = this.serve(id) || progress;
       for (const id of [...this.flights.keys()]) progress = this.timeout(id) || progress;

@@ -86,7 +86,6 @@ export interface StreamError {
 }
 
 export interface Stream {
-  readonly key: string;
   /** The valid copy, ending at its cursor; null before the first forward response. */
   readonly copy: Copy | null;
   /** A forward fetch was asked for (first fetch, socket open, epoch switch, resync, failure). */
@@ -225,9 +224,8 @@ export function initialState(cfg: Config = DEFAULT_CONFIG, now = 0): State {
   };
 }
 
-export function newStream(key: string, cfg: Config): Stream {
+export function newStream(cfg: Config): Stream {
   return {
-    key,
     copy: null,
     asked: true,
     resync: false,
@@ -267,7 +265,7 @@ export function status(s: State): Status {
 }
 
 /** List order: open threads first, then `cwd`, then `thread_id`. */
-export function compareRows(a: ThreadInfo, b: ThreadInfo): number {
+function compareRows(a: ThreadInfo, b: ThreadInfo): number {
   if (a.closed !== b.closed) return a.closed ? 1 : -1;
   if (a.cwd !== b.cwd) return a.cwd < b.cwd ? -1 : 1;
   return a.thread_id < b.thread_id ? -1 : a.thread_id > b.thread_id ? 1 : 0;

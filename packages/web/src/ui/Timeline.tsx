@@ -3,7 +3,7 @@
 // latest (docs/design/w1-pwa.md §2.4, §2.5). An `<ol>` with no live region: new events
 // are announced by the page's one status region.
 
-import { listRows, rowView, type State, threadStream } from "../sync/state";
+import { HOST, type State, threadStream } from "../sync/state";
 import { eventText } from "./eventText";
 
 const time = new Intl.DateTimeFormat(undefined, { dateStyle: "short", timeStyle: "medium" });
@@ -32,8 +32,8 @@ export function Timeline(props: {
       </section>
     );
   }
-  const row = listRows(state).find((r) => r.info.thread_id === selected);
-  const view = row ? rowView(state, row) : null;
+  const host = state.streams[HOST]?.copy;
+  const info = host?.kind === "host" && !state.gone[selected] ? host.threads[selected]?.info : undefined;
   const stream = state.streams[threadStream(selected)];
   const cursor = stream?.copy?.cursor ?? null;
   const w = state.window?.thread === selected ? state.window : null;
@@ -44,9 +44,9 @@ export function Timeline(props: {
     <section aria-labelledby="timeline-heading" className="min-w-0">
       <div className="flex flex-wrap items-center gap-2 p-3">
         <h2 id="timeline-heading" className="me-auto min-w-0 text-lg font-semibold">
-          <span>{view?.info.agent ?? "thread"}</span>{" "}
+          <span>{info?.agent ?? "thread"}</span>{" "}
           <span className="break-all text-sm font-normal" dir="auto">
-            {view?.info.cwd ?? selected}
+            {info?.cwd ?? selected}
           </span>
         </h2>
         <div className="flex flex-wrap gap-2" role="group" aria-label="History">

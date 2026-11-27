@@ -1,17 +1,18 @@
 // W1-5 `sync.converges`: when the network quiesces after any losses, delays, restarts,
 // and epoch changes, the client holds the server's epoch, cursors, owned projections,
-// and exact window (docs/design/w1-pwa.md §4).
+// and the exact window as delivered pages and live events apply to it (oracle.ts;
+// docs/design/w1-pwa.md §4). That each read is asked for is window.test.ts's.
 
 import fc from "fast-check";
 import { describe, expect, test } from "vitest";
 
 import { HISTORY_FAILED, problems } from "./check";
 import { MODEL_CONFIG, Sim, TEST_CONFIG } from "./sim";
-import { status } from "./state";
+import { status, threadStream } from "./state";
 import { threadId } from "./model/server";
 import { type Op, opArb, run, seeded, start, startArb } from "./ops";
 
-export const NUM_RUNS = 1000;
+const NUM_RUNS = 1000;
 
 /**
  * Quiesces and checks convergence. A history read that failed shows a Retry and is not
@@ -19,7 +20,7 @@ export const NUM_RUNS = 1000;
  * window it retains included, must already hold; then the user retries and the page must
  * converge exactly.
  */
-export function settle(sim: Sim): void {
+function settle(sim: Sim): void {
   sim.quiesce();
   const first = problems(sim);
   if (first.some((p) => p.startsWith(HISTORY_FAILED))) {
@@ -77,7 +78,7 @@ describe("sync.converges", () => {
     const sim = seeded();
     sim.dispatch({ type: "select", thread: threadId(2) });
     sim.connect();
-    const key = `thread:${threadId(2)}`;
+    const key = threadStream(threadId(2));
     for (let k = 0; k < 10 && sim.flight(key, "backward") === undefined; k++) {
       for (const id of [...sim.flights.keys()]) sim.serve(id);
       while (sim.deliver());

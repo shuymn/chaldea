@@ -34,7 +34,7 @@ const MISSING_HOST = "the daemon reported no host stream";
 
 const utf8 = new TextEncoder();
 /** The size the window counts for one event: its JSON in UTF-8 bytes. */
-export function eventBytes(e: EventEnvelope): number {
+function eventBytes(e: EventEnvelope): number {
   return utf8.encode(JSON.stringify(e)).length;
 }
 
@@ -56,7 +56,6 @@ class Step {
       now: Math.max(prev.now, now),
       streams: { ...prev.streams },
       inflight: { ...prev.inflight },
-      gone: { ...prev.gone },
     };
   }
 
@@ -656,7 +655,7 @@ class Step {
     }
     for (const key of keys) {
       if (!this.s.streams[key]) {
-        (this.s.streams as Record<string, Stream>)[key] = newStream(key, this.s.cfg);
+        (this.s.streams as Record<string, Stream>)[key] = newStream(this.s.cfg);
         this.touched.add(key);
       }
     }
@@ -785,11 +784,8 @@ class Step {
       this.effects.push({ type: "ticket", socket: id, generation: s.generation });
     }
     const displayed = this.displayedKey();
-    const order = [HOST, ...(displayed ? [displayed] : []), ...s.followed];
-    const seen = new Set<string>();
-    for (const key of order) {
-      if (seen.has(key)) continue;
-      seen.add(key);
+    // `followed` is unique, in priority order: host, the displayed thread, the others.
+    for (const key of s.followed) {
       if (Object.keys(s.inflight).length >= s.cfg.slots) break;
       const st = s.streams[key];
       if (!st) continue;
@@ -890,7 +886,7 @@ function emptyCopy(key: string): Copy {
 }
 
 /** Applies one event of the copy's own stream; kinds that change no projection advance the cursor only. */
-export function applyEvent(copy: Copy, e: EventEnvelope): Copy {
+function applyEvent(copy: Copy, e: EventEnvelope): Copy {
   const d = decode(e);
   if (copy.kind === "host") {
     let threads = copy.threads;

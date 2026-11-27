@@ -10,7 +10,6 @@ export interface EventText {
   readonly body: string | null;
   /** The body is a blob's preview, not the whole content. */
   readonly preview: boolean;
-  readonly unknown: boolean;
 }
 
 function content(c: Content): { text: string; preview: boolean } {
@@ -27,12 +26,11 @@ const plain = (title: string, body: string | null = null): EventText => ({
   title,
   body,
   preview: false,
-  unknown: false,
 });
 
 const withContent = (title: string, c: Content): EventText => {
   const { text, preview } = content(c);
-  return { title, body: text, preview, unknown: false };
+  return { title, body: text, preview };
 };
 
 const label = (kind: string) => kind.replaceAll("_", " ");
@@ -40,7 +38,7 @@ const label = (kind: string) => kind.replaceAll("_", " ");
 export function eventText(e: EventEnvelope): EventText {
   const d = decode(e);
   if (d.outcome !== "typed") {
-    return { title: "unknown event", body: e.kind, preview: false, unknown: true };
+    return plain("unknown event", e.kind);
   }
   const ev = d.event;
   switch (ev.kind) {

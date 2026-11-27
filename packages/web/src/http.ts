@@ -36,7 +36,7 @@ function headers(token: string | null, json: boolean): Headers {
 }
 
 /** Reads the body as text, refusing more than `max` bytes before parsing. */
-export async function readLimited(res: Response, max: number): Promise<string | null> {
+async function readLimited(res: Response, max: number): Promise<string | null> {
   const declared = res.headers.get("Content-Length");
   if (declared !== null && Number(declared) > max) {
     await res.body?.cancel();
@@ -67,7 +67,8 @@ export async function readLimited(res: Response, max: number): Promise<string | 
 
 /**
  * The `retry_after` of an error body. A read cut off by `signal` (the deadline or an
- * abort) rethrows, so the request settles as timed out rather than as its status.
+ * abort) rethrows: the status is discarded, and the caller classifies the request
+ * (a timeout for events, transport for the ticket).
  */
 async function retryAfter(res: Response, signal: AbortSignal): Promise<number | null> {
   const text = await readLimited(res, 64 * 1024).catch((e: unknown) => {

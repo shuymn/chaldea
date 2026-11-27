@@ -84,10 +84,6 @@ export class Runner {
     this.lifetime.abort();
     this.unlisten?.();
     this.unlisten = null;
-    this.endTransport();
-  }
-
-  private endTransport(): void {
     for (const ac of this.aborts.values()) ac.abort();
     this.aborts.clear();
     for (const ac of this.tickets.values()) ac.abort();
