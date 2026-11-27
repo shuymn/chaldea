@@ -1721,9 +1721,9 @@ mod tests {
             );
             s.idle.push(Connection::open_in_memory().unwrap());
             s.open += 1;
-            std::thread::sleep(
-                wait_until.saturating_duration_since(Instant::now()) + Duration::from_millis(50),
-            );
+            while Instant::now() < wait_until {
+                std::thread::sleep(wait_until.saturating_duration_since(Instant::now()));
+            }
             drop(s);
             pool.cv.notify_all();
             assert!(matches!(waiter.join().unwrap(), Err(ReadError::Busy)));
