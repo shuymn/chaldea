@@ -4,17 +4,17 @@ T1 of `docs/mvp-design.md` §4 (mvp:436, :475; CL-19, :613): the daemon side of 
 
 ## 1. Scope
 
-**Adds.** The attach handler (`crates/daemon/src/attach/`), frames (`crates/core/src/attach.rs`), a pty-runtime `SessionHandle` and bounded close, the launch lease, the attach interval, per-purpose limits.
+**Adds.** The attach handler (`crates/daemon/src/attach/`), frames (`crates/core/src/attach.rs`), a pty-runtime `SessionHandle` and bounded close, the launch lease, attach interval, per-purpose limits.
 
-**Does not add.** A client, `chaldea attach`, P-9, an SGR serializer (deferred, mvp:451-452, :462), commands, event kinds, or routes.
+**Does not add.** A client, `chaldea attach`, P-9, an SGR serializer (deferred, mvp:451-462), commands, event kinds, routes.
 
 ## 2. Wire Contract
 
-Admission is PR 7's: an owner-only `attach:<thread>` ticket, single use, 30 s (http-surface §2.4).
+Admission (PR 7): an owner-only, single-use, 30 s `attach:<thread>` ticket (http-surface §2.4).
 
 | Dir | Frame | Content |
 |---|---|---|
-| ← | `attached` (first) | `thread_id`, `launch_id`, `cols`, `rows`, `cursor`, `modes { bracketed_paste, alt_screen, show_cursor, app_cursor, app_keypad, kitty_flags }`, `grid` (pty-runtime §2.6 encoding) or `null` |
+| ← | `attached` (first) | `thread_id`, `launch_id`, `cols`, `rows`, `cursor`, `modes { bracketed_paste, alt_screen, show_cursor, app_cursor, app_keypad, kitty_flags }`, `grid` (pty-runtime §2.6) or `null` |
 | ← | binary | PTY output after the snapshot, gapless |
 | ← | `size` | PTY size after a resize attempt, `ok` |
 | ← | `paste_result` | `paste_id`, `outcome` (`written`, `incomplete`, `pending`, `not_written`, `rejected`), `bytes_written: u64 \| null` (null on `pending`), `reason` |
@@ -24,20 +24,20 @@ Admission is PR 7's: an owner-only `attach:<thread>` ticket, single use, 30 s (h
 | → | `resize` | `cols` 2–512, `rows` 1–256 |
 | → | `paste` | `paste_id` (socket-local, never replayed, ≤ 128 bytes), `text` |
 
-**Reasons.** `rejected`: a `RejectReason`, `prompt_too_large`, `bracketed_paste_off`. Writer and session: `expired`, `bracketed_paste_off`, `queue_full`, `busy`, `incomplete`, otherwise `not_written`. Raw only: `paste_marker`, `too_large`, `pending`.
+**Reasons.** `rejected`: a `RejectReason`, `prompt_too_large`, `bracketed_paste_off`. Writer and session: `expired`, `bracketed_paste_off`, `queue_full`, `busy`, `incomplete`, else `not_written`. Raw only: `paste_marker`, `too_large`, `pending`.
 
 **Close codes** (best effort). 4000 `no_live_launch`, 4001 `launch_ended` (after `ended`), 4002 `lagged`, 4003 `replaced`, 4004 `busy`; 1001 shutdown, 1003 malformed frame or size, 1007 invalid UTF-8, 1008 token revoked, 1009 over the limit.
 
-**Limits.** Inbound message: 6 × `MAX_PROMPT_BYTES` + 4 KiB for attach (any JSON escape of a 256 KiB paste), 64 KiB for `/api/ws`; raw frame 64 KiB; paste text 256 KiB; `paste_id` 128 bytes (longer: 1003, nothing written); `attached` ≤ 192 KiB whole; queued output 1 MiB; drain 5 s; send 10 s per frame; idle 75 s; candidacy 15 s from the upgrade, then 4004.
+**Limits.** Inbound message: 6 × `MAX_PROMPT_BYTES` + 4 KiB for attach (a fully escaped 256 KiB paste), 64 KiB for `/api/ws`; raw frame 64 KiB; paste text 256 KiB; `paste_id` 128 bytes (longer: 1003, nothing written); `attached` ≤ 192 KiB whole; queued output 1 MiB; drain 5 s; send 10 s per frame; idle 75 s; candidacy 15 s from the upgrade, then 4004.
 
 ## 3. Decisions
 
 | # | Decision | Rejected alternative |
 |---|---|---|
-| D1 | One socket serves one launch; process state comes from sync; resume needs a new socket. | Following the thread across launches. |
-| D2 | One operating socket per launch for M1; a newer one takes over (4003); T2 shows why and offers take-back. | Several viewers with last-resize-wins. |
-| D3 | Initial screen: the snapshot, then the redraw the first resize forces (one-row nudge at equal size). T2 applies `modes`, keeps operate off after `grid: null` or a failed resize until the human enables it, and offers Redraw. | A daemon VT serializer (deferred). |
-| D4 | Clipboard text arrives only as `paste`; T2 intercepts paste and suppresses ghostty-web's query replies. | Recognising pastes in raw input: unmarked pastes submit early on Codex for Windows. |
+| D1 | One socket serves one launch; resume needs a new one; process state comes from sync. | Following the thread across launches. |
+| D2 | One operating socket per launch for M1; a newer one takes over (4003); T2 explains and offers take-back. | Several viewers with last-resize-wins. |
+| D3 | Initial screen: the snapshot, then the first resize's forced redraw (one-row nudge at equal size). T2 applies `modes`, keeps operate off after `grid: null` or a failed resize until the human enables it, and offers Redraw. | A daemon VT serializer (deferred). |
+| D4 | Clipboard text arrives only as `paste`; T2 intercepts paste and suppresses ghostty-web's query replies. | Recognising pastes in raw input: unmarked ones submit early on Codex for Windows. |
 | D5 | A paste on a bracketed-paste row needs DECSET 2004 on at encoding and dispatch. | Unwrapped text: CR newlines submit each line. |
 | D6 | One outstanding unit per socket; raw input joined; T2 holds submit and queue keys until `paste_result` and sends them only on `written`, else (or on disconnect) drops them. | One unit per frame: lost middle units, stale Enter after a failed paste. |
 | D7 | One launch lease orders resizes against sends, outside the op lock. | A flag beside `running`. |
@@ -53,11 +53,11 @@ All are reversible except D4's public frame.
 
 | ID | Invariant | Test |
 |---|---|---|
-| I-1 | `Session::close` returns within one absolute deadline even while a resize holds the control, reporting it unreleased until closed; a resize starts only before seal. | pty `close_with_resize_held`, `resize_after_seal_refused` |
+| I-1 | `Session::close` returns within one absolute deadline even while a resize holds the control, reporting it unreleased until closed; resizes start only before seal. | pty `close_with_resize_held`, `resize_after_seal_refused` |
 | I-2 | Every unit and resize carries its socket's grant from takeover; replacement, revocation, disconnect, and launch end revoke it: no unpermitted old write or resize reaches the PTY. | `old_enter_after_disconnect_and_reattach`, `delayed_old_submission`, `old_resize_parked_before_backend`, `failed_candidate_keeps_current` |
-| I-3 | Only the lease's holder, by acquisition id, submits or resizes; a known rollback or non-admission releases it; an indeterminate commit keeps it until exit; `stop` never waits for resize. | `resize_waits_for_opened_send`, `open_waits_for_resize`, `open_result_unrecorded`, `invalidation_races_conversion`, `stop_with_resize_held` |
+| I-3 | Only the lease holder (by acquisition id) submits or resizes; known rollback or non-admission releases it; an indeterminate commit keeps it until exit; `stop` never waits for resize. | `resize_waits_for_opened_send`, `open_waits_for_resize`, `open_result_unrecorded`, `invalidation_races_conversion`, `stop_with_resize_held` |
 | I-4 | Pending input stays ≤ 64 KiB plus one validated message; after `pending`, nothing more until that unit settles. | `crossing_paste_kept`, `max_paste_with_raw_outstanding`, `stuck_writer_after_pending` |
-| I-5 | `ready → key → attach` records `human_write { attach }`; `attach → card_key → attach` records it once; gate and ack decisions are unchanged. | `ready_key_attach_records`, `attach_card_key_attach_skips`, `typing_records_once`, `worker_exit_overlap` |
+| I-5 | `ready → key → attach` records `human_write { attach }`; `attach → card_key → attach` records it once; gate and ack decisions unchanged. | `ready_key_attach_records`, `attach_card_key_attach_skips`, `typing_records_once`, `worker_exit_overlap` |
 | I-6 | No complete bracketed-paste marker reaches the PTY from raw input; a lone Escape is written at once. | `marker_split_at_every_position`, `lone_escape_immediate`, `dsr_answered_once`; T2: paste with 2004 off yields only `paste`, a rendered DSR yields no client frame |
 | I-7 | Revocation ends the socket within §6's phase bounds and moves the grant: no new attach unit dispatches after. | `revoked_at_startup`, `revoked_read_parked_in_snapshot`, `revoked_lost_nudge_under_load`, `slot_with_cleanup_held` |
 | I-8 | The first terminal event wins and revokes the grant; `ended` is the last application frame; sends stop at the drain end (§6). | `drain_cutoff_drops`, `lag_then_gone_keeps_4002`, `lag_stalled_releases_slot` |
@@ -81,11 +81,12 @@ FakePty on both runners, Codex `win_keys` on a Windows host row; production moun
 ## 6. Risks and Accepted Limits
 
 - Attach never feeds state (invariant 1).
-- Accepted: typed non-ASCII to Codex on Windows (D9); unpadded paste triggers (input-encoders D10); L-11's late `Stop` after an attach-started turn.
+- Accepted: unpadded paste triggers (input-encoders D10); L-11's late `Stop` after attach-started turns.
 - Accepted: redraw needs the CLI to honour resize; a sequence split at the snapshot renders wrong until redrawn (D3).
-- Accepted (I-7): from the nudge, a revoked socket's slot is released ≤ 6 s while operating (5 s read, 1 s close grace), ≤ 10 s in the terminal close, ≤ 11.25 s at startup (startup read, 250 ms lock, fresh read, close grace; within the 15 s candidacy); a lost nudge adds the 30 s tick (operating). ≤ 4 blocking reads per socket. Dispatched units finish (pty-runtime §2.3); transport bytes may arrive.
-- Accepted (I-8): an end latched before takeover starts its 5 s at the first loop turn (drain end ≤ 10 s after the latch or a later startup nudge, ≤ 20 s after the upgrade). One send batch (an application frame, maybe a Ping), also one selected after the latch, may follow the cutoff within its 10 s. Order and the terminal event hold.
+- Accepted (I-7): from the nudge, a revoked socket's slot is released ≤ 6 s while operating (5 s read, 1 s close grace), ≤ 10 s in the terminal close, ≤ 11.25 s at startup (two reads, a 250 ms lock, close grace; within the 15 s candidacy); lost nudges add the 30 s tick (operating). ≤ 4 blocking reads per socket. Dispatched units finish (pty-runtime §2.3); transport bytes may arrive.
+- Accepted (I-6): after a takeover over a held write, a marker-refused last frame can send an accepted partial alone: ≤ one split escape (ConPTY may drop it); no refused byte is written; order holds.
+- Accepted (I-8): an end latched during candidacy ends with it (15 s from the upgrade plus close grace) or drains 5 s from the first loop turn (≤ 20 s from the upgrade). One send batch (an application frame, maybe a Ping), even one selected after the latch, may follow the cutoff (≤ 10 s). Order and terminal event hold.
 
 ## 7. Canonical-Doc Edits
 
-Folded into mvp (:88, :116, `GateEvidence`, :176, :205, :239, :439, :475, :480), supervisor-send (§2.3, §2.6, SB11), pty-runtime (§2.2, §2.7, §4-§5), http-surface (§2.6, §2.11, §4, PR7-CL-26), input-encoders (§2.3, §4), and architecture §5.
+Folded into mvp (§2.3-§2.5, §4, `GateEvidence`), supervisor-send (§2.3, §2.6, SB11), pty-runtime (§2.2, §2.7, §4-§5), http-surface (§2.6, §2.11, §4), input-encoders (§2.3, §4), architecture §5.
