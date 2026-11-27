@@ -813,6 +813,65 @@ async fn lag_then_gone_keeps_4002() {
     rig.stop().await;
 }
 
+/// I-8: the first terminal event wins across the sink and the gone poll. The session has
+/// left (its output end held back in the drain) and the loop parks right after sampling
+/// the latch (nothing latched); the sink then lags, and the gone poll is ready when the
+/// loop resumes: still 4002, no `ended`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lag_before_gone_poll_keeps_4002() {
+    use chaldea_pty_runtime::fake::ProbePoint;
+    let rig = SRig::with(|c| c.attach.out_max = 16).await;
+    let live = rig.claude().await;
+    let (mut c, _) = attach(&rig, &live).await;
+    let h = hooks(&rig);
+    let probe = rig.probe(&live).await;
+    let rx = rig.watch(&live).await;
+    // Every send stalls, and verification reads hold: only the gone poll can be ready.
+    let shared = rig.srv.server.shared().clone();
+    let (reached, held) = shared.faults.arm_socket_send_gate();
+    let (verifying, gos) = park_verify_reads(&rig, 2);
+    // The over-budget piece waits in the drain, so its lag comes after the sample.
+    let piece = probe.park(ProbePoint::PieceParsing);
+    live.child.emit(&[b'z'; 64]);
+    assert!(probe.wait(ProbePoint::PieceParsing, 1, soon()));
+    live.child.exit(chaldea_pty_runtime::ChildExit {
+        code: Some(0),
+        signal: None,
+    });
+    rig.until("the session left", || {
+        rig.sup.live(live.t, live.l).is_none()
+    })
+    .await;
+    // The exit's nudge was taken (its read holds) before the parked iteration.
+    next_entered(&verifying);
+    let (at, go) = park_sync(&h.sampled);
+    h.tick();
+    entered(&at);
+    drop(piece);
+    SRig::delivered(&rx, &[b'z'; 64]).await;
+    // Half a second past the poll (and within the held reads' deadline): its timer is
+    // already elapsed when registered, so it is ready at its first poll, ahead of the
+    // sink's wake.
+    rig.clock
+        .advance(rig.sup.cfg.attach.gone_poll + Duration::from_millis(500));
+    go.send(()).unwrap();
+    bounded(WS_WAIT, reached).await.unwrap().unwrap();
+    rig.until("the gone poll ran", || {
+        h.gone_polls.load(std::sync::atomic::Ordering::SeqCst) > 0
+    })
+    .await;
+    held.send(()).unwrap();
+    let mut texts = Vec::new();
+    while let Some(f) = c.next().await {
+        if let Frame::Text(m) = f {
+            texts.push(m);
+        }
+    }
+    drop(gos);
+    assert_eq!((c.closed, texts), (Some(Some(4002)), Vec::new()));
+    rig.stop().await;
+}
+
 /// The serialized `attached` of a fresh socket on `live`.
 async fn attached_len(rig: &SRig, live: &Live) -> (usize, AttachServerMessage) {
     let (_c, first) = attach(rig, live).await;
@@ -1020,6 +1079,16 @@ async fn max_paste_with_raw_outstanding() {
 
 // ---- timers on the test clock, takeover, revocation, drain -----------------------------------
 
+/// A rig whose sends and closes have far longer bounds than any wait of the test: only the
+/// drain deadline (on the test clock) can end a stalled send.
+async fn slow_sends(tune: impl FnOnce(&mut crate::supervisor::SupervisorConfig)) -> SRig {
+    SRig::on_http(chaldea_core::adapter::HostOs::Macos, tune, |h| {
+        h.ws.send_timeout = Duration::from_secs(600);
+        h.ws.close_grace = Duration::from_secs(600);
+    })
+    .await
+}
+
 fn hooks(rig: &SRig) -> std::sync::Arc<super::AttachHooks> {
     rig.sup.cfg.attach.hooks.clone()
 }
@@ -1127,7 +1196,7 @@ async fn ends_on_gone() {
 /// frame.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drain_cutoff_drops() {
-    let rig = SRig::new().await;
+    let rig = slow_sends(|_| {}).await;
     let live = rig.claude().await;
     let (mut c, _) = attach(&rig, &live).await;
     let (reached, _held) = rig.srv.server.shared().faults.arm_socket_send_gate();
@@ -1774,7 +1843,7 @@ async fn drain_progresses_while_output_stalled() {
 /// passes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lag_stalled_releases_slot() {
-    let rig = SRig::with(|c| c.attach.out_max = 16).await;
+    let rig = slow_sends(|c| c.attach.out_max = 16).await;
     let live = rig.claude().await;
     let shared = rig.srv.server.shared().clone();
     let (mut c, _) = attach(&rig, &live).await;
@@ -2079,15 +2148,17 @@ async fn busy_budget_recovers() {
     rig.stop().await;
 }
 
-/// I-8: `ended` is the last application frame; a close frame stalled after it is not
-/// waited for past the close's grace: the socket ends without it and releases its slot.
+/// I-8: `ended` is the last application frame, and the 5 s drain deadline cuts off the
+/// close frame too: with the close's grace far longer, a close frame stalled after `ended`
+/// is dropped at the drain deadline (the slot released), and releasing it afterwards
+/// sends nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn close_stalled_after_ended() {
-    let rig = SRig::new().await;
+    let rig = slow_sends(|_| {}).await;
     let live = rig.claude().await;
     let shared = rig.srv.server.shared().clone();
     let (mut c, _) = attach(&rig, &live).await;
-    let (reached, _held) = shared.faults.arm_close_frame_gate();
+    let (reached, held) = shared.faults.arm_close_frame_gate();
     live.child.close_output();
     assert_eq!(
         c.text().await,
@@ -2097,8 +2168,11 @@ async fn close_stalled_after_ended() {
         })
     );
     bounded(WS_WAIT, reached).await.unwrap().unwrap();
+    rig.clock.advance(rig.sup.cfg.attach.drain);
+    let _p = poker(&rig);
     rig.until("the slot released", || shared.sockets.held() == 0)
         .await;
+    let _ = held.send(());
     assert_eq!(c.until_closed().await, (None, Vec::new()));
     rig.stop().await;
 }

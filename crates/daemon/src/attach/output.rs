@@ -12,11 +12,19 @@ use tokio::sync::Notify;
 
 use crate::supervisor::lock;
 
+/// A terminal event (R-8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ending {
+    Ended(EndReason),
+    Lagged,
+}
+
 #[derive(Default)]
 struct State {
     data: VecDeque<u8>,
-    end: Option<EndReason>,
-    lagged: bool,
+    /// The first terminal event, latched once: the sink's lag or end, or the session gone.
+    /// Nothing is buffered after it (the prefix is frozen under the same lock).
+    ending: Option<Ending>,
 }
 
 /// One socket's output.
@@ -54,10 +62,13 @@ impl OutBuf {
                 return Flow::Stop;
             }
             let mut st = lock(&me.st);
+            if st.ending.is_some() {
+                return Flow::Stop;
+            }
             let flow = match ev {
                 OutputEvent::Bytes { bytes, .. } => {
                     if st.data.len() + bytes.len() > me.max {
-                        st.lagged = true;
+                        me.latch_in(&mut st, Ending::Lagged);
                         Flow::Stop
                     } else {
                         st.data.extend(bytes);
@@ -65,10 +76,11 @@ impl OutBuf {
                     }
                 }
                 OutputEvent::End(e) => {
-                    st.end = Some(match e {
+                    let reason = match e {
                         OutputEnd::Eof => EndReason::Eof,
                         OutputEnd::Error(_) => EndReason::Error,
-                    });
+                    };
+                    me.latch_in(&mut st, Ending::Ended(reason));
                     Flow::Stop
                 }
             };
@@ -88,14 +100,23 @@ impl OutBuf {
         Taken::Bytes(st.data.drain(..n).collect())
     }
 
-    /// The output's end, if the sink saw it.
-    pub(crate) fn end(&self) -> Option<EndReason> {
-        lock(&self.st).end
+    /// The latched terminal event.
+    pub(crate) fn ending(&self) -> Option<Ending> {
+        lock(&self.st).ending
     }
 
-    /// Whether the sink went over its budget.
-    pub(crate) fn lagged(&self) -> bool {
-        lock(&self.st).lagged
+    /// Latches `e` unless an event is latched already; the latched one.
+    pub(crate) fn latch(&self, e: Ending) -> Ending {
+        let mut st = lock(&self.st);
+        self.latch_in(&mut st, e)
+    }
+
+    fn latch_in(&self, st: &mut State, e: Ending) -> Ending {
+        if st.ending.is_none() {
+            st.ending = Some(e);
+            self.active.store(false, Ordering::Release);
+        }
+        st.ending.unwrap_or(e)
     }
 
     /// Stops the sink; the buffered bytes stay (the frozen prefix).

@@ -25,7 +25,7 @@ use futures_util::StreamExt;
 use tokio::sync::oneshot;
 
 use super::input::{Item, Pending, Verdict, advance_tail, completes_marker, filter};
-use super::output::{OutBuf, Taken};
+use super::output::{Ending, OutBuf, Taken};
 use super::registry::{Candidate, LaunchAttach, Removed, Replaced};
 use super::{Attach, AttachConfig, paste_reason, refusal_reason, submit_reason};
 use crate::http::ws::{
@@ -300,13 +300,6 @@ type ResizeOut = (u16, u16, bool);
 /// A resize in flight.
 type Resizing = Pin<Box<dyn Future<Output = Result<ResizeOut, tokio::task::JoinError>> + Send>>;
 
-/// The latched terminal event (R-8).
-#[derive(Debug, Clone, Copy)]
-enum Ending {
-    Ended(EndReason),
-    Lagged,
-}
-
 /// What woke the loop.
 enum Ev {
     Shutdown,
@@ -320,6 +313,8 @@ enum Ev {
     Sent(Sink, Result<(), axum::Error>),
     Inbound(Option<Result<Message, axum::Error>>),
     Output,
+    /// The terminal close is due: every frame before it was sent.
+    Terminal,
     GonePoll,
     HoldEnd,
     Submitted(Submitted),
@@ -779,16 +774,16 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
     let mut next_gone = sup.now() + cfg.gone_poll;
 
     loop {
+        let mut terminal: Option<(u16, &str)> = None;
         // Latch a terminal event (the first wins): the sink stops, the grant is revoked,
         // and one deadline covers the rest.
         if ending.is_none() {
-            let latched = if buf.lagged() {
-                Some(Ending::Lagged)
-            } else {
-                buf.end().map(Ending::Ended)
-            };
+            let latched = buf.ending();
+            #[cfg(test)]
+            if let Some(f) = crate::supervisor::lock(&cfg.hooks.sampled).take() {
+                f();
+            }
             if let Some(e) = latched {
-                buf.stop();
                 la.revoke(me);
                 ending = Some((e, sup.now() + cfg.drain));
                 #[cfg(test)]
@@ -872,27 +867,12 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                 } else if let Taken::Bytes(b) = buf.take(cfg.frame_out) {
                     msgs.push(Message::Binary(b.into()));
                 } else if let Some((e, _)) = ending {
+                    // The terminal close is decided in the select below, after shutdown,
+                    // revocation, and the deadlines.
                     match e {
-                        Ending::Lagged => {
-                            return close(
-                                &shared,
-                                Out::Free(sink),
-                                &mut stream,
-                                close_code::LAGGED,
-                                "lagged",
-                            )
-                            .await;
-                        }
-                        Ending::Ended(reason) if ended_sent => {
-                            let _ = reason;
-                            return close(
-                                &shared,
-                                Out::Free(sink),
-                                &mut stream,
-                                close_code::LAUNCH_ENDED,
-                                "launch_ended",
-                            )
-                            .await;
+                        Ending::Lagged => terminal = Some((close_code::LAGGED, "lagged")),
+                        Ending::Ended(_) if ended_sent => {
+                            terminal = Some((close_code::LAUNCH_ENDED, "launch_ended"));
                         }
                         Ending::Ended(reason) => {
                             ended_sent = true;
@@ -919,6 +899,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             }
             sending @ Out::Sending(..) => sending,
         };
+        let drain_timer = drain_at.filter(|_| matches!(out, Out::Free(_)));
         let (sending, send_deadline) = match &mut out {
             Out::Sending(f, d) => (Some(f), Some(drain_at.map_or(*d, |e| e.min(*d)))),
             Out::Free(_) => (None, None),
@@ -955,6 +936,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             _ = nudge.changed() => Ev::Nudge,
             () = replaced.wait() => Ev::Replaced,
             () = pending_opt(send_deadline.map(socket_timer)) => Ev::Dropped,
+            () = pending_opt(drain_timer.map(socket_timer)) => Ev::Dropped,
             () = pending_opt(idle_at.map(socket_timer)) => Ev::Dropped,
             () = socket_timer(next_tick) => Ev::Tick,
             n = test_tick(&cfg, ticks_seen) => {
@@ -973,11 +955,28 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             () = pending_opt(report_by.map(socket_timer)) => Ev::ReportLate,
             r = pending_opt(resizing.as_mut()) => Ev::Resized(r),
             () = pending_opt(hold_until.map(|at| socket_timer(sup.timer(at)))) => Ev::HoldEnd,
+            () = std::future::ready(()), if terminal.is_some() => Ev::Terminal,
             m = stream.next(), if reading => Ev::Inbound(m),
         };
         let refusal: (u16, &str) = match ev {
             Ev::Shutdown => (code::AWAY, "shutting_down"),
             Ev::Dropped => return,
+            Ev::Terminal => {
+                let Some(((code, why), (_, at))) = terminal.zip(ending) else {
+                    return;
+                };
+                // The close frame too is sent only before the drain deadline (R-8).
+                let mut closing = pin!(close(&shared, out, &mut stream, code, why));
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = shutdown.wait() => return,
+                        () = socket_timer(sup.timer(at)) => return,
+                        () = poked(&cfg) => {}
+                        () = &mut closing => return,
+                    }
+                }
+            }
             Ev::Replaced => (close_code::REPLACED, "replaced"),
             Ev::Nudge => {
                 generation += 1;
@@ -1032,10 +1031,13 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             Ev::Output => continue,
             Ev::GonePoll => {
                 next_gone = sup.now() + cfg.gone_poll;
-                if sup.live(thread, launch).is_none() && ending.is_none() {
-                    buf.stop();
-                    la.revoke(me);
-                    ending = Some((Ending::Ended(EndReason::Gone), sup.now() + cfg.drain));
+                #[cfg(test)]
+                cfg.hooks
+                    .gone_polls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if sup.live(thread, launch).is_none() {
+                    // Latched with the sink's events: the first one wins.
+                    buf.latch(Ending::Ended(EndReason::Gone));
                 }
                 continue;
             }

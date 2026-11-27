@@ -82,10 +82,23 @@ impl SRig {
 
     /// A rig with the send workers and driver running.
     pub(crate) async fn on(host: HostOs, tune: impl FnOnce(&mut SupervisorConfig)) -> SRig {
-        let (rig, chains, ingest) = Rig::with_chains_on(host, |c| {
-            c.send_workers = true;
-            tune(c);
-        })
+        SRig::on_http(host, tune, |_| {}).await
+    }
+
+    /// [`SRig::on`] whose server configuration `http` tunes.
+    pub(crate) async fn on_http(
+        host: HostOs,
+        tune: impl FnOnce(&mut SupervisorConfig),
+        http: impl FnOnce(&mut crate::http::HttpConfig),
+    ) -> SRig {
+        let (rig, chains, ingest) = Rig::with_chains_http(
+            host,
+            |c| {
+                c.send_workers = true;
+                tune(c);
+            },
+            http,
+        )
         .await;
         SRig {
             rig,

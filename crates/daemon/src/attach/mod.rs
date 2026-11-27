@@ -79,6 +79,11 @@ pub(crate) struct AttachHooks {
     pub ticked: std::sync::atomic::AtomicU64,
     /// Nudges or ticks that found both verification slots taken, by every socket.
     pub saturated: std::sync::atomic::AtomicU64,
+    /// Runs on the socket's task right after its loop sampled the terminal latch (none
+    /// latched yet).
+    pub sampled: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Gone polls run, by every socket.
+    pub gone_polls: std::sync::atomic::AtomicU64,
     /// Runs on the blocking pool after the next startup subscription returned.
     pub subscribed: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
