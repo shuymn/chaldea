@@ -1854,6 +1854,46 @@ async fn unwritten_escape_does_not_refuse() {
     assert_eq!(written.as_slice(), b"k[200~q");
 }
 
+/// I-6, R-10: a raw unit that waited for an earlier raw unit to settle takes its session
+/// lock budget when it tries the lock, not before the wait: no spurious `busy`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raw_settlement_does_not_spend_the_session_lock_budget() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let (mut a, _) = attach(&rig, &live).await;
+    let before = live.child.input().len();
+    let hold = live.child.hold_writes();
+    a.binary(b"a").await;
+    assert!(hold.wait_entered(soon()));
+    let (mut b, _) = attach(&rig, &live).await;
+    assert_eq!(a.until_closed().await.0, Some(4003));
+    let (at, go) = park_sync(&hooks(&rig).submit);
+    b.binary(b"q").await;
+    entered(&at);
+    rig.clock
+        .advance(crate::supervisor::send::READ_WAIT + Duration::from_millis(1));
+    drop(hold);
+    rig.until("A settled", || sl.state().human_unsettled == 0)
+        .await;
+    go.send(()).unwrap();
+    b.json(json!({ "type": "paste", "paste_id": "barrier", "text": "z" }))
+        .await;
+    let result = b.text().await;
+    assert!(
+        matches!(
+            result,
+            Some(AttachServerMessage::PasteResult {
+                outcome: PasteOutcome::Written,
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    assert_eq!(&live.child.input()[before..], b"aq\x1b[200~z\x1b[201~");
+    rig.stop().await;
+}
+
 /// I-4: a unit with no report by `not_after` + 1 s and not cancellable is `pending`; the
 /// socket submits nothing more until its report arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

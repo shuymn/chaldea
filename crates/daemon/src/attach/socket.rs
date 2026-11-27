@@ -371,6 +371,9 @@ impl Writer {
                 f();
             }
             loop {
+                if sup.now() >= not_after {
+                    return Err(Refused::NotWritten(AttachReason::Expired));
+                }
                 // A raw unit waits until every earlier raw unit of the launch settled, by
                 // its own dispatch deadline.
                 if !paste {
@@ -397,9 +400,10 @@ impl Writer {
                     not_after: sup.real(not_after),
                     report: tx,
                 };
-                let r = entry
-                    .with_session(&sup, now + READ_WAIT, move |s| unit.run(s))
-                    .await;
+                // The lock budget starts when the lock is tried (after any wait above),
+                // within the dispatch deadline.
+                let by = (sup.now() + READ_WAIT).min(not_after);
+                let r = entry.with_session(&sup, by, move |s| unit.run(s)).await;
                 return match r {
                     Ok(Ok(Some(ticket))) => Ok((ticket, rx, not_after)),
                     Ok(Ok(None)) => continue,
