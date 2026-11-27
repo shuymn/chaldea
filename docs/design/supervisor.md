@@ -508,7 +508,7 @@ PR 10a2's design is `docs/design/supervisor-recovery.md`.
 
 Decisions are numbered SD (supervisor decision), apart from the obligation ids of §4 such as D2 and D4. Each compares options by gain, loss, reversibility, and cost. "Public" marks a decision visible to users or clients.
 
-**SD1. Nudge for revoking intents (E4 vs X1).** http-surface §2.4 says command PRs pass the revocation nudge as `after_ok` to `run_write`, but a command's intent job is the runner's (`commands.rs:743` passes `None`) and `Prepared` has no `after_ok`.
+**SD1. Nudge for revoking intents (E4 vs X1).** http-surface §2.4 has command PRs pass the revocation nudge as `after_ok` to `run_write`, but a command's intent job is the runner's and `Prepared` has no `after_ok`; the runner passes the nudge for a handler whose `revokes()` is true (`commands.rs:738-743`).
 
 | Option | Gain | Loss | Reversibility | Cost |
 |---|---|---|---|---|
@@ -602,7 +602,7 @@ Obligation ids number the PR 10 obligations collected from the sources in the se
 | A6 | mvp §4 PR 10; mvp CL-8 | own commands: PR10a1-CL-5 |
 | A13 | mvp §4 PR 10; mvp CL-6 | §2.5, §2.11 exit steps; PR10a1-CL-14 |
 | A21 | mvp §4 PR 10 | §2.5; PR10a1-CL-8 |
-| A22 | mvp §4 PR 10; hook-ingest §2.9 (`HookConfig`), §3 "Stdin over 4 MiB" | §2.5, §2.6, §2.11; PR10a1-CL-15 |
+| A22 | mvp §4 PR 10; hook-ingest §2.9 "Launch that can no longer bind", hook-ingest §4 row "10 supervisor" | §2.5, §2.6, §2.11; PR10a1-CL-15 |
 | A24 | mvp §4 PR 10; mvp CL-1 | §6 FakeCli `banner`; PR10a1-CL-18 |
 | A25 | mvp §4 PR 10; daemon-lifecycle §2.11 | §2.3 Natural exit, §2.9 ownership; PR10a1-CL-13, PR10a1-CL-19, PR10a1-CL-36 |
 | A26 | mvp §4 PR 10; pty-windows §2.5 | §2.1 rule 5, §2.3 Stop step 4 (busy retries), §2.4; SD20; PR10a1-CL-10, PR10a1-CL-11 |
@@ -614,20 +614,20 @@ Obligation ids number the PR 10 obligations collected from the sources in the se
 | A35 (anchor part) | mvp §4 PR 10; formal-specs §3 | §2.3 step 5, §2.11 Observation; PR10a1-CL-30 (the ack decision: 10b) |
 | B1 | mvp §4 PR 10; hook-ingest D10 | §2.4; SD6; PR10a1-CL-10 |
 | C1 | input-encoders §4, §2.3 (the Codex positional first prompt) | §2.2 Prompt admission, §2.7; PR10a1-CL-1, PR10a1-CL-2 |
-| C6 | input-encoders F13 and its D3; http-surface §2.6 "Bounded disconnect", "Why a socket converges" | §2.8; SD5; PR10a1-CL-24 |
+| C6 | input-encoders F14 and its D3; http-surface §2.7 (`/api/adapters` is PR 10's) | §2.8; SD5; PR10a1-CL-24 |
 | C7 | input-encoders §2.2 (the host OS as a value) | §2.8; PR10a1-CL-2 |
-| D2 | hook-ingest §3 "Stdin over 4 MiB", §2.7 row 10 | §2.7, §2.3; PR10a1-CL-6, PR10a1-CL-7, PR10a1-CL-31 |
-| D4 | hook-ingest §2.5, §2.7 (binding and routing rules), §3 "Stdin over 4 MiB" | §2.6; PR10a1-CL-17; §7 |
-| E1 | http-surface §2.8 "Handler replies", §3 "Socket ownership" | §2.2 (`spawn`, `resume`, `stop`, `close`); PR10a1-CL-21, PR10a1-CL-35 |
-| E2 | http-surface §2.8 "What admission bounds" through "Dispatch seam" | §2.2 codes, §2.3 "Requests and ops"; PR10a1-CL-21, PR10a1-CL-22, PR10a1-CL-32 |
-| E3 | http-surface §2.4 "Hashing and comparison"; daemon-lifecycle §2.14 | §2.5; SD7; PR10a1-CL-16 |
-| E4, X1 | http-surface §2.4 "Secret format"; `commands.rs:743` | SD1; PR10a1-CL-20 |
+| D2 | hook-ingest §2.8, hook-ingest §4 row "10 supervisor" | §2.7, §2.3; PR10a1-CL-6, PR10a1-CL-7, PR10a1-CL-31 |
+| D4 | hook-ingest §2.5, §2.7 (binding and routing rules), hook-ingest §4 row "10 supervisor" | §2.6; PR10a1-CL-17; §7 |
+| E1 | http-surface §2.8 "What PR 7 completes end to end", §4 row "10 supervisor" | §2.2 (`spawn`, `resume`, `stop`, `close`); PR10a1-CL-21, PR10a1-CL-35 |
+| E2 | http-surface §2.8 "Dispatch seam", "Handler replies" | §2.2 codes, §2.3 "Requests and ops"; PR10a1-CL-21, PR10a1-CL-22, PR10a1-CL-32 |
+| E3 | http-surface §2.4 (the credential table's token row: restart revokes every launch's tokens); daemon-lifecycle §2.14 | §2.5; SD7; PR10a1-CL-16 |
+| E4, X1 | http-surface §2.4 "Revocation nudges come from the observer"; `commands.rs:738-743` | SD1; PR10a1-CL-20 |
 | E5 | daemon-lifecycle §2.14 (restart reconciliation, shutdown participants) | §2.9; SD10, SD17; PR10a1-CL-22, PR10a1-CL-33, PR10a1-CL-36 |
 | E6 | daemon-lifecycle PR8-P-3b | PR10a1-CL-23 |
 | F1 | pty-unix:409 | `docs/design/supervisor-recovery.md` (`orphan::kill_recorded`, identity-only) |
 | F2 | pty-unix:417 | SD15; PR10a1-CL-11 (the emergency kill is `stop`) |
 | X5 | `state.rs:255-258` | §2.3 Stop; SD4, SD11; PR10a1-CL-12 |
-| A38 | formal-specs §5 | own guards: §7; PR10a1-CL-27 |
+| A38 | formal-specs §6 "Extending" (PR 10: a changed guard changes the spec and its traces in the same PR) | own guards: §7; PR10a1-CL-27 |
 
 **Handed on.** A7–A12, A14–A20, A23, A31, A33, A34, A35's attribution, A36, A37, B2, B3, C2–C5, C8 for `send`, D1, D3, F3–F5, X2–X4: PR 10b (the send and ack path; 10a1 defines `prompt_too_large`, the observation, the anchor, and the stop-before-write order it uses). A1's restart scan, F1, A28, A29's finder evidence, A2's owner assertion: PR 10a2, because they decide what happens to processes the daemon no longer owns, under the owner decision and mvp P-18's survivor policy (§2.12). A5's removal race: the deferred `worktree remove` (10a1's reservation check and carry-over are the reading half). Hook configuration per CLI and real same-session resume: PR 13, PR 14 (SD14). A29's orphan finder: PR 21 (deferred).
 
