@@ -142,18 +142,7 @@ async fn open_as(rig: &SRig, secret: &str, t: ThreadId) -> Result<Client, u16> {
         .ticket(secret, &format!("attach:{t}"))
         .await
         .map_err(|r| r.status)?;
-    let url = format!(
-        "ws://127.0.0.1:{}/api/attach/{t}?ticket={ticket}",
-        rig.srv.port
-    );
-    match bounded(WS_WAIT, tokio_tungstenite::connect_async(url))
-        .await
-        .expect("the handshake ends within the wait")
-    {
-        Ok((ws, _)) => Ok(Client { ws, closed: None }),
-        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err(r.status().as_u16()),
-        Err(e) => panic!("not an HTTP refusal: {e}"),
-    }
+    open_ticket(rig, t, &ticket).await
 }
 
 /// Opens the attach socket of `t` with `ticket`.
@@ -2792,7 +2781,7 @@ async fn revoked_send_discarded() {
     rig.srv.revoke(&owner).await;
     rig.until("the socket ended", || shared.sockets.held() == 0)
         .await;
-    let _ = held.send(());
+    drop(held);
     let mut binary = Vec::new();
     while let Some(f) = a.next().await {
         if let Frame::Binary(b) = f {
@@ -3115,7 +3104,7 @@ async fn revoked_staged_frame_dropped() {
     rig.srv.revoke(&owner).await;
     rig.until("the socket ended", || shared.sockets.held() == 0)
         .await;
-    let _ = held.send(());
+    drop(held);
     let mut binary = Vec::new();
     while let Some(f) = a.next().await {
         if let Frame::Binary(b) = f {
@@ -3161,7 +3150,7 @@ async fn revoked_lost_nudge_under_load() {
     hooks(&rig).tick();
     rig.until("the socket ended", || shared.sockets.held() == 0)
         .await;
-    let _ = held.send(());
+    drop(held);
     let (code, texts) = a.until_closed().await;
     assert_eq!((code, texts), (None, Vec::new()));
     rig.stop().await;
