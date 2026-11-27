@@ -74,10 +74,18 @@ test("offline_then_catch_up", async ({ daemon, page }) => {
     const server = ws.connectToServer();
     ws.onMessage((m) => server.send(m));
     server.onMessage((m) => {
-      const type = typeof m === "string" ? (JSON.parse(m) as { type?: string }).type : undefined;
-      if (holding && type !== "hello") {
-        if (type === "heads") droppedHeads += 1;
-        return;
+      if (holding) {
+        // Only frames read as JSON with a type are filtered; anything else passes unchanged.
+        let type: unknown;
+        try {
+          type = typeof m === "string" ? (JSON.parse(m) as { type?: unknown }).type : undefined;
+        } catch {
+          type = undefined;
+        }
+        if (typeof type === "string" && type !== "hello") {
+          if (type === "heads") droppedHeads += 1;
+          return;
+        }
       }
       ws.send(m);
     });

@@ -61,7 +61,13 @@ export async function within(p: Proc, ms: number): Promise<End | null> {
   }
 }
 
-/** Sends `sig` to a running `p`; throws when it could not be delivered. */
+/**
+ * Sends `sig` to a running `p`; throws when it could not be delivered.
+ *
+ * Accepted limit: a failed kill of the harness's own child (EPERM, ESRCH) is not a state it
+ * reaches in practice. It is reported and `p` still counts as running; the caller's cleanup
+ * then goes on, bounded by the CI job's timeout.
+ */
 export function signal(p: Proc, sig: NodeJS.Signals): void {
   if (p.running() && !p.child.kill(sig)) {
     throw new Error(`process ${p.child.pid} could not be signalled (${sig}); it may still run`);
