@@ -1195,6 +1195,69 @@ async fn marker_tail_across_takeover() {
     rig.stop().await;
 }
 
+/// I-6: the marker rule's tail is the bytes the PTY received. A writes a lone Escape, then
+/// `xxxxx`, whose submission waits at its submit point while B takes over: A's `xxxxx` is
+/// refused (fence), so B's `[200~` would complete a marker after the Escape and is refused;
+/// B can still type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refused_old_raw_does_not_hide_marker_prefix() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut a, _) = attach(&rig, &live).await;
+    let before = live.child.input().len();
+    a.binary(b"\x1b").await;
+    rig.until("the lone Escape reached the PTY", || {
+        live.child.input()[before..] == *b"\x1b"
+    })
+    .await;
+    let (at, go) = park_sync(&hooks(&rig).submit);
+    a.binary(b"xxxxx").await;
+    entered(&at);
+    let (mut b, _) = attach(&rig, &live).await;
+    go.send(()).unwrap();
+    assert_eq!(a.until_closed().await.0, Some(4003));
+    b.binary(b"[200~").await;
+    b.binary(b"q").await;
+    rig.until("the new socket can still type", || {
+        live.child.input()[before..].ends_with(b"q")
+    })
+    .await;
+    let written = live.child.input()[before..].to_vec();
+    rig.stop().await;
+    assert_eq!(written.as_slice(), b"\x1bq");
+}
+
+/// I-6: an Escape that was queued and never written is not context: A's Escape waits
+/// behind a held write when B takes over, so the writer refuses it (fence), and B's
+/// `[200~` is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unwritten_escape_does_not_refuse() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let (mut a, _) = attach(&rig, &live).await;
+    let before = live.child.input().len();
+    let hold = live.child.hold_writes();
+    let other = rig.attach(&live, b"k").await;
+    assert!(hold.wait_entered(soon()));
+    a.binary(b"\x1b").await;
+    rig.until("A's Escape queued", || sl.state().human_unsettled == 2)
+        .await;
+    let (mut b, _) = attach(&rig, &live).await;
+    assert_eq!(a.until_closed().await.0, Some(4003));
+    b.binary(b"[200~").await;
+    b.binary(b"q").await;
+    drop(hold);
+    bounded(WS_WAIT, other).await.unwrap().unwrap();
+    rig.until("B's input arrived", || {
+        live.child.input()[before..].ends_with(b"q")
+    })
+    .await;
+    let written = live.child.input()[before..].to_vec();
+    rig.stop().await;
+    assert_eq!(written.as_slice(), b"k[200~q");
+}
+
 /// I-4: a unit with no report by `not_after` + 1 s and not cancellable is `pending`; the
 /// socket submits nothing more until its report arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

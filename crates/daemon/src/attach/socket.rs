@@ -24,7 +24,7 @@ use chaldea_pty_runtime::{
 use futures_util::StreamExt;
 use tokio::sync::oneshot;
 
-use super::input::{Item, Pending, Verdict, advance_tail, filter};
+use super::input::{Item, Pending, Verdict, advance_tail, completes_marker, filter};
 use super::output::{OutBuf, Taken};
 use super::registry::{Candidate, LaunchAttach, Removed, Replaced};
 use super::{Attach, AttachConfig, paste_reason, refusal_reason, submit_reason};
@@ -37,7 +37,7 @@ use crate::http::{
 use crate::store::{ReadTx, StoreError};
 use crate::supervisor::Supervisor;
 use crate::supervisor::live::{LiveLaunch, SessionError};
-use crate::supervisor::send::{KeyReport, LeaseKind, READ_WAIT, SendLaunch};
+use crate::supervisor::send::{KeyReport, LeaseKind, READ_WAIT, RecordHook, SendLaunch};
 
 /// Close codes of the attach socket (§2 "Close codes").
 mod close_code {
@@ -275,6 +275,7 @@ enum Ev {
 /// The pieces a unit's submission needs.
 struct Writer {
     sup: Arc<Supervisor>,
+    la: Arc<LaunchAttach>,
     entry: Arc<LiveLaunch>,
     sl: Arc<SendLaunch>,
     fence: Fence,
@@ -300,6 +301,7 @@ impl Writer {
         );
         let wait = self.cfg.unit_wait;
         let needs_2004 = paste && self.paste_on_2004;
+        let la = self.la.clone();
         #[cfg(test)]
         let hook = crate::supervisor::lock(&self.cfg.hooks.submit).take();
         Box::pin(async move {
@@ -309,35 +311,44 @@ impl Writer {
                 f();
             }
             let now = sup.now();
-            let not_after = sup.real(now + wait);
-            let (tx, rx) = oneshot::channel();
-            let r = entry
-                .with_session(&sup, now + READ_WAIT, move |s| {
-                    let modes = s.modes();
-                    if needs_2004 && !modes.modes.bracketed_paste {
-                        return Err(Refused::Rejected(AttachReason::BracketedPasteOff));
+            let not_after = now + wait;
+            loop {
+                // A raw unit waits until every earlier raw unit of the launch settled, by
+                // its own dispatch deadline.
+                if !paste {
+                    let mut settled = pin!(la.settled.notified());
+                    settled.as_mut().enable();
+                    if crate::supervisor::lock(&la.marks).unsettled > 0 {
+                        tokio::select! {
+                            () = settled => {}
+                            () = socket_timer(sup.timer(not_after)) => {
+                                return Err(Refused::NotWritten(AttachReason::Expired));
+                            }
+                        }
+                        continue;
                     }
-                    let guard = Guard {
-                        not_after,
-                        basis: None,
-                        bracketed_paste: needs_2004.then_some(modes.bracketed_paste_epoch),
-                        recheck: None,
-                        fence: Some(fence),
-                    };
-                    sl.submit_human(
-                        s,
-                        WriteUnit::bytes(WriteOrigin::Attach, bytes),
-                        guard,
-                        Some(tx),
-                    )
-                    .map_err(|e| Refused::NotWritten(submit_reason(e)))
-                })
-                .await;
-            match r {
-                Ok(Ok(ticket)) => Ok((ticket, rx)),
-                Ok(Err(e)) => Err(e),
-                Err(SessionError::Busy) => Err(Refused::NotWritten(AttachReason::Busy)),
-                Err(SessionError::Gone) => Err(Refused::NotWritten(AttachReason::NotWritten)),
+                }
+                let (tx, rx) = oneshot::channel();
+                let unit = Submit {
+                    sl: sl.clone(),
+                    la: la.clone(),
+                    fence: fence.clone(),
+                    bytes: bytes.clone(),
+                    paste,
+                    needs_2004,
+                    not_after: sup.real(not_after),
+                    report: tx,
+                };
+                let r = entry
+                    .with_session(&sup, now + READ_WAIT, move |s| unit.run(s))
+                    .await;
+                return match r {
+                    Ok(Ok(Some(ticket))) => Ok((ticket, rx)),
+                    Ok(Ok(None)) => continue,
+                    Ok(Err(e)) => Err(e),
+                    Err(SessionError::Busy) => Err(Refused::NotWritten(AttachReason::Busy)),
+                    Err(SessionError::Gone) => Err(Refused::NotWritten(AttachReason::NotWritten)),
+                };
             }
         })
     }
@@ -347,6 +358,65 @@ impl Writer {
         encode(self.agent, self.host_os, text, Purpose::AttachPaste)
             .map(|e| e.text)
             .map_err(|r| PasteReason::Rejected(r.reason))
+    }
+}
+
+/// One unit's submission inside `with_session`.
+struct Submit {
+    sl: Arc<SendLaunch>,
+    la: Arc<LaunchAttach>,
+    fence: Fence,
+    bytes: Vec<u8>,
+    paste: bool,
+    needs_2004: bool,
+    not_after: Instant,
+    report: oneshot::Sender<KeyReport>,
+}
+
+impl Submit {
+    /// The ticket, or `None` when an earlier raw unit is unsettled again (another socket
+    /// submitted one meanwhile): the caller waits and retries.
+    fn run(self, s: &chaldea_pty_runtime::Session) -> Result<Option<WriteTicket>, Refused> {
+        let modes = s.modes();
+        if self.needs_2004 && !modes.modes.bracketed_paste {
+            return Err(Refused::Rejected(AttachReason::BracketedPasteOff));
+        }
+        let guard = Guard {
+            not_after: self.not_after,
+            basis: None,
+            bracketed_paste: self.needs_2004.then_some(modes.bracketed_paste_epoch),
+            recheck: None,
+            fence: Some(self.fence),
+        };
+        let unit = WriteUnit::bytes(WriteOrigin::Attach, self.bytes.clone());
+        if self.paste {
+            return self
+                .sl
+                .submit_human(s, unit, guard, Some(self.report))
+                .map(Some)
+                .map_err(|e| Refused::NotWritten(submit_reason(e)));
+        }
+        // The marker rule's final decision (R-6): every earlier raw unit settled, so the
+        // tail is what the PTY received before this unit.
+        {
+            let mut m = crate::supervisor::lock(&self.la.marks);
+            if m.unsettled > 0 {
+                return Ok(None);
+            }
+            if completes_marker(&m.tail, &self.bytes) {
+                return Err(Refused::NotWritten(AttachReason::PasteMarker));
+            }
+            m.unsettled += 1;
+        }
+        let (la, bytes) = (self.la.clone(), self.bytes);
+        let settled: RecordHook = Box::new(move |r| la.raw_settled(&bytes, r.bytes_written));
+        self.sl
+            .submit_human_then(s, unit, guard, Some(self.report), Some(settled))
+            .map(Some)
+            .map_err(|e| {
+                self.la.raw_unqueued();
+                Refused::NotWritten(submit_reason(e))
+            })
     }
 }
 
@@ -551,6 +621,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
     let fence = la.fence(granted);
     let writer = Writer {
         sup: sup.clone(),
+        la: la.clone(),
         entry: entry.clone(),
         sl: sl.clone(),
         fence: fence.clone(),
@@ -570,6 +641,8 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
     let mut ctl: VecDeque<AttachServerMessage> = VecDeque::new();
     let mut pending = Pending::default();
     let mut held: Vec<u8> = Vec::new();
+    // The tail the socket's own accepted raw input will follow (the receipt check).
+    let mut proj: Vec<u8> = Vec::new();
     // Timers on the supervisor's clock (`sup.timer` each iteration), so a test clock
     // drives them.
     let mut hold_until: Option<Instant> = None;
@@ -849,7 +922,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             Ev::HoldEnd => {
                 hold_until = None;
                 let h = std::mem::take(&mut held);
-                advance_tail(&mut crate::supervisor::lock(&la.tail), &h);
+                advance_tail(&mut proj, &h);
                 pending.raw(&h);
                 continue;
             }
@@ -932,18 +1005,24 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                             });
                             continue;
                         }
-                        let mut tail = crate::supervisor::lock(&la.tail);
-                        match filter(&tail, &held, &b) {
+                        // With none of its own raw input in flight, the socket's view of
+                        // the tail is the launch's written tail; the final decision is made
+                        // at submission, in write order.
+                        let own = pending.has_raw()
+                            || !held.is_empty()
+                            || matches!(&outstanding, Some(o) if matches!(o.unit, Unit::Raw(_)));
+                        if !own {
+                            proj.clone_from(&crate::supervisor::lock(&la.marks).tail);
+                        }
+                        match filter(&proj, &held, &b) {
                             Verdict::Refused => {
-                                drop(tail);
                                 ctl.push_back(AttachServerMessage::InputDropped {
                                     bytes: b.len() as u64,
                                     reason: AttachReason::PasteMarker,
                                 });
                             }
                             Verdict::Accepted { write, held: h } => {
-                                advance_tail(&mut tail, &write);
-                                drop(tail);
+                                advance_tail(&mut proj, &write);
                                 pending.raw(&write);
                                 held = h;
                                 hold_until = (!held.is_empty()).then(|| sup.now() + cfg.hold);
@@ -976,7 +1055,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                                 if !held.is_empty() {
                                     let h = std::mem::take(&mut held);
                                     hold_until = None;
-                                    advance_tail(&mut crate::supervisor::lock(&la.tail), &h);
+                                    advance_tail(&mut proj, &h);
                                     pending.raw(&h);
                                 }
                                 pending.paste(paste_id, text);

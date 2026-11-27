@@ -58,6 +58,15 @@ pub(crate) fn filter(tail: &[u8], held: &[u8], frame: &[u8]) -> Verdict {
     }
 }
 
+/// Whether `unit`, written after `tail`, completes or contains a marker: the final
+/// decision, made in write order against the bytes the PTY received.
+pub(crate) fn completes_marker(tail: &[u8], unit: &[u8]) -> bool {
+    let mut window = Vec::with_capacity(tail.len() + unit.len());
+    window.extend_from_slice(tail);
+    window.extend_from_slice(unit);
+    marker_from(&window, tail.len())
+}
+
 /// `tail` after `written`: its last [`TAIL`] bytes.
 pub(crate) fn advance_tail(tail: &mut Vec<u8>, written: &[u8]) {
     tail.extend_from_slice(written);
@@ -105,6 +114,11 @@ impl Pending {
             Item::Paste { text, .. } => text.len(),
         };
         Some(it)
+    }
+
+    /// Whether raw bytes are pending.
+    pub(crate) fn has_raw(&self) -> bool {
+        self.items.iter().any(|i| matches!(i, Item::Raw(_)))
     }
 
     /// Pending bytes, raw and paste.

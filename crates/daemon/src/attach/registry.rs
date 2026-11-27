@@ -11,6 +11,7 @@ use chaldea_core::ids::LaunchId;
 use chaldea_pty_runtime::{Fence, SessionHandle, SubscriptionId};
 use tokio::sync::Notify;
 
+use super::input::advance_tail;
 use crate::supervisor::lock;
 
 /// A socket's replacement signal: set once, then notified.
@@ -62,9 +63,20 @@ pub(crate) struct LaunchAttach {
     /// resize whose `expect` is an older grant is refused.
     pub word: Arc<AtomicU64>,
     current: Mutex<Option<Current>>,
-    /// The last bytes of raw input accepted for writing, in write order across sockets
-    /// (the marker rule's context).
-    pub tail: Mutex<Vec<u8>>,
+    /// The marker rule's context (R-6), in write order across sockets.
+    pub marks: Mutex<Marks>,
+    /// Notified when a raw unit settles.
+    pub settled: Notify,
+}
+
+/// The raw input the PTY received, and the raw units not yet settled.
+#[derive(Default)]
+pub(crate) struct Marks {
+    /// The last bytes of raw input the writer wrote.
+    pub tail: Vec<u8>,
+    /// Raw units submitted and not yet settled: the next raw unit is decided only once
+    /// every earlier one settled, so `tail` is what precedes it in the PTY.
+    pub unsettled: usize,
 }
 
 impl LaunchAttach {
@@ -113,6 +125,27 @@ impl LaunchAttach {
         Some((c.handle, c.sub))
     }
 
+    /// A raw unit's settlement, from its write record (on the writer thread, in write
+    /// order): `written` bytes of `unit` reached the PTY.
+    pub(crate) fn raw_settled(&self, unit: &[u8], written: u64) {
+        let n = usize::try_from(written)
+            .unwrap_or(usize::MAX)
+            .min(unit.len());
+        let mut m = lock(&self.marks);
+        advance_tail(&mut m.tail, &unit[..n]);
+        m.unsettled = m.unsettled.saturating_sub(1);
+        drop(m);
+        self.settled.notify_waiters();
+    }
+
+    /// A raw unit that was counted and then not queued.
+    pub(crate) fn raw_unqueued(&self) {
+        let mut m = lock(&self.marks);
+        m.unsettled = m.unsettled.saturating_sub(1);
+        drop(m);
+        self.settled.notify_waiters();
+    }
+
     /// The fence of a socket holding `grant`.
     pub(crate) fn fence(&self, grant: u64) -> Fence {
         Fence {
@@ -145,7 +178,8 @@ impl Registry {
                 Arc::new(LaunchAttach {
                     word: Arc::new(AtomicU64::new(0)),
                     current: Mutex::new(None),
-                    tail: Mutex::new(Vec::new()),
+                    marks: Mutex::new(Marks::default()),
+                    settled: Notify::new(),
                 })
             })
             .clone()

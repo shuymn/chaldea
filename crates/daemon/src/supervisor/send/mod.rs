@@ -412,8 +412,22 @@ impl SendLaunch {
         written: Option<Arc<AtomicBool>>,
         report: Option<oneshot::Sender<KeyReport>>,
     ) -> chaldea_pty_runtime::Completion {
+        self.completion_then(written, report, None)
+    }
+
+    /// [`SendLaunch::completion`] that first runs `first` with the record, on the thread
+    /// that settles the unit (the writer, in write order, for a unit it took).
+    fn completion_then(
+        self: &Arc<Self>,
+        written: Option<Arc<AtomicBool>>,
+        report: Option<oneshot::Sender<KeyReport>>,
+        first: Option<RecordHook>,
+    ) -> chaldea_pty_runtime::Completion {
         let me = Arc::downgrade(self);
         Box::new(move |r: &WriteRecord| {
+            if let Some(f) = first {
+                f(r);
+            }
             let Some(me) = Weak::upgrade(&me) else {
                 return;
             };
@@ -456,6 +470,23 @@ impl SendLaunch {
         guard: chaldea_pty_runtime::Guard,
         report: Option<oneshot::Sender<KeyReport>>,
     ) -> Result<WriteTicket, chaldea_pty_runtime::SubmitError> {
+        self.submit_human_then(s, unit, guard, report, None)
+    }
+
+    /// [`SendLaunch::submit_human`] whose completion first runs `first` with the record
+    /// (attach's raw units: the marker rule's tail, in write order).
+    ///
+    /// # Errors
+    ///
+    /// The session refused the unit (nothing was queued; `first` never runs).
+    pub(crate) fn submit_human_then(
+        self: &Arc<Self>,
+        s: &chaldea_pty_runtime::Session,
+        unit: chaldea_pty_runtime::WriteUnit,
+        guard: chaldea_pty_runtime::Guard,
+        report: Option<oneshot::Sender<KeyReport>>,
+        first: Option<RecordHook>,
+    ) -> Result<WriteTicket, chaldea_pty_runtime::SubmitError> {
         #[cfg(test)]
         let report = if *lock(&self.drop_report) == Some(DropReport::Submit) {
             lock(&self.drop_report).take();
@@ -465,7 +496,7 @@ impl SendLaunch {
         };
         self.human_up(&mut self.state());
         self.outstanding.fetch_add(1, Ordering::AcqRel);
-        let done = self.completion(None, report);
+        let done = self.completion_then(None, report, first);
         s.submit(unit, guard, done).inspect_err(|_| {
             self.outstanding.fetch_sub(1, Ordering::AcqRel);
             self.human_down(&mut self.state());
@@ -527,6 +558,9 @@ impl SendLaunch {
         self.lease_free.notify_waiters();
     }
 }
+
+/// Runs first in a unit's completion, with its record; must not block.
+pub(crate) type RecordHook = Box<dyn FnOnce(&WriteRecord) + Send>;
 
 /// The send side's shared parts: the launches, the decoders, and the driver's channel.
 pub(crate) struct SendSide {
