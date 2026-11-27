@@ -5,6 +5,13 @@
 //! A dist directory holds `index.html` and files under `assets/` of an allowed type; source
 //! maps (`*.map`) and Vite's `.vite/` are skipped. Anything else fails the build.
 
+#[allow(
+    clippy::duplicate_mod,
+    reason = "build.rs reaches no crate module, so this file carries its own copy of the trim"
+)]
+#[path = "../../lifecycle/trim.rs"]
+mod trim;
+
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs;
@@ -58,12 +65,17 @@ pub fn resolve(value: &OsStr, workspace: &Path) -> Result<PathBuf, String> {
 /// and `assets/`, has a type outside the allowlist, or a name with a character outside
 /// `A-Z a-z 0-9 . _ -`.
 pub fn classify(rel: &Path) -> Result<Option<(String, &'static str)>, String> {
+    // The skips read the native names, before any name is checked.
+    let first = rel.components().next().map(Component::as_os_str);
+    let map = rel
+        .file_name()
+        .is_some_and(|n| n.as_encoded_bytes().ends_with(b".map"));
+    if first == Some(OsStr::new(".vite")) || map {
+        return Ok(None);
+    }
     let parts = parts(rel)?;
     let shown = parts.join("/");
     let last = parts.last().map_or("", String::as_str);
-    if parts.first().is_some_and(|p| p == ".vite") || last.ends_with(".map") {
-        return Ok(None);
-    }
     if parts.len() == 1 && last == "index.html" {
         return Ok(Some(("/".to_owned(), INDEX_TYPE)));
     }
@@ -132,9 +144,7 @@ fn parts(rel: &Path) -> Result<Vec<String>, String> {
 /// When `root` is a symlink or not a directory, has no `index.html`, holds a symlink, holds a
 /// file [`classify`] refuses, or two files with one request path.
 pub fn collect(root: &Path) -> Result<(Vec<DistFile>, Vec<PathBuf>), String> {
-    // Without trailing separators (and `.`), so `lstat` reads the last component itself
-    // instead of following it.
-    let root: PathBuf = root.components().collect();
+    let root = without_terminal_dots(root);
     let root = root.as_path();
     let meta = fs::symlink_metadata(root).map_err(|e| format!("{}: {e}", root.display()))?;
     if meta.is_symlink() {
@@ -153,6 +163,29 @@ pub fn collect(root: &Path) -> Result<(Vec<DistFile>, Vec<PathBuf>), String> {
         return Err(format!("{}: no index.html", root.display()));
     }
     Ok((table(files)?, dirs))
+}
+
+/// `root` without its terminal separators and `.` components, so `lstat` reads its last name
+/// itself instead of following it; the rest keeps its spelling (`trim`: no rebuild from
+/// components, which would resolve `..` in a Windows verbatim path, where `.` is a name too
+/// and is kept).
+fn without_terminal_dots(root: &Path) -> PathBuf {
+    let mut p = trim::without_trailing_separators(root);
+    #[cfg(windows)]
+    let verbatim = matches!(
+        p.components().next(),
+        Some(Component::Prefix(x)) if x.kind().is_verbatim()
+    );
+    #[cfg(not(windows))]
+    let verbatim = false;
+    while !verbatim
+        && let Some(s) = p.to_str()
+        && let Some(rest) = s.strip_suffix('.')
+        && rest.ends_with(std::path::is_separator)
+    {
+        p = trim::without_trailing_separators(Path::new(rest));
+    }
+    p
 }
 
 /// `files` sorted by request path.

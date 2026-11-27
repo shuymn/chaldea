@@ -16,6 +16,7 @@ fn main() {
     println!("cargo::rerun-if-env-changed={VAR}");
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=src/http/pwa/dist.rs");
+    println!("cargo::rerun-if-changed=src/lifecycle/trim.rs");
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
     let table = match env::var_os(VAR) {
         None => Ok(dist::render(&[]).expect("an empty table renders")),

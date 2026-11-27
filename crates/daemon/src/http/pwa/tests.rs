@@ -83,6 +83,26 @@ fn backslash_in_a_name_is_refused() {
     }
 }
 
+/// Skipping reads the native names first: a source map or `.vite/` entry is skipped whatever
+/// its name holds, a `\` included.
+#[cfg(not(windows))]
+#[test]
+fn skips_come_before_name_checks() {
+    for p in [
+        r"assets/debug\app.js.map",
+        r"weird\name.map",
+        r".vite/a\b.json",
+    ] {
+        assert_eq!(classify(Path::new(p)), Ok(None), "{p}");
+    }
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path();
+    write(root, "index.html", b"x");
+    write(root, r"assets/debug\app.js.map", b"{}");
+    let (files, _) = collect(root).unwrap();
+    assert_eq!(files.len(), 1);
+}
+
 /// A root-level file named `assets\app.js` next to `assets/app.js` fails the build instead of
 /// becoming a second `/assets/app.js`.
 #[cfg(not(windows))]
@@ -167,6 +187,47 @@ fn collect_refuses_a_symlink() {
     std::os::unix::fs::symlink(root.join("elsewhere.js"), root.join("assets/a.js")).unwrap();
     fs::remove_file(root.join("elsewhere.js")).unwrap();
     assert!(collect(root).unwrap_err().contains("symlink"));
+}
+
+/// The root's spelling is kept apart from its terminal separators and `.`: a verbatim path
+/// with a `..` component is not resolved into another directory (Windows does not interpret
+/// `..` in that syntax), as `lifecycle::tests::state_dir` checks for the state directory.
+#[cfg(windows)]
+#[test]
+fn collect_refuses_a_verbatim_root_with_a_parent_component() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = fs::canonicalize(tmp.path()).unwrap();
+    write(&parent.join("dist"), "index.html", b"x");
+    let mut raw = parent.as_os_str().to_os_string();
+    raw.push(r"\missing\..\dist");
+    let path = Path::new(&raw);
+    assert!(fs::symlink_metadata(path).is_err());
+    assert!(collect(path).is_err());
+    let mut slashed = raw.clone();
+    slashed.push(r"\");
+    assert!(collect(Path::new(&slashed)).is_err());
+}
+
+/// Only terminal separators and `.` are dropped; the rest of the root is read as given.
+#[test]
+fn collect_keeps_the_root_spelling() {
+    let d = tempfile::tempdir().unwrap();
+    let dist = d.path().join("dist");
+    write(&dist, "index.html", b"x");
+    let sep = std::path::MAIN_SEPARATOR_STR;
+    for suffix in [
+        "",
+        sep,
+        &format!("{sep}{sep}"),
+        &format!("{sep}."),
+        &format!("{sep}.{sep}"),
+    ] {
+        let mut root = dist.clone().into_os_string();
+        root.push(suffix);
+        let (files, dirs) = collect(Path::new(&root)).unwrap_or_else(|e| panic!("{suffix:?}: {e}"));
+        assert_eq!(files.len(), 1, "{suffix:?}");
+        assert_eq!(dirs[0], dist, "{suffix:?}");
+    }
 }
 
 /// A dist root that is a symlink is refused, also when the value ends in a separator (which
