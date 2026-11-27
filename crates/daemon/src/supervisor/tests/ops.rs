@@ -105,7 +105,6 @@ async fn pending_after_one_poll(fut: &mut std::pin::Pin<&mut impl std::future::F
 async fn report_before_a_late_join() {
     use crate::supervisor::ops::{KillTask, await_kill};
     let rig = Rig::new().await;
-    rig.clock.resume();
     let sup = rig.sup.clone();
     let (tx, first) = tokio::sync::oneshot::channel();
     let (release, held) = tokio::sync::oneshot::channel::<()>();
@@ -126,7 +125,7 @@ async fn report_before_a_late_join() {
     tokio::pin!(fut);
     assert!(pending_after_one_poll(&mut fut).await, "the join is held");
     rig.clock
-        .skew(crate::supervisor::PROOF_CUTOFF + std::time::Duration::from_secs(1));
+        .advance(crate::supervisor::PROOF_CUTOFF + std::time::Duration::from_secs(1));
     release.send(()).unwrap();
     let proof = fut.await;
     assert_eq!(proof.report, Some(report));

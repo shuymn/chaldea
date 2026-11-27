@@ -183,7 +183,6 @@ async fn recorded_closes() {
         c.kill_budget = Duration::from_millis(300);
     })
     .await;
-    rig.clock.resume();
     // A stop the close did not prove.
     rig.pty.script_next(FakeScript {
         kill: KillBehavior::Unconfirmed,

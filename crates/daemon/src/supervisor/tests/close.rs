@@ -4,9 +4,11 @@ use chaldea_core::ids::LaunchId;
 use chaldea_pty_runtime::ChildExit;
 use chaldea_pty_runtime::fake::FakeEvent;
 use serde_json::json;
+use std::time::Duration;
 
 use super::support::http::spawn_send;
 use super::{Rig, cid, json};
+use crate::store::tests::support::waits;
 use crate::supervisor::Pause;
 
 fn code(r: &super::support::http::Reply) -> String {
@@ -65,7 +67,9 @@ async fn cases() {
 /// PR10a1-CL-39 `stop_result`: a launch that exits by itself between the close's intent and
 /// the stop's seal: `stop` is `already_exited`, the thread closed; its
 /// `confirmed_within_deadline` is true when the stop's re-read returned by `RequestStart` +
-/// 5 s, and false when the clock passed that before the re-read.
+/// 5 s, and false when the clock passed that before the re-read: late, 2 s pass before the
+/// stop starts and 4 s after, so the re-read is past `RequestStart` + 5 s but not past the
+/// stop's start + 5 s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stop_result() {
     for late in [false, true] {
@@ -74,12 +78,15 @@ async fn stop_result() {
 }
 
 async fn stop_result_with(late: bool) {
-    // The clock stays stopped: the hold below spends no budget, and only `advance` makes
+    // The clock stays stopped: the holds below spend no budget, and only `advance` makes
     // the re-read late.
     let rig = Rig::new().await;
     let (t, l) = rig.spawn_codex(None).await;
     let child = rig.pty.take_child().unwrap();
     let start = rig.pauses.arm(Pause::StopStart);
+    let runner = crate::http::tests::shared(&rig.srv)
+        .faults
+        .arm_runner_gate();
     let reply = spawn_send(
         &rig.srv,
         &rig.srv.command(
@@ -89,6 +96,15 @@ async fn stop_result_with(late: bool) {
             &json!({ "thread_id": t, "expected_launch_id": l, "stop": true }).to_string(),
         ),
     );
+    let (submitting, submit) = runner;
+    waits::bounded(Duration::from_secs(10), submitting)
+        .await
+        .expect("the close's runner starts")
+        .unwrap();
+    if late {
+        rig.clock.advance(Duration::from_secs(2));
+    }
+    submit.send(()).unwrap();
     start.wait();
     child.exit(ChildExit {
         code: Some(0),
@@ -99,7 +115,7 @@ async fn stop_result_with(late: bool) {
     })
     .await;
     if late {
-        rig.clock.advance(std::time::Duration::from_secs(6));
+        rig.clock.advance(Duration::from_secs(4));
     }
     start.go();
     let r = reply.await.unwrap();
