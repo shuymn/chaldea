@@ -37,7 +37,7 @@ Also rejected: unbounded waits, test retries, worker-side repair (SB15).
 **Start point (cancellation, unwind).** Each request has a start cell (`Pending`, `Started`, `Cancelled`).
 - Dropping the request future swaps `Pending` → `Cancelled`; the closure, under `state`, claims (`Pending` → `Started`), then checks the request deadline, immediately before reserving the ordinal.
 - **Cancelled first or claimed late:** it releases the guard; no ordinal, `latest_intake`, or fence changes.
-- **In time:** the intake runs to its end; a later drop finishes it once with no marks.
+- **In time:** the intake runs to its end; a request dropped before its write observer registers finishes it once with no marks; after the registration the observer owns the intake (supervisor-send P2).
 - The ticket is owned from the reservation and fence cleanup armed at the advance: an unwind after it finishes once with no marks; one before releases only the ordinal.
 
 **Steps.** (1) entry check; (2) async `intake` lock; (3) dispatch check; (4) start point, ordinal; (5) publication wait; (6) `SendState`; (7) observation; (8) `now()` (pid-wait origin). Without `SendState`: store `latest_intake`, advance the fence, `None`. Without observation: `None`.
@@ -80,7 +80,7 @@ EARS. Red: `old` fails on `fb5f13a3`; `mut` fails under the named mutation; `kep
 ## 7. Proposed Canonical-Doc Edits
 
 1. supervisor-send §2.5 "Intake facts" (§3), §2.4 `stop_settled` (D7), §2.8 (D4), §2.3 (`SeqCst`), PR10b-CL-7 (SF-1, 3, 5, 8; the `SendMap` read stays the one wait with no own deadline).
-2. supervisor-send L-12, and PR10b-P-1's exception: "A hook has its facts missing when its launch was removed, when the final attempt (the first made at or after its facts deadline: `INTAKE_WAIT`, 500 ms, or the request deadline if sooner) of its `SendLaunch` mutex wait or of its position read fails, or when its observation, after the publication wait, still finds `L` unpublished once its creation started." 408s: the handler's cutoff is its last deadline check before its write observer registers; after it the writer decides by hook-ingest's J rows.
+2. supervisor-send L-12, and PR10b-P-1's exception: "A hook has its facts missing when its launch was removed, when the final attempt (the first made at or after its facts deadline: `INTAKE_WAIT`, 500 ms, or the request deadline if sooner) of its `SendLaunch` mutex wait or of its position read fails, or when its observation, after the publication wait, still finds `L` unpublished once its creation started." 408s: the handler's last deadline check, made immediately before its write observer registers, answers 408; after the registration hook-ingest §2.11 decides the reply.
 3. supervisor.md §2.11 "Observation", "Where 10b plugs in", code block, identifiers, SD12, PR10a1-CL-30, the hook-ingest "§4 PR 10 row" cross-reference: D1, D2.
 4. hook-ingest §2.3 step 5, §2.4 (D5, §3; `facts` takes `F`), §2.11 H6, §4 PR 10 row, §5 resource paths and "Waits" (the pid wait follows D6).
 5. pty-runtime §2.2 (`published_last_started` replaces `try_last_started_each`), §2.3 (D1), §2.7 (`Publishing`, `BetweenPositionLoads`), §5 waits.
