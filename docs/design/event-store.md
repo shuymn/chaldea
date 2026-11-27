@@ -276,7 +276,7 @@ pub struct NewGeneration { pub file_id: String, pub continuity: Continuity }   /
 pub struct TranscriptLine {
     pub offset_start: u64, pub offset_end: u64,
     pub event: TypedEvent, pub occurred_at: Option<Timestamp>,
-    pub continuity: Continuity,               // evidence at offset_end (PR 13 / 14 define its content)
+    pub continuity: Continuity,               // evidence at offset_end (its content: §2.6 Annex)
     pub blobs: Vec<BlobInput>,
 }
 pub struct ReadPos { pub read_offset: u64, pub continuity: Continuity }
@@ -601,14 +601,14 @@ The persisted JSON, exactly (serde's externally tagged form of the tuple variant
 
 ```json
 {"readiness":{"launch_id":"0190c6f2-0000-7000-8000-000000000001","position":42,"counted":["input","human","reply"]}}
-{"transcript":"<opaque continuity text from PR 13 / 14>"}
+{"transcript":"sha256:<64 lowercase hex digits>"}
 {"hook":{"truncated":true}}
 {"prompt":{"superseded":true}}
 ```
 
 The `CHECK` of §2.4 reads these paths: `$.readiness.launch_id`, a non-negative integer `$.readiness.position`, and `$.readiness.counted` of JSON type array (a string spelling an array is refused) and equal to one of the eight canonical arrays, so a set has one spelling and two equal sets compare equal for idempotency.
 
-`WriteBasis` is the PTY writer's `Basis { seq, counted }` captured at the evidence's intake (S15): `position` is `last_started(counted)`, and `counted` is stored with it in `ClassSet::iter()`'s order (`crates/pty-runtime/src/origin.rs`), so the gate checks the same origin set the basis was computed over even if the adapter policy changes later. `launch_id` must equal the event's launch. Transcript continuity keeps two pieces of evidence apart: the event position's (`proj_transcript_cursors.event_continuity`, from the annex of the last transcript event, restored by rebuild) and the read position's (`read_continuity`, from `ReadPos`, kept in the projection across restarts and replaced by the event position's evidence on rebuild, which is the permitted rewind). Their content is PR 13 / 14's.
+`WriteBasis` is the PTY writer's `Basis { seq, counted }` captured at the evidence's intake (S15): `position` is `last_started(counted)`, and `counted` is stored with it in `ClassSet::iter()`'s order (`crates/pty-runtime/src/origin.rs`), so the gate checks the same origin set the basis was computed over even if the adapter policy changes later. `launch_id` must equal the event's launch. Transcript continuity keeps two pieces of evidence apart: the event position's (`proj_transcript_cursors.event_continuity`, from the annex of the last transcript event, restored by rebuild) and the read position's (`read_continuity`, from `ReadPos`, kept in the projection across restarts and replaced by the event position's evidence on rebuild, which is the permitted rewind). The store treats both as opaque text. For Claude (`docs/design/c1-claude-adapter.md` D10) each is `sha256:` and the lowercase hex SHA-256 of the transcript's bytes `[0, offset)` at that position: a `transcript_generation` carries the digest of no bytes, a line the digest up to its `offset_end`, `ReadPos` the digest up to the read offset. The tailer verifies the stored read continuity against the file at every open (mvp §2.1 "Transcript cursor rules").
 
 **Rebuild.** `rebuild_projections` runs in the job's transaction: `DELETE` from every `proj_*` table (children first), read `events` ordered by `global_seq`, call `apply` on each, and write the code's `projection_version` to `meta`. Equality with the maintained projections holds by construction: the same function on the same events in the same order, where `global_seq` is the commit order (one write transaction at a time, S5, and `events_global_order`). The tests check it instead of assuming it (§7).
 
