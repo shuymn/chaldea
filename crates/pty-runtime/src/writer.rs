@@ -792,6 +792,14 @@ fn wait<'a>(sh: &Shared, q: MutexGuard<'a, Queue>) -> MutexGuard<'a, Queue> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// A granted write permission's publication: stores `seq` as the class's started position,
+/// in the published view and in the queue, and closes the odd section `s` opened.
+fn publish_start(sh: &Shared, q: &mut Queue, s: u64, class: OriginClass, seq: u64) {
+    sh.published.set(class, seq);
+    q.last_started[class.index()] = seq;
+    sh.published.end(s);
+}
+
 fn serve(sh: &Shared, input: &mut dyn Write) {
     loop {
         let batch = {
@@ -839,9 +847,7 @@ fn write_reply(sh: &Shared, input: &mut dyn Write) {
             split_writes: 0,
             outcome: WriteOutcome::InProgress,
         };
-        sh.published.set(OriginClass::Reply, seq);
-        q.last_started[OriginClass::Reply.index()] = seq;
-        sh.published.end(s);
+        publish_start(sh, &mut q, s, OriginClass::Reply, seq);
         q.slot = Some(Slot {
             id: REPLY,
             record,
@@ -955,9 +961,7 @@ fn write_next_unit(sh: &Shared, input: &mut dyn Write) {
         s.record.byte_start = pos;
     }
     let _ = started.set(at);
-    sh.published.set(class, seq);
-    q.last_started[class.index()] = seq;
-    sh.published.end(s);
+    publish_start(sh, &mut q, s, class, seq);
     drop(q);
     write_parts(sh, input, seq, &unit.parts);
 }
