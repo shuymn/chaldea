@@ -12,7 +12,7 @@
 // functions is rewritten to imports of the generated formats.js, and any other `require`
 // fails the script.
 
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -102,11 +102,7 @@ dts.push(
   "export type Validator<T> = ((data: unknown) => data is T) & { errors?: ErrorObject[] | null };",
 );
 for (const n of names) {
-  let type = "unknown";
-  try {
-    readFileSync(join(generated, `${n}.ts`));
-    type = `import("../generated/${n}").${n}`;
-  } catch {}
+  const type = existsSync(join(generated, `${n}.ts`)) ? `import("../generated/${n}").${n}` : "unknown";
   dts.push(`export declare const ${n}: Validator<${type}>;`);
 }
 writeFileSync(join(outDir, "validators.d.ts"), `${dts.join("\n")}\n`);
