@@ -544,15 +544,22 @@ async fn deadline_at_claim() {
         rig.ingest.order.next(live.l),
     );
     let s = shared(&rig.srv);
+    let timers = |s: &Shared| {
+        s.faults
+            .timers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    };
     let before_join = Arc::new(AtomicUsize::new(usize::MAX));
     let (s1, b1) = (s.clone(), before_join.clone());
     *rig.ingest.order.after_lock.lock().unwrap() = Some(Box::new(move || {
-        b1.store(s1.faults.timers().len(), Ordering::SeqCst);
+        b1.store(timers(&s1), Ordering::SeqCst);
     }));
     let clock = rig.clock.clone();
     *rig.ingest.order.before_claim.lock().unwrap() = Some(Box::new(move || {
         let end = Instant::now() + Duration::from_secs(10);
-        while s.faults.timers().len() <= before_join.load(Ordering::SeqCst) {
+        while timers(&s) <= before_join.load(Ordering::SeqCst) {
             assert!(Instant::now() < end, "the join's timer was set");
             std::thread::yield_now();
         }

@@ -261,9 +261,9 @@ async fn probe_beside_map_reader() {
     let live = rig.claude().await;
     let p = probe_of(&rig);
     let held = rig.sup.send.map.read().unwrap();
-    let (l, p2) = (live.l, p.clone());
+    let l = live.l;
     let h = std::thread::spawn(move || {
-        let (f, g) = intake(&p2, l, 50, soon());
+        let (f, g) = intake(&p, l, 50, soon());
         drop(g);
         f.is_some()
     });
@@ -274,7 +274,9 @@ async fn probe_beside_map_reader() {
 }
 
 /// Holds `sl`'s state on its own thread until the returned sender is used or dropped.
-fn hold_state(sl: &Arc<SendLaunch>) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+pub(super) fn hold_state(
+    sl: &Arc<SendLaunch>,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
     let (held_tx, held) = std::sync::mpsc::channel();
     let (free, until) = std::sync::mpsc::channel::<()>();
     let s2 = sl.clone();

@@ -380,17 +380,11 @@ async fn record_during_intake_keeps_running() {
         while !recorded.load(Ordering::Acquire) && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(1));
         }
-        loop {
-            let seen = e.observe(None);
-            if matches!(seen, LaunchObservation::Started { .. }) {
-                o.store(recorded.load(Ordering::Acquire), Ordering::SeqCst);
-                return seen;
-            }
-            if Instant::now() >= end {
-                return seen;
-            }
-            std::thread::sleep(Duration::from_millis(1));
+        let seen = e.observe(Some(end));
+        if matches!(seen, LaunchObservation::Started { .. }) {
+            o.store(recorded.load(Ordering::Acquire), Ordering::SeqCst);
         }
+        seen
     }));
     let stop = rig.next_ordinal(&live);
     assert_eq!(
@@ -685,15 +679,7 @@ async fn record_during_state_wait() {
     let p = rig.send(&live, "P").await;
     reached(entered).await;
     let recorded = sl.state().running.as_ref().unwrap().recorded.clone();
-    let (held_tx, held) = std::sync::mpsc::channel();
-    let (free, until) = std::sync::mpsc::channel::<()>();
-    let s2 = sl.clone();
-    let holder = std::thread::spawn(move || {
-        let _st = s2.state();
-        held_tx.send(()).unwrap();
-        let _ = until.recv_timeout(Duration::from_secs(30));
-    });
-    held.recv().unwrap();
+    let (free, holder) = super::probe::hold_state(&sl);
     let (contended_tx, contended) = std::sync::mpsc::channel();
     set(&sl.hooks.state_contended, move || {
         contended_tx.send(()).unwrap();
