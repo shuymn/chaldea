@@ -188,12 +188,12 @@ jobs:
           [ -z "$bad" ] || { echo "testkit depends on: $bad"; exit 1; }
 
   # The PWA's packages (docs/design/w1-pwa.md §3 D8): the validator codegen, typecheck, and
-  # Vitest of packages/contracts. The golden cases they read are owned by the workspace job's
-  # tests.
+  # Vitest of packages/contracts and packages/web, the Vite build, and the daemon built with
+  # that build embedded. The golden cases they read are owned by the workspace job's tests.
   web:
     name: web
     runs-on: macos-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
     defaults:
@@ -225,6 +225,21 @@ jobs:
       - name: Codegen, typecheck, and test
         working-directory: packages/contracts
         run: mise exec -- pnpm run check
+
+      # The web app's `check`: codegen, typecheck, Vitest, then the Vite build into dist/.
+      - name: Typecheck, test, and build the web app
+        working-directory: packages/web
+        run: mise exec -- pnpm run check
+
+      # rustup reads the channel and components from rust-toolchain.toml.
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      # The daemon's build.rs embeds dist/ and fails on a file it does not allow.
+      - name: Build chaldea with the web app embedded
+        env:
+          CHALDEA_WEB_DIST: packages/web/dist
+        run: cargo build -p chaldea-cli --locked
 
   # The Quint specs (docs/design/formal-specs.md): typecheck, seeded simulation of every
   # invariant, and the check that specs/traces/ equals what the spec exports. The traces
