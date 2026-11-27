@@ -69,13 +69,14 @@ test("offline_then_catch_up", async ({ daemon, page }) => {
   // page: `heads` and `stream_advanced` are dropped, so after the restart the page learns
   // of new events only from the refetch its socket open schedules.
   let holding = false;
-  let dropped = 0;
+  let droppedHeads = 0;
   await page.routeWebSocket(/\/api\/ws(\?|$)/, (ws) => {
     const server = ws.connectToServer();
     ws.onMessage((m) => server.send(m));
     server.onMessage((m) => {
-      if (holding && (typeof m !== "string" || (JSON.parse(m) as { type?: string }).type !== "hello")) {
-        dropped += 1;
+      const type = typeof m === "string" ? (JSON.parse(m) as { type?: string }).type : undefined;
+      if (holding && type !== "hello") {
+        if (type === "heads") droppedHeads += 1;
         return;
       }
       ws.send(m);
@@ -130,7 +131,8 @@ test("offline_then_catch_up", async ({ daemon, page }) => {
     .toEqual(range(lo, last));
   await expect(statusOf(page)).toHaveText("live", { timeout: 45_000 });
   await expect(page.getByText(/^last synced /)).not.toHaveText(synced!);
-  expect(dropped, "the socket carried no frame to drop").toBeGreaterThan(0);
+  // The reconnected socket's subscribe was answered with heads, which the page never saw.
+  await expect.poll(() => droppedHeads, { message: "no heads frame was dropped", timeout: 15_000 }).toBeGreaterThan(0);
 
   // History before the window still loads.
   await page.getByRole("button", { name: "Older", exact: true }).click();
@@ -179,9 +181,12 @@ test("layout_390", async ({ daemon, page }) => {
     await expect(rows.locator(part), part).toHaveCount(n);
   }
 
-  // Each of them, and each of their parts, lies inside the viewport and shows its whole
-  // content: no box past either edge, no block narrower than what it holds.
+  // Each of them, and each of their parts, is rendered visible (not `visibility: hidden`,
+  // not transparent), lies inside the viewport, and shows its whole content: no box past
+  // either edge, no block narrower than what it holds.
   const clipped = await page.evaluate(() => {
+    // Both spellings of the options: the current ones and the older ones WebKit may read.
+    const visible = { visibilityProperty: true, opacityProperty: true, checkVisibilityCSS: true, checkOpacity: true };
     const roots = [
       ...document.querySelectorAll("[data-status], li[data-thread], #timeline-heading, [role='group'], main ol > li"),
     ];
@@ -191,6 +196,7 @@ test("layout_390", async ({ daemon, page }) => {
         const r = el.getBoundingClientRect();
         const what = `${el.tagName.toLowerCase()} "${(el.textContent ?? "").slice(0, 30)}"`;
         if (r.width === 0 || r.height === 0) bad.push(`${what}: no box`);
+        else if (!el.checkVisibility(visible)) bad.push(`${what}: not visible`);
         else if (r.left < 0 || r.right > innerWidth + 0.5) bad.push(`${what}: ${r.left}..${r.right} of ${innerWidth}`);
         else if (getComputedStyle(el).display !== "inline" && el.scrollWidth > el.clientWidth + 1) {
           bad.push(`${what}: ${el.scrollWidth} wide in ${el.clientWidth}`);

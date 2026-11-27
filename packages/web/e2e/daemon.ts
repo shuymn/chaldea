@@ -8,7 +8,7 @@ import { createServer } from "node:net";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { type Proc, reap, redact, runProc, startProc, within } from "./proc";
+import { type Proc, reap, redact, runProc, signal, startProc, within } from "./proc";
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 export const RELEASE = join(ROOT, "target", "release");
@@ -124,7 +124,7 @@ export class Daemon {
   async stop(): Promise<void> {
     const p = this.proc;
     if (!p?.running()) return;
-    p.child.kill("SIGTERM");
+    signal(p, "SIGTERM");
     if ((await within(p, this.waits.stop)) === null) {
       await reap(p, this.waits.reap);
       throw new Error(`the daemon did not stop within ${this.waits.stop} ms of SIGTERM`);

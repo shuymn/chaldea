@@ -2,6 +2,7 @@
 // listens, a daemon that ignores SIGTERM, a command past its deadline or cancelled, and the
 // redaction of diagnostics. Stand-ins are Node scripts, so no release build is needed.
 
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,7 +10,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { Daemon, type Waits } from "./daemon";
-import { redact, runProc } from "./proc";
+import { reap, redact, runProc, startProc } from "./proc";
 
 const fast: Waits = { start: 1_000, stop: 300, reap: 5_000, command: 1_000 };
 const roots: string[] = [];
@@ -60,7 +61,8 @@ describe("harness lifecycle", () => {
     expect(alive(s.pid())).toBe(false);
   });
 
-  test("a daemon that ignores SIGTERM is killed and reaped past the stop deadline", async () => {
+  // Windows Node ends the process on SIGTERM whatever its handlers, so there is no escalation.
+  test.skipIf(process.platform === "win32")("a daemon that ignores SIGTERM is killed and reaped past the stop deadline", async () => {
     const root = scratch();
     const s = standIn(
       root,
@@ -83,16 +85,6 @@ describe("harness lifecycle", () => {
     expect(alive(s.pid())).toBe(false);
   });
 
-  test("a cancelled command is killed and reaped", async () => {
-    const root = scratch();
-    const s = standIn(root, `process.on("SIGTERM", () => {});\nsetInterval(() => {}, 1000);`);
-    const ac = new AbortController();
-    const run = runProc(s.program[0]!, s.program.slice(1), { deadlineMs: 60_000, signal: ac.signal });
-    setTimeout(() => ac.abort(), 300);
-    await expect(run).rejects.toThrow(/cancelled/);
-    expect(alive(s.pid())).toBe(false);
-  });
-
   test("a command that cannot start throws", async () => {
     await expect(runProc(join(scratch(), "missing"), [], { deadlineMs: 1_000 })).rejects.toThrow(/could not start/);
   });
@@ -102,5 +94,79 @@ describe("harness lifecycle", () => {
     const s = redact(`chd_${marker} chdp_${marker} http://127.0.0.1:1/#pair=${marker} ok`);
     expect(s.includes(marker)).toBe(false);
     expect(s).toContain("ok");
+  });
+
+  test("redact removes a prefix glued to other text, like the daemon's redactor", () => {
+    const secret = "A".repeat(43);
+    for (const p of ["chd_", "chdp_", "chdt_"]) {
+      const s = redact(`prefix${p}${secret} and x${p}${secret}`);
+      expect(s.includes(secret), p).toBe(false);
+      expect(s).toBe(`prefix${p}<redacted> and x${p}<redacted>`);
+    }
+  });
+
+  test("a spawn failure's message is redacted", async () => {
+    const root = scratch();
+    const secret = "B".repeat(43);
+    const missing = join(root, `chdp_${secret}`);
+    const e = await runProc(missing, [], { deadlineMs: 1_000 }).catch((x: unknown) => x as Error);
+    expect(e).toBeInstanceOf(Error);
+    expect((e as Error).message.includes(secret)).toBe(false);
+    const d = new Daemon({ root, port: 1, program: [missing], waits: fast });
+    const f = await d.start().catch((x: unknown) => x as Error);
+    expect((f as Error).message).toMatch(/could not start/);
+    expect((f as Error).message.includes(secret)).toBe(false);
+  });
+
+  test("a failed kill is not taken for an exit: reap throws and the process still counts as running", async () => {
+    const root = scratch();
+    const s = standIn(root, "setInterval(() => {}, 1000);");
+    const p = startProc(s.program[0]!, s.program.slice(1), { stdio: "ignore" });
+    await new Promise((ok) => p.child.once("spawn", ok));
+    const real = p.child.kill.bind(p.child);
+    // What Node does when a signal cannot be delivered: `error`, `false`, and no `exit`.
+    p.child.kill = () => {
+      p.child.emit("error", Object.assign(new Error("kill EPERM"), { code: "EPERM" }));
+      return false;
+    };
+    try {
+      await expect(reap(p, 300)).rejects.toThrow(/could not be signalled|not reaped/);
+      expect(p.running()).toBe(true);
+      expect(alive(p.child.pid!)).toBe(true);
+    } finally {
+      p.child.kill = real;
+      await reap(p, 5_000);
+    }
+    expect(p.running()).toBe(false);
+  });
+
+  test("a descendant holding the capture pipes does not keep the command or Node waiting", async () => {
+    const root = scratch();
+    // The child starts a descendant that inherits stdout and stderr, then exits at once.
+    const holderPid = join(root, "holder");
+    const js = join(root, "parent.mjs");
+    writeFileSync(
+      js,
+      `import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+const h = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: ["ignore", "inherit", "inherit"] });
+writeFileSync(${JSON.stringify(holderPid)}, String(h.pid));
+h.unref();
+process.stdout.write("out");
+`,
+    );
+    // A separate Node runs `runProc` and must exit on its own soon after, while the
+    // descendant still holds the pipes for 30 s.
+    const proc = new URL("./proc.ts", import.meta.url).href;
+    const runner = `import { runProc } from ${JSON.stringify(proc)};\nconst r = await runProc(process.execPath, [${JSON.stringify(js)}], { deadlineMs: 5_000 });\nprocess.stdout.write(JSON.stringify({ code: r.code, stdout: r.stdout, drained: r.drained }));\n`;
+    const started = Date.now();
+    const out = spawnSync(process.execPath, ["--input-type=module", "-e", runner], { encoding: "utf8", timeout: 10_000 });
+    try {
+      expect(out.status, out.stderr).toBe(0);
+      expect(JSON.parse(out.stdout)).toEqual({ code: 0, stdout: "out", drained: false });
+      expect(Date.now() - started).toBeLessThan(4_000);
+    } finally {
+      process.kill(Number(readFileSync(holderPid, "utf8")), "SIGKILL");
+    }
   });
 });

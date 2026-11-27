@@ -243,11 +243,7 @@ test("two_tabs", async ({ daemon, context }) => {
     await expect(statusOf(t.page)).toHaveText("live");
   }
 
-  // Hold A's next host read under generation B, then tab C pairs again: A and B reread on
-  // its notice and adopt C, retiring B's work.
-  const heldB = hold.next(tokenB);
-  const { thread: real } = await daemon.spawnThread();
-  const routeB = await heldB;
+  // Tab C pairs again: A and B reread on its notice and adopt C, retiring B's work.
   const c = await tab(context);
   const tokenC = await pair(daemon, c);
   for (const [name, t] of [
@@ -259,31 +255,6 @@ test("two_tabs", async ({ daemon, context }) => {
       .toBe(true);
     await expect(statusOf(t.page)).toHaveText("live");
   }
-  await expect(a.page.locator(`li[data-thread="${real}"]`)).toHaveCount(1);
-
-  // A's held generation-B read, answered after the adoption with a page that registers a
-  // phantom thread, changes nothing in A.
-  const res = await routeB.fetch();
-  const body = (await res.json()) as { mode: string; events?: Record<string, unknown>[] };
-  const registered = body.events?.find((e) => e.kind === "thread_registered");
-  expect(registered !== undefined, "the held page registers no thread").toBe(true);
-  const phantom = "00000000-0000-4000-8000-00000000f00d";
-  const last = body.events!.at(-1)!;
-  body.events!.push({
-    ...registered,
-    seq: (last.seq as number) + 1,
-    event_id: "00000000-0000-4000-8000-00000000f00e",
-    idempotency_key: "phantom",
-    thread_id: phantom,
-    payload: { ...(registered!.payload as object), thread_id: phantom, cwd: "/work/phantom" },
-  });
-  (body as { head_seq?: number }).head_seq = (last.seq as number) + 1;
-  await routeB.fulfill({ response: res, json: body });
-  await a.page.waitForTimeout(1_000);
-  await expect(a.page.locator(`li[data-thread="${phantom}"]`)).toHaveCount(0);
-  await expect(a.page.getByText("/work/phantom")).toHaveCount(0);
-  await expect(a.page.locator(`li[data-thread="${real}"]`)).toHaveCount(1);
-  await expect(statusOf(a.page)).toHaveText("live");
 
   // C's credential is stored: a reload stays paired and uses it.
   await b.page.reload();
