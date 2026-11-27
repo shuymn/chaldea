@@ -430,6 +430,13 @@ async fn sealed_applied_once() {
             go.send(()).unwrap();
         }
         assert_eq!(stop.await.unwrap().status, 200);
+        // The removal from the live map wakes no worker, and the worker may have parked
+        // before it: a tick wakes it after the removal.
+        rig.until("the launch left the live map", || {
+            rig.sup.entry(live.l).is_none()
+        })
+        .await;
+        rig.tick().await;
         rig.until("the worker ended", || rig.sup.send.launch(live.l).is_none())
             .await;
         let m = moves(&rig, &live, id);
