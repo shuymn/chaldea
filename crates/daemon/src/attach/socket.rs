@@ -804,6 +804,13 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
     let mut ticks_seen = cfg.hooks.ticks.load(std::sync::atomic::Ordering::SeqCst);
     #[cfg(not(test))]
     let mut ticks_seen = 0;
+    #[cfg(test)]
+    let mut gones_seen = cfg
+        .hooks
+        .gone_requests
+        .load(std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(test))]
+    let mut gones_seen = 0;
     let mut next_gone = sup.now() + cfg.gone_poll;
 
     loop {
@@ -976,7 +983,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             () = pending_opt(drain_timer.map(socket_timer)) => Ev::Dropped,
             () = pending_opt(idle_at.map(socket_timer)) => Ev::Dropped,
             () = socket_timer(next_tick) => Ev::Tick,
-            n = test_tick(&cfg, ticks_seen) => {
+            n = test_tick(&cfg, false, ticks_seen) => {
                 ticks_seen = n;
                 Ev::TestTick
             }
@@ -985,6 +992,10 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                 None => Ev::Dropped,
             },
             () = socket_timer(sup.timer(next_gone)) => Ev::GonePoll,
+            n = test_tick(&cfg, true, gones_seen) => {
+                gones_seen = n;
+                Ev::GonePoll
+            }
             () = poked(&cfg) => continue,
             () = buf.wake.notified(), if ending.is_none() => Ev::Output,
             r = pending_opt(submitting) => Ev::Submitted(r),
@@ -1293,12 +1304,17 @@ async fn poked(cfg: &AttachConfig) {
 
 /// Resolves with the test's tick count once it is past `seen`. Never resolves outside
 /// tests.
-async fn test_tick(cfg: &AttachConfig, seen: u64) -> u64 {
+async fn test_tick(cfg: &AttachConfig, gone: bool, seen: u64) -> u64 {
     #[cfg(test)]
     loop {
         let mut n = pin!(cfg.hooks.tick_now.notified());
         n.as_mut().enable();
-        let c = cfg.hooks.ticks.load(std::sync::atomic::Ordering::SeqCst);
+        let counter = if gone {
+            &cfg.hooks.gone_requests
+        } else {
+            &cfg.hooks.ticks
+        };
+        let c = counter.load(std::sync::atomic::Ordering::SeqCst);
         if c > seen {
             return c;
         }
@@ -1306,7 +1322,7 @@ async fn test_tick(cfg: &AttachConfig, seen: u64) -> u64 {
     }
     #[cfg(not(test))]
     {
-        let _ = (cfg, seen);
+        let _ = (cfg, gone, seen);
         std::future::pending().await
     }
 }

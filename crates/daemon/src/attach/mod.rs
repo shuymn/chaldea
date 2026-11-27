@@ -73,6 +73,8 @@ pub(crate) struct AttachHooks {
     /// Ticks requested by the test ([`AttachHooks::tick`]); every socket runs one tick per
     /// request made after it started.
     pub ticks: std::sync::atomic::AtomicU64,
+    /// Gone polls requested by the test ([`AttachHooks::gone_poll`]), as `ticks`.
+    pub gone_requests: std::sync::atomic::AtomicU64,
     /// Notified with each tick request.
     pub tick_now: tokio::sync::Notify,
     /// Ticks every socket has taken (its verification started), by every socket.
@@ -105,6 +107,14 @@ impl AttachHooks {
     /// Asks every socket for one tick.
     pub fn tick(&self) {
         self.ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.tick_now.notify_waiters();
+    }
+
+    /// Asks every socket for one gone poll, ready at the loop's next select ahead of the
+    /// output wake.
+    pub fn gone_poll(&self) {
+        self.gone_requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.tick_now.notify_waiters();
     }
 }

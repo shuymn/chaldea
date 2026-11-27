@@ -1144,11 +1144,10 @@ async fn lag_before_gone_poll_keeps_4002() {
     entered(&at);
     drop(piece);
     SRig::delivered(&rx, &[b'z'; 64]).await;
-    // Half a second past the poll (and within the held reads' deadline): its timer is
-    // already elapsed when registered, so it is ready at its first poll, ahead of the
+    // The lag is latched (under the buffer's lock) before the gone poll runs: the poll is
+    // requested now and is ready at the loop's first select after the park, ahead of the
     // sink's wake.
-    rig.clock
-        .advance(rig.sup.cfg.attach.gone_poll + Duration::from_millis(500));
+    h.gone_poll();
     go.send(()).unwrap();
     bounded(WS_WAIT, reached).await.unwrap().unwrap();
     rig.until("the gone poll ran", || {
