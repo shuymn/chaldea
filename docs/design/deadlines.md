@@ -83,7 +83,7 @@ Step 3 is §2.10's "each return is classified with one clock sample", and `in_ti
   | `shutdown::record_pause` | `sleep` | record-removal retry; the deletion is admitted by the budget checks (§2.8 step 5) |
   | `listener::accept_backoff` | `sleep` | accept-error backoff, shutdown wins (§2.2) |
   | `listener::stall_timer` | `sleep` | `ConnIo` write stall, progress first (§2.2) |
-  | `supervisor::tick_timer` | `sleep_until` | the supervisor's 1 s tick period; each tick decides from the store (`docs/design/supervisor.md` §2.6) |
+  | `supervisor::tick_timer` | `sleep_until` | the supervisor's 1 s tick period; each tick decides from the store (`docs/design/supervisor.md` §2.6). The transcript tailer's 1 s poll period uses it too; each poll decides from the store and the file (`docs/design/c1-claude-adapter.md` D10). |
 
   Moving one of these sites to `settle_before` needs its own design for the poll, sample, and drop order it changes.
 

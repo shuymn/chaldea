@@ -17,6 +17,7 @@ mod screen;
 mod shutdown;
 mod stop;
 mod tick;
+mod transcript;
 pub(crate) mod version;
 mod workspace;
 
@@ -223,6 +224,7 @@ pub(crate) fn config(
                 .collect(),
         }),
         claude_settings: "/work/state/claude-settings.json".to_owned(),
+        tail_poll: crate::transcript::TAIL_POLL,
     }
 }
 

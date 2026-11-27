@@ -58,6 +58,19 @@ pub use state_dir::{STATE_DIR_ENV, resolve as resolve_state_dir, set_marker_paus
 
 pub(crate) use panic::{TaskKindGuard, recoverable};
 
+/// Installs the production panic hook and registers an active gate, as a daemon run does;
+/// for a helper process's test only (the hook is process-wide).
+#[cfg(test)]
+pub(crate) fn production_panic_hook() -> Arc<ShutdownGate> {
+    panic::install();
+    let g = Arc::new(ShutdownGate::new(
+        Duration::from_secs(5),
+        log::Logger::start(log::LogTarget::Discard),
+    ));
+    gate::register(&g);
+    g
+}
+
 /// The files of the state directory (design §2.4).
 pub mod names {
     pub const MARKER: &str = "CHALDEA_STATE";

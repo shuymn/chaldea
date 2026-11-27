@@ -152,6 +152,7 @@ pub(crate) fn new_supervisor(
         instance,
         probe_slots: Arc::new(tokio::sync::Semaphore::new(super::PROBE_SLOTS)),
         version_left: super::version::VersionLeft::default(),
+        tailers: crate::transcript::Tailers::default(),
     })
 }
 
@@ -215,6 +216,19 @@ pub(crate) async fn shutdown(sup: Arc<Supervisor>, end: Instant) -> ParticipantE
     let _ = sup.window.set(Window { close_end, end });
     // Step 1.
     sup.tracker.close_admission();
+    // The transcript tailers stop with admission and are joined within the budget, so none
+    // holds a store reader once the store shuts down.
+    let tailers = sup.tailers.stop_all();
+    let tails = async {
+        let joined = futures_util::future::join_all(tailers);
+        if settle_before(|| sup.now(), end, sup.timer(end), joined)
+            .await
+            .in_time()
+            .is_none()
+        {
+            tracing::warn!("a transcript tailer did not end within the shutdown budget");
+        }
+    };
     // Step 2, in parallel with steps 3–5.
     let git = git_step(&sup, end);
     let ptys = async {
@@ -241,7 +255,7 @@ pub(crate) async fn shutdown(sup: Arc<Supervisor>, end: Instant) -> ParticipantE
         });
         futures_util::future::join_all(closes).await;
     };
-    tokio::join!(git, ptys);
+    tokio::join!(git, ptys, tails);
     // Step 6.
     if sup.tracker.empty_before(end).await {
         ParticipantEnd::Clean

@@ -19,7 +19,8 @@ pub(crate) trait TickStep: Send + Sync {
 }
 
 /// The tick's period timer: the supervisor's exception to the timer rule (deadlines.md);
-/// it decides nothing, each tick re-reads the store.
+/// it decides nothing, each tick re-reads the store. The transcript tailer's poll period uses
+/// it too: each poll decides from the store and the file.
 #[allow(
     clippy::disallowed_methods,
     reason = "the supervisor tick's period (design §2.6); each tick decides from the store"
