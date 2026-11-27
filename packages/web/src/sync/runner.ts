@@ -6,9 +6,12 @@ import { validators } from "@chaldea/contracts";
 
 import type { Credential, CredentialStore } from "../auth/credential";
 import { type Fetch, postTicket, readEvents } from "../http";
-import type { Action, Effect } from "./effects";
+import type { Action, Effect, FetchResult } from "./effects";
 import { reduce } from "./reducer";
 import { type Config, DEFAULT_CONFIG, initialState, type State } from "./state";
+
+/** How long a socket may take to open (the read timeout's length). */
+export const SOCKET_OPEN_TIMEOUT_MS = 10_000;
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 export type Input = DistributiveOmit<Action, "now">;
@@ -26,6 +29,8 @@ export class Runner {
   private readonly listeners = new Set<() => void>();
   private readonly aborts = new Map<number, AbortController>();
   private readonly sockets = new Map<number, WebSocket>();
+  /** The open deadline of each socket not yet open. */
+  private readonly opening = new Map<number, ReturnType<typeof setTimeout>>();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private cred: Credential | null = null;
   private readonly deps: RunnerDeps;
@@ -81,9 +86,12 @@ export class Runner {
         const ac = new AbortController();
         this.aborts.set(e.req.id, ac);
         const id = e.req.id;
-        const done = (result: Parameters<typeof this.dispatchResponse>[1]) =>
-          this.dispatchResponse(id, result);
+        const done = (result: FetchResult) => {
+          this.aborts.delete(id);
+          this.dispatch({ type: "response", id, result });
+        };
         if (token === null) {
+          // A generation already retired: the reducer discards the answer.
           queueMicrotask(() => done({ kind: "timeout" }));
           return;
         }
@@ -119,6 +127,8 @@ export class Runner {
         return;
       }
       case "close":
+        clearTimeout(this.opening.get(e.socket));
+        this.opening.delete(e.socket);
         this.sockets.get(e.socket)?.close();
         this.sockets.delete(e.socket);
         return;
@@ -142,11 +152,6 @@ export class Runner {
     }
   }
 
-  private dispatchResponse(id: number, result: import("./effects").FetchResult): void {
-    this.aborts.delete(id);
-    this.dispatch({ type: "response", id, result });
-  }
-
   private connect(id: number, ticket: string): void {
     let ws: WebSocket;
     try {
@@ -158,8 +163,22 @@ export class Runner {
       return;
     }
     this.sockets.set(id, ws);
+    // A socket that does not open in time is closed and counts as closed.
+    const deadline = setTimeout(() => {
+      this.opening.delete(id);
+      ws.onopen = null;
+      ws.onclose = null;
+      ws.close();
+      this.sockets.delete(id);
+      this.dispatch({ type: "socketClosed", socket: id });
+    }, SOCKET_OPEN_TIMEOUT_MS);
+    this.opening.set(id, deadline);
     // Every callback is bound to this socket's id; the reducer ignores a superseded one.
-    ws.onopen = () => this.dispatch({ type: "socketOpen", socket: id });
+    ws.onopen = () => {
+      clearTimeout(deadline);
+      this.opening.delete(id);
+      this.dispatch({ type: "socketOpen", socket: id });
+    };
     ws.onmessage = (ev: MessageEvent) => {
       if (typeof ev.data !== "string") return;
       let msg: unknown;
@@ -173,6 +192,8 @@ export class Runner {
       }
     };
     ws.onclose = () => {
+      clearTimeout(deadline);
+      this.opening.delete(id);
       this.sockets.delete(id);
       this.dispatch({ type: "socketClosed", socket: id });
     };
