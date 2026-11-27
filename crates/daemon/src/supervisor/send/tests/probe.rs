@@ -302,8 +302,8 @@ async fn session_start_beside_parked_writer() {
 }
 
 /// SF-5: the probe waits for a held `SendLaunch` until the facts deadline: released after the
-/// probe's `try_lock` failed, the facts; held past the deadline, `None`. The fence advances
-/// once either way.
+/// probe's `try_lock` failed (the holder joined there), the facts; held past the deadline,
+/// `None`. The fence advances once either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn state_wait() {
     let rig = SRig::new().await;
@@ -311,15 +311,23 @@ async fn state_wait() {
     let p = probe_of(&rig);
     let sl = rig.sl(&live);
     let word = || sl.fence.load(Ordering::SeqCst);
-    // Released while the probe waits.
-    let (free, holder) = hold_state(&sl);
-    set(&sl.hooks.state_contended, move || free.send(()).unwrap());
-    let w = word();
-    let (f, g) = intake(&p, live.l, 20, soon());
+    // Released (the holder gone) while the probe waits; the worker parked, so no other
+    // holder takes the state before the next attempt.
+    let (f, g, w) = rig
+        .worker_parked(&live, async {
+            let (free, holder) = hold_state(&sl);
+            set(&sl.hooks.state_contended, move || {
+                free.send(()).unwrap();
+                holder.join().unwrap();
+            });
+            let w = word();
+            let (f, g) = intake(&p, live.l, 20, soon());
+            (f, g, w)
+        })
+        .await;
     assert!(f.is_some(), "the facts after the release");
     assert_eq!(word(), w + (1 << OPEN_BITS) + 1, "advanced once");
     drop(g);
-    holder.join().unwrap();
     // Held past the facts deadline.
     let (free, holder) = hold_state(&sl);
     let w = word();
@@ -371,7 +379,9 @@ async fn pool_past_facts_deadline() {
     *rig.ingest.order.task_started.lock().unwrap() =
         Some(Box::new(|| std::thread::sleep(Duration::from_millis(700))));
     let ord = rig.next_ordinal(&live);
-    rig.hook(&live, "SessionStart", &json!({})).await;
+    // The worker parked through the intake, so its one attempt at the state meets no holder.
+    rig.worker_parked(&live, rig.hook(&live, "SessionStart", &json!({})))
+        .await;
     assert!(rig.ingest.order.task_started.lock().unwrap().is_none());
     assert_eq!(rig.sl(&live).latest_intake.load(Ordering::SeqCst), ord);
     assert_eq!(super::evidence::evidences(&rig, &live), ["session_start"]);

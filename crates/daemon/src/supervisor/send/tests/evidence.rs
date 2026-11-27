@@ -748,8 +748,9 @@ async fn settle_limit_l11() {
 }
 
 /// A pass of a Codex launch's worker parked where its settle is due, its seam not yet in:
-/// `ready` asserted, the clock stopped, a turn's `UserPromptSubmit` and `Stop` in, the
-/// worker parked at a pass's `after_read`, and only then the clock moved `SETTLE` on (the
+/// `ready` asserted, the clock stopped, a turn's `UserPromptSubmit` and `Stop` in, a pass
+/// run to its end (so no pass that read before the `Stop` is still in flight), the worker
+/// parked at the next pass's `after_read`, and only then the clock moved `SETTLE` on (the
 /// pass reads its `now` after the point). No earlier pass can settle.
 struct DuePass {
     rig: SRig,
@@ -769,6 +770,7 @@ impl DuePass {
     async fn new() -> DuePass {
         let (rig, live) = settle_rig().await;
         turn(&rig, &live, "p").await;
+        rig.pass(&live).await;
         let sl = rig.sl(&live);
         let ordinal = sl.latest_intake.load(Ordering::SeqCst);
         let (read_tx, read) = std::sync::mpsc::channel();

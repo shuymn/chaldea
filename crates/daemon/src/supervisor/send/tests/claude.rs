@@ -690,7 +690,10 @@ async fn published_at_facts_deadline() {
         }
     }));
     let hook = own(&rig, &live, &fixture("plain-turn", "SessionStart-1"));
-    assert_eq!(rig.post(&hook).await.status, 200);
+    // The worker parked through the intake: the start commit's wake cannot have it hold the
+    // state during the intake's one remaining attempt.
+    let r = rig.worker_parked(&live, rig.post(&hook)).await;
+    assert_eq!(r.status, 200);
     assert!(
         crate::supervisor::lock(&entry.hooks.final_wake).is_none(),
         "the final wake ran"

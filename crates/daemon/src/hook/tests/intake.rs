@@ -528,10 +528,13 @@ async fn deadline_before_ordinal() {
 
 /// SF-9: the request deadline passing just before the start point's claim (the request
 /// clock read after it): the claim takes nothing, so a `UserPromptSubmit` is 408 with the
-/// launch's next ordinal, its fence word, and its `latest_intake` unchanged.
+/// launch's next ordinal, its fence word, and its `latest_intake` unchanged. The clock moves
+/// only once the handler's timer for the intake's join is set (on the stopped clock, a day
+/// away), so no timer cancels the request first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deadline_at_claim() {
     use crate::supervisor::send::tests::SRig;
+    use std::sync::atomic::AtomicUsize;
     let rig = SRig::new().await;
     let live = rig.claude().await;
     let sl = rig.sl(&live);
@@ -540,9 +543,21 @@ async fn deadline_at_claim() {
         sl.latest_intake.load(Ordering::SeqCst),
         rig.ingest.order.next(live.l),
     );
+    let s = shared(&rig.srv);
+    let before_join = Arc::new(AtomicUsize::new(usize::MAX));
+    let (s1, b1) = (s.clone(), before_join.clone());
+    *rig.ingest.order.after_lock.lock().unwrap() = Some(Box::new(move || {
+        b1.store(s1.faults.timers().len(), Ordering::SeqCst);
+    }));
     let clock = rig.clock.clone();
-    *rig.ingest.order.before_claim.lock().unwrap() =
-        Some(Box::new(move || clock.advance(Duration::from_secs(3600))));
+    *rig.ingest.order.before_claim.lock().unwrap() = Some(Box::new(move || {
+        let end = Instant::now() + Duration::from_secs(10);
+        while s.faults.timers().len() <= before_join.load(Ordering::SeqCst) {
+            assert!(Instant::now() < end, "the join's timer was set");
+            std::thread::yield_now();
+        }
+        clock.advance(Duration::from_secs(3600));
+    }));
     let r = rig
         .post(&rig.hook_of(
             &live,
@@ -584,9 +599,10 @@ async fn drop_after_ordinal() {
     env.stop().await;
 }
 
-/// SF-9: the request deadline passing while the probe waits: on tokio's paused time, moved
-/// past the deadline, the deadline's timer answers 408 while the probe is still held;
-/// released, the intake finishes once with no marks and its ordinal is a gap.
+/// SF-9: the request deadline passing while the probe waits: on tokio's time, paused before
+/// the request and moved past the deadline once the probe holds, the deadline's timer
+/// answers 408 while the probe is still held; released, the intake finishes once with no
+/// marks and its ordinal is a gap.
 #[tokio::test]
 async fn deadline_during_wait() {
     let srv = TestServer::start_with(Mounts::mvp(), |c| {
@@ -596,9 +612,9 @@ async fn deadline_during_wait() {
     let env = Env::on(srv);
     let (entered, go, hold) = gate();
     *env.counting.latch.lock().unwrap() = Some(hold);
+    tokio::time::pause();
     let mut req = env.spawn(l());
     reached_sync(entered).await;
-    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(6)).await;
     tokio::time::resume();
     let r = waits::bounded(WAIT, &mut req)
