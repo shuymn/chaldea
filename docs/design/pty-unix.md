@@ -116,7 +116,7 @@ Validation gives early, classified errors; correctness does not depend on it, be
    A `pre_exec` closure makes std fork rather than `posix_spawn` (`:459-467`). The child is a session and group leader (pid = pgid = sid) whose controlling terminal is the slave, with only fds 0–2, default signal state, in `spec.cwd`, with exactly `spec.env`: nothing is added, so a spec without `SHELL` runs without it. Cost: the sweep takes about 0.08 µs per fd slot below `bound` (F7): under 1 ms at the launchd default of 256 or at 10 240, about 20 ms at the 245 760 ceiling of this host. This is work, not a deadline: `spawn` has none, and it returns once the lock is free and std's handshake ends.
    - **`Err(e)`**: the program never executed. std reports a failure of `chdir`, `pre_exec`, or `execvp` through its close-on-exec error pipe and waits for (reaps) the forked child before it returns (`:136-160`), so no process remains (F5). This is the positive evidence `NeverStarted` requires. `kind`: `ENOENT` → `NotFound` if `metadata(argv[0])` now fails with `NotFound` (symlinks followed, so a removed link target counts; any other error, such as a directory without search permission, leaves the cause open), else `Setup` (a missing cwd or interpreter); `EACCES` → `PermissionDenied`; other (a `pre_exec` failure included) → `Setup`. Release: drop the parent's slave and the writer, close the control, `Drain::finish(2 s)` (the master reads EOF once the parent's slave is gone); `Cleanup::Confirmed` when the drain ended, else `Unresolved { kill: None, close: Some(..), drain_abandoned: true }`.
    - **`Ok(child)`**: std's handshake read EOF, so the child either exec'd or died before exec (a default-action signal after step 4). Given `SpawnSpec`'s precondition that `argv[0]` is a native executable (`backend.rs:34`), an exec runs the CLI; a file without a known format would instead run under `/bin/sh` (`execvp`'s `ENOEXEC` rule, F6), which is outside that precondition. So `Ok` does not prove that the program ran: a child that died before exec (a signal pending across the fork whose default action ends the process, delivered when step 4 clears the mask) appears in stage 5 as an exited leader, and the session reports that exit. The pid is taken from `child.id()`, the `std::process::Child` is dropped without waiting (std never waits for it), and the `UnixChild` guard (§2.4) is built at once. From here every failure is `StartedThenFailed`.
-5. **Settle.** Drop the parent's slave (EOF then reaches the drain when the tree's last slave holder closes it, PR2 §2.1). Read the leader's identity with `proc_pidinfo(pid, PROC_PIDTBSDINFO, arg 1)`, which also returns a leader that already exited (F10), so a CLI that exits at once still gets an identity and a normal exit. `group` is the pid (`pre_exec` ran `setsid` or the spawn failed). Failure (any error from that read): `StartedThenFailed { stage: "identity", identity: None }`, released by `SpawnedParts::teardown` (`backend.rs:268-290`): `kill_tree(&[], 5 s)` (the owned group, §2.5), drop the writer, close the control, `Drain::finish(2 s)`, with its `Cleanup`.
+5. **Settle.** Drop the parent's slave (EOF then reaches the drain when the tree's last slave holder closes it, PR2 §2.1). Read the leader's identity with `proc_pidinfo(pid, PROC_PIDTBSDINFO, arg 1)`, which also returns a leader that already exited (F10), so a CLI that exits at once still gets an identity and a normal exit. `group` is the pid (`pre_exec` ran `setsid` or the spawn failed). Failure (any error from that read): `StartedThenFailed { stage: "identity", identity: None }`, released by `SpawnedParts::teardown` (`backend.rs:314-345`): `kill_tree(&[], 5 s)` (the owned group, §2.5), drop the writer, close the control, `Drain::finish(2 s)`, with its `Cleanup`.
 6. **Hand over** `SpawnedPty::new(SpawnedParts { child: Arc<UnixChild>, output, input: Box<MasterWriter>, control: Box<UnixControl>, size: spec.size, evidence: vec![] })`.
 
 The Unix backend reports no `evidence`; a key added later is additive. A `spawn` has no deadline of its own: it waits for `SPAWN_LOCK`, the forked child does bounded work before `exec`, and std returns once `exec` succeeded or failed; under the spawn rule nothing else holds the handshake open.
@@ -149,18 +149,18 @@ So after a close the drain returns what the master can deliver at once, at most 
    - after `EAGAIN`: `poll([wake: IN, master: OUT])`, no timeout, `EINTR` repeats (a `cfg(test)` hook and the `fake` counter `unix_writer_polls` mark the entry into this `poll`). Nonzero wake `revents` is checked first and ends the call as `closed` does. Master `POLLOUT`, `POLLHUP`, or `POLLERR` retries the `write` (a hangup then fails `EIO`, F15, and ends the call as above; nothing spins); master `POLLNVAL` ends the call with `other("pty master invalid")` under the same progress rule.
 3. `flush()` returns `Ok(())`: nothing is buffered.
 
-So the seam keeps whole-write-or-fail semantics on the nonblocking master: a short count is returned only after progress followed by close or an error, and the error, if any, comes on the next call. During `Session::close` a wake-interrupted short write settles through PR 2's next permission check as `Incomplete { error: "closed" }` without another `write` (`writer.rs:851-866`). A write blocked on a CLI that stopped reading ends at close step 4 (PR2 §2.2) instead of holding the writer thread. A slave in canonical mode never blocks the writer: the line discipline discards input beyond its buffer (F14), which is the terminal's behaviour, not the backend's. Dropping a `MasterWriter` closes its duplicate and writes nothing.
+So the seam keeps whole-write-or-fail semantics on the nonblocking master: a short count is returned only after progress followed by close or an error, and the error, if any, comes on the next call. During `Session::close` a wake-interrupted short write settles through PR 2's next permission check as `Incomplete { error: "closed" }` without another `write` (`writer.rs:996-1014`). A write blocked on a CLI that stopped reading ends at close step 4 (PR2 §2.2) instead of holding the writer thread. A slave in canonical mode never blocks the writer: the line discipline discards input beyond its buffer (F14), which is the terminal's behaviour, not the backend's. Dropping a `MasterWriter` closes its duplicate and writes nothing.
 
 ### 2.4 Child: Ownership, Exit, Reaping
 
 ```rust
 struct UnixChild {
-    pid: u32,
+    own: Ownership,                      // the leader's pid, its recorded start (None during a stage 5 failure), and
+                                         // `lost: AtomicBool`: ownership of its wait status was lost; never cleared
     identity: ProcessIdentity,           // start_time empty only during a stage 5 failure
-    start: Option<u64>,                  // the recorded start; None in that case
     exit: OnceLock<ChildExit>,
-    lost: AtomicBool,                     // ownership of the leader's wait status was lost; never cleared
     kill: Mutex<KillState>,               // targets kept across calls (§2.5); wait_timeout never takes it
+    me: u32,                             // the daemon's own pid
 }
 ```
 
@@ -186,14 +186,14 @@ A reaper racing between `owned()` and the signal is a broken precondition, not a
 ```rust
 impl PtyChild for UnixChild { fn kill_tree(&self, extra: &[ProcessIdentity], lock_by: Instant, deadline: Instant) -> KillReport; }
 
-pub(crate) struct Proc { pid: u32, ppid: u32, pgid: u32, start: u64 }
+pub(crate) struct Proc { pid: u32, ppid: u32, pgid: u32, start: u64, name: [u8; 32] }
 pub(crate) enum Lookup { Live(Proc), Zombie(u64), Gone, Unreadable }   // PROC_PIDTBSDINFO arg 1: SZOMB (with start), ESRCH;
                                                                        // refused: PROC_PIDT_SHORTBSDINFO SZOMB → Zombie(0), else Unreadable
 pub(crate) trait Os {
-    fn owned(&self, deadline: Instant) -> (bool, Option<Lookup>);   // with the leader record it read
-    fn pid_list(&self, capacity: usize) -> io::Result<(Vec<u32>, bool)>;   // (pids, saturated)
+    fn owned(&self, deadline: Instant) -> (bool, Option<Lookup>); fn lost(&self) -> bool;   // owned: with the leader record it read
+    fn pid_count(&self) -> io::Result<usize>; fn pid_list(&self, capacity: usize) -> io::Result<(Vec<u32>, bool)>;   // (pids, saturated)
     fn lookup(&self, pid: u32) -> Lookup;
-    fn getsid(&self, pid: u32) -> Result<u32, Errno>;
+    fn getsid(&self, pid: u32) -> Result<u32, i32>;                 // the errno
     fn killpg(&self, pgid: u32, sig: Sig);
     fn kill(&self, pid: u32, sig: Sig);
     fn now(&self) -> Instant;
@@ -253,13 +253,13 @@ The proof covers the original session (while owned), every descendant of a cover
 **Never a reused pid.**
 
 - Group and session targets are numeric only right after `owned()`, which ties `L` to the recorded leader; after loss there are none.
-- A per-pid signal follows a lookup of the same pid that showed the recorded start. **Residual window:** the process can exit, be reaped by its parent, and the pid be handed to another process between that lookup and the `kill(2)`. macOS allocates pids sequentially (F17), so this needs the pid space to wrap while the daemon is descheduled between two syscalls; nothing bounds the descheduling, and macOS has no pidfd to close the gap. This is the spike's recheck rule (`os/unix.rs:127-133`, spike §4.6), kept as is. testkit's `Cleanup` has the same window.
+- A per-pid signal follows a lookup of the same pid that showed the recorded start. **Residual window:** the process can exit, be reaped by its parent, and the pid be handed to another process between that lookup and the `kill(2)`. macOS allocates pids sequentially (F17), so this needs the pid space to wrap while the daemon is descheduled between two syscalls; nothing bounds the descheduling, and macOS has no pidfd to close the gap. This is the spike's recheck rule (`os/unix.rs:127-133`, spike §4.6). testkit's `Cleanup` has the same window.
 - A pass is not atomic: a pid can be reused between the list and its lookup, or between a parent's and a child's lookup within one pass, so a descendant can be attributed to a parent that has just been replaced. The same wraparound bounds this.
 
 ### 2.6 Control
 
 ```rust
-struct UnixControl { master: OwnedFd, wake: Arc<Wake>, wake_write: PipeWriter }   // PtyControl
+struct UnixControl { master: OwnedFd, wake: Arc<Wake>, wake_write: Option<PipeWriter> }   // PtyControl
 ```
 
 - `resize(size)`: `tcsetwinsize(&master, { ws_row, ws_col, ws_xpixel: cols × 8, ws_ypixel: rows × 16 })`; the kernel sends `SIGWINCH` to the foreground group (F1). The `io::Error` keeps its errno. Never blocks.
@@ -267,7 +267,7 @@ struct UnixControl { master: OwnedFd, wake: Arc<Wake>, wake_write: PipeWriter } 
 
 ### 2.7 The `unsafe` Carve-Out (PR2 D7)
 
-`crates/pty-runtime/Cargo.toml` gets its own `[lints]` table: `[lints.rust] unsafe_code = "deny"`, `unsafe_op_in_unsafe_fn = "deny"`; `[lints.clippy]` the workspace's clippy set restated with the same values, plus `undocumented_unsafe_blocks = "deny"` and `multiple_unsafe_ops_per_block = "deny"`. `deny`, because the workspace's `forbid` cannot be lifted by an `#[allow]`; restated, because Cargo's `[lints] workspace = true` cannot be combined with crate-local keys. Every other crate keeps `[lints] workspace = true` with `forbid`.
+`crates/pty-runtime/Cargo.toml` has its own `[lints]` table: `[lints.rust] unsafe_code = "deny"`, `unsafe_op_in_unsafe_fn = "deny"`; `[lints.clippy]` the workspace's clippy set restated with the same values, plus `undocumented_unsafe_blocks = "deny"` and `multiple_unsafe_ops_per_block = "deny"`. `deny`, because the workspace's `forbid` cannot be lifted by an `#[allow]`; restated, because Cargo's `[lints] workspace = true` cannot be combined with crate-local keys. Every other crate keeps `[lints] workspace = true` with `forbid`.
 
 Exactly one module is allowed `unsafe`: `#[allow(unsafe_code)] pub(crate) mod sys;` in `src/unix/mod.rs` (crate-visible so that `host` (docs/design/daemon-lifecycle.md §2.2) calls its safe functions too). Everything else, the kill engine included, is safe code over rustix and std. `sys` exposes safe functions only:
 
@@ -547,7 +547,7 @@ Checked on a real macOS host (and `macos-latest` CI) by `cargo test -p chaldea-t
 
 **D7. The public additions are `native()` and `with_spawn_lock()`.** The lock takes a closure, not a `&mut std::process::Command`, so `tokio::process` and process-wrap spawns run under it too. Process identity lookup stays internal, reachable by tests through the `fake` feature; PR 9 adds the public lookup for hook binding, its first consumer (`docs/design/hook-ingest.md` §2.5).
 
-**D8. FakeCli is library code with a thin binary, reports over loopback TCP with `ping`/`pong`, and lifts a mode only with the PR that first tests it.** Its real-PTY tests are testkit integration tests, so Cargo locates the binary. `stall`, `banner`, hooks, the `mcp` role, and attach input parsing are still to come (§2.8).
+**D8. FakeCli is library code with a thin binary, reports over loopback TCP with `ping`/`pong`, and lifts a mode only with the PR that first tests it.** Its real-PTY tests are testkit integration tests, so Cargo locates the binary. `stall`, `banner`, hooks, the `mcp` role, and attach input parsing come with the PRs that first test them (§2.8).
 
 **D9. Validation classifies early; the forked child decides.** The checks of §2.2 give typed errors; any failure found after the fork is still `NeverStarted`, because std reports it before `exec` succeeds and reaps the child.
 
