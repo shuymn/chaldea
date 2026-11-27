@@ -9,6 +9,7 @@ mod panic;
 mod refuse;
 mod resume;
 
+use std::cell::Cell;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,10 +27,14 @@ use super::tailer::{binding_view, commit};
 use crate::store::tests::support::{self, TestStore};
 use crate::store::{NewEvent, TranscriptBatch, TranscriptCursor};
 
-/// The store side over a test store, with a hook between a poll's read and its checks.
+/// The store side over a test store, with hooks between a poll's read and its checks and
+/// before a batch of lines is committed, and generation commits that fail on demand.
 pub(crate) struct TestBackend<'a> {
     pub(crate) store: &'a TestStore,
     pub(crate) after_read: Box<dyn Fn() + 'a>,
+    pub(crate) before_commit: Box<dyn Fn() + 'a>,
+    /// Generation commits still to fail as a full queue would.
+    pub(crate) fail_generations: Cell<u32>,
 }
 
 impl Backend for TestBackend<'_> {
@@ -44,6 +49,12 @@ impl Backend for TestBackend<'_> {
     }
 
     fn commit(&self, batch: TranscriptBatch) -> Commit {
+        if batch.new_generation.is_none() {
+            (self.before_commit)();
+        } else if self.fail_generations.get() > 0 {
+            self.fail_generations.set(self.fail_generations.get() - 1);
+            return Commit::Failed("queue full (test)".into());
+        }
         commit(self.store.store(), batch)
     }
 
@@ -101,15 +112,24 @@ impl Fx {
     pub(crate) fn tail_of(&self, l: LaunchId) -> Tail {
         Tail::new(
             self.binding(l),
-            SpoolDir(self.store.dir().to_owned()),
+            SpoolDir::new(self.store.dir().to_owned()),
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    /// A tailer whose state directory holds at most `limit` spool files at once.
+    pub(crate) fn tail_with_spool_limit(&self, limit: usize) -> Tail {
+        let mut dir = SpoolDir::new(self.store.dir().to_owned());
+        dir.limit = Some(limit);
+        Tail::new(self.binding(self.l), dir, Arc::new(AtomicBool::new(false)))
     }
 
     pub(crate) fn backend(&self) -> TestBackend<'_> {
         TestBackend {
             store: &self.store,
             after_read: Box::new(|| {}),
+            before_commit: Box::new(|| {}),
+            fail_generations: Cell::new(0),
         }
     }
 

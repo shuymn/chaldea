@@ -1,6 +1,6 @@
 //! The transcript tailer in the supervisor (C1 D10): one per Claude launch, reading from its
-//! binding; the final read after the exit; joined by the shutdown participant before the
-//! store shuts down.
+//! binding; the final read after the exit, also at daemon shutdown; joined by the shutdown
+//! participant before the store shuts down, or reported as left running.
 
 use std::time::{Duration, Instant};
 
@@ -9,8 +9,11 @@ use chaldea_core::ids::{LaunchId, ThreadId};
 use serde_json::json;
 
 use super::{Rig, json};
+use crate::lifecycle::ParticipantEnd;
 use crate::store::tests::support;
+use crate::supervisor::Pause;
 use crate::supervisor::components::shutdown;
+use crate::transcript::DROPPED_OFF_BLOCKING;
 
 const LINE: &str =
     "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n";
@@ -71,9 +74,10 @@ async fn starts_at_binding_and_stops_at_shutdown() {
         .await;
     let end = rig.sup.now() + Duration::from_secs(2);
     let started = Instant::now();
-    shutdown(rig.sup.clone(), end).await;
+    assert_eq!(shutdown(rig.sup.clone(), end).await, ParticipantEnd::Clean);
     assert!(started.elapsed() < Duration::from_secs(10));
     assert!(rig.sup.tailers.launches().is_empty());
+    assert!(!DROPPED_OFF_BLOCKING.lock().unwrap().contains(&l));
     let (_, mut store) = rig.srv.into_store(Duration::from_secs(10)).await;
     let report = store.shutdown();
     assert!(report.readers_returned, "{report:?}");
@@ -110,4 +114,73 @@ async fn the_final_read_follows_the_exit() {
     let (_t2, _l2) = rig.spawn_codex(None).await;
     assert!(rig.sup.tailers.launches().is_empty());
     rig.srv.stop().await;
+}
+
+/// Bind `l` of `t` to a new transcript holding `body`, in a temp directory the caller keeps.
+async fn bind(rig: &Rig, t: ThreadId, l: LaunchId, body: &str) -> tempfile::TempDir {
+    let files = tempfile::tempdir().unwrap();
+    let path = files.path().join("session.jsonl");
+    std::fs::write(&path, body).unwrap();
+    rig.srv
+        .append(vec![support::bound(
+            t,
+            l,
+            "s1",
+            Some(&path.to_string_lossy()),
+        )])
+        .await;
+    files
+}
+
+/// At daemon shutdown the participant records the exit, then the tailer makes its final
+/// read within the budget: the trailing fragment is stored as `partial_line`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_shutdown_makes_the_final_read() {
+    let rig = rig().await;
+    let (t, l) = spawn_claude(&rig).await;
+    let _files = bind(&rig, t, l, &[LINE, "{\"type\""].concat()).await;
+    rig.until("the line is stored", || texts(&rig, t) == ["ok"])
+        .await;
+    let end = rig.sup.now() + Duration::from_secs(5);
+    assert_eq!(shutdown(rig.sup.clone(), end).await, ParticipantEnd::Clean);
+    assert!(rig.launch(l).exit_reason.is_some());
+    assert_eq!(texts(&rig, t), ["ok", "raw:partial_line"]);
+    assert!(rig.sup.tailers.launches().is_empty());
+    rig.srv.stop().await;
+}
+
+/// A tailer holding a store reader past the participant's end: the participant answers
+/// `LeftRunning` and the tailer is still there; once the read returns, the tailer ends and
+/// the store shuts down with every reader returned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tailer_holding_a_reader_at_the_end_is_left_running() {
+    let rig = rig().await;
+    let read = rig.pauses.arm(Pause::TailerRead);
+    let (_t, l) = spawn_claude(&rig).await;
+    let read = tokio::task::spawn_blocking(move || {
+        read.wait();
+        read
+    })
+    .await
+    .unwrap();
+    // A budget the launch's close fits in, so only the tailer is left.
+    let end = rig.sup.now() + Duration::from_secs(2);
+    assert_eq!(
+        shutdown(rig.sup.clone(), end).await,
+        ParticipantEnd::LeftRunning
+    );
+    assert!(
+        rig.sup
+            .tracker
+            .empty_before(rig.sup.now() + Duration::from_secs(1))
+            .await
+    );
+    assert_eq!(rig.sup.tailers.launches(), [l]);
+    read.go();
+    rig.until("the tailer ended", || rig.sup.tailers.launches().is_empty())
+        .await;
+    let (_, mut store) = rig.srv.into_store(Duration::from_secs(10)).await;
+    let report = store.shutdown();
+    assert!(report.readers_returned, "{report:?}");
+    assert_eq!(report.readers_abandoned, 0);
 }

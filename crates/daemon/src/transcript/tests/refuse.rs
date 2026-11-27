@@ -1,5 +1,5 @@
 //! C1-9: a transcript path that is not an absolute regular file is never read, and the
-//! poll returns at once: the store keeps serving.
+//! poll returns at once: the store keeps serving. A missing file is read once it appears.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -62,4 +62,16 @@ fn a_device_namespace_path_ends_the_tailer() {
         let fx = Fx::at(|_| PathBuf::from(p));
         assert!(matches!(poll_once(&fx), Step::End(_)), "{p}");
     }
+}
+
+/// A path that does not exist yet is retried, and read once the file appears.
+#[test]
+fn a_missing_file_is_read_once_it_appears() {
+    let fx = Fx::new();
+    assert_eq!(poll_once(&fx), Step::Wait);
+    let mut tail = fx.tail();
+    assert_eq!(tail.poll(&fx.backend()), Step::Wait);
+    fx.write(super::assistant("late").as_bytes());
+    assert_eq!(fx.settle(&mut tail), Step::Wait);
+    assert_eq!(super::shorts(&fx.events()), ["generation:1", "text:late"]);
 }

@@ -13,4 +13,6 @@ mod tailer;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use tailer::{TAIL_POLL, Tailers};
+#[cfg(test)]
+pub(crate) use read::DROPPED_OFF_BLOCKING;
+pub(crate) use tailer::{Mode, TAIL_POLL, Tailers};

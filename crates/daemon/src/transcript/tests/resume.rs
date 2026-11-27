@@ -1,6 +1,6 @@
 //! C1-10, tailer half: the final read after `launch_exited` (a trailing partial line, a
-//! flaky read), a resume that continues the generation, and a resume reserved before the
-//! final read.
+//! flaky read), a resume that continues the generation, and a resume reserved before or
+//! during the final read.
 
 use super::{Fx, TestBackend, assistant, shorts};
 use crate::store::tests::support;
@@ -139,7 +139,7 @@ fn a_resume_continues_the_same_generation() {
 /// `StaleBinding` ends it with nothing stored, and the next launch's tailer reads those
 /// bytes from the cursor.
 #[test]
-fn a_resume_before_the_final_read_is_stale_binding() {
+fn a_resume_reserved_after_the_final_read_is_stale_binding() {
     let fx = Fx::new();
     fx.write(assistant("one").as_bytes());
     let mut first = fx.tail();
@@ -148,8 +148,8 @@ fn a_resume_before_the_final_read_is_stale_binding() {
     fx.add(vec![support::exited(fx.t, fx.l)]);
     let l2 = support::launch(2);
     let be = TestBackend {
-        store: &fx.store,
         after_read: Box::new(|| fx.add(vec![support::reserved(fx.t, l2)])),
+        ..fx.backend()
     };
     let end = first.poll(&be);
     assert!(
@@ -164,6 +164,39 @@ fn a_resume_before_the_final_read_is_stale_binding() {
     ]);
     let mut next = fx.tail_of(l2);
     fx.settle(&mut next);
+    assert_eq!(
+        shorts(&fx.events()),
+        ["generation:1", "text:one", "text:two"]
+    );
+}
+
+/// A resume reserved before the old tailer's final read: the poll ends it with nothing
+/// read or stored, and the next launch's tailer reads those bytes from the cursor.
+#[test]
+fn a_resume_reserved_before_the_final_read_ends_it() {
+    let fx = Fx::new();
+    fx.write(assistant("one").as_bytes());
+    let mut first = fx.tail();
+    fx.settle(&mut first);
+    fx.append(assistant("two").as_bytes());
+    let l2 = support::launch(2);
+    fx.add(vec![
+        support::exited(fx.t, fx.l),
+        support::reserved(fx.t, l2),
+    ]);
+    let end = first.poll(&fx.backend());
+    assert!(
+        matches!(&end, Step::End(why) if why.contains("no longer the bound one")),
+        "{end:?}"
+    );
+    assert_eq!(shorts(&fx.events()), ["generation:1", "text:one"]);
+    let path = fx.path.to_string_lossy().into_owned();
+    fx.add(vec![
+        support::started(fx.t, l2),
+        support::bound(fx.t, l2, "s1", Some(&path)),
+    ]);
+    let mut next = fx.tail_of(l2);
+    assert_eq!(fx.settle(&mut next), Step::Wait);
     assert_eq!(
         shorts(&fx.events()),
         ["generation:1", "text:one", "text:two"]

@@ -86,3 +86,17 @@ fn text_is_decoded_intact() {
         ["generation:1", "text:日本語\n😀 か\u{3099}"]
     );
 }
+
+/// A line's `promptId` becomes the event's `turn_ref`; without one it is null.
+#[test]
+fn the_prompt_id_is_the_turn_ref() {
+    let fx = Fx::new();
+    let with = assistant("a").replacen("{", "{\"promptId\":\"p1\",", 1);
+    fx.write([with, assistant("b")].concat().as_bytes());
+    let mut tail = fx.tail();
+    fx.settle(&mut tail);
+    let evs = fx.events();
+    assert_eq!(shorts(&evs), ["generation:1", "text:a", "text:b"]);
+    assert_eq!(evs[1].payload["turn_ref"], "p1");
+    assert!(evs[2].payload["turn_ref"].is_null());
+}

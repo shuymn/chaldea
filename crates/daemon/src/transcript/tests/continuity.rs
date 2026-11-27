@@ -97,8 +97,8 @@ fn truncation_while_a_batch_is_read_discards_it() {
         fx.settle(&mut tail);
         fx.append(appended.as_bytes());
         let be = TestBackend {
-            store: &fx.store,
             after_read: Box::new(|| truncate(&fx, 5)),
+            ..fx.backend()
         };
         assert_eq!(tail.poll(&be), Step::Again);
         assert_eq!(tail.stats.discarded, 1);
@@ -130,8 +130,8 @@ fn a_file_shrinking_below_the_advance_is_discarded() {
     fx.append([two.as_str(), &assistant("three")].concat().as_bytes());
     let keep = (one.len() + two.len()) as u64;
     let be = TestBackend {
-        store: &fx.store,
         after_read: Box::new(|| truncate(&fx, keep)),
+        ..fx.backend()
     };
     assert_eq!(tail.poll(&be), Step::Again);
     assert_eq!(
@@ -176,4 +176,121 @@ fn a_replaced_file_starts_a_generation() {
     assert_eq!(c.generation, 2);
     assert_ne!(c.file_id, old_id);
     assert_eq!(evs[2].payload["file_id"], c.file_id.as_str());
+}
+
+/// A truncate or replace after the checks before a commit and before the commit itself: the
+/// batch commits and stays in history, the check after the commit finds the break, and the
+/// next poll starts a new generation even when the file has grown past the old offset
+/// again. For a batch with an event and one that only advances the cursor.
+#[test]
+fn a_break_during_a_commit_starts_a_generation_after_it() {
+    for (appended, kept) in [
+        (assistant("two"), Some("text:two")),
+        (MODE.to_owned(), None),
+    ] {
+        for replace in [false, true] {
+            let fx = Fx::new();
+            fx.write(assistant("one").as_bytes());
+            let mut tail = fx.tail();
+            fx.settle(&mut tail);
+            fx.append(appended.as_bytes());
+            let be = TestBackend {
+                before_commit: Box::new(|| {
+                    if replace {
+                        let other = fx.files.path().join("other.jsonl");
+                        std::fs::write(&other, b"").unwrap();
+                        std::fs::rename(&other, &fx.path).unwrap();
+                    } else {
+                        truncate(&fx, 0);
+                    }
+                }),
+                ..fx.backend()
+            };
+            assert_eq!(tail.poll(&be), Step::Again, "replace: {replace}");
+            assert_eq!(tail.stats.late, 1);
+            let mut want = vec!["generation:1", "text:one"];
+            want.extend(kept);
+            assert_eq!(shorts(&fx.events()), want);
+            // Longer than the committed offset, written in place (or into the new file).
+            let body = [assistant("three"), assistant("four"), assistant("five")].concat();
+            assert!(body.len() > assistant("one").len() + appended.len());
+            fx.write(body.as_bytes());
+            assert_eq!(fx.settle(&mut tail), Step::Wait);
+            want.extend(["generation:2", "text:three", "text:four", "text:five"]);
+            assert_eq!(shorts(&fx.events()), want, "replace: {replace}");
+        }
+    }
+}
+
+/// A break found while the generation that answers it fails to commit is kept: the original
+/// prefix written back in place does not let the next open continue the old generation.
+#[test]
+fn a_break_is_kept_when_its_generation_fails_to_commit() {
+    let fx = Fx::new();
+    let one = assistant("one");
+    fx.write(one.as_bytes());
+    let mut tail = fx.tail();
+    fx.settle(&mut tail);
+    fx.append(assistant("two").as_bytes());
+    let be = TestBackend {
+        after_read: Box::new(|| truncate(&fx, 5)),
+        fail_generations: std::cell::Cell::new(1),
+        ..fx.backend()
+    };
+    assert_eq!(tail.poll(&be), Step::Wait);
+    assert_eq!(shorts(&fx.events()), ["generation:1", "text:one"]);
+    fx.write(
+        [one, assistant("two"), assistant("three")]
+            .concat()
+            .as_bytes(),
+    );
+    assert_eq!(fx.settle(&mut tail), Step::Wait);
+    assert_eq!(
+        shorts(&fx.events()),
+        [
+            "generation:1",
+            "text:one",
+            "generation:2",
+            "text:one",
+            "text:two",
+            "text:three"
+        ]
+    );
+}
+
+/// A commit refused as `StaleCursor` (another tailer advanced the cursor meanwhile): the
+/// tailer reads the stored cursor and verifies the prefix from 0 again, here finding it
+/// rewritten.
+#[test]
+fn a_stale_cursor_verifies_the_prefix_again() {
+    let fx = Fx::new();
+    fx.write(assistant("one").as_bytes());
+    let mut first = fx.tail();
+    fx.settle(&mut first);
+    fx.append(assistant("two").as_bytes());
+    let other = std::cell::RefCell::new(fx.tail());
+    let be = TestBackend {
+        after_read: Box::new(|| {
+            assert_eq!(fx.settle(&mut other.borrow_mut()), Step::Wait);
+            overwrite(&fx, 0, assistant("One").as_bytes());
+        }),
+        ..fx.backend()
+    };
+    assert_eq!(first.poll(&be), Step::Again);
+    assert_eq!(
+        shorts(&fx.events()),
+        ["generation:1", "text:one", "text:two"]
+    );
+    assert_eq!(fx.settle(&mut first), Step::Wait);
+    assert_eq!(
+        shorts(&fx.events()),
+        [
+            "generation:1",
+            "text:one",
+            "text:two",
+            "generation:2",
+            "text:One",
+            "text:two"
+        ]
+    );
 }

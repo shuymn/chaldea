@@ -8,20 +8,24 @@
 //! read again and checked against the stored digest. Every poll, before any cursor advance,
 //! the path must still name the handle's file and the handle's size must not be below the
 //! offset the batch advances to (nor the read position). A failed check discards the batch
-//! and starts a new generation at offset 0; reading starts again from 0.
+//! and starts a new generation at offset 0; reading starts again from 0. The same check runs
+//! again after each commit: a truncate or replace between the check and the commit is
+//! detected there (or at the next poll's check), the committed batch stays in history, and
+//! the next poll starts a new generation. A detected break is kept until a new generation is
+//! stored, so a failed generation commit does not let a later open continue the old one.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chaldea_core::event::TypedEvent;
-use chaldea_core::ids::{Agent, LaunchId, ThreadId};
+use chaldea_core::ids::{Agent, LaunchId, ThreadId, Timestamp};
 use chaldea_core::payload::{AssistantMessage, RawUnknown, RawUnknownReason, SourceKind};
 use chaldea_pty_runtime::file::{OpenError, RegularFile, open_regular};
 use sha2::{Digest, Sha256};
 
-use super::acc::{ByteAcc, SpoolDir};
-use super::claude::{self, Line};
+use super::acc::{ByteAcc, Meter, SpoolDir};
+use super::claude::{Emit, LineParser, Outcome};
 use crate::store::{
     BlobInput, Continuity, CursorPos, NewGeneration, ReadPos, TranscriptBatch, TranscriptCursor,
     TranscriptLine,
@@ -96,10 +100,12 @@ pub(crate) enum Step {
 /// What tests observe of a tailer.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Stats {
-    /// The most bytes one line held in memory (its raw bytes and its text).
+    /// The most bytes one line held in memory at once (its raw bytes and its text).
     pub(crate) peak_line_memory: usize,
     /// Batches discarded by the checks before a commit.
     pub(crate) discarded: u32,
+    /// Breaks found by the check after a commit.
+    pub(crate) late: u32,
 }
 
 /// The stored cursor, as far as the tailer compares it.
@@ -185,10 +191,12 @@ pub(crate) struct Tail {
     stop: Arc<AtomicBool>,
     cursor: Option<Cursor>,
     open: Option<OpenFile>,
-    /// A check failed and the path could not be opened again: the next open starts a
-    /// generation whatever its continuity.
-    force_generation: bool,
+    /// The generation (0: none) whose continuity a check disproved: until a new generation
+    /// is stored, the next open starts one whatever its continuity.
+    disproved: Option<u64>,
     final_failures: u32,
+    /// The last poll's view had the launch's exit stored.
+    exited: bool,
     /// The last failure logged, so a repeated one is logged once.
     last_failure: Option<String>,
     pub(crate) stats: Stats,
@@ -202,8 +210,9 @@ impl Tail {
             stop,
             cursor: None,
             open: None,
-            force_generation: false,
+            disproved: None,
             final_failures: 0,
+            exited: false,
             last_failure: None,
             stats: Stats::default(),
         }
@@ -215,10 +224,18 @@ impl Tail {
             Ok(v) => v,
             Err(e) => return self.failed(&Fail::Store(e), false),
         };
+        self.exited = view.exited;
         if !view.current {
             return Step::End("the launch is no longer the bound one".into());
         }
         let stored = view.cursor.map(Cursor::from);
+        if self
+            .disproved
+            .is_some_and(|g| stored.as_ref().map_or(0, |c| c.generation) != g)
+        {
+            // Another job stored a generation.
+            self.disproved = None;
+        }
         if stored != self.cursor {
             // A cursor this tailer did not write (the first poll, a rebuild, another
             // tailer): open again and verify against it.
@@ -234,6 +251,11 @@ impl Tail {
             Err(Fail::Stopped) => Step::End("stopped".into()),
             Err(f) => self.failed(&f, view.exited),
         }
+    }
+
+    /// The last poll's view had the launch's exit stored (its read was a final read).
+    pub(crate) fn exited(&self) -> bool {
+        self.exited
     }
 
     fn failed(&mut self, f: &Fail, last: bool) -> Step {
@@ -283,12 +305,15 @@ impl Tail {
                 Ok(f) => f,
                 Err(end) => return Ok(end),
             };
-            if self.force_generation {
+            if self.disproved.is_some() {
                 return self.new_generation(be, f);
             }
             match self.verify(f)? {
                 Ok(open) => self.open = Some(open),
-                Err(f) => return self.new_generation(be, f),
+                Err(f) => {
+                    self.disprove();
+                    return self.new_generation(be, f);
+                }
             }
         }
         let Some(mut open) = self.open.take() else {
@@ -310,41 +335,22 @@ impl Tail {
             }
         };
         be.after_read();
-        // The checks before any cursor advance: the path still names the handle's file, and
-        // the handle's size is not below the read position or the batch's advance.
-        // A missing path or another file there disproves continuity; an open that fails
-        // otherwise proves nothing and is retried.
-        let same = match open_regular(std::path::Path::new(&self.b.path)) {
-            Ok(f) => f.id() == open.file.id(),
-            Err(OpenError::Io(e)) if e.kind() == io::ErrorKind::NotFound => false,
-            Err(OpenError::NotRegular) => false,
-            Err(OpenError::Io(e)) => {
+        match self.check(&open, batch.advance.max(start)) {
+            Check::Same => {}
+            Check::Unknown(e) => {
                 self.open = Some(open);
                 return Err(e.into());
             }
-            Err(OpenError::NotAbsolute | OpenError::DeviceNamespace) => {
-                return Ok(Step::End("the path cannot be read".into()));
+            Check::Disproved { replaced, size } => {
+                self.stats.discarded += 1;
+                drop(open);
+                self.disprove();
+                tracing::info!(thread = %self.b.thread_id, launch = %self.b.launch_id, replaced, size, "transcript continuity is disproved; a new generation starts");
+                return match self.open_path()? {
+                    Ok(f) => self.new_generation(be, f),
+                    Err(end) => Ok(end),
+                };
             }
-        };
-        let size = match open.file.size() {
-            Ok(n) => n,
-            Err(e) => {
-                self.open = Some(open);
-                return Err(e.into());
-            }
-        };
-        if !same || size < batch.advance.max(start) {
-            self.stats.discarded += 1;
-            drop(open);
-            tracing::info!(thread = %self.b.thread_id, launch = %self.b.launch_id, replaced = !same, size, "transcript continuity is disproved; a new generation starts");
-            return match self.open_path() {
-                Ok(Ok(f)) => self.new_generation(be, f),
-                Ok(Err(end)) => Ok(end),
-                Err(e) => {
-                    self.force_generation = true;
-                    Err(e)
-                }
-            };
         }
         if batch.lines.is_empty() && batch.advance == start {
             self.open = Some(open);
@@ -366,11 +372,18 @@ impl Tail {
             Commit::Done => {
                 open.digest = batch.digest;
                 open.pos = batch.advance;
-                self.open = Some(open);
                 if let Some(c) = &mut self.cursor {
                     c.read_offset = advance_to.read_offset;
                     c.continuity = advance_to.continuity;
                 }
+                // The check again: a truncate or replace after the one before the commit.
+                if let Check::Disproved { replaced, size } = self.check(&open, batch.advance) {
+                    self.stats.late += 1;
+                    self.disprove();
+                    tracing::info!(thread = %self.b.thread_id, launch = %self.b.launch_id, replaced, size, "transcript continuity broke while a batch was committed; the batch stays and a new generation starts");
+                    return Ok(Step::Again);
+                }
+                self.open = Some(open);
                 Ok(if batch.more {
                     Step::Again
                 } else if last && batch.eof {
@@ -389,6 +402,33 @@ impl Tail {
                 self.open = Some(open);
                 Err(Fail::Store(e))
             }
+        }
+    }
+
+    /// Records that the stored generation's continuity is disproved.
+    fn disprove(&mut self) {
+        self.disproved = Some(self.cursor.as_ref().map_or(0, |c| c.generation));
+    }
+
+    /// Whether the path still names `open`'s file and the handle's size is at least
+    /// `upto`. A missing path or another file there disproves continuity; an open that
+    /// fails otherwise proves nothing.
+    fn check(&self, open: &OpenFile, upto: u64) -> Check {
+        let same = match open_regular(std::path::Path::new(&self.b.path)) {
+            Ok(f) => f.id() == open.file.id(),
+            Err(OpenError::Io(e)) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(OpenError::NotRegular) => false,
+            Err(OpenError::Io(e)) => return Check::Unknown(e),
+            // Refused before the first open, so not seen here.
+            Err(OpenError::NotAbsolute | OpenError::DeviceNamespace) => false,
+        };
+        match open.file.size() {
+            Ok(size) if same && size >= upto => Check::Same,
+            Ok(size) => Check::Disproved {
+                replaced: !same,
+                size,
+            },
+            Err(e) => Check::Unknown(e),
         }
     }
 
@@ -478,7 +518,7 @@ impl Tail {
                     digest: Sha256::new(),
                     pos: 0,
                 });
-                self.force_generation = false;
+                self.disproved = None;
                 Ok(Step::Again)
             }
             Commit::StaleCursor => {
@@ -490,6 +530,53 @@ impl Tail {
             Commit::Failed(e) => Err(Fail::Store(e)),
         }
     }
+}
+
+/// Marks the thread as one of a tailer's blocking tasks while it lives (tests).
+#[cfg(test)]
+pub(crate) struct OnBlocking(bool);
+
+#[cfg(test)]
+thread_local! {
+    static ON_BLOCKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The launches whose `Tail` was dropped off a tailer's blocking task (tests).
+#[cfg(test)]
+pub(crate) static DROPPED_OFF_BLOCKING: std::sync::Mutex<Vec<LaunchId>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+impl OnBlocking {
+    pub(crate) fn enter() -> OnBlocking {
+        OnBlocking(ON_BLOCKING.replace(true))
+    }
+}
+
+#[cfg(test)]
+impl Drop for OnBlocking {
+    fn drop(&mut self) {
+        ON_BLOCKING.set(self.0);
+    }
+}
+
+#[cfg(test)]
+impl Drop for Tail {
+    fn drop(&mut self) {
+        if !ON_BLOCKING.get() {
+            DROPPED_OFF_BLOCKING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(self.b.launch_id);
+        }
+    }
+}
+
+/// What [`Tail::check`] found.
+enum Check {
+    Same,
+    Disproved { replaced: bool, size: u64 },
+    Unknown(io::Error),
 }
 
 /// One poll's lines.
@@ -540,51 +627,130 @@ impl Src<'_> {
     }
 }
 
-/// One line's bytes up to its newline (excluded), copied to `raw` and the digest as they
-/// are read.
-struct LineReader<'a, 'b> {
-    src: &'a mut Src<'b>,
-    raw: &'a mut ByteAcc,
-    digest: &'a mut Sha256,
-    stop: &'a AtomicBool,
+/// An event a line produces, with its blob and time.
+type LineEvent = (TypedEvent, Option<BlobInput>, Option<Timestamp>);
+
+/// A line [`next_line`] read.
+struct LineRead {
     /// The bytes before the newline.
     len: u64,
-    /// The newline was read.
     newline: bool,
-    done: bool,
+    event: Option<LineEvent>,
+    /// The most bytes the line held in memory at once.
+    peak: usize,
 }
 
-impl Read for LineReader<'_, '_> {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.done || out.is_empty() {
-            return Ok(0);
+/// Reads the next line from `src` and classifies it, extending `digest` with its bytes;
+/// `None` at the end of the file at a line start, or for a line still being written (not a
+/// final read).
+///
+/// The reading, the copy kept for `raw_unknown`, and the text's spools stay outside
+/// `lifecycle::recoverable`; only the parser's `feed` and `finish`, which do no I/O, run
+/// inside it.
+fn next_line(
+    src: &mut Src<'_>,
+    digest: &mut Sha256,
+    b: &Binding,
+    dir: &SpoolDir,
+    stop: &AtomicBool,
+    last: bool,
+    at: u64,
+) -> Result<Option<LineRead>, Fail> {
+    let meter = Meter::default();
+    let mut raw = ByteAcc::new(dir.clone(), meter.clone());
+    let mut text = ByteAcc::new(dir.clone(), meter.clone());
+    let mut aside: Option<ByteAcc> = None;
+    // `None` once the parser panicked.
+    let mut parser = Some(LineParser::default());
+    let mut emits = Vec::new();
+    let (mut len, mut newline) = (0u64, false);
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Err(Fail::Stopped);
         }
-        if self.stop.load(Ordering::Acquire) {
-            return Err(io::Error::other("stopped"));
+        if !src.fill()? {
+            break;
         }
-        if !self.src.fill()? {
-            self.done = true;
-            return Ok(0);
+        let avail = &src.buf[src.pos..src.end];
+        let upto = avail.iter().position(|&c| c == b'\n');
+        let piece = &avail[..upto.unwrap_or(avail.len())];
+        raw.push(piece)?;
+        digest.update(piece);
+        len += piece.len() as u64;
+        if let Some(p) = &mut parser {
+            if crate::lifecycle::recoverable(|| p.feed(piece, &mut emits)).is_err() {
+                parser = None;
+                emits.clear();
+            }
+            for e in emits.drain(..) {
+                match e {
+                    Emit::Text(v) => text.push(&v)?,
+                    Emit::Aside(v) => aside
+                        .get_or_insert_with(|| ByteAcc::new(dir.clone(), meter.clone()))
+                        .push(&v)?,
+                    Emit::KeepAside => {
+                        if let Some(a) = aside.take() {
+                            text.append(a)?;
+                        }
+                    }
+                    Emit::DropAside => aside = None,
+                }
+            }
         }
-        let avail = &self.src.buf[self.src.pos..self.src.end];
-        let upto = avail.iter().position(|&b| b == b'\n');
-        let n = upto.unwrap_or(avail.len()).min(out.len());
-        out[..n].copy_from_slice(&avail[..n]);
-        self.raw.push(&avail[..n])?;
-        self.digest.update(&avail[..n]);
-        self.src.pos += n;
-        self.len += n as u64;
-        if upto == Some(n) {
-            self.digest.update(b"\n");
-            self.src.pos += 1;
-            self.newline = true;
-            self.done = true;
+        src.pos += piece.len();
+        if upto.is_some() {
+            src.pos += 1;
+            digest.update(b"\n");
+            newline = true;
+            break;
         }
-        Ok(n)
     }
+    if !newline && (!last || len == 0) {
+        return Ok(None);
+    }
+    drop(aside);
+    let event = if newline {
+        let outcome = parser.map(|p| crate::lifecycle::recoverable(|| p.finish()));
+        match outcome {
+            Some(Ok(Outcome::Assistant {
+                occurred_at,
+                turn_ref,
+            })) => {
+                drop(raw);
+                let p = text.finish(TEXT)?;
+                Some((
+                    TypedEvent::AssistantMessage(AssistantMessage {
+                        text: p.content,
+                        turn_ref,
+                    }),
+                    p.blob,
+                    occurred_at,
+                ))
+            }
+            Some(Ok(Outcome::Skip)) => None,
+            Some(Ok(Outcome::Raw(reason))) => Some(raw_event(b, reason, raw)?),
+            Some(Err(_)) | None => {
+                tracing::warn!(thread = %b.thread_id, launch = %b.launch_id, offset = at, "the transcript line parser panicked; the line is kept as raw_unknown");
+                Some(raw_event(b, RawUnknownReason::SchemaMismatch, raw)?)
+            }
+        }
+    } else {
+        // A final read: the trailing fragment is kept verbatim.
+        Some(raw_event(b, RawUnknownReason::PartialLine, raw)?)
+    };
+    Ok(Some(LineRead {
+        len,
+        newline,
+        event,
+        peak: meter.peak(),
+    }))
 }
 
 /// Reads the lines after `open.pos` up to the batch bounds or the end of the file.
+///
+/// A batch closes after a line whose blob is spooled, so one write job holds at most one
+/// spool. A read or spool error after some progress closes the batch before the failed line
+/// (read again at the next poll).
 fn read_lines(
     open: &mut OpenFile,
     b: &Binding,
@@ -594,10 +760,12 @@ fn read_lines(
     stats: &mut Stats,
 ) -> Result<Batch, Fail> {
     open.file.seek(SeekFrom::Start(open.pos))?;
+    let start = open.pos;
     let mut digest = open.digest.clone();
     let mut at = open.pos;
     let mut lines = Vec::new();
     let mut memory = 0usize;
+    let mut spooled = false;
     let mut src = Src {
         file: &mut open.file,
         buf: vec![0u8; CHUNK].into_boxed_slice(),
@@ -609,7 +777,7 @@ fn read_lines(
         if stop.load(Ordering::Acquire) {
             return Err(Fail::Stopped);
         }
-        if lines.len() >= BATCH_LINES || memory >= BATCH_MEMORY {
+        if lines.len() >= BATCH_LINES || memory >= BATCH_MEMORY || spooled {
             return Ok(Batch {
                 lines,
                 advance: at,
@@ -618,85 +786,44 @@ fn read_lines(
                 eof: false,
             });
         }
-        if !src.fill()? {
-            break;
-        }
         let mut line_digest = digest.clone();
-        let mut raw = ByteAcc::new(dir.clone());
-        let mut lr = LineReader {
-            src: &mut src,
-            raw: &mut raw,
-            digest: &mut line_digest,
+        let (len, newline, event, peak) = match next_line(
+            &mut src,
+            &mut line_digest,
+            b,
+            dir,
             stop,
-            len: 0,
-            newline: false,
-            done: false,
-        };
-        let parsed = crate::lifecycle::recoverable(|| claude::parse(&mut lr, dir));
-        // Whatever the parser left of the line (after an error or a panic).
-        let drained = io::copy(&mut lr, &mut io::sink());
-        if stop.load(Ordering::Acquire) {
-            return Err(Fail::Stopped);
-        }
-        drained?;
-        let (len, newline) = (lr.len, lr.newline);
-        if !newline && !last {
-            // A line still being written: read again from its start at the next poll.
-            break;
-        }
-        let end = at + len + u64::from(newline);
-        let (event, occurred_at, held) = if newline {
-            match parsed {
-                Ok(Ok(Line::Assistant { text, occurred_at })) => {
-                    let held = raw.peak_mem.max(text.peak_mem);
-                    let p = text.finish(TEXT)?;
-                    (
-                        Some((
-                            TypedEvent::AssistantMessage(AssistantMessage {
-                                text: p.content,
-                                turn_ref: None,
-                            }),
-                            p.blob,
-                        )),
-                        occurred_at,
-                        held,
-                    )
-                }
-                Ok(Ok(Line::Skip)) => (None, None, raw.peak_mem),
-                Ok(Ok(Line::Raw(reason))) => {
-                    let held = raw.peak_mem;
-                    (Some(raw_event(b, reason, raw)?), None, held)
-                }
-                Ok(Err(e)) => return Err(e.into()),
-                Err(_panic) => {
-                    tracing::warn!(thread = %b.thread_id, launch = %b.launch_id, offset = at, "the transcript line parser panicked; the line is kept as raw_unknown");
-                    let held = raw.peak_mem;
-                    (
-                        Some(raw_event(b, RawUnknownReason::SchemaMismatch, raw)?),
-                        None,
-                        held,
-                    )
-                }
+            last,
+            at,
+        ) {
+            Ok(None) => break,
+            Ok(Some(LineRead {
+                len,
+                newline,
+                event,
+                peak,
+            })) => (len, newline, event, peak),
+            Err(Fail::Io(e)) if at > start => {
+                tracing::debug!(thread = %b.thread_id, launch = %b.launch_id, offset = at, error = %e, "a transcript line failed to read; the lines before it are committed");
+                return Ok(Batch {
+                    lines,
+                    advance: at,
+                    digest,
+                    more: true,
+                    eof: false,
+                });
             }
-        } else {
-            // A final read: the trailing fragment is kept verbatim.
-            if len == 0 {
-                break;
-            }
-            let held = raw.peak_mem;
-            (
-                Some(raw_event(b, RawUnknownReason::PartialLine, raw)?),
-                None,
-                held,
-            )
+            Err(e) => return Err(e),
         };
-        stats.peak_line_memory = stats.peak_line_memory.max(held);
+        stats.peak_line_memory = stats.peak_line_memory.max(peak);
         digest = line_digest;
-        if let Some((event, blob)) = event {
-            memory += match &blob {
-                Some(BlobInput::Bytes(v)) => v.len(),
-                _ => 0,
-            };
+        let end = at + len + u64::from(newline);
+        if let Some((event, blob, occurred_at)) = event {
+            match &blob {
+                Some(BlobInput::Bytes(v)) => memory += v.len(),
+                Some(BlobInput::Spooled(_)) => spooled = true,
+                None => {}
+            }
             lines.push(TranscriptLine {
                 offset_start: at,
                 offset_end: end,
@@ -721,11 +848,7 @@ fn read_lines(
 }
 
 /// A line kept verbatim.
-fn raw_event(
-    b: &Binding,
-    reason: RawUnknownReason,
-    raw: ByteAcc,
-) -> io::Result<(TypedEvent, Option<BlobInput>)> {
+fn raw_event(b: &Binding, reason: RawUnknownReason, raw: ByteAcc) -> io::Result<LineEvent> {
     let content_type = match reason {
         RawUnknownReason::Unparseable | RawUnknownReason::PartialLine => OCTET,
         _ => JSON,
@@ -741,5 +864,6 @@ fn raw_event(
             raw: p.content,
         }),
         p.blob,
+        None,
     ))
 }

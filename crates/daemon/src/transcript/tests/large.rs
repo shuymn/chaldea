@@ -105,13 +105,18 @@ fn lines_over_64_mib_are_stored_whole() {
     let sha = raw["sha256"].as_str().unwrap();
     assert_eq!(sha, sha_of(b'x', n));
     assert_eq!(download(&fx, sha), (sha_of(b'x', n), n as u64));
-    // One line never held more than the in-memory limit.
+    // The valid line held its raw bytes and its text in memory together (each up to the
+    // in-memory limit before its spool), and never more.
+    let peak = tail.stats.peak_line_memory;
     assert!(
-        tail.stats.peak_line_memory <= MAX_BLOB_BYTES,
-        "{}",
-        tail.stats.peak_line_memory
+        peak > MAX_BLOB_BYTES && peak <= 2 * MAX_BLOB_BYTES,
+        "{peak}"
     );
-    // No spool file is left in the state directory.
+    no_spools(&fx);
+}
+
+/// No spool file is left in the state directory.
+fn no_spools(fx: &Fx) {
     let spools: Vec<_> = std::fs::read_dir(fx.store.dir())
         .unwrap()
         .filter_map(Result::ok)
@@ -122,4 +127,66 @@ fn lines_over_64_mib_are_stored_whole() {
         })
         .collect();
     assert!(spools.is_empty(), "{spools:?}");
+}
+
+/// A block's `text` over 64 MiB read before its `type` is held aside in a spool and moved
+/// to the line's text by replay, whole.
+#[test]
+fn a_text_over_64_mib_before_its_type_is_kept_whole() {
+    let fx = Fx::new();
+    let n = MAX_BLOB_BYTES + 1;
+    {
+        let mut w = BufWriter::new(File::create(&fx.path).unwrap());
+        w.write_all(b"{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"b\"},{\"text\":\"")
+            .unwrap();
+        fill(&mut w, b'a', n);
+        w.write_all(b"\",\"type\":\"text\"}]}}\n").unwrap();
+        w.flush().unwrap();
+    }
+    let mut tail = fx.tail();
+    assert_eq!(fx.settle(&mut tail), Step::Wait);
+    let evs = fx.events();
+    assert_eq!(
+        shorts(&evs),
+        ["generation:1".to_owned(), format!("text:<blob {}>", n + 1)]
+    );
+    let sha = evs[1].payload["text"]["blob"]["sha256"].as_str().unwrap();
+    let mut h = Sha256::new();
+    h.update(b"b");
+    h.update(vec![b'a'; n]);
+    let want = hex(&h.finalize());
+    assert_eq!(download(&fx, sha), (want, n as u64 + 1));
+    no_spools(&fx);
+}
+
+/// With room for one spool at a time, lines over 64 MiB in a row are still stored: a batch
+/// closes after a spooled line, so its spool is gone before the next line needs one, and a
+/// failed spool keeps the lines before it.
+#[test]
+fn consecutive_lines_over_64_mib_need_one_spool_at_a_time() {
+    let fx = Fx::new();
+    let n = MAX_BLOB_BYTES + 1;
+    {
+        let mut w = BufWriter::new(File::create(&fx.path).unwrap());
+        w.write_all(assistant("before").as_bytes()).unwrap();
+        for _ in 0..2 {
+            fill(&mut w, b'x', n);
+            w.write_all(b"\n").unwrap();
+        }
+        w.write_all(assistant("after").as_bytes()).unwrap();
+        w.flush().unwrap();
+    }
+    let mut tail = fx.tail_with_spool_limit(1);
+    assert_eq!(fx.settle(&mut tail), Step::Wait);
+    assert_eq!(
+        shorts(&fx.events()),
+        [
+            "generation:1".to_owned(),
+            "text:before".to_owned(),
+            format!("raw:unparseable:<blob {n}>"),
+            format!("raw:unparseable:<blob {n}>"),
+            "text:after".to_owned(),
+        ]
+    );
+    no_spools(&fx);
 }

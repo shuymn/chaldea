@@ -170,6 +170,9 @@ pub enum Pause {
     /// snapshot's deadline (unit tests only).
     #[cfg(test)]
     ScreenRead,
+    /// A transcript tailer's store read, holding a reader (blocking; unit tests only).
+    #[cfg(test)]
+    TailerRead,
 }
 
 /// The test seam of [`Pause`]: the daemon's own is [`NoPauses`].

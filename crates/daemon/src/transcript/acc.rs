@@ -2,20 +2,65 @@
 //! a blob spool in the state directory (`docs/design/c1-claude-adapter.md` D14), so a value of
 //! any size is kept whole and memory stays bounded.
 
+use std::cell::Cell;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::rc::Rc;
 
 use crate::store::{BlobSpool, MAX_BLOB_BYTES, Prepared, prepare_content};
 
-use super::json::StrSink;
-
 /// Where an accumulator's spool goes: the state directory.
 #[derive(Debug, Clone)]
-pub(crate) struct SpoolDir(pub(crate) PathBuf);
+pub(crate) struct SpoolDir {
+    path: PathBuf,
+    /// Spool files the directory may hold at once; one more fails to be created as a full
+    /// descriptor table would (tests).
+    #[cfg(test)]
+    pub(crate) limit: Option<usize>,
+}
 
 impl SpoolDir {
+    pub(crate) fn new(path: PathBuf) -> SpoolDir {
+        SpoolDir {
+            path,
+            #[cfg(test)]
+            limit: None,
+        }
+    }
+
     fn create(&self) -> io::Result<BlobSpool> {
-        BlobSpool::create(Path::new(&self.0))
+        #[cfg(test)]
+        if let Some(limit) = self.limit {
+            let held = std::fs::read_dir(&self.path)?
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(crate::store::SPOOL_FILE_PREFIX)
+                })
+                .count();
+            if held >= limit {
+                return Err(io::Error::other("too many open files (test limit)"));
+            }
+        }
+        BlobSpool::create(&self.path)
+    }
+}
+
+/// The bytes the accumulators of one line hold in memory together: now and at most.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Meter(Rc<(Cell<usize>, Cell<usize>)>);
+
+impl Meter {
+    fn change(&self, from: usize, to: usize) {
+        let now = self.0.0.get() - from + to;
+        self.0.0.set(now);
+        self.0.1.set(self.0.1.get().max(now));
+    }
+
+    /// The most bytes held at once.
+    pub(crate) fn peak(&self) -> usize {
+        self.0.1.get()
     }
 }
 
@@ -24,18 +69,26 @@ pub(crate) struct ByteAcc {
     dir: SpoolDir,
     mem: Vec<u8>,
     spool: Option<BlobSpool>,
-    /// The most bytes this accumulator held in memory at once.
-    pub(crate) peak_mem: usize,
+    meter: Meter,
+    /// The memory reported to the meter.
+    counted: usize,
 }
 
 impl ByteAcc {
-    pub(crate) fn new(dir: SpoolDir) -> ByteAcc {
+    pub(crate) fn new(dir: SpoolDir, meter: Meter) -> ByteAcc {
         ByteAcc {
             dir,
             mem: Vec::new(),
             spool: None,
-            peak_mem: 0,
+            meter,
+            counted: 0,
         }
+    }
+
+    fn recount(&mut self) {
+        let now = self.mem.capacity();
+        self.meter.change(self.counted, now);
+        self.counted = now;
     }
 
     /// Appends `bytes`; the first append past `MAX_BLOB_BYTES` moves the memory to a spool.
@@ -55,13 +108,14 @@ impl ByteAcc {
                 self.mem.reserve_exact(target - self.mem.len());
             }
             self.mem.extend_from_slice(bytes);
-            self.peak_mem = self.peak_mem.max(self.mem.capacity());
+            self.recount();
             return Ok(());
         }
         let mut s = self.dir.create()?;
         s.append(&self.mem)?;
         s.append(bytes)?;
         self.mem = Vec::new();
+        self.recount();
         self.spool = Some(s);
         Ok(())
     }
@@ -71,8 +125,8 @@ impl ByteAcc {
     /// # Errors
     ///
     /// A spool error.
-    pub(crate) fn append(&mut self, other: ByteAcc) -> io::Result<()> {
-        match other.spool {
+    pub(crate) fn append(&mut self, mut other: ByteAcc) -> io::Result<()> {
+        match other.spool.take() {
             None => self.push(&other.mem),
             Some(s) => s.replay(&mut |b| self.push(b)),
         }
@@ -83,16 +137,19 @@ impl ByteAcc {
     /// # Errors
     ///
     /// A spool error.
-    pub(crate) fn finish(self, media_type: &str) -> io::Result<Prepared> {
-        match self.spool {
-            None => prepare_content(self.mem, media_type).map_err(io::Error::other),
+    pub(crate) fn finish(mut self, media_type: &str) -> io::Result<Prepared> {
+        match self.spool.take() {
+            None => {
+                let mem = std::mem::take(&mut self.mem);
+                prepare_content(mem, media_type).map_err(io::Error::other)
+            }
             Some(s) => s.finish(media_type),
         }
     }
 }
 
-impl StrSink for ByteAcc {
-    fn push(&mut self, bytes: &[u8]) -> io::Result<()> {
-        ByteAcc::push(self, bytes)
+impl Drop for ByteAcc {
+    fn drop(&mut self) {
+        self.meter.change(self.counted, 0);
     }
 }

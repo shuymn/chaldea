@@ -18,6 +18,7 @@ use crate::lifecycle::{
     receipts_reconciler,
 };
 use crate::store::Store;
+use crate::transcript::Mode;
 
 use super::commands::{CloseHandler, ResumeHandler, SpawnHandler, StopHandler};
 use super::live::LiveMap;
@@ -216,19 +217,8 @@ pub(crate) async fn shutdown(sup: Arc<Supervisor>, end: Instant) -> ParticipantE
     let _ = sup.window.set(Window { close_end, end });
     // Step 1.
     sup.tracker.close_admission();
-    // The transcript tailers stop with admission and are joined within the budget, so none
-    // holds a store reader once the store shuts down.
-    let tailers = sup.tailers.stop_all();
-    let tails = async {
-        let joined = futures_util::future::join_all(tailers);
-        if settle_before(|| sup.now(), end, sup.timer(end), joined)
-            .await
-            .in_time()
-            .is_none()
-        {
-            tracing::warn!("a transcript tailer did not end within the shutdown budget");
-        }
-    };
+    // No transcript poll starts once admission is closed.
+    sup.tailers.set(Mode::Hold);
     // Step 2, in parallel with steps 3–5.
     let git = git_step(&sup, end);
     let ptys = async {
@@ -255,9 +245,25 @@ pub(crate) async fn shutdown(sup: Arc<Supervisor>, end: Instant) -> ParticipantE
         });
         futures_util::future::join_all(closes).await;
     };
-    tokio::join!(git, ptys, tails);
+    // After the exits are recorded, each transcript tailer makes its final read, joined
+    // within the budget so none holds a store reader once the store shuts down.
+    let ptys_then_tails = async {
+        ptys.await;
+        sup.tailers.set(Mode::Final);
+        let joined = futures_util::future::join_all(sup.tailers.tasks());
+        let in_time = settle_before(|| sup.now(), end, sup.timer(end), joined)
+            .await
+            .in_time()
+            .is_some();
+        if !in_time {
+            sup.tailers.set(Mode::Stop);
+            tracing::warn!("a transcript tailer did not end within the shutdown budget");
+        }
+        in_time
+    };
+    let ((), tails_ended) = tokio::join!(git, ptys_then_tails);
     // Step 6.
-    if sup.tracker.empty_before(end).await {
+    if sup.tracker.empty_before(end).await && tails_ended {
         ParticipantEnd::Clean
     } else {
         ParticipantEnd::LeftRunning
