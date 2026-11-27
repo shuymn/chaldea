@@ -278,12 +278,13 @@ pub(crate) async fn shutdown(sup: Arc<Supervisor>, end: Instant) -> ParticipantE
 }
 
 /// Dropped with the participant cut at its end before it joined the transcript tailers: the
-/// launches whose tailers are left are logged as unverified, since their final reads may
-/// never run.
+/// tailers are stopped, and the launches whose tailers are left are logged as unverified,
+/// since their final reads may never run.
 struct TailsLeft<'a>(&'a Supervisor);
 
 impl Drop for TailsLeft<'_> {
     fn drop(&mut self) {
+        self.0.tailers.set(Mode::Stop);
         let launches = self.0.tailers.launches();
         if launches.is_empty() {
             return;

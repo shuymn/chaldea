@@ -441,7 +441,8 @@ async fn no_reader_is_borrowed_past_the_participants_end() {
 }
 
 /// The participant cut at its end (dropped, as the outer deadline does) before it joined the
-/// tailers: the launches whose tailers are left are logged as unverified.
+/// tailers: the launches whose tailers are left are logged as unverified, and the tailers
+/// stop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_participant_cut_before_the_final_reads_logs_them_unverified() {
     let rig = rig().await;
@@ -461,6 +462,8 @@ async fn a_participant_cut_before_the_final_reads_logs_them_unverified() {
         rig.sup.tailers.abandoned_unverified.load(Ordering::Relaxed),
         1
     );
+    rig.until("the tailers stop", || rig.sup.tailers.launches().is_empty())
+        .await;
     close.go();
     rig.srv.stop().await;
 }
