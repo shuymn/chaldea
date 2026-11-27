@@ -105,7 +105,7 @@ impl Components for SupervisorComponents {
         );
         self.sup = Some(sup.clone());
         Built {
-            mounts: mounts_with(&sup, seams(&sup)),
+            mounts: crate::http::mount_pwa(mounts_with(&sup, seams(&sup)), sup.cfg.pwa),
             commands: registry(&sup),
             participants: vec![Box::new(Participant(sup))],
         }

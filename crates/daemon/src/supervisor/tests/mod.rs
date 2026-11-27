@@ -226,6 +226,7 @@ pub(crate) fn config(
         claude_settings: "/work/state/claude-settings.json".to_owned(),
         tail_poll: crate::transcript::TAIL_POLL,
         attach: crate::attach::AttachConfig::default(),
+        pwa: &[],
     }
 }
 

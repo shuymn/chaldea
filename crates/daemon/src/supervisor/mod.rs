@@ -277,6 +277,10 @@ pub struct SupervisorConfig {
     pub(crate) tail_poll: Duration,
     /// The attach socket's bounds (`docs/design/t1-attach.md` §2 "Limits").
     pub(crate) attach: crate::attach::AttachConfig,
+    /// The PWA build `SupervisorComponents::build` mounts: the embedded one; the binary tests
+    /// pass an empty table for a daemon without the PWA whatever the build embedded.
+    #[doc(hidden)]
+    pub pwa: &'static [crate::http::Asset],
 }
 
 impl Default for SupervisorConfig {
@@ -304,6 +308,7 @@ impl Default for SupervisorConfig {
             claude_settings: chaldea_core::launch::CLAUDE_SETTINGS_FILE.to_owned(),
             tail_poll: crate::transcript::TAIL_POLL,
             attach: crate::attach::AttachConfig::default(),
+            pwa: crate::http::EMBEDDED,
         }
     }
 }
