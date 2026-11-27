@@ -1208,6 +1208,53 @@ pub(crate) fn file_links(h: BorrowedHandle<'_>) -> io::Result<u32> {
     Ok(info.nNumberOfLinks)
 }
 
+/// What `open_regular` reads from an open handle: whether `GetFileType` says a disk file,
+/// its attributes, its volume serial number, and its 64-bit file index
+/// (`GetFileInformationByHandle`).
+pub(crate) struct HandleFile {
+    pub(crate) disk: bool,
+    pub(crate) attributes: u32,
+    pub(crate) volume_serial: u32,
+    pub(crate) index: u64,
+}
+
+/// [`HandleFile`] of the file open as `h`.
+pub(crate) fn handle_file(h: BorrowedHandle<'_>) -> io::Result<HandleFile> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_TYPE_DISK, FILE_TYPE_UNKNOWN, GetFileInformationByHandle,
+        GetFileType,
+    };
+    // SAFETY: the handle is borrowed and valid.
+    let kind = unsafe { GetFileType(raw(&h)) };
+    if kind == FILE_TYPE_UNKNOWN {
+        // `FILE_TYPE_UNKNOWN` with `NO_ERROR` is a type, not a failure.
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(0) {
+            return Err(e);
+        }
+    }
+    if kind != FILE_TYPE_DISK {
+        return Ok(HandleFile {
+            disk: false,
+            attributes: 0,
+            volume_serial: 0,
+            index: 0,
+        });
+    }
+    // SAFETY: a plain-data struct the call fills.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is borrowed and valid; `info` is a local.
+    if unsafe { GetFileInformationByHandle(raw(&h), &raw mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(HandleFile {
+        disk: true,
+        attributes: info.dwFileAttributes,
+        volume_serial: info.dwVolumeSerialNumber,
+        index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    })
+}
+
 /// The pids attached to this process's console (tests).
 #[cfg(feature = "fake")]
 pub(crate) fn console_processes() -> io::Result<Vec<u32>> {

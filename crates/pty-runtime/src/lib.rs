@@ -34,6 +34,7 @@
 mod backend;
 mod drain;
 mod env;
+pub mod file;
 pub mod host;
 mod limits;
 mod origin;
