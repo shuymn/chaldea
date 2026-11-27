@@ -102,8 +102,54 @@ pub struct Fence {
 }
 
 impl Fence {
+    /// `SeqCst`: with the publication's odd store before it and the caller's `SeqCst` advance
+    /// before its own read of the publication, either this load sees the advance or that read
+    /// sees the odd counter (`docs/design/pty-runtime.md` §2.3).
     fn moved(&self) -> bool {
-        self.word.load(Ordering::Acquire) != self.expect
+        self.word.load(Ordering::SeqCst) != self.expect
+    }
+}
+
+/// `last_started` published for readers that never take the queue lock: one writer, always
+/// under the queue lock, makes the counter odd before a write permission, stores the
+/// position the permission changes, and makes it even again; a refusal or an empty reply
+/// lane makes it even with no position. Every access is `SeqCst`. A reader accepts the
+/// positions it read between two equal even counter loads.
+#[derive(Default)]
+pub(crate) struct PublishedPositions {
+    seq: AtomicU64,
+    pos: [AtomicU64; 3],
+}
+
+impl PublishedPositions {
+    /// Makes the counter odd; returns the even value it had.
+    fn begin(&self) -> u64 {
+        let s = self.seq.load(Ordering::SeqCst);
+        self.seq.store(s.wrapping_add(1), Ordering::SeqCst);
+        s
+    }
+
+    fn set(&self, class: OriginClass, seq: u64) {
+        self.pos[class.index()].store(seq, Ordering::SeqCst);
+    }
+
+    /// Makes the counter even again after [`PublishedPositions::begin`] returned `s`.
+    fn end(&self, s: u64) {
+        self.seq.store(s.wrapping_add(2), Ordering::SeqCst);
+    }
+
+    /// One read: the positions when no publication overlapped it, else `None`. `between`
+    /// runs after the first position load.
+    pub(crate) fn read_once(&self, between: impl FnOnce()) -> Option<[u64; 3]> {
+        let s1 = self.seq.load(Ordering::SeqCst);
+        if s1 & 1 != 0 {
+            return None;
+        }
+        let p0 = self.pos[0].load(Ordering::SeqCst);
+        between();
+        let p1 = self.pos[1].load(Ordering::SeqCst);
+        let p2 = self.pos[2].load(Ordering::SeqCst);
+        (self.seq.load(Ordering::SeqCst) == s1).then_some([p0, p1, p2])
     }
 }
 
@@ -746,6 +792,14 @@ fn wait<'a>(sh: &Shared, q: MutexGuard<'a, Queue>) -> MutexGuard<'a, Queue> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// A granted write permission's publication: stores `seq` as the class's started position,
+/// in the published view and in the queue, and closes the odd section `s` opened.
+fn publish_start(sh: &Shared, q: &mut Queue, s: u64, class: OriginClass, seq: u64) {
+    sh.published.set(class, seq);
+    q.last_started[class.index()] = seq;
+    sh.published.end(s);
+}
+
 fn serve(sh: &Shared, input: &mut dyn Write) {
     loop {
         let batch = {
@@ -771,12 +825,16 @@ fn serve(sh: &Shared, input: &mut dyn Write) {
 fn write_reply(sh: &Shared, input: &mut dyn Write) {
     let (seq, bytes) = {
         let mut q = lock(&sh.q);
+        // The dequeue is the reply's write permission: it is published with it.
+        let s = sh.published.begin();
         // Close, exit, and input breakage each clear the lane under the queue lock, and
         // enqueue refuses after them, so a reply popped here may be written. The lane can
         // be empty when the sampled batch was cleared.
         let Some(r) = q.replies.pop_front() else {
+            sh.published.end(s);
             return;
         };
+        crate::probe!(sh, Publishing);
         let seq = q.next_seq();
         let record = WriteRecord {
             seq,
@@ -789,7 +847,7 @@ fn write_reply(sh: &Shared, input: &mut dyn Write) {
             split_writes: 0,
             outcome: WriteOutcome::InProgress,
         };
-        q.last_started[OriginClass::Reply.index()] = seq;
+        publish_start(sh, &mut q, s, OriginClass::Reply, seq);
         q.slot = Some(Slot {
             id: REPLY,
             record,
@@ -878,8 +936,9 @@ fn write_next_unit(sh: &Shared, input: &mut dyn Write) {
         }
     }
     // Dispatch boundary: the first write call's permission. The deadline and the fence are
-    // part of it, decided here under the queue lock.
+    // part of it, decided here under the queue lock inside the publication's odd section.
     crate::probe!(sh, Dispatching);
+    let s = sh.published.begin();
     let last = if Instant::now() >= not_after {
         Some(Refusal::Expired)
     } else if fence.as_ref().is_some_and(Fence::moved) {
@@ -888,11 +947,13 @@ fn write_next_unit(sh: &Shared, input: &mut dyn Write) {
         None
     };
     if let Some(r) = last {
+        sh.published.end(s);
         q.settle_slot(WriteOutcome::NotStarted(r), &mut fired);
         drop(q);
         fired.fire(sh);
         return;
     }
+    crate::probe!(sh, Publishing);
     let pos = q.input_pos;
     let at = Instant::now();
     if let Some(s) = q.slot.as_mut() {
@@ -900,7 +961,7 @@ fn write_next_unit(sh: &Shared, input: &mut dyn Write) {
         s.record.byte_start = pos;
     }
     let _ = started.set(at);
-    q.last_started[class.index()] = seq;
+    publish_start(sh, &mut q, s, class, seq);
     drop(q);
     write_parts(sh, input, seq, &unit.parts);
 }
@@ -1007,4 +1068,57 @@ fn fail_io(sh: &Shared, mut q: MutexGuard<'_, Queue>, seq: u64, error: &str, mut
     sh.break_input(&mut q, error, &mut fired);
     drop(q);
     fired.fire(sh);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::PublishedPositions;
+    use crate::origin::OriginClass;
+
+    /// SF-4 stress: a writer publishes `(k, k, k)` for increasing `k`; readers on other
+    /// threads never accept a triple with unequal components. Ignored by default (about 2 s);
+    /// CI runs it by name on macOS (arm64), where loads and stores can reorder without
+    /// `SeqCst`.
+    #[test]
+    #[ignore = "about 2 s of contention; run on macOS arm64"]
+    fn published_positions_stress() {
+        let p = Arc::new(PublishedPositions::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (p, stop) = (p.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let (mut accepted, mut last) = (0u64, 0u64);
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Some([a, b, c]) = p.read_once(|| {}) {
+                            assert!(a == b && b == c, "mixed triple ({a}, {b}, {c})");
+                            assert!(a >= last, "went back from {last} to {a}");
+                            last = a;
+                            accepted += 1;
+                        }
+                    }
+                    accepted
+                })
+            })
+            .collect();
+        let end = Instant::now() + Duration::from_secs(2);
+        let mut k = 0u64;
+        while Instant::now() < end {
+            k += 1;
+            let s = p.begin();
+            for c in OriginClass::ALL {
+                p.set(c, k);
+            }
+            p.end(s);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            assert!(r.join().unwrap() > 0, "every reader accepted some triple");
+        }
+        assert!(k > 1000, "the writer published {k} times");
+    }
 }

@@ -124,26 +124,15 @@ async fn evidence_kinds() {
     assert_eq!(rig.post(&h).await.status, 200);
     assert!(rig.launch(live.l).session_id.is_some(), "bound");
     assert_eq!(count(&rig, &live, "session_start"), 0);
-    // A `PostDecision` without facts (the launch unobservable at its intake: the live map
-    // held) records none. The worker is parked meanwhile, so it never blocks a runtime
-    // thread on the held map.
+    // A `PostDecision` without facts (the launch unobservable at its intake) records none.
     rig.stop().await;
     let (rig, live) = bound_in(ReadinessMode::PostDecision, Agent::Codex).await;
-    rig.worker_parked(&live, async {
-        let (locked_tx, locked) = tokio::sync::oneshot::channel();
-        let (release, released) = std::sync::mpsc::channel::<()>();
-        let sup = rig.sup.clone();
-        let holder = tokio::task::spawn_blocking(move || {
-            let _map = sup.live.lock();
-            let _ = locked_tx.send(());
-            let _ = released.recv_timeout(Duration::from_secs(20));
-        });
-        locked.await.unwrap();
-        rig.hook(&live, "PostDecision", &json!({})).await;
-        release.send(()).unwrap();
-        holder.await.unwrap();
-    })
-    .await;
+    let sl = rig.sl(&live);
+    *crate::supervisor::send::lock(&sl.hooks.observe) = Some(Box::new(|_, _| {
+        crate::supervisor::live::LaunchObservation::Unobservable
+    }));
+    rig.hook(&live, "PostDecision", &json!({})).await;
+    assert!(crate::supervisor::send::lock(&sl.hooks.observe).is_none());
     assert_eq!(count(&rig, &live, "post_decision"), 0);
     rig.hook(&live, "PostDecision", &json!({})).await;
     assert_eq!(count(&rig, &live, "post_decision"), 1);
@@ -153,7 +142,11 @@ async fn evidence_kinds() {
 /// A Codex launch with `ready` asserted and the clock stopped: settles come only from
 /// [`advance`].
 pub(super) async fn settle_rig() -> (SRig, Live) {
-    let rig = SRig::new().await;
+    settle_on(SRig::new().await).await
+}
+
+/// [`settle_rig`] on `rig`.
+pub(super) async fn settle_on(rig: SRig) -> (SRig, Live) {
     let live = rig.bound(Agent::Codex).await;
     rig.clock.stop();
     (rig, live)
@@ -193,8 +186,9 @@ async fn settle_timing() {
 }
 
 /// PR10b-CL-4: a later hook ends the candidate: a raw hook; a hook taken in and held before
-/// its job; a hook taken in after the pass chose the candidate, before the settle job; a hook
-/// whose request ended before its job was submitted.
+/// its job, then answered 408 before its write observer registers; a hook taken in after the
+/// pass chose the candidate, before the settle job; an intake whose facts were sampled and
+/// whose armed guard was dropped with no job.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn settle_later_hooks() {
     // A later raw hook.
@@ -215,8 +209,9 @@ async fn settle_later_hooks() {
     advance(&rig, &live, SETTLE).await;
     assert_eq!(count(&rig, &live, "stop_settled"), 0);
     release.send(()).unwrap();
-    // The clock moved past the hook's deadline while it was held: its job expired, so its
-    // intake finished without a mark, and the candidate stays ended by it.
+    // The clock moved past the hook's deadline while it was held: the request is 408 before
+    // its write observer registers, so its intake finished without a mark, and the
+    // candidate stays ended by it.
     assert_eq!(reply.await.unwrap().status, 408);
     rig.pass(&live).await;
     assert_eq!(count(&rig, &live, "stop_settled"), 0);
@@ -250,16 +245,17 @@ async fn settle_later_hooks() {
     assert_eq!(count(&rig, &live, "stop_settled"), 0);
     rig.stop().await;
 
-    // A hook taken in after the `Stop` whose request ended before its job was submitted.
+    // An intake after the `Stop` whose facts are sampled directly and whose armed guard is
+    // dropped with no job: it finishes without a mark.
     let (rig, live) = settle_rig().await;
     turn(&rig, &live, "p").await;
     let p: Arc<dyn IntakeProbe> = Arc::new(SupervisorProbe {
-        sup: Arc::downgrade(&rig.sup),
         side: rig.sup.send.clone(),
     });
     let ord = rig.next_ordinal(&live);
-    let _ = p.facts(live.l, ord);
-    drop(IntakeGuard::new(p, live.l, ord));
+    let g = IntakeGuard::new(p.clone(), live.l, ord);
+    let _ = p.facts(live.l, ord, Instant::now() + Duration::from_secs(10), &g);
+    drop(g);
     advance(&rig, &live, SETTLE).await;
     assert_eq!(count(&rig, &live, "stop_settled"), 0);
     rig.stop().await;
@@ -752,4 +748,165 @@ async fn settle_limit_l11() {
     advance(&rig, &live, SETTLE).await;
     assert_eq!(count(&rig, &live, "stop_settled"), 1, "the accepted gap");
     rig.stop().await;
+}
+
+/// A pass of a Codex launch's worker parked where its settle is due, its seam not yet in:
+/// `ready` asserted, the clock stopped, a turn's `UserPromptSubmit` and `Stop` in, a pass
+/// run to its end (so no pass that read before the `Stop` is still in flight), the worker
+/// parked at the next pass's `after_read`, and only then the clock moved `SETTLE` on (the
+/// pass reads its `now` after the point). No earlier pass can settle.
+struct DuePass {
+    rig: SRig,
+    live: Live,
+    sl: Arc<crate::supervisor::send::SendLaunch>,
+    /// The `Stop`'s ordinal.
+    ordinal: u64,
+    /// The passes ended before the parked one.
+    n: u64,
+    go: std::sync::mpsc::Sender<()>,
+    /// Gets the passes ended when a settle job starts.
+    job: std::sync::mpsc::Receiver<u64>,
+    job_tx: std::sync::mpsc::Sender<u64>,
+}
+
+impl DuePass {
+    async fn new() -> DuePass {
+        let (rig, live) = settle_rig().await;
+        turn(&rig, &live, "p").await;
+        rig.pass(&live).await;
+        let sl = rig.sl(&live);
+        let ordinal = sl.latest_intake.load(Ordering::SeqCst);
+        let (read_tx, read) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let s2 = sl.clone();
+        set(&sl.hooks.after_read, move || {
+            read_tx.send(s2.passes.load(Ordering::SeqCst)).unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(30));
+        });
+        sl.wake.notify_one();
+        let n = tokio::task::spawn_blocking(move || read.recv_timeout(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .expect("the worker parked");
+        rig.clock.advance(SETTLE);
+        let (job_tx, job) = std::sync::mpsc::channel();
+        let due = DuePass {
+            rig,
+            live,
+            sl,
+            ordinal,
+            n,
+            go,
+            job,
+            job_tx,
+        };
+        due.on_job(|| {});
+        due
+    }
+
+    /// A settle job reports the passes ended, then runs `f`.
+    fn on_job(&self, f: impl FnOnce() + Send + 'static) {
+        let (tx, sl) = (self.job_tx.clone(), self.sl.clone());
+        set(&self.sl.hooks.settle_job, move || {
+            let _ = tx.send(sl.passes.load(Ordering::SeqCst));
+            f();
+        });
+    }
+
+    /// Lets the parked pass go and returns the passes ended when its settle job started,
+    /// `None` when no settle job started by the time the pass ended.
+    async fn resume(&self) -> Option<u64> {
+        self.go.send(()).unwrap();
+        let sl = self.sl.clone();
+        let n = self.n;
+        self.rig
+            .until("the parked pass ended", move || {
+                sl.passes.load(Ordering::SeqCst) > n
+            })
+            .await;
+        self.job.try_recv().ok()
+    }
+
+    /// Whether the `Stop`'s settle was recorded.
+    fn settled(&self) -> bool {
+        let key = format!("settle:{}:{}", self.live.l, self.ordinal);
+        let t = self.live.t;
+        self.rig.srv.store.read(move |r| {
+            Ok(
+                r.events_after(chaldea_core::ids::StreamId::Thread(t), 0, 10_000)?
+                    .events
+                    .iter()
+                    .any(|e| e.idempotency_key.0 == key),
+            )
+        })
+    }
+}
+
+/// SF-11: the settle's one observation takes no lock: with the PTY writer parked at its
+/// dispatch boundary (its queue lock held) before the pass, that pass settles the `Stop`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_beside_parked_writer() {
+    let due = DuePass::new().await;
+    let (park, _) = due.rig.writer_q_held(&due.live).await;
+    assert_eq!(due.resume().await, Some(due.n), "the parked pass's settle");
+    assert!(due.settled());
+    drop(park);
+    due.rig.stop().await;
+}
+
+/// SF-11: with the live map held from the pass's read to its end, that pass settles the
+/// `Stop`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_beside_held_map() {
+    let due = DuePass::new().await;
+    let (locked_tx, locked) = std::sync::mpsc::channel();
+    let (free, until) = std::sync::mpsc::channel::<()>();
+    let sup = due.rig.sup.clone();
+    let holder = std::thread::spawn(move || {
+        let _map = sup.live.lock();
+        locked_tx.send(()).unwrap();
+        let _ = until.recv_timeout(Duration::from_secs(30));
+    });
+    locked.recv().unwrap();
+    due.go.send(()).unwrap();
+    let job = tokio::task::block_in_place(|| due.job.recv_timeout(Duration::from_secs(10)));
+    assert_eq!(job.ok(), Some(due.n), "the parked pass's settle");
+    let d = &due;
+    due.rig
+        .until("settled with the map held", || d.settled())
+        .await;
+    free.send(()).unwrap();
+    holder.join().unwrap();
+    due.rig.stop().await;
+}
+
+/// SF-11 (kept): a launch removed from the live map between the pass's read and its
+/// observation does not settle: the pass starts no settle job, and the worker ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_after_removal() {
+    let due = DuePass::new().await;
+    due.rig.sup.remove(due.live.l);
+    assert_eq!(due.resume().await, None, "no settle job");
+    worker_ends(&due.rig, &due.live).await;
+    assert!(!due.settled());
+    due.rig.stop().await;
+}
+
+/// SF-11: a launch removed between the settle's observation and its job (no exit recorded)
+/// does not settle: the parked pass's job refuses a removed entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_removed_before_job() {
+    let due = DuePass::new().await;
+    let (sup, l) = (due.rig.sup.clone(), due.live.l);
+    due.on_job(move || sup.remove(l));
+    assert_eq!(due.resume().await, Some(due.n), "the parked pass's job");
+    worker_ends(&due.rig, &due.live).await;
+    assert!(!due.settled());
+    due.rig.stop().await;
+}
+
+/// Waits until `live`'s worker ended: its launch was removed.
+async fn worker_ends(rig: &SRig, live: &Live) {
+    rig.until("the worker ended", || rig.sup.send.launch(live.l).is_none())
+        .await;
 }

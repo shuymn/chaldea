@@ -49,6 +49,33 @@ pub(crate) async fn settle_before<F: Future>(
     }
 }
 
+/// Short waits between the attempts of a bounded poll on a blocking thread: spins, then
+/// yields, then sleeps of at most 1 ms, each capped by the time left, so the poll never asks
+/// to sleep past its deadline (send §2.5 "Intake facts"); none when no time is left, so the
+/// final attempt follows at once.
+#[derive(Default)]
+pub(crate) struct Backoff(u32);
+
+impl Backoff {
+    const SPINS: u32 = 16;
+    const YIELDS: u32 = 4;
+
+    /// One wait of at most `left`.
+    pub(crate) fn wait(&mut self, left: std::time::Duration) {
+        if left.is_zero() {
+            return;
+        }
+        if self.0 < Self::SPINS {
+            std::hint::spin_loop();
+        } else if self.0 < Self::SPINS + Self::YIELDS {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(left.min(std::time::Duration::from_millis(1)));
+        }
+        self.0 = self.0.saturating_add(1);
+    }
+}
+
 #[allow(
     clippy::disallowed_methods,
     reason = "the helper's own timer: its output is classified by settle_before"

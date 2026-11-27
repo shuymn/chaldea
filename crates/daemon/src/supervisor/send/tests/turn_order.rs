@@ -374,23 +374,17 @@ async fn record_during_intake_keeps_running() {
     // commits there, and the launch is observed, so the facts are present.
     let observed = Arc::new(AtomicBool::new(false));
     let o = observed.clone();
-    *crate::supervisor::send::lock(&sl.hooks.observe) = Some(Box::new(move |sup, l| {
+    *crate::supervisor::send::lock(&sl.hooks.observe) = Some(Box::new(move |e, _| {
         go.send(()).unwrap();
         let end = Instant::now() + Duration::from_secs(10);
         while !recorded.load(Ordering::Acquire) && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(1));
         }
-        loop {
-            let seen = sup.observe(l);
-            if matches!(seen, LaunchObservation::Started { .. }) {
-                o.store(recorded.load(Ordering::Acquire), Ordering::SeqCst);
-                return seen;
-            }
-            if Instant::now() >= end {
-                return seen;
-            }
-            std::thread::sleep(Duration::from_millis(1));
+        let seen = e.observe(Some(end));
+        if matches!(seen, LaunchObservation::Started { .. }) {
+            o.store(recorded.load(Ordering::Acquire), Ordering::SeqCst);
         }
+        seen
     }));
     let stop = rig.next_ordinal(&live);
     assert_eq!(
@@ -667,5 +661,42 @@ async fn stale_start_after_unrecorded_exit() {
     assert_eq!(start.finish().await.status, 200);
     assert_eq!(turn(&rig, &live), TurnState::Unknown);
     assert_eq!(rig.launch(live.l).last_turn_start_seq, before);
+    rig.stop().await;
+}
+
+/// SF-6: a `Stop` whose intake waits for the launch's held state while the input unit's
+/// completion job commits counts the record before its intake point: the state released
+/// after the commit, its mark settles. The facts deadline outlasts every bound here, so the
+/// wait cannot give up before the gated commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn record_during_state_wait() {
+    let (rig, live) =
+        super::evidence::settle_on(SRig::with_intake_wait(super::LONG_INTAKE_WAIT, |_| {}).await)
+            .await;
+    let sl = rig.sl(&live);
+    let (entered, go, point) = gate_point();
+    set(&sl.hooks.record_job, point);
+    let p = rig.send(&live, "P").await;
+    reached(entered).await;
+    let recorded = sl.state().running.as_ref().unwrap().recorded.clone();
+    let (free, holder) = super::probe::hold_state(&sl);
+    let (contended_tx, contended) = std::sync::mpsc::channel();
+    set(&sl.hooks.state_contended, move || {
+        contended_tx.send(()).unwrap();
+    });
+    let stop = rig.next_ordinal(&live);
+    let reply = spawn_send(
+        &rig.srv,
+        &rig.hook_of(&live, "Stop", &json!({})).req(&rig.srv),
+    );
+    crate::supervisor::tests::support::http::reached_sync(contended).await;
+    go.send(()).unwrap();
+    rig.until("the record committed", || recorded.load(Ordering::Acquire))
+        .await;
+    free.send(()).unwrap();
+    holder.join().unwrap();
+    assert_eq!(reply.await.unwrap().status, 200);
+    end_mark(&rig, &live, stop, true);
+    rig.until_input(p, InputState::Sent).await;
     rig.stop().await;
 }

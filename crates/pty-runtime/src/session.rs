@@ -20,8 +20,8 @@ use crate::origin::{ClassSet, ReplyKind};
 use crate::snapshot::Snapshot;
 use crate::vt::{ModeView, ModeWord, ReplyTarget, Vt};
 use crate::writer::{
-    Completion, Fired, Guard, LogTruncated, PendingReply, Queue, SubmitError, WriteRecord,
-    WriteTicket, WriteUnit, writer_main,
+    Completion, Fired, Guard, LogTruncated, PendingReply, PublishedPositions, Queue, SubmitError,
+    WriteRecord, WriteTicket, WriteUnit, writer_main,
 };
 
 /// How often the waiter polls the child.
@@ -230,6 +230,8 @@ pub(crate) struct Shared {
     /// [`WriterObserver`].
     pub(crate) q: Arc<Mutex<Queue>>,
     pub(crate) cv: Condvar,
+    /// `last_started` published under the queue lock for lock-free readers.
+    pub(crate) published: Arc<PublishedPositions>,
     /// VT lock: the `Term`, the parser, the subscribers, the output end.
     vt: Mutex<VtState>,
     /// Control lock.
@@ -280,6 +282,7 @@ impl Shared {
             Shared {
                 q: Arc::new(Mutex::new(Queue::new(limits.log_records))),
                 cv: Condvar::new(),
+                published: Arc::new(PublishedPositions::default()),
                 vt: Mutex::new(VtState {
                     vt,
                     output_offset: 0,
@@ -713,6 +716,9 @@ impl Session {
     pub fn observer(&self) -> WriterObserver {
         WriterObserver {
             q: self.sh.q.clone(),
+            published: self.sh.published.clone(),
+            #[cfg(feature = "fake")]
+            probe: self.sh.probe.clone(),
         }
     }
 
@@ -1111,10 +1117,13 @@ impl Screen {
 }
 
 /// Reads the writer's dispatch positions without the session: a clone of the session's
-/// queue lock, so it outlives the session. `Clone`.
+/// queue lock and its published positions, so it outlives the session. `Clone`.
 #[derive(Clone)]
 pub struct WriterObserver {
     q: Arc<Mutex<Queue>>,
+    published: Arc<PublishedPositions>,
+    #[cfg(feature = "fake")]
+    probe: crate::fake::Probe,
 }
 
 impl fmt::Debug for WriterObserver {
@@ -1137,15 +1146,56 @@ impl WriterObserver {
         lock(&self.q).last_started_each()
     }
 
-    /// [`WriterObserver::last_started_each`] without waiting: `None` while another thread
-    /// holds the queue lock.
+    /// [`WriterObserver::last_started_each`] without the queue lock, from the positions the
+    /// writer publishes with each write permission. `deadline: None` makes exactly one
+    /// attempt; `Some(f)` retries, with sleeps capped by the time left to `f`, until one
+    /// attempt is consistent, and the first attempt started at or after `f` is the last, so
+    /// it returns within `f` plus one attempt. `None`: every attempt overlapped a publication.
     #[must_use]
-    pub fn try_last_started_each(&self) -> Option<[u64; 3]> {
-        match self.q.try_lock() {
-            Ok(q) => Some(q.last_started_each()),
-            Err(TryLockError::Poisoned(e)) => Some(e.into_inner().last_started_each()),
-            Err(TryLockError::WouldBlock) => None,
+    pub fn published_last_started(&self, deadline: Option<Instant>) -> Option<[u64; 3]> {
+        let read = || {
+            self.published.read_once(|| {
+                #[cfg(feature = "fake")]
+                self.probe
+                    .hit(crate::fake::ProbePoint::BetweenPositionLoads);
+            })
+        };
+        let Some(f) = deadline else {
+            return read();
+        };
+        let mut backoff = Backoff::default();
+        loop {
+            let last = Instant::now() >= f;
+            let seen = read();
+            if seen.is_some() || last {
+                return seen;
+            }
+            backoff.wait(f.saturating_duration_since(Instant::now()));
         }
+    }
+}
+
+/// Short waits between attempts: spins, then yields, then sleeps of 1 ms, each capped by
+/// the time left; none when no time is left, so the final attempt follows at once.
+#[derive(Default)]
+pub(crate) struct Backoff(u32);
+
+impl Backoff {
+    const SPINS: u32 = 16;
+    const YIELDS: u32 = 4;
+
+    pub(crate) fn wait(&mut self, left: Duration) {
+        if left.is_zero() {
+            return;
+        }
+        if self.0 < Self::SPINS {
+            std::hint::spin_loop();
+        } else if self.0 < Self::SPINS + Self::YIELDS {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(left.min(Duration::from_millis(1)));
+        }
+        self.0 = self.0.saturating_add(1);
     }
 }
 

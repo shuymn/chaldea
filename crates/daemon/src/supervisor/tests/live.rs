@@ -1,19 +1,21 @@
 //! The observation the hook intake reads (design §2.11 "Observation"; PR10a1-CL-30).
 
-use chaldea_core::ids::LaunchId;
-use chaldea_pty_runtime::OriginClass;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use chaldea_pty_runtime::fake::FakeScript;
+use chaldea_pty_runtime::{Cleanup, NeverStartedKind, OriginClass, SpawnError};
 
 use super::Rig;
-use crate::supervisor::Pause;
-use crate::supervisor::live::LaunchObservation;
+use crate::supervisor::live::{LaunchObservation, LiveLaunch};
+use crate::supervisor::{Pause, lock};
 
-/// PR10a1-CL-30 `observe`: synchronous calls while the spawn op holds the op lock: right
-/// after the reservation `Reserved`; once creation began (before the spawn, after it, and
-/// after the reference was sampled, before publication) `Unobservable`; published, with the
-/// start job held, `Started` with the sampled `reference`, and a terminal reply the
-/// responder then writes has its class position above it; with the map mutex held
-/// `Unobservable` at once; an unknown launch `Unobservable`. No send worker runs (the rig's
-/// default): its pass takes the map mutex, which `observe` would answer with `Unobservable`.
+/// PR10a1-CL-30 `LiveLaunch::observe`: synchronous calls while the spawn op holds the op
+/// lock: right after the reservation `Reserved`; once creation began (before the spawn, after
+/// it, and after the reference was sampled, before publication) `Unobservable`; published,
+/// with the start job held, `Started` with the sampled `reference`, and a terminal reply the
+/// responder then writes has its class position above it; with the live map held, the same
+/// at once (the observation takes no lock).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn observe() {
     let rig = Rig::new().await;
@@ -43,20 +45,14 @@ async fn observe() {
                 .store
                 .read(|r| Ok(r.threads()?.pop().unwrap().current_launch_id.unwrap()))
         });
-        let seen = rig.sup.observe(launch);
+        let entry = rig.sup.entry(launch).unwrap();
+        let seen = entry.observe(None);
         if let Some(want) = want {
             assert_eq!(seen, want, "{p:?}");
             held.go();
             continue;
         }
-        // Published, the start job not yet run. The writer thread takes the queue lock when
-        // it first runs (`Unobservable` while it holds it).
-        let mut seen = seen;
-        rig.until("the published launch observed", || {
-            seen = rig.sup.observe(launch);
-            seen != LaunchObservation::Unobservable
-        })
-        .await;
+        // Published, the start job not yet run.
         let LaunchObservation::Started {
             reference,
             last_started,
@@ -68,10 +64,9 @@ async fn observe() {
         assert!(last_started[reply_class] <= reference, "{seen:?}");
         let child = rig.pty.take_child().unwrap();
         child.emit(b"\x1b[5n");
-        // The writer may still hold the queue lock right after the write (`Unobservable`).
         let mut same = None;
         rig.until("the reply's dispatch observed", || {
-            match rig.sup.observe(launch) {
+            match entry.observe(None) {
                 LaunchObservation::Started {
                     reference: r,
                     last_started,
@@ -89,14 +84,168 @@ async fn observe() {
             "the reference sampled before publication"
         );
         let map = rig.sup.live.lock();
-        assert_eq!(rig.sup.observe(launch), LaunchObservation::Unobservable);
+        assert!(matches!(
+            entry.observe(None),
+            LaunchObservation::Started { reference: r, .. } if r == reference
+        ));
         drop(map);
         held.go();
     }
     assert_eq!(reply.await.unwrap().status, 200);
-    assert_eq!(
-        rig.sup.observe(LaunchId(uuid::Uuid::new_v4())),
-        LaunchObservation::Unobservable
+    rig.srv.stop().await;
+}
+
+/// Starts a spawn of `agent` held at `pause` and returns the held point, the reply, and the
+/// launch's entry.
+async fn held_spawn(
+    rig: &Rig,
+    pause: Pause,
+    agent: &str,
+) -> (
+    super::Armed,
+    tokio::task::JoinHandle<super::support::http::Reply>,
+    Arc<LiveLaunch>,
+) {
+    let held = rig.pauses.arm(pause);
+    let cwd = rig.cwd.path().to_string_lossy().into_owned();
+    let reply = super::support::http::spawn_send(
+        &rig.srv,
+        &rig.srv.command(
+            "spawn",
+            &rig.owner,
+            super::cid(),
+            &serde_json::json!({ "agent": agent, "cwd": cwd }).to_string(),
+        ),
     );
+    tokio::task::block_in_place(|| held.wait());
+    let launch = rig
+        .srv
+        .store
+        .read(|r| Ok(r.threads()?.pop().unwrap().current_launch_id.unwrap()));
+    let entry = rig.sup.entry(launch).unwrap();
+    (held, reply, entry)
+}
+
+/// Runs `entry.await_published` on its own thread with a facts deadline an hour away, so
+/// within a test's bounds only a change it sees ends the wait. Returns the receivers of its
+/// first wait and of its end.
+fn waiting(
+    entry: &Arc<LiveLaunch>,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Receiver<()>) {
+    let (waiting_tx, waiting) = std::sync::mpsc::channel();
+    *lock(&entry.hooks.publication_waiting) = Some(Box::new(move || {
+        let _ = waiting_tx.send(());
+    }));
+    let (ended_tx, ended) = std::sync::mpsc::channel();
+    let e = entry.clone();
+    std::thread::spawn(move || {
+        e.await_published(Instant::now() + Duration::from_secs(3600));
+        let _ = ended_tx.send(());
+    });
+    (waiting, ended)
+}
+
+/// How long a test waits for a wait it ended to return.
+const ENDS: Duration = Duration::from_secs(30);
+
+/// SF-8 `observe` and the removal: a launch removed before its creation began is
+/// `Unobservable` with no wait; one whose spawn fails after creation began ends a
+/// publication wait at the removal, not at the facts deadline; a published launch detached
+/// and still in the map is `Started`; one removed between the positions' read and the return
+/// is `Unobservable`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observe_removed() {
+    // Removed before creation began.
+    let rig = Rig::new().await;
+    let (held, reply, entry) = held_spawn(&rig, Pause::AfterReserve, "codex").await;
+    rig.sup.remove(entry.launch_id);
+    assert!(entry.removed());
+    assert_eq!(entry.observe(None), LaunchObservation::Unobservable);
+    let t0 = Instant::now();
+    entry.await_published(t0 + Duration::from_secs(10));
+    assert!(t0.elapsed() < Duration::from_secs(1), "no wait");
+    held.go();
+    let _ = reply.await.unwrap();
+    rig.srv.stop().await;
+
+    // The spawn fails after creation began: the wait ends on the removal.
+    let rig = Rig::new().await;
+    rig.pty.script_next(FakeScript {
+        fail: Some(SpawnError::NeverStarted {
+            kind: NeverStartedKind::Setup,
+            error: std::io::Error::other("x"),
+            cleanup: Cleanup::Confirmed,
+        }),
+        ..FakeScript::default()
+    });
+    let (held, reply, entry) = held_spawn(&rig, Pause::BeforeSpawn, "codex").await;
+    assert!(entry.creation_started());
+    let (reported, ended) = waiting(&entry);
+    reported.recv_timeout(Duration::from_secs(10)).unwrap();
+    held.go();
+    assert_eq!(
+        super::json(&reply.await.unwrap())["outcome"],
+        "spawn_failed"
+    );
+    ended
+        .recv_timeout(ENDS)
+        .expect("the wait ended on the removal, not at the facts deadline");
+    assert!(entry.removed());
+    assert_eq!(entry.observe(None), LaunchObservation::Unobservable);
+    rig.srv.stop().await;
+
+    // Detached and still in the map; then removed between the positions and the return.
+    let rig = Rig::new().await;
+    let cwd = rig.cwd.path().to_string_lossy().into_owned();
+    let r = rig
+        .cmd(
+            "spawn",
+            &serde_json::json!({ "agent": "codex", "cwd": cwd }),
+        )
+        .await;
+    assert_eq!(r.status, 200);
+    let launch = serde_json::from_value(super::json(&r)["launch_id"].clone()).unwrap();
+    let entry = rig.sup.entry(launch).unwrap();
+    let mut g = entry
+        .lock_before(&rig.sup, rig.sup.now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+    let session = entry.take_session(&mut g);
+    assert!(
+        matches!(entry.observe(None), LaunchObservation::Started { .. }),
+        "detached"
+    );
+    *g = session;
+    drop(g);
+    let (sup, l) = (rig.sup.clone(), entry.launch_id);
+    *lock(&entry.hooks.after_positions) = Some(Box::new(move || sup.remove(l)));
+    assert_eq!(entry.observe(None), LaunchObservation::Unobservable);
+    assert!(entry.removed());
+    rig.srv.stop().await;
+}
+
+/// SF-8: a publication or a removal made after the publication wait began ends the wait,
+/// long before the facts deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn poll_sees_later_change() {
+    // Published.
+    let rig = Rig::new().await;
+    let (held, reply, entry) = held_spawn(&rig, Pause::BeforePublish, "codex").await;
+    let (reported, ended) = waiting(&entry);
+    reported.recv_timeout(Duration::from_secs(10)).unwrap();
+    held.go();
+    ended.recv_timeout(ENDS).expect("the publication was seen");
+    assert!(entry.published().is_some());
+    assert_eq!(reply.await.unwrap().status, 200);
+    rig.srv.stop().await;
+    // Removed.
+    let rig = Rig::new().await;
+    let (held, reply, entry) = held_spawn(&rig, Pause::BeforePublish, "codex").await;
+    let (reported, ended) = waiting(&entry);
+    reported.recv_timeout(Duration::from_secs(10)).unwrap();
+    rig.sup.remove(entry.launch_id);
+    ended.recv_timeout(ENDS).expect("the removal was seen");
+    held.go();
+    let _ = reply.await.unwrap();
     rig.srv.stop().await;
 }

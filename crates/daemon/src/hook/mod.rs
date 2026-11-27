@@ -57,6 +57,9 @@ pub struct HookConfig {
     pub emitter_name: String,
     /// Early hooks wait this long, inside the deadline, for `launch_started` (1 s).
     pub pid_wait: Duration,
+    /// The intake's waits for its facts end this long after its entry, or at the request
+    /// deadline if sooner (500 ms; design §2.4).
+    pub intake_wait: Duration,
     /// Links walked from the emitter (16).
     pub max_chain: usize,
     /// Buffered deliveries per launch (32).
@@ -74,6 +77,7 @@ impl Default for HookConfig {
         HookConfig {
             emitter_name: "chaldea".to_owned(),
             pid_wait: Duration::from_secs(1),
+            intake_wait: Duration::from_millis(500),
             max_chain: 16,
             buffer_max_count: 32,
             buffer_max_bytes: 8 * 1024 * 1024,
@@ -107,7 +111,7 @@ impl HookSeams {
 pub struct HookIngest {
     cfg: HookConfig,
     seams: HookSeams,
-    order: Arc<IntakeOrder>,
+    pub(crate) order: Arc<IntakeOrder>,
     budget: Arc<Semaphore>,
     #[cfg(test)]
     pub(crate) points: tests::points::Points,
@@ -222,12 +226,22 @@ impl HookIngest {
             return Ok(reply(&d.first_reply));
         }
         // 5. Intake: the ordinal, the facts, and the pid wait's origin together.
-        let (ticket, facts, guard, intake_at) = self.order.intake(
-            pre.launch.launch_id,
-            pre.stored_max,
-            &self.seams.intake,
-            || shared.cfg.clock.now(),
-        );
+        let intake::Taken {
+            ticket,
+            facts,
+            guard,
+            at: intake_at,
+        } = self
+            .order
+            .intake(
+                &shared,
+                deadline,
+                pre.launch.launch_id,
+                pre.stored_max,
+                &self.seams.intake,
+                self.cfg.intake_wait,
+            )
+            .await?;
         #[cfg(test)]
         self.points.after_intake(ticket.ordinal()).await;
         // 6. Ancestry walk.

@@ -34,6 +34,20 @@ pub(crate) fn shared(srv: &TestServer) -> Arc<Shared> {
     srv.server.shared().clone()
 }
 
+/// The server's clock on tokio's time, which a test pauses and advances: the server's
+/// deadline checks and the timers it sets move together.
+pub(crate) struct TokioClock;
+
+impl super::MonotonicClock for TokioClock {
+    fn now(&self) -> std::time::Instant {
+        tokio::time::Instant::now().into_std()
+    }
+
+    fn real(&self, at: std::time::Instant) -> std::time::Instant {
+        at
+    }
+}
+
 /// Mints a ticket for the token `secret` directly in the server's ticket store.
 pub(crate) fn mint_ticket(srv: &TestServer, secret: &str, purpose: TicketPurpose) -> String {
     let sha: [u8; 32] = Sha256::digest(secret.as_bytes()).into();
