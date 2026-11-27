@@ -171,7 +171,7 @@ async fn zero_byte_attempt_opens_interval() {
         let mut st = me.state();
         me.clear_lease(&mut st);
         assert!(
-            me.take_lease(&mut st, crate::supervisor::send::LeaseKind::Resize(0))
+            me.take_lease(&mut st, crate::supervisor::send::LeaseKind::Resize)
                 .is_some()
         );
     });

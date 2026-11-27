@@ -146,7 +146,7 @@ pub(crate) enum LeaseKind {
     /// An input's open and submission, until it becomes the running unit.
     Send(InputId),
     /// An attach socket's resize, until its backend call returns.
-    Resize(u64),
+    Resize,
 }
 
 /// The launch lease: one holder at a time orders a send's open and submission against a

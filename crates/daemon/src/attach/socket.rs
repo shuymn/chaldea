@@ -577,7 +577,6 @@ pub(super) fn resize(
     sl: Arc<SendLaunch>,
     handle: SessionHandle,
     fence: Fence,
-    socket: u64,
     size: PtySize,
     first: bool,
     newer: Arc<Mutex<Option<PtySize>>>,
@@ -586,7 +585,7 @@ pub(super) fn resize(
         let id = loop {
             let mut free = pin!(sl.lease_free.notified());
             free.as_mut().enable();
-            if let Some(id) = sl.take_lease(&mut sl.state(), LeaseKind::Resize(socket)) {
+            if let Some(id) = sl.take_lease(&mut sl.state(), LeaseKind::Resize) {
                 break id;
             }
             #[cfg(test)]
@@ -951,7 +950,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
     // On the supervisor's clock, as the other socket timers.
     let mut idle_at: Option<Instant> = None;
     #[cfg(test)]
-    let tick_every = cfg.tick_every.unwrap_or(wcfg.heads_interval);
+    let tick_every = super::TEST_TICK_EVERY;
     #[cfg(not(test))]
     let tick_every = wcfg.heads_interval;
     let mut next_tick = tokio::time::Instant::now() + tick_every;
@@ -1041,7 +1040,6 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                     sl.clone(),
                     handle.clone(),
                     fence.clone(),
-                    me,
                     size,
                     first,
                     size_wanted.clone(),
@@ -1244,10 +1242,6 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                 generation += 1;
                 verify_due = true;
                 ping_due = true;
-                #[cfg(test)]
-                cfg.hooks
-                    .ticked
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 continue;
             }
             Ev::Verified(i, j) => {
@@ -1372,7 +1366,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                     }
                     (_, Ok(report)) => ctl.extend(report_frame(&o.unit, &report)),
                     (Phase::Waiting { ticket, .. }, Err(_)) => {
-                        outstanding = settle_lost(o.unit, &ticket, &mut ctl);
+                        outstanding = settle_unreported(o.unit, &ticket, None, &mut ctl);
                     }
                     (Phase::Submitting(_), Err(_)) => {}
                 }
@@ -1387,7 +1381,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                     continue;
                 }
                 if let Phase::Waiting { ticket, rx, .. } = o.phase {
-                    outstanding = settle_late(o.unit, &ticket, rx, &mut ctl);
+                    outstanding = settle_unreported(o.unit, &ticket, Some(rx), &mut ctl);
                 }
                 continue;
             }
@@ -1679,30 +1673,20 @@ fn pending_frame(unit: &Unit, cancelled: bool) -> AttachServerMessage {
     }
 }
 
-/// The report channel dropped (R-10): the cancel decides `not_written`; otherwise the unit
-/// is `pending` and stays outstanding with no settlement to come (R-4).
-fn settle_lost(unit: Unit, ticket: &WriteTicket, ctl: &mut Ctl) -> Option<Outstanding> {
-    let cancelled = ticket.try_cancel() == Some(true);
-    ctl.push_back(pending_frame(&unit, cancelled));
-    (!cancelled).then_some(Outstanding {
-        unit,
-        phase: Phase::Stuck(None),
-    })
-}
-
-/// No report by `not_after` + 1 s (R-4, R-10): the cancel decides `not_written` (the
-/// worker still records the cancelled unit); otherwise `pending`, and the unit stays
-/// outstanding until its report arrives.
-fn settle_late(
+/// No report by `not_after` + 1 s, with its channel `rx`, or the report channel dropped
+/// (`None`) (R-4, R-10): the cancel decides `not_written` (the worker still records the
+/// cancelled unit); otherwise the unit is `pending` and stays outstanding, until its report
+/// arrives or, with no channel, with no settlement to come.
+fn settle_unreported(
     unit: Unit,
     ticket: &WriteTicket,
-    rx: oneshot::Receiver<KeyReport>,
+    rx: Option<oneshot::Receiver<KeyReport>>,
     ctl: &mut Ctl,
 ) -> Option<Outstanding> {
     let cancelled = ticket.try_cancel() == Some(true);
     ctl.push_back(pending_frame(&unit, cancelled));
     (!cancelled).then_some(Outstanding {
         unit,
-        phase: Phase::Stuck(Some(rx)),
+        phase: Phase::Stuck(rx),
     })
 }

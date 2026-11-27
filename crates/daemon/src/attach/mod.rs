@@ -23,6 +23,11 @@ use crate::supervisor::Supervisor;
 
 pub(crate) use registry::Registry;
 
+/// The verification and ping tick in tests, in place of the server's `heads_interval`:
+/// tests tick explicitly through [`AttachHooks::tick`].
+#[cfg(test)]
+pub(crate) const TEST_TICK_EVERY: Duration = Duration::from_secs(24 * 3600);
+
 /// The route's path.
 pub(crate) const ATTACH_PATH: &str = "/api/attach/{thread}";
 
@@ -54,10 +59,6 @@ pub(crate) struct AttachConfig {
     /// one fresh verification read (5 s each), the handle and the subscription waits
     /// (250 ms each), and close grace (1 s), 11.5 s.
     pub candidacy: Duration,
-    /// The verification and ping tick in place of the server's `heads_interval` (tests
-    /// tick explicitly through [`AttachHooks::tick`]).
-    #[cfg(test)]
-    pub tick_every: Option<Duration>,
     /// Test points.
     #[cfg(test)]
     pub hooks: Arc<AttachHooks>,
@@ -82,8 +83,6 @@ pub(crate) struct AttachHooks {
     pub gone_requests: std::sync::atomic::AtomicU64,
     /// Notified with each tick request.
     pub tick_now: tokio::sync::Notify,
-    /// Ticks every socket has taken (its verification started), by every socket.
-    pub ticked: std::sync::atomic::AtomicU64,
     /// Nudges or ticks that found both verification slots taken, by every socket.
     pub saturated: std::sync::atomic::AtomicU64,
     /// Runs on the socket's task right after its loop sampled the terminal latch (none
@@ -157,8 +156,6 @@ impl Default for AttachConfig {
             gone_poll: Duration::from_secs(1),
             subscribe_wait: Duration::from_millis(250),
             candidacy: Duration::from_secs(15),
-            #[cfg(test)]
-            tick_every: Some(Duration::from_secs(24 * 3600)),
             #[cfg(test)]
             hooks: Arc::default(),
         }

@@ -96,7 +96,7 @@ async fn foreign_lease_not_converted() {
     set(&sl.hooks.before_submit, move || {
         let mut st = me.state();
         me.clear_lease(&mut st);
-        let other = me.take_lease(&mut st, crate::supervisor::send::LeaseKind::Resize(0));
+        let other = me.take_lease(&mut st, crate::supervisor::send::LeaseKind::Resize);
         assert!(other.is_some());
     });
     let id = rig.send(&live, "prompt").await;

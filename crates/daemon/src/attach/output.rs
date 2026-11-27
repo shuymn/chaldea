@@ -121,20 +121,19 @@ impl OutBuf {
         *lock(&self.on_latch) = Some(f);
     }
 
-    /// Latches `e` unless an event is latched already; the latched one.
-    pub(crate) fn latch(&self, e: Ending) -> Ending {
+    /// Latches `e` unless an event is latched already.
+    pub(crate) fn latch(&self, e: Ending) {
         let mut st = lock(&self.st);
-        self.latch_in(&mut st, e)
+        self.latch_in(&mut st, e);
     }
 
-    fn latch_in(&self, st: &mut State, e: Ending) -> Ending {
+    fn latch_in(&self, st: &mut State, e: Ending) {
         if st.ending.is_none() {
             st.ending = Some(e);
             self.active.store(false, Ordering::Release);
             // The grant moves with the latch, before any unit can be permitted after it.
             st.latched_at = lock(&self.on_latch).as_ref().and_then(|f| f());
         }
-        st.ending.unwrap_or(e)
     }
 
     /// Stops the sink; the buffered bytes stay (the frozen prefix).

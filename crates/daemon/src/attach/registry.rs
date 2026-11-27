@@ -35,20 +35,12 @@ impl Replaced {
     }
 }
 
-/// The launch's operating socket.
-struct Current {
-    socket: u64,
-    sub: SubscriptionId,
-    /// The socket's output sink accepts bytes while set.
-    active: Arc<AtomicBool>,
-    handle: SessionHandle,
-    replaced: Arc<Replaced>,
-}
-
-/// A candidate's parts, registered by [`LaunchAttach::swap`] once its subscription exists.
+/// A candidate's parts, registered by [`LaunchAttach::swap`] once its subscription exists;
+/// the launch's operating socket from then on.
 pub(crate) struct Candidate {
     pub socket: u64,
     pub sub: SubscriptionId,
+    /// The socket's output sink accepts bytes while set.
     pub active: Arc<AtomicBool>,
     pub handle: SessionHandle,
     pub replaced: Arc<Replaced>,
@@ -62,7 +54,7 @@ pub(crate) struct LaunchAttach {
     /// Moved at every swap and by every terminal path of the current socket: a unit or a
     /// resize whose `expect` is an older grant is refused.
     pub word: Arc<AtomicU64>,
-    current: Mutex<Option<Current>>,
+    current: Mutex<Option<Candidate>>,
     /// The marker rule's context (R-6), in write order across sockets.
     pub marks: Mutex<Marks>,
     /// Notified when a raw unit settles.
@@ -86,13 +78,7 @@ impl LaunchAttach {
         let mut cur = lock(&self.current);
         let grant = self.word.load(Ordering::Acquire).wrapping_add(1);
         self.word.store(grant, Ordering::Release);
-        let old = cur.replace(Current {
-            socket: c.socket,
-            sub: c.sub,
-            active: c.active,
-            handle: c.handle,
-            replaced: c.replaced,
-        });
+        let old = cur.replace(c);
         // Under the lock, with the swap: the replaced sink stops and its socket is told.
         let removed = old.map(|o| {
             o.active.store(false, Ordering::Release);
