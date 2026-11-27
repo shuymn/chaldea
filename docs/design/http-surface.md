@@ -284,7 +284,7 @@ impl ReadCtx {
 pub struct WriteCtx { principal: Option<Principal>, deadline: Instant, shared: Arc<Shared> }
 impl WriteCtx {
     pub async fn body_within(&self, body: Body, max: u64) -> Result<Bytes, ApiError>;   // 408 at the deadline, 413 over max
-    /// One non-command write through `await_write_releasing` (`await_write` with a release), its result awaited until `deadline + write_reply_grace`.
+    /// One non-command write through the shared helper `await_write_releasing` (no release), its result awaited until `deadline + write_reply_grace`.
     pub async fn write<R: Send + 'static>(&self, job: impl FnOnce(&mut WriteTx<'_>, Option<&Authorized>) -> Result<R, JobError> + Send + 'static)
         -> Result<R, ApiError>;     // no reply by then → 503 `outcome_unknown` (never `in_progress`: no receipt)
     /// `write` whose observer drops `release` as soon as `Store::submit` returns (or with the observer, refused
@@ -315,7 +315,7 @@ pub(crate) trait OnReply<R>: Send + 'static {
 /// revocation nudge). Called by an already registered task: a plain write's observer or a `CommandRunner`.
 pub(crate) async fn run_write<R: Send + 'static>(shared: &Shared, not_after: Instant, job: Job<R>, after_ok: Option<AfterOk>)
     -> Result<R, WriteFailure>;   // WriteFailure = WriteError | SubmitError
-/// Token revocation (and `WriteCtx::write`, through `await_write_releasing`): 408 at or after the deadline; else one registered observer task runs `run_write` (`run_write_releasing`)
+/// Token revocation (`WriteCtx::write` shares its helper, `await_write_releasing`): 408 at or after the deadline; else one registered observer task calls `run_write_releasing`
 /// and its reply is awaited until `deadline + write_reply_grace` (none by then, or one taken at or after it: 503 `outcome_unknown`); 503 `shutting_down` once closing.
 pub(crate) async fn await_write<R: Send + 'static>(shared: &Arc<Shared>, deadline: Instant, job: Job<R>, after_ok: Option<AfterOk>)
     -> Result<R, ApiError>;
