@@ -132,10 +132,11 @@ pub(crate) fn human_write_in(
     if matches!(rec.outcome, WriteOutcome::NotStarted(_)) {
         return Ok(());
     }
-    let key = if origin == HumanWriteOrigin::Attach {
+    // The key, and whether this attempt already found no event with it.
+    let (key, absent) = if origin == HumanWriteOrigin::Attach {
         match decided.get().cloned() {
             Some(None) => return Ok(()),
-            Some(Some(key)) => key,
+            Some(Some(key)) => (key, false),
             None => {
                 let key = attach_key(launch, attach_interval(tx, launch)?);
                 let append = tx
@@ -149,16 +150,17 @@ pub(crate) fn human_write_in(
                 if !append {
                     return Ok(());
                 }
-                key
+                (key, true)
             }
         }
     } else {
-        human_key(launch, rec.seq)
+        (human_key(launch, rec.seq), false)
     };
-    if tx
-        .read()
-        .event_by_key(StreamId::Thread(thread), &key)?
-        .is_some()
+    if !absent
+        && tx
+            .read()
+            .event_by_key(StreamId::Thread(thread), &key)?
+            .is_some()
     {
         return Ok(());
     }
