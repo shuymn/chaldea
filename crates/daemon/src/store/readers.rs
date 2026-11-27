@@ -41,11 +41,6 @@ pub(super) const BINDING_ORDINAL_SQL: &str = "SELECT d.receipt_ordinal FROM even
      WHERE e.stream_id = ?1 AND e.kind = 'session_bound' AND e.launch_id = ?2
      ORDER BY e.seq DESC LIMIT 1";
 
-/// [`ReadTx::last_attempt_seq`]'s query: the launch's inputs through
-/// `proj_inputs_launch_attempt`, never a scan of every input.
-pub(super) const LAST_ATTEMPT_SQL: &str =
-    "SELECT max(attempt_seq) FROM proj_inputs WHERE launch_id = ?1";
-
 /// One page of a stream, as `core::sync::EventsResponse::Replay` carries it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Page {
@@ -1444,10 +1439,11 @@ impl<'a> ReadTx<'a> {
     /// A store error.
     pub fn last_attempt_seq(&self, l: LaunchId) -> Result<Option<u64>, StoreError> {
         self.guard(|| {
-            let max: Option<i64> =
-                sql(self
-                    .conn
-                    .query_row(LAST_ATTEMPT_SQL, [l.to_string()], |r| r.get(0)))?;
+            let max: Option<i64> = sql(self.conn.query_row(
+                "SELECT max(attempt_seq) FROM proj_inputs WHERE launch_id = ?1",
+                [l.to_string()],
+                |r| r.get(0),
+            ))?;
             opt_u64(max)
         })
     }

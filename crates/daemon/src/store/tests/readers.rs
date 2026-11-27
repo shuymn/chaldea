@@ -107,28 +107,3 @@ fn binding_lookup_stays_in_the_stream() {
         "{plan:?}"
     );
 }
-
-/// The attach interval's lookup runs in every attach `human_write` job: it reads the
-/// launch's inputs through the launch index, not a scan of every thread's inputs.
-#[test]
-fn last_attempt_lookup_uses_the_launch_index() {
-    let s = TestStore::new();
-    let c = raw(&s.path());
-    let mut q = c
-        .prepare(&format!(
-            "EXPLAIN QUERY PLAN {}",
-            crate::store::readers::LAST_ATTEMPT_SQL
-        ))
-        .unwrap();
-    let plan: Vec<String> = q
-        .query_map(["l"], |r| r.get(3))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    assert!(
-        plan.iter()
-            .any(|d| d.contains("USING") && d.contains("INDEX proj_inputs_launch_attempt")),
-        "{plan:?}"
-    );
-    assert!(!plan.iter().any(|d| d.starts_with("SCAN")), "{plan:?}");
-}

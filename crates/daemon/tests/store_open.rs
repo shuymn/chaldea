@@ -88,10 +88,6 @@ fn refuses_foreign_rollback_journal_database() {
     assert!(!PathBuf::from(wal).exists());
 }
 
-/// Undoes schema v5 (the `proj_inputs` launch index), so a v5 database reads as v4. Runs
-/// before [`V4_DOWN`].
-const V5_DOWN: &str = "DROP INDEX proj_inputs_launch_attempt; PRAGMA user_version = 4;";
-
 /// Undoes schema v3 (the two `proj_inputs` columns), so a v3 database reads as v2. Runs
 /// after [`V4_DOWN`].
 const V3_DOWN: &str = "ALTER TABLE proj_inputs DROP COLUMN last_write_before; \
@@ -151,7 +147,7 @@ fn refuses_newer_schema() {
             r,
             Err(OpenError::NewerSchema {
                 found: 99,
-                supported: 5
+                supported: 4
             })
         ),
         "{:?}",
@@ -170,7 +166,7 @@ fn refuses_altered_schema() {
         .execute_batch("DROP TRIGGER events_no_update")
         .unwrap();
     match open(&s.path()) {
-        Err(OpenError::SchemaMismatch { version: 5, names }) => {
+        Err(OpenError::SchemaMismatch { version: 4, names }) => {
             assert!(names.contains(&"events_no_update".to_owned()), "{names:?}");
         }
         other => panic!("{:?}", other.err()),
@@ -222,7 +218,7 @@ fn sqlite_version_is_bundled() {
     )]
     let info = s.read(|r| r.schema_info());
     assert_eq!(info.sqlite_version, "3.54.1");
-    assert_eq!(info.user_version, 5);
+    assert_eq!(info.user_version, 4);
     assert_eq!(info.application_id, 0x4348_4C44);
 }
 
@@ -587,13 +583,13 @@ fn v3_upgrades_to_v4() {
     s.shutdown();
     Connection::open(s.path())
         .unwrap()
-        .execute_batch(&format!("{V5_DOWN} {V4_DOWN}"))
+        .execute_batch(V4_DOWN)
         .unwrap();
     let before = support::http::dump(&s.path());
 
     s.reopen();
     assert_eq!(dump_without_v4(&s.path()), before, "a v3 row changed");
-    assert_eq!(s.read(|r| Ok(r.schema_info()?.user_version)), 5);
+    assert_eq!(s.read(|r| Ok(r.schema_info()?.user_version)), 4);
     for (sha, bytes, media) in blobs {
         let (exists, body) =
             s.read(move |r| Ok((r.blob_ref_exists(stream, &sha)?, r.blob(stream, &sha)?)));
@@ -674,14 +670,14 @@ fn v1_upgrades_to_v2() {
     Connection::open(s.path())
         .unwrap()
         .execute_batch(&format!(
-            "{V5_DOWN} {V4_DOWN} DROP TRIGGER events_session_bound_once; {V3_DOWN} PRAGMA user_version = 1"
+            "{V4_DOWN} DROP TRIGGER events_session_bound_once; {V3_DOWN} PRAGMA user_version = 1"
         ))
         .unwrap();
     let before = support::http::dump(&s.path());
 
     s.reopen();
     assert_eq!(dump_without_v4(&s.path()), before, "a v1 row changed");
-    assert_eq!(s.read(|r| Ok(r.schema_info()?.user_version)), 5);
+    assert_eq!(s.read(|r| Ok(r.schema_info()?.user_version)), 4);
     let diff = s.run(|tx| Ok(tx.verify_projections()?)).unwrap();
     assert!(diff.is_empty(), "{diff:?}");
     // The v2 trigger is in force: a second binding of l1 is refused.
@@ -787,7 +783,7 @@ fn v2_upgrades_to_v3() {
     Connection::open(s.path())
         .unwrap()
         .execute_batch(&format!(
-            "{V5_DOWN} {V4_DOWN} {V3_DOWN} PRAGMA user_version = 2; \
+            "{V4_DOWN} {V3_DOWN} PRAGMA user_version = 2; \
              UPDATE meta SET value = '1' WHERE key = 'projection_version'; \
              UPDATE proj_launches SET last_write_seq = 999"
         ))
@@ -800,7 +796,7 @@ fn v2_upgrades_to_v3() {
     let info = s.read(|r| r.schema_info());
     assert_eq!(
         (info.user_version, info.projection_version.as_str()),
-        (5, "3")
+        (4, "3")
     );
     let diff = s.run(|tx| Ok(tx.verify_projections()?)).unwrap();
     assert!(diff.is_empty(), "{diff:?}");
