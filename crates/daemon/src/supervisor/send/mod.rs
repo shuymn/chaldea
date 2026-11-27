@@ -257,10 +257,11 @@ pub(crate) struct SendHooks {
     /// Runs in the probe's `facts` after `written` was read, before the fence advance (the
     /// launch's state held).
     pub after_written_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    /// Runs in the probe's `facts` each time its `try_lock` of the launch's state failed.
+    /// Runs in the probe's `facts` each time its `try_lock` of the launch's state failed
+    /// before the facts deadline, before its sleep.
     pub state_contended: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    /// Runs in the probe's `facts` after a wait for the launch's state that ended at or past
-    /// the facts deadline, before the final `try_lock`.
+    /// Runs in the probe's `facts` before its last `try_lock` of the launch's state, the first
+    /// made at or after the facts deadline.
     pub state_final_wake: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs at the start of the probe's `finished` (on the write's observer), before the
     /// hook's turn marks are applied.

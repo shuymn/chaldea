@@ -71,25 +71,26 @@ pub(crate) struct SupervisorProbe {
     pub side: Arc<SendSide>,
 }
 
-/// The launch's state, retried until `f` (real time) with sleeps capped by the time left, and
-/// tried once more after the last; `None` when every attempt found it held.
+/// The launch's state, retried until `f` (real time) with sleeps capped by the time left;
+/// the first attempt made at or after `f` is the last. `None` when every attempt found it
+/// held.
 fn state_until(sl: &SendLaunch, f: Instant) -> Option<MutexGuard<'_, SendState>> {
     let mut backoff = Backoff::default();
     loop {
+        let last = Instant::now() >= f;
+        #[cfg(test)]
+        if last {
+            super::run_hook(&sl.hooks.state_final_wake);
+        }
         if let Some(st) = sl.try_state() {
             return Some(st);
         }
-        #[cfg(test)]
-        super::run_hook(&sl.hooks.state_contended);
-        let now = Instant::now();
-        if now >= f {
+        if last {
             return None;
         }
-        backoff.wait(f - now);
         #[cfg(test)]
-        if Instant::now() >= f {
-            super::run_hook(&sl.hooks.state_final_wake);
-        }
+        super::run_hook(&sl.hooks.state_contended);
+        backoff.wait(f.saturating_duration_since(Instant::now()));
     }
 }
 

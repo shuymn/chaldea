@@ -76,10 +76,11 @@ pub(crate) struct LiveLaunch {
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct LiveHooks {
-    /// Runs in `await_published` each time it saw the launch unpublished and not removed.
+    /// Runs in `await_published` each time it saw the launch unpublished and not removed
+    /// before the facts deadline, before its sleep.
     pub publication_waiting: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    /// Runs in `await_published` after a wait that ended at or past the facts deadline,
-    /// before the final read.
+    /// Runs in `await_published` before its last check, the first made at or after the facts
+    /// deadline.
     pub final_wake: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs in `observe` after the positions were read, before `removed` is read again.
     pub after_positions: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -235,25 +236,22 @@ impl LiveLaunch {
 
     /// Waits, until `f` (real time), while the launch's creation began and it is neither
     /// published nor removed (send §2.5 "Intake facts"). It polls those atomics and takes no
-    /// lock; each sleep is capped by the time left to `f`, and the predicate is read once more
-    /// after the last one.
+    /// lock; each sleep is capped by the time left to `f`, and the first check made at or
+    /// after `f` is the last.
     pub(crate) fn await_published(&self, f: Instant) {
         let mut backoff = Backoff::default();
         loop {
-            if !self.creation_started() || self.published().is_some() || self.removed() {
+            let last = Instant::now() >= f;
+            #[cfg(test)]
+            if last {
+                run_hook(&self.hooks.final_wake);
+            }
+            if !self.creation_started() || self.published().is_some() || self.removed() || last {
                 return;
             }
             #[cfg(test)]
             run_hook(&self.hooks.publication_waiting);
-            let now = Instant::now();
-            if now >= f {
-                return;
-            }
-            backoff.wait(f - now);
-            #[cfg(test)]
-            if Instant::now() >= f {
-                run_hook(&self.hooks.final_wake);
-            }
+            backoff.wait(f.saturating_duration_since(Instant::now()));
         }
     }
 
