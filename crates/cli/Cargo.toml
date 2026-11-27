@@ -30,6 +30,12 @@ name = "daemon_stop"
 path = "tests/daemon_stop.rs"
 harness = false
 
+# Interactive `open` against a foreground daemon of this binary without the PWA.
+[[test]]
+name = "daemon_open"
+path = "tests/daemon_open.rs"
+harness = false
+
 # A foreground daemon of this binary whose agent program is FakeCli (tests/support/faults.rs).
 [[test]]
 name = "supervisor_e2e"

@@ -78,6 +78,12 @@ pub const MARKER_PAUSE: &str = "CHALDEA_TEST_MARKER_PAUSE";
 pub const STOP_PAUSE: &str = "CHALDEA_TEST_STOP_PAUSE";
 /// Milliseconds a shutdown participant takes (bounded by its end).
 pub const SLOW_SHUTDOWN_MS: &str = "CHALDEA_TEST_SLOW_SHUTDOWN_MS";
+/// Set: `daemon run` builds `SupervisorComponents` with no PWA, as a Rust-only build does,
+/// whatever this build embedded (`GET /` answers 501).
+pub const NO_PWA: &str = "CHALDEA_TEST_NO_PWA";
+/// A file: `open`'s launcher appends each URL it is handed to it, a line each, instead of
+/// opening a browser.
+pub const LAUNCHER: &str = "CHALDEA_TEST_LAUNCHER";
 /// Milliseconds a store reader, started at step 9, stays open: the shutdown's store report,
 /// and so the lock decision, waits that long.
 pub const HOLD_READER_MS: &str = "CHALDEA_TEST_HOLD_READER_MS";
@@ -392,6 +398,27 @@ pub fn enter_if_chaldea() {
                 hold_reader,
                 shutdown_gate,
             }) as Box<dyn Components>
+        }));
+    }
+    if std::env::var_os(NO_PWA).is_some() {
+        seams.components = Some(Box::new(|| {
+            let host = chaldea_core::adapter::HostOs::from_os_str(std::env::consts::OS)
+                .expect("a supported host");
+            let mut cfg = chaldea_daemon::supervisor::SupervisorConfig::default();
+            cfg.pwa = &[];
+            Box::new(chaldea_daemon::supervisor::SupervisorComponents::new(
+                host, cfg,
+            )) as Box<dyn Components>
+        }));
+    }
+    if let Some(file) = env_path(LAUNCHER) {
+        seams.launcher = Some(Box::new(move |url: &str| {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file)?;
+            writeln!(f, "{url}")
         }));
     }
     if let Ok(json) = std::env::var(AGENT_PROGRAM) {
