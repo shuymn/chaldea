@@ -2,7 +2,7 @@
 
 Status: implemented in `crates/daemon/src/store`. Scope is the PR 6 row of `docs/mvp-design.md` §4 (cited as "mvp §N"): the store in a new `crates/daemon`, holding append-only events, projections, command receipts, hook deliveries, tokens, and blobs. Its design obligations: drop-and-rebuild equality for every projection; `INSERT OR REPLACE`, update, and delete on `events` abort; `transcript_generation` before new-generation lines; a stale-cursor batch aborts; blob offload and lossy preview. Plan-layer claims it owns (mvp §6.2): CL-9, CL-10 (store side), CL-11, CL-12 (store side).
 
-The contract implemented is mvp §2.1 ("Store", "Projections", "Transcript cursor rules", "Idempotency keys", "`Content`") and the store side of mvp §2.3 (gate evidence), §2.4 (epoch, `head_seq`, `cum_bytes`, receipts), §2.6 (worktree record), §2.9 (launch reservation, hook deliveries), and §2.11. No public type of `crates/core` changes. PR 6 clarifies one public sentence, the `Content` preview rule (mvp §2.1 and the doc comment of `core::payload::Content::Blob`, §2.5 below); no producer has persisted events yet, so no stored value changes meaning.
+The contract implemented is mvp §2.1 ("Store", "Projections", "Transcript cursor rules", "Idempotency keys", "`Content`") and the store side of mvp §2.3 (gate evidence), §2.4 (epoch, `head_seq`, `cum_bytes`, receipts), §2.6 (worktree record), §2.9 (launch reservation, hook deliveries), and §2.11. No public type of `crates/core` changes; the `Content` preview rule is the one public sentence the store defines (mvp §2.1 and the doc comment of `core::payload::Content::Blob`, §2.5 below).
 
 **What the store does and does not decide.** The store guarantees ordering, immutability, atomicity, idempotency by key, projection consistency, and durability, and it exposes every read and write the later PRs need as an operation inside one transaction. It does not decide routes, tokens, gate policy, hook binding and matching, reservation preconditions, transcript continuity, or retention; those PRs run their checks inside a store job (§2.2), so a check and the write it guards are atomic, and the store returns error kinds they map to their own outcomes.
 
@@ -12,7 +12,6 @@ Sources read for this document (paths are relative to each root):
 
 | Source | Revision | Read for |
 |---|---|---|
-| This repository | `f019dee` | `crates/core/src/{event,payload,state,input,sync,command,ids,lib}.rs`, `crates/core/clippy.toml`, `crates/pty-runtime/src/{writer,origin}.rs`, `Cargo.toml`, `Cargo.lock`, `.github/workflows/ci.yml`, `lefthook.yml`, `docs/architecture.md` §3–§4, `docs/design/pty-runtime.md` |
 | T3 Code (`pingdotgg/t3code`) | `10586f9e` | `apps/server/src/persistence/Migrations/{001_OrchestrationEvents,055_OrchestrationV2}.ts`, `persistence/{OrchestrationEventStore,OrchestrationCommandReceipts,Sqlite}.ts`, `orchestration-v2/{CommandReceiptStore,EventStore,ProjectionStore,ProjectionMaintenance}.ts` |
 | `rusqlite` | crate 0.41.1 | `Cargo.toml` (features), `src/transaction.rs`, `src/config.rs`, `src/busy.rs`, `src/lib.rs` |
 | `libsqlite3-sys` | crate 0.39.1 | `build.rs` (bundled compile flags), `sqlite3/sqlite3.c` (version, unix file mode, win32 VFSs) |
@@ -36,7 +35,7 @@ Sources read for this document (paths are relative to each root):
 | S12 | `SQLITE_DBCONFIG_DEFENSIVE` disables `writable_schema` edits and other direct corruption paths on that connection; rusqlite exposes it through `Connection::set_db_config`. | "sqlite3_db_config"; `rusqlite` `src/config.rs:38`, `:123` | D |
 | S13 | On Unix, SQLite creates `-wal` and `-shm` with the database file's permissions. On Windows, the default `win32` VFS limits a path to `MAX_PATH × 4` = 1040 UTF-8 bytes; the `win32-longpath` VFS allows `UNICODE_STRING_MAX_CHARS`; rusqlite selects a VFS by name with `Connection::open_with_flags_and_vfs`. | `sqlite3.c:47085-47100`, `:49286`, `:49309-49310`, `:54486-54488`, `:54534`, `:54512`; `rusqlite` `src/lib.rs:493` | T for Windows paths (PR6-CL-21); D for Unix modes |
 | S14 | rusqlite: `Connection::is_autocommit`, `busy_timeout`; the `cache` feature gates prepared-statement caching and pulls `hashlink`. | `rusqlite` `src/lib.rs:83-90`, `:1071`; `src/busy.rs:24` | D |
-| S15 | The PTY writer's readiness basis is `Basis { seq, counted: ClassSet }`, where `seq` is `last_started(counted)` and `ClassSet` is a subset of `{Input, Human, Reply}`; the default counts all three. | `crates/pty-runtime/src/writer.rs:102-107`, `src/origin.rs:22-57` | D (PR 10 tests it) |
+| S15 | The PTY writer's readiness basis is `Basis { seq, counted: ClassSet }`, where `seq` is `last_started(counted)` and `ClassSet` is a subset of `{Input, Human, Reply}`; the default counts all three. | `crates/pty-runtime/src/writer.rs:168-173`, `src/origin.rs:23-75` | D (PR 10 tests it) |
 | S16 | A trigger can use `json_tree`, joins, and subqueries, including a recursive CTE inside a subquery. | "CREATE TRIGGER" (syntax restrictions) | D |
 
 ## 1. Goal and Dependencies
@@ -47,9 +46,10 @@ Sources read for this document (paths are relative to each root):
 
 ```
 Cargo.toml                                  # members += "crates/daemon"; [workspace.dependencies] += rusqlite, sha2, tokio, base64, tempfile
-crates/daemon/Cargo.toml                    # chaldea-daemon (lib only in PR 6); [lints] workspace = true
+crates/daemon/Cargo.toml                    # chaldea-daemon (lib); [lints] workspace = true
 crates/daemon/src/lib.rs                    # pub mod store; crate doc: the store rules of §2.1
-crates/daemon/src/store/mod.rs              # Store, StoreConfig, Clock, IdSource, WriteTicket, Committed, errors
+crates/daemon/src/store/mod.rs              # Store, StoreConfig, Clock, IdSource, WriteTicket, Committed, SubmitError, WriteError, JobError
+crates/daemon/src/store/error.rs            # StoreError, ReadError, OpenError, ProjectionError
 crates/daemon/src/store/open.rs             # open sequence, connection setup, header checks, migrations, fingerprints
 crates/daemon/src/store/schema.rs           # MIGRATIONS (v1 DDL to v4), shipped fingerprints per version, PROJECTION_VERSION, PART_BYTES
 crates/daemon/src/store/writer.rs           # writer thread, job queue, deadlines, poisoning, failed state, shutdown
@@ -67,50 +67,13 @@ crates/daemon/tests/store_*.rs              # integration tests through the publ
 crates/daemon/tests/support/mod.rs          # temp store, fixed clock and ids, history model and generators
 ```
 
-**Dependencies.** Root `[workspace.dependencies]`, exact pins in the existing style:
-
-```toml
-# The store (docs/design/event-store.md): SQLite 3.54.1 compiled from the bundled source, so
-# macOS and Windows run the same SQLite. No default features (prepared-statement cache, wasm FFI).
-rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled"] }
-# Blob content addresses (mvp §2.1 `Content`); PR 7's token hashes reuse it.
-sha2 = "=0.11.1"
-# The writer's reply channel and commit notifications only; PR 7 and PR 8 add runtime features.
-tokio = { version = "=1.54.1", default-features = false, features = ["sync"] }
-# Inline `Content` with `encoding: base64` (already in the lock through alacritty_terminal).
-base64 = "=0.22.1"
-# Test databases in the OS temp directory (already in the lock through proptest).
-tempfile = "=3.27.0"
-```
-
-```toml
-# crates/daemon/Cargo.toml
-[dependencies]
-chaldea-core = { path = "../core" }
-rusqlite.workspace = true
-sha2.workspace = true
-tokio.workspace = true
-base64.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-# Event ids and the epoch are random v4 UUIDs.
-uuid = { workspace = true, features = ["v4"] }
-
-[dev-dependencies]
-proptest.workspace = true
-tempfile.workspace = true
-
-[lints]
-workspace = true
-```
+**Dependencies** (D1): pinned in the root `[workspace.dependencies]`, each with its reason; `crates/daemon/Cargo.toml` adds `uuid` with `v4` (event ids, the epoch) and dev `proptest`.
 
 `Cargo.lock` resolves `libsqlite3-sys` to `0.39.1` (`rusqlite =0.41.1` requires `0.39`). `rusqlite` needs Rust 1.89; the toolchain is 1.96.0. The bundled build needs a C compiler: Xcode's `cc` on `macos-latest`, MSVC on `windows-latest`. The daemon stays `unsafe_code = "forbid"`; the store needs no `unsafe` (Unix file mode through `std::os::unix::fs::OpenOptionsExt::mode`).
 
-**Workspace and CI.** The crate joins `members`. The `workspace` job runs unchanged; `cargo test --workspace --locked` now includes the store's unit and integration tests on both runners. No new CI step: the existing `core` dependency check keeps `rusqlite` and `tokio` out of `core`, and the only `cfg(windows)` store test (`store_open::long_path_vfs_is_selected`) is listed in the Windows sentinel step. `lefthook.yml` needs no change.
+**Workspace and CI.** The crate is a workspace member; `cargo test --workspace --locked` in the `workspace` job runs the store's unit and integration tests on both runners. The `core` dependency check keeps `rusqlite` and `tokio` out of `core`, and the only `cfg(windows)` store test (`store_open::long_path_vfs_is_selected`) is listed in the Windows sentinel step.
 
 ## 2. Types and Functions
-
-Names may change in review; shapes may not.
 
 ### 2.1 The Rules
 
@@ -198,7 +161,7 @@ pub struct Committed { pub heads: Vec<StreamHeadEntry> }   // streams this job a
 
 **Notifications.** `Committed` goes out on a `tokio::sync::broadcast` channel (capacity 1024) after the reply. The owning `shutdown` call drops the store's own sender and the writer thread drops its sender before it publishes its report, so once a report says `writer_exited` every receiver gets `Closed` after draining the notifications still buffered for it; `subscribe` after shutdown returns a closed receiver. A lagging subscriber gets `Lagged`, then the notifications still buffered, then `Closed`, and resyncs from heads, which mvp §2.4's subscribe-time and periodic `heads` already cover. Poll commit notifications in ordinary Tokio tasks; custom wakers must return promptly and must not panic or wait for shutdown progress, because the owning `shutdown` wakes pending receivers inline when it drops the last sender (§5).
 
-**What callers learn** (for PR 7's mapping, which this PR does not design): `Ok` means committed and durable (§2.9); `Expired`, `Busy`, `Rejected`, `RolledBack`, `Panicked` mean the job left nothing; `CommitUnknown` and `WriterGone` mean all or nothing, unknown until a later read; `Failed` before the job ran means nothing, and the store is unusable for writes. For a command whose intent job ended `CommitUnknown`, the receipt after a restart is absent (the job did not commit), `completed` (it did, and completed in that job, as `send` does), or `in_progress` (it did, and completes later); only the last becomes `unknown_after_crash` (mvp §2.4 "Restart").
+**What callers learn** (for PR 7's mapping): `Ok` means committed and durable (§2.9); `Expired`, `Busy`, `Rejected`, `RolledBack`, `Panicked` mean the job left nothing; `CommitUnknown` and `WriterGone` mean all or nothing, unknown until a later read; `Failed` before the job ran means nothing, and the store is unusable for writes. For a command whose intent job ended `CommitUnknown`, the receipt after a restart is absent (the job did not commit), `completed` (it did, and completed in that job, as `send` does), or `in_progress` (it did, and completes later); only the last becomes `unknown_after_crash` (mvp §2.4 "Restart").
 
 **Readers.** `readers` connections opened read-only (`SQLITE_OPEN_READ_ONLY`, `PRAGMA query_only=ON`) in a pool with a `Condvar`; `read` waits for a free connection until `wait_until`, else `ReadError::Busy`; after `shutdown` began it returns `ReadError::Closed`. Each call runs `BEGIN DEFERRED`, `f`, `COMMIT`, so everything `f` reads comes from one WAL snapshot (S7): a snapshot and its `as_of_seq`, or events and `head_seq`, are consistent however many statements `f` runs. A reader can get `SQLITE_BUSY` during WAL recovery (S7), returned as `ReadError::Store(Busy)`. `read` is synchronous; async callers run it in `spawn_blocking` (PR 7). Reads must be short: an open read transaction keeps the WAL from resetting.
 
@@ -535,7 +498,7 @@ impl BlobSpool {                                                    // also io::
 
 - **Inline** when `bytes.len() <= core::payload::INLINE_LIMIT_BYTES` (65 536): `encoding: utf8` with the text when the bytes are valid UTF-8, else `encoding: base64` (standard alphabet, padded). The limit applies to the content's bytes, not the encoded form.
 - **Blob** above it: `sha256` = lowercase hex SHA-256 of the bytes, `size`, `media_type`, `preview`, `preview_lossy`.
-- **Preview** (mvp §2.1 as clarified by this PR). Decode `bytes[..min(len, 1024)]` as UTF-8, replacing each invalid sequence with U+FFFD and setting `preview_lossy`. If the window ends inside a sequence that is incomplete only because of the window (`Utf8Error::error_len() == None` at the end), look at up to 3 bytes past byte 1024: if they complete a valid scalar, that scalar is left out of the preview and does not set `preview_lossy`; if they do not (or the content ends), the partial sequence is invalid, is replaced with U+FFFD, and sets `preview_lossy`. A U+FFFD present in the content itself is valid UTF-8 and does not set it. Reason: the flag tells a reader that the preview misrepresents the content; a character cut only by the window misrepresents nothing, and Japanese text (AGENTS.md invariant 4) would otherwise be flagged lossy on most large blobs.
+- **Preview** (mvp §2.1). Decode `bytes[..min(len, 1024)]` as UTF-8, replacing each invalid sequence with U+FFFD and setting `preview_lossy`. If the window ends inside a sequence that is incomplete only because of the window (`Utf8Error::error_len() == None` at the end), look at up to 3 bytes past byte 1024: if they complete a valid scalar, that scalar is left out of the preview and does not set `preview_lossy`; if they do not (or the content ends), the partial sequence is invalid, is replaced with U+FFFD, and sets `preview_lossy`. A U+FFFD present in the content itself is valid UTF-8 and does not set it. Reason: the flag tells a reader that the preview misrepresents the content; a character cut only by the window misrepresents nothing, and Japanese text (AGENTS.md invariant 4) would otherwise be flagged lossy on most large blobs.
 - **Store boundary** (`append`, `append_transcript`, promotion). For every typed `Content` field of the event (the walker of §2.4): an `Inline` value must be at most 65 536 bytes (for `base64`, after decoding; the decoded bytes must be valid base64 and must not be valid UTF-8, so each content has one form); a `Blob` value must match the bytes it will name, with equal `sha256`, `size`, preview, and `preview_lossy` (recomputed from those bytes), and a non-empty `media_type`: the blob already stored under its hash when there is one (in `blobs`, or `large_blobs` with the preview from part 0; an input of that hash is then not inserted), else the first of this event's `BlobInput`s of that hash, the one step 3 inserts. Any mismatch is `ContentError`. SHA-256 of a stored blob is computed by the store from the bytes (§2.3 step 3); this rule rests on Rust, because SQLite has no built-in hash function (§2.1). `BlobInput`s are matched by hash (the store's own for in-memory bytes, the producer's for a spooled input, which step 3 recomputes): several inputs of one hash (two separately prepared references, under different media types) are all used by any reference to that hash, and only the first is checked and inserted. Every `BlobInput` must be referenced by the event; an unreferenced one is refused.
 - **Size bound.** A blob has no size cap beyond `MAX_SAFE_INTEGER` bytes (`BlobRef.size` on the wire). `MAX_BLOB_BYTES` (64 MiB) bounds a value held in memory and one `blobs` row: above it `prepare_content` returns `TooLarge`, and a producer of a value of unknown or larger size spools it instead. The bound and `size > 65 536` are `CHECK`s on `blobs`; `size > 67 108 864` and `size <= 2^53 − 1` are `CHECK`s on `large_blobs`, so a hash is in at most one of the two tables.
 - **Spooling** (D14). `Store::blob_spool` creates a temporary file the producer owns in the state directory (never `TMPDIR`); `append` fills a 64 KiB buffer and writes it to the file, computing the whole SHA-256, the size, and the first 1027 bytes for the preview as it goes, so the producer never holds the value in memory. `finish` returns, at or below `MAX_BLOB_BYTES`, what `prepare_content` returns for the bytes read back; above it a `Content::Blob` with that hash, size, and preview and a `BlobInput::Spooled` that owns the file handle. The file is closed and then removed (closing first, for Windows) when the last owner drops: after the job's append, whether it commits or rolls back, or with a job that never runs, before its reply. The file is created owner-only like the state directory's other files (`host::create_private_file`: mode `0600`, on Windows a protected DACL). A spool file left by a process crash stays in the state directory; nothing removes it.
@@ -597,7 +560,7 @@ pub struct CountedClasses(u8);
 pub enum CountedClass { Input, Human, Reply }              // mirrors pty_runtime::origin::OriginClass
 ```
 
-The persisted JSON, exactly (serde's externally tagged form of the tuple variants; `annex.rs` has a golden test for each):
+The persisted JSON, exactly (serde's externally tagged form of the variants; `annex::golden_json` checks each):
 
 ```json
 {"readiness":{"launch_id":"0190c6f2-0000-7000-8000-000000000001","position":42,"counted":["input","human","reply"]}}
@@ -696,7 +659,7 @@ Corruption found later (`SQLITE_CORRUPT`) puts the writer in the failed state (�
 | A process crash during a job, before `COMMIT` began | No part of the job is visible after restart | WAL recovery ignores frames without a commit frame (S6) |
 | A process crash during `COMMIT` | All or none of the job is visible after restart, never part | S6 (a D-fact; not timed in CI) |
 | A process crash after `COMMIT` returned, before the reply | The whole job is visible after restart | S6 |
-| `CommitUnknown` | Unknown to this process; after restart the database shows it fully or not at all, and the writer is retired | S6; for a command, the receipt after restart is absent, `completed`, or `in_progress`, and only `in_progress` becomes `unknown_after_crash` (§2.2) |
+| `CommitUnknown` | Unknown to this process; after restart the database shows it fully or not at all, and the writer is retired | S6; for a command's receipt after restart, §2.2 "What callers learn" |
 | A refused statement or a poisoned job | The whole job rolls back | `RAISE(ROLLBACK)` (S4) and poisoning (§2.2) |
 | Disk full during the job, or at `COMMIT` with the transaction still open | The job rolls back; `RolledBack(DiskFull)`; later jobs run normally once space exists | S4, S6 |
 | Disk full at `COMMIT` with the transaction ended | `CommitUnknown`, as above | S6 |
@@ -706,7 +669,7 @@ Corruption found later (`SQLITE_CORRUPT`) puts the writer in the failed state (�
 | Fork | Option | Precedent | Verdict |
 |---|---|---|---|
 | **Crate** | A. A separate `chaldea-store` crate | — | Rejected by mvp §3 ("one user"). |
-| | B. `crates/daemon` with only the `store` module | mvp §3 layout | **Adopted.** No binary yet (PR 8 adds `daemon run` in `crates/cli`). |
+| | B. A `store` module of `crates/daemon` | mvp §3 layout | **Adopted.** The crate is a library; `daemon run` is in `crates/cli`. |
 | **SQLite source** | A. System SQLite | — | Rejected: no SQLite development package on the Windows runner, and versions differ per OS; `STRICT`, `octet_length`, and trigger behaviour must be the same on both. |
 | | B. `bundled` | `libsqlite3-sys` `build.rs:170-187` | **Adopted**: SQLite 3.54.1 on both runners (S1). |
 | **Writer model** | A. `Mutex<Connection>` shared by callers | — | Rejected: std `Mutex` is not FIFO and has no deadline; a caller holding it across an `.await` would block the runtime. |
@@ -800,7 +763,7 @@ Every later PR that reads or writes the store, and what it uses. None needs a st
 | Job error, panic, or poisoned job | Rolled back as in §2.2; the writer continues. |
 | Writer thread panic outside a job | The queue's receiver drops: `submit` returns `Closed`, pending tickets resolve `WriterGone`. PR 8 stops the daemon. |
 | `SQLITE_BUSY` | Only another process holding the database (PR 8 prevents a second daemon): the job ends `Busy` with nothing written. Readers do not wait on the writer (S7) but can get `Busy` during WAL recovery. |
-| Disk full (`SQLITE_FULL`) | During the job, or at `COMMIT` with the transaction still open: the job rolls back, `RolledBack(DiskFull)`, and later jobs run normally once space exists. At `COMMIT` with the transaction ended: `CommitUnknown` and the failed state. |
+| Disk full (`SQLITE_FULL`) | As in §2.2's outcome table and §2.9: `RolledBack(DiskFull)` while the transaction is open, `CommitUnknown` and the failed state once `COMMIT` ended it. |
 | Corruption, I/O error outside `COMMIT`, failed `ROLLBACK` | The failed state (§2.2): queued jobs get `Failed`, new submissions `SubmitError::Failed`, reads continue. Nothing is deleted. |
 | `COMMIT` fails with the transaction ended (I/O error, or `SQLITE_FULL` that ended it) | `CommitUnknown` for that job; the failed state follows. |
 | Process crash | No partial job (S6); the next `open` recovers the WAL. In-progress receipts and open launches are recovered by PR 8 / PR 10 through the restart operations. |
@@ -857,30 +820,20 @@ Checked by running the store tests on `macos-latest` and `windows-latest` CI aga
 | PR6-CL-20 | When two `Store`s open one file, their writes shall serialize, and a job of one shall see the other's committed rows. | §5 file locking | `store_open::second_store_serializes_writes` |
 | PR6-CL-21 | On Windows, the store shall open, write, and reopen a database under a multi-level multibyte path longer than the `win32` VFS limit. | §5 paths | `store_open::long_multibyte_path` (both OSes), `store_open::long_path_vfs_is_selected` (Windows only, in the sentinel list) |
 | PR6-CL-22 | When `shutdown` begins, no clone shall be able to submit or borrow a reader, and both shall close in one transition; the first call shall own the shutdown and every later call shall do no work; each call's deadline shall limit its timed waits for shutdown progress (lock acquisition, synchronous cleanup, and scheduling can delay its return), and the owner shall detach the writer thread without joining it; the writer shall checkpoint only after the owner finished with the readers (closed, or abandoned at the owner's deadline); a report with `writer_exited` shall mean the writer thread published its exit report as its last statement by the caller's deadline (its connection already closed; its thread-local teardown may still run), with every commit notification receiver `Closed` once it drains its buffered notifications (a lagging one gets `Lagged` first); each caller shall count a timestamped publication only if it was published by its deadline (the writer's report for every caller; the owner's report and the notification close for a later call), and the reader fields shall be observations at the caller's checks; when the owner closed every reader in time, on the normal writer path and if the report is available, the writer shall have run its checkpoint after the readers were closed and shall not commit again. | §5 shutdown | `store_open::shutdown_stops_every_clone`, unit `open::in_time_shutdown_checkpoints_after_readers` (a reader held while `shutdown` runs: the writer's checkpoint call has not begun; after the reader returns, fault-point marks record the release, the readers closing, and the checkpoint call's start and end in that order; `readers_returned`, checkpoint `Complete`, `writer_exited`), `store_open::deadline_with_a_held_reader` (a reader held past the deadline: `readers_returned` false, and `writer_exited` and `checkpoint` reported as observed, `NotRun` when not reached); unit `writer::writer_blocked_past_the_deadline` (a job blocks past the deadline: `writer_exited` false, `readers_returned` true; a later call reports the exit); unit `shutdown::intake_closes_for_submit_and_read_together` (gated right after the intake transition: `submit` and `read` both `Closed`), `shutdown::checkpoint_waits_for_the_owner_to_finish_with_the_readers` (the owner gated while it holds the idle readers it took: a later call with an expired deadline returns with both flags false, and the checkpoint gate stays unreached until the owner is released), `shutdown::shorter_shutdown_returns_by_its_deadline` (the owner waits for a writer blocked in a job; a later call with a 1 s deadline returns within it), `shutdown::reported_writer_exit_has_closed_notifications` (the writer held at its last step: the owner returns by its deadline; any report with `writer_exited` comes with `Closed` notifications); `store_open::shutdown_closes_commit_notifications_with_a_live_clone`, unit `shutdown::later_report_of_an_early_writer_exit_has_closed_notifications` (the writer ends on its own while the owner is held after its intake transition: a later call that reports the exit finds notifications `Closed`), `shutdown::owner_detaches_a_writer_still_running` (the owner returns before the writer's last step: the store keeps no handle; a later call reports the exit), `shutdown::later_call_reports_only_progress_by_its_deadline` (a later call that timed out, held while the writer then exits: `writer_exited` false, checkpoint `NotRun`), `shutdown::later_call_past_its_deadline_leaves_out_late_reports` (a later call held before it observes, past its deadline, while the writer then exits: both reports present, still `writer_exited` false and checkpoint `NotRun`), `shutdown::closing_notifications_leaves_the_intake_locks_free` (a receiver's waker, run inline when the owner drops the last notification sender, finds the queue-sender and shutdown-state locks free), `shutdown::later_call_waits_for_the_notification_close_to_report_the_exit` (the writer ended on its own and the owner is held after claiming the shutdown: a later call that reports the exit finds notifications `Closed`), `shutdown::timed_out_owner_detaches_a_finished_writer` (the owner's exit wait timed out and the writer's main returned while a thread-local destructor still runs: the owner returns without joining and the store keeps no handle), `shutdown::later_call_leaves_out_a_notification_close_after_its_deadline` (the writer exited in time, a later call held past its deadline while the owner then closes notifications: `writer_exited` false), `shutdown::later_call_leaves_out_an_owner_report_after_its_deadline` (a later call held past its deadline while the owner then reports: `readers_returned` false), `shutdown::owner_detaches_a_reported_writer_still_tearing_down` (the writer reported in time and its main returned while a thread-local destructor still runs: the owner returns by its deadline with `writer_exited` and keeps no handle), `shutdown::owner_leaves_out_a_writer_report_after_its_deadline` (the owner held after releasing the writer until the writer reported after the owner's deadline: `writer_exited` false, checkpoint `NotRun`) |
-| PR6-CL-23 | Every `readiness_observed` shall carry a write basis for its own launch with a non-negative position and its counted classes in the one canonical form, and a retry and a rebuild shall restore it; transcript continuity evidence shall be restored per position: the event position's by rebuild, the read position's across reopen. | mvp §2.1 gate evidence; §4 PR 13 / 14 | unit `annex::golden_json` (both variants, the exact JSON of §2.6), `store_append::readiness_basis_round_trip` (insert, retry: `Existing`, rebuild: same `write_basis`), `store_append::readiness_basis_is_refused` (missing, other launch), unit `triggers::readiness_annex_check` (raw inserts: `counted` as a string spelling an array, negative position, unknown class, non-canonical order, repeated class, missing `counted`), `store_rebuild::event_continuity_restored_by_rebuild`, `store_transcript::read_continuity_survives_reopen` |
+| PR6-CL-23 | Every `readiness_observed` shall carry a write basis for its own launch with a non-negative position and its counted classes in the one canonical form, and a retry and a rebuild shall restore it; transcript continuity evidence shall be restored per position: the event position's by rebuild, the read position's across reopen. | mvp §2.1 gate evidence; §4 PR 13 / 14 | unit `annex::golden_json` (every variant, the exact JSON of §2.6), `store_append::readiness_basis_round_trip` (insert, retry: `Existing`, rebuild: same `write_basis`), `store_append::readiness_basis_is_refused` (missing, other launch), unit `triggers::readiness_annex_check` (raw inserts: `counted` as a string spelling an array, negative position, unknown class, non-canonical order, repeated class, missing `counted`), `store_rebuild::event_continuity_restored_by_rebuild`, `store_transcript::read_continuity_survives_reopen` |
 | PR6-CL-24 | When `shutdown` returns with `readers_returned`, every reader connection shall be closed (by the owning call, which counts a connection until its handle is dropped) and, once `writer_exited` is also true (the writer's exit report published, its connection closed before), no handle of the store shall keep a database file open. | §5 shutdown | `store_open::shutdown_waits_for_lent_readers` (a reader returned before the deadline: `readers_returned` true), `store_open::shutdown_releases_every_file` (both facts true; on Windows the three files are deleted; on macOS reopened through a new `Store`) |
 
 **Mapping.** Obligations: rebuild equality → PR6-CL-7, CL-8; forbidden statements → CL-2 (CL-3 for the other tables); generation before lines → CL-10; stale-cursor batch → CL-9; blob offload and lossy preview → CL-11, CL-12. mvp §6.2: CL-9 → PR6-CL-1, CL-2; CL-10 (store side) → PR6-CL-5, CL-6; CL-11 → PR6-CL-7, CL-8, CL-23; CL-12 (store side) → PR6-CL-9, CL-10; CL-8's storage → PR6-CL-13. mvp CL-2 (task state) → PR6-CL-8 on the store side. mvp CL-13 (sync) rests on PR6-CL-1, CL-14, CL-16, CL-18.
 
-**Known limits** (no test, by design): a process with raw file access can drop a trigger and edit rows while the store runs (§2.1); `open` detects only the schema change, at the next open. SHA-256 of a blob is the store's Rust guarantee, not the engine's. Power-loss durability is not observable in CI. `ProjectionTx`'s restriction to `proj_*` is a type boundary; a projection that read the clock would pass a test that does not vary it, which is why the rebuild runs with a different clock. A commit-notification waker must return promptly and must not panic or wait for shutdown progress (§2.2): the owning `shutdown` wakes pending receivers inline as it drops the last sender, and a waker that panics or blocks there can leave the shutdown unfinished.
+**Known limits** (no test, by design): a process with raw file access can drop a trigger and edit rows while the store runs (§2.1); `open` detects only the schema change, at the next open. SHA-256 of a blob is the store's Rust guarantee, not the engine's. Power-loss durability is not observable in CI. `ProjectionTx`'s restriction to `proj_*` is a type boundary; a projection that read the clock would pass a test that does not vary it, which is why the rebuild runs with a different clock. A commit-notification waker that panics or blocks can leave the shutdown unfinished (§2.2 "Notifications").
 
 ## 7. Tests and Completion Commands
 
-**Two kinds of tests.** A test that needs privileged access is a unit test in `crates/daemon/src/store/tests/` (`triggers`, `writer`, `readers`, `rebuild`, `open`, `annex`): raw SQL, the writer connection's `max_page_count`, raw inserts of undecodable rows, dropping projection tables, fault points and panics outside the closure, a second `Store` built with another projection version. These open connections with the production `open::configure` and the shipped DDL, so the pragmas and triggers under test are the production ones. A test that needs only the public API is an integration test in `crates/daemon/tests/store_*.rs`. Both run in `cargo test --workspace --locked` on both runners.
+**Two kinds of tests.** A test that needs privileged access is a unit test in `crates/daemon/src/store/tests/` (`triggers`, `writer`, `readers`, `rebuild`, `open`, `shutdown`, `annex`): raw SQL, the writer connection's `max_page_count`, raw inserts of undecodable rows, dropping projection tables, fault points and panics outside the closure, a second `Store` built with another projection version. These open connections with the production `open::configure` and the shipped DDL, so the pragmas and triggers under test are the production ones. A test that needs only the public API is an integration test in `crates/daemon/tests/store_*.rs`. Both run in `cargo test --workspace --locked` on both runners.
 
 Each test opens a store in its own `tempfile::TempDir` (OS temp directory) with a fixed `Clock` and a counter `IdSource`, and calls `shutdown` before the directory drops (Windows cannot delete open files). `tests/support/mod.rs` holds a history model: a proptest strategy that walks threads, launches, sessions, inputs, approvals, surfaces, worktrees, and transcripts, emits valid jobs (with annexes, no-event advances, re-reads, empty surfaces, launchless inputs, blob content, unknown kinds through the unit-test raw helper, and jobs that fail midway), and computes the expected projection values itself. Property tests use proptest's default 256 cases with histories of at most 200 events.
 
-Completion commands (mvp §5, extended):
-
-```
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-deps="$(cargo tree -p chaldea-core -e normal --prefix none)" && ! grep -Eq '^(tokio|rusqlite|axum) ' <<<"$deps"
-deps="$(cargo tree -p chaldea-pty-runtime -e normal --prefix none)" && ! grep -Eq '^tokio ' <<<"$deps"
-```
-
-plus the `workspace` job green on both runners with `store_open::long_path_vfs_is_selected` added to the Windows sentinel list.
+Completion: the `workspace` job of `.github/workflows/ci.yml` green on both runners (fmt, clippy with `-D warnings`, `cargo test --workspace --locked`, and the `core` and `pty-runtime` dependency checks; §1 "Workspace and CI").
 
 ## 8. Decisions
 
@@ -904,7 +857,7 @@ plus the `workspace` job green on both runners with `store_open::long_path_vfs_i
 
 **D10. `open` refuses before it changes anything, never deletes, and never repairs.** Not a database, not UTF-8, foreign, newer schema, or changed schema: an error with the file as found (apart from what SQLite itself does on open, §2.8). A failed first open may leave an uninitialized file, which the next open reuses. Corruption at run time stops writes. Integrity checks are the doctor's (deferred, mvp §4 "Deferred").
 
-**D11. `Content` previews leave out a valid character cut by the 1 KiB window** without setting `preview_lossy`, and replace every invalid sequence, including one at the boundary, with U+FFFD and set it (§2.5). mvp §2.1 and the `core::payload::Content::Blob` doc comment say so; no type changes and no stored value existed before. Rejected: decoding exactly the first 1024 bytes lossily, under which most Japanese text above 64 KiB would be flagged lossy because of where the window ends.
+**D11. `Content` previews leave out a valid character cut by the 1 KiB window** without setting `preview_lossy`, and replace every invalid sequence, including one at the boundary, with U+FFFD and set it (§2.5). mvp §2.1 and the `core::payload::Content::Blob` doc comment say so; no type changes. Rejected: decoding exactly the first 1024 bytes lossily, under which most Japanese text above 64 KiB would be flagged lossy because of where the window ends.
 
 ### Open Questions
 
