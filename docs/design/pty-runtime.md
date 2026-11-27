@@ -191,7 +191,7 @@ impl WriterObserver {
     pub fn last_started(&self, classes: ClassSet) -> u64;
     pub fn last_started_each(&self) -> [u64; 3];                 // per class (OriginClass::index), under one queue lock
     /// The published positions (§2.3), no queue lock: `None` deadline makes one attempt; `Some(f)`
-    /// retries, sleeps capped by the time left, until consistent or `f`, plus one final attempt.
+    /// retries, sleeps capped by the time left, until consistent; the first attempt at or after `f` is the last.
     pub fn published_last_started(&self, deadline: Option<Instant>) -> Option<[u64; 3]>;
 }
 ```

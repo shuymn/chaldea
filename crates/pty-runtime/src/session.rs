@@ -1149,32 +1149,34 @@ impl WriterObserver {
     /// [`WriterObserver::last_started_each`] without the queue lock, from the positions the
     /// writer publishes with each write permission. `deadline: None` makes exactly one
     /// attempt; `Some(f)` retries, with sleeps capped by the time left to `f`, until one
-    /// attempt is consistent, and the attempt started last still counts, so it returns
-    /// within `f` plus one attempt. `None`: every attempt overlapped a publication.
+    /// attempt is consistent, and the first attempt started at or after `f` is the last, so
+    /// it returns within `f` plus one attempt. `None`: every attempt overlapped a publication.
     #[must_use]
     pub fn published_last_started(&self, deadline: Option<Instant>) -> Option<[u64; 3]> {
-        let mut backoff = Backoff::default();
-        loop {
-            let seen = self.published.read_once(|| {
+        let read = || {
+            self.published.read_once(|| {
                 #[cfg(feature = "fake")]
                 self.probe
                     .hit(crate::fake::ProbePoint::BetweenPositionLoads);
-            });
-            if seen.is_some() {
+            })
+        };
+        let Some(f) = deadline else {
+            return read();
+        };
+        let mut backoff = Backoff::default();
+        loop {
+            let last = Instant::now() >= f;
+            let seen = read();
+            if seen.is_some() || last {
                 return seen;
             }
-            let f = deadline?;
-            let now = Instant::now();
-            if now >= f {
-                return None;
-            }
-            backoff.wait(f - now);
+            backoff.wait(f.saturating_duration_since(Instant::now()));
         }
     }
 }
 
 /// Short waits between attempts: spins, then yields, then sleeps of 1 ms, each capped by
-/// the time left.
+/// the time left; none when no time is left, so the final attempt follows at once.
 #[derive(Default)]
 pub(crate) struct Backoff(u32);
 
@@ -1183,6 +1185,9 @@ impl Backoff {
     const YIELDS: u32 = 4;
 
     pub(crate) fn wait(&mut self, left: Duration) {
+        if left.is_zero() {
+            return;
+        }
         if self.0 < Self::SPINS {
             std::hint::spin_loop();
         } else if self.0 < Self::SPINS + Self::YIELDS {
