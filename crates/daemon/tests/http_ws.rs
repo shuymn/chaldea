@@ -17,9 +17,7 @@ use chaldea_daemon::http::{HttpConfig, Mount, Mounts, UpgradedSocket, spec};
 use chaldea_daemon::store::{NewEvent, TokenSelector};
 use futures_util::StreamExt;
 use proptest::prelude::*;
-use support::http::{
-    DEADLINE, HEADS_INTERVAL, REQUEST_BUDGET, TestServer, WS_WAIT, eventually, head_of,
-};
+use support::http::{DEADLINE, HEADS_INTERVAL, TestServer, WS_WAIT, eventually, head_of};
 use support::waits;
 use support::{raw_unknown, registered, registered_under, reserved, started};
 use tokio_tungstenite::tungstenite::Error as WsError;
@@ -532,7 +530,7 @@ fn only_heads(before: &[WsServerMessage]) {
 /// heads interval plus a read deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revocation_closes_socket() {
-    let srv = TestServer::start(Mounts::mvp()).await;
+    let srv = TestServer::start_with(Mounts::mvp(), |c| c.short_deadline = DEADLINE).await;
     let t = thread(&srv, 1).await;
     // With the nudge.
     let owner = srv.token(TokenKind::Owner, None, None).await;
@@ -555,7 +553,7 @@ async fn revocation_closes_socket() {
     let (code, before) = ws.until_closed().await;
     assert_eq!(code, Some(1008));
     only_heads(&before);
-    let bound = HEADS_INTERVAL + REQUEST_BUDGET;
+    let bound = HEADS_INTERVAL + DEADLINE;
     assert!(at.elapsed() < bound, "{:?} past {bound:?}", at.elapsed());
     srv.stop().await;
 }

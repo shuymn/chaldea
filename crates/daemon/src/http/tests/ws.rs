@@ -379,7 +379,7 @@ async fn stalled_read_drops_the_socket() {
 /// within `heads_interval + 2 × read deadline + 2 × send_timeout`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lost_notification_recovered_by_heads() {
-    let srv = TestServer::start(Mounts::mvp()).await;
+    let srv = TestServer::start_with(Mounts::mvp(), |c| c.short_deadline = DEADLINE).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let t = ThreadId::from_u128(0x7001);
     srv.append(vec![registered(t, false)]).await;
@@ -534,16 +534,15 @@ async fn revoked_before_final_admission() {
 /// A final admission read that fails (here at its cutoff) does not spend the ticket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn final_admission_failure_keeps_ticket() {
-    let srv = TestServer::start(Mounts::mvp()).await;
+    let srv = TestServer::start_with(Mounts::mvp(), |c| c.short_deadline = DEADLINE).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let ticket = mint_ticket(&srv, &owner, TicketPurpose::Events);
     let s = shared(&srv);
     let clock = srv.clock.clone();
     // The final admission read returns past its deadline on the server's clock.
     s.faults
-        .arm_after_read(1, move || clock.skew(Duration::from_secs(3600)));
+        .arm_after_read(1, move || clock.skew(Duration::from_secs(5)));
     assert_eq!(redeem_status(&srv, &ticket).await, 408);
-    srv.clock.skew(Duration::ZERO);
     assert_eq!(s.tickets.len(), 1);
     let mut ws = srv.ws_with(&ticket).await.expect("a 101");
     assert!(matches!(
