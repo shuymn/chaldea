@@ -33,7 +33,7 @@ A pure reducer `(State, Action) → (State, Effect[])` holds sync state.
 - **Rules**: formal-specs §7.1, §7.4 (:224-240, :339). A thread 404 removes copy, selection, and row for the epoch; a `host` 404 is an error.
 - **Socket**: every `open` makes earlier requests older, resets announced heads, subscribes the full set, and makes streams and pending history due; callbacks bind to it. `hello` sets the socket's epoch only; heads count in the held epoch, merged by max for followed ids, omissions ignored (http D15). Only a current successful forward response sets the epoch; a backward resync waits for a later forward issue.
 - **Scheduling**: host, displayed, others; four reads at most, ticket outside; 10 s timeout (daemon 5 s).
-- **Failures**: forward 408, 503, and network errors stay due, backing off to 30 s (honouring `retry_after`). Bodies over 16 MiB are refused unparsed: pages retry smaller; a snapshot or event that large shows an error naming the limit. Other failures keep the last good copy and show a retry where they occur, never looping.
+- **Failures**: forward 408, 503, and network errors stay due, backing off to 30 s (honouring `retry_after`). Bodies over 16 MiB are refused unparsed: pages retry smaller; a snapshot or event that large shows an error naming the limit. Other failures keep the last good copy and show a retry, never looping.
 - **Status** (mvp:220), by the forward reads of `host` and the selected thread: `connecting` first, `live` (`hello`, reads reach the daemon), `offline` (socket down, reads or ticket POST fail in transport), else `updates paused`; W2 locks input unless `live`. "Last synced" marks a current forward read completing catch-up of every followed stream not in error; outages keep it. State is in memory.
 
 ### 2.4 History Window
@@ -76,7 +76,7 @@ All reversible.
 
 | ID | Claim (EARS) | Test |
 |---|---|---|
-| W1-5 | When the network quiesces after any losses, delays, restarts, and epoch changes, the client shall hold the server's epoch, cursors, owned projections, and exact window, within §5's oversize limit (CL-13). | Vitest `sync.converges` |
+| W1-5 | When the network quiesces after losses, delays, restarts, and epoch changes, the client shall hold the server's epoch, cursors, owned projections, and exact window (applied pages), within §5's oversize limit (CL-13). | Vitest `sync.converges`, `sync.window` |
 | W1-6 | Stale responses and failed reads shall change no epoch or copy; the rest of §2.3 shall hold. | `sync.generations`, `paging`, `heads`, `f1`, `vanished`, `reconnect`, `failures`, `status` |
 | W1-7 | The window shall follow §2.4, all history reachable within §5's limit. | `sync.window` |
 | W1-8 | The decoder shall match Rust's golden cases; bad outer bodies keep the copy. | Vitest `decode.golden`; drift check; Playwright `generic_rows` |
