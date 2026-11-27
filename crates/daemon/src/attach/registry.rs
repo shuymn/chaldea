@@ -93,12 +93,13 @@ impl LaunchAttach {
             handle: c.handle,
             replaced: c.replaced,
         });
-        drop(cur);
+        // Under the lock, with the swap: the replaced sink stops and its socket is told.
         let removed = old.map(|o| {
             o.active.store(false, Ordering::Release);
             o.replaced.fire();
             (o.handle, o.sub)
         });
+        drop(cur);
         (grant, removed)
     }
 

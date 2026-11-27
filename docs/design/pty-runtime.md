@@ -534,7 +534,7 @@ Every MVP path where bytes reach the PTY or PTY output is consumed:
 | Reply lane | `Session` | 64 replies | discarded and counted on exit, input breakage, or close |
 | Unit slot, counters | `Session` | one slot, 3 counters | the slot's completion fires once (writer or closer) |
 | Origin log ring | `Session` | 4096 records | dropped with the session |
-| Subscribers | `subscribe`, `SessionHandle::subscribe` | 8 (the daemon's attach: one operating socket per launch plus at most one candidate, t1-attach D2) | `Stop`, panic, `unsubscribe` (also after the seal), output end, close |
+| Subscribers | `subscribe`, `SessionHandle::subscribe` | 8 (the daemon's attach: one operating socket per launch, plus overlapping candidates and replaced subscriptions not yet removed on the blocking pool; a candidate over the limit closes 4004, t1-attach D2) | `Stop`, panic, `unsubscribe` (also after the seal), output end, close |
 | Completion | `submit` | one per unit | exactly once: written, refused, incomplete, `Cancelled` at cancel, `Closed` at close, or `unknown_after_close` |
 | Output pipe / input / control / child | backend, owned by the guard then `Session` | one each | close steps 2–5, or the guard's teardown |
 
