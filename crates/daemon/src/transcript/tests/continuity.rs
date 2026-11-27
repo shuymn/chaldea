@@ -1,5 +1,6 @@
 //! C1-8, continuity (D10): a rewritten prefix, truncation, a replaced file, and a file that
-//! shrinks between the read and the commit each start a new generation; so do a same-inode
+//! shrinks between the read and the commit each start a new generation; so do a rewrite of
+//! the tail before the read position (Claude's tombstone removal), a deeper same-inode
 //! rewrite found by the final read's prefix check or by a modification time moving back,
 //! and a break found by the check after a commit.
 
@@ -9,6 +10,7 @@ use std::io::{Seek, SeekFrom, Write};
 use super::{Flaky, Fx, MODE, TestBackend, assistant, shorts};
 use crate::store::tests::support;
 use crate::transcript::read::Step;
+use crate::transcript::read::TAIL_WINDOW;
 
 /// Overwrites `at..` of the file in place (same file, same length).
 fn overwrite(fx: &Fx, at: u64, bytes: &[u8]) {
@@ -298,20 +300,60 @@ fn a_stale_cursor_verifies_the_prefix_again() {
     );
 }
 
-/// A same-inode rewrite of the read bytes with the same length, then an append: the light
-/// checks of each poll pass, and the final read checks the prefix once and starts a new
-/// generation from 0.
+/// A line that skips past the tail window (a known type, no event).
+fn filler() -> String {
+    format!(
+        "{{\"type\":\"mode\",\"mode\":\"{}\"}}\n",
+        "x".repeat(TAIL_WINDOW + 1024)
+    )
+}
+
+/// Claude's tombstone removal: a line before the read position is cut out in place (the file
+/// truncated at its start and the rest written back) and the file grows again past the read
+/// position; the tail window shows it at the next poll, which starts a new generation.
 #[test]
-fn the_final_read_finds_a_same_inode_rewrite() {
+fn a_tail_rewrite_starts_a_generation_at_the_next_poll() {
     let fx = Fx::new();
-    fx.write([assistant("one"), assistant("two")].concat().as_bytes());
+    let (one, two, three) = (assistant("one"), assistant("two"), assistant("three"));
+    fx.write([one.as_str(), &two, &three].concat().as_bytes());
     let mut tail = fx.tail();
     fx.settle(&mut tail);
-    overwrite(
-        &fx,
-        0,
-        [assistant("uno"), assistant("dos")].concat().as_bytes(),
+    truncate(&fx, one.len() as u64);
+    fx.append([three.as_str(), &assistant("four")].concat().as_bytes());
+    assert!(
+        std::fs::metadata(&fx.path).unwrap().len() >= (one.len() + two.len() + three.len()) as u64
     );
+    assert_eq!(fx.settle(&mut tail), Step::Wait);
+    assert_eq!(
+        shorts(&fx.events()),
+        [
+            "generation:1",
+            "text:one",
+            "text:two",
+            "text:three",
+            "generation:2",
+            "text:one",
+            "text:three",
+            "text:four"
+        ]
+    );
+}
+
+/// A same-inode rewrite with the same length deeper than the tail window, then an append:
+/// each poll's checks pass, and the final read checks the prefix once and starts a new
+/// generation from 0.
+#[test]
+fn a_rewrite_deeper_than_the_window_is_found_at_the_final_read() {
+    let fx = Fx::new();
+    let filler = filler();
+    fx.write(
+        [assistant("one"), filler.clone(), assistant("two")]
+            .concat()
+            .as_bytes(),
+    );
+    let mut tail = fx.tail();
+    fx.settle(&mut tail);
+    overwrite(&fx, 0, assistant("uno").as_bytes());
     fx.append(assistant("new").as_bytes());
     assert_eq!(fx.settle(&mut tail), Step::Wait);
     assert_eq!(
@@ -329,18 +371,18 @@ fn the_final_read_finds_a_same_inode_rewrite() {
             "text:new",
             "generation:2",
             "text:uno",
-            "text:dos",
+            "text:two",
             "text:new"
         ]
     );
 }
 
-/// A modification time that moves back makes the next poll check the prefix: a same-length
-/// rewrite is found before the final read.
+/// A modification time that moves back makes the next poll check the whole prefix: a
+/// same-length rewrite deeper than the tail window is found before the final read.
 #[test]
 fn a_modification_time_moving_back_checks_the_prefix() {
     let fx = Fx::new();
-    fx.write(assistant("one").as_bytes());
+    fx.write([assistant("one"), filler()].concat().as_bytes());
     let mut tail = fx.tail();
     fx.settle(&mut tail);
     overwrite(&fx, 0, assistant("One").as_bytes());

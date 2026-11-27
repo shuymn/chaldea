@@ -7,14 +7,16 @@
 //! `file_id` and the path are compared with the stored cursor's, and the whole prefix is
 //! read again and checked against the stored digest. Every poll, before any cursor advance,
 //! the path must still name the handle's file and the handle's size must not be below the
-//! offset the batch advances to (nor the read position). A failed check discards the batch
+//! offset the batch advances to (nor the read position), and the [`TAIL_WINDOW`] bytes before
+//! the read position must still be those read (Claude rewrites its own tail when it removes a
+//! discarded message). A failed check discards the batch
 //! and starts a new generation at offset 0; reading starts again from 0. The same check runs
 //! again after each commit: a truncate or replace between the check and the commit is
 //! detected there (or at the next poll's check), the committed batch stays in history, and
 //! the next poll starts a new generation; a check that cannot open the path drops the handle,
-//! so the next poll opens and verifies again. A rewrite in place that keeps the size is
-//! invisible to these checks: the whole prefix is read again once at the final read, and at
-//! a poll that sees the modification time move back. A detected break is kept until a new
+//! so the next poll opens and verifies again. A deeper rewrite in place that keeps the size
+//! is invisible to these checks: the whole prefix is read again once at the final read, and
+//! at a poll that sees the modification time move back. A detected break is kept until a new
 //! generation is stored, so a failed generation commit does not let a later open continue
 //! the old one. A stop is honoured at every chunk read or replayed and before every commit.
 
@@ -147,12 +149,40 @@ impl Cursor {
     }
 }
 
-/// The open handle, the running digest of `[0, pos)`, and the latest modification time
-/// seen.
+/// The bytes before the read position compared at every poll: Claude 2.1.331 removes a
+/// discarded message (a tombstone) by truncating its transcript at that line and writing the
+/// rest back in place, and only within the file's last 64 KiB (`performRemoveByUuid`,
+/// `kw=65536`); since the read position is never past the end, such a rewrite of read bytes
+/// lies within this many bytes before it.
+pub(crate) const TAIL_WINDOW: usize = 64 * 1024;
+
+/// The last [`TAIL_WINDOW`] bytes before a position, as read. Up to twice that is held, so
+/// a push trims at most once per window of bytes pushed.
+#[derive(Debug, Clone, Default)]
+struct Recent(Vec<u8>);
+
+impl Recent {
+    fn push(&mut self, bytes: &[u8]) {
+        let bytes = &bytes[bytes.len().saturating_sub(TAIL_WINDOW)..];
+        if self.0.len() + bytes.len() > 2 * TAIL_WINDOW {
+            let keep = TAIL_WINDOW - bytes.len();
+            self.0.drain(..self.0.len() - keep);
+        }
+        self.0.extend_from_slice(bytes);
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.0[self.0.len().saturating_sub(TAIL_WINDOW)..]
+    }
+}
+
+/// The open handle, the running digest of `[0, pos)`, the bytes just before `pos`, and the
+/// latest modification time seen.
 struct OpenFile {
     file: RegularFile,
     digest: Sha256,
     pos: u64,
+    recent: Recent,
     mtime: Option<std::time::SystemTime>,
 }
 
@@ -403,7 +433,23 @@ impl Tail {
         };
         be.after_read();
         match self.check(&open, batch.advance.max(start)) {
-            Check::Same => {}
+            Check::Same => {
+                // The tail before the read position, where Claude's own rewrites land.
+                match self.window_holds(&mut open) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.stats.discarded += 1;
+                        drop(open);
+                        self.disprove();
+                        tracing::info!(thread = %self.b.thread_id, launch = %self.b.launch_id, "the transcript's tail before the read position changed; a new generation starts");
+                        return self.restart(be);
+                    }
+                    Err(e) => {
+                        self.open = Some(open);
+                        return Err(e);
+                    }
+                }
+            }
             Check::Unknown(e) => {
                 self.open = Some(open);
                 return Err(e.into());
@@ -440,6 +486,7 @@ impl Tail {
             Commit::Done => {
                 open.digest = batch.digest;
                 open.pos = batch.advance;
+                open.recent = batch.recent;
                 if let Some(c) = &mut self.cursor {
                     c.read_offset = advance_to.read_offset;
                     c.continuity = advance_to.continuity;
@@ -554,7 +601,7 @@ impl Tail {
         if c.path != self.b.path || c.file_id != f.id().as_str() || f.size()? < c.read_offset {
             return Ok(Err(f));
         }
-        let Some(digest) = self.hash_prefix(&mut f, c.read_offset)? else {
+        let Some((digest, recent)) = self.hash_prefix(&mut f, c.read_offset)? else {
             return Ok(Err(f));
         };
         if continuity(&digest) != c.continuity {
@@ -565,17 +612,20 @@ impl Tail {
             file: f,
             digest,
             pos: c.read_offset,
+            recent,
         }))
     }
 
-    /// The digest of `f`'s first `len` bytes, read again; `None` when the file is shorter.
-    fn hash_prefix(&self, f: &mut RegularFile, len: u64) -> Result<Option<Sha256>, Fail> {
+    /// The digest of `f`'s first `len` bytes, read again, and their last [`TAIL_WINDOW`]
+    /// bytes; `None` when the file is shorter.
+    fn hash_prefix(&self, f: &mut RegularFile, len: u64) -> Result<Option<(Sha256, Recent)>, Fail> {
         #[cfg(test)]
         if self.stop_at_prefix_check {
             self.stop.store(true, Ordering::Release);
         }
         f.seek(SeekFrom::Start(0))?;
         let mut digest = Sha256::new();
+        let mut recent = Recent::default();
         let mut buf = vec![0u8; CHUNK];
         let mut left = len;
         while left > 0 {
@@ -588,9 +638,23 @@ impl Tail {
                 Err(e) => return Err(e.into()),
             };
             digest.update(&buf[..n]);
+            recent.push(&buf[..n]);
             left -= n as u64;
         }
-        Ok(Some(digest))
+        Ok(Some((digest, recent)))
+    }
+
+    /// Whether the file's bytes just before the read position are still those read.
+    fn window_holds(&self, open: &mut OpenFile) -> Result<bool, Fail> {
+        let want = open.recent.bytes();
+        open.file
+            .seek(SeekFrom::Start(open.pos - want.len() as u64))?;
+        let mut got = vec![0u8; want.len()];
+        match open.file.read_exact(&mut got) {
+            Ok(()) => Ok(got == want),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Whether the open file's bytes before the read position still have the digest read.
@@ -598,7 +662,7 @@ impl Tail {
         let pos = open.pos;
         Ok(self
             .hash_prefix(&mut open.file, pos)?
-            .is_some_and(|d| continuity(&d) == continuity(&open.digest)))
+            .is_some_and(|(d, _)| continuity(&d) == continuity(&open.digest)))
     }
 
     /// Commits a new generation of `f` alone at offset 0.
@@ -631,6 +695,7 @@ impl Tail {
                     file: f,
                     digest: Sha256::new(),
                     pos: 0,
+                    recent: Recent::default(),
                 });
                 self.disproved = None;
                 Ok(Step::Again)
@@ -700,6 +765,8 @@ struct Batch {
     advance: u64,
     /// The digest of `[0, advance)`.
     digest: Sha256,
+    /// The last bytes before `advance`.
+    recent: Recent,
     /// The batch closed at its bounds with more to read.
     more: bool,
     /// The read reached the end of the file.
@@ -748,6 +815,8 @@ type LineEvent = (TypedEvent, Option<BlobInput>, Option<Timestamp>);
 struct LineRead {
     /// The bytes before the newline.
     len: u64,
+    /// Their last [`TAIL_WINDOW`] bytes.
+    tail: Recent,
     newline: bool,
     event: Option<LineEvent>,
     /// The most bytes the line held in memory at once.
@@ -778,6 +847,7 @@ fn next_line(
     let mut parser = Some(LineParser::default());
     let mut emits = Vec::new();
     let (mut len, mut newline) = (0u64, false);
+    let mut tail = Recent::default();
     loop {
         if stop.load(Ordering::Acquire) {
             return Err(Fail::Stopped);
@@ -789,6 +859,7 @@ fn next_line(
         let upto = avail.iter().position(|&c| c == b'\n');
         let piece = &avail[..upto.unwrap_or(avail.len())];
         raw.push(piece)?;
+        tail.push(piece);
         digest.update(piece);
         len += piece.len() as u64;
         if let Some(p) = &mut parser {
@@ -860,6 +931,7 @@ fn next_line(
     };
     Ok(Some(LineRead {
         len,
+        tail,
         newline,
         event,
         peak: meter.peak(),
@@ -882,6 +954,7 @@ fn read_lines(
     open.file.seek(SeekFrom::Start(open.pos))?;
     let start = open.pos;
     let mut digest = open.digest.clone();
+    let mut recent = open.recent.clone();
     let mut at = open.pos;
     let mut lines = Vec::new();
     let mut memory = 0usize;
@@ -902,12 +975,13 @@ fn read_lines(
                 lines,
                 advance: at,
                 digest,
+                recent,
                 more: true,
                 eof: false,
             });
         }
         let mut line_digest = digest.clone();
-        let (len, newline, event, peak) = match next_line(
+        let (len, tail, newline, event, peak) = match next_line(
             &mut src,
             &mut line_digest,
             b,
@@ -919,16 +993,18 @@ fn read_lines(
             Ok(None) => break,
             Ok(Some(LineRead {
                 len,
+                tail,
                 newline,
                 event,
                 peak,
-            })) => (len, newline, event, peak),
+            })) => (len, tail, newline, event, peak),
             Err(Fail::Io(e)) if at > start => {
                 tracing::debug!(thread = %b.thread_id, launch = %b.launch_id, offset = at, error = %e, "a transcript line failed to read; the lines before it are committed");
                 return Ok(Batch {
                     lines,
                     advance: at,
                     digest,
+                    recent,
                     more: true,
                     eof: false,
                 });
@@ -937,6 +1013,10 @@ fn read_lines(
         };
         stats.peak_line_memory = stats.peak_line_memory.max(peak);
         digest = line_digest;
+        recent.push(tail.bytes());
+        if newline {
+            recent.push(b"\n");
+        }
         let end = at + len + u64::from(newline);
         if let Some((event, blob, occurred_at)) = event {
             match &blob {
@@ -962,6 +1042,7 @@ fn read_lines(
         lines,
         advance: at,
         digest,
+        recent,
         more: false,
         eof: true,
     })
