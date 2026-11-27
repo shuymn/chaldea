@@ -87,9 +87,15 @@ impl Pool {
 
     fn borrow(&self, wait_until: Instant) -> Result<Connection, ReadError> {
         let mut s = lock(&self.state);
+        let mut waited = false;
         loop {
             if s.closed {
                 return Err(ReadError::Closed);
+            }
+            // After a wait, a reader freed once `wait_until` passed is not lent: the deadline
+            // is checked under the lock, just before the lend.
+            if waited && Instant::now() >= wait_until {
+                return Err(ReadError::Busy);
             }
             if let Some(c) = s.idle.pop() {
                 return Ok(c);
@@ -103,6 +109,7 @@ impl Pool {
                 .wait_timeout(s, wait_until - now)
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
+            waited = true;
         }
     }
 
@@ -1671,5 +1678,37 @@ pub(crate) mod launch_reads {
         if let Some(read) = lock(&WATCHED).get_mut(&l) {
             *read = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use rusqlite::Connection;
+
+    use super::{Pool, ReadError, lock};
+
+    /// A reader freed while a borrower waits, but taken in only after the borrower's deadline
+    /// passed, is not lent.
+    #[test]
+    fn a_reader_freed_past_the_deadline_is_not_lent() {
+        let pool = Pool::new(Vec::new(), std::sync::Arc::default());
+        let wait_until = Instant::now() + Duration::from_millis(200);
+        std::thread::scope(|sc| {
+            let waiter = sc.spawn(|| pool.borrow(wait_until).map(drop));
+            // The borrower is waiting; the reader comes back under the lock, which is held
+            // past the deadline.
+            std::thread::sleep(Duration::from_millis(50));
+            let mut s = lock(&pool.state);
+            s.idle.push(Connection::open_in_memory().unwrap());
+            s.open += 1;
+            std::thread::sleep(
+                wait_until.saturating_duration_since(Instant::now()) + Duration::from_millis(50),
+            );
+            drop(s);
+            pool.cv.notify_all();
+            assert!(matches!(waiter.join().unwrap(), Err(ReadError::Busy)));
+        });
     }
 }

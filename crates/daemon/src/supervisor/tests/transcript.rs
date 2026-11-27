@@ -421,7 +421,7 @@ async fn spent_binding_reads_at_the_final_read_are_unverified() {
 }
 
 /// Past the participant's end a tailer read borrows no reader: it fails before the pool,
-/// which lends a free reader before it checks a deadline.
+/// which lends a reader free at once without checking the deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_reader_is_borrowed_past_the_participants_end() {
     let rig = rig().await;

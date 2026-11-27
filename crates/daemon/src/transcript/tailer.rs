@@ -160,7 +160,7 @@ fn read<R>(
     }
     let mut until = sup.now() + READ_WAIT;
     if let Some(w) = sup.window.get() {
-        // The pool lends a free reader before it checks a deadline.
+        // The pool lends a reader free at once without checking the deadline.
         if sup.now() >= w.end {
             return Err("the participant's end has passed".into());
         }
