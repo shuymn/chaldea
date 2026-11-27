@@ -38,7 +38,7 @@ A pure reducer `(State, Action) → (State, Effect[])` holds sync state.
 
 ### 2.4 History Window
 
-The displayed thread has one contiguous window (2,000 events, 16 MiB) at or below the cursor, filled by backward reads; selection loads the newest page once the cursor is known. Attached (ending at the cursor), live events append and the oldest drop past the cap. "Older" reads before the first retained seq; past the cap the newest drop, detaching it from live events. "Newer" reads `n = min(limit, cursor − last)` events (`before_seq = last + n + 1`), reattaching at the current cursor; "Jump to latest" reloads the tail. A bound snapshot resets an attached window to the new tail and keeps a detached one; `CursorAhead` discards and reloads it, aging its history requests; an epoch switch drops it.
+The displayed thread has one contiguous window (2,000 events, 16 MiB) at or below the cursor, filled by backward reads; selection loads the newest page once the cursor is known. Attached (ending at the cursor), live events append and the oldest drop past the cap. "Older" reads before the first retained seq; past the cap the newest drop, detaching it. "Newer" reads `n = min(limit, cursor − last)` events (`before_seq = last + n + 1`), reattaching at the current cursor; "Jump to latest" reloads the tail. A bound snapshot resets an attached window to the new tail and keeps a detached one; `CursorAhead` discards and reloads it, aging its history requests; an epoch switch drops it.
 
 ### 2.5 Rendering
 
@@ -90,7 +90,7 @@ All reversible.
 - **Screen as state** (invariant 1): no action carries screen data; W1 never uses `/screen` or attach.
 - **Limit, one OS account**: same-origin script could read the token; the MVP trusts the account.
 - **Epochs**: a restored database keeping tokens and epoch shows only through `CursorAhead`.
-- **Limits**: history within the read limit is one action away; evicted storage costs one `chaldea open`; a snapshot can pass 16 MiB (e.g. 250 unresolved 64 KiB inline inputs, `payload.rs:18`, or a huge thread list); a resume racing a notice may use the old token once (valid or 401).
+- **Limits**: history within the read limit is one action away; evicted storage costs one `chaldea open`; a snapshot can pass 16 MiB (e.g. 250 unresolved 64 KiB inputs, `payload.rs:18`, or a huge thread list); a resume racing a notice may use the previous token until the notice is adopted (valid or 401).
 
 ## 6. Proposed Canonical Edits
 
