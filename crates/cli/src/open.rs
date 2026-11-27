@@ -109,14 +109,11 @@ pub(crate) fn run(
     print_url: bool,
     launcher: &dyn Fn(&str) -> io::Result<()>,
 ) -> ExitCode {
-    let (mut out, mut err) = (io::stdout(), io::stderr());
     let port = match port_of(dir) {
         Ok(p) => p,
-        Err(m) => {
-            let _ = writeln!(err, "chaldea: {}", diag(&m));
-            return ExitCode::Failed;
-        }
+        Err(m) => return crate::fail(&m),
     };
+    let (mut out, mut err) = (io::stdout(), io::stderr());
     let probe = || client::request_status(port, "GET", "/", None, Instant::now() + REQUEST_WAIT);
     let mint = || pair_url(dir, port);
     open_with(print_url, &probe, &mint, launcher, &mut out, &mut err)
