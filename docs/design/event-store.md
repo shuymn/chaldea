@@ -837,7 +837,7 @@ Completion: the `workspace` job of `.github/workflows/ci.yml` green on both runn
 
 ## 8. Decisions
 
-**D1. `crates/daemon` starts with the store only.** No HTTP, no binary. Dependencies: `rusqlite =0.41.1` (`bundled`, no defaults), `sha2 =0.11.1`, `tokio =1.54.1` (`sync` only), `base64 =0.22.1`, `uuid` with `v4`, dev `proptest` and `tempfile =3.27.0`.
+**D1. The store is a module of the library crate `crates/daemon`**, which also holds the HTTP server, hook ingest, the supervisor, and the lifecycle (`crates/daemon/src/lib.rs`); the binary is `crates/cli`. The store's dependencies: `rusqlite =0.41.1` (`bundled`, no defaults; dev adds `blob`), `sha2 =0.11.1`, `tokio =1.54.1` (the store uses `sync`; the crate enables `rt`, `rt-multi-thread`, `net`, `time`, `macros`, `signal`, never `process`), `base64 =0.22.1`, `uuid` with `v4`; its tests use `proptest` and `tempfile =3.27.0`.
 
 **D2. Bundled SQLite 3.54.1.** One SQLite on both runners; the schema relies on `STRICT`, generated columns, `RETURNING`, `octet_length`, JSON functions in triggers and checks, and `trusted_schema=OFF` with them (S9).
 
