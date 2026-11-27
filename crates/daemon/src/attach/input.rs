@@ -19,7 +19,7 @@ fn marker_from(hay: &[u8], from: usize) -> bool {
 
 /// The length of the longest proper marker prefix of 2 to 5 bytes `bytes` ends with; a lone
 /// ESC (1 byte) is not held.
-fn partial_len(bytes: &[u8]) -> usize {
+pub(crate) fn partial_len(bytes: &[u8]) -> usize {
     (2..TAIL + 1)
         .rev()
         .find(|&k| k <= bytes.len() && MARKERS.iter().any(|m| bytes.ends_with(&m[..k])))
@@ -68,20 +68,34 @@ pub(crate) fn completes_marker(tail: &[u8], unit: &[u8]) -> bool {
 }
 
 /// The marker rule's final decision over a unit's `frames` after `tail`, in write order:
-/// the bytes to write and the bytes of the frames refused (each whole).
-pub(crate) fn decide_frames(tail: &[u8], frames: &[Vec<u8>]) -> (Vec<u8>, usize) {
+/// the bytes to write, the bytes of the frames refused (each whole), and the trailing
+/// partial marker held back from the write when the last frame is accepted and `hold_last`
+/// (a deferred frame, whose hold the decision applies after accepting it).
+pub(crate) fn decide_frames(
+    tail: &[u8],
+    frames: &[Vec<u8>],
+    hold_last: bool,
+) -> (Vec<u8>, usize, Vec<u8>) {
     let mut tail = tail.to_vec();
     let mut out = Vec::new();
     let mut refused = 0;
+    let mut last_accepted = false;
     for f in frames {
-        if completes_marker(&tail, f) {
-            refused += f.len();
-        } else {
+        last_accepted = !completes_marker(&tail, f);
+        if last_accepted {
             out.extend_from_slice(f);
             advance_tail(&mut tail, f);
+        } else {
+            refused += f.len();
         }
     }
-    (out, refused)
+    let k = if hold_last && last_accepted {
+        partial_len(&out)
+    } else {
+        0
+    };
+    let held = out.split_off(out.len() - k);
+    (out, refused, held)
 }
 
 /// `tail` after `written`: its last [`TAIL`] bytes.
@@ -95,8 +109,9 @@ pub(crate) fn advance_tail(tail: &mut Vec<u8>, written: &[u8]) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Item {
     /// Raw frames joined for one unit, each kept whole: the marker rule's final decision
-    /// refuses a frame, not the unit.
-    Raw(Vec<Vec<u8>>),
+    /// refuses a frame, not the unit. The flag: the last frame was deferred, so its
+    /// partial-marker hold applies once it is accepted.
+    Raw(Vec<Vec<u8>>, bool),
     Paste {
         id: String,
         text: String,
@@ -112,14 +127,38 @@ pub(crate) struct Pending {
 
 impl Pending {
     pub(crate) fn raw(&mut self, b: &[u8]) {
+        self.push_raw(b, false);
+    }
+
+    /// A frame left whole to the decision at submission.
+    pub(crate) fn raw_deferred(&mut self, b: &[u8]) {
+        self.push_raw(b, true);
+    }
+
+    fn push_raw(&mut self, b: &[u8], deferred: bool) {
         if b.is_empty() {
             return;
         }
         self.bytes += b.len();
-        if let Some(Item::Raw(r)) = self.items.back_mut() {
+        if let Some(Item::Raw(r, last)) = self.items.back_mut() {
             r.push(b.to_vec());
+            *last = deferred;
         } else {
-            self.items.push_back(Item::Raw(vec![b.to_vec()]));
+            self.items.push_back(Item::Raw(vec![b.to_vec()], deferred));
+        }
+    }
+
+    /// Held bytes a decision gave back, ahead of everything pending: the first frame of
+    /// the next raw unit when raw input is next (so they share its write), else its own
+    /// item.
+    pub(crate) fn raw_front(&mut self, b: Vec<u8>) {
+        if b.is_empty() {
+            return;
+        }
+        self.bytes += b.len();
+        match self.items.front_mut() {
+            Some(Item::Raw(r, _)) => r.insert(0, b),
+            _ => self.items.push_front(Item::Raw(vec![b], false)),
         }
     }
 
@@ -132,7 +171,7 @@ impl Pending {
     pub(crate) fn next(&mut self) -> Option<Item> {
         let it = self.items.pop_front()?;
         self.bytes -= match &it {
-            Item::Raw(r) => r.iter().map(Vec::len).sum::<usize>(),
+            Item::Raw(r, _) => r.iter().map(Vec::len).sum::<usize>(),
             Item::Paste { id, text } => id.len() + text.len(),
         };
         Some(it)
@@ -140,7 +179,7 @@ impl Pending {
 
     /// Whether raw bytes are pending.
     pub(crate) fn has_raw(&self) -> bool {
-        self.items.iter().any(|i| matches!(i, Item::Raw(_)))
+        self.items.iter().any(|i| matches!(i, Item::Raw(..)))
     }
 
     /// Every byte the items hold, paste ids included (tests check the bound with it).
@@ -149,7 +188,7 @@ impl Pending {
         self.items
             .iter()
             .map(|i| match i {
-                Item::Raw(r) => r.iter().map(Vec::len).sum::<usize>(),
+                Item::Raw(r, _) => r.iter().map(Vec::len).sum::<usize>(),
                 Item::Paste { id, text } => id.len() + text.len(),
             })
             .sum()

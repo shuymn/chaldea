@@ -1986,6 +1986,42 @@ async fn deferred_refusal_drops_the_whole_original_frame() {
     assert_eq!(written.as_slice(), b"\x1bq");
 }
 
+/// I-6: an accepted deferred frame still holds its trailing partial marker: `ESC[`, sent
+/// while `k` is held, waits after `k` settles and goes out with the next key in one
+/// backend write (a split escape can be lost on ConPTY).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_partial_keeps_the_next_key_in_one_backend_write() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let (mut c, _) = attach(&rig, &live).await;
+    let before = live.child.writes().len();
+    let reports = sl.reports_sent.load(SeqCst);
+    let hold = live.child.hold_writes();
+    c.binary(b"k").await;
+    assert!(hold.wait_entered(soon()));
+    c.binary(b"\x1b[").await;
+    c.json(json!({ "type": "resize", "cols": 100, "rows": 30 }))
+        .await;
+    assert_eq!(size_frame(&mut c).await, (100, 30, true));
+    drop(hold);
+    rig.until("the first raw report is ready", || {
+        sl.reports_sent.load(SeqCst) > reports
+    })
+    .await;
+    c.json(json!({ "type": "resize", "cols": 101, "rows": 30 }))
+        .await;
+    assert_eq!(size_frame(&mut c).await, (101, 30, true));
+    c.binary(b"A").await;
+    input_has(&rig, &live, b"k\x1b[A").await;
+    assert_eq!(
+        &live.child.writes()[before..],
+        &[b"k".to_vec(), b"\x1b[A".to_vec()]
+    );
+    rig.stop().await;
+}
+
 /// I-6: a deferred refusal keeps frame boundaries: of frames joined while an earlier write
 /// is unsettled, only the one completing a marker is dropped; the others are written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

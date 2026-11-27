@@ -267,7 +267,8 @@ type Submitted = Result<Submission, Refused>;
 
 /// A queued unit.
 struct Submission {
-    ticket: WriteTicket,
+    /// `None` when nothing was queued: the unit's accepted bytes were all held back.
+    ticket: Option<WriteTicket>,
     report: oneshot::Receiver<KeyReport>,
     /// The unit's dispatch deadline (supervisor clock), taken before the submission.
     not_after: Instant,
@@ -275,6 +276,16 @@ struct Submission {
     len: usize,
     /// The bytes of raw frames the marker rule refused at the submission.
     refused: usize,
+    /// An accepted deferred frame's trailing partial marker, held for the next frame.
+    held: Vec<u8>,
+}
+
+/// A unit's decision inside `with_session`.
+struct Decided {
+    ticket: Option<WriteTicket>,
+    len: usize,
+    refused: usize,
+    held: Vec<u8>,
 }
 
 /// Why a unit was not queued.
@@ -362,6 +373,7 @@ impl Writer {
     fn submit(
         &self,
         frames: Vec<Vec<u8>>,
+        hold_last: bool,
         paste: Option<ModeView>,
     ) -> Pin<Box<dyn Future<Output = Submitted> + Send>> {
         let (sup, entry, sl, fence) = (
@@ -410,6 +422,7 @@ impl Writer {
                     la: la.clone(),
                     fence: fence.clone(),
                     frames: frames.clone(),
+                    hold_last,
                     paste,
                     needs_2004,
                     not_after: sup.real(not_after),
@@ -420,12 +433,13 @@ impl Writer {
                 let by = (sup.now() + READ_WAIT).min(not_after);
                 let r = entry.with_session(&sup, by, move |s| unit.run(s)).await;
                 return match r {
-                    Ok(Ok(Some((ticket, len, refused)))) => Ok(Submission {
-                        ticket,
+                    Ok(Ok(Some(d))) => Ok(Submission {
+                        ticket: d.ticket,
                         report: rx,
                         not_after,
-                        len,
-                        refused,
+                        len: d.len,
+                        refused: d.refused,
+                        held: d.held,
                     }),
                     Ok(Ok(None)) => continue,
                     Ok(Err(e)) => Err(e),
@@ -450,6 +464,8 @@ struct Submit {
     la: Arc<LaunchAttach>,
     fence: Fence,
     frames: Vec<Vec<u8>>,
+    /// The last frame was deferred: its partial-marker hold applies once accepted.
+    hold_last: bool,
     paste: bool,
     /// The mode at encoding, for a paste on a bracketed-paste row.
     needs_2004: Option<ModeView>,
@@ -461,10 +477,7 @@ impl Submit {
     /// The ticket with the bytes queued and the raw bytes refused, or `None` when an
     /// earlier raw unit is unsettled again (another socket submitted one meanwhile): the
     /// caller waits and retries.
-    fn run(
-        self,
-        s: &chaldea_pty_runtime::Session,
-    ) -> Result<Option<(WriteTicket, usize, usize)>, Refused> {
+    fn run(self, s: &chaldea_pty_runtime::Session) -> Result<Option<Decided>, Refused> {
         if self.needs_2004.is_some_and(|m| !m.modes.bracketed_paste) {
             return Err(Refused::Rejected(AttachReason::BracketedPasteOff));
         }
@@ -486,32 +499,54 @@ impl Submit {
                     guard,
                     Some(self.report),
                 )
-                .map(|t| Some((t, len, 0)))
+                .map(|t| {
+                    Some(Decided {
+                        ticket: Some(t),
+                        len,
+                        refused: 0,
+                        held: Vec::new(),
+                    })
+                })
                 .map_err(|e| Refused::NotWritten(submit_reason(e)));
         }
         // The marker rule's final decision (R-6): every earlier raw unit settled, so the
         // tail is what the PTY received before this unit; a frame that would complete a
         // marker is refused whole, the others are written.
-        let bytes = {
+        let (bytes, refused, held) = {
             let mut m = crate::supervisor::lock(&self.la.marks);
             if m.unsettled > 0 {
                 return Ok(None);
             }
-            let (bytes, refused) = decide_frames(&m.tail, &self.frames);
+            let (bytes, refused, held) = decide_frames(&m.tail, &self.frames, self.hold_last);
             if bytes.is_empty() {
-                return Err(Refused::NotWritten(AttachReason::PasteMarker));
+                if held.is_empty() {
+                    return Err(Refused::NotWritten(AttachReason::PasteMarker));
+                }
+                // Only a held partial: nothing is queued.
+                return Ok(Some(Decided {
+                    ticket: None,
+                    len: 0,
+                    refused,
+                    held,
+                }));
             }
             m.unsettled += 1;
-            (bytes, refused)
+            (bytes, refused, held)
         };
-        let (bytes, refused) = bytes;
         let len = bytes.len();
         let unit = WriteUnit::bytes(WriteOrigin::Attach, bytes.clone());
         let la = self.la.clone();
         let settled: RecordHook = Box::new(move |r| la.raw_settled(&bytes, r.bytes_written));
         self.sl
             .submit_human_then(s, unit, guard, Some(self.report), Some(settled))
-            .map(|t| Some((t, len, refused)))
+            .map(|t| {
+                Some(Decided {
+                    ticket: Some(t),
+                    len,
+                    refused,
+                    held,
+                })
+            })
             .map_err(|e| {
                 self.la.raw_unqueued();
                 Refused::NotWritten(submit_reason(e))
@@ -945,9 +980,9 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
         // The next unit, when none is outstanding (D6).
         if outstanding.is_none() && ending.is_none() {
             outstanding = match pending.next() {
-                Some(Item::Raw(b)) => Some(Outstanding {
+                Some(Item::Raw(b, hold_last)) => Some(Outstanding {
                     unit: Unit::Raw(b.iter().map(Vec::len).sum()),
-                    phase: Phase::Submitting(writer.submit(b, None)),
+                    phase: Phase::Submitting(writer.submit(b, hold_last, None)),
                 }),
                 Some(Item::Paste { id, text }) => {
                     // The mode is sampled before the encoding; the writer refuses the unit
@@ -956,7 +991,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                     match writer.paste_bytes(&text) {
                         Ok(b) => Some(Outstanding {
                             unit: Unit::Paste(id),
-                            phase: Phase::Submitting(writer.submit(vec![b], Some(modes))),
+                            phase: Phase::Submitting(writer.submit(vec![b], false, Some(modes))),
                         }),
                         Err(reason) => {
                             ctl.push_back(AttachServerMessage::PasteResult {
@@ -1255,6 +1290,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                         not_after,
                         len,
                         refused,
+                        held: back,
                     }) => {
                         let by = not_after + READ_WAIT;
                         if refused > 0 {
@@ -1263,6 +1299,19 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                                 reason: AttachReason::PasteMarker,
                             });
                         }
+                        // A held partial goes ahead of what arrived meanwhile; with nothing
+                        // pending it waits for the next frame or the hold's end.
+                        if !back.is_empty() {
+                            if pending.bytes() > 0 || !held.is_empty() {
+                                pending.raw_front(back);
+                            } else {
+                                held = back;
+                                hold_until = Some(sup.now() + cfg.hold);
+                            }
+                        }
+                        let Some(ticket) = ticket else {
+                            continue;
+                        };
                         let unit = match o.unit {
                             Unit::Raw(_) => Unit::Raw(len),
                             u @ Unit::Paste(_) => u,
@@ -1374,7 +1423,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                                 pending.raw(&h);
                             }
                             advance_tail(&mut proj, &b);
-                            pending.raw(&b);
+                            pending.raw_deferred(&b);
                             continue;
                         }
                         match filter(&proj, &held, &b) {
