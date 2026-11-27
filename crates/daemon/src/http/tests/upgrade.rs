@@ -1,4 +1,4 @@
-//! The upgrade path through the 7a test upgrade mount (design §2.2, §2.4 "Redemption";
+//! The upgrade path through the test upgrade mount (design §2.2, §2.4 "Redemption";
 //! PR7-CL-7's `101` case, PR7-CL-28's socket case).
 
 use std::time::{Duration, Instant};

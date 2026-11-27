@@ -212,7 +212,7 @@ pub enum StoreFatal {
     CommitUnknown,
     WriterGone,
     Failed,
-    /// A command's receipt could not be completed after its effect ran (PR 7c's runner).
+    /// A command's receipt could not be completed after its effect ran (design §2.8's runner).
     ReceiptUncompleted {
         command_id: chaldea_core::ids::CommandId,
     },

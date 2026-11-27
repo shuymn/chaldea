@@ -1,5 +1,5 @@
 //! Commands and receipts over HTTP (`docs/design/http-surface.md` §2.8; PR7-CL-18, CL-19,
-//! CL-20, CL-21, and the 7c cases of CL-8 and CL-22), through the test-only handlers of
+//! CL-20, CL-21, and the command cases of CL-8 and CL-22), through the test-only handlers of
 //! `support::commands`. Cases that need the server's fault points are the unit tests
 //! `http::tests::commands` and `http::tests::registry`.
 

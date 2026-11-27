@@ -28,7 +28,7 @@ pub enum TaskKind {
     Socket,
     /// The observer of one plain write.
     Write,
-    /// One command runner (PR 7c).
+    /// One command runner (design §2.8).
     Runner,
 }
 
