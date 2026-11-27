@@ -1,6 +1,7 @@
 //! C1-8, continuity (D10): a rewritten prefix, truncation, a replaced file, and a file that
 //! shrinks between the read and the commit each start a new generation; so do a rewrite of
-//! the tail before the read position (Claude's tombstone removal), a deeper same-inode
+//! the tail before the read position or while a batch is read (Claude's tombstone removal),
+//! a deeper same-inode
 //! rewrite found by the final read's prefix check or by a modification time moving back,
 //! and a break found by the check after a commit.
 
@@ -335,6 +336,75 @@ fn a_tail_rewrite_starts_a_generation_at_the_next_poll() {
             "text:one",
             "text:three",
             "text:four"
+        ]
+    );
+}
+
+/// Claude's tombstone removal while a batch is read: `two` is read, then cut out, and the
+/// file regrows with `dos` and a line longer than the tail window. The batch stops at the end
+/// seen at its start, so the window before its advance shows the change: `two` is not
+/// committed and a new generation starts.
+#[test]
+fn a_tail_rewrite_while_a_batch_is_read_starts_a_generation() {
+    let fx = Fx::new();
+    let one = assistant("one");
+    fx.write(one.as_bytes());
+    let mut tail = fx.tail();
+    fx.settle(&mut tail);
+    fx.append(assistant("two").as_bytes());
+    let done = std::cell::Cell::new(false);
+    let be = TestBackend {
+        after_fill: Box::new(|| {
+            if !done.replace(true) {
+                truncate(&fx, one.len() as u64);
+                fx.append([assistant("dos"), filler()].concat().as_bytes());
+            }
+        }),
+        ..fx.backend()
+    };
+    assert_eq!(fx.settle_with(&mut tail, &be), Step::Wait);
+    assert_eq!(
+        shorts(&fx.events()),
+        [
+            "generation:1",
+            "text:one",
+            "generation:2",
+            "text:one",
+            "text:dos"
+        ]
+    );
+}
+
+/// The same removal during the final read, with nothing appended after it: the window before
+/// the batch's advance shows it before the commit, so the final read does not end on `two`.
+#[test]
+fn a_tail_rewrite_during_the_final_read_starts_a_generation() {
+    let fx = Fx::new();
+    let one = assistant("one");
+    fx.write(one.as_bytes());
+    let mut tail = fx.tail();
+    fx.settle(&mut tail);
+    fx.append(assistant("two").as_bytes());
+    fx.add(vec![support::exited(fx.t, fx.l)]);
+    let done = std::cell::Cell::new(false);
+    let be = TestBackend {
+        after_fill: Box::new(|| {
+            if !done.replace(true) {
+                truncate(&fx, one.len() as u64);
+                fx.append(assistant("dos").as_bytes());
+            }
+        }),
+        ..fx.backend()
+    };
+    assert!(matches!(fx.settle_with(&mut tail, &be), Step::End(_)));
+    assert_eq!(
+        shorts(&fx.events()),
+        [
+            "generation:1",
+            "text:one",
+            "generation:2",
+            "text:one",
+            "text:dos"
         ]
     );
 }

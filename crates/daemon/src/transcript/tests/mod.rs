@@ -27,10 +27,12 @@ use super::tailer::{binding_view, commit};
 use crate::store::tests::support::{self, TestStore};
 use crate::store::{NewEvent, TranscriptBatch, TranscriptCursor};
 
-/// The store side over a test store, with hooks between a poll's read and its checks and
-/// before a batch of lines is committed, and generation commits that fail on demand.
+/// The store side over a test store, with hooks after each read from the file, between a
+/// poll's read and its checks, and before a batch of lines is committed, and generation
+/// commits that fail on demand.
 pub(crate) struct TestBackend<'a> {
     pub(crate) store: &'a TestStore,
+    pub(crate) after_fill: Box<dyn Fn() + 'a>,
     pub(crate) after_read: Box<dyn Fn() + 'a>,
     pub(crate) before_commit: Box<dyn Fn(&TranscriptBatch) + 'a>,
     /// Generation commits still to fail as a full queue would.
@@ -66,6 +68,10 @@ impl Backend for TestBackend<'_> {
 
     fn after_read(&self) {
         (self.after_read)();
+    }
+
+    fn after_fill(&self) {
+        (self.after_fill)();
     }
 }
 
@@ -138,6 +144,7 @@ impl Fx {
     pub(crate) fn backend(&self) -> TestBackend<'_> {
         TestBackend {
             store: &self.store,
+            after_fill: Box::new(|| {}),
             after_read: Box::new(|| {}),
             before_commit: Box::new(|_| {}),
             fail_generations: Cell::new(0),

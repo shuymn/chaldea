@@ -8,15 +8,16 @@
 //! read again and checked against the stored digest. Every poll, before any cursor advance,
 //! the path must still name the handle's file and the handle's size must not be below the
 //! offset the batch advances to (nor the read position), and the [`TAIL_WINDOW`] bytes before
-//! the read position must still be those read (Claude rewrites its own tail when it removes a
-//! discarded message). A failed check discards the batch
-//! and starts a new generation at offset 0; reading starts again from 0. The same check runs
-//! again after each commit: a truncate or replace between the check and the commit is
-//! detected there (or at the next poll's check), the committed batch stays in history, and
-//! the next poll starts a new generation; a check that cannot open the path drops the handle,
-//! so the next poll opens and verifies again. A deeper rewrite in place that keeps the size
-//! is invisible to these checks: the whole prefix is read again once at the final read, and
-//! at a poll that sees the modification time move back. A detected break is kept until a new
+//! the read position and before the batch's advance must still be those read (Claude rewrites
+//! its own tail when it removes a discarded message; a batch reads no further than the end
+//! seen at its start). A failed check discards the batch and starts a new generation at
+//! offset 0; reading starts again from 0. The same check runs again after each commit: a
+//! truncate or replace between the check and the commit is detected there (or at the next
+//! poll's check), the committed batch stays in history, and the next poll starts a new
+//! generation; a check that cannot open the path drops the handle, so the next poll opens
+//! and verifies again. A deeper rewrite in place that keeps the size is invisible to these
+//! checks: the whole prefix is read again once at the final read, and at a poll
+//! that sees the modification time move back. A detected break is kept until a new
 //! generation is stored, so a failed generation commit does not let a later open continue
 //! the old one. A stop is honoured at every chunk read or replayed and before every commit.
 
@@ -90,6 +91,8 @@ pub(crate) trait Backend {
     fn commit(&self, batch: TranscriptBatch) -> Commit;
     /// After a poll's read, before its checks (a test seam).
     fn after_read(&self) {}
+    /// After each read from the file within a batch (a test seam).
+    fn after_fill(&self) {}
 }
 
 /// What the driver does after a poll.
@@ -152,8 +155,9 @@ impl Cursor {
 /// The bytes before the read position compared at every poll: Claude 2.1.331 removes a
 /// discarded message (a tombstone) by truncating its transcript at that line and writing the
 /// rest back in place, and only within the file's last 64 KiB (`performRemoveByUuid`,
-/// `kw=65536`); since the read position is never past the end, such a rewrite of read bytes
-/// lies within this many bytes before it.
+/// `kw=65536`); since neither the read position nor a batch's advance is past the end seen
+/// before the rewrite, such a rewrite of read bytes lies within this many bytes before one
+/// of them.
 pub(crate) const TAIL_WINDOW: usize = 64 * 1024;
 
 /// The last [`TAIL_WINDOW`] bytes before a position, as read. Up to twice that is held, so
@@ -427,6 +431,7 @@ impl Tail {
             &self.stop,
             last,
             &mut self.stats,
+            be,
         ) {
             Ok(b) => b,
             Err(e) => {
@@ -437,8 +442,19 @@ impl Tail {
         be.after_read();
         match self.check(&open, batch.advance.max(start)) {
             Check::Same => {
-                // The tail before the read position, where Claude's own rewrites land.
-                match self.window_holds(&mut open) {
+                // The tails before the read position and before the batch's advance, where
+                // Claude's own rewrites land: one between polls is within the first, one
+                // while the batch was read (never past the end seen at its start) within the
+                // second.
+                let held =
+                    window_holds(&mut open.file, open.pos, open.recent.bytes()).and_then(|held| {
+                        if held && batch.advance > start {
+                            window_holds(&mut open.file, batch.advance, batch.recent.bytes())
+                        } else {
+                            Ok(held)
+                        }
+                    });
+                match held {
                     Ok(true) => {}
                     Ok(false) => {
                         self.stats.discarded += 1;
@@ -647,19 +663,6 @@ impl Tail {
         Ok(Some((digest, recent)))
     }
 
-    /// Whether the file's bytes just before the read position are still those read.
-    fn window_holds(&self, open: &mut OpenFile) -> Result<bool, Fail> {
-        let want = open.recent.bytes();
-        open.file
-            .seek(SeekFrom::Start(open.pos - want.len() as u64))?;
-        let mut got = vec![0u8; want.len()];
-        match open.file.read_exact(&mut got) {
-            Ok(()) => Ok(got == want),
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     /// Whether the open file's bytes before the read position still have the digest read.
     fn prefix_holds(&self, open: &mut OpenFile) -> Result<bool, Fail> {
         let pos = open.pos;
@@ -711,6 +714,17 @@ impl Tail {
             Commit::StaleBinding => Ok(Step::End("the binding changed (StaleBinding)".into())),
             Commit::Failed(e) => Err(Fail::Store(e)),
         }
+    }
+}
+
+/// Whether `file`'s bytes just before `pos` are still `want`.
+fn window_holds(file: &mut RegularFile, pos: u64, want: &[u8]) -> Result<bool, Fail> {
+    file.seek(SeekFrom::Start(pos - want.len() as u64))?;
+    let mut got = vec![0u8; want.len()];
+    match file.read_exact(&mut got) {
+        Ok(()) => Ok(got == want),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -776,13 +790,15 @@ struct Batch {
     eof: bool,
 }
 
-/// The handle's bytes from a position, through one buffer.
+/// The handle's bytes from a position up to `left` more, through one buffer.
 struct Src<'a> {
     file: &'a mut RegularFile,
     buf: Box<[u8]>,
     pos: usize,
     end: usize,
+    left: u64,
     eof: bool,
+    be: &'a dyn Backend,
 }
 
 impl Src<'_> {
@@ -790,11 +806,13 @@ impl Src<'_> {
         if self.pos < self.end {
             return Ok(true);
         }
-        if self.eof {
+        if self.eof || self.left == 0 {
+            self.eof = true;
             return Ok(false);
         }
+        let want = usize::try_from(self.left).map_or(self.buf.len(), |l| l.min(self.buf.len()));
         loop {
-            match self.file.read(&mut self.buf) {
+            match self.file.read(&mut self.buf[..want]) {
                 Ok(0) => {
                     self.eof = true;
                     return Ok(false);
@@ -802,6 +820,8 @@ impl Src<'_> {
                 Ok(n) => {
                     self.pos = 0;
                     self.end = n;
+                    self.left -= n as u64;
+                    self.be.after_fill();
                     return Ok(true);
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -941,7 +961,9 @@ fn next_line(
     }))
 }
 
-/// Reads the lines after `open.pos` up to the batch bounds or the end of the file.
+/// Reads the lines after `open.pos` up to the batch bounds or the end of the file as its size
+/// was at the start, so a rewrite while the batch is read lies within the [`TAIL_WINDOW`]
+/// before its advance.
 ///
 /// A batch closes after a line whose blob is spooled, so one write job holds at most one
 /// spool. A read or spool error after some progress closes the batch before the failed line
@@ -953,7 +975,9 @@ fn read_lines(
     stop: &AtomicBool,
     last: bool,
     stats: &mut Stats,
+    be: &dyn Backend,
 ) -> Result<Batch, Fail> {
+    let size = open.file.size()?;
     open.file.seek(SeekFrom::Start(open.pos))?;
     let start = open.pos;
     let mut digest = open.digest.clone();
@@ -967,7 +991,9 @@ fn read_lines(
         buf: vec![0u8; CHUNK].into_boxed_slice(),
         pos: 0,
         end: 0,
+        left: size.saturating_sub(open.pos),
         eof: false,
+        be,
     };
     loop {
         if stop.load(Ordering::Acquire) {
