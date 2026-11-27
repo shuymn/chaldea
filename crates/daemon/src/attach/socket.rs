@@ -275,7 +275,14 @@ impl Writer {
         );
         let wait = self.cfg.unit_wait;
         let needs_2004 = paste && self.paste_on_2004;
+        #[cfg(test)]
+        let hook = crate::supervisor::lock(&self.cfg.hooks.submit).take();
         Box::pin(async move {
+            // Runs on the socket's task: the socket handles nothing else meanwhile.
+            #[cfg(test)]
+            if let Some(f) = hook {
+                f();
+            }
             let now = sup.now();
             let not_after = sup.real(now + wait);
             let (tx, rx) = oneshot::channel();
@@ -532,7 +539,9 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
     let mut ctl: VecDeque<AttachServerMessage> = VecDeque::new();
     let mut pending = Pending::default();
     let mut held: Vec<u8> = Vec::new();
-    let mut hold_until: Option<tokio::time::Instant> = None;
+    // Timers on the supervisor's clock (`sup.timer` each iteration), so a test clock
+    // drives them.
+    let mut hold_until: Option<Instant> = None;
     let mut outstanding: Option<Outstanding> = None;
     let size_wanted: Arc<Mutex<Option<PtySize>>> = Arc::new(Mutex::new(None));
     let mut resizing: Option<Resizing> = None;
@@ -544,12 +553,12 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
     // a read started after the nudge answers first.
     let mut verify_by: Option<tokio::time::Instant> = None;
     let mut verify_due = false;
-    let mut ending: Option<(Ending, tokio::time::Instant)> = None;
+    let mut ending: Option<(Ending, Instant)> = None;
     let mut ended_sent = false;
     let mut ping_due = false;
     let mut idle_at: Option<tokio::time::Instant> = None;
     let mut next_tick = tokio::time::Instant::now() + wcfg.heads_interval;
-    let mut next_gone = sup.timer(sup.now() + cfg.gone_poll);
+    let mut next_gone = sup.now() + cfg.gone_poll;
 
     loop {
         // Latch a terminal event (the first wins): the sink stops, the grant is revoked,
@@ -563,10 +572,14 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             if let Some(e) = latched {
                 buf.stop();
                 la.revoke(me);
-                ending = Some((e, tokio::time::Instant::now() + cfg.drain));
+                ending = Some((e, sup.now() + cfg.drain));
+                #[cfg(test)]
+                cfg.hooks
+                    .latched
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
         }
-        let drain_at = ending.map(|(_, at)| at);
+        let drain_at = ending.map(|(_, at)| sup.timer(at));
         // A fresh verification on a nudge or a tick, even with one read in flight.
         if verify_due && let Some(slot) = verifying.iter_mut().find(|v| v.is_none()) {
             verify_due = false;
@@ -732,13 +745,14 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                 Some((sink, r)) => Ev::Sent(sink, r),
                 None => Ev::Dropped,
             },
-            () = socket_timer(next_gone) => Ev::GonePoll,
+            () = socket_timer(sup.timer(next_gone)) => Ev::GonePoll,
+            () = poked(&cfg) => continue,
             () = buf.wake.notified(), if ending.is_none() => Ev::Output,
             r = pending_opt(submitting) => Ev::Submitted(r),
             r = pending_opt(report_rx) => Ev::Report(r),
             () = pending_opt(report_by.map(socket_timer)) => Ev::ReportLate,
             r = pending_opt(resizing.as_mut()) => Ev::Resized(r),
-            () = pending_opt(hold_until.map(socket_timer)) => Ev::HoldEnd,
+            () = pending_opt(hold_until.map(|at| socket_timer(sup.timer(at)))) => Ev::HoldEnd,
             m = stream.next(), if reading => Ev::Inbound(m),
         };
         let refusal: (u16, &str) = match ev {
@@ -786,14 +800,11 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             }
             Ev::Output => continue,
             Ev::GonePoll => {
-                next_gone = sup.timer(sup.now() + cfg.gone_poll);
+                next_gone = sup.now() + cfg.gone_poll;
                 if sup.live(thread, launch).is_none() && ending.is_none() {
                     buf.stop();
                     la.revoke(me);
-                    ending = Some((
-                        Ending::Ended(EndReason::Gone),
-                        tokio::time::Instant::now() + cfg.drain,
-                    ));
+                    ending = Some((Ending::Ended(EndReason::Gone), sup.now() + cfg.drain));
                 }
                 continue;
             }
@@ -897,8 +908,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                                 drop(tail);
                                 pending.raw(&write);
                                 held = h;
-                                hold_until = (!held.is_empty())
-                                    .then(|| tokio::time::Instant::now() + cfg.hold);
+                                hold_until = (!held.is_empty()).then(|| sup.now() + cfg.hold);
                             }
                         }
                         continue;
@@ -947,6 +957,18 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
         };
         la.revoke(me);
         return close(&shared, out, &mut stream, refusal.0, refusal.1).await;
+    }
+}
+
+/// A test's poke: the loop recomputes its timers after the test clock moved. Never
+/// resolves outside tests.
+async fn poked(cfg: &AttachConfig) {
+    #[cfg(test)]
+    cfg.hooks.poke.notified().await;
+    #[cfg(not(test))]
+    {
+        let _ = cfg;
+        std::future::pending::<()>().await;
     }
 }
 

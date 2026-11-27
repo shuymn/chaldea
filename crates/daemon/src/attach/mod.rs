@@ -49,6 +49,28 @@ pub(crate) struct AttachConfig {
     pub gone_poll: Duration,
     /// The startup subscription's wait for the op lock and the VT lock.
     pub subscribe_wait: Duration,
+    /// Test points.
+    #[cfg(test)]
+    pub hooks: Arc<AttachHooks>,
+}
+
+/// Test points of the attach sockets.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct AttachHooks {
+    /// Wakes every socket loop to recompute its timers (after the test clock moved).
+    pub poke: tokio::sync::Notify,
+    /// Terminal events latched, by every socket.
+    pub latched: std::sync::atomic::AtomicU64,
+    /// Runs at the next unit's submission, before `with_session`, on the socket's task.
+    pub submit: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for AttachHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachHooks").finish_non_exhaustive()
+    }
 }
 
 impl Default for AttachConfig {
@@ -64,6 +86,8 @@ impl Default for AttachConfig {
             hold: Duration::from_millis(50),
             gone_poll: Duration::from_secs(1),
             subscribe_wait: Duration::from_millis(250),
+            #[cfg(test)]
+            hooks: Arc::default(),
         }
     }
 }
