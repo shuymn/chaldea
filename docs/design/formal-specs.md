@@ -2,7 +2,7 @@
 
 Status: Q-A (issue #13, target 2) and Q-B, the Sync Seam (target 1), implemented in `specs/`. Cited as "mvp §N" for `docs/mvp-design.md`, "http §N" for `docs/design/http-surface.md`, "store §N" for `docs/design/event-store.md`.
 
-**Roles.** Quint checks the design-stage contract under interleavings: what the daemon may feed the reducers, in which order, and what must then hold. It does not check the Rust code; `proptest` (`crates/core/tests/input_step.rs`, `state_reduce.rs`) checks each reducer alone, and a `stateright` model of the sync code (PR 17) is deferred (mvp §4 "Deferred"). Q-A's value is the coupled model: `ThreadState`, the gate projection, several inputs across two launches, approval cards, and attention, together. Q-B's is the Sync Seam protocol before its code exists (§7). The trace bridge (§4, §7.5) ties the specs to the code: committed Quint traces replay against the real `core` functions.
+**Roles.** Quint checks the design-stage contract under interleavings: what the daemon may feed the reducers, in which order, and what must then hold. It does not check the Rust code; `proptest` (`crates/core/tests/input_step.rs`, `state_reduce.rs`) checks each reducer alone, and a `stateright` model of the sync code (PR 17) is deferred (mvp §4 "Deferred"). Q-A's value is the coupled model: `ThreadState`, the gate projection, several inputs across two launches, approval cards, and attention, together. Q-B's is the Sync Seam protocol apart from its code (§7). The trace bridge (§4, §7.5) ties the specs to the code: committed Quint traces replay against the real `core` functions.
 
 | File | What |
 |---|---|
@@ -40,7 +40,6 @@ Two layers in one module:
 - Only hooks of the launch's selected session enter the model. Selecting it is PR 9's check: hooks of another session become `raw_unknown` (`foreign_session`, mvp §2.9).
 - Hooks follow the adapter: `Interrupt` only for Codex (mvp §2.2, §2.7); a manual Codex launch fires none until a human starts the first turn through attach (`manualFirstTurn`; mvp §2.7).
 - A post-decision signal is its own entry for the current turn and may arrive at any point after the turn started, before or after the daemon takes in the turn's `Stop`. The CLI emits it only after every `Stop` hook decided (mvp §2.3), so this over-approximates; PR 12 checks that such a signal exists and its order, and PR 13–14 attribute it on the adapter side if one is adopted.
-- A bound `UserPromptSubmit` supersedes the open cards, as the `PromptSubmitted` comment in `state.rs` says; mvp §2.10 lists only `Stop` and an interrupt, and PR 13–14 adds it.
 
 Under `none`, Claude's `SessionStart` is no evidence either (mvp §2.3 "only `chaldea ready`"; `docs/design/supervisor-send.md` SB2).
 
@@ -76,7 +75,7 @@ Under `none`, Claude's `SessionStart` is no evidence either (mvp §2.3 "only `ch
 | `bufferPrompt`, `bufferStop`, `bufferReady(ev, stop)` | hooks of an unbound live launch, buffered; a settle completion only for the buffered `Stop` it names while no later hook arrived; promotion applies it only if that `Stop` is then the current turn's candidate, and keeps an unsettled `Stop` as the candidate only if it was still live at intake | mvp §2.9 |
 | `ready(ev, stop)` | evidence of the current bound live launch, of a kind its adapter and mode produce: `SessionStart` backed by Claude's own; a settle completion only for the `Stop` it names, of the current launch and turn, with no later hook since; a post-decision signal on its own entry once a turn started | mvp §2.3, §2.7 |
 | `ownerReady` | `chaldea ready`: disabled while a unit of the launch may still write (`unit_running`); the bound launch only; otherwise refused, writing nothing | mvp §2.3; `docs/design/supervisor-send.md` SB15 |
-| `prompt(matches)` | bound `UserPromptSubmit`: turn start, supersedes cards, invalidates the evidence candidate; ack attribution from the hook's intake facts for its one in-flight candidate (unique candidate, same launch, after the attempt, dispatched, written before the intake, no other counted write after it (VT replies do not count for a positional prompt), no matching input the owner resolved, no competing submission); an attributable record acks a `sent` or `unconfirmed` input, and a `sending` one (`sent`, then `acked`); otherwise a `sent` input becomes `unconfirmed` and the others are unchanged | mvp §2.3; docs/design/pty-runtime.md §2.3 "Ack attribution"; `docs/design/supervisor-send.md` §2.5 |
+| `prompt(matches)` | bound `UserPromptSubmit`: turn start, supersedes cards, invalidates the evidence candidate; ack attribution from the hook's intake facts for its one in-flight candidate (unique candidate, same launch, after the attempt, dispatched, written before the intake, no other counted write after it (VT replies do not count for a positional prompt), no matching input the owner resolved, no competing submission); an attributable record acks a `sent` or `unconfirmed` input, and a `sending` one (`sent`, then `acked`); otherwise a `sent` input becomes `unconfirmed` and the others are unchanged | mvp §2.3, §2.10; docs/design/pty-runtime.md §2.3 "Ack attribution"; `docs/design/supervisor-send.md` §2.5 |
 | `humanWrite(o)` | `attach` and `key` set the last write and last human write; a card key carries its launch and card and sets the last write only; one whose card is not open in the current launch is refused, writing nothing | mvp §2.1, §2.3, §2.10 |
 | `vtReply` | a counted write with no event | docs/design/pty-runtime.md §2.5 |
 | `send`, `open` | `queued`; the gate opens when, beyond `gate`, no counted write started since the evidence's basis and no unit of the launch may still write; `sending` advances the last write, the attempt keeps the basis the gate opened on, records whether a gate-closing human write follows the last turn start, and starts its unit | mvp §2.3; `docs/design/supervisor-send.md` SB3, SB15 |
@@ -206,7 +205,7 @@ The `specs` job of `ci.yml` (`ubuntu-latest`, mise pinned in `mise-action`) inst
 
 ## 7. Q-B: Sync Seam
 
-Q-B checks the Sync Seam protocol of mvp §2.4 and the PR 7 design (http §2.5–§2.8, §8 D14, D15) under interleavings. PR 7 implements its HTTP side (sync reads, the WebSocket, commands, receipts), PR 8 reconciles receipts at startup, and PR 18 owns the client rules (epoch changes, request invalidation, the backward resync); §7.4 hands each its obligations. It assumes PR 6's store guarantees (store §2.2, §2.7, §2.8): atomic commits, gapless per-stream `seq`, idempotency, an epoch fixed when the database is created, and one read snapshot per call. Four rules of mvp §2.4 come from Q-B (§7.4: the epoch rule, F1, F2, the backward resync), and the model implements them as written there. Two modules, simulated and traced separately:
+Q-B checks the Sync Seam protocol of mvp §2.4 and the PR 7 design (http §2.5–§2.8, §8 D14, D15) under interleavings. PR 7 implements its HTTP side (sync reads, the WebSocket, commands, receipts), PR 8 reconciles receipts at startup, and PR 18 owns the client rules (epoch changes, request invalidation, the backward resync); §7.4 hands each its obligations. It assumes PR 6's store guarantees (store §2.2, §2.7, §2.8): atomic commits, gapless per-stream `seq`, idempotency, an epoch fixed when the database is created, and one read snapshot per call. Two modules, simulated and traced separately:
 
 - `specs/sync.qnt`: replay, paging, snapshots, epochs, stream existence, and notify-then-pull;
 - `specs/receipts.qnt`: command receipts across retries, lost replies, deadlines, writer contention, and restarts.
@@ -346,7 +345,7 @@ Four rules of mvp §2.4 come from what the model needed; it implements them as w
 
 ### 7.6 Results
 
-The CI size (seeds 1–4, 1 000 samples, 40 steps per spec) reaches every witness of both modules; the rarest are a stream only a heads refresh recovers (12 of 4 000 traces) and a runner starting the effect after its request replied (13). On a development machine one seed takes about 18 s for `sync.qnt` and 8 s for `receipts.qnt` alone; with Q-A, the twelve runs take about 30 s pooled over 12 cores (about 250 CPU-seconds).
+The CI size (seeds 1–4, 1 000 samples, 40 steps per spec) reaches every witness of both modules; the rarest are a stream only a heads refresh recovers (12 of 4 000 traces) and a runner starting the effect after its request replied (13). On a development machine one seed takes about 18 s for `sync.qnt` and 8 s for `receipts.qnt` alone (the pooled run: §5).
 
 Each invariant has a spec mutation that violates it, judged by the exit status of `quint run` at the CI size with only that invariant (1 on all four seeds unless stated), and by the named traces (`quint test`):
 
