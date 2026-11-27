@@ -88,6 +88,12 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo test --workspace --locked --no-fail-fast
 
+      # SF-4 (docs/design/stop-facts.md §6): the published positions' stress test, ignored by
+      # default, runs where loads and stores can reorder (macOS arm64).
+      - name: Stress the published positions (macOS)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        run: cargo test -p chaldea-pty-runtime --lib --locked -- --ignored --exact writer::tests::published_positions_stress
+
       # Every test except those of the WMI step above.
       - name: Run tests (Windows)
         if: ${{ !cancelled() && runner.os == 'Windows' }}

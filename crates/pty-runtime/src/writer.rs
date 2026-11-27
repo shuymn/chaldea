@@ -1077,7 +1077,8 @@ mod tests {
 
     /// SF-4 stress: a writer publishes `(k, k, k)` for increasing `k`; readers on other
     /// threads never accept a triple with unequal components. Ignored by default (about 2 s);
-    /// run on macOS arm64, where loads and stores can reorder without `SeqCst`.
+    /// CI runs it by name on macOS (arm64), where loads and stores can reorder without
+    /// `SeqCst`.
     #[test]
     #[ignore = "about 2 s of contention; run on macOS arm64"]
     fn published_positions_stress() {
