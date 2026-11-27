@@ -637,7 +637,8 @@ async fn early_session_start(
     use crate::supervisor::Pause;
     use chaldea_core::ids::Agent;
     use chaldea_pty_runtime::process::AncestryEnd;
-    let (rig, chains, ingest) = Rig::with_chains(|_| {}).await;
+    // No git: the stopped clock would give its probe a day-long deadline.
+    let (rig, chains, ingest) = Rig::with_chains(|c| c.git.clear()).await;
     let job = run_out.then(|| ingest.points.arm_job(1));
     let subscribe = run_out.then(|| ingest.points.arm_subscribe());
     let held = rig.pauses.arm(Pause::BeforeStartJob);
