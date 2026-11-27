@@ -853,3 +853,61 @@ async fn key_past_deadline_at_boundary() {
     assert!(live.child.input().is_empty());
     rig.stop().await;
 }
+
+/// SF-2: `same_turn_evidence`'s raw-key branch with the second `Stop` taken in while the PTY
+/// writer is parked at its dispatch boundary (its queue lock held): the `Stop` has its facts,
+/// so its mark settles, and the queued input is sent after `SETTLE`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_turn_evidence_beside_parked_writer() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    rig.clock.stop();
+    rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "turn" }))
+        .await;
+    assert_eq!(key(&rig, &live, &["escape"], None).await.0, 200);
+    rig.until("recorded", || human_writes(&rig, &live).len() == 1)
+        .await;
+    rig.hook(&live, "Stop", &json!({})).await;
+    rig.clock.advance(SETTLE);
+    rig.pass(&live).await;
+    let id = rig.send(&live, "after").await;
+    rig.pass(&live).await;
+    assert_eq!(rig.input(id).state, InputState::Queued, "same turn");
+    rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "next" }))
+        .await;
+    // The first `Stop` may have settled already; the target is one more.
+    let n0 = super::evidence::count(&rig, &live, "stop_settled");
+    let ord = rig.next_ordinal(&live);
+    let (r, done) = rig
+        .worker_parked(&live, async {
+            let (park, done) = rig.writer_q_held(&live).await;
+            let r = rig.post(&rig.hook_of(&live, "Stop", &json!({}))).await;
+            drop(park);
+            (r, done)
+        })
+        .await;
+    assert_eq!(r.status, 200, "{r:?}");
+    let sl = rig.sl(&live);
+    rig.until("the Stop's mark", || sl.state().log.0.contains_key(&ord))
+        .await;
+    assert!(
+        matches!(
+            sl.state().log.0.get(&ord),
+            Some((crate::hook::TurnMark::End { settle: true }, _))
+        ),
+        "{:?}",
+        sl.state().log.0
+    );
+    rig.until("the parked unit was written", || {
+        done.load(Ordering::SeqCst)
+    })
+    .await;
+    rig.clock.advance(SETTLE);
+    let end = Instant::now() + Duration::from_secs(10);
+    while super::evidence::count(&rig, &live, "stop_settled") < n0 + 1 {
+        assert!(Instant::now() < end, "the second Stop settled");
+        rig.pass(&live).await;
+    }
+    rig.until_input(id, InputState::Sent).await;
+    rig.stop().await;
+}

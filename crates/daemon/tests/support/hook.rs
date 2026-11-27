@@ -269,7 +269,13 @@ pub struct Facts {
 }
 
 impl IntakeProbe for Facts {
-    fn facts(&self, _launch: LaunchId, _ordinal: u64) -> Option<IntakeFacts> {
+    fn facts(
+        &self,
+        _launch: LaunchId,
+        _ordinal: u64,
+        _f: std::time::Instant,
+        _arm: &chaldea_daemon::hook::IntakeGuard,
+    ) -> Option<IntakeFacts> {
         let k = self.n.fetch_add(1, Ordering::SeqCst) + 1;
         if self.null.load(Ordering::SeqCst) {
             return Some(IntakeFacts(serde_json::Value::Null));

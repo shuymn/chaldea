@@ -582,13 +582,15 @@ async fn session_start_binds() {
     rig.stop().await;
 }
 
-/// A `SessionStart` taken in after the child was created and before the launch was published
-/// (a CLI that emits it at once) has no intake facts (sup §2.11 "Observation": creation begun
-/// and unpublished is `Unobservable`): it binds the launch, records no readiness, and, with no
-/// event of its own, is kept as `raw_unknown` `unknown_event`, so a send waits.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn session_start_before_publication() {
-    let rig = claude_rig().await;
+/// Spawns Claude held at `BeforePublish` and adopts the launch: the held point, the spawn's
+/// reply, and the launch.
+async fn held_before_publish(
+    rig: &SRig,
+) -> (
+    crate::supervisor::tests::Armed,
+    tokio::task::JoinHandle<crate::supervisor::tests::support::http::Reply>,
+    Live,
+) {
     let held = rig.pauses.arm(crate::supervisor::Pause::BeforePublish);
     let args = json!({ "agent": "claude", "cwd": rig.cwd.path().to_string_lossy() });
     let spawn = crate::supervisor::tests::support::http::spawn_send(
@@ -600,14 +602,49 @@ async fn session_start_before_publication() {
             &args.to_string(),
         ),
     );
-    held.wait();
+    tokio::task::block_in_place(|| held.wait());
     let (t, l) = rig.srv.store.read(|r| {
         let t = r.threads()?.pop().unwrap();
         Ok((t.thread_id, t.current_launch_id.unwrap()))
     });
-    let live = rig.adopt(t, l, Agent::Claude);
+    (held, spawn, rig.adopt(t, l, Agent::Claude))
+}
+
+/// SF-8: a `SessionStart` taken in after the child was created and before the launch was
+/// published (a CLI that emits it at once) waits for the publication: published while the
+/// intake waits, its facts are present, so it binds the launch and records `session_start`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_start_before_publication() {
+    let rig = claude_rig().await;
+    let (held, spawn, live) = held_before_publish(&rig).await;
+    let entry = rig.sup.entry(live.l).unwrap();
+    let (waiting_tx, waiting) = std::sync::mpsc::channel();
+    *crate::supervisor::lock(&entry.hooks.publication_waiting) = Some(Box::new(move || {
+        let _ = waiting_tx.send(());
+    }));
     let hook = own(&rig, &live, &fixture("plain-turn", "SessionStart-1"));
-    // The intake (its ordinal, facts, and the pid wait's origin) has ended, its facts sampled
+    let post = crate::supervisor::tests::support::http::spawn_send(&rig.srv, &hook.req(&rig.srv));
+    crate::supervisor::tests::support::http::reached_sync(waiting).await;
+    held.go();
+    assert_eq!(spawn.await.unwrap().status, 200);
+    assert_eq!(post.await.unwrap().status, 200);
+    assert_eq!(
+        rig.thread(live.t).session_id.as_deref(),
+        Some(live.session.as_str())
+    );
+    assert_eq!(super::evidence::evidences(&rig, &live), ["session_start"]);
+    rig.stop().await;
+}
+
+/// SF-8 (kept): the same `SessionStart` with the publication held past its facts deadline
+/// has no intake facts: it binds the launch, records no readiness, and, with no event of its
+/// own, is kept as `raw_unknown` `unknown_event`, so a send waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_start_before_publication_after_deadline() {
+    let rig = claude_rig().await;
+    let (held, spawn, live) = held_before_publish(&rig).await;
+    let hook = own(&rig, &live, &fixture("plain-turn", "SessionStart-1"));
+    // The intake (its ordinal, facts, and the pid wait's origin) has ended, its facts taken
     // while the launch is unpublished, before the publication is let go.
     let (after_intake, go_on) = rig.ingest.points.arm_intake(1);
     let post = crate::supervisor::tests::support::http::spawn_send(&rig.srv, &hook.req(&rig.srv));
@@ -631,6 +668,33 @@ async fn session_start_before_publication() {
     rig.pass(&live).await;
     assert_eq!(rig.input(id).state, InputState::Queued);
     assert!(live.child.input().is_empty(), "no byte");
+    rig.stop().await;
+}
+
+/// SF-10: a publication made between the publication wait's last sleep, which reached the
+/// facts deadline, and its final read is used: the `SessionStart` has its facts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn published_at_facts_deadline() {
+    let rig = claude_rig().await;
+    let (held, spawn, live) = held_before_publish(&rig).await;
+    let entry = rig.sup.entry(live.l).unwrap();
+    let e = entry.clone();
+    *crate::supervisor::lock(&entry.hooks.final_wake) = Some(Box::new(move || {
+        held.go();
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while e.published().is_none() {
+            assert!(std::time::Instant::now() < end, "published");
+            std::thread::yield_now();
+        }
+    }));
+    let hook = own(&rig, &live, &fixture("plain-turn", "SessionStart-1"));
+    assert_eq!(rig.post(&hook).await.status, 200);
+    assert!(
+        crate::supervisor::lock(&entry.hooks.final_wake).is_none(),
+        "the final wake ran"
+    );
+    assert_eq!(spawn.await.unwrap().status, 200);
+    assert_eq!(super::evidence::evidences(&rig, &live), ["session_start"]);
     rig.stop().await;
 }
 

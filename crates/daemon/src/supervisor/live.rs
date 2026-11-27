@@ -1,9 +1,9 @@
 //! The live map and its entries (design §2.11): one op lock per launch, the observation that
-//! never waits, and the interfaces 10b uses.
+//! takes no lock, and the interfaces 10b uses.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use chaldea_core::adapter::Capabilities;
@@ -13,7 +13,7 @@ use tokio::sync::OwnedMutexGuard;
 
 use super::tracker::TrackedSession;
 use super::{Supervisor, lock};
-use crate::deadline::settle_before;
+use crate::deadline::{Backoff, settle_before};
 
 /// The live map: a `std::sync::Mutex` held only for map operations.
 #[derive(Default)]
@@ -22,15 +22,6 @@ pub(crate) struct LiveMap(Mutex<HashMap<LaunchId, Arc<LiveLaunch>>>);
 impl LiveMap {
     pub(crate) fn lock(&self) -> MutexGuard<'_, HashMap<LaunchId, Arc<LiveLaunch>>> {
         lock(&self.0)
-    }
-
-    /// The map, or `None` while another holder has it (never waits).
-    pub(crate) fn try_lock(&self) -> Option<MutexGuard<'_, HashMap<LaunchId, Arc<LiveLaunch>>>> {
-        match self.0.try_lock() {
-            Ok(g) => Some(g),
-            Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
-            Err(TryLockError::WouldBlock) => None,
-        }
     }
 
     /// Every entry.
@@ -59,6 +50,8 @@ pub(crate) struct LiveLaunch {
     pub cli_version: Option<String>,
     /// Set before `Session::spawn`; never cleared.
     creation_started: AtomicBool,
+    /// Set by `Supervisor::remove` before the entry leaves the live map; never cleared.
+    removed: AtomicBool,
     /// Set with the stop's seal, under the op lock.
     stop_requested: AtomicBool,
     /// Set under the op lock when the session leaves its slot for good: a reader that finds
@@ -75,6 +68,29 @@ pub(crate) struct LiveLaunch {
     /// The deadline of the last `snapshot_before` (unit tests only).
     #[cfg(test)]
     pub(crate) snapshot_deadline: Mutex<Option<Instant>>,
+    #[cfg(test)]
+    pub(crate) hooks: LiveHooks,
+}
+
+/// Test points of one entry's observation and publication wait.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct LiveHooks {
+    /// Runs in `await_published` each time it saw the launch unpublished and not removed.
+    pub publication_waiting: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs in `await_published` after a wait that ended at or past the facts deadline,
+    /// before the final read.
+    pub final_wake: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs in `observe` after the positions were read, before `removed` is read again.
+    pub after_positions: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[cfg(test)]
+fn run_hook(slot: &Mutex<Option<Box<dyn FnOnce() + Send>>>) {
+    let f = lock(slot).take();
+    if let Some(f) = f {
+        f();
+    }
 }
 
 /// What the publication set (design §2.3 step 5).
@@ -133,7 +149,7 @@ pub(crate) enum LaunchObservation {
         reference: u64,
         last_started: [u64; 3],
     },
-    /// Creation begun and unpublished, contended, or no entry.
+    /// Removed, creation begun and unpublished, or positions not read in time.
     Unobservable,
 }
 
@@ -155,6 +171,7 @@ impl LiveLaunch {
             positional,
             cli_version: None,
             creation_started: AtomicBool::new(false),
+            removed: AtomicBool::new(false),
             stop_requested: AtomicBool::new(false),
             detached: Arc::new(AtomicBool::new(false)),
             published: OnceLock::new(),
@@ -164,6 +181,8 @@ impl LiveLaunch {
             ops: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(test)]
             snapshot_deadline: Mutex::new(None),
+            #[cfg(test)]
+            hooks: LiveHooks::default(),
         }
     }
 
@@ -173,6 +192,69 @@ impl LiveLaunch {
 
     pub(crate) fn creation_started(&self) -> bool {
         self.creation_started.load(Ordering::SeqCst)
+    }
+
+    /// Marks the entry removed; `Supervisor::remove` calls it before the entry leaves the map.
+    pub(crate) fn mark_removed(&self) {
+        self.removed.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn removed(&self) -> bool {
+        self.removed.load(Ordering::SeqCst)
+    }
+
+    /// The observation the hook intake and the settle read (design §2.11 "Observation"),
+    /// taking no lock: removed → `Unobservable`; published → the positions the writer
+    /// publishes ([`WriterObserver::published_last_started`] with `deadline`), `Started`
+    /// unless they were not read in time or the entry was removed meanwhile; creation begun
+    /// → `Unobservable`; else `Reserved`.
+    pub(crate) fn observe(&self, deadline: Option<Instant>) -> LaunchObservation {
+        if self.removed() {
+            return LaunchObservation::Unobservable;
+        }
+        if let Some(p) = self.published() {
+            let Some(last_started) = p.observer.published_last_started(deadline) else {
+                return LaunchObservation::Unobservable;
+            };
+            #[cfg(test)]
+            run_hook(&self.hooks.after_positions);
+            if self.removed() {
+                return LaunchObservation::Unobservable;
+            }
+            return LaunchObservation::Started {
+                reference: p.reference,
+                last_started,
+            };
+        }
+        if self.creation_started() {
+            LaunchObservation::Unobservable
+        } else {
+            LaunchObservation::Reserved
+        }
+    }
+
+    /// Waits, until `f` (real time), while the launch's creation began and it is neither
+    /// published nor removed (send §2.5 "Intake facts"). It polls those atomics and takes no
+    /// lock; each sleep is capped by the time left to `f`, and the predicate is read once more
+    /// after the last one.
+    pub(crate) fn await_published(&self, f: Instant) {
+        let mut backoff = Backoff::default();
+        loop {
+            if !self.creation_started() || self.published().is_some() || self.removed() {
+                return;
+            }
+            #[cfg(test)]
+            run_hook(&self.hooks.publication_waiting);
+            let now = Instant::now();
+            if now >= f {
+                return;
+            }
+            backoff.wait(f - now);
+            #[cfg(test)]
+            if Instant::now() >= f {
+                run_hook(&self.hooks.final_wake);
+            }
+        }
     }
 
     pub(crate) fn stop_requested(&self) -> bool {
@@ -320,33 +402,6 @@ impl LiveLaunch {
         match guard.as_ref() {
             Some(s) => Ok(f(s)),
             None => Err(SessionError::Gone),
-        }
-    }
-}
-
-impl Supervisor {
-    /// Never waits: for the hook intake path (design §2.11 "Observation").
-    pub(crate) fn observe(&self, launch: LaunchId) -> LaunchObservation {
-        let Some(map) = self.live.try_lock() else {
-            return LaunchObservation::Unobservable;
-        };
-        let Some(entry) = map.get(&launch).cloned() else {
-            return LaunchObservation::Unobservable;
-        };
-        drop(map);
-        if let Some(p) = entry.published() {
-            return match p.observer.published_last_started(None) {
-                Some(last_started) => LaunchObservation::Started {
-                    reference: p.reference,
-                    last_started,
-                },
-                None => LaunchObservation::Unobservable,
-            };
-        }
-        if entry.creation_started() {
-            LaunchObservation::Unobservable
-        } else {
-            LaunchObservation::Reserved
         }
     }
 }

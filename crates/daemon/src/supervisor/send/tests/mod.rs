@@ -5,10 +5,10 @@ mod ack;
 mod claude;
 mod evidence;
 mod flow;
-mod gate;
+pub(crate) mod gate;
 mod human;
 mod outcomes;
-mod probe;
+pub(crate) mod probe;
 mod timers;
 mod turn_order;
 
@@ -265,10 +265,10 @@ impl SRig {
     }
 
     /// Runs `f` with `live`'s send worker parked after a pass's read, outside the live map and
-    /// out of the runtime's way (`block_in_place`): an intake meanwhile never meets the
-    /// worker's map lock (which it would answer with no facts), and a test holding the map
-    /// never has the worker block a runtime thread on it. The worker is released before the
-    /// caller waits on anything it records.
+    /// out of the runtime's way (`block_in_place`): the park keeps the order of the hooks `f`
+    /// posts against the worker's own steps, and a test holding the map never has the worker
+    /// block a runtime thread on it. The worker is released before the caller waits on
+    /// anything it records.
     pub(crate) fn worker_parked<'a, T: 'a>(
         &'a self,
         live: &'a Live,
@@ -406,6 +406,54 @@ impl SRig {
         .unwrap()
         .unwrap();
         rx
+    }
+
+    /// Parks `live`'s PTY writer at its dispatch boundary with the queue lock held, on a raw
+    /// `Attach` unit `x` submitted for it; returns the park and the flag the unit's completion
+    /// sets.
+    pub(crate) async fn writer_q_held(
+        &self,
+        live: &Live,
+    ) -> (
+        chaldea_pty_runtime::fake::Park,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use chaldea_pty_runtime::fake::ProbePoint;
+        let probe = self.probe(live).await;
+        let n = probe.count(ProbePoint::Dispatching);
+        let park = probe.park(ProbePoint::Dispatching);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = done.clone();
+        let not_after = self.sup.real(self.sup.now() + Duration::from_secs(60));
+        let e = self.sup.entry(live.l).unwrap();
+        e.with_session(
+            &self.sup,
+            self.sup.now() + Duration::from_secs(5),
+            move |s| {
+                s.submit(
+                    chaldea_pty_runtime::WriteUnit::bytes(
+                        chaldea_pty_runtime::WriteOrigin::Attach,
+                        b"x".to_vec(),
+                    ),
+                    chaldea_pty_runtime::Guard::until(not_after),
+                    Box::new(move |_| d.store(true, Ordering::SeqCst)),
+                )
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let reached = tokio::task::spawn_blocking(move || {
+            probe.wait(
+                ProbePoint::Dispatching,
+                n + 1,
+                std::time::Instant::now() + Duration::from_secs(10),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(reached, "the writer parked at its dispatch boundary");
+        (park, done)
     }
 
     /// The next hook's receipt ordinal for `live`.

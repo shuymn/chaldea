@@ -124,26 +124,15 @@ async fn evidence_kinds() {
     assert_eq!(rig.post(&h).await.status, 200);
     assert!(rig.launch(live.l).session_id.is_some(), "bound");
     assert_eq!(count(&rig, &live, "session_start"), 0);
-    // A `PostDecision` without facts (the launch unobservable at its intake: the live map
-    // held) records none. The worker is parked meanwhile, so it never blocks a runtime
-    // thread on the held map.
+    // A `PostDecision` without facts (the launch unobservable at its intake) records none.
     rig.stop().await;
     let (rig, live) = bound_in(ReadinessMode::PostDecision, Agent::Codex).await;
-    rig.worker_parked(&live, async {
-        let (locked_tx, locked) = tokio::sync::oneshot::channel();
-        let (release, released) = std::sync::mpsc::channel::<()>();
-        let sup = rig.sup.clone();
-        let holder = tokio::task::spawn_blocking(move || {
-            let _map = sup.live.lock();
-            let _ = locked_tx.send(());
-            let _ = released.recv_timeout(Duration::from_secs(20));
-        });
-        locked.await.unwrap();
-        rig.hook(&live, "PostDecision", &json!({})).await;
-        release.send(()).unwrap();
-        holder.await.unwrap();
-    })
-    .await;
+    let sl = rig.sl(&live);
+    *crate::supervisor::send::lock(&sl.hooks.observe) = Some(Box::new(|_, _| {
+        crate::supervisor::live::LaunchObservation::Unobservable
+    }));
+    rig.hook(&live, "PostDecision", &json!({})).await;
+    assert!(crate::supervisor::send::lock(&sl.hooks.observe).is_none());
     assert_eq!(count(&rig, &live, "post_decision"), 0);
     rig.hook(&live, "PostDecision", &json!({})).await;
     assert_eq!(count(&rig, &live, "post_decision"), 1);
@@ -254,12 +243,12 @@ async fn settle_later_hooks() {
     let (rig, live) = settle_rig().await;
     turn(&rig, &live, "p").await;
     let p: Arc<dyn IntakeProbe> = Arc::new(SupervisorProbe {
-        sup: Arc::downgrade(&rig.sup),
         side: rig.sup.send.clone(),
     });
     let ord = rig.next_ordinal(&live);
-    let _ = p.facts(live.l, ord);
-    drop(IntakeGuard::new(p, live.l, ord));
+    let g = IntakeGuard::new(p.clone(), live.l, ord);
+    let _ = p.facts(live.l, ord, Instant::now() + Duration::from_secs(10), &g);
+    drop(g);
     advance(&rig, &live, SETTLE).await;
     assert_eq!(count(&rig, &live, "stop_settled"), 0);
     rig.stop().await;
@@ -751,5 +740,92 @@ async fn settle_limit_l11() {
     rig.hook(&live, "Stop", &json!({})).await;
     advance(&rig, &live, SETTLE).await;
     assert_eq!(count(&rig, &live, "stop_settled"), 1, "the accepted gap");
+    rig.stop().await;
+}
+
+/// A Codex `Stop` turn whose settle is due: `ready` asserted, the clock stopped, the turn's
+/// hooks in, and the clock moved `SETTLE` on without a pass.
+async fn due_settle() -> (SRig, Live) {
+    let (rig, live) = settle_rig().await;
+    turn(&rig, &live, "p").await;
+    rig.clock.advance(SETTLE);
+    (rig, live)
+}
+
+/// SF-11: the settle's one observation takes no lock: with the PTY writer parked at its
+/// dispatch boundary (its queue lock held), the due candidate settles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_beside_parked_writer() {
+    let (rig, live) = due_settle().await;
+    let (park, _) = rig.writer_q_held(&live).await;
+    rig.pass(&live).await;
+    assert_eq!(count(&rig, &live, "stop_settled"), 1);
+    drop(park);
+    rig.stop().await;
+}
+
+/// SF-11: with the live map held from the pass's read to its settle, the due candidate
+/// settles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_beside_held_map() {
+    let (rig, live) = due_settle().await;
+    let sl = rig.sl(&live);
+    let (read_tx, read) = std::sync::mpsc::channel();
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    set(&sl.hooks.after_read, move || {
+        read_tx.send(()).unwrap();
+        let _ = wait.recv_timeout(Duration::from_secs(30));
+    });
+    sl.wake.notify_one();
+    crate::supervisor::tests::support::http::reached_sync(read).await;
+    let (locked_tx, locked) = std::sync::mpsc::channel();
+    let (free, until) = std::sync::mpsc::channel::<()>();
+    let sup = rig.sup.clone();
+    let holder = std::thread::spawn(move || {
+        let _map = sup.live.lock();
+        locked_tx.send(()).unwrap();
+        let _ = until.recv_timeout(Duration::from_secs(30));
+    });
+    locked.recv().unwrap();
+    go.send(()).unwrap();
+    rig.until("settled with the map held", || {
+        count(&rig, &live, "stop_settled") == 1
+    })
+    .await;
+    free.send(()).unwrap();
+    holder.join().unwrap();
+    rig.stop().await;
+}
+
+/// SF-11 (kept): a launch removed from the live map between the pass's read and its
+/// observation does not settle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_after_removal() {
+    let (rig, live) = due_settle().await;
+    let sl = rig.sl(&live);
+    let sup = rig.sup.clone();
+    let l = live.l;
+    set(&sl.hooks.after_read, move || sup.remove(l));
+    rig.pass(&live).await;
+    assert!(super::super::lock(&sl.hooks.after_read).is_none());
+    assert_eq!(count(&rig, &live, "stop_settled"), 0);
+    rig.stop().await;
+}
+
+/// SF-11: a launch removed between the settle's observation and its job (no exit recorded)
+/// does not settle: the job refuses a removed entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_removed_before_job() {
+    let (rig, live) = due_settle().await;
+    let sl = rig.sl(&live);
+    let sup = rig.sup.clone();
+    let l = live.l;
+    set(&sl.hooks.settle_job, move || sup.remove(l));
+    rig.pass(&live).await;
+    assert!(
+        super::super::lock(&sl.hooks.settle_job).is_none(),
+        "the job ran"
+    );
+    assert_eq!(count(&rig, &live, "stop_settled"), 0);
     rig.stop().await;
 }

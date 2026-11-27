@@ -374,14 +374,14 @@ async fn record_during_intake_keeps_running() {
     // commits there, and the launch is observed, so the facts are present.
     let observed = Arc::new(AtomicBool::new(false));
     let o = observed.clone();
-    *crate::supervisor::send::lock(&sl.hooks.observe) = Some(Box::new(move |sup, l| {
+    *crate::supervisor::send::lock(&sl.hooks.observe) = Some(Box::new(move |e, _| {
         go.send(()).unwrap();
         let end = Instant::now() + Duration::from_secs(10);
         while !recorded.load(Ordering::Acquire) && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(1));
         }
         loop {
-            let seen = sup.observe(l);
+            let seen = e.observe(None);
             if matches!(seen, LaunchObservation::Started { .. }) {
                 o.store(recorded.load(Ordering::Acquire), Ordering::SeqCst);
                 return seen;
@@ -667,5 +667,47 @@ async fn stale_start_after_unrecorded_exit() {
     assert_eq!(start.finish().await.status, 200);
     assert_eq!(turn(&rig, &live), TurnState::Unknown);
     assert_eq!(rig.launch(live.l).last_turn_start_seq, before);
+    rig.stop().await;
+}
+
+/// SF-6: a `Stop` whose intake waits for the launch's held state while the input unit's
+/// completion job commits counts the record before its intake point: the state released
+/// after the commit, its mark settles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn record_during_state_wait() {
+    let (rig, live) = settle_rig().await;
+    let sl = rig.sl(&live);
+    let (entered, go, point) = gate_point();
+    set(&sl.hooks.record_job, point);
+    let p = rig.send(&live, "P").await;
+    reached(entered).await;
+    let recorded = sl.state().running.as_ref().unwrap().recorded.clone();
+    let (held_tx, held) = std::sync::mpsc::channel();
+    let (free, until) = std::sync::mpsc::channel::<()>();
+    let s2 = sl.clone();
+    let holder = std::thread::spawn(move || {
+        let _st = s2.state();
+        held_tx.send(()).unwrap();
+        let _ = until.recv_timeout(Duration::from_secs(30));
+    });
+    held.recv().unwrap();
+    let (contended_tx, contended) = std::sync::mpsc::channel();
+    set(&sl.hooks.state_contended, move || {
+        contended_tx.send(()).unwrap();
+    });
+    let stop = rig.next_ordinal(&live);
+    let reply = spawn_send(
+        &rig.srv,
+        &rig.hook_of(&live, "Stop", &json!({})).req(&rig.srv),
+    );
+    crate::supervisor::tests::support::http::reached_sync(contended).await;
+    go.send(()).unwrap();
+    rig.until("the record committed", || recorded.load(Ordering::Acquire))
+        .await;
+    free.send(()).unwrap();
+    holder.join().unwrap();
+    assert_eq!(reply.await.unwrap().status, 200);
+    end_mark(&rig, &live, stop, true);
+    rig.until_input(p, InputState::Sent).await;
     rig.stop().await;
 }
