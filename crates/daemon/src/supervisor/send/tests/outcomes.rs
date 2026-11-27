@@ -356,11 +356,15 @@ async fn after_exit() {
     .await;
     rig.until_input(id, InputState::Unconfirmed).await;
     let before = moves(&rig, &live, id);
+    // The removal from the live map wakes no worker: released before it, the worker could
+    // park for good.
+    rig.until("the launch left the live map", || {
+        rig.sup.entry(live.l).is_none()
+    })
+    .await;
     go.send(()).unwrap();
-    let sl = rig.sl(&live);
     rig.until("the worker ended", || rig.sup.send.launch(live.l).is_none())
         .await;
-    drop(sl);
     assert_eq!(moves(&rig, &live, id), before, "nothing changed");
     rig.stop().await;
 }
@@ -426,6 +430,15 @@ async fn sealed_applied_once() {
             go.send(()).unwrap();
         }
         assert_eq!(stop.await.unwrap().status, 200);
+        // The removal from the live map wakes no worker, and the worker may have parked
+        // before it: wake it after the removal.
+        rig.until("the launch left the live map", || {
+            rig.sup.entry(live.l).is_none()
+        })
+        .await;
+        if let Some(sl) = rig.sup.send.launch(live.l) {
+            sl.wake.notify_one();
+        }
         rig.until("the worker ended", || rig.sup.send.launch(live.l).is_none())
             .await;
         let m = moves(&rig, &live, id);
