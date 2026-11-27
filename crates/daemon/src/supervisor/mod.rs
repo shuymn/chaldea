@@ -177,6 +177,10 @@ pub enum Pause {
     /// tests only).
     #[cfg(test)]
     TailerPoll,
+    /// A participant cut before it joined the tailers, after it stopped them and before it
+    /// logs them (blocking; unit tests only).
+    #[cfg(test)]
+    TailsLeftStopped,
 }
 
 /// The test seam of [`Pause`]: the daemon's own is [`NoPauses`].

@@ -284,8 +284,11 @@ struct TailsLeft<'a>(&'a Supervisor);
 
 impl Drop for TailsLeft<'_> {
     fn drop(&mut self) {
-        self.0.tailers.set(Mode::Stop);
+        // The launches as cut: a stopped tailer leaves the list without its final read.
         let launches = self.0.tailers.launches();
+        self.0.tailers.set(Mode::Stop);
+        #[cfg(test)]
+        self.0.pauses().blocking(super::Pause::TailsLeftStopped);
         if launches.is_empty() {
             return;
         }

@@ -448,22 +448,43 @@ async fn a_participant_cut_before_the_final_reads_logs_them_unverified() {
     let rig = rig().await;
     let (_t, _l) = spawn_claude(&rig).await;
     let close = rig.pauses.arm(Pause::ShutdownCloseEnd);
+    let stopped = rig.pauses.arm(Pause::TailsLeftStopped);
     let end = rig.sup.now() + Duration::from_secs(5);
-    let participant = tokio::spawn(shutdown(rig.sup.clone(), end));
+    let (cut, cut_rx) = tokio::sync::oneshot::channel::<()>();
+    let sup = rig.sup.clone();
+    let participant = tokio::spawn(async move {
+        let mut fut = Box::pin(shutdown(sup, end));
+        tokio::select! {
+            r = &mut fut => panic!("the participant ended: {r:?}"),
+            // Handed out whole, to be dropped elsewhere.
+            _ = cut_rx => Some(fut),
+        }
+    });
     let close = tokio::task::spawn_blocking(move || {
         close.wait();
         close
     })
     .await
     .unwrap();
-    participant.abort();
-    assert!(participant.await.unwrap_err().is_cancelled());
+    cut.send(()).unwrap();
+    let fut = participant.await.unwrap().unwrap();
+    // Dropped off the runtime, so the pause below holds no worker the tailer needs.
+    let dropped = std::thread::spawn(move || drop(fut));
+    let stopped = tokio::task::spawn_blocking(move || {
+        stopped.wait();
+        stopped
+    })
+    .await
+    .unwrap();
+    // Stopped before it logs: the tailer ends and leaves the list first.
+    rig.until("the tailers stop", || rig.sup.tailers.launches().is_empty())
+        .await;
+    stopped.go();
+    dropped.join().unwrap();
     assert_eq!(
         rig.sup.tailers.abandoned_unverified.load(Ordering::Relaxed),
         1
     );
-    rig.until("the tailers stop", || rig.sup.tailers.launches().is_empty())
-        .await;
     close.go();
     rig.srv.stop().await;
 }
