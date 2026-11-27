@@ -45,12 +45,20 @@ test("pair_once", async ({ daemon, browser, page }) => {
 test("request_policy", async ({ daemon, page }) => {
   const { thread } = await daemon.spawnThread({ prompt: "policy check" });
   // Headers as sent: a finished request's full headers (WebKit gives them only once the
-  // response arrived), a failed one's provisional headers.
-  const sent: { method: string; url: string; headers: Promise<Record<string, string>> }[] = [];
-  const record = (r: Request, h: Promise<Record<string, string>>) =>
-    sent.push({ method: r.method(), url: r.url(), headers: h });
-  page.on("requestfinished", (r) => record(r, r.allHeaders()));
-  page.on("requestfailed", (r) => record(r, Promise.resolve(r.headers())));
+  // response arrived). A failed one (the page aborts a request it no longer needs) has only
+  // the browser's provisional headers, where Chromium lists a suppressed referrer as an
+  // empty `referer` for every request, assets included; a finished request's wire headers
+  // never carry it.
+  const sent: {
+    method: string;
+    url: string;
+    provisional: boolean;
+    headers: Promise<Record<string, string>>;
+  }[] = [];
+  const record = (r: Request, provisional: boolean, h: Promise<Record<string, string>>) =>
+    sent.push({ method: r.method(), url: r.url(), provisional, headers: h });
+  page.on("requestfinished", (r) => record(r, false, r.allHeaders()));
+  page.on("requestfailed", (r) => record(r, true, Promise.resolve(r.headers())));
   const sockets: string[] = [];
   page.on("websocket", (ws) => sockets.push(ws.url()));
 
@@ -65,7 +73,8 @@ test("request_policy", async ({ daemon, page }) => {
     const u = new URL(r.url);
     expect(u.origin, `a request left the page's origin (${u.pathname})`).toBe(daemon.origin);
     const h = await r.headers;
-    expect(h.referer, `Referer on ${r.method} ${u.pathname}`).toBeUndefined();
+    if (r.provisional) expect(h.referer ?? "", `Referer on aborted ${r.method} ${u.pathname}`).toBe("");
+    else expect(h.referer, `Referer on ${r.method} ${u.pathname}`).toBeUndefined();
     if (r.method === "POST") {
       posts += 1;
       expect(h.origin, `Origin on POST ${u.pathname}`).toBe(daemon.origin);

@@ -142,9 +142,15 @@ test("offline_then_catch_up", async ({ daemon, page }) => {
   // The reconnected socket's subscribe was answered with heads, which the page never saw.
   await expect.poll(() => droppedHeads, { message: "no heads frame was dropped", timeout: 15_000 }).toBeGreaterThan(0);
 
-  // History before the window still loads.
-  await page.getByRole("button", { name: "Older", exact: true }).click();
-  await expect(page.locator("main ol > li").first().locator("span").first()).toHaveText("#1", { timeout: 20_000 });
+  // History before the window still loads, one page of up to 100 events per "Older". How
+  // many events the sends produced depends on how fast FakeCli took them, so the number of
+  // pages does too.
+  const firstRow = page.locator("main ol > li").first().locator("span").first();
+  for (let first = lo; first > 1; ) {
+    await page.getByRole("button", { name: "Older", exact: true }).click();
+    first = Math.max(1, first - 100);
+    await expect(firstRow).toHaveText(`#${first}`, { timeout: 20_000 });
+  }
   expect(await shownSeqs(page)).toEqual(range(1, last));
 });
 
