@@ -10,13 +10,13 @@ The defect this design guards against is a completion racing its deadline. `toki
 
 - `deadline::settle_before` is the `ctx` shape as a function: await an owned `timeout_at`, then classify a ready result with one clock sample. Its return type makes each caller say whether a late result counts.
 - `crates/daemon/clippy.toml` forbids `tokio::time::{timeout, timeout_at, sleep, sleep_until}`. **The guarantee** is what clippy enforces: no direct call of a banned function in any scope where `clippy::disallowed_methods` is active, outside the named exception functions, the helper, and the test wrappers. A new deadline decision either uses `settle_before` or adds a reviewed exception. A new caller of an existing exception function adds no `allow`; review owns those callers. Two functions allow the lint for other APIs, `routes::build_router` (the router) and `lifecycle::spawn_locked` (the spawn lock), so a timer call inside them would not be caught; neither contains one. The probe's four raw calls (D4) are the negative fixture and are not part of this inventory.
-- Only the two `ctx` sites in the helper's shape use it; every other site (a **kept site**) keeps its own poll order, with its timer constructed by a private exception function.
+- The two `ctx` sites (D3) and the supervisor's deadline waits (designed in `docs/design/supervisor.md` and its sibling designs) use it; every other site (a **kept site**) keeps its own poll order, with its timer constructed by a private exception function.
 
 ## 2. The three poll orders
 
 | Order | Check before poll | Sample after `Ready` | Clock | Used by |
 |---|---|---|---|---|
-| `settle_before` (owned `timeout_at`, then one sample) | no | yes, one sample classifies | the caller's (`MonotonicClock`, injectable) | `ctx::read_cut`, `ctx::until_deadline` |
+| `settle_before` (owned `timeout_at`, then one sample) | no | yes, one sample classifies | the caller's (`MonotonicClock`, injectable) | `ctx::read_cut`, `ctx::until_deadline`, the supervisor's waits |
 | `ws::before` | yes | no | tokio clock | WebSocket sends (http-surface §2.6 "Bounded disconnect") |
 | `shutdown::deadline_first` | yes | no | std clock | the shutdown coordinator (daemon-lifecycle §2.8) |
 
