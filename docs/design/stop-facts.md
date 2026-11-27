@@ -26,13 +26,13 @@ Also rejected: unbounded waits, test retries, worker-side repair (SB15).
 
 **Request deadline** (server clock), checked on entry, after the async guard before dispatch, and at the start point:
 - 408 before the start point takes no ordinal.
-- After it, the handler's timer can still answer 408 before routing; the closure finishes once without marks, leaving an ordinal gap.
+- After it, the handler's last deadline check, made before its write observer registers, can still answer 408; the closure finishes once without marks, leaving an ordinal gap. After the registration the writer decides (supervisor-send L-12).
 - `F` never causes 408.
 - Retries reuse the `emit_id`: newly recorded, `intake_reliable: false`; after a committed first delivery, its response replays.
 
 **Facts deadline** `F = min(Instant::now() at entry + INTAKE_WAIT, real(request deadline))`:
 - Each wait (publication, `SendState`, triple) backs off with sleeps capped by the time left to `F`, then makes one final attempt, returning within `F` plus one attempt.
-- Facts are missing only when `removed`, or when a wait ends unpublished, without `SendState`, or with an inconsistent triple.
+- Facts are missing only when `removed`, when the final attempt of the `SendState` wait (the `SendLaunch` mutex) or of the triple (the position read) fails, or when the observation after the publication wait still finds `L` unpublished once its creation started; a final publication poll that misses is followed by that observation, which can still succeed.
 
 **Start point (cancellation, unwind).** Each request has a start cell (`Pending`, `Started`, `Cancelled`).
 - Dropping the request future swaps `Pending` → `Cancelled`; the closure, under `state`, claims (`Pending` → `Started`), then checks the request deadline, immediately before reserving the ordinal.
@@ -71,7 +71,7 @@ EARS. Red: `old` fails on `fb5f13a3`; `mut` fails under the named mutation; `kep
 | SF-6 | A record committing during the `SendState` wait shall count before the intake point. | `turn_order::record_during_state_wait` | old |
 | SF-7 | While an intake waits, ticket drops, `earlier_released`, other launches, and timers proceed. | `hook::tests::intake::waiting_intake_blocks_nothing` | old |
 | SF-8 | When a hook arrives after creation and before publication, the intake shall wait until publication or removal (made after the wait began) or `F`. | `claude::session_start_before_publication` (old), `…_after_deadline` (kept), `live::observe_removed` (mut: `removed` ignored), `live::poll_sees_later_change` (mut: sleep straight to `F`) | per test |
-| SF-9 | If cancelled or expired before the start point, the intake shall take no ordinal; after it, a 408 or drop finishes it once. | `hook::tests::intake::drop_waiting_for_pool`, `deadline_before_ordinal`, `deadline_at_claim`, `drop_after_ordinal`, `deadline_during_wait` | mut: start cell ignored; dispatch check removed (a pool task appears); check before claim |
+| SF-9 | If cancelled or expired before the start point, the intake shall take no ordinal; after it, a 408 or drop finishes it once. | `hook::tests::intake::drop_waiting_for_pool`, `deadline_before_ordinal`, `deadline_at_claim`, `hook::intake::tests::deadline_crosses_at_claim`, `drop_after_ordinal`, `deadline_during_wait` | mut: start cell ignored; dispatch check removed (a pool task appears); check before claim |
 | SF-10 | When a wait reaches `F`, it shall return within `F` plus one attempt, with facts if that attempt saw them; past `F` with request time left, 200. | `probe::pool_past_facts_deadline`, `probe::state_at_facts_deadline` (mut: no final attempt); `claude::published_at_facts_deadline` (kept) | per test |
 | SF-11 | While the writer is parked or the map held, a candidate shall settle; one removed before observation or job shall not. | `evidence::settle_beside_parked_writer` (old), `…_beside_held_map` (old), `…_after_removal` (kept), `…_removed_before_job` (old) | per test |
 | SF-12 | If an intake unwinds after the fence advance, it shall finish once without marks, releasing `pending` and the fence; before, only its ordinal. | `hook::tests::intake::panic_after_advance`, `panic_before_advance` | mut: guard armed early or late |
@@ -80,7 +80,7 @@ EARS. Red: `old` fails on `fb5f13a3`; `mut` fails under the named mutation; `kep
 ## 7. Proposed Canonical-Doc Edits
 
 1. supervisor-send §2.5 "Intake facts" (§3), §2.4 `stop_settled` (D7), §2.8 (D4), §2.3 (`SeqCst`), PR10b-CL-7 (SF-1, 3, 5, 8; the `SendMap` read stays the one wait with no own deadline).
-2. supervisor-send L-12, and PR10b-P-1's exception: "A hook whose intake waits end at its facts deadline (`INTAKE_WAIT`, 500 ms) without `L`'s `SendState`, `L`'s publication when its creation started, or a consistent position triple, or whose launch was removed, has its facts missing." 408s follow hook-ingest.
+2. supervisor-send L-12, and PR10b-P-1's exception: "A hook has its facts missing when its launch was removed, when the final attempt (the first made at or after its facts deadline: `INTAKE_WAIT`, 500 ms, or the request deadline if sooner) of its `SendLaunch` mutex wait or of its position read fails, or when its observation, after the publication wait, still finds `L` unpublished once its creation started." 408s: the handler's cutoff is its last deadline check before its write observer registers; after it the writer decides by hook-ingest's J rows.
 3. supervisor.md §2.11 "Observation", "Where 10b plugs in", code block, identifiers, SD12, PR10a1-CL-30, the hook-ingest "§4 PR 10 row" cross-reference: D1, D2.
 4. hook-ingest §2.3 step 5, §2.4 (D5, §3; `facts` takes `F`), §2.11 H6, §4 PR 10 row, §5 resource paths and "Waits" (the pid wait follows D6).
 5. pty-runtime §2.2 (`published_last_started` replaces `try_last_started_each`), §2.3 (D1), §2.7 (`Publishing`, `BetweenPositionLoads`), §5 waits.
