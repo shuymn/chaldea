@@ -491,9 +491,9 @@ async fn a_participant_cut_before_the_final_reads_logs_them_unverified() {
 
 /// A writer that keeps completing lines through the final read at shutdown (a Claude that
 /// outlived its recorded exit): each read finds the last line grown and the next one begun,
-/// and the cursor advances line by line. The participant's end, passing while a read is
-/// held, stops the tailer: the participant answers `LeftRunning`, and the held read ends
-/// without a further commit.
+/// and the cursor advances line by line. The participant's end, passing on the stopped test
+/// clock while a read is held, stops the tailer: the participant answers `LeftRunning`, and
+/// the held read ends without a further commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_final_read_with_a_writer_that_keeps_writing_ends_at_the_participants_end() {
     use std::io::Write;
@@ -512,11 +512,12 @@ async fn a_final_read_with_a_writer_that_keeps_writing_ends_at_the_participants_
         f.write_all(bytes.concat().as_bytes()).unwrap();
     };
     write(&[head]);
+    // No deadline passes until the clock is moved below.
+    rig.clock.stop();
+    let budget = Duration::from_secs(2);
     let close = rig.pauses.arm(Pause::ShutdownCloseEnd);
-    let participant = tokio::spawn(shutdown(
-        rig.sup.clone(),
-        rig.sup.now() + Duration::from_secs(2),
-    ));
+    let join = rig.pauses.arm(Pause::ShutdownTailJoin);
+    let participant = tokio::spawn(shutdown(rig.sup.clone(), rig.sup.now() + budget));
     let close = tokio::task::spawn_blocking(move || {
         close.wait();
         close
@@ -548,7 +549,15 @@ async fn a_final_read_with_a_writer_that_keeps_writing_ends_at_the_participants_
     .await
     .unwrap();
     assert_eq!(texts(&rig, t), ["ok", "ok", "ok"]);
-    // The participant's end passes while the read is held.
+    // The participant's end passes while the read is held: its join timer is set after it.
+    let join = tokio::task::spawn_blocking(move || {
+        join.wait();
+        join
+    })
+    .await
+    .unwrap();
+    rig.clock.advance(budget);
+    join.go();
     assert_eq!(participant.await.unwrap(), ParticipantEnd::LeftRunning);
     assert!(rig.sup.tailers.stopped());
     assert_eq!(rig.sup.tailers.launches(), [l]);

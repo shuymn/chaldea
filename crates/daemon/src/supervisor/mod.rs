@@ -181,6 +181,10 @@ pub enum Pause {
     /// only).
     #[cfg(test)]
     TailerAfterRead,
+    /// The participant after it set the tailers' final mode, before it sets its timer for
+    /// joining them (async; unit tests only).
+    #[cfg(test)]
+    ShutdownTailJoin,
     /// A participant cut before it joined the tailers, after it stopped them and before it
     /// logs them (blocking; unit tests only).
     #[cfg(test)]

@@ -251,6 +251,8 @@ pub(crate) async fn shutdown(sup: Arc<Supervisor>, end: Instant) -> ParticipantE
         let left = TailsLeft(&sup);
         ptys.await;
         sup.tailers.set(Mode::Final);
+        #[cfg(test)]
+        sup.pauses().at(Pause::ShutdownTailJoin).await;
         let joined = futures_util::future::join_all(sup.tailers.tasks());
         let in_time = settle_before(|| sup.now(), end, sup.timer(end), joined)
             .await
