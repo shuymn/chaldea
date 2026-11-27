@@ -657,7 +657,9 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
     let sub_deadline = sup.real(sup.now() + cfg.subscribe_wait);
     let (h2, sink2, max) = (handle.clone(), buf.sink(), cfg.attached_max);
     #[cfg(test)]
-    let hook = crate::supervisor::lock(&cfg.hooks.subscribed).take();
+    let hook = crate::supervisor::lock(&cfg.hooks.subscribed)
+        .take()
+        .or_else(|| crate::supervisor::lock(&cfg.hooks.subscribes).pop());
     let subscribing = sup.rt.spawn_blocking(move || {
         let r = h2.subscribe(sink2, sub_deadline, |m| grid_budget(thread, launch, m, max));
         #[cfg(test)]

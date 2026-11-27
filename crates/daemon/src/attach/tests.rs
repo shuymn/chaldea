@@ -1982,64 +1982,111 @@ async fn failed_candidate_keeps_current() {
     rig.stop().await;
 }
 
-/// I-2: overlapping candidates: exactly one stays current, the others close 4003.
+/// I-2: a candidate whose subscription finds the VT lock held past its wait closes 4004 and
+/// changes nothing: the current socket keeps operating.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vt_unavailable_candidate_keeps_current() {
+    use chaldea_pty_runtime::fake::ProbePoint;
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut a, _) = attach(&rig, &live).await;
+    let probe = rig.probe(&live).await;
+    // The drain holds the VT lock inside a piece; the candidate's wait for it ends.
+    let park = probe.park(ProbePoint::PieceParsing);
+    live.child.emit(b"p");
+    assert!(probe.wait(ProbePoint::PieceParsing, 1, soon()));
+    // The subscription's wait passes on the running clock; the lock stays held throughout.
+    rig.clock.resume();
+    let mut b = open_as(&rig, &rig.owner, live.t).await.expect("a 101");
+    assert_eq!(b.until_closed().await.0, Some(4004));
+    drop(park);
+    let before = live.child.input().len();
+    a.binary(b"still").await;
+    rig.until("A still writes", || {
+        live.child.input()[before..] == *b"still"
+    })
+    .await;
+    rig.stop().await;
+}
+
+/// I-2: three candidates all subscribed and held before any swap; released together,
+/// exactly one stays current and can write, the others close 4003.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn takeover_atomic() {
     let rig = SRig::new().await;
     let live = rig.claude().await;
-    let mut tickets = Vec::new();
-    for _ in 0..3 {
-        tickets.push(
-            rig.srv
-                .ticket(&rig.owner, &format!("attach:{}", live.t))
-                .await
-                .unwrap(),
-        );
+    let (entered_tx, reached) = std::sync::mpsc::channel::<()>();
+    let mut gos = Vec::new();
+    {
+        let h = hooks(&rig);
+        let mut v = h.subscribes.lock().unwrap();
+        for _ in 0..3 {
+            let (go, wait) = std::sync::mpsc::channel::<()>();
+            gos.push(go);
+            let tx = entered_tx.clone();
+            v.push(Box::new(move || {
+                let _ = tx.send(());
+                let _ = wait.recv();
+            }));
+        }
     }
-    let port = rig.srv.port;
-    let t = live.t;
-    let opens = tickets.into_iter().map(|ticket| async move {
-        let url = format!("ws://127.0.0.1:{port}/api/attach/{t}?ticket={ticket}");
-        let (ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-        let mut c = Client { ws, closed: None };
-        assert!(matches!(
-            c.text().await,
-            Some(AttachServerMessage::Attached { .. })
-        ));
-        c
-    });
-    let clients = futures_util::future::join_all(opens).await;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut tasks = Vec::new();
-    for (i, mut c) in clients.into_iter().enumerate() {
-        let tx = tx.clone();
-        tasks.push(tokio::spawn(async move {
+    let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut writes = Vec::new();
+    for i in 0..3 {
+        let ticket = rig
+            .srv
+            .ticket(&rig.owner, &format!("attach:{}", live.t))
+            .await
+            .unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/api/attach/{}?ticket={ticket}",
+            rig.srv.port, live.t
+        );
+        let (write_tx, mut write_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        writes.push(write_tx);
+        let closed_tx = closed_tx.clone();
+        tokio::spawn(async move {
+            let (ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
             loop {
-                match c.ws.next().await {
-                    Some(Ok(WsMessage::Close(f))) => {
-                        let _ = tx.send((i, f.map(|f| u16::from(f.code))));
-                        return;
+                tokio::select! {
+                    b = write_rx.recv() => {
+                        let Some(b) = b else { return };
+                        let _ = tx.send(WsMessage::Binary(b.into())).await;
                     }
-                    Some(Ok(_)) => {}
-                    _ => {
-                        let _ = tx.send((i, None));
-                        return;
-                    }
+                    m = rx.next() => match m {
+                        Some(Ok(WsMessage::Close(f))) => {
+                            let _ = closed_tx.send((i, f.map(|f| u16::from(f.code))));
+                            return;
+                        }
+                        Some(Ok(_)) => {}
+                        _ => {
+                            let _ = closed_tx.send((i, None));
+                            return;
+                        }
+                    },
                 }
             }
-        }));
+        });
     }
+    for _ in 0..3 {
+        entered(&reached);
+    }
+    // Every candidate subscribed before any swap.
+    drop(gos);
     let mut closed = Vec::new();
     for _ in 0..2 {
-        closed.push(bounded(WS_WAIT, rx.recv()).await.unwrap().unwrap());
+        closed.push(bounded(WS_WAIT, closed_rx.recv()).await.unwrap().unwrap());
     }
     assert!(closed.iter().all(|(_, c)| *c == Some(4003)), "{closed:?}");
-    // The third is current: it still operates.
     let survivor = (0..3).find(|i| closed.iter().all(|(j, _)| j != i)).unwrap();
-    assert!(!tasks[survivor].is_finished());
-    for t in tasks {
-        t.abort();
-    }
+    let before = live.child.input().len();
+    writes[survivor].send(b"s".to_vec()).unwrap();
+    rig.until("the survivor writes", || {
+        live.child.input()[before..] == *b"s"
+    })
+    .await;
+    drop(writes);
     rig.stop().await;
 }
 

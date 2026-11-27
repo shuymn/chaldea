@@ -95,6 +95,9 @@ pub(crate) struct AttachHooks {
     pub gone_polls: std::sync::atomic::AtomicU64,
     /// Runs on the blocking pool after the next startup subscription returned.
     pub subscribed: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// As `subscribed`, one per startup subscription, last first (when `subscribed` is
+    /// empty).
+    pub subscribes: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>>,
 }
 
 #[cfg(test)]
