@@ -27,6 +27,7 @@ mod shutdown;
 mod signals;
 mod startup;
 mod state_dir;
+pub(crate) mod trim;
 
 #[cfg(test)]
 pub(crate) mod faults;

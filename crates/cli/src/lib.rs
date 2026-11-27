@@ -68,6 +68,8 @@ pub struct Seams {
     pub on_exit: Option<Box<dyn FnOnce(i32)>>,
     /// `daemon run`'s OS name instead of `std::env::consts::OS`.
     pub host_os: Option<String>,
+    /// `open`'s browser launcher instead of `host::open_url`.
+    pub launcher: Option<Box<dyn Fn(&str) -> std::io::Result<()>>>,
 }
 
 /// The `chaldea` process from its arguments (`argv[0]` first) to its exit; `main` is this one
@@ -200,7 +202,11 @@ fn command(cli: Cli, seams: &mut Seams) -> ExitCode {
         Command::Daemon {
             command: DaemonCommand::Stop,
         } => daemon_cmd::stop(&state_dir, seams),
-        Command::Open { print_url } => open::run(&state_dir, print_url, &host::open_url),
+        Command::Open { print_url } => open::run(
+            &state_dir,
+            print_url,
+            seams.launcher.as_deref().unwrap_or(&host::open_url),
+        ),
         Command::Spawn {
             agent,
             cwd,

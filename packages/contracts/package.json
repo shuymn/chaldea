@@ -1,0 +1,24 @@
+{
+  "name": "@chaldea/contracts",
+  "private": true,
+  "description": "Chaldea's wire types and event decoder, generated from the Rust types (crates/core/tests/contracts_export.rs)",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./generated/*": "./src/generated/*.ts"
+  },
+  "scripts": {
+    "codegen": "node scripts/codegen.mjs",
+    "typecheck": "node scripts/codegen.mjs && tsc --noEmit",
+    "test": "node scripts/codegen.mjs && vitest run",
+    "check": "node scripts/codegen.mjs && tsc --noEmit && vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "typescript": "7.0.2",
+    "vitest": "5.1.1"
+  }
+}

@@ -1,0 +1,11 @@
+# The PWA's packages (docs/design/w1-pwa.md §3 D8). specs/ keeps its own workspace and
+# lockfile.
+packages:
+  - packages/contracts
+  - packages/web
+
+# Matches the minimumReleaseAge of the shared Renovate preset (3 days, in minutes).
+minimumReleaseAge: 4320
+
+# `pnpm run` fails when node_modules does not match package.json and the lockfile.
+verifyDepsBeforeRun: error

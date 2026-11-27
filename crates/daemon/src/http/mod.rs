@@ -24,6 +24,7 @@ mod error;
 mod guard;
 mod listener;
 mod pair;
+mod pwa;
 mod registry;
 mod routes;
 mod scope;
@@ -54,6 +55,7 @@ pub use commands::{
 };
 pub use ctx::{Deadline, ReadCtx, RequestStart, WriteCtx};
 pub use error::ApiError;
+pub use pwa::{Asset, EMBEDDED, PwaHandler, mount_pwa};
 pub use registry::{Closing, KindCounts, TaskKind, TaskRegistry};
 pub use routes::{
     ActionRule, BodyRule, Credential, Mount, MountKind, Mounts, OriginRule, ROUTES, ReadHandler,
