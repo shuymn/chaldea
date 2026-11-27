@@ -1997,6 +1997,56 @@ async fn revoked_send_discarded() {
     rig.stop().await;
 }
 
+/// A socket task aborted while its startup subscription is still on the blocking pool:
+/// the subscription that registers after the abort is removed (no output needed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aborted_startup_removes_late_subscription() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let handle = rig
+        .sup
+        .entry(live.l)
+        .unwrap()
+        .with_session(
+            &rig.sup,
+            rig.sup.now() + Duration::from_secs(5),
+            chaldea_pty_runtime::Session::handle,
+        )
+        .await
+        .unwrap();
+    let base = handle.subscriber_count();
+    let (at, go) = park_sync(&hooks(&rig).subscribed);
+    let connect = tokio::spawn({
+        let ticket = rig
+            .srv
+            .ticket(&rig.owner, &format!("attach:{}", live.t))
+            .await
+            .unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/api/attach/{}?ticket={ticket}",
+            rig.srv.port, live.t
+        );
+        tokio_tungstenite::connect_async(url)
+    });
+    entered(&at);
+    assert_eq!(
+        handle.subscriber_count(),
+        base + 1,
+        "registered, then parked"
+    );
+    let shared = rig.srv.server.shared().clone();
+    shared.registry.abort_remaining();
+    rig.until("the socket task ended", || shared.sockets.held() == 0)
+        .await;
+    go.send(()).unwrap();
+    rig.until("the late subscription removed", || {
+        handle.subscriber_count() == base
+    })
+    .await;
+    drop(connect);
+    rig.stop().await;
+}
+
 /// I-7: a revocation whose nudge is lost is found by the periodic verification.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revoked_lost_nudge() {

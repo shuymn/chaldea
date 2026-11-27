@@ -1317,6 +1317,13 @@ impl fmt::Debug for SessionHandle {
 }
 
 impl SessionHandle {
+    /// The subscribers registered now (tests).
+    #[cfg(feature = "fake")]
+    #[must_use]
+    pub fn subscriber_count(&self) -> usize {
+        lock(&self.sh.vt).sub_count()
+    }
+
     /// One atomic load of the mode word.
     #[must_use]
     pub fn modes(&self) -> ModeView {
