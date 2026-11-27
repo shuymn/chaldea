@@ -107,6 +107,26 @@ impl Client {
             .unwrap();
     }
 
+    /// One data message as `parts.len()` frames: the first of `opcode`, the rest
+    /// continuations.
+    async fn fragments(
+        &mut self,
+        opcode: tokio_tungstenite::tungstenite::protocol::frame::coding::Data,
+        parts: &[&[u8]],
+    ) {
+        use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+        for (i, p) in parts.iter().enumerate() {
+            let op = if i == 0 {
+                OpCode::Data(opcode)
+            } else {
+                OpCode::Data(Data::Continue)
+            };
+            let f = Frame::message(p.to_vec(), op, i + 1 == parts.len());
+            self.ws.send(WsMessage::Frame(f)).await.unwrap();
+        }
+    }
+
     async fn json(&mut self, v: serde_json::Value) {
         self.ws
             .send(WsMessage::Text(v.to_string().into()))
@@ -122,6 +142,22 @@ async fn open_as(rig: &SRig, secret: &str, t: ThreadId) -> Result<Client, u16> {
         .ticket(secret, &format!("attach:{t}"))
         .await
         .map_err(|r| r.status)?;
+    let url = format!(
+        "ws://127.0.0.1:{}/api/attach/{t}?ticket={ticket}",
+        rig.srv.port
+    );
+    match bounded(WS_WAIT, tokio_tungstenite::connect_async(url))
+        .await
+        .expect("the handshake ends within the wait")
+    {
+        Ok((ws, _)) => Ok(Client { ws, closed: None }),
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err(r.status().as_u16()),
+        Err(e) => panic!("not an HTTP refusal: {e}"),
+    }
+}
+
+/// Opens the attach socket of `t` with `ticket`.
+async fn open_ticket(rig: &SRig, t: ThreadId, ticket: &str) -> Result<Client, u16> {
     let url = format!(
         "ws://127.0.0.1:{}/api/attach/{t}?ticket={ticket}",
         rig.srv.port
@@ -482,6 +518,33 @@ async fn resume_with_old_socket_held() {
     rig.stop().await;
 }
 
+/// R-10: a paste whose first write call fails writes zero bytes: `incomplete` with 0 bytes,
+/// and the `human_write` is still recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zero_byte_incomplete_records() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut c, _) = attach(&rig, &live).await;
+    let before = live.child.input().len();
+    live.child
+        .fail_writes_after(before as u64, std::io::ErrorKind::BrokenPipe);
+    c.json(json!({ "type": "paste", "paste_id": "z", "text": "t" }))
+        .await;
+    assert_eq!(
+        c.text().await,
+        Some(AttachServerMessage::PasteResult {
+            paste_id: "z".into(),
+            outcome: PasteOutcome::Incomplete,
+            bytes_written: Some(0),
+            reason: Some(PasteReason::Attach(AttachReason::Incomplete)),
+        })
+    );
+    assert_eq!(live.child.input().len(), before);
+    rig.until("recorded", || human_writes(&rig, &live) == 1)
+        .await;
+    rig.stop().await;
+}
+
 /// T1-8: output EOF sends `ended { eof }`, then 4001.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ends_on_eof() {
@@ -541,9 +604,16 @@ async fn no_live_launch() {
     let live = rig.claude().await;
     let r = rig.cmd("stop", &json!({ "thread_id": live.t })).await;
     assert_eq!(r.status, 200);
-    let mut c = open_as(&rig, &rig.owner, live.t).await.expect("a 101");
+    let ticket = rig
+        .srv
+        .ticket(&rig.owner, &format!("attach:{}", live.t))
+        .await
+        .unwrap();
+    let mut c = open_ticket(&rig, live.t, &ticket).await.expect("a 101");
     let (code, texts) = c.until_closed().await;
     assert_eq!((code, texts), (Some(4000), Vec::new()));
+    // The `101` spent the ticket.
+    assert_eq!(open_ticket(&rig, live.t, &ticket).await.err(), Some(401));
     rig.stop().await;
 }
 
@@ -725,27 +795,65 @@ async fn frame_limits() {
     c.binary(&vec![b'y'; 64 * 1024]).await;
     rig.until("written", || live.child.input().len() == before + 64 * 1024)
         .await;
+    // The bound is the message's: two fragments of 40 KiB are one 80 KiB message.
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::Data;
+    let part = vec![b'f'; 40 * 1024];
+    c.fragments(Data::Binary, &[&part, &part]).await;
+    assert_eq!(
+        c.text().await,
+        Some(AttachServerMessage::InputDropped {
+            bytes: 80 * 1024,
+            reason: AttachReason::TooLarge
+        })
+    );
+    let part = vec![b'g'; 32 * 1024];
+    c.fragments(Data::Binary, &[&part, &part]).await;
+    rig.until("the fragmented message written", || {
+        live.child.input().len() == before + 128 * 1024
+    })
+    .await;
+    assert_eq!(live.child.input()[before + 64 * 1024..], [b'g'; 64 * 1024]);
     rig.stop().await;
 }
 
-/// T1-9: a 256 KiB paste with every byte `\u00XX`-escaped fits the attach inbound limit.
+/// T1-9: a 256 KiB paste with every byte `\u00XX`-escaped fits the attach inbound limit,
+/// in one frame and in fragments, and the PTY gets exactly the encoder's wrapped text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worst_case_escape_fits() {
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::Data;
     let rig = SRig::new().await;
     let live = rig.claude().await;
     let (mut c, _) = attach(&rig, &live).await;
-    let text = "\u{7f}".repeat(MAX_PROMPT_BYTES);
+    let text = "a".repeat(MAX_PROMPT_BYTES);
     let escaped = format!(
         r#"{{ "type" : "paste" , "paste_id" : "p" , "text" : "{}" }}"#,
-        "\\u007f".repeat(MAX_PROMPT_BYTES)
+        "\\u0061".repeat(MAX_PROMPT_BYTES)
     );
     assert!(escaped.len() <= crate::http::ATTACH_INBOUND_BYTES);
-    assert_eq!(text.len(), MAX_PROMPT_BYTES);
-    c.ws.send(WsMessage::Text(escaped.into())).await.unwrap();
-    let Some(AttachServerMessage::PasteResult { outcome, .. }) = c.text().await else {
-        panic!("a paste result")
-    };
-    assert_eq!(outcome, PasteOutcome::Written);
+    let want = chaldea_core::input::encode::encode(
+        chaldea_core::ids::Agent::Claude,
+        rig.sup.host_os,
+        &text,
+        chaldea_core::input::encode::Purpose::AttachPaste,
+    )
+    .unwrap()
+    .text;
+    for fragmented in [false, true] {
+        let before = live.child.input().len();
+        if fragmented {
+            let (a, b) = escaped.as_bytes().split_at(escaped.len() / 2);
+            c.fragments(Data::Text, &[a, b]).await;
+        } else {
+            c.ws.send(WsMessage::Text(escaped.clone().into()))
+                .await
+                .unwrap();
+        }
+        let Some(AttachServerMessage::PasteResult { outcome, .. }) = c.text().await else {
+            panic!("a paste result")
+        };
+        assert_eq!(outcome, PasteOutcome::Written, "{fragmented}");
+        assert!(live.child.input()[before..] == want[..], "{fragmented}");
+    }
     rig.stop().await;
 }
 
@@ -1654,7 +1762,10 @@ async fn paste_2004_toggled() {
     assert_eq!(live.child.input()[before..], *b"k");
     rig.until("settled", || sl.state().human_unsettled == 0)
         .await;
-    assert!(human_writes(&rig, &live) <= before_events.max(1));
+    // The leading `k` records the interval's one event; the refused paste adds none.
+    rig.until("recorded", || human_writes(&rig, &live) >= 1)
+        .await;
+    assert_eq!(human_writes(&rig, &live), before_events.max(1));
     rig.stop().await;
 }
 
@@ -2090,10 +2201,16 @@ async fn startup_busy() {
     let held = e.ops.clone().lock_owned().await;
     // The startup wait passes on the running clock; the lock stays held throughout.
     rig.clock.resume();
-    let mut c = open_as(&rig, &rig.owner, live.t).await.expect("a 101");
+    let ticket = rig
+        .srv
+        .ticket(&rig.owner, &format!("attach:{}", live.t))
+        .await
+        .unwrap();
+    let mut c = open_ticket(&rig, live.t, &ticket).await.expect("a 101");
     let (code, _) = c.until_closed().await;
     drop(held);
     assert_eq!(code, Some(4004));
+    assert_eq!(open_ticket(&rig, live.t, &ticket).await.err(), Some(401));
     rig.stop().await;
 }
 
@@ -2278,9 +2395,10 @@ async fn registry_retires_ended_launch() {
     rig.stop().await;
 }
 
-/// I-7: a revocation whose nudge is lost is found by the periodic verification.
+/// I-7: a revocation whose nudge is lost is found by the periodic verification (a tick the
+/// test asks for), while the launch writes output all along: verification goes first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn revoked_lost_nudge() {
+async fn revoked_lost_nudge_under_load() {
     let rig = SRig::new().await;
     let live = rig.claude().await;
     let owner = rig.srv.token(TokenKind::Owner, None, None).await;
@@ -2289,9 +2407,22 @@ async fn revoked_lost_nudge() {
         a.text().await,
         Some(AttachServerMessage::Attached { .. })
     ));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let load = {
+        let (child, stop) = (live.child.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                child.emit(&[b'o'; 1024]);
+            }
+        })
+    };
+    a.next().await.expect("output under way");
     rig.srv.revoke_quietly(&owner).await;
     hooks(&rig).tick();
-    assert_eq!(a.until_closed().await.0, Some(1008));
+    let code = a.until_closed().await.0;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    load.join().unwrap();
+    assert_eq!(code, Some(1008));
     rig.stop().await;
 }
 
