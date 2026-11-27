@@ -1,12 +1,12 @@
 # Design: The Attach WebSocket (MVP T1)
 
-Row T1 of `docs/mvp-design.md` §4 (mvp:436): the daemon side of `GET /api/attach/{thread}` (PR 11, M1) for T2's terminal view; mvp:475 and CL-19's attach half (mvp:613).
+Row T1 of `docs/mvp-design.md` §4 (mvp:436, :475; CL-19's attach half, :613): the daemon side of `GET /api/attach/{thread}` (PR 11, M1) for T2's terminal view.
 
 ## 1. Scope
 
-**Adds.** The attach handler and loop (`crates/daemon/src/attach/`), frames in `crates/core/src/attach.rs` (`ts-rs`), a pty-runtime `SessionHandle` and bounded close, a launch lease and attach `human_write` interval, and per-purpose inbound limits.
+**Adds.** The attach handler and loop (`crates/daemon/src/attach/`), frames (`crates/core/src/attach.rs`, `ts-rs`), a pty-runtime `SessionHandle` and bounded close, a launch lease, an attach `human_write` interval, per-purpose inbound limits.
 
-**Does not add.** A client, `chaldea attach`, P-9, an SGR serializer (deferred, mvp:451-452, :462), commands, event kinds, or routes. No state reads attach output.
+**Does not add.** A client, `chaldea attach`, P-9, an SGR serializer (deferred, mvp:451-452, :462), commands, event kinds, or routes.
 
 ## 2. Wire Contract
 
@@ -26,26 +26,26 @@ Admission is PR 7's: an owner-only `attach:<thread>` ticket, single use, 30 s (h
 
 **Reasons.** `rejected`: a `RejectReason`, `prompt_too_large`, `bracketed_paste_off`. Writer and session: `expired`, `bracketed_paste_off`, `queue_full`, `busy`, `incomplete`, otherwise `not_written`. Raw only: `paste_marker`, `too_large`, `pending`.
 
-**Close codes.** 4000 `no_live_launch`, 4001 `launch_ended` (after `ended`), 4002 `lagged`, 4003 `replaced`, 4004 `busy`; 1001 shutdown, 1003 malformed frame or size, 1007 invalid UTF-8, 1008 token revoked, 1009 over the limit. Best effort.
+**Close codes** (best effort). 4000 `no_live_launch`, 4001 `launch_ended` (after `ended`), 4002 `lagged`, 4003 `replaced`, 4004 `busy`; 1001 shutdown, 1003 malformed frame or size, 1007 invalid UTF-8, 1008 token revoked, 1009 over the limit.
 
-**Limits.** Inbound message: 6 × `MAX_PROMPT_BYTES` + 4 KiB for attach (any JSON escape of a 256 KiB paste), 64 KiB for `/api/ws`; raw frame 64 KiB; paste text 256 KiB; `paste_id` 128 bytes (longer is a malformed frame, 1003, before any write, so every `paste_result` can echo it); `attached` ≤ 192 KiB whole; queued output 1 MiB; drain 5 s; send 10 s per frame; idle 75 s.
+**Limits.** Inbound message: 6 × `MAX_PROMPT_BYTES` + 4 KiB for attach (any JSON escape of a 256 KiB paste), 64 KiB for `/api/ws`; raw frame 64 KiB; paste text 256 KiB; `paste_id` 128 bytes (longer: 1003 before any write, so a result can echo it); `attached` ≤ 192 KiB whole; queued output 1 MiB; drain 5 s; send 10 s per frame; idle 75 s.
 
 ## 3. Decisions
 
 | # | Decision | Rejected alternative |
 |---|---|---|
-| D1 | One socket serves one launch; process state comes from sync; a resume needs a new socket. | Following the thread across launches. |
+| D1 | One socket serves one launch; process state comes from sync; resume needs a new socket. | Following the thread across launches. |
 | D2 | One operating socket per launch for M1; a newer one takes over (4003); T2 shows why and offers take-back. | Several viewers with last-resize-wins. |
 | D3 | Initial screen: the snapshot, then the redraw the first resize forces (one-row nudge at equal size). T2 applies `modes`, keeps operate off after `grid: null` or a failed resize until the human enables it, and offers Redraw. | A daemon VT serializer (deferred). |
 | D4 | Clipboard text arrives only as `paste`; T2 intercepts paste and suppresses ghostty-web's query replies. | Recognising pastes in raw input: unmarked pastes submit early on Codex for Windows. |
 | D5 | A paste on a bracketed-paste row needs DECSET 2004 on at encoding and dispatch. | Unwrapped text: CR newlines submit each line. |
-| D6 | One outstanding unit per socket; raw input joined; T2 holds submit and queue keys until `paste_result` and sends them only on `written`; otherwise (or on disconnect) it drops them. | One unit per frame: lost middle units, stale Enter after a failed paste. |
-| D7 | One launch lease orders resize against sends; resize runs outside the op lock. | A flag beside `running`. |
+| D6 | One outstanding unit per socket; raw input joined; T2 holds submit and queue keys until `paste_result` and sends them only on `written`, else (or on disconnect) drops them. | One unit per frame: lost middle units, stale Enter after a failed paste. |
+| D7 | One launch lease orders resizes against sends; resizes run outside the op lock. | A flag beside `running`. |
 | D8 | A lagging client gets the prefix, then 4002. | In-place resync. |
-| D9 | Raw input is written as sent; T2 notes typed non-ASCII may be lost on Codex for Windows; X2 decides on keyed entry. | Keying raw input now. |
+| D9 | Raw input is written as sent; T2 notes typed non-ASCII may be lost on Codex for Windows; X2 decides keyed entry. | Keying raw input now. |
 | D10 | Inbound limits by ticket purpose. | Chunked paste frames. |
 | D11 | Attach records `human_write` once per interval (mvp:88); `key` and `card_key` stay per unit. | One event per attach unit. |
-| D12 | The snapshot copy is budgeted; over budget `grid` is `null` with the same offset. | A larger write buffer. |
+| D12 | The snapshot copy is budgeted; over budget, `grid` is `null`, same offset. | A larger write buffer. |
 
 All are reversible except D4's public frame.
 
@@ -53,8 +53,8 @@ All are reversible except D4's public frame.
 
 | ID | Invariant | Test |
 |---|---|---|
-| I-1 | `Session::close` returns within one absolute deadline even while a resize holds the PTY control, reporting the control unreleased until it closes; a resize starts only before seal. | pty `close_with_resize_held`, `resize_after_seal_refused` |
-| I-2 | Every unit and resize carries its socket's grant from takeover; replacement, revocation, disconnect, and launch end revoke it, so no unpermitted old write or resize reaches the PTY; permitted writes settle as pty-runtime §2.3 says. | `old_enter_after_disconnect_and_reattach`, `delayed_old_submission`, `old_resize_parked_before_backend`, `failed_candidate_keeps_current` |
+| I-1 | `Session::close` returns within one absolute deadline even while a resize holds the control, reporting it unreleased until closed; a resize starts only before seal. | pty `close_with_resize_held`, `resize_after_seal_refused` |
+| I-2 | Every unit and resize carries its socket's grant from takeover; replacement, revocation, disconnect, and launch end revoke it, so no unpermitted old write or resize reaches the PTY; permitted writes settle (pty-runtime §2.3). | `old_enter_after_disconnect_and_reattach`, `delayed_old_submission`, `old_resize_parked_before_backend`, `failed_candidate_keeps_current` |
 | I-3 | Only the lease's holder, by acquisition id, submits or resizes; a known rollback or non-admission releases it; an indeterminate commit keeps it until exit; `stop` never waits for resize. | `resize_waits_for_opened_send`, `open_waits_for_resize`, `open_result_unrecorded`, `invalidation_races_conversion`, `stop_with_resize_held` |
 | I-4 | Pending input stays ≤ 64 KiB plus one validated message; after `pending` nothing more is submitted until that unit settles. | `crossing_paste_kept`, `max_paste_with_raw_outstanding`, `stuck_writer_after_pending` |
 | I-5 | `ready → key → attach` records `human_write { attach }`; `attach → card_key → attach` records it once; gate and ack decisions are unchanged. | `ready_key_attach_records`, `attach_card_key_attach_skips`, `typing_records_once`, `worker_exit_overlap` |
@@ -64,7 +64,7 @@ All are reversible except D4's public frame.
 
 ## 5. Acceptance Criteria
 
-FakePty on both runners (Codex `win_keys` on Windows); `attach::tests::…` through the production mount.
+FakePty on both runners (Codex `win_keys` on a Windows host row), through the production mount.
 
 | ID | Criterion (EARS) | Test |
 |---|---|---|
@@ -83,18 +83,10 @@ FakePty on both runners (Codex `win_keys` on Windows); `attach::tests::…` thro
 - Attach never feeds state (invariant 1).
 - Accepted: typed non-ASCII to Codex on Windows (D9); unpadded paste triggers (input-encoders D10); L-11's late `Stop` after an attach-started turn.
 - Accepted: redraw needs the CLI to honour resize; a sequence split at the snapshot renders wrong until then (D3).
-- Accepted: after revocation, permitted writes settle.
+- Accepted: permitted writes settle after revocation.
+- Accepted (I-7): verification is per phase: ≤ 4 blocking reads per socket (2 startup reads may outlive takeover); the terminal close drops the saturation cutoff. A revoked socket ends ≤ 5 s after the nudge (10 s in the terminal close; lost nudge: plus the 30 s tick), writing nothing after.
+- Accepted (I-8): an end latched before takeover starts its 5 s at the first loop turn (drain end ≤ 10 s after the latch or a later startup nudge); a send in flight at the latch keeps its 10 s deadline, so one frame may follow the cutoff. Order and the terminal event hold.
 
-## 7. Proposed Canonical-Doc Edits
+## 7. Canonical-Doc Edits
 
-1. mvp:88, :116 and `GateEvidence`: I-5 for attach; per unit for `key`/`card_key`.
-2. mvp §2.3 (:176): the gate also waits for the lease.
-3. mvp §2.4 (:205): "opens a `/api/ws` socket", both occurrences.
-4. mvp §2.5 (:239): attach protocol in this document.
-5. mvp §4 T1 (:475): F5 by I-3; T2 (:439, :480): D3, D4, D6, D9 duties and I-6's client evidence.
-6. supervisor-send §2.3 (:101-107), §2.6 (:198), SB11 (:304): lease, attach interval, `NotStarted(Refusal)`.
-7. pty-runtime §2.2, §2.7, §4-§5: `SessionHandle`, I-1, budgeted subscribe, one operating socket per launch.
-8. http-surface §2.6 (:430, :462-472): limits by purpose; revocation rationale scoped to `/api/ws`.
-9. http-surface §2.11 (:648), §4 (:738): `UpgradedSocket`/`UpgradeGrant`; :757, PR7-CL-26 (:826): binary and `subscribe` rules for `/api/ws` only.
-10. input-encoders §2.3 (:178), §4 (:336): paste text as a JSON string.
-11. architecture §5 (:77): T1 uses FakePty, X1 FakeCli; D9's limit.
+Folded into mvp (:88, :116, `GateEvidence`, :176, :205, :239, :439, :475, :480), supervisor-send (§2.3, §2.6, SB11), pty-runtime (§2.2, §2.7, §4-§5), http-surface (§2.6, §2.11, §4, PR7-CL-26), input-encoders (§2.3, §4), and architecture §5.
