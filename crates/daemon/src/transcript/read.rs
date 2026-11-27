@@ -16,7 +16,7 @@
 //! poll's check), the committed batch stays in history, and the next poll starts a new
 //! generation; a check that cannot open the path drops the handle, so the next poll opens
 //! and verifies again. A deeper rewrite in place that keeps the size is invisible to these
-//! checks: the whole prefix is read again once at the final read, and at a poll
+//! checks: the whole prefix is read again at the final read (once per handle), and at a poll
 //! that sees the modification time move back. A detected break is kept until a new
 //! generation is stored, so a failed generation commit does not let a later open continue
 //! the old one. A stop is honoured at every chunk read or replayed and before every commit.
@@ -180,14 +180,15 @@ impl Recent {
     }
 }
 
-/// The open handle, the running digest of `[0, pos)`, the bytes just before `pos`, and the
-/// latest modification time seen.
+/// The open handle, the running digest of `[0, pos)`, the bytes just before `pos`, the
+/// latest modification time seen, and whether a final read checked this handle's prefix.
 struct OpenFile {
     file: RegularFile,
     digest: Sha256,
     pos: u64,
     recent: Recent,
     mtime: Option<std::time::SystemTime>,
+    checked: bool,
 }
 
 /// Why a poll could not finish; it is retried at the next one.
@@ -239,8 +240,6 @@ pub(crate) struct Tail {
     final_failures: u32,
     /// The last poll's view: the launch's exit stored or not; `None` when the view failed.
     exited: Option<bool>,
-    /// The final read checked the whole prefix against the cursor's digest.
-    prefix_checked: bool,
     /// The next prefix check sets the stop as it starts (tests).
     #[cfg(test)]
     stop_at_prefix_check: bool,
@@ -260,7 +259,6 @@ impl Tail {
             disproved: None,
             final_failures: 0,
             exited: None,
-            prefix_checked: false,
             #[cfg(test)]
             stop_at_prefix_check: false,
             last_failure: None,
@@ -312,9 +310,10 @@ impl Tail {
         self.exited
     }
 
-    /// Whether the final read checked the whole prefix.
+    /// Whether the final read checked the whole prefix of the handle it holds; a dropped
+    /// handle or a new generation needs the check again.
     pub(crate) fn prefix_checked(&self) -> bool {
-        self.prefix_checked
+        self.open.as_ref().is_some_and(|o| o.checked)
     }
 
     /// Records that the final read's prefix check did not complete.
@@ -338,7 +337,7 @@ impl Tail {
         if last {
             self.final_failures += 1;
             if self.final_failures >= FINAL_TRIES {
-                if !self.prefix_checked {
+                if !self.prefix_checked() {
                     self.unverified("the final read failed before its prefix check");
                 }
                 tracing::warn!(thread = %self.b.thread_id, launch = %self.b.launch_id, error = %text, "the final transcript read failed {FINAL_TRIES} times; the tailer ends and the bytes stay in the file");
@@ -387,8 +386,8 @@ impl Tail {
                 self.unverified("the final read stopped during the prefix check at its open");
             }
             match verified? {
-                Ok(open) => {
-                    self.prefix_checked |= last;
+                Ok(mut open) => {
+                    open.checked = last;
                     self.open = Some(open);
                 }
                 Err(f) => {
@@ -405,9 +404,9 @@ impl Tail {
         let mtime = open.file.modified().ok();
         let moved_back = matches!((open.mtime, mtime), (Some(was), Some(now)) if now < was);
         open.mtime = mtime.or(open.mtime);
-        if (last && !self.prefix_checked) || moved_back {
+        if (last && !open.checked) || moved_back {
             match self.prefix_holds(&mut open) {
-                Ok(true) => self.prefix_checked |= last,
+                Ok(true) => open.checked |= last,
                 Ok(false) => {
                     drop(open);
                     self.disprove();
@@ -632,6 +631,7 @@ impl Tail {
             digest,
             pos: c.read_offset,
             recent,
+            checked: false,
         }))
     }
 
@@ -702,6 +702,7 @@ impl Tail {
                     digest: Sha256::new(),
                     pos: 0,
                     recent: Recent::default(),
+                    checked: false,
                 });
                 self.disproved = None;
                 Ok(Step::Again)

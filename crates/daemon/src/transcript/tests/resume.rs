@@ -218,3 +218,30 @@ fn a_final_read_that_never_opens_is_unverified() {
     assert!(matches!(tail.poll(&fx.backend()), Step::End(_)));
     assert_eq!(tail.stats.unverified, 1);
 }
+
+/// The final read checked the prefix, then the check after its commit could not open the
+/// path, so the handle is dropped and its check with it: when the path does not open again
+/// before the retries are spent, the continuity is recorded as unverified. (On Windows the
+/// held lock does not stop the open, so the check after the commit passes.)
+#[cfg(unix)]
+#[test]
+fn a_dropped_handle_needs_the_final_prefix_check_again() {
+    let fx = Fx::new();
+    fx.write(assistant("one").as_bytes());
+    let mut tail = fx.tail();
+    fx.settle(&mut tail);
+    fx.append(assistant("two").as_bytes());
+    fx.add(vec![support::exited(fx.t, fx.l)]);
+    let flaky = std::cell::RefCell::new(None);
+    let be = TestBackend {
+        before_commit: Box::new(|_| *flaky.borrow_mut() = Some(Flaky::new(&fx.path))),
+        ..fx.backend()
+    };
+    assert_eq!(tail.poll(&be), Step::Again);
+    for _ in 1..FINAL_TRIES {
+        assert_eq!(tail.poll(&fx.backend()), Step::Wait);
+    }
+    assert!(matches!(tail.poll(&fx.backend()), Step::End(_)));
+    assert_eq!(tail.stats.unverified, 1);
+    drop(flaky.borrow_mut().take());
+}

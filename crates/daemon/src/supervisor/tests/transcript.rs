@@ -439,3 +439,28 @@ async fn no_reader_is_borrowed_past_the_participants_end() {
     assert_eq!(rig.sup.tailers.reads.load(Ordering::Relaxed), before);
     rig.srv.stop().await;
 }
+
+/// The participant cut at its end (dropped, as the outer deadline does) before it joined the
+/// tailers: the launches whose tailers are left are logged as unverified.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_participant_cut_before_the_final_reads_logs_them_unverified() {
+    let rig = rig().await;
+    let (_t, _l) = spawn_claude(&rig).await;
+    let close = rig.pauses.arm(Pause::ShutdownCloseEnd);
+    let end = rig.sup.now() + Duration::from_secs(5);
+    let participant = tokio::spawn(shutdown(rig.sup.clone(), end));
+    let close = tokio::task::spawn_blocking(move || {
+        close.wait();
+        close
+    })
+    .await
+    .unwrap();
+    participant.abort();
+    assert!(participant.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        rig.sup.tailers.abandoned_unverified.load(Ordering::Relaxed),
+        1
+    );
+    close.go();
+    rig.srv.stop().await;
+}

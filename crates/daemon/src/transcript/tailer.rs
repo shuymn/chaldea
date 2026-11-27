@@ -68,6 +68,9 @@ pub(crate) struct Tailers {
     /// Final reads abandoned before the tailer had its binding (tests).
     #[cfg(test)]
     pub(crate) unbound_unverified: std::sync::atomic::AtomicU32,
+    /// Shutdown participants cut before they joined the tailers (tests).
+    #[cfg(test)]
+    pub(crate) abandoned_unverified: std::sync::atomic::AtomicU32,
 }
 
 impl Default for Tailers {
@@ -84,6 +87,8 @@ impl Default for Tailers {
             reads: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             unbound_unverified: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            abandoned_unverified: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }

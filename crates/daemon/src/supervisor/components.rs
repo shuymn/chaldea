@@ -248,6 +248,7 @@ pub(crate) async fn shutdown(sup: Arc<Supervisor>, end: Instant) -> ParticipantE
     // After the exits are recorded, each transcript tailer makes its final read, joined
     // within the budget so none holds a store reader once the store shuts down.
     let ptys_then_tails = async {
+        let left = TailsLeft(&sup);
         ptys.await;
         sup.tailers.set(Mode::Final);
         let joined = futures_util::future::join_all(sup.tailers.tasks());
@@ -263,6 +264,8 @@ pub(crate) async fn shutdown(sup: Arc<Supervisor>, end: Instant) -> ParticipantE
                 "a transcript tailer did not end within the shutdown budget; its final read's continuity is unverified"
             );
         }
+        // Joined, or the tailers left are logged above.
+        std::mem::forget(left);
         in_time
     };
     let ((), tails_ended) = tokio::join!(git, ptys_then_tails);
@@ -271,6 +274,29 @@ pub(crate) async fn shutdown(sup: Arc<Supervisor>, end: Instant) -> ParticipantE
         ParticipantEnd::Clean
     } else {
         ParticipantEnd::LeftRunning
+    }
+}
+
+/// Dropped with the participant cut at its end before it joined the transcript tailers: the
+/// launches whose tailers are left are logged as unverified, since their final reads may
+/// never run.
+struct TailsLeft<'a>(&'a Supervisor);
+
+impl Drop for TailsLeft<'_> {
+    fn drop(&mut self) {
+        let launches = self.0.tailers.launches();
+        if launches.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            ?launches,
+            "the shutdown participant was cut before the transcript tailers' final reads; their continuity is unverified"
+        );
+        #[cfg(test)]
+        self.0
+            .tailers
+            .abandoned_unverified
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
