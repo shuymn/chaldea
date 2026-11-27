@@ -270,3 +270,75 @@ fn zero_width_cell_budget() {
     let cell = &s.lines.unwrap()[0].cells[0];
     assert_eq!(cell.text.chars().count(), 20_001);
 }
+
+/// Waits until `h` finished or `soon()` passes; the held actors stay held either way.
+fn finished(h: &JoinHandle<impl Sized>) -> bool {
+    wait_until(|| h.is_finished())
+}
+
+/// I-1: the close's release guard is not held up by the backend close a resize runs for it.
+/// The close timed out on the control (left to the resize) and its guard is about to take
+/// the control when the resize, past its backend call, starts that close and stays in it:
+/// the guard still returns, and the control is closed exactly once.
+#[test]
+fn release_not_blocked_by_handoff_close() {
+    let Rig { session, child, .. } = rig();
+    let h = session.handle();
+    let probe = session.probe();
+    let done = probe.park(ProbePoint::ResizeDone);
+    let resize = resize_in_thread(&h);
+    assert!(probe.wait(ProbePoint::ResizeDone, 1, soon()));
+    let guard = probe.park(ProbePoint::ReleaseControl);
+    let close = std::thread::spawn(move || session.close(&[], short_bounds()));
+    assert!(probe.wait(ProbePoint::ReleaseControl, 1, soon()));
+    let handoff = probe.park(ProbePoint::HandoffClose);
+    drop(done);
+    assert!(probe.wait(ProbePoint::HandoffClose, 1, soon()));
+    drop(guard);
+    let returned = finished(&close);
+    drop(handoff);
+    assert!(returned, "the guard waited for the resize's backend close");
+    let out = close.join().unwrap();
+    assert!(!out.released.control, "{out:?}");
+    assert!(resize.join().unwrap().is_ok());
+    assert_eq!(control_closes(&child), 1);
+}
+
+/// I-1: every step's wait ends by the close's one end, even when an earlier step ran past
+/// its own budget: the join step starts after the end and still waits no longer.
+#[test]
+fn close_steps_capped_at_end() {
+    let Rig { session, child, .. } = rig_with(
+        FakeScript {
+            hold_waiter: true,
+            ..FakeScript::default()
+        },
+        Limits::default(),
+        80,
+        24,
+    );
+    let probe = session.probe();
+    let park = probe.park(ProbePoint::CloseJoin);
+    let close = std::thread::spawn(move || session.close(&[], short_bounds()));
+    assert!(probe.wait(ProbePoint::CloseJoin, 1, soon()));
+    let end = probe
+        .deadlines()
+        .iter()
+        .find(|(s, _)| *s == DeadlineSite::CloseEnd)
+        .map(|(_, at)| *at)
+        .unwrap();
+    // A condition on the clock, not a window: the end has passed once this returns.
+    assert!(wait_until(|| Instant::now() > end));
+    drop(park);
+    let out = close.join().unwrap();
+    child.release_waiter();
+    let steps: Vec<Instant> = probe
+        .deadlines()
+        .iter()
+        .filter(|(s, _)| *s == DeadlineSite::Step)
+        .map(|(_, at)| *at)
+        .collect();
+    assert!(!steps.is_empty());
+    assert!(steps.iter().all(|at| *at <= end), "{steps:?} after {end:?}");
+    assert!(out.abandoned.contains(&"pty-wait"), "{out:?}");
+}

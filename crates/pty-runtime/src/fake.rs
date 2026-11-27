@@ -917,6 +917,12 @@ pub enum ProbePoint {
     ResizeLocked,
     /// A resize after its backend call, before it releases the control lock.
     ResizeDone,
+    /// A resize that a close left the control to, about to call the backend close.
+    HandoffClose,
+    /// The close's release guard, about to take the control.
+    ReleaseControl,
+    /// The close, about to compute its join step's deadline.
+    CloseJoin,
 }
 
 impl ProbePoint {
@@ -930,6 +936,9 @@ impl ProbePoint {
             ProbePoint::Dispatching => 5,
             ProbePoint::ResizeLocked => 6,
             ProbePoint::ResizeDone => 7,
+            ProbePoint::HandoffClose => 8,
+            ProbePoint::ReleaseControl => 9,
+            ProbePoint::CloseJoin => 10,
         }
     }
 }
@@ -941,12 +950,14 @@ pub enum DeadlineSite {
     CloseEnd,
     /// A wait for the control lock (close step 4, the release guard).
     ControlWait,
+    /// The deadline of a close step other than the control wait: kill, input, drain, join.
+    Step,
 }
 
 #[derive(Default)]
 struct ProbeState {
-    counts: [u64; 8],
-    armed: [Option<u64>; 8],
+    counts: [u64; 11],
+    armed: [Option<u64>; 11],
     released: Vec<u64>,
     next: u64,
     deadlines: Vec<(DeadlineSite, Instant)>,

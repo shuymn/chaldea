@@ -270,7 +270,8 @@ enum Ctl {
 }
 
 /// A resize's hold of the control lock: on release (also while unwinding), under the
-/// handoff lock, it closes the control when a close left it to the holder.
+/// handoff lock, it takes the control out when a close left it to the holder, and closes it
+/// after releasing both locks.
 struct ControlHold<'a> {
     sh: &'a Shared,
     ctl: Option<MutexGuard<'a, Option<Box<dyn PtyControl>>>>,
@@ -278,15 +279,21 @@ struct ControlHold<'a> {
 
 impl Drop for ControlHold<'_> {
     fn drop(&mut self) {
+        // The control leaves the lock under the handoff lock; the backend close runs after
+        // both are released, so a close waiting for either is never held up by it.
         let h = lock(&self.sh.handoff);
-        if h.abandoned
-            && let Some(c) = self.ctl.as_mut().and_then(|g| g.take())
-        {
+        let abandoned = if h.abandoned {
+            self.ctl.as_mut().and_then(|g| g.take())
+        } else {
+            None
+        };
+        drop(self.ctl.take());
+        drop(h);
+        if let Some(c) = abandoned {
+            crate::probe!(self.sh, HandoffClose);
             let deadline = deadline_in(HANDOFF_CLOSE);
             let _ = catch_unwind(AssertUnwindSafe(|| c.close(deadline)));
         }
-        drop(self.ctl.take());
-        drop(h);
     }
 }
 
@@ -753,6 +760,15 @@ pub(crate) fn deadline_in(d: Duration) -> Instant {
         .unwrap_or(now)
 }
 
+/// A close step's deadline: now + its bound, capped at the close's one end.
+fn step_by(sh: &Shared, bound: Duration, end: Instant) -> Instant {
+    let at = deadline_in(bound).min(end);
+    crate::probe_deadline!(sh, Step, at);
+    #[cfg(not(feature = "fake"))]
+    let _ = sh;
+    at
+}
+
 /// Waits until `h` finished or `deadline`; true when it finished.
 fn wait_finished(h: Option<&JoinHandle<()>>, deadline: Instant) -> bool {
     let Some(h) = h else {
@@ -1112,14 +1128,14 @@ impl Session {
             (Some((k, _)), None) if k.tree_dead && extra.is_empty() => k,
             (Some((k, list)), Some(_)) if k.tree_dead && list == extra => k,
             (_, at) => {
-                let at = at.unwrap_or_else(|| deadline_in(bounds.kill));
+                let at = at.unwrap_or_else(|| step_by(&sh, bounds.kill, end));
                 self.child.kill_tree(extra, at, at)
             }
         };
 
         // 3. Release the input.
         sh.stop_writer();
-        let _ = wait_finished(self.writer.as_ref(), deadline_in(bounds.input));
+        let _ = wait_finished(self.writer.as_ref(), step_by(&sh, bounds.input, end));
 
         // 4. Close the PTY while the drain keeps reading. A resize holding the control past
         // the step's deadline closes it itself when it returns.
@@ -1133,10 +1149,12 @@ impl Session {
         };
 
         // 5. Finish the drain.
-        let output = self.drain.take().and_then(|d| d.finish(bounds.drain));
+        let drain_by = step_by(&sh, bounds.drain, end);
+        let output = self.drain.take().and_then(|d| d.finish_by(drain_by));
 
         // 6. Join and snapshot.
-        let deadline = deadline_in(bounds.join);
+        crate::probe!(sh, CloseJoin);
+        let deadline = step_by(&sh, bounds.join, end);
         self.waiter_stop.store(true, Ordering::Release);
         let writer_done = wait_finished(self.writer.as_ref(), deadline);
         if writer_done && let Some(h) = self.writer.take() {
@@ -1208,6 +1226,7 @@ impl Drop for Release<'_> {
     fn drop(&mut self) {
         self.sh.stop_writer();
         self.waiter_stop.store(true, Ordering::Release);
+        crate::probe!(self.sh, ReleaseControl);
         if let Ctl::Taken(Some(c)) = self.sh.take_control(self.end) {
             let end = self.end;
             let _ = catch_unwind(AssertUnwindSafe(|| c.close(end)));
