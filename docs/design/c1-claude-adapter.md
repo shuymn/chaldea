@@ -65,6 +65,7 @@ The PRs bring canonical text in line with code: C1a mvp §2.5 (screen route), §
 | A denied card stays open until the boundary; a later equal call without a card marks it `ran`. | M1 P-16. | Only the label is wrong; no byte is written. |
 | **L-13 after C1.** Card order is receipt order, not firing order. A turn's `UserPromptSubmit` received after its `PermissionRequest` and committed first closes a legitimate card at open. A dialog answered through attach, followed by a late `PermissionRequest` first taken in above the watermark, leaves an open card for a dialog that ended, and its card key can reach the composer. | The screen. | The owner sees `card_closed`, or an open card the screen contradicts, and answers through attach (T1, T2). |
 | An in-place rewrite of read bytes on an open, growing file. | Next open. | Claude only appends; truncation shows at the next poll. |
+| A truncate or replace between the last check and the commit. | The check after the commit, or the next poll. | Claude does not synchronise with the tailer, so the window stays open: the batch read before it stays in history, and the next poll starts a new generation. |
 | A resume before the old tailer's final read. | Tailer log. | The next tailer reads the bytes from the cursor. |
 | Lenient forms where captures do not cover a transform. | C1-5. | Two candidates ack none. |
 
