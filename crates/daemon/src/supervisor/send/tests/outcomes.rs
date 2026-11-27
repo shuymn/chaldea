@@ -356,6 +356,12 @@ async fn after_exit() {
     .await;
     rig.until_input(id, InputState::Unconfirmed).await;
     let before = moves(&rig, &live, id);
+    // The removal from the live map wakes no worker: released before it, the worker could
+    // park for good.
+    rig.until("the launch left the live map", || {
+        rig.sup.entry(live.l).is_none()
+    })
+    .await;
     go.send(()).unwrap();
     rig.until("the worker ended", || rig.sup.send.launch(live.l).is_none())
         .await;
