@@ -489,39 +489,72 @@ async fn a_participant_cut_before_the_final_reads_logs_them_unverified() {
     rig.srv.stop().await;
 }
 
-/// A writer that keeps writing through the final read at shutdown (a Claude that outlived its
-/// recorded exit, completing lines and starting new ones): the tailer reads on, and the
-/// participant still returns by its end with the tailer ended.
+/// A writer that keeps completing lines through the final read at shutdown (a Claude that
+/// outlived its recorded exit): each read finds the last line grown and the next one begun,
+/// and the cursor advances line by line. The participant's end, passing while a read is
+/// held, stops the tailer: the participant answers `LeftRunning`, and the held read ends
+/// without a further commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_final_read_with_a_writer_that_keeps_writing_ends_by_the_participants_end() {
+async fn a_final_read_with_a_writer_that_keeps_writing_ends_at_the_participants_end() {
     use std::io::Write;
     let rig = rig().await;
     let (t, l) = spawn_claude(&rig).await;
     let files = bind(&rig, t, l, LINE).await;
     rig.until("the line is stored", || texts(&rig, t) == ["ok"])
         .await;
-    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let writer = {
-        let done = done.clone();
-        let path = files.path().join("session.jsonl");
-        std::thread::spawn(move || {
-            let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
-            let (head, rest) = LINE.split_at(LINE.len() / 2);
-            while !done.load(Ordering::Relaxed) {
-                f.write_all(head.as_bytes()).unwrap();
-                std::thread::sleep(Duration::from_micros(200));
-                f.write_all(rest.as_bytes()).unwrap();
-            }
-        })
+    let path = files.path().join("session.jsonl");
+    let (head, rest) = LINE.split_at(LINE.len() / 2);
+    let write = move |bytes: &[&str]| {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(bytes.concat().as_bytes()).unwrap();
     };
-    let budget = Duration::from_secs(1);
-    let started = Instant::now();
-    let _ = shutdown(rig.sup.clone(), rig.sup.now() + budget).await;
-    let took = started.elapsed();
-    done.store(true, Ordering::Relaxed);
-    writer.join().unwrap();
-    assert!(took < budget + Duration::from_millis(500), "{took:?}");
+    write(&[head]);
+    let close = rig.pauses.arm(Pause::ShutdownCloseEnd);
+    let participant = tokio::spawn(shutdown(
+        rig.sup.clone(),
+        rig.sup.now() + Duration::from_secs(2),
+    ));
+    let close = tokio::task::spawn_blocking(move || {
+        close.wait();
+        close
+    })
+    .await
+    .unwrap();
+    let mut read = rig.pauses.arm(Pause::TailerAfterRead);
+    close.go();
+    // Each held read: the line it read half of is completed and the next one begun, so the
+    // read leaves its last bytes for the next and commits the lines before them (the first
+    // read has none before them).
+    for stored in [1, 1, 2] {
+        read = tokio::task::spawn_blocking(move || {
+            read.wait();
+            read
+        })
+        .await
+        .unwrap();
+        assert_eq!(texts(&rig, t).len(), stored);
+        write(&[rest, head]);
+        let next = rig.pauses.arm(Pause::TailerAfterRead);
+        read.go();
+        read = next;
+    }
+    let read = tokio::task::spawn_blocking(move || {
+        read.wait();
+        read
+    })
+    .await
+    .unwrap();
+    assert_eq!(texts(&rig, t), ["ok", "ok", "ok"]);
+    // The participant's end passes while the read is held.
+    assert_eq!(participant.await.unwrap(), ParticipantEnd::LeftRunning);
+    assert!(rig.sup.tailers.stopped());
+    assert_eq!(rig.sup.tailers.launches(), [l]);
+    read.go();
     rig.until("the tailer ended", || rig.sup.tailers.launches().is_empty())
         .await;
+    assert_eq!(texts(&rig, t), ["ok", "ok", "ok"]);
     rig.srv.stop().await;
 }

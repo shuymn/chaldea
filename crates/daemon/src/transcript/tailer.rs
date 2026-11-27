@@ -103,6 +103,12 @@ impl Tailers {
         self.lock().keys().copied().collect()
     }
 
+    /// Whether the tailers were stopped (tests).
+    #[cfg(test)]
+    pub(crate) fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
     /// Sets every tailer's mode.
     pub(crate) fn set(&self, mode: Mode) {
         if mode == Mode::Stop {
@@ -192,6 +198,13 @@ impl Backend for StoreBackend {
 
     fn commit(&self, batch: TranscriptBatch) -> Commit {
         commit(&self.sup.store, batch)
+    }
+
+    #[cfg(test)]
+    fn after_read(&self) {
+        self.sup
+            .pauses()
+            .blocking(crate::supervisor::Pause::TailerAfterRead);
     }
 }
 
