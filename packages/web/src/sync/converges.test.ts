@@ -8,7 +8,7 @@ import { describe, expect, test } from "vitest";
 
 import { HISTORY_FAILED, problems } from "./check";
 import { MODEL_CONFIG, Sim, TEST_CONFIG } from "./sim";
-import { status, threadStream } from "./state";
+import { status } from "./state";
 import { threadId } from "./model/server";
 import { type Op, opArb, run, seeded, start, startArb } from "./ops";
 
@@ -78,7 +78,7 @@ describe("sync.converges", () => {
     const sim = seeded();
     sim.dispatch({ type: "select", thread: threadId(2) });
     sim.connect();
-    const key = threadStream(threadId(2));
+    const key = `thread:${threadId(2)}`;
     for (let k = 0; k < 10 && sim.flight(key, "backward") === undefined; k++) {
       for (const id of [...sim.flights.keys()]) sim.serve(id);
       while (sim.deliver());

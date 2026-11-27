@@ -4,7 +4,7 @@
 // that shows its Retry is reported as such (`HISTORY_FAILED`), never as an exact window.
 
 import type { Sim } from "./sim";
-import { HOST, listRows, rowView, status, threadOf, threadStream } from "./state";
+import { HOST, listRows, rowView, status, threadOf } from "./state";
 
 const bytesOf = (e: unknown) => new TextEncoder().encode(JSON.stringify(e)).length;
 
@@ -68,7 +68,7 @@ export function problems(sim: Sim): string[] {
   // The followed set: every thread the server has and the client shows, within the cap.
   const sel = s.selected;
   if (sel !== null) {
-    const key = threadStream(sel);
+    const key = `thread:${sel}`;
     if (!srv.exists(key)) out.push("selected a missing thread");
     else if (!s.followed.includes(key)) out.push("selected thread not followed");
     out.push(...windowProblems(sim, sel));
@@ -82,7 +82,7 @@ export function problems(sim: Sim): string[] {
 export function windowProblems(sim: Sim, thread: string): string[] {
   const out: string[] = [];
   const s = sim.state;
-  const key = threadStream(thread);
+  const key = `thread:${thread}`;
   const w = s.window;
   const head = sim.server.head(key);
   if (!w || w.thread !== thread) return ["no window for the selected thread"];

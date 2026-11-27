@@ -7,7 +7,6 @@ import { describe, expect, test } from "vitest";
 import { windowProblems } from "./check";
 import { threadId } from "./model/server";
 import { MODEL_CONFIG, Sim, TEST_CONFIG } from "./sim";
-import { threadStream } from "./state";
 
 const ID = threadId(1);
 const bytes = (es: readonly unknown[]) => es.reduce<number>((n, e) => n + new TextEncoder().encode(JSON.stringify(e)).length, 0);
@@ -56,7 +55,7 @@ describe("window oracle", () => {
   test("checks the window a failed read leaves, before any Retry", () => {
     const sim = load(3);
     sim.dispatch({ type: "older" });
-    const id = sim.flight(threadStream(ID), "backward") ?? -1;
+    const id = sim.flight(`thread:${ID}`, "backward") ?? -1;
     sim.fail(id, { kind: "status", status: 503, retryAfter: null });
     sim.deliverId(id);
     const w = sim.state.window;
