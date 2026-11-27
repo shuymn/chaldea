@@ -83,10 +83,10 @@ FakePty on both runners, Codex `win_keys` on a Windows host row; production moun
 - Attach never feeds state (invariant 1).
 - Accepted: unpadded paste triggers (input-encoders D10); L-11's late `Stop` after attach-started turns.
 - Accepted: redraw needs the CLI to honour resize; a sequence split at the snapshot renders wrong until redrawn (D3).
-- Accepted (I-7): from the nudge, a revoked socket's slot is released ≤ 6 s while operating (5 s read, 1 s close grace), ≤ 10 s in the terminal close, ≤ 11.25 s at startup (two reads, a 250 ms lock, close grace; within the 15 s candidacy); lost nudges add the 30 s tick (operating). ≤ 4 blocking reads per socket. Dispatched units finish (pty-runtime §2.3); transport bytes may arrive.
-- Accepted (I-6): after a takeover over a held write, a marker-refused last frame can send an accepted partial alone: ≤ one split escape (ConPTY may drop it); no refused byte is written; order holds.
-- Accepted (I-8): an end latched during candidacy ends with it (15 s from the upgrade plus close grace) or drains 5 s from the first loop turn (≤ 20 s from the upgrade). One send batch (an application frame, maybe a Ping), even one selected after the latch, may follow the cutoff (≤ 10 s). Order and terminal event hold.
+- Accepted (I-7): from the nudge, a revoked socket's slot is released ≤ 6 s while operating (5 s read, 1 s close grace), ≤ 10 s in the terminal close, ≤ 11.25 s at startup (two reads, a 250 ms lock, close grace; within the candidacy); lost nudges add the 30 s tick (operating). ≤ 4 blocking reads per socket. Dispatched units finish (pty-runtime §2.3); transport bytes may arrive.
+- Accepted (I-6): with raw input in flight (a takeover's held write or the socket's earlier unit), a marker-refused last frame flushes an accepted partial alone: ≤ one split escape (ConPTY may drop it); no refused byte is written; order holds.
+- Accepted (I-8): an end latched during candidacy ends with it (15 s from the attach handler's WebSocket handover, plus close grace) or drains 5 s from the first operating-loop turn. One send batch (an application frame, maybe a Ping), even one selected after the latch, may follow the cutoff (≤ 10 s). Order and terminal event hold.
 
-## 7. Canonical-Doc Edits
+## 7. Canonical Text
 
-Folded into mvp (§2.3-§2.5, §4, `GateEvidence`), supervisor-send (§2.3, §2.6, SB11), pty-runtime (§2.2, §2.7, §4-§5), http-surface (§2.6, §2.11, §4), input-encoders (§2.3, §4), architecture §5.
+mvp (§2.1, §2.3-§2.5, §4, `GateEvidence`), supervisor-send (§2.3, §2.6, SB11), pty-runtime (§2.2, §2.7, §4-§5), http-surface (§2.6, §2.11, §4), input-encoders (§2.3, §4), architecture §5.
