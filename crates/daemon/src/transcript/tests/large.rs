@@ -262,3 +262,40 @@ fn a_stop_during_a_replay_ends_it_at_the_next_chunk() {
     assert_eq!(shorts(&fx.events()), ["generation:1"]);
     no_spools(&fx);
 }
+
+/// The accumulator bound when a block's `text` precedes its `type`: a line of 64 MiB whose
+/// second block holds about half of it aside while the first block's text and the raw copy
+/// are held too, about 3 × 64 MiB at most (2 × 64 MiB otherwise).
+#[test]
+fn a_text_before_its_type_holds_at_most_three_buffers() {
+    let fx = Fx::new();
+    let (a, b) = (33_554_378, 33_554_390);
+    {
+        let mut w = BufWriter::new(File::create(&fx.path).unwrap());
+        w.write_all(
+            b"{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"",
+        )
+        .unwrap();
+        fill(&mut w, b'A', a);
+        w.write_all(b"\"},{\"text\":\"").unwrap();
+        fill(&mut w, b'B', b);
+        w.write_all(b"\",\"type\":\"text\"}]}}\n").unwrap();
+        w.flush().unwrap();
+    }
+    assert_eq!(
+        std::fs::metadata(&fx.path).unwrap().len(),
+        MAX_BLOB_BYTES as u64 + 1
+    );
+    let mut tail = fx.tail();
+    assert_eq!(fx.settle(&mut tail), Step::Wait);
+    assert_eq!(
+        shorts(&fx.events()),
+        ["generation:1".to_owned(), format!("text:<blob {}>", a + b)]
+    );
+    let peak = tail.stats.peak_line_memory;
+    assert!(
+        peak > 5 * MAX_BLOB_BYTES / 2 && peak <= 3 * MAX_BLOB_BYTES,
+        "{peak}"
+    );
+    no_spools(&fx);
+}

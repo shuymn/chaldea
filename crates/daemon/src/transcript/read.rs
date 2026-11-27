@@ -110,6 +110,8 @@ pub(crate) struct Stats {
     pub(crate) discarded: u32,
     /// Breaks found by the check after a commit.
     pub(crate) late: u32,
+    /// Final reads whose prefix check did not complete, logged as unverified.
+    pub(crate) unverified: u32,
 }
 
 /// The stored cursor, as far as the tailer compares it.
@@ -205,6 +207,9 @@ pub(crate) struct Tail {
     exited: Option<bool>,
     /// The final read checked the whole prefix against the cursor's digest.
     prefix_checked: bool,
+    /// The next prefix check sets the stop as it starts (tests).
+    #[cfg(test)]
+    stop_at_prefix_check: bool,
     /// The last failure logged, so a repeated one is logged once.
     last_failure: Option<String>,
     pub(crate) stats: Stats,
@@ -222,6 +227,8 @@ impl Tail {
             final_failures: 0,
             exited: None,
             prefix_checked: false,
+            #[cfg(test)]
+            stop_at_prefix_check: false,
             last_failure: None,
             stats: Stats::default(),
         }
@@ -269,6 +276,23 @@ impl Tail {
     /// read); `None` when the view could not be read.
     pub(crate) fn exited(&self) -> Option<bool> {
         self.exited
+    }
+
+    /// Whether the final read checked the whole prefix.
+    pub(crate) fn prefix_checked(&self) -> bool {
+        self.prefix_checked
+    }
+
+    /// Records that the final read's prefix check did not complete.
+    pub(crate) fn unverified(&mut self, why: &str) {
+        self.stats.unverified += 1;
+        tracing::warn!(thread = %self.b.thread_id, launch = %self.b.launch_id, why, "the transcript's continuity is unverified: the final read's prefix check did not complete");
+    }
+
+    /// Makes the next prefix check set the stop as it starts (tests).
+    #[cfg(test)]
+    pub(crate) fn stop_at_prefix_check(&mut self) {
+        self.stop_at_prefix_check = true;
     }
 
     fn failed(&mut self, f: &Fail, last: bool) -> Step {
@@ -321,7 +345,11 @@ impl Tail {
             if self.disproved.is_some() {
                 return self.new_generation(be, f);
             }
-            match self.verify(f)? {
+            let verified = self.verify(f);
+            if last && matches!(verified, Err(Fail::Stopped)) {
+                self.unverified("the final read stopped during the prefix check at its open");
+            }
+            match verified? {
                 Ok(open) => {
                     self.prefix_checked |= last;
                     self.open = Some(open);
@@ -351,7 +379,7 @@ impl Tail {
                 }
                 Err(e) => {
                     if matches!(e, Fail::Stopped) && last {
-                        tracing::warn!(thread = %self.b.thread_id, launch = %self.b.launch_id, "the final read stopped before its prefix check finished; the transcript's continuity is unverified");
+                        self.unverified("the final read stopped during its prefix check");
                     }
                     self.open = Some(open);
                     return Err(e);
@@ -542,6 +570,10 @@ impl Tail {
 
     /// The digest of `f`'s first `len` bytes, read again; `None` when the file is shorter.
     fn hash_prefix(&self, f: &mut RegularFile, len: u64) -> Result<Option<Sha256>, Fail> {
+        #[cfg(test)]
+        if self.stop_at_prefix_check {
+            self.stop.store(true, Ordering::Release);
+        }
         f.seek(SeekFrom::Start(0))?;
         let mut digest = Sha256::new();
         let mut buf = vec![0u8; CHUNK];

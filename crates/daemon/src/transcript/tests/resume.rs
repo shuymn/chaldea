@@ -184,3 +184,21 @@ fn a_failed_view_leaves_the_exit_unknown() {
         ["generation:1", "text:one", "text:two"]
     );
 }
+
+/// A final read that opens the file (a new tailer) and stops during the prefix check at
+/// that open: the continuity is recorded as unverified.
+#[test]
+fn a_stop_during_the_final_reads_open_check_is_unverified() {
+    let fx = Fx::new();
+    fx.write(assistant("one").as_bytes());
+    let mut first = fx.tail();
+    fx.settle(&mut first);
+    fx.append(assistant("two").as_bytes());
+    fx.add(vec![support::exited(fx.t, fx.l)]);
+    let mut next = fx.tail_with(|_| {}, std::sync::Arc::default());
+    next.stop_at_prefix_check();
+    assert_eq!(next.poll(&fx.backend()), Step::End("stopped".into()));
+    assert!(!next.prefix_checked());
+    assert_eq!(next.stats.unverified, 1);
+    assert_eq!(shorts(&fx.events()), ["generation:1", "text:one"]);
+}

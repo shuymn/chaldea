@@ -3,6 +3,7 @@
 //! after admission closed, a poll begun across the close, and short retries); joined by the
 //! shutdown participant before the store shuts down, or reported as left running.
 
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use chaldea_core::adapter::HostOs;
@@ -14,7 +15,7 @@ use crate::lifecycle::ParticipantEnd;
 use crate::store::tests::support;
 use crate::supervisor::Pause;
 use crate::supervisor::components::shutdown;
-use crate::transcript::{BATCH_LINES, DROPPED_OFF_BLOCKING, Mode};
+use crate::transcript::{BATCH_LINES, DROPPED_OFF_BLOCKING, FINAL_TRIES, Mode};
 
 const LINE: &str =
     "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n";
@@ -219,7 +220,7 @@ async fn a_binding_after_hold_is_read_at_the_final_read() {
 }
 
 /// A final read that keeps failing (the file is missing) under the default poll period
-/// ends within the participant's default 2 s: its retries are short.
+/// ends within the participant's default 2 s after `FINAL_TRIES` short tries.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failing_final_read_ends_within_the_default_budget() {
     let rig = Rig::with(HostOs::Macos, |_| {}).await;
@@ -235,9 +236,82 @@ async fn a_failing_final_read_ends_within_the_default_budget() {
             Some(&path.to_string_lossy()),
         )])
         .await;
+    rig.until("a poll ran", || polls(&rig) > 0).await;
+    let before = polls(&rig);
     let end = rig.sup.now() + Duration::from_secs(2);
     assert_eq!(shutdown(rig.sup.clone(), end).await, ParticipantEnd::Clean);
     assert!(rig.sup.tailers.launches().is_empty());
+    assert_eq!(polls(&rig) - before, FINAL_TRIES);
+    rig.srv.stop().await;
+}
+
+fn polls(rig: &Rig) -> u32 {
+    rig.sup.tailers.polls.load(Ordering::Relaxed)
+}
+
+/// A budget too short for a wait and another try: the failing final read (a missing file)
+/// ends after its first try instead of waiting past the participant's end (three tries 100 ms
+/// apart would need about 200 ms).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_final_retry_is_not_waited_past_the_budget() {
+    let rig = rig().await;
+    let (t, l) = spawn_claude(&rig).await;
+    let files = tempfile::tempdir().unwrap();
+    let path = files.path().join("missing.jsonl");
+    rig.srv
+        .append(vec![support::bound(
+            t,
+            l,
+            "s1",
+            Some(&path.to_string_lossy()),
+        )])
+        .await;
+    rig.until("a poll ran", || polls(&rig) > 0).await;
+    let before = polls(&rig);
+    let end = rig.sup.now() + Duration::from_millis(180);
+    assert_eq!(shutdown(rig.sup.clone(), end).await, ParticipantEnd::Clean);
+    assert!(rig.sup.tailers.launches().is_empty());
+    assert_eq!(polls(&rig) - before, 1);
+    rig.srv.stop().await;
+}
+
+/// At the final read, failed binding reads and a failed view are counted apart: two failed
+/// binding reads, then the binding, then a failed view that is still tried again, so the
+/// fragment is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn binding_and_view_failures_are_counted_apart() {
+    let rig = rig().await;
+    let (t, l) = spawn_claude(&rig).await;
+    let files = tempfile::tempdir().unwrap();
+    let path = files.path().join("session.jsonl");
+    std::fs::write(&path, [LINE, "{\"type\""].concat()).unwrap();
+    let close = rig.pauses.arm(Pause::ShutdownCloseEnd);
+    let end = rig.sup.now() + Duration::from_secs(5);
+    let participant = tokio::spawn(shutdown(rig.sup.clone(), end));
+    let close = tokio::task::spawn_blocking(move || {
+        close.wait();
+        close
+    })
+    .await
+    .unwrap();
+    rig.srv
+        .append(vec![support::bound(
+            t,
+            l,
+            "s1",
+            Some(&path.to_string_lossy()),
+        )])
+        .await;
+    rig.sup
+        .tailers
+        .read_faults
+        .lock()
+        .unwrap()
+        .extend([true, true, false, true]);
+    close.go();
+    assert_eq!(participant.await.unwrap(), ParticipantEnd::Clean);
+    assert!(rig.sup.tailers.read_faults.lock().unwrap().is_empty());
+    assert_eq!(texts(&rig, t), ["ok", "raw:partial_line"]);
     rig.srv.stop().await;
 }
 

@@ -257,7 +257,11 @@ pub(crate) async fn shutdown(sup: Arc<Supervisor>, end: Instant) -> ParticipantE
             .is_some();
         if !in_time {
             sup.tailers.set(Mode::Stop);
-            tracing::warn!("a transcript tailer did not end within the shutdown budget");
+            let launches = sup.tailers.launches();
+            tracing::warn!(
+                ?launches,
+                "a transcript tailer did not end within the shutdown budget; its final read's continuity is unverified"
+            );
         }
         in_time
     };

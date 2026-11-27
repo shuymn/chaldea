@@ -56,6 +56,12 @@ pub(crate) struct Tailers {
     map: Mutex<HashMap<LaunchId, Option<JoinHandle<()>>>>,
     mode: watch::Sender<Mode>,
     stop: Arc<AtomicBool>,
+    /// Store reads to fail, in order (`true`: fail), before the rest succeed (tests).
+    #[cfg(test)]
+    pub(crate) read_faults: Mutex<std::collections::VecDeque<bool>>,
+    /// Polls that ran (tests).
+    #[cfg(test)]
+    pub(crate) polls: std::sync::atomic::AtomicU32,
 }
 
 impl Default for Tailers {
@@ -64,6 +70,10 @@ impl Default for Tailers {
             map: Mutex::default(),
             mode: watch::Sender::new(Mode::Run),
             stop: Arc::default(),
+            #[cfg(test)]
+            read_faults: Mutex::default(),
+            #[cfg(test)]
+            polls: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -73,8 +83,7 @@ impl Tailers {
         self.map.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The launches whose tailer has not ended (tests).
-    #[cfg(test)]
+    /// The launches whose tailer has not ended.
     pub(crate) fn launches(&self) -> Vec<LaunchId> {
         self.lock().keys().copied().collect()
     }
@@ -117,13 +126,29 @@ pub(super) fn binding_view(r: &ReadTx<'_>, b: &Binding) -> Result<View, StoreErr
     })
 }
 
-/// A tailer's store read (on the blocking task it runs on).
+/// A tailer's store read (on the blocking task it runs on); at shutdown its wait for a
+/// reader ends with the participant's budget.
 fn read<R>(
     sup: &Supervisor,
     f: impl FnOnce(&ReadTx<'_>) -> Result<R, StoreError>,
 ) -> Result<R, String> {
+    #[cfg(test)]
+    if sup
+        .tailers
+        .read_faults
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .pop_front()
+        == Some(true)
+    {
+        return Err("no reader (test)".into());
+    }
+    let mut until = sup.now() + READ_WAIT;
+    if let Some(w) = sup.window.get() {
+        until = until.min(w.end);
+    }
     sup.store
-        .read(Instant::now() + READ_WAIT, |r| {
+        .read(sup.real(until), |r| {
             #[cfg(test)]
             sup.pauses().blocking(crate::supervisor::Pause::TailerRead);
             f(r)
@@ -226,13 +251,20 @@ impl Supervisor {
         )
     }
 
-    /// Waits [`FINAL_RETRY`] or a mode change (the participant's end sets `Stop`).
-    async fn final_wait(&self, mode: &mut watch::Receiver<Mode>) {
+    /// Waits [`FINAL_RETRY`] or a mode change before a final read is tried again; `false`,
+    /// at once, when the participant's budget leaves no room for the wait and another try.
+    async fn final_wait(&self, mode: &mut watch::Receiver<Mode>) -> bool {
+        if let Some(w) = self.window.get()
+            && w.end.saturating_duration_since(self.now()) < 2 * FINAL_RETRY
+        {
+            return false;
+        }
         let timer = crate::supervisor::tick_timer(self.timer(self.now() + FINAL_RETRY));
         tokio::select! {
             () = timer => {}
             _ = mode.changed() => {}
         }
+        true
     }
 
     /// Waits a period, a commit naming `thread` when `commits` is given, or a mode change.
@@ -287,7 +319,7 @@ async fn run(sup: Arc<Supervisor>, thread: ThreadId, launch: LaunchId) {
     let mut mode = sup.tailers.mode.subscribe();
     // Wait for the binding; at shutdown it is read once more when the exits are recorded.
     let mut commits = sup.store.subscribe();
-    let mut final_tries = 0;
+    let mut bind_tries = 0;
     let b = loop {
         let m = *mode.borrow_and_update();
         match m {
@@ -311,12 +343,11 @@ async fn run(sup: Arc<Supervisor>, thread: ThreadId, launch: LaunchId) {
             Some(Ok(Bound::NotYet) | Err(_)) | None => {}
         }
         if m == Mode::Final {
-            // A failed read at shutdown is retried a few times, shortly.
-            final_tries += 1;
-            if final_tries >= FINAL_TRIES {
+            // A failed read at shutdown is retried a few times, shortly, within the budget.
+            bind_tries += 1;
+            if bind_tries >= FINAL_TRIES || !sup.final_wait(&mut mode).await {
                 return finish(&sup, launch);
             }
-            sup.final_wait(&mut mode).await;
         } else {
             sup.tail_wait(thread, Some(&mut commits), &mut mode).await;
         }
@@ -326,8 +357,12 @@ async fn run(sup: Arc<Supervisor>, thread: ThreadId, launch: LaunchId) {
     let backend = Arc::new(StoreBackend { sup: sup.clone() });
     let mut tail = Some(Tail::new(b, sup.spool_dir(), sup.tailers.stop.clone()));
     let mut again = 0;
+    // Failed views at shutdown, counted apart from the binding's reads.
+    let mut final_tries = 0;
+    let mut final_seen = false;
     while let Some(mut t) = tail.take() {
         let m = *mode.borrow_and_update();
+        final_seen |= m == Mode::Final;
         match m {
             Mode::Run | Mode::Final => {}
             Mode::Hold => {
@@ -352,6 +387,11 @@ async fn run(sup: Arc<Supervisor>, thread: ThreadId, launch: LaunchId) {
             if *at_start.borrow() == Mode::Hold {
                 return (t, None);
             }
+            #[cfg(test)]
+            be.sup
+                .tailers
+                .polls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let step = t.poll(&*be);
             (t, Some(step))
         })
@@ -378,7 +418,9 @@ async fn run(sup: Arc<Supervisor>, thread: ThreadId, launch: LaunchId) {
                         break;
                     }
                 }
-                sup.final_wait(&mut mode).await;
+                if !sup.final_wait(&mut mode).await {
+                    break;
+                }
             }
             Step::Again if again < MAX_AGAIN => {
                 again += 1;
@@ -389,7 +431,12 @@ async fn run(sup: Arc<Supervisor>, thread: ThreadId, launch: LaunchId) {
             }
         }
     }
-    if let Some(t) = tail {
+    if let Some(mut t) = tail {
+        // A final read that ended (retries spent, the budget, a stop) before its prefix check.
+        if final_seen && !t.prefix_checked() && t.stats.unverified == 0 && t.exited() != Some(false)
+        {
+            t.unverified("the tailer ended before its final read's prefix check");
+        }
         blocking(&sup, move || drop(t)).await;
     }
     finish(&sup, launch);
