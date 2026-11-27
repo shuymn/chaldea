@@ -532,6 +532,8 @@ async fn wait_failed() {
     ] {
         let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
             c.kill_budget = std::time::Duration::from_millis(300);
+            // No git probe: its deadline would be the stopped clock's.
+            c.git.clear();
         })
         .await;
         // `Ignore` uses its whole real kill deadline, which a stopped clock never gives; the

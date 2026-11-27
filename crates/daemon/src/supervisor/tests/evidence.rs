@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use super::{Rig, json as body};
 use crate::lifecycle::ParticipantEnd;
+use crate::store::tests::support::waits;
 use crate::supervisor::Pause;
 use crate::supervisor::components::shutdown;
 use crate::supervisor::ops::{CloseReceipt, close_evidence};
@@ -174,15 +175,23 @@ async fn recorded_failed_starts() {
     rig.srv.stop().await;
 }
 
+/// A rig whose kill budget is 300 ms and whose spawns probe no git (the workspace is the
+/// cwd), so nothing the setup starts waits on the stopped clock.
+async fn closes_rig() -> Rig {
+    Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
+        c.kill_budget = Duration::from_millis(300);
+        c.git.clear();
+    })
+    .await
+}
+
 /// PR10a2-CL-7 `recorded`, the owned closes: a stop whose close reports `tree_dead: false`
 /// with survivors (and the builder with none): `tree_unproven`; a confirmed stop: none; a
-/// natural exit and the participant's close left unconfirmed: their survivors.
+/// natural exit and the participant's close left unconfirmed: their survivors, the
+/// participant's session still holding its token.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recorded_closes() {
-    let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
-        c.kill_budget = Duration::from_millis(300);
-    })
-    .await;
+    let rig = closes_rig().await;
     // A stop the close did not prove.
     rig.pty.script_next(FakeScript {
         kill: KillBehavior::Unconfirmed,
@@ -216,16 +225,25 @@ async fn recorded_closes() {
     let p = checked(&rig, t, l, "process").expect("close evidence of an exit");
     assert_eq!(p["unchecked"], json!(["tree_unproven"]));
     assert_eq!(p["identities"].as_array().unwrap().len(), 1);
-    // The participant's close left unconfirmed.
+    rig.srv.stop().await;
+    // The participant's close left unconfirmed, on a rig of its own: its session's token is
+    // the only one, and the close keeps it.
+    let rig = closes_rig().await;
     rig.pty.script_next(FakeScript {
         kill: KillBehavior::Unconfirmed,
         ..FakeScript::default()
     });
     let (t, l) = rig.spawn_codex(None).await;
+    assert_eq!(rig.sup.tracker.count(), 1);
     let end = rig.sup.now() + Duration::from_secs(2);
+    let ended = waits::bounded(Duration::from_secs(10), shutdown(rig.sup.clone(), end))
+        .await
+        .expect("the participant ends within 10 s");
+    assert_eq!(ended, ParticipantEnd::LeftRunning);
     assert_eq!(
-        shutdown(rig.sup.clone(), end).await,
-        ParticipantEnd::LeftRunning
+        rig.sup.tracker.count(),
+        1,
+        "the unproven close kept its token"
     );
     let p = checked(&rig, t, l, "process").expect("close evidence of the participant");
     assert_eq!(p["unchecked"], json!(["tree_unproven"]));
