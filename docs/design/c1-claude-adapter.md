@@ -1,6 +1,6 @@
 # C1: Claude Code Adapter (lite) and the Rescue Read Surface
 
-Design for mvp §4 row C1: Claude Code launches bind, take prompts, handle approval cards, record assistant text, and resume; external agents read threads via the screen route and `chaldea inspect`. *New* marks identifiers absent at main.
+Design for mvp §4 row C1.
 
 ## 1. Acceptance criteria
 
@@ -27,8 +27,8 @@ FC: FakeCli/FakePty CI (macOS, Windows); M1: real Claude on macOS (Windows at M2
 
 | # | Decision | Rejected |
 |---|---|---|
-| D1 | **Public** `GET /api/threads/{thread_id}/screen`: `READERS`, thread read check, `ReadStream`; errors 404, 409 `no_live_launch`, 503 `busy`, 500 `internal`. `ScreenResponse` (*new*): `thread_id`, `launch_id`, `cols`, `rows`, `cursor`, `modes`, one text line per row, `truncated`; body ≤ 512 KiB. | Owner only (orchestrators could not diagnose children); the cell grid. |
-| D2 | **Public** `chaldea inspect <thread> [--json]` (owner token): one snapshot read (`cursor_ahead` fallback, 16 MiB cap), then the screen; `ThreadSummary` fallback; `InspectOutput` (*new*), `ErrorBody` errors; exit 0/1/2/4. | A snapshot route; raising the client's global cap. |
+| D1 | **Public** `GET /api/threads/{thread_id}/screen`: `READERS`, thread read check, `ReadStream`; errors 404, 409 `no_live_launch`, 503 `busy`, 500 `internal`. `ScreenResponse`: `thread_id`, `launch_id`, `cols`, `rows`, `cursor`, `modes`, one text line per row, `truncated`; body ≤ 512 KiB. | Owner only (orchestrators could not diagnose children); the cell grid. |
+| D2 | **Public** `chaldea inspect <thread> [--json]` (owner token): one snapshot read (`cursor_ahead` fallback, 16 MiB cap), then the screen; `ThreadSummary` fallback; `InspectOutput`, `ErrorBody` errors; exit 0/1/2/4. | A snapshot route; raising the client's global cap. |
 | D3 | **Public** Claude argv gains `--settings`; one settings file per daemon start. | One per launch. |
 | D4 | Six Claude hook events: `SessionStart`, `UserPromptSubmit`, `Stop`, `PermissionRequest`, `PreToolUse`, `PostToolUse`. | All eight (no kind carries `SessionEnd`, `Notification`). |
 | D5 | A launch keeps its first binding across `/clear` and in-session `/resume`. | Following the new session. |
@@ -36,7 +36,7 @@ FC: FakeCli/FakePty CI (macOS, Windows); M1: real Claude on macOS (Windows at M2
 | D7 | A caught decoder panic is `raw_unknown` `schema_mismatch`; only pure parsing runs in the recovered region. | A reason `decoder_panic`. |
 | D8 | Prompt forms come from captures; `prompt_matches` accepts only them, and a folded paste of any size whose body equals the sent text. | Every transform subset; a size threshold (it refused real folded prompts). |
 | D9 | No VT snapshot when a card opens. | Recording one (`interpret` is data only). |
-| D10 | Continuity is a SHA-256 of the read prefix, checked in full at every open and the final read, and each poll by `file_id`, size, and the 64 KiB before the read position (§3). | A tail window alone (misses deeper rewrites); full re-hash per poll (O(n²)). |
+| D10 | Continuity is a SHA-256 of the read prefix, checked in full at every open and the final read, and each poll by `file_id`, size, and the 64 KiB before the read position and the batch's end (§3). | A tail window alone (misses deeper rewrites); full re-hash per poll (O(n²)). |
 | D11 | The CLI version is `claude --version` per launch (own process tree, 5 s deadline, 4 KiB output cap); failure, non-zero exit, or the cap records `null`. | `null` (arch §2 wants the version). |
 | D12 | `GET /api/adapters` gains no readiness column. | A field no client acts on. |
 | D13 | `open_regular` lives in `pty-runtime`, Windows FFI in `windows::sys`. | `cfg` code in the daemon. |
@@ -57,11 +57,11 @@ FC: FakeCli/FakePty CI (macOS, Windows); M1: real Claude on macOS (Windows at M2
 | An escaped descendant or late write can change the version read (D11). | `cli_version`. | Not fixed: diagnostic only. |
 | After `/clear` the thread follows the old session (D5). | `foreign_session`. | A send ends `unconfirmed`, never resent. |
 | A denied card stays open until the boundary; a later equal call marks it `ran`. | M1 P-16. | Only the label is wrong; nothing is written. |
-| **L-13 after C1.** Cards follow receipt order: a late `UserPromptSubmit` closes a legitimate card at open; a late `PermissionRequest` after an attach-answered dialog leaves a stale card whose key can reach the composer. | The screen. | The owner sees `card_closed` or a contradicting card and answers through attach (T1, T2). |
-| A same-inode rewrite of read bytes, truncate-and-regrow included; Claude 2.1.331 does this to remove a discarded message, within the last 64 KiB, or the whole file for an older line. | Within the 64 KiB before the read position: the next poll; deeper: the next open's or final read's prefix check. | A deeper rewrite between those checks, or during or after the final one, is missed; history keeps what was read. An incomplete final prefix check is logged as unverified. |
-| The file's modification time moves back. | The next poll's full prefix check. | May be missed when that poll's prefix read fails; the next open or final read checks again. |
-| A truncate or replace between the last check and the commit. | The post-commit check or the next poll. | The batch stays; a new generation follows. |
-| The daemon runs out of file descriptors. | Tailer log. | Ingest stalls and retries; bytes stay in the file. |
+| **L-13 after C1.** Receipt order can close a legitimate card at open (a late `UserPromptSubmit`) or leave a stale card whose key reaches the composer (a late `PermissionRequest`). | The screen. | The owner sees `card_closed` or a contradicting card and answers through attach (T1, T2). |
+| A same-inode rewrite of read bytes, truncate-and-regrow included; Claude 2.1.331 does this to remove a discarded message, within the last 64 KiB, or the whole file for an older line (up to 50 MiB; larger files are not rewritten). | Within 64 KiB before the read position or a batch's end: the next window check; deeper: the next open's or final read's prefix check. | May be missed: a deeper rewrite between those checks or during the final one, and any after the final read's last check; history keeps what was read. An incomplete final check is logged as unverified. |
+| The modification time moves back. | The next poll's full prefix check. | May be missed if that read fails; the next open or final read checks again. |
+| A truncate or replace between the last check and the commit. | The post-commit check or the next poll, when the id changed or the size fell below the offset. | The batch stays in history; a new generation follows. |
+| File descriptors run out. | Tailer log. | Ingest stalls and retries; bytes stay in the file. |
 | Lenient forms where captures do not cover a transform. | C1-5. | Two candidates ack none. |
-| Memory per line. | — | Values over 64 MiB spool (D14); a line holds at most about 192 MiB, plus fixed buffers and one tokenizer bit per open container. |
+| Memory per line. | — | Values over 64 MiB spool (D14); a line holds at most about 192 MiB plus fixed buffers and a one-bit-per-container tokenizer stack. |
 | A resume before the old tailer's final read. | Tailer log. | The next tailer reads from the cursor. |
