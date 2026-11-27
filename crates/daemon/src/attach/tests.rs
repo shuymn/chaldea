@@ -819,44 +819,133 @@ async fn attached_len(rig: &SRig, live: &Live) -> (usize, AttachServerMessage) {
     (serde_json::to_string(&first).unwrap().len(), first)
 }
 
-/// T1-2: `attached` at exactly its bound keeps the grid; one byte less and the envelope
-/// pushes it over: `grid: null`, everything else the same.
+/// The production path at `attached_max` = the full frame's length less `under`: whether
+/// the grid was kept, and the rest of the frame equal to the full one.
+async fn cutoff(under: usize) -> bool {
+    let screen = b"\x1b[2J\x1b[Hscreen \xe3\x81\x82 \"q\"";
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let rx = rig.watch(&live).await;
+    live.child.emit(screen);
+    SRig::delivered(&rx, b"\"q\"").await;
+    let (len, full) = attached_len(&rig, &live).await;
+    rig.stop().await;
+
+    let rig = SRig::with(|c| c.attach.attached_max = len - under).await;
+    let live = rig.claude().await;
+    let rx = rig.watch(&live).await;
+    live.child.emit(screen);
+    SRig::delivered(&rx, b"\"q\"").await;
+    let (got_len, got) = attached_len(&rig, &live).await;
+    assert!(got_len <= len - under);
+    let strip = |m: AttachServerMessage| match m {
+        AttachServerMessage::Attached {
+            cols,
+            rows,
+            cursor,
+            modes,
+            grid,
+            ..
+        } => (cols, rows, cursor, modes, grid.is_some()),
+        other => panic!("{other:?}"),
+    };
+    let (want, got) = (strip(full), strip(got));
+    assert_eq!(
+        (want.0, want.1, want.2, want.3),
+        (got.0, got.1, got.2, got.3)
+    );
+    rig.stop().await;
+    got.4
+}
+
+/// T1-2: `attached` at exactly its bound keeps the grid.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn attached_at_cutoff() {
-    for under in [0, 1] {
-        let rig = SRig::new().await;
-        let live = rig.claude().await;
-        let rx = rig.watch(&live).await;
-        live.child.emit(b"\x1b[2J\x1b[Hscreen \xe3\x81\x82 \"q\"");
-        SRig::delivered(&rx, b"\"q\"").await;
-        let (len, full) = attached_len(&rig, &live).await;
-        rig.stop().await;
+    assert!(cutoff(0).await);
+}
 
-        let rig = SRig::with(|c| c.attach.attached_max = len - under).await;
-        let live = rig.claude().await;
-        let rx = rig.watch(&live).await;
-        live.child.emit(b"\x1b[2J\x1b[Hscreen \xe3\x81\x82 \"q\"");
-        SRig::delivered(&rx, b"\"q\"").await;
-        let (_, got) = attached_len(&rig, &live).await;
-        let strip = |m: AttachServerMessage| match m {
-            AttachServerMessage::Attached {
-                cols,
-                rows,
-                cursor,
-                modes,
-                grid,
-                ..
-            } => (cols, rows, cursor, modes, grid.is_some()),
-            other => panic!("{other:?}"),
-        };
-        let (want, got) = (strip(full), strip(got));
-        assert_eq!(got.4, under == 0, "under {under}");
-        assert_eq!(
-            (want.0, want.1, want.2, want.3),
-            (got.0, got.1, got.2, got.3)
-        );
-        rig.stop().await;
+/// T1-2: the grid alone fits, the envelope pushes the frame one byte over: `grid: null`,
+/// the rest the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn envelope_tips_over() {
+    assert!(!cutoff(1).await);
+}
+
+/// R-9: a screen whose grid encodes above 256 KiB attaches with `grid: null` within the
+/// bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attached_over_256k_is_null_grid() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    // A watcher whose budget takes the whole screen's output.
+    let (sink, rx) = chaldea_pty_runtime::channel_sink(1 << 20);
+    let e = rig.sup.entry(live.l).unwrap();
+    e.with_session(&rig.sup, rig.sup.now() + Duration::from_secs(1), |s| {
+        s.subscribe(sink, soon())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let mut out = String::new();
+    for _ in 0..7 {
+        out.push('e');
+        for _ in 0..20_000 {
+            out.push('\u{301}');
+        }
+        out.push(' ');
     }
+    out.push('!');
+    live.child.emit(out.as_bytes());
+    SRig::delivered(&rx, b"!").await;
+    let (len, first) = attached_len(&rig, &live).await;
+    assert!(len <= 192 * 1024, "{len}");
+    assert_eq!(grid_of(&first), None);
+    rig.stop().await;
+}
+
+fn frame_meta() -> chaldea_pty_runtime::ScreenMeta {
+    chaldea_pty_runtime::ScreenMeta {
+        cols: 4,
+        rows: 2,
+        cursor: chaldea_pty_runtime::Cursor {
+            row: 1,
+            col: 2,
+            visible: true,
+        },
+        modes: chaldea_pty_runtime::TermModes::default(),
+        output_offset: 7,
+    }
+}
+
+/// D12: the subscription's grid budget is exactly the frame's bound less the envelope: a
+/// grid of `budget` bytes makes a frame of exactly `max`.
+#[test]
+fn grid_budget_is_the_frame_bound() {
+    use chaldea_core::ids::LaunchId;
+    let (t, l) = (ThreadId::from_u128(1), LaunchId::from_u128(2));
+    let lines = chaldea_pty_runtime::decode_grid(r#"[["a","\""],["c"]]"#, 4, 2).unwrap();
+    let grid = serde_json::to_string(&chaldea_pty_runtime::grid_rows(&lines))
+        .unwrap()
+        .len();
+    let m = frame_meta();
+    let full = super::socket::attached(t, l, &m, Some(&lines), usize::MAX).len();
+    assert_eq!(super::socket::grid_budget(t, l, &m, full), grid);
+    assert_eq!(super::socket::grid_budget(t, l, &m, full - 1), grid - 1);
+}
+
+/// D12: the frame's own check: lines above the bound give `grid: null`, the rest the same.
+#[test]
+fn attached_frame_check() {
+    use chaldea_core::ids::LaunchId;
+    let (t, l) = (ThreadId::from_u128(1), LaunchId::from_u128(2));
+    let lines = chaldea_pty_runtime::decode_grid(r#"[["a","b"],["c"]]"#, 4, 2).unwrap();
+    let m = frame_meta();
+    let full = super::socket::attached(t, l, &m, Some(&lines), usize::MAX);
+    let at = super::socket::attached(t, l, &m, Some(&lines), full.len());
+    assert_eq!(at, full);
+    let over = super::socket::attached(t, l, &m, Some(&lines), full.len() - 1);
+    let none = super::socket::attached(t, l, &m, None, usize::MAX);
+    assert_eq!(over, none);
 }
 
 /// I-6: a DSR the child emits is answered by the daemon's responder alone; the attached

@@ -18,8 +18,8 @@ use chaldea_core::input::MAX_PROMPT_BYTES;
 use chaldea_core::input::encode::{Purpose, check, encode};
 use chaldea_core::payload::{InputEncoding, VtCursor};
 use chaldea_pty_runtime::{
-    Fence, Guard, PtySize, ScreenMeta, SessionHandle, SubscribeError, Subscribed, WriteOrigin,
-    WriteTicket, WriteUnit, grid_rows,
+    Fence, Guard, PtySize, ScreenMeta, SessionHandle, SubscribeError, WriteOrigin, WriteTicket,
+    WriteUnit, grid_rows,
 };
 use futures_util::StreamExt;
 use tokio::sync::oneshot;
@@ -91,11 +91,20 @@ fn verify_read(
     }
 }
 
-/// The `attached` frame of `s`, its grid kept only while the whole frame fits `max`.
-fn attached(thread: ThreadId, launch: LaunchId, s: &Subscribed, max: usize) -> String {
+/// The `attached` frame of `meta` and `lines`, its grid kept only while the whole frame
+/// fits `max`. The subscription's budget ([`grid_budget`]) already stops the copy at the
+/// same bound; this check is the frame's own, so the bound holds even if the walk's count
+/// and the serialization ever disagree.
+pub(super) fn attached(
+    thread: ThreadId,
+    launch: LaunchId,
+    meta: &ScreenMeta,
+    lines: Option<&[chaldea_pty_runtime::Line]>,
+    max: usize,
+) -> String {
     let frame =
-        |grid| serde_json::to_string(&envelope(thread, launch, &s.meta, grid)).unwrap_or_default();
-    if let Some(lines) = &s.lines {
+        |grid| serde_json::to_string(&envelope(thread, launch, meta, grid)).unwrap_or_default();
+    if let Some(lines) = lines {
         let text = frame(Some(grid_rows(lines)));
         if text.len() <= max {
             return text;
@@ -134,7 +143,12 @@ fn envelope(
 
 /// The grid budget for `meta`: what the frame may hold besides its envelope (whose empty
 /// grid `[]` the grid replaces).
-fn grid_budget(thread: ThreadId, launch: LaunchId, meta: &ScreenMeta, max: usize) -> usize {
+pub(super) fn grid_budget(
+    thread: ThreadId,
+    launch: LaunchId,
+    meta: &ScreenMeta,
+    max: usize,
+) -> usize {
     let empty = serde_json::to_string(&envelope(thread, launch, meta, Some(Vec::new())))
         .map_or(usize::MAX, |t| t.len());
     (max + 2).saturating_sub(empty)
@@ -507,7 +521,13 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             return close(&shared, out, &mut stream, close_code::BUSY, "busy").await;
         }
     };
-    let first = attached(thread, launch, &subscribed, cfg.attached_max);
+    let first = attached(
+        thread,
+        launch,
+        &subscribed.meta,
+        subscribed.lines.as_deref(),
+        cfg.attached_max,
+    );
     // The takeover: the candidate subscribed, so it becomes current.
     let (granted, removed) = la.swap(Candidate {
         socket: me,
