@@ -249,7 +249,7 @@ pub(crate) async fn apply_records(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>) {
                     sl.set_running(&mut st, None);
                 }
             }
-            Recorded::Unrecorded | Recorded::ShuttingDown => kept.push(f),
+            Recorded::Unrecorded(_) | Recorded::ShuttingDown => kept.push(f),
         }
     }
     if !kept.is_empty() {
@@ -285,7 +285,7 @@ async fn record_humans(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>) {
                 tracing::error!(error = ?e, "a human_write job refused");
                 return;
             }
-            Recorded::Unrecorded | Recorded::ShuttingDown => return,
+            Recorded::Unrecorded(_) | Recorded::ShuttingDown => return,
         }
     }
 }

@@ -140,6 +140,23 @@ pub(crate) struct RunningUnit {
     pub stalled: bool,
 }
 
+/// What holds the launch lease (`docs/design/t1-attach.md` D7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaseKind {
+    /// An input's open and submission, until it becomes the running unit.
+    Send(InputId),
+    /// An attach socket's resize, until its backend call returns.
+    Resize(u64),
+}
+
+/// The launch lease: one holder at a time orders a send's open and submission against a
+/// resize. Only the holder, by `id`, converts or releases it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Lease {
+    pub id: u64,
+    pub kind: LeaseKind,
+}
+
 /// What the worker reports to a key's effect once it decided the unit's record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KeyReport {
@@ -218,6 +235,8 @@ impl TurnLog {
 pub(crate) struct SendState {
     pub dispatch: Option<Dispatch>,
     pub running: Option<RunningUnit>,
+    /// The launch lease; a running unit holds it as `running` (send §2.3 step 1).
+    pub lease: Option<Lease>,
     pub human_unsettled: u32,
     /// Each card's human writer position at its observation (`None` when unreliable).
     /// Dropped at the card's resolution, when a key finds the card closed in the store, or
@@ -310,6 +329,10 @@ pub(crate) struct SendLaunch {
     /// Units submitted whose completion has not fired.
     pub outstanding: AtomicU64,
     pub wake: Notify,
+    /// Lease ids.
+    next_lease: AtomicU64,
+    /// Notified at every release of the lease, for the resizes waiting for it.
+    pub lease_free: Notify,
     /// Passes finished (tests poll it).
     #[cfg(test)]
     pub passes: AtomicU64,
@@ -336,6 +359,8 @@ impl SendLaunch {
             fired: Mutex::new(Vec::new()),
             outstanding: AtomicU64::new(0),
             wake: Notify::new(),
+            next_lease: AtomicU64::new(1),
+            lease_free: Notify::new(),
             #[cfg(test)]
             passes: AtomicU64::new(0),
             tick: Mutex::new(None),
@@ -424,10 +449,47 @@ impl SendLaunch {
         self.human_flag.store(st.human_unsettled, Ordering::SeqCst);
     }
 
-    /// Sets the running unit and its flag.
+    /// Sets the running unit and its flag. Clearing it releases the lease the unit held.
     pub(crate) fn set_running(&self, st: &mut SendState, r: Option<RunningUnit>) {
+        let cleared = r.is_none() && st.running.is_some();
         self.running_flag.store(r.is_some(), Ordering::SeqCst);
         st.running = r;
+        if cleared {
+            self.lease_released();
+        }
+    }
+
+    /// Takes the lease for `kind` when it is free and no unit runs; its id.
+    pub(crate) fn take_lease(&self, st: &mut SendState, kind: LeaseKind) -> Option<u64> {
+        if st.lease.is_some() || st.running.is_some() {
+            return None;
+        }
+        let id = self.next_lease.fetch_add(1, Ordering::Relaxed);
+        st.lease = Some(Lease { id, kind });
+        Some(id)
+    }
+
+    /// Releases the lease when `id` still holds it; true when it did.
+    pub(crate) fn release_lease(&self, st: &mut SendState, id: u64) -> bool {
+        if st.lease.is_none_or(|l| l.id != id) {
+            return false;
+        }
+        st.lease = None;
+        self.lease_released();
+        true
+    }
+
+    /// Clears whatever holds the lease (the launch's exit, the shutdown).
+    pub(crate) fn clear_lease(&self, st: &mut SendState) {
+        if st.lease.take().is_some() {
+            self.lease_released();
+        }
+    }
+
+    /// Every release wakes the worker and the waiting resizes.
+    fn lease_released(&self) {
+        self.wake.notify_one();
+        self.lease_free.notify_waiters();
     }
 }
 

@@ -105,7 +105,11 @@ impl ExitStep for SendExitStep {
         let Some(sl) = self.0.launch(exit.launch_id) else {
             return;
         };
-        let set = sl.state().exit_set.take().unwrap_or_default();
+        let set = {
+            let mut st = sl.state();
+            sl.clear_lease(&mut st);
+            st.exit_set.take().unwrap_or_default()
+        };
         for (rec, _) in set {
             settle_human(&sl, rec.seq, report_of(&rec));
         }

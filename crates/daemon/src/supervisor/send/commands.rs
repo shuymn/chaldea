@@ -312,7 +312,7 @@ async fn ready_op(sup: Arc<Supervisor>, req: ReadyReq) -> EffectOutcome {
             tracing::error!(error = ?e, "the ready job refused");
             EffectOutcome::Unrecorded
         }
-        Recorded::Unrecorded => EffectOutcome::Unrecorded,
+        Recorded::Unrecorded(_) => EffectOutcome::Unrecorded,
         Recorded::ShuttingDown => EffectOutcome::ShuttingDown,
     }
 }

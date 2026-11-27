@@ -266,7 +266,7 @@ async fn record_probe(sup: Arc<Supervisor>, p: Probe, join: JoinHandle<Option<Or
         Recorded::Refused(e) => {
             tracing::error!(%launch, error = ?e, "the probe's evidence job refused");
         }
-        Recorded::Unrecorded | Recorded::ShuttingDown => {
+        Recorded::Unrecorded(_) | Recorded::ShuttingDown => {
             tracing::warn!(%launch, "the probe's evidence was not recorded; the next start probes again");
         }
     }

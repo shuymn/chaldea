@@ -27,10 +27,30 @@ pub(crate) enum Recorded<R> {
     /// The job refused (rolled back): a value, not a failure.
     Refused(JobError),
     /// Not recorded within the budget, or a fatal outcome `write_with` reported, while the
-    /// daemon runs.
-    Unrecorded,
+    /// daemon runs; whether the job may have committed.
+    Unrecorded(Commit),
     /// Not recorded once admission closed, or the store refused it as `Closed`.
     ShuttingDown,
+}
+
+/// Whether an unrecorded job may have committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Commit {
+    /// Known not committed: every attempt was refused before it ran, or rolled back.
+    NotCommitted,
+    /// The last attempt's `COMMIT` result is not known (`CommitUnknown`, `WriterGone`, or a
+    /// job left queued by `WouldDeadlock`).
+    Unknown,
+}
+
+/// The commit a non-retryable failure leaves.
+fn commit_of(f: &WriteFailure) -> Commit {
+    match f {
+        WriteFailure::Write(
+            WriteError::CommitUnknown(_) | WriteError::WriterGone | WriteError::WouldDeadlock,
+        ) => Commit::Unknown,
+        _ => Commit::NotCommitted,
+    }
 }
 
 /// Runs `job` by the completion policy. `nudge`: the job ends a token's validity, so the
@@ -45,7 +65,7 @@ pub(crate) async fn record<R: Send + 'static>(
     loop {
         let now = sup.now();
         if now >= budget_end {
-            return sup.unrecorded();
+            return sup.unrecorded(Commit::NotCommitted);
         }
         let not_after = (now + COMPLETION_ATTEMPT).min(budget_end);
         let j = job.clone();
@@ -70,7 +90,7 @@ pub(crate) async fn record<R: Send + 'static>(
             Err(f) if retryable(&f) => {}
             Err(f) => {
                 tracing::warn!(failure = ?f, "a supervisor job was not recorded");
-                return sup.unrecorded();
+                return sup.unrecorded(commit_of(&f));
             }
         }
         let from = sup.now();
@@ -82,9 +102,9 @@ pub(crate) async fn record<R: Send + 'static>(
 
 impl Supervisor {
     /// `Unrecorded` while admission is open, `ShuttingDown` once it closed.
-    pub(crate) fn unrecorded<R>(&self) -> Recorded<R> {
+    pub(crate) fn unrecorded<R>(&self, commit: Commit) -> Recorded<R> {
         if self.tracker.accepting() {
-            Recorded::Unrecorded
+            Recorded::Unrecorded(commit)
         } else {
             Recorded::ShuttingDown
         }
