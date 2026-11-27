@@ -136,10 +136,6 @@ class Step {
       case "storageFailed":
         this.s.storageFailed = true;
         return;
-      case "suspend":
-        return this.suspend();
-      case "resume":
-        return this.resume();
       case "response":
         return this.response(a.id, a.result);
       case "ticket":
@@ -177,34 +173,6 @@ class Step {
     this.s.socketAttempt = 0;
     this.s.socketRetryAt = 0;
     this.s.generation = generation;
-  }
-
-  /** Into the back-forward cache: every request and the socket end; the copies stay. */
-  private suspend(): void {
-    this.olderAll();
-    this.dropSocket();
-    this.s.suspended = true;
-  }
-
-  /**
-   * Back from the cache: reconnect now, and make every followed stream due as a socket
-   * open does, terminal errors cleared included (a resume is a reconnect).
-   */
-  private resume(): void {
-    // Only a suspended page resumes; a duplicate changes nothing.
-    if (!this.s.suspended) return;
-    this.s.suspended = false;
-    this.s.socketAttempt = 0;
-    this.s.socketRetryAt = 0;
-    for (const key of this.s.followed) {
-      const st = this.st(key);
-      if (!st) continue;
-      st.asked = true;
-      st.error = null;
-      st.attempt = 0;
-      st.retryAt = 0;
-      st.fwdLimit = this.s.cfg.forwardLimit;
-    }
   }
 
   private dropSocket(): void {
@@ -806,7 +774,7 @@ class Step {
   schedule(): void {
     const s = this.s;
     this.ensureFollowed();
-    if (typeof s.generation !== "string" || s.checkingCredential || s.suspended) {
+    if (typeof s.generation !== "string" || s.checkingCredential) {
       this.wake();
       return;
     }
@@ -902,11 +870,9 @@ class Step {
   private wake(): void {
     const s = this.s;
     let at = Number.POSITIVE_INFINITY;
-    if (!s.suspended) {
-      if (s.socket === null && s.socketRetryAt > s.now) at = Math.min(at, s.socketRetryAt);
-      for (const st of Object.values(s.streams)) {
-        if (st.fwd === null && st.error === null && st.retryAt > s.now) at = Math.min(at, st.retryAt);
-      }
+    if (s.socket === null && s.socketRetryAt > s.now) at = Math.min(at, s.socketRetryAt);
+    for (const st of Object.values(s.streams)) {
+      if (st.fwd === null && st.error === null && st.retryAt > s.now) at = Math.min(at, st.retryAt);
     }
     const next = Number.isFinite(at) ? at : null;
     // A null deadline stops the runner's timer.

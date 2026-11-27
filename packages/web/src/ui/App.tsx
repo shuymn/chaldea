@@ -27,7 +27,7 @@ export function App(props: { runner: Runner }) {
         <h1 className="text-xl font-bold">Chaldea</h1>
         <StatusBar state={state} />
       </header>
-      {state.storageFailed && (state.generation === undefined || state.suspended) ? (
+      {state.storageFailed && state.generation === undefined ? (
         <main id="main" className="p-3">
           <p className="flex flex-wrap items-center gap-2">
             <span>

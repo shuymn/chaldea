@@ -30,12 +30,8 @@ function live() {
 describe("ui", () => {
   test("unreadable browser storage shows a recoverable state, not connecting", async () => {
     let fail = true;
-    const listeners: (() => void)[] = [];
     const store = {
-      listen: (f: () => void) => {
-        listeners.push(f);
-        return () => {};
-      },
+      listen: () => () => {},
       read: async () => {
         if (fail) throw new Error("storage unavailable");
         return null;
@@ -60,20 +56,6 @@ describe("ui", () => {
     });
     expect(screen.queryByText(/Browser storage is unavailable/)).toBeNull();
     expect(screen.getByText(/This link is spent or expired/)).toBeTruthy();
-    // A resume whose store read fails shows the same recoverable state.
-    act(() => runner.suspend());
-    fail = true;
-    await act(() => runner.resume());
-    expect(screen.getByText(/Browser storage is unavailable/)).toBeTruthy();
-    // A notice the store answers then completes the restore: the page resumes rather
-    // than losing its Retry while still suspended.
-    fail = false;
-    await act(async () => {
-      for (const l of listeners) l();
-      await new Promise((r) => setTimeout(r, 0));
-    });
-    expect(runner.getState().suspended).toBe(false);
-    expect(screen.queryByText(/Browser storage is unavailable/)).toBeNull();
     runner.stop();
   });
 

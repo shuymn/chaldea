@@ -171,8 +171,6 @@ export interface State {
   readonly checkingCredential: boolean;
   /** The credential store could not be read; the page offers a retry. */
   readonly storageFailed: boolean;
-  /** The page is in the back-forward cache: no request, socket, or timer runs. */
-  readonly suspended: boolean;
   readonly epoch: string | null;
   readonly nextId: number;
   /** Requests issued and not yet answered or made older: the slots in use. */
@@ -207,7 +205,6 @@ export function initialState(cfg: Config = DEFAULT_CONFIG, now = 0): State {
     generation: undefined,
     checkingCredential: false,
     storageFailed: false,
-    suspended: false,
     epoch: null,
     nextId: 1,
     inflight: {},

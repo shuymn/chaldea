@@ -40,11 +40,6 @@ export class Runner {
   private adoption: Promise<void> = Promise.resolve();
   private unlisten: (() => void) | null = null;
   private stopped = false;
-  /** Counts suspensions (and stop): a resume acts only for the suspension it started in. */
-  private suspension = 0;
-  private resuming: Promise<void> | null = null;
-  /** The suspension whose resume failed to read the store, still waiting to resume. */
-  private failedResume: number | null = null;
   /** Aborted by `stop`: boot and pairing run under it, so a late exchange is not applied. */
   private readonly lifetime = new AbortController();
   /** Generations refused with 401 whose delete failed: never used again by this page. */
@@ -71,69 +66,20 @@ export class Runner {
    */
   async start(boot: (signal: AbortSignal) => Promise<unknown> = async () => {}): Promise<void> {
     this.unlisten = this.deps.store.listen(() => {
-      void this.reread("keep").then((ok) => {
-        // A notice the store answers completes a restore whose read failed, for the
-        // same suspension only.
-        if (ok && this.failedResume === this.suspension) void this.resume();
-      });
+      void this.reread("keep");
     });
     await boot(this.lifetime.signal).catch(() => null);
     if (this.stopped) return;
     await this.reread("report");
   }
 
-  /**
-   * Reads the store again after it failed. On a suspended page this is the versioned
-   * `resume`, so a Retry cannot resume a later suspension.
-   */
+  /** Reads the store again after it failed, as at startup. */
   async retryStorage(): Promise<void> {
-    if (this.state.suspended) return this.resume();
     await this.reread("report");
-  }
-
-  /**
-   * Into the back-forward cache: the socket closes, reads and the ticket POST end, and
-   * timers stop; the state in memory stays for `resume`. A new suspension invalidates a
-   * resume still reconciling.
-   */
-  suspend(): void {
-    this.suspension += 1;
-    this.resuming = null;
-    this.dispatch({ type: "suspend" });
-    this.endTransport();
-  }
-
-  /**
-   * Back from the cache: reconcile with the store first (a notice may have been missed
-   * while frozen), then reconnect and refetch, keeping what the page showed. A no-op
-   * unless suspended; duplicate calls for one suspension share one resume. If the store
-   * cannot be read, the page stays suspended and shows the storage error with Retry.
-   */
-  resume(): Promise<void> {
-    if (this.stopped || !this.state.suspended) return Promise.resolve();
-    if (this.resuming) return this.resuming;
-    const version = this.suspension;
-    const resuming = (async () => {
-      const ok = await this.reread("report");
-      // A suspend or stop since then invalidates this resume.
-      if (this.stopped || version !== this.suspension) return;
-      if (!ok) {
-        this.failedResume = version;
-        return;
-      }
-      this.failedResume = null;
-      this.dispatch({ type: "resume" });
-    })().finally(() => {
-      if (this.resuming === resuming) this.resuming = null;
-    });
-    this.resuming = resuming;
-    return resuming;
   }
 
   /** Ends every request, socket, and timer, and stops listening; the runner does nothing after. */
   stop(): void {
-    this.suspension += 1;
-    this.resuming = null;
     this.stopped = true;
     this.lifetime.abort();
     this.unlisten?.();
@@ -165,12 +111,12 @@ export class Runner {
    *
    * The one adoption rule: a reread triggered by a generation (a 401's clear) acts only
    * if that generation is still the current one when the read completes; then a read
-   * failure retires it. Notices, startup, Retry, and resume name no generation and
-   * adopt what the store holds.
+   * failure retires it. Notices, startup, and Retry name no generation and adopt what
+   * the store holds.
    */
-  private reread(onError: "keep" | "report", trigger?: string): Promise<boolean> {
-    const read = this.adoption.then(async (): Promise<boolean> => {
-      if (this.stopped) return false;
+  private reread(onError: "keep" | "report", trigger?: string): Promise<void> {
+    this.adoption = this.adoption.then(async () => {
+      if (this.stopped) return;
       let cred: Credential | null;
       let failed = false;
       try {
@@ -180,19 +126,17 @@ export class Runner {
         cred = null;
       }
       if (trigger !== undefined) {
-        if (this.cred?.generation !== trigger) return !failed;
+        if (this.cred?.generation !== trigger) return;
         this.adopt(cred);
-        return !failed;
+        return;
       }
       if (failed) {
         if (onError === "report") this.dispatch({ type: "storageFailed" });
-        return false;
+        return;
       }
       this.adopt(cred);
-      return true;
     });
-    this.adoption = read.then(() => undefined);
-    return read;
+    return this.adoption;
   }
 
   /** Adopts `cred`, unless it is a generation retired here after a failed delete. */

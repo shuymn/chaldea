@@ -21,17 +21,13 @@ if (root) {
   );
   // Best effort: ask the browser not to evict the credential under storage pressure.
   void navigator.storage?.persist?.().catch(() => false);
-  // Into the back-forward cache the client suspends its transport and keeps what it
-  // shows; back from it, it reconnects. A page that is discarded is torn down.
-  addEventListener("pagehide", (e) => {
-    if (e.persisted) {
-      runner.suspend();
-      return;
-    }
+  // Leaving the page ends every request, socket, and timer. A page restored from the
+  // back-forward cache reloads, which reads everything from the daemon again.
+  addEventListener("pagehide", () => {
     runner.stop();
     view.unmount();
   });
   addEventListener("pageshow", (e) => {
-    if (e.persisted) void runner.resume();
+    if (e.persisted) location.reload();
   });
 }

@@ -226,31 +226,6 @@ describe("sync.status", () => {
     }
   });
 
-  test("resume refetches host and the selected thread, a terminal error cleared as at a reconnect", () => {
-    const sim = live();
-    const id = forwardRead(sim);
-    failWith(sim, id, { kind: "schema" });
-    expect(sim.state.streams[T1]?.error).not.toBeNull();
-    sim.dispatch({ type: "suspend" });
-    const effects = sim.dispatch({ type: "resume" });
-    const streams = effects.flatMap((e) => (e.type === "fetch" ? [e.req.stream] : []));
-    expect(streams).toContain(HOST);
-    expect(streams).toContain(T1);
-    expect(sim.state.streams[T1]?.error).toBeNull();
-  });
-
-  test("a second resume for one suspension does not clear a terminal error again", () => {
-    const sim = live();
-    sim.dispatch({ type: "suspend" });
-    sim.dispatch({ type: "resume" });
-    sim.quiesce();
-    const id = forwardRead(sim);
-    failWith(sim, id, { kind: "schema" });
-    const effects = sim.dispatch({ type: "resume" });
-    expect(sim.state.streams[T1]?.error).not.toBeNull();
-    expect(effects.filter((e) => e.type === "fetch")).toEqual([]);
-  });
-
   test("a failed history read shows on the window only; the page stays live (N1)", () => {
     const sim = live();
     sim.dispatch({ type: "older" });
