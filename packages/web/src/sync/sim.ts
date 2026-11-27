@@ -5,6 +5,7 @@ import type { WsServerMessage } from "@chaldea/contracts/generated/WsServerMessa
 
 import type { Action, Effect, FetchResult } from "./effects";
 import { type ModelConfig, ModelServer, ModelSocket } from "./model/server";
+import { WindowOracle } from "./oracle";
 import { reduce } from "./reducer";
 import { type Config, DEFAULT_CONFIG, initialState, type Request, type State } from "./state";
 
@@ -38,10 +39,10 @@ export const TEST_CONFIG: Config = {
   followMax: 2,
   windowMaxEvents: 6,
   // The window cap equals the read limit, as in production. The largest model event
-  // (2,500 code points of Japanese, about 8.5 KB) fits a backward page of three, so a tail
-  // read is never split, while a forward page of four can be oversized.
-  windowMaxBytes: 32 * 1024,
-  readMaxBytes: 32 * 1024,
+  // (2,500 code points of Japanese, about 8.5 KB) fits alone, but a backward page of
+  // three and a forward page of four can be oversized and are halved.
+  windowMaxBytes: 16 * 1024,
+  readMaxBytes: 16 * 1024,
 };
 
 export const MODEL_CONFIG: ModelConfig = { replayMaxEvents: 6, replayMaxBytes: 4096, recent: 1 };
@@ -57,6 +58,8 @@ export class Sim {
   readonly conns = new Map<number, Conn>();
   readonly frames: { socket: number; msg: WsServerMessage }[] = [];
   readonly log: Effect[] = [];
+  /** The expected history window, fed with every action (oracle.ts). */
+  readonly oracle = new WindowOracle();
   up = true;
   /** Every frame but `hello` is lost: the client learns heads from its reads only. */
   withholdHeads = false;
@@ -73,8 +76,11 @@ export class Sim {
   }
 
   dispatch(a: DistributiveOmit<Action, "now">): Effect[] {
-    const [next, effects] = reduce(this.state, { ...a, now: this.now } as Action);
+    const action = { ...a, now: this.now } as Action;
+    const before = this.state;
+    const [next, effects] = reduce(before, action);
     this.state = next;
+    this.oracle.observe(before, action, next);
     for (const e of effects) this.effect(e);
     this.log.push(...effects);
     return effects;

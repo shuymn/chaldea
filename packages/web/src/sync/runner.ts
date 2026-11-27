@@ -40,6 +40,10 @@ export class Runner {
   private adoption: Promise<void> = Promise.resolve();
   private unlisten: (() => void) | null = null;
   private stopped = false;
+  /** Aborted by `stop`: boot and pairing run under it, so a late exchange is not applied. */
+  private readonly lifetime = new AbortController();
+  /** Generations refused with 401 whose delete failed: never used again by this page. */
+  private readonly retired = new Set<string>();
 
   constructor(deps: RunnerDeps, cfg: Config = DEFAULT_CONFIG) {
     this.deps = deps;
@@ -55,23 +59,49 @@ export class Runner {
 
   /**
    * Listens for other tabs first, then runs `boot` (the pair flow, which may store a
-   * credential), then adopts what the store holds. Startup and every notice take the same
-   * path, a reread of the store, so a change committed by another tab during startup is
-   * not missed.
+   * credential) under the runner's lifetime signal, then adopts what the store holds.
+   * Startup and every notice take the same path, a reread of the store, so a change
+   * committed by another tab during startup is not missed. A store that cannot be read
+   * at startup shows as `storageFailed`, which `retryStorage` retries.
    */
-  async start(boot: () => Promise<unknown> = async () => {}): Promise<void> {
+  async start(boot: (signal: AbortSignal) => Promise<unknown> = async () => {}): Promise<void> {
     this.unlisten = this.deps.store.listen(() => {
-      void this.reread();
+      void this.reread("keep");
     });
-    await boot().catch(() => null);
-    await this.reread();
+    await boot(this.lifetime.signal).catch(() => null);
+    if (this.stopped) return;
+    await this.reread("report");
+  }
+
+  /** Reads the store again after it failed. */
+  retryStorage(): Promise<void> {
+    return this.reread("report");
+  }
+
+  /**
+   * Into the back-forward cache: the socket closes, reads and the ticket POST end, and
+   * timers stop; the state in memory stays for `resume`.
+   */
+  suspend(): void {
+    this.dispatch({ type: "suspend" });
+    this.endTransport();
+  }
+
+  /** Back from the cache: reconnect and refetch, keeping what the page showed. */
+  resume(): void {
+    this.dispatch({ type: "resume" });
   }
 
   /** Ends every request, socket, and timer, and stops listening; the runner does nothing after. */
   stop(): void {
     this.stopped = true;
+    this.lifetime.abort();
     this.unlisten?.();
     this.unlisten = null;
+    this.endTransport();
+  }
+
+  private endTransport(): void {
     for (const ac of this.aborts.values()) ac.abort();
     this.aborts.clear();
     for (const ac of this.tickets.values()) ac.abort();
@@ -89,25 +119,33 @@ export class Runner {
     this.timer = null;
   }
 
-  /** Rereads the store and adopts what it holds; `fallback` is adopted if it cannot be read. */
-  private reread(fallback?: () => Credential | null): Promise<void> {
+  /**
+   * Rereads the store and adopts what it holds. If it cannot be read: `keep` keeps the
+   * current credential, `report` shows the storage failure, and `retire` drops the
+   * current one (a 401's generation that could not be deleted).
+   */
+  private reread(onError: "keep" | "report" | "retire"): Promise<void> {
     this.adoption = this.adoption.then(async () => {
+      if (this.stopped) return;
       let cred: Credential | null;
       try {
         cred = await this.deps.store.read();
       } catch {
-        if (!fallback) return;
-        cred = fallback();
+        if (onError === "report") this.dispatch({ type: "storageFailed" });
+        if (onError !== "retire") return;
+        cred = null;
       }
       this.adopt(cred);
     });
     return this.adoption;
   }
 
+  /** Adopts `cred`, unless it is a generation retired here after a failed delete. */
   private adopt(cred: Credential | null): void {
     if (this.stopped) return;
-    this.cred = cred;
-    this.dispatch({ type: "credential", generation: cred?.generation ?? null });
+    const usable = cred !== null && this.retired.has(cred.generation) ? null : cred;
+    this.cred = usable;
+    this.dispatch({ type: "credential", generation: usable?.generation ?? null });
   }
 
   dispatch(input: Input): void {
@@ -193,13 +231,16 @@ export class Runner {
         return;
       }
       case "clearCredential": {
-        // Compare-and-delete, then the same reread as a notice; if the store cannot be
-        // read, the 401's generation is retired.
+        // Compare-and-delete, then the same reread as a notice. If the delete failed, the
+        // refused generation is retired here, so a reread that still returns it does not
+        // reuse it; a newer generation is adopted as usual.
         const gen = e.generation;
-        const retire = () => (this.cred?.generation === gen ? null : this.cred);
         void this.deps.store.clearIf(gen).then(
-          () => this.reread(retire),
-          () => this.reread(retire),
+          () => this.reread("retire"),
+          () => {
+            this.retired.add(gen);
+            return this.reread("retire");
+          },
         );
         return;
       }

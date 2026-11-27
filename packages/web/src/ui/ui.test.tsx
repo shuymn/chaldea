@@ -2,11 +2,14 @@
 // Component checks of the list, the timeline, and the status (cheap ones; the 390 × 844
 // layout is checked in a real browser).
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
+import type { CredentialStore } from "../auth/credential";
 import { threadId } from "../sync/model/server";
 import { seeded } from "../sync/ops";
+import { Runner } from "../sync/runner";
+import { App } from "./App";
 import { StatusBar } from "./StatusBar";
 import { SETTLE_MS, ThreadList } from "./ThreadList";
 import { Timeline } from "./Timeline";
@@ -25,6 +28,37 @@ function live() {
 }
 
 describe("ui", () => {
+  test("unreadable browser storage shows a recoverable state, not connecting", async () => {
+    let fail = true;
+    const store = {
+      listen: () => () => {},
+      read: async () => {
+        if (fail) throw new Error("storage unavailable");
+        return null;
+      },
+    } as unknown as CredentialStore;
+    const runner = new Runner({
+      fetch: () => new Promise<Response>(() => {}),
+      openSocket: () => {
+        throw new Error("unused");
+      },
+      store,
+      now: () => 0,
+      socketUrl: (p) => p,
+    });
+    render(<App runner={runner} />);
+    await act(() => runner.start());
+    expect(screen.getByText(/Browser storage is unavailable/)).toBeTruthy();
+    fail = false;
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await runner.retryStorage();
+    });
+    expect(screen.queryByText(/Browser storage is unavailable/)).toBeNull();
+    expect(screen.getByText(/This link is spent or expired/)).toBeTruthy();
+    runner.stop();
+  });
+
   test("the list shows agent, cwd, axes, closed, and the labels of unfollowed rows", () => {
     const sim = live();
     sim.server.close(threadId(3));
@@ -65,6 +99,21 @@ describe("ui", () => {
     expect(within(row).queryByText(/the daemon.s answer did not match/)).not.toBeNull();
     fireEvent.click(within(row).getByRole("button", { name: "Retry" }));
     expect(retried).toBe(1);
+  });
+
+  test("a background stream whose reads fail in transport is marked retrying on its row", () => {
+    const sim = live();
+    const id = threadId(1);
+    sim.dispatch({ type: "visible", threads: [id] });
+    sim.quiesce();
+    sim.server.message(id, 3);
+    sim.connect();
+    const request = sim.flight(`thread:${id}`, "forward") ?? -1;
+    sim.fail(request, { kind: "transport" });
+    sim.deliverId(request);
+    render(<ThreadList state={sim.state} onSelect={noop} onVisible={noop} onRetry={noop} />);
+    const row = screen.getAllByRole("listitem").find((li) => li.dataset.thread === id);
+    expect(row?.textContent).toContain("retrying");
   });
 
   test("visible rows are reported only once scrolling settles", () => {

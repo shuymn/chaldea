@@ -41,6 +41,7 @@ function Row(props: {
           {label(view.process)} · {label(view.turn)} · task {label(view.task)}
         </span>
         {attention && <span className="block text-sm font-semibold">attention: {attention}</span>}
+        {view.retrying && <span className="block text-sm italic">reads failing, retrying</span>}
       </button>
       {view.error && (
         <p className="flex flex-wrap items-center gap-2 px-3 pb-2 text-sm">

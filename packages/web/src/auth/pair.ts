@@ -11,6 +11,8 @@ export interface PairDeps {
   readonly history: Pick<History, "replaceState">;
   readonly fetch: Fetch;
   readonly store: CredentialStore;
+  /** The page's lifetime: once aborted, a late exchange is not stored. */
+  readonly signal?: AbortSignal;
 }
 
 /** The code of a `#pair=<code>` fragment, or null. */
@@ -30,7 +32,9 @@ export async function pairFromLink(deps: PairDeps): Promise<Credential | null> {
   if (code !== null) {
     // The fragment goes before the code leaves the page.
     deps.history.replaceState(null, "", deps.location.pathname + deps.location.search);
-    const r = await postPair(deps.fetch, code);
+    const signal = deps.signal ?? new AbortController().signal;
+    const r = await postPair(deps.fetch, code, signal);
+    if (signal.aborted) return null;
     if (r.kind === "ok") return deps.store.store(r.token);
   } else if (deps.location.hash.startsWith("#pair")) {
     deps.history.replaceState(null, "", deps.location.pathname + deps.location.search);

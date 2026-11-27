@@ -131,7 +131,15 @@ class Step {
         if (this.s.wakeAt !== null && this.s.now >= this.s.wakeAt) this.s.wakeAt = null;
         return;
       case "credential":
+        this.s.storageFailed = false;
         return this.credential(a.generation);
+      case "storageFailed":
+        this.s.storageFailed = true;
+        return;
+      case "suspend":
+        return this.suspend();
+      case "resume":
+        return this.resume();
       case "response":
         return this.response(a.id, a.result);
       case "ticket":
@@ -171,6 +179,27 @@ class Step {
     this.s.generation = generation;
   }
 
+  /** Into the back-forward cache: every request and the socket end; the copies stay. */
+  private suspend(): void {
+    this.olderAll();
+    this.dropSocket();
+    this.s.suspended = true;
+  }
+
+  /** Back from the cache: reconnect now, and make every followed stream due as at an open. */
+  private resume(): void {
+    this.s.suspended = false;
+    this.s.socketAttempt = 0;
+    this.s.socketRetryAt = 0;
+    for (const key of this.s.followed) {
+      const st = this.st(key);
+      if (!st) continue;
+      st.asked = true;
+      st.attempt = 0;
+      st.retryAt = 0;
+    }
+  }
+
   private dropSocket(): void {
     if (this.s.socket) this.effects.push({ type: "close", socket: this.s.socket.id });
     this.s.socket = null;
@@ -197,11 +226,11 @@ class Step {
     if (req.dir === "forward") ms.fwd = null;
     else ms.bwd = null;
 
-    // Read reachability is per stream; any read that reached the daemon shows it up.
-    if (result.kind === "transport" || result.kind === "timeout") {
-      ms.lastRead = "down";
-    } else {
-      ms.lastRead = "ok";
+    // Forward reads alone record a stream's reachability; a history failure shows only
+    // through the window's error and Retry.
+    const down = result.kind === "transport" || result.kind === "timeout";
+    if (req.dir === "forward") ms.lastRead = down ? "down" : "ok";
+    if (!down) {
       this.s.ticketDown = false;
       this.s.reached = true;
     }
@@ -503,6 +532,7 @@ class Step {
       return;
     }
     this.s.window = {
+      id: this.s.nextId++,
       thread: t,
       lo: cursor + 1,
       hi: cursor,
@@ -769,7 +799,7 @@ class Step {
   schedule(): void {
     const s = this.s;
     this.ensureFollowed();
-    if (typeof s.generation !== "string" || s.checkingCredential) {
+    if (typeof s.generation !== "string" || s.checkingCredential || s.suspended) {
       this.wake();
       return;
     }
@@ -865,9 +895,11 @@ class Step {
   private wake(): void {
     const s = this.s;
     let at = Number.POSITIVE_INFINITY;
-    if (s.socket === null && s.socketRetryAt > s.now) at = Math.min(at, s.socketRetryAt);
-    for (const st of Object.values(s.streams)) {
-      if (st.fwd === null && st.error === null && st.retryAt > s.now) at = Math.min(at, st.retryAt);
+    if (!s.suspended) {
+      if (s.socket === null && s.socketRetryAt > s.now) at = Math.min(at, s.socketRetryAt);
+      for (const st of Object.values(s.streams)) {
+        if (st.fwd === null && st.error === null && st.retryAt > s.now) at = Math.min(at, st.retryAt);
+      }
     }
     const next = Number.isFinite(at) ? at : null;
     // A null deadline stops the runner's timer.

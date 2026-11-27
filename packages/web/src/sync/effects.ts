@@ -33,6 +33,11 @@ export type Action = At &
     | { readonly type: "tick" }
     /** The stored credential, reread: its generation, or null when none is stored. */
     | { readonly type: "credential"; readonly generation: string | null }
+    /** The credential store could not be read. */
+    | { readonly type: "storageFailed" }
+    /** The page went into the back-forward cache, or came back from it. */
+    | { readonly type: "suspend" }
+    | { readonly type: "resume" }
     | { readonly type: "response"; readonly id: number; readonly result: FetchResult }
     | { readonly type: "ticket"; readonly socket: number; readonly result: TicketResult }
     | { readonly type: "socketOpen"; readonly socket: number }

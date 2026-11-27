@@ -16,16 +16,22 @@ if (root) {
   const runner = browserRunner(store);
   const view = createRoot(root);
   view.render(<App runner={runner} />);
-  void runner.start(() => pairFromLink({ location, history, fetch: (i, init) => fetch(i, init), store }));
+  void runner.start((signal) =>
+    pairFromLink({ location, history, fetch: (i, init) => fetch(i, init), store, signal }),
+  );
   // Best effort: ask the browser not to evict the credential under storage pressure.
   void navigator.storage?.persist?.().catch(() => false);
-  // Leaving the page ends every request, socket, and timer. A page restored from the
-  // back-forward cache starts again rather than resume a stopped client.
-  addEventListener("pagehide", () => {
+  // Into the back-forward cache the client suspends its transport and keeps what it
+  // shows; back from it, it reconnects. A page that is discarded is torn down.
+  addEventListener("pagehide", (e) => {
+    if (e.persisted) {
+      runner.suspend();
+      return;
+    }
     runner.stop();
     view.unmount();
   });
   addEventListener("pageshow", (e) => {
-    if (e.persisted) location.reload();
+    if (e.persisted) runner.resume();
   });
 }

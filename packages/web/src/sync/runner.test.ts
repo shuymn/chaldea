@@ -249,4 +249,124 @@ describe("runner", () => {
     expect(r.getState().wakeAt).toBeNull();
     expect(vi.getTimerCount()).toBe(timers - 1);
   });
+
+  test("a store that cannot be read at startup shows as such, and Retry recovers", async () => {
+    const store = fakeStore(A);
+    const read = store.read;
+    store.read = async () => {
+      throw new Error("storage unavailable");
+    };
+    const { r } = runner(store);
+    await r.start();
+    expect(r.getState().generation).toBeUndefined();
+    expect(r.getState().storageFailed).toBe(true);
+    store.read = read;
+    await r.retryStorage();
+    expect(r.getState().storageFailed).toBe(false);
+    expect(r.getState().generation).toBe("a");
+  });
+
+  test("a 401 whose delete fails retires that generation; a newer one is still adopted", async () => {
+    const store = fakeStore(A);
+    let clears = 0;
+    store.clearIf = async () => {
+      clears += 1;
+      throw new Error("write aborted");
+    };
+    const reads: string[] = [];
+    const r = new Runner({
+      fetch: (path, init) => {
+        if (path.startsWith("/api/events")) {
+          const auth = new Headers(init.headers).get("Authorization") ?? "";
+          reads.push(auth);
+          if (auth === "Bearer tok-a") return Promise.resolve(new Response("{}", { status: 401 }));
+        }
+        return new Promise<Response>(() => {});
+      },
+      openSocket: () => {
+        throw new Error("unused");
+      },
+      store: store as unknown as CredentialStore,
+      now: () => 0,
+      socketUrl: (p) => p,
+    });
+    await r.start();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(clears).toBe(1);
+    expect(reads.filter((a) => a === "Bearer tok-a")).toEqual(["Bearer tok-a"]);
+    expect(r.getState().generation).toBeNull();
+    // Another tab pairs again: the new generation is adopted.
+    store.stored = B;
+    store.notify();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(r.getState().generation).toBe("b");
+    r.stop();
+  });
+
+  test("a pair exchange that answers after stop is not stored; no store read follows", async () => {
+    vi.useRealTimers();
+    let finish: (r: Response) => void = () => {};
+    let signal: AbortSignal | undefined;
+    let writes = 0;
+    let reads = 0;
+    const store = {
+      listen: () => () => {},
+      read: async () => {
+        reads += 1;
+        return null;
+      },
+      store: async (token: string) => {
+        writes += 1;
+        return { generation: "new", token };
+      },
+    };
+    const { r } = runner(store);
+    const done = r.start((lifetime) =>
+      pairFromLink({
+        store: store as unknown as CredentialStore,
+        location: { hash: "#pair=code", pathname: "/", search: "" },
+        history: { replaceState() {} },
+        fetch: (_path, init) => {
+          signal = init.signal ?? undefined;
+          return new Promise<Response>((resolve) => {
+            finish = resolve;
+          });
+        },
+        signal: lifetime,
+      }),
+    );
+    r.stop();
+    finish(new Response(JSON.stringify({ token: "fresh" }), { status: 200 }));
+    await done;
+    expect(signal?.aborted).toBe(true);
+    expect(writes).toBe(0);
+    expect(reads).toBe(0);
+  });
+
+  test("suspend ends the transport and keeps the state; resume reconnects and refetches", async () => {
+    const store = fakeStore(A);
+    const { r, calls, sockets } = runner(store);
+    await r.start();
+    await vi.advanceTimersByTimeAsync(0);
+    sockets[0]?.open();
+    sockets[0]?.hello();
+    r.dispatch({ type: "select", thread: "0193abcd-ef01-7000-8000-000000000001" });
+    const before = r.getState();
+    r.suspend();
+    expect(calls.every((c) => c.path === "/api/ws-ticket" || c.init.signal?.aborted)).toBe(true);
+    expect(sockets[0]?.closed).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(r.getState().selected).toBe(before.selected);
+    expect(r.getState().generation).toBe("a");
+    const made = calls.length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(calls.length).toBe(made);
+    r.resume();
+    await vi.advanceTimersByTimeAsync(0);
+    const after = calls.slice(made).map((c) => c.path.split("?")[0]);
+    expect(after).toContain("/api/ws-ticket");
+    expect(after.filter((p) => p === "/api/events").length).toBeGreaterThanOrEqual(2);
+    expect(r.getState().selected).toBe(before.selected);
+    r.stop();
+  });
 });

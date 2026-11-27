@@ -103,7 +103,7 @@ export interface Stream {
   readonly bwd: number | null;
   /** The current forward `limit`, halved after an oversized response. */
   readonly fwdLimit: number;
-  /** How the latest read of this stream ended: reached the daemon, or failed in transport. */
+  /** How the latest forward read of this stream ended: reached the daemon, or failed in transport. */
   readonly lastRead: "ok" | "down" | null;
   /** A failure that is not retried automatically. */
   readonly error: StreamError | null;
@@ -137,6 +137,8 @@ export type Pending =
  * cursor (`hi = lo - 1` when empty).
  */
 export interface Window {
+  /** Distinguishes each window opened (a new selection, Jump to latest, a reset). */
+  readonly id: number;
   readonly thread: string;
   readonly lo: number;
   readonly hi: number;
@@ -167,6 +169,10 @@ export interface State {
   readonly generation: string | null | undefined;
   /** A 401's compare-and-delete is running: no request goes until it answers. */
   readonly checkingCredential: boolean;
+  /** The credential store could not be read; the page offers a retry. */
+  readonly storageFailed: boolean;
+  /** The page is in the back-forward cache: no request, socket, or timer runs. */
+  readonly suspended: boolean;
   readonly epoch: string | null;
   readonly nextId: number;
   /** Requests issued and not yet answered or made older: the slots in use. */
@@ -200,6 +206,8 @@ export function initialState(cfg: Config = DEFAULT_CONFIG, now = 0): State {
     now,
     generation: undefined,
     checkingCredential: false,
+    storageFailed: false,
+    suspended: false,
     epoch: null,
     nextId: 1,
     inflight: {},
@@ -245,14 +253,17 @@ export type Status = "connecting" | "live" | "updates paused" | "offline";
 
 /** The page's status (mvp §2.4 "Offline"; docs/design/w1-pwa.md §2.3 "Status"). */
 export function status(s: State): Status {
-  // Socket frames show the socket's health only; reads show the read path, per stream.
+  // Socket frames show the socket's health only. The read path is the latest forward
+  // reads of `host` and the selected thread; a background stream's failure shows on its
+  // row and a history failure on the window, never here.
   const socketUp = s.socket?.phase === "open" && s.socket.epoch !== null;
-  const reads = s.followed.map((k) => s.streams[k]?.lastRead ?? null);
+  const keys = [HOST, ...(s.selected !== null ? [threadStream(s.selected)] : [])];
+  const reads = keys.map((k) => s.streams[k]?.lastRead ?? null);
   const someDown = reads.includes("down");
   const readsDown = someDown && !reads.includes("ok");
   if (!socketUp && (s.ticketDown || readsDown)) return "offline";
   if (!s.reached) return "connecting";
-  // Live needs the read path too, so a frame cannot unlock input while reads fail.
+  // Live needs the read path too, so a frame cannot unlock input while it fails.
   if (socketUp && !someDown) return "live";
   return "updates paused";
 }
@@ -286,12 +297,15 @@ export interface RowView {
   readonly label: Label;
   /** The failure of the thread's stream that waits for a retry, if any. */
   readonly error: StreamError | null;
+  /** The stream's latest forward read failed in transport; it is retried on backoff. */
+  readonly retrying: boolean;
 }
 
 export function rowView(s: State, row: HostRow): RowView {
   const stream = s.streams[threadStream(row.info.thread_id)];
   const copy = stream?.copy;
   const error = stream?.error ?? null;
+  const retrying = stream?.lastRead === "down" && error === null;
   if (copy?.kind === "thread") {
     return {
       info: row.info,
@@ -301,6 +315,7 @@ export function rowView(s: State, row: HostRow): RowView {
       attention: copy.attention,
       label: null,
       error,
+      retrying,
     };
   }
   return {
@@ -311,5 +326,6 @@ export function rowView(s: State, row: HostRow): RowView {
     attention: row.info.attention,
     label: row.fromSnapshot ? "last known" : "unavailable",
     error,
+    retrying,
   };
 }

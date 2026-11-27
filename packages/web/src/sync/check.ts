@@ -87,31 +87,21 @@ export function windowProblems(sim: Sim, thread: string): string[] {
   const head = sim.server.head(key);
   if (!w || w.thread !== thread) return ["no window for the selected thread"];
   // A failed history read is not retried automatically: it shows its error and a Retry.
+  // The window it leaves is still checked below, before any Retry.
   if (w.error) {
     out.push(`${HISTORY_FAILED}: ${w.error.message}`);
     if (!w.pending) out.push("window error without a pending read");
-    return out;
+  } else if (w.pending) {
+    out.push(`history read unresolved: ${w.pending.purpose}`);
   }
-  if (w.pending) out.push(`history read unresolved: ${w.pending.purpose}`);
   const log = sim.server.log(key);
   const want = log.slice(w.lo - 1, w.hi);
   if (w.events.length !== w.hi - w.lo + 1) out.push("window length != hi - lo + 1");
   if (JSON.stringify(w.events) !== JSON.stringify(want)) out.push(`window ${w.lo}..${w.hi} differs from the log`);
   if (w.hi > head) out.push(`window hi ${w.hi} > head ${head}`);
   if (w.attached && w.hi !== head) out.push(`attached window ends at ${w.hi}, head ${head}`);
-  // The retained range the intent asks for. An attached window holds at least the tail
-  // page, reaches seq 1, or cannot take the next older event within the caps; a detached
-  // one (Older past the cap, then Newer) is full at one of its ends.
-  const fits = (seq: number) => {
-    const e = log[seq - 1];
-    return e !== undefined && w.events.length + 1 <= s.cfg.windowMaxEvents && w.bytes + bytesOf(e) <= s.cfg.windowMaxBytes;
-  };
-  if (w.attached && w.lo > 1 && fits(w.lo - 1) && w.events.length < s.cfg.backwardLimit) {
-    out.push(`attached window ${w.lo}..${w.hi} short of its tail page`);
-  }
-  if (!w.attached && !((w.lo > 1 && !fits(w.lo - 1)) || !fits(w.hi + 1))) {
-    out.push(`detached window ${w.lo}..${w.hi} is not full at either end`);
-  }
+  // The retained range the navigation intent asks for (oracle.ts).
+  out.push(...sim.oracle.problems(s));
   if (w.events.length > s.cfg.windowMaxEvents) out.push("window over the event cap");
   const bytes = w.events.reduce((n, e) => n + bytesOf(e), 0);
   if (bytes !== w.bytes) out.push(`window bytes ${w.bytes} != ${bytes}`);

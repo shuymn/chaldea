@@ -156,15 +156,15 @@ export type PairResult =
   | { readonly kind: "transport" };
 
 /** `POST /api/pair` with the code from the link. */
-export async function postPair(fetchFn: Fetch, code: string): Promise<PairResult> {
-  const timeout = AbortSignal.timeout(READ_TIMEOUT_MS);
+export async function postPair(fetchFn: Fetch, code: string, signal: AbortSignal): Promise<PairResult> {
+  const any = AbortSignal.any([signal, AbortSignal.timeout(READ_TIMEOUT_MS)]);
   try {
     const res = await fetchFn("/api/pair", {
       ...REQUEST_POLICY,
       method: "POST",
       headers: headers(null, true),
       body: JSON.stringify({ code }),
-      signal: timeout,
+      signal: any,
     });
     if (!res.ok) {
       await res.body?.cancel();

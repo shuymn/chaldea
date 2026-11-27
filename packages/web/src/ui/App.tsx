@@ -27,7 +27,19 @@ export function App(props: { runner: Runner }) {
         <h1 className="text-xl font-bold">Chaldea</h1>
         <StatusBar state={state} />
       </header>
-      {state.generation === null ? (
+      {state.storageFailed && state.generation === undefined ? (
+        <main id="main" className="p-3">
+          <p className="flex flex-wrap items-center gap-2">
+            <span>
+              Browser storage is unavailable, so the pairing cannot be read. Retry, or run{" "}
+              <code>chaldea open</code> again.
+            </span>
+            <button type="button" className="control" onClick={() => void runner.retryStorage()}>
+              Retry
+            </button>
+          </p>
+        </main>
+      ) : state.generation === null ? (
         <main id="main" className="p-3">
           <p>
             This link is spent or expired; run <code>chaldea open</code> again.

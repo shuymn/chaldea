@@ -8,7 +8,7 @@ import type { FetchResult } from "./effects";
 import { threadId } from "./model/server";
 import { seeded } from "./ops";
 import { MODEL_CONFIG, Sim, TEST_CONFIG } from "./sim";
-import { HOST, status, threadStream } from "./state";
+import { HOST, listRows, rowView, status, threadStream } from "./state";
 
 const T1 = threadStream(threadId(1));
 const T2 = threadStream(threadId(2));
@@ -193,6 +193,52 @@ describe("sync.status", () => {
     const next = sim.flight(T1, "forward") ?? -1;
     sim.serve(next);
     sim.deliverId(next);
+    expect(status(sim.state)).toBe("live");
+  });
+
+  test("a failed history read shows on the window only; the page stays live (N1)", () => {
+    const sim = live();
+    sim.dispatch({ type: "older" });
+    const id = sim.flight(T1, "backward") ?? -1;
+    failWith(sim, id, { kind: "timeout" });
+    expect(sim.state.window?.error).not.toBeNull();
+    expect(sim.state.streams[T1]?.lastRead).toBe("ok");
+    expect(status(sim.state)).toBe("live");
+    // Selecting another thread leaves nothing behind that could hold the page.
+    sim.dispatch({ type: "select", thread: threadId(2) });
+    sim.quiesce();
+    expect(status(sim.state)).toBe("live");
+  });
+
+  test("a background stream's failing reads show on its row, not in the page status (N2)", () => {
+    const sim = live();
+    sim.server.message(threadId(2), 3);
+    for (const id of sim.conns.keys()) while (sim.socketStep(id));
+    while (sim.deliverFrame());
+    const bg = sim.flight(T2, "forward") ?? -1;
+    failWith(sim, bg, { kind: "transport" });
+    expect(status(sim.state)).toBe("live");
+    const row = listRows(sim.state).find((r) => r.info.thread_id === threadId(2));
+    expect(row && rowView(sim.state, row).retrying).toBe(true);
+    sim.quiesce();
+    expect(row && rowView(sim.state, row).retrying).toBe(false);
+  });
+
+  test("a history timeout on one thread, then selecting another, does not stick (sol M1)", () => {
+    const sim = seeded();
+    sim.quiesce();
+    sim.dispatch({ type: "visible", threads: [threadId(2)] });
+    sim.dispatch({ type: "select", thread: threadId(2) });
+    sim.quiesce();
+    sim.dispatch({ type: "latest" });
+    const old = sim.flight(T2, "backward") ?? -1;
+    failWith(sim, old, { kind: "timeout" });
+    sim.dispatch({ type: "select", thread: threadId(1) });
+    sim.quiesce();
+    sim.advance(120_000);
+    sim.server.message(threadId(1), 3);
+    sim.quiesce();
+    expect(sim.state.streams[T1]?.copy?.cursor).toBe(sim.server.head(T1));
     expect(status(sim.state)).toBe("live");
   });
 
