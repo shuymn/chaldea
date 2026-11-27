@@ -307,19 +307,20 @@ fn read_fn(
 
 // ---- the driver ---------------------------------------------------------------------------
 
-type Sink = SplitSink<WebSocket, Message>;
-type Sending = Pin<Box<dyn Future<Output = (Sink, Result<(), axum::Error>)> + Send>>;
+pub(crate) type Sink = SplitSink<WebSocket, Message>;
+pub(crate) type Sending = Pin<Box<dyn Future<Output = (Sink, Result<(), axum::Error>)> + Send>>;
 
 /// Close codes (RFC 6455 §7.4.1).
 pub(crate) mod code {
     pub(crate) const AWAY: u16 = 1001;
     pub(crate) const UNSUPPORTED: u16 = 1003;
+    pub(crate) const INVALID_DATA: u16 = 1007;
     pub(crate) const POLICY: u16 = 1008;
     pub(crate) const TOO_BIG: u16 = 1009;
 }
 
 /// The sink: free, or inside the send in flight with its deadline.
-enum Out {
+pub(crate) enum Out {
     Free(Sink),
     Sending(Sending, tokio::time::Instant),
 }
@@ -332,7 +333,7 @@ struct InFlightRead {
 }
 
 /// Sends `msgs` as one send; held by the loop until it completes or its deadline passes.
-fn send(shared: &Arc<Shared>, mut sink: Sink, msgs: Vec<Message>) -> Sending {
+pub(crate) fn send(shared: &Arc<Shared>, mut sink: Sink, msgs: Vec<Message>) -> Sending {
     #[cfg(test)]
     let s = shared.clone();
     #[cfg(not(test))]
@@ -357,7 +358,7 @@ fn send(shared: &Arc<Shared>, mut sink: Sink, msgs: Vec<Message>) -> Sending {
 /// Sends a close frame best effort within `close_grace`, then reads until the peer's close
 /// or the grace ends. A send in flight keeps its own deadline: it gets the earlier of that
 /// deadline and the grace to complete, else the socket is dropped without a close frame.
-async fn close(
+pub(crate) async fn close(
     shared: &Arc<Shared>,
     out: Out,
     stream: &mut SplitStream<WebSocket>,
@@ -398,7 +399,7 @@ async fn close(
 /// immediately before every poll of `f` (after the timer's poll), so a future that became
 /// ready after its deadline is dropped unpolled; `timeout_at` polls the future first and
 /// would deliver it.
-async fn before<F: Future>(deadline: tokio::time::Instant, f: F) -> Option<F::Output> {
+pub(crate) async fn before<F: Future>(deadline: tokio::time::Instant, f: F) -> Option<F::Output> {
     let mut f = pin!(f);
     let mut timer = pin!(socket_timer(deadline));
     std::future::poll_fn(|cx| {
@@ -417,8 +418,19 @@ async fn before<F: Future>(deadline: tokio::time::Instant, f: F) -> Option<F::Ou
     clippy::disallowed_methods,
     reason = "socket timers: a fired timer drops the socket or ticks; results are decided by take_read or before (http-surface §2.6)"
 )]
-fn socket_timer(at: tokio::time::Instant) -> tokio::time::Sleep {
+pub(crate) fn socket_timer(at: tokio::time::Instant) -> tokio::time::Sleep {
     tokio::time::sleep_until(at)
+}
+
+/// Whether a socket read error is a text message that is not UTF-8: tungstenite's `Utf8`
+/// error, found by type in the error's source chain.
+pub(crate) fn bad_utf8(e: &(dyn std::error::Error + 'static)) -> bool {
+    in_source_chain(e, |err| {
+        matches!(
+            err.downcast_ref::<tungstenite::Error>(),
+            Some(tungstenite::Error::Utf8(_))
+        )
+    })
 }
 
 /// Whether a socket read error is an inbound message or frame over the size bound:
@@ -433,7 +445,7 @@ pub(crate) fn too_big(e: &(dyn std::error::Error + 'static)) -> bool {
     })
 }
 
-async fn pending_opt<T>(f: Option<impl Future<Output = T>>) -> T {
+pub(crate) async fn pending_opt<T>(f: Option<impl Future<Output = T>>) -> T {
     match f {
         Some(f) => f.await,
         None => std::future::pending().await,

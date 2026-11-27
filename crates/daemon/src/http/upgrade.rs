@@ -128,6 +128,19 @@ fn asks_close(headers: &HeaderMap) -> bool {
         .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"close"))
 }
 
+/// An attach socket's inbound message and frame bound (`docs/design/t1-attach.md` D10): a
+/// paste of `MAX_PROMPT_BYTES` with every byte JSON-escaped as `\u00XX`, and 4 KiB for the
+/// envelope.
+pub(crate) const ATTACH_INBOUND_BYTES: usize = 6 * chaldea_core::input::MAX_PROMPT_BYTES + 4096;
+
+/// The inbound bound by the ticket's purpose: `events` keeps the configured one.
+fn inbound_limit(purpose: TicketPurpose, events: usize) -> usize {
+    match purpose {
+        TicketPurpose::Events => events,
+        TicketPurpose::Attach(_) => ATTACH_INBOUND_BYTES,
+    }
+}
+
 /// Steps 3–6 of the redemption; every refusal keeps the ticket and releases the task.
 pub(crate) async fn admit(
     shared: Arc<Shared>,
@@ -147,9 +160,10 @@ pub(crate) async fn admit(
         return Err(ApiError::bad_request());
     }
     let wcfg = &shared.cfg.ws;
+    let inbound = inbound_limit(purpose, wcfg.max_message_bytes);
     let ws = ws
-        .max_message_size(wcfg.max_message_bytes)
-        .max_frame_size(wcfg.max_message_bytes)
+        .max_message_size(inbound)
+        .max_frame_size(inbound)
         .max_write_buffer_size(wcfg.max_write_buffer_bytes);
     // The socket slot, held by the socket task from here to its exit.
     let slot = shared

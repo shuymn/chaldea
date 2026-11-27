@@ -31,7 +31,7 @@ mod sync_api;
 mod tickets;
 mod trace;
 mod upgrade;
-mod ws;
+pub(crate) mod ws;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -64,9 +64,11 @@ pub use trace::redact_secrets;
 pub use upgrade::{ShutdownSignal, UpgradeGrant, UpgradedSocket};
 
 pub(crate) use auth::{TOKEN_PREFIX, has_secret_form, verify_in_read};
-pub(crate) use ctx::{OnReply, until_deadline};
+pub(crate) use ctx::{Joined, OnReply, spawn_read, take_read, until_deadline};
 pub(crate) use error::refused;
 pub(crate) use sync_api::{json, no_query, readable_summary, thread_in_path};
+#[cfg(test)]
+pub(crate) use upgrade::ATTACH_INBOUND_BYTES;
 // The seams for components that write without a request (the supervisor's ops).
 pub(crate) use {
     auth::mint_token,
