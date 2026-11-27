@@ -1503,6 +1503,90 @@ async fn paste_2004_toggled_after_encoding() {
     rig.stop().await;
 }
 
+/// R-10: the report wait ends at the unit's own cutoff, taken before its submission. The
+/// submission waits for the op lock while the clock moves half a second; once the clock is
+/// past `not_after` + 1 s (and short of that plus the half second), the held unit answers
+/// `pending`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn report_wait_from_cutoff() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut c, _) = attach(&rig, &live).await;
+    let before = live.child.input().len();
+    let hold = live.child.hold_writes();
+    let ops = rig
+        .sup
+        .entry(live.l)
+        .unwrap()
+        .ops
+        .clone()
+        .lock_owned()
+        .await;
+    let (at, go) = park_sync(&hooks(&rig).submit);
+    c.json(json!({ "type": "paste", "paste_id": "p", "text": "t" }))
+        .await;
+    entered(&at);
+    go.send(()).unwrap();
+    let half = Duration::from_millis(500);
+    rig.clock.advance(half);
+    drop(ops);
+    assert!(hold.wait_entered(soon()));
+    let wait = rig.sup.cfg.attach.unit_wait + crate::supervisor::send::READ_WAIT;
+    rig.clock.advance(wait - half + half / 2);
+    let _p = poker(&rig);
+    assert_eq!(
+        c.text().await,
+        Some(AttachServerMessage::PasteResult {
+            paste_id: "p".into(),
+            outcome: PasteOutcome::Pending,
+            bytes_written: None,
+            reason: None,
+        })
+    );
+    drop(hold);
+    input_has(&rig, &live, b"t").await;
+    assert!(live.child.input().len() > before);
+    rig.stop().await;
+}
+
+/// R-10: a report that comes only after `not_after` + 1 s is late even when the loop finds
+/// it ready together with the deadline: `pending`, as for `key`; the unit is settled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_report_is_pending() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let h = hooks(&rig);
+    let (mut c, _) = attach(&rig, &live).await;
+    let hold = live.child.hold_writes();
+    c.json(json!({ "type": "paste", "paste_id": "p", "text": "t" }))
+        .await;
+    assert!(hold.wait_entered(soon()));
+    // The loop parks before its select; the report becomes ready after the deadline.
+    let (at, go) = park_sync(&h.sampled);
+    h.tick();
+    entered(&at);
+    rig.clock
+        .advance(rig.sup.cfg.attach.unit_wait + crate::supervisor::send::READ_WAIT);
+    drop(hold);
+    rig.until("the unit settled", || sl.state().human_unsettled == 0)
+        .await;
+    go.send(()).unwrap();
+    assert_eq!(
+        c.text().await,
+        Some(AttachServerMessage::PasteResult {
+            paste_id: "p".into(),
+            outcome: PasteOutcome::Pending,
+            bytes_written: None,
+            reason: None,
+        })
+    );
+    // Settled: the socket submits again.
+    c.binary(b"q").await;
+    input_has(&rig, &live, b"q").await;
+    rig.stop().await;
+}
+
 /// I-2: A's submission runs after B's takeover: its grant is the one fixed at A's swap, so
 /// the writer refuses it (`FenceMoved`), zero bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

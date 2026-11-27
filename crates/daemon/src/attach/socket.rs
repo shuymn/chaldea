@@ -256,8 +256,9 @@ enum Unit {
     Paste(String),
 }
 
-/// A unit's submission, inside `with_session`.
-type Submitted = Result<(WriteTicket, oneshot::Receiver<KeyReport>), Refused>;
+/// A unit's submission, inside `with_session`: the ticket, the report, and the unit's
+/// dispatch deadline (supervisor clock), taken before the submission.
+type Submitted = Result<(WriteTicket, oneshot::Receiver<KeyReport>, Instant), Refused>;
 
 /// Why a unit was not queued.
 #[derive(Debug, Clone, Copy)]
@@ -358,13 +359,14 @@ impl Writer {
         #[cfg(test)]
         let hook = crate::supervisor::lock(&self.cfg.hooks.submit).take();
         Box::pin(async move {
-            // Runs on the socket's task: the socket handles nothing else meanwhile.
+            let now = sup.now();
+            let not_after = now + wait;
+            // After the cutoff is taken; on the socket's task: the socket handles nothing
+            // else meanwhile.
             #[cfg(test)]
             if let Some(f) = hook {
                 f();
             }
-            let now = sup.now();
-            let not_after = now + wait;
             loop {
                 // A raw unit waits until every earlier raw unit of the launch settled, by
                 // its own dispatch deadline.
@@ -396,7 +398,7 @@ impl Writer {
                     .with_session(&sup, now + READ_WAIT, move |s| unit.run(s))
                     .await;
                 return match r {
-                    Ok(Ok(Some(ticket))) => Ok((ticket, rx)),
+                    Ok(Ok(Some(ticket))) => Ok((ticket, rx, not_after)),
                     Ok(Ok(None)) => continue,
                     Ok(Err(e)) => Err(e),
                     Err(SessionError::Busy) => Err(Refused::NotWritten(AttachReason::Busy)),
@@ -1081,8 +1083,8 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                     continue;
                 };
                 match r {
-                    Ok((ticket, rx)) => {
-                        let by = sup.now() + cfg.unit_wait + READ_WAIT;
+                    Ok((ticket, rx, not_after)) => {
+                        let by = not_after + READ_WAIT;
                         outstanding = Some(Outstanding {
                             unit: o.unit,
                             phase: Phase::Waiting { rx, ticket, by },
@@ -1105,6 +1107,12 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                             unit: o.unit,
                             phase: Phase::Stuck(None),
                         });
+                    }
+                    // The deadline decision of `key`: a report at or after `by` is late, so
+                    // the unit is `pending` (it is settled: nothing stays outstanding).
+                    (Phase::Waiting { ticket, by, .. }, Ok(_)) if sup.now() >= by => {
+                        let cancelled = ticket.try_cancel() == Some(true);
+                        ctl.push_back(pending_frame(&o.unit, cancelled));
                     }
                     (_, Ok(report)) => ctl.extend(report_frame(&o.unit, &report)),
                     (Phase::Waiting { ticket, .. }, Err(_)) => {
