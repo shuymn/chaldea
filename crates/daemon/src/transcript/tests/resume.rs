@@ -279,3 +279,25 @@ fn a_line_completed_during_the_final_read_is_stored_whole() {
         (one.len() + two.len()) as u64
     );
 }
+
+/// A line Claude keeps extending through the final read: after `FINAL_TRIES` reads that find
+/// it still growing the tailer ends, the cursor stays before the line, and the line is
+/// recorded as unread.
+#[test]
+fn a_line_growing_through_the_final_read_ends_it_unread() {
+    let fx = Fx::new();
+    let one = assistant("one");
+    fx.write(one.as_bytes());
+    let mut tail = fx.tail();
+    fx.settle(&mut tail);
+    fx.append(b"{\"type\":\"assistant\"");
+    fx.add(vec![support::exited(fx.t, fx.l)]);
+    let be = TestBackend {
+        after_read: Box::new(|| fx.append(b" ")),
+        ..fx.backend()
+    };
+    assert!(matches!(fx.settle_with(&mut tail, &be), Step::End(_)));
+    assert_eq!(shorts(&fx.events()), ["generation:1", "text:one"]);
+    assert_eq!(fx.cursor().unwrap().read_offset, one.len() as u64);
+    assert_eq!(tail.stats.unread, 1);
+}

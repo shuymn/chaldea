@@ -44,7 +44,10 @@ const CHUNK: usize = 64 * 1024;
 /// `MAX_BLOB_BYTES`; the next batch follows at once.
 pub(crate) const BATCH_LINES: usize = 1024;
 const BATCH_MEMORY: usize = crate::store::MAX_BLOB_BYTES;
-/// After `launch_exited`, a final read that fails this many polls in a row ends the tailer.
+/// After `launch_exited`, a final read that fails this many polls in a row ends the tailer;
+/// so does one that finds its last line still growing this many reads in a row (the reads
+/// follow one another at once, so a writer still extending the line would otherwise hold the
+/// tailer, and its participant's budget, without end).
 pub(crate) const FINAL_TRIES: u32 = 3;
 
 const TEXT: &str = "text/plain; charset=utf-8";
@@ -117,6 +120,8 @@ pub(crate) struct Stats {
     pub(crate) late: u32,
     /// Final reads whose prefix check did not complete, logged as unverified.
     pub(crate) unverified: u32,
+    /// Final reads that ended before a line still being written, logged as unread.
+    pub(crate) unread: u32,
 }
 
 /// The stored cursor, as far as the tailer compares it.
@@ -238,6 +243,8 @@ pub(crate) struct Tail {
     /// is stored, the next open starts one whatever its continuity.
     disproved: Option<u64>,
     final_failures: u32,
+    /// Final reads in a row that found their last line still growing.
+    growing: u32,
     /// The last poll's view: the launch's exit stored or not; `None` when the view failed.
     exited: Option<bool>,
     /// The next prefix check sets the stop as it starts (tests).
@@ -258,6 +265,7 @@ impl Tail {
             open: None,
             disproved: None,
             final_failures: 0,
+            growing: 0,
             exited: None,
             #[cfg(test)]
             stop_at_prefix_check: false,
@@ -439,11 +447,15 @@ impl Tail {
             }
         };
         be.after_read();
+        let mut grew = false;
         if let Some(f) = batch.fragment.take() {
             match open.file.size() {
                 // The file goes on past the bytes without a newline: the line is still being
                 // written, and the next batch reads it whole.
-                Ok(size) if size > f.end => batch.more = true,
+                Ok(size) if size > f.end => {
+                    batch.more = true;
+                    grew = true;
+                }
                 Ok(_) => batch.take(f),
                 Err(e) => {
                     self.open = Some(open);
@@ -494,6 +506,14 @@ impl Tail {
         }
         if batch.lines.is_empty() && batch.advance == start {
             self.open = Some(open);
+            if grew {
+                self.growing += 1;
+                if self.growing >= FINAL_TRIES {
+                    self.stats.unread += 1;
+                    tracing::warn!(thread = %self.b.thread_id, launch = %self.b.launch_id, offset = start, "the final read found the transcript's last line still being written {FINAL_TRIES} times; the tailer ends and the line stays unread in the file");
+                    return Ok(Step::End("the last line was still being written".into()));
+                }
+            }
             return Ok(if batch.more {
                 Step::Again
             } else if last {
@@ -516,6 +536,7 @@ impl Tail {
         }
         match be.commit(out) {
             Commit::Done => {
+                self.growing = 0;
                 open.digest = batch.digest;
                 open.pos = batch.advance;
                 open.recent = batch.recent;
