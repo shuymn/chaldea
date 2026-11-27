@@ -6,7 +6,7 @@
 
 **Adds** to `packages/web`: an IME-guarded `<textarea>` composer; `send`, `ready`, `input_resolve`, `input_cancel`, `spawn`, `stop`, `resume`; per-thread inputs; an attention banner; `raw_unknown` counts; Playwright IME tests.
 
-**Leaves** the terminal view, the key bar, and approval answers (raw keys, `card_key`) to T2 (mvp:439, :645); `close`, `task_set`, `mailbox_send`, and `stop --assume-dead` to the CLI; deferred items stay deferred (mvp:446). No daemon endpoint is added (each exists, mvp:211); the only Rust change exports launch-command types (§6).
+**Leaves** the terminal view, the key bar, and approval answers (raw keys, `card_key`) to T2 (mvp:439, :645); `close`, `task_set`, `mailbox_send`, and `stop --assume-dead` to the CLI; deferred items stay deferred (mvp:446). No daemon endpoint is added (each exists, mvp:211); the only Rust change exports the launch-command types (`SpawnArgs`, `SpawnResult`, `ResumeArgs`, `ResumeResult`, `StopArgs`) to TypeScript.
 
 ## 2. Contract
 
@@ -125,30 +125,3 @@ No state offers a resend (mvp:185).
 - **Token scope**: the owner token issues only §2.2's commands; no raw key or attach write (AGENTS:27).
 - **Ready misuse**: a false assertion may land a prompt in a dialog; it is attributed or `unconfirmed`, never resent (mvp:172, :185).
 - **Re-pairing**: a retry under a new token answers `conflict` (http-surface:616).
-
-## 6. Implementation Notes
-
-*Outside the word limit; for the PR brief.*
-
-**Files** (approximate added lines):
-
-- `crates/core/tests/contracts_export.rs`: export TS and JSON Schema for `SpawnArgs`, `SpawnResult`, `ResumeArgs`, `ResumeResult`, `StopArgs` (`command.rs:105-190`; today only `StopResult`/`CloseResult` of the launch commands are exported, `contracts_export.rs:136`, `:176`), +15. Regenerated `packages/contracts/schema/*.json` and `src/generated/*.ts`.
-- `packages/web/src/commands/`: `client.ts` (post, classify per §2.2's table, ~150), `reducer.ts` (pending commands, drafts, single flight, ~250), `commands.test.ts` (~300).
-- `packages/web/src/sync/reducer.ts`, `state.ts`: §2.3 projections (~150); `inputs.test.ts`, `rawunknown.test.ts` (~250).
-- `packages/web/src/ui/`: `Composer.tsx` (+ `keys.ts`, the pure Enter decision, ~200), `Inputs.tsx` (~120), `AttentionBanner.tsx` (~100), `ThreadActions.tsx` (stop, resume, ready dialogs, ~150), `SpawnForm.tsx` (~120), `App.tsx` and `ThreadList.tsx` wiring (~60); `composer.test.ts`, `ui.test.tsx` additions (~250).
-- `packages/web/e2e/`: `composer.spec.ts`, `commands.spec.ts` (~450); `daemon.ts` gains `inputs(thread)` and per-test FakeCli mode (~40).
-
-**`keys.ts`** decides from `{ key, shift, ctrlOrMeta, isComposing, keyCode, composingFlag, timeStamp, lastCompositionEnd, finePointer }` → `ime | newline | submit`; `composer.keys` is a table over every combination, with the 49/50 ms boundary and an inverted (negative) difference.
-
-**`ime_sequences`**: Chromium through CDP `Input.imeSetComposition` / `Input.insertText` and a 229 keydown via `Input.dispatchKeyEvent`; WebKit through dispatched `CompositionEvent` and `KeyboardEvent` (WebKit order: `compositionend` before the confirming keydown, `keyCode` 229 defined on the event). Each sequence asserts zero `POST /api/commands/send` and then one after a real Enter. At 390 px with `hasTouch` and a coarse pointer emulated, plain Enter inserts a newline.
-
-**FakeCli triggers**: `echo` emits a `UserPromptSubmit` per line, so a single-line Japanese and emoji prompt is acked (`send_intact`), and a two-line prompt yields no matching hook and goes `unconfirmed` after 30 s (`unconfirmed_resolve`, test timeout 120 s). No `ready` leaves an input `queued` 60 s for `input_gate_timeout` (`gate_timeout_cancel`). `send_rejected_keeps_draft` sends `!ls` (Claude `lossy_text`, c1-claude-adapter D16). `send_outcome_unknown` aborts the first command response with `page.route` after the request reached the daemon, retries, and asserts one `input_created`.
-
-**Messages**: one table from `ErrorCode` to text, exhaustive by type (a new code fails `tsc`).
-
-### Canonical-doc edits proposed
-
-1. mvp §2.4 "Offline" (:220): "locks input" → "sends no command outside `live`; drafts stay editable".
-2. mvp §4 W2 row (:438) or §6.2: name the `raw_unknown` count source (client-side, "at least" over a snapshot, D5); nothing canonical states it today.
-3. mvp :480 and CL-22 (:616): state the composer rule as §2.1 (the 50 ms window, Enter on fine pointers only, a composing Enter not prevented); CL-22's "W2 Playwright" covers synthesized compositions, real IMEs are P-11.
-4. w1-pwa §2.3 "Status": "W2 locks input" → the wording of item 1.
