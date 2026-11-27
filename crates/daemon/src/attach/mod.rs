@@ -49,6 +49,11 @@ pub(crate) struct AttachConfig {
     pub gone_poll: Duration,
     /// The startup subscription's wait for the op lock and the VT lock.
     pub subscribe_wait: Duration,
+    /// From the upgrade to the takeover at most; past it the candidate closes 4004.
+    /// Above the longest legitimate startup under default timers: the startup read and
+    /// one fresh verification read (5 s each), the handle and the subscription waits
+    /// (250 ms each), and close grace (1 s), 11.5 s.
+    pub candidacy: Duration,
     /// The verification and ping tick in place of the server's `heads_interval` (tests
     /// tick explicitly through [`AttachHooks::tick`]).
     #[cfg(test)]
@@ -151,6 +156,7 @@ impl Default for AttachConfig {
             hold: Duration::from_millis(50),
             gone_poll: Duration::from_secs(1),
             subscribe_wait: Duration::from_millis(250),
+            candidacy: Duration::from_secs(15),
             #[cfg(test)]
             tick_every: Some(Duration::from_secs(24 * 3600)),
             #[cfg(test)]

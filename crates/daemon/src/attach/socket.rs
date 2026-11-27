@@ -669,6 +669,9 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
     let Some(sup) = a.sup.upgrade() else {
         return close(&shared, out, &mut stream, code::AWAY, "shutting_down").await;
     };
+    // The candidacy's one deadline from the upgrade: no subscription delay or nudge
+    // extends it.
+    let candidacy_end = sup.now() + cfg.candidacy;
 
     // Startup: the token, the thread, its live launch.
     let deadline = shared.cfg.clock.now() + shared.cfg.short_deadline;
@@ -820,6 +823,9 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             biased;
             () = shutdown.wait() => {
                 return close(&shared, out, &mut stream, code::AWAY, "shutting_down").await;
+            }
+            () = socket_timer(sup.timer(candidacy_end)) => {
+                return close(&shared, out, &mut stream, close_code::BUSY, "busy").await;
             }
             () = pending_opt(verify_by.map(|d| socket_timer(shared.timer(d)))) => return,
             () = pending_opt(read_by.map(socket_timer)) => return,

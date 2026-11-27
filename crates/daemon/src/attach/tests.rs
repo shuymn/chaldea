@@ -2805,6 +2805,47 @@ async fn revoked_send_discarded() {
     rig.stop().await;
 }
 
+/// The candidacy cap is above the longest legitimate startup under default timers.
+#[test]
+fn candidacy_covers_the_startup_path() {
+    let a = super::AttachConfig::default();
+    let h = crate::http::HttpConfig::new(0);
+    let path = 2 * h.short_deadline + 2 * a.subscribe_wait + h.ws.close_grace;
+    assert!(a.candidacy >= path, "{:?} < {path:?}", a.candidacy);
+}
+
+/// A candidate that has not taken over by the candidacy deadline from its upgrade closes
+/// 4004 and releases its slot, even with its subscription still on the blocking pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn candidacy_cap_releases_the_slot() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let shared = rig.srv.server.shared().clone();
+    let (at, hold_subscribe) = park_sync(&hooks(&rig).subscribed);
+    let connect = tokio::spawn({
+        let ticket = rig
+            .srv
+            .ticket(&rig.owner, &format!("attach:{}", live.t))
+            .await
+            .unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/api/attach/{}?ticket={ticket}",
+            rig.srv.port, live.t
+        );
+        tokio_tungstenite::connect_async(url)
+    });
+    entered(&at);
+    rig.clock.advance(rig.sup.cfg.attach.candidacy);
+    let _p = poker(&rig);
+    let (ws, _) = bounded(WS_WAIT, connect).await.unwrap().unwrap().unwrap();
+    let mut c = Client { ws, closed: None };
+    assert_eq!(c.until_closed().await, (Some(4004), Vec::new()));
+    rig.until("the slot released", || shared.sockets.held() == 0)
+        .await;
+    drop(hold_subscribe);
+    rig.stop().await;
+}
+
 /// A socket task aborted while its startup subscription is still on the blocking pool:
 /// the subscription that registers after the abort is removed (no output needed).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
