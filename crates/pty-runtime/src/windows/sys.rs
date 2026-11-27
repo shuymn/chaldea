@@ -1209,20 +1209,21 @@ pub(crate) fn file_links(h: BorrowedHandle<'_>) -> io::Result<u32> {
 }
 
 /// What `open_regular` reads from an open handle: whether `GetFileType` says a disk file,
-/// its attributes, its volume serial number, and its 64-bit file index
-/// (`GetFileInformationByHandle`).
+/// its attributes, and its identity: the volume serial number and 128-bit file id of
+/// `FileIdInfo`, or, where the file system does not answer that class, the 32-bit serial and
+/// 64-bit file index of `GetFileInformationByHandle` (unique on NTFS, not on ReFS).
 pub(crate) struct HandleFile {
     pub(crate) disk: bool,
     pub(crate) attributes: u32,
-    pub(crate) volume_serial: u32,
-    pub(crate) index: u64,
+    pub(crate) volume_serial: u64,
+    pub(crate) id: u128,
 }
 
 /// [`HandleFile`] of the file open as `h`.
 pub(crate) fn handle_file(h: BorrowedHandle<'_>) -> io::Result<HandleFile> {
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_TYPE_DISK, FILE_TYPE_UNKNOWN, GetFileInformationByHandle,
-        GetFileType,
+        BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO, FILE_TYPE_DISK, FILE_TYPE_UNKNOWN, FileIdInfo,
+        GetFileInformationByHandle, GetFileInformationByHandleEx, GetFileType,
     };
     // SAFETY: the handle is borrowed and valid.
     let kind = unsafe { GetFileType(raw(&h)) };
@@ -1238,7 +1239,7 @@ pub(crate) fn handle_file(h: BorrowedHandle<'_>) -> io::Result<HandleFile> {
             disk: false,
             attributes: 0,
             volume_serial: 0,
-            index: 0,
+            id: 0,
         });
     }
     // SAFETY: a plain-data struct the call fills.
@@ -1247,11 +1248,33 @@ pub(crate) fn handle_file(h: BorrowedHandle<'_>) -> io::Result<HandleFile> {
     if unsafe { GetFileInformationByHandle(raw(&h), &raw mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: a plain-data struct the call fills.
+    let mut ids: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is borrowed and valid; `ids` is a local of the size passed.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            raw(&h),
+            FileIdInfo,
+            (&raw mut ids).cast(),
+            len_u32(std::mem::size_of::<FILE_ID_INFO>()),
+        )
+    } != 0;
+    let (volume_serial, id) = if ok {
+        (
+            ids.VolumeSerialNumber,
+            u128::from_le_bytes(ids.FileId.Identifier),
+        )
+    } else {
+        (
+            u64::from(info.dwVolumeSerialNumber),
+            (u128::from(info.nFileIndexHigh) << 32) | u128::from(info.nFileIndexLow),
+        )
+    };
     Ok(HandleFile {
         disk: true,
         attributes: info.dwFileAttributes,
-        volume_serial: info.dwVolumeSerialNumber,
-        index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        volume_serial,
+        id,
     })
 }
 

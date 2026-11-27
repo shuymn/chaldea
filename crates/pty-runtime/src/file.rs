@@ -11,8 +11,8 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-/// The identity of an open file: device and inode on Unix, volume serial number and file
-/// index on Windows. Two handles with equal ids name the same file.
+/// The identity of an open file: device and inode on Unix, volume serial number and 128-bit
+/// file id on Windows. Two handles with equal ids name the same file.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FileId(String);
 
@@ -36,7 +36,7 @@ pub enum OpenError {
     /// The path is not absolute.
     NotAbsolute,
     /// A Windows device or pipe namespace path (`\\.\`, `\\?\` other than a drive or UNC
-    /// share, `\??\`).
+    /// share, `\??\`, or the UNC share `pipe`).
     DeviceNamespace,
     /// The opened file is not a regular file (a directory, FIFO, socket, or device).
     NotRegular,
@@ -111,6 +111,32 @@ pub fn open_regular(path: &Path) -> Result<RegularFile, OpenError> {
     imp::open_regular(path)
 }
 
+/// Whether the Windows path `text` names the device or pipe namespace: `\\.\…`, the NT
+/// namespace `\??\…`, a verbatim `\\?\…` other than a drive (`\\?\C:\`) or a UNC share
+/// (`\\?\UNC\`), or the named-pipe share `pipe` of any server (`\\server\pipe\…`,
+/// `\\?\UNC\server\pipe\…`), with either separator and in any case.
+#[cfg(any(windows, test))]
+fn device_namespace(text: &str) -> bool {
+    let text = text.replace('/', "\\").to_ascii_lowercase();
+    // The share of a UNC path's `server\share\…` part.
+    let pipe_share = |unc: &str| {
+        unc.split('\\')
+            .nth(1)
+            .is_some_and(|share| share.trim_end_matches(['.', ' ']) == "pipe")
+    };
+    if text.starts_with("\\\\.\\") || text.starts_with("\\??\\") {
+        return true;
+    }
+    if let Some(rest) = text.strip_prefix("\\\\?\\") {
+        if let Some(unc) = rest.strip_prefix("unc\\") {
+            return pipe_share(unc);
+        }
+        let b = rest.as_bytes();
+        return !(b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':');
+    }
+    text.strip_prefix("\\\\").is_some_and(pipe_share)
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use std::fs::OpenOptions;
@@ -139,7 +165,7 @@ mod imp {
 mod imp {
     use std::fs::OpenOptions;
     use std::os::windows::io::AsHandle;
-    use std::path::{Component, Path, Prefix};
+    use std::path::Path;
 
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -149,7 +175,7 @@ mod imp {
     use crate::windows::sys;
 
     pub(super) fn open_regular(path: &Path) -> Result<RegularFile, OpenError> {
-        if device_namespace(path) {
+        if super::device_namespace(&path.as_os_str().to_string_lossy()) {
             return Err(OpenError::DeviceNamespace);
         }
         // std shares read, write, and delete, so the writer keeps appending, renaming, and
@@ -161,24 +187,8 @@ mod imp {
         {
             return Err(OpenError::NotRegular);
         }
-        let id = FileId(format!("{:08x}:{:016x}", info.volume_serial, info.index));
+        let id = FileId(format!("{:016x}:{:032x}", info.volume_serial, info.id));
         Ok(RegularFile { file, id })
-    }
-
-    /// Whether `path` names the device or pipe namespace: `\\.\…`, a verbatim `\\?\…` other
-    /// than a drive (`\\?\C:\`) or a UNC share (`\\?\UNC\`), or the NT namespace `\??\…`,
-    /// with either separator.
-    pub(super) fn device_namespace(path: &Path) -> bool {
-        let text = path.as_os_str().to_string_lossy().replace('/', "\\");
-        if text.starts_with("\\\\.\\") || text.starts_with("\\??\\") {
-            return true;
-        }
-        match path.components().next() {
-            Some(Component::Prefix(p)) => {
-                matches!(p.kind(), Prefix::DeviceNS(_) | Prefix::Verbatim(_))
-            }
-            _ => false,
-        }
     }
 }
 
@@ -246,17 +256,37 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[cfg(windows)]
     #[test]
     fn device_and_pipe_namespaces_are_refused() {
-        for p in [
+        let refused = [
             r"\\.\pipe\chaldea-none",
             r"\\.\NUL",
             "//./pipe/chaldea-none",
             r"\\?\pipe\chaldea-none",
             r"\\?\GLOBALROOT\Device\Null",
             r"\??\C:\work\t.jsonl",
+            r"\\localhost\pipe\chaldea-probe",
+            r"\\server\PIPE\x",
+            "//server/Pipe/x",
+            r"\\server\pipe.\x",
+            r"\\?\UNC\server\pipe\x",
+            r"\\?\unc\server\PiPe\x",
+            "//?/UNC/server/pipe/x",
+        ];
+        for p in refused {
+            assert!(device_namespace(p), "{p}");
+        }
+        for p in [
+            r"\\?\C:\work\t.jsonl",
+            r"\\?\UNC\server\share\t.jsonl",
+            r"\\server\share\pipe\t.jsonl",
+            r"\\server\pipes\t.jsonl",
+            r"C:\work\pipe\t.jsonl",
         ] {
+            assert!(!device_namespace(p), "{p}");
+        }
+        #[cfg(windows)]
+        for p in refused {
             assert!(
                 matches!(
                     open_regular(Path::new(p)),
@@ -265,10 +295,5 @@ mod tests {
                 "{p}"
             );
         }
-        assert!(!imp::device_namespace(Path::new(r"\\?\C:\work\t.jsonl")));
-        assert!(!imp::device_namespace(Path::new(
-            r"\\?\UNC\server\share\t.jsonl"
-        )));
-        assert!(!imp::device_namespace(Path::new(r"C:\work\t.jsonl")));
     }
 }
