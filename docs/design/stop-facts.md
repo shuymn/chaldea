@@ -1,6 +1,6 @@
 # Design: Intake Facts Under Lock Contention (fix/stop-facts)
 
-Narrows supervisor-send L-12 (hooks under held locks lack facts).
+Narrows supervisor-send L-12.
 
 ## 1. Scope
 
@@ -66,13 +66,13 @@ EARS. Red: `old` fails on `fb5f13a3`; `mut` fails under the named mutation; `kep
 | SF-1 | When a Claude `SessionStart` is taken in with the writer parked at `Dispatching`, the binding job shall record `session_start`. | `probe::session_start_beside_parked_writer` | old |
 | SF-2 | When a `Stop` is taken in under that park, the queued input shall send after `SETTLE`. | `human::same_turn_evidence_beside_parked_writer` | old |
 | SF-3 | If a reply was permitted before a `UserPromptSubmit`'s first counter read, its facts shall include the reply or be missing. | `ack::reply_permitted_before_intake` | old; mut: odd store after `Publishing` |
-| SF-4 | Readers shall never accept a mixed triple; retrying returns the new one. | pty `writer::tests::published_positions`, `…_stress` (arm64) | mut: no second counter load |
+| SF-4 | Readers shall never accept a mixed triple; retrying returns the new one. | pty `published_positions`, `…_stress` (arm64) | mut: no second counter load |
 | SF-5 | While `SendState` is held until before `F`, the intake shall wait and return facts; past `F`, `None`; the fence advances once; a later completion is no fact. | `probe::state_wait`, `ack::completion_during_intake` | old |
 | SF-6 | A record committing during the `SendState` wait shall count before the intake point. | `turn_order::record_during_state_wait` | old |
 | SF-7 | While an intake waits, ticket drops, `earlier_released`, other launches, and timers proceed. | `hook::tests::intake::waiting_intake_blocks_nothing` | old |
 | SF-8 | When a hook arrives after creation and before publication, the intake shall wait until publication or removal (made after the wait began) or `F`. | `claude::session_start_before_publication` (old), `…_after_deadline` (kept), `live::observe_removed` (mut: `removed` ignored), `live::poll_sees_later_change` (mut: sleep straight to `F`) | per test |
 | SF-9 | If cancelled or expired before the start point, the intake shall take no ordinal; after it, a 408 or drop finishes it once. | `hook::tests::intake::drop_waiting_for_pool`, `deadline_before_ordinal`, `drop_after_ordinal`, `deadline_during_wait` | mut: start cell ignored; dispatch check removed (a pool task appears) |
-| SF-10 | When a wait reaches `F`, it shall return within `F` plus one attempt, with facts if that attempt saw them; past `F` with request time left, 200. | `pool_past_facts_deadline`, `claude::published_at_facts_deadline` | mut: no final attempt |
+| SF-10 | When a wait reaches `F`, it shall return within `F` plus one attempt, with facts if that attempt saw them; past `F` with request time left, 200. | `probe::pool_past_facts_deadline`, `probe::state_at_facts_deadline` (mut: no final attempt); `claude::published_at_facts_deadline` (kept) | per test |
 | SF-11 | While the writer is parked or the map held, a candidate shall settle; one removed before observation or job shall not. | `evidence::settle_beside_parked_writer` (old), `…_beside_held_map` (old), `…_after_removal` (kept), `…_removed_before_job` (old) | per test |
 | SF-12 | If an intake unwinds after the fence advance, it shall finish once without marks, releasing `pending` and the fence; before, only its ordinal. | `hook::tests::intake::panic_after_advance`, `panic_before_advance` | mut: guard armed early or late |
 | SF-13 | Kept: a record after the read leaves its unit running; an older fence word gets `FenceMoved`; facts-missing hooks fail closed (PR10b-CL-4, CL-11). | `record_during_intake_keeps_running`, `gate::fence`, facts-missing cases | kept |
