@@ -340,14 +340,17 @@ async fn state_at_facts_deadline() {
     let live = rig.claude().await;
     let p = probe_of(&rig);
     let sl = rig.sl(&live);
-    let (free, holder) = hold_state(&sl);
-    let s2 = sl.clone();
-    set(&sl.hooks.state_final_wake, move || {
-        free.send(()).unwrap();
-        holder.join().unwrap();
-        drop(s2);
-    });
-    let (f, g) = intake(&p, live.l, 20, Instant::now() + Duration::from_millis(50));
+    // The worker parked first, so the final attempt meets no other holder.
+    let (f, g) = rig
+        .worker_parked(&live, async {
+            let (free, holder) = hold_state(&sl);
+            set(&sl.hooks.state_final_wake, move || {
+                free.send(()).unwrap();
+                holder.join().unwrap();
+            });
+            intake(&p, live.l, 20, Instant::now() + Duration::from_millis(50))
+        })
+        .await;
     assert!(
         super::super::lock(&sl.hooks.state_final_wake).is_none(),
         "the final wake ran"

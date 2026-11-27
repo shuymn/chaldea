@@ -797,6 +797,14 @@ async fn settle_beside_held_map() {
     rig.stop().await;
 }
 
+/// Wakes `live`'s worker and waits until it ended: its launch was removed, so the pass that
+/// ran the test point is its last.
+async fn worker_ends(rig: &SRig, live: &Live, sl: &crate::supervisor::send::SendLaunch) {
+    sl.wake.notify_one();
+    rig.until("the worker ended", || rig.sup.send.launch(live.l).is_none())
+        .await;
+}
+
 /// SF-11 (kept): a launch removed from the live map between the pass's read and its
 /// observation does not settle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -806,7 +814,7 @@ async fn settle_after_removal() {
     let sup = rig.sup.clone();
     let l = live.l;
     set(&sl.hooks.after_read, move || sup.remove(l));
-    rig.pass(&live).await;
+    worker_ends(&rig, &live, &sl).await;
     assert!(super::super::lock(&sl.hooks.after_read).is_none());
     assert_eq!(count(&rig, &live, "stop_settled"), 0);
     rig.stop().await;
@@ -821,7 +829,7 @@ async fn settle_removed_before_job() {
     let sup = rig.sup.clone();
     let l = live.l;
     set(&sl.hooks.settle_job, move || sup.remove(l));
-    rig.pass(&live).await;
+    worker_ends(&rig, &live, &sl).await;
     assert!(
         super::super::lock(&sl.hooks.settle_job).is_none(),
         "the job ran"
