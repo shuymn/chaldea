@@ -229,6 +229,43 @@ async fn initial_screen_gapless() {
     rig.stop().await;
 }
 
+/// T1-2 at the boundary: the drain holds the VT lock inside a piece while the socket's
+/// subscription waits for it; once released, the piece is in the snapshot and not in the
+/// binary output, and the next piece is exactly the later bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_boundary_held() {
+    use chaldea_pty_runtime::fake::ProbePoint;
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let probe = rig.probe(&live).await;
+    let park = probe.park(ProbePoint::PieceParsing);
+    live.child.emit(b"hello");
+    assert!(probe.wait(ProbePoint::PieceParsing, 1, soon()));
+    let subscribing = probe.count(ProbePoint::Subscribing);
+    let open = tokio::spawn({
+        let ticket = rig
+            .srv
+            .ticket(&rig.owner, &format!("attach:{}", live.t))
+            .await
+            .unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/api/attach/{}?ticket={ticket}",
+            rig.srv.port, live.t
+        );
+        tokio_tungstenite::connect_async(url)
+    });
+    assert!(probe.wait(ProbePoint::Subscribing, subscribing + 1, soon()));
+    drop(park);
+    let (ws, _) = bounded(WS_WAIT, open).await.unwrap().unwrap().unwrap();
+    let mut c = Client { ws, closed: None };
+    let first = c.text().await.expect("attached");
+    let grid = grid_of(&first).expect("a grid");
+    assert!(grid[0].concat().ends_with("hello"), "{grid:?}");
+    live.child.emit(b" world");
+    assert_eq!(c.output_until(b" world").await, b" world");
+    rig.stop().await;
+}
+
 /// T1-3: the first resize at an equal size nudges a row and back; a later equal size is a
 /// no-op; each attempt answers `size`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

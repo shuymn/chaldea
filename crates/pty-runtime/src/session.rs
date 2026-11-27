@@ -577,6 +577,7 @@ impl Shared {
         if self.sealed() {
             return Err(SubscribeError::Closed);
         }
+        crate::probe!(self, Subscribing);
         let mut st = try_lock_until(&self.vt, deadline).ok_or(SubscribeError::VtUnavailable)?;
         if self.vt_failed.load(Ordering::Acquire) {
             return Err(SubscribeError::VtUnavailable);

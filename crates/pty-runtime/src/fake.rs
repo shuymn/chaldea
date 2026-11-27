@@ -934,6 +934,8 @@ pub enum ProbePoint {
     ReleaseControl,
     /// The close, about to compute its join step's deadline.
     CloseJoin,
+    /// A subscription about to wait for the VT lock.
+    Subscribing,
 }
 
 impl ProbePoint {
@@ -950,6 +952,7 @@ impl ProbePoint {
             ProbePoint::HandoffClose => 8,
             ProbePoint::ReleaseControl => 9,
             ProbePoint::CloseJoin => 10,
+            ProbePoint::Subscribing => 11,
         }
     }
 }
@@ -967,8 +970,8 @@ pub enum DeadlineSite {
 
 #[derive(Default)]
 struct ProbeState {
-    counts: [u64; 11],
-    armed: [Option<u64>; 11],
+    counts: [u64; 12],
+    armed: [Option<u64>; 12],
     released: Vec<u64>,
     next: u64,
     deadlines: Vec<(DeadlineSite, Instant)>,
