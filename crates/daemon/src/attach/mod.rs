@@ -60,6 +60,8 @@ pub(crate) struct AttachConfig {
 pub(crate) struct AttachHooks {
     /// Wakes every socket loop to recompute its timers (after the test clock moved).
     pub poke: tokio::sync::Notify,
+    /// Run, last first, inside verification reads after their snapshot was taken.
+    pub verify: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>>,
     /// Terminal events latched, by every socket.
     pub latched: std::sync::atomic::AtomicU64,
     /// Runs at the next unit's submission, before `with_session`, on the socket's task.

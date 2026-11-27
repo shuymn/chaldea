@@ -83,11 +83,23 @@ fn startup_read(
 /// A verification read: whether the token is still valid.
 fn verify_read(
     sha: [u8; 32],
+    #[cfg(test)] hooks: Arc<super::AttachHooks>,
 ) -> impl FnOnce(&ReadTx<'_>) -> Result<bool, StoreError> + Send + 'static {
-    move |tx| match verify_hash_in(tx, &sha) {
-        Ok(_) => Ok(true),
-        Err(AuthFailure::Invalid) => Ok(false),
-        Err(AuthFailure::Store(e)) => Err(e),
+    move |tx| {
+        let r = match verify_hash_in(tx, &sha) {
+            Ok(_) => Ok(true),
+            Err(AuthFailure::Invalid) => Ok(false),
+            Err(AuthFailure::Store(e)) => Err(e),
+        };
+        // After the read's snapshot was taken.
+        #[cfg(test)]
+        {
+            let hook = crate::supervisor::lock(&hooks.verify).pop();
+            if let Some(f) = hook {
+                f();
+            }
+        }
+        r
     }
 }
 
@@ -224,7 +236,6 @@ struct Outstanding {
 struct Verifying {
     handle: tokio::task::JoinHandle<Result<bool, crate::store::ReadError>>,
     deadline: Instant,
-    timer: tokio::time::Instant,
     /// The nudge count when it started: an older read does not answer a newer nudge.
     generation: u64,
 }
@@ -571,7 +582,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
     let mut verified_generation: u64 = 0;
     // Set when a nudge found both read slots taken: the socket drops at this instant unless
     // a read started after the nudge answers first.
-    let mut verify_by: Option<tokio::time::Instant> = None;
+    let mut verify_by: Option<Instant> = None;
     let mut verify_due = false;
     let mut ending: Option<(Ending, Instant)> = None;
     let mut ended_sent = false;
@@ -605,13 +616,20 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             verify_due = false;
             let deadline = shared.cfg.clock.now() + shared.cfg.short_deadline;
             *slot = Some(Verifying {
-                handle: spawn_read(&shared, deadline, verify_read(sha)),
+                handle: spawn_read(
+                    &shared,
+                    deadline,
+                    verify_read(
+                        sha,
+                        #[cfg(test)]
+                        cfg.hooks.clone(),
+                    ),
+                ),
                 deadline,
-                timer: shared.timer(deadline),
                 generation,
             });
         } else if verify_due && verify_by.is_none() {
-            verify_by = verifying.iter().flatten().map(|v| v.timer).min();
+            verify_by = verifying.iter().flatten().map(|v| v.deadline).min();
         }
         // The next unit, when none is outstanding (D6).
         if outstanding.is_none() && ending.is_none() {
@@ -748,11 +766,11 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             _ => (None, None),
         };
         let [v0, v1] = &mut verifying;
-        let verify_timer = verifying_min(v0.as_ref(), v1.as_ref());
+        let verify_timer = verifying_min(v0.as_ref(), v1.as_ref()).map(|d| shared.timer(d));
         let ev = tokio::select! {
             biased;
             () = shutdown.wait() => Ev::Shutdown,
-            () = pending_opt(verify_by.map(socket_timer)) => Ev::Dropped,
+            () = pending_opt(verify_by.map(|d| socket_timer(shared.timer(d)))) => Ev::Dropped,
             () = pending_opt(verify_timer.map(socket_timer)) => Ev::Dropped,
             j = pending_opt(v0.as_mut().map(|v| &mut v.handle)) => Ev::Verified(0, j),
             j = pending_opt(v1.as_mut().map(|v| &mut v.handle)) => Ev::Verified(1, j),
@@ -992,8 +1010,8 @@ async fn poked(cfg: &AttachConfig) {
     }
 }
 
-fn verifying_min(a: Option<&Verifying>, b: Option<&Verifying>) -> Option<tokio::time::Instant> {
-    [a, b].into_iter().flatten().map(|v| v.timer).min()
+fn verifying_min(a: Option<&Verifying>, b: Option<&Verifying>) -> Option<Instant> {
+    [a, b].into_iter().flatten().map(|v| v.deadline).min()
 }
 
 fn report_by_of(o: &Outstanding) -> Option<Instant> {

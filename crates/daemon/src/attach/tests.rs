@@ -1650,3 +1650,86 @@ async fn lag_stalled_releases_slot() {
     assert_eq!(c.until_closed().await, (None, Vec::new()));
     rig.stop().await;
 }
+
+/// Pushes `n` verification-read parks; returns the channel that hears each park's index
+/// as it is entered, and the releases by index.
+fn park_verify_reads(
+    rig: &SRig,
+    n: usize,
+) -> (
+    std::sync::mpsc::Receiver<usize>,
+    Vec<std::sync::mpsc::Sender<()>>,
+) {
+    let (entered_tx, entered) = std::sync::mpsc::channel::<usize>();
+    let mut gos = Vec::new();
+    let h = hooks(rig);
+    let mut v = h.verify.lock().unwrap();
+    for i in 0..n {
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        gos.push(go);
+        let tx = entered_tx.clone();
+        v.push(Box::new(move || {
+            let _ = tx.send(i);
+            let _ = wait.recv_timeout(Duration::from_secs(30));
+        }));
+    }
+    (entered, gos)
+}
+
+fn next_entered(rx: &std::sync::mpsc::Receiver<usize>) -> usize {
+    tokio::task::block_in_place(|| rx.recv_timeout(Duration::from_secs(30)))
+        .expect("a verification read parked")
+}
+
+/// I-7: a verification parked after its snapshot when the token is revoked: the nudge
+/// starts a fresh read at once, which closes the socket while the stale one is parked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_read_parked_in_snapshot() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let owner = rig.srv.token(TokenKind::Owner, None, None).await;
+    let mut a = open_as(&rig, &owner, live.t).await.expect("a 101");
+    assert!(matches!(
+        a.text().await,
+        Some(AttachServerMessage::Attached { .. })
+    ));
+    let (entered, gos) = park_verify_reads(&rig, 1);
+    next_entered(&entered);
+    rig.srv.revoke(&owner).await;
+    assert_eq!(a.until_closed().await.0, Some(1008));
+    drop(gos);
+    rig.stop().await;
+}
+
+/// I-7: both read slots held by reads from before the revocation; the nudge's fresh read
+/// can start only after a stale one ends, and the socket drops by the stale reads' own
+/// deadline even though fresh reads are still in flight; no stale success keeps it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn saturated_reads_drop_by_original_deadline() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let owner = rig.srv.token(TokenKind::Owner, None, None).await;
+    let mut a = open_as(&rig, &owner, live.t).await.expect("a 101");
+    assert!(matches!(
+        a.text().await,
+        Some(AttachServerMessage::Attached { .. })
+    ));
+    let (entered, gos) = park_verify_reads(&rig, 4);
+    let first = next_entered(&entered);
+    let second = next_entered(&entered);
+    // The stale reads' deadline is the short deadline from now; fresh reads start later.
+    let short = rig.srv.server.shared().cfg.short_deadline;
+    rig.clock.advance(Duration::from_secs(1));
+    rig.srv.revoke(&owner).await;
+    // Both stale reads answer `true`; fresh reads take their slots and park.
+    gos[first].send(()).unwrap();
+    gos[second].send(()).unwrap();
+    next_entered(&entered);
+    next_entered(&entered);
+    rig.clock.advance(short - Duration::from_secs(1));
+    let _p = poker(&rig);
+    let (code, texts) = a.until_closed().await;
+    assert_eq!((code, texts), (None, Vec::new()));
+    drop(gos);
+    rig.stop().await;
+}
