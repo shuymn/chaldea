@@ -488,3 +488,40 @@ async fn a_participant_cut_before_the_final_reads_logs_them_unverified() {
     close.go();
     rig.srv.stop().await;
 }
+
+/// A writer that keeps writing through the final read at shutdown (a Claude that outlived its
+/// recorded exit, completing lines and starting new ones): the tailer reads on, and the
+/// participant still returns by its end with the tailer ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_final_read_with_a_writer_that_keeps_writing_ends_by_the_participants_end() {
+    use std::io::Write;
+    let rig = rig().await;
+    let (t, l) = spawn_claude(&rig).await;
+    let files = bind(&rig, t, l, LINE).await;
+    rig.until("the line is stored", || texts(&rig, t) == ["ok"])
+        .await;
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let done = done.clone();
+        let path = files.path().join("session.jsonl");
+        std::thread::spawn(move || {
+            let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            let (head, rest) = LINE.split_at(LINE.len() / 2);
+            while !done.load(Ordering::Relaxed) {
+                f.write_all(head.as_bytes()).unwrap();
+                std::thread::sleep(Duration::from_micros(200));
+                f.write_all(rest.as_bytes()).unwrap();
+            }
+        })
+    };
+    let budget = Duration::from_secs(1);
+    let started = Instant::now();
+    let _ = shutdown(rig.sup.clone(), rig.sup.now() + budget).await;
+    let took = started.elapsed();
+    done.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(took < budget + Duration::from_millis(500), "{took:?}");
+    rig.until("the tailer ended", || rig.sup.tailers.launches().is_empty())
+        .await;
+    rig.srv.stop().await;
+}
