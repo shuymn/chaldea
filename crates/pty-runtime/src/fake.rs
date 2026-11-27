@@ -826,8 +826,14 @@ pub enum ProbePoint {
     /// The drain is about to parse a piece, with the VT lock held.
     PieceParsing,
     /// The writer is about to decide a unit's first write permission, with the queue lock
-    /// held: every check but the final deadline check has passed.
+    /// held: every check but the final deadline check has passed. Before the publication's
+    /// odd counter store.
     Dispatching,
+    /// The writer granted a write permission (a unit's first, or a reply's dequeue), with the
+    /// queue lock held and the publication's counter odd, before the position store.
+    Publishing,
+    /// A reader of the published positions loaded the first position, before the others.
+    BetweenPositionLoads,
 }
 
 impl ProbePoint {
@@ -839,14 +845,16 @@ impl ProbePoint {
             ProbePoint::Permitted => 3,
             ProbePoint::PieceParsing => 4,
             ProbePoint::Dispatching => 5,
+            ProbePoint::Publishing => 6,
+            ProbePoint::BetweenPositionLoads => 7,
         }
     }
 }
 
 #[derive(Default)]
 struct ProbeState {
-    counts: [u64; 6],
-    armed: [Option<u64>; 6],
+    counts: [u64; 8],
+    armed: [Option<u64>; 8],
     released: Vec<u64>,
     next: u64,
 }

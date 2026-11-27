@@ -335,7 +335,7 @@ impl Supervisor {
         };
         drop(map);
         if let Some(p) = entry.published() {
-            return match p.observer.try_last_started_each() {
+            return match p.observer.published_last_started(None) {
                 Some(last_started) => LaunchObservation::Started {
                     reference: p.reference,
                     last_started,

@@ -72,7 +72,10 @@ const COUNT_MAX: u64 = (1 << (64 - OPEN_BITS)) - 1;
 pub(crate) const FENCE_CLOSED: u64 = u64::MAX;
 
 /// One intake taken in: both counts up by one with one compare-and-swap; an add that would
-/// overflow either field closes the word instead. The closed word never changes.
+/// overflow either field closes the word instead. The closed word never changes. The
+/// successful swap is `SeqCst`: with the writer's `SeqCst` publication and fence load, either
+/// the writer's dispatch check sees this advance or the intake's later read of the published
+/// positions sees that dispatch (send §2.5 "Intake facts").
 pub(crate) fn fence_advance(word: &AtomicU64) {
     let mut cur = word.load(Ordering::Acquire);
     loop {
@@ -84,7 +87,7 @@ pub(crate) fn fence_advance(word: &AtomicU64) {
         } else {
             cur + (1 << OPEN_BITS) + 1
         };
-        match word.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+        match word.compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::Acquire) {
             Ok(_) => return,
             Err(seen) => cur = seen,
         }
