@@ -253,6 +253,8 @@ pub(crate) struct SendState {
     pub held: Vec<Fired>,
     /// The records the exit job copied at its first attempt (send §2.3 "After exit").
     pub exit_set: Option<Vec<(WriteRecord, Decided)>>,
+    /// The opened input the exit job took the lease from, decided at its first attempt.
+    pub exit_unsubmitted: Option<Option<InputId>>,
 }
 
 /// Test points inside a launch's send side (send §6 "Host speed").

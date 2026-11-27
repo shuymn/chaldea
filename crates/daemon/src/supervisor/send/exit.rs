@@ -53,6 +53,29 @@ impl SendExitStep {
         }
         st.exit_set.clone().unwrap_or_default()
     }
+
+    /// The input whose open committed `sending` and whose submission has not converted the
+    /// lease yet: the exit takes the lease from it, so the submission never writes, and the
+    /// input wrote zero bytes. Decided at the exit job's first attempt, the same on every
+    /// retry.
+    fn unsubmitted(&self, exit: &ExitFacts) -> Option<chaldea_core::ids::InputId> {
+        let sl = self.0.launch(exit.launch_id)?;
+        let mut st = sl.state();
+        if st.exit_unsubmitted.is_none() {
+            let held = match st.lease {
+                Some(super::Lease {
+                    kind: super::LeaseKind::Send(input),
+                    ..
+                }) if st.running.is_none() => Some(input),
+                _ => None,
+            };
+            if held.is_some() {
+                sl.clear_lease(&mut st);
+            }
+            st.exit_unsubmitted = Some(held);
+        }
+        st.exit_unsubmitted.flatten()
+    }
 }
 
 impl ExitStep for SendExitStep {
@@ -62,11 +85,17 @@ impl ExitStep for SendExitStep {
         for rec in &exit.sealed {
             match rec.origin {
                 WriteOrigin::Input { input_id } => {
-                    sealed_input(tx, exit, input_id, rec).map_err(store_err)?;
+                    let cause = IdempotencyKey(format!("sealed:{}:{}", exit.launch_id, rec.seq));
+                    zero_bytes_input(tx, exit, input_id, &cause).map_err(store_err)?;
                 }
                 _ => human_write_in(tx, thread, launch, rec, &Decided::default())
                     .map_err(store_err)?,
             }
+        }
+        // An opened input never submitted wrote zero bytes.
+        if let Some(input) = self.unsubmitted(exit) {
+            let cause = IdempotencyKey(format!("unsubmitted:{launch}:{input}"));
+            zero_bytes_input(tx, exit, input, &cause).map_err(store_err)?;
         }
         for (rec, decided) in self.exit_set(exit) {
             human_write_in(tx, thread, launch, &rec, &decided).map_err(store_err)?;
@@ -117,13 +146,13 @@ impl ExitStep for SendExitStep {
     }
 }
 
-/// A sealed input unit's record, applied in the exit job after `launch_exited`: the input,
-/// if still `sending`, is cancelled (zero bytes).
-fn sealed_input(
+/// An input unit that wrote zero bytes (sealed, or opened and never submitted), applied in
+/// the exit job after `launch_exited`: the input, if still `sending`, is cancelled.
+fn zero_bytes_input(
     tx: &mut WriteTx<'_>,
     exit: &ExitFacts,
     input: chaldea_core::ids::InputId,
-    rec: &WriteRecord,
+    cause: &IdempotencyKey,
 ) -> Result<(), JobError> {
     let Some(row) = tx.read().input(input)? else {
         return Ok(());
@@ -133,9 +162,8 @@ fn sealed_input(
     }
     let t = thread_row(tx, exit.thread_id)?;
     let mut job = ThreadJob::new(exit.thread_id, t.agent, t.state, SourceKind::Process, None);
-    let cause = IdempotencyKey(format!("sealed:{}:{}", exit.launch_id, rec.seq));
     job.step_input(
-        &cause,
+        cause,
         &row,
         &InputInput::RecheckFailed,
         None,

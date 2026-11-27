@@ -8,6 +8,7 @@ mod flow;
 mod gate;
 mod human;
 mod interval;
+mod lease;
 mod outcomes;
 mod probe;
 mod timers;
