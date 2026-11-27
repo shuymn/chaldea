@@ -1,6 +1,6 @@
 # The same checks CI runs: the workflow linters of the shared gha workflow, the
-# secret scan of the shared security workflow, and the workspace and specs checks
-# of ci.yml (tests and the specs simulation on push, since they take several
+# secret scan of the shared security workflow, and the workspace, web, and specs
+# checks of ci.yml (tests and the specs simulation on push, since they take several
 # seconds).
 pre-commit:
   commands:
@@ -81,6 +81,15 @@ pre-commit:
         - "specs/package.json"
         - "specs/pnpm-*.yaml"
       run: 'mise exec -- pnpm install --frozen-lockfile --silent && mise exec -- pnpm run --silent typecheck && mise exec -- pnpm run --silent traces:check'
+    # The web job of ci.yml (docs/design/w1-pwa.md §3 D8): typecheck and Vitest of
+    # packages/contracts, each after its codegen. Vitest reads the core golden cases too.
+    web-check:
+      root: packages/contracts/
+      glob:
+        - "packages/**"
+        - "crates/core/tests/golden/**"
+        - "pnpm-*.yaml"
+      run: 'mise exec -- pnpm install --frozen-lockfile --silent && mise exec -- pnpm run --silent typecheck && mise exec -- pnpm run --silent test'
 
 pre-push:
   commands:
