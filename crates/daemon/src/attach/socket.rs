@@ -353,6 +353,23 @@ enum Ev {
     Resized(Result<ResizeOut, tokio::task::JoinError>),
 }
 
+/// A unit's input as submitted.
+enum Input {
+    /// Raw frames, each kept whole for the marker rule's final decision; the flag: the
+    /// last frame was deferred, so its partial-marker hold applies once it is accepted.
+    Raw(Vec<Vec<u8>>, bool),
+    /// A paste's encoded bytes and the mode sampled before its encoding.
+    Paste(Vec<u8>, ModeView),
+}
+
+/// The bytes one submission attempt writes.
+enum Payload<'a> {
+    /// Borrowed: a raw unit is decided again on every attempt.
+    Raw(&'a [Vec<u8>], bool),
+    /// Moved into the unit's one part: a paste is submitted once.
+    Paste(Vec<u8>),
+}
+
 /// The pieces a unit's submission needs.
 struct Writer {
     sup: Arc<Supervisor>,
@@ -367,15 +384,10 @@ struct Writer {
 }
 
 impl Writer {
-    /// Submits `bytes` as one attach unit (R-4): its guard carries the socket's grant, a
+    /// Submits `input` as one attach unit (R-4): its guard carries the socket's grant, a
     /// 30 s dispatch deadline, and for a paste on a bracketed-paste row the mode epoch
-    /// `paste` sampled before its encoding (D5).
-    fn submit(
-        &self,
-        frames: Vec<Vec<u8>>,
-        hold_last: bool,
-        paste: Option<ModeView>,
-    ) -> Pin<Box<dyn Future<Output = Submitted> + Send>> {
+    /// sampled before its encoding (D5).
+    fn submit(&self, mut input: Input) -> Pin<Box<dyn Future<Output = Submitted> + Send>> {
         let (sup, entry, sl, fence) = (
             self.sup.clone(),
             self.entry.clone(),
@@ -383,8 +395,10 @@ impl Writer {
             self.fence.clone(),
         );
         let wait = self.cfg.unit_wait;
-        let needs_2004 = paste.filter(|_| self.paste_on_2004);
-        let paste = paste.is_some();
+        let needs_2004 = match &input {
+            Input::Paste(_, m) if self.paste_on_2004 => Some(*m),
+            _ => None,
+        };
         let la = self.la.clone();
         #[cfg(test)]
         let hook = crate::supervisor::lock(&self.cfg.hooks.submit).take();
@@ -403,7 +417,7 @@ impl Writer {
                 }
                 // A raw unit waits until every earlier raw unit of the launch settled, by
                 // its own dispatch deadline.
-                if !paste {
+                if matches!(input, Input::Raw(..)) {
                     let mut settled = pin!(la.settled.notified());
                     settled.as_mut().enable();
                     if crate::supervisor::lock(&la.marks).unsettled > 0 {
@@ -421,9 +435,10 @@ impl Writer {
                     sl: sl.clone(),
                     la: la.clone(),
                     fence: fence.clone(),
-                    frames: frames.clone(),
-                    hold_last,
-                    paste,
+                    payload: match &mut input {
+                        Input::Raw(frames, hold_last) => Payload::Raw(frames, *hold_last),
+                        Input::Paste(bytes, _) => Payload::Paste(std::mem::take(bytes)),
+                    },
                     needs_2004,
                     not_after: sup.real(not_after),
                     report: tx,
@@ -458,22 +473,19 @@ impl Writer {
     }
 }
 
-/// One unit's submission inside `with_session`.
-struct Submit {
+/// One unit's submission attempt inside `with_session`.
+struct Submit<'a> {
     sl: Arc<SendLaunch>,
     la: Arc<LaunchAttach>,
     fence: Fence,
-    frames: Vec<Vec<u8>>,
-    /// The last frame was deferred: its partial-marker hold applies once accepted.
-    hold_last: bool,
-    paste: bool,
+    payload: Payload<'a>,
     /// The mode at encoding, for a paste on a bracketed-paste row.
     needs_2004: Option<ModeView>,
     not_after: Instant,
     report: oneshot::Sender<KeyReport>,
 }
 
-impl Submit {
+impl Submit<'_> {
     /// The ticket with the bytes queued and the raw bytes refused, or `None` when an
     /// earlier raw unit is unsettled again (another socket submitted one meanwhile): the
     /// caller waits and retries.
@@ -488,27 +500,29 @@ impl Submit {
             recheck: None,
             fence: Some(self.fence),
         };
-        if self.paste {
-            let bytes = self.frames.concat();
-            let len = bytes.len();
-            return self
-                .sl
-                .submit_human(
-                    s,
-                    WriteUnit::bytes(WriteOrigin::Attach, bytes),
-                    guard,
-                    Some(self.report),
-                )
-                .map(|t| {
-                    Some(Decided {
-                        ticket: Some(t),
-                        len,
-                        refused: 0,
-                        held: Vec::new(),
+        let (frames, hold_last) = match self.payload {
+            Payload::Raw(frames, hold_last) => (frames, hold_last),
+            Payload::Paste(bytes) => {
+                let len = bytes.len();
+                return self
+                    .sl
+                    .submit_human(
+                        s,
+                        WriteUnit::bytes(WriteOrigin::Attach, bytes),
+                        guard,
+                        Some(self.report),
+                    )
+                    .map(|t| {
+                        Some(Decided {
+                            ticket: Some(t),
+                            len,
+                            refused: 0,
+                            held: Vec::new(),
+                        })
                     })
-                })
-                .map_err(|e| Refused::NotWritten(submit_reason(e)));
-        }
+                    .map_err(|e| Refused::NotWritten(submit_reason(e)));
+            }
+        };
         // The marker rule's final decision (R-6): every earlier raw unit settled, so the
         // tail is what the PTY received before this unit; a frame that would complete a
         // marker is refused whole, the others are written.
@@ -517,7 +531,7 @@ impl Submit {
             if m.unsettled > 0 {
                 return Ok(None);
             }
-            let (bytes, refused, held) = decide_frames(&m.tail, &self.frames, self.hold_last);
+            let (bytes, refused, held) = decide_frames(&m.tail, frames, hold_last);
             if bytes.is_empty() {
                 if held.is_empty() {
                     return Err(Refused::NotWritten(AttachReason::PasteMarker));
@@ -991,7 +1005,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             outstanding = match pending.next() {
                 Some(Item::Raw(b, hold_last)) => Some(Outstanding {
                     unit: Unit::Raw(b.iter().map(Vec::len).sum()),
-                    phase: Phase::Submitting(writer.submit(b, hold_last, None)),
+                    phase: Phase::Submitting(writer.submit(Input::Raw(b, hold_last))),
                 }),
                 Some(Item::Paste { id, text }) => {
                     // The mode is sampled before the encoding; the writer refuses the unit
@@ -1000,7 +1014,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                     match writer.paste_bytes(&text) {
                         Ok(b) => Some(Outstanding {
                             unit: Unit::Paste(id),
-                            phase: Phase::Submitting(writer.submit(vec![b], false, Some(modes))),
+                            phase: Phase::Submitting(writer.submit(Input::Paste(b, modes))),
                         }),
                         Err(reason) => {
                             ctl.push_back(AttachServerMessage::PasteResult {
