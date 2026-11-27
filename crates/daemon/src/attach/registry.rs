@@ -1,0 +1,161 @@
+//! The per-launch attach registry (`docs/design/t1-attach.md` D2, I-2): the operating
+//! socket of each launch, its grant, and the launch's fence word for attach writes and
+//! resizes. Nothing here calls the session: the caller unsubscribes the replaced socket on
+//! the blocking pool after the registry lock is released.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use chaldea_core::ids::LaunchId;
+use chaldea_pty_runtime::{Fence, SessionHandle, SubscriptionId};
+use tokio::sync::Notify;
+
+use crate::supervisor::lock;
+
+/// A socket's replacement signal: set once, then notified.
+#[derive(Default)]
+pub(crate) struct Replaced {
+    set: AtomicBool,
+    notify: Notify,
+}
+
+impl Replaced {
+    fn fire(&self) {
+        self.set.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+
+    /// Resolves once the socket was replaced.
+    pub(crate) async fn wait(&self) {
+        while !self.set.load(Ordering::Acquire) {
+            self.notify.notified().await;
+        }
+    }
+}
+
+/// The launch's operating socket.
+struct Current {
+    socket: u64,
+    sub: SubscriptionId,
+    /// The socket's output sink accepts bytes while set.
+    active: Arc<AtomicBool>,
+    handle: SessionHandle,
+    replaced: Arc<Replaced>,
+}
+
+/// A candidate's parts, registered by [`LaunchAttach::swap`] once its subscription exists.
+pub(crate) struct Candidate {
+    pub socket: u64,
+    pub sub: SubscriptionId,
+    pub active: Arc<AtomicBool>,
+    pub handle: SessionHandle,
+    pub replaced: Arc<Replaced>,
+}
+
+/// The subscription a swap or an end leaves to the caller to remove.
+pub(crate) type Removed = (SessionHandle, SubscriptionId);
+
+/// One launch's attach state.
+pub(crate) struct LaunchAttach {
+    /// Moved at every swap and by every terminal path of the current socket: a unit or a
+    /// resize whose `expect` is an older grant is refused.
+    pub word: Arc<AtomicU64>,
+    current: Mutex<Option<Current>>,
+    /// The last bytes of raw input accepted for writing, in write order across sockets
+    /// (the marker rule's context).
+    pub tail: Mutex<Vec<u8>>,
+}
+
+impl LaunchAttach {
+    /// The candidate becomes current with the next grant; the replaced socket's sink stops,
+    /// it is told to close 4003, and its subscription is returned for removal.
+    pub(crate) fn swap(&self, c: Candidate) -> (u64, Option<Removed>) {
+        let mut cur = lock(&self.current);
+        let grant = self.word.load(Ordering::Acquire).wrapping_add(1);
+        self.word.store(grant, Ordering::Release);
+        let old = cur.replace(Current {
+            socket: c.socket,
+            sub: c.sub,
+            active: c.active,
+            handle: c.handle,
+            replaced: c.replaced,
+        });
+        drop(cur);
+        let removed = old.map(|o| {
+            o.active.store(false, Ordering::Release);
+            o.replaced.fire();
+            (o.handle, o.sub)
+        });
+        (grant, removed)
+    }
+
+    /// Revokes `socket`'s grant if it is still current: its permitted work settles, nothing
+    /// else of it reaches the PTY. The entry stays until [`LaunchAttach::end`].
+    pub(crate) fn revoke(&self, socket: u64) {
+        let cur = lock(&self.current);
+        if cur.as_ref().is_some_and(|c| c.socket == socket) {
+            self.word.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// `socket`'s exit: when it is still current, the word moves, then its entry is
+    /// cleared and its subscription returned for removal. Another socket's entry is never
+    /// touched.
+    pub(crate) fn end(&self, socket: u64) -> Option<Removed> {
+        let mut cur = lock(&self.current);
+        if cur.as_ref().is_none_or(|c| c.socket != socket) {
+            return None;
+        }
+        self.word.fetch_add(1, Ordering::AcqRel);
+        let c = cur.take()?;
+        c.active.store(false, Ordering::Release);
+        Some((c.handle, c.sub))
+    }
+
+    /// The fence of a socket holding `grant`.
+    pub(crate) fn fence(&self, grant: u64) -> Fence {
+        Fence {
+            word: self.word.clone(),
+            expect: grant,
+        }
+    }
+
+    fn idle(&self) -> bool {
+        lock(&self.current).is_none()
+    }
+}
+
+/// Every launch's attach state, and the socket ids.
+#[derive(Default)]
+pub(crate) struct Registry {
+    launches: Mutex<HashMap<LaunchId, Arc<LaunchAttach>>>,
+    next_socket: AtomicU64,
+}
+
+impl Registry {
+    pub(crate) fn socket_id(&self) -> u64 {
+        self.next_socket.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub(crate) fn launch(&self, l: LaunchId) -> Arc<LaunchAttach> {
+        lock(&self.launches)
+            .entry(l)
+            .or_insert_with(|| {
+                Arc::new(LaunchAttach {
+                    word: Arc::new(AtomicU64::new(0)),
+                    current: Mutex::new(None),
+                    tail: Mutex::new(Vec::new()),
+                })
+            })
+            .clone()
+    }
+
+    /// Forgets `l` once no socket operates it and its session is gone.
+    pub(crate) fn forget_if_idle(&self, l: LaunchId, live: bool) {
+        let mut map = lock(&self.launches);
+        if !live && map.get(&l).is_some_and(|la| la.idle()) {
+            map.remove(&l);
+        }
+    }
+}

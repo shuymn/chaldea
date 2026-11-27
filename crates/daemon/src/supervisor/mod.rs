@@ -21,7 +21,7 @@ pub(crate) mod commands;
 mod components;
 mod events;
 mod exit;
-mod live;
+pub(crate) mod live;
 mod ops;
 pub(crate) mod prober;
 pub(crate) mod record;
