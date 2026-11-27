@@ -353,26 +353,33 @@ impl Snapshot {
     }
 }
 
+/// A row's cells up to its last non-blank one: trailing blank `Single` cells omitted.
+fn kept(line: &Line) -> &[Cell] {
+    let keep = line
+        .cells
+        .iter()
+        .rposition(|c| !c.is_blank())
+        .map_or(0, |i| i + 1);
+    &line.cells[..keep]
+}
+
 /// The §2.6 rows of `lines`: each row's cell strings, trailing blank `Single` cells
 /// omitted.
 #[must_use]
 pub fn grid_rows(lines: &[Line]) -> Vec<Vec<String>> {
     lines
         .iter()
-        .map(|line| {
-            let keep = line
-                .cells
-                .iter()
-                .rposition(|c| !c.is_blank())
-                .map_or(0, |i| i + 1);
-            line.cells[..keep].iter().map(|c| c.text.clone()).collect()
-        })
+        .map(|line| kept(line).iter().map(|c| c.text.clone()).collect())
         .collect()
 }
 
 /// JSON rows of cell strings; trailing blank `Single` cells omitted.
 fn encode_grid(lines: &[Line]) -> String {
-    serde_json::to_string(&grid_rows(lines)).expect("string rows always serialize")
+    let rows: Vec<Vec<&str>> = lines
+        .iter()
+        .map(|line| kept(line).iter().map(|c| c.text.as_str()).collect())
+        .collect();
+    serde_json::to_string(&rows).expect("string rows always serialize")
 }
 
 /// Why a grid is unreadable.
