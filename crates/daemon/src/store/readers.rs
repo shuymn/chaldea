@@ -66,6 +66,9 @@ pub(crate) struct Pool {
     faults: std::sync::Arc<super::writer::Faults>,
     state: Mutex<PoolState>,
     cv: Condvar,
+    /// Waits begun, counted under the lock just before it is released (tests).
+    #[cfg(test)]
+    waits: std::sync::atomic::AtomicU32,
 }
 
 impl Pool {
@@ -82,14 +85,22 @@ impl Pool {
                 drained: false,
             }),
             cv: Condvar::new(),
+            #[cfg(test)]
+            waits: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
     fn borrow(&self, wait_until: Instant) -> Result<Connection, ReadError> {
         let mut s = lock(&self.state);
+        let mut waited = false;
         loop {
             if s.closed {
                 return Err(ReadError::Closed);
+            }
+            // After a wait, a reader freed once `wait_until` passed is not lent: the deadline
+            // is checked under the lock, just before the lend.
+            if waited && Instant::now() >= wait_until {
+                return Err(ReadError::Busy);
             }
             if let Some(c) = s.idle.pop() {
                 return Ok(c);
@@ -98,11 +109,15 @@ impl Pool {
             if now >= wait_until {
                 return Err(ReadError::Busy);
             }
+            #[cfg(test)]
+            self.waits
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
             s = self
                 .cv
                 .wait_timeout(s, wait_until - now)
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
+            waited = true;
         }
     }
 
@@ -1671,5 +1686,47 @@ pub(crate) mod launch_reads {
         if let Some(read) = lock(&WATCHED).get_mut(&l) {
             *read = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use rusqlite::Connection;
+
+    use super::{Pool, ReadError, lock};
+
+    /// A reader freed while a borrower waits, but taken in only after the borrower's deadline
+    /// passed, is not lent.
+    #[test]
+    fn a_reader_freed_past_the_deadline_is_not_lent() {
+        let pool = Pool::new(Vec::new(), std::sync::Arc::default());
+        let wait_until = Instant::now() + Duration::from_millis(200);
+        std::thread::scope(|sc| {
+            let waiter = sc.spawn(|| pool.borrow(wait_until).map(drop));
+            // Once the lock is taken after the wait was counted, the borrower waits; the
+            // reader comes back under the lock, which is held past the deadline.
+            while pool.waits.load(std::sync::atomic::Ordering::Acquire) == 0
+                && !waiter.is_finished()
+            {
+                std::thread::yield_now();
+            }
+            let mut s = lock(&pool.state);
+            // The reader comes back while the borrower waits.
+            assert!(pool.waits.load(std::sync::atomic::Ordering::Acquire) > 0);
+            assert!(
+                !waiter.is_finished(),
+                "the borrower ended before the reader came back"
+            );
+            s.idle.push(Connection::open_in_memory().unwrap());
+            s.open += 1;
+            std::thread::sleep(
+                wait_until.saturating_duration_since(Instant::now()) + Duration::from_millis(50),
+            );
+            drop(s);
+            pool.cv.notify_all();
+            assert!(matches!(waiter.join().unwrap(), Err(ReadError::Busy)));
+        });
     }
 }

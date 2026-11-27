@@ -18,6 +18,7 @@ use crate::lifecycle::{
     receipts_reconciler,
 };
 use crate::store::Store;
+use crate::transcript::Mode;
 
 use super::commands::{CloseHandler, ResumeHandler, SpawnHandler, StopHandler};
 use super::live::LiveMap;
@@ -152,6 +153,7 @@ pub(crate) fn new_supervisor(
         instance,
         probe_slots: Arc::new(tokio::sync::Semaphore::new(super::PROBE_SLOTS)),
         version_left: super::version::VersionLeft::default(),
+        tailers: crate::transcript::Tailers::default(),
     })
 }
 
@@ -215,6 +217,8 @@ pub(crate) async fn shutdown(sup: Arc<Supervisor>, end: Instant) -> ParticipantE
     let _ = sup.window.set(Window { close_end, end });
     // Step 1.
     sup.tracker.close_admission();
+    // No transcript poll starts once admission is closed.
+    sup.tailers.set(Mode::Hold);
     // Step 2, in parallel with steps 3–5.
     let git = git_step(&sup, end);
     let ptys = async {
@@ -241,12 +245,64 @@ pub(crate) async fn shutdown(sup: Arc<Supervisor>, end: Instant) -> ParticipantE
         });
         futures_util::future::join_all(closes).await;
     };
-    tokio::join!(git, ptys);
+    // After the exits are recorded, each transcript tailer makes its final read, joined
+    // within the budget so none holds a store reader once the store shuts down.
+    let ptys_then_tails = async {
+        let left = TailsLeft(&sup);
+        ptys.await;
+        sup.tailers.set(Mode::Final);
+        #[cfg(test)]
+        sup.pauses().at(Pause::ShutdownTailJoin).await;
+        let joined = futures_util::future::join_all(sup.tailers.tasks());
+        let in_time = settle_before(|| sup.now(), end, sup.timer(end), joined)
+            .await
+            .in_time()
+            .is_some();
+        if !in_time {
+            sup.tailers.set(Mode::Stop);
+            let launches = sup.tailers.launches();
+            tracing::warn!(
+                ?launches,
+                "a transcript tailer did not end within the shutdown budget; its final read's continuity is unverified"
+            );
+        }
+        // Joined, or the tailers left are logged above.
+        std::mem::forget(left);
+        in_time
+    };
+    let ((), tails_ended) = tokio::join!(git, ptys_then_tails);
     // Step 6.
-    if sup.tracker.empty_before(end).await {
+    if sup.tracker.empty_before(end).await && tails_ended {
         ParticipantEnd::Clean
     } else {
         ParticipantEnd::LeftRunning
+    }
+}
+
+/// Dropped with the participant cut at its end before it joined the transcript tailers: the
+/// tailers are stopped, and the launches whose tailers are left are logged as unverified,
+/// since their final reads may never run.
+struct TailsLeft<'a>(&'a Supervisor);
+
+impl Drop for TailsLeft<'_> {
+    fn drop(&mut self) {
+        // The launches as cut: a stopped tailer leaves the list without its final read.
+        let launches = self.0.tailers.launches();
+        self.0.tailers.set(Mode::Stop);
+        #[cfg(test)]
+        self.0.pauses().blocking(super::Pause::TailsLeftStopped);
+        if launches.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            ?launches,
+            "the shutdown participant was cut before the transcript tailers' final reads; their continuity is unverified"
+        );
+        #[cfg(test)]
+        self.0
+            .tailers
+            .abandoned_unverified
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

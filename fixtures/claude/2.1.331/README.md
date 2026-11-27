@@ -1,4 +1,4 @@
-# Claude Code 2.1.331 hook fixtures
+# Claude Code 2.1.331 hook and transcript fixtures
 
 Captured on macOS from a real `claude` 2.1.331 launched by the daemon with its
 `claude-settings.json` in place and no decoder (`NoDecoder`), so every hook was kept as
@@ -17,6 +17,23 @@ Each `<Event>-<n>.meta.json` holds, from the captures and independent of the dec
 (`bind`, `interpret`, or `foreign_session`, as the daemon routed it), and for a
 `UserPromptSubmit`, `sent` (the text the daemon sent, `null` for a prompt Claude generated) and
 `expected_prompt` (the recorded prompt, literally).
+
+`<case>/transcript.jsonl` is an excerpt of the session transcript Claude wrote during that case
+(`~/.claude/projects/<cwd>/<session>.jsonl`): selected whole lines, in the file's order, scrubbed
+like the hooks (also the emitter path, now `/work/bin/chaldea`, and each thinking `signature`,
+now `scrubbed`), and written back as compact JSON. Lines that carry the capture host's own
+setup (skill, tool, and instruction listings, the system prompt in `api-request-shape` and most
+`api-request-blob` lines) are left out. `transcript.meta.json` holds the number of lines and the
+events the tailer stores from them, from the captures: one `assistant_message` per `assistant`
+line with a `text` block (the text blocks concatenated, `occurred_at` its `timestamp`); every
+other line is a known type that stores nothing.
+
+| Case | Line types in the excerpt |
+|---|---|
+| `plain-turn` | `mode`, `permission-mode`, `atis-latch`, `file-history-snapshot`, `user`, `attachment`, `api-request`, `last-prompt`, `assistant` (text), `system`, `ai-title`, `cost-state` |
+| `permission-approved` | `file-history-snapshot`, `user` (prompt, `tool_result`), `api-request`, `api-request-blob`, `last-prompt`, `tools-used`, `assistant` (`tool_use`, text), `ai-title`, `system` |
+| `subagent` | `ai-title`, `tools-used`, `assistant` (`tool_use`, thinking, text), `user` (`tool_result`, meta, `<task-notification>`), `system`, `file-history-snapshot`, `queue-operation` |
+| `corpus-wrapped-small` | `data-flow-records`, `atis-latch`, `ai-title`, `assistant` (thinking, text), `data-flow-incomplete`, `system`, `api-request` |
 
 ## Cases
 
