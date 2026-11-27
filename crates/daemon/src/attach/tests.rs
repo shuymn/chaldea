@@ -466,23 +466,28 @@ async fn owner_only() {
     rig.stop().await;
 }
 
-/// D2, I-2: a newer socket takes over (4003); the old socket's queued input is never
-/// written after it.
+/// D2, I-2: a newer socket takes over (4003); the old socket's unit, queued behind a held
+/// write when the takeover moved the fence, is refused at its dispatch: zero bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn old_enter_after_disconnect_and_reattach() {
     let rig = SRig::new().await;
     let live = rig.claude().await;
+    let sl = rig.sl(&live);
     let (mut a, _) = attach(&rig, &live).await;
+    // Another human unit holds the writer.
     let hold = live.child.hold_writes();
-    a.binary(b"q").await;
+    let other = rig.attach(&live, b"k").await;
     assert!(hold.wait_entered(std::time::Instant::now() + Duration::from_secs(10)));
-    // The held write is permitted; the next unit of A queues behind it.
+    // A's Enter is queued behind it.
     a.binary(b"\r").await;
+    rig.until("A's unit queued", || sl.state().human_unsettled == 2)
+        .await;
     let (_b, _) = attach(&rig, &live).await;
-    let (code, _) = a.until_closed().await;
-    assert_eq!(code, Some(4003));
+    let (code, texts) = a.until_closed().await;
+    assert_eq!(code, Some(4003), "{texts:?}");
     drop(hold);
-    rig.until("settled", || rig.sl(&live).state().human_unsettled == 0)
+    other.await.unwrap();
+    rig.until("settled", || sl.state().human_unsettled == 0)
         .await;
     assert!(!live.child.input().contains(&b'\r'), "no Enter of A");
     rig.stop().await;
@@ -552,6 +557,366 @@ async fn worst_case_escape_fits() {
     assert!(escaped.len() <= crate::http::ATTACH_INBOUND_BYTES);
     assert_eq!(text.len(), MAX_PROMPT_BYTES);
     c.ws.send(WsMessage::Text(escaped.into())).await.unwrap();
+    let Some(AttachServerMessage::PasteResult { outcome, .. }) = c.text().await else {
+        panic!("a paste result")
+    };
+    assert_eq!(outcome, PasteOutcome::Written);
+    rig.stop().await;
+}
+
+/// R-10: every writer refusal and submission error maps to its reason.
+#[test]
+fn refusal_mapping() {
+    use chaldea_pty_runtime::{Refusal, SubmitError};
+
+    use super::{refusal_reason, submit_reason};
+    assert_eq!(refusal_reason(&Refusal::Expired), AttachReason::Expired);
+    assert_eq!(
+        refusal_reason(&Refusal::BracketedPasteChanged),
+        AttachReason::BracketedPasteOff
+    );
+    for r in [
+        Refusal::Cancelled,
+        Refusal::Closed,
+        Refusal::ChildExited,
+        Refusal::InputBroken,
+        Refusal::FenceMoved,
+        Refusal::WriteSinceBasis { seq: 1 },
+        Refusal::BasisUnknown { basis: 1, head: 2 },
+        Refusal::Recheck("x".into()),
+        Refusal::RecheckPanicked,
+    ] {
+        assert_eq!(refusal_reason(&r), AttachReason::NotWritten, "{r:?}");
+    }
+    assert_eq!(
+        submit_reason(SubmitError::QueueFull),
+        AttachReason::QueueFull
+    );
+    for e in [
+        SubmitError::Closed,
+        SubmitError::BadShape("x"),
+        SubmitError::UnitTooLarge,
+        SubmitError::ReplyOrigin,
+    ] {
+        assert_eq!(submit_reason(e), AttachReason::NotWritten, "{e:?}");
+    }
+}
+
+/// The index of the first event matching `f` in the child's log.
+fn first_in_log(live: &Live, f: impl Fn(&FakeEvent) -> bool) -> Option<usize> {
+    live.child.log().iter().position(f)
+}
+
+/// I-3: a send that committed its open holds the lease: a resize arriving meanwhile starts
+/// only after the unit's writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resize_waits_for_opened_send() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut c, _) = attach(&rig, &live).await;
+    let sl = rig.sl(&live);
+    let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    crate::supervisor::send::tests::set_hook(&sl.hooks.before_submit, move || {
+        let _ = entered_tx.send(());
+        tokio::task::block_in_place(|| {
+            let _ = wait.recv();
+        });
+    });
+    let id = rig.send(&live, "prompt").await;
+    tokio::task::block_in_place(|| entered.recv_timeout(Duration::from_secs(30)))
+        .expect("the send parked before its submission");
+    assert_eq!(
+        rig.input(id).state,
+        chaldea_core::input::InputState::Sending
+    );
+    c.json(json!({ "type": "resize", "cols": 100, "rows": 30 }))
+        .await;
+    rig.until("the resize waits for the lease", || {
+        sl.lease_waits.load(std::sync::atomic::Ordering::SeqCst) > 0
+    })
+    .await;
+    assert!(resizes(&live).is_empty());
+    go.send(()).unwrap();
+    assert!(matches!(
+        c.text().await,
+        Some(AttachServerMessage::Size { ok: true, .. })
+    ));
+    let write = first_in_log(&live, |e| matches!(e, FakeEvent::Write(_))).unwrap();
+    let resize = first_in_log(&live, |e| matches!(e, FakeEvent::Resize(_))).unwrap();
+    assert!(write < resize, "{:?}", live.child.log());
+    rig.until_input(id, chaldea_core::input::InputState::Sent)
+        .await;
+    rig.stop().await;
+}
+
+/// I-3: a resize held in the backend keeps the lease: the queued input stays queued and
+/// opens after the resize returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_waits_for_resize() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut c, _) = attach(&rig, &live).await;
+    let hold = live.child.hold_resizes();
+    c.json(json!({ "type": "resize", "cols": 100, "rows": 30 }))
+        .await;
+    assert!(hold.wait_entered(std::time::Instant::now() + Duration::from_secs(10)));
+    let id = rig.send(&live, "prompt").await;
+    rig.pass(&live).await;
+    assert_eq!(rig.input(id).state, chaldea_core::input::InputState::Queued);
+    drop(hold);
+    assert!(matches!(
+        c.text().await,
+        Some(AttachServerMessage::Size { ok: true, .. })
+    ));
+    rig.until_input(id, chaldea_core::input::InputState::Sent)
+        .await;
+    rig.stop().await;
+}
+
+/// I-7: a revocation closes the socket 1008.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_closes_1008() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let owner = rig.srv.token(TokenKind::Owner, None, None).await;
+    let mut c = open_as(&rig, &owner, live.t).await.expect("a 101");
+    assert!(matches!(
+        c.text().await,
+        Some(AttachServerMessage::Attached { .. })
+    ));
+    rig.srv.revoke(&owner).await;
+    let (code, _) = c.until_closed().await;
+    assert_eq!(code, Some(1008));
+    rig.stop().await;
+}
+
+/// T1-1: against the real attach handler, a ticket of another purpose or thread is 401
+/// and stays unspent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn production_mount_admission() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let other = rig.claude().await;
+    let events = rig.srv.ticket(&rig.owner, "events").await.unwrap();
+    let attach_t = rig
+        .srv
+        .ticket(&rig.owner, &format!("attach:{}", live.t))
+        .await
+        .unwrap();
+    for (path, ticket) in [
+        (format!("/api/attach/{}", live.t), &events),
+        (format!("/api/attach/{}", other.t), &attach_t),
+    ] {
+        let url = format!("ws://127.0.0.1:{}{path}?ticket={ticket}", rig.srv.port);
+        match tokio_tungstenite::connect_async(url).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(r)) => {
+                assert_eq!(r.status().as_u16(), 401, "{path}");
+            }
+            other => panic!("{path}: {other:?}"),
+        }
+    }
+    let url = format!(
+        "ws://127.0.0.1:{}/api/attach/{}?ticket={attach_t}",
+        rig.srv.port, live.t
+    );
+    let (ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("unspent");
+    let mut c = Client { ws, closed: None };
+    assert!(matches!(
+        c.text().await,
+        Some(AttachServerMessage::Attached { .. })
+    ));
+    rig.stop().await;
+}
+
+/// T1-9: `/api/ws` keeps its 64 KiB inbound bound; attach refuses only above its own (the
+/// 1009 is best effort: the peer may still be writing when the socket closes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn events_limit_unchanged() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let mut ws = rig.srv.ws(&rig.owner).await;
+    ws.text(&"x".repeat(64 * 1024 + 1)).await;
+    assert_eq!(ws.until_closed().await.0, Some(1009));
+    let (mut c, _) = attach(&rig, &live).await;
+    let before = live.child.input().len();
+    let _ =
+        c.ws.send(WsMessage::Text(
+            format!(
+                r#"{{"type":"paste","paste_id":"p","text":"{}"}}"#,
+                "x".repeat(crate::http::ATTACH_INBOUND_BYTES)
+            )
+            .into(),
+        ))
+        .await;
+    let (code, texts) = c.until_closed().await;
+    assert!(matches!(code, Some(1009) | None), "{code:?}");
+    assert!(texts.is_empty(), "{texts:?}");
+    assert_eq!(live.child.input().len(), before);
+    rig.stop().await;
+}
+
+/// T1-9: a text frame that is not UTF-8 closes 1007.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_utf8_closes_1007() {
+    use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut c, _) = attach(&rig, &live).await;
+    let f = Frame::message(vec![0xff, 0xfe], OpCode::Data(Data::Text), true);
+    c.ws.send(WsMessage::Frame(f)).await.unwrap();
+    assert_eq!(c.until_closed().await.0, Some(1007));
+    rig.stop().await;
+}
+
+/// D8, I-8: output over the buffer's budget sends exactly the prefix before it, then 4002.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lag_prefix_then_4002() {
+    let rig = SRig::with(|c| c.attach.out_max = 16).await;
+    let live = rig.claude().await;
+    let (mut c, _) = attach(&rig, &live).await;
+    // Two pieces: the first is parsed (and buffered for the socket) before the second.
+    let rx = rig.watch(&live).await;
+    live.child.emit(b"abc");
+    SRig::delivered(&rx, b"abc").await;
+    live.child.emit(&[b'z'; 64]);
+    let mut out = Vec::new();
+    while let Some(f) = c.next().await {
+        match f {
+            Frame::Binary(b) => out.extend(b),
+            Frame::Text(m) => panic!("unexpected {m:?}"),
+        }
+    }
+    assert_eq!(out, b"abc");
+    assert_eq!(c.closed, Some(Some(4002)));
+    rig.stop().await;
+}
+
+/// I-8: a lag latched before the output's end still closes 4002 (the first event wins).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lag_then_gone_keeps_4002() {
+    let rig = SRig::with(|c| c.attach.out_max = 16).await;
+    let live = rig.claude().await;
+    let (mut c, _) = attach(&rig, &live).await;
+    live.child.emit(&[b'z'; 64]);
+    live.child.close_output();
+    let (code, texts) = c.until_closed().await;
+    assert_eq!((code, texts), (Some(4002), Vec::new()));
+    rig.stop().await;
+}
+
+/// The serialized `attached` of a fresh socket on `live`.
+async fn attached_len(rig: &SRig, live: &Live) -> (usize, AttachServerMessage) {
+    let (_c, first) = attach(rig, live).await;
+    (serde_json::to_string(&first).unwrap().len(), first)
+}
+
+/// T1-2: `attached` at exactly its bound keeps the grid; one byte less and the envelope
+/// pushes it over: `grid: null`, everything else the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attached_at_cutoff() {
+    for under in [0, 1] {
+        let rig = SRig::new().await;
+        let live = rig.claude().await;
+        let rx = rig.watch(&live).await;
+        live.child.emit(b"\x1b[2J\x1b[Hscreen \xe3\x81\x82 \"q\"");
+        SRig::delivered(&rx, b"\"q\"").await;
+        let (len, full) = attached_len(&rig, &live).await;
+        rig.stop().await;
+
+        let rig = SRig::with(|c| c.attach.attached_max = len - under).await;
+        let live = rig.claude().await;
+        let rx = rig.watch(&live).await;
+        live.child.emit(b"\x1b[2J\x1b[Hscreen \xe3\x81\x82 \"q\"");
+        SRig::delivered(&rx, b"\"q\"").await;
+        let (_, got) = attached_len(&rig, &live).await;
+        let strip = |m: AttachServerMessage| match m {
+            AttachServerMessage::Attached {
+                cols,
+                rows,
+                cursor,
+                modes,
+                grid,
+                ..
+            } => (cols, rows, cursor, modes, grid.is_some()),
+            other => panic!("{other:?}"),
+        };
+        let (want, got) = (strip(full), strip(got));
+        assert_eq!(got.4, under == 0, "under {under}");
+        assert_eq!(
+            (want.0, want.1, want.2, want.3),
+            (got.0, got.1, got.2, got.3)
+        );
+        rig.stop().await;
+    }
+}
+
+/// I-6: a DSR the child emits is answered by the daemon's responder alone; the attached
+/// client sends nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dsr_answered_once() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (_c, _) = attach(&rig, &live).await;
+    let before = live.child.input().len();
+    live.child.emit(b"\x1b[6n");
+    rig.until("answered", || live.child.input().ends_with(b"R"))
+        .await;
+    let reply = live.child.input()[before..].to_vec();
+    assert!(reply.starts_with(b"\x1b["), "{reply:?}");
+    assert_eq!(reply.iter().filter(|b| **b == b'R').count(), 1, "{reply:?}");
+    rig.stop().await;
+}
+
+/// I-4: a raw unit outstanding, 60 KiB pending, a 100 KiB paste crossing the watermark: it
+/// is kept and written after, in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crossing_paste_kept() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut c, _) = attach(&rig, &live).await;
+    let before = live.child.input().len();
+    let hold = live.child.hold_writes();
+    c.binary(b"a").await;
+    assert!(hold.wait_entered(std::time::Instant::now() + Duration::from_secs(10)));
+    let raw = vec![b'x'; 60 * 1024];
+    c.binary(&raw).await;
+    let text = "p".repeat(100 * 1024);
+    c.json(json!({ "type": "paste", "paste_id": "big", "text": text }))
+        .await;
+    drop(hold);
+    let Some(AttachServerMessage::PasteResult { outcome, .. }) = c.text().await else {
+        panic!("a paste result")
+    };
+    assert_eq!(outcome, PasteOutcome::Written);
+    let pasted = chaldea_core::input::encode::encode(
+        chaldea_core::ids::Agent::Claude,
+        rig.sup.host_os,
+        &text,
+        chaldea_core::input::encode::Purpose::AttachPaste,
+    )
+    .unwrap()
+    .text;
+    let want = [b"a".as_slice(), &raw, &pasted].concat();
+    assert_eq!(live.child.input()[before..], want[..]);
+    rig.stop().await;
+}
+
+/// I-4: a 256 KiB paste with a raw unit outstanding is accepted and written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_paste_with_raw_outstanding() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut c, _) = attach(&rig, &live).await;
+    let hold = live.child.hold_writes();
+    c.binary(b"a").await;
+    assert!(hold.wait_entered(std::time::Instant::now() + Duration::from_secs(10)));
+    c.json(json!({ "type": "paste", "paste_id": "max", "text": "m".repeat(MAX_PROMPT_BYTES) }))
+        .await;
+    drop(hold);
     let Some(AttachServerMessage::PasteResult { outcome, .. }) = c.text().await else {
         panic!("a paste result")
     };

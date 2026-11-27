@@ -83,20 +83,18 @@ impl UpgradeHandler for Handler {
     }
 }
 
-/// The route's mount over `sup`.
-pub(crate) fn mount(sup: Weak<Supervisor>) -> Mount {
-    mount_with(Arc::new(Attach {
-        sup,
-        reg: Registry::default(),
-        cfg: AttachConfig::default(),
-    }))
-}
-
-/// The route's mount over `a`.
-pub(crate) fn mount_with(a: Arc<Attach>) -> Mount {
+/// The route's mount over `sup`, with `cfg`.
+pub(crate) fn mount(sup: Weak<Supervisor>, cfg: AttachConfig) -> Mount {
     let route =
         spec(&Method::GET, ATTACH_PATH).unwrap_or_else(|| panic!("GET {ATTACH_PATH} is in ROUTES"));
-    Mount::upgrade(route, Handler(a))
+    Mount::upgrade(
+        route,
+        Handler(Arc::new(Attach {
+            sup,
+            reg: Registry::default(),
+            cfg,
+        })),
+    )
 }
 
 /// A writer refusal's reason (R-10).

@@ -24,6 +24,8 @@ use chaldea_pty_runtime::fake::FakeChild;
 use chaldea_pty_runtime::process::AncestryEnd;
 use serde_json::{Value, json};
 
+pub(crate) use gate::set as set_hook;
+
 use super::SendLaunch;
 use crate::hook::HookIngest;
 use crate::store::InputRow;

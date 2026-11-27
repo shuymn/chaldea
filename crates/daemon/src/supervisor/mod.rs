@@ -273,6 +273,8 @@ pub struct SupervisorConfig {
     pub(crate) claude_settings: String,
     /// The transcript tailer's poll period (C1 D10; tests shorten it).
     pub(crate) tail_poll: Duration,
+    /// The attach socket's bounds (`docs/design/t1-attach.md` §2 "Limits").
+    pub(crate) attach: crate::attach::AttachConfig,
 }
 
 impl Default for SupervisorConfig {
@@ -299,6 +301,7 @@ impl Default for SupervisorConfig {
             kill_recorded: Arc::new(chaldea_pty_runtime::orphan::kill_recorded),
             claude_settings: chaldea_core::launch::CLAUDE_SETTINGS_FILE.to_owned(),
             tail_poll: crate::transcript::TAIL_POLL,
+            attach: crate::attach::AttachConfig::default(),
         }
     }
 }

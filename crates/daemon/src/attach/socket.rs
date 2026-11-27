@@ -336,6 +336,9 @@ fn resize(
             if let Some(id) = sl.take_lease(&mut sl.state(), LeaseKind::Resize(socket)) {
                 break id;
             }
+            #[cfg(test)]
+            sl.lease_waits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             free.await;
         };
         tokio::task::spawn_blocking(move || {

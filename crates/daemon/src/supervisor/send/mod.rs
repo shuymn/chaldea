@@ -333,6 +333,9 @@ pub(crate) struct SendLaunch {
     next_lease: AtomicU64,
     /// Notified at every release of the lease, for the resizes waiting for it.
     pub lease_free: Notify,
+    /// Waits for the lease begun (tests poll it).
+    #[cfg(test)]
+    pub lease_waits: AtomicU64,
     /// Passes finished (tests poll it).
     #[cfg(test)]
     pub passes: AtomicU64,
@@ -361,6 +364,8 @@ impl SendLaunch {
             wake: Notify::new(),
             next_lease: AtomicU64::new(1),
             lease_free: Notify::new(),
+            #[cfg(test)]
+            lease_waits: AtomicU64::new(0),
             #[cfg(test)]
             passes: AtomicU64::new(0),
             tick: Mutex::new(None),
