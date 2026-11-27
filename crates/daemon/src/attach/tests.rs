@@ -2846,6 +2846,39 @@ async fn candidacy_cap_releases_the_slot() {
     rig.stop().await;
 }
 
+/// The candidacy deadline is checked at the takeover itself: a candidate held just
+/// before its swap until the deadline closes 4004 with no `attached`, and A stays current.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn candidacy_checked_at_takeover() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut a, _) = attach(&rig, &live).await;
+    let (at, go) = park_sync(&hooks(&rig).before_swap);
+    let connect = tokio::spawn({
+        let ticket = rig
+            .srv
+            .ticket(&rig.owner, &format!("attach:{}", live.t))
+            .await
+            .unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/api/attach/{}?ticket={ticket}",
+            rig.srv.port, live.t
+        );
+        tokio_tungstenite::connect_async(url)
+    });
+    entered(&at);
+    rig.clock.advance(rig.sup.cfg.attach.candidacy);
+    go.send(()).unwrap();
+    let (ws, _) = bounded(WS_WAIT, connect).await.unwrap().unwrap().unwrap();
+    let mut b = Client { ws, closed: None };
+    assert_eq!(b.until_closed().await, (Some(4004), Vec::new()));
+    let before = live.child.input().len();
+    a.binary(b"q").await;
+    rig.until("A still current", || live.child.input()[before..] == *b"q")
+        .await;
+    rig.stop().await;
+}
+
 /// A socket task aborted while its startup subscription is still on the blocking pool:
 /// the subscription that registers after the abort is removed (no output needed).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

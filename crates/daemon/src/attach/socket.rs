@@ -793,6 +793,11 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             }
             #[cfg(not(test))]
             let _ = &mut before_swap_ran;
+            // The candidacy's deadline holds at the takeover too, before the subscription
+            // and the grant change hands.
+            if sup.now() >= candidacy_end {
+                return close(&shared, out, &mut stream, close_code::BUSY, "busy").await;
+            }
             let published = nudge.borrow();
             if *published == seen {
                 #[cfg(test)]
