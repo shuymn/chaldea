@@ -9,7 +9,8 @@
     "typecheck": "pnpm run codegen && tsc --noEmit",
     "test": "pnpm run codegen && vitest run",
     "build": "pnpm run codegen && vite build",
-    "check": "pnpm run codegen && tsc --noEmit && vitest run && vite build"
+    "check": "pnpm run codegen && tsc --noEmit && vitest run && vite build",
+    "e2e": "playwright test"
   },
   "dependencies": {
     "@chaldea/contracts": "workspace:*",
@@ -17,6 +18,7 @@
     "react-dom": "19.3.1"
   },
   "devDependencies": {
+    "@playwright/test": "1.65.1",
     "@tailwindcss/vite": "4.3.5",
     "@testing-library/react": "16.3.3",
     "@types/node": "24.19.2",

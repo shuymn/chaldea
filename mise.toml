@@ -24,3 +24,15 @@ lockfile_platforms = ["macos-arm64", "linux-x64", "windows-x64"]
 locked = true
 # Matches the minimumReleaseAge of the shared Renovate preset.
 minimum_release_age = "3d"
+
+# The release command (docs/design/w1-pwa.md §2.1 "Release"): the owner's `chaldea` on
+# macOS and Windows, with the web app embedded, at target/release/chaldea(.exe). A relative
+# CHALDEA_WEB_DIST resolves against the workspace root (crates/daemon/build.rs).
+[tasks.release]
+description = "Build the release chaldea with the web app embedded"
+env = { CHALDEA_WEB_DIST = "packages/web/dist" }
+run = [
+  "pnpm install --frozen-lockfile",
+  "pnpm -C packages/web build",
+  "cargo build --release --locked -p chaldea-cli",
+]
