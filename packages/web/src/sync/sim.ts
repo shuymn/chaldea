@@ -37,9 +37,11 @@ export const TEST_CONFIG: Config = {
   backwardLimit: 3,
   followMax: 2,
   windowMaxEvents: 6,
-  // A single event always fits both: the window cap equals the read limit, as in production.
-  windowMaxBytes: 16 * 1024,
-  readMaxBytes: 16 * 1024,
+  // The window cap equals the read limit, as in production. The largest model event
+  // (2,500 code points of Japanese, about 8.5 KB) fits a backward page of three, so a tail
+  // read is never split, while a forward page of four can be oversized.
+  windowMaxBytes: 32 * 1024,
+  readMaxBytes: 32 * 1024,
 };
 
 export const MODEL_CONFIG: ModelConfig = { replayMaxEvents: 6, replayMaxBytes: 4096, recent: 1 };

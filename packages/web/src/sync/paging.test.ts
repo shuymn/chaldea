@@ -15,6 +15,18 @@ const T1 = threadStream(threadId(1));
 const T2 = threadStream(threadId(2));
 const NO_SNAPSHOTS = { ...MODEL_CONFIG, replayMaxEvents: 10_000, replayMaxBytes: 1 << 30 };
 
+describe("model server", () => {
+  test("answers 400 like the daemon: both cursors, or a limit out of range; 404 first", () => {
+    const sim = seeded();
+    const q = { stream: HOST, afterSeq: 0, beforeSeq: 1, limit: 1, epoch: null };
+    expect(sim.server.answer(q).status).toBe(400);
+    expect(sim.server.answer({ ...q, beforeSeq: null, limit: 0 }).status).toBe(400);
+    expect(sim.server.answer({ ...q, beforeSeq: null, limit: 1001 }).status).toBe(400);
+    expect(sim.server.answer({ ...q, beforeSeq: null, limit: 1000 }).status).toBe(200);
+    expect(sim.server.answer({ ...q, stream: threadStream(threadId(9)) }).status).toBe(404);
+  });
+});
+
 describe("sync.paging", () => {
   test("forward pages continue while has_more, without any socket heads", () => {
     fc.assert(

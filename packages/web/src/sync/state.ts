@@ -103,6 +103,8 @@ export interface Stream {
   readonly bwd: number | null;
   /** The current forward `limit`, halved after an oversized response. */
   readonly fwdLimit: number;
+  /** How the latest read of this stream ended: reached the daemon, or failed in transport. */
+  readonly lastRead: "ok" | "down" | null;
   /** A failure that is not retried automatically. */
   readonly error: StreamError | null;
   /** Transient failures in a row, and when the next forward read may go. */
@@ -181,8 +183,8 @@ export interface State {
   readonly socket: Socket | null;
   readonly socketAttempt: number;
   readonly socketRetryAt: number;
-  /** The latest read or ticket POST failed in transport. */
-  readonly transportDown: boolean;
+  /** The latest ticket POST failed in transport (cleared by any read or ticket that reached the daemon). */
+  readonly ticketDown: boolean;
   /** A `hello` or a current response was seen. */
   readonly reached: boolean;
   readonly lastSyncedAt: number | null;
@@ -210,7 +212,7 @@ export function initialState(cfg: Config = DEFAULT_CONFIG, now = 0): State {
     socket: null,
     socketAttempt: 0,
     socketRetryAt: 0,
-    transportDown: false,
+    ticketDown: false,
     reached: false,
     lastSyncedAt: null,
     wakeAt: null,
@@ -230,6 +232,7 @@ export function newStream(key: string, cfg: Config): Stream {
     fwd: null,
     bwd: null,
     fwdLimit: cfg.forwardLimit,
+    lastRead: null,
     error: null,
     attempt: 0,
     retryAt: 0,
@@ -242,10 +245,15 @@ export type Status = "connecting" | "live" | "updates paused" | "offline";
 
 /** The page's status (mvp §2.4 "Offline"; docs/design/w1-pwa.md §2.3 "Status"). */
 export function status(s: State): Status {
-  const live = s.socket?.phase === "open" && s.socket.epoch !== null;
-  if (s.transportDown && !live) return "offline";
+  // Socket frames show the socket's health only; reads show the read path, per stream.
+  const socketUp = s.socket?.phase === "open" && s.socket.epoch !== null;
+  const reads = s.followed.map((k) => s.streams[k]?.lastRead ?? null);
+  const someDown = reads.includes("down");
+  const readsDown = someDown && !reads.includes("ok");
+  if (!socketUp && (s.ticketDown || readsDown)) return "offline";
   if (!s.reached) return "connecting";
-  if (live && !s.transportDown) return "live";
+  // Live needs the read path too, so a frame cannot unlock input while reads fail.
+  if (socketUp && !someDown) return "live";
   return "updates paused";
 }
 
@@ -276,10 +284,14 @@ export interface RowView {
   readonly attention: readonly AttentionCause[];
   /** Null when the axes come from a valid thread copy. */
   readonly label: Label;
+  /** The failure of the thread's stream that waits for a retry, if any. */
+  readonly error: StreamError | null;
 }
 
 export function rowView(s: State, row: HostRow): RowView {
-  const copy = s.streams[threadStream(row.info.thread_id)]?.copy;
+  const stream = s.streams[threadStream(row.info.thread_id)];
+  const copy = stream?.copy;
+  const error = stream?.error ?? null;
   if (copy?.kind === "thread") {
     return {
       info: row.info,
@@ -288,6 +300,7 @@ export function rowView(s: State, row: HostRow): RowView {
       task: copy.task ?? row.info.task_state,
       attention: copy.attention,
       label: null,
+      error,
     };
   }
   return {
@@ -297,5 +310,6 @@ export function rowView(s: State, row: HostRow): RowView {
     task: row.info.task_state,
     attention: row.info.attention,
     label: row.fromSnapshot ? "last known" : "unavailable",
+    error,
   };
 }

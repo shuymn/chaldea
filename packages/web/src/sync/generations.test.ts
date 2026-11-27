@@ -113,6 +113,19 @@ describe("sync.generations", () => {
     expect(sim.flight(HOST, "forward")).toBeDefined();
   });
 
+  test("socket construction ages nothing: an answer delivered before open is current", () => {
+    const sim = seeded();
+    const host = sim.flight(HOST, "forward");
+    if (host === undefined) throw new Error("no host read");
+    sim.serve(host);
+    // The ticket arrives and the socket is constructed, but not open yet.
+    while (sim.serveTicket());
+    expect(sim.state.socket?.phase).toBe("connecting");
+    sim.deliverId(host);
+    expect(sim.state.epoch).toBe("epoch-1");
+    expect(sim.state.streams[HOST]?.copy?.cursor).toBe(sim.server.head(HOST));
+  });
+
   test("reconnect: answers to requests of the previous socket are discarded", () => {
     const sim = live();
     sim.server.message(threadId(1), 3);

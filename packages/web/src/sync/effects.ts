@@ -56,7 +56,7 @@ export type Effect =
   | { readonly type: "connect"; readonly socket: number; readonly ticket: string }
   | { readonly type: "send"; readonly socket: number; readonly msg: WsClientMessage }
   | { readonly type: "close"; readonly socket: number }
-  /** Dispatch a `tick` at this time. */
-  | { readonly type: "wake"; readonly at: number }
+  /** Dispatch a `tick` at this time; null stops the pending one. */
+  | { readonly type: "wake"; readonly at: number | null }
   /** A 401 for this generation: compare-and-delete, then dispatch `credential`. */
   | { readonly type: "clearCredential"; readonly generation: string };

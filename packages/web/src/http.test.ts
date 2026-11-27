@@ -1,6 +1,6 @@
 // The request policy (docs/design/w1-pwa.md §2.2) and the read limit (§2.3 "Failures").
 
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import { eventsPath, readEvents, postTicket } from "./http";
 import type { Request } from "./sync/state";
@@ -58,9 +58,29 @@ describe("http", () => {
     expect(await readEvents(async () => new Response(stream, { status: 200 }), req, "t", never, 1024)).toEqual({ kind: "oversize" });
   });
 
+  test("a timeout while reading an error body settles as a timeout, never as the status", async () => {
+    for (const status of [404, 401]) {
+      const deadline = new AbortController();
+      const spy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+      const stalled = () =>
+        new ReadableStream({
+          start(c) {
+            deadline.signal.addEventListener("abort", () => c.error(deadline.signal.reason));
+          },
+        });
+      const read = readEvents(async () => new Response(stalled(), { status }), req, "t", never, 1024);
+      const ticket = postTicket(async () => new Response(stalled(), { status }), "t", never);
+      setTimeout(() => deadline.abort(new DOMException("deadline", "TimeoutError")), 0);
+      expect(await read).toEqual({ kind: "timeout" });
+      expect(await ticket).toEqual({ kind: "transport" });
+      spy.mockRestore();
+    }
+    vi.restoreAllMocks();
+  });
+
   test("a network failure is transport, a bad body schema", async () => {
     expect(await readEvents(async () => Promise.reject(new TypeError("x")), req, "t", never, 1024)).toEqual({ kind: "transport" });
     expect(await readEvents(async () => new Response("{}", { status: 200 }), req, "t", never, 1024)).toEqual({ kind: "schema" });
-    expect(await postTicket(async () => Promise.reject(new TypeError("x")), "t")).toEqual({ kind: "transport" });
+    expect(await postTicket(async () => Promise.reject(new TypeError("x")), "t", never)).toEqual({ kind: "transport" });
   });
 });

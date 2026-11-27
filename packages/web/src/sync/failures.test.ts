@@ -179,6 +179,68 @@ describe("sync.failures", () => {
 });
 
 describe("sync.status", () => {
+  test("a socket frame does not make the page live while a read fails in transport", () => {
+    const sim = live();
+    const id = forwardRead(sim);
+    failWith(sim, id, { kind: "transport" });
+    expect(status(sim.state)).toBe("updates paused");
+    const socket = sim.state.socket?.id ?? -1;
+    sim.dispatch({ type: "socketMessage", socket, msg: { type: "heads", heads: [] } });
+    sim.dispatch({ type: "socketMessage", socket, msg: { type: "stream_advanced", stream_id: HOST, head_seq: 1 } });
+    expect(status(sim.state)).toBe("updates paused");
+    // The stream's next read succeeding is what restores live.
+    sim.advance(1000);
+    const next = sim.flight(T1, "forward") ?? -1;
+    sim.serve(next);
+    sim.deliverId(next);
+    expect(status(sim.state)).toBe("live");
+  });
+
+  test("one failed background read with the socket down is not offline while the host read works", () => {
+    const sim = live();
+    const id = forwardRead(sim);
+    sim.restart();
+    sim.fail(id, { kind: "transport" });
+    sim.deliverId(id);
+    expect(status(sim.state)).toBe("updates paused");
+  });
+
+  test("a forward 404 does not set last synced", () => {
+    const sim = live();
+    sim.advance(2000);
+    const before = sim.state.lastSyncedAt;
+    const id = forwardRead(sim);
+    sim.fail(id, { kind: "status", status: 404, retryAfter: null });
+    sim.deliverId(id);
+    expect(sim.state.gone[threadId(1)]).toBe(true);
+    expect(sim.state.lastSyncedAt).toBe(before);
+  });
+
+  test("last synced waits for has_more alone and for the reported head alone", () => {
+    for (const gate of ["has_more", "head"] as const) {
+      const sim = live();
+      sim.advance(1000);
+      const before = sim.state.lastSyncedAt;
+      const id = forwardRead(sim);
+      const a = sim.server.answer({
+        stream: T1,
+        afterSeq: sim.state.streams[T1]?.copy?.cursor ?? 0,
+        beforeSeq: null,
+        limit: 4,
+        epoch: sim.state.epoch,
+      });
+      if (a.status !== 200 || a.body.mode !== "replay") throw new Error("no page");
+      // A page that reaches the head but says has_more, or ends below a head it reports.
+      const body =
+        gate === "has_more"
+          ? { ...a.body, has_more: true }
+          : { ...a.body, head_seq: a.body.head_seq + 1, has_more: false };
+      sim.fail(id, { kind: "ok", body });
+      sim.deliverId(id);
+      expect(sim.state.lastSyncedAt).toBe(before);
+    }
+  });
+
   test("connecting, then live", () => {
     const sim = seeded();
     expect(status(sim.state)).toBe("connecting");

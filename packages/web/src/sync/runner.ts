@@ -28,12 +28,18 @@ export class Runner {
   private state: State;
   private readonly listeners = new Set<() => void>();
   private readonly aborts = new Map<number, AbortController>();
+  /** The ticket POST of each socket still waiting for one. */
+  private readonly tickets = new Map<number, AbortController>();
   private readonly sockets = new Map<number, WebSocket>();
   /** The open deadline of each socket not yet open. */
   private readonly opening = new Map<number, ReturnType<typeof setTimeout>>();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private cred: Credential | null = null;
   private readonly deps: RunnerDeps;
+  /** Rereads of the store, one at a time, so the latest read is adopted last. */
+  private adoption: Promise<void> = Promise.resolve();
+  private unlisten: (() => void) | null = null;
+  private stopped = false;
 
   constructor(deps: RunnerDeps, cfg: Config = DEFAULT_CONFIG) {
     this.deps = deps;
@@ -47,28 +53,65 @@ export class Runner {
 
   readonly getState = (): State => this.state;
 
-  /** Adopts the credential read at start (or after pairing) and listens for other tabs. */
-  start(cred: Credential | null): () => void {
-    this.adopt(cred);
-    return this.deps.store.listen(() => {
+  /**
+   * Listens for other tabs first, then runs `boot` (the pair flow, which may store a
+   * credential), then adopts what the store holds. Startup and every notice take the same
+   * path, a reread of the store, so a change committed by another tab during startup is
+   * not missed.
+   */
+  async start(boot: () => Promise<unknown> = async () => {}): Promise<void> {
+    this.unlisten = this.deps.store.listen(() => {
       void this.reread();
     });
+    await boot().catch(() => null);
+    await this.reread();
   }
 
-  private async reread(): Promise<void> {
-    try {
-      this.adopt(await this.deps.store.read());
-    } catch {
-      // The store could not be read: keep the current credential.
+  /** Ends every request, socket, and timer, and stops listening; the runner does nothing after. */
+  stop(): void {
+    this.stopped = true;
+    this.unlisten?.();
+    this.unlisten = null;
+    for (const ac of this.aborts.values()) ac.abort();
+    this.aborts.clear();
+    for (const ac of this.tickets.values()) ac.abort();
+    this.tickets.clear();
+    for (const t of this.opening.values()) clearTimeout(t);
+    this.opening.clear();
+    for (const ws of this.sockets.values()) {
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onclose = null;
+      ws.close();
     }
+    this.sockets.clear();
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.timer = null;
+  }
+
+  /** Rereads the store and adopts what it holds; `fallback` is adopted if it cannot be read. */
+  private reread(fallback?: () => Credential | null): Promise<void> {
+    this.adoption = this.adoption.then(async () => {
+      let cred: Credential | null;
+      try {
+        cred = await this.deps.store.read();
+      } catch {
+        if (!fallback) return;
+        cred = fallback();
+      }
+      this.adopt(cred);
+    });
+    return this.adoption;
   }
 
   private adopt(cred: Credential | null): void {
+    if (this.stopped) return;
     this.cred = cred;
     this.dispatch({ type: "credential", generation: cred?.generation ?? null });
   }
 
   dispatch(input: Input): void {
+    if (this.stopped) return;
     const [next, effects] = reduce(this.state, { ...input, now: this.deps.now() } as Action);
     this.state = next;
     for (const e of effects) this.run(e);
@@ -113,9 +156,12 @@ export class Runner {
           );
           return;
         }
-        void postTicket(this.deps.fetch, token).then((result) =>
-          this.dispatch({ type: "ticket", socket: sock, result }),
-        );
+        const ac = new AbortController();
+        this.tickets.set(sock, ac);
+        void postTicket(this.deps.fetch, token, ac.signal).then((result) => {
+          this.tickets.delete(sock);
+          this.dispatch({ type: "ticket", socket: sock, result });
+        });
         return;
       }
       case "connect":
@@ -127,6 +173,9 @@ export class Runner {
         return;
       }
       case "close":
+        // A socket still waiting for its ticket gives the POST up.
+        this.tickets.get(e.socket)?.abort();
+        this.tickets.delete(e.socket);
         clearTimeout(this.opening.get(e.socket));
         this.opening.delete(e.socket);
         this.sockets.get(e.socket)?.close();
@@ -134,6 +183,8 @@ export class Runner {
         return;
       case "wake": {
         if (this.timer !== null) clearTimeout(this.timer);
+        this.timer = null;
+        if (e.at === null) return;
         const delay = Math.max(0, e.at - this.deps.now());
         this.timer = setTimeout(() => {
           this.timer = null;
@@ -142,10 +193,13 @@ export class Runner {
         return;
       }
       case "clearCredential": {
+        // Compare-and-delete, then the same reread as a notice; if the store cannot be
+        // read, the 401's generation is retired.
         const gen = e.generation;
+        const retire = () => (this.cred?.generation === gen ? null : this.cred);
         void this.deps.store.clearIf(gen).then(
-          (cur) => this.adopt(cur),
-          () => this.adopt(this.cred?.generation === gen ? null : this.cred),
+          () => this.reread(retire),
+          () => this.reread(retire),
         );
         return;
       }

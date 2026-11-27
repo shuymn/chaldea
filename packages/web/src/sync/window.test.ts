@@ -174,8 +174,25 @@ describe("sync.window", () => {
     sim.deliverId(tail);
     const w = sim.state.window;
     expect(w?.attached).toBe(true);
-    expect(w?.hi).toBe(sim.server.head(T1));
+    // The tail page (8–10) is kept under the live events (11, 12).
+    expect(w?.events.map((e) => e.seq)).toEqual([8, 9, 10, 11, 12]);
     expect(windowProblems(sim, ID1)).toEqual([]);
+  });
+
+  test("selecting the already selected row keeps its window, attached or detached", () => {
+    const sim = busy(20);
+    sim.dispatch({ type: "select", thread: ID1 });
+    sim.quiesce();
+    const attached = sim.state.window;
+    sim.dispatch({ type: "select", thread: ID1 });
+    expect(sim.state.window).toEqual(attached);
+    expect(sim.flight(T1, "backward")).toBeUndefined();
+    press(sim, "older");
+    press(sim, "older");
+    const detached = sim.state.window;
+    expect(detached?.attached).toBe(false);
+    sim.dispatch({ type: "select", thread: ID1 });
+    expect(sim.state.window).toEqual(detached);
   });
 
   test("fill four slots, then switch thread", () => {

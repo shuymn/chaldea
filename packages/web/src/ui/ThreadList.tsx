@@ -1,12 +1,14 @@
 // The thread list: agent, cwd, the three axes, attention, and closed. Axes of a row
 // without a valid thread copy are the host's, labelled "last known" or "unavailable"
-// (F1). Visible rows (IntersectionObserver, settled for 250 ms) choose what is followed.
+// (F1); a followed row whose stream failed shows the failure and a retry. The rows on
+// screen (IntersectionObserver) are reported once scrolling settles: no scroll event and
+// no visibility change for 250 ms.
 
 import { useEffect, useRef } from "react";
 
 import { listRows, type RowView, rowView, type State } from "../sync/state";
 
-const SETTLE_MS = 250;
+export const SETTLE_MS = 250;
 
 const label = (s: string) => s.replaceAll("_", " ");
 
@@ -14,6 +16,7 @@ function Row(props: {
   view: RowView;
   selected: boolean;
   onSelect: (thread: string) => void;
+  onRetry: () => void;
 }) {
   const { view, selected } = props;
   const { info } = view;
@@ -39,6 +42,14 @@ function Row(props: {
         </span>
         {attention && <span className="block text-sm font-semibold">attention: {attention}</span>}
       </button>
+      {view.error && (
+        <p className="flex flex-wrap items-center gap-2 px-3 pb-2 text-sm">
+          <span>{view.error.message}</span>
+          <button type="button" className="control" onClick={props.onRetry}>
+            Retry
+          </button>
+        </p>
+      )}
     </li>
   );
 }
@@ -47,6 +58,7 @@ export function ThreadList(props: {
   state: State;
   onSelect: (thread: string) => void;
   onVisible: (threads: string[]) => void;
+  onRetry: () => void;
 }) {
   const { state, onVisible } = props;
   const rows = listRows(state);
@@ -60,9 +72,13 @@ export function ThreadList(props: {
   useEffect(() => {
     const list = listRef.current;
     if (!list || typeof IntersectionObserver === "undefined") return;
-    const flush = () => {
-      settle.current = null;
-      report.current([...visible.current]);
+    // Every visibility change and every scroll restarts the settle timer.
+    const restart = () => {
+      if (settle.current !== null) clearTimeout(settle.current);
+      settle.current = setTimeout(() => {
+        settle.current = null;
+        report.current([...visible.current]);
+      }, SETTLE_MS);
     };
     const io = new IntersectionObserver((entries) => {
       for (const e of entries) {
@@ -71,13 +87,15 @@ export function ThreadList(props: {
         if (e.isIntersecting) visible.current.add(t);
         else visible.current.delete(t);
       }
-      if (settle.current !== null) clearTimeout(settle.current);
-      settle.current = setTimeout(flush, SETTLE_MS);
+      restart();
     });
     visible.current = new Set();
     for (const li of list.querySelectorAll<HTMLElement>("li[data-thread]")) io.observe(li);
+    // Capture: a scroll of the page or of any container scrolls the rows.
+    addEventListener("scroll", restart, { capture: true, passive: true });
     return () => {
       io.disconnect();
+      removeEventListener("scroll", restart, { capture: true });
       if (settle.current !== null) clearTimeout(settle.current);
     };
   }, [ids]);
@@ -97,6 +115,7 @@ export function ThreadList(props: {
               view={rowView(state, r)}
               selected={state.selected === r.info.thread_id}
               onSelect={props.onSelect}
+              onRetry={props.onRetry}
             />
           ))}
         </ul>

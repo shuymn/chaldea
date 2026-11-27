@@ -197,10 +197,12 @@ class Step {
     if (req.dir === "forward") ms.fwd = null;
     else ms.bwd = null;
 
+    // Read reachability is per stream; any read that reached the daemon shows it up.
     if (result.kind === "transport" || result.kind === "timeout") {
-      this.s.transportDown = true;
+      ms.lastRead = "down";
     } else {
-      this.s.transportDown = false;
+      ms.lastRead = "ok";
+      this.s.ticketDown = false;
       this.s.reached = true;
     }
     if (result.kind === "status" && result.status === 401) {
@@ -213,8 +215,6 @@ class Step {
         ms.error = { kind: "missing_host", message: MISSING_HOST };
       } else {
         this.vanish(threadOf(req.stream) ?? "");
-        // Removing the stream can complete the catch-up of the rest.
-        if (req.dir === "forward") this.syncedCheck();
       }
       return;
     }
@@ -516,6 +516,8 @@ class Step {
   }
 
   private select(thread: string | null): void {
+    // Selecting the displayed row again keeps its window; Jump to latest resets it.
+    if (thread !== null && thread === this.s.selected) return;
     const before = this.displayedKey();
     if (before !== null) this.olderBackward(before);
     this.s.selected = thread !== null && this.s.gone[thread] ? null : thread;
@@ -663,16 +665,16 @@ class Step {
     if (!sock || sock.id !== id || sock.phase !== "ticket") return;
     switch (r.kind) {
       case "ok":
-        this.s.transportDown = false;
+        this.s.ticketDown = false;
         this.s.socket = { ...sock, phase: "connecting" };
         this.effects.push({ type: "connect", socket: id, ticket: r.ticket });
         return;
       case "transport":
-        this.s.transportDown = true;
+        this.s.ticketDown = true;
         this.socketClosed(id);
         return;
       case "status":
-        this.s.transportDown = false;
+        this.s.ticketDown = false;
         this.s.reached = true;
         this.socketClosed(id);
         if (r.status === 401 && typeof this.s.generation === "string") {
@@ -718,8 +720,6 @@ class Step {
       return;
     }
     if (sock.epoch === null) return;
-    // A frame shows the daemon reachable.
-    this.s.transportDown = false;
     const entries =
       msg.type === "heads"
         ? msg.heads
@@ -870,7 +870,8 @@ class Step {
       if (st.fwd === null && st.error === null && st.retryAt > s.now) at = Math.min(at, st.retryAt);
     }
     const next = Number.isFinite(at) ? at : null;
-    if (next !== null && next !== s.wakeAt) this.effects.push({ type: "wake", at: next });
+    // A null deadline stops the runner's timer.
+    if (next !== s.wakeAt) this.effects.push({ type: "wake", at: next });
     s.wakeAt = next;
   }
 }

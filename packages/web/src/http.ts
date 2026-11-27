@@ -65,8 +65,15 @@ export async function readLimited(res: Response, max: number): Promise<string | 
   return new TextDecoder().decode(all);
 }
 
-async function retryAfter(res: Response): Promise<number | null> {
-  const text = await readLimited(res, 64 * 1024).catch(() => null);
+/**
+ * The `retry_after` of an error body. A read cut off by `signal` (the deadline or an
+ * abort) rethrows, so the request settles as timed out rather than as its status.
+ */
+async function retryAfter(res: Response, signal: AbortSignal): Promise<number | null> {
+  const text = await readLimited(res, 64 * 1024).catch((e: unknown) => {
+    if (signal.aborted) throw e;
+    return null;
+  });
   if (text === null) return null;
   try {
     const body: unknown = JSON.parse(text);
@@ -98,7 +105,7 @@ export async function readEvents(
       signal: any,
     });
     if (!res.ok) {
-      return { kind: "status", status: res.status, retryAfter: await retryAfter(res) };
+      return { kind: "status", status: res.status, retryAfter: await retryAfter(res, any) };
     }
     const text = await readLimited(res, maxBytes);
     if (text === null) return { kind: "oversize" };
@@ -115,19 +122,23 @@ export async function readEvents(
   }
 }
 
-/** `POST /api/ws-ticket` for the events socket. */
-export async function postTicket(fetchFn: Fetch, token: string): Promise<TicketResult> {
-  const timeout = AbortSignal.timeout(READ_TIMEOUT_MS);
+/** `POST /api/ws-ticket` for the events socket; `signal` cancels it. */
+export async function postTicket(
+  fetchFn: Fetch,
+  token: string,
+  signal: AbortSignal,
+): Promise<TicketResult> {
+  const any = AbortSignal.any([signal, AbortSignal.timeout(READ_TIMEOUT_MS)]);
   try {
     const res = await fetchFn("/api/ws-ticket", {
       ...REQUEST_POLICY,
       method: "POST",
       headers: headers(token, true),
       body: JSON.stringify({ purpose: "events" }),
-      signal: timeout,
+      signal: any,
     });
     if (!res.ok) {
-      return { kind: "status", status: res.status, retryAfter: await retryAfter(res) };
+      return { kind: "status", status: res.status, retryAfter: await retryAfter(res, any) };
     }
     const text = await readLimited(res, 64 * 1024);
     const body: unknown = text === null ? null : JSON.parse(text);

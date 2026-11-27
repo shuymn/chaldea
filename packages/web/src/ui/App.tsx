@@ -12,6 +12,7 @@ export function App(props: { runner: Runner }) {
   const { runner } = props;
   const state = useSyncExternalStore(runner.subscribe, runner.getState);
   const select = useCallback((thread: string) => runner.dispatch({ type: "select", thread }), [runner]);
+  const retry = useCallback(() => runner.dispatch({ type: "retry" }), [runner]);
   const visible = useCallback(
     (threads: string[]) => runner.dispatch({ type: "visible", threads }),
     [runner],
@@ -37,19 +38,19 @@ export function App(props: { runner: Runner }) {
           {host?.error && (
             <p className="px-3 py-2">
               {host.error.message}{" "}
-              <button type="button" className="control" onClick={() => runner.dispatch({ type: "retry" })}>
+              <button type="button" className="control" onClick={retry}>
                 Retry
               </button>
             </p>
           )}
-          <ThreadList state={state} onSelect={select} onVisible={visible} />
+          <ThreadList state={state} onSelect={select} onVisible={visible} onRetry={retry} />
           <main id="main" tabIndex={-1} className="min-w-0">
             <Timeline
               state={state}
               onOlder={() => runner.dispatch({ type: "older" })}
               onNewer={() => runner.dispatch({ type: "newer" })}
               onLatest={() => runner.dispatch({ type: "latest" })}
-              onRetry={() => runner.dispatch({ type: "retry" })}
+              onRetry={retry}
             />
           </main>
         </div>

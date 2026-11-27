@@ -1,9 +1,9 @@
 // W1-10 `credential.generation` (fake IndexedDB): a 401 deletes the stored credential only
 // when it is the request's generation, and posts only committed changes.
 
-import { IDBFactory } from "fake-indexeddb";
+import { IDBFactory, IDBObjectStore as FDBObjectStore } from "fake-indexeddb";
 import fc from "fast-check";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import { threadId } from "../sync/model/server";
 import { seeded } from "../sync/ops";
@@ -66,6 +66,31 @@ describe("credential.generation", () => {
     await new Promise((r) => setTimeout(r, 10));
     // The receiver rereads the store, which already shows the delete.
     expect(seenByOther).toBeNull();
+  });
+
+  test("a clear is posted only once its transaction commits", async () => {
+    const { posted, make } = harness();
+    const tab = make();
+    const a = await tab.store("token-a");
+    posted.length = 0;
+    // The delete succeeds as a request, then its transaction aborts before committing.
+    const original = FDBObjectStore.prototype.delete;
+    const spy = vi.spyOn(FDBObjectStore.prototype, "delete").mockImplementation(function (
+      this: IDBObjectStore,
+      key: IDBValidKey | IDBKeyRange,
+    ) {
+      const req = original.call(this, key);
+      const tx = this.transaction;
+      req.addEventListener("success", () => queueMicrotask(() => tx.abort()));
+      return req;
+    });
+    try {
+      await expect(tab.clearIf(a.generation)).rejects.toThrow();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(posted).toEqual([]);
+    expect(await tab.read()).toEqual(a);
   });
 
   test("a losing 401 that finds the record empty adopts the cleared state and posts no second clear", async () => {

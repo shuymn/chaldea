@@ -55,7 +55,7 @@ export type Query = {
 
 export type Answer =
   | { readonly status: 200; readonly body: EventsResponse }
-  | { readonly status: 401 | 404 };
+  | { readonly status: 400 | 401 | 404 };
 
 const TS = "2026-11-22T09:45:00.000Z";
 const hex = (n: number, w: number) => n.toString(16).padStart(w, "0");
@@ -244,6 +244,11 @@ export class ModelServer {
     if (!this.db.tokens) return { status: 401 };
     const log = this.db.logs.get(q.stream);
     if (!log) return { status: 404 };
+    // `decide_replay`'s 400s, after the 404 as in the daemon: a limit out of range, or
+    // both cursors.
+    if (q.limit < 1 || q.limit > 1000 || (q.afterSeq !== null && q.beforeSeq !== null)) {
+      return { status: 400 };
+    }
     const head = log.length;
     const after = q.afterSeq ?? 0;
     const bytesAfter = log.slice(after).reduce((n, e) => n + payloadBytes(e.payload), 0);

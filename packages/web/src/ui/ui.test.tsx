@@ -2,13 +2,13 @@
 // Component checks of the list, the timeline, and the status (cheap ones; the 390 × 844
 // layout is checked in a real browser).
 
-import { cleanup, render, screen, within } from "@testing-library/react";
-import { afterEach, describe, expect, test } from "vitest";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { threadId } from "../sync/model/server";
 import { seeded } from "../sync/ops";
 import { StatusBar } from "./StatusBar";
-import { ThreadList } from "./ThreadList";
+import { SETTLE_MS, ThreadList } from "./ThreadList";
 import { Timeline } from "./Timeline";
 
 afterEach(cleanup);
@@ -29,7 +29,7 @@ describe("ui", () => {
     const sim = live();
     sim.server.close(threadId(3));
     sim.quiesce();
-    render(<ThreadList state={sim.state} onSelect={noop} onVisible={noop} />);
+    render(<ThreadList state={sim.state} onSelect={noop} onVisible={noop} onRetry={noop} />);
     const nav = screen.getByRole("navigation", { name: "Threads" });
     const items = within(nav).getAllByRole("listitem");
     expect(items).toHaveLength(3);
@@ -43,6 +43,63 @@ describe("ui", () => {
     const closed = items.find((li) => li.dataset.thread === threadId(3));
     expect(closed?.textContent).toContain("closed");
     expect(within(nav).getByRole("button", { current: true })).toBeTruthy();
+  });
+
+  test("a background stream error is visible on its row, with a retry", () => {
+    const sim = live();
+    const id = threadId(1);
+    const key = `thread:${id}`;
+    sim.dispatch({ type: "visible", threads: [id] });
+    sim.quiesce();
+    sim.server.message(id, 3);
+    sim.connect();
+    const request = sim.flight(key, "forward") ?? -1;
+    sim.fail(request, { kind: "schema" });
+    sim.deliverId(request);
+    expect(sim.state.selected).toBe(threadId(2));
+    expect(sim.state.streams[key]?.error?.kind).toBe("schema");
+    let retried = 0;
+    render(<ThreadList state={sim.state} onSelect={noop} onVisible={noop} onRetry={() => retried++} />);
+    const row = screen.getAllByRole("listitem").find((li) => li.dataset.thread === id);
+    if (!row) throw new Error("no row");
+    expect(within(row).queryByText(/the daemon.s answer did not match/)).not.toBeNull();
+    fireEvent.click(within(row).getByRole("button", { name: "Retry" }));
+    expect(retried).toBe(1);
+  });
+
+  test("visible rows are reported only once scrolling settles", () => {
+    vi.useFakeTimers();
+    type Observe = (entries: { target: Element; isIntersecting: boolean }[]) => void;
+    const io: { observe: Observe | null } = { observe: null };
+    vi.stubGlobal(
+      "IntersectionObserver",
+      class {
+        constructor(cb: Observe) {
+          io.observe = cb;
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    try {
+      const sim = live();
+      const reports: string[][] = [];
+      render(<ThreadList state={sim.state} onSelect={noop} onVisible={(t) => reports.push(t)} onRetry={noop} />);
+      const rows = screen.getAllByRole("listitem");
+      io.observe?.(rows.map((target) => ({ target, isIntersecting: true })));
+      // The page keeps scrolling without crossing another row boundary.
+      for (let k = 0; k < 6; k++) {
+        vi.advanceTimersByTime(100);
+        fireEvent.scroll(window);
+      }
+      expect(reports).toEqual([]);
+      vi.advanceTimersByTime(SETTLE_MS);
+      expect(reports).toHaveLength(1);
+      expect(reports[0]?.sort()).toEqual(rows.map((r) => r.dataset.thread).sort());
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
   });
 
   test("the timeline is an ordered list of plain text, unknown events labelled, with window controls", () => {

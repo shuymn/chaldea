@@ -1,4 +1,4 @@
-// Entry: pair from the link if there is one, then start the sync client and render.
+// Entry: start the sync client (which pairs from the link if there is one) and render.
 // State lives in memory only; there is no service worker (docs/design/w1-pwa.md D7).
 
 import "./index.css";
@@ -14,12 +14,18 @@ const root = document.getElementById("root");
 if (root) {
   const store = new CredentialStore();
   const runner = browserRunner(store);
-  createRoot(root).render(<App runner={runner} />);
-  pairFromLink({ location, history, fetch: (i, init) => fetch(i, init), store })
-    .catch(() => null)
-    .then((cred) => {
-      runner.start(cred);
-      // Best effort: ask the browser not to evict the credential under storage pressure.
-      void navigator.storage?.persist?.().catch(() => false);
-    });
+  const view = createRoot(root);
+  view.render(<App runner={runner} />);
+  void runner.start(() => pairFromLink({ location, history, fetch: (i, init) => fetch(i, init), store }));
+  // Best effort: ask the browser not to evict the credential under storage pressure.
+  void navigator.storage?.persist?.().catch(() => false);
+  // Leaving the page ends every request, socket, and timer. A page restored from the
+  // back-forward cache starts again rather than resume a stopped client.
+  addEventListener("pagehide", () => {
+    runner.stop();
+    view.unmount();
+  });
+  addEventListener("pageshow", (e) => {
+    if (e.persisted) location.reload();
+  });
 }

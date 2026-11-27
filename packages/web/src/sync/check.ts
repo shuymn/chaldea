@@ -1,10 +1,15 @@
 // What "converged" means after a quiesce (W1-5): the server's epoch, cursors, owned
-// projections, and the exact history window (test only).
+// projections, and the exact history window with the range its loads and navigation
+// should retain (test only). An unresolved history read is not converged; a failed one
+// that shows its Retry is reported as such (`HISTORY_FAILED`), never as an exact window.
 
 import type { Sim } from "./sim";
 import { HOST, listRows, rowView, status, threadOf } from "./state";
 
 const bytesOf = (e: unknown) => new TextEncoder().encode(JSON.stringify(e)).length;
+
+/** The prefix of the problem a failed history read with a visible Retry reports. */
+export const HISTORY_FAILED = "history read failed, Retry shown";
 
 export function problems(sim: Sim): string[] {
   const out: string[] = [];
@@ -13,7 +18,6 @@ export function problems(sim: Sim): string[] {
   if (s.epoch !== srv.db.epoch) out.push(`epoch ${s.epoch} != ${srv.db.epoch}`);
   if (s.socket?.phase !== "open" || s.socket.epoch !== srv.db.epoch) out.push("socket not live");
   if (status(s) !== "live") out.push(`status ${status(s)}`);
-  if (s.lastSyncedAt === null) out.push("never synced");
   if (!s.followed.includes(HOST)) out.push("host not followed");
   for (const key of s.followed) {
     const st = s.streams[key];
@@ -82,17 +86,32 @@ export function windowProblems(sim: Sim, thread: string): string[] {
   const w = s.window;
   const head = sim.server.head(key);
   if (!w || w.thread !== thread) return ["no window for the selected thread"];
-  // A failed history read is not retried automatically: it shows its error and a retry,
-  // and the window keeps what it held.
-  if (w.pending && !w.error) out.push(`window pending ${w.pending.purpose}`);
-  if (w.error && !w.pending) out.push(`window error without a pending read`);
+  // A failed history read is not retried automatically: it shows its error and a Retry.
+  if (w.error) {
+    out.push(`${HISTORY_FAILED}: ${w.error.message}`);
+    if (!w.pending) out.push("window error without a pending read");
+    return out;
+  }
+  if (w.pending) out.push(`history read unresolved: ${w.pending.purpose}`);
   const log = sim.server.log(key);
   const want = log.slice(w.lo - 1, w.hi);
   if (w.events.length !== w.hi - w.lo + 1) out.push("window length != hi - lo + 1");
   if (JSON.stringify(w.events) !== JSON.stringify(want)) out.push(`window ${w.lo}..${w.hi} differs from the log`);
   if (w.hi > head) out.push(`window hi ${w.hi} > head ${head}`);
   if (w.attached && w.hi !== head) out.push(`attached window ends at ${w.hi}, head ${head}`);
-  if (w.attached && head > 0 && w.events.length === 0 && !w.error) out.push("attached window empty");
+  // The retained range the intent asks for. An attached window holds at least the tail
+  // page, reaches seq 1, or cannot take the next older event within the caps; a detached
+  // one (Older past the cap, then Newer) is full at one of its ends.
+  const fits = (seq: number) => {
+    const e = log[seq - 1];
+    return e !== undefined && w.events.length + 1 <= s.cfg.windowMaxEvents && w.bytes + bytesOf(e) <= s.cfg.windowMaxBytes;
+  };
+  if (w.attached && w.lo > 1 && fits(w.lo - 1) && w.events.length < s.cfg.backwardLimit) {
+    out.push(`attached window ${w.lo}..${w.hi} short of its tail page`);
+  }
+  if (!w.attached && !((w.lo > 1 && !fits(w.lo - 1)) || !fits(w.hi + 1))) {
+    out.push(`detached window ${w.lo}..${w.hi} is not full at either end`);
+  }
   if (w.events.length > s.cfg.windowMaxEvents) out.push("window over the event cap");
   const bytes = w.events.reduce((n, e) => n + bytesOf(e), 0);
   if (bytes !== w.bytes) out.push(`window bytes ${w.bytes} != ${bytes}`);
