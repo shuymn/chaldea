@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use crate::store::tests::support::http::WS_WAIT;
-use crate::store::tests::support::waits::bounded;
+use crate::store::tests::support::waits::{bounded, bounded_at};
 use crate::supervisor::send::tests::{Live, SRig};
 
 type Ws =
@@ -38,10 +38,12 @@ struct Client {
 }
 
 impl Client {
-    /// The next frame within the wait (a hang guard), or `None` once closed.
+    /// The next frame within the wait (a hang guard: one bound for the call, so pings do
+    /// not extend it), or `None` once closed.
     async fn next(&mut self) -> Option<Frame> {
+        let until = tokio::time::Instant::now() + WS_WAIT;
         loop {
-            let m = bounded(WS_WAIT, self.ws.next())
+            let m = bounded_at(until, self.ws.next())
                 .await
                 .expect("a frame or the close within the wait");
             match m {
@@ -486,7 +488,10 @@ async fn old_enter_after_disconnect_and_reattach() {
     let (code, texts) = a.until_closed().await;
     assert_eq!(code, Some(4003), "{texts:?}");
     drop(hold);
-    other.await.unwrap();
+    bounded(WS_WAIT, other)
+        .await
+        .expect("the report within the wait")
+        .unwrap();
     rig.until("settled", || sl.state().human_unsettled == 0)
         .await;
     assert!(!live.child.input().contains(&b'\r'), "no Enter of A");
