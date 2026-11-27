@@ -353,6 +353,9 @@ pub(crate) struct SendLaunch {
     /// Passes finished (tests poll it).
     #[cfg(test)]
     pub passes: AtomicU64,
+    /// Times the worker went to sleep with no wake pending (tests poll it).
+    #[cfg(test)]
+    pub slept: AtomicU64,
     /// The latest tick's instant (supervisor clock).
     pub tick: Mutex<Option<Instant>>,
     #[cfg(test)]
@@ -384,6 +387,8 @@ impl SendLaunch {
             drop_report: Mutex::new(None),
             #[cfg(test)]
             passes: AtomicU64::new(0),
+            #[cfg(test)]
+            slept: AtomicU64::new(0),
             tick: Mutex::new(None),
             #[cfg(test)]
             hooks: SendHooks::default(),
@@ -545,6 +550,15 @@ impl SendLaunch {
         true
     }
 
+    /// The worker's release of its own open's lease: wakes the waiting resizes, not the
+    /// worker (nothing it waits for changed, and a wake would repeat the pass at once).
+    pub(crate) fn release_own_lease(&self, st: &mut SendState, id: u64) {
+        if st.lease.is_some_and(|l| l.id == id) {
+            st.lease = None;
+            self.lease_free.notify_waiters();
+        }
+    }
+
     /// Clears whatever holds the lease (the launch's exit, the shutdown).
     pub(crate) fn clear_lease(&self, st: &mut SendState) {
         if st.lease.take().is_some() {
@@ -552,7 +566,8 @@ impl SendLaunch {
         }
     }
 
-    /// Every release wakes the worker and the waiting resizes.
+    /// A release by anything but the worker's own open wakes the worker and the waiting
+    /// resizes.
     fn lease_released(&self) {
         self.wake.notify_one();
         self.lease_free.notify_waiters();

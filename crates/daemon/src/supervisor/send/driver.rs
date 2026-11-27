@@ -92,6 +92,15 @@ pub(crate) async fn worker(sup: Arc<Supervisor>, sl: Arc<SendLaunch>) {
                 .remove(&sl.launch_id);
             return;
         }
+        #[cfg(test)]
+        {
+            let mut woken = std::pin::pin!(sl.wake.notified());
+            if !woken.as_mut().enable() {
+                sl.slept.fetch_add(1, Ordering::SeqCst);
+            }
+            woken.await;
+        }
+        #[cfg(not(test))]
         sl.wake.notified().await;
     }
 }
@@ -665,9 +674,13 @@ async fn open(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>, entry: &LiveLaunch, v
     };
     let opened = match record(sup, open_job(sl, q, lease, modes, last_started), false).await {
         Recorded::Done(Some(o)) => o,
-        Recorded::Done(None)
-        | Recorded::Unrecorded(Commit::NotCommitted)
-        | Recorded::ShuttingDown => {
+        // Nothing opened (the job's checks refused): no wake for the worker itself, which
+        // would only repeat the same pass; what can change the checks wakes it.
+        Recorded::Done(None) => {
+            sl.release_own_lease(&mut sl.state(), lease);
+            return;
+        }
+        Recorded::Unrecorded(Commit::NotCommitted) | Recorded::ShuttingDown => {
             release();
             return;
         }

@@ -20,7 +20,7 @@ fn park_submit(
     set(&sl.hooks.before_submit, move || {
         let _ = entered_tx.send(());
         tokio::task::block_in_place(|| {
-            let _ = wait.recv_timeout(Duration::from_secs(30));
+            let _ = wait.recv();
         });
     });
     (entered, go)
@@ -53,5 +53,31 @@ async fn invalidation_races_conversion() {
         .await;
     assert_eq!(live.child.input().len(), before, "zero bytes");
     assert_eq!(rig.input(id).state, InputState::Cancelled);
+    rig.stop().await;
+}
+
+/// A queued input behind a closed gate does not wake its own worker: after a pass that
+/// opened nothing (its speculative lease released), the worker sleeps with no wake pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_gate_worker_sleeps() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let report = rig.attach(&live, b"x").await;
+    assert!(report.await.is_ok());
+    rig.until("recorded", || {
+        !rig.of_kind(live.t, "human_write").is_empty()
+    })
+    .await;
+    let id = rig.send(&live, "after").await;
+    rig.pass(&live).await;
+    assert_eq!(rig.input(id).state, InputState::Queued);
+    let slept = sl.slept.load(std::sync::atomic::Ordering::SeqCst);
+    sl.wake.notify_one();
+    rig.until("the worker sleeps with no wake pending", || {
+        sl.slept.load(std::sync::atomic::Ordering::SeqCst) > slept
+    })
+    .await;
+    assert_eq!(rig.input(id).state, InputState::Queued);
     rig.stop().await;
 }
