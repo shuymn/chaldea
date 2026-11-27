@@ -221,14 +221,10 @@ jobs:
       - name: Install dependencies
         run: mise exec -- pnpm install --frozen-lockfile
 
-      # Each script runs the codegen first.
-      - name: Typecheck
+      # `check` runs the codegen once, then typecheck and Vitest.
+      - name: Codegen, typecheck, and test
         working-directory: packages/contracts
-        run: mise exec -- pnpm run typecheck
-
-      - name: Test
-        working-directory: packages/contracts
-        run: mise exec -- pnpm run test
+        run: mise exec -- pnpm run check
 
   # The Quint specs (docs/design/formal-specs.md): typecheck, seeded simulation of every
   # invariant, and the check that specs/traces/ equals what the spec exports. The traces

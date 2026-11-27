@@ -70,7 +70,8 @@ pre-commit:
         - "Cargo.{toml,lock}"
       run: deps="$(cargo tree -p chaldea-testkit -e normal --target all --prefix none)" && bad="$(printf '%s\n' "$deps" | awk '/^chaldea-/ && !/^chaldea-(testkit|core) /')" && [ -z "$bad" ]
     # specs/ checks (docs/design/formal-specs.md). Globs are repository-relative; `root`
-    # only sets the working directory. The frozen install comes first (pnpm skips it when
+    # sets the working directory and also limits the staged files the glob sees to specs/,
+    # where every input of these checks lives. The frozen install comes first (pnpm skips it when
     # node_modules is up to date), so every run uses the pinned Quint.
     specs-check:
       root: specs/
@@ -81,15 +82,15 @@ pre-commit:
         - "specs/package.json"
         - "specs/pnpm-*.yaml"
       run: 'mise exec -- pnpm install --frozen-lockfile --silent && mise exec -- pnpm run --silent typecheck && mise exec -- pnpm run --silent traces:check'
-    # The web job of ci.yml (docs/design/w1-pwa.md §3 D8): typecheck and Vitest of
-    # packages/contracts, each after its codegen. Vitest reads the core golden cases too. No
-    # `root`: it would drop every staged file outside packages/contracts from the glob.
+    # The web job of ci.yml (docs/design/w1-pwa.md §3 D8): the codegen, typecheck, and Vitest
+    # of packages/contracts (its `check`). Vitest reads the core golden cases too. No `root`:
+    # it would drop every staged file outside packages/contracts from the glob.
     web-check:
       glob:
         - "packages/**"
         - "crates/core/tests/golden/**"
         - "pnpm-*.yaml"
-      run: 'mise exec -- pnpm install --frozen-lockfile --silent && mise exec -- pnpm -C packages/contracts run --silent typecheck && mise exec -- pnpm -C packages/contracts run --silent test'
+      run: 'mise exec -- pnpm install --frozen-lockfile --silent && mise exec -- pnpm -C packages/contracts run --silent check'
 
 pre-push:
   commands:

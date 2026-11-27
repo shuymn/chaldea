@@ -11,7 +11,8 @@
   "scripts": {
     "codegen": "node scripts/codegen.mjs",
     "typecheck": "node scripts/codegen.mjs && tsc --noEmit",
-    "test": "node scripts/codegen.mjs && vitest run"
+    "test": "node scripts/codegen.mjs && vitest run",
+    "check": "node scripts/codegen.mjs && tsc --noEmit && vitest run"
   },
   "devDependencies": {
     "@types/node": "24.19.2",
