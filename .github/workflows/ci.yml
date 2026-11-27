@@ -187,13 +187,53 @@ jobs:
           bad="$(awk '/^chaldea-/ && !/^chaldea-(testkit|core) /' <<<"$deps")"
           [ -z "$bad" ] || { echo "testkit depends on: $bad"; exit 1; }
 
+  # Whether a pull request touches what the release command builds or its smoke reads
+  # (docs/design/w1-pwa.md §2.1 "Release"); pushes to main and manual runs always do.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      release: ${{ steps.filter.outputs.release }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Filter the changed paths
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then
+            echo release=true >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files="$(git diff --name-only "$BASE...$HEAD")"
+          if grep -Eq '^(packages/|crates/daemon/build\.rs$|crates/daemon/src/http/pwa/dist\.rs$|mise\.(toml|lock)$|pnpm-(lock|workspace)\.yaml$|scripts/release-smoke\.mjs$|\.github/workflows/ci\.yml$)' <<<"$files"; then
+            echo release=true >>"$GITHUB_OUTPUT"
+          else
+            echo release=false >>"$GITHUB_OUTPUT"
+          fi
+
   # The PWA's packages (docs/design/w1-pwa.md §3 D8): the validator codegen, typecheck, and
-  # Vitest of packages/contracts and packages/web, the Vite build, and the daemon built with
-  # that build embedded. The golden cases they read are owned by the workspace job's tests.
+  # Vitest of packages/contracts and packages/web, the Vite build, the release command, and
+  # Playwright (Chromium and WebKit) against that release binary; then, when `changes` says
+  # so, the release smoke. The golden cases they read are owned by the workspace job's tests.
   web:
     name: web
+    needs: changes
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
     defaults:
@@ -235,11 +275,70 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install
 
-      # The daemon's build.rs embeds dist/ and fails on a file it does not allow.
-      - name: Build chaldea with the web app embedded
+      # The daemon's build.rs embeds dist/ and fails on a file it does not allow. The task
+      # needs only Node and pnpm, installed above.
+      - name: Build the release chaldea (mise run release)
         env:
-          CHALDEA_WEB_DIST: packages/web/dist
-        run: cargo build -p chaldea-cli --locked
+          MISE_TASK_RUN_AUTO_INSTALL: "false"
+        run: mise run release
+
+      # The browsers of the pinned @playwright/test.
+      - name: Install the Playwright browsers
+        working-directory: packages/web
+        run: mise exec -- pnpm exec playwright install chromium webkit
+
+      # Its global setup builds FakeCli; the release chaldea is already built.
+      - name: Run Playwright
+        working-directory: packages/web
+        run: mise exec -- pnpm run e2e
+
+      # Last: it rebuilds chaldea without the web app.
+      - name: Smoke the release binary
+        if: needs.changes.outputs.release == 'true'
+        run: mise exec -- node scripts/release-smoke.mjs
+
+  # The release smoke on Windows (docs/design/w1-pwa.md §2.1 "Release").
+  web-smoke:
+    name: web-smoke
+    needs: changes
+    if: needs.changes.outputs.release == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
+        with:
+          version: 2026.10.17
+          install: false
+          cache: false
+
+      - name: Install Node and pnpm
+        env:
+          MISE_YES: 1
+        run: |
+          mise trust mise.toml >/dev/null
+          mise install --locked node pnpm
+
+      # rustup reads the channel and components from rust-toolchain.toml.
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - name: Build the release chaldea (mise run release)
+        env:
+          MISE_TASK_RUN_AUTO_INSTALL: "false"
+        run: mise run release
+
+      - name: Smoke the release binary
+        run: mise exec -- node scripts/release-smoke.mjs
 
   # The Quint specs (docs/design/formal-specs.md): typecheck, seeded simulation of every
   # invariant, and the check that specs/traces/ equals what the spec exports. The traces
