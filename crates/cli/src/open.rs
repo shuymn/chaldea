@@ -19,8 +19,7 @@ use crate::client::{self, Discovery};
 const REQUEST_WAIT: Duration = Duration::from_secs(5);
 
 /// What `open` prints when the daemon answers `GET /` with 501.
-pub(crate) const NO_PWA: &str =
-    "this chaldea was built without the PWA; build it with the release command";
+pub(crate) const NO_PWA: &str = "the running daemon was built without the PWA; stop it and start the daemon of a release build (the release command)";
 
 /// The port of the daemon serving `dir`.
 fn port_of(dir: &Path) -> Result<u16, String> {

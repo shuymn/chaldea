@@ -97,7 +97,7 @@ fn open_without_pwa() {
     ));
     assert_eq!(code, 1, "{out}{err}");
     assert!(
-        err.contains("this chaldea was built without the PWA; build it with the release command"),
+        err.contains("the running daemon was built without the PWA; stop it and start the daemon of a release build (the release command)"),
         "{err}"
     );
     assert!(out.is_empty(), "{out}");
