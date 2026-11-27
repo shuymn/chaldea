@@ -17,15 +17,17 @@ use crate::backend::{
 use crate::drain::{Drain, DrainEvent};
 use crate::limits::{CloseBounds, Limits};
 use crate::origin::{ClassSet, ReplyKind};
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Line, ScreenMeta, Snapshot, Walk};
 use crate::vt::{ModeView, ModeWord, ReplyTarget, Vt};
 use crate::writer::{
-    Completion, Fired, Guard, LogTruncated, PendingReply, Queue, SubmitError, WriteRecord,
+    Completion, Fence, Fired, Guard, LogTruncated, PendingReply, Queue, SubmitError, WriteRecord,
     WriteTicket, WriteUnit, writer_main,
 };
 
 /// How often the waiter polls the child.
 const WAIT_POLL: Duration = Duration::from_millis(100);
+/// The backend close a resize runs when a close left the control to it.
+const HANDOFF_CLOSE: Duration = Duration::from_secs(2);
 
 /// Locks `m`, ignoring poisoning: every callback runs inside `catch_unwind`, so a poisoned
 /// lock only means a thread died while holding it, and its state is still consistent.
@@ -116,7 +118,41 @@ pub struct SubscriptionId(u64);
 pub enum SubscribeError {
     VtUnavailable,
     TooManySubscribers,
+    /// The queue is sealed: the session is closing.
+    Closed,
 }
+
+/// A subscription's start: the screen's facts at `meta.output_offset` and its cells, unless
+/// their §2.6 encoding went over the subscriber's budget (`lines: None`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subscribed {
+    pub id: SubscriptionId,
+    pub meta: ScreenMeta,
+    pub lines: Option<Vec<Line>>,
+}
+
+/// Why a [`SessionHandle::resize`] did nothing.
+#[derive(Debug)]
+pub enum ResizeError {
+    /// The queue is sealed, or the PTY is closed.
+    Closed,
+    /// The caller's fence word moved.
+    FenceMoved,
+    /// The backend refused; neither side changed.
+    Failed(io::Error),
+}
+
+impl fmt::Display for ResizeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResizeError::Closed => f.write_str("pty closed"),
+            ResizeError::FenceMoved => f.write_str("fence moved"),
+            ResizeError::Failed(e) => write!(f, "resize failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ResizeError {}
 
 /// What a successful `resize` changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +254,42 @@ impl VtState {
     }
 }
 
+/// What a close that timed out on the control lock left to the lock's holder.
+#[derive(Default)]
+struct Handoff {
+    /// The holder closes the control when it releases the lock.
+    abandoned: bool,
+}
+
+/// [`Shared::take_control`]'s result.
+enum Ctl {
+    /// The lock was taken: the control, or `None` when it was closed already.
+    Taken(Option<Box<dyn PtyControl>>),
+    /// Still held at the deadline: the holder closes it.
+    Held,
+}
+
+/// A resize's hold of the control lock: on release (also while unwinding), under the
+/// handoff lock, it closes the control when a close left it to the holder.
+struct ControlHold<'a> {
+    sh: &'a Shared,
+    ctl: Option<MutexGuard<'a, Option<Box<dyn PtyControl>>>>,
+}
+
+impl Drop for ControlHold<'_> {
+    fn drop(&mut self) {
+        let h = lock(&self.sh.handoff);
+        if h.abandoned
+            && let Some(c) = self.ctl.as_mut().and_then(|g| g.take())
+        {
+            let deadline = deadline_in(HANDOFF_CLOSE);
+            let _ = catch_unwind(AssertUnwindSafe(|| c.close(deadline)));
+        }
+        drop(self.ctl.take());
+        drop(h);
+    }
+}
+
 const EV_EXITED: u8 = 1;
 const EV_WAIT_FAILED: u8 = 1 << 1;
 const EV_OUTPUT_ENDED: u8 = 1 << 2;
@@ -234,6 +306,9 @@ pub(crate) struct Shared {
     vt: Mutex<VtState>,
     /// Control lock.
     control: Mutex<Option<Box<dyn PtyControl>>>,
+    /// Taken by a close that timed out on the control lock, and by a resize releasing the
+    /// control lock (inside it): exactly one of them closes the control.
+    handoff: Mutex<Handoff>,
     pub(crate) modes: ModeWord,
     exit: OnceLock<ChildExit>,
     wait_failed: OnceLock<String>,
@@ -290,6 +365,7 @@ impl Shared {
                     next_sub: 1,
                 }),
                 control: Mutex::new(None),
+                handoff: Mutex::new(Handoff::default()),
                 modes,
                 exit: OnceLock::new(),
                 wait_failed: OnceLock::new(),
@@ -459,6 +535,116 @@ impl Shared {
         drop(st);
         // Dropped after unlocking: a sink's captures may call the session.
         drop(gone);
+    }
+
+    /// Takes the control by `deadline`. When the lock is still held then (a resize holds it
+    /// across its backend call), the holder is told to close the control when it releases
+    /// the lock, unless it released it meanwhile: under the handoff lock, a last `try_lock`
+    /// decides which.
+    fn take_control(&self, deadline: Instant) -> Ctl {
+        if let Some(mut g) = try_lock_until(&self.control, deadline) {
+            return Ctl::Taken(g.take());
+        }
+        let mut h = lock(&self.handoff);
+        h.abandoned = true;
+        let taken = match self.control.try_lock() {
+            Ok(mut g) => Ctl::Taken(g.take()),
+            Err(TryLockError::Poisoned(e)) => Ctl::Taken(e.into_inner().take()),
+            Err(TryLockError::WouldBlock) => Ctl::Held,
+        };
+        drop(h);
+        taken
+    }
+
+    fn sealed(&self) -> bool {
+        lock(&self.q).closed
+    }
+
+    fn subscribe(
+        &self,
+        mut sink: OutputSink,
+        deadline: Instant,
+        budget: impl FnOnce(&ScreenMeta) -> usize,
+    ) -> Result<Subscribed, SubscribeError> {
+        if self.sealed() {
+            return Err(SubscribeError::Closed);
+        }
+        let mut st = try_lock_until(&self.vt, deadline).ok_or(SubscribeError::VtUnavailable)?;
+        if self.vt_failed.load(Ordering::Acquire) {
+            return Err(SubscribeError::VtUnavailable);
+        }
+        // Under the VT lock (VT lock → queue lock): a seal before it is seen here.
+        if self.sealed() {
+            return Err(SubscribeError::Closed);
+        }
+        if st.sub_count() >= self.limits.subscribers {
+            return Err(SubscribeError::TooManySubscribers);
+        }
+        let (meta, lines) = match st.vt.snapshot_within(st.output_offset, deadline, budget) {
+            Walk::Copied(snap) => (snap.meta(), Some(snap.lines)),
+            Walk::OverBudget(meta) => (meta, None),
+            Walk::Late => return Err(SubscribeError::VtUnavailable),
+        };
+        let id = SubscriptionId(st.next_sub);
+        st.next_sub += 1;
+        let started = Subscribed { id, meta, lines };
+        if let Some(end) = self.output_end.get() {
+            drop(st);
+            let _ = catch_unwind(AssertUnwindSafe(|| sink(OutputEvent::End(end))));
+            return Ok(started);
+        }
+        st.subs.push(Sub { id, sink });
+        Ok(started)
+    }
+
+    fn unsubscribe(&self, id: SubscriptionId) {
+        let mut st = lock(&self.vt);
+        // Taken out and dropped after unlocking: a sink's captures may call the session.
+        let removed = take_sub(&mut st.subs, id);
+        if removed.is_none() && st.dispatching {
+            st.pending_remove.push(id);
+        }
+        drop(st);
+        drop(removed);
+    }
+
+    /// The PTY first, without the VT lock, then the grid and the size the responder
+    /// reports. The permission is decided after the control lock is taken, under the queue
+    /// lock, immediately before the backend call: not sealed and the fence unmoved.
+    fn resize(&self, size: PtySize, fence: Option<&Fence>) -> Result<Resized, ResizeError> {
+        let held = ControlHold {
+            sh: self,
+            ctl: Some(lock(&self.control)),
+        };
+        crate::probe!(self, ResizeLocked);
+        {
+            let q = lock(&self.q);
+            if q.closed {
+                return Err(ResizeError::Closed);
+            }
+            if fence.is_some_and(Fence::moved) {
+                return Err(ResizeError::FenceMoved);
+            }
+        }
+        let Some(control) = held.ctl.as_ref().and_then(|c| c.as_ref()) else {
+            return Err(ResizeError::Closed);
+        };
+        control.resize(size).map_err(ResizeError::Failed)?;
+        let mut st = lock(&self.vt);
+        let mut resized = Resized::PtyOnly;
+        if !self.vt_failed.load(Ordering::Acquire) {
+            let vt = &mut st.vt;
+            if catch_unwind(AssertUnwindSafe(|| vt.resize(size))).is_ok() {
+                resized = Resized::PtyAndVt;
+            } else {
+                self.vt_failed.store(true, Ordering::Release);
+            }
+        }
+        drop(st);
+        self.size.store(pack_size(size), Ordering::Release);
+        crate::probe!(self, ResizeDone);
+        drop(held);
+        Ok(resized)
     }
 
     fn end(&self, end: &OutputEnd) {
@@ -767,65 +953,49 @@ impl Session {
         }
     }
 
-    /// A diagnostic snapshot plus every output byte after its offset, then one `End`.
-    pub fn subscribe(
-        &self,
-        mut sink: OutputSink,
-        deadline: Instant,
-    ) -> Result<(Snapshot, SubscriptionId), SubscribeError> {
-        let mut st = try_lock_until(&self.sh.vt, deadline).ok_or(SubscribeError::VtUnavailable)?;
-        if self.sh.vt_failed.load(Ordering::Acquire) {
-            return Err(SubscribeError::VtUnavailable);
+    /// The session's subscription and resize side, to call without the session (and
+    /// without whatever lock the caller holds the session under).
+    #[must_use]
+    pub fn handle(&self) -> SessionHandle {
+        SessionHandle {
+            sh: self.sh.clone(),
         }
-        if st.sub_count() >= self.sh.limits.subscribers {
-            return Err(SubscribeError::TooManySubscribers);
-        }
-        let Some(snap) = st.vt.snapshot(st.output_offset, deadline) else {
-            return Err(SubscribeError::VtUnavailable);
-        };
-        let id = SubscriptionId(st.next_sub);
-        st.next_sub += 1;
-        if let Some(end) = self.sh.output_end.get() {
-            drop(st);
-            let _ = catch_unwind(AssertUnwindSafe(|| sink(OutputEvent::End(end))));
-            return Ok((snap, id));
-        }
-        st.subs.push(Sub { id, sink });
-        Ok((snap, id))
     }
 
+    /// A diagnostic snapshot plus every output byte after its offset, then one `End`.
+    /// Refused `Closed` once the queue is sealed.
+    pub fn subscribe(
+        &self,
+        sink: OutputSink,
+        deadline: Instant,
+    ) -> Result<(Snapshot, SubscriptionId), SubscribeError> {
+        let s = self.sh.subscribe(sink, deadline, |_| usize::MAX)?;
+        let m = s.meta;
+        let snap = Snapshot {
+            cols: m.cols,
+            rows: m.rows,
+            lines: s.lines.unwrap_or_default(),
+            cursor: m.cursor,
+            modes: m.modes,
+            output_offset: m.output_offset,
+        };
+        Ok((snap, s.id))
+    }
+
+    /// Works after the seal too.
     pub fn unsubscribe(&self, id: SubscriptionId) {
-        let mut st = lock(&self.sh.vt);
-        // Taken out and dropped after unlocking: a sink's captures may call the session.
-        let removed = take_sub(&mut st.subs, id);
-        if removed.is_none() && st.dispatching {
-            st.pending_remove.push(id);
-        }
-        drop(st);
-        drop(removed);
+        self.sh.unsubscribe(id);
     }
 
     /// Resizes the PTY first, without the VT lock, then the grid and the size the
     /// responder reports. On failure neither side changes. After `VtFailed` only the PTY
-    /// is resized, and the result says so. Not bounded.
+    /// is resized, and the result says so. Refused once the queue is sealed. Waits for the
+    /// control lock: not bounded.
     pub fn resize(&self, size: PtySize) -> io::Result<Resized> {
-        let ctl = lock(&self.sh.control);
-        let Some(control) = ctl.as_ref() else {
-            return Err(io::Error::other("pty closed"));
-        };
-        control.resize(size)?;
-        let mut st = lock(&self.sh.vt);
-        let mut resized = Resized::PtyOnly;
-        if !self.sh.vt_failed.load(Ordering::Acquire) {
-            let vt = &mut st.vt;
-            if catch_unwind(AssertUnwindSafe(|| vt.resize(size))).is_ok() {
-                resized = Resized::PtyAndVt;
-            } else {
-                self.sh.vt_failed.store(true, Ordering::Release);
-            }
-        }
-        self.sh.size.store(pack_size(size), Ordering::Release);
-        Ok(resized)
+        self.sh.resize(size, None).map_err(|e| match e {
+            ResizeError::Failed(e) => e,
+            other => io::Error::other(other.to_string()),
+        })
     }
 
     #[must_use]
@@ -917,11 +1087,13 @@ impl Session {
     ) -> CloseOutcome {
         self.closed = true;
         let t0 = Instant::now();
+        // One absolute end for every lock wait, the backend close, and the cleanup.
+        let end = deadline_in(bounds.total());
         let sh = self.sh.clone();
         let _release = Release {
             sh: &sh,
             waiter_stop: &self.waiter_stop,
-            close: bounds.close,
+            end,
         };
 
         // 1. Close the queue and settle everything that has not dispatched.
@@ -947,15 +1119,15 @@ impl Session {
         sh.stop_writer();
         let _ = wait_finished(self.writer.as_ref(), deadline_in(bounds.input));
 
-        // 4. Close the PTY while the drain keeps reading.
-        let close = {
-            let mut ctl = lock(&sh.control);
-            match ctl.take() {
-                Some(c) => c.close(deadline_in(bounds.close)),
-                None => CloseReport {
-                    elapsed: Some(Duration::ZERO),
-                },
-            }
+        // 4. Close the PTY while the drain keeps reading. A resize holding the control past
+        // the step's deadline closes it itself when it returns.
+        let step = deadline_in(bounds.close).min(end);
+        let close = match sh.take_control(step) {
+            Ctl::Taken(Some(c)) => c.close(step),
+            Ctl::Taken(None) => CloseReport {
+                elapsed: Some(Duration::ZERO),
+            },
+            Ctl::Held => CloseReport { elapsed: None },
         };
 
         // 5. Finish the drain.
@@ -1022,21 +1194,21 @@ impl Session {
 /// close): ends the writer, stops the waiter, and closes the control unless a step already
 /// did, so the threads end and drop their references to the input, the child, and the PTY.
 /// On Windows the child's job handle closes with the last of them, which ends the tree
-/// (kill-on-close) even after a kill that panicked.
+/// (kill-on-close) even after a kill that panicked. Bounded by the close's own end; a
+/// resize holding the control then closes it itself.
 struct Release<'a> {
     sh: &'a Shared,
     waiter_stop: &'a AtomicBool,
-    close: Duration,
+    end: Instant,
 }
 
 impl Drop for Release<'_> {
     fn drop(&mut self) {
         self.sh.stop_writer();
         self.waiter_stop.store(true, Ordering::Release);
-        let control = lock(&self.sh.control).take();
-        if let Some(c) = control {
-            let deadline = deadline_in(self.close);
-            let _ = catch_unwind(AssertUnwindSafe(|| c.close(deadline)));
+        if let Ctl::Taken(Some(c)) = self.sh.take_control(self.end) {
+            let end = self.end;
+            let _ = catch_unwind(AssertUnwindSafe(|| c.close(end)));
         }
     }
 }
@@ -1107,6 +1279,51 @@ impl Screen {
     #[must_use]
     pub fn vt_failed(&self) -> bool {
         self.sh.vt_failed.load(Ordering::Acquire)
+    }
+}
+
+/// A session's subscription and resize side, without the session: a clone of its shared
+/// state, so it outlives the session (every call then refuses or does nothing).
+#[derive(Clone)]
+pub struct SessionHandle {
+    sh: Arc<Shared>,
+}
+
+impl fmt::Debug for SessionHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionHandle").finish_non_exhaustive()
+    }
+}
+
+impl SessionHandle {
+    /// The current size: the spawn size until a resize succeeds.
+    #[must_use]
+    pub fn size(&self) -> PtySize {
+        unpack_size(self.sh.size.load(Ordering::Acquire))
+    }
+
+    /// [`Session::subscribe`] whose copy of the cells, under the VT lock, stops once their
+    /// §2.6 encoding would pass `grid_budget(meta)` bytes, checked per cell with the cell's
+    /// text (zero-width characters included) and the deadline: the subscription is then
+    /// registered as usual, with `lines: None` and the same offset.
+    pub fn subscribe(
+        &self,
+        sink: OutputSink,
+        deadline: Instant,
+        grid_budget: impl FnOnce(&ScreenMeta) -> usize,
+    ) -> Result<Subscribed, SubscribeError> {
+        self.sh.subscribe(sink, deadline, grid_budget)
+    }
+
+    /// Works after the seal too.
+    pub fn unsubscribe(&self, id: SubscriptionId) {
+        self.sh.unsubscribe(id);
+    }
+
+    /// [`Session::resize`] whose permission also needs `fence` unmoved, checked with the
+    /// seal immediately before the backend call. Waits for the control lock.
+    pub fn resize(&self, size: PtySize, fence: Option<&Fence>) -> Result<Resized, ResizeError> {
+        self.sh.resize(size, fence)
     }
 }
 

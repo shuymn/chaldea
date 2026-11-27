@@ -15,7 +15,7 @@ use alacritty_terminal::vte::ansi::{NamedColor, Processor, Rgb, Timeout};
 
 use crate::backend::PtySize;
 use crate::origin::ReplyKind;
-use crate::snapshot::{Snapshot, TermModes, walk};
+use crate::snapshot::{ScreenMeta, Snapshot, TermModes, Walk, walk, walk_within};
 
 /// Nominal foreground reported for OSC 10, OSC 12 (cursor), and OSC 4 (palette).
 pub(crate) const FG: Rgb = Rgb {
@@ -184,6 +184,16 @@ impl Vt {
     /// The screen, or `None` once `deadline` passes during the copy.
     pub(crate) fn snapshot(&self, output_offset: u64, deadline: Instant) -> Option<Snapshot> {
         walk(&self.term, output_offset, deadline)
+    }
+
+    /// The screen, its cells only while their encoding stays within `budget(meta)` bytes.
+    pub(crate) fn snapshot_within(
+        &self,
+        output_offset: u64,
+        deadline: Instant,
+        budget: impl FnOnce(&ScreenMeta) -> usize,
+    ) -> Walk {
+        walk_within(&self.term, output_offset, deadline, budget)
     }
 }
 

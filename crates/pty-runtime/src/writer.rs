@@ -102,7 +102,7 @@ pub struct Fence {
 }
 
 impl Fence {
-    fn moved(&self) -> bool {
+    pub(crate) fn moved(&self) -> bool {
         self.word.load(Ordering::Acquire) != self.expect
     }
 }

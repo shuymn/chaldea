@@ -121,6 +121,10 @@ struct Proc {
     input: Mutex<InputState>,
     input_cv: Condvar,
     fail_resize: AtomicBool,
+    /// The next `resize` blocks inside the backend call (`hold_resizes`).
+    resize_hold: Mutex<Option<Hold>>,
+    resize_cv: Condvar,
+    next_resize_hold: std::sync::atomic::AtomicU64,
     /// The kill-state lock: whether a `kill_tree` call or a test hold has it.
     kill_lock: Mutex<bool>,
     kill_cv: Condvar,
@@ -282,6 +286,9 @@ impl PtyRuntime for FakePty {
             input: Mutex::new(InputState::default()),
             input_cv: Condvar::new(),
             fail_resize: AtomicBool::new(false),
+            resize_hold: Mutex::new(None),
+            resize_cv: Condvar::new(),
+            next_resize_hold: std::sync::atomic::AtomicU64::new(0),
             kill_lock: Mutex::new(false),
             kill_cv: Condvar::new(),
             signals: AtomicU32::new(0),
@@ -403,6 +410,21 @@ struct FakeControl(Arc<Proc>);
 
 impl PtyControl for FakeControl {
     fn resize(&self, size: PtySize) -> io::Result<()> {
+        {
+            let p = &self.0;
+            let mut h = lock(&p.resize_hold);
+            if let Some(hold) = h.as_mut() {
+                hold.entered = true;
+                p.resize_cv.notify_all();
+                while h.as_ref().is_some_and(|h| !h.released) {
+                    h = p
+                        .resize_cv
+                        .wait(h)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                *h = None;
+            }
+        }
         if self.0.fail_resize.swap(false, Ordering::AcqRel) {
             self.0.record(FakeEvent::ResizeFailed);
             return Err(io::Error::other("injected resize failure"));
@@ -746,6 +768,22 @@ impl FakeChild {
         self.proc.fail_resize.store(true, Ordering::Release);
     }
 
+    /// The next backend `resize` blocks inside the call until the hold is released or
+    /// dropped.
+    #[must_use]
+    pub fn hold_resizes(&self) -> ResizeHold {
+        let id = self.proc.next_resize_hold.fetch_add(1, Ordering::AcqRel) + 1;
+        *lock(&self.proc.resize_hold) = Some(Hold {
+            id,
+            entered: false,
+            released: false,
+        });
+        ResizeHold {
+            proc: self.proc.clone(),
+            id,
+        }
+    }
+
     /// Every accepted `write()` call's bytes, in order.
     #[must_use]
     pub fn writes(&self) -> Vec<Vec<u8>> {
@@ -812,6 +850,53 @@ impl Drop for WriteHold {
     }
 }
 
+/// A blocked backend `resize`, released by `release` or drop.
+pub struct ResizeHold {
+    proc: Arc<Proc>,
+    id: u64,
+}
+
+impl ResizeHold {
+    /// Whether the held resize has been entered (and is blocked) by `deadline`.
+    #[must_use]
+    pub fn wait_entered(&self, deadline: Instant) -> bool {
+        let mut h = lock(&self.proc.resize_hold);
+        loop {
+            match h.as_ref() {
+                Some(x) if x.id == self.id && x.entered => return true,
+                Some(x) if x.id == self.id => {}
+                _ => return false,
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            h = self
+                .proc
+                .resize_cv
+                .wait_timeout(h, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    pub fn release(self) {}
+}
+
+impl Drop for ResizeHold {
+    fn drop(&mut self) {
+        let mut h = lock(&self.proc.resize_hold);
+        if let Some(x) = h.as_mut().filter(|x| x.id == self.id) {
+            x.released = true;
+            if !x.entered {
+                *h = None;
+            }
+        }
+        drop(h);
+        self.proc.resize_cv.notify_all();
+    }
+}
+
 /// A point in the runtime's threads that tests wait for or park at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProbePoint {
@@ -828,6 +913,10 @@ pub enum ProbePoint {
     /// The writer is about to decide a unit's first write permission, with the queue lock
     /// held: every check but the final deadline check has passed.
     Dispatching,
+    /// A resize holds the control lock, before its seal and fence check.
+    ResizeLocked,
+    /// A resize after its backend call, before it releases the control lock.
+    ResizeDone,
 }
 
 impl ProbePoint {
@@ -839,14 +928,16 @@ impl ProbePoint {
             ProbePoint::Permitted => 3,
             ProbePoint::PieceParsing => 4,
             ProbePoint::Dispatching => 5,
+            ProbePoint::ResizeLocked => 6,
+            ProbePoint::ResizeDone => 7,
         }
     }
 }
 
 #[derive(Default)]
 struct ProbeState {
-    counts: [u64; 6],
-    armed: [Option<u64>; 6],
+    counts: [u64; 8],
+    armed: [Option<u64>; 8],
     released: Vec<u64>,
     next: u64,
 }
