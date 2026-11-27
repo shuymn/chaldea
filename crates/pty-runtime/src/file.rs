@@ -135,7 +135,8 @@ pub(crate) fn file_id_class_unsupported(code: Option<i32>) -> bool {
 /// `\\?\UNC\server\pipe\…`), with either separator, repeated separators, and in any case.
 #[cfg(any(windows, test))]
 fn device_namespace(text: &str) -> bool {
-    let text = text.replace('/', "\\").to_ascii_lowercase();
+    let mut text = text.replace('/', "\\");
+    text.make_ascii_lowercase();
     // The share of a UNC path's `server\share\…` part; Win32 collapses repeated separators.
     let pipe_share = |unc: &str| {
         unc.split('\\')

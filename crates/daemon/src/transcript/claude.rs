@@ -87,6 +87,13 @@ impl Capped {
         }
     }
 
+    /// Empties the string for one capped at `cap`, keeping its buffer.
+    fn reset(&mut self, cap: usize) {
+        self.cap = cap;
+        self.bytes.clear();
+        self.over = false;
+    }
+
     fn push(&mut self, b: &[u8]) {
         if self.over || self.bytes.len() + b.len() > self.cap {
             self.over = true;
@@ -289,15 +296,15 @@ impl Feed<'_> {
         let slot = self.slot();
         self.w.str_to = match slot {
             Slot::Type | Slot::Stamp => {
-                self.w.value = Capped::new(VALUE_BYTES);
+                self.w.value.reset(VALUE_BYTES);
                 StrTo::Capped(slot)
             }
             Slot::Prompt => {
-                self.w.value = Capped::new(PROMPT_BYTES);
+                self.w.value.reset(PROMPT_BYTES);
                 StrTo::Capped(slot)
             }
             Slot::BlockType => {
-                self.w.value = Capped::new(KEY_BYTES);
+                self.w.value.reset(KEY_BYTES);
                 StrTo::Capped(slot)
             }
             Slot::BlockText => {
@@ -411,7 +418,7 @@ impl Sink for Feed<'_> {
         }
         match t {
             Tok::StrBegin { key: true } => {
-                self.w.key = Capped::new(KEY_BYTES);
+                self.w.key.reset(KEY_BYTES);
                 self.w.str_to = StrTo::Key;
             }
             Tok::StrBegin { key: false } => self.begin_string(),

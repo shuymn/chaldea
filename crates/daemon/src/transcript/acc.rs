@@ -5,7 +5,6 @@
 use std::cell::Cell;
 use std::io;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::store::{BlobSpool, MAX_BLOB_BYTES, Prepared, prepare_content};
@@ -62,34 +61,37 @@ impl SpoolDir {
 }
 
 /// The bytes the accumulators of one line hold in memory together: now and at most.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct Meter(Rc<(Cell<usize>, Cell<usize>)>);
+#[derive(Debug, Default)]
+pub(crate) struct Meter {
+    now: Cell<usize>,
+    peak: Cell<usize>,
+}
 
 impl Meter {
     fn change(&self, from: usize, to: usize) {
-        let now = self.0.0.get() - from + to;
-        self.0.0.set(now);
-        self.0.1.set(self.0.1.get().max(now));
+        let now = self.now.get() - from + to;
+        self.now.set(now);
+        self.peak.set(self.peak.get().max(now));
     }
 
     /// The most bytes held at once.
     pub(crate) fn peak(&self) -> usize {
-        self.0.1.get()
+        self.peak.get()
     }
 }
 
 /// Bytes in memory, then, past `MAX_BLOB_BYTES`, in a spool.
-pub(crate) struct ByteAcc {
-    dir: SpoolDir,
+pub(crate) struct ByteAcc<'a> {
+    dir: &'a SpoolDir,
     mem: Vec<u8>,
     spool: Option<BlobSpool>,
-    meter: Meter,
+    meter: &'a Meter,
     /// The memory reported to the meter.
     counted: usize,
 }
 
-impl ByteAcc {
-    pub(crate) fn new(dir: SpoolDir, meter: Meter) -> ByteAcc {
+impl<'a> ByteAcc<'a> {
+    pub(crate) fn new(dir: &'a SpoolDir, meter: &'a Meter) -> ByteAcc<'a> {
         ByteAcc {
             dir,
             mem: Vec::new(),
@@ -140,7 +142,7 @@ impl ByteAcc {
     /// # Errors
     ///
     /// A spool error, or `stop` set during the replay.
-    pub(crate) fn append(&mut self, mut other: ByteAcc, stop: &AtomicBool) -> io::Result<()> {
+    pub(crate) fn append(&mut self, mut other: ByteAcc<'_>, stop: &AtomicBool) -> io::Result<()> {
         match other.spool.take() {
             None => self.push(&other.mem),
             Some(s) => s.replay(&mut |b| {
@@ -173,7 +175,7 @@ impl ByteAcc {
     }
 }
 
-impl Drop for ByteAcc {
+impl Drop for ByteAcc<'_> {
     fn drop(&mut self) {
         self.meter.change(self.counted, 0);
     }

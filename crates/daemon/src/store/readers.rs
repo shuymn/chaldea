@@ -1706,7 +1706,7 @@ mod tests {
         std::thread::scope(|sc| {
             let waiter = sc.spawn(|| pool.borrow(wait_until).map(drop));
             // Once the lock is taken after the wait was counted, the borrower waits; the
-            // reader comes back under the lock, which is held past the deadline.
+            // reader comes back under the lock, which is held until the deadline is reached.
             while pool.waits.load(std::sync::atomic::Ordering::Acquire) == 0
                 && !waiter.is_finished()
             {
@@ -1721,9 +1721,9 @@ mod tests {
             );
             s.idle.push(Connection::open_in_memory().unwrap());
             s.open += 1;
-            std::thread::sleep(
-                wait_until.saturating_duration_since(Instant::now()) + Duration::from_millis(50),
-            );
+            while Instant::now() < wait_until {
+                std::thread::sleep(wait_until.saturating_duration_since(Instant::now()));
+            }
             drop(s);
             pool.cv.notify_all();
             assert!(matches!(waiter.join().unwrap(), Err(ReadError::Busy)));

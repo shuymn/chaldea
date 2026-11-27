@@ -505,16 +505,14 @@ impl Utf8 {
 mod tests {
     use super::*;
 
-    /// Collects the decoded strings and counts the other tokens.
+    /// Collects the decoded strings.
     #[derive(Default)]
     struct Collect {
         strings: Vec<Vec<u8>>,
-        tokens: usize,
     }
 
     impl Sink for Collect {
         fn tok(&mut self, t: Tok<'_>) {
-            self.tokens += 1;
             match t {
                 Tok::StrBegin { .. } => self.strings.push(Vec::new()),
                 Tok::Chunk(b) => self.strings.last_mut().unwrap().extend_from_slice(b),
