@@ -66,6 +66,9 @@ pub(crate) struct Pool {
     faults: std::sync::Arc<super::writer::Faults>,
     state: Mutex<PoolState>,
     cv: Condvar,
+    /// Waits begun, counted under the lock just before it is released (tests).
+    #[cfg(test)]
+    waits: std::sync::atomic::AtomicU32,
 }
 
 impl Pool {
@@ -82,6 +85,8 @@ impl Pool {
                 drained: false,
             }),
             cv: Condvar::new(),
+            #[cfg(test)]
+            waits: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -104,6 +109,9 @@ impl Pool {
             if now >= wait_until {
                 return Err(ReadError::Busy);
             }
+            #[cfg(test)]
+            self.waits
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
             s = self
                 .cv
                 .wait_timeout(s, wait_until - now)
@@ -1697,9 +1705,13 @@ mod tests {
         let wait_until = Instant::now() + Duration::from_millis(200);
         std::thread::scope(|sc| {
             let waiter = sc.spawn(|| pool.borrow(wait_until).map(drop));
-            // The borrower is waiting; the reader comes back under the lock, which is held
-            // past the deadline.
-            std::thread::sleep(Duration::from_millis(50));
+            // Once the lock is taken after the wait was counted, the borrower waits; the
+            // reader comes back under the lock, which is held past the deadline.
+            while pool.waits.load(std::sync::atomic::Ordering::Acquire) == 0
+                && !waiter.is_finished()
+            {
+                std::thread::yield_now();
+            }
             let mut s = lock(&pool.state);
             s.idle.push(Connection::open_in_memory().unwrap());
             s.open += 1;
