@@ -198,6 +198,15 @@ fn decode(r: &Reply) -> EventsResponse {
     serde_json::from_slice(&r.body).unwrap()
 }
 
+/// A server whose 60 s request budget holds the commits [`with_commits_during`] waits for
+/// inside the read: a read that outlasts the test server's 2 s budget is 408 by design.
+async fn start() -> TestServer {
+    TestServer::start_with(Mounts::mvp(), |c| {
+        c.short_deadline = Duration::from_secs(60);
+    })
+    .await
+}
+
 /// Arms the handler's read (after the guard's token read) to let the jobs queued behind
 /// `hold` commit before the handler goes on, then sends `req`.
 async fn with_commits_during(
@@ -237,7 +246,7 @@ fn queue(srv: &TestServer, events: Vec<NewEvent>, done: &mpsc::Sender<()>) {
 /// request runs (after its read) are not in it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_equals_model_at_cut() {
-    let srv = TestServer::start(Mounts::mvp()).await;
+    let srv = start().await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let mut m = Model::default();
     let mut log = Log::default();
@@ -381,7 +390,7 @@ async fn snapshot_equals_model_at_cut() {
 /// it, and `has_more` and `head_seq` agree with the page.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn page_and_head_from_one_snapshot() {
-    let srv = TestServer::start(Mounts::mvp()).await;
+    let srv = start().await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let hold = srv.hold_writer().await;
     let (done_tx, done_rx) = mpsc::channel();
