@@ -93,6 +93,25 @@ describe("credential.generation", () => {
     expect(await tab.read()).toEqual(a);
   });
 
+  test("close releases the connection, so the database can be deleted without blocking", async () => {
+    const idb = new IDBFactory();
+    const store = new CredentialStore({
+      indexedDB: idb,
+      uuid: () => "g",
+      channel: () => ({ postMessage() {}, close() {}, onmessage: null }) as unknown as BroadcastChannel,
+    });
+    // A write is in flight while the close is asked for: it still commits.
+    const write = store.store("token");
+    store.close();
+    await write;
+    const blocked = await new Promise<boolean>((resolve) => {
+      const req = idb.deleteDatabase("chaldea");
+      req.onblocked = () => resolve(true);
+      req.onsuccess = () => resolve(false);
+    });
+    expect(blocked).toBe(false);
+  });
+
   test("a losing 401 that finds the record empty adopts the cleared state and posts no second clear", async () => {
     const { posted, make } = harness();
     const tab = make();

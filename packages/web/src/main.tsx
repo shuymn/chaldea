@@ -25,6 +25,7 @@ if (root) {
   // back-forward cache reloads, which reads everything from the daemon again.
   addEventListener("pagehide", () => {
     runner.stop();
+    store.close();
     view.unmount();
   });
   addEventListener("pageshow", (e) => {

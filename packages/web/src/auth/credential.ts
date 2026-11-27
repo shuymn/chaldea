@@ -103,9 +103,9 @@ export class CredentialStore {
 
   /**
    * The 401 path: deletes the record only if its generation is `generation`, in one
-   * transaction, and posts the clear after the commit. Resolves with what is stored
-   * afterwards: null after the delete or when the record is already empty (no second
-   * clear is posted), else the newer credential, which the caller adopts silently.
+   * transaction, and posts the clear after the commit; an empty record posts no second
+   * clear. Resolves with what is stored afterwards; the runner does not use it, it
+   * rereads the store under the 401's generation instead.
    */
   async clearIf(generation: string): Promise<Credential | null> {
     const result = await this.tx<{ deleted: boolean; current: Credential | null }>(
@@ -125,6 +125,19 @@ export class CredentialStore {
     );
     if (result.deleted) this.post({ cleared: generation });
     return result.current;
+  }
+
+  /**
+   * Closes the connection once any open in progress finishes; transactions already
+   * created complete first. For the page's teardown, after the runner stopped.
+   */
+  close(): void {
+    const db = this.db;
+    this.db = null;
+    void db?.then(
+      (d) => d.close(),
+      () => {},
+    );
   }
 
   /** Calls `onChange` when another tab posts a committed change; returns the unsubscribe. */
