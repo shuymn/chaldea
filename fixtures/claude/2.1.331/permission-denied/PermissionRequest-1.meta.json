@@ -1,0 +1,14 @@
+{
+  "fact": {
+    "card_opened": {
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "printf c1b > c1b-denied.txt",
+        "description": "Write c1b to a second file"
+      },
+      "turn_ref": "f96a6534-71cb-48e8-8cef-11b746498fa7"
+    }
+  },
+  "events": [],
+  "route": "interpret"
+}

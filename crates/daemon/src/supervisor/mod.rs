@@ -30,6 +30,7 @@ mod screen;
 pub mod send;
 mod tick;
 mod tracker;
+pub(crate) mod version;
 pub(crate) mod workspace;
 
 #[cfg(test)]
@@ -236,10 +237,10 @@ pub struct SupervisorConfig {
     pub(crate) tick_steps: Vec<Arc<dyn TickStep>>,
     /// Whether the tick task runs (tests drive [`Supervisor::tick`] themselves).
     pub(crate) tick_task: bool,
-    /// The hook decoder of the send side (send §2.5): the daemon's decodes nothing until
-    /// an adapter PR adds one; tests pass `FakeDecoder`.
+    /// Each agent's hook decoder (send §2.5): `ClaudeDecoder` for Claude, `NoDecoder` for
+    /// Codex until its adapter; tests pass `FakeDecoder` for both.
     #[doc(hidden)]
-    pub decoder: Arc<dyn send::HookDecoder>,
+    pub decoders: send::Decoders,
     /// The readiness mode of every row, when a unit test overrides the capability table's.
     pub(crate) readiness_mode: Option<ReadinessMode>,
     /// Whether each launch's send worker and the driver run (unit tests that drive no send
@@ -248,6 +249,9 @@ pub struct SupervisorConfig {
     /// The restart prober's OS work (`docs/design/supervisor-recovery.md` §2.3).
     #[doc(hidden)]
     pub kill_recorded: KillRecordedFn,
+    /// The Claude settings file every Claude launch passes as `--settings`: set by
+    /// `SupervisorComponents::build` to `<state_dir>/claude-settings.json`.
+    pub(crate) claude_settings: String,
 }
 
 impl Default for SupervisorConfig {
@@ -268,10 +272,11 @@ impl Default for SupervisorConfig {
             exit_steps: Vec::new(),
             tick_steps: Vec::new(),
             tick_task: true,
-            decoder: Arc::new(send::NoDecoder),
+            decoders: send::Decoders::mvp(),
             readiness_mode: None,
             send_workers: true,
             kill_recorded: Arc::new(chaldea_pty_runtime::orphan::kill_recorded),
+            claude_settings: chaldea_core::launch::CLAUDE_SETTINGS_FILE.to_owned(),
         }
     }
 }
@@ -307,6 +312,8 @@ pub(crate) struct Supervisor {
     pub(crate) instance: String,
     /// The restart prober's concurrency slots (`PROBE_SLOTS`).
     pub(crate) probe_slots: Arc<tokio::sync::Semaphore>,
+    /// Version probes killed at their deadline and not yet reaped (C1 D11).
+    pub(crate) version_left: version::VersionLeft,
 }
 
 impl Supervisor {
@@ -352,6 +359,25 @@ impl Supervisor {
 
     pub(crate) fn remove(&self, launch: LaunchId) {
         self.live.lock().remove(&launch);
+    }
+}
+
+/// A store read on a blocking task, bounded by now + [`send::READ_WAIT`]; `None` when the read
+/// fails or is not in time.
+pub(crate) async fn read_bounded<R: Send + 'static>(
+    sup: &Supervisor,
+    f: impl FnOnce(&crate::store::ReadTx<'_>) -> Result<R, crate::store::StoreError> + Send + 'static,
+) -> Option<R> {
+    let deadline = sup.now() + send::READ_WAIT;
+    let store = sup.store.clone();
+    let real = sup.real(deadline);
+    let task = sup.rt.spawn_blocking(move || store.read(real, f));
+    match crate::deadline::settle_before(|| sup.now(), deadline, sup.timer(deadline), task)
+        .await
+        .in_time()
+    {
+        Some(Ok(Ok(v))) => Some(v),
+        _ => None,
     }
 }
 

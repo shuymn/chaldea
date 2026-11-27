@@ -68,6 +68,9 @@ pub struct LaunchInput {
     pub port: u16,
     /// This launch's hook token.
     pub hook_token: String,
+    /// The daemon's Claude settings file (`<state_dir>/claude-settings.json`), passed to
+    /// every Claude launch as `--settings`; unused for Codex.
+    pub claude_settings: String,
 }
 
 impl fmt::Debug for LaunchInput {
@@ -118,8 +121,8 @@ impl fmt::Debug for LaunchPlan {
 ///
 /// | Launch | Claude | Codex |
 /// |---|---|---|
-/// | Fresh | `--session-id <launch_id>` | `--no-daemon` [Windows flag] [`--` `<prompt>`] |
-/// | Resume | `--resume <session_id>` | `resume` `--no-daemon` [Windows flag] `<session_id>` [`--` `<prompt>`] |
+/// | Fresh | `--settings <file>` `--session-id <launch_id>` | `--no-daemon` [Windows flag] [`--` `<prompt>`] |
+/// | Resume | `--settings <file>` `--resume <session_id>` | `resume` `--no-daemon` [Windows flag] `<session_id>` [`--` `<prompt>`] |
 ///
 /// The prompt is one argument after a `--` that ends the argv. The environment is the
 /// daemon's minus [`ENV_SCRUB`], plus `CHALDEA_URL`, `CHALDEA_HOOK_URL`, `CHALDEA_HOOK_TOKEN`,
@@ -140,10 +143,13 @@ pub fn plan(input: &LaunchInput) -> LaunchPlan {
 fn args(input: &LaunchInput) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     match input.agent {
-        Agent::Claude => match &input.resume_session {
-            Some(session) => a.extend(["--resume".to_owned(), session.clone()]),
-            None => a.extend(["--session-id".to_owned(), input.launch_id.to_string()]),
-        },
+        Agent::Claude => {
+            a.extend(["--settings".to_owned(), input.claude_settings.clone()]);
+            match &input.resume_session {
+                Some(session) => a.extend(["--resume".to_owned(), session.clone()]),
+                None => a.extend(["--session-id".to_owned(), input.launch_id.to_string()]),
+            }
+        }
         Agent::Codex => {
             if input.resume_session.is_some() {
                 a.push("resume".to_owned());
@@ -161,6 +167,62 @@ fn args(input: &LaunchInput) -> Vec<String> {
         }
     }
     a
+}
+
+/// The settings file every Claude launch passes as `--settings`, in the state directory.
+pub const CLAUDE_SETTINGS_FILE: &str = "claude-settings.json";
+
+/// The Claude hook events the settings file registers, each as one command hook.
+pub const CLAUDE_HOOK_EVENTS: [&str; 6] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "Stop",
+    "PermissionRequest",
+    "PreToolUse",
+    "PostToolUse",
+];
+
+/// The command a Claude hook runs: `<emitter> hook-emit claude`. On macOS Claude runs it in
+/// `sh`: the path single-quoted for a POSIX shell (`'` written `'\''`). On Windows the
+/// settings set `shell` to `powershell` ([`claude_settings`]), with or without Git Bash: the
+/// call operator `&` and the path single-quoted for PowerShell, each single quotation mark
+/// (`'`, U+2018–U+201B) doubled.
+#[must_use]
+pub fn claude_hook_command(emitter: &str, host_os: HostOs) -> String {
+    match host_os {
+        HostOs::Macos => format!("'{}' hook-emit claude", emitter.replace('\'', "'\\''")),
+        HostOs::Windows => {
+            let mut path = String::with_capacity(emitter.len());
+            for c in emitter.chars() {
+                if matches!(c, '\'' | '\u{2018}'..='\u{201b}') {
+                    path.push(c);
+                }
+                path.push(c);
+            }
+            format!("& '{path}' hook-emit claude")
+        }
+    }
+}
+
+/// The settings file's bytes: [`CLAUDE_HOOK_EVENTS`], each with one command hook running
+/// [`claude_hook_command`] (on Windows with `"shell": "powershell"`), and nothing else.
+#[must_use]
+pub fn claude_settings(emitter: &str, host_os: HostOs) -> Vec<u8> {
+    let mut hook = serde_json::json!({
+        "type": "command",
+        "command": claude_hook_command(emitter, host_os),
+    });
+    if host_os == HostOs::Windows {
+        hook["shell"] = "powershell".into();
+    }
+    let hooks: serde_json::Map<String, serde_json::Value> = CLAUDE_HOOK_EVENTS
+        .iter()
+        .map(|e| ((*e).to_owned(), serde_json::json!([{ "hooks": [hook] }])))
+        .collect();
+    let mut out =
+        serde_json::to_vec_pretty(&serde_json::json!({ "hooks": hooks })).unwrap_or_default();
+    out.push(b'\n');
+    out
 }
 
 fn argv_digest(args: &[String]) -> String {
@@ -421,6 +483,7 @@ mod tests {
             key_has_prefix: exact_prefix,
             port: 4100,
             hook_token: "chh_token".to_owned(),
+            claude_settings: "/work/state/claude-settings.json".to_owned(),
         }
     }
 
@@ -491,23 +554,123 @@ mod tests {
         assert!(!plan(&i).args.iter().any(|a| a.contains("paste_burst")));
     }
 
-    /// PR10a1-CL-6 (argv part): Claude's session flag is the launch id (lowercase
-    /// hyphenated, as `expected_session` computes it) on a fresh launch and the bound session
-    /// on a resume; no prompt is ever in a Claude argv; Claude is never manual.
+    /// PR10a1-CL-6 (argv part), C1-1: Claude's argv is `--settings <file>` then the session
+    /// flag, the launch id (lowercase hyphenated, as `expected_session` computes it) on a
+    /// fresh launch and the bound session on a resume; no prompt is ever in a Claude argv;
+    /// Claude is never manual; the digest covers the settings path.
     #[test]
     fn claude_session_args() {
-        let mut i = input(Agent::Claude, HostOs::Macos);
-        let p = plan(&i);
-        assert_eq!(
-            p.args,
-            s(&["--session-id", "01234567-89ab-cdef-0123-456789abcdef"])
-        );
-        assert!(!p.manual);
-        i.resume_session = Some("bound-session".to_owned());
-        i.prompt = Some("never in argv".to_owned());
-        let p = plan(&i);
-        assert_eq!(p.args, s(&["--resume", "bound-session"]));
-        assert!(!p.manual);
+        for os in [HostOs::Macos, HostOs::Windows] {
+            let mut i = input(Agent::Claude, os);
+            let p = plan(&i);
+            assert_eq!(
+                p.args,
+                s(&[
+                    "--settings",
+                    "/work/state/claude-settings.json",
+                    "--session-id",
+                    "01234567-89ab-cdef-0123-456789abcdef"
+                ])
+            );
+            assert!(!p.manual);
+            assert_eq!(p.argv_digest, argv_digest(&p.args));
+            i.resume_session = Some("bound-session".to_owned());
+            i.prompt = Some("never in argv".to_owned());
+            let p = plan(&i);
+            assert_eq!(
+                p.args,
+                s(&[
+                    "--settings",
+                    "/work/state/claude-settings.json",
+                    "--resume",
+                    "bound-session"
+                ])
+            );
+            assert!(!p.manual);
+            let before = plan(&i).argv_digest;
+            i.claude_settings = r"C:\work\state\claude-settings.json".to_owned();
+            assert_ne!(plan(&i).argv_digest, before);
+        }
+        // Codex takes no settings file.
+        let p = plan(&input(Agent::Codex, HostOs::Macos));
+        assert!(!p.args.iter().any(|a| a.contains("settings")));
+    }
+
+    /// C1-1: the settings file registers exactly the six events, each one command hook
+    /// running the emitter with `hook-emit claude`.
+    #[test]
+    fn claude_settings_content() {
+        for (os, exe, hook) in [
+            (
+                HostOs::Macos,
+                "/work/bin/chaldea",
+                serde_json::json!({ "type": "command", "command": "'/work/bin/chaldea' hook-emit claude" }),
+            ),
+            (
+                HostOs::Windows,
+                r"C:\work\bin\chaldea.exe",
+                serde_json::json!({
+                    "type": "command",
+                    "command": r"& 'C:\work\bin\chaldea.exe' hook-emit claude",
+                    "shell": "powershell",
+                }),
+            ),
+        ] {
+            let v: serde_json::Value = serde_json::from_slice(&claude_settings(exe, os)).unwrap();
+            let obj = v.as_object().unwrap();
+            assert_eq!(obj.keys().collect::<Vec<_>>(), ["hooks"]);
+            let hooks = v["hooks"].as_object().unwrap();
+            let mut names: Vec<&str> = hooks.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                [
+                    "PermissionRequest",
+                    "PostToolUse",
+                    "PreToolUse",
+                    "SessionStart",
+                    "Stop",
+                    "UserPromptSubmit"
+                ]
+            );
+            for (name, entries) in hooks {
+                assert_eq!(entries, &serde_json::json!([{ "hooks": [hook] }]), "{name}");
+            }
+        }
+    }
+
+    /// C1-1: executable paths with spaces and quotes stay one word for the hook shell.
+    #[test]
+    fn claude_hook_command_quoting() {
+        for (os, exe, want) in [
+            (
+                HostOs::Macos,
+                "/work/my tools/it's \"x\"/chaldea",
+                r#"'/work/my tools/it'\''s "x"/chaldea' hook-emit claude"#,
+            ),
+            (
+                HostOs::Macos,
+                "/work/$HOME/`x`/chaldea",
+                "'/work/$HOME/`x`/chaldea' hook-emit claude",
+            ),
+            (
+                HostOs::Windows,
+                r"C:\Program Files\it's\chaldea.exe",
+                r"& 'C:\Program Files\it''s\chaldea.exe' hook-emit claude",
+            ),
+            (
+                HostOs::Windows,
+                "C:\\work\\a\u{2019}b $x `y\\chaldea.exe",
+                "& 'C:\\work\\a\u{2019}\u{2019}b $x `y\\chaldea.exe' hook-emit claude",
+            ),
+            (
+                HostOs::Windows,
+                r"\\server\share\a b\chaldea.exe",
+                r"& '\\server\share\a b\chaldea.exe' hook-emit claude",
+            ),
+        ] {
+            assert_eq!(claude_hook_command(exe, os), want, "{exe}");
+        }
     }
 
     fn get<'a>(env: &'a [(OsString, OsString)], k: &str) -> Vec<&'a OsString> {

@@ -2,6 +2,7 @@
 //! `FakeDecoder` behind the real `/hook` route, and the send side's test points.
 
 mod ack;
+mod claude;
 mod evidence;
 mod flow;
 mod gate;

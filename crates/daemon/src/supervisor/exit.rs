@@ -61,8 +61,8 @@ pub(crate) struct ExitPlan {
     pub stop_first: bool,
     /// Records the start first, as the start job would, when the launch has none (the
     /// participant's or a late creation's published session whose start job did not
-    /// commit): the identity and the launch's positional input.
-    pub start: Option<(ProcessIdentity, Option<InputId>)>,
+    /// commit): the identity, the launch's positional input, and its CLI version.
+    pub start: Option<(ProcessIdentity, Option<InputId>, Option<String>)>,
     /// The positional input's own move, before the steps (a spawn failure).
     pub positional: Option<(InputId, InputInput)>,
     /// What an owned close or a failed start could not prove, appended right after
@@ -116,11 +116,11 @@ pub(crate) fn exit_in(
     };
     let mut job = ThreadJob::new(t.thread_id, t.agent, t.state.clone(), kind, None);
     let lid = Some(plan.launch);
-    if let Some((id, input)) = &plan.start
+    if let Some((id, input, version)) = &plan.start
         && l.pid.is_none()
         && job.state.process == ProcessState::Starting
     {
-        super::ops::started_in(tx, &mut job, plan.launch, id, *input)?;
+        super::ops::started_in(tx, &mut job, plan.launch, id, *input, version.clone())?;
     }
     if plan.stop_first && job.state.process == ProcessState::Running {
         let key = launch_key(plan.launch, "stop_requested");

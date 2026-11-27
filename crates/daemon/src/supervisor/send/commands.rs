@@ -420,7 +420,7 @@ async fn key_op(sup: Arc<Supervisor>, req: KeyReq) -> EffectOutcome {
     }
     // 2. The launch and the card, read afresh.
     let (thread, launch, card) = (req.thread, req.launch, req.card);
-    let Some((t, l, c)) = super::driver::read(&sup, move |r| {
+    let Some((t, l, c)) = crate::supervisor::read_bounded(&sup, move |r| {
         let t = r.thread(thread)?;
         let l = r.launch(launch)?;
         let c = card.map(|c| r.approval(c)).transpose()?.flatten();

@@ -24,6 +24,7 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -36,9 +37,9 @@ use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHan
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, GetProcessTimes,
-    InitializeProcThreadAttributeList, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    InitializeProcThreadAttributeList, OpenProcess, OpenThread, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, THREAD_SUSPEND_RESUME, TerminateProcess,
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
@@ -174,7 +175,8 @@ pub(crate) fn set_job_limit(job: &OwnedHandle, limit: u32) -> io::Result<()> {
 /// The limit the backend sets on every session job.
 pub(crate) const KILL_ON_JOB_CLOSE: u32 = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
-pub(crate) fn assign(job: &OwnedHandle, process: &OwnedHandle) -> io::Result<()> {
+/// Assigns `process` (owned here or by another owner, such as a `std::process::Child`) to `job`.
+pub(crate) fn assign(job: &OwnedHandle, process: &impl AsRawHandle) -> io::Result<()> {
     // SAFETY: both handles are borrowed and valid.
     if unsafe { AssignProcessToJobObject(raw(job), raw(process)) } == 0 {
         return Err(io::Error::last_os_error());
@@ -1300,12 +1302,7 @@ pub(crate) fn take_std_output() -> io::Result<OwnedHandle> {
 /// Resumes every thread of the process `pid` (a process created suspended by a caller that
 /// holds no thread handle): one `TH32CS_SNAPTHREAD` snapshot, `OpenThread` with
 /// `THREAD_SUSPEND_RESUME`, and `ResumeThread` on each of its threads. The number resumed.
-#[cfg(feature = "fake")]
 pub(crate) fn resume_process_threads(pid: u32) -> io::Result<usize> {
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-    };
-    use windows_sys::Win32::System::Threading::{OpenThread, THREAD_SUSPEND_RESUME};
     // SAFETY: plain call; the result is checked (INVALID_HANDLE_VALUE) before wrapping.
     let snap = owned(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) })?;
     let mut e = THREADENTRY32 {

@@ -17,6 +17,7 @@ mod screen;
 mod shutdown;
 mod stop;
 mod tick;
+pub(crate) mod version;
 mod workspace;
 
 use std::collections::HashMap;
@@ -209,7 +210,9 @@ pub(crate) fn config(
         exit_steps: Vec::new(),
         tick_steps: Vec::new(),
         tick_task: false,
-        decoder: Arc::new(crate::supervisor::send::fake_decoder::FakeDecoder),
+        decoders: crate::supervisor::send::Decoders::all(Arc::new(
+            crate::supervisor::send::fake_decoder::FakeDecoder,
+        )),
         readiness_mode: None,
         send_workers: false,
         // No OS work: every identity is reported not read. The prober tests script it.
@@ -219,6 +222,7 @@ pub(crate) fn config(
                 .map(|id| (id.clone(), chaldea_pty_runtime::orphan::Fate::NotRead))
                 .collect(),
         }),
+        claude_settings: "/work/state/claude-settings.json".to_owned(),
     }
 }
 

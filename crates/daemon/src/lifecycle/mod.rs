@@ -56,7 +56,7 @@ pub use process::prepare_process;
 pub use ready::{ReadyOpener, ReadyWriter, early_fail_line, host_ready_opener};
 pub use state_dir::{STATE_DIR_ENV, resolve as resolve_state_dir, set_marker_pause};
 
-pub(crate) use panic::TaskKindGuard;
+pub(crate) use panic::{TaskKindGuard, recoverable};
 
 /// The files of the state directory (design §2.4).
 pub mod names {
@@ -218,6 +218,20 @@ pub enum ParticipantEnd {
 pub trait Components: Send + 'static {
     /// Step 9, before the listener exists; run in order, each its own write job.
     fn reconcilers(&mut self, store: &Store) -> Vec<Reconciler>;
+    /// Step 11, before `build`: files the components keep in the canonical state directory
+    /// `dir`, each `(name, bytes)` written by rename. An error here, or a failed write, fails
+    /// the start with `state_dir`.
+    ///
+    /// # Errors
+    ///
+    /// A file's content cannot be built.
+    fn state_files(
+        &mut self,
+        dir: &std::path::Path,
+    ) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+        let _ = dir;
+        Ok(Vec::new())
+    }
     /// Step 11, after bind.
     fn build(&mut self, ctx: &BuildCtx) -> Built;
     /// Step 12, after `HttpServer::new`, before `serve`.

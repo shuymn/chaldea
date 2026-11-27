@@ -32,6 +32,8 @@ getrandom.workspace = true
 tracing.workspace = true
 http-body-util.workspace = true
 futures-util.workspace = true
+# The version probe's stdout (an anonymous temporary file, C1 D11).
+tempfile.workspace = true
 tungstenite.workspace = true
 # The global log subscriber (docs/design/daemon-lifecycle.md §2.13).
 tracing-subscriber.workspace = true
@@ -40,7 +42,6 @@ tracing-subscriber.workspace = true
 # The `host` test helpers (links, ACL grants, signal state).
 chaldea-pty-runtime = { path = "../pty-runtime", features = ["fake"] }
 proptest.workspace = true
-tempfile.workspace = true
 # Tests that a part of a large blob cannot be opened for incremental BLOB writes.
 rusqlite = { workspace = true, features = ["blob"] }
 # Paused-clock tests (the runtime features are normal dependencies above).

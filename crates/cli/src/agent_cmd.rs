@@ -20,9 +20,9 @@ use chaldea_core::command::{
 };
 use chaldea_core::http::{ErrorBody, ErrorCode};
 use chaldea_core::ids::{Agent, ApprovalId, CommandId, InputId, LaunchId, ThreadId};
-use chaldea_core::input::MAX_PROMPT_BYTES;
 use chaldea_core::input::encode::{Purpose, check};
 use chaldea_core::input::key::KeyToken;
+use chaldea_core::input::{MAX_PROMPT_BYTES, RejectReason};
 use chaldea_core::payload::{ExitReason, InputEncoding};
 use chaldea_core::state::{ProcessState, TurnState};
 use chaldea_core::sync::ThreadSummary;
@@ -457,6 +457,27 @@ fn stop_exit(t: ThreadId, r: &StopResult, err: &mut dyn Write) -> ExitCode {
     }
 }
 
+/// Why Claude's `lossy_text` refuses a prompt (C1 D16).
+const CLAUDE_COMMAND: &str = "Claude runs a prompt that starts with `!` as a shell command and \
+one that starts with `/` (after leading white space) as a slash command, so it is not sent; \
+type it through attach";
+
+/// The D16 explanation where the thread's agent is not known (`send`, `resume`): named for a
+/// Claude thread, printed when the shared check refuses `text` for Claude as `lossy_text`, so
+/// an earlier rule (a control character) takes precedence as it does at `spawn --prompt`.
+fn claude_command_hint(text: &str, err: &mut dyn Write) {
+    if check(
+        Agent::Claude,
+        InputEncoding::BracketedPaste,
+        Purpose::Send,
+        text,
+    )
+    .is_err_and(|r| r.reason == RejectReason::LossyText)
+    {
+        say(err, &format!("for a Claude thread: {CLAUDE_COMMAND}"));
+    }
+}
+
 /// The prompt checks the daemon makes first, so their reason can be printed: the size, and,
 /// when the agent is known, `check` in its first prompt's encoding (Codex's positional
 /// argument, Claude's queued input). A resumed thread's agent is the daemon's to check.
@@ -485,6 +506,9 @@ fn admit_prompt(agent: Option<Agent>, prompt: Option<&str>, err: &mut dyn Write)
             .unwrap_or_default();
         let at = r.at.map(|a| format!(" at byte {a}")).unwrap_or_default();
         say(err, &format!("the prompt is refused: {reason}{at}"));
+        if a == Agent::Claude && r.reason == RejectReason::LossyText {
+            say(err, CLAUDE_COMMAND);
+        }
         return false;
     }
     true
@@ -572,6 +596,13 @@ impl Client<'_> {
             }
             Err(CommandEnd::Refused(_, Some(ErrorCode::DeathUnconfirmed))) => {
                 self.pinned_unconfirmed(cutoff, t, l, err)
+            }
+            Err(e @ CommandEnd::Refused(_, Some(ErrorCode::PromptRejected))) => {
+                let code = not_done(e, err);
+                if let Some(p) = args.prompt.as_deref() {
+                    claude_command_hint(p, err);
+                }
+                code
             }
             Err(e) => not_done(e, err),
         }
@@ -665,6 +696,9 @@ impl Client<'_> {
                         .and_then(|v| v.as_str().map(str::to_owned))
                         .unwrap_or_default();
                     say(err, &format!("the prompt is refused: {reason}"));
+                    if r == RejectReason::LossyText {
+                        claude_command_hint(&args.text, err);
+                    }
                     return ExitCode::Failed;
                 }
                 ExitCode::Ok

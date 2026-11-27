@@ -1,0 +1,11 @@
+{
+  "fact": {
+    "prompt_submitted": {
+      "prompt": "<task-notification>\n<task-id>afb1da0bca12929d9</task-id>\n<tool-use-id>toolu_01MQxXPaUjSVTcozxS3Adec4</tool-use-id>\n<output-file>/work/tmp/claude/-work-c1b-ws/49d26b25-1154-454e-85b7-8312f5a9aeb6/tasks/afb1da0bca12929d9.output</output-file>\n<status>completed</status>\n<summary>Agent \"Write c1b-sub.txt\" finished</summary>\n<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>\n<result>The command succeeded: `printf sub &gt; c1b-sub.txt` exited 0 with no output, so the file `/work/c1b-ws/c1b-sub.txt` should now contain `sub`. I didn't run anything to check the file.\n\nOne difference from your instructions: I put `cd` into that directory in front of the command so it would run there. The command itself was unchanged.</result>\n<usage><subagent_tokens>23882</subagent_tokens><tool_uses>1</tool_uses><duration_ms>11838</duration_ms></usage>\n</task-notification>"
+    }
+  },
+  "events": [],
+  "sent": null,
+  "expected_prompt": "<task-notification>\n<task-id>afb1da0bca12929d9</task-id>\n<tool-use-id>toolu_01MQxXPaUjSVTcozxS3Adec4</tool-use-id>\n<output-file>/work/tmp/claude/-work-c1b-ws/49d26b25-1154-454e-85b7-8312f5a9aeb6/tasks/afb1da0bca12929d9.output</output-file>\n<status>completed</status>\n<summary>Agent \"Write c1b-sub.txt\" finished</summary>\n<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>\n<result>The command succeeded: `printf sub &gt; c1b-sub.txt` exited 0 with no output, so the file `/work/c1b-ws/c1b-sub.txt` should now contain `sub`. I didn't run anything to check the file.\n\nOne difference from your instructions: I put `cd` into that directory in front of the command so it would run there. The command itself was unchanged.</result>\n<usage><subagent_tokens>23882</subagent_tokens><tool_uses>1</tool_uses><duration_ms>11838</duration_ms></usage>\n</task-notification>",
+  "route": "interpret"
+}

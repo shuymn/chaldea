@@ -644,8 +644,17 @@ pub(crate) async fn run(mut cx: StartupCtx) -> Started {
     #[cfg(test)]
     let _ = cx.faults.port.set(port);
 
-    // Step 11: the components and the server.
+    // Step 11: the components' state files, then the components and the server.
     boundary!(cx, st, 11);
+    let files = match cx.components.state_files(&dir) {
+        Ok(f) => f,
+        Err(e) => return st.failed(FailReason::StateDir, e),
+    };
+    for (name, bytes) in files {
+        if let Err(e) = cx.replace(&dir, name, &bytes) {
+            return st.failed(FailReason::StateDir, e);
+        }
+    }
     let sink: Arc<dyn LifecycleSink> = Arc::new(GateSink(cx.gate.clone()));
     let built = cx.components.build(&BuildCtx {
         store: store.clone(),

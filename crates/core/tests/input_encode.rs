@@ -75,6 +75,8 @@ enum W {
     Ok(&'static str),
     /// Accepted as a positional argument (no PTY bytes).
     Argv,
+    /// Accepted; the bytes are pinned elsewhere.
+    Large,
     Err(RejectReason, Option<usize>),
 }
 
@@ -114,6 +116,7 @@ impl From<W> for Want {
         match w {
             W::Ok(b) => Want::Bytes(b.as_bytes().to_vec()),
             W::Err(reason, at) => Want::Err(reason, at),
+            W::Large => Want::Large,
             W::Argv => panic!("no PTY bytes for a positional prompt"),
         }
     }
@@ -479,21 +482,21 @@ static CORPUS: &[Entry] = &[
         id: "f_slash_first",
         text: T::Lit("/review の件"),
         golden: Derived,
-        claude: O::Ok(p!("/review の件")),
+        claude: O::Split(W::Err(LossyText, Some(0)), W::Ok(p!("/review の件"))),
         codex_paste: O::Ok(p!("/review の件")),
         win_keys: O::Ok(concat!("/review ", r!(12398), r!(20214))),
         positional: W::Argv,
-        expected: [E::Text, E::Text, E::Text, E::Text],
+        expected: [E::No, E::Text, E::Text, E::Text],
     },
     Entry {
         id: "f_bang_first",
         text: T::Lit("!ls は実行しない"),
         golden: Derived,
-        claude: O::Ok(p!("!ls は実行しない")),
+        claude: O::Split(W::Err(LossyText, Some(0)), W::Ok(p!("!ls は実行しない"))),
         codex_paste: O::Ok(p!("!ls は実行しない")),
         win_keys: O::Ok(concat!("!ls ", r!(12399), r!(23455), r!(34892), r!(12375), r!(12394), r!(12356))),
         positional: W::Argv,
-        expected: [E::Text, E::Text, E::Text, E::Text],
+        expected: [E::No, E::Text, E::Text, E::Text],
     },
     Entry {
         id: "f_question_first",
@@ -563,7 +566,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Ok(p!("\u{3000}一行目\r二行目\r")),
         win_keys: O::Err(LeadingTrailingWhitespace, Some(0)),
         positional: W::Argv,
-        expected: [E::Text, E::Lit("一行目\n二行目"), E::No, E::Text],
+        expected: [E::Lit("\u{3000}一行目\n二行目"), E::Lit("一行目\n二行目"), E::No, E::Text],
     },
     Entry {
         id: "f_lossy_tab",
@@ -973,7 +976,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Err(LossyText, Some(1)),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::No, E::Text],
+        expected: [E::Lit("ab"), E::No, E::No, E::Text],
     },
     Entry {
         id: "del_c1_80",
@@ -983,7 +986,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(128), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_81",
@@ -993,7 +996,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(129), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_82",
@@ -1003,7 +1006,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(130), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_83",
@@ -1013,7 +1016,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(131), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_84",
@@ -1023,7 +1026,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(132), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_85",
@@ -1033,7 +1036,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(133), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_86",
@@ -1043,7 +1046,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(134), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_87",
@@ -1053,7 +1056,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(135), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_88",
@@ -1063,7 +1066,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(136), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_89",
@@ -1073,7 +1076,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(137), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_8a",
@@ -1083,7 +1086,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(138), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_8b",
@@ -1093,7 +1096,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(139), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_8c",
@@ -1103,7 +1106,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(140), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_8d",
@@ -1113,7 +1116,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(141), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_8e",
@@ -1123,7 +1126,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(142), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_8f",
@@ -1133,7 +1136,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(143), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_90",
@@ -1143,7 +1146,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(144), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_91",
@@ -1153,7 +1156,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(145), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_92",
@@ -1163,7 +1166,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(146), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_93",
@@ -1173,7 +1176,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(147), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_94",
@@ -1183,7 +1186,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(148), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_95",
@@ -1193,7 +1196,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(149), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_96",
@@ -1203,7 +1206,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(150), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_97",
@@ -1213,7 +1216,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(151), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_98",
@@ -1223,7 +1226,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(152), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_99",
@@ -1233,7 +1236,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(153), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_9a",
@@ -1243,7 +1246,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(154), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_9b",
@@ -1253,7 +1256,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(155), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_9c",
@@ -1263,7 +1266,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(156), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_9d",
@@ -1273,7 +1276,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(157), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_9e",
@@ -1283,7 +1286,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(158), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "del_c1_9f",
@@ -1293,7 +1296,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Ok(concat!("a", r!(159), "b")),
         positional: W::Argv,
-        expected: [E::Text, E::No, E::Text, E::Text],
+        expected: [E::Lit("ab"), E::No, E::Text, E::Text],
     },
     Entry {
         id: "empty",
@@ -1383,7 +1386,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Ok(p!("a ")),
         win_keys: O::Err(LeadingTrailingWhitespace, Some(1)),
         positional: W::Argv,
-        expected: [E::Text, E::Lit("a"), E::No, E::Text],
+        expected: [E::Lit("a"), E::Lit("a"), E::No, E::Text],
     },
     Entry {
         id: "leading_ideographic_space",
@@ -1403,7 +1406,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Ok(p!("a\u{3000}")),
         win_keys: O::Err(LeadingTrailingWhitespace, Some(1)),
         positional: W::Argv,
-        expected: [E::Text, E::Lit("a"), E::No, E::Text],
+        expected: [E::Lit("a"), E::Lit("a"), E::No, E::Text],
     },
     Entry {
         id: "leading_lf",
@@ -1423,7 +1426,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Ok(p!("a\r")),
         win_keys: O::Err(LeadingTrailingWhitespace, Some(1)),
         positional: W::Argv,
-        expected: [E::Text, E::Lit("a"), E::No, E::Text],
+        expected: [E::Lit("a"), E::Lit("a"), E::No, E::Text],
     },
     Entry {
         id: "tab_middle",
@@ -1473,7 +1476,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Err(LossyText, Some(1)),
         win_keys: O::Err(LossyText, Some(1)),
         positional: W::Argv,
-        expected: [E::Lit("    \u{7f}"), E::No, E::No, E::Text],
+        expected: [E::Lit(""), E::No, E::No, E::Text],
     },
     Entry {
         id: "lone_cr_end",
@@ -1483,7 +1486,7 @@ static CORPUS: &[Entry] = &[
         codex_paste: O::Ok(p!("a\r")),
         win_keys: O::Err(LeadingTrailingWhitespace, Some(1)),
         positional: W::Argv,
-        expected: [E::Lit("a\n"), E::Lit("a"), E::No, E::Lit("a\n")],
+        expected: [E::Lit("a"), E::Lit("a"), E::No, E::Lit("a\n")],
     },
     Entry {
         id: "mixed_newlines",
@@ -1499,21 +1502,21 @@ static CORPUS: &[Entry] = &[
         id: "zzexample_1000",
         text: T::Gen(zzexample_1000),
         golden: Derived,
-        claude: O::Large,
+        claude: O::Split(W::Err(LossyText, Some(0)), W::Large),
         codex_paste: O::Large,
         win_keys: O::Large,
         positional: W::Argv,
-        expected: [E::Text, E::Text, E::Text, E::Text],
+        expected: [E::No, E::Text, E::Text, E::Text],
     },
     Entry {
         id: "zzexample_1001",
         text: T::Gen(zzexample_1001),
         golden: Derived,
-        claude: O::Large,
+        claude: O::Split(W::Err(LossyText, Some(0)), W::Large),
         codex_paste: O::Large,
         win_keys: O::Large,
         positional: W::Argv,
-        expected: [E::Text, E::Text, E::Text, E::Text],
+        expected: [E::No, E::Text, E::Text, E::Text],
     },
     Entry {
         id: "image_relative",
@@ -1529,11 +1532,11 @@ static CORPUS: &[Entry] = &[
         id: "image_absolute",
         text: T::Lit("/work/diagram.png"),
         golden: Derived,
-        claude: O::Ok(p!("/work/diagram.png")),
+        claude: O::Split(W::Err(LossyText, Some(0)), W::Ok(p!("/work/diagram.png"))),
         codex_paste: O::Ok(p!("/work/diagram.png")),
         win_keys: O::Ok("/work/diagram.png"),
         positional: W::Argv,
-        expected: [E::Text, E::Text, E::Text, E::Text],
+        expected: [E::No, E::Text, E::Text, E::Text],
     },
     Entry {
         id: "image_file_url",
@@ -1621,7 +1624,15 @@ fn model_paste(agent: Agent, bytes: &[u8]) -> Option<String> {
     };
     let s = std::str::from_utf8(body).ok()?.replace('\r', "\n");
     Some(match agent {
-        Agent::Claude => tab4(&nfc(&s)),
+        // Claude 2.1.331 (`fixtures/claude/2.1.331/README.md`): DEL and C1 dropped, trailing
+        // whitespace removed, then NFC and TAB as four spaces.
+        Agent::Claude => {
+            let kept: String = s
+                .chars()
+                .filter(|c| !matches!(u32::from(*c), 0x7F..=0x9F))
+                .collect();
+            tab4(&nfc(kept.trim_end()))
+        }
         Agent::Codex => format!(" {s} ").trim().to_owned(),
     })
 }
@@ -1835,7 +1846,7 @@ fn corpus_goldens() {
                     e.id
                 );
             }
-            w @ W::Ok(_) => panic!("{}: positional {w:?}", e.id),
+            w @ (W::Ok(_) | W::Large) => panic!("{}: positional {w:?}", e.id),
         }
         let encodings = [
             (Agent::Claude, BracketedPaste),

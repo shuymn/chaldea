@@ -18,17 +18,16 @@ use chaldea_pty_runtime::{
 };
 use tokio::sync::broadcast::error::RecvError;
 
-use super::super::Supervisor;
 use super::super::events::{ThreadJob, derived, thread_row};
 use super::super::live::{LaunchObservation, LiveLaunch};
 use super::super::record::{JobOf, Recorded, record};
+use super::super::{Supervisor, read_bounded};
 use super::attribution::content_text;
 use super::completion::{apply_records, move_input};
 use super::{
     ACK_WINDOW, DISPATCH_WAIT, Dispatch, Fired, GATE_TIMEOUT, READ_WAIT, RunningUnit, SAMPLE_WAIT,
     SETTLE, SendLaunch, WRITE_STALL, fence_quiet, lock,
 };
-use crate::deadline::settle_before;
 use crate::store::{CountedClass, CountedClasses, EventAnnex, InputRow, LaunchRow, ThreadRow};
 
 /// Wakes the workers: a commit naming a thread wakes its launches, a tick or a lag wakes
@@ -105,24 +104,6 @@ struct View {
     inputs: Vec<InputRow>,
 }
 
-/// A read on a blocking task, bounded by now + 1 s; `None` when not in time.
-pub(super) async fn read<R: Send + 'static>(
-    sup: &Supervisor,
-    f: impl FnOnce(&crate::store::ReadTx<'_>) -> Result<R, crate::store::StoreError> + Send + 'static,
-) -> Option<R> {
-    let deadline = sup.now() + READ_WAIT;
-    let store = sup.store.clone();
-    let real = sup.real(deadline);
-    let task = sup.rt.spawn_blocking(move || store.read(real, f));
-    match settle_before(|| sup.now(), deadline, sup.timer(deadline), task)
-        .await
-        .in_time()
-    {
-        Some(Ok(Ok(v))) => Some(v),
-        _ => None,
-    }
-}
-
 /// The instant a pass decides its timers at: the clock, or the latest tick when later.
 fn pass_now(sup: &Supervisor, sl: &SendLaunch) -> Instant {
     let now = sup.now();
@@ -135,7 +116,7 @@ pub(crate) async fn pass(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>) {
         return;
     };
     let (thread, launch) = (sl.thread_id, sl.launch_id);
-    let Some(view) = read(sup, move |r| {
+    let Some(view) = read_bounded(sup, move |r| {
         let (Some(t), Some(l)) = (r.thread(thread)?, r.launch(launch)?) else {
             return Ok(None);
         };

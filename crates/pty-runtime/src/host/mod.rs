@@ -1122,6 +1122,110 @@ pub fn no_console_window(cmd: &mut std::process::Command) {
     let _ = cmd;
 }
 
+// ---- A helper's process tree ----
+
+/// The process tree of a short helper the daemon reads (the version probe): the child in a
+/// new process group (Unix) or in a kill-on-close Job Object it joined before running any
+/// instruction (Windows), so [`ProcessTree::kill`] reaches every descendant it started.
+#[derive(Debug)]
+pub struct ProcessTree {
+    #[cfg(unix)]
+    pgid: u32,
+    #[cfg(windows)]
+    job: std::os::windows::io::OwnedHandle,
+}
+
+/// Prepares `cmd` for [`adopt_tree`]: a new process group on Unix; on Windows
+/// `CREATE_NO_WINDOW | CREATE_SUSPENDED`, so the child starts nothing before it is in its job.
+/// Replaces [`no_console_window`] for such a child.
+pub fn own_tree(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        /// `CREATE_NO_WINDOW` (`winbase.h`).
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        /// `CREATE_SUSPENDED` (`winbase.h`).
+        const CREATE_SUSPENDED: u32 = 0x0000_0004;
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+    }
+}
+
+/// The tree of `child`, spawned from a command [`own_tree`] prepared: its process group
+/// (Unix); a new kill-on-close job the child is assigned to, then its threads resumed
+/// (Windows).
+///
+/// # Errors
+///
+/// Windows: the job could not be created, limited, or assigned, or no thread was resumed. The
+/// child may then still be suspended: the caller kills it.
+pub fn adopt_tree(child: &std::process::Child) -> io::Result<ProcessTree> {
+    #[cfg(unix)]
+    {
+        Ok(ProcessTree { pgid: child.id() })
+    }
+    #[cfg(windows)]
+    {
+        use crate::windows::sys;
+        use std::os::windows::io::AsHandle;
+        let job = sys::create_job()?;
+        sys::set_job_limit(&job, sys::KILL_ON_JOB_CLOSE)?;
+        sys::assign(&job, &child.as_handle())?;
+        if sys::resume_process_threads(child.id())? == 0 {
+            return Err(io::Error::other("no thread of the child to resume"));
+        }
+        Ok(ProcessTree { job })
+    }
+}
+
+impl ProcessTree {
+    /// Whether `child` (this tree's leader) has exited, without reaping it on Unix
+    /// (`waitid(WEXITED | WNOHANG | WNOWAIT)`), so its process group id stays its own until
+    /// it is reaped and [`Self::kill`] can still name the group.
+    ///
+    /// # Errors
+    ///
+    /// The OS refused the query.
+    pub fn exited(&self, child: &mut std::process::Child) -> io::Result<bool> {
+        #[cfg(unix)]
+        {
+            use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+            let _ = child;
+            let pid = i32::try_from(self.pgid)
+                .ok()
+                .and_then(Pid::from_raw)
+                .ok_or_else(|| io::Error::other("pid out of range"))?;
+            let opts = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+            Ok(waitid(WaitId::Pid(pid), opts)?.is_some())
+        }
+        #[cfg(windows)]
+        {
+            Ok(child.try_wait()?.is_some())
+        }
+    }
+
+    /// Kills every process of the tree: `SIGKILL` to the process group (Unix), which must
+    /// happen before the leader is reaped (after, the group id may name another group);
+    /// `TerminateJobObject` (Windows). Errors are ignored: a tree already gone is the goal.
+    pub fn kill(&self) {
+        #[cfg(unix)]
+        {
+            use rustix::process::{Pid, Signal, kill_process_group};
+            if let Some(pid) = i32::try_from(self.pgid).ok().and_then(Pid::from_raw) {
+                let _ = kill_process_group(pid, Signal::KILL);
+            }
+        }
+        #[cfg(windows)]
+        {
+            let _ = crate::windows::sys::terminate_job(&self.job, 1);
+        }
+    }
+}
+
 /// The first `name` (`name.exe` on Windows) in an absolute directory of `path` (a `PATH`
 /// value) that is an executable file (on macOS, one this process may execute by its
 /// effective ids), as a shell's search continues past a candidate it cannot run.

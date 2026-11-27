@@ -63,6 +63,9 @@ pub const WINDOWS_FAULT: &str = "CHALDEA_TEST_WINDOWS_FAULT";
 /// With [`AGENT_PROGRAM`], set: the supervisor runs on `FakePty`, its first child's waiter
 /// held, so a close of it abandons `pty-wait` and its token stays counted.
 pub const FAKE_PTY_HOLD_WAITER: &str = "CHALDEA_TEST_FAKE_PTY_HOLD_WAITER";
+/// With [`AGENT_PROGRAM`]: the Claude decoder panics on a `UserPromptSubmit`, `in_parse` (in
+/// its payload parser, the recovered region) or `after_parse` (after the parser returned).
+pub const CLAUDE_DECODER_PANIC: &str = "CHALDEA_TEST_CLAUDE_DECODER_PANIC";
 /// The launchd label prefix (every test start on a GUI host uses its own).
 pub const LABEL_PREFIX: &str = "CHALDEA_TEST_LABEL_PREFIX";
 /// A `launchctl` fault: see [`launchctl_fault`].
@@ -141,6 +144,39 @@ const EXPIRED: &str = "expired";
 pub const TOKEN_MSG: &str = "chd_MSGMSGMSGMSGMSGMSGMSGMSGMSGMSGMSGMSGMSGMSGM";
 pub const TOKEN_FIELD: &str = "chdt_FIELDFIELDFIELDFIELDFIELDFIELDFIELDFIELDF";
 pub const TOKEN_SPAN: &str = "chdp_SPANSPANSPANSPANSPANSPANSPANSPANSPANSPANS";
+
+/// The Claude payload parser, panicking on a `UserPromptSubmit`.
+fn panic_in_parse(
+    event: &str,
+    json: &serde_json::Value,
+) -> chaldea_daemon::supervisor::send::claude::Parsed {
+    assert!(event != "UserPromptSubmit", "injected parser panic");
+    chaldea_daemon::supervisor::send::claude::parse(event, json)
+}
+
+/// The Claude decoder, panicking on a `UserPromptSubmit` once its parser returned.
+struct PanicAfterParse;
+
+impl chaldea_daemon::supervisor::send::HookDecoder for PanicAfterParse {
+    fn decode(
+        &self,
+        tx: &chaldea_daemon::store::ReadTx<'_>,
+        hook: &chaldea_daemon::hook::AcceptedHook<'_>,
+    ) -> Result<
+        (
+            chaldea_daemon::supervisor::send::HookFact,
+            Vec<chaldea_daemon::hook::HookEvent>,
+        ),
+        chaldea_daemon::store::StoreError,
+    > {
+        let out = chaldea_daemon::supervisor::send::ClaudeDecoder::default().decode(tx, hook)?;
+        assert!(
+            hook.event_name != "UserPromptSubmit",
+            "injected panic after the parser"
+        );
+        Ok(out)
+    }
+}
 
 /// A pause point shared by a test and its child processes (G1–G3 in the module doc).
 pub struct Gate {
@@ -387,6 +423,16 @@ pub fn enter_if_chaldea() {
                     ..chaldea_pty_runtime::fake::FakeScript::default()
                 });
                 cfg.runtime = std::sync::Arc::new(pty);
+            }
+            match std::env::var(CLAUDE_DECODER_PANIC).as_deref() {
+                Ok("in_parse") => {
+                    cfg.decoders.claude = std::sync::Arc::new(
+                        chaldea_daemon::supervisor::send::ClaudeDecoder::with_parse(panic_in_parse),
+                    );
+                }
+                Ok("after_parse") => cfg.decoders.claude = std::sync::Arc::new(PanicAfterParse),
+                Ok(other) => panic!("unknown decoder panic {other}"),
+                Err(_) => {}
             }
             #[cfg(windows)]
             if std::env::var(WINDOWS_FAULT).as_deref() == Ok("assign_terminate_denied") {
