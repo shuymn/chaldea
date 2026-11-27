@@ -100,9 +100,10 @@ pub(crate) fn decide_frames(
 
 /// `tail` after `written`: its last [`TAIL`] bytes.
 pub(crate) fn advance_tail(tail: &mut Vec<u8>, written: &[u8]) {
+    let written = &written[written.len().saturating_sub(TAIL)..];
+    let keep = TAIL - written.len();
+    tail.drain(..tail.len().saturating_sub(keep));
     tail.extend_from_slice(written);
-    let drop = tail.len().saturating_sub(TAIL);
-    tail.drain(..drop);
 }
 
 /// One pending item, in arrival order: raw bytes are joined.
