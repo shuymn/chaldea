@@ -1,6 +1,6 @@
 //! The spelling-preserving trim of a path's trailing separators, std only: the state directory
-//! (`state_dir`) uses it, and the PWA dist rules (`http/pwa/dist.rs`, which the daemon's
-//! `build.rs` also includes) include this file with `#[path]`.
+//! (`state_dir`) and the PWA dist rules (`http/pwa/dist.rs`) use it, and the daemon's
+//! `build.rs` includes this file with `#[path]` for its copy of those rules.
 
 use std::path::{Path, PathBuf};
 

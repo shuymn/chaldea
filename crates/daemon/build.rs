@@ -5,6 +5,9 @@
 
 #[path = "src/http/pwa/dist.rs"]
 mod dist;
+// `dist`'s `super::trim`.
+#[path = "src/lifecycle/trim.rs"]
+mod trim;
 
 use std::env;
 use std::fs;

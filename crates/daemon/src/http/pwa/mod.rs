@@ -7,6 +7,9 @@
 mod dist;
 #[cfg(test)]
 mod tests;
+// `dist`'s `super::trim`.
+#[cfg(test)]
+use crate::lifecycle::trim;
 
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};

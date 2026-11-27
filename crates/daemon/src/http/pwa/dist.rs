@@ -1,16 +1,12 @@
 //! The PWA build's asset table (docs/design/w1-pwa.md §2.1 "Embedding"), std only: the
 //! daemon's `build.rs` includes this file with `#[path]`, and `pwa::tests` includes it too, so
-//! the workspace tests check it on every host without `CHALDEA_WEB_DIST`.
+//! the workspace tests check it on every host without `CHALDEA_WEB_DIST`. Its parent provides
+//! `trim` (`lifecycle/trim.rs`: the crate's module in the tests, `build.rs`'s own include).
 //!
 //! A dist directory holds `index.html` and files under `assets/` of an allowed type; source
 //! maps (`*.map`) and Vite's `.vite/` are skipped. Anything else fails the build.
 
-#[allow(
-    clippy::duplicate_mod,
-    reason = "build.rs reaches no crate module, so this file carries its own copy of the trim"
-)]
-#[path = "../../lifecycle/trim.rs"]
-mod trim;
+use super::trim;
 
 use std::ffi::OsStr;
 use std::fmt::Write as _;
@@ -65,7 +61,16 @@ pub fn resolve(value: &OsStr, workspace: &Path) -> Result<PathBuf, String> {
 /// and `assets/`, has a type outside the allowlist, or a name with a character outside
 /// `A-Z a-z 0-9 . _ -`.
 pub fn classify(rel: &Path) -> Result<Option<(String, &'static str)>, String> {
-    // The skips read the native names, before any name is checked.
+    // The structure first; then the skips, on the native names, before any name is checked.
+    if rel.components().next().is_none() {
+        return Err("an empty path".to_owned());
+    }
+    if !rel.components().all(|c| matches!(c, Component::Normal(_))) {
+        return Err(format!(
+            "{}: not a plain relative path",
+            rel.to_string_lossy()
+        ));
+    }
     let first = rel.components().next().map(Component::as_os_str);
     let map = rel
         .file_name()

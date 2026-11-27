@@ -53,6 +53,9 @@ fn classify_refuses_everything_else() {
         ("assets/.hidden.js", "character"),
         ("../index.html", "plain relative"),
         ("assets/../index.html", "plain relative"),
+        ("../outside.map", "plain relative"),
+        ("/abs/x.js.map", "plain relative"),
+        ("", "an empty path"),
     ] {
         let e = classify(Path::new(p)).expect_err(p);
         assert!(e.contains(why), "{p}: {e}");
