@@ -11,9 +11,9 @@ import { fileURLToPath } from "node:url";
 import { type Proc, reap, redact, runProc, signal, startProc, within } from "./proc";
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
-export const RELEASE = join(ROOT, "target", "release");
-export const CHALDEA = join(RELEASE, "chaldea");
-export const FAKE_CLI = join(RELEASE, "chaldea-fake-cli");
+const RELEASE = join(ROOT, "target", "release");
+const CHALDEA = join(RELEASE, "chaldea");
+const FAKE_CLI = join(RELEASE, "chaldea-fake-cli");
 
 export interface Waits {
   readonly start: number;
@@ -22,7 +22,7 @@ export interface Waits {
   readonly command: number;
 }
 
-export const WAITS: Waits = { start: 30_000, stop: 30_000, reap: 10_000, command: 30_000 };
+const WAITS: Waits = { start: 30_000, stop: 30_000, reap: 10_000, command: 30_000 };
 
 export function freePort(): Promise<number> {
   return new Promise((ok, err) => {
@@ -35,7 +35,7 @@ export function freePort(): Promise<number> {
   });
 }
 
-export interface Envelope {
+interface Envelope {
   readonly seq: number;
   readonly kind: string;
   readonly launch_id: string | null;
@@ -152,21 +152,21 @@ export class Daemon {
   }
 
   /** A new Claude thread in a new directory under this test's root; its thread id. */
-  async spawnThread(opts: { cwd?: string; prompt?: string } = {}): Promise<{ thread: string; launch: string }> {
+  async spawnThread(opts: { cwd?: string; prompt?: string } = {}): Promise<{ thread: string }> {
     const cwd = opts.cwd ?? mkdtempSync(join(this.root, "cwd-"));
     mkdirSync(cwd, { recursive: true });
     const args = ["spawn", "--agent", "claude", "--cwd", cwd];
     if (opts.prompt !== undefined) args.push("--prompt", opts.prompt);
-    const v = (await this.chaldea(args)) as { outcome: string; thread_id: string; launch_id: string };
+    const v = (await this.chaldea(args)) as { outcome: string; thread_id: string };
     if (v.outcome !== "started") throw new Error(`spawn: ${v.outcome}`);
-    return { thread: v.thread_id, launch: v.launch_id };
+    return { thread: v.thread_id };
   }
 
   /** The thread's events through the owner token (the test's own view of the daemon). */
-  async events(thread: string, afterSeq = 0): Promise<Envelope[]> {
+  async events(thread: string): Promise<Envelope[]> {
     const token = readFileSync(join(this.state, "owner.token"), "utf8").trim();
     const out: Envelope[] = [];
-    let after = afterSeq;
+    let after = 0;
     for (;;) {
       const q = new URLSearchParams({ stream_id: `thread:${thread}`, after_seq: String(after), limit: "1000" });
       const r = await fetch(`${this.origin}/api/events?${q}`, {
@@ -183,8 +183,8 @@ export class Daemon {
   }
 
   /** Polls the thread until `pred` holds over its events; returns them. */
-  async waitEvents(thread: string, pred: (es: Envelope[]) => boolean, ms = 20_000): Promise<Envelope[]> {
-    const end = Date.now() + ms;
+  async waitEvents(thread: string, pred: (es: Envelope[]) => boolean): Promise<Envelope[]> {
+    const end = Date.now() + 20_000;
     for (;;) {
       const es = await this.events(thread);
       if (pred(es)) return es;

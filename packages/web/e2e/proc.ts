@@ -6,7 +6,7 @@
 
 import { type ChildProcess, spawn, type SpawnOptions } from "node:child_process";
 
-export interface End {
+interface End {
   readonly code: number | null;
   readonly signal: NodeJS.Signals | null;
   readonly error: Error | null;
@@ -19,9 +19,9 @@ export interface Proc {
 }
 
 /** How long a SIGKILLed process may take to be reaped. */
-export const REAP_MS = 10_000;
+const REAP_MS = 10_000;
 /** How long the capture pipes may stay open after the exit (a descendant may hold them). */
-export const DRAIN_MS = 1_000;
+const DRAIN_MS = 1_000;
 
 /** Drops every `chd_`, `chdp_`, and `chdt_` secret and pairing fragment, as the daemon's redactor does. */
 export function redact(s: string): string {
@@ -83,7 +83,7 @@ export async function reap(p: Proc, ms = REAP_MS): Promise<void> {
   }
 }
 
-export interface RunResult extends End {
+interface RunResult extends End {
   readonly stdout: string;
   readonly stderr: string;
   /** Both pipes closed within `DRAIN_MS` of the exit; otherwise they were destroyed. */
@@ -98,9 +98,9 @@ export interface RunResult extends End {
 export async function runProc(
   cmd: string,
   args: readonly string[],
-  opts: SpawnOptions & { deadlineMs: number; reapMs?: number; capture?: boolean },
+  opts: SpawnOptions & { deadlineMs: number; capture?: boolean },
 ): Promise<RunResult> {
-  const { deadlineMs, reapMs, capture = true, ...spawnOpts } = opts;
+  const { deadlineMs, capture = true, ...spawnOpts } = opts;
   const p = startProc(cmd, args, capture ? { ...spawnOpts, stdio: ["ignore", "pipe", "pipe"] } : spawnOpts);
   let stdout = "";
   let stderr = "";
@@ -129,6 +129,6 @@ export async function runProc(
     return { ...end, stdout, stderr, drained };
   } finally {
     for (const s of pipes) s.destroy();
-    await reap(p, reapMs);
+    await reap(p);
   }
 }

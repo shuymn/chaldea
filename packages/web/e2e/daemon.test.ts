@@ -1,5 +1,5 @@
 // The harness's failure paths (Vitest): a program that cannot start, a daemon that never
-// listens, a daemon that ignores SIGTERM, a command past its deadline or cancelled, and the
+// listens, a daemon that ignores SIGTERM, a command past its deadline, and the
 // redaction of diagnostics. Stand-ins are Node scripts, so no release build is needed.
 
 import { spawnSync } from "node:child_process";

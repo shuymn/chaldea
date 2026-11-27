@@ -1,7 +1,7 @@
 // Builds what the end-to-end tests run: the release `chaldea` with packages/web/dist embedded
 // (a no-op after `mise run release`) and the release FakeCli. Two builds, so FakeCli's
-// dependencies cannot change the features `chaldea` is built with. Each build is killed and
-// reaped past its deadline.
+// dependencies cannot change the features `chaldea` is built with. A build past its deadline
+// is killed and its exit awaited within a bound; failing that, the setup reports it.
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";

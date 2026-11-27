@@ -187,8 +187,9 @@ jobs:
           bad="$(awk '/^chaldea-/ && !/^chaldea-(testkit|core) /' <<<"$deps")"
           [ -z "$bad" ] || { echo "testkit depends on: $bad"; exit 1; }
 
-  # Whether the release jobs run (docs/design/w1-pwa.md §2.1 "Release"): on every push to
-  # main and manual run, and on pull requests that change more than docs.
+  # Whether the release smoke runs (docs/design/w1-pwa.md §2.1 "Release"): on every push to
+  # main and manual run, and on pull requests that change more than docs. The web job's
+  # release build and Playwright run regardless.
   changes:
     name: changes
     runs-on: ubuntu-latest
@@ -207,7 +208,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      # Docs-only pull requests skip the release jobs; any other change runs them (every Rust,
+      # Docs-only pull requests skip the release smoke; any other change runs it (every Rust,
       # Cargo, toolchain, web, pnpm, mise, script, or workflow input of the release binary).
       # `--no-renames` lists a rename as its deletion and its addition, so both sides count.
       - name: Filter the changed paths
@@ -232,7 +233,7 @@ jobs:
             fi
           fi
           echo "release=$release" >>"$GITHUB_OUTPUT"
-          echo "release jobs: $release ($why)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "release smoke: $release ($why)" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # The PWA's packages (docs/design/w1-pwa.md §3 D8): the validator codegen, typecheck, and
   # Vitest of packages/contracts and packages/web, the Vite build, the release command, and

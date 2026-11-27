@@ -243,7 +243,7 @@ test("two_tabs", async ({ daemon, context }) => {
     await expect(statusOf(t.page)).toHaveText("live");
   }
 
-  // Tab C pairs again: A and B reread on its notice and adopt C, retiring B's work.
+  // Tab C pairs again: A and B reread on its notice and adopt C.
   const c = await tab(context);
   const tokenC = await pair(daemon, c);
   for (const [name, t] of [

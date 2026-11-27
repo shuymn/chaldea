@@ -1,7 +1,6 @@
 // The read path against the daemon: generic rows (W1-8), the restart (W1-3, W1-12), and the
 // 390 × 844 layout (W1-4).
 
-import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { expect, openLink, shownSeqs, statusOf, test, untilShown } from "./harness";
@@ -65,9 +64,10 @@ test("offline_then_catch_up", async ({ daemon, page }) => {
   const before = await daemon.waitEvents(thread, (es) => es.some((e) => e.kind === "launch_death_confirmed"));
   const head = before.at(-1)!.seq;
 
-  // The socket passes through the test. Once `holding` is set, only `hello` reaches the
-  // page: `heads` and `stream_advanced` are dropped, so after the restart the page learns
-  // of new events only from the refetch its socket open schedules.
+  // The socket passes through the test. Once `holding` is set, every typed message other
+  // than `hello` (`heads`, `stream_advanced`) is dropped; frames that do not parse or carry
+  // no type pass unchanged. After the restart the page learns of new events only from the
+  // refetch its socket open schedules.
   let holding = false;
   let droppedHeads = 0;
   await page.routeWebSocket(/\/api\/ws(\?|$)/, (ws) => {
@@ -156,7 +156,6 @@ function range(from: number, to: number): number[] {
 test("layout_390", async ({ daemon, page }) => {
   // Long unbroken text in every field the list and the timeline show, and a closed row.
   const cwd = join(daemon.root, `a-directory-name-without-any-break-${"x".repeat(120)}`);
-  mkdirSync(cwd);
   const { thread } = await daemon.spawnThread({ cwd, prompt: `unbroken-${"y".repeat(300)}` });
   await daemon.waitEvents(thread, (es) => es.some((e) => e.kind === "user_message"));
   const { thread: closed } = await daemon.spawnThread({ cwd: join(daemon.root, `closed-${"z".repeat(120)}`) });

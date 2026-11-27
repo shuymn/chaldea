@@ -79,7 +79,7 @@ test("distAssets fails on a symlink and does not follow it", { skip: process.pla
   }
 });
 
-const fast = { start: 5_000, stop: 300, reap: 5_000, request: 5_000, build: 5_000 };
+const fast = { start: 5_000, stop: 300, reap: 5_000 };
 
 test("a binary that cannot start fails without calling the body", async () => {
   const scratch = mkdtempSync(join(tmpdir(), "smoke-test-"));

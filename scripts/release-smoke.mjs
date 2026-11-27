@@ -25,10 +25,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-export const DIST = join(root, "packages", "web", "dist");
-export const EXE = join(root, "target", "release", `chaldea${process.platform === "win32" ? ".exe" : ""}`);
+const DIST = join(root, "packages", "web", "dist");
+const EXE = join(root, "target", "release", `chaldea${process.platform === "win32" ? ".exe" : ""}`);
 
-export const WAITS = {
+const WAITS = {
   start: 60_000,
   stop: 30_000,
   /** How long a killed process may take to be reaped. */
@@ -103,7 +103,7 @@ export async function reap(p, waits = WAITS) {
 }
 
 /** Runs `cmd` to its end within `ms` (killed past it); resolves with its exit. */
-export async function run(cmd, args, opts, ms, waits = WAITS) {
+async function run(cmd, args, opts, ms, waits = WAITS) {
   const p = start(cmd, args, opts);
   try {
     const end = await within(p, ms);
@@ -116,7 +116,7 @@ export async function run(cmd, args, opts, ms, waits = WAITS) {
 }
 
 /** A port that was free a moment ago on 127.0.0.1. */
-export function freePort() {
+function freePort() {
   return new Promise((ok, err) => {
     const s = createServer();
     s.once("error", err);
@@ -136,8 +136,9 @@ const csp = (port) =>
  * Runs `body(port)` against `<exe> --state-dir <state> daemon run --port <free>`, then stops
  * it with `daemon stop`. `state` must not exist yet: the daemon creates it with its private
  * descriptor (an existing directory keeps the ACL it inherited, which the daemon may refuse
- * on Windows). On every exit path the daemon is gone (killed by PID past the stop deadline,
- * then reaped within a bound).
+ * on Windows). On every exit path a daemon still running is killed by PID and its exit
+ * awaited within a bound; a kill that cannot be delivered or a daemon not reaped in time is
+ * reported as a failure.
  */
 export async function withDaemon(exe, state, body, waits = WAITS) {
   const port = await freePort();
@@ -229,7 +230,7 @@ async function build(env) {
   if (end.code !== 0) fail(`cargo build exited ${end.code ?? end.signal}`);
 }
 
-export async function main(exe = EXE, dist = DIST) {
+async function main(exe = EXE, dist = DIST) {
   const scratch = mkdtempSync(join(tmpdir(), "chaldea-smoke-"));
   try {
     const assets = distAssets(dist);
