@@ -3,8 +3,6 @@
 //! units keep one event each and neither open nor satisfy an interval; the decision for
 //! each record is made once, by the worker or the exit job.
 
-use std::time::Duration;
-
 use chaldea_core::ids::{IdempotencyKey, StreamId};
 use chaldea_core::input::InputState;
 use serde_json::json;
@@ -135,7 +133,7 @@ async fn worker_exit_overlap() {
         let (go, wait) = std::sync::mpsc::channel::<()>();
         set(&sl.hooks.after_human_record, move || {
             let _ = entered_tx.send(());
-            let _ = wait.recv_timeout(Duration::from_secs(30));
+            let _ = wait.recv();
         });
         let _report = rig.attach(&live, b"b").await;
         entered.await.unwrap();
