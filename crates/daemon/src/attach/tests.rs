@@ -329,18 +329,30 @@ async fn raw_input_order() {
     rig.stop().await;
 }
 
-/// T1-4: attach input closes the gate: a send stays queued until `ready`.
+/// T1-4: attach input closes the gate: with same-turn evidence a send stays queued until
+/// `ready`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn input_closes_gate() {
     let rig = SRig::new().await;
     let live = rig.claude().await;
     let (mut c, _) = attach(&rig, &live).await;
+    // Attach input inside a turn, then that turn's settle: evidence of the same turn as
+    // the human write, which leaves the gate closed.
+    rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "turn" }))
+        .await;
     c.binary(b"x").await;
     rig.until("recorded", || human_writes(&rig, &live) == 1)
         .await;
+    rig.hook(&live, "Stop", &json!({})).await;
+    rig.clock.advance(crate::supervisor::send::SETTLE);
+    rig.pass(&live).await;
     let id = rig.send(&live, "after").await;
     rig.pass(&live).await;
-    assert_eq!(rig.input(id).state, chaldea_core::input::InputState::Queued);
+    assert_eq!(
+        rig.input(id).state,
+        chaldea_core::input::InputState::Queued,
+        "same turn"
+    );
     rig.cmd_ok("ready", &json!({ "thread_id": live.t }), 200)
         .await;
     rig.until_input(id, chaldea_core::input::InputState::Sent)
