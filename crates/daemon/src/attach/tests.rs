@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use crate::store::tests::support::http::WS_WAIT;
-use crate::store::tests::support::waits::{bounded, bounded_at};
+use crate::store::tests::support::waits::{bounded, bounded_at, pause};
 use crate::supervisor::send::tests::{Live, SRig};
 
 type Ws =
@@ -751,16 +751,13 @@ async fn stuck_writer_idle_drop() {
     })
     .await;
     let (mut tx, mut rx) = c.ws.split();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "the peer's ping pace; the drop does not depend on it"
-    )]
+    // The peer's ping pace; the drop does not depend on it.
     let pinger = tokio::spawn(async move {
         loop {
             if tx.send(WsMessage::Ping(Vec::new().into())).await.is_err() {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            pause(Duration::from_millis(200)).await;
         }
     });
     // The idle timeout passes on the test clock after the pause was acknowledged.
@@ -1641,16 +1638,13 @@ impl Drop for Poker {
     }
 }
 
-#[allow(
-    clippy::disallowed_methods,
-    reason = "the poke loop's pace; no result depends on it"
-)]
 fn poker(rig: &SRig) -> Poker {
     let h = hooks(rig);
     Poker(tokio::spawn(async move {
         loop {
             h.poke.notify_waiters();
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            // The poke loop's pace; no result depends on it.
+            pause(Duration::from_millis(5)).await;
         }
     }))
 }
