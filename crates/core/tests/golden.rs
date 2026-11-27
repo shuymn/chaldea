@@ -19,9 +19,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chaldea_core::command::{CloseResult, StopArgs, StopOutcome, StopResult};
-use chaldea_core::event::{
-    EventEnvelope, GenericEvent, GenericReason, Source, TranscriptPos, TypedEvent,
-};
+use chaldea_core::event::{EventEnvelope, GenericReason, Source, TranscriptPos, TypedEvent};
 use chaldea_core::ids::{
     Actor, Agent, ApprovalId, CommandId, Epoch, EventId, EventKindTag, IdempotencyKey, InputId,
     LaunchId, MessageId, StreamId, SurfaceId, ThreadId, Timestamp, WorkspaceId, WorktreeId,
@@ -954,61 +952,71 @@ fn envelope_holders_decode_from_a_value() {
     assert_eq!(serde_json::to_value(&back).unwrap(), page);
 }
 
-fn known_envelope_json() -> Value {
-    let samples = samples();
-    let (stream, event) = &samples[10]; // user_message
-    serde_json::to_value(envelope(11, *stream, event)).unwrap()
+/// One case of `golden/decode/`: an envelope and what `TypedEvent::decode` makes of it, read
+/// here and by the PWA's decoder (`packages/contracts/src/decode.golden.test.ts`), so both
+/// readers meet the same cases.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecodeCase {
+    expect: DecodeExpect,
+    envelope: Value,
 }
 
-#[allow(clippy::result_large_err, reason = "mirrors TypedEvent::decode")]
-fn decode_json(v: &Value) -> Result<TypedEvent, GenericEvent> {
-    let env: EventEnvelope =
-        serde_json::from_str(&v.to_string()).expect("the open envelope still parses");
-    TypedEvent::decode(&env)
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum DecodeExpect {
+    /// The generic reason; the envelope is kept whole.
+    Why(GenericReason),
+    /// The kind it decodes as.
+    Typed(String),
 }
 
+/// The generic cases (an unknown kind, a newer schema on a known kind and on an unknown one,
+/// invalid payloads) and the tolerated unknown fields, each in `golden/decode/`.
 #[test]
-fn unknown_kind_is_generic() {
-    let mut v = known_envelope_json();
-    v["kind"] = "artifact_diff".into();
-    v["payload"] = serde_json::json!({ "files": [1, 2, 3] });
-    let g = decode_json(&v).unwrap_err();
-    assert_eq!(g.why, GenericReason::UnknownKind);
-    assert_eq!(g.envelope.kind.as_str(), "artifact_diff");
-    assert_eq!(g.envelope.payload.get(), r#"{"files":[1,2,3]}"#);
-}
-
-#[test]
-fn newer_schema_version_is_generic_even_for_a_known_kind() {
-    let mut v = known_envelope_json();
-    v["schema_version"] = (SCHEMA_VERSION + 1).into();
-    let g = decode_json(&v).unwrap_err();
-    assert_eq!(g.why, GenericReason::NewerSchema);
-}
-
-#[test]
-fn invalid_payload_is_generic() {
-    let mut v = known_envelope_json();
-    v["payload"]["prompt"] = 42.into();
-    assert_eq!(
-        decode_json(&v).unwrap_err().why,
-        GenericReason::PayloadInvalid
-    );
-
-    let mut v = known_envelope_json();
-    v["payload"] = "not an object".into();
-    assert_eq!(
-        decode_json(&v).unwrap_err().why,
-        GenericReason::PayloadInvalid
-    );
-}
-
-#[test]
-fn unknown_fields_in_envelope_and_payload_are_tolerated() {
-    let mut v = known_envelope_json();
-    v["relay_hint"] = "later".into();
-    v["payload"]["turn_ref"] = "t-1".into();
-    assert!(matches!(decode_json(&v), Ok(TypedEvent::UserMessage(_))));
+fn decode_cases_match_typed_event_decode() {
+    let dir = golden_dir().join("decode");
+    let mut names = BTreeSet::new();
+    let mut whys = BTreeSet::new();
+    for entry in fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let case: DecodeCase = serde_json::from_slice(&fs::read(&path).unwrap())
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let env: EventEnvelope = serde_json::from_str(&case.envelope.to_string())
+            .unwrap_or_else(|e| panic!("{name}: the open envelope does not parse: {e}"));
+        match (TypedEvent::decode(&env), case.expect) {
+            (Err(g), DecodeExpect::Why(why)) => {
+                assert_eq!(g.why, why, "{name}");
+                assert_eq!(
+                    serde_json::to_value(&g.envelope).unwrap(),
+                    case.envelope,
+                    "{name}: the envelope is not kept whole"
+                );
+                whys.insert(format!("{why:?}"));
+            }
+            (Ok(t), DecodeExpect::Typed(kind)) => {
+                assert_eq!(t.kind(), kind, "{name}");
+                whys.insert("typed".to_owned());
+            }
+            (Ok(t), DecodeExpect::Why(why)) => {
+                panic!("{name}: decoded as {}, not {why:?}", t.kind())
+            }
+            (Err(g), DecodeExpect::Typed(kind)) => panic!("{name}: {:?}, not {kind}", g.why),
+        }
+        names.insert(name);
+    }
+    for want in [
+        "unknown_kind.json",
+        "newer_schema_known_kind.json",
+        "newer_schema_unknown_kind.json",
+        "payload_field_wrong_type.json",
+        "payload_not_an_object.json",
+        "unknown_fields_tolerated.json",
+    ] {
+        assert!(names.contains(want), "golden/decode/{want} is missing");
+    }
+    assert_eq!(whys.len(), 4, "every outcome has a case: {whys:?}");
 }
 
 #[test]
