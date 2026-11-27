@@ -28,17 +28,17 @@ IndexedDB holds `{ generation (UUID), token }`. A 401 deletes it only when the s
 
 A pure reducer `(State, Action) → (State, Effect[])` holds sync state.
 
-- **Followed set** (= subscriptions, http:475): `host`, the selected thread, up to 64 open threads, visible first in list order (open, `cwd`, `thread_id`), recomputed when scrolling settles, evicting hidden ones only for newly visible ones. Unfollowing drops the copy, aging its requests.
+- **Followed set** (= subscriptions, http:475): `host`, the selected thread, up to 64 open threads, visible first in list order, recomputed when scrolling settles, evicting hidden ones only for newly visible ones. Unfollowing drops the copy, aging its requests.
 - **F1 both ways** (formal-specs:326): host owns membership and `closed`; a valid thread copy owns axes and attention; initial `task_state` comes from registration. Unfollowed rows label host values "last known" or "unavailable".
 - **Rules**: formal-specs §7.1, §7.4 (:224-240, :339). A thread 404 removes copy, selection, and row for the epoch; a `host` 404 is an error.
 - **Socket**: every `open` makes earlier requests older, resets announced heads, subscribes the full set, and makes streams and pending history due; callbacks bind to it. `hello` sets the socket's epoch only; heads count in the held epoch, merged by max for followed ids, omissions ignored (http D15). Only a current successful forward response sets the epoch; a backward resync waits for a later forward issue.
 - **Scheduling**: host, displayed, others; four reads at most, ticket outside; 10 s timeout (daemon 5 s).
-- **Failures**: forward 408, 503, and network errors stay due, backing off to 30 s (honouring `retry_after`). Bodies over 16 MiB are refused unparsed: pages retry smaller; a snapshot or event that large shows an error naming the limit. Other failures keep the last good copy and show a retry, never looping.
-- **Status** (mvp:220): `connecting`, `live`, `updates paused` (socket down, reads work), `offline` (reads or ticket POST fail in transport); W2 locks input unless `live`. "Last synced" is set when a current forward read completes catch-up of every followed stream not in error (valid copy, cursor ≥ known head), and kept through outages. State is in memory.
+- **Failures**: forward 408, 503, and network errors stay due, backing off to 30 s (honouring `retry_after`). Bodies over 16 MiB are refused unparsed: pages retry smaller; a snapshot or event that large shows an error naming the limit. Other failures keep the last good copy and show a retry where they occur, never looping.
+- **Status** (mvp:220), by the forward reads of `host` and the selected thread: `connecting` first, `live` (`hello`, reads reach the daemon), `offline` (socket down, reads or ticket POST fail in transport), else `updates paused`; W2 locks input unless `live`. "Last synced" marks a current forward read completing catch-up of every followed stream not in error; outages keep it. State is in memory.
 
 ### 2.4 History Window
 
-The displayed thread has one contiguous window (2,000 events, 16 MiB) at or below the cursor, filled by backward reads; selection loads the newest page once a forward response set the cursor. Attached (ending at the cursor), live events append and the oldest drop past the cap. "Older" reads before the first retained seq; past the cap the newest drop, detaching it from live events. "Newer" reads `n = min(limit, cursor − last)` events (`before_seq = last + n + 1`), merged by seq, reattaching at the current cursor; "Jump to latest" reloads the tail. A bound snapshot resets an attached window to the new tail and keeps a detached one; `CursorAhead` discards and reloads it, aging its history requests; an epoch switch drops it.
+The displayed thread has one contiguous window (2,000 events, 16 MiB) at or below the cursor, filled by backward reads; selection loads the newest page once the cursor is known. Attached (ending at the cursor), live events append and the oldest drop past the cap. "Older" reads before the first retained seq; past the cap the newest drop, detaching it from live events. "Newer" reads `n = min(limit, cursor − last)` events (`before_seq = last + n + 1`), reattaching at the current cursor; "Jump to latest" reloads the tail. A bound snapshot resets an attached window to the new tail and keeps a detached one; `CursorAhead` discards and reloads it, aging its history requests; an epoch switch drops it.
 
 ### 2.5 Rendering
 
@@ -90,7 +90,7 @@ All reversible.
 - **Screen as state** (invariant 1): no action carries screen data; W1 never uses `/screen` or attach.
 - **Limit, one OS account**: same-origin script could read the token; the MVP trusts the account.
 - **Epochs**: a restored database may keep tokens and epoch, detectable only through `CursorAhead`.
-- **Limits**: unfollowed rows show "last known" until visible or selected; history within the read limit stays one action away; evicted storage costs one `chaldea open`; a snapshot passes 16 MiB only with many unresolved inputs (e.g. about 250 at the 64 KiB inline limit, `payload.rs:18`).
+- **Limits**: unfollowed rows show "last known"; history within the read limit stays one action away; evicted storage costs one `chaldea open`; a snapshot can pass 16 MiB (e.g. 250 unresolved inputs at the 64 KiB inline limit, `payload.rs:18`, or a huge thread list).
 
 ## 6. Proposed Canonical Edits
 
