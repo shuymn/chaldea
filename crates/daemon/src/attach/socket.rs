@@ -24,7 +24,7 @@ use chaldea_pty_runtime::{
 use futures_util::StreamExt;
 use tokio::sync::oneshot;
 
-use super::input::{Item, Pending, Verdict, advance_tail, decide_frames, filter};
+use super::input::{Item, Pending, Verdict, decide_frames, filter};
 use super::output::{Ending, OutBuf, Taken};
 use super::registry::{Candidate, LaunchAttach, Removed, Replaced};
 use super::{Attach, AttachConfig, paste_reason, refusal_reason, submit_reason};
@@ -917,8 +917,6 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
     let mut ctl = Ctl::default();
     let mut pending = Pending::default();
     let mut held: Vec<u8> = Vec::new();
-    // The tail the socket's own accepted raw input will follow (the receipt check).
-    let mut proj: Vec<u8> = Vec::new();
     // Timers on the supervisor's clock (`sup.timer` each iteration), so a test clock
     // drives them.
     let mut hold_until: Option<Instant> = None;
@@ -1285,9 +1283,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             }
             Ev::HoldEnd => {
                 hold_until = None;
-                let h = std::mem::take(&mut held);
-                advance_tail(&mut proj, &h);
-                pending.raw(&h);
+                pending.raw(&std::mem::take(&mut held));
                 continue;
             }
             Ev::Submitted(r) => {
@@ -1415,29 +1411,25 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                         // is left to the submission, decided in write order.
                         let own = pending.has_raw()
                             || matches!(&outstanding, Some(o) if matches!(o.unit, Unit::Raw(_)));
-                        let certain = !own && {
+                        let tail = if own {
+                            None
+                        } else {
                             let m = crate::supervisor::lock(&la.marks);
-                            let known = m.unsettled == 0;
-                            if known {
-                                proj.clone_from(&m.tail);
-                            }
-                            known
+                            (m.unsettled == 0).then(|| m.tail.clone())
                         };
-                        if !certain {
+                        let Some(tail) = tail else {
                             // Deferred: the frame stays whole (no held split) until its
                             // decision at submission, after any held partial in arrival
-                            // order; an accepted deferred frame is written whole.
+                            // order; once it is accepted there, the partial marker the write
+                            // ends with is held back, as at receipt.
                             if !held.is_empty() {
-                                let h = std::mem::take(&mut held);
                                 hold_until = None;
-                                advance_tail(&mut proj, &h);
-                                pending.raw(&h);
+                                pending.raw(&std::mem::take(&mut held));
                             }
-                            advance_tail(&mut proj, &b);
                             pending.raw_deferred(&b);
                             continue;
-                        }
-                        match filter(&proj, &held, &b) {
+                        };
+                        match filter(&tail, &held, &b) {
                             Verdict::Refused => {
                                 ctl.push_back(AttachServerMessage::InputDropped {
                                     bytes: b.len() as u64,
@@ -1445,7 +1437,6 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                                 });
                             }
                             Verdict::Accepted { write, held: h } => {
-                                advance_tail(&mut proj, &write);
                                 pending.raw(&write);
                                 held = h;
                                 hold_until = (!held.is_empty()).then(|| sup.now() + cfg.hold);
@@ -1476,10 +1467,8 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                             } else {
                                 // The held partial marker goes first: input stays in order.
                                 if !held.is_empty() {
-                                    let h = std::mem::take(&mut held);
                                     hold_until = None;
-                                    advance_tail(&mut proj, &h);
-                                    pending.raw(&h);
+                                    pending.raw(&std::mem::take(&mut held));
                                 }
                                 pending.paste(paste_id, text);
                             }
