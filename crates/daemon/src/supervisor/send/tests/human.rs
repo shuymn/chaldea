@@ -208,6 +208,12 @@ async fn human_writes_at_exit() {
             "the fault was taken"
         );
         assert_eq!(human_writes(&rig, &live), ["key"], "by the exit job");
+        // The removal from the live map wakes no worker: released before it, the worker
+        // could park for good.
+        rig.until("the launch left the live map", || {
+            rig.sup.entry(live.l).is_none()
+        })
+        .await;
         go.send(()).unwrap();
         rig.until("the worker ended", || rig.sup.send.launch(live.l).is_none())
             .await;
