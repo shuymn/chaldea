@@ -1318,10 +1318,13 @@ async fn revocation_nudge_from_the_server() {
 
 /// The launch commands' codes (supervisor §2.2) are handler replies at one status each: a
 /// result with the code at that status is stored and answered as it is; at any other status
-/// it is 500 `internal`.
+/// it is 500 `internal`. The requests are sent one after another under a 60 s budget: a
+/// request that outlasts the test server's 2 s one is 503 `outcome_unknown` by design, and
+/// this test is about the codes, not the deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn launch_codes_at_their_statuses() {
-    let (srv, _probe) = TestServer::with_commands(|_| {}).await;
+    let (srv, _probe) =
+        TestServer::with_commands(|c| c.short_deadline = Duration::from_secs(60)).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let codes = [
         ("thread_closed", 409),
