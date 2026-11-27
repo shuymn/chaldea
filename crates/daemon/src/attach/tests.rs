@@ -1542,3 +1542,111 @@ async fn revoked_lost_nudge() {
     assert_eq!(a.until_closed().await.0, Some(1008));
     rig.stop().await;
 }
+
+/// I-7: a revocation committed before the startup read: no `attached`, close 1008.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_at_startup() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let owner = rig.srv.token(TokenKind::Owner, None, None).await;
+    let ticket = rig
+        .srv
+        .ticket(&owner, &format!("attach:{}", live.t))
+        .await
+        .unwrap();
+    // The third read (after the guard's lookup and the admission read) is the startup read:
+    // parked until the revocation committed, with no nudge, so only it can see it.
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    rig.srv.server.shared().faults.arm_before_read(2, move || {
+        let _ = entered_tx.send(());
+        let _ = wait.recv_timeout(Duration::from_secs(30));
+    });
+    let url = format!(
+        "ws://127.0.0.1:{}/api/attach/{}?ticket={ticket}",
+        rig.srv.port, live.t
+    );
+    let connect = tokio::spawn(tokio_tungstenite::connect_async(url));
+    entered(&entered_rx);
+    rig.srv.revoke_quietly(&owner).await;
+    go.send(()).unwrap();
+    let (ws, _) = bounded(WS_WAIT, connect).await.unwrap().unwrap().unwrap();
+    let mut c = Client { ws, closed: None };
+    let (code, texts) = c.until_closed().await;
+    assert_eq!((code, texts), (Some(1008), Vec::new()));
+    rig.stop().await;
+}
+
+/// I-8: a read error with the child alive revokes the grant at the latch: a unit queued
+/// behind a held write is not written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_error_revokes_held_input() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let (mut a, _) = attach(&rig, &live).await;
+    let hold = live.child.hold_writes();
+    let other = rig.attach(&live, b"k").await;
+    assert!(hold.wait_entered(soon()));
+    a.binary(b"\r").await;
+    rig.until("A's unit queued", || sl.state().human_unsettled == 2)
+        .await;
+    live.child.fail_output(std::io::ErrorKind::Other);
+    // The latch is seen; the socket has not ended (its close is not acknowledged yet).
+    assert_eq!(
+        a.text().await,
+        Some(AttachServerMessage::Ended {
+            launch_id: live.l,
+            reason: EndReason::Error
+        })
+    );
+    drop(hold);
+    bounded(WS_WAIT, other).await.unwrap().unwrap();
+    rig.until("settled", || sl.state().human_unsettled == 0)
+        .await;
+    assert!(!live.child.input().contains(&b'\r'));
+    assert_eq!(a.until_closed().await.0, Some(4001));
+    rig.stop().await;
+}
+
+/// I-8: the socket's stalled send does not hold up the PTY's drain: another subscriber
+/// still gets every byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_progresses_while_output_stalled() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (_c, _) = attach(&rig, &live).await;
+    let (reached, _held) = rig.srv.server.shared().faults.arm_socket_send_gate();
+    live.child.emit(b"first");
+    bounded(WS_WAIT, reached).await.unwrap().unwrap();
+    let rx = rig.watch(&live).await;
+    live.child.emit(b"later bytes");
+    SRig::delivered(&rx, b"later bytes").await;
+    rig.stop().await;
+}
+
+/// I-8: a lagging socket whose peer never reads releases its slot once the drain deadline
+/// passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lag_stalled_releases_slot() {
+    let rig = SRig::with(|c| c.attach.out_max = 16).await;
+    let live = rig.claude().await;
+    let shared = rig.srv.server.shared().clone();
+    let (mut c, _) = attach(&rig, &live).await;
+    let (reached, _held) = shared.faults.arm_socket_send_gate();
+    live.child.emit(b"abc");
+    bounded(WS_WAIT, reached).await.unwrap().unwrap();
+    live.child.emit(&[b'z'; 64]);
+    let h = hooks(&rig);
+    rig.until("the lag latched", || {
+        h.latched.load(std::sync::atomic::Ordering::SeqCst) > 0
+    })
+    .await;
+    assert_eq!(shared.sockets.held(), 1);
+    rig.clock.advance(rig.sup.cfg.attach.drain);
+    let _p = poker(&rig);
+    rig.until("the slot released", || shared.sockets.held() == 0)
+        .await;
+    assert_eq!(c.until_closed().await, (None, Vec::new()));
+    rig.stop().await;
+}
