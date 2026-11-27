@@ -1733,3 +1733,154 @@ async fn saturated_reads_drop_by_original_deadline() {
     drop(gos);
     rig.stop().await;
 }
+
+/// I-3: an open job whose commit result is unknown keeps the lease (the input may be
+/// `sending`): a resize waits for it and never reaches the PTY meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_result_unrecorded() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let (mut c, _) = attach(&rig, &live).await;
+    let store = rig.srv.store.store().clone();
+    crate::supervisor::send::tests::set_hook(&sl.hooks.open_job, move || {
+        *store.faults().commit.lock().unwrap() =
+            Some(crate::store::test_faults::CommitFault::IoErrAfterCommit);
+    });
+    let _ = rig.send_text(&live, "prompt").await;
+    rig.until("the open's commit is unknown", || {
+        rig.srv
+            .store
+            .store()
+            .faults()
+            .commit
+            .lock()
+            .unwrap()
+            .is_none()
+            && !rig.sink.0.lock().unwrap().is_empty()
+    })
+    .await;
+    rig.until("the open ended", || {
+        sl.state()
+            .lease
+            .is_some_and(|l| matches!(l.kind, crate::supervisor::send::LeaseKind::Send(_)))
+            && sl.state().running.is_none()
+    })
+    .await;
+    c.json(json!({ "type": "resize", "cols": 100, "rows": 30 }))
+        .await;
+    rig.until("the resize waits for the lease", || {
+        sl.lease_waits.load(std::sync::atomic::Ordering::SeqCst) > 0
+    })
+    .await;
+    let sl2 = sl.clone();
+    rig.until_async("the worker's pass after the open", || {
+        let sl = sl2.clone();
+        async move { sl.passes.load(std::sync::atomic::Ordering::SeqCst) > 0 }
+    })
+    .await;
+    assert!(resizes(&live).is_empty());
+    assert!(sl.state().lease.is_some());
+    rig.stop().await;
+}
+
+/// I-7: the socket's cleanup (its unsubscribe) blocked on the VT lock does not hold its
+/// slot: the slot is released when the socket ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slot_with_cleanup_held() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let shared = rig.srv.server.shared().clone();
+    let (c, _) = attach(&rig, &live).await;
+    let probe = rig.probe(&live).await;
+    let park = probe.park(chaldea_pty_runtime::fake::ProbePoint::PieceParsing);
+    live.child.emit(b"x");
+    assert!(probe.wait(
+        chaldea_pty_runtime::fake::ProbePoint::PieceParsing,
+        1,
+        soon()
+    ));
+    assert_eq!(shared.sockets.held(), 1);
+    drop(c);
+    rig.until("the slot released", || shared.sockets.held() == 0)
+        .await;
+    drop(park);
+    rig.stop().await;
+}
+
+/// I-2: repeated takeovers with no output never leave old subscriptions behind: every
+/// takeover past the subscriber limit still attaches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacement_without_output() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut prev, _) = attach(&rig, &live).await;
+    for _ in 0..12 {
+        let (next, _) = attach(&rig, &live).await;
+        assert_eq!(prev.until_closed().await.0, Some(4003));
+        prev = next;
+    }
+    prev.binary(b"ok").await;
+    input_has(&rig, &live, b"ok").await;
+    rig.stop().await;
+}
+
+/// R-10, R-4: the report channel lost with the unit still queued: the cancel takes it,
+/// `not_written`; with the unit dispatched: `pending`, and the socket submits nothing more
+/// (no settlement can come).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn report_channel_lost() {
+    use crate::supervisor::send::DropReport;
+    // Queued.
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let (mut c, _) = attach(&rig, &live).await;
+    let hold = live.child.hold_writes();
+    let other = rig.attach(&live, b"k").await;
+    assert!(hold.wait_entered(soon()));
+    *sl.drop_report.lock().unwrap() = Some(DropReport::Submit);
+    c.binary(b"x").await;
+    assert_eq!(
+        c.text().await,
+        Some(AttachServerMessage::InputDropped {
+            bytes: 1,
+            reason: AttachReason::NotWritten
+        })
+    );
+    drop(hold);
+    bounded(WS_WAIT, other).await.unwrap().unwrap();
+    rig.until("settled", || sl.state().human_unsettled == 0)
+        .await;
+    assert!(!live.child.input().contains(&b'x'));
+    rig.stop().await;
+
+    // Dispatched.
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let (mut c, first) = attach(&rig, &live).await;
+    let AttachServerMessage::Attached { cols, rows, .. } = first else {
+        unreachable!()
+    };
+    *sl.drop_report.lock().unwrap() = Some(DropReport::Fire);
+    c.binary(b"x").await;
+    assert_eq!(
+        c.text().await,
+        Some(AttachServerMessage::InputDropped {
+            bytes: 1,
+            reason: AttachReason::Pending
+        })
+    );
+    c.binary(b"y").await;
+    c.json(json!({ "type": "resize", "cols": cols, "rows": rows }))
+        .await;
+    size_frame(&mut c).await;
+    rig.until("settled", || sl.state().human_unsettled == 0)
+        .await;
+    assert!(
+        !live.child.input().contains(&b'y'),
+        "nothing more submitted"
+    );
+    rig.stop().await;
+}

@@ -229,6 +229,14 @@ impl TurnLog {
     }
 }
 
+/// Where a test drops a human unit's report sender.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropReport {
+    Submit,
+    Fire,
+}
+
 /// Everything the worker, the probe, and the commands share about one launch under one
 /// mutex (send §2.1 rule 1). The probe only `try_lock`s it.
 #[derive(Default)]
@@ -338,6 +346,10 @@ pub(crate) struct SendLaunch {
     /// Waits for the lease begun (tests poll it).
     #[cfg(test)]
     pub lease_waits: AtomicU64,
+    /// Drops the next human unit's report sender: at its submission, or when its
+    /// completion fires (tests of a lost report channel).
+    #[cfg(test)]
+    pub drop_report: Mutex<Option<DropReport>>,
     /// Passes finished (tests poll it).
     #[cfg(test)]
     pub passes: AtomicU64,
@@ -368,6 +380,8 @@ impl SendLaunch {
             lease_free: Notify::new(),
             #[cfg(test)]
             lease_waits: AtomicU64::new(0),
+            #[cfg(test)]
+            drop_report: Mutex::new(None),
             #[cfg(test)]
             passes: AtomicU64::new(0),
             tick: Mutex::new(None),
@@ -405,6 +419,13 @@ impl SendLaunch {
             };
             #[cfg(test)]
             run_hook(&me.hooks.completion);
+            #[cfg(test)]
+            let report = if *lock(&me.drop_report) == Some(DropReport::Fire) {
+                lock(&me.drop_report).take();
+                None
+            } else {
+                report
+            };
             if r.outcome == chaldea_pty_runtime::WriteOutcome::Written
                 && let Some(w) = &written
             {
@@ -435,6 +456,13 @@ impl SendLaunch {
         guard: chaldea_pty_runtime::Guard,
         report: Option<oneshot::Sender<KeyReport>>,
     ) -> Result<WriteTicket, chaldea_pty_runtime::SubmitError> {
+        #[cfg(test)]
+        let report = if *lock(&self.drop_report) == Some(DropReport::Submit) {
+            lock(&self.drop_report).take();
+            None
+        } else {
+            report
+        };
         self.human_up(&mut self.state());
         self.outstanding.fetch_add(1, Ordering::AcqRel);
         let done = self.completion(None, report);
