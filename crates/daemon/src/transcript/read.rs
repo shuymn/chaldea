@@ -334,6 +334,9 @@ impl Tail {
         if last {
             self.final_failures += 1;
             if self.final_failures >= FINAL_TRIES {
+                if !self.prefix_checked {
+                    self.unverified("the final read failed before its prefix check");
+                }
                 tracing::warn!(thread = %self.b.thread_id, launch = %self.b.launch_id, error = %text, "the final transcript read failed {FINAL_TRIES} times; the tailer ends and the bytes stay in the file");
                 return Step::End(format!("the final read failed: {text}"));
             }

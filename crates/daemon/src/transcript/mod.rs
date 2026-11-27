@@ -15,4 +15,6 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) use read::{BATCH_LINES, DROPPED_OFF_BLOCKING, FINAL_TRIES};
+#[cfg(test)]
+pub(crate) use tailer::read_probe;
 pub(crate) use tailer::{Mode, TAIL_POLL, Tailers};

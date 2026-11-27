@@ -202,3 +202,19 @@ fn a_stop_during_the_final_reads_open_check_is_unverified() {
     assert_eq!(next.stats.unverified, 1);
     assert_eq!(shorts(&fx.events()), ["generation:1", "text:one"]);
 }
+
+/// A final read that never opens the file (it was never created) ends after `FINAL_TRIES`
+/// polls in the normal course of a launch's exit, with the continuity recorded as
+/// unverified.
+#[test]
+fn a_final_read_that_never_opens_is_unverified() {
+    let fx = Fx::new();
+    let mut tail = fx.tail();
+    assert_eq!(tail.poll(&fx.backend()), Step::Wait);
+    fx.add(vec![support::exited(fx.t, fx.l)]);
+    for _ in 1..FINAL_TRIES {
+        assert_eq!(tail.poll(&fx.backend()), Step::Wait);
+    }
+    assert!(matches!(tail.poll(&fx.backend()), Step::End(_)));
+    assert_eq!(tail.stats.unverified, 1);
+}

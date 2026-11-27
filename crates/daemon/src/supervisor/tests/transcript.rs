@@ -15,7 +15,7 @@ use crate::lifecycle::ParticipantEnd;
 use crate::store::tests::support;
 use crate::supervisor::Pause;
 use crate::supervisor::components::shutdown;
-use crate::transcript::{BATCH_LINES, DROPPED_OFF_BLOCKING, FINAL_TRIES, Mode};
+use crate::transcript::{BATCH_LINES, DROPPED_OFF_BLOCKING, FINAL_TRIES, Mode, read_probe};
 
 const LINE: &str =
     "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n";
@@ -387,5 +387,55 @@ async fn the_final_read_without_a_stored_exit_ends_after_one_poll() {
     rig.until("the tailer ended", || rig.sup.tailers.launches().is_empty())
         .await;
     assert_eq!(texts(&rig, t).len(), 2 * BATCH_LINES);
+    rig.srv.stop().await;
+}
+
+/// At the final read a tailer still waiting for its binding whose binding reads all fail
+/// records the continuity as unverified.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spent_binding_reads_at_the_final_read_are_unverified() {
+    let rig = rig().await;
+    let (_t, _l) = spawn_claude(&rig).await;
+    let close = rig.pauses.arm(Pause::ShutdownCloseEnd);
+    let end = rig.sup.now() + Duration::from_secs(5);
+    let participant = tokio::spawn(shutdown(rig.sup.clone(), end));
+    let close = tokio::task::spawn_blocking(move || {
+        close.wait();
+        close
+    })
+    .await
+    .unwrap();
+    rig.sup
+        .tailers
+        .read_faults
+        .lock()
+        .unwrap()
+        .extend([true; FINAL_TRIES as usize]);
+    close.go();
+    assert_eq!(participant.await.unwrap(), ParticipantEnd::Clean);
+    assert_eq!(
+        rig.sup.tailers.unbound_unverified.load(Ordering::Relaxed),
+        1
+    );
+    rig.srv.stop().await;
+}
+
+/// Past the participant's end a tailer read borrows no reader: it fails before the pool,
+/// which lends a free reader before it checks a deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_reader_is_borrowed_past_the_participants_end() {
+    let rig = rig().await;
+    let past = rig.sup.now() - Duration::from_millis(1);
+    let _ = rig.sup.window.set(crate::supervisor::Window {
+        close_end: past,
+        end: past,
+    });
+    let before = rig.sup.tailers.reads.load(Ordering::Relaxed);
+    let sup = rig.sup.clone();
+    let r = tokio::task::spawn_blocking(move || read_probe(&sup))
+        .await
+        .unwrap();
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(rig.sup.tailers.reads.load(Ordering::Relaxed), before);
     rig.srv.stop().await;
 }

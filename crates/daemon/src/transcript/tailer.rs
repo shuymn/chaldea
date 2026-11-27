@@ -62,6 +62,12 @@ pub(crate) struct Tailers {
     /// Polls that ran (tests).
     #[cfg(test)]
     pub(crate) polls: std::sync::atomic::AtomicU32,
+    /// Store reads that borrowed a reader (tests).
+    #[cfg(test)]
+    pub(crate) reads: std::sync::atomic::AtomicU32,
+    /// Final reads abandoned before the tailer had its binding (tests).
+    #[cfg(test)]
+    pub(crate) unbound_unverified: std::sync::atomic::AtomicU32,
 }
 
 impl Default for Tailers {
@@ -74,6 +80,10 @@ impl Default for Tailers {
             read_faults: Mutex::default(),
             #[cfg(test)]
             polls: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            reads: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            unbound_unverified: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -145,15 +155,29 @@ fn read<R>(
     }
     let mut until = sup.now() + READ_WAIT;
     if let Some(w) = sup.window.get() {
+        // The pool lends a free reader before it checks a deadline.
+        if sup.now() >= w.end {
+            return Err("the participant's end has passed".into());
+        }
         until = until.min(w.end);
     }
     sup.store
         .read(sup.real(until), |r| {
             #[cfg(test)]
+            sup.tailers
+                .reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(test)]
             sup.pauses().blocking(crate::supervisor::Pause::TailerRead);
             f(r)
         })
         .map_err(|e| format!("{e:?}"))
+}
+
+/// One tailer store read that does nothing (tests).
+#[cfg(test)]
+pub(crate) fn read_probe(sup: &Supervisor) -> Result<(), String> {
+    read(sup, |_| Ok(()))
 }
 
 impl Backend for StoreBackend {
@@ -346,6 +370,12 @@ async fn run(sup: Arc<Supervisor>, thread: ThreadId, launch: LaunchId) {
             // A failed read at shutdown is retried a few times, shortly, within the budget.
             bind_tries += 1;
             if bind_tries >= FINAL_TRIES || !sup.final_wait(&mut mode).await {
+                // Whether the launch had a transcript to read is unknown.
+                tracing::warn!(%thread, %launch, "the transcript's continuity is unverified: the binding could not be read for the final read");
+                #[cfg(test)]
+                sup.tailers
+                    .unbound_unverified
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return finish(&sup, launch);
             }
         } else {
