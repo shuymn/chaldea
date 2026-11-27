@@ -1412,6 +1412,58 @@ async fn paste_2004_toggled() {
     rig.stop().await;
 }
 
+/// T1-6, D5: the mode is the one at encoding. A paste encoded with 2004 on whose
+/// submission waits while 2004 goes off and on again is refused `bracketed_paste_off`
+/// (zero bytes, no event); one encoded with 2004 off whose submission waits while 2004
+/// comes on is still rejected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paste_2004_toggled_after_encoding() {
+    use super::super::supervisor::send::tests::{PASTE_OFF, PASTE_ON};
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let rx = rig.watch(&live).await;
+    let (mut c, _) = attach(&rig, &live).await;
+    let before = live.child.input().len();
+    for (start_on, toggles, want) in [
+        (
+            true,
+            [PASTE_OFF, PASTE_ON].concat(),
+            PasteOutcome::NotWritten,
+        ),
+        (false, PASTE_ON.to_vec(), PasteOutcome::Rejected),
+    ] {
+        rig.paste(&live, start_on).await;
+        let (at, go) = park_sync(&hooks(&rig).submit);
+        c.json(json!({ "type": "paste", "paste_id": "p", "text": "t" }))
+            .await;
+        entered(&at);
+        live.child.emit(&toggles);
+        SRig::delivered(&rx, &toggles).await;
+        go.send(()).unwrap();
+        let Some(AttachServerMessage::PasteResult {
+            outcome,
+            bytes_written,
+            reason,
+            ..
+        }) = c.text().await
+        else {
+            panic!("a paste result")
+        };
+        assert_eq!(
+            (outcome, bytes_written, reason),
+            (
+                want,
+                Some(0),
+                Some(PasteReason::Attach(AttachReason::BracketedPasteOff))
+            ),
+            "{start_on}"
+        );
+    }
+    assert_eq!(live.child.input().len(), before);
+    assert_eq!(human_writes(&rig, &live), 0);
+    rig.stop().await;
+}
+
 /// I-2: A's submission runs after B's takeover: its grant is the one fixed at A's swap, so
 /// the writer refuses it (`FenceMoved`), zero bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

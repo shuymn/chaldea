@@ -1317,6 +1317,12 @@ impl fmt::Debug for SessionHandle {
 }
 
 impl SessionHandle {
+    /// One atomic load of the mode word.
+    #[must_use]
+    pub fn modes(&self) -> ModeView {
+        self.sh.modes.load()
+    }
+
     /// The current size: the spawn size until a resize succeeds.
     #[must_use]
     pub fn size(&self) -> PtySize {

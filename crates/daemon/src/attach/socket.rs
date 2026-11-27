@@ -18,8 +18,8 @@ use chaldea_core::input::MAX_PROMPT_BYTES;
 use chaldea_core::input::encode::{Purpose, check, encode};
 use chaldea_core::payload::{InputEncoding, VtCursor};
 use chaldea_pty_runtime::{
-    Fence, Guard, PtySize, ScreenMeta, SessionHandle, SubscribeError, Subscribed, SubscriptionId,
-    WriteOrigin, WriteTicket, WriteUnit, grid_rows,
+    Fence, Guard, ModeView, PtySize, ScreenMeta, SessionHandle, SubscribeError, Subscribed,
+    SubscriptionId, WriteOrigin, WriteTicket, WriteUnit, grid_rows,
 };
 use futures_util::StreamExt;
 use tokio::sync::oneshot;
@@ -338,11 +338,12 @@ struct Writer {
 
 impl Writer {
     /// Submits `bytes` as one attach unit (R-4): its guard carries the socket's grant, a
-    /// 30 s dispatch deadline, and for a paste on a bracketed-paste row the mode epoch.
+    /// 30 s dispatch deadline, and for a paste on a bracketed-paste row the mode epoch
+    /// `paste` sampled before its encoding (D5).
     fn submit(
         &self,
         bytes: Vec<u8>,
-        paste: bool,
+        paste: Option<ModeView>,
     ) -> Pin<Box<dyn Future<Output = Submitted> + Send>> {
         let (sup, entry, sl, fence) = (
             self.sup.clone(),
@@ -351,7 +352,8 @@ impl Writer {
             self.fence.clone(),
         );
         let wait = self.cfg.unit_wait;
-        let needs_2004 = paste && self.paste_on_2004;
+        let needs_2004 = paste.filter(|_| self.paste_on_2004);
+        let paste = paste.is_some();
         let la = self.la.clone();
         #[cfg(test)]
         let hook = crate::supervisor::lock(&self.cfg.hooks.submit).take();
@@ -419,7 +421,8 @@ struct Submit {
     fence: Fence,
     bytes: Vec<u8>,
     paste: bool,
-    needs_2004: bool,
+    /// The mode at encoding, for a paste on a bracketed-paste row.
+    needs_2004: Option<ModeView>,
     not_after: Instant,
     report: oneshot::Sender<KeyReport>,
 }
@@ -428,14 +431,13 @@ impl Submit {
     /// The ticket, or `None` when an earlier raw unit is unsettled again (another socket
     /// submitted one meanwhile): the caller waits and retries.
     fn run(self, s: &chaldea_pty_runtime::Session) -> Result<Option<WriteTicket>, Refused> {
-        let modes = s.modes();
-        if self.needs_2004 && !modes.modes.bracketed_paste {
+        if self.needs_2004.is_some_and(|m| !m.modes.bracketed_paste) {
             return Err(Refused::Rejected(AttachReason::BracketedPasteOff));
         }
         let guard = Guard {
             not_after: self.not_after,
             basis: None,
-            bracketed_paste: self.needs_2004.then_some(modes.bracketed_paste_epoch),
+            bracketed_paste: self.needs_2004.map(|m| m.bracketed_paste_epoch),
             recheck: None,
             fence: Some(self.fence),
         };
@@ -809,23 +811,28 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             outstanding = match pending.next() {
                 Some(Item::Raw(b)) => Some(Outstanding {
                     unit: Unit::Raw(b.len()),
-                    phase: Phase::Submitting(writer.submit(b, false)),
+                    phase: Phase::Submitting(writer.submit(b, None)),
                 }),
-                Some(Item::Paste { id, text }) => match writer.paste_bytes(&text) {
-                    Ok(b) => Some(Outstanding {
-                        unit: Unit::Paste(id),
-                        phase: Phase::Submitting(writer.submit(b, true)),
-                    }),
-                    Err(reason) => {
-                        ctl.push_back(AttachServerMessage::PasteResult {
-                            paste_id: id,
-                            outcome: PasteOutcome::Rejected,
-                            bytes_written: Some(0),
-                            reason: Some(reason),
-                        });
-                        continue;
+                Some(Item::Paste { id, text }) => {
+                    // The mode is sampled before the encoding; the writer refuses the unit
+                    // if 2004 changed after it.
+                    let modes = handle.modes();
+                    match writer.paste_bytes(&text) {
+                        Ok(b) => Some(Outstanding {
+                            unit: Unit::Paste(id),
+                            phase: Phase::Submitting(writer.submit(b, Some(modes))),
+                        }),
+                        Err(reason) => {
+                            ctl.push_back(AttachServerMessage::PasteResult {
+                                paste_id: id,
+                                outcome: PasteOutcome::Rejected,
+                                bytes_written: Some(0),
+                                reason: Some(reason),
+                            });
+                            continue;
+                        }
                     }
-                },
+                }
                 None => None,
             };
         }
