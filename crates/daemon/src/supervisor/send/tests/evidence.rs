@@ -186,8 +186,9 @@ async fn settle_timing() {
 }
 
 /// PR10b-CL-4: a later hook ends the candidate: a raw hook; a hook taken in and held before
-/// its job; a hook taken in after the pass chose the candidate, before the settle job; a hook
-/// whose request ended before its job was submitted.
+/// its job, then answered 408 before its write observer registers; a hook taken in after the
+/// pass chose the candidate, before the settle job; an intake whose facts were sampled and
+/// whose armed guard was dropped with no job.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn settle_later_hooks() {
     // A later raw hook.
@@ -208,8 +209,9 @@ async fn settle_later_hooks() {
     advance(&rig, &live, SETTLE).await;
     assert_eq!(count(&rig, &live, "stop_settled"), 0);
     release.send(()).unwrap();
-    // The clock moved past the hook's deadline while it was held: its job expired, so its
-    // intake finished without a mark, and the candidate stays ended by it.
+    // The clock moved past the hook's deadline while it was held: the request is 408 before
+    // its write observer registers, so its intake finished without a mark, and the
+    // candidate stays ended by it.
     assert_eq!(reply.await.unwrap().status, 408);
     rig.pass(&live).await;
     assert_eq!(count(&rig, &live, "stop_settled"), 0);
@@ -243,7 +245,8 @@ async fn settle_later_hooks() {
     assert_eq!(count(&rig, &live, "stop_settled"), 0);
     rig.stop().await;
 
-    // A hook taken in after the `Stop` whose request ended before its job was submitted.
+    // An intake after the `Stop` whose facts are sampled directly and whose armed guard is
+    // dropped with no job: it finishes without a mark.
     let (rig, live) = settle_rig().await;
     turn(&rig, &live, "p").await;
     let p: Arc<dyn IntakeProbe> = Arc::new(SupervisorProbe {

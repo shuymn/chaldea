@@ -343,7 +343,8 @@ async fn state_wait() {
 }
 
 /// SF-10: a wait for the launch's state that reaches the facts deadline makes one more
-/// attempt: released between the last sleep and that attempt, the facts are present.
+/// attempt: released after the clock check selects that attempt and before its read, the
+/// facts are present.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn state_at_facts_deadline() {
     let rig = SRig::new().await;

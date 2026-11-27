@@ -297,7 +297,8 @@ impl IntakeOrder {
     /// and at the start point, where the ordinal is taken; each is 408 with no ordinal. The
     /// facts deadline `F = min(now + wait, real(deadline))` (real time) bounds the probe's
     /// waits and never answers 408. From the start point the intake runs to its end; a 408
-    /// or a drop after it leaves its ordinal a gap and finishes it with no marks.
+    /// or a drop after it, before the job's write observer registers, leaves its ordinal a
+    /// gap and finishes it with no marks.
     ///
     /// # Errors
     ///

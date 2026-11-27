@@ -677,8 +677,9 @@ async fn session_start_before_publication_after_deadline() {
     rig.stop().await;
 }
 
-/// SF-10: a publication made between the publication wait's last sleep, which reached the
-/// facts deadline, and its final read is used: the `SessionStart` has its facts.
+/// SF-10: a publication made after the publication wait's clock check, at the facts
+/// deadline, selects the final attempt and before that attempt's read is used: the
+/// `SessionStart` has its facts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn published_at_facts_deadline() {
     let rig = claude_rig().await;
