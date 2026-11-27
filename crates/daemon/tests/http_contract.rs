@@ -3,9 +3,8 @@
 //! generated JSON Schema; every daemon-generated response carries `Cache-Control:
 //! no-store`, and hyper's own parser responses carry no `ErrorBody` and no daemon header.
 //!
-//! PR 7a captures the codes its guard and outer layer decide; the credential, list, and
-//! command bodies join with the handlers that produce them (PR 7b, 7c: the command codes
-//! through the test-only handlers of `support::commands`).
+//! The guard and outer layer's codes, the credential and list bodies, and the command
+//! codes (through the test-only handlers of `support::commands`) are captured.
 
 mod support;
 

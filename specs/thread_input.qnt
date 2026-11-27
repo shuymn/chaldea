@@ -1396,7 +1396,7 @@ module thread_input {
   }
 
   /// The launch unbound 20 s after `launch_started` of a non-manual launch (mvp §2.2:142):
-  /// a `SessionStart` that did not bind leaves it unbound (hook-ingest:268). The timer
+  /// a `SessionStart` that did not bind leaves it unbound (hook-ingest §2.5, §2.7). The timer
   /// belongs to the current launch and also runs while `stopping`.
   action sessionTimer: bool = all {
     alive(st),

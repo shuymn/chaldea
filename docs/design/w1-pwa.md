@@ -10,10 +10,10 @@
 
 ### 2.1 Mount and Build
 
-- **Routes** (http:232): `GET /` → `index.html`; `GET /assets/{*path}` → an exact embedded file of an allowlisted type, else 404. This handler's responses carry `nosniff` and `Cross-Origin-Resource-Policy: same-origin`.
+- **Routes** (http:230): `GET /` → `index.html`; `GET /assets/{*path}` → an exact embedded file of an allowlisted type, else 404. This handler's responses carry `nosniff` and `Cross-Origin-Resource-Policy: same-origin`.
 - **`/` headers**: `Content-Security-Policy: default-src 'self'; connect-src 'self' ws://<host>; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; require-trusted-types-for 'script'; trusted-types 'none'` (`<host>`: validated `Host`, lowercased; mvp:228); `X-Frame-Options: DENY`; `Referrer-Policy: no-referrer`; `Cross-Origin-Opener-Policy: same-origin`.
-- **Caching** (http:625): errors and `/` `no-store`; hashed assets `max-age=31536000, immutable`.
-- **Embedding**: the daemon's std-only `build.rs` regenerates the asset table from `CHALDEA_WEB_DIST` (absolute or workspace-relative), tracking it and every file; an invalid value fails the build. `Mounts::mvp()` keeps both routes `Mount::unimplemented` (501, http:219); production swaps in `Mount::read` over a non-empty table passed to the handler.
+- **Caching** (http:624): errors and `/` `no-store`; hashed assets `max-age=31536000, immutable`.
+- **Embedding**: the daemon's std-only `build.rs` regenerates the asset table from `CHALDEA_WEB_DIST` (absolute or workspace-relative), tracking it and every file; an invalid value fails the build. `Mounts::mvp()` keeps both routes `Mount::unimplemented` (501, http:217); production swaps in `Mount::read` over a non-empty table passed to the handler.
 - **Release**: owner binaries on both hosts come from one command (Vite build, then `cargo build --release` with the variable); per non-docs change, each packaged binary is smoked for `/` and every embeddable asset (source maps skipped), its unset rebuild for 501; only macOS Playwright checks `index.html`'s references. Interactive `chaldea open` first checks `GET /` (no Bearer): 501 reports the missing PWA and exits 1 before minting; others keep their path; `--print-url` skips it.
 
 ### 2.2 Pairing and Credential
@@ -22,14 +22,14 @@ The page removes `#pair=<code>` with `history.replaceState` before the exchange 
 
 IndexedDB holds `{ generation (UUID), token }`. A 401 deletes it only when the stored generation is the request's (one compare-and-delete transaction); a losing 401 adopts the newer generation silently. After a committed replacement or deletion, other tabs reread and retire the old generation's responses and socket. A failed or ambiguous pairing keeps a valid credential; with none, the page asks for a fresh link.
 
-**Assumption** (daemon-lifecycle:131-133): one OS account; the origin is not an authenticated server. Reopen on a shared host.
+**Assumption** (daemon-lifecycle:129-133): one OS account; the origin is not an authenticated server. Reopen on a shared host.
 
 ### 2.3 Sync Client
 
 A pure reducer `(State, Action) → (State, Effect[])` holds sync state.
 
-- **Followed set** (= subscriptions, http:475): `host`, the selected thread, up to 64 open threads, visible first in list order, recomputed when scrolling settles, evicting hidden ones only for newly visible ones. Unfollowing drops the copy, aging its requests.
-- **F1 both ways** (formal-specs:326): host owns membership and `closed`; a valid thread copy owns axes and attention; initial `task_state` comes from registration. Unfollowed rows label host values "last known" or "unavailable".
+- **Followed set** (= subscriptions, http:474): `host`, the selected thread, up to 64 open threads, visible first in list order, recomputed when scrolling settles, evicting hidden ones only for newly visible ones. Unfollowing drops the copy, aging its requests.
+- **F1 both ways** (formal-specs:325): host owns membership and `closed`; a valid thread copy owns axes and attention; initial `task_state` comes from registration. Unfollowed rows label host values "last known" or "unavailable".
 - **Rules**: formal-specs §7.1, §7.4 (:224-240, :339). A thread 404 removes copy, selection, and row for the epoch; a `host` 404 is an error.
 - **Socket**: every `open` makes earlier requests older, resets announced heads, subscribes the full set, and makes streams and pending history due; callbacks bind to it. `hello` sets the socket's epoch only; heads count in the held epoch, merged by max for followed ids, omissions ignored (http D15). Only a current successful forward response sets the epoch; a backward resync waits for a later forward issue.
 - **Scheduling**: host, displayed, others; four reads at most, ticket outside; 10 s timeout.
@@ -92,6 +92,6 @@ All reversible.
 - **Epochs**: a restored database keeping tokens and epoch shows only through `CursorAhead`.
 - **Limits**: history within the read limit is one action away; evicted storage costs one `chaldea open`; a snapshot can pass 16 MiB (e.g. 250 unresolved 64 KiB inputs, `payload.rs:18`, or a huge thread list); a back/forward return reloads the page (with the daemon down, the last view is lost).
 
-## 6. Proposed Canonical Edits
+## 6. Canonical Text
 
-mvp :234, :375, :409, :220 (headers, validators, D8, release, statuses); daemon-lifecycle :614 (the interactive check); formal-specs §7.4 (an empty database reaches browsers as 401).
+mvp §2.4 "Offline" (statuses), §2.5 route table (`/` headers), §3 (validators; "Tooling": the `web` job and the release command, D8); daemon-lifecycle §2.13 `chaldea open` step 2 (the page check); formal-specs §7.4 "PR 18" (an empty database reaches browsers as 401).

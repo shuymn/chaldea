@@ -570,7 +570,7 @@ fn handshake(srv: &TestServer, path: &str, ticket: &str) -> Req {
     srv.ws_handshake(&format!("{path}?ticket={ticket}"))
 }
 
-/// PR 7b's credential cells of PR7-CL-4: a ticket minted with each kind (and none) and
+/// The credential cells of PR7-CL-4: a ticket minted with each kind (and none) and
 /// redeemed on each ticket route, and `/api/pair` with a Bearer header and no code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn minted_ticket_matrix() {

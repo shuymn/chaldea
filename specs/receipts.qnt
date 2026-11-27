@@ -539,7 +539,7 @@ module receipts {
 
   /// CL-8, PR7-CL-19: at most one effect per `command_id`, across retries and restarts.
   /// (That a healthy runner starts and completes the effect after it observed the intent
-  /// committed is liveness, left to PR 7c and PR 17.)
+  /// committed is liveness, left to http-surface §2.8 and PR 17.)
   val oneEffectPerCommand = CMDS.forall(c => st.effectStarts.get(c) <= 1)
 
   /// mvp §2.4 "Insert": the receipt and the intent commit together or not at all.

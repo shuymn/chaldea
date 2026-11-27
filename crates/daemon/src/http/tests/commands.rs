@@ -1,4 +1,4 @@
-//! The command runner with fault points (design §2.8; PR7-CL-8's 7c cases, CL-18, CL-19,
+//! The command runner with fault points (design §2.8; PR7-CL-8's command cases, CL-18, CL-19,
 //! CL-20, CL-23). Over HTTP where the case allows it; through `commands::run` directly
 //! where a test needs an exact deadline or the reply's cutoff gate (which the guard's
 //! credential read would otherwise take).

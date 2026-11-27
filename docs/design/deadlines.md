@@ -9,14 +9,14 @@ This is its own document rather than a section of `http-surface.md` because the 
 The defect this design guards against is a completion racing its deadline. `tokio::time::timeout_at` polls the inner future before its timer, so a result that became ready after the deadline is still delivered; a `select!` against a sleep has the same race unless something samples the clock after the result.
 
 - `deadline::settle_before` is the `ctx` shape as a function: await an owned `timeout_at`, then classify a ready result with one clock sample. Its return type makes each caller say whether a late result counts.
-- `crates/daemon/clippy.toml` forbids `tokio::time::{timeout, timeout_at, sleep, sleep_until}`. **The guarantee** is what clippy enforces: no direct call of a banned function in any scope where `clippy::disallowed_methods` is active, outside the named exception functions, the helper, and the test wrappers. A new deadline decision either uses `settle_before` or adds a reviewed exception. A new caller of an existing exception function adds no `allow`; review owns those callers. Two functions allow the lint for other APIs, `routes::build_router` (the router) and `lifecycle::spawn_locked` (the spawn lock), so a timer call inside them would not be caught; neither contains one. The probe's four raw calls (D4) are the negative fixture and are not part of this inventory.
-- Only the two `ctx` sites in the helper's shape use it; every other site (a **kept site**) keeps its own poll order, with its timer constructed by a private exception function.
+- `crates/daemon/clippy.toml` forbids `tokio::time::{timeout, timeout_at, sleep, sleep_until}`. **The guarantee** is what clippy enforces: no direct call of a banned function in any scope where `clippy::disallowed_methods` is active, outside the named exception functions, the helper, and the test wrappers. A new deadline decision either uses `settle_before` or adds a reviewed exception. A new caller of an existing exception function adds no `allow`; review owns those callers. Three functions allow the lint for other APIs, `routes::build_router` (the router), `lifecycle::spawn_locked` and `lifecycle::spawn_locked_before` (the spawn lock), so a timer call inside them would not be caught; none contains one. The probe's four raw calls (D4) are the negative fixture and are not part of this inventory.
+- The two `ctx` sites (D3) and the supervisor's deadline waits (designed in `docs/design/supervisor.md` and its sibling designs) use it; every other site (a **kept site**) keeps its own poll order, with its timer constructed by a private exception function.
 
 ## 2. The three poll orders
 
 | Order | Check before poll | Sample after `Ready` | Clock | Used by |
 |---|---|---|---|---|
-| `settle_before` (owned `timeout_at`, then one sample) | no | yes, one sample classifies | the caller's (`MonotonicClock`, injectable) | `ctx::read_cut`, `ctx::until_deadline` |
+| `settle_before` (owned `timeout_at`, then one sample) | no | yes, one sample classifies | the caller's (`MonotonicClock`, injectable) | `ctx::read_cut`, `ctx::until_deadline`, the supervisor's waits |
 | `ws::before` | yes | no | tokio clock | WebSocket sends (http-surface §2.6 "Bounded disconnect") |
 | `shutdown::deadline_first` | yes | no | std clock | the shutdown coordinator (daemon-lifecycle §2.8) |
 
@@ -57,7 +57,7 @@ Step 3 is §2.10's "each return is classified with one clock sample", and `in_ti
 
 **Poll first.** A second, check-before-poll entry point (`admit_before`) for the WebSocket and coordinator waits was rejected: it would move the clock sample relative to `ws::before`'s timer poll and change the registry's poll order and notification consumption. Those waits keep their own orders (§2).
 
-**Home.** `crates/daemon/src/deadline.rs`, daemon-local: the daemon is the only crate with async production code, and `crates/core` is Sans-IO.
+**Home.** `crates/daemon/src/deadline.rs`, daemon-local: the daemon is the only crate with async production code, and `crates/core` is Sans-IO. The module also holds `Backoff`, the waits between the attempts of a bounded poll on a blocking thread (spins, then yields, then sleeps of at most 1 ms, each capped by the time left; `docs/design/supervisor-send.md` §2.5 "Intake facts"); it uses no tokio timer.
 
 ### D2. The lint
 
@@ -65,7 +65,7 @@ Step 3 is §2.10's "each return is classified with one clock sample", and `in_ti
 
 - **Where.** In the daemon's own `clippy.toml`: clippy reads the nearest `clippy.toml` above the crate's manifest and does not merge it with a parent's, so a workspace-root file would be shadowed by `crates/{core,cli,daemon}/clippy.toml`.
 - **Coverage.** The lint fires on a `use`-imported bare call, the full path, a module alias, a crate re-export, the function taken as a value (as in `deadline.map(sleep_until)`), inside `#[cfg(test)]` modules, and in integration tests under `--all-targets`. `Sleep::reset`, `interval`, `interval_at`, and timers inside libraries (hyper's `header_read_timeout`) are outside it; review owns them.
-- **Exception scope.** `clippy::disallowed_methods` also carries the router and spawn-lock entries, so an `allow` covers only a private function whose body is the one tokio call, with `#[allow(clippy::disallowed_methods, reason = "…")]` naming the contract its callers follow (the repository's form: `routes::build_router`, `lifecycle::spawn_locked`). Each call site calls the function where it would call tokio, so the timer is constructed at that point with the same instant or duration, including Tokio's relative `timeout` with its checked add at the hand-over; `listener::accept_backoff` takes no argument and holds its constant 1 s inside.
+- **Exception scope.** `clippy::disallowed_methods` also carries the router and spawn-lock entries, so an `allow` covers only a private function whose body is the one tokio call, with `#[allow(clippy::disallowed_methods, reason = "…")]` naming the contract its callers follow (the repository's form: `routes::build_router`, `lifecycle::spawn_locked`, `lifecycle::spawn_locked_before`). Each call site calls the function where it would call tokio, so the timer is constructed at that point with the same instant or duration, including Tokio's relative `timeout` with its checked add at the hand-over; `listener::accept_backoff` takes no argument and holds its constant 1 s inside.
 - **Production exceptions (14).**
 
   | Function | Wraps | Callers and the contract in the reason |
@@ -83,11 +83,11 @@ Step 3 is §2.10's "each return is classified with one clock sample", and `in_ti
   | `shutdown::record_pause` | `sleep` | record-removal retry; the deletion is admitted by the budget checks (§2.8 step 5) |
   | `listener::accept_backoff` | `sleep` | accept-error backoff, shutdown wins (§2.2) |
   | `listener::stall_timer` | `sleep` | `ConnIo` write stall, progress first (§2.2) |
-  | `supervisor::tick_timer` | `sleep_until` | the supervisor's 1 s tick period; each tick decides from the store (`docs/design/supervisor.md` §2.6). The transcript tailer's 1 s poll period uses it too; each poll decides from the store and the file (`docs/design/c1-claude-adapter.md` D10). |
+  | `supervisor::tick_timer` | `sleep_until` | the supervisor's 1 s tick period; each tick decides from the store (`docs/design/supervisor.md` §2.6). The transcript tailer's 1 s poll period uses it too; each poll decides from the store and the file (`docs/design/c1-claude-adapter.md` D10). So does the tailer's `FINAL_RETRY` wait before a final read is tried again (`final_wait`, ended early by a mode change), skipped when the participant's budget leaves no room for it. |
 
   Moving one of these sites to `settle_before` needs its own design for the poll, sample, and drop order it changes.
 
-- **Tests** bound and pause through `crates/daemon/tests/support/waits.rs`, compiled into the integration tests as `support::waits` and into the unit tests as `crate::store::tests::support::waits` (through the existing `#[path]`). `bounded` and `bounded_at` wrap `timeout` and `timeout_at` and carry the file's two `allow`s; `pause` and `pause_until` are `bounded(d, pending())` and `bounded_at(at, pending())` with the result dropped. All four are plain functions, not `async fn`, so a deadline is computed when the call is evaluated, as Tokio's constructors compute it. They return `Timeout` or `impl Future`; a test that needs a `Sleep` method (`reset`, `deadline`) needs a new wrapper. A deadline claim under test is checked with paused time, an injected clock, or the fault gates, never with these as its oracle.
+- **Tests** bound and pause through `crates/daemon/tests/support/waits.rs`, compiled into the integration tests as `support::waits` and into the unit tests as `crate::store::tests::support::waits` (through the existing `#[path]`). `bounded` and `bounded_at` wrap `timeout` and `timeout_at` and carry the file's two `allow`s; `pause` and `pause_until` are `bounded(d, pending())` and `bounded_at(at, pending())` with the result dropped. All four are plain functions, not `async fn`, so a deadline is computed when the call is evaluated, as Tokio's constructors compute it. They return `Timeout` or `impl Future`; a test that needs a `Sleep` method (`reset`, `deadline`) needs a new wrapper. A deadline claim under test is checked with paused time, an injected clock, or the fault gates, never with these as its oracle. Two unit-test pacers in `crates/daemon/src/attach/tests.rs` carry their own `allow` for `tokio::time::sleep`: the ping loop of `stuck_writer_idle_drop` (the peer's ping pace) and `poker` (the poke loop's pace); no result depends on their pace.
 
 ### D3. Call sites
 
