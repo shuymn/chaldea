@@ -1348,10 +1348,19 @@ async fn launch_codes_at_their_statuses() {
         ] {
             n += 1;
             let args = format!(r#"{{"text":"x","code":"{c}","status":{at}}}"#);
+            // The time taken and the sink tell a missed deadline from an early 503.
+            let started = std::time::Instant::now();
             let r = srv
                 .send(&srv.command("test_completed", &owner, cid(n), &args))
                 .await;
-            assert_eq!(r.outcome(), want, "{c} at {at}");
+            let took = started.elapsed();
+            assert_eq!(
+                r.outcome(),
+                want,
+                "{c} at {at}: answered in {took:?} (budget {:?}); sink {:?}",
+                shared(&srv).cfg.short_deadline + shared(&srv).cfg.write_reply_grace,
+                srv.sink.0.lock().unwrap(),
+            );
         }
     }
     srv.stop().await;

@@ -20,7 +20,7 @@ use chaldea_core::sync::{
 };
 
 use super::shared;
-use super::support::http::{Reply, TestServer};
+use super::support::http::{CLIENT_WAIT, Reply, TestServer};
 use super::support::{Model, Op, event, raw_unknown, soon};
 use crate::http::Mounts;
 use crate::store::NewEvent;
@@ -207,8 +207,14 @@ async fn start() -> TestServer {
     .await
 }
 
+/// How long [`with_commits_during`] waits for all its queued jobs together: half the client's
+/// wait for the reply, so a commit that never comes fails here, with its own message, before
+/// the client gives up on the request.
+const COMMITS_WAIT: Duration = CLIENT_WAIT.checked_div(2).unwrap();
+
 /// Arms the handler's read (after the guard's token read) to let the jobs queued behind
-/// `hold` commit before the handler goes on, then sends `req`.
+/// `hold` commit, within [`COMMITS_WAIT`] in total, before the handler goes on, then sends
+/// `req`.
 async fn with_commits_during(
     srv: &TestServer,
     req: &super::support::http::Req,
@@ -217,11 +223,14 @@ async fn with_commits_during(
     jobs: usize,
 ) -> Reply {
     shared(srv).faults.arm_after_read(1, move || {
+        let until = std::time::Instant::now() + COMMITS_WAIT;
         drop(hold);
-        for _ in 0..jobs {
+        for n in 0..jobs {
             committed
-                .recv_timeout(Duration::from_secs(10))
-                .expect("the queued jobs commit");
+                .recv_timeout(until.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or_else(|e| {
+                    panic!("{n} of {jobs} queued jobs committed within {COMMITS_WAIT:?}: {e}")
+                });
         }
     });
     srv.send(req).await
