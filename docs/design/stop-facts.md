@@ -26,7 +26,7 @@ Also rejected: unbounded waits, test retries, worker-side repair (SB15).
 
 **Request deadline** (server clock), checked on entry, after the async guard before dispatch, and at the start point:
 - 408 before the start point takes no ordinal.
-- After it, the handler's last deadline check, made before its write observer registers, can still answer 408; the closure finishes once without marks, leaving an ordinal gap. After the registration the writer decides (supervisor-send L-12).
+- After it, the handler's last deadline check, made before its write observer registers, can still answer 408; the intake finishes once without marks, leaving an ordinal gap. After the registration hook-ingest §2.11 decides the reply (supervisor-send L-12).
 - `F` never causes 408.
 - Retries reuse the `emit_id`: newly recorded, `intake_reliable: false`; after a committed first delivery, its response replays.
 
@@ -71,7 +71,7 @@ EARS. Red: `old` fails on `fb5f13a3`; `mut` fails under the named mutation; `kep
 | SF-6 | A record committing during the `SendState` wait shall count before the intake point. | `turn_order::record_during_state_wait` | old |
 | SF-7 | While an intake waits, ticket drops, `earlier_released`, other launches, and timers proceed. | `hook::tests::intake::waiting_intake_blocks_nothing` | old |
 | SF-8 | When a hook arrives after creation and before publication, the intake shall wait until publication or removal (made after the wait began) or `F`. | `claude::session_start_before_publication` (old), `…_after_deadline` (kept), `live::observe_removed` (mut: `removed` ignored), `live::poll_sees_later_change` (mut: sleep straight to `F`) | per test |
-| SF-9 | If cancelled or expired before the start point, the intake shall take no ordinal; after it, a 408 or drop finishes it once. | `hook::tests::intake::drop_waiting_for_pool`, `deadline_before_ordinal`, `deadline_at_claim`, `hook::intake::tests::deadline_crosses_at_claim`, `drop_after_ordinal`, `deadline_during_wait` | mut: start cell ignored; dispatch check removed (a pool task appears); check before claim |
+| SF-9 | If cancelled or expired before the start point, the intake shall take no ordinal; after it, a 408, or a drop before the write observer registers, finishes it once. | `hook::tests::intake::drop_waiting_for_pool`, `deadline_before_ordinal`, `deadline_at_claim`, `hook::intake::tests::deadline_crosses_at_claim`, `drop_after_ordinal`, `deadline_during_wait` | mut: start cell ignored; dispatch check removed (a pool task appears); check before claim |
 | SF-10 | When a wait reaches `F`, it shall return within `F` plus one attempt, with facts if that attempt saw them; past `F` with request time left, 200. | `probe::pool_past_facts_deadline`, `probe::state_at_facts_deadline` (mut: no final attempt); `claude::published_at_facts_deadline` (kept) | per test |
 | SF-11 | While the writer is parked or the map held, a candidate shall settle; one removed before observation or job shall not. | `evidence::settle_beside_parked_writer` (old), `…_beside_held_map` (old), `…_after_removal` (kept), `…_removed_before_job` (old) | per test |
 | SF-12 | If an intake unwinds after the fence advance, it shall finish once without marks, releasing `pending` and the fence; before, only its ordinal. | `hook::tests::intake::panic_after_advance`, `panic_before_advance` | mut: guard armed early or late |
