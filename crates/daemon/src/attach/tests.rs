@@ -254,13 +254,22 @@ async fn nudge_second_leg_fails() {
     let AttachServerMessage::Attached { cols, rows, .. } = first else {
         unreachable!()
     };
-    live.child.fail_next_resize();
+    // The first leg is held after its backend call; the failure is armed for the next
+    // call, the second leg.
+    use chaldea_pty_runtime::fake::ProbePoint;
+    let probe = rig.probe(&live).await;
+    let park = probe.park(ProbePoint::ResizeDone);
     c.json(json!({ "type": "resize", "cols": cols, "rows": rows }))
         .await;
+    assert!(probe.wait(ProbePoint::ResizeDone, 1, soon()));
+    live.child.fail_next_resize();
+    drop(park);
     let Some(AttachServerMessage::Size { ok, .. }) = c.text().await else {
         panic!("a size frame")
     };
     assert!(!ok);
+    assert_eq!(resizes(&live), [PtySize::new(cols, rows + 1).unwrap()]);
+    assert!(live.child.log().contains(&FakeEvent::ResizeFailed));
     rig.stop().await;
 }
 
@@ -271,11 +280,14 @@ async fn raw_input_order() {
     let rig = SRig::new().await;
     let live = rig.claude().await;
     let (mut c, _) = attach(&rig, &live).await;
+    let before = live.child.input().len();
     for b in [b"ab".as_slice(), b"c", "\u{3042}".as_bytes(), b"\x1b[A"] {
         c.binary(b).await;
     }
     let want = [b"abc".as_slice(), "\u{3042}".as_bytes(), b"\x1b[A"].concat();
     input_has(&rig, &live, &want).await;
+    // Exactly these bytes, nothing around them.
+    assert_eq!(live.child.input()[before..], want[..]);
     rig.until("recorded", || human_writes(&rig, &live) == 1)
         .await;
     rig.stop().await;
@@ -478,22 +490,27 @@ async fn ends_on_eof() {
     let (mut c, _) = attach(&rig, &live).await;
     live.child.emit(b"last");
     live.child.close_output();
-    let mut out = Vec::new();
-    let mut texts = Vec::new();
+    let mut frames = Vec::new();
     while let Some(f) = c.next().await {
-        match f {
-            Frame::Binary(b) => out.extend(b),
-            Frame::Text(m) => texts.push(m),
-        }
+        frames.push(f);
     }
-    assert!(out.ends_with(b"last"));
+    // In order: the output, then `ended` as the last frame.
+    let last = frames.pop();
     assert_eq!(
-        texts,
-        [AttachServerMessage::Ended {
+        last,
+        Some(Frame::Text(AttachServerMessage::Ended {
             launch_id: live.l,
             reason: EndReason::Eof
-        }]
+        }))
     );
+    let out: Vec<u8> = frames
+        .into_iter()
+        .flat_map(|f| match f {
+            Frame::Binary(b) => b,
+            Frame::Text(m) => panic!("unexpected {m:?}"),
+        })
+        .collect();
+    assert!(out.ends_with(b"last"));
     assert_eq!(c.closed, Some(Some(4001)));
     rig.stop().await;
 }
@@ -579,6 +596,85 @@ async fn old_enter_after_disconnect_and_reattach() {
     rig.until("settled", || sl.state().human_unsettled == 0)
         .await;
     assert!(!live.child.input().contains(&b'\r'), "no Enter of A");
+    rig.stop().await;
+}
+
+/// I-2: a disconnect alone moves the grant: A's Enter, queued behind a held write, is
+/// refused at its dispatch once A's socket has ended, with no other socket attached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disconnect_moves_grant() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let shared = rig.srv.server.shared().clone();
+    let (mut a, _) = attach(&rig, &live).await;
+    let hold = live.child.hold_writes();
+    let other = rig.attach(&live, b"k").await;
+    assert!(hold.wait_entered(soon()));
+    a.binary(b"\r").await;
+    rig.until("A's unit queued", || sl.state().human_unsettled == 2)
+        .await;
+    drop(a);
+    rig.until("A's socket ended", || shared.sockets.held() == 0)
+        .await;
+    drop(hold);
+    bounded(WS_WAIT, other).await.unwrap().unwrap();
+    rig.until("settled", || sl.state().human_unsettled == 0)
+        .await;
+    assert!(!live.child.input().contains(&b'\r'), "no Enter of A");
+    rig.stop().await;
+}
+
+/// I-4: while reads are paused at the watermark, pings are not read either: a writer stuck
+/// past the idle timeout drops the socket though the peer keeps pinging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stuck_writer_idle_drop() {
+    let rig = SRig::on_http(
+        chaldea_core::adapter::HostOs::Macos,
+        |_| {},
+        |h| {
+            h.ws.idle_timeout = Duration::from_secs(2);
+        },
+    )
+    .await;
+    let live = rig.claude().await;
+    let h = hooks(&rig);
+    let (mut c, _) = attach(&rig, &live).await;
+    let hold = live.child.hold_writes();
+    c.binary(b"a").await;
+    assert!(hold.wait_entered(soon()));
+    let paused = h.paused.load(std::sync::atomic::Ordering::SeqCst);
+    c.binary(&[b'x'; 64 * 1024]).await;
+    rig.until("the reads paused", || {
+        h.paused.load(std::sync::atomic::Ordering::SeqCst) > paused
+    })
+    .await;
+    let (mut tx, mut rx) = c.ws.split();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the peer's ping pace; the drop does not depend on it"
+    )]
+    let pinger = tokio::spawn(async move {
+        loop {
+            if tx.send(WsMessage::Ping(Vec::new().into())).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+    let ended = bounded(WS_WAIT, async {
+        while let Some(Ok(m)) = rx.next().await {
+            if matches!(m, WsMessage::Close(_)) {
+                return Some(m);
+            }
+        }
+        None
+    })
+    .await
+    .expect("dropped at the idle timeout");
+    pinger.abort();
+    assert_eq!(ended, None, "dropped without a close frame");
+    drop(hold);
     rig.stop().await;
 }
 
@@ -867,11 +963,18 @@ async fn lag_prefix_then_4002() {
     let rig = SRig::with(|c| c.attach.out_max = 16).await;
     let live = rig.claude().await;
     let (mut c, _) = attach(&rig, &live).await;
-    // Two pieces: the first is parsed (and buffered for the socket) before the second.
-    let rx = rig.watch(&live).await;
+    // The first piece's send is held; the second goes over the budget meanwhile; the peer
+    // then resumes reading.
+    let (reached, held) = rig.srv.server.shared().faults.arm_socket_send_gate();
     live.child.emit(b"abc");
-    SRig::delivered(&rx, b"abc").await;
+    bounded(WS_WAIT, reached).await.unwrap().unwrap();
     live.child.emit(&[b'z'; 64]);
+    let h = hooks(&rig);
+    rig.until("the lag latched", || {
+        h.latched.load(std::sync::atomic::Ordering::SeqCst) > 0
+    })
+    .await;
+    held.send(()).unwrap();
     let mut out = Vec::new();
     while let Some(f) = c.next().await {
         match f {
@@ -1121,9 +1224,15 @@ async fn crossing_paste_kept() {
     assert!(hold.wait_entered(std::time::Instant::now() + Duration::from_secs(10)));
     let raw = vec![b'x'; 60 * 1024];
     c.binary(&raw).await;
+    let h = hooks(&rig);
+    let paused = h.paused.load(std::sync::atomic::Ordering::SeqCst);
     let text = "p".repeat(100 * 1024);
     c.json(json!({ "type": "paste", "paste_id": "big", "text": text }))
         .await;
+    rig.until("the reads paused at the watermark", || {
+        h.paused.load(std::sync::atomic::Ordering::SeqCst) > paused
+    })
+    .await;
     drop(hold);
     let Some(AttachServerMessage::PasteResult { outcome, .. }) = c.text().await else {
         panic!("a paste result")
@@ -1190,8 +1299,15 @@ async fn max_paste_with_raw_outstanding() {
     let hold = live.child.hold_writes();
     c.binary(b"a").await;
     assert!(hold.wait_entered(std::time::Instant::now() + Duration::from_secs(10)));
+    let h = hooks(&rig);
+    let paused = h.paused.load(std::sync::atomic::Ordering::SeqCst);
     c.json(json!({ "type": "paste", "paste_id": "max", "text": "m".repeat(MAX_PROMPT_BYTES) }))
         .await;
+    // The paste was taken in (pending, over the watermark) while the raw unit is held.
+    rig.until("the paste taken in", || {
+        h.paused.load(std::sync::atomic::Ordering::SeqCst) > paused
+    })
+    .await;
     drop(hold);
     let Some(AttachServerMessage::PasteResult { outcome, .. }) = c.text().await else {
         panic!("a paste result")
@@ -1462,8 +1578,15 @@ async fn stuck_writer_after_pending() {
         unreachable!()
     };
     let hold = live.child.hold_writes();
+    let h = hooks(&rig);
+    let waiting = h.waiting.load(std::sync::atomic::Ordering::SeqCst);
     c.binary(b"a").await;
     assert!(hold.wait_entered(soon()));
+    // The report deadline is installed before the clock moves.
+    rig.until("the report wait began", || {
+        h.waiting.load(std::sync::atomic::Ordering::SeqCst) > waiting
+    })
+    .await;
     rig.clock
         .advance(rig.sup.cfg.attach.unit_wait + crate::supervisor::send::READ_WAIT);
     let p = poker(&rig);

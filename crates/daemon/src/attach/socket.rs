@@ -1090,6 +1090,10 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                 match r {
                     Ok((ticket, rx, not_after)) => {
                         let by = not_after + READ_WAIT;
+                        #[cfg(test)]
+                        cfg.hooks
+                            .waiting
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         outstanding = Some(Outstanding {
                             unit: o.unit,
                             phase: Phase::Waiting { rx, ticket, by },

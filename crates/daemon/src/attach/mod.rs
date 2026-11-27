@@ -89,6 +89,8 @@ pub(crate) struct AttachHooks {
     pub paused: std::sync::atomic::AtomicU64,
     /// The registry's entries after its last change by a socket.
     pub registry_len: std::sync::atomic::AtomicUsize,
+    /// Units whose report wait began (`Waiting`), by every socket.
+    pub waiting: std::sync::atomic::AtomicU64,
     /// Gone polls run, by every socket.
     pub gone_polls: std::sync::atomic::AtomicU64,
     /// Runs on the blocking pool after the next startup subscription returned.
