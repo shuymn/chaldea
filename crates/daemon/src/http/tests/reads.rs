@@ -7,7 +7,7 @@ use axum::http::Method;
 use chaldea_core::auth::TokenKind;
 use futures_util::StreamExt;
 
-use super::support::http::TestServer;
+use super::support::http::{DEADLINE, TestServer};
 use super::{handshake, hello_then_hold, mint_ticket, shared};
 use crate::http::ctx::read_until;
 use crate::http::tickets::TicketPurpose;
@@ -167,7 +167,7 @@ async fn late_admission_read_keeps_the_ticket() {
 /// A token lookup that fails or is cut off is never 401 (PR7-CL-3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lookup_failure_is_not_unauthorized() {
-    let srv = TestServer::start(Mounts::mvp()).await;
+    let srv = TestServer::start_with(Mounts::mvp(), |c| c.short_deadline = DEADLINE).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let req = srv.req("GET", "/api/threads").bearer(&owner);
 

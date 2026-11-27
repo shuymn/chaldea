@@ -17,7 +17,9 @@ use chaldea_daemon::http::{HttpConfig, Mount, Mounts, UpgradedSocket, spec};
 use chaldea_daemon::store::{NewEvent, TokenSelector};
 use futures_util::StreamExt;
 use proptest::prelude::*;
-use support::http::{DEADLINE, HEADS_INTERVAL, TestServer, WS_WAIT, eventually, head_of};
+use support::http::{
+    DEADLINE, HEADS_INTERVAL, REQUEST_BUDGET, TestServer, WS_WAIT, eventually, head_of,
+};
 use support::waits;
 use support::{raw_unknown, registered, registered_under, reserved, started};
 use tokio_tungstenite::tungstenite::Error as WsError;
@@ -394,7 +396,12 @@ async fn attach_ticket_owner_only() {
 /// test `ws::final_admission_failure_keeps_ticket`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejected_upgrade_keeps_ticket() {
-    let srv = quiet_with(Mounts::mvp(), |c| c.ws.max_sockets_per_token = 1).await;
+    // The pool's wait ends at the short budget.
+    let srv = quiet_with(Mounts::mvp(), |c| {
+        c.ws.max_sockets_per_token = 1;
+        c.short_deadline = DEADLINE;
+    })
+    .await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let ticket = srv.ticket(&owner, "events").await.unwrap();
     let q = format!("?ticket={ticket}");
@@ -548,7 +555,7 @@ async fn revocation_closes_socket() {
     let (code, before) = ws.until_closed().await;
     assert_eq!(code, Some(1008));
     only_heads(&before);
-    let bound = HEADS_INTERVAL + DEADLINE;
+    let bound = HEADS_INTERVAL + REQUEST_BUDGET;
     assert!(at.elapsed() < bound, "{:?} past {bound:?}", at.elapsed());
     srv.stop().await;
 }

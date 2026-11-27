@@ -150,7 +150,7 @@ async fn rejections_with_body_in_flight() {
 /// by the deadline from the first head byte, never later.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slow_head_then_slow_lookup() {
-    let srv = TestServer::start(Mounts::mvp()).await;
+    let srv = TestServer::start_with(Mounts::mvp(), |c| c.short_deadline = DEADLINE).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let s = shared(&srv);
     let (release_tx, release_rx) = mpsc::channel::<()>();

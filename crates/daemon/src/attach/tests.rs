@@ -16,7 +16,7 @@ use serde_json::json;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
-use crate::store::tests::support::http::WS_WAIT;
+use crate::store::tests::support::http::{DEADLINE, WS_WAIT};
 use crate::store::tests::support::waits::{bounded, bounded_at, pause};
 use crate::supervisor::send::tests::{Live, SRig};
 
@@ -1620,6 +1620,10 @@ async fn slow_sends(tune: impl FnOnce(&mut crate::supervisor::SupervisorConfig))
     SRig::on_http(chaldea_core::adapter::HostOs::Macos, tune, |h| {
         h.ws.send_timeout = Duration::from_secs(600);
         h.ws.close_grace = Duration::from_secs(600);
+        // Below the candidacy cap, as the production default is
+        // (`candidacy_covers_the_startup_path`); the rig's clock is stopped, so the short
+        // budget passes only when a test advances it.
+        h.short_deadline = DEADLINE;
     })
     .await
 }

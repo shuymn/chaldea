@@ -13,7 +13,8 @@ use chaldea_core::auth::TokenKind;
 use chaldea_core::ids::{LaunchId, ThreadId};
 use chaldea_daemon::http::{ApiError, MonotonicClock, Mount, Mounts, ReadCtx, WriteCtx, spec};
 use support::http::{
-    DEADLINE, HEAD_TIMEOUT, Req, TestServer, connect, dump, parse, read_to_end, send,
+    DEADLINE, HEAD_TIMEOUT, REQUEST_BUDGET, Req, TestServer, connect, dump, parse, read_to_end,
+    send,
 };
 use support::waits;
 use support::{exited, reserved};
@@ -552,7 +553,7 @@ async fn deadline_from_first_head_byte() {
             }
         },
     ));
-    let srv = TestServer::start(mounts).await;
+    let srv = TestServer::start_with(mounts, |c| c.short_deadline = DEADLINE).await;
     let hook = srv.token_of(TokenKind::Hook, 1).await;
     let req = srv
         .req("POST", "/hook")
@@ -585,7 +586,7 @@ async fn read_past_deadline_is_408() {
         spec(&Method::GET, "/").unwrap(),
         |_ctx: ReadCtx, _req| std::future::pending::<Result<Response<Body>, ApiError>>(),
     ));
-    let srv = TestServer::start(mounts).await;
+    let srv = TestServer::start_with(mounts, |c| c.short_deadline = DEADLINE).await;
     let started = Instant::now();
     let r = srv.send(&srv.req("GET", "/")).await;
     let took = started.elapsed();
@@ -649,7 +650,7 @@ async fn plain_write_expired_is_408() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plain_write_unreplied_is_outcome_unknown() {
     let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
-    let srv = TestServer::start(plain_write_mount(dtx)).await;
+    let srv = TestServer::start_with(plain_write_mount(dtx), |c| c.short_deadline = DEADLINE).await;
     let hook = srv.token_of(TokenKind::Hook, 1).await;
     let release = srv.hold_writer().await;
     let r = srv
@@ -694,13 +695,13 @@ async fn ready_read_past_deadline_is_408() {
     srv.stop().await;
 }
 
-/// Deadlines are on the server's clock: a clock moved forward by more than the short
-/// deadline before the request takes nothing from the request's budget.
+/// Deadlines are on the server's clock: a clock moved forward by twice the request budget
+/// before the request takes nothing from its budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn skewed_clock_keeps_the_budget() {
     let srv = TestServer::start(Mounts::mvp()).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
-    srv.clock.skew(DEADLINE * 30);
+    srv.clock.skew(2 * REQUEST_BUDGET);
     let r = srv
         .send(&srv.req("GET", "/api/threads").bearer(&owner))
         .await;
@@ -774,7 +775,7 @@ async fn skewed_clock_keeps_the_timers() {
         spec(&Method::GET, "/").unwrap(),
         |_ctx: ReadCtx, _req| std::future::pending::<Result<Response<Body>, ApiError>>(),
     ));
-    let srv = TestServer::start(mounts).await;
+    let srv = TestServer::start_with(mounts, |c| c.short_deadline = DEADLINE).await;
     srv.clock.skew(Duration::from_secs(3600));
     let started = Instant::now();
     let r = srv.send(&srv.req("GET", "/")).await;

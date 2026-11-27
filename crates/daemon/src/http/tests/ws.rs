@@ -9,7 +9,7 @@ use chaldea_core::ids::{StreamId, ThreadId};
 use chaldea_core::payload::Content;
 use chaldea_core::sync::{StreamHeadEntry, WsServerMessage};
 
-use super::support::http::{TestServer, WsClient};
+use super::support::http::{DEADLINE, TestServer, WsClient};
 use super::support::{raw_unknown, registered, soon};
 use super::{eventually, mint_ticket, shared};
 use crate::http::tickets::TicketPurpose;
@@ -354,6 +354,7 @@ async fn idle_period_starts_after_hello() {
 async fn stalled_read_drops_the_socket() {
     let srv = TestServer::start_with(Mounts::mvp(), |c: &mut HttpConfig| {
         c.ws.heads_interval = Duration::from_secs(600);
+        c.short_deadline = DEADLINE;
     })
     .await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
@@ -540,8 +541,9 @@ async fn final_admission_failure_keeps_ticket() {
     let clock = srv.clock.clone();
     // The final admission read returns past its deadline on the server's clock.
     s.faults
-        .arm_after_read(1, move || clock.skew(Duration::from_secs(5)));
+        .arm_after_read(1, move || clock.skew(Duration::from_secs(3600)));
     assert_eq!(redeem_status(&srv, &ticket).await, 408);
+    srv.clock.skew(Duration::ZERO);
     assert_eq!(s.tickets.len(), 1);
     let mut ws = srv.ws_with(&ticket).await.expect("a 101");
     assert!(matches!(

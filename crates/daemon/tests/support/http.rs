@@ -27,7 +27,12 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use super::waits;
 use super::{TestStore, registered, reserved, soon, started};
 
-/// The short deadline of test servers.
+/// The request budget of test servers (`short_deadline`): far past any scheduling stall of a
+/// loaded runner, so a test that does not check a deadline never reaches it. It is past
+/// [`CLIENT_WAIT`] too: a reply that slow fails the client's own wait, not the server's
+/// budget.
+pub const REQUEST_BUDGET: Duration = Duration::from_secs(60);
+/// The short budget a test sets when the deadline it checks passes in real time.
 pub const DEADLINE: Duration = Duration::from_secs(2);
 /// The header read timeout of test servers.
 pub const HEAD_TIMEOUT: Duration = Duration::from_secs(3);
@@ -208,7 +213,7 @@ impl TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let mut cfg = HttpConfig::new(port);
-        cfg.short_deadline = DEADLINE;
+        cfg.short_deadline = REQUEST_BUDGET;
         cfg.header_read_timeout = HEAD_TIMEOUT;
         cfg.write_stall_timeout = Duration::from_secs(5);
         cfg.ws.heads_interval = HEADS_INTERVAL;
@@ -373,10 +378,7 @@ impl TestServer {
         let n = self
             .server
             .tokens()
-            .revoke(
-                TokenSelector::Token(row.token_id),
-                Instant::now() + DEADLINE,
-            )
+            .revoke(TokenSelector::Token(row.token_id), soon())
             .await
             .unwrap();
         assert_eq!(n, 1);

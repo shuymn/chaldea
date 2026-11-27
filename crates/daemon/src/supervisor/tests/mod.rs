@@ -239,6 +239,18 @@ impl Rig {
         Rig::on(TestStore::new(), host, tune).await
     }
 
+    /// [`Rig::new`] whose server configuration `http` tunes.
+    pub(crate) async fn with_http(http: impl FnOnce(&mut crate::http::HttpConfig)) -> Rig {
+        Rig::on_mounts(
+            TestStore::new(),
+            HostOs::Macos,
+            |_| {},
+            http,
+            |sup| mounts_with(sup, seams(sup)),
+        )
+        .await
+    }
+
     pub(crate) async fn on(
         store: TestStore,
         host: HostOs,

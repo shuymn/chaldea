@@ -18,7 +18,7 @@ use chaldea_core::http::{ErrorBody, ErrorCode};
 use chaldea_core::ids::{CommandId, LaunchId, ThreadId};
 use chaldea_daemon::http::{ApiError, Mount, Mounts, ReadCtx, spec};
 use serde_json::{Value, json};
-use support::http::{Reply, TestServer, send, settled};
+use support::http::{DEADLINE, Reply, TestServer, send, settled};
 use support::soon;
 use support::waits;
 
@@ -49,7 +49,8 @@ async fn error_bodies_match_the_contract() {
         spec(&Method::GET, "/").unwrap(),
         |_ctx: ReadCtx, _req| std::future::pending::<Result<Response<Body>, ApiError>>(),
     ));
-    let srv = TestServer::start(mounts).await;
+    // The pending read is cut off by the short budget.
+    let srv = TestServer::start_with(mounts, |c| c.short_deadline = DEADLINE).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let hook = srv.token_of(TokenKind::Hook, 1).await;
     let agent = srv
