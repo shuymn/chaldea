@@ -81,3 +81,30 @@ async fn closed_gate_worker_sleeps() {
     assert_eq!(rig.input(id).state, InputState::Queued);
     rig.stop().await;
 }
+
+/// I-3: the open's lease replaced by another holder while the session is still reachable
+/// (a test seam between the open job and the submission): the submission does not convert
+/// a lease that is not its own, so nothing is submitted and the input is cancelled with
+/// zero bytes; the launch stays live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn foreign_lease_not_converted() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let before = live.child.input().len();
+    let me = sl.clone();
+    set(&sl.hooks.before_submit, move || {
+        let mut st = me.state();
+        me.clear_lease(&mut st);
+        let other = me.take_lease(&mut st, crate::supervisor::send::LeaseKind::Resize(0));
+        assert!(other.is_some());
+    });
+    let id = rig.send(&live, "prompt").await;
+    rig.until_input(id, InputState::Cancelled).await;
+    assert_eq!(live.child.input().len(), before, "zero bytes");
+    assert!(
+        rig.sup.live(live.t, live.l).is_some(),
+        "the session is reachable"
+    );
+    rig.stop().await;
+}

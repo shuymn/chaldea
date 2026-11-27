@@ -155,3 +155,36 @@ async fn worker_exit_overlap() {
         rig.stop().await;
     }
 }
+
+/// I-5: a zero-byte input attempt opens an interval too (one extra event, never one
+/// fewer): the attempt's unit is refused before its submission (its lease taken by another
+/// holder through a test seam), and the next attach unit records at the attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zero_byte_attempt_opens_interval() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    typed(&rig, &live, b"a").await;
+    let r = ready(&rig, &live).await;
+    let sl = rig.sl(&live);
+    let me = sl.clone();
+    set(&sl.hooks.before_submit, move || {
+        let mut st = me.state();
+        me.clear_lease(&mut st);
+        assert!(
+            me.take_lease(&mut st, crate::supervisor::send::LeaseKind::Resize(0))
+                .is_some()
+        );
+    });
+    let before = live.child.input().len();
+    let id = rig.send(&live, "prompt").await;
+    rig.until_input(id, InputState::Cancelled).await;
+    assert_eq!(live.child.input().len(), before, "zero bytes");
+    let l = live.l;
+    let attempt = rig.srv.store.read(move |r| r.last_attempt_seq(l)).unwrap();
+    assert!(attempt > r);
+    typed(&rig, &live, b"z").await;
+    assert!(interval_recorded(&rig, &live, attempt));
+    assert!(!interval_recorded(&rig, &live, r));
+    assert_eq!(origins(&rig, &live), ["attach", "attach"]);
+    rig.stop().await;
+}
