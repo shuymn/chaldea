@@ -3,4 +3,9 @@
 /**
  * Client to server on `GET /api/attach/{thread}`.
  */
-export type AttachClientMessage = { "type": "resize", cols: number, rows: number, } | { "type": "paste", paste_id: string, text: string, };
+export type AttachClientMessage = { "type": "resize", cols: number, rows: number, } | { "type": "paste",
+/**
+ * At most `MAX_PASTE_ID_BYTES` (128) UTF-8 bytes; a longer one is a malformed
+ * frame.
+ */
+paste_id: string, text: string, };

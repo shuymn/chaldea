@@ -16,6 +16,8 @@ pub const MAX_COLS: u16 = 512;
 /// The resize frame's row range.
 pub const MIN_ROWS: u16 = 1;
 pub const MAX_ROWS: u16 = 256;
+/// The longest `paste_id`, in UTF-8 bytes: every `paste_result` can echo it.
+pub const MAX_PASTE_ID_BYTES: usize = 128;
 
 /// The terminal modes `attached` carries, for the client's emulator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
@@ -149,12 +151,17 @@ pub enum AttachClientMessage {
     /// `cols` 2–512, `rows` 1–256.
     Resize { cols: u16, rows: u16 },
     /// Clipboard text; `paste_id` is the socket's own and never replayed.
-    Paste { paste_id: String, text: String },
+    Paste {
+        /// At most `MAX_PASTE_ID_BYTES` (128) UTF-8 bytes; a longer one is a malformed
+        /// frame.
+        paste_id: String,
+        text: String,
+    },
 }
 
 impl AttachClientMessage {
-    /// The frame in `text`, or `None` when it is not a client message or its size is out
-    /// of range.
+    /// The frame in `text`, or `None` when it is not a client message, its size is out of
+    /// range, or its `paste_id` is longer than [`MAX_PASTE_ID_BYTES`].
     #[must_use]
     pub fn parse(text: &str) -> Option<AttachClientMessage> {
         let m: AttachClientMessage = serde_json::from_str(text).ok()?;
@@ -162,6 +169,11 @@ impl AttachClientMessage {
             AttachClientMessage::Resize { cols, rows }
                 if !(MIN_COLS..=MAX_COLS).contains(&cols)
                     || !(MIN_ROWS..=MAX_ROWS).contains(&rows) =>
+            {
+                None
+            }
+            AttachClientMessage::Paste { ref paste_id, .. }
+                if paste_id.len() > MAX_PASTE_ID_BYTES =>
             {
                 None
             }
@@ -239,6 +251,19 @@ mod tests {
             Some(AttachClientMessage::Resize { cols: 2, rows: 1 })
         );
         assert!(AttachClientMessage::parse(r#"{"type":"resize","cols":512,"rows":256}"#).is_some());
+        let id = "p".repeat(MAX_PASTE_ID_BYTES);
+        assert!(
+            AttachClientMessage::parse(&format!(
+                r#"{{"type":"paste","paste_id":"{id}","text":"x"}}"#
+            ))
+            .is_some()
+        );
+        assert_eq!(
+            AttachClientMessage::parse(&format!(
+                r#"{{"type":"paste","paste_id":"{id}p","text":"x"}}"#
+            )),
+            None
+        );
         for bad in [
             r#"{"type":"resize","cols":1,"rows":10}"#,
             r#"{"type":"resize","cols":10,"rows":0}"#,

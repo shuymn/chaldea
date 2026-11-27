@@ -22,13 +22,13 @@ Admission is PR 7's: an owner-only `attach:<thread>` ticket, single use, 30 s (h
 | ← | `ended` | `launch_id`, `reason` (`eof`, `error`, `gone`) |
 | → | binary | deliberate input only (keys, IME commits, key bar); empty ignored |
 | → | `resize` | `cols` 2–512, `rows` 1–256 |
-| → | `paste` | `paste_id` (socket-local, never replayed), `text` |
+| → | `paste` | `paste_id` (socket-local, never replayed, ≤ 128 bytes), `text` |
 
 **Reasons.** `rejected`: a `RejectReason`, `prompt_too_large`, `bracketed_paste_off`. Writer and session: `expired`, `bracketed_paste_off`, `queue_full`, `busy`, `incomplete`, otherwise `not_written`. Raw only: `paste_marker`, `too_large`, `pending`.
 
 **Close codes.** 4000 `no_live_launch`, 4001 `launch_ended` (after `ended`), 4002 `lagged`, 4003 `replaced`, 4004 `busy`; 1001 shutdown, 1003 malformed frame or size, 1007 invalid UTF-8, 1008 token revoked, 1009 over the limit. Best effort.
 
-**Limits.** Inbound message: 6 × `MAX_PROMPT_BYTES` + 4 KiB for attach (any JSON escape of a 256 KiB paste), 64 KiB for `/api/ws`; raw frame 64 KiB; paste text 256 KiB; `attached` ≤ 192 KiB whole; queued output 1 MiB; drain 5 s; send 10 s per frame; idle 75 s.
+**Limits.** Inbound message: 6 × `MAX_PROMPT_BYTES` + 4 KiB for attach (any JSON escape of a 256 KiB paste), 64 KiB for `/api/ws`; raw frame 64 KiB; paste text 256 KiB; `paste_id` 128 bytes (longer is a malformed frame, 1003, before any write, so every `paste_result` can echo it); `attached` ≤ 192 KiB whole; queued output 1 MiB; drain 5 s; send 10 s per frame; idle 75 s.
 
 ## 3. Decisions
 

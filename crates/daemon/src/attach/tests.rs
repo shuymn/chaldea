@@ -797,6 +797,30 @@ async fn stuck_writer_idle_drop() {
     rig.stop().await;
 }
 
+/// T1-9: a `paste_id` is at most 128 bytes, so every `paste_result` can echo it: 128
+/// bytes are written and answered; 129 bytes close the socket 1003 before any write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paste_id_bound() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut c, _) = attach(&rig, &live).await;
+    let id = "p".repeat(chaldea_core::attach::MAX_PASTE_ID_BYTES);
+    c.json(json!({ "type": "paste", "paste_id": id, "text": "ok" }))
+        .await;
+    assert!(matches!(
+        c.text().await,
+        Some(AttachServerMessage::PasteResult { paste_id, outcome: PasteOutcome::Written, .. })
+            if paste_id == id
+    ));
+    let before = live.child.input().len();
+    let long = "p".repeat(chaldea_core::attach::MAX_PASTE_ID_BYTES + 1);
+    c.json(json!({ "type": "paste", "paste_id": long, "text": "ok" }))
+        .await;
+    assert_eq!(c.until_closed().await, (Some(1003), Vec::new()));
+    assert_eq!(live.child.input().len(), before, "nothing written");
+    rig.stop().await;
+}
+
 /// T1-9: frames outside the format or the limits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bad_frames() {
