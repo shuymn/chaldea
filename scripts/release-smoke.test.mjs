@@ -39,6 +39,8 @@ test("distAssets lists every served file under assets/, skipping maps", () => {
 for (const [name, files] of [
   ["a type the daemon does not serve", ["a.js", "b.svg"]],
   ["no extension", ["a.js", "README"]],
+  ["an inherited property as the extension (toString)", ["a.js", "foo.toString"]],
+  ["an inherited property as the extension (constructor)", ["a.js", "x.constructor"]],
   ["an empty directory", []],
 ]) {
   test(`distAssets fails on ${name}`, () => {
@@ -52,6 +54,18 @@ for (const [name, files] of [
     }
   });
 }
+
+test("distAssets refuses an assets/ root that is a symlink", { skip: process.platform === "win32" }, () => {
+  const d = mkdtempSync(join(tmpdir(), "smoke-test-"));
+  try {
+    mkdirSync(join(d, "real"));
+    writeFileSync(join(d, "real", "a.js"), "a");
+    symlinkSync(join(d, "real"), join(d, "assets"));
+    assert.throws(() => distAssets(d), /a symlink is refused/);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+});
 
 test("distAssets fails on a symlink and does not follow it", { skip: process.platform === "win32" }, () => {
   const d = mkdtempSync(join(tmpdir(), "smoke-test-"));
@@ -88,9 +102,21 @@ test("the smoke exits 1 for a missing binary and removes its scratch dir", () =>
   // Run through a symlink: the entry check must still recognise the script.
   const link = mkdtempSync(join(tmpdir(), "smoke-link-"));
   symlinkSync(SCRIPT, join(link, "release-smoke.mjs"));
+  // Its own dist, so the test needs no built packages/web/dist.
+  const dist = mkdtempSync(join(tmpdir(), "smoke-dist-"));
+  mkdirSync(join(dist, "assets"));
+  writeFileSync(join(dist, "index.html"), "<!doctype html>");
+  writeFileSync(join(dist, "assets", "a.js"), "a");
   try {
     const r = spawnSync(process.execPath, [join(link, "release-smoke.mjs")], {
-      env: { ...process.env, CHALDEA_SMOKE_EXE: join(tmp, "missing", "chaldea"), TMPDIR: tmp, TEMP: tmp, TMP: tmp },
+      env: {
+        ...process.env,
+        CHALDEA_SMOKE_EXE: join(tmp, "missing", "chaldea"),
+        CHALDEA_SMOKE_DIST: dist,
+        TMPDIR: tmp,
+        TEMP: tmp,
+        TMP: tmp,
+      },
       encoding: "utf8",
       timeout: 60_000,
     });
@@ -100,6 +126,7 @@ test("the smoke exits 1 for a missing binary and removes its scratch dir", () =>
   } finally {
     rmSync(tmp, { recursive: true, force: true });
     rmSync(link, { recursive: true, force: true });
+    rmSync(dist, { recursive: true, force: true });
   }
 });
 

@@ -3,9 +3,12 @@
 // CI on macOS and Windows after `mise run release`:
 //
 // 1. The release binary's `daemon run` (a new state dir, a free port) answers `GET /` with
-//    200, the CSP, and the bytes of dist/index.html, and every file under dist/assets/ at
-//    `/assets/<path>` with 200, its type, and its bytes. `daemon stop` ends it. Whether the
-//    page names the right files is Playwright's to check: it loads the app.
+//    200, the CSP, and the bytes of dist/index.html, and every embeddable asset under
+//    dist/assets/ (source maps skipped) at `/assets/<path>` with 200, its type, and its bytes.
+//    `daemon stop` ends it. Accepted limit: no host checks here that index.html names the
+//    right files. The Vite output does not depend on the host, and Playwright on macOS loads
+//    the app built from the same inputs; this smoke proves each packaged binary serves every
+//    built file.
 // 2. The same binary rebuilt without CHALDEA_WEB_DIST, in the same Cargo target dir, answers
 //    `/` and one of those assets with 501: no stale table survives the rebuild.
 //
@@ -15,14 +18,14 @@
 //   node scripts/release-smoke.mjs
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const dist = join(root, "packages", "web", "dist");
+export const DIST = join(root, "packages", "web", "dist");
 export const EXE = join(root, "target", "release", `chaldea${process.platform === "win32" ? ".exe" : ""}`);
 
 export const WAITS = {
@@ -34,7 +37,8 @@ export const WAITS = {
   build: 30 * 60_000,
 };
 
-// The daemon's allowlist under assets/ (crates/daemon/src/http/pwa/dist.rs).
+// The daemon's allowlist under assets/ (crates/daemon/src/http/pwa/dist.rs). Looked up by
+// own property only, so a name like `x.constructor` is not a type.
 const TYPES = {
   js: "text/javascript; charset=utf-8",
   css: "text/css; charset=utf-8",
@@ -186,7 +190,7 @@ async function get(port, path) {
  * Every file under `<distDir>/assets/` as `{ path, file, type }`, sorted by path, with
  * source maps skipped as the daemon's build skips them. Fails on a type outside the
  * allowlist, on anything that is neither a file nor a directory (symlinks included, never
- * followed), and on an empty directory.
+ * followed, the `assets/` root included), and on an empty directory.
  */
 export function distAssets(distDir) {
   const out = [];
@@ -198,13 +202,15 @@ export function distAssets(distDir) {
       else if (!e.isFile()) fail(`assets/${parts.join("/")} is neither a file nor a directory`);
       else if (!e.name.endsWith(".map")) {
         const ext = e.name.includes(".") ? e.name.slice(e.name.lastIndexOf(".") + 1) : "";
-        const type = TYPES[ext];
+        const type = Object.hasOwn(TYPES, ext) ? TYPES[ext] : undefined;
         if (!type) fail(`assets/${parts.join("/")} has a type the daemon does not serve`);
         out.push({ path: `/assets/${parts.join("/")}`, file, type });
       }
     }
   };
-  walk(join(distDir, "assets"), []);
+  const assets = join(distDir, "assets");
+  if (!lstatSync(assets).isDirectory()) fail("dist/assets is not a directory (a symlink is refused)");
+  walk(assets, []);
   if (out.length === 0) fail("dist/assets/ holds no file");
   return out.sort((x, y) => (x.path < y.path ? -1 : 1));
 }
@@ -223,7 +229,7 @@ async function build(env) {
   if (end.code !== 0) fail(`cargo build exited ${end.code ?? end.signal}`);
 }
 
-export async function main(exe = EXE) {
+export async function main(exe = EXE, dist = DIST) {
   const scratch = mkdtempSync(join(tmpdir(), "chaldea-smoke-"));
   try {
     const assets = distAssets(dist);
@@ -262,7 +268,7 @@ export async function main(exe = EXE) {
 if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
   // Failure unless `main` resolves: a promise that never settles leaves this exit code.
   process.exitCode = 1;
-  main(process.env.CHALDEA_SMOKE_EXE || EXE).then(
+  main(process.env.CHALDEA_SMOKE_EXE || EXE, process.env.CHALDEA_SMOKE_DIST || DIST).then(
     () => {
       console.log("release smoke passed");
       process.exitCode = 0;
