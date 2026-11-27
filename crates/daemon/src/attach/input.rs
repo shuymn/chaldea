@@ -102,7 +102,7 @@ impl Pending {
     }
 
     pub(crate) fn paste(&mut self, id: String, text: String) {
-        self.bytes += text.len();
+        self.bytes += id.len() + text.len();
         self.items.push_back(Item::Paste { id, text });
     }
 
@@ -111,7 +111,7 @@ impl Pending {
         let it = self.items.pop_front()?;
         self.bytes -= match &it {
             Item::Raw(r) => r.len(),
-            Item::Paste { text, .. } => text.len(),
+            Item::Paste { id, text } => id.len() + text.len(),
         };
         Some(it)
     }
@@ -121,7 +121,19 @@ impl Pending {
         self.items.iter().any(|i| matches!(i, Item::Raw(_)))
     }
 
-    /// Pending bytes, raw and paste.
+    /// Every byte the items hold, paste ids included (tests check the bound with it).
+    #[cfg(test)]
+    pub(crate) fn retained(&self) -> usize {
+        self.items
+            .iter()
+            .map(|i| match i {
+                Item::Raw(r) => r.len(),
+                Item::Paste { id, text } => id.len() + text.len(),
+            })
+            .sum()
+    }
+
+    /// Pending bytes: raw bytes, paste texts and their ids.
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }

@@ -741,7 +741,7 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
         ),
         o @ Out::Sending(..) => o,
     };
-    let mut ctl: VecDeque<AttachServerMessage> = VecDeque::new();
+    let mut ctl = Ctl::default();
     let mut pending = Pending::default();
     let mut held: Vec<u8> = Vec::new();
     // The tail the socket's own accepted raw input will follow (the receipt check).
@@ -869,8 +869,8 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
         out = match out {
             Out::Free(sink) => {
                 let mut msgs = Vec::new();
-                if let Some(m) = ctl.pop_front().filter(|_| ending.is_none()) {
-                    msgs.extend(text(&m));
+                if let Some(t) = ctl.pop_front().filter(|_| ending.is_none()) {
+                    msgs.push(Message::Text(t.into()));
                 } else if let Taken::Bytes(b) = buf.take(cfg.frame_out) {
                     msgs.push(Message::Binary(b.into()));
                 } else if let Some((e, _)) = ending {
@@ -911,8 +911,18 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
             Out::Sending(f, d) => (Some(f), Some(drain_at.map_or(*d, |e| e.min(*d)))),
             Out::Free(_) => (None, None),
         };
-        // Reads pause at the watermark (pongs too); never during the drain.
-        let reading = pending.bytes() < cfg.watermark;
+        // Reads pause at the watermark (pongs too): pending input and queued responses.
+        let reading = pending.bytes() + ctl.bytes < cfg.watermark;
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+            if reading {
+                let retained = (pending.retained() + ctl.bytes) as u64;
+                cfg.hooks.retained_max.fetch_max(retained, SeqCst);
+            } else {
+                cfg.hooks.paused.fetch_add(1, SeqCst);
+            }
+        }
         let report_by = match &outstanding {
             Some(Outstanding {
                 phase: Phase::Waiting { by, .. },
@@ -1206,6 +1216,39 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
     }
 }
 
+/// Responses queued for the socket, serialized, and their bytes (counted against the
+/// watermark with the pending input).
+#[derive(Default)]
+struct Ctl {
+    q: VecDeque<String>,
+    bytes: usize,
+}
+
+impl Ctl {
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "callers build the frame in place"
+    )]
+    fn push_back(&mut self, m: AttachServerMessage) {
+        if let Ok(t) = serde_json::to_string(&m) {
+            self.bytes += t.len();
+            self.q.push_back(t);
+        }
+    }
+
+    fn extend(&mut self, m: Option<AttachServerMessage>) {
+        if let Some(m) = m {
+            self.push_back(m);
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<String> {
+        let t = self.q.pop_front()?;
+        self.bytes -= t.len();
+        Some(t)
+    }
+}
+
 /// A test's poke: the loop recomputes its timers after the test clock moved. Never
 /// resolves outside tests.
 async fn poked(cfg: &AttachConfig) {
@@ -1346,11 +1389,7 @@ fn pending_frame(unit: &Unit, cancelled: bool) -> AttachServerMessage {
 
 /// The report channel dropped (R-10): the cancel decides `not_written`; otherwise the unit
 /// is `pending` and stays outstanding with no settlement to come (R-4).
-fn settle_lost(
-    unit: Unit,
-    ticket: &WriteTicket,
-    ctl: &mut VecDeque<AttachServerMessage>,
-) -> Option<Outstanding> {
+fn settle_lost(unit: Unit, ticket: &WriteTicket, ctl: &mut Ctl) -> Option<Outstanding> {
     let cancelled = ticket.try_cancel() == Some(true);
     ctl.push_back(pending_frame(&unit, cancelled));
     (!cancelled).then_some(Outstanding {
@@ -1366,7 +1405,7 @@ fn settle_late(
     unit: Unit,
     ticket: &WriteTicket,
     rx: oneshot::Receiver<KeyReport>,
-    ctl: &mut VecDeque<AttachServerMessage>,
+    ctl: &mut Ctl,
 ) -> Option<Outstanding> {
     let cancelled = ticket.try_cancel() == Some(true);
     ctl.push_back(pending_frame(&unit, cancelled));

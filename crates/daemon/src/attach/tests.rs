@@ -1058,6 +1058,45 @@ async fn crossing_paste_kept() {
     rig.stop().await;
 }
 
+/// I-4: retained paste ids and queued responses count against the watermark: with the
+/// outbound send held, rejected pastes with long ids stop the reads; with a write held,
+/// accepted pastes with long ids and short texts do too. While reading, the socket never
+/// retained more than the watermark plus one message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watermark_counts_ids_and_responses() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let h = hooks(&rig);
+    let watermark = rig.sup.cfg.attach.watermark as u64;
+    let id = "i".repeat(16 * 1024);
+    // One message: its id twice (the frame and the echo) plus framing.
+    let message = 2 * id.len() as u64 + 256;
+    for rejected in [true, false] {
+        let (mut c, _) = attach(&rig, &live).await;
+        let shared = rig.srv.server.shared().clone();
+        let paused = h.paused.load(SeqCst);
+        let (_reached, held) = shared.faults.arm_socket_send_gate();
+        let hold = live.child.hold_writes();
+        if !rejected {
+            c.binary(b"a").await;
+            assert!(hold.wait_entered(soon()));
+        }
+        let text = if rejected { "" } else { "t" };
+        for _ in 0..12 {
+            c.json(json!({ "type": "paste", "paste_id": id, "text": text }))
+                .await;
+        }
+        rig.until("the reads paused", || h.paused.load(SeqCst) > paused)
+            .await;
+        let max = h.retained_max.load(SeqCst);
+        drop(hold);
+        drop(held);
+        assert!(max < watermark + message, "{rejected}: {max}");
+    }
+    rig.stop().await;
+}
+
 /// I-4: a 256 KiB paste with a raw unit outstanding is accepted and written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn max_paste_with_raw_outstanding() {

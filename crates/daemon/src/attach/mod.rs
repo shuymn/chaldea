@@ -82,6 +82,11 @@ pub(crate) struct AttachHooks {
     /// Runs on the socket's task right after its loop sampled the terminal latch (none
     /// latched yet).
     pub sampled: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// The most bytes of pending input and queued responses retained while a socket was
+    /// reading frames, over every socket.
+    pub retained_max: std::sync::atomic::AtomicU64,
+    /// Loop turns that did not read frames (the watermark reached), by every socket.
+    pub paused: std::sync::atomic::AtomicU64,
     /// Gone polls run, by every socket.
     pub gone_polls: std::sync::atomic::AtomicU64,
     /// Runs on the blocking pool after the next startup subscription returned.
