@@ -20,7 +20,7 @@ use chaldea_core::sync::{
 };
 
 use super::shared;
-use super::support::http::{Reply, TestServer};
+use super::support::http::{CLIENT_WAIT, Reply, TestServer};
 use super::support::{Model, Op, event, raw_unknown, soon};
 use crate::http::Mounts;
 use crate::store::NewEvent;
@@ -198,8 +198,23 @@ fn decode(r: &Reply) -> EventsResponse {
     serde_json::from_slice(&r.body).unwrap()
 }
 
+/// A server whose 60 s request budget holds the commits [`with_commits_during`] waits for
+/// inside the read: a read that outlasts the test server's 2 s budget is 408 by design.
+async fn start() -> TestServer {
+    TestServer::start_with(Mounts::mvp(), |c| {
+        c.short_deadline = Duration::from_secs(60);
+    })
+    .await
+}
+
+/// How long [`with_commits_during`] waits for all its queued jobs together: half the client's
+/// wait for the reply, so a commit that never comes fails here, with its own message, before
+/// the client gives up on the request.
+const COMMITS_WAIT: Duration = CLIENT_WAIT.checked_div(2).unwrap();
+
 /// Arms the handler's read (after the guard's token read) to let the jobs queued behind
-/// `hold` commit before the handler goes on, then sends `req`.
+/// `hold` commit, within [`COMMITS_WAIT`] in total, before the handler goes on, then sends
+/// `req`.
 async fn with_commits_during(
     srv: &TestServer,
     req: &super::support::http::Req,
@@ -208,11 +223,14 @@ async fn with_commits_during(
     jobs: usize,
 ) -> Reply {
     shared(srv).faults.arm_after_read(1, move || {
+        let until = std::time::Instant::now() + COMMITS_WAIT;
         drop(hold);
-        for _ in 0..jobs {
+        for n in 0..jobs {
             committed
-                .recv_timeout(Duration::from_secs(10))
-                .expect("the queued jobs commit");
+                .recv_timeout(until.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or_else(|e| {
+                    panic!("{n} of {jobs} queued jobs committed within {COMMITS_WAIT:?}: {e}")
+                });
         }
     });
     srv.send(req).await
@@ -237,7 +255,7 @@ fn queue(srv: &TestServer, events: Vec<NewEvent>, done: &mpsc::Sender<()>) {
 /// request runs (after its read) are not in it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_equals_model_at_cut() {
-    let srv = TestServer::start(Mounts::mvp()).await;
+    let srv = start().await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let mut m = Model::default();
     let mut log = Log::default();
@@ -381,7 +399,7 @@ async fn snapshot_equals_model_at_cut() {
 /// it, and `has_more` and `head_seq` agree with the page.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn page_and_head_from_one_snapshot() {
-    let srv = TestServer::start(Mounts::mvp()).await;
+    let srv = start().await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let hold = srv.hold_writer().await;
     let (done_tx, done_rx) = mpsc::channel();
