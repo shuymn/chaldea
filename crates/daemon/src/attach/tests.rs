@@ -1073,6 +1073,86 @@ async fn production_mount_admission() {
     rig.stop().await;
 }
 
+/// R-11, T1-1 against the real attach handler: a foreign `Host` (421) or `Origin` (403)
+/// leaves the ticket unspent, and a matching `Origin` redeems it; of 16 concurrent valid
+/// redemptions of one ticket exactly one gets a `101`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn production_mount_layers() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let ticket = rig
+        .srv
+        .ticket(&rig.owner, &format!("attach:{}", live.t))
+        .await
+        .unwrap();
+    let path = format!("/api/attach/{}?ticket={ticket}", live.t);
+    let r = rig
+        .srv
+        .send(&rig.srv.ws_handshake(&path).host(Some("evil:1")))
+        .await;
+    assert_eq!(r.outcome(), (421, Some("misdirected_request".into())));
+    let r = rig
+        .srv
+        .send(&rig.srv.ws_handshake(&path).header("Origin", "http://evil"))
+        .await;
+    assert_eq!(r.outcome(), (403, Some("origin_rejected".into())));
+    let mut req = format!("ws://127.0.0.1:{}{path}", rig.srv.port)
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        "Origin",
+        format!("http://127.0.0.1:{}", rig.srv.port)
+            .parse()
+            .unwrap(),
+    );
+    let (ws, _) = bounded(WS_WAIT, tokio_tungstenite::connect_async(req))
+        .await
+        .unwrap()
+        .expect("the ticket was unspent");
+    let mut c = Client { ws, closed: None };
+    assert!(matches!(
+        c.text().await,
+        Some(AttachServerMessage::Attached { .. })
+    ));
+    drop(c);
+
+    let ticket = rig
+        .srv
+        .ticket(&rig.owner, &format!("attach:{}", live.t))
+        .await
+        .unwrap();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let (barrier, url) = (
+            barrier.clone(),
+            format!(
+                "ws://127.0.0.1:{}/api/attach/{}?ticket={ticket}",
+                rig.srv.port, live.t
+            ),
+        );
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            match tokio_tungstenite::connect_async(url).await {
+                Ok((ws, _)) => Ok(ws),
+                Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err(r.status().as_u16()),
+                Err(e) => panic!("{e}"),
+            }
+        }));
+    }
+    let mut ok = Vec::new();
+    for t in tasks {
+        match bounded(WS_WAIT, t).await.unwrap().unwrap() {
+            Ok(ws) => ok.push(ws),
+            Err(status) => assert_eq!(status, 401),
+        }
+    }
+    assert_eq!(ok.len(), 1);
+    drop(ok);
+    rig.stop().await;
+}
+
 /// T1-9: `/api/ws` keeps its 64 KiB inbound bound; attach refuses only above its own (the
 /// 1009 is best effort: the peer may still be writing when the socket closes).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
