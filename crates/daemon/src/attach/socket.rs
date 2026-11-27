@@ -473,15 +473,18 @@ impl Submit {
     }
 }
 
-/// Runs one resize attempt under the launch lease (D7): waits for the lease, then on the
-/// blocking pool each leg under the socket's fence; the blocking task releases the lease
-/// by its id when the backend call returns, even after the socket ended.
+/// Runs one resize attempt to `size` under the launch lease (D7): waits for the lease, then
+/// on the blocking pool decides the legs from the size it finds (at an equal size, the
+/// nudge on a socket's `first` resize, else nothing) and runs each under the socket's
+/// fence; it reads the result size, then releases the lease by its id, even after the
+/// socket ended.
 fn resize(
     sl: Arc<SendLaunch>,
     handle: SessionHandle,
     fence: Fence,
     socket: u64,
-    legs: Vec<PtySize>,
+    size: PtySize,
+    first: bool,
     newer: Arc<Mutex<Option<PtySize>>>,
 ) -> Resizing {
     Box::pin(async move {
@@ -497,6 +500,13 @@ fn resize(
             free.await;
         };
         tokio::task::spawn_blocking(move || {
+            // Released by its id also if a leg panics.
+            let lease = LeaseGuard { sl: &sl, id };
+            let legs = match (size == handle.size(), first) {
+                (false, _) => vec![size],
+                (true, true) => nudge_legs(size),
+                (true, false) => Vec::new(),
+            };
             let mut ok = true;
             for (i, leg) in legs.iter().enumerate() {
                 // A newer size replaces the nudge's second leg.
@@ -508,12 +518,24 @@ fn resize(
                     break;
                 }
             }
-            sl.release_lease(&mut sl.state(), id);
             let s = handle.size();
+            drop(lease);
             (s.cols(), s.rows(), ok)
         })
         .await
     })
+}
+
+/// A resize's lease, released by its id when dropped (unwinding included).
+struct LeaseGuard<'a> {
+    sl: &'a SendLaunch,
+    id: u64,
+}
+
+impl Drop for LeaseGuard<'_> {
+    fn drop(&mut self) {
+        self.sl.release_lease(&mut self.sl.state(), self.id);
+    }
 }
 
 /// The two legs that force a redraw at an equal size: one row more (one less at the
@@ -836,33 +858,22 @@ pub(crate) async fn run(a: Arc<Attach>, s: UpgradedSocket) {
                 None => None,
             };
         }
-        // The next resize: one in flight, the latest size wins.
+        // The next resize: one in flight, the latest size wins; what it does is decided
+        // under the lease.
         if resizing.is_none() && ending.is_none() {
             let want = crate::supervisor::lock(&size_wanted).take();
             if let Some(size) = want {
-                let current = handle.size();
-                if size == current && resized_once {
-                    ctl.push_back(AttachServerMessage::Size {
-                        cols: size.cols(),
-                        rows: size.rows(),
-                        ok: true,
-                    });
-                } else {
-                    let legs = if size == current {
-                        nudge_legs(size)
-                    } else {
-                        vec![size]
-                    };
-                    resized_once = true;
-                    resizing = Some(resize(
-                        sl.clone(),
-                        handle.clone(),
-                        fence.clone(),
-                        me,
-                        legs,
-                        size_wanted.clone(),
-                    ));
-                }
+                let first = !resized_once;
+                resized_once = true;
+                resizing = Some(resize(
+                    sl.clone(),
+                    handle.clone(),
+                    fence.clone(),
+                    me,
+                    size,
+                    first,
+                    size_wanted.clone(),
+                ));
             }
         }
         // The next frame, when the sink is free.

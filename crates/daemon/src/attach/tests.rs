@@ -1672,6 +1672,91 @@ async fn latest_size_after_release() {
     rig.stop().await;
 }
 
+/// T1-3: the nudge is decided under the lease. A's resize to 100x30 is held in the backend
+/// when B takes over and asks for 100x30 as its first resize; B waits for the lease, and
+/// once A's resize returns the size is equal, so B nudges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nudge_decided_under_lease() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let sl = rig.sl(&live);
+    let (mut a, _) = attach(&rig, &live).await;
+    let hold = live.child.hold_resizes();
+    a.json(json!({ "type": "resize", "cols": 100, "rows": 30 }))
+        .await;
+    assert!(hold.wait_entered(soon()));
+    let (mut b, _) = attach(&rig, &live).await;
+    assert_eq!(a.until_closed().await.0, Some(4003));
+    let waits = sl.lease_waits.load(SeqCst);
+    b.json(json!({ "type": "resize", "cols": 100, "rows": 30 }))
+        .await;
+    rig.until("B waits for the lease", || {
+        sl.lease_waits.load(SeqCst) > waits
+    })
+    .await;
+    drop(hold);
+    assert_eq!(size_frame(&mut b).await, (100, 30, true));
+    assert_eq!(
+        resizes(&live),
+        [
+            PtySize::new(100, 30).unwrap(),
+            PtySize::new(100, 31).unwrap(),
+            PtySize::new(100, 30).unwrap()
+        ]
+    );
+    rig.stop().await;
+}
+
+/// A panic in the resize's backend call still releases the lease: the attempt answers
+/// `ok: false`, and the next resize gets the lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resize_panic_releases_lease() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut c, _) = attach(&rig, &live).await;
+    live.child.panic_on_next_resize();
+    c.json(json!({ "type": "resize", "cols": 100, "rows": 30 }))
+        .await;
+    assert!(!size_frame(&mut c).await.2);
+    c.json(json!({ "type": "resize", "cols": 90, "rows": 20 }))
+        .await;
+    assert_eq!(size_frame(&mut c).await, (90, 20, true));
+    assert_eq!(resizes(&live), [PtySize::new(90, 20).unwrap()]);
+    rig.stop().await;
+}
+
+/// T1-3: a newer size replaces the nudge's second leg.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nudge_superseded() {
+    let rig = SRig::new().await;
+    let live = rig.claude().await;
+    let (mut c, first) = attach(&rig, &live).await;
+    let AttachServerMessage::Attached { cols, rows, .. } = first else {
+        unreachable!()
+    };
+    let hold = live.child.hold_resizes();
+    c.json(json!({ "type": "resize", "cols": cols, "rows": rows }))
+        .await;
+    assert!(hold.wait_entered(soon()));
+    c.json(json!({ "type": "resize", "cols": 90, "rows": 20 }))
+        .await;
+    // A later frame handled: the newer size was read while the first leg is held.
+    c.binary(b"z").await;
+    input_has(&rig, &live, b"z").await;
+    drop(hold);
+    assert_eq!(size_frame(&mut c).await, (cols, rows + 1, true));
+    assert_eq!(size_frame(&mut c).await, (90, 20, true));
+    assert_eq!(
+        resizes(&live),
+        [
+            PtySize::new(cols, rows + 1).unwrap(),
+            PtySize::new(90, 20).unwrap()
+        ]
+    );
+    rig.stop().await;
+}
+
 /// I-1, I-3: `stop` with a resize held in the backend meets its budget; the resize returns
 /// after.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

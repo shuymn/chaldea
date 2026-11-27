@@ -121,6 +121,7 @@ struct Proc {
     input: Mutex<InputState>,
     input_cv: Condvar,
     fail_resize: AtomicBool,
+    panic_resize: AtomicBool,
     /// The next `resize` blocks inside the backend call (`hold_resizes`).
     resize_hold: Mutex<Option<Hold>>,
     resize_cv: Condvar,
@@ -286,6 +287,7 @@ impl PtyRuntime for FakePty {
             input: Mutex::new(InputState::default()),
             input_cv: Condvar::new(),
             fail_resize: AtomicBool::new(false),
+            panic_resize: AtomicBool::new(false),
             resize_hold: Mutex::new(None),
             resize_cv: Condvar::new(),
             next_resize_hold: std::sync::atomic::AtomicU64::new(0),
@@ -410,6 +412,10 @@ struct FakeControl(Arc<Proc>);
 
 impl PtyControl for FakeControl {
     fn resize(&self, size: PtySize) -> io::Result<()> {
+        assert!(
+            !self.0.panic_resize.swap(false, Ordering::AcqRel),
+            "injected resize panic"
+        );
         {
             let p = &self.0;
             let mut h = lock(&p.resize_hold);
@@ -766,6 +772,11 @@ impl FakeChild {
 
     pub fn fail_next_resize(&self) {
         self.proc.fail_resize.store(true, Ordering::Release);
+    }
+
+    /// The next backend `resize` panics at its entry.
+    pub fn panic_on_next_resize(&self) {
+        self.proc.panic_resize.store(true, Ordering::Release);
     }
 
     /// The next backend `resize` blocks inside the call until the hold is released or
