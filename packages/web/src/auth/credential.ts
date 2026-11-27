@@ -45,13 +45,17 @@ export class CredentialStore {
   }
 
   private open(): Promise<IDBDatabase> {
-    this.db ??= new Promise((resolve, reject) => {
+    this.db ??= new Promise<IDBDatabase>((resolve, reject) => {
       const req = this.deps.indexedDB.open(DB_NAME, 1);
       req.onupgradeneeded = () => {
         req.result.createObjectStore(STORE);
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(new Error("the credential store could not be opened"));
+    }).catch((e: unknown) => {
+      // A failed open is not kept: the next call (a Retry) opens again.
+      this.db = null;
+      throw e;
     });
     return this.db;
   }

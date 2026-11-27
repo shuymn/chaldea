@@ -264,7 +264,8 @@ export function status(s: State): Status {
   if (!socketUp && (s.ticketDown || readsDown)) return "offline";
   if (!s.reached) return "connecting";
   // Live needs the read path too, so a frame cannot unlock input while it fails.
-  if (socketUp && !someDown) return "live";
+  // A pending first read is not yet a working read path.
+  if (socketUp && reads.every((r) => r === "ok")) return "live";
   return "updates paused";
 }
 
@@ -297,7 +298,7 @@ export interface RowView {
   readonly label: Label;
   /** The failure of the thread's stream that waits for a retry, if any. */
   readonly error: StreamError | null;
-  /** The stream's latest forward read failed in transport; it is retried on backoff. */
+  /** The stream's latest forward read failed transiently; it is retried on backoff. */
   readonly retrying: boolean;
 }
 
@@ -305,7 +306,9 @@ export function rowView(s: State, row: HostRow): RowView {
   const stream = s.streams[threadStream(row.info.thread_id)];
   const copy = stream?.copy;
   const error = stream?.error ?? null;
-  const retrying = stream?.lastRead === "down" && error === null;
+  // From the forward retry state: a transient failure (transport, timeout, 408, 503) is
+  // retried on backoff until a read succeeds.
+  const retrying = error === null && (stream?.attempt ?? 0) > 0;
   if (copy?.kind === "thread") {
     return {
       info: row.info,

@@ -87,8 +87,12 @@ export class Runner {
     this.endTransport();
   }
 
-  /** Back from the cache: reconnect and refetch, keeping what the page showed. */
-  resume(): void {
+  /**
+   * Back from the cache: reconcile with the store first (a notice may have been missed
+   * while frozen), then reconnect and refetch, keeping what the page showed.
+   */
+  async resume(): Promise<void> {
+    await this.reread("keep");
     this.dispatch({ type: "resume" });
   }
 
@@ -120,20 +124,33 @@ export class Runner {
   }
 
   /**
-   * Rereads the store and adopts what it holds. If it cannot be read: `keep` keeps the
-   * current credential, `report` shows the storage failure, and `retire` drops the
-   * current one (a 401's generation that could not be deleted).
+   * Rereads the store and adopts what it holds. If it cannot be read, `keep` keeps the
+   * current credential and `report` shows the storage failure.
+   *
+   * The one adoption rule: a reread triggered by a generation (a 401's clear) acts only
+   * if that generation is still the current one when the read completes; then a read
+   * failure retires it. Notices, startup, Retry, and resume name no generation and
+   * adopt what the store holds.
    */
-  private reread(onError: "keep" | "report" | "retire"): Promise<void> {
+  private reread(onError: "keep" | "report", trigger?: string): Promise<void> {
     this.adoption = this.adoption.then(async () => {
       if (this.stopped) return;
       let cred: Credential | null;
+      let failed = false;
       try {
         cred = await this.deps.store.read();
       } catch {
-        if (onError === "report") this.dispatch({ type: "storageFailed" });
-        if (onError !== "retire") return;
+        failed = true;
         cred = null;
+      }
+      if (trigger !== undefined) {
+        if (this.cred?.generation !== trigger) return;
+        this.adopt(cred);
+        return;
+      }
+      if (failed) {
+        if (onError === "report") this.dispatch({ type: "storageFailed" });
+        return;
       }
       this.adopt(cred);
     });
@@ -231,15 +248,15 @@ export class Runner {
         return;
       }
       case "clearCredential": {
-        // Compare-and-delete, then the same reread as a notice. If the delete failed, the
-        // refused generation is retired here, so a reread that still returns it does not
-        // reuse it; a newer generation is adopted as usual.
+        // Compare-and-delete, then a reread triggered by this generation. If the delete
+        // failed and the generation is still current, it is retired here, so a reread
+        // that still returns it does not reuse it; a newer generation is never touched.
         const gen = e.generation;
         void this.deps.store.clearIf(gen).then(
-          () => this.reread("retire"),
+          () => this.reread("keep", gen),
           () => {
-            this.retired.add(gen);
-            return this.reread("retire");
+            if (this.cred?.generation === gen) this.retired.add(gen);
+            return this.reread("keep", gen);
           },
         );
         return;

@@ -1,9 +1,13 @@
-// The window oracle (test only): an independent model of the history window of
-// docs/design/w1-pwa.md §2.4, fed with what the client was asked to do and what it
-// received. Each window the client opens starts empty at its cursor; every page the
-// client accepted for it (its size as served, a halved one included) and every live event
-// is applied by these rules, not the reducer's, so the expected range follows the
-// navigation intent: the tail, Older, Newer, and Jump to latest.
+// The window oracle (test only): an independent model of how the history window of
+// docs/design/w1-pwa.md §2.4 applies what it receives. Each window the client opens
+// starts empty at its cursor; every page the client accepted for it (its size as served,
+// a halved one included) and every live event is applied by these rules, not the
+// reducer's.
+//
+// Boundary: it takes window openings and each read's purpose from the client, so it does
+// not check that a required read was asked for. That scheduling (the tail once the
+// cursor is valid, Jump to latest, the reload after CursorAhead) is covered by directed
+// tests in window.test.ts, and check.ts flags an empty attached window with no read.
 
 import type { EventEnvelope } from "@chaldea/contracts/generated/EventEnvelope";
 

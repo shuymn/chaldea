@@ -266,6 +266,95 @@ describe("runner", () => {
     expect(r.getState().generation).toBe("a");
   });
 
+  test("Retry reopens a credential store whose first open failed (real CredentialStore)", async () => {
+    vi.useRealTimers();
+    const idb = new IDBFactory();
+    let opens = 0;
+    const flaky = {
+      open: (name: string, version?: number) => {
+        opens += 1;
+        if (opens > 1) return idb.open(name, version);
+        const req = {} as IDBOpenDBRequest;
+        queueMicrotask(() => req.onerror?.(new Event("error")));
+        return req;
+      },
+    } as unknown as IDBFactory;
+    const store = new CredentialStore({
+      indexedDB: flaky,
+      uuid: () => "fresh",
+      channel: () => ({ postMessage() {}, close() {}, onmessage: null }) as unknown as BroadcastChannel,
+    });
+    const { r } = runner(store);
+    await r.start();
+    expect(r.getState().storageFailed).toBe(true);
+    await r.retryStorage();
+    expect(opens).toBe(2);
+    expect(r.getState().storageFailed).toBe(false);
+    expect(r.getState().generation).toBeNull();
+    r.stop();
+  });
+
+  test("a clear for A that completes after B is adopted never retires B", async () => {
+    const store = fakeStore(A);
+    let finishClear: () => void = () => {};
+    store.clearIf = () =>
+      new Promise((resolve) => {
+        finishClear = () => resolve(null);
+      });
+    let first = true;
+    const calls: Call[] = [];
+    const r = new Runner({
+      fetch: (path, init) => {
+        calls.push({ path, init });
+        if (path.startsWith("/api/events") && first) {
+          first = false;
+          return Promise.resolve(new Response("{}", { status: 401 }));
+        }
+        return new Promise<Response>(() => {});
+      },
+      openSocket: () => {
+        throw new Error("unused");
+      },
+      store: store as unknown as CredentialStore,
+      now: () => 0,
+      socketUrl: (p) => p,
+    });
+    await r.start();
+    await vi.advanceTimersByTimeAsync(0);
+    store.stored = B;
+    store.notify();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(r.getState().generation).toBe("b");
+    // A's clear completes, and the reread it triggers fails.
+    store.read = async () => {
+      throw new Error("busy");
+    };
+    finishClear();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(r.getState().generation).toBe("b");
+    const bCalls = calls.filter((c) => auth(c) === "Bearer tok-b");
+    expect(bCalls.length).toBeGreaterThan(0);
+    expect(bCalls.every((c) => !c.init.signal?.aborted)).toBe(true);
+    r.stop();
+  });
+
+  test("resume reconciles with the store before any transport starts", async () => {
+    const store = fakeStore(A);
+    const { r, calls } = runner(store);
+    await r.start();
+    await vi.advanceTimersByTimeAsync(0);
+    r.suspend();
+    // B is committed while the page is frozen; its notice is not delivered.
+    store.stored = B;
+    const mark = calls.length;
+    await r.resume();
+    await vi.advanceTimersByTimeAsync(0);
+    const resumed = calls.slice(mark);
+    expect(resumed.length).toBeGreaterThan(0);
+    expect(resumed.every((c) => auth(c) === "Bearer tok-b")).toBe(true);
+    r.stop();
+  });
+
   test("a 401 whose delete fails retires that generation; a newer one is still adopted", async () => {
     const store = fakeStore(A);
     let clears = 0;

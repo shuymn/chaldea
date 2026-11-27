@@ -32,6 +32,6 @@ if (root) {
     view.unmount();
   });
   addEventListener("pageshow", (e) => {
-    if (e.persisted) runner.resume();
+    if (e.persisted) void runner.resume();
   });
 }

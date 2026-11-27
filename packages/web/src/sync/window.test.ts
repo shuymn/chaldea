@@ -195,6 +195,54 @@ describe("sync.window", () => {
     expect(sim.state.window).toEqual(detached);
   });
 
+  // Scheduling (the oracle's boundary, oracle.ts): each intent issues its read.
+  const tailReads = (sim: Sim, from: number) =>
+    sim.log.slice(from).flatMap((e) => (e.type === "fetch" && e.req.dir === "backward" && e.req.purpose === "tail" ? [e.req] : []));
+
+  test("scheduling: selection issues the tail read once the cursor is valid, and the timeline fills", () => {
+    const sim = busy(1);
+    sim.quiesce();
+    const mark = sim.log.length;
+    sim.dispatch({ type: "select", thread: ID1 });
+    const fwd = sim.flight(T1, "forward") ?? -1;
+    sim.serve(fwd);
+    sim.deliverId(fwd);
+    expect(tailReads(sim, mark).map((r) => r.beforeSeq)).toEqual([2]);
+    sim.quiesce();
+    expect(sim.state.window?.events.map((e) => e.seq)).toEqual([1]);
+    expect(windowProblems(sim, ID1)).toEqual([]);
+  });
+
+  test("scheduling: Jump to latest issues a fresh tail read at the cursor", () => {
+    const sim = busy(20);
+    sim.dispatch({ type: "select", thread: ID1 });
+    sim.quiesce();
+    press(sim, "older");
+    press(sim, "older");
+    expect(sim.state.window?.attached).toBe(false);
+    const mark = sim.log.length;
+    sim.dispatch({ type: "latest" });
+    const cursor = sim.state.streams[T1]?.copy?.cursor ?? -1;
+    expect(tailReads(sim, mark).map((r) => r.beforeSeq)).toEqual([cursor + 1]);
+  });
+
+  test("scheduling: a CursorAhead reset issues the reload of the tail", () => {
+    const sim = busy(20);
+    sim.dispatch({ type: "select", thread: ID1 });
+    sim.quiesce();
+    const cursor = sim.state.streams[T1]?.copy?.cursor ?? 0;
+    sim.server.message(ID1, 3);
+    for (const id of sim.conns.keys()) while (sim.socketStep(id));
+    while (sim.deliverFrame());
+    const fwd = sim.flight(T1, "forward") ?? -1;
+    const a = sim.server.answer({ stream: T1, afterSeq: cursor + 50, beforeSeq: null, limit: 4, epoch: sim.state.epoch });
+    if (a.status !== 200) throw new Error("no snapshot");
+    const mark = sim.log.length;
+    sim.fail(fwd, { kind: "ok", body: a.body });
+    sim.deliverId(fwd);
+    expect(tailReads(sim, mark).map((r) => r.beforeSeq)).toEqual([sim.server.head(T1) + 1]);
+  });
+
   test("fill four slots, then switch thread", () => {
     const sim = busy(10, { followMax: 3 });
     sim.server.register(3, false);

@@ -186,7 +186,10 @@ class Step {
     this.s.suspended = true;
   }
 
-  /** Back from the cache: reconnect now, and make every followed stream due as at an open. */
+  /**
+   * Back from the cache: reconnect now, and make every followed stream due as a socket
+   * open does, terminal errors cleared included (a resume is a reconnect).
+   */
   private resume(): void {
     this.s.suspended = false;
     this.s.socketAttempt = 0;
@@ -195,8 +198,10 @@ class Step {
       const st = this.st(key);
       if (!st) continue;
       st.asked = true;
+      st.error = null;
       st.attempt = 0;
       st.retryAt = 0;
+      st.fwdLimit = this.s.cfg.forwardLimit;
     }
   }
 

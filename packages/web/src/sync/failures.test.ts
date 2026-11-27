@@ -196,6 +196,49 @@ describe("sync.status", () => {
     expect(status(sim.state)).toBe("live");
   });
 
+  test("selecting a thread not yet followed is not live until its first forward read arrives", () => {
+    const sim = seeded();
+    sim.quiesce();
+    expect(status(sim.state)).toBe("live");
+    sim.dispatch({ type: "select", thread: threadId(1) });
+    expect(sim.state.streams[T1]?.lastRead).toBeNull();
+    expect(status(sim.state)).toBe("updates paused");
+    const id = sim.flight(T1, "forward") ?? -1;
+    sim.serve(id);
+    sim.deliverId(id);
+    expect(status(sim.state)).toBe("live");
+  });
+
+  test("a background 408 or 503 in backoff marks the row retrying", () => {
+    for (const code of [408, 503]) {
+      const sim = live();
+      sim.server.message(threadId(2), 3);
+      for (const id of sim.conns.keys()) while (sim.socketStep(id));
+      while (sim.deliverFrame());
+      const bg = sim.flight(T2, "forward") ?? -1;
+      failWith(sim, bg, { kind: "status", status: code, retryAfter: 20 });
+      const row = listRows(sim.state).find((r) => r.info.thread_id === threadId(2));
+      if (!row) throw new Error("no row");
+      expect(rowView(sim.state, row).retrying).toBe(true);
+      expect(status(sim.state)).toBe("live");
+      sim.quiesce();
+      expect(rowView(sim.state, row).retrying).toBe(false);
+    }
+  });
+
+  test("resume refetches host and the selected thread, a terminal error cleared as at a reconnect", () => {
+    const sim = live();
+    const id = forwardRead(sim);
+    failWith(sim, id, { kind: "schema" });
+    expect(sim.state.streams[T1]?.error).not.toBeNull();
+    sim.dispatch({ type: "suspend" });
+    const effects = sim.dispatch({ type: "resume" });
+    const streams = effects.flatMap((e) => (e.type === "fetch" ? [e.req.stream] : []));
+    expect(streams).toContain(HOST);
+    expect(streams).toContain(T1);
+    expect(sim.state.streams[T1]?.error).toBeNull();
+  });
+
   test("a failed history read shows on the window only; the page stays live (N1)", () => {
     const sim = live();
     sim.dispatch({ type: "older" });

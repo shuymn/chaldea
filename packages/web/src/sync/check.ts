@@ -100,6 +100,11 @@ export function windowProblems(sim: Sim, thread: string): string[] {
   if (JSON.stringify(w.events) !== JSON.stringify(want)) out.push(`window ${w.lo}..${w.hi} differs from the log`);
   if (w.hi > head) out.push(`window hi ${w.hi} > head ${head}`);
   if (w.attached && w.hi !== head) out.push(`attached window ends at ${w.hi}, head ${head}`);
+  // The oracle checks how pages are applied, not that they were asked for (oracle.ts):
+  // an attached, healthy window with nothing in it and nothing asked is wrong.
+  if (w.attached && head > 0 && w.events.length === 0 && !w.error && !w.pending) {
+    out.push("attached window empty with no read pending");
+  }
   // The retained range the navigation intent asks for (oracle.ts).
   out.push(...sim.oracle.problems(s));
   if (w.events.length > s.cfg.windowMaxEvents) out.push("window over the event cap");
