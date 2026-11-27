@@ -71,10 +71,12 @@ impl Default for CloseBounds {
 }
 
 impl CloseBounds {
-    /// The sum of every budget: the bound on `close`.
+    /// The sum of every budget: the bound on `close`. Saturates at `Duration::MAX`.
     #[must_use]
     pub fn total(&self) -> Duration {
-        self.kill + self.input + self.close + self.drain + self.join
+        [self.input, self.close, self.drain, self.join]
+            .into_iter()
+            .fold(self.kill, Duration::saturating_add)
     }
 }
 

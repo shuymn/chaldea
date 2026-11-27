@@ -1431,6 +1431,23 @@ impl<'a> ReadTx<'a> {
         })
     }
 
+    /// The seq of launch `l`'s latest input attempt (`input_state_changed` to `sending`),
+    /// a zero-byte one included.
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub fn last_attempt_seq(&self, l: LaunchId) -> Result<Option<u64>, StoreError> {
+        self.guard(|| {
+            let max: Option<i64> = sql(self.conn.query_row(
+                "SELECT max(attempt_seq) FROM proj_inputs WHERE launch_id = ?1",
+                [l.to_string()],
+                |r| r.get(0),
+            ))?;
+            opt_u64(max)
+        })
+    }
+
     /// The largest `receipt_ordinal` of the launch's deliveries; 0 when it has none.
     ///
     /// # Errors

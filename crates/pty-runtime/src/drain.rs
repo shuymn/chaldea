@@ -108,7 +108,11 @@ impl Drain {
     /// Waits at most `bound` for the end, then joins the thread; `None` when the thread is
     /// abandoned (it did not end in time).
     pub(crate) fn finish(self, bound: Duration) -> Option<OutputEnd> {
-        let deadline = crate::session::deadline_in(bound);
+        self.finish_by(crate::session::deadline_in(bound))
+    }
+
+    /// [`Drain::finish`] by an absolute deadline.
+    pub(crate) fn finish_by(self, deadline: Instant) -> Option<OutputEnd> {
         let end = {
             let mut p = lock(&self.state.progress);
             loop {

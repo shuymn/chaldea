@@ -312,7 +312,7 @@ async fn ready_op(sup: Arc<Supervisor>, req: ReadyReq) -> EffectOutcome {
             tracing::error!(error = ?e, "the ready job refused");
             EffectOutcome::Unrecorded
         }
-        Recorded::Unrecorded => EffectOutcome::Unrecorded,
+        Recorded::Unrecorded(_) => EffectOutcome::Unrecorded,
         Recorded::ShuttingDown => EffectOutcome::ShuttingDown,
     }
 }
@@ -508,7 +508,7 @@ async fn key_op(sup: Arc<Supervisor>, req: KeyReq) -> EffectOutcome {
             },
             bytes_written: Some(bytes),
         })),
-        Some(Ok(KeyReport::NotStarted)) => done(ErrorCode::KeyNotWritten),
+        Some(Ok(KeyReport::NotStarted(_))) => done(ErrorCode::KeyNotWritten),
         Some(Err(_)) | None => {
             // Never waits for the queue lock: a writer holding it at the unit's dispatch
             // boundary may still permit it, so that is `pending` too.

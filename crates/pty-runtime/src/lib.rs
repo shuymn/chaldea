@@ -74,6 +74,16 @@ macro_rules! probe {
 }
 pub(crate) use probe;
 
+/// Notes a deadline at a [`fake::DeadlineSite`]; nothing without the `fake` feature.
+macro_rules! probe_deadline {
+    ($sh:expr, $site:ident, $at:expr) => {
+        #[cfg(feature = "fake")]
+        $sh.probe
+            .note_deadline($crate::fake::DeadlineSite::$site, $at);
+    };
+}
+pub(crate) use probe_deadline;
+
 pub use backend::{
     ChildExit, Cleanup, CloseReport, DrainSink, KillAttempt, KillReport, MAX_DIMENSION,
     NeverStartedKind, ProcessIdentity, PtyChild, PtyControl, PtyRuntime, PtySize, SizeError,
@@ -86,10 +96,14 @@ pub use origin::{ClassSet, OriginClass, ReplyKind, WriteOrigin};
 pub use session::StartFault;
 pub use session::{
     CloseOutcome, Flow, OutputEnd, OutputEvent, OutputReceiver, OutputSink, Received, Released,
-    Resized, ResponderStatus, Screen, Session, SessionConfig, SessionEvent, SessionStatus,
-    SubscribeError, SubscriptionId, VtUnavailable, WriterObserver, channel_sink,
+    ResizeError, Resized, ResponderStatus, Screen, Session, SessionConfig, SessionEvent,
+    SessionHandle, SessionStatus, SubscribeError, Subscribed, SubscriptionId, VtUnavailable,
+    WriterObserver, channel_sink,
 };
-pub use snapshot::{Cell, CellWidth, Cursor, GridError, Line, Snapshot, TermModes, decode_grid};
+pub use snapshot::{
+    Cell, CellWidth, Cursor, GridError, Line, ScreenMeta, Snapshot, TermModes, decode_grid,
+    grid_rows,
+};
 pub use spawn::{with_spawn_lock, with_spawn_lock_before};
 #[cfg(target_os = "macos")]
 pub use unix::native;

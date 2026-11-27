@@ -7,6 +7,8 @@ mod evidence;
 mod flow;
 pub(crate) mod gate;
 mod human;
+mod interval;
+mod lease;
 mod outcomes;
 pub(crate) mod probe;
 mod timers;
@@ -22,6 +24,8 @@ use chaldea_core::input::InputState;
 use chaldea_pty_runtime::fake::FakeChild;
 use chaldea_pty_runtime::process::AncestryEnd;
 use serde_json::{Value, json};
+
+pub(crate) use gate::set as set_hook;
 
 use super::SendLaunch;
 use crate::hook::HookIngest;
@@ -81,7 +85,16 @@ impl SRig {
 
     /// A rig with the send workers and driver running.
     pub(crate) async fn on(host: HostOs, tune: impl FnOnce(&mut SupervisorConfig)) -> SRig {
-        SRig::build(host, tune, crate::hook::HookConfig::default()).await
+        SRig::build(host, tune, crate::hook::HookConfig::default(), |_| {}).await
+    }
+
+    /// [`SRig::on`] whose server configuration `http` tunes.
+    pub(crate) async fn on_http(
+        host: HostOs,
+        tune: impl FnOnce(&mut SupervisorConfig),
+        http: impl FnOnce(&mut crate::http::HttpConfig),
+    ) -> SRig {
+        SRig::build(host, tune, crate::hook::HookConfig::default(), http).await
     }
 
     /// A rig whose intakes wait up to `wait` for their facts: long enough that a wait the
@@ -94,21 +107,23 @@ impl SRig {
             intake_wait: wait,
             ..crate::hook::HookConfig::default()
         };
-        SRig::build(HostOs::Macos, tune, hook).await
+        SRig::build(HostOs::Macos, tune, hook, |_| {}).await
     }
 
     async fn build(
         host: HostOs,
         tune: impl FnOnce(&mut SupervisorConfig),
         hook: crate::hook::HookConfig,
+        http: impl FnOnce(&mut crate::http::HttpConfig),
     ) -> SRig {
-        let (rig, chains, ingest) = Rig::with_chains_on(
+        let (rig, chains, ingest) = Rig::with_chains_http(
             host,
             |c| {
                 c.send_workers = true;
                 tune(c);
             },
             hook,
+            http,
         )
         .await;
         SRig {

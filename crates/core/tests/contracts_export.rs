@@ -24,6 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chaldea_core::MAX_SAFE_INTEGER;
+use chaldea_core::attach::{AttachClientMessage, AttachServerMessage};
 use chaldea_core::command::{
     CloseResult, InputCancelArgs, InputCommandResult, InputResolveArgs, KeyArgs, KeyResult,
     ReadyArgs, ReadyResult, SendArgs, SendResult, StopResult,
@@ -120,6 +121,8 @@ fn generate(out: &Path) -> (PathBuf, PathBuf) {
     export_ts::<EventsResponse>(&cfg);
     export_ts::<WsServerMessage>(&cfg);
     export_ts::<WsClientMessage>(&cfg);
+    export_ts::<AttachServerMessage>(&cfg);
+    export_ts::<AttachClientMessage>(&cfg);
     export_ts::<CommandRequest>(&cfg);
     export_ts::<ErrorBody>(&cfg);
     export_ts::<WsTicketRequest>(&cfg);
@@ -149,6 +152,8 @@ fn generate(out: &Path) -> (PathBuf, PathBuf) {
     export_schema::<EventsResponse>(&schema);
     export_schema::<WsServerMessage>(&schema);
     export_schema::<WsClientMessage>(&schema);
+    export_schema::<AttachServerMessage>(&schema);
+    export_schema::<AttachClientMessage>(&schema);
     export_schema::<CommandRequest>(&schema);
     export_schema::<ErrorBody>(&schema);
     export_schema::<WsTicketRequest>(&schema);

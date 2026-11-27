@@ -27,7 +27,7 @@ pub(crate) mod tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, TryLockError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use chaldea_core::adapter::{Capabilities, ReadinessMode};
@@ -143,19 +143,41 @@ pub(crate) struct RunningUnit {
     pub stalled: bool,
 }
 
-/// What the worker reports to a key's effect once it decided the unit's record.
+/// What holds the launch lease (`docs/design/t1-attach.md` D7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaseKind {
+    /// An input's open and submission, until it becomes the running unit.
+    Send(InputId),
+    /// An attach socket's resize, until its backend call returns.
+    Resize,
+}
+
+/// The launch lease: one holder at a time orders a send's open and submission against a
+/// resize. Only the holder, by `id`, converts or releases it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Lease {
+    pub id: u64,
+    pub kind: LeaseKind,
+}
+
+/// What the worker reports to a key's effect once it decided the unit's record.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KeyReport {
     /// The `human_write` committed.
     Recorded { complete: bool, bytes: u64 },
-    /// The unit wrote zero bytes.
-    NotStarted,
+    /// The unit wrote zero bytes, refused by the writer for this reason.
+    NotStarted(chaldea_pty_runtime::Refusal),
 }
+
+/// An attach record's `human_write` decision, set once by the first committed job that made
+/// it: the interval key it appended, or `None` when its interval already had its event.
+pub(crate) type Decided = Arc<OnceLock<Option<chaldea_core::ids::IdempotencyKey>>>;
 
 /// One completion the writer fired, with the key effect waiting for it, if any.
 pub(crate) struct Fired {
     pub record: WriteRecord,
     pub report: Option<oneshot::Sender<KeyReport>>,
+    pub decided: Decided,
 }
 
 /// The turn log (send §2.4 "Settle completion"): each interpreted hook's mark by receipt
@@ -210,12 +232,22 @@ impl TurnLog {
     }
 }
 
+/// Where a test drops a human unit's report sender.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropReport {
+    Submit,
+    Fire,
+}
+
 /// Everything the worker, the probe, and the commands share about one launch under one
 /// mutex (send §2.1 rule 1). The probe only `try_lock`s it.
 #[derive(Default)]
 pub(crate) struct SendState {
     pub dispatch: Option<Dispatch>,
     pub running: Option<RunningUnit>,
+    /// The launch lease; a running unit holds it as `running` (send §2.3 step 1).
+    pub lease: Option<Lease>,
     pub human_unsettled: u32,
     /// Each card's human writer position at its observation (`None` when unreliable).
     /// Dropped at the card's resolution, when a key finds the card closed in the store, or
@@ -231,7 +263,9 @@ pub(crate) struct SendState {
     /// Human records taken from the writer and not yet recorded, in `seq` order.
     pub held: Vec<Fired>,
     /// The records the exit job copied at its first attempt (send §2.3 "After exit").
-    pub exit_set: Option<Vec<WriteRecord>>,
+    pub exit_set: Option<Vec<(WriteRecord, Decided)>>,
+    /// The opened input the exit job took the lease from, decided at its first attempt.
+    pub exit_unsubmitted: Option<Option<InputId>>,
 }
 
 /// Test points inside a launch's send side (send §6 "Host speed").
@@ -243,10 +277,14 @@ pub(crate) struct SendHooks {
     pub completion: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs between the open job's commit and the unit's submission (async-free).
     pub before_submit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs in an attach resize's blocking task right after it released the lease.
+    pub after_resize_release: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs right after `submit` returned (inside `with_session`).
     pub after_submit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs before each completion or human-write job.
     pub record_job: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs on the worker after a human record's job committed, before the record settles.
+    pub after_human_record: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs inside the settle job (on the store writer).
     pub settle_job: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs inside the open job (on the store writer).
@@ -318,9 +356,26 @@ pub(crate) struct SendLaunch {
     /// Units submitted whose completion has not fired.
     pub outstanding: AtomicU64,
     pub wake: Notify,
+    /// Lease ids.
+    next_lease: AtomicU64,
+    /// Notified at every release of the lease, for the resizes waiting for it.
+    pub lease_free: Notify,
+    /// Waits for the lease begun (tests poll it).
+    #[cfg(test)]
+    pub lease_waits: AtomicU64,
+    /// Drops the next human unit's report sender: at its submission, or when its
+    /// completion fires (tests of a lost report channel).
+    #[cfg(test)]
+    pub drop_report: Mutex<Option<DropReport>>,
     /// Passes finished (tests poll it).
     #[cfg(test)]
     pub passes: AtomicU64,
+    /// Times the worker went to sleep with no wake pending (tests poll it).
+    #[cfg(test)]
+    pub slept: AtomicU64,
+    /// Human reports handed to their waiters (tests poll it).
+    #[cfg(test)]
+    pub reports_sent: AtomicU64,
     /// The latest tick's instant (supervisor clock).
     pub tick: Mutex<Option<Instant>>,
     #[cfg(test)]
@@ -345,8 +400,18 @@ impl SendLaunch {
             fired: Mutex::new(Vec::new()),
             outstanding: AtomicU64::new(0),
             wake: Notify::new(),
+            next_lease: AtomicU64::new(1),
+            lease_free: Notify::new(),
+            #[cfg(test)]
+            lease_waits: AtomicU64::new(0),
+            #[cfg(test)]
+            drop_report: Mutex::new(None),
             #[cfg(test)]
             passes: AtomicU64::new(0),
+            #[cfg(test)]
+            slept: AtomicU64::new(0),
+            #[cfg(test)]
+            reports_sent: AtomicU64::new(0),
             tick: Mutex::new(None),
             #[cfg(test)]
             hooks: SendHooks::default(),
@@ -375,13 +440,34 @@ impl SendLaunch {
         written: Option<Arc<AtomicBool>>,
         report: Option<oneshot::Sender<KeyReport>>,
     ) -> chaldea_pty_runtime::Completion {
+        self.completion_then(written, report, None)
+    }
+
+    /// [`SendLaunch::completion`] that first runs `first` with the record, on the thread
+    /// that settles the unit (the writer, in write order, for a unit it took).
+    fn completion_then(
+        self: &Arc<Self>,
+        written: Option<Arc<AtomicBool>>,
+        report: Option<oneshot::Sender<KeyReport>>,
+        first: Option<RecordHook>,
+    ) -> chaldea_pty_runtime::Completion {
         let me = Arc::downgrade(self);
         Box::new(move |r: &WriteRecord| {
+            if let Some(f) = first {
+                f(r);
+            }
             let Some(me) = Weak::upgrade(&me) else {
                 return;
             };
             #[cfg(test)]
             run_hook(&me.hooks.completion);
+            #[cfg(test)]
+            let report = if *lock(&me.drop_report) == Some(DropReport::Fire) {
+                lock(&me.drop_report).take();
+                None
+            } else {
+                report
+            };
             if r.outcome == chaldea_pty_runtime::WriteOutcome::Written
                 && let Some(w) = &written
             {
@@ -391,6 +477,7 @@ impl SendLaunch {
             lock(&me.fired).push(Fired {
                 record: r.clone(),
                 report,
+                decided: Decided::default(),
             });
             me.outstanding.fetch_sub(1, Ordering::AcqRel);
             me.wake.notify_one();
@@ -411,9 +498,33 @@ impl SendLaunch {
         guard: chaldea_pty_runtime::Guard,
         report: Option<oneshot::Sender<KeyReport>>,
     ) -> Result<WriteTicket, chaldea_pty_runtime::SubmitError> {
+        self.submit_human_then(s, unit, guard, report, None)
+    }
+
+    /// [`SendLaunch::submit_human`] whose completion first runs `first` with the record
+    /// (attach's raw units: the marker rule's tail, in write order).
+    ///
+    /// # Errors
+    ///
+    /// The session refused the unit (nothing was queued; `first` never runs).
+    pub(crate) fn submit_human_then(
+        self: &Arc<Self>,
+        s: &chaldea_pty_runtime::Session,
+        unit: chaldea_pty_runtime::WriteUnit,
+        guard: chaldea_pty_runtime::Guard,
+        report: Option<oneshot::Sender<KeyReport>>,
+        first: Option<RecordHook>,
+    ) -> Result<WriteTicket, chaldea_pty_runtime::SubmitError> {
+        #[cfg(test)]
+        let report = if *lock(&self.drop_report) == Some(DropReport::Submit) {
+            lock(&self.drop_report).take();
+            None
+        } else {
+            report
+        };
         self.human_up(&mut self.state());
         self.outstanding.fetch_add(1, Ordering::AcqRel);
-        let done = self.completion(None, report);
+        let done = self.completion_then(None, report, first);
         s.submit(unit, guard, done).inspect_err(|_| {
             self.outstanding.fetch_sub(1, Ordering::AcqRel);
             self.human_down(&mut self.state());
@@ -432,12 +543,62 @@ impl SendLaunch {
         self.human_flag.store(st.human_unsettled, Ordering::SeqCst);
     }
 
-    /// Sets the running unit and its flag.
+    /// Sets the running unit and its flag. Clearing it releases the lease the unit held.
     pub(crate) fn set_running(&self, st: &mut SendState, r: Option<RunningUnit>) {
+        let cleared = r.is_none() && st.running.is_some();
         self.running_flag.store(r.is_some(), Ordering::SeqCst);
         st.running = r;
+        if cleared {
+            self.lease_released();
+        }
+    }
+
+    /// Takes the lease for `kind` when it is free and no unit runs; its id.
+    pub(crate) fn take_lease(&self, st: &mut SendState, kind: LeaseKind) -> Option<u64> {
+        if st.lease.is_some() || st.running.is_some() {
+            return None;
+        }
+        let id = self.next_lease.fetch_add(1, Ordering::Relaxed);
+        st.lease = Some(Lease { id, kind });
+        Some(id)
+    }
+
+    /// Releases the lease when `id` still holds it; true when it did.
+    pub(crate) fn release_lease(&self, st: &mut SendState, id: u64) -> bool {
+        if st.lease.is_none_or(|l| l.id != id) {
+            return false;
+        }
+        st.lease = None;
+        self.lease_released();
+        true
+    }
+
+    /// The worker's release of its own open's lease: wakes the waiting resizes, not the
+    /// worker (nothing it waits for changed, and a wake would repeat the pass at once).
+    pub(crate) fn release_own_lease(&self, st: &mut SendState, id: u64) {
+        if st.lease.is_some_and(|l| l.id == id) {
+            st.lease = None;
+            self.lease_free.notify_waiters();
+        }
+    }
+
+    /// Clears whatever holds the lease (the launch's exit, the shutdown).
+    pub(crate) fn clear_lease(&self, st: &mut SendState) {
+        if st.lease.take().is_some() {
+            self.lease_released();
+        }
+    }
+
+    /// A release by anything but the worker's own open wakes the worker and the waiting
+    /// resizes.
+    fn lease_released(&self) {
+        self.wake.notify_one();
+        self.lease_free.notify_waiters();
     }
 }
+
+/// Runs first in a unit's completion, with its record; must not block.
+pub(crate) type RecordHook = Box<dyn FnOnce(&WriteRecord) + Send>;
 
 /// The send side's shared parts: the launches, the decoders, and the driver's channel.
 pub(crate) struct SendSide {

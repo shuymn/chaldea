@@ -90,7 +90,7 @@ fn outcome_of<R>(r: Recorded<R>) -> Result<R, EffectOutcome> {
             tracing::error!(error = ?e, "a supervisor job refused");
             Err(EffectOutcome::Unrecorded)
         }
-        Recorded::Unrecorded => Err(EffectOutcome::Unrecorded),
+        Recorded::Unrecorded(_) => Err(EffectOutcome::Unrecorded),
         Recorded::ShuttingDown => Err(EffectOutcome::ShuttingDown),
     }
 }

@@ -105,7 +105,7 @@ impl Fence {
     /// `SeqCst`: with the publication's odd store before it and the caller's `SeqCst` advance
     /// before its own read of the publication, either this load sees the advance or that read
     /// sees the odd counter (`docs/design/pty-runtime.md` §2.3).
-    fn moved(&self) -> bool {
+    pub(crate) fn moved(&self) -> bool {
         self.word.load(Ordering::SeqCst) != self.expect
     }
 }

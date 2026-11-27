@@ -225,6 +225,7 @@ pub(crate) fn config(
         }),
         claude_settings: "/work/state/claude-settings.json".to_owned(),
         tail_poll: crate::transcript::TAIL_POLL,
+        attach: crate::attach::AttachConfig::default(),
     }
 }
 
@@ -242,7 +243,14 @@ impl Rig {
         host: HostOs,
         tune: impl FnOnce(&mut SupervisorConfig),
     ) -> Rig {
-        Rig::on_mounts(store, host, tune, |sup| mounts_with(sup, seams(sup))).await
+        Rig::on_mounts(
+            store,
+            host,
+            tune,
+            |_| {},
+            |sup| mounts_with(sup, seams(sup)),
+        )
+        .await
     }
 
     /// A rig whose `/hook` walks the test's process chains instead of the OS's; also
@@ -267,10 +275,24 @@ impl Rig {
         Arc<support::hook::Chains>,
         Arc<crate::hook::HookIngest>,
     ) {
+        Rig::with_chains_http(host, tune, hook, |_| {}).await
+    }
+
+    /// [`Rig::with_chains_on`] whose server configuration `http` tunes.
+    pub(crate) async fn with_chains_http(
+        host: HostOs,
+        tune: impl FnOnce(&mut SupervisorConfig),
+        hook: crate::hook::HookConfig,
+        http: impl FnOnce(&mut crate::http::HttpConfig),
+    ) -> (
+        Rig,
+        Arc<support::hook::Chains>,
+        Arc<crate::hook::HookIngest>,
+    ) {
         let chains = Arc::new(support::hook::Chains::default());
         let made = Arc::new(Mutex::new(None));
         let (c, m) = (chains.clone(), made.clone());
-        let rig = Rig::on_mounts(TestStore::new(), host, tune, move |sup| {
+        let rig = Rig::on_mounts(TestStore::new(), host, tune, http, move |sup| {
             let chained = crate::hook::HookSeams {
                 procs: c,
                 ..seams(sup)
@@ -288,6 +310,7 @@ impl Rig {
         store: TestStore,
         host: HostOs,
         tune: impl FnOnce(&mut SupervisorConfig),
+        http: impl FnOnce(&mut crate::http::HttpConfig),
         mounts: impl FnOnce(&Arc<Supervisor>) -> crate::http::Mounts,
     ) -> Rig {
         // Stopped: no deadline taken from it passes however slowly the host runs. A test
@@ -315,7 +338,7 @@ impl Rig {
             mounts(&sup),
             registry(&sup),
             (clock.clone(), sink.clone()),
-            |_| {},
+            http,
         )
         .await;
         let _ = sup.nudge.set(srv.server.revocation_nudge());

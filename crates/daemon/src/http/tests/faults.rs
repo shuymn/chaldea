@@ -55,6 +55,12 @@ pub(crate) struct Points {
     pub(crate) steps: Mutex<Vec<&'static str>>,
     /// Held once by a socket's next send before it writes.
     pub(crate) socket_send_gate: Mutex<Option<Gate>>,
+    /// Held once by a socket's next send after its frames were fed to the sink, before the
+    /// flush that hands them to the transport.
+    pub(crate) socket_flush_gate: Mutex<Option<Gate>>,
+    /// Held once by a socket's next close frame before it is sent (inside the close's
+    /// grace).
+    pub(crate) close_frame_gate: Mutex<Option<Gate>>,
     /// While set, sockets drop the store's commit notifications.
     pub(crate) drop_notifications: AtomicBool,
     /// Held once by a command runner between its registration and its first submit.
@@ -69,6 +75,8 @@ pub(crate) struct Points {
     pub(crate) completion_pauses: Mutex<Vec<(std::time::Instant, std::time::Instant)>>,
     /// Connections whose first byte was read (the request origin recorded).
     pub(crate) first_bytes: AtomicUsize,
+    /// Revocation nudges about to be published (before the watch's lock).
+    pub(crate) nudges_publishing: AtomicUsize,
     /// Taken by the next receipt completion attempt, which holds it inside its job on the
     /// writer thread.
     pub(crate) completion_hold: Mutex<Option<WriterHold>>,
@@ -299,7 +307,25 @@ impl Points {
     }
 
     pub(crate) async fn before_socket_send(&self) {
-        pass(&self.socket_send_gate).await;
+        pass_held(&self.socket_send_gate).await;
+    }
+
+    /// Arms the socket flush gate, as [`Points::arm_removal_gate`].
+    pub(crate) fn arm_socket_flush_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        arm(&self.socket_flush_gate)
+    }
+
+    pub(crate) async fn before_socket_flush(&self) {
+        pass_held(&self.socket_flush_gate).await;
+    }
+
+    /// Arms the close frame gate, as [`Points::arm_removal_gate`].
+    pub(crate) fn arm_close_frame_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        arm(&self.close_frame_gate)
+    }
+
+    pub(crate) async fn before_close_frame(&self) {
+        pass_held(&self.close_frame_gate).await;
     }
 
     /// Arms the runner gate, as [`Points::arm_removal_gate`].
@@ -346,6 +372,10 @@ impl Points {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    pub(crate) fn publishing(&self) {
+        self.nudges_publishing.fetch_add(1, Ordering::SeqCst);
     }
 
     pub(crate) fn first_byte_read(&self) {

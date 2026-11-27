@@ -189,6 +189,7 @@ pub(crate) fn mounts_with(sup: &Arc<Supervisor>, seams: HookSeams) -> Mounts {
         vec![
             adapters::mount(sup.host_os),
             screen::mount(Arc::downgrade(sup)),
+            crate::attach::mount(Arc::downgrade(sup), sup.cfg.attach.clone()),
         ],
     )
 }

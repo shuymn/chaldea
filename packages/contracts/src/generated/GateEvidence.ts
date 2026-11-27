@@ -10,6 +10,7 @@ export type GateEvidence = { readiness_seq: number | null, readiness_evidence: R
  */
 last_write_seq: number | null,
 /**
- * The last human write that closes the gate (`attach` or `key`).
+ * The last human write that closes the gate (`attach` or `key`); for `attach`, the
+ * first write of its interval (one event per interval, `docs/design/t1-attach.md` I-5).
  */
 last_human_write_seq: number | null, last_turn_start_seq: number | null, };

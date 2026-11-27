@@ -20,13 +20,13 @@ use tokio::sync::broadcast::error::RecvError;
 
 use super::super::events::{ThreadJob, derived, thread_row};
 use super::super::live::{LaunchObservation, LiveLaunch};
-use super::super::record::{JobOf, Recorded, record};
+use super::super::record::{Commit, JobOf, Recorded, record};
 use super::super::{Supervisor, read_bounded};
 use super::attribution::content_text;
 use super::completion::{apply_records, move_input};
 use super::{
-    ACK_WINDOW, DISPATCH_WAIT, Dispatch, Fired, GATE_TIMEOUT, READ_WAIT, RunningUnit, SAMPLE_WAIT,
-    SETTLE, SendLaunch, WRITE_STALL, fence_quiet, lock,
+    ACK_WINDOW, DISPATCH_WAIT, Dispatch, Fired, GATE_TIMEOUT, LeaseKind, READ_WAIT, RunningUnit,
+    SAMPLE_WAIT, SETTLE, SendLaunch, WRITE_STALL, fence_quiet, lock,
 };
 use crate::store::{CountedClass, CountedClasses, EventAnnex, InputRow, LaunchRow, ThreadRow};
 
@@ -92,6 +92,15 @@ pub(crate) async fn worker(sup: Arc<Supervisor>, sl: Arc<SendLaunch>) {
                 .remove(&sl.launch_id);
             return;
         }
+        #[cfg(test)]
+        {
+            let mut woken = std::pin::pin!(sl.wake.notified());
+            if !woken.as_mut().enable() {
+                sl.slept.fetch_add(1, Ordering::SeqCst);
+            }
+            woken.await;
+        }
+        #[cfg(not(test))]
         sl.wake.notified().await;
     }
 }
@@ -507,6 +516,7 @@ fn classes(c: CountedClasses) -> ClassSet {
 fn open_job(
     sl: &Arc<SendLaunch>,
     input: InputId,
+    lease: u64,
     modes: ModeView,
     last_started: [u64; 3],
 ) -> JobOf<Option<Opened>> {
@@ -590,10 +600,14 @@ fn open_job(
         let head = r.head(StreamId::Thread(thread), 0)?.head_seq;
         // The decision, after the last read, under the state a human unit's registration
         // takes: a unit registered before it keeps the input queued; one registered after it
-        // is ordered after the open (its writer refuses this unit if it starts first).
+        // is ordered after the open (its writer refuses this unit if it starts first). The
+        // lease must still be this open's.
         {
             let st = me.state();
-            if st.running.is_some() || st.human_unsettled > 0 {
+            if st.running.is_some()
+                || st.human_unsettled > 0
+                || st.lease.is_none_or(|l| l.id != lease)
+            {
                 return Ok(None);
             }
         }
@@ -625,14 +639,11 @@ fn open_job(
     })
 }
 
-/// The open and the submit of the launch's oldest queued input, when no unit runs.
+/// The open and the submit of the launch's oldest queued input, when no unit runs and the
+/// lease is free: the open takes the lease before its samples and its job, and keeps it
+/// into the submission, which converts it to the running unit. A known rollback or
+/// non-admission releases it; a job whose commit is unknown keeps it until the exit.
 async fn open(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>, entry: &LiveLaunch, view: &View) {
-    {
-        let st = sl.state();
-        if st.running.is_some() || st.human_unsettled > 0 {
-            return;
-        }
-    }
     if !fence_quiet(sl.fence.load(Ordering::Acquire)) {
         return;
     }
@@ -644,24 +655,47 @@ async fn open(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>, entry: &LiveLaunch, v
     else {
         return;
     };
+    let lease = {
+        let mut st = sl.state();
+        if st.human_unsettled > 0 {
+            return;
+        }
+        match sl.take_lease(&mut st, LeaseKind::Send(q)) {
+            Some(id) => id,
+            None => return,
+        }
+    };
+    let release = || sl.release_lease(&mut sl.state(), lease);
     let Ok((modes, last_started)) = entry
         .with_session(sup, sup.now() + SAMPLE_WAIT, |s| {
             (s.modes(), s.observer().last_started_each())
         })
         .await
     else {
+        release();
         return;
     };
-    let opened = match record(sup, open_job(sl, q, modes, last_started), false).await {
+    let opened = match record(sup, open_job(sl, q, lease, modes, last_started), false).await {
         Recorded::Done(Some(o)) => o,
-        Recorded::Done(None) => return,
-        Recorded::Refused(e) => {
-            tracing::error!(error = ?e, "an open job refused");
+        // Nothing opened (the job's checks refused): no wake for the worker itself, which
+        // would only repeat the same pass; what can change the checks wakes it.
+        Recorded::Done(None) => {
+            sl.release_own_lease(&mut sl.state(), lease);
             return;
         }
-        Recorded::Unrecorded | Recorded::ShuttingDown => return,
+        Recorded::Unrecorded(Commit::NotCommitted) | Recorded::ShuttingDown => {
+            release();
+            return;
+        }
+        Recorded::Refused(e) => {
+            tracing::error!(error = ?e, "an open job refused");
+            release();
+            return;
+        }
+        // The input may be `sending`: the lease stays held until the exit clears it.
+        Recorded::Unrecorded(Commit::Unknown) => return,
     };
-    submit(sup, sl, entry, q, opened).await;
+    submit(sup, sl, entry, q, lease, opened).await;
 }
 
 /// A refused submission: zero bytes are certain, so the input is cancelled through the
@@ -680,6 +714,7 @@ fn refuse(sl: &SendLaunch, input: InputId) {
             outcome: WriteOutcome::NotStarted(chaldea_pty_runtime::Refusal::Closed),
         },
         report: None,
+        decided: super::Decided::default(),
     });
     sl.wake.notify_one();
 }
@@ -691,16 +726,21 @@ async fn submit(
     sl: &Arc<SendLaunch>,
     entry: &LiveLaunch,
     input: InputId,
+    lease: u64,
     o: Opened,
 ) {
     #[cfg(test)]
     super::run_hook(&sl.hooks.before_submit);
-    let Ok(enc) = encode(sl.agent, sup.host_os, &o.text, Purpose::Send) else {
+    let refuse_released = || {
+        sl.release_lease(&mut sl.state(), lease);
         refuse(sl, input);
+    };
+    let Ok(enc) = encode(sl.agent, sup.host_os, &o.text, Purpose::Send) else {
+        refuse_released();
         return;
     };
     let Some(sub) = enc.submit else {
-        refuse(sl, input);
+        refuse_released();
         return;
     };
     let unit = WriteUnit {
@@ -733,6 +773,12 @@ async fn submit(
             let written = Arc::new(AtomicBool::new(false));
             {
                 let mut st = me.state();
+                // The lease becomes the running unit only while this open still holds it
+                // (an exit may have cleared it).
+                if st.lease.is_none_or(|l| l.id != lease) {
+                    return false;
+                }
+                st.lease = None;
                 st.dispatch = Some(Dispatch {
                     input_id: input,
                     before,
@@ -772,6 +818,6 @@ async fn submit(
         })
         .await;
     if !matches!(submitted, Ok(true)) {
-        refuse(sl, input);
+        refuse_released();
     }
 }

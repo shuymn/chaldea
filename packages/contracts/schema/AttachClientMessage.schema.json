@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Client to server on `GET /api/attach/{thread}`.",
+  "oneOf": [
+    {
+      "additionalProperties": false,
+      "description": "`cols` 2–512, `rows` 1–256.",
+      "properties": {
+        "cols": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rows": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "const": "resize",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "cols",
+        "rows"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "description": "Clipboard text; `paste_id` is the socket's own and never replayed.",
+      "properties": {
+        "paste_id": {
+          "description": "At most `MAX_PASTE_ID_BYTES` (128) UTF-8 bytes; a longer one is a malformed\nframe.",
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "type": {
+          "const": "paste",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "paste_id",
+        "text"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "AttachClientMessage"
+}

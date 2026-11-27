@@ -7,13 +7,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use chaldea_core::event::TypedEvent;
 use chaldea_core::ids::{IdempotencyKey, InputId, LaunchId, StreamId, ThreadId};
 use chaldea_core::input::{InputInput, InputState};
-use chaldea_core::payload::{HumanWrite, SourceKind};
+use chaldea_core::payload::{HumanWrite, HumanWriteOrigin, SourceKind};
 use chaldea_pty_runtime::{WriteOrigin, WriteOutcome, WriteRecord};
 
 use super::super::Supervisor;
 use super::super::events::{ThreadJob, thread_row};
 use super::super::record::{JobOf, Recorded, record};
-use super::{Fired, KeyReport, SendLaunch};
+use super::{Decided, Fired, KeyReport, SendLaunch};
 use crate::store::{CommitStamp, JobError, WriteTx};
 
 /// `derived:human_write:<launch_id>:<seq>`: a retried job finds its event.
@@ -87,8 +87,34 @@ fn completion_job(
     })
 }
 
+/// `derived:human_write:attach:<launch_id>:<start>`: the one attach `human_write` of the
+/// interval that starts at seq `start` (send §2.6 "Human units").
+fn attach_key(l: LaunchId, start: u64) -> IdempotencyKey {
+    IdempotencyKey(format!("derived:human_write:attach:{l}:{start}"))
+}
+
+/// Where the launch's current attach interval starts: its latest readiness evidence, turn
+/// start, or input attempt (a zero-byte one included), whichever is last. Key and card-key
+/// writes neither open nor satisfy it.
+fn attach_interval(tx: &WriteTx<'_>, launch: LaunchId) -> Result<u64, JobError> {
+    let r = tx.read();
+    let Some(l) = r.launch(launch)? else {
+        return Ok(0);
+    };
+    let attempt = r.last_attempt_seq(launch)?;
+    Ok([l.readiness.map(|m| m.seq), l.last_turn_start_seq, attempt]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(0))
+}
+
 /// Appends `rec`'s `human_write` once: for `Written` or `Incomplete`, nothing for
-/// `NotStarted`.
+/// `NotStarted`. A key or card-key record has its own event (keyed by its seq); an attach
+/// record appends one only as the first of its interval. The attach decision, append or
+/// skip, is made once per record: the first committed job that decides it sets `decided`,
+/// and every later job for the record (the worker's or the exit job's) applies it rather
+/// than deciding again in a later interval.
 ///
 /// # Errors
 ///
@@ -98,6 +124,7 @@ pub(crate) fn human_write_in(
     thread: ThreadId,
     launch: LaunchId,
     rec: &WriteRecord,
+    decided: &Decided,
 ) -> Result<(), JobError> {
     let Some(origin) = rec.origin.human_write() else {
         return Ok(());
@@ -105,11 +132,35 @@ pub(crate) fn human_write_in(
     if matches!(rec.outcome, WriteOutcome::NotStarted(_)) {
         return Ok(());
     }
-    let key = human_key(launch, rec.seq);
-    if tx
-        .read()
-        .event_by_key(StreamId::Thread(thread), &key)?
-        .is_some()
+    // The key, and whether this attempt already found no event with it.
+    let (key, absent) = if origin == HumanWriteOrigin::Attach {
+        match decided.get().cloned() {
+            Some(None) => return Ok(()),
+            Some(Some(key)) => (key, false),
+            None => {
+                let key = attach_key(launch, attach_interval(tx, launch)?);
+                let append = tx
+                    .read()
+                    .event_by_key(StreamId::Thread(thread), &key)?
+                    .is_none();
+                let (d, v) = (decided.clone(), append.then(|| key.clone()));
+                tx.after_commit(move || {
+                    let _ = d.set(v);
+                });
+                if !append {
+                    return Ok(());
+                }
+                (key, true)
+            }
+        }
+    } else {
+        (human_key(launch, rec.seq), false)
+    };
+    if !absent
+        && tx
+            .read()
+            .event_by_key(StreamId::Thread(thread), &key)?
+            .is_some()
     {
         return Ok(());
     }
@@ -135,7 +186,7 @@ pub(crate) fn human_write_in(
 /// The report a key's effect gets for its unit's record.
 pub(crate) fn report_of(rec: &WriteRecord) -> KeyReport {
     match &rec.outcome {
-        WriteOutcome::NotStarted(_) => KeyReport::NotStarted,
+        WriteOutcome::NotStarted(r) => KeyReport::NotStarted(r.clone()),
         WriteOutcome::Written => KeyReport::Recorded {
             complete: true,
             bytes: rec.bytes_written,
@@ -200,7 +251,7 @@ pub(crate) async fn apply_records(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>) {
                     sl.set_running(&mut st, None);
                 }
             }
-            Recorded::Unrecorded | Recorded::ShuttingDown => kept.push(f),
+            Recorded::Unrecorded(_) | Recorded::ShuttingDown => kept.push(f),
         }
     }
     if !kept.is_empty() {
@@ -214,10 +265,10 @@ pub(crate) async fn apply_records(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>) {
 /// Records `held` in `seq` order until one job is not recorded.
 async fn record_humans(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>) {
     loop {
-        let rec = {
+        let (rec, decided) = {
             let st = sl.state();
             match st.held.first() {
-                Some(f) => f.record.clone(),
+                Some(f) => (f.record.clone(), f.decided.clone()),
                 None => return,
             }
         };
@@ -225,14 +276,18 @@ async fn record_humans(sup: &Arc<Supervisor>, sl: &Arc<SendLaunch>) {
         super::run_hook(&sl.hooks.record_job);
         let (thread, launch) = (sl.thread_id, sl.launch_id);
         let r = rec.clone();
-        let job: JobOf<()> = Arc::new(move |tx| human_write_in(tx, thread, launch, &r));
+        let job: JobOf<()> = Arc::new(move |tx| human_write_in(tx, thread, launch, &r, &decided));
         match record(sup, job, false).await {
-            Recorded::Done(()) => settle_human(sl, rec.seq, report_of(&rec)),
+            Recorded::Done(()) => {
+                #[cfg(test)]
+                super::run_hook(&sl.hooks.after_human_record);
+                settle_human(sl, rec.seq, report_of(&rec));
+            }
             Recorded::Refused(e) => {
                 tracing::error!(error = ?e, "a human_write job refused");
                 return;
             }
-            Recorded::Unrecorded | Recorded::ShuttingDown => return,
+            Recorded::Unrecorded(_) | Recorded::ShuttingDown => return,
         }
     }
 }
@@ -249,5 +304,8 @@ pub(crate) fn settle_human(sl: &SendLaunch, seq: u64, report: KeyReport) {
     drop(st);
     if let Some(tx) = f.report {
         let _ = tx.send(report);
+        #[cfg(test)]
+        sl.reports_sent
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }

@@ -493,7 +493,7 @@ async fn close_op(sup: Arc<Supervisor>, req: CloseReq) -> EffectOutcome {
             tracing::error!(error = ?e, "the closing job refused");
             EffectOutcome::Unrecorded
         }
-        Recorded::Unrecorded => EffectOutcome::Unrecorded,
+        Recorded::Unrecorded(_) => EffectOutcome::Unrecorded,
         Recorded::ShuttingDown => EffectOutcome::ShuttingDown,
     }
 }

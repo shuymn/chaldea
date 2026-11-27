@@ -21,7 +21,7 @@ pub(crate) mod commands;
 mod components;
 mod events;
 mod exit;
-mod live;
+pub(crate) mod live;
 mod ops;
 pub(crate) mod prober;
 pub(crate) mod record;
@@ -96,6 +96,8 @@ pub(crate) const SLOT_WAIT: Duration = Duration::from_secs(30);
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Pause {
+    /// A recorded job's backoff after a retryable failure, before its wait.
+    RecordBackoff,
     /// After the reservation committed, before the token and `Session::spawn`.
     AfterReserve,
     /// After taking the tracker token, before `Session::spawn` (on the op).
@@ -273,6 +275,8 @@ pub struct SupervisorConfig {
     pub(crate) claude_settings: String,
     /// The transcript tailer's poll period (C1 D10; tests shorten it).
     pub(crate) tail_poll: Duration,
+    /// The attach socket's bounds (`docs/design/t1-attach.md` §2 "Limits").
+    pub(crate) attach: crate::attach::AttachConfig,
 }
 
 impl Default for SupervisorConfig {
@@ -299,6 +303,7 @@ impl Default for SupervisorConfig {
             kill_recorded: Arc::new(chaldea_pty_runtime::orphan::kill_recorded),
             claude_settings: chaldea_core::launch::CLAUDE_SETTINGS_FILE.to_owned(),
             tail_poll: crate::transcript::TAIL_POLL,
+            attach: crate::attach::AttachConfig::default(),
         }
     }
 }
