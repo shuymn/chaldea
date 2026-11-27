@@ -43,6 +43,8 @@ export class Runner {
   /** Counts suspensions (and stop): a resume acts only for the suspension it started in. */
   private suspension = 0;
   private resuming: Promise<void> | null = null;
+  /** The suspension whose resume failed to read the store, still waiting to resume. */
+  private failedResume: number | null = null;
   /** Aborted by `stop`: boot and pairing run under it, so a late exchange is not applied. */
   private readonly lifetime = new AbortController();
   /** Generations refused with 401 whose delete failed: never used again by this page. */
@@ -69,17 +71,24 @@ export class Runner {
    */
   async start(boot: (signal: AbortSignal) => Promise<unknown> = async () => {}): Promise<void> {
     this.unlisten = this.deps.store.listen(() => {
-      void this.reread("keep");
+      void this.reread("keep").then((ok) => {
+        // A notice the store answers completes a restore whose read failed, for the
+        // same suspension only.
+        if (ok && this.failedResume === this.suspension) void this.resume();
+      });
     });
     await boot(this.lifetime.signal).catch(() => null);
     if (this.stopped) return;
     await this.reread("report");
   }
 
-  /** Reads the store again after it failed; a suspended page then resumes. */
+  /**
+   * Reads the store again after it failed. On a suspended page this is the versioned
+   * `resume`, so a Retry cannot resume a later suspension.
+   */
   async retryStorage(): Promise<void> {
-    const ok = await this.reread("report");
-    if (ok && this.state.suspended) await this.resume();
+    if (this.state.suspended) return this.resume();
+    await this.reread("report");
   }
 
   /**
@@ -107,7 +116,12 @@ export class Runner {
     const resuming = (async () => {
       const ok = await this.reread("report");
       // A suspend or stop since then invalidates this resume.
-      if (this.stopped || version !== this.suspension || !ok) return;
+      if (this.stopped || version !== this.suspension) return;
+      if (!ok) {
+        this.failedResume = version;
+        return;
+      }
+      this.failedResume = null;
       this.dispatch({ type: "resume" });
     })().finally(() => {
       if (this.resuming === resuming) this.resuming = null;

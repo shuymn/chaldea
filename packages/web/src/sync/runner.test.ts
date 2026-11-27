@@ -428,6 +428,73 @@ describe("runner", () => {
     r.stop();
   });
 
+  test("a Retry held across a second hide does not resume that later suspension", async () => {
+    const store = fakeStore(A);
+    const { r, calls } = runner(store);
+    await r.start();
+    await vi.advanceTimersByTimeAsync(0);
+    r.suspend();
+    const read = store.read;
+    store.read = async () => {
+      throw new Error("storage unavailable");
+    };
+    await r.resume();
+    expect(r.getState().storageFailed).toBe(true);
+    let finish: (c: Credential) => void = () => {};
+    let reads = 0;
+    store.read = () => {
+      reads += 1;
+      return new Promise<Credential>((resolve) => {
+        finish = resolve;
+      });
+    };
+    const mark = calls.length;
+    const pending = r.retryStorage();
+    await vi.advanceTimersByTimeAsync(0);
+    r.suspend();
+    finish(A);
+    await pending;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reads).toBe(1);
+    expect(calls.slice(mark)).toEqual([]);
+    expect(r.getState().suspended).toBe(true);
+    store.read = read;
+    r.stop();
+  });
+
+  test("a failed resume read, then a notice the store answers, completes the restore", async () => {
+    const store = fakeStore(A);
+    const { r, calls } = runner(store);
+    await r.start();
+    await vi.advanceTimersByTimeAsync(0);
+    r.suspend();
+    const read = store.read;
+    store.read = async () => {
+      throw new Error("storage unavailable");
+    };
+    await r.resume();
+    expect(r.getState().suspended).toBe(true);
+    const mark = calls.length;
+    store.read = read;
+    store.stored = B;
+    store.notify();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(r.getState().generation).toBe("b");
+    expect(r.getState().suspended).toBe(false);
+    expect(r.getState().storageFailed).toBe(false);
+    const resumed = calls.slice(mark);
+    expect(resumed.some((c) => c.path === "/api/ws-ticket")).toBe(true);
+    expect(resumed.every((c) => auth(c) === "Bearer tok-b")).toBe(true);
+    // A notice for a page that is simply in the cache does not resume it.
+    r.suspend();
+    const mark2 = calls.length;
+    store.notify();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(r.getState().suspended).toBe(true);
+    expect(calls.slice(mark2)).toEqual([]);
+    r.stop();
+  });
+
   test("a 401 whose delete fails retires that generation; a newer one is still adopted", async () => {
     const store = fakeStore(A);
     let clears = 0;
