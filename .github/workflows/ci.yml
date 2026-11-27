@@ -301,7 +301,7 @@ jobs:
         working-directory: packages/web
         run: mise exec -- pnpm run e2e
 
-      # The smoke's own failure paths: its tag reader, a binary that cannot start, a daemon
+      # The smoke's own failure paths: its asset list, a binary that cannot start, a daemon
       # that ignores `daemon stop`.
       - name: Test the release smoke
         if: needs.changes.outputs.release == 'true'

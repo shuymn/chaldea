@@ -3,8 +3,9 @@
 // CI on macOS and Windows after `mise run release`:
 //
 // 1. The release binary's `daemon run` (a new state dir, a free port) answers `GET /` with
-//    200, the CSP, and the bytes of dist/index.html, and every script and stylesheet the page
-//    names with 200, its type, and the bytes of its dist file. `daemon stop` ends it.
+//    200, the CSP, and the bytes of dist/index.html, and every file under dist/assets/ at
+//    `/assets/<path>` with 200, its type, and its bytes. `daemon stop` ends it. Whether the
+//    page names the right files is Playwright's to check: it loads the app.
 // 2. The same binary rebuilt without CHALDEA_WEB_DIST, in the same Cargo target dir, answers
 //    `/` and one of those assets with 501: no stale table survives the rebuild.
 //
@@ -14,7 +15,7 @@
 //   node scripts/release-smoke.mjs
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -33,9 +34,13 @@ export const WAITS = {
   build: 30 * 60_000,
 };
 
+// The daemon's allowlist under assets/ (crates/daemon/src/http/pwa/dist.rs).
 const TYPES = {
   js: "text/javascript; charset=utf-8",
   css: "text/css; charset=utf-8",
+  woff2: "font/woff2",
+  png: "image/png",
+  wasm: "application/wasm",
 };
 
 function fail(message) {
@@ -82,6 +87,9 @@ async function within(p, ms) {
 }
 
 /** Kills `p` if it still runs and waits for it within `WAITS.reap`; throws past that. */
+// A failed kill of this script's own child (EPERM, ESRCH) is not a state the smoke can reach
+// in practice; it is reported and the process still counts as running. Cleanup then goes
+// on, bounded by the CI job's timeout.
 export async function reap(p, waits = WAITS) {
   if (!p.running()) return;
   if (!p.child.kill("SIGKILL")) fail(`process ${p.child.pid} could not be signalled; it may still run`);
@@ -174,46 +182,31 @@ async function get(port, path) {
   return { status: r.status, headers: r.headers, body: Buffer.from(await r.arrayBuffer()) };
 }
 
-// The one tag form `named` reads: lowercase `<script` or `<link`, then attributes that are
-// bare names or double-quoted values, then `>`. Every other `<script`/`<link` spelling fails
-// the smoke rather than being skipped.
-const TAG = /^<(script|link)((?:\s+[a-z-]+(?:="[^"<>]*")?)*)\s*\/?>$/;
-const ATTR = /\s+([a-z-]+)(?:="([^"<>]*)")?/g;
-
 /**
- * The `src` of every `<script>` and the `href` of every `<link rel="stylesheet">` in `html`.
- * Comments are skipped. Fails on a tag it cannot read, an inline script, any other `<link>`,
- * an unterminated comment, or a page that names no script or no stylesheet.
+ * Every file under `<distDir>/assets/` as `{ path, file, type }`, sorted by path, with
+ * source maps skipped as the daemon's build skips them. Fails on a type outside the
+ * allowlist, on anything that is neither a file nor a directory (symlinks included, never
+ * followed), and on an empty directory.
  */
-export function named(html) {
-  const scripts = [];
-  const styles = [];
-  // Commented-out tags name nothing; an unterminated comment is a page the smoke cannot read.
-  const live = html.replace(/<!--[\s\S]*?-->/g, "");
-  if (live.includes("<!--")) fail("index.html has an unterminated comment");
-  for (const m of live.matchAll(/<\s*\/?\s*(script|link)\b[^>]*>?/gi)) {
-    const text = m[0];
-    if (text === "</script>") continue;
-    const t = TAG.exec(text);
-    if (!t) fail(`index.html has a tag the smoke cannot read: ${text}`);
-    const attrs = new Map();
-    for (const a of t[2].matchAll(ATTR)) {
-      if (attrs.has(a[1])) fail(`index.html repeats ${a[1]} in ${text}`);
-      attrs.set(a[1], a[2] ?? "");
-    }
-    if (t[1] === "script") {
-      if (!attrs.get("src")) fail(`index.html has a script without src: ${text}`);
-      scripts.push(attrs.get("src"));
-    } else {
-      if (attrs.get("rel") !== "stylesheet" || !attrs.get("href")) {
-        fail(`index.html has a link other than a stylesheet: ${text}`);
+export function distAssets(distDir) {
+  const out = [];
+  const walk = (dir, rel) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const parts = [...rel, e.name];
+      const file = join(dir, e.name);
+      if (e.isDirectory()) walk(file, parts);
+      else if (!e.isFile()) fail(`assets/${parts.join("/")} is neither a file nor a directory`);
+      else if (!e.name.endsWith(".map")) {
+        const ext = e.name.includes(".") ? e.name.slice(e.name.lastIndexOf(".") + 1) : "";
+        const type = TYPES[ext];
+        if (!type) fail(`assets/${parts.join("/")} has a type the daemon does not serve`);
+        out.push({ path: `/assets/${parts.join("/")}`, file, type });
       }
-      styles.push(attrs.get("href"));
     }
-  }
-  if (scripts.length === 0) fail("index.html names no script");
-  if (styles.length === 0) fail("index.html names no stylesheet");
-  return [...scripts, ...styles];
+  };
+  walk(join(distDir, "assets"), []);
+  if (out.length === 0) fail("dist/assets/ holds no file");
+  return out.sort((x, y) => (x.path < y.path ? -1 : 1));
 }
 
 function expect(what, actual, wanted) {
@@ -233,34 +226,29 @@ async function build(env) {
 export async function main(exe = EXE) {
   const scratch = mkdtempSync(join(tmpdir(), "chaldea-smoke-"));
   try {
-    let paths = [];
+    const assets = distAssets(dist);
     await withDaemon(exe, join(scratch, "state-pwa"), async (port) => {
       const index = readFileSync(join(dist, "index.html"));
-      paths = named(index.toString("utf8"));
       const page = await get(port, "/");
       expect("GET / status", page.status, 200);
       expect("GET / Content-Type", page.headers.get("content-type"), "text/html; charset=utf-8");
       expect("GET / Content-Security-Policy", page.headers.get("content-security-policy"), csp(port));
       if (!page.body.equals(index)) fail("GET / is not dist/index.html");
-      for (const p of paths) {
-        if (!p.startsWith("/assets/")) fail(`${p} is not under /assets/`);
-        const ext = p.slice(p.lastIndexOf(".") + 1);
-        const r = await get(port, p);
-        expect(`GET ${p} status`, r.status, 200);
-        expect(`GET ${p} Content-Type`, r.headers.get("content-type"), TYPES[ext] ?? `(no type for .${ext})`);
-        if (!r.body.equals(readFileSync(join(dist, ...p.slice(1).split("/"))))) {
-          fail(`GET ${p} is not its dist file`);
-        }
-        console.log(`ok ${p} ${r.headers.get("content-type")} ${r.body.length} bytes`);
+      for (const a of assets) {
+        const r = await get(port, a.path);
+        expect(`GET ${a.path} status`, r.status, 200);
+        expect(`GET ${a.path} Content-Type`, r.headers.get("content-type"), a.type);
+        if (!r.body.equals(readFileSync(a.file))) fail(`GET ${a.path} is not its dist file`);
+        console.log(`ok ${a.path} ${a.type} ${r.body.length} bytes`);
       }
-      console.log(`ok / with the CSP; ${paths.length} assets`);
+      console.log(`ok / with the CSP; ${assets.length} assets`);
     });
 
     const env = { ...process.env };
     delete env.CHALDEA_WEB_DIST;
     await build(env);
     await withDaemon(exe, join(scratch, "state-rust-only"), async (port) => {
-      for (const p of ["/", paths[0]]) {
+      for (const p of ["/", assets[0].path]) {
         const r = await get(port, p);
         expect(`GET ${p} status without the PWA`, r.status, 501);
         console.log(`ok ${p} 501 without the PWA`);

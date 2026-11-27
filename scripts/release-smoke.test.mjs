@@ -1,39 +1,69 @@
-// The release smoke's failure paths (`node --test scripts/release-smoke.test.mjs`): the tag
-// reader fails closed, a binary that cannot start fails the smoke and leaves nothing behind,
-// and a daemon that ignores `daemon stop` is killed within the bounds.
+// The release smoke's parts (`node --test scripts/release-smoke.test.mjs`): the asset list
+// comes from dist/assets/ and fails closed, a binary that cannot start fails the smoke and
+// leaves nothing behind, and a daemon that ignores `daemon stop` is killed within the bounds.
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { named, reap, start, withDaemon } from "./release-smoke.mjs";
+import { distAssets, reap, start, withDaemon } from "./release-smoke.mjs";
 
 const SCRIPT = fileURLToPath(new URL("./release-smoke.mjs", import.meta.url));
 
-test("named reads Vite's tags", () => {
-  const html =
-    '<script type="module" crossorigin src="/assets/a.js"></script>\n' +
-    '<link rel="stylesheet" crossorigin href="/assets/a.css">';
-  assert.deepEqual(named(html), ["/assets/a.js", "/assets/a.css"]);
+test("distAssets lists every served file under assets/, skipping maps", () => {
+  const d = mkdtempSync(join(tmpdir(), "smoke-test-"));
+  try {
+    mkdirSync(join(d, "assets", "sub"), { recursive: true });
+    for (const f of ["index-a.js", "index-a.js.map", "index-b.css", "sub/f.woff2", "sub/i.png", "t.wasm"]) {
+      writeFileSync(join(d, "assets", f), f);
+    }
+    assert.deepEqual(
+      distAssets(d).map((a) => [a.path, a.type]),
+      [
+        ["/assets/index-a.js", "text/javascript; charset=utf-8"],
+        ["/assets/index-b.css", "text/css; charset=utf-8"],
+        ["/assets/sub/f.woff2", "font/woff2"],
+        ["/assets/sub/i.png", "image/png"],
+        ["/assets/t.wasm", "application/wasm"],
+      ],
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
 });
 
-for (const [name, html] of [
-  ["a single-quoted src", `<script src="/assets/a.js"></script><script src='/assets/b.js'></script><link rel="stylesheet" href="/assets/a.css">`],
-  ["a single-quoted rel", `<script src="/assets/a.js"></script><link rel="stylesheet" href="/assets/a.css"><link rel='stylesheet' href="/assets/b.css">`],
-  ["an unquoted value", `<script src=/assets/a.js></script><link rel="stylesheet" href="/assets/a.css">`],
-  ["an uppercase tag", `<SCRIPT src="/assets/a.js"></SCRIPT><link rel="stylesheet" href="/assets/a.css">`],
-  ["an inline script", `<script>1</script><script src="/assets/a.js"></script><link rel="stylesheet" href="/assets/a.css">`],
-  ["another link", `<script src="/assets/a.js"></script><link rel="modulepreload" href="/assets/b.js"><link rel="stylesheet" href="/assets/a.css">`],
-  ["no stylesheet", `<script src="/assets/a.js"></script>`],
+for (const [name, files] of [
+  ["a type the daemon does not serve", ["a.js", "b.svg"]],
+  ["no extension", ["a.js", "README"]],
+  ["an empty directory", []],
 ]) {
-  test(`named fails on ${name}`, () => {
-    assert.throws(() => named(html));
+  test(`distAssets fails on ${name}`, () => {
+    const d = mkdtempSync(join(tmpdir(), "smoke-test-"));
+    try {
+      mkdirSync(join(d, "assets"));
+      for (const f of files) writeFileSync(join(d, "assets", f), f);
+      assert.throws(() => distAssets(d));
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
   });
 }
+
+test("distAssets fails on a symlink and does not follow it", { skip: process.platform === "win32" }, () => {
+  const d = mkdtempSync(join(tmpdir(), "smoke-test-"));
+  try {
+    mkdirSync(join(d, "assets"));
+    writeFileSync(join(d, "assets", "a.js"), "a");
+    symlinkSync(join(d, "assets", "a.js"), join(d, "assets", "b.js"));
+    assert.throws(() => distAssets(d), /neither a file nor a directory/);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+});
 
 const fast = { start: 5_000, stop: 300, reap: 5_000, request: 5_000, build: 5_000 };
 
@@ -120,19 +150,4 @@ test("a failed kill is not taken for an exit", async () => {
     await reap(p, fast);
   }
   assert.equal(p.running(), false);
-});
-
-test("named ignores HTML comments", () => {
-  assert.throws(
-    () => named('<!-- <script src="/assets/a.js"></script><link rel="stylesheet" href="/assets/a.css"> -->'),
-    /names no script/,
-  );
-  assert.deepEqual(
-    named(
-      '<!-- <script src="/assets/old.js"></script> --><script src="/assets/a.js"></script>' +
-        '<link rel="stylesheet" href="/assets/a.css"><!-- <link rel="stylesheet" href="/assets/old.css"> -->',
-    ),
-    ["/assets/a.js", "/assets/a.css"],
-  );
-  assert.throws(() => named('<script src="/assets/a.js"></script><link rel="stylesheet" href="/assets/a.css"><!-- open'));
 });

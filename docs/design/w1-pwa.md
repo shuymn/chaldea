@@ -14,7 +14,7 @@
 - **`/` headers**: `Content-Security-Policy: default-src 'self'; connect-src 'self' ws://<host>; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; require-trusted-types-for 'script'; trusted-types 'none'` (`<host>`: validated `Host`, lowercased; mvp:228); `X-Frame-Options: DENY`; `Referrer-Policy: no-referrer`; `Cross-Origin-Opener-Policy: same-origin`.
 - **Caching** (http:625): errors and `/` `no-store`; hashed assets `max-age=31536000, immutable`.
 - **Embedding**: the daemon's std-only `build.rs` regenerates the asset table from `CHALDEA_WEB_DIST` (absolute or workspace-relative), tracking it and every file; an invalid value fails the build. `Mounts::mvp()` keeps both routes `Mount::unimplemented` (501, http:219); production swaps in `Mount::read` over a non-empty table passed to the handler.
-- **Release**: owner binaries on both hosts come from one documented command (Vite build, then `cargo build --release` with the variable); on PRs touching the web, `build.rs`, or the command, each packaged binary is smoked for `/` and the scripts and styles it names. Interactive `chaldea open` first checks `GET /` (no Bearer): 501 reports the missing PWA and exits 1 before minting; other failures keep their path; `--print-url` skips it.
+- **Release**: owner binaries on both hosts come from one documented command (Vite build, then `cargo build --release` with the variable); on every change beyond docs, each packaged binary is smoked for `/` and every file of `dist/assets/`, and its rebuild without the variable for 501. Interactive `chaldea open` first checks `GET /` (no Bearer): 501 reports the missing PWA and exits 1 before minting; other failures keep their path; `--print-url` skips it.
 
 ### 2.2 Pairing and Credential
 
