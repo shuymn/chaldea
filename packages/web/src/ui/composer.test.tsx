@@ -39,6 +39,7 @@ describe("composer.keys", () => {
     ["49 ms after compositionend", { lastCompositionEnd: 951 }, "ime"],
     ["50 ms after compositionend", { lastCompositionEnd: 950 }, "submit"],
     ["inverted timestamp (keydown 10 ms before compositionend)", { lastCompositionEnd: 1010 }, "ime"],
+    ["the window is absolute: 50 ms before compositionend", { lastCompositionEnd: 1050 }, "submit"],
     ["no compositionend with a small timeStamp", { timeStamp: 5, lastCompositionEnd: null }, "submit"],
     ["each guard blocks Ctrl+Enter too", { ctrlOrMeta: true, isComposing: true }, "ime"],
     ["229 blocks Cmd+Enter", { ctrlOrMeta: true, keyCode: 229 }, "ime"],

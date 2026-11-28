@@ -220,7 +220,7 @@ test("catch_up_after_hello", async ({ daemon, page }) => {
 /** Dispatches a synthesized composition and its confirming Enter, in `order`. */
 async function syntheticComposition(page: Page, text: string, how: "inside" | "webkit229" | "window") {
   await composer(page).evaluate(
-    (el, { text, how }) => {
+    async (el, { text, how }) => {
       const ta = el as HTMLTextAreaElement;
       const key = (keyCode: number, isComposing: boolean) => {
         const e = new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true, isComposing });
@@ -240,7 +240,13 @@ async function syntheticComposition(page: Page, text: string, how: "inside" | "w
       } else {
         // WebKit's order: compositionend before the confirming keydown.
         ta.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: text }));
-        notPrevented = how === "webkit229" ? key(229, false) : key(13, false);
+        if (how === "webkit229") {
+          // Past the 50 ms window, so keyCode 229 alone holds the Enter back.
+          await new Promise((ok) => setTimeout(ok, 80));
+          notPrevented = key(229, false);
+        } else {
+          notPrevented = key(13, false);
+        }
       }
       (window as unknown as { __notPrevented: boolean }).__notPrevented = notPrevented;
     },
