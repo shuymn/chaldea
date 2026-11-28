@@ -1,7 +1,8 @@
 //! The `unsafe` carve-out (`docs/design/pty-unix.md` §2.7, `docs/design/pty-windows.md`
 //! §2.7): exactly two `#[allow(unsafe_code)]`, on `unix::sys` and `windows::sys`, and a
 //! crate lints table that restates the workspace's clippy set with only the listed
-//! additions. Every other crate keeps the workspace table (`forbid`).
+//! additions. Every other crate keeps the workspace table (`forbid`). Every injected fault
+//! panic in the workspace skips the panic hook (`fake::inject_panic`), but the listed ones.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -48,9 +49,20 @@ fn table(manifest: &Path, section: &str) -> BTreeMap<String, String> {
 /// `text` with comments and the contents of string and char literals blanked, so only
 /// code remains; lengths and line breaks are kept.
 fn code_only(text: &str) -> String {
+    scrub(text, false)
+}
+
+/// `text` with comments and char literals blanked; string literals are kept, but a quote
+/// inside a raw one is blanked, so every kept literal is one `"…"` with `\` escapes.
+fn without_comments(text: &str) -> String {
+    scrub(text, true)
+}
+
+fn scrub(text: &str, keep_strings: bool) -> String {
     let b: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
+    let lit = |c: char| if keep_strings { c } else { blank(c) };
     let mut i = 0;
     while i < b.len() {
         let c = b[i];
@@ -98,7 +110,7 @@ fn code_only(text: &str) -> String {
                     j += 1 + hashes;
                     break;
                 }
-                out.push(blank(b[j]));
+                out.push(if b[j] == '"' { ' ' } else { lit(b[j]) });
                 j += 1;
             }
             out.push('"');
@@ -108,11 +120,11 @@ fn code_only(text: &str) -> String {
             i += 1;
             while i < b.len() && b[i] != '"' {
                 if b[i] == '\\' {
-                    out.push(' ');
+                    out.push(lit('\\'));
                     i += 1;
                 }
                 if i < b.len() {
-                    out.push(blank(b[i]));
+                    out.push(lit(b[i]));
                     i += 1;
                 }
             }
@@ -359,4 +371,180 @@ fn other_crates_keep_the_workspace_table() {
             manifest.display()
         );
     }
+}
+
+/// The calls that raise a panic through the hook.
+const RAISERS: [&str; 3] = ["panic!(", "assert!(", "panic_any("];
+
+/// Every fault panic in `text` raised through the hook, as `(call, message)`: a
+/// `panic_any` call (its only use is a fault's payload), or a `panic!`/`assert!` with a
+/// message that names an injected fault (`injected …` or `an injected …`, the workspace's
+/// convention for fault messages; an assertion's own failure message never says so).
+fn hooked_faults(text: &str) -> Vec<(&'static str, String)> {
+    let b: Vec<char> = without_comments(text).chars().collect();
+    let at = |i: usize, s: &str| s.chars().enumerate().all(|(k, c)| b.get(i + k) == Some(&c));
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '"' {
+            i = literal(&b, i).1;
+            continue;
+        }
+        let raiser = RAISERS
+            .into_iter()
+            .find(|r| at(i, r) && !ident(i.checked_sub(1).and_then(|k| b.get(k))));
+        let Some(raiser) = raiser else {
+            i += 1;
+            continue;
+        };
+        // The string literals among the call's own arguments (not inside a nested call,
+        // as in `assert!(why.contains("injected"))`).
+        let mut j = i + raiser.len();
+        let mut depth = 1;
+        let mut msgs = Vec::new();
+        while j < b.len() && depth > 0 {
+            match b[j] {
+                '"' => {
+                    let (s, end) = literal(&b, j);
+                    if depth == 1 {
+                        msgs.push(s);
+                    }
+                    j = end;
+                    continue;
+                }
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            j += 1;
+        }
+        let fault = msgs
+            .iter()
+            .find(|m| m.starts_with("injected") || m.starts_with("an injected"));
+        if raiser == "panic_any(" {
+            out.push((raiser, msgs.first().cloned().unwrap_or_default()));
+        } else if let Some(m) = fault {
+            out.push((raiser, m.clone()));
+        }
+        i += raiser.len();
+    }
+    out
+}
+
+/// The content of the string literal whose opening quote is at `i`, and the index after
+/// its closing quote.
+fn literal(b: &[char], i: usize) -> (String, usize) {
+    let mut s = String::new();
+    let mut j = i + 1;
+    while j < b.len() && b[j] != '"' {
+        if b[j] == '\\' {
+            j += 1;
+        }
+        if let Some(c) = b.get(j) {
+            s.push(*c);
+        }
+        j += 1;
+    }
+    (s, j + 1)
+}
+
+/// Fault panics that keep the hook, because the hook's work is the behaviour under test.
+const HOOKED: [(&str, &str); 4] = [
+    // The daemon's own hook requests the stop and logs `panic in …`; the panic-path
+    // tests of the lifecycle read both.
+    (
+        "crates/daemon/src/lifecycle/shutdown.rs",
+        "injected panic before the runtime",
+    ),
+    // A daemon child's decoder panics; the e2e test reads the hook's `panic in` line.
+    (
+        "crates/cli/tests/support/faults.rs",
+        "injected parser panic",
+    ),
+    (
+        "crates/cli/tests/support/faults.rs",
+        "injected panic after the parser",
+    ),
+    // The emitter's watchdog hook turns the panic into its exit 0.
+    (
+        "crates/cli/src/hook_emit/mod.rs",
+        "injected hook-emit panic",
+    ),
+];
+
+/// Every injected fault panic in the workspace's code and tests unwinds through
+/// `fake::inject_panic`, which skips the hook (so nothing waits on a backtrace), but the
+/// ones in [`HOOKED`].
+#[test]
+fn fault_panics_skip_the_hook() {
+    let root = root().canonicalize().unwrap();
+    let me = crate_dir().join("tests/lints.rs").canonicalize().unwrap();
+    let mut found = Vec::new();
+    let mut kept = [false; HOOKED.len()];
+    for e in std::fs::read_dir(root.join("crates")).unwrap() {
+        let dir = e.unwrap().path();
+        let mut files = Vec::new();
+        for sub in ["src", "tests"] {
+            if dir.join(sub).is_dir() {
+                sources(&dir.join(sub), &mut files);
+            }
+        }
+        for f in files {
+            let f = f.canonicalize().unwrap();
+            if f == me {
+                continue;
+            }
+            let rel = f
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            for (call, msg) in hooked_faults(&std::fs::read_to_string(&f).unwrap()) {
+                match HOOKED
+                    .iter()
+                    .position(|h| *h == (rel.as_str(), msg.as_str()))
+                {
+                    Some(k) => kept[k] = true,
+                    None => found.push(format!("{rel}: {call}\"{msg}\"")),
+                }
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "fault panics through the hook (use fake::inject_panic): {found:#?}"
+    );
+    // A listed one that is gone leaves the list.
+    assert_eq!(kept, [true; HOOKED.len()], "{HOOKED:?}");
+}
+
+#[test]
+fn the_fault_scan_finds_only_faults() {
+    let src = r##"
+// panic!("injected in a comment");
+/* assert!(false, "injected in a block") */
+let s = "panic!(\"injected in a string\")";
+let r = r#"assert!(x, "injected in a raw string")"#;
+assert!(ok, "the reply: {r:?}");
+assert!(cut || why.contains("injected"), "{why}");
+assert_eq!(a, b, "injected");
+debug_assert!(x, "injected");
+panic!("unexpected {m:?}");
+assert!(!flag, "injected spawn panic");
+panic!("an injected (nested) panic");
+std::panic::panic_any(Payload(tx));
+fake::inject_panic("injected resize panic");
+"##;
+    let found: Vec<String> = hooked_faults(src)
+        .into_iter()
+        .map(|(c, m)| format!("{c}{m}"))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            "assert!(injected spawn panic",
+            "panic!(an injected (nested) panic",
+            "panic_any(",
+        ]
+    );
 }

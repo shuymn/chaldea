@@ -519,10 +519,8 @@ impl CommandHandler for Refuse {
                     tx.append(vec![e])?;
                     Ok(Intent::Pending(EffectRun::new(())))
                 }
-                // Unwinds without the panic hook, which would delay the job's reply by as
-                // long as it takes (std's default hook prints a backtrace under a lock).
                 How::Panic => {
-                    std::panic::resume_unwind(Box::new("test_refuse panics in its intent"))
+                    chaldea_pty_runtime::fake::inject_panic("test_refuse panics in its intent")
                 }
             }),
         })
