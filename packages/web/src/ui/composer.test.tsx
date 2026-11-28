@@ -122,6 +122,7 @@ describe("composer", () => {
       generation: "g",
       session: "s",
       thread: T1,
+      label: null,
       text: "x",
       revision: 1,
       phase: "inflight",

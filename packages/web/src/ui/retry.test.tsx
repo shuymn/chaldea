@@ -7,7 +7,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test } from "vitest";
 
-import { canRetry, context, slots } from "../commands/controls";
+import { canRetry, context, slots, supersededSlots, threadLabel } from "../commands/controls";
 import {
   type CmdAction,
   type CmdEffect,
@@ -19,6 +19,7 @@ import type { CommandRunner } from "../commands/runner";
 import { threadId } from "../sync/model/server";
 import { seeded } from "../sync/ops";
 import type { Sim } from "../sync/sim";
+import { AttentionBanner } from "./AttentionBanner";
 import { CommandLine } from "./CommandLine";
 import { bindOps } from "./ops";
 
@@ -46,14 +47,27 @@ function harness(sim: Sim) {
     getState: () => s,
     dispatch: run,
     gesture: (g: { slot: string; name: never; thread: string | null; args: Record<string, unknown>; allowed: (x: typeof sim.state) => boolean }) =>
-      run({ type: "gesture", ...g, allowed: g.allowed(sim.state), commandId: `c${posts.length}`, generation: "gen-1" }),
+      run({
+        type: "gesture",
+        ...g,
+        label: g.thread === null ? null : threadLabel(sim.state, g.thread),
+        allowed: g.allowed(sim.state),
+        commandId: `c${posts.length}`,
+        generation: "gen-1",
+      }),
     retry: (slot: string, allowed: (x: typeof sim.state) => boolean) => run({ type: "retry", slot, allowed: allowed(sim.state) }),
   } as unknown as CommandRunner;
   const reply = () => {
     const last = posts.at(-1);
     if (last?.type === "post") run({ type: "reply", attempt: last.attempt, reply: BUSY });
   };
-  return { runner, ops: bindOps(runner), posts, reply, state: () => s, sync: () => run({ type: "context", ctx: context(sim.state) }) };
+  // What CommandRunner.follow does on each sync change: the context, then superseded releases.
+  const sync = () => {
+    run({ type: "context", ctx: context(sim.state) });
+    const gone = supersededSlots(s, sim.state);
+    if (gone.length > 0) run({ type: "release", slots: gone });
+  };
+  return { runner, ops: bindOps(runner), posts, reply, state: () => s, sync };
 }
 
 function running(): Sim {
@@ -83,7 +97,7 @@ describe("retry targets", () => {
       sim.quiesce();
       expect(context(sim.state).session).toBe(session);
       h.sync();
-      expect(h.state().slots[slot]?.phase).toBe("not_done");
+      expect(h.state().slots[slot]?.phase).toBe("released");
       expect(canRetry(h.state(), sim.state, slot), kind).toBe(false);
       render(<CommandLine state={sim.state} cmds={h.state()} slot={slot} ops={h.ops} />);
       expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
@@ -120,6 +134,65 @@ describe("retry targets", () => {
     expect(h.posts).toHaveLength(2);
     const [a, b] = h.posts as Extract<CmdEffect, { type: "post" }>[];
     expect(b!.body).toBe(a!.body);
+  });
+
+  test("Resume and It arrived keep their Retry on an unchanged target", () => {
+    // Resume on an exited launch whose death is confirmed.
+    const a = running();
+    a.server.status(T, "process", "exited");
+    a.server.launchExited(T, "stopped", true);
+    a.quiesce();
+    const h = harness(a);
+    h.ops.resume(T, L1);
+    h.reply();
+    expect(canRetry(h.state(), a.state, slots.launch(T))).toBe(true);
+    h.ops.retry(slots.launch(T));
+    expect(h.posts).toHaveLength(2);
+
+    // It arrived on an unconfirmed input.
+    const b = running();
+    b.server.inputCreated(T, I1, "x");
+    b.server.inputState(T, I1, "unconfirmed", { kind: "launch_exited" });
+    b.quiesce();
+    const g = harness(b);
+    g.ops.resolve(T, I1, true);
+    g.reply();
+    expect(canRetry(g.state(), b.state, slots.input(I1))).toBe(true);
+    g.ops.retry(slots.input(I1));
+    expect(g.posts).toHaveLength(2);
+  });
+
+  test("a superseded not-done Stop frees its slot: the banner's Stop for the new launch is enabled", () => {
+    const sim = running();
+    const h = harness(sim);
+    h.ops.stop(T, L1);
+    h.reply();
+    expect(h.state().slots[slots.launch(T)]?.phase).toBe("not_done");
+    // A exits on its own; B starts and stalls, in the same socket session.
+    sim.server.launchExited(T, "exit", true);
+    sim.server.launchReserved(T, L2);
+    sim.server.status(T, "process", "running");
+    sim.server.status(T, "attention", [{ kind: "startup_stall" }]);
+    sim.quiesce();
+    h.sync();
+    expect(h.state().slots[slots.launch(T)]?.phase).toBe("released");
+    render(<AttentionBanner state={sim.state} cmds={h.state()} ops={h.ops} />);
+    const stop = screen.getByRole("region", { name: "Attention" }).querySelector('[data-cause="startup_stall"] button');
+    expect(stop?.textContent).toBe("Stop");
+    expect((stop as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  test("an ambiguous outcome keeps its hold when the target changes", () => {
+    const sim = running();
+    const h = harness(sim);
+    h.ops.stop(T, L1);
+    const last = h.posts.at(-1);
+    if (last?.type === "post") h.runner.dispatch({ type: "reply", attempt: last.attempt, reply: { kind: "unknown", status: null, code: null } });
+    sim.server.launchExited(T, "exit", true);
+    sim.server.launchReserved(T, L2);
+    sim.quiesce();
+    h.sync();
+    expect(h.state().slots[slots.launch(T)]?.phase).toBe("check_thread");
   });
 
   test("a held slot takes no second gesture from the page", () => {

@@ -140,6 +140,7 @@ describe("commands.runner", () => {
       slot: slots.spawn,
       name: "spawn",
       thread: null,
+      label: null,
       args: {},
       allowed: true,
       commandId: "c",

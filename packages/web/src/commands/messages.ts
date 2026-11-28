@@ -5,7 +5,7 @@ import type { ErrorCode } from "@chaldea/contracts/generated/ErrorCode";
 import type { RejectReason } from "@chaldea/contracts/generated/RejectReason";
 
 import type { Reply } from "./client";
-import type { CmdState, Command, Notice } from "./reducer";
+import type { Command } from "./reducer";
 
 const CODES: Partial<Record<ErrorCode, string>> = {
   bad_args: "the daemon refused the arguments",
@@ -47,8 +47,12 @@ const REJECT: Record<RejectReason, string> = {
 export const rejectText = (r: RejectReason) => REJECT[r];
 
 /** The hint for an exited launch whose death is not confirmed (mvp:216). */
-export function hintText(thread: string, launch: string): string {
-  return `Resume waits until the previous launch is confirmed dead. Review with "chaldea stop ${thread} --assume-dead", then confirm with "--launch ${launch}".`;
+export function hintText(thread: string, launch: string | null): string {
+  const review = `Review with "chaldea stop ${thread} --assume-dead"`;
+  // `--launch` names only a current launch whose death is unconfirmed.
+  return launch === null
+    ? `Resume is blocked. ${review}.`
+    : `Resume waits until the previous launch is confirmed dead. ${review}, then confirm with "--launch ${launch}".`;
 }
 
 export const INVALID_TEXT = {
@@ -56,18 +60,7 @@ export const INVALID_TEXT = {
   too_large: "The message is over 256 KiB of UTF-8; shorten it to send.",
 } as const;
 
-/** The status bar's line for the latest notice; `label` names the thread. */
-export function noticeText(cmds: CmdState, n: Notice, label: (thread: string) => string): string | null {
-  const where = n.thread === null ? "" : `${label(n.thread)}: `;
-  if (n.kind === "invalid") {
-    const why = n.thread === null ? undefined : cmds.invalid[n.thread];
-    return why === undefined ? null : `${where}${INVALID_TEXT[why]}`;
-  }
-  const c = cmds.slots[n.slot];
-  return c === undefined ? null : `${where}${commandText(c)}`;
-}
-
-const codeText =(code: ErrorCode | null) => (code !== null ? (CODES[code] ?? `refused (${code})`) : null);
+const codeText = (code: ErrorCode | null) => (code !== null ? (CODES[code] ?? `refused (${code})`) : null);
 
 /** The reply's text, for the command's own result line. */
 export function replyText(r: Reply): string {

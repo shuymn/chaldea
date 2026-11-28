@@ -10,6 +10,7 @@
 // after its context changed updates only its own command's shown result.
 
 import type { CommandName, Reply } from "./client";
+import { commandText, INVALID_TEXT } from "./messages";
 
 export type Phase =
   /** An attempt is in flight. */
@@ -44,6 +45,8 @@ export interface Command {
   readonly session: string;
   /** The thread it acts on (null for `spawn`). */
   readonly thread: string | null;
+  /** The thread as named at the gesture (agent, cwd, short id), frozen for its notices. */
+  readonly label: string | null;
   /** A `send`'s frozen text and the draft revision it came from. */
   readonly text: string | null;
   readonly revision: number | null;
@@ -65,12 +68,13 @@ export interface Draft {
 
 export type Invalid = "empty" | "too_large";
 
+/** An outcome to announce and show, its text frozen when recorded. `seq` grows with each. */
 export interface Notice {
   readonly seq: number;
-  readonly kind: "result" | "invalid";
-  readonly slot: string;
-  readonly thread: string | null;
+  readonly text: string;
 }
+
+const prefixed = (label: string | null, text: string) => (label === null ? text : `${label}: ${text}`);
 
 /** What the sync side says about the page's context, for session checks. */
 export interface Context {
@@ -115,6 +119,8 @@ export type Gesture = {
   readonly slot: string;
   readonly name: CommandName;
   readonly thread: string | null;
+  /** The thread as the page names it now (controls.ts `threadLabel`); null for `spawn`. */
+  readonly label: string | null;
   readonly args: Readonly<Record<string, unknown>>;
   /** From the gate at the gesture: `live`, and the current copy the command needs. */
   readonly allowed: boolean;
@@ -132,6 +138,8 @@ export type CmdAction = At &
     | { readonly type: "forget"; readonly slot: string }
     | { readonly type: "reply"; readonly attempt: number; readonly reply: Reply }
     | { readonly type: "tick" }
+    /** Not-done commands whose target was superseded: released. */
+    | { readonly type: "release"; readonly slots: readonly string[] }
   );
 
 export type CmdEffect =
@@ -169,6 +177,9 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
   const put = (c: Command) => {
     s = { ...s, slots: { ...s.slots, [c.slot]: c } };
   };
+  const notify = (text: string) => {
+    s = { ...s, notice: { seq: (s.notice?.seq ?? 0) + 1, text } };
+  };
   switch (a.type) {
     case "tick":
       break;
@@ -203,7 +214,7 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
         // The value is sent unchanged (mvp:184).
         if (d.text.length === 0 || utf8.encode(d.text).length > MAX_PROMPT_BYTES) {
           s = { ...s, invalid: { ...s.invalid, [a.thread]: d.text.length === 0 ? "empty" : "too_large" } };
-          s = { ...s, notice: { seq: (s.notice?.seq ?? 0) + 1, kind: "invalid", slot: a.slot, thread: a.thread } };
+          notify(prefixed(a.label, INVALID_TEXT[d.text.length === 0 ? "empty" : "too_large"]));
           break;
         }
         text = d.text;
@@ -219,6 +230,7 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
         generation: a.generation,
         session: s.ctx.session,
         thread: a.thread,
+        label: a.label,
         text,
         revision,
         phase: "inflight",
@@ -257,7 +269,6 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
       if (!c) break;
       const fresh = !c.stale && inSession(s.ctx, c);
       const r = a.reply;
-      s = { ...s, notice: { seq: (s.notice?.seq ?? 0) + 1, kind: "result", slot: c.slot, thread: c.thread } };
       switch (r.kind) {
         case "ok":
         case "unreadable":
@@ -291,6 +302,18 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
         case "not_sent":
           put({ ...c, phase: "released", reply: r, retryAt: null });
           break;
+      }
+      // The outcome as shown now, frozen with its target.
+      const settled = s.slots[c.slot];
+      if (settled) notify(prefixed(c.label, commandText(settled)));
+      break;
+    }
+    case "release": {
+      // Not-done commands whose target was superseded (controls.ts `superseded`): no Retry can
+      // ever go, so the slot is free. Other phases keep their hold.
+      for (const slot of a.slots) {
+        const c = s.slots[slot];
+        if (c?.phase === "not_done") put({ ...c, phase: "released", retryAt: null, stale: true });
       }
       break;
     }

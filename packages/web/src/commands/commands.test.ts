@@ -65,6 +65,7 @@ class Cmds {
     return this.do({
       type: "gesture",
       thread: null,
+      label: null,
       args: {},
       allowed: true,
       commandId: `cmd-${this.posts.length + 1}-${g.slot}`,
@@ -494,6 +495,7 @@ describe("commands.retry", () => {
                 slot: k.slot(th),
                 name: k.name,
                 thread: k.name === "spawn" ? null : th,
+                label: null,
                 args: {},
                 allowed: op.allowed,
                 commandId: `id-${n++}`,

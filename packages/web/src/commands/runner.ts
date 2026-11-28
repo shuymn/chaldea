@@ -7,7 +7,7 @@ import type { Fetch } from "../http";
 import type { Runner } from "../sync/runner";
 import type { State } from "../sync/state";
 import { type CommandName, postCommand } from "./client";
-import { context, sameContext } from "./controls";
+import { context, sameContext, supersededSlots, threadLabel } from "./controls";
 import { type CmdAction, type CmdEffect, type CmdState, initialCmdState, reduceCommands } from "./reducer";
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
@@ -45,8 +45,12 @@ export class CommandRunner {
 
   /** The sync side changed: pass its session context on when it differs. */
   private follow(): void {
-    const ctx = context(this.sync.getState());
+    const s = this.sync.getState();
+    const ctx = context(s);
     if (!sameContext(ctx, this.state.ctx)) this.dispatch({ type: "context", ctx });
+    // A not-done command whose target was superseded can never be retried: free its slot.
+    const gone = supersededSlots(this.state, s);
+    if (gone.length > 0) this.dispatch({ type: "release", slots: gone });
   }
 
   /**
@@ -69,6 +73,7 @@ export class CommandRunner {
       slot: opts.slot,
       name: opts.name,
       thread: opts.thread,
+      label: opts.thread === null ? null : threadLabel(s, opts.thread),
       args: opts.args,
       allowed: opts.allowed(s),
       commandId: this.deps.uuid(),

@@ -2,35 +2,27 @@
 // (docs/design/w1-pwa.md §2.3 "Status"). One `role="status"` region announces new-event
 // counts and "back online" (debounced), and each command outcome and refused send at once
 // (docs/design/w2-composer.md §2.2); going offline is a `role="alert"`. The latest command
-// outcome also stays visible here, naming its thread, whatever is selected.
+// outcome also stays visible here, its text and thread frozen when it was recorded.
 
 import { useEffect, useRef, useState } from "react";
 
-import { noticeText } from "../commands/messages";
-import { type CmdState, initialCmdState } from "../commands/reducer";
-import { HOST, type State, status } from "../sync/state";
+import type { CmdState } from "../commands/reducer";
+import { type State, status } from "../sync/state";
 
 const ANNOUNCE_MS = 1000;
 const time = new Intl.DateTimeFormat(undefined, { timeStyle: "medium" });
-const NO_COMMANDS = initialCmdState();
 
-/** A thread as the status bar names it: agent and cwd from the host copy, else its id. */
-export function threadLabel(state: State, thread: string): string {
-  const host = state.streams[HOST]?.copy;
-  const info = host?.kind === "host" ? host.threads[thread]?.info : undefined;
-  return info ? `${info.agent} ${info.cwd}` : `thread ${thread}`;
-}
+/** One announcement: `key` makes each one a new node, so an identical text announces again. */
+type Message = { readonly key: string; readonly text: string };
 
 export function StatusBar(props: { state: State; cmds?: CmdState }) {
   const { state } = props;
-  const cmds = props.cmds ?? NO_COMMANDS;
   const now = status(state);
-  const [message, setMessage] = useState("");
+  const [message, setMessage] = useState<Message>({ key: "none", text: "" });
   const counted = useRef(state.appended);
   const was = useRef(now);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const notice = cmds.notice;
-  const last = notice === null ? null : noticeText(cmds, notice, (t) => threadLabel(state, t));
+  const notice = props.cmds?.notice ?? null;
 
   useEffect(() => {
     const backOnline = was.current === "offline" && now !== "offline";
@@ -45,18 +37,23 @@ export function StatusBar(props: { state: State; cmds?: CmdState }) {
       const parts = [];
       if (backOnline) parts.push("Back online.");
       if (n > 0) parts.push(n === 1 ? "1 new event." : `${n} new events.`);
-      setMessage(parts.join(" "));
+      setMessage({ key: `sync:${state.appended}:${now}`, text: parts.join(" ") });
     }, ANNOUNCE_MS);
   }, [now, state.appended]);
 
-  // Each new notice is announced once, when it arrives.
+  // Each new notice is announced once, at once. It replaces a pending counter message.
   const seq = notice?.seq ?? 0;
   const announced = useRef(seq);
   useEffect(() => {
-    if (seq === announced.current) return;
+    if (notice === null || seq === announced.current) return;
     announced.current = seq;
-    if (last !== null) setMessage(last);
-  }, [seq, last]);
+    if (timer.current !== null) {
+      clearTimeout(timer.current);
+      timer.current = null;
+      counted.current = state.appended;
+    }
+    setMessage({ key: `notice:${seq}`, text: notice.text });
+  }, [seq, notice, state.appended]);
 
   useEffect(
     () => () => {
@@ -75,13 +72,13 @@ export function StatusBar(props: { state: State; cmds?: CmdState }) {
           ? "not synced yet"
           : `last synced ${time.format(new Date(state.lastSyncedAt))}`}
       </span>
-      {last !== null && (
+      {notice !== null && (
         <span data-last-command className="min-w-0 break-all" dir="auto">
-          {last}
+          {notice.text}
         </span>
       )}
       <span role="status" className="sr-only">
-        {message}
+        <span key={message.key}>{message.text}</span>
       </span>
       {now === "offline" && (
         <span role="alert" className="font-semibold">

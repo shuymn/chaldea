@@ -65,7 +65,7 @@ function ThreadEntries(props: { state: State; cmds: CmdState; thread: string; en
               </button>
             )}
             {e.kind === "resume_blocked" && (
-              <span className="hint break-words text-sm">{hintText(thread, hintLaunch(state, thread) ?? "<id>")}</span>
+              <span className="hint break-words text-sm">{hintText(thread, hintLaunch(state, thread))}</span>
             )}
           </li>
         ))}
