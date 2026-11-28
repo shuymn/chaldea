@@ -129,7 +129,6 @@ describe("composer", () => {
       reply: null,
       retryAt: null,
       stale: false,
-      posts: 1,
     } as const;
     const cmds: CmdState = {
       ...initialCmdState(0),

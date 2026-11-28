@@ -15,26 +15,15 @@ import { type Fetch, headers, READ_TIMEOUT_MS, readLimited, REQUEST_POLICY } fro
 
 export type CommandName = "send" | "ready" | "input_resolve" | "input_cancel" | "spawn" | "stop" | "resume";
 
-/** The page sends these commands and no other (W2-12). */
-export const COMMANDS: readonly CommandName[] = [
-  "send",
-  "ready",
-  "input_resolve",
-  "input_cancel",
-  "spawn",
-  "stop",
-  "resume",
-];
-
 /** 10 s, or 40 s for the launch commands (supervisor.md:102-104). */
-export function timeoutMs(name: CommandName): number {
+function timeoutMs(name: CommandName): number {
   return name === "spawn" || name === "resume" || name === "stop" ? 40_000 : READ_TIMEOUT_MS;
 }
 
 /** The largest reply body read, success or error. */
-export const REPLY_MAX_BYTES = 64 * 1024;
+const REPLY_MAX_BYTES = 64 * 1024;
 
-export interface Results {
+interface Results {
   send: SendResult;
   ready: ReadyResult;
   input_resolve: InputCommandResult;
@@ -44,7 +33,7 @@ export interface Results {
   resume: ResumeResult;
 }
 
-export type Result = Results[CommandName];
+type Result = Results[CommandName];
 
 const RESULT: { readonly [K in CommandName]: (v: unknown) => v is Results[K] } = {
   send: validators.SendResult,

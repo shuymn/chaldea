@@ -96,7 +96,7 @@ export function Composer(props: { state: State; cmds: CmdState; thread: string; 
           Send
         </button>
       </div>
-      <CommandLine state={state} cmds={cmds} slot={slot} ops={ops} showText />
+      <CommandLine state={state} cmds={cmds} slot={slot} ops={ops} />
     </form>
   );
 }

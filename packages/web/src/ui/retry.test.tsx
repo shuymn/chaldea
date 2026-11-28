@@ -14,7 +14,7 @@ import {
   initialCmdState,
   reduceCommands,
 } from "../commands/reducer";
-import type { CommandRunner } from "../commands/runner";
+import type { CmdInput, CommandRunner } from "../commands/runner";
 import { threadId } from "../sync/model/server";
 import { seeded } from "../sync/ops";
 import { MODEL_CONFIG, Sim, TEST_CONFIG } from "../sync/sim";
@@ -30,14 +30,13 @@ const L2 = "0193cccc-0000-7000-8000-000000000002";
 const I1 = "0193dddd-0000-7000-8000-000000000001";
 const BUSY = { kind: "not_done", status: 503, code: "busy", retryAfter: 0 } as const;
 
-type Input = CmdAction extends infer A ? (A extends unknown ? Omit<A, "now"> : never) : never;
 type Post = Extract<CmdEffect, { type: "post" }>;
 
 /** The command reducer against a live sim, with a CommandRunner-shaped facade for `bindOps`. */
 function harness(sim: Sim) {
   let s: CmdState = initialCmdState(0);
   const posts: Post[] = [];
-  const run = (a: Input) => {
+  const run = (a: CmdInput) => {
     const [next, effects] = reduceCommands(s, { ...a, now: 0 } as CmdAction);
     s = next;
     for (const e of effects) if (e.type === "post") posts.push(e);
@@ -192,7 +191,7 @@ describe("slots and Retry", () => {
     h.ops.send(T);
     h.busy();
     h.ops.edit(T, "current draft");
-    render(<CommandLine state={sim.state} cmds={h.state()} slot={slots.send(T)} ops={h.ops} showText />);
+    render(<CommandLine state={sim.state} cmds={h.state()} slot={slots.send(T)} ops={h.ops} />);
     expect(h.state().slots[slots.send(T)]?.phase).toBe("not_done");
     expect(document.querySelector("[data-frozen-text]")?.textContent).toBe("Retry sends: earlier prompt");
   });

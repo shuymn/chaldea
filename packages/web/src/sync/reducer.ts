@@ -961,7 +961,6 @@ function applyEvent(copy: Copy, e: EventEnvelope): Copy {
         case "attention":
           return { ...next, attention: p.to };
       }
-      return next;
     }
     case "launch_reserved":
       // The reserved launch becomes the thread's current one (store/project.rs).

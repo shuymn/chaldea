@@ -44,7 +44,7 @@ Unconfirmed death shows *the hint* instead of Resume: review with `chaldea stop 
 
 | Reply (http-surface:563-610) | Means | Controls |
 |---|---|---|
-| 2xx, valid | the result: `rejected` with reason; `spawn_failed`; `death_confirmed: false` with the hint | — |
+| 2xx, valid | the result: `rejected` with reason; `spawn_failed`; `death_confirmed: false` | — |
 | 2xx, invalid | done, unreadable | — |
 | other handler code; guard and parser 4xx; 501; 409 `conflict`, `unknown_after_crash` (own texts) | settled | — |
 | 409 `in_progress`, undecodable 409; 503 `outcome_unknown`, unparsed 503; 500; transport; timeout; body-read failure | unknown | "check the thread", Forget |

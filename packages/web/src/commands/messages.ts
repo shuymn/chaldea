@@ -112,7 +112,7 @@ export function commandText(c: Command): string {
     case "released":
       return `${verb}: ${c.reply ? replyText(c.reply) : "not done."}`;
     case "settled":
-      return `${verb}: ${c.reply ? resultText(c) : "done."}`;
+      return `${verb}: ${resultText(c)}`;
   }
 }
 

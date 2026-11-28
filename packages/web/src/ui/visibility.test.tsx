@@ -16,6 +16,7 @@ import type { Sim } from "../sync/sim";
 import type { HostCopy, State } from "../sync/state";
 import { AttentionBanner } from "./AttentionBanner";
 import type { Ops } from "./ops";
+import type { CmdInput } from "../commands/runner";
 import { StatusBar } from "./StatusBar";
 
 afterEach(() => {
@@ -25,9 +26,8 @@ afterEach(() => {
 
 const T1 = threadId(1);
 const T2 = threadId(2);
-type Input = CmdAction extends infer A ? (A extends unknown ? Omit<A, "now"> : never) : never;
 
-function step(s: CmdState, a: Input): CmdState {
+function step(s: CmdState, a: CmdInput): CmdState {
   return reduceCommands(s, { ...a, now: 0 } as CmdAction)[0];
 }
 
@@ -43,7 +43,7 @@ function gesture(sim: Sim, s: CmdState, g: Pick<Gesture, "slot" | "name" | "thre
   });
 }
 
-const reply = (s: CmdState, slot: string, r: Extract<Input, { type: "reply" }>["reply"]) =>
+const reply = (s: CmdState, slot: string, r: Extract<CmdInput, { type: "reply" }>["reply"]) =>
   step(s, { type: "reply", attempt: s.slots[slot]!.attempt, reply: r });
 
 const announced = () => screen.getByRole("status").textContent;

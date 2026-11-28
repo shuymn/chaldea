@@ -20,10 +20,10 @@ export const sameContext = (a: Context, b: Context) => a.session === b.session &
 
 const live = (s: State) => status(s) === "live";
 
-/** The thread is listed and open (the host owns `closed`, F1). */
+/** The thread is listed and open (the host owns `closed`, F1); callers drop gone threads through `threadCopy`. */
 function open(s: State, thread: string): boolean {
   const host = s.streams[HOST]?.copy;
-  if (host?.kind !== "host" || s.gone[thread]) return false;
+  if (host?.kind !== "host") return false;
   const row = host.threads[thread];
   return row !== undefined && !row.info.closed;
 }
@@ -120,9 +120,10 @@ export function targetGate(c: Pick<Command, "name" | "thread" | "body">): (s: St
     // Stop and Resume dispatch on the latest valid copy, but their Retry also waits for a
     // current one: a refollow still paging may show a launch already replaced.
     case "stop":
-      return (s) => launch !== null && current(s, threadStream(t)) && stopLaunch(s, t) === launch;
-    case "resume":
-      return (s) => launch !== null && current(s, threadStream(t)) && resumeLaunch(s, t) === launch;
+    case "resume": {
+      const pinned = c.name === "stop" ? stopLaunch : resumeLaunch;
+      return (s) => launch !== null && current(s, threadStream(t)) && pinned(s, t) === launch;
+    }
     case "input_resolve":
       return (s) => input !== null && canResolve(s, t, input);
     case "input_cancel":

@@ -9,7 +9,7 @@ import { commandText } from "../commands/messages";
 import type { State } from "../sync/state";
 import type { Ops } from "./ops";
 
-export function CommandLine(props: { state: State; cmds: CmdState; slot: string; ops: Ops; showText?: boolean }) {
+export function CommandLine(props: { state: State; cmds: CmdState; slot: string; ops: Ops }) {
   const { cmds, slot, ops } = props;
   const c = cmds.slots[slot];
   if (!c) return null;
@@ -17,7 +17,7 @@ export function CommandLine(props: { state: State; cmds: CmdState; slot: string;
   return (
     <div className="command-line flex flex-wrap items-center gap-2 text-sm" data-slot={slot} data-phase={c.phase}>
       <span>{commandText(c)}</span>
-      {props.showText && c.text !== null && (busy(cmds, slot) || c.phase === "not_done") && (
+      {c.text !== null && (busy(cmds, slot) || c.phase === "not_done") && (
         // A not-done Send's frozen text: what Retry sends, whatever the draft is now.
         <span data-frozen-text>
           {c.phase === "not_done" && "Retry sends: "}

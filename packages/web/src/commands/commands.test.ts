@@ -38,8 +38,8 @@ import {
   reduceCommands,
   retryable,
 } from "./reducer";
+import type { CmdInput } from "./runner";
 
-type Input = CmdAction extends infer A ? (A extends unknown ? Omit<A, "now"> : never) : never;
 
 const T1 = threadId(1);
 const T2 = threadId(2);
@@ -54,7 +54,7 @@ class Cmds {
   constructor(ctx: Context = S1) {
     this.do({ type: "context", ctx });
   }
-  do(a: Input): CmdEffect[] {
+  do(a: CmdInput): CmdEffect[] {
     const [s, effects] = reduceCommands(this.s, { ...a, now: this.now } as CmdAction);
     this.s = s;
     this.effects.push(...effects);

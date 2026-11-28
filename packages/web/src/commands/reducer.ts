@@ -63,10 +63,8 @@ export interface Command {
   readonly reply: Reply | null;
   /** When Retry may go (ms); null when not offered. */
   readonly retryAt: number | null;
-  /** Its session or target ended: later replies change only its shown result. */
+  /** Its socket session changed or its thread 404ed: later replies change only its shown result. */
   readonly stale: boolean;
-  /** POSTs made for this command, Retry included. */
-  readonly posts: number;
 }
 
 export interface Draft {
@@ -103,8 +101,8 @@ export interface CmdState {
   readonly nextAttempt: number;
   readonly wakeAt: number | null;
   /**
-   * The latest outcome to announce and show in the status bar, whatever is selected: a
-   * command reply (by slot), or a refused send (by thread). `seq` grows with each.
+   * The latest outcome to announce and show in the status bar, whatever is selected: the
+   * frozen text of a reply or a refused gesture (`Notice`).
    */
   readonly notice: Notice | null;
 }
@@ -266,7 +264,6 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
         reply: null,
         retryAt: null,
         stale: false,
-        posts: 1,
       };
       s = { ...s, nextAttempt: s.nextAttempt + 1 };
       put(c);
@@ -286,7 +283,7 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
         break;
       }
       // The same command: its frozen id, body bytes, and generation.
-      const next: Command = { ...c, attempt: s.nextAttempt, phase: "inflight", reply: null, retryAt: null, posts: c.posts + 1 };
+      const next: Command = { ...c, attempt: s.nextAttempt, phase: "inflight", reply: null, retryAt: null };
       s = { ...s, nextAttempt: s.nextAttempt + 1 };
       put(next);
       effects.push({ type: "post", attempt: next.attempt, name: next.name, body: next.body, generation: next.generation });
@@ -342,8 +339,7 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
           break;
       }
       // The outcome as shown now, frozen with its target.
-      const settled = s.slots[c.slot];
-      if (settled) notify(prefixed(c.label, commandText(settled)));
+      notify(prefixed(c.label, commandText(s.slots[c.slot] ?? c)));
       break;
     }
   }
