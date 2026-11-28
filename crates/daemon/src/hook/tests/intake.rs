@@ -663,8 +663,9 @@ async fn panic_after_advance() {
         1,
         "one intake open"
     );
-    *crate::supervisor::lock(&sl.hooks.observe) =
-        Some(Box::new(|_, _| panic!("the observation panicked")));
+    *crate::supervisor::lock(&sl.hooks.observe) = Some(Box::new(|_, _| {
+        chaldea_pty_runtime::fake::inject_panic("injected observation panic")
+    }));
     let ord = rig.next_ordinal(&live);
     let r = rig
         .post(&rig.hook_of(
@@ -709,7 +710,7 @@ async fn panic_before_advance() {
     let w = sl.fence.load(Ordering::SeqCst);
     assert_eq!(w & crate::supervisor::send::OPEN_MASK, 1, "one intake open");
     crate::supervisor::send::tests::gate::set(&sl.hooks.after_written_read, || {
-        panic!("the state section panicked")
+        chaldea_pty_runtime::fake::inject_panic("injected state section panic")
     });
     let ord = rig.next_ordinal(&live);
     let r = rig

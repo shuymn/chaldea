@@ -491,11 +491,12 @@ impl Shared {
             if !self.vt_failed.load(Ordering::Acquire) {
                 #[cfg(feature = "fake")]
                 let inject = self.fail_vt_next.swap(false, Ordering::AcqRel);
-                #[cfg(not(feature = "fake"))]
-                let inject = false;
                 let vt = &mut st.vt;
                 let r = catch_unwind(AssertUnwindSafe(|| {
-                    assert!(!inject, "injected VT failure");
+                    #[cfg(feature = "fake")]
+                    if inject {
+                        crate::fake::inject_panic("injected VT failure");
+                    }
                     vt.feed(piece);
                 }));
                 match r {

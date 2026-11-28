@@ -1479,7 +1479,7 @@ mod tests {
         let st = state();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _g = st.lock().unwrap();
-            panic!("poison");
+            crate::fake::inject_panic("injected panic that poisons the lock");
         }));
         assert!(os.kill(&[], os.at(1_000), &st).tree_dead);
     }

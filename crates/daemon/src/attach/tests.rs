@@ -16,8 +16,8 @@ use serde_json::json;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
-use crate::store::tests::support::http::WS_WAIT;
-use crate::store::tests::support::waits::{bounded, bounded_at};
+use crate::store::tests::support::http::{DEADLINE, WS_WAIT};
+use crate::store::tests::support::waits::{bounded, bounded_at, pause};
 use crate::supervisor::send::tests::{Live, SRig};
 
 type Ws =
@@ -751,16 +751,13 @@ async fn stuck_writer_idle_drop() {
     })
     .await;
     let (mut tx, mut rx) = c.ws.split();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "the peer's ping pace; the drop does not depend on it"
-    )]
+    // The peer's ping pace; the drop does not depend on it.
     let pinger = tokio::spawn(async move {
         loop {
             if tx.send(WsMessage::Ping(Vec::new().into())).await.is_err() {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            pause(Duration::from_millis(200)).await;
         }
     });
     // The idle timeout passes on the test clock after the pause was acknowledged.
@@ -1164,16 +1161,26 @@ async fn production_mount_layers() {
 }
 
 /// T1-9: `/api/ws` keeps its 64 KiB inbound bound; attach refuses only above its own (the
-/// 1009 is best effort: the peer may still be writing when the socket closes).
+/// 1009 is best effort on both: the server closes with the frame's payload unread, so the
+/// close frame can be lost to the reset; `http_caps::oversized_message_closes_with_1009`
+/// asserts the code exactly).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn events_limit_unchanged() {
     let rig = SRig::new().await;
     let live = rig.claude().await;
-    let mut ws = rig.srv.ws(&rig.owner).await;
-    ws.text(&"x".repeat(64 * 1024 + 1)).await;
-    assert_eq!(ws.until_closed().await.0, Some(1009));
-    let (mut c, _) = attach(&rig, &live).await;
     let before = live.child.input().len();
+    let mut ws = rig.srv.ws(&rig.owner).await;
+    // A valid `subscribe`, refused only for its size.
+    let host = chaldea_core::ids::StreamId::Host.to_string();
+    let mut over = json!({ "type": "subscribe", "stream_ids": [host] }).to_string();
+    over.push_str(&" ".repeat(64 * 1024 + 1 - over.len()));
+    // The server may close while the client is still sending; the outcome is read below.
+    let _ = ws.ws.send(WsMessage::Text(over.into())).await;
+    let (code, frames) = ws.until_closed().await;
+    assert!(matches!(code, Some(1009) | None), "{code:?}");
+    assert!(frames.is_empty(), "{frames:?}");
+    assert_eq!(live.child.input().len(), before);
+    let (mut c, _) = attach(&rig, &live).await;
     let _ =
         c.ws.send(WsMessage::Text(
             format!(
@@ -1623,6 +1630,10 @@ async fn slow_sends(tune: impl FnOnce(&mut crate::supervisor::SupervisorConfig))
     SRig::on_http(chaldea_core::adapter::HostOs::Macos, tune, |h| {
         h.ws.send_timeout = Duration::from_secs(600);
         h.ws.close_grace = Duration::from_secs(600);
+        // Below the candidacy cap, as the production default is
+        // (`candidacy_covers_the_startup_path`); the rig's clock is stopped, so the short
+        // budget passes only when a test advances it.
+        h.short_deadline = DEADLINE;
     })
     .await
 }
@@ -1641,16 +1652,13 @@ impl Drop for Poker {
     }
 }
 
-#[allow(
-    clippy::disallowed_methods,
-    reason = "the poke loop's pace; no result depends on it"
-)]
 fn poker(rig: &SRig) -> Poker {
     let h = hooks(rig);
     Poker(tokio::spawn(async move {
         loop {
             h.poke.notify_waiters();
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            // The poke loop's pace; no result depends on it.
+            pause(Duration::from_millis(5)).await;
         }
     }))
 }

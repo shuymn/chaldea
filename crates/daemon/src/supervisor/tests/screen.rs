@@ -338,12 +338,12 @@ async fn detached_session() {
 }
 
 /// C1-11: the snapshot waits at most 250 ms of the request's time, and never past the
-/// request's deadline (the test server's 2 s). With time left, a copy not done by 250 ms is
+/// request's deadline (the short budget, [`support::http::DEADLINE`]: 2 s). With time left, a copy not done by 250 ms is
 /// 503 `busy`; a request with 100 ms left takes that as the snapshot's deadline and ends
 /// 408 at it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_deadline() {
-    let rig = Rig::new().await;
+    let rig = Rig::with_http(|h| h.short_deadline = support::http::DEADLINE).await;
     let (t, l) = rig.spawn_codex(None).await;
     let entry = rig.sup.entry(l).unwrap();
     let get_owner = |rig: &Rig| {

@@ -416,7 +416,7 @@ impl TestAdapter {
             })
         };
         match mode {
-            Mode::Panic => panic!("the test adapter panics"),
+            Mode::Panic => chaldea_pty_runtime::fake::inject_panic("injected test adapter panic"),
             Mode::RepeatName => {
                 return Ok(Interpretation::Events(vec![
                     hook_event(note(), "twice"),

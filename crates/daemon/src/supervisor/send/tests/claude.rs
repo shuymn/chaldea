@@ -1074,7 +1074,9 @@ async fn cards_resolve_in_turn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parser_panic_is_schema_mismatch() {
     fn boom(event: &str, j: &Value) -> Parsed {
-        assert!(event != "Stop", "the parser panicked");
+        if event == "Stop" {
+            chaldea_pty_runtime::fake::inject_panic("injected parser panic");
+        }
         parse(event, j)
     }
     let rig = SRig::with(|c| {

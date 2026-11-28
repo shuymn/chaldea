@@ -607,7 +607,7 @@ mod tests {
 
     /// A failed join: a task that panicked.
     async fn failed_join() -> tokio::task::JoinError {
-        tokio::spawn(async { panic!("the read panics") })
+        tokio::spawn(async { chaldea_pty_runtime::fake::inject_panic("injected read panic") })
             .await
             .unwrap_err()
     }
