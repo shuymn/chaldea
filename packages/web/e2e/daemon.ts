@@ -42,13 +42,12 @@ interface Envelope {
   readonly payload: Record<string, unknown>;
 }
 
-export interface InputRecord {
+interface InputRecord {
   readonly input_id: string;
   readonly state: string;
   readonly text: string;
   readonly origin: string;
   readonly reason: string | null;
-  readonly by: string | null;
 }
 
 const sleep = (ms: number) => new Promise((ok) => setTimeout(ok, ms));
@@ -202,7 +201,6 @@ export class Daemon {
         origin: string;
         to: string;
         reason?: { kind: string };
-        by?: string | null;
       };
       if (e.kind === "input_created") {
         out.set(p.input_id, {
@@ -211,11 +209,10 @@ export class Daemon {
           text: await this.content(`thread:${thread}`, p.text),
           origin: p.origin,
           reason: null,
-          by: null,
         });
       } else if (e.kind === "input_state_changed") {
         const i = out.get(p.input_id);
-        if (i) out.set(p.input_id, { ...i, state: p.to, reason: p.reason?.kind ?? null, by: p.by ?? null });
+        if (i) out.set(p.input_id, { ...i, state: p.to, reason: p.reason?.kind ?? null });
       }
     }
     return [...out.values()];

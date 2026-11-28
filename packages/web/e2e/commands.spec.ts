@@ -11,7 +11,7 @@ import { mkdtempSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 
-import type { Page, Route, WebSocketRoute } from "@playwright/test";
+import type { Page, Route } from "@playwright/test";
 
 import {
   commandLine,
@@ -19,20 +19,16 @@ import {
   composer,
   type Daemon,
   expect,
+  openGate,
   openLink,
   openThread,
   sendButton,
+  socketTap,
   statusOf,
   test,
 } from "./harness";
 
 const SPENT = "This link is spent or expired";
-
-async function openGate(daemon: Daemon): Promise<string> {
-  const { thread } = await daemon.spawnThread();
-  await daemon.waitEvents(thread, (es) => es.some((e) => e.kind === "readiness_observed"));
-  return thread;
-}
 
 /** The closed-gate fixture: a first prompt acked, the turn running, the gate closed. */
 async function closedGate(daemon: Daemon): Promise<string> {
@@ -546,26 +542,6 @@ test("command_401", async ({ daemon, context }) => {
   await expect(a.getByText(SPENT)).toBeVisible({ timeout: 15_000 });
   await expect(b.getByText(SPENT)).toBeVisible({ timeout: 15_000 });
 });
-
-/** The page's events socket passed through; `drop()` closes it so the page opens a new one. */
-async function socketTap(page: Page): Promise<{ drop: () => void; opened: () => number }> {
-  let current: WebSocketRoute | null = null;
-  let n = 0;
-  await page.routeWebSocket(/\/api\/ws(\?|$)/, (ws) => {
-    const server = ws.connectToServer();
-    current = ws;
-    n += 1;
-    ws.onMessage((m) => server.send(m));
-    server.onMessage((m) => ws.send(m));
-  });
-  return {
-    drop: () => {
-      void current?.close();
-      current = null;
-    },
-    opened: () => n,
-  };
-}
 
 test("retry_session", async ({ daemon, page }) => {
   test.setTimeout(150_000);

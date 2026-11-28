@@ -3,27 +3,21 @@
 // `oversize_no_post`, and W2-11 `offline_locks`, `catch_up_after_hello` (with
 // `stop_during_paging`).
 
-import { devices, type Page, type Route, type WebSocketRoute } from "@playwright/test";
+import { devices, type Page, type Route } from "@playwright/test";
 
 import {
   commandLine,
   commandPosts,
   composer,
-  type Daemon,
   expect,
+  openGate,
   openLink,
   openThread,
   sendButton,
+  socketTap,
   statusOf,
   test,
 } from "./harness";
-
-/** A thread whose launch is ready (an open gate: no prompt has been written yet). */
-async function openGate(daemon: Daemon): Promise<string> {
-  const { thread } = await daemon.spawnThread();
-  await daemon.waitEvents(thread, (es) => es.some((e) => e.kind === "readiness_observed"));
-  return thread;
-}
 
 const sendSlot = (thread: string) => `send:${thread}`;
 
@@ -139,23 +133,6 @@ test("offline_locks", async ({ daemon, page }) => {
   expect(await composer(page).inputValue()).toMatch(/^kept while offline/);
 });
 
-/** The page's events socket, passed through; `drop()` closes it so the page reopens one. */
-async function socketTap(page: Page): Promise<{ drop: () => void }> {
-  let current: WebSocketRoute | null = null;
-  await page.routeWebSocket(/\/api\/ws(\?|$)/, (ws) => {
-    const server = ws.connectToServer();
-    current = ws;
-    ws.onMessage((m) => server.send(m));
-    server.onMessage((m) => ws.send(m));
-  });
-  return {
-    drop: () => {
-      void current?.close();
-      current = null;
-    },
-  };
-}
-
 /** Holds the thread's forward reads while `on`; `release` lets the held ones go. */
 async function holdForward(page: Page, thread: string) {
   const held: Route[] = [];
@@ -219,7 +196,7 @@ test("catch_up_after_hello", async ({ daemon, page }) => {
 
 /** Dispatches a synthesized composition and its confirming Enter, in `order`. */
 async function syntheticComposition(page: Page, text: string, how: "inside" | "webkit229" | "window") {
-  await composer(page).evaluate(
+  return composer(page).evaluate(
     async (el, { text, how }) => {
       const ta = el as HTMLTextAreaElement;
       const key = (keyCode: number, isComposing: boolean) => {
@@ -248,11 +225,10 @@ async function syntheticComposition(page: Page, text: string, how: "inside" | "w
           notPrevented = key(13, false);
         }
       }
-      (window as unknown as { __notPrevented: boolean }).__notPrevented = notPrevented;
+      return notPrevented;
     },
     { text, how },
   );
-  return page.evaluate(() => (window as unknown as { __notPrevented: boolean }).__notPrevented);
 }
 
 test("ime_sequences", async ({ daemon, page, browserName, browser }) => {

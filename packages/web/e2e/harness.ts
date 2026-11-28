@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { test as base, expect, type Page } from "@playwright/test";
+import { test as base, expect, type Page, type WebSocketRoute } from "@playwright/test";
 
 import { Daemon, freePort } from "./daemon";
 
@@ -49,6 +49,36 @@ export async function openThread(page: Page, daemon: Daemon, thread: string): Pr
   await openLink(page, await daemon.pairUrl());
   await page.locator(`li[data-thread="${thread}"] button`).first().click();
   await expect(statusOf(page)).toHaveText("live");
+}
+
+/** A thread whose launch is ready (an open gate: no prompt has been written yet). */
+export async function openGate(daemon: Daemon): Promise<string> {
+  const { thread } = await daemon.spawnThread();
+  await daemon.waitEvents(thread, (es) => es.some((e) => e.kind === "readiness_observed"));
+  return thread;
+}
+
+/**
+ * The page's events socket, passed through. `drop()` closes it so the page opens a new
+ * one; `opened()` counts the sockets opened so far.
+ */
+export async function socketTap(page: Page): Promise<{ drop: () => void; opened: () => number }> {
+  let current: WebSocketRoute | null = null;
+  let n = 0;
+  await page.routeWebSocket(/\/api\/ws(\?|$)/, (ws) => {
+    const server = ws.connectToServer();
+    current = ws;
+    n += 1;
+    ws.onMessage((m) => server.send(m));
+    server.onMessage((m) => ws.send(m));
+  });
+  return {
+    drop: () => {
+      void current?.close();
+      current = null;
+    },
+    opened: () => n,
+  };
 }
 
 /** The bodies of every `POST /api/commands/<name>` the page sends from now on. */
