@@ -972,15 +972,12 @@ pub(crate) enum Verb {
     InputCancel {
         input: InputId,
     },
-    /// A plain stop, of launch `launch` only when given.
+    /// `stop`, of launch `launch` only when given; with `assume_dead`, the assertion for it,
+    /// or the preview without one.
     Stop {
         thread: ThreadId,
         launch: Option<LaunchId>,
-    },
-    /// `stop --assume-dead`: the preview without a launch, the assertion with one.
-    AssumeDead {
-        thread: ThreadId,
-        launch: Option<LaunchId>,
+        assume_dead: bool,
     },
     Close {
         thread: ThreadId,
@@ -1064,15 +1061,17 @@ pub(crate) fn run(dir: &Path, verb: Verb) -> ExitCode {
             out,
             err,
         ),
-        Verb::Stop { thread, launch } => c.stop(thread, launch, false, out, err),
-        Verb::AssumeDead {
-            thread,
-            launch: Some(l),
-        } => c.stop(thread, Some(l), true, out, err),
-        Verb::AssumeDead {
+        // `--assume-dead` without a launch is the preview, which sends nothing.
+        Verb::Stop {
             thread,
             launch: None,
+            assume_dead: true,
         } => c.preview(thread, out, err),
+        Verb::Stop {
+            thread,
+            launch,
+            assume_dead,
+        } => c.stop(thread, launch, assume_dead, out, err),
         Verb::Close {
             thread,
             stop,

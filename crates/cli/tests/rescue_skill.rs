@@ -101,18 +101,20 @@ fn argv(example: &str) -> Vec<OsString> {
 fn rescue_skill_commands() {
     let examples = examples(SKILL);
     assert!(examples.len() >= 10, "{examples:?}");
-    for e in &examples {
-        if let Err(m) = chaldea_cli::check_args(&argv(e)) {
-            panic!("`{e}` does not parse:\n{m}");
-        }
-    }
+    let commands: Vec<String> = examples
+        .iter()
+        .map(|e| {
+            chaldea_cli::check_args(&argv(e))
+                .unwrap_or_else(|m| panic!("`{e}` does not parse:\n{m}"))
+        })
+        .collect();
     // `send`'s text and `spawn`'s path each reach the command whole and literal.
     let parsed = |cmd: &str| {
-        let e = examples
+        let i = examples
             .iter()
-            .find(|e| e.split_whitespace().nth(1) == Some(cmd))
+            .position(|e| e.split_whitespace().nth(1) == Some(cmd))
             .unwrap_or_else(|| panic!("no `chaldea {cmd}` example"));
-        chaldea_cli::check_args(&argv(e)).unwrap()
+        &commands[i]
     };
     let send = parsed("send");
     assert!(

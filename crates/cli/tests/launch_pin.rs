@@ -262,7 +262,6 @@ fn key() {
     let m = Moved::start();
     m.drain();
     m.refused(&["key", &m.t, "--launch", &m.old, "y", "enter"]);
-    // The matching pin: the marker is written, alone.
     m.no_byte_since_drain();
     m.end();
 }
@@ -633,6 +632,31 @@ fn explicit_pin_reads_nothing() {
     }
 }
 
+/// Thread `t`'s summary with current launch `l`: running, or exited for `exit` with its
+/// death confirmed.
+fn summary(t: &str, l: LaunchId, exit: Option<ExitReason>) -> Value {
+    serde_json::to_value(ThreadSummary {
+        thread_id: ThreadId(uuid::Uuid::parse_str(t).unwrap()),
+        closed: false,
+        process_state: if exit.is_some() {
+            ProcessState::Exited
+        } else {
+            ProcessState::Running
+        },
+        turn_state: TurnState::Idle,
+        task_state: TaskState::None,
+        attention_count: 0,
+        launch: Some(LaunchInfo {
+            launch_id: l,
+            pid: None,
+            manual: false,
+            exit_reason: exit,
+            death_confirmed: exit.is_some(),
+        }),
+    })
+    .unwrap()
+}
+
 /// Without `--launch`, `ready`, `key`, `resume`, and `close` read the summary first and pin
 /// its current launch `Y`.
 fn unpinned_reads_the_launch() {
@@ -640,27 +664,9 @@ fn unpinned_reads_the_launch() {
     let d = state();
     let t = "00000000-0000-4000-8000-000000000007";
     let y = LaunchId::from_u128(0x3);
-    let summary = ThreadSummary {
-        thread_id: ThreadId(uuid::Uuid::parse_str(t).unwrap()),
-        closed: false,
-        process_state: ProcessState::Running,
-        turn_state: TurnState::Idle,
-        task_state: TaskState::None,
-        attention_count: 0,
-        launch: Some(LaunchInfo {
-            launch_id: y,
-            pid: None,
-            manual: false,
-            exit_reason: None,
-            death_confirmed: false,
-        }),
-    };
     let summary_path = format!("/api/threads/{t}");
     let mut replies = command_replies(t, y);
-    replies.push((
-        summary_path.clone(),
-        serde_json::to_value(&summary).unwrap(),
-    ));
+    replies.push((summary_path.clone(), summary(t, y, None)));
     let stub = Stub::start(&d.path, &replies);
     for (cmd_args, name, field) in PINNED {
         let args = command_line(t, cmd_args, None);
@@ -689,21 +695,6 @@ fn preview_posts_nothing() {
     let d = state();
     let t = "00000000-0000-4000-8000-000000000007";
     let x = LaunchId::from_u128(0x1);
-    let summary = ThreadSummary {
-        thread_id: ThreadId(uuid::Uuid::parse_str(t).unwrap()),
-        closed: false,
-        process_state: ProcessState::Exited,
-        turn_state: TurnState::Idle,
-        task_state: TaskState::None,
-        attention_count: 0,
-        launch: Some(LaunchInfo {
-            launch_id: x,
-            pid: None,
-            manual: false,
-            exit_reason: Some(ExitReason::Stopped),
-            death_confirmed: true,
-        }),
-    };
     let at = "2026-11-26T00:00:00.001Z";
     let exited = json!({
         "stream_id": format!("thread:{t}"),
@@ -730,15 +721,16 @@ fn preview_posts_nothing() {
         "has_more": false,
         "has_more_before": false,
     });
-    let mut replies = command_replies(t, x);
-    replies.push((
-        format!("/api/threads/{t}"),
-        serde_json::to_value(&summary).unwrap(),
-    ));
-    replies.push((
-        format!("/api/events?stream_id=thread:{t}&before_seq=9007199254740991&limit=16"),
-        page,
-    ));
+    let replies = [
+        (
+            format!("/api/threads/{t}"),
+            summary(t, x, Some(ExitReason::Stopped)),
+        ),
+        (
+            format!("/api/events?stream_id=thread:{t}&before_seq=9007199254740991&limit=16"),
+            page,
+        ),
+    ];
     let stub = Stub::start(&d.path, &replies);
     let (code, out, err) = run_to_exit(&mut cmd(
         &labels,

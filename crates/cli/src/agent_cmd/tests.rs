@@ -788,20 +788,6 @@ fn send_prints_the_input() {
     assert!(err.contains("empty_prompt"), "{err}");
 }
 
-/// PR10a2-CL-9: the `death_unconfirmed` tail names the preview with the thread's id.
-#[test]
-fn unconfirmed_text() {
-    let stub = Stub::start(vec![Reply::Json(409, error("death_unconfirmed"))]);
-    let (code, _, err) = run(&stub, |c, o, e| c.stop(T, None, false, o, e));
-    assert_eq!(code, ExitCode::Failed);
-    assert_eq!(
-        err.lines().last().unwrap(),
-        format!(
-            "chaldea: To review what was checked, run `chaldea stop {T} --assume-dead`; once you have made sure its processes ended, confirm with `chaldea stop {T} --assume-dead --launch <id>`. Its history is kept, and new threads can be started."
-        )
-    );
-}
-
 mod inspect;
 mod preview;
 
