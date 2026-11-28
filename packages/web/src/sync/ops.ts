@@ -1,6 +1,8 @@
 // Random schedules for the sync properties (test only): writes, network steps with
 // losses and reordering, restarts, database swaps, and user actions.
 
+import type { InputReason } from "@chaldea/contracts/generated/InputReason";
+import type { InputState } from "@chaldea/contracts/generated/InputState";
 import fc from "fast-check";
 
 import type { Axes } from "./model/server";
@@ -16,6 +18,12 @@ export type Op =
   | { t: "message"; n: number; size: number; jp: boolean }
   | { t: "burst"; n: number; k: number; size: number; jp: boolean }
   | { t: "unknown"; n: number }
+  /** A `raw_unknown` event on a thread (`n`) or the host (`n` 0), typed or generic. */
+  | { t: "raw"; n: number; typed: boolean }
+  /** The launch's next step: reserved, exited (death confirmed or not), death confirmed. */
+  | { t: "launch"; n: number; v: number }
+  /** An input created, or the next transition of one. */
+  | { t: "input"; n: number; v: number }
   | { t: "close"; n: number }
   | { t: "serve"; i: number }
   | { t: "deliver"; i: number }
@@ -107,6 +115,21 @@ export const opArb = (w: OpWeights = { writes: 3, network: 6, faults: 1, user: 3
     { weight: 1, arbitrary: fc.record({ t: fc.constant("latest" as const) }) },
   );
 
+/**
+ * The writes W2's projections read (`raw_unknown`, launches, inputs), mixed into `opArb`'s
+ * schedules. Kept apart so `opArb`'s recorded seeds and paths still replay.
+ */
+export const w2OpArb = (): fc.Arbitrary<Op> =>
+  fc.oneof(
+    { weight: 6, arbitrary: opArb() },
+    {
+      weight: 1,
+      arbitrary: fc.record({ t: fc.constant("raw" as const), n: fc.oneof(n, fc.constant(0)), typed: fc.boolean() }),
+    },
+    { weight: 1, arbitrary: fc.record({ t: fc.constant("launch" as const), n, v: fc.nat(5) }) },
+    { weight: 1, arbitrary: fc.record({ t: fc.constant("input" as const), n, v: fc.nat(11) }) },
+  );
+
 const PROCESS = ["starting", "running", "stopping", "exited"] as const;
 const TURN = ["unknown", "idle", "running", "awaiting_approval"] as const;
 const TASK = ["none", "active", "blocked", "completed", "failed", "cancelled"] as const;
@@ -127,6 +150,41 @@ function statusWrite(sim: Sim, id: string, v: number): void {
   sim.server.status(id, field, to as never);
 }
 
+let launchN = 1;
+let inputN = 1;
+
+function launchWrite(sim: Sim, id: string, v: number): void {
+  const l = sim.server.thread(id)?.launch ?? null;
+  if (l === null || (l.exit_reason !== null && l.death_confirmed)) {
+    sim.server.launchReserved(id, `0193ffff-0000-7000-8000-${(launchN++).toString(16).padStart(12, "0")}`);
+  } else if (l.exit_reason === null) {
+    sim.server.launchExited(id, (["exit", "stopped", "daemon_restart"] as const)[v % 3] ?? "exit", v % 2 === 0);
+  } else {
+    sim.server.deathConfirmed(id);
+  }
+}
+
+const NEXT: readonly (readonly [InputState, InputReason])[] = [
+  ["sending", { kind: "gate_opened" }],
+  ["sent", { kind: "write_completed" }],
+  ["acked", { kind: "ack_attributed" }],
+  ["unconfirmed", { kind: "ack_window_expired" }],
+  ["cancelled", { kind: "cancelled" }],
+  ["dismissed", { kind: "resolved" }],
+];
+
+function inputWrite(sim: Sim, id: string, v: number): void {
+  const t = sim.server.thread(id);
+  if (!t) return;
+  const open = t.inputs[v % Math.max(1, t.inputs.length)];
+  if (open === undefined || v % 4 === 0) {
+    sim.server.inputCreated(id, `0193eeee-0000-7000-8000-${(inputN++).toString(16).padStart(12, "0")}`, `入力 ${v}`);
+    return;
+  }
+  const [to, reason] = NEXT[v % NEXT.length] ?? NEXT[0]!;
+  sim.server.inputState(id, open.input_id, to, reason, to === "dismissed" || to === "cancelled" ? "human" : null);
+}
+
 const at = <T>(xs: readonly T[], i: number): T | undefined => (xs.length === 0 ? undefined : xs[i % xs.length]);
 
 export function run(sim: Sim, op: Op): void {
@@ -142,6 +200,12 @@ export function run(sim: Sim, op: Op): void {
       return;
     case "unknown":
       return sim.server.unknown(threadId(op.n));
+    case "raw":
+      return sim.server.rawUnknown(op.n === 0 ? "host" : `thread:${threadId(op.n)}`, op.typed);
+    case "launch":
+      return launchWrite(sim, threadId(op.n), op.v);
+    case "input":
+      return inputWrite(sim, threadId(op.n), op.v);
     case "close":
       return sim.server.close(threadId(op.n));
     case "serve": {

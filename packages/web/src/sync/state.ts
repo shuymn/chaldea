@@ -3,8 +3,12 @@
 // handles, and React reads it through `useSyncExternalStore`. No secret is kept here:
 // the credential is named by its generation, the token stays in the runner.
 
+import type { Actor } from "@chaldea/contracts/generated/Actor";
 import type { AttentionCause } from "@chaldea/contracts/generated/AttentionCause";
 import type { EventEnvelope } from "@chaldea/contracts/generated/EventEnvelope";
+import type { ExitReason } from "@chaldea/contracts/generated/ExitReason";
+import type { InputReason } from "@chaldea/contracts/generated/InputReason";
+import type { InputState } from "@chaldea/contracts/generated/InputState";
 import type { ProcessState } from "@chaldea/contracts/generated/ProcessState";
 import type { TaskState } from "@chaldea/contracts/generated/TaskState";
 import type { ThreadInfo } from "@chaldea/contracts/generated/ThreadInfo";
@@ -65,7 +69,35 @@ export interface HostCopy {
   readonly kind: "host";
   readonly cursor: number;
   readonly threads: Readonly<Record<string, HostRow>>;
+  /** The stream's `raw_unknown` events at or below `cursor` (docs/design/w2-composer.md §2.3). */
+  readonly rawUnknown: number;
 }
+
+/** The thread's current launch, from its own stream (docs/design/w2-composer.md §2.3). */
+export interface LaunchView {
+  readonly id: string;
+  /** `launch_exited` was seen: `exit_reason` is set. */
+  readonly exited: boolean;
+  readonly exitReason: ExitReason | null;
+  readonly deathConfirmed: boolean;
+}
+
+/** One input as the thread stream shows it. */
+export interface InputView {
+  readonly id: string;
+  readonly state: InputState;
+  /** The latest transition's reason and actor; null until a transition is seen. */
+  readonly reason: InputReason | null;
+  readonly by: Actor | null;
+  readonly createdBy: Actor;
+  /** The text inline, or the blob's preview. */
+  readonly preview: string;
+}
+
+/** Terminal transitions a copy keeps, newest last. */
+export const TERMINAL_INPUTS = 20;
+
+export const TERMINAL_STATES: ReadonlySet<InputState> = new Set(["acked", "rejected", "cancelled", "dismissed"]);
 
 /** The thread stream's own projection: the axes and attention it owns (F1). */
 export interface ThreadCopy {
@@ -76,6 +108,13 @@ export interface ThreadCopy {
   /** Null until the thread stream itself states a task state; the host's is the initial one. */
   readonly task: TaskState | null;
   readonly attention: readonly AttentionCause[];
+  readonly launch: LaunchView | null;
+  /** Inputs not yet terminal, in creation order. */
+  readonly inputs: readonly InputView[];
+  /** Terminal transitions this copy observed, at most `TERMINAL_INPUTS`, newest last. */
+  readonly done: readonly InputView[];
+  /** The stream's `raw_unknown` events at or below `cursor`. */
+  readonly rawUnknown: number;
 }
 
 export type Copy = HostCopy | ThreadCopy;
@@ -295,6 +334,29 @@ export interface RowView {
   readonly error: StreamError | null;
   /** The stream's latest forward read failed transiently; it is retried on backoff. */
   readonly retrying: boolean;
+}
+
+/**
+ * Whether the copy of one stream is current (docs/design/w2-composer.md §2.2 "Dispatch"):
+ * the conditions "last synced" checks per stream (reducer.ts `syncedCheck`), plus a socket
+ * whose `hello` epoch is the copy's. A copy that advanced into a new epoch while the old
+ * socket still holds is not current.
+ */
+export function current(s: State, key: string): boolean {
+  const st = s.streams[key];
+  if (!st) return false;
+  const { copy } = st;
+  if (copy === null || st.error !== null || st.asked || st.hasMore || st.fwd !== null) return false;
+  if (st.knownHead === null || copy.cursor < st.knownHead) return false;
+  if (st.announced !== null && copy.cursor < st.announced) return false;
+  return s.socket?.epoch != null && s.socket.epoch === s.epoch;
+}
+
+/** The thread's own copy, when the page holds one (it may lag; `current` says whether it does). */
+export function threadCopy(s: State, thread: string): ThreadCopy | null {
+  if (s.gone[thread]) return null;
+  const copy = s.streams[threadStream(thread)]?.copy;
+  return copy?.kind === "thread" ? copy : null;
 }
 
 export function rowView(s: State, row: HostRow): RowView {

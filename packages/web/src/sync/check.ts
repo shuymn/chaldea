@@ -36,6 +36,8 @@ export function problems(sim: Sim): string[] {
       continue;
     }
     if (copy.cursor !== srv.head(key)) out.push(`${key}: cursor ${copy.cursor} != head ${srv.head(key)}`);
+    const raw = srv.rawUnknownCount(key);
+    if (copy.rawUnknown !== raw) out.push(`${key}: raw_unknown ${copy.rawUnknown} != ${raw}`);
     if (copy.kind === "host") {
       const want = srv.threadIds().sort();
       const got = Object.keys(copy.threads).sort();
@@ -63,6 +65,13 @@ export function problems(sim: Sim): string[] {
         out.push(`${key}: axes ${v.process}/${v.turn}/${v.task} != ${want.process}/${want.turn}/${want.task}`);
       }
       if (JSON.stringify(v.attention) !== JSON.stringify(want.attention)) out.push(`${key}: attention differs`);
+      const l = t.launch;
+      const wantLaunch =
+        l === null ? null : { id: l.launch_id, exited: l.exit_reason !== null, exitReason: l.exit_reason, deathConfirmed: l.death_confirmed };
+      if (JSON.stringify(copy.launch) !== JSON.stringify(wantLaunch)) out.push(`${key}: launch differs`);
+      const inputs = (xs: readonly { id: string; state: string }[]) => xs.map((x) => `${x.id}:${x.state}`).join();
+      const wantInputs = inputs(t.inputs.map((x) => ({ id: x.input_id, state: x.state })));
+      if (inputs(copy.inputs) !== wantInputs) out.push(`${key}: inputs ${inputs(copy.inputs)} != ${wantInputs}`);
     }
   }
   // The followed set: every thread the server has and the client shows, within the cap.
