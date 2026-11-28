@@ -54,18 +54,68 @@ export async function openThread(page: Page, daemon: Daemon, thread: string): Pr
 /** Selects `thread` in the list and waits until its composer is mounted and caught up. */
 export async function selectThread(page: Page, thread: string): Promise<void> {
   await page.locator(`li[data-thread="${thread}"] button`).first().click();
-  await caughtUp(page);
+  await caughtUp(page, thread);
+}
+
+/** The composer's hint when sending is not locked (Composer.tsx). */
+const READY_HINT = "Enter sends on a desktop pointer";
+
+/**
+ * `thread` is the selected row, and its mounted composer shows the ready hint (the page is
+ * live with a current copy of the thread, no lock hint), read in one check: the state a send,
+ * ready, or input command needs at the gesture. A gesture made earlier is refused with a
+ * notice, and typing into a just-mounted composer can be lost to WebKit's fill.
+ */
+export async function caughtUp(page: Page, thread: string): Promise<void> {
+  await expect
+    .poll(
+      () =>
+        page.evaluate(
+          ({ thread, hint }) => {
+            const row = document.querySelector(`li[data-thread="${thread}"] button`);
+            const form = document.querySelector('form[aria-label="Composer"]');
+            return (
+              row?.getAttribute("aria-current") === "true" &&
+              form?.querySelector("textarea") !== null &&
+              (form?.textContent ?? "").includes(hint)
+            );
+          },
+          { thread, hint: READY_HINT },
+        ),
+      { message: "the thread's composer never became ready" },
+    )
+    .toBe(true);
+}
+
+/** Waits until the timeline's last row is at least `#<seq>`. */
+export async function shownAtLeast(page: Page, seq: number): Promise<void> {
+  await expect
+    .poll(async () => (await shownSeqs(page)).at(-1) ?? 0, { timeout: 20_000, message: `timeline never reached #${seq}` })
+    .toBeGreaterThanOrEqual(seq);
 }
 
 /**
- * The selected thread's composer is mounted, and the page is live with a current copy of the
- * thread (no lock hint): the state a send, ready, or input command needs at the gesture. A
- * gesture made earlier is refused with a notice, and typing into a just-mounted composer can
- * be lost to WebKit's fill.
+ * How long a check for an absent request waits after a gesture that must not make one. Only
+ * silence is being proven, so no condition exists to wait on: a request the page would start
+ * synchronously from the gesture is reported to the test well within this.
  */
-export async function caughtUp(page: Page): Promise<void> {
-  await expect(composer(page)).toBeVisible();
-  await expect(page.getByRole("form", { name: "Composer" }).getByText(/^Commands wait until/)).toHaveCount(0);
+export const SILENCE_MS = 500;
+
+/** Counts the composer form's `submit` events in the page (`window.__submits`). */
+export async function countSubmits(page: Page): Promise<() => Promise<number>> {
+  await page.evaluate(() => {
+    const w = window as unknown as { __submits?: number };
+    if (w.__submits !== undefined) return;
+    w.__submits = 0;
+    document.addEventListener(
+      "submit",
+      (e) => {
+        if ((e.target as Element).matches('form[aria-label="Composer"]')) w.__submits = (w.__submits ?? 0) + 1;
+      },
+      true,
+    );
+  });
+  return () => page.evaluate(() => (window as unknown as { __submits?: number }).__submits ?? 0);
 }
 
 /** A thread whose launch is ready (an open gate: no prompt has been written yet). */

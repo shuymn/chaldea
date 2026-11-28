@@ -22,6 +22,7 @@ import {
   openGate,
   openLink,
   openThread,
+  SILENCE_MS,
   selectThread,
   sendButton,
   socketTap,
@@ -82,7 +83,7 @@ test("ready_opens_gate", async ({ daemon, page }) => {
   await expect(dialog).toContainText("Queued prompts may then be written");
   await dialog.getByRole("button", { name: "Cancel" }).click();
   await expect(dialog).toBeHidden();
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(SILENCE_MS);
   expect(readies).toEqual([]);
 
   await actions(page).getByRole("button", { name: "Mark ready" }).click();
@@ -156,7 +157,8 @@ test("send_outcome_unknown", async ({ daemon, page }) => {
   await expect(line).toContainText("Check the thread");
   await expect(line.getByRole("button", { name: "Retry" })).toHaveCount(0);
   await expect(sendButton(page)).toBeDisabled();
-  await page.waitForTimeout(1500);
+  // Silence: no Retry appears even past a 1 s `retry_after`.
+  await page.waitForTimeout(1_000 + SILENCE_MS);
   await expect(line.getByRole("button", { name: "Retry" })).toHaveCount(0);
   expect(posts).toHaveLength(1);
   expect(await daemon.waitInputs(thread, (is) => is.length === 1)).toHaveLength(1);
@@ -191,7 +193,7 @@ test("send_not_done_retry", async ({ daemon, page }) => {
   expect(posts).toHaveLength(2);
   expect(posts[1] === posts[0], "the Retry's body differs from the first attempt's").toBe(true);
   expect(JSON.parse(posts[1]!).command_id).toBe(JSON.parse(posts[0]!).command_id);
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(SILENCE_MS);
   expect(await daemon.inputs(thread)).toHaveLength(1);
 });
 
@@ -255,7 +257,7 @@ test("double_submit", async ({ daemon, page }) => {
   await expect(row.getByRole("button", { name: "Dismiss" })).toBeDisabled();
   await row.getByRole("button", { name: "Dismiss" }).dispatchEvent("click");
   await banner(page).locator(`[data-cause="input_unconfirmed"]`).getByRole("button", { name: "Dismiss" }).dispatchEvent("click");
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(SILENCE_MS);
   expect(resolves).toHaveLength(1);
   await route.continue();
   await daemon.waitInputs(fresh, (is) => is[0]?.state === "acked");
@@ -322,7 +324,7 @@ test("stop_dialog_pins", async ({ daemon, page }) => {
   await daemon.chaldea(["stop", thread]);
   await daemon.chaldea(["resume", thread]);
   await expect(dialog).toBeHidden({ timeout: 20_000 });
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(SILENCE_MS);
   expect(stops).toEqual([]);
 });
 
@@ -402,7 +404,8 @@ test("reply_body_cut", async ({ daemon, page }) => {
     await sendButton(page).click();
     const line = commandLine(page, `send:${thread}`);
     await expect(line).toHaveAttribute("data-phase", "check_thread", { timeout: 20_000 });
-    await page.waitForTimeout(1500);
+    // Silence: no Retry appears even past a 1 s `retry_after`.
+    await page.waitForTimeout(1_000 + SILENCE_MS);
     await expect(line.getByRole("button", { name: "Retry" })).toHaveCount(0);
     await expect(sendButton(page)).toBeDisabled();
     expect([spawns.length, sends.length]).toEqual([1, 1]);
@@ -427,8 +430,10 @@ test("single_flight_held", async ({ daemon, page }) => {
   const first = await sendHold.next();
   await composer(page).press("Control+Enter");
   await composer(page).press("Enter");
+  // The reducer refused the keyboard gestures (a held slot) with a notice, posting nothing; a
+  // click on the disabled button runs no handler.
+  await expect(page.locator("[data-last-command]")).toContainText("Send: not sent — the previous one is still pending.");
   await sendButton(page).dispatchEvent("click");
-  await page.waitForTimeout(500);
   expect(sends).toHaveLength(1);
   await first.continue();
   await expect(commandLine(page, `send:${thread}`)).toHaveAttribute("data-phase", "settled");
@@ -440,7 +445,7 @@ test("single_flight_held", async ({ daemon, page }) => {
   const stop = await stopHold.next();
   await expect(actions(page).getByRole("button", { name: "Stop" })).toBeDisabled();
   await actions(page).getByRole("button", { name: "Stop" }).dispatchEvent("click");
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(SILENCE_MS);
   await expect(page.getByRole("dialog", { name: "Stop this launch?" })).toBeHidden();
   expect(stops).toHaveLength(1);
   await stop.continue();
@@ -522,7 +527,9 @@ test("command_401", async ({ daemon, context }) => {
   const tokenB = auth.at(-1)!;
   await route.fulfill({ status: 401, contentType: "application/json", body: '{"code":"unauthorized"}' });
   await expect(commandLine(a, `send:${thread}`)).toContainText("the pairing was refused");
-  await a.waitForTimeout(1_000);
+  // Silence: the late 401's compare-and-delete (an IndexedDB transaction and a reread) left
+  // the newer credential; nothing signals that it ran, so this waits.
+  await a.waitForTimeout(2 * SILENCE_MS);
   await expect(a.getByText(SPENT)).toHaveCount(0);
   await expect(statusOf(a)).toHaveText("live");
   await expect(composer(a)).toHaveValue("held with the old pairing");
@@ -590,7 +597,7 @@ test("retry_session", async ({ daemon, page }) => {
   await reopen();
   await expect(sendButton(page)).toBeDisabled();
   await composer(page).press("Control+Enter");
-  await page.waitForTimeout(300);
+  await expect(page.locator("[data-last-command]")).toContainText("Send: not sent — the previous one is still pending.");
   expect(posts).toHaveLength(3);
   await c.fulfill({ response: res });
   await expect(line).toHaveAttribute("data-phase", "settled");

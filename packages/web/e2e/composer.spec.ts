@@ -5,21 +5,24 @@
 
 import { devices, type Page, type Route } from "@playwright/test";
 
+import { COMPOSITION_WINDOW_MS } from "../src/ui/keys";
 import {
   caughtUp,
   commandLine,
   commandPosts,
   composer,
+  countSubmits,
   expect,
   openGate,
   openLink,
   openThread,
+  SILENCE_MS,
   selectThread,
   sendButton,
+  shownAtLeast,
   socketTap,
   statusOf,
   test,
-  untilShown,
 } from "./harness";
 
 const sendSlot = (thread: string) => `send:${thread}`;
@@ -112,7 +115,7 @@ test("oversize_no_post", async ({ daemon, page }) => {
       .join(" "),
   );
   expect(described).toMatch(/over 256 KiB/);
-  await page.waitForTimeout(500);
+  // The refusal (aria-invalid) is set in the same reducer step that would have posted.
   expect(posts).toEqual([]);
   expect((await composer(page).inputValue()) === big).toBe(true);
 });
@@ -131,7 +134,8 @@ test("offline_locks", async ({ daemon, page }) => {
   await expect(page.getByRole("button", { name: "Start thread" })).toBeDisabled();
   await composer(page).press("Control+Enter");
   await composer(page).press("Enter");
-  await page.waitForTimeout(500);
+  // The reducer refused them with a notice, posting nothing.
+  await expect(page.locator("[data-last-command]")).toContainText("Send: not sent — the page is not live.");
   expect(posts).toEqual([]);
   expect(await composer(page).inputValue()).toMatch(/^kept while offline/);
 });
@@ -239,35 +243,53 @@ test("ime_sequences", async ({ daemon, page, browserName, browser }) => {
   const thread = await openGate(daemon);
   await openThread(page, daemon, thread);
   const posts = commandPosts(page, "send");
+  const submits = await countSubmits(page);
   const line = commandLine(page, sendSlot(thread));
-  /** A fresh Enter after the composition sends once. */
-  const freshEnter = async (n: number) => {
-    await page.waitForTimeout(100);
-    expect(posts, "a POST after the confirming Enter").toHaveLength(n - 1);
-    // The earlier inputs are done writing events, and the page shows the thread's last one:
-    // the copy stays current for this Enter. An input is done once queued behind the closed
-    // gate, or written with the echo CLI's prompt recorded (acked; a decomposed text, which
-    // the echo CLI does not normalize, stays `sent` until the 30 s window).
-    const settled = await daemon.waitEvents(thread, (es) => {
-      const inputs = es.filter((e) => e.kind === "input_created").length;
-      const written = new Set(
-        es.filter((e) => e.kind === "input_state_changed" && e.payload.to === "sent").map((e) => e.payload.input_id),
-      ).size;
-      const pending = es.some((e) => e.kind === "input_state_changed" && e.payload.to === "sending" && !es.some(
-        (x) => x.kind === "input_state_changed" && x.payload.input_id === e.payload.input_id && x.payload.from === "sending",
-      ));
-      return inputs === n - 1 && !pending && es.filter((e) => e.kind === "user_message").length >= written;
-    });
-    await untilShown(page, settled.at(-1)!.seq);
-    await caughtUp(page);
+  type Base = { readonly posts: number; readonly submits: number };
+  /**
+   * Readiness before a guarded key, monotonic: the daemon holds `n` inputs and, once one was
+   * sent, the first prompt's `user_message` and the running turn (the fixture's gate is then
+   * closed, so later inputs queue and write no more events); the page shows at least that
+   * sequence; the composer is ready. Returns the POST and submit counts to compare against.
+   */
+  const ready = async (n: number): Promise<Base> => {
+    const es = await daemon.waitEvents(
+      thread,
+      (xs) =>
+        xs.filter((e) => e.kind === "input_created").length === n &&
+        (n === 0 ||
+          (xs.some((e) => e.kind === "user_message") &&
+            xs.some((e) => e.kind === "status_changed" && e.payload.field === "turn_state" && e.payload.to === "running"))),
+    );
+    await shownAtLeast(page, es.at(-1)!.seq);
+    await caughtUp(page, thread);
+    expect(posts).toHaveLength(n);
+    return { posts: posts.length, submits: await submits() };
+  };
+  /**
+   * The guarded key submitted nothing. Only silence is proven, so this waits: the window in
+   * which the composer still gives an Enter to the IME (keys.ts), plus `SILENCE_MS`.
+   */
+  const silent = async (base: Base, how: string) => {
+    await page.waitForTimeout(COMPOSITION_WINDOW_MS + SILENCE_MS);
+    expect(await submits(), `${how}: the guarded key submitted the form`).toBe(base.submits);
+    expect(posts, `${how}: the guarded key made a POST`).toHaveLength(base.posts);
+  };
+  /** One fresh Enter, rechecked right before it, makes exactly one submit and one POST. */
+  const freshEnter = async (base: Base) => {
+    await caughtUp(page, thread);
+    expect(posts, "a POST before the fresh Enter").toHaveLength(base.posts);
+    expect(await submits()).toBe(base.submits);
     await composer(page).press("Enter");
-    await expect.poll(() => posts.length).toBe(n);
+    await expect.poll(() => posts.length).toBe(base.posts + 1);
+    expect(await submits()).toBe(base.submits + 1);
     await expect(line).toHaveAttribute("data-phase", "settled");
   };
 
   let n = 0;
   if (browserName === "chromium") {
     // A real composition through CDP: the confirming Enter arrives as keyCode 229.
+    const base = await ready(n);
     const cdp = await page.context().newCDPSession(page);
     await composer(page).focus();
     await cdp.send("Input.imeSetComposition", { text: "にほんご", selectionStart: 4, selectionEnd: 4 });
@@ -281,15 +303,20 @@ test("ime_sequences", async ({ daemon, page, browserName, browser }) => {
     await cdp.send("Input.insertText", { text: "日本語" });
     await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
     await expect(composer(page)).toHaveValue("日本語");
-    await freshEnter(++n);
+    await silent(base, "cdp");
+    await freshEnter(base);
+    n += 1;
     expect(JSON.parse(posts[n - 1]!).args.text).toBe("日本語");
   }
   for (const how of ["inside", "webkit229", "window"] as const) {
     // A decomposed が (U+304B U+3099): kept as typed, never normalized to NFC.
     const text = `変換 ${how} が`;
+    const base = await ready(n);
     expect(await syntheticComposition(page, text, how), `${how}: the composing Enter was prevented`).toBe(true);
     await expect(composer(page)).toHaveValue(text);
-    await freshEnter(++n);
+    await silent(base, how);
+    await freshEnter(base);
+    n += 1;
     expect(JSON.parse(posts[n - 1]!).args.text).toBe(text);
   }
   const stored = (await daemon.waitInputs(thread, (is) => is.length === n)).map((i) => i.text);
@@ -307,14 +334,18 @@ test("ime_sequences", async ({ daemon, page, browserName, browser }) => {
     const sent = commandPosts(p, "send");
     await openLink(p, await daemon.pairUrl());
     await selectThread(p, thread);
+    const submitted = await countSubmits(p);
     await composer(p).fill("一行目");
     await composer(p).press("End");
     await composer(p).press("Enter");
+    // The keydown ran to its default action (the newline), so a submit would already have
+    // been counted: the form's submit count is the condition, not a wait.
     await expect(composer(p)).toHaveValue("一行目\n");
-    await p.waitForTimeout(300);
+    expect(await submitted()).toBe(0);
     expect(sent).toEqual([]);
     await composer(p).press("Control+Enter");
     await expect.poll(() => sent.length).toBe(1);
+    expect(await submitted()).toBe(1);
   } finally {
     await mobile.close();
   }
