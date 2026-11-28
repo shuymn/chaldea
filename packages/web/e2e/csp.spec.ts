@@ -26,24 +26,34 @@ async function recordViolations(page: Page): Promise<void> {
 const violations = (page: Page) => page.evaluate(() => window.__violations ?? null);
 
 test("csp_clean", async ({ daemon, page }) => {
+  // The spawn prompt's 35 s wait, then the catch-up and the command waits.
+  test.setTimeout(90_000);
   await recordViolations(page);
-  const { thread } = await daemon.spawnThread({ prompt: "CSP の確認 🎌" });
+  const prompt = "CSP の確認 🎌";
+  const { thread } = await daemon.spawnThread({ prompt });
   await openLink(page, await daemon.pairUrl());
   await selectThread(page, thread);
   // Typed rows: the page decoded the events with the validators under this CSP.
   const timeline = page.locator("main ol");
   await expect(timeline.getByText("thread registered").or(timeline.getByText("launch reserved")).first()).toBeVisible();
-  await expect(timeline.getByText("CSP の確認 🎌").first()).toBeVisible();
+  await expect(timeline.getByText(prompt).first()).toBeVisible();
   await expect(statusOf(page)).toHaveText("live");
-  // The spawn prompt settles first: acked, with its own prompt record (the echo CLI's hook
-  // binds it; a lost hook fails here rather than passing).
-  await daemon.waitEvents(thread, (xs) => {
-    const spawned = inputsOf(xs)[0];
-    return (
-      spawned?.state === "acked" &&
-      xs.some((e) => e.kind === "user_message" && e.payload.input_id === spawned.id)
-    );
-  });
+  // Settled: once the prompt's hook has committed no later ack can come, and once the input is
+  // acked or unconfirmed (past the 30 s ack window) no `sent` or `unconfirmed` is pending.
+  await daemon.waitEvents(
+    thread,
+    (xs) => {
+      const spawned = inputsOf(xs)[0];
+      const hooked = xs.some(
+        (e) =>
+          e.kind === "user_message" &&
+          e.launch_id === spawned?.launch &&
+          (e.payload.prompt as { inline?: string } | undefined)?.inline === prompt,
+      );
+      return hooked && (spawned?.state === "acked" || spawned?.state === "unconfirmed");
+    },
+    35_000,
+  );
   // A live event over the socket.
   await daemon.chaldea(["send", thread, "live over the socket"]);
   await expect(timeline.getByText("live over the socket").first()).toBeVisible();

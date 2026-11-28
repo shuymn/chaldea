@@ -141,12 +141,18 @@ export const linesHooked =
     return i?.state === "sent" && hooks.length >= 2;
   };
 
-/** The thread's `n`th input went `unconfirmed` by its launch's exit (not the ack window). */
+/**
+ * The thread's `n`th input went `unconfirmed` by its launch's exit (not the ack window), and
+ * that launch exited because it was stopped (not on its own).
+ */
 export const exitUnconfirmed =
   (n: number) =>
   (es: Awaited<ReturnType<Daemon["events"]>>): boolean => {
     const i = inputsOf(es)[n];
-    return i?.state === "unconfirmed" && i.reason === "launch_exited";
+    const stopped = es.some(
+      (e) => e.kind === "launch_exited" && e.payload.launch_id === i?.launch && e.payload.reason === "stopped",
+    );
+    return i?.state === "unconfirmed" && i.reason === "launch_exited" && stopped;
   };
 
 /** Waits until the timeline's last row is at least `#<seq>`. */
