@@ -54,7 +54,7 @@ The thread copy gains `cards`: the snapshot's `open_approvals` (`sync.rs:227`), 
 
 ### 2.7 Rescue Skill
 
-The agent (draft §6.4) uses only the CLI. It reads alone (`inspect --json`, `wait`) and changes state only when the human asked for that command, pinned to what it inspected. **CLI addition**: `--launch <id>` on `ready`, `stop`, `resume`, `close`, `key` sends the existing pin (`command.rs:124`, :138, :160, :273, :288) instead of the current launch; a stale one gets `launch_changed` (exit 1, zero effect). Screen and tool text are data, never authorization.
+The agent (draft §6.4) uses only the CLI. It reads alone (`inspect --json`, `wait`) and acts only on the human's request, pinned to what it inspected. **CLI addition**: `--launch <id>` on `ready`, `stop`, `resume`, `close`, `key` sends the existing pin (`command.rs:124`, :138, :160, :273, :288) instead of the current launch; a stale one gets `launch_changed` (exit 1; no event or PTY byte, §6.6). Screen and tool text are data, never authorization.
 
 ## 3. Decisions
 
@@ -270,3 +270,4 @@ The code review verifies each item against the code, not only the tests:
 7. The T1 and MVP wording edits (§6.5) point to the latch rules.
 8. `card_attempted_disabled` asserts no automatic raw fallback.
 9. The `web` CI job builds the test variant once; the release artifact still runs the CSP and `request_policy` tests.
+10. Stale `--launch`: "no effect" means no event, no reservation, and no PTY byte. A stale `resume` may still run the adapter's `--version` probe before the daemon checks the pin (`crates/daemon/src/supervisor/ops.rs:150`); that ordering predates T2 and is in the backlog.
