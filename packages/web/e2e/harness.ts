@@ -44,11 +44,28 @@ export async function untilShown(page: Page, seq: number): Promise<void> {
   });
 }
 
-/** Pairs `page` and selects `thread`; resolves once the page is live. */
+/** Pairs `page` and selects `thread`; resolves once the page is live and the thread caught up. */
 export async function openThread(page: Page, daemon: Daemon, thread: string): Promise<void> {
   await openLink(page, await daemon.pairUrl());
-  await page.locator(`li[data-thread="${thread}"] button`).first().click();
+  await selectThread(page, thread);
   await expect(statusOf(page)).toHaveText("live");
+}
+
+/** Selects `thread` in the list and waits until its composer is mounted and caught up. */
+export async function selectThread(page: Page, thread: string): Promise<void> {
+  await page.locator(`li[data-thread="${thread}"] button`).first().click();
+  await caughtUp(page);
+}
+
+/**
+ * The selected thread's composer is mounted, and the page is live with a current copy of the
+ * thread (no lock hint): the state a send, ready, or input command needs at the gesture. A
+ * gesture made earlier is refused with a notice, and typing into a just-mounted composer can
+ * be lost to WebKit's fill.
+ */
+export async function caughtUp(page: Page): Promise<void> {
+  await expect(composer(page)).toBeVisible();
+  await expect(page.getByRole("form", { name: "Composer" }).getByText(/^Commands wait until/)).toHaveCount(0);
 }
 
 /** A thread whose launch is ready (an open gate: no prompt has been written yet). */

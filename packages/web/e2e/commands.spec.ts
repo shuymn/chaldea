@@ -22,6 +22,7 @@ import {
   openGate,
   openLink,
   openThread,
+  selectThread,
   sendButton,
   socketTap,
   statusOf,
@@ -219,7 +220,7 @@ test("double_submit", async ({ daemon, page }) => {
   expect(host.filter((e) => e.kind === "thread_registered" && e.payload.cwd === cwd)).toHaveLength(1);
 
   // Retry, double-clicked: one more POST.
-  await page.locator(`li[data-thread="${thread}"] button`).first().click();
+  await selectThread(page, thread);
   let first = true;
   await page.route("**/api/commands/send", async (route) => {
     if (first) {
@@ -244,8 +245,7 @@ test("double_submit", async ({ daemon, page }) => {
 
   // An unconfirmed input: It arrived held, then Dismiss sends nothing.
   const fresh = await openGate(daemon);
-  await page.locator(`li[data-thread="${fresh}"] button`).first().click();
-  await expect(statusOf(page)).toHaveText("live");
+  await selectThread(page, fresh);
   const id = await unconfirmed(daemon, page, fresh);
   const resolves = commandPosts(page, "input_resolve");
   const held = await hold(page, "/api/commands/input_resolve");
@@ -536,8 +536,9 @@ test("command_401", async ({ daemon, context }) => {
   await a.route("**/api/commands/send", (r) =>
     r.fulfill({ status: 401, contentType: "application/json", body: '{"code":"unauthorized"}' }),
   );
-  await a.locator(`li[data-thread="${thread}"] button`).first().click();
+  await selectThread(a, thread);
   await composer(a).fill("refused");
+  await expect(composer(a)).toHaveValue("refused");
   await sendButton(a).click();
   await expect(a.getByText(SPENT)).toBeVisible({ timeout: 15_000 });
   await expect(b.getByText(SPENT)).toBeVisible({ timeout: 15_000 });

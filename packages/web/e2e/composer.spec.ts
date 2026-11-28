@@ -6,6 +6,7 @@
 import { devices, type Page, type Route } from "@playwright/test";
 
 import {
+  caughtUp,
   commandLine,
   commandPosts,
   composer,
@@ -13,10 +14,12 @@ import {
   openGate,
   openLink,
   openThread,
+  selectThread,
   sendButton,
   socketTap,
   statusOf,
   test,
+  untilShown,
 } from "./harness";
 
 const sendSlot = (thread: string) => `send:${thread}`;
@@ -81,7 +84,7 @@ test("draft_edit_during_send", async ({ daemon, page }) => {
   await composer(page).fill("a new draft 新しい");
   await page.locator(`li[data-thread="${other}"] button`).first().click();
   await expect(composer(page)).toHaveValue("");
-  await page.locator(`li[data-thread="${thread}"] button`).first().click();
+  await selectThread(page, thread);
   await expect(composer(page)).toHaveValue("a new draft 新しい");
   const [i] = await daemon.waitInputs(thread, (is) => is[0]?.state === "acked");
   await expect(page.locator(`[data-input="${i!.input_id}"]`).first()).toHaveAttribute("data-state", "acked");
@@ -241,6 +244,22 @@ test("ime_sequences", async ({ daemon, page, browserName, browser }) => {
   const freshEnter = async (n: number) => {
     await page.waitForTimeout(100);
     expect(posts, "a POST after the confirming Enter").toHaveLength(n - 1);
+    // The earlier inputs are done writing events, and the page shows the thread's last one:
+    // the copy stays current for this Enter. An input is done once queued behind the closed
+    // gate, or written with the echo CLI's prompt recorded (acked; a decomposed text, which
+    // the echo CLI does not normalize, stays `sent` until the 30 s window).
+    const settled = await daemon.waitEvents(thread, (es) => {
+      const inputs = es.filter((e) => e.kind === "input_created").length;
+      const written = new Set(
+        es.filter((e) => e.kind === "input_state_changed" && e.payload.to === "sent").map((e) => e.payload.input_id),
+      ).size;
+      const pending = es.some((e) => e.kind === "input_state_changed" && e.payload.to === "sending" && !es.some(
+        (x) => x.kind === "input_state_changed" && x.payload.input_id === e.payload.input_id && x.payload.from === "sending",
+      ));
+      return inputs === n - 1 && !pending && es.filter((e) => e.kind === "user_message").length >= written;
+    });
+    await untilShown(page, settled.at(-1)!.seq);
+    await caughtUp(page);
     await composer(page).press("Enter");
     await expect.poll(() => posts.length).toBe(n);
     await expect(line).toHaveAttribute("data-phase", "settled");
@@ -287,8 +306,7 @@ test("ime_sequences", async ({ daemon, page, browserName, browser }) => {
     expect(await p.evaluate(() => matchMedia("(pointer: coarse)").matches)).toBe(true);
     const sent = commandPosts(p, "send");
     await openLink(p, await daemon.pairUrl());
-    await p.locator(`li[data-thread="${thread}"] button`).first().click();
-    await expect(statusOf(p)).toHaveText("live");
+    await selectThread(p, thread);
     await composer(p).fill("一行目");
     await composer(p).press("End");
     await composer(p).press("Enter");

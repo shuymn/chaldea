@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 import type { BrowserContext, Page, Request, Route } from "@playwright/test";
 
-import { type Daemon, expect, hasFragment, openLink, statusOf, test } from "./harness";
+import { type Daemon, expect, hasFragment, openLink, selectThread, statusOf, test } from "./harness";
 
 const SPENT = "This link is spent or expired";
 
@@ -71,7 +71,7 @@ test("request_policy", async ({ daemon, page }) => {
   });
 
   await openLink(page, await daemon.pairUrl());
-  await page.locator(`li[data-thread="${thread}"] button`).first().click();
+  await selectThread(page, thread);
   await expect(page.locator("main ol").getByText("policy check").first()).toBeVisible();
   await expect(statusOf(page)).toHaveText("live");
   // Every command the page has, through its own controls (W2-12).
@@ -115,10 +115,13 @@ test("request_policy", async ({ daemon, page }) => {
   await page.getByLabel("Working directory (absolute path)").fill(join(daemon.root));
   await page.getByRole("button", { name: "Start thread" }).click();
   await expect(line("spawn")).toHaveAttribute("data-phase", "settled", { timeout: 45_000 });
-  const commandPaths = new Set(sent.map((r) => new URL(r.url).pathname).filter((p) => p.startsWith("/api/commands/")));
-  expect([...commandPaths].sort()).toEqual(
-    ["input_cancel", "input_resolve", "ready", "resume", "send", "spawn", "stop"].map((c) => `/api/commands/${c}`),
-  );
+  // `sent` takes a request when Playwright reports it finished, which can come after the page
+  // showed its reply: wait for the last one rather than read the list once.
+  const commandPaths = () =>
+    [...new Set(sent.map((r) => new URL(r.url).pathname).filter((p) => p.startsWith("/api/commands/")))].sort();
+  await expect
+    .poll(commandPaths)
+    .toEqual(["input_cancel", "input_resolve", "ready", "resume", "send", "spawn", "stop"].map((c) => `/api/commands/${c}`));
 
   // Every mutation is one the page is allowed; nothing reads the screen, attaches, or writes keys.
   const MUTATIONS = new Set([
