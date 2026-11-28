@@ -41,6 +41,7 @@
   },
   "required": [
     "launch_id",
+    "input_id",
     "outcome"
   ],
   "title": "ResumeResult",

@@ -51,6 +51,7 @@
   "required": [
     "thread_id",
     "launch_id",
+    "input_id",
     "outcome"
   ],
   "title": "SpawnResult",

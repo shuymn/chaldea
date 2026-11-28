@@ -294,9 +294,9 @@ fn committed_contracts_equal_generated_output() {
     );
 }
 
-/// `StopResult`'s `exit_code` and `signal` and `CloseResult`'s `stop` are always present on
-/// the wire, as `null` when unknown or when no stop ran: each schema lists them in
-/// `required`.
+/// `StopResult`'s `exit_code` and `signal`, `CloseResult`'s `stop`, and the `input_id` of
+/// `SpawnResult` and `ResumeResult` are always present on the wire, as `null` when unknown,
+/// when no stop ran, or without a prompt: each schema lists them in `required`.
 #[test]
 fn nullable_result_fields_are_required() {
     let required = |schema: Value| -> Vec<String> {
@@ -328,6 +328,20 @@ fn nullable_result_fields_are_required() {
     let send = required(serde_json::to_value(schemars::schema_for!(SendResult)).unwrap());
     for f in ["input_id", "state", "reject_reason"] {
         assert!(send.iter().any(|r| r == f), "SendResult: {f} not required");
+    }
+    let spawn = required(serde_json::to_value(schemars::schema_for!(SpawnResult)).unwrap());
+    for f in ["thread_id", "launch_id", "input_id", "outcome"] {
+        assert!(
+            spawn.iter().any(|r| r == f),
+            "SpawnResult: {f} not required"
+        );
+    }
+    let resume = required(serde_json::to_value(schemars::schema_for!(ResumeResult)).unwrap());
+    for f in ["launch_id", "input_id", "outcome"] {
+        assert!(
+            resume.iter().any(|r| r == f),
+            "ResumeResult: {f} not required"
+        );
     }
     let key = required(serde_json::to_value(schemars::schema_for!(KeyResult)).unwrap());
     for f in ["outcome", "bytes_written"] {
