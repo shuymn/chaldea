@@ -1,8 +1,9 @@
 //! The `unsafe` carve-out (`docs/design/pty-unix.md` §2.7, `docs/design/pty-windows.md`
 //! §2.7): exactly two `#[allow(unsafe_code)]`, on `unix::sys` and `windows::sys`, and a
 //! crate lints table that restates the workspace's clippy set with only the listed
-//! additions. Every other crate keeps the workspace table (`forbid`). Every injected fault
-//! panic in the workspace skips the panic hook (`fake::inject_panic`), but the listed ones.
+//! additions. Every other crate keeps the workspace table (`forbid`). A fault panic named
+//! `injected …`, or raised with `panic_any`, skips the panic hook (`fake::inject_panic`), but
+//! the listed ones.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -377,9 +378,11 @@ fn other_crates_keep_the_workspace_table() {
 const RAISERS: [&str; 3] = ["panic!(", "assert!(", "panic_any("];
 
 /// Every fault panic in `text` raised through the hook, as `(call, message)`: a
-/// `panic_any` call (its only use is a fault's payload), or a `panic!`/`assert!` with a
-/// message that names an injected fault (`injected …` or `an injected …`, the workspace's
-/// convention for fault messages; an assertion's own failure message never says so).
+/// `panic_any` call (its only use is a fault's payload), or a `panic!`/`assert!` whose
+/// message argument (the first of `panic!`, the second of `assert!`) is a literal naming an
+/// injected fault: `injected …` or `an injected …`, the workspace's convention for fault
+/// messages. The scan relies on that convention: a fault panic named otherwise, or raised
+/// as `panic![…]`/`panic!{…}`, is not found.
 fn hooked_faults(text: &str) -> Vec<(&'static str, String)> {
     let b: Vec<char> = without_comments(text).chars().collect();
     let at = |i: usize, s: &str| s.chars().enumerate().all(|(k, c)| b.get(i + k) == Some(&c));
@@ -397,34 +400,56 @@ fn hooked_faults(text: &str) -> Vec<(&'static str, String)> {
             i += 1;
             continue;
         };
-        // The string literals among the call's own arguments (not inside a nested call,
-        // as in `assert!(why.contains("injected"))`).
+        // Each top-level argument's text, with each literal as one `"`, and the content of
+        // its last top-level literal.
         let mut j = i + raiser.len();
         let mut depth = 1;
-        let mut msgs = Vec::new();
+        let mut args = vec![(String::new(), None::<String>)];
         while j < b.len() && depth > 0 {
+            let arg = args.last_mut().unwrap();
             match b[j] {
                 '"' => {
                     let (s, end) = literal(&b, j);
                     if depth == 1 {
-                        msgs.push(s);
+                        arg.1 = Some(s);
                     }
+                    arg.0.push('"');
                     j = end;
                     continue;
                 }
-                '(' => depth += 1,
-                ')' => depth -= 1,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 1 => {
+                    args.push((String::new(), None));
+                    j += 1;
+                    continue;
+                }
                 _ => {}
+            }
+            // The call's closing delimiter is no argument's.
+            if depth > 0
+                && let Some(arg) = args.last_mut()
+            {
+                arg.0.push(b[j]);
             }
             j += 1;
         }
-        let fault = msgs
-            .iter()
-            .find(|m| m.starts_with("injected") || m.starts_with("an injected"));
-        if raiser == "panic_any(" {
-            out.push((raiser, msgs.first().cloned().unwrap_or_default()));
-        } else if let Some(m) = fault {
-            out.push((raiser, m.clone()));
+        // A message: an argument that is one literal (not `reason == "injected"`).
+        let message = |k: usize| {
+            args.get(k)
+                .filter(|a| a.0.trim() == "\"")
+                .and_then(|a| a.1.clone())
+        };
+        match raiser {
+            "panic_any(" => out.push((raiser, message(0).unwrap_or_default())),
+            _ => {
+                let m = message(usize::from(raiser == "assert!("));
+                if let Some(m) =
+                    m.filter(|m| m.starts_with("injected") || m.starts_with("an injected"))
+                {
+                    out.push((raiser, m));
+                }
+            }
         }
         i += raiser.len();
     }
@@ -472,15 +497,16 @@ const HOOKED: [(&str, &str); 4] = [
     ),
 ];
 
-/// Every injected fault panic in the workspace's code and tests unwinds through
-/// `fake::inject_panic`, which skips the hook (so nothing waits on a backtrace), but the
-/// ones in [`HOOKED`].
+/// No fault panic that [`hooked_faults`] finds in the workspace's code and tests runs the
+/// hook, but each one in [`HOOKED`] (found exactly once): the others unwind through
+/// `fake::inject_panic`, so nothing waits on a backtrace. It checks the `injected` naming
+/// convention and `panic_any`; a fault panic named otherwise is not caught.
 #[test]
 fn fault_panics_skip_the_hook() {
     let root = root().canonicalize().unwrap();
     let me = crate_dir().join("tests/lints.rs").canonicalize().unwrap();
     let mut found = Vec::new();
-    let mut kept = [false; HOOKED.len()];
+    let mut kept = [0; HOOKED.len()];
     for e in std::fs::read_dir(root.join("crates")).unwrap() {
         let dir = e.unwrap().path();
         let mut files = Vec::new();
@@ -504,7 +530,7 @@ fn fault_panics_skip_the_hook() {
                     .iter()
                     .position(|h| *h == (rel.as_str(), msg.as_str()))
                 {
-                    Some(k) => kept[k] = true,
+                    Some(k) => kept[k] += 1,
                     None => found.push(format!("{rel}: {call}\"{msg}\"")),
                 }
             }
@@ -514,8 +540,8 @@ fn fault_panics_skip_the_hook() {
         found.is_empty(),
         "fault panics through the hook (use fake::inject_panic): {found:#?}"
     );
-    // A listed one that is gone leaves the list.
-    assert_eq!(kept, [true; HOOKED.len()], "{HOOKED:?}");
+    // A listed one that is gone leaves the list; a second site needs its own reason.
+    assert_eq!(kept, [1; HOOKED.len()], "{HOOKED:?}");
 }
 
 #[test]
@@ -527,6 +553,8 @@ let s = "panic!(\"injected in a string\")";
 let r = r#"assert!(x, "injected in a raw string")"#;
 assert!(ok, "the reply: {r:?}");
 assert!(cut || why.contains("injected"), "{why}");
+assert!(reason == "injected failure", "unexpected reason");
+panic!("the read panics");
 assert_eq!(a, b, "injected");
 debug_assert!(x, "injected");
 panic!("unexpected {m:?}");

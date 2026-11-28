@@ -148,7 +148,7 @@ async fn failed_join_waits_for_the_report() {
     let sup = rig.sup.clone();
     let (tx, first) = tokio::sync::oneshot::channel();
     let join: tokio::task::JoinHandle<chaldea_pty_runtime::CloseOutcome> =
-        tokio::spawn(async { panic!("a kill task that panicked") });
+        tokio::spawn(async { chaldea_pty_runtime::fake::inject_panic("injected kill task panic") });
     rig.until("the join is ready", || join.is_finished()).await;
     let fut = await_kill(&sup, KillTask::of(sup.now(), join, first));
     tokio::pin!(fut);
