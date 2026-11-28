@@ -17,6 +17,7 @@ import {
   commandLine,
   commandPosts,
   composer,
+  countSubmits,
   type Daemon,
   expect,
   openGate,
@@ -425,15 +426,21 @@ test("single_flight_held", async ({ daemon, page }) => {
   await openThread(page, daemon, thread);
   const sends = commandPosts(page, "send");
   const stops = commandPosts(page, "stop");
+  const submits = await countSubmits(page);
   await composer(page).fill("once only");
   await composer(page).press("Control+Enter");
   const first = await sendHold.next();
+  expect(await submits()).toBe(1);
+  // Each held-slot key still submits the form (so none was dropped), and the reducer refuses
+  // it with a notice, posting nothing.
   await composer(page).press("Control+Enter");
+  expect(await submits()).toBe(2);
   await composer(page).press("Enter");
-  // The reducer refused the keyboard gestures (a held slot) with a notice, posting nothing; a
-  // click on the disabled button runs no handler.
+  expect(await submits()).toBe(3);
   await expect(page.locator("[data-last-command]")).toContainText("Send: not sent — the previous one is still pending.");
+  // A click on the disabled button runs no handler.
   await sendButton(page).dispatchEvent("click");
+  expect(await submits()).toBe(3);
   expect(sends).toHaveLength(1);
   await first.continue();
   await expect(commandLine(page, `send:${thread}`)).toHaveAttribute("data-phase", "settled");

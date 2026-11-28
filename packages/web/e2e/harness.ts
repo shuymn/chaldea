@@ -73,12 +73,11 @@ export async function caughtUp(page: Page, thread: string): Promise<void> {
         page.evaluate(
           ({ thread, hint }) => {
             const row = document.querySelector(`li[data-thread="${thread}"] button`);
-            const form = document.querySelector('form[aria-label="Composer"]');
-            return (
-              row?.getAttribute("aria-current") === "true" &&
-              form?.querySelector("textarea") !== null &&
-              (form?.textContent ?? "").includes(hint)
-            );
+            const box = document.querySelector('form[aria-label="Composer"] textarea');
+            // The textarea's own hint: the first element its `aria-describedby` names.
+            const hintId = box?.getAttribute("aria-describedby")?.split(" ")[0] ?? "";
+            const shown = hintId === "" ? "" : (document.getElementById(hintId)?.textContent ?? "");
+            return row?.getAttribute("aria-current") === "true" && shown.startsWith(hint);
           },
           { thread, hint: READY_HINT },
         ),

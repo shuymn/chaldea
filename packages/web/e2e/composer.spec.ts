@@ -1,5 +1,5 @@
 // The composer against the daemon (docs/design/w2-composer.md §2.1, §4): W2-4
-// `ime_sequences`, W2-6 `send_intact`, `send_rejected_keeps_draft`, `draft_edit_during_send`,
+// `ime_sequences`, W2-6 `send_intact`, `send_decomposed`, `send_rejected_keeps_draft`, `draft_edit_during_send`,
 // `oversize_no_post`, and W2-11 `offline_locks`, `catch_up_after_hello` (with
 // `stop_during_paging`).
 
@@ -52,6 +52,26 @@ test("send_intact", async ({ daemon, page }) => {
   await expect(commandLine(page, sendSlot(thread))).toHaveAttribute("data-phase", "settled", { timeout: 20_000 });
   const inputs = await daemon.waitInputs(thread, (is) => is.length === 2);
   expect(inputs[1]!.text === big, "the stored 200 KiB text differs from the textarea's").toBe(true);
+});
+
+test("send_decomposed", async ({ daemon, page }) => {
+  // A decomposed が (U+304B U+3099) is sent and stored as typed, never normalized to NFC.
+  // One send, no later ones, and no wait for `acked`: the echo CLI reports the prompt without
+  // Claude's NFC, so the daemon leaves it `sent` (a known FakeCli gap).
+  const thread = await openGate(daemon);
+  await openThread(page, daemon, thread);
+  const posts = commandPosts(page, "send");
+  const text = `日本語の確認です。${String.fromCharCode(0x304b, 0x3099)}`;
+  await composer(page).fill(text);
+  await expect(composer(page)).toHaveValue(text);
+  await sendButton(page).click();
+  await expect(commandLine(page, sendSlot(thread))).toHaveAttribute("data-phase", "settled");
+  expect(posts).toHaveLength(1);
+  const hex = (s: string) => Buffer.from(s, "utf8").toString("hex");
+  expect(hex(JSON.parse(posts[0]!).args.text)).toBe(hex(text));
+  const [input] = await daemon.waitInputs(thread, (is) => is.length === 1);
+  expect(hex(input!.text)).toBe(hex(text));
+  expect(hex(input!.text).endsWith("e3818be38299")).toBe(true);
 });
 
 test("send_rejected_keeps_draft", async ({ daemon, page }) => {
@@ -201,8 +221,21 @@ test("catch_up_after_hello", async ({ daemon, page }) => {
 
 // ---- IME (W2-4; CL-22). Real IMEs are W2-1, the owner's check. ----------------------------
 
-/** Dispatches a synthesized composition and its confirming Enter, in `order`. */
-async function syntheticComposition(page: Page, text: string, how: "inside" | "webkit229" | "window") {
+/**
+ * The synthesized sequences, each a set of composing signals and its confirming Enter:
+ * - `inside`: the Enter inside the composition (isComposing, keyCode 229, the flag);
+ * - `webkit229`: WebKit's order, compositionend first, then an Enter with keyCode 229 past
+ *   the 50 ms window (keyCode 229 alone);
+ * - `window`: compositionend, then at once an Enter with keyCode 13 (the window alone);
+ * - `isComposing`: no composition events, an Enter with `isComposing` and keyCode 13
+ *   (`isComposing` alone);
+ * - `flag`: compositionstart, then an Enter with neither `isComposing` nor 229, then
+ *   compositionend (the composition flag alone).
+ */
+type How = "inside" | "webkit229" | "window" | "isComposing" | "flag";
+
+/** Dispatches a synthesized sequence and its confirming Enter; whether the Enter was not prevented. */
+async function syntheticComposition(page: Page, text: string, how: How) {
   return composer(page).evaluate(
     async (el, { text, how }) => {
       const ta = el as HTMLTextAreaElement;
@@ -212,121 +245,125 @@ async function syntheticComposition(page: Page, text: string, how: "inside" | "w
         Object.defineProperty(e, "keyCode", { value: keyCode });
         return ta.dispatchEvent(e);
       };
-      ta.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true, data: "" }));
       // The committed text, as the IME leaves it.
-      const set = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
-      set?.call(ta, text);
-      ta.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertCompositionText", data: text }));
-      let notPrevented: boolean;
-      if (how === "inside") {
-        notPrevented = key(229, true);
-        ta.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: text }));
-      } else {
-        // WebKit's order: compositionend before the confirming keydown.
-        ta.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: text }));
-        if (how === "webkit229") {
+      const commit = () => {
+        const set = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+        set?.call(ta, text);
+        ta.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertCompositionText", data: text }));
+      };
+      const start = () => ta.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true, data: "" }));
+      const end = () => ta.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: text }));
+      switch (how) {
+        case "inside": {
+          start();
+          commit();
+          const r = key(229, true);
+          end();
+          return r;
+        }
+        case "webkit229":
+          start();
+          commit();
+          end();
           // Past the 50 ms window, so keyCode 229 alone holds the Enter back.
           await new Promise((ok) => setTimeout(ok, 80));
-          notPrevented = key(229, false);
-        } else {
-          notPrevented = key(13, false);
+          return key(229, false);
+        case "window":
+          start();
+          commit();
+          end();
+          return key(13, false);
+        case "isComposing":
+          commit();
+          return key(13, true);
+        case "flag": {
+          start();
+          commit();
+          const r = key(13, false);
+          // Ends the composition; the fresh Enter comes after the window.
+          end();
+          return r;
         }
       }
-      return notPrevented;
     },
     { text, how },
   );
 }
 
 test("ime_sequences", async ({ daemon, page, browserName, browser }) => {
-  test.setTimeout(120_000);
-  const thread = await openGate(daemon);
-  await openThread(page, daemon, thread);
+  test.setTimeout(180_000);
+  await openLink(page, await daemon.pairUrl());
+  await expect(statusOf(page)).toHaveText("live");
   const posts = commandPosts(page, "send");
   const submits = await countSubmits(page);
-  const line = commandLine(page, sendSlot(thread));
-  type Base = { readonly posts: number; readonly submits: number };
+  /** POSTs and submits so far: each sequence adds exactly one of each. */
+  let sent = 0;
   /**
-   * Readiness before a guarded key, monotonic: the daemon holds `n` inputs and, once one was
-   * sent, the first prompt's `user_message` and the running turn (the fixture's gate is then
-   * closed, so later inputs queue and write no more events); the page shows at least that
-   * sequence; the composer is ready. Returns the POST and submit counts to compare against.
+   * A fresh thread per sequence. The echo CLI never ends a turn, so a thread's gate closes
+   * after its first prompt and a second input would stay queued: here every input is the
+   * thread's first, so it reaches `acked` and the thread's events stop. Precomposed text, so
+   * the echo CLI's prompt matches (its NFC gap is `send_decomposed`'s).
    */
-  const ready = async (n: number): Promise<Base> => {
-    const es = await daemon.waitEvents(
-      thread,
-      (xs) =>
-        xs.filter((e) => e.kind === "input_created").length === n &&
-        (n === 0 ||
-          (xs.some((e) => e.kind === "user_message") &&
-            xs.some((e) => e.kind === "status_changed" && e.payload.field === "turn_state" && e.payload.to === "running"))),
+  const sequence = async (name: string, text: string, guarded: () => Promise<boolean | void>) => {
+    const thread = await openGate(daemon);
+    // The startup writes end with the idle turn; then the page holds them and is ready.
+    const es = await daemon.waitEvents(thread, (xs) =>
+      xs.some((e) => e.kind === "status_changed" && e.payload.field === "turn_state" && e.payload.to === "idle"),
     );
+    await selectThread(page, thread);
     await shownAtLeast(page, es.at(-1)!.seq);
     await caughtUp(page, thread);
-    expect(posts).toHaveLength(n);
-    return { posts: posts.length, submits: await submits() };
-  };
-  /**
-   * The guarded key submitted nothing. Only silence is proven, so this waits: the window in
-   * which the composer still gives an Enter to the IME (keys.ts), plus `SILENCE_MS`.
-   */
-  const silent = async (base: Base, how: string) => {
+    expect(posts, `${name}: POSTs before the guarded key`).toHaveLength(sent);
+    expect(await submits(), `${name}: submits before the guarded key`).toBe(sent);
+
+    const notPrevented = await guarded();
+    if (notPrevented !== undefined) expect(notPrevented, `${name}: the composing Enter was prevented`).toBe(true);
+    await expect(composer(page)).toHaveValue(text);
+    // Silence: the window in which the composer still gives an Enter to the IME (keys.ts),
+    // plus `SILENCE_MS`.
     await page.waitForTimeout(COMPOSITION_WINDOW_MS + SILENCE_MS);
-    expect(await submits(), `${how}: the guarded key submitted the form`).toBe(base.submits);
-    expect(posts, `${how}: the guarded key made a POST`).toHaveLength(base.posts);
-  };
-  /** One fresh Enter, rechecked right before it, makes exactly one submit and one POST. */
-  const freshEnter = async (base: Base) => {
+    expect(await submits(), `${name}: the guarded key submitted the form`).toBe(sent);
+    expect(posts, `${name}: the guarded key made a POST`).toHaveLength(sent);
+
+    // One fresh Enter, the counts rechecked right before it.
     await caughtUp(page, thread);
-    expect(posts, "a POST before the fresh Enter").toHaveLength(base.posts);
-    expect(await submits()).toBe(base.submits);
+    expect(posts).toHaveLength(sent);
+    expect(await submits()).toBe(sent);
     await composer(page).press("Enter");
-    await expect.poll(() => posts.length).toBe(base.posts + 1);
-    expect(await submits()).toBe(base.submits + 1);
-    await expect(line).toHaveAttribute("data-phase", "settled");
+    sent += 1;
+    await expect.poll(() => posts.length, { message: `${name}: the fresh Enter made no POST` }).toBe(sent);
+    expect(await submits()).toBe(sent);
+    expect(JSON.parse(posts[sent - 1]!).args.text).toBe(text);
+    await expect(commandLine(page, sendSlot(thread))).toHaveAttribute("data-phase", "settled");
+    const [input] = await daemon.waitInputs(thread, (is) => is[0]?.state === "acked");
+    expect(input!.text === text, `${name}: the stored text differs`).toBe(true);
   };
 
-  let n = 0;
   if (browserName === "chromium") {
     // A real composition through CDP: the confirming Enter arrives as keyCode 229.
-    const base = await ready(n);
-    const cdp = await page.context().newCDPSession(page);
-    await composer(page).focus();
-    await cdp.send("Input.imeSetComposition", { text: "にほんご", selectionStart: 4, selectionEnd: 4 });
-    await cdp.send("Input.dispatchKeyEvent", {
-      type: "rawKeyDown",
-      key: "Enter",
-      code: "Enter",
-      windowsVirtualKeyCode: 229,
-      nativeVirtualKeyCode: 229,
+    await sequence("cdp", "日本語", async () => {
+      const cdp = await page.context().newCDPSession(page);
+      await composer(page).focus();
+      await cdp.send("Input.imeSetComposition", { text: "にほんご", selectionStart: 4, selectionEnd: 4 });
+      await cdp.send("Input.dispatchKeyEvent", {
+        type: "rawKeyDown",
+        key: "Enter",
+        code: "Enter",
+        windowsVirtualKeyCode: 229,
+        nativeVirtualKeyCode: 229,
+      });
+      await cdp.send("Input.insertText", { text: "日本語" });
+      await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
     });
-    await cdp.send("Input.insertText", { text: "日本語" });
-    await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
-    await expect(composer(page)).toHaveValue("日本語");
-    await silent(base, "cdp");
-    await freshEnter(base);
-    n += 1;
-    expect(JSON.parse(posts[n - 1]!).args.text).toBe("日本語");
   }
-  for (const how of ["inside", "webkit229", "window"] as const) {
-    // A decomposed が (U+304B U+3099): kept as typed, never normalized to NFC.
-    const text = `変換 ${how} が`;
-    const base = await ready(n);
-    expect(await syntheticComposition(page, text, how), `${how}: the composing Enter was prevented`).toBe(true);
-    await expect(composer(page)).toHaveValue(text);
-    await silent(base, how);
-    await freshEnter(base);
-    n += 1;
-    expect(JSON.parse(posts[n - 1]!).args.text).toBe(text);
+  for (const how of ["inside", "webkit229", "window", "isComposing", "flag"] as const) {
+    const text = `変換 ${how} が`;
+    await sequence(how, text, () => syntheticComposition(page, text, how));
   }
-  const stored = (await daemon.waitInputs(thread, (is) => is.length === n)).map((i) => i.text);
-  for (const how of ["inside", "webkit229", "window"] as const) {
-    expect(stored).toContain(`変換 ${how} が`);
-  }
-  expect(stored.some((t) => t.includes("が"))).toBe(false);
 
   if (browserName !== "chromium") return;
   // A coarse primary pointer: plain Enter is a newline; Ctrl+Enter sends.
+  const thread = await openGate(daemon);
   const mobile = await browser.newContext({ ...devices["Pixel 7"] });
   try {
     const p = await mobile.newPage();
