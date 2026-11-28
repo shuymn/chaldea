@@ -10,7 +10,7 @@ import { threadId } from "../sync/model/server";
 import { seeded } from "../sync/ops";
 import type { Sim } from "../sync/sim";
 import { threadStream } from "../sync/state";
-import { type CommandName, classify, type Reply } from "./client";
+import { type CommandName, classify, postCommand, type Reply } from "./client";
 import {
   canCancel,
   canResolve,
@@ -107,6 +107,8 @@ describe("commands.classify", () => {
     [409, body("death_unconfirmed"), "settled"],
     [504, body("launch_busy"), "settled"],
     [409, body("in_progress", ',"retry_after":1'), "unknown"],
+    [409, null, "unknown"],
+    [409, "garbage", "unknown"],
     [503, body("outcome_unknown", ',"retry_after":1'), "unknown"],
     [503, "garbage", "unknown"],
     [503, null, "unknown"],
@@ -122,6 +124,36 @@ describe("commands.classify", () => {
   ];
   test.each(rows)("%i %s → %s", (status, text, kind, name = "send") => {
     expect(classify(name, status, text).kind).toBe(kind);
+  });
+
+  test.each([200, 401, 408, 409, 503])("a %i whose body fails after the headers is an unknown outcome", async (status) => {
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('{"code":"bu'));
+        c.error(new TypeError("network error"));
+      },
+    });
+    const fetchFn = async () => new Response(body, { status });
+    const r = await postCommand(fetchFn, "spawn", "{}", "chd_t", new AbortController().signal);
+    expect(r).toEqual({ kind: "unknown", status, code: null });
+  });
+
+  test("a body that stalls until the request ends is an unknown outcome", async () => {
+    const ac = new AbortController();
+    const fetchFn = async (_: string, init: RequestInit) =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(new TextEncoder().encode("{"));
+            init.signal?.addEventListener("abort", () => c.error(new DOMException("aborted", "AbortError")));
+          },
+        }),
+        { status: 408 },
+      );
+    const p = postCommand(fetchFn, "send", "{}", "chd_t", ac.signal);
+    await new Promise((ok) => setTimeout(ok, 10));
+    ac.abort();
+    expect(await p).toEqual({ kind: "unknown", status: 408, code: null });
   });
 
   test("a not-done reply carries its retry_after; 401 offers no Retry", () => {

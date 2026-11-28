@@ -104,7 +104,8 @@ export function classify(name: CommandName, status: number, text: string | null)
     // `outcome_unknown`, and any 503 whose body did not parse.
     return { kind: "unknown", status, code };
   }
-  if (status === 409 && code === "in_progress") return { kind: "unknown", status, code };
+  // `in_progress`, and a 409 whose body did not decode: the receipt may exist.
+  if (status === 409 && (code === "in_progress" || code === null)) return { kind: "unknown", status, code };
   if (status === 500) return { kind: "unknown", status, code };
   // Guard and parser 4xx, 501, 409 `conflict` and `unknown_after_crash`, and every other
   // handler refusal (e.g. 504 `launch_busy`): definitive.
@@ -138,7 +139,13 @@ export async function postCommand(
   } catch {
     return { kind: "unknown", status: null, code: null };
   }
-  // A body cut off after the status arrived is read as no body: the status still decides.
-  const text = await readLimited(res, REPLY_MAX_BYTES).catch(() => null);
+  // A body that fails or stalls after the headers proves nothing, whatever the status: the
+  // command may still take effect. (A body over the cap is read as no body.)
+  let text: string | null;
+  try {
+    text = await readLimited(res, REPLY_MAX_BYTES);
+  } catch {
+    return { kind: "unknown", status: res.status, code: null };
+  }
   return classify(name, res.status, text);
 }
