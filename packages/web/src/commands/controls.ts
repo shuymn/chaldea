@@ -116,10 +116,12 @@ export function targetGate(c: Pick<Command, "name" | "thread" | "body">): (s: St
       return (s) => canSend(s, t);
     case "ready":
       return (s) => launch !== null && readyLaunch(s, t) === launch;
+    // Stop and Resume dispatch on the latest valid copy, but their Retry also waits for a
+    // current one: a refollow still paging may show a launch already replaced.
     case "stop":
-      return (s) => launch !== null && stopLaunch(s, t) === launch;
+      return (s) => launch !== null && current(s, threadStream(t)) && stopLaunch(s, t) === launch;
     case "resume":
-      return (s) => launch !== null && resumeLaunch(s, t) === launch;
+      return (s) => launch !== null && current(s, threadStream(t)) && resumeLaunch(s, t) === launch;
     case "input_resolve":
       return (s) => input !== null && canResolve(s, t, input);
     case "input_cancel":

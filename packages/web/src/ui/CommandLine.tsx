@@ -17,13 +17,15 @@ export function CommandLine(props: { state: State; cmds: CmdState; slot: string;
   return (
     <div className="command-line flex flex-wrap items-center gap-2 text-sm" data-slot={slot} data-phase={c.phase}>
       <span>{commandText(c)}</span>
-      {props.showText && c.text !== null && busy(cmds, slot) && (
-        <span className="whitespace-pre-wrap break-all italic" dir="auto">
+      {props.showText && c.text !== null && (busy(cmds, slot) || c.phase === "not_done") && (
+        // A not-done Send's frozen text: what Retry sends, whatever the draft is now.
+        <span className="whitespace-pre-wrap break-all italic" dir="auto" data-frozen-text>
+          {c.phase === "not_done" && <span className="not-italic">Retry sends: </span>}
           {c.text.length > 200 ? `${c.text.slice(0, 200)}…` : c.text}
         </span>
       )}
       {canRetry(cmds, props.state, slot) && (
-        <button type="button" className="control" onClick={() => ops.retry(slot, c.attempt)}>
+        <button type="button" className="control" onClick={() => ops.retry(slot, c.attempt, c.name)}>
           Retry
         </button>
       )}

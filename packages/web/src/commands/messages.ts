@@ -93,6 +93,11 @@ export function refusedText(name: Command["name"], why: string): string {
   return `${VERB[name]}: not sent — ${why}.`;
 }
 
+/** A Retry that sent nothing, named by the action it retried. */
+export function retryRefusedText(name: Command["name"], why: string): string {
+  return `Retry ${VERB[name]}: not sent — ${why}.`;
+}
+
 /** One line for a command: its state, then its result. */
 export function commandText(c: Command): string {
   const verb = VERB[c.name];

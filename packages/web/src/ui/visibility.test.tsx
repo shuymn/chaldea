@@ -113,6 +113,32 @@ describe("command visibility", () => {
     expect(announced()).toBe(first);
   });
 
+  test("going offline again clears a pending Back online", () => {
+    vi.useFakeTimers();
+    const sim = live();
+    const s = step(initialCmdState(), { type: "context", ctx: context(sim.state) });
+    const view = render(<StatusBar state={sim.state} cmds={s} />);
+    const offline = () => {
+      sim.restart();
+      sim.up = false;
+      for (let k = 0; k < 3; k++) {
+        sim.advance(31_000);
+        while (sim.serveTicket());
+        for (const id of [...sim.flights.keys()]) sim.serve(id);
+        while (sim.deliver());
+      }
+      act(() => view.rerender(<StatusBar state={sim.state} cmds={s} />));
+      expect(screen.getByRole("alert")).toBeTruthy();
+    };
+    offline();
+    sim.quiesce();
+    act(() => view.rerender(<StatusBar state={sim.state} cmds={s} />));
+    // Back online is pending (debounced); the daemon goes away again first.
+    offline();
+    act(() => vi.advanceTimersByTime(5000));
+    expect(announced()).not.toContain("Back online");
+  });
+
   test("a pending Back online is announced after a command notice that took priority", () => {
     vi.useFakeTimers();
     const sim = live();

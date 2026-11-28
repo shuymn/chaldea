@@ -12,7 +12,7 @@
 // changed updates only its own command's shown result.
 
 import type { CommandName, Reply } from "./client";
-import { commandText, INVALID_TEXT, refusedText } from "./messages";
+import { commandText, INVALID_TEXT, refusedText, retryRefusedText } from "./messages";
 
 export type Phase =
   /** An attempt is in flight. */
@@ -145,7 +145,15 @@ export type CmdAction = At &
     | { readonly type: "edit"; readonly thread: string; readonly text: string }
     /** A gesture starting a command; a `send` takes its text from the thread's draft. */
     | ({ readonly type: "gesture" } & Gesture)
-    | { readonly type: "retry"; readonly slot: string; readonly attempt: number; readonly allowed: boolean; readonly why?: string }
+    /** A Retry of the attempt (and the action) its control showed. */
+    | {
+        readonly type: "retry";
+        readonly slot: string;
+        readonly attempt: number;
+        readonly name: CommandName;
+        readonly allowed: boolean;
+        readonly why?: string;
+      }
     | { readonly type: "forget"; readonly slot: string }
     | { readonly type: "reply"; readonly attempt: number; readonly reply: Reply }
     | { readonly type: "tick" }
@@ -270,11 +278,11 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
       if (!c) break;
       // The slot is reserved again at the click: a newer command in it refuses the Retry.
       if (c.attempt !== a.attempt) {
-        notify(prefixed(c.label, refusedText(c.name, busy(s, a.slot) ? busyReason(c) : "a newer one replaced it")));
+        notify(prefixed(c.label, retryRefusedText(a.name, busy(s, a.slot) ? busyReason(c) : "a newer one replaced it")));
         break;
       }
       if (!a.allowed || !retryable(s, a.slot) || !inSession(s.ctx, c)) {
-        notify(prefixed(c.label, refusedText(c.name, a.why ?? "it is not available now")));
+        notify(prefixed(c.label, retryRefusedText(a.name, a.why ?? "it is not available now")));
         break;
       }
       // The same command: its frozen id, body bytes, and generation.

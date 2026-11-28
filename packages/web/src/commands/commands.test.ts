@@ -291,14 +291,14 @@ describe("commands.retry (unit)", () => {
     c.do({ type: "tick" });
     expect(retryable(c.s, slots.send(T1))).toBe(true);
     c.do({ type: "edit", thread: T1, text: "changed" });
-    c.do({ type: "retry", slot: slots.send(T1), attempt: c.slot(slots.send(T1))?.attempt ?? 0, allowed: true });
+    c.do({ type: "retry", slot: slots.send(T1), attempt: c.slot(slots.send(T1))?.attempt ?? 0, name: "send", allowed: true });
     expect(c.posts).toHaveLength(2);
     expect(c.posts[1]!.body).toBe(c.posts[0]!.body);
     c.reply(BUSY_1);
     c.now = 5000;
     c.do({ type: "context", ctx: { session: "2|e1|e1|g1", gone: {} } });
     expect(c.slot(slots.send(T1))?.phase).toBe("released");
-    c.do({ type: "retry", slot: slots.send(T1), attempt: c.slot(slots.send(T1))?.attempt ?? 0, allowed: true });
+    c.do({ type: "retry", slot: slots.send(T1), attempt: c.slot(slots.send(T1))?.attempt ?? 0, name: "send", allowed: true });
     expect(c.posts).toHaveLength(2);
   });
 
@@ -310,7 +310,7 @@ describe("commands.retry (unit)", () => {
       c.now = 600_000;
       c.do({ type: "tick" });
       expect(c.slot(slots.send(T1))?.phase).toBe("check_thread");
-      c.do({ type: "retry", slot: slots.send(T1), attempt: c.slot(slots.send(T1))?.attempt ?? 0, allowed: true });
+      c.do({ type: "retry", slot: slots.send(T1), attempt: c.slot(slots.send(T1))?.attempt ?? 0, name: "send", allowed: true });
       expect(c.posts).toHaveLength(1);
     }
   });
@@ -506,7 +506,7 @@ describe("commands.retry", () => {
             case "retry":
               {
                 const slot = KINDS[op.k]!.slot(THREADS[op.th]!);
-                c.do({ type: "retry", slot, attempt: c.s.slots[slot]?.attempt ?? 0, allowed: op.allowed });
+                c.do({ type: "retry", slot, attempt: c.s.slots[slot]?.attempt ?? 0, name: KINDS[op.k]!.name, allowed: op.allowed });
               }
               break;
             case "forget":

@@ -78,11 +78,11 @@ export class CommandRunner {
     });
   }
 
-  retry(slot: string, attempt: number, allowed: (s: State) => boolean): void {
+  retry(slot: string, attempt: number, name: CommandName, allowed: (s: State) => boolean): void {
     this.follow();
     const s = this.sync.getState();
     const c = this.state.slots[slot];
-    this.dispatch({ type: "retry", slot, attempt, allowed: allowed(s), why: refusal(s, c?.name ?? "send", c?.thread ?? null) });
+    this.dispatch({ type: "retry", slot, attempt, name, allowed: allowed(s), why: refusal(s, name, c?.thread ?? null) });
   }
 
   dispatch(input: CmdInput): void {

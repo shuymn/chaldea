@@ -29,7 +29,7 @@ export interface Ops {
   cancel(thread: string, input: string): void;
   spawn(args: SpawnArgs): void;
   /** Retry of the attempt the control was shown for. */
-  retry(slot: string, attempt: number): void;
+  retry(slot: string, attempt: number, name: CommandName): void;
   forget(slot: string): void;
 }
 
@@ -77,11 +77,11 @@ export function bindOps(commands: CommandRunner): Ops {
     cancel: (thread, input) =>
       gesture(slots.input(input), "input_cancel", thread, { input_id: input }, (s) => canCancel(s, thread, input)),
     spawn: (args) => gesture(slots.spawn, "spawn", null, { ...args }, canSpawn),
-    retry: (slot, attempt) => {
+    retry: (slot, attempt, name) => {
       const c = commands.getState().slots[slot];
       // The Retry gate the control shows (controls.ts `canRetry`); the reducer refuses the
       // Retry, with a notice, when a newer command now holds the slot.
-      if (c) commands.retry(slot, attempt, targetGate(c));
+      if (c) commands.retry(slot, attempt, name, targetGate(c));
     },
     forget: (slot) => commands.dispatch({ type: "forget", slot }),
   };

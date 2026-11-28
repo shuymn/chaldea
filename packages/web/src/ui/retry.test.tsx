@@ -55,8 +55,8 @@ function harness(sim: Sim) {
         commandId: `c${posts.length}`,
         generation: "gen-1",
       }),
-    retry: (slot: string, attempt: number, allowed: (x: typeof sim.state) => boolean) =>
-      run({ type: "retry", slot, attempt, allowed: allowed(sim.state) }),
+    retry: (slot: string, attempt: number, name: never, allowed: (x: typeof sim.state) => boolean) =>
+      run({ type: "retry", slot, attempt, name, allowed: allowed(sim.state) }),
   } as unknown as CommandRunner;
   /** Answers the latest POST with 503 `busy`. */
   const busy = () => {
@@ -141,9 +141,60 @@ describe("slots and Retry", () => {
     expect(sawA).toBe(true);
     expect(context(sim.state).session).toBe(session);
     expect(canRetry(h.state(), sim.state, slots.launch(T))).toBe(true);
-    h.ops.retry(slots.launch(T), attemptOf(h, slots.launch(T)));
+    h.ops.retry(slots.launch(T), attemptOf(h, slots.launch(T)), "stop");
     expect(h.posts).toHaveLength(2);
     expect(h.posts[1]!.body).toBe(h.posts[0]!.body);
+  });
+
+  test("a refollow replaying A on its way to B offers no Retry for A, and posts nothing", () => {
+    const sim = new Sim({ ...TEST_CONFIG, forwardLimit: 1, followMax: 0 }, MODEL_CONFIG);
+    sim.server.register(1, false);
+    sim.server.register(2, false);
+    sim.server.status(T, "process", "running");
+    sim.server.launchReserved(T, L1);
+    sim.boot();
+    sim.dispatch({ type: "select", thread: T });
+    sim.quiesce();
+    const h = harness(sim);
+    h.ops.stop(T, L1);
+    h.busy();
+    expect(canRetry(h.state(), sim.state, slots.launch(T))).toBe(true);
+    // B replaces A: A's Retry goes.
+    replace(sim, "stopped");
+    sim.quiesce();
+    h.sync();
+    expect(canRetry(h.state(), sim.state, slots.launch(T))).toBe(false);
+    // Unfollow, then follow again: the replay passes through A, page by page.
+    sim.dispatch({ type: "select", thread: threadId(1) });
+    sim.quiesce();
+    sim.dispatch({ type: "select", thread: T });
+    let sawA = false;
+    for (let k = 0; k < 40; k++) {
+      for (const id of [...sim.flights.keys()]) sim.serve(id);
+      if (!sim.deliver()) break;
+      const copy = sim.state.streams[`thread:${T}`]?.copy;
+      if (copy?.kind === "thread" && copy.launch?.id === L1 && !copy.launch.exited) {
+        sawA = true;
+        expect(canRetry(h.state(), sim.state, slots.launch(T))).toBe(false);
+        h.ops.retry(slots.launch(T), attemptOf(h, slots.launch(T)), "stop");
+      }
+    }
+    sim.quiesce();
+    expect(sawA).toBe(true);
+    expect(canRetry(h.state(), sim.state, slots.launch(T))).toBe(false);
+    expect(h.posts).toHaveLength(1);
+  });
+
+  test("a not-done Send shows the frozen text Retry will send, whatever the draft is now", () => {
+    const sim = running();
+    const h = harness(sim);
+    h.ops.edit(T, "earlier prompt");
+    h.ops.send(T);
+    h.busy();
+    h.ops.edit(T, "current draft");
+    render(<CommandLine state={sim.state} cmds={h.state()} slot={slots.send(T)} ops={h.ops} showText />);
+    expect(h.state().slots[slots.send(T)]?.phase).toBe("not_done");
+    expect(document.querySelector("[data-frozen-text]")?.textContent).toBe("Retry sends: earlier prompt");
   });
 
   test("Retry with the slot taken by a newer command is refused with a notice", () => {
@@ -155,9 +206,9 @@ describe("slots and Retry", () => {
     // The free slot takes a newer Stop, in flight.
     h.ops.stop(T, L1);
     expect(h.posts).toHaveLength(2);
-    h.ops.retry(slots.launch(T), old);
+    h.ops.retry(slots.launch(T), old, "stop");
     expect(h.posts).toHaveLength(2);
-    expect(h.state().notice?.text).toBe("claude /work/p2 [0193abcd]: Stop: not sent — the previous one is still pending.");
+    expect(h.state().notice?.text).toBe("claude /work/p2 [0193abcd]: Retry Stop: not sent — the previous one is still pending.");
   });
 
   test("a held slot refuses a gesture with the way out: wait while in flight, check the thread when unknown", () => {
@@ -191,7 +242,7 @@ describe("slots and Retry", () => {
       render(<CommandLine state={sim.state} cmds={h.state()} slot={slot} ops={h.ops} />);
       expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
       cleanup();
-      h.ops.retry(slot, attemptOf(h, slot));
+      h.ops.retry(slot, attemptOf(h, slot), kind);
       expect(h.posts, kind).toHaveLength(1);
     }
   });
@@ -208,7 +259,7 @@ describe("slots and Retry", () => {
     sim.quiesce();
     h.sync();
     expect(canRetry(h.state(), sim.state, slots.input(I1))).toBe(false);
-    h.ops.retry(slots.input(I1), attemptOf(h, slots.input(I1)));
+    h.ops.retry(slots.input(I1), attemptOf(h, slots.input(I1)), "input_cancel");
     expect(h.posts).toHaveLength(1);
   });
 
@@ -219,7 +270,7 @@ describe("slots and Retry", () => {
     h.busy();
     render(<CommandLine state={sim.state} cmds={h.state()} slot={slots.launch(T)} ops={h.ops} />);
     expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
-    h.ops.retry(slots.launch(T), attemptOf(h, slots.launch(T)));
+    h.ops.retry(slots.launch(T), attemptOf(h, slots.launch(T)), "stop");
     expect(h.posts).toHaveLength(2);
     expect(h.posts[1]!.body).toBe(h.posts[0]!.body);
   });
@@ -233,7 +284,7 @@ describe("slots and Retry", () => {
     h.ops.resume(T, L1);
     h.busy();
     expect(canRetry(h.state(), a.state, slots.launch(T))).toBe(true);
-    h.ops.retry(slots.launch(T), attemptOf(h, slots.launch(T)));
+    h.ops.retry(slots.launch(T), attemptOf(h, slots.launch(T)), "resume");
     expect(h.posts).toHaveLength(2);
 
     const b = running();
@@ -244,7 +295,7 @@ describe("slots and Retry", () => {
     g.ops.resolve(T, I1, true);
     g.busy();
     expect(canRetry(g.state(), b.state, slots.input(I1))).toBe(true);
-    g.ops.retry(slots.input(I1), attemptOf(g, slots.input(I1)));
+    g.ops.retry(slots.input(I1), attemptOf(g, slots.input(I1)), "input_resolve");
     expect(g.posts).toHaveLength(2);
   });
 });

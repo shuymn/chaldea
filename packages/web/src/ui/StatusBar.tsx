@@ -43,6 +43,8 @@ export function StatusBar(props: { state: State; cmds?: CmdState }) {
 
   useEffect(() => {
     if (was.current === "offline" && now !== "offline") backOnline.current = true;
+    // Offline again before it was announced: no "Back online".
+    if (now === "offline") backOnline.current = false;
     was.current = now;
     if (!backOnline.current && state.appended - counted.current <= 0) return;
     schedule();
