@@ -149,7 +149,7 @@ fn job_panic_rolls_back() {
     let e = registered(thread(1), false);
     let r = s.run(move |tx| -> Result<(), chaldea_daemon::store::JobError> {
         tx.append(vec![e])?;
-        panic!("injected job panic");
+        chaldea_pty_runtime::fake::inject_panic("injected job panic");
     });
     assert!(matches!(r, Err(WriteError::Panicked)), "{r:?}");
     assert_eq!(host_head(&s), 0);

@@ -349,7 +349,9 @@ fn each_refusal_writes_zero_bytes() {
     );
     // Recheck panics.
     let g = Guard {
-        recheck: Some(Box::new(|_| panic!("recheck bug"))),
+        recheck: Some(Box::new(|_| {
+            chaldea_pty_runtime::fake::inject_panic("injected recheck panic")
+        })),
         ..open()
     };
     assert_refused(
@@ -1148,7 +1150,9 @@ fn panic_after_acceptance_marks_the_span_uncertain() {
     let r = rig();
     submit(&r.session, key(b"pre"), open()).wait();
     r.child.on_input(|bytes| {
-        assert!(bytes != b"abc", "script bug after acceptance");
+        if bytes == b"abc" {
+            chaldea_pty_runtime::fake::inject_panic("injected script panic after acceptance");
+        }
         Vec::new()
     });
     let rec = submit(&r.session, key(b"abc"), open()).wait();

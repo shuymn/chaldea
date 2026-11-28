@@ -209,7 +209,7 @@ async fn read_by_cutoff_precedes_the_outcome() {
     let c = ctx.clone();
     let waiter = tokio::spawn(async move {
         c.read_by(by, |_| -> Result<(), StoreError> {
-            panic!("the read panics")
+            chaldea_pty_runtime::fake::inject_panic("injected read panic")
         })
         .await
     });
@@ -234,7 +234,7 @@ async fn read_by_cutoff_precedes_the_outcome() {
     let w = s.clone();
     let waiter = tokio::spawn(async move {
         read_until(&w, deadline, |_| -> Result<(), StoreError> {
-            panic!("the read panics")
+            chaldea_pty_runtime::fake::inject_panic("injected read panic")
         })
         .await
     });

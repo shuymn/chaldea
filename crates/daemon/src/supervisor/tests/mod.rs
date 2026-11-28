@@ -102,7 +102,7 @@ impl Hold {
         let _ = self.reached.send(());
         let _ = self.release.recv_timeout(Duration::from_secs(60));
         if self.panic {
-            std::panic::panic_any(Unwound(self.unwound));
+            chaldea_pty_runtime::fake::inject_panic(Unwound(self.unwound));
         }
     }
 }

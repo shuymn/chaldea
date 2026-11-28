@@ -329,7 +329,7 @@ fn sink_panic_keeps_draining() {
         .subscribe(
             Box::new(move |_| {
                 c.fetch_add(1, Ordering::SeqCst);
-                panic!("sink bug")
+                chaldea_pty_runtime::fake::inject_panic("injected sink panic")
             }),
             soon(),
         )
@@ -367,7 +367,7 @@ fn reply_dropped_panic_keeps_draining() {
     let mut config = SessionConfig::new(move |e| {
         if e == SessionEvent::ReplyDropped {
             d.fetch_add(1, Ordering::SeqCst);
-            panic!("handler bug");
+            chaldea_pty_runtime::fake::inject_panic("injected handler panic");
         }
     });
     config.limits.reply_queue = 1;
@@ -1467,7 +1467,7 @@ fn implicit_close_survives_an_unwind() {
     let (session, child) = panicking_kill();
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let _held = session;
-        panic!("a fault while the session is open");
+        chaldea_pty_runtime::fake::inject_panic("injected fault while the session is open");
     }));
     assert!(run.is_err());
     released_after_a_kill_panic(&child);
