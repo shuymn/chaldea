@@ -15,14 +15,15 @@ import type { Page, Route } from "@playwright/test";
 
 import {
   caughtUpWith,
-  inputsOf,
-  linesHooked,
   commandLine,
   commandPosts,
   composer,
   countSubmits,
   type Daemon,
+  exitUnconfirmed,
   expect,
+  inputsOf,
+  linesHooked,
   openGate,
   openLink,
   openThread,
@@ -124,7 +125,7 @@ async function unconfirmed(daemon: Daemon, page: Page, thread: string): Promise<
   await send(page, thread, "line one\nline two");
   const [i] = inputsOf(await daemon.waitEvents(thread, linesHooked(0), 25_000));
   await daemon.chaldea(["stop", thread]);
-  await caughtUpWith(page, daemon, thread, (es) => inputsOf(es)[0]?.state === "unconfirmed");
+  await caughtUpWith(page, daemon, thread, exitUnconfirmed(0));
   return i!.id;
 }
 

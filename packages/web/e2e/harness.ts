@@ -109,15 +109,17 @@ export async function caughtUpWith(
   await caughtUp(page, thread, head);
 }
 
-/** The thread's inputs from its events, in creation order: id, launch, seq created, latest state. */
+/** The thread's inputs from its events, in creation order: id, launch, seq created, latest state and reason. */
 export function inputsOf(es: Awaited<ReturnType<Daemon["events"]>>) {
-  const out = new Map<string, { id: string; launch: string | null; seq: number; state: string }>();
+  type Input = { id: string; launch: string | null; seq: number; state: string; reason: string | null };
+  const out = new Map<string, Input>();
   for (const e of es) {
     const id = e.payload.input_id as string;
     if (e.kind === "input_created") {
-      out.set(id, { id, launch: e.launch_id, seq: e.seq, state: e.payload.initial_state as string });
+      out.set(id, { id, launch: e.launch_id, seq: e.seq, state: e.payload.initial_state as string, reason: null });
     } else if (e.kind === "input_state_changed" && out.has(id)) {
-      out.set(id, { ...out.get(id)!, state: e.payload.to as string });
+      const reason = (e.payload.reason as { kind?: string } | undefined)?.kind ?? null;
+      out.set(id, { ...out.get(id)!, state: e.payload.to as string, reason });
     }
   }
   return [...out.values()];
@@ -126,6 +128,8 @@ export function inputsOf(es: Awaited<ReturnType<Daemon["events"]>>) {
 /**
  * The thread's `n`th input is a two-line prompt that is `sent`, and FakeCli's two per-line
  * prompt hooks of its launch (matching no input) are in: a stop now leaves neither in flight.
+ * Hook delivery is best effort, so a lost hook fails these fixtures with "never matched"
+ * rather than letting them pass.
  */
 export const linesHooked =
   (n: number) =>
@@ -135,6 +139,14 @@ export const linesHooked =
       (e) => e.kind === "user_message" && e.payload.input_id === null && e.launch_id === i?.launch && e.seq > i.seq,
     );
     return i?.state === "sent" && hooks.length >= 2;
+  };
+
+/** The thread's `n`th input went `unconfirmed` by its launch's exit (not the ack window). */
+export const exitUnconfirmed =
+  (n: number) =>
+  (es: Awaited<ReturnType<Daemon["events"]>>): boolean => {
+    const i = inputsOf(es)[n];
+    return i?.state === "unconfirmed" && i.reason === "launch_exited";
   };
 
 /** Waits until the timeline's last row is at least `#<seq>`. */

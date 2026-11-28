@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import type { Page } from "@playwright/test";
 
-import { caughtUpWith, expect, linesHooked, openLink, selectThread, shownSeqs, statusOf, test, untilShown } from "./harness";
+import { caughtUpWith, exitUnconfirmed, expect, linesHooked, openLink, selectThread, shownSeqs, statusOf, test, untilShown } from "./harness";
 
 test("generic_rows", async ({ daemon, page }) => {
   const { thread } = await daemon.spawnThread({ prompt: "typed neighbour" });
@@ -210,7 +210,7 @@ test("layout_390", async ({ daemon, page }) => {
   await daemon.chaldea(["send", busy, `first-line-${"v".repeat(200)}\nsecond line`]);
   await daemon.waitEvents(busy, linesHooked(0), 25_000);
   await daemon.chaldea(["stop", busy]);
-  await daemon.waitInputs(busy, (is) => is[0]?.state === "unconfirmed");
+  await daemon.waitEvents(busy, exitUnconfirmed(0));
   const { launch_id: resumed } = (await daemon.chaldea(["resume", busy])) as { launch_id: string };
   await selectThread(page, busy);
   await caughtUpWith(page, daemon, busy, (es) =>

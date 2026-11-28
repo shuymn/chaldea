@@ -9,6 +9,7 @@ import type { BrowserContext, Page, Request, Route } from "@playwright/test";
 import {
   caughtUpWith,
   type Daemon,
+  exitUnconfirmed,
   expect,
   hasFragment,
   inputsOf,
@@ -121,7 +122,7 @@ test("request_policy", async ({ daemon, page }) => {
   await sendText("line one\nline two");
   const sentOne = inputsOf(await daemon.waitEvents(thread, linesHooked(2), 25_000))[2]!;
   await daemon.chaldea(["stop", thread]);
-  await caughtUpWith(page, daemon, thread, (es) => inputsOf(es)[2]?.state === "unconfirmed");
+  await caughtUpWith(page, daemon, thread, exitUnconfirmed(2));
   await row(sentOne.id).getByRole("button", { name: "Dismiss" }).click();
   await daemon.waitInputs(thread, (is) => is[2]?.state === "dismissed");
   // spawn from the form.

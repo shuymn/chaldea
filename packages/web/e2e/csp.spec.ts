@@ -26,7 +26,6 @@ async function recordViolations(page: Page): Promise<void> {
 const violations = (page: Page) => page.evaluate(() => window.__violations ?? null);
 
 test("csp_clean", async ({ daemon, page }) => {
-  test.setTimeout(120_000);
   await recordViolations(page);
   const { thread } = await daemon.spawnThread({ prompt: "CSP の確認 🎌" });
   await openLink(page, await daemon.pairUrl());
@@ -36,23 +35,22 @@ test("csp_clean", async ({ daemon, page }) => {
   await expect(timeline.getByText("thread registered").or(timeline.getByText("launch reserved")).first()).toBeVisible();
   await expect(timeline.getByText("CSP の確認 🎌").first()).toBeVisible();
   await expect(statusOf(page)).toHaveText("live");
+  // The spawn prompt settles first: acked, with its own prompt record (the echo CLI's hook
+  // binds it; a lost hook fails here rather than passing).
+  await daemon.waitEvents(thread, (xs) => {
+    const spawned = inputsOf(xs)[0];
+    return (
+      spawned?.state === "acked" &&
+      xs.some((e) => e.kind === "user_message" && e.payload.input_id === spawned.id)
+    );
+  });
   // A live event over the socket.
   await daemon.chaldea(["send", thread, "live over the socket"]);
   await expect(timeline.getByText("live over the socket").first()).toBeVisible();
   await expect(page.getByText("unknown event")).toHaveCount(0);
-  // The spawn prompt's writes end with its last state, `acked`, or `unconfirmed` past the
-  // 30 s ack window when its hook came before the write completed; the echo CLI never ends
-  // the turn, so the CLI's input stays queued. Then the page holds them and the composer is ready.
-  await caughtUpWith(
-    page,
-    daemon,
-    thread,
-    (xs) => {
-      const [spawned, sent] = inputsOf(xs);
-      return ["acked", "unconfirmed"].includes(spawned?.state ?? "") && sent?.state === "queued";
-    },
-    45_000,
-  );
+  // The echo CLI never ends the turn, so the CLI's input stays queued: then the page holds
+  // every write and the composer is ready.
+  await caughtUpWith(page, daemon, thread, (xs) => inputsOf(xs)[1]?.state === "queued");
   // The composer, a command, and a native dialog under the same CSP (W2-12).
   await page.getByLabel("Message", { exact: true }).fill("CSP の送信 🎌");
   await page.getByRole("form", { name: "Composer" }).getByRole("button", { name: "Send", exact: true }).click();
