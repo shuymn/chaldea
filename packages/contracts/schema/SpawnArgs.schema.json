@@ -1,0 +1,43 @@
+{
+  "$defs": {
+    "Agent": {
+      "description": "The CLI a thread runs.",
+      "enum": [
+        "claude",
+        "codex"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The arguments of `spawn`.",
+  "properties": {
+    "agent": {
+      "$ref": "#/$defs/Agent"
+    },
+    "cwd": {
+      "type": "string"
+    },
+    "prompt": {
+      "description": "A first prompt: Codex's positional argument, or a queued input for Claude.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "task": {
+      "description": "The task given at spawn (`thread_registered.task`).",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "agent",
+    "cwd"
+  ],
+  "title": "SpawnArgs",
+  "type": "object"
+}

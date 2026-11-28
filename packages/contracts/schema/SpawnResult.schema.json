@@ -1,0 +1,58 @@
+{
+  "$defs": {
+    "InputId": {
+      "description": "One prompt sent through `chaldea send`, the PWA, or `surface_action` (§2.3).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "LaunchId": {
+      "description": "A launch: one process lifetime of a thread.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "LaunchOutcome": {
+      "description": "Whether a spawn or resume started its process.",
+      "enum": [
+        "started",
+        "spawn_failed"
+      ],
+      "type": "string"
+    },
+    "ThreadId": {
+      "description": "A thread: one agent conversation across all its launches.",
+      "format": "uuid",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The success body of `spawn`.",
+  "properties": {
+    "input_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/InputId"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The first prompt's input; `null` without one."
+    },
+    "launch_id": {
+      "$ref": "#/$defs/LaunchId"
+    },
+    "outcome": {
+      "$ref": "#/$defs/LaunchOutcome"
+    },
+    "thread_id": {
+      "$ref": "#/$defs/ThreadId"
+    }
+  },
+  "required": [
+    "thread_id",
+    "launch_id",
+    "outcome"
+  ],
+  "title": "SpawnResult",
+  "type": "object"
+}

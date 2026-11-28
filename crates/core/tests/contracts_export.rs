@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 use chaldea_core::attach::{AttachClientMessage, AttachServerMessage};
 use chaldea_core::command::{
     CloseResult, InputCancelArgs, InputCommandResult, InputResolveArgs, KeyArgs, KeyResult,
-    ReadyArgs, ReadyResult, SendArgs, SendResult, StopResult,
+    ReadyArgs, ReadyResult, ResumeArgs, ResumeResult, SendArgs, SendResult, SpawnArgs, SpawnResult,
+    StopArgs, StopResult,
 };
 use chaldea_core::event::{EventEnvelope, GenericEvent, TypedEvent};
 use chaldea_core::http::{
@@ -133,6 +134,11 @@ fn generate(out: &Path) -> (PathBuf, PathBuf) {
     export_ts::<PairResponse>(&cfg);
     export_ts::<ThreadsResponse>(&cfg);
     export_ts::<WorktreesResponse>(&cfg);
+    export_ts::<SpawnArgs>(&cfg);
+    export_ts::<SpawnResult>(&cfg);
+    export_ts::<ResumeArgs>(&cfg);
+    export_ts::<ResumeResult>(&cfg);
+    export_ts::<StopArgs>(&cfg);
     export_ts::<StopResult>(&cfg);
     export_ts::<CloseResult>(&cfg);
     export_ts::<SendArgs>(&cfg);
@@ -173,6 +179,11 @@ fn generate(out: &Path) -> (PathBuf, PathBuf) {
     export_schema::<PairResponse>(&schema);
     export_schema::<ThreadsResponse>(&schema);
     export_schema::<WorktreesResponse>(&schema);
+    export_schema::<SpawnArgs>(&schema);
+    export_schema::<SpawnResult>(&schema);
+    export_schema::<ResumeArgs>(&schema);
+    export_schema::<ResumeResult>(&schema);
+    export_schema::<StopArgs>(&schema);
     export_schema::<StopResult>(&schema);
     export_schema::<CloseResult>(&schema);
     export_schema::<SendArgs>(&schema);
@@ -328,7 +339,6 @@ fn nullable_result_fields_are_required() {
 /// `ErrorBody` only from a non-2xx status, and a success body must not look like one.
 #[test]
 fn success_schemas_have_no_code() {
-    use chaldea_core::command::{ResumeResult, SpawnResult};
     for (name, schema) in [
         ("SpawnResult", schemars::schema_for!(SpawnResult)),
         ("ResumeResult", schemars::schema_for!(ResumeResult)),
