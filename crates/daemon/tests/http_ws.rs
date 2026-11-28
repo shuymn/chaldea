@@ -394,7 +394,12 @@ async fn attach_ticket_owner_only() {
 /// test `ws::final_admission_failure_keeps_ticket`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejected_upgrade_keeps_ticket() {
-    let srv = quiet_with(Mounts::mvp(), |c| c.ws.max_sockets_per_token = 1).await;
+    // The pool's wait ends at the short budget.
+    let srv = quiet_with(Mounts::mvp(), |c| {
+        c.ws.max_sockets_per_token = 1;
+        c.short_deadline = DEADLINE;
+    })
+    .await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let ticket = srv.ticket(&owner, "events").await.unwrap();
     let q = format!("?ticket={ticket}");
@@ -525,7 +530,7 @@ fn only_heads(before: &[WsServerMessage]) {
 /// heads interval plus a read deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revocation_closes_socket() {
-    let srv = TestServer::start(Mounts::mvp()).await;
+    let srv = TestServer::start_with(Mounts::mvp(), |c| c.short_deadline = DEADLINE).await;
     let t = thread(&srv, 1).await;
     // With the nudge.
     let owner = srv.token(TokenKind::Owner, None, None).await;

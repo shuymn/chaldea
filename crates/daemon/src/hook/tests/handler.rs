@@ -7,7 +7,7 @@ use chaldea_core::ids::Agent;
 use chaldea_core::payload::RawUnknownReason as R;
 
 use super::support::hook::{Hook, HookServer, Launch, start, status};
-use super::support::http::{connect, eventually, write};
+use super::support::http::{DEADLINE, connect, eventually, write};
 use super::support::{FixedClock, T0, TestStore, config};
 use super::{WAIT, annex_of, bind, ok, reached, reached_sync};
 use crate::hook::HookConfig;
@@ -51,6 +51,12 @@ async fn start_now(h: &HookServer, l: &Launch) {
 /// 300 ms pid wait and every wait these tests make, so the pid-wait bound and not the
 /// request deadline ends the wait on a slow host.
 const LONG_REQUEST: Duration = Duration::from_secs(30);
+
+/// A hook server whose requests have the short budget ([`DEADLINE`]), for a case whose
+/// deadline passes in real time from a freeze or is reached by a fixed `advance`.
+async fn short_budget() -> HookServer {
+    HookServer::start_with(HookConfig::default(), |c| c.short_deadline = DEADLINE).await
+}
 
 /// The pid wait: a start committed before its subscription, one committed during it, one
 /// committed after its bound and before the job, re-reads held by the reader pool across
@@ -194,13 +200,13 @@ async fn pid_wait_timings() {
             pid_wait: Duration::from_secs(10),
             ..HookConfig::default()
         },
-        |_| {},
+        |c| c.short_deadline = DEADLINE,
     )
     .await;
     h.srv.clock.stop();
     let l = unstarted(&h).await;
     let before = h.snapshot(&l);
-    let request_deadline = h.srv.clock.now() + super::support::http::DEADLINE;
+    let request_deadline = h.srv.clock.now() + DEADLINE;
     let (subscribed, go_on) = h.ingest.points.arm_subscribe();
     let (mut job, _job_open) = h.ingest.points.arm_job(1);
     let reply = h.spawn_post(&Hook::of(&l, "SessionStart", "s"));
@@ -210,7 +216,7 @@ async fn pid_wait_timings() {
         [request_deadline],
         "the pid-wait deadline is not the request deadline"
     );
-    h.srv.clock.advance(super::support::http::DEADLINE);
+    h.srv.clock.advance(DEADLINE);
     go_on.send(()).unwrap();
     let r = waits::bounded(WAIT, reply)
         .await
@@ -461,7 +467,7 @@ fn write_ctx(h: &HookServer, l: &Launch) -> crate::http::WriteCtx {
             kind: token.kind,
             thread: token.thread_id,
         }),
-        h.srv.clock.now() + super::support::http::DEADLINE,
+        h.srv.clock.now() + shared(&h.srv).cfg.short_deadline,
         shared(&h.srv),
     )
 }
@@ -694,11 +700,11 @@ async fn submitted_hook_can_expire_after_disconnect() {
 }
 
 /// The stopped clock `hook_ingest` runs on (`SkewClock::stop`): a hook whose job has passed
-/// `Store::submit` behind a held writer is held there past the request deadline (2 s, the
-/// test server's) and the reply grace (100 ms), and the job still answers 200.
+/// `Store::submit` behind a held writer is held there past the request deadline
+/// ([`DEADLINE`]) and the reply grace (100 ms), and the job still answers 200.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stopped_clock_keeps_a_queued_hook_past_reply_grace() {
-    let h = HookServer::start().await;
+    let h = short_budget().await;
     h.srv.clock.stop();
     let l = h.codex(1).await;
     let hook = Hook::of(&l, "Stop", "s");
@@ -732,7 +738,7 @@ async fn stopped_clock_keeps_a_queued_hook_past_reply_grace() {
 async fn grace_exceeded_then_commits() {
     use crate::http::MonotonicClock;
 
-    let h = HookServer::start().await;
+    let h = short_budget().await;
     h.srv.clock.stop();
     let l = h.codex(1).await;
     bind(&h, &l, "s").await;
@@ -861,7 +867,7 @@ async fn handler_rejections() {
     // G9: the server's clock moves past the deadline after the guard's token read took its
     // clock sample, so that read counts; the guard's own deadline check answers 408, and
     // the handler never reads the body.
-    let h = HookServer::start().await;
+    let h = short_budget().await;
     h.srv.clock.stop();
     let l = h.codex(1).await;
     let before = h.snapshot(&l);
@@ -897,7 +903,7 @@ async fn handler_rejections() {
 
     // H5: every reader held through the deadline: the pre-read is busy or cut off. The
     // clock stands still until the pre-read; frozen there, its deadline passes in real time.
-    let h = HookServer::start().await;
+    let h = short_budget().await;
     h.srv.clock.stop();
     let l = h.codex(1).await;
     let before = h.snapshot(&l);
@@ -933,7 +939,7 @@ async fn handler_rejections() {
     let _ = srv.into_store(WAIT).await;
 
     // H6: the deadline passed before the walk: 408, and no walk starts.
-    let h = HookServer::start().await;
+    let h = short_budget().await;
     h.srv.clock.stop();
     let l = h.codex(1).await;
     let before = h.snapshot(&l);
@@ -949,7 +955,7 @@ async fn handler_rejections() {
 
     // H6: the walk held past the deadline. Frozen after intake, the clock lets the walk's
     // deadline pass in real time while the walk is held.
-    let h = HookServer::start().await;
+    let h = short_budget().await;
     h.srv.clock.stop();
     let l = h.codex(1).await;
     let before = h.snapshot(&l);
@@ -972,7 +978,7 @@ async fn handler_rejections() {
     // between its intake and the binding order: the clock stands still until its intake
     // gate and, frozen there, the deadline passes in real time while the binding order
     // waits.
-    let h = HookServer::start().await;
+    let h = short_budget().await;
     h.srv.clock.stop();
     let l = h.codex(1).await;
     let (gate, open) = h.ingest.points.arm_job(1);
