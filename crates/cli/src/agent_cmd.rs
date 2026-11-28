@@ -55,7 +55,7 @@ const UNCONFIRMED_RESTART: &str = "The previous process of this thread could not
 const UNCONFIRMED_STOPPED: &str =
     "The previous process of this thread could not be confirmed to have ended when it stopped.";
 /// The tail of the `death_unconfirmed` lines; `<thread>` is the thread's id.
-const UNCONFIRMED_TAIL: &str = "To review what was checked, run `chaldea stop <thread> --assume-dead`; once you have made sure its processes ended, confirm with `--launch <id>`. Its history is kept, and new threads can be started.";
+const UNCONFIRMED_TAIL: &str = "To review what was checked, run `chaldea stop <thread> --assume-dead`; once you have made sure its processes ended, confirm with `chaldea stop <thread> --assume-dead --launch <id>`. Its history is kept, and new threads can be started.";
 /// The line of a stop whose death was confirmed after its 5 s, counted from the attempt the
 /// daemon accepted.
 const CONFIRMED_LATE: &str = "The process ended, but its end was not confirmed within 5 s of the stop request the daemon accepted.";
@@ -548,8 +548,17 @@ impl Client<'_> {
         }
     }
 
-    /// The current launch, read once before the command, pinned as `expected_launch_id`.
-    fn pinned(&self, cutoff: Instant, t: ThreadId) -> Result<LaunchId, End> {
+    /// The launch a command pins as `expected_launch_id` (or `key`'s `launch_id`): `given`
+    /// (`--launch`), else the current launch, read once before the command.
+    fn pinned(
+        &self,
+        cutoff: Instant,
+        t: ThreadId,
+        given: Option<LaunchId>,
+    ) -> Result<LaunchId, End> {
+        if let Some(l) = given {
+            return Ok(l);
+        }
         let s = self.summary(cutoff, t)?;
         s.launch
             .map(|l| l.launch_id)
@@ -573,6 +582,7 @@ impl Client<'_> {
         &self,
         t: ThreadId,
         prompt: Option<String>,
+        launch: Option<LaunchId>,
         out: &mut dyn Write,
         err: &mut dyn Write,
     ) -> ExitCode {
@@ -580,7 +590,7 @@ impl Client<'_> {
             return ExitCode::Usage;
         }
         let cutoff = self.cutoff(COMMAND_CUTOFF);
-        let l = match self.pinned(cutoff, t) {
+        let l = match self.pinned(cutoff, t, launch) {
             Ok(l) => l,
             Err(e) => return ended(e, err),
         };
@@ -608,20 +618,21 @@ impl Client<'_> {
         }
     }
 
-    /// `chaldea stop`; with `assume_dead`, the owner's assertion for launch `launch`
-    /// (`docs/design/supervisor-recovery.md` §2.5).
+    /// `chaldea stop`, of launch `launch` only when given; with `assume_dead`, the owner's
+    /// assertion for launch `launch` (`docs/design/supervisor-recovery.md` §2.5).
     pub(crate) fn stop(
         &self,
         t: ThreadId,
-        assume_dead: Option<LaunchId>,
+        launch: Option<LaunchId>,
+        assume_dead: bool,
         out: &mut dyn Write,
         err: &mut dyn Write,
     ) -> ExitCode {
         let cutoff = self.cutoff(COMMAND_CUTOFF);
         let args = StopArgs {
             thread_id: t,
-            expected_launch_id: assume_dead,
-            assume_dead: assume_dead.is_some(),
+            expected_launch_id: launch,
+            assume_dead,
         };
         match self.command::<_, StopResult>(cutoff, "stop", &args) {
             Ok(v) => {
@@ -639,11 +650,12 @@ impl Client<'_> {
         &self,
         t: ThreadId,
         stop: bool,
+        launch: Option<LaunchId>,
         out: &mut dyn Write,
         err: &mut dyn Write,
     ) -> ExitCode {
         let cutoff = self.cutoff(COMMAND_CUTOFF);
-        let l = match self.pinned(cutoff, t) {
+        let l = match self.pinned(cutoff, t, launch) {
             Ok(l) => l,
             Err(e) => return ended(e, err),
         };
@@ -707,10 +719,16 @@ impl Client<'_> {
         }
     }
 
-    /// `chaldea ready`, pinned to the current launch.
-    pub(crate) fn ready(&self, t: ThreadId, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    /// `chaldea ready`, pinned to `launch` when given, else to the current launch.
+    pub(crate) fn ready(
+        &self,
+        t: ThreadId,
+        launch: Option<LaunchId>,
+        out: &mut dyn Write,
+        err: &mut dyn Write,
+    ) -> ExitCode {
         let cutoff = self.cutoff(COMMAND_CUTOFF);
-        let l = match self.pinned(cutoff, t) {
+        let l = match self.pinned(cutoff, t, launch) {
             Ok(l) => l,
             Err(e) => return ended(e, err),
         };
@@ -727,18 +745,20 @@ impl Client<'_> {
         }
     }
 
-    /// `chaldea key`, to the current launch: 0 once every byte was written; 1 for
-    /// `incomplete` or `pending`, whose bytes may or may not have reached the CLI.
+    /// `chaldea key`, to `launch` when given, else to the current launch: 0 once every byte
+    /// was written; 1 for `incomplete` or `pending`, whose bytes may or may not have reached
+    /// the CLI.
     pub(crate) fn key(
         &self,
         t: ThreadId,
         keys: Vec<KeyToken>,
         approval: Option<ApprovalId>,
+        launch: Option<LaunchId>,
         out: &mut dyn Write,
         err: &mut dyn Write,
     ) -> ExitCode {
         let cutoff = self.cutoff(COMMAND_CUTOFF);
-        let l = match self.pinned(cutoff, t) {
+        let l = match self.pinned(cutoff, t, launch) {
             Ok(l) => l,
             Err(e) => return ended(e, err),
         };
@@ -929,6 +949,7 @@ pub(crate) enum Verb {
     Resume {
         thread: ThreadId,
         prompt: Option<String>,
+        launch: Option<LaunchId>,
     },
     Send {
         thread: ThreadId,
@@ -936,11 +957,13 @@ pub(crate) enum Verb {
     },
     Ready {
         thread: ThreadId,
+        launch: Option<LaunchId>,
     },
     Key {
         thread: ThreadId,
         keys: Vec<KeyToken>,
         approval: Option<ApprovalId>,
+        launch: Option<LaunchId>,
     },
     InputResolve {
         input: InputId,
@@ -949,17 +972,17 @@ pub(crate) enum Verb {
     InputCancel {
         input: InputId,
     },
+    /// `stop`, of launch `launch` only when given; with `assume_dead`, the assertion for it,
+    /// or the preview without one.
     Stop {
         thread: ThreadId,
-    },
-    /// `stop --assume-dead`: the preview without a launch, the assertion with one.
-    AssumeDead {
-        thread: ThreadId,
         launch: Option<LaunchId>,
+        assume_dead: bool,
     },
     Close {
         thread: ThreadId,
         stop: bool,
+        launch: Option<LaunchId>,
     },
     Wait {
         thread: ThreadId,
@@ -1010,14 +1033,19 @@ pub(crate) fn run(dir: &Path, verb: Verb) -> ExitCode {
                 err,
             )
         }
-        Verb::Resume { thread, prompt } => c.resume(thread, prompt, out, err),
+        Verb::Resume {
+            thread,
+            prompt,
+            launch,
+        } => c.resume(thread, prompt, launch, out, err),
         Verb::Send { thread, text } => c.send(thread, text, out, err),
-        Verb::Ready { thread } => c.ready(thread, out, err),
+        Verb::Ready { thread, launch } => c.ready(thread, launch, out, err),
         Verb::Key {
             thread,
             keys,
             approval,
-        } => c.key(thread, keys, approval, out, err),
+            launch,
+        } => c.key(thread, keys, approval, launch, out, err),
         Verb::InputResolve { input, delivered } => c.input(
             "input_resolve",
             &InputResolveArgs {
@@ -1033,16 +1061,22 @@ pub(crate) fn run(dir: &Path, verb: Verb) -> ExitCode {
             out,
             err,
         ),
-        Verb::Stop { thread } => c.stop(thread, None, out, err),
-        Verb::AssumeDead {
-            thread,
-            launch: Some(l),
-        } => c.stop(thread, Some(l), out, err),
-        Verb::AssumeDead {
+        // `--assume-dead` without a launch is the preview, which sends nothing.
+        Verb::Stop {
             thread,
             launch: None,
+            assume_dead: true,
         } => c.preview(thread, out, err),
-        Verb::Close { thread, stop } => c.close(thread, stop, out, err),
+        Verb::Stop {
+            thread,
+            launch,
+            assume_dead,
+        } => c.stop(thread, launch, assume_dead, out, err),
+        Verb::Close {
+            thread,
+            stop,
+            launch,
+        } => c.close(thread, stop, launch, out, err),
         Verb::Wait {
             thread,
             until,

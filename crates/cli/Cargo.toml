@@ -42,6 +42,13 @@ name = "supervisor_e2e"
 path = "tests/supervisor_e2e.rs"
 harness = false
 
+# T2-16: `--launch` pins against a foreground daemon of this binary whose agent program is
+# FakeCli, and the `stop` request bodies against a stub daemon.
+[[test]]
+name = "launch_pin"
+path = "tests/launch_pin.rs"
+harness = false
+
 [[test]]
 name = "daemon_macos"
 path = "tests/daemon_macos.rs"

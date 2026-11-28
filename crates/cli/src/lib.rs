@@ -155,6 +155,20 @@ fn parse(args: &[OsString]) -> Result<Cli, clap::Error> {
     Cli::try_parse_from(args)
 }
 
+/// The command `args` (the program name first) parse as, in its `Debug` form, or clap's
+/// message (help included) when they do not parse as a command; runs nothing (the documented
+/// examples' check).
+///
+/// # Errors
+///
+/// Clap's rendered message.
+#[doc(hidden)]
+pub fn check_args(args: &[OsString]) -> Result<String, String> {
+    parse(args)
+        .map(|cli| format!("{:?}", cli.command))
+        .map_err(|e| e.render().to_string())
+}
+
 /// Prints a `clap::Error` through `diag` (stdout for `--help` and `--version`) and returns its
 /// exit code.
 fn usage_error(e: &clap::Error) -> i32 {
@@ -221,23 +235,36 @@ fn command(cli: Cli, seams: &mut Seams) -> ExitCode {
                 task,
             },
         ),
-        Command::Resume { thread, prompt } => {
-            agent_cmd::run(&state_dir, agent_cmd::Verb::Resume { thread, prompt })
-        }
+        Command::Resume {
+            thread,
+            prompt,
+            launch,
+        } => agent_cmd::run(
+            &state_dir,
+            agent_cmd::Verb::Resume {
+                thread,
+                prompt,
+                launch,
+            },
+        ),
         Command::Send { thread, text } => {
             agent_cmd::run(&state_dir, agent_cmd::Verb::Send { thread, text })
         }
-        Command::Ready { thread } => agent_cmd::run(&state_dir, agent_cmd::Verb::Ready { thread }),
+        Command::Ready { thread, launch } => {
+            agent_cmd::run(&state_dir, agent_cmd::Verb::Ready { thread, launch })
+        }
         Command::Key {
             thread,
             keys,
             approval,
+            launch,
         } => agent_cmd::run(
             &state_dir,
             agent_cmd::Verb::Key {
                 thread,
                 keys,
                 approval,
+                launch,
             },
         ),
         Command::Input {
@@ -254,17 +281,28 @@ fn command(cli: Cli, seams: &mut Seams) -> ExitCode {
         } => agent_cmd::run(&state_dir, agent_cmd::Verb::InputCancel { input }),
         Command::Stop {
             thread,
-            assume_dead: false,
-            ..
-        } => agent_cmd::run(&state_dir, agent_cmd::Verb::Stop { thread }),
-        Command::Stop {
-            thread,
-            assume_dead: true,
+            assume_dead,
             launch,
-        } => agent_cmd::run(&state_dir, agent_cmd::Verb::AssumeDead { thread, launch }),
-        Command::Close { thread, stop } => {
-            agent_cmd::run(&state_dir, agent_cmd::Verb::Close { thread, stop })
-        }
+        } => agent_cmd::run(
+            &state_dir,
+            agent_cmd::Verb::Stop {
+                thread,
+                launch,
+                assume_dead,
+            },
+        ),
+        Command::Close {
+            thread,
+            stop,
+            launch,
+        } => agent_cmd::run(
+            &state_dir,
+            agent_cmd::Verb::Close {
+                thread,
+                stop,
+                launch,
+            },
+        ),
         Command::Inspect { thread, json } => {
             agent_cmd::run(&state_dir, agent_cmd::Verb::Inspect { thread, json })
         }

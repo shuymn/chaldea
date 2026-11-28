@@ -58,6 +58,11 @@ pub enum Command {
         /// it is ready.
         #[arg(long)]
         prompt: Option<String>,
+        /// Resume only if this exited launch is still the thread's current launch (else
+        /// nothing is done and the command exits 1); without it, the current launch is read
+        /// first.
+        #[arg(long, value_parser = crate::agent_cmd::launch_id)]
+        launch: Option<LaunchId>,
     },
     /// Queue a prompt for a thread's agent CLI; it is written once the CLI is ready.
     ///
@@ -74,6 +79,10 @@ pub enum Command {
     Ready {
         #[arg(value_parser = crate::agent_cmd::thread_id)]
         thread: ThreadId,
+        /// Act only if this is still the thread's current launch (else nothing is done and
+        /// the command exits 1); without it, the current launch is read first.
+        #[arg(long, value_parser = crate::agent_cmd::launch_id)]
+        launch: Option<LaunchId>,
     },
     /// Write keys to a thread's agent CLI: enter, escape, tab, backspace, ctrl_c, up, down,
     /// left, right, or one printable character.
@@ -85,6 +94,10 @@ pub enum Command {
         /// Answer this approval card: navigation keys, then at most one deciding key, last.
         #[arg(long, value_parser = crate::agent_cmd::approval_id)]
         approval: Option<chaldea_core::ids::ApprovalId>,
+        /// Act only if this is still the thread's current launch (else nothing is done and
+        /// the command exits 1); without it, the current launch is read first.
+        #[arg(long, value_parser = crate::agent_cmd::launch_id)]
+        launch: Option<LaunchId>,
     },
     /// Resolve or cancel an input.
     Input {
@@ -97,6 +110,9 @@ pub enum Command {
     /// accepted, 4 when it was confirmed later, and 1 when it could not be confirmed. A
     /// request retried after a refused attempt counts from the attempt the daemon accepted.
     ///
+    /// With `--launch` alone, the stop is done only if that launch is still the thread's
+    /// current launch (else nothing is done and the command exits 1).
+    ///
     /// With `--assume-dead`, an exited launch whose end could not be confirmed: without
     /// `--launch`, print what was checked of the current launch and send nothing (exit 0, or
     /// 1 when the history could not be read completely); with `--launch`, confirm as the
@@ -107,8 +123,8 @@ pub enum Command {
         /// Review, or with `--launch` confirm, the end of the current launch's processes.
         #[arg(long)]
         assume_dead: bool,
-        /// The current launch's id, which the confirmation names.
-        #[arg(long, requires = "assume_dead", value_parser = crate::agent_cmd::launch_id)]
+        /// The current launch's id: the launch to stop, or the one the confirmation names.
+        #[arg(long, value_parser = crate::agent_cmd::launch_id)]
         launch: Option<LaunchId>,
     },
     /// Close a thread whose agent CLI has ended.
@@ -118,6 +134,10 @@ pub enum Command {
         /// Stop a running agent CLI first.
         #[arg(long)]
         stop: bool,
+        /// Act only if this is still the thread's current launch (else nothing is done and
+        /// the command exits 1); without it, the current launch is read first.
+        #[arg(long, value_parser = crate::agent_cmd::launch_id)]
+        launch: Option<LaunchId>,
     },
     /// Show a thread's state, attention, launch, session, inputs, open cards, recent events,
     /// and live screen.

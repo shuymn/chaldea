@@ -460,8 +460,8 @@ fn exited_l() -> String {
 #[test]
 fn expected_launch_pinned() {
     type Verb = fn(&Client<'_>, &mut Vec<u8>, &mut Vec<u8>) -> ExitCode;
-    let resume: Verb = |c, o, e| c.resume(T, Some("go".to_owned()), o, e);
-    let close: Verb = |c, o, e| c.close(T, false, o, e);
+    let resume: Verb = |c, o, e| c.resume(T, Some("go".to_owned()), None, o, e);
+    let close: Verb = |c, o, e| c.close(T, false, None, o, e);
     for (name, verb, done) in [
         ("resume", resume, resume_ok()),
         ("close", close, close_ok(None)),
@@ -512,7 +512,7 @@ const RESTART: &str = "The previous process of this thread could not be confirme
 const STOPPED: &str =
     "The previous process of this thread could not be confirmed to have ended when it stopped.";
 /// The tail, with `T` for the thread.
-const TAIL: &str = "To review what was checked, run `chaldea stop 00000000-0000-0000-0000-000000000007 --assume-dead`; once you have made sure its processes ended, confirm with `--launch <id>`. Its history is kept, and new threads can be started.";
+const TAIL: &str = "To review what was checked, run `chaldea stop 00000000-0000-0000-0000-000000000007 --assume-dead`; once you have made sure its processes ended, confirm with `chaldea stop 00000000-0000-0000-0000-000000000007 --assume-dead --launch <id>`. Its history is kept, and new threads can be started.";
 
 /// PR10a1-CL-37: `death_unconfirmed` prints the reason's line only when the read after the
 /// refusal shows the pinned launch exited unconfirmed; otherwise, and for `stop`, the general
@@ -520,8 +520,8 @@ const TAIL: &str = "To review what was checked, run `chaldea stop 00000000-0000-
 #[test]
 fn death_unconfirmed_message() {
     type Verb = fn(&Client<'_>, &mut Vec<u8>, &mut Vec<u8>) -> ExitCode;
-    let resume: Verb = |c, o, e| c.resume(T, None, o, e);
-    let close: Verb = |c, o, e| c.close(T, true, o, e);
+    let resume: Verb = |c, o, e| c.resume(T, None, None, o, e);
+    let close: Verb = |c, o, e| c.close(T, true, None, o, e);
     let unconfirmed = |l, r| {
         summary(
             ProcessState::Exited,
@@ -562,7 +562,7 @@ fn death_unconfirmed_message() {
     }
     // `stop` pins no launch: the general line, with no read.
     let stub = Stub::start(vec![refusal()]);
-    let (code, _, err) = run(&stub, |c, o, e| c.stop(T, None, o, e));
+    let (code, _, err) = run(&stub, |c, o, e| c.stop(T, None, false, o, e));
     assert_eq!(code, ExitCode::Failed);
     assert_eq!(
         err.lines().collect::<Vec<_>>(),
@@ -602,7 +602,7 @@ fn stop_outcomes() {
     ] {
         let body = serde_json::to_string(&r).unwrap();
         let stub = Stub::start(vec![ok(body.clone())]);
-        let (got, out, err) = run(&stub, |c, o, e| c.stop(T, None, o, e));
+        let (got, out, err) = run(&stub, |c, o, e| c.stop(T, None, false, o, e));
         assert_eq!(got, code, "{r:?}");
         assert_eq!(out.trim(), body);
         assert_eq!(err.lines().collect::<Vec<_>>(), lines, "{r:?}");
@@ -640,7 +640,7 @@ fn stop_outcomes() {
         let body = serde_json::to_string(r).unwrap();
         let stub = Stub::start(vec![ok(body.clone())]);
         let launch = assume.then_some(L);
-        let (got, out, err) = run(&stub, |c, o, e| c.stop(T, launch, o, e));
+        let (got, out, err) = run(&stub, |c, o, e| c.stop(T, launch, assume, o, e));
         assert_eq!(got, code, "{r:?}");
         assert_eq!(out.trim(), body);
         assert_eq!(err.lines().collect::<Vec<_>>(), [line], "{r:?}");
@@ -656,13 +656,13 @@ fn stop_outcomes() {
         ok(running()),
         ok(close_ok(Some(stop_result(true, false)))),
     ]);
-    let (code, _, err) = run(&stub, |c, o, e| c.close(T, true, o, e));
+    let (code, _, err) = run(&stub, |c, o, e| c.close(T, true, None, o, e));
     assert_eq!(code, ExitCode::Timeout);
     assert_eq!(err.lines().collect::<Vec<_>>(), [late]);
     assert_eq!(stub.posts()[0].body["args"]["stop"], true);
     // Without a stop: exit 0.
     let stub = Stub::start(vec![ok(exited_l()), ok(close_ok(None))]);
-    let (code, _, err) = run(&stub, |c, o, e| c.close(T, false, o, e));
+    let (code, _, err) = run(&stub, |c, o, e| c.close(T, false, None, o, e));
     assert_eq!(code, ExitCode::Ok, "{err}");
 }
 
@@ -788,20 +788,6 @@ fn send_prints_the_input() {
     assert!(err.contains("empty_prompt"), "{err}");
 }
 
-/// PR10a2-CL-9: the `death_unconfirmed` tail names the preview with the thread's id.
-#[test]
-fn unconfirmed_text() {
-    let stub = Stub::start(vec![Reply::Json(409, error("death_unconfirmed"))]);
-    let (code, _, err) = run(&stub, |c, o, e| c.stop(T, None, o, e));
-    assert_eq!(code, ExitCode::Failed);
-    assert_eq!(
-        err.lines().last().unwrap(),
-        format!(
-            "chaldea: To review what was checked, run `chaldea stop {T} --assume-dead`; once you have made sure its processes ended, confirm with `--launch <id>`. Its history is kept, and new threads can be started."
-        )
-    );
-}
-
 mod inspect;
 mod preview;
 
@@ -837,7 +823,9 @@ fn claude_command_explained() {
             ok(exited_l()),
             Reply::Json(400, error("prompt_rejected")),
         ]);
-        let (code, _, err) = run(&stub, |c, o, e| c.resume(T, Some(prompt.to_owned()), o, e));
+        let (code, _, err) = run(&stub, |c, o, e| {
+            c.resume(T, Some(prompt.to_owned()), None, o, e)
+        });
         assert_eq!(code, ExitCode::Failed, "{err}");
         assert!(err.contains("prompt_rejected"), "{err}");
         assert_eq!(
