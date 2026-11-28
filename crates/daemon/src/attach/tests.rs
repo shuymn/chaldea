@@ -1164,16 +1164,21 @@ async fn production_mount_layers() {
 }
 
 /// T1-9: `/api/ws` keeps its 64 KiB inbound bound; attach refuses only above its own (the
-/// 1009 is best effort: the peer may still be writing when the socket closes).
+/// 1009 is best effort on both: the server closes with the frame's payload unread, so the
+/// close frame can be lost to the reset; `http_caps::oversized_message_closes_with_1009`
+/// asserts the code exactly).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn events_limit_unchanged() {
     let rig = SRig::new().await;
     let live = rig.claude().await;
+    let before = live.child.input().len();
     let mut ws = rig.srv.ws(&rig.owner).await;
     ws.text(&"x".repeat(64 * 1024 + 1)).await;
-    assert_eq!(ws.until_closed().await.0, Some(1009));
+    let (code, frames) = ws.until_closed().await;
+    assert!(matches!(code, Some(1009) | None), "{code:?}");
+    assert!(frames.is_empty(), "{frames:?}");
+    assert_eq!(live.child.input().len(), before);
     let (mut c, _) = attach(&rig, &live).await;
-    let before = live.child.input().len();
     let _ =
         c.ws.send(WsMessage::Text(
             format!(
