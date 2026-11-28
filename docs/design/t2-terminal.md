@@ -270,4 +270,4 @@ The code review verifies each item against the code, not only the tests:
 7. The T1 and MVP wording edits (§6.5) point to the latch rules.
 8. `card_attempted_disabled` asserts no automatic raw fallback.
 9. The `web` CI job builds the test variant once; the release artifact still runs the CSP and `request_policy` tests.
-10. Stale `--launch`: "no effect" means no event, no reservation, and no PTY byte. A stale `resume` may still run the adapter's `--version` probe before the daemon checks the pin (`crates/daemon/src/supervisor/ops.rs:150`); that ordering predates T2 and is in the backlog.
+10. Stale `--launch`: a pin already stale at the daemon's first check changes nothing: no event, no reservation, no PTY byte. A `close --stop` whose pin was valid can stop the inspected launch and then answer `launch_changed` or `thread_closed` if a resume or close raced it (`crates/daemon/src/supervisor/tests/close.rs:190`); the skill tells the human so. A stale `resume` may still run the adapter's `--version` probe before the daemon checks the pin (`crates/daemon/src/supervisor/ops.rs:150`); that ordering predates T2 and is in the backlog.
