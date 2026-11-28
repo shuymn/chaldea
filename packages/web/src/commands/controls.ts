@@ -135,47 +135,6 @@ export function canRetry(cmds: CmdState, s: State, slot: string): boolean {
   return c !== undefined && retryable(cmds, slot) && targetGate(c)(s);
 }
 
-/**
- * Whether a command's frozen target is provably gone, so it can never be retried: the
- * thread's copy shows another launch than the one it named (or that launch exited, for
- * Ready and Stop), or its input left the state it acts on. A copy that lags shows less
- * progress, never more, so this holds whether or not the copy is current. Send and Spawn
- * have no such target.
- */
-export function superseded(c: Pick<Command, "name" | "thread" | "body">, s: State): boolean {
-  const copy = c.thread === null ? null : threadCopy(s, c.thread);
-  if (copy === null) return false;
-  let args: Record<string, unknown> = {};
-  try {
-    args = (JSON.parse(c.body) as { args?: Record<string, unknown> }).args ?? {};
-  } catch {
-    return false;
-  }
-  const l = copy.launch;
-  switch (c.name) {
-    case "ready":
-    case "stop":
-      return l !== null && (l.id !== args.expected_launch_id || l.exited);
-    case "resume":
-      return l !== null && l.id !== args.expected_launch_id;
-    case "input_resolve":
-    case "input_cancel": {
-      const want = c.name === "input_resolve" ? "unconfirmed" : "queued";
-      const now = copy.inputs.find((i) => i.id === args.input_id)?.state ?? copy.done.find((i) => i.id === args.input_id)?.state;
-      return now !== undefined && now !== want;
-    }
-    default:
-      return false;
-  }
-}
-
-/** The not-done commands whose target was superseded (the runner releases them). */
-export function supersededSlots(cmds: CmdState, s: State): string[] {
-  return Object.values(cmds.slots)
-    .filter((c) => c.phase === "not_done" && superseded(c, s))
-    .map((c) => c.slot);
-}
-
 /** A thread as notices name it: agent, cwd, and the first 8 characters of its id. */
 export function threadLabel(s: State, thread: string): string {
   const host = s.streams[HOST]?.copy;

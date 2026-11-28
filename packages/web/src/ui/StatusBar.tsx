@@ -22,26 +22,34 @@ export function StatusBar(props: { state: State; cmds?: CmdState }) {
   const counted = useRef(state.appended);
   const was = useRef(now);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** A "Back online" not announced yet. */
+  const backOnline = useRef(false);
   const notice = props.cmds?.notice ?? null;
 
-  useEffect(() => {
-    const backOnline = was.current === "offline" && now !== "offline";
-    was.current = now;
-    const fresh = state.appended - counted.current;
-    if (!backOnline && fresh <= 0) return;
+  /** Announces, after the debounce, "Back online" if pending and the events counted since. */
+  const schedule = () => {
     if (timer.current !== null) clearTimeout(timer.current);
     timer.current = setTimeout(() => {
       timer.current = null;
       const n = state.appended - counted.current;
       counted.current = state.appended;
       const parts = [];
-      if (backOnline) parts.push("Back online.");
+      if (backOnline.current) parts.push("Back online.");
+      backOnline.current = false;
       if (n > 0) parts.push(n === 1 ? "1 new event." : `${n} new events.`);
-      setMessage({ key: `sync:${state.appended}:${now}`, text: parts.join(" ") });
+      if (parts.length > 0) setMessage({ key: `sync:${Date.now()}:${state.appended}`, text: parts.join(" ") });
     }, ANNOUNCE_MS);
+  };
+
+  useEffect(() => {
+    if (was.current === "offline" && now !== "offline") backOnline.current = true;
+    was.current = now;
+    if (!backOnline.current && state.appended - counted.current <= 0) return;
+    schedule();
   }, [now, state.appended]);
 
-  // Each new notice is announced once, at once. It replaces a pending counter message.
+  // Each new notice is announced once, at once. It replaces a pending event count; a pending
+  // "Back online" is queued behind it.
   const seq = notice?.seq ?? 0;
   const announced = useRef(seq);
   useEffect(() => {
@@ -50,9 +58,10 @@ export function StatusBar(props: { state: State; cmds?: CmdState }) {
     if (timer.current !== null) {
       clearTimeout(timer.current);
       timer.current = null;
-      counted.current = state.appended;
     }
+    counted.current = state.appended;
     setMessage({ key: `notice:${seq}`, text: notice.text });
+    if (backOnline.current) schedule();
   }, [seq, notice, state.appended]);
 
   useEffect(

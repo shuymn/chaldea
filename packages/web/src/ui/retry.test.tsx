@@ -1,13 +1,12 @@
 // @vitest-environment jsdom
-// W2-10 Retry targets (docs/design/w2-composer.md §2.2): a not-done command's Retry is
-// shown and dispatched through one gate on its frozen target. When the launch it named
-// is superseded, or its input moved on, within the same socket session, no Retry is shown
-// and none is sent.
+// W2-5 and W2-10 slots and Retry (docs/design/w2-composer.md §2.2): a not-done command did
+// nothing, so it frees its slot at once; its Retry is offered only through the gate on its
+// frozen target, and reserves the slot again at the click through the reducer's busy check.
 
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test } from "vitest";
 
-import { canRetry, context, slots, supersededSlots, threadLabel } from "../commands/controls";
+import { canRetry, context, slots, threadLabel } from "../commands/controls";
 import {
   type CmdAction,
   type CmdEffect,
@@ -18,7 +17,7 @@ import {
 import type { CommandRunner } from "../commands/runner";
 import { threadId } from "../sync/model/server";
 import { seeded } from "../sync/ops";
-import type { Sim } from "../sync/sim";
+import { MODEL_CONFIG, Sim, TEST_CONFIG } from "../sync/sim";
 import { AttentionBanner } from "./AttentionBanner";
 import { CommandLine } from "./CommandLine";
 import { bindOps } from "./ops";
@@ -32,15 +31,16 @@ const I1 = "0193dddd-0000-7000-8000-000000000001";
 const BUSY = { kind: "not_done", status: 503, code: "busy", retryAfter: 0 } as const;
 
 type Input = CmdAction extends infer A ? (A extends unknown ? Omit<A, "now"> : never) : never;
+type Post = Extract<CmdEffect, { type: "post" }>;
 
 /** The command reducer against a live sim, with a CommandRunner-shaped facade for `bindOps`. */
 function harness(sim: Sim) {
   let s: CmdState = initialCmdState(0);
-  const posts: CmdEffect[] = [];
+  const posts: Post[] = [];
   const run = (a: Input) => {
     const [next, effects] = reduceCommands(s, { ...a, now: 0 } as CmdAction);
     s = next;
-    posts.push(...effects.filter((e) => e.type === "post"));
+    for (const e of effects) if (e.type === "post") posts.push(e);
   };
   run({ type: "context", ctx: context(sim.state) });
   const runner = {
@@ -55,19 +55,15 @@ function harness(sim: Sim) {
         commandId: `c${posts.length}`,
         generation: "gen-1",
       }),
-    retry: (slot: string, allowed: (x: typeof sim.state) => boolean) => run({ type: "retry", slot, allowed: allowed(sim.state) }),
+    retry: (slot: string, attempt: number, allowed: (x: typeof sim.state) => boolean) =>
+      run({ type: "retry", slot, attempt, allowed: allowed(sim.state) }),
   } as unknown as CommandRunner;
-  const reply = () => {
+  /** Answers the latest POST with 503 `busy`. */
+  const busy = () => {
     const last = posts.at(-1);
-    if (last?.type === "post") run({ type: "reply", attempt: last.attempt, reply: BUSY });
+    if (last) run({ type: "reply", attempt: last.attempt, reply: BUSY });
   };
-  // What CommandRunner.follow does on each sync change: the context, then superseded releases.
-  const sync = () => {
-    run({ type: "context", ctx: context(sim.state) });
-    const gone = supersededSlots(s, sim.state);
-    if (gone.length > 0) run({ type: "release", slots: gone });
-  };
-  return { runner, ops: bindOps(runner), posts, reply, state: () => s, sync };
+  return { runner, ops: bindOps(runner), posts, busy, state: () => s, sync: () => run({ type: "context", ctx: context(sim.state) }) };
 }
 
 function running(): Sim {
@@ -79,30 +75,123 @@ function running(): Sim {
   return sim;
 }
 
-describe("retry targets", () => {
-  test("Ready and Stop: a launch superseded in the same session offers and sends no Retry", () => {
+/** A's launch replaced by B on the model server. */
+function replace(sim: Sim, cause: "exit" | "stopped" = "exit") {
+  sim.server.launchExited(T, cause, true);
+  sim.server.launchReserved(T, L2);
+  sim.server.status(T, "process", "running");
+}
+
+const attemptOf = (h: ReturnType<typeof harness>, slot: string) => h.state().slots[slot]!.attempt;
+
+describe("slots and Retry", () => {
+  test("a not-done Stop on A frees the slot at once: after A exits and B starts, the banner's Stop for B is enabled", () => {
+    const sim = running();
+    const h = harness(sim);
+    h.ops.stop(T, L1);
+    h.busy();
+    expect(h.state().slots[slots.launch(T)]?.phase).toBe("not_done");
+    replace(sim);
+    sim.server.status(T, "attention", [{ kind: "startup_stall" }]);
+    sim.quiesce();
+    h.sync();
+    render(<AttentionBanner state={sim.state} cmds={h.state()} ops={h.ops} />);
+    const stop = screen.getByRole("region", { name: "Attention" }).querySelector('[data-cause="startup_stall"] button');
+    expect(stop?.textContent).toBe("Stop");
+    expect((stop as HTMLButtonElement).disabled).toBe(false);
+    // A's Retry is not offered (its target changed), and B's Stop goes.
+    expect(canRetry(h.state(), sim.state, slots.launch(T))).toBe(false);
+    h.ops.stop(T, L2);
+    expect(h.posts.map((p) => JSON.parse(p.body).args.expected_launch_id)).toEqual([L1, L2]);
+  });
+
+  test("a refollow replaying an old launch hides B's Retry only until the replay reaches B", () => {
+    // One-event forward pages and no other followed threads, so a refollow replays from 0.
+    const sim = new Sim({ ...TEST_CONFIG, forwardLimit: 1, followMax: 0 }, MODEL_CONFIG);
+    sim.server.register(1, false);
+    sim.server.register(2, false);
+    sim.server.status(T, "process", "running");
+    sim.server.launchReserved(T, L1);
+    sim.server.launchExited(T, "stopped", true);
+    sim.server.launchReserved(T, L2);
+    sim.boot();
+    sim.dispatch({ type: "select", thread: T });
+    sim.quiesce();
+    const h = harness(sim);
+    h.ops.stop(T, L2);
+    h.busy();
+    expect(canRetry(h.state(), sim.state, slots.launch(T))).toBe(true);
+    const session = context(sim.state).session;
+    // Unfollow (another selection), then follow again: the copy replays from seq 1, page by page.
+    sim.dispatch({ type: "select", thread: threadId(1) });
+    sim.quiesce();
+    sim.dispatch({ type: "select", thread: T });
+    let sawA = false;
+    for (let k = 0; k < 40; k++) {
+      for (const id of [...sim.flights.keys()]) sim.serve(id);
+      if (!sim.deliver()) break;
+      const launch = sim.state.streams[`thread:${T}`]?.copy;
+      if (launch?.kind === "thread" && launch.launch?.id === L1) {
+        sawA = true;
+        expect(canRetry(h.state(), sim.state, slots.launch(T))).toBe(false);
+      }
+    }
+    sim.quiesce();
+    h.sync();
+    expect(sawA).toBe(true);
+    expect(context(sim.state).session).toBe(session);
+    expect(canRetry(h.state(), sim.state, slots.launch(T))).toBe(true);
+    h.ops.retry(slots.launch(T), attemptOf(h, slots.launch(T)));
+    expect(h.posts).toHaveLength(2);
+    expect(h.posts[1]!.body).toBe(h.posts[0]!.body);
+  });
+
+  test("Retry with the slot taken by a newer command is refused with a notice", () => {
+    const sim = running();
+    const h = harness(sim);
+    h.ops.stop(T, L1);
+    h.busy();
+    const old = attemptOf(h, slots.launch(T));
+    // The free slot takes a newer Stop, in flight.
+    h.ops.stop(T, L1);
+    expect(h.posts).toHaveLength(2);
+    h.ops.retry(slots.launch(T), old);
+    expect(h.posts).toHaveLength(2);
+    expect(h.state().notice?.text).toBe("claude /work/p2 [0193abcd]: Stop: not sent — the previous one is still pending.");
+  });
+
+  test("a held slot refuses a gesture with the way out: wait while in flight, check the thread when unknown", () => {
+    const sim = running();
+    const h = harness(sim);
+    h.ops.stop(T, L1);
+    h.ops.stop(T, L1);
+    expect(h.state().notice?.text).toMatch(/Stop: not sent — the previous one is still pending\.$/);
+    const last = h.posts.at(-1)!;
+    h.runner.dispatch({ type: "reply", attempt: last.attempt, reply: { kind: "unknown", status: null, code: null } });
+    h.ops.stop(T, L1);
+    expect(h.state().notice?.text).toMatch(/Stop: not sent — check the thread first, or Forget the earlier one\.$/);
+    expect(h.posts).toHaveLength(1);
+  });
+
+  test("Ready and Stop: a launch replaced in the same session offers and sends no Retry", () => {
     for (const kind of ["ready", "stop"] as const) {
       const sim = running();
       const h = harness(sim);
       if (kind === "ready") h.ops.ready(T, L1);
       else h.ops.stop(T, L1);
-      h.reply();
+      h.busy();
       const slot = kind === "ready" ? slots.ready(T) : slots.launch(T);
       expect(canRetry(h.state(), sim.state, slot), kind).toBe(true);
       const session = context(sim.state).session;
-      // Launch A ends and B runs, with no reopen.
-      sim.server.launchExited(T, "stopped", true);
-      sim.server.launchReserved(T, L2);
-      sim.server.status(T, "process", "running");
+      replace(sim, "stopped");
       sim.quiesce();
       expect(context(sim.state).session).toBe(session);
       h.sync();
-      expect(h.state().slots[slot]?.phase).toBe("released");
       expect(canRetry(h.state(), sim.state, slot), kind).toBe(false);
       render(<CommandLine state={sim.state} cmds={h.state()} slot={slot} ops={h.ops} />);
       expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
       cleanup();
-      h.ops.retry(slot);
+      h.ops.retry(slot, attemptOf(h, slot));
       expect(h.posts, kind).toHaveLength(1);
     }
   });
@@ -113,13 +202,13 @@ describe("retry targets", () => {
     sim.quiesce();
     const h = harness(sim);
     h.ops.cancel(T, I1);
-    h.reply();
+    h.busy();
     expect(canRetry(h.state(), sim.state, slots.input(I1))).toBe(true);
     sim.server.inputState(T, I1, "sending", { kind: "gate_opened" });
     sim.quiesce();
     h.sync();
     expect(canRetry(h.state(), sim.state, slots.input(I1))).toBe(false);
-    h.ops.retry(slots.input(I1));
+    h.ops.retry(slots.input(I1), attemptOf(h, slots.input(I1)));
     expect(h.posts).toHaveLength(1);
   });
 
@@ -127,81 +216,35 @@ describe("retry targets", () => {
     const sim = running();
     const h = harness(sim);
     h.ops.stop(T, L1);
-    h.reply();
+    h.busy();
     render(<CommandLine state={sim.state} cmds={h.state()} slot={slots.launch(T)} ops={h.ops} />);
     expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
-    h.ops.retry(slots.launch(T));
+    h.ops.retry(slots.launch(T), attemptOf(h, slots.launch(T)));
     expect(h.posts).toHaveLength(2);
-    const [a, b] = h.posts as Extract<CmdEffect, { type: "post" }>[];
-    expect(b!.body).toBe(a!.body);
+    expect(h.posts[1]!.body).toBe(h.posts[0]!.body);
   });
 
   test("Resume and It arrived keep their Retry on an unchanged target", () => {
-    // Resume on an exited launch whose death is confirmed.
     const a = running();
     a.server.status(T, "process", "exited");
     a.server.launchExited(T, "stopped", true);
     a.quiesce();
     const h = harness(a);
     h.ops.resume(T, L1);
-    h.reply();
+    h.busy();
     expect(canRetry(h.state(), a.state, slots.launch(T))).toBe(true);
-    h.ops.retry(slots.launch(T));
+    h.ops.retry(slots.launch(T), attemptOf(h, slots.launch(T)));
     expect(h.posts).toHaveLength(2);
 
-    // It arrived on an unconfirmed input.
     const b = running();
     b.server.inputCreated(T, I1, "x");
     b.server.inputState(T, I1, "unconfirmed", { kind: "launch_exited" });
     b.quiesce();
     const g = harness(b);
     g.ops.resolve(T, I1, true);
-    g.reply();
+    g.busy();
     expect(canRetry(g.state(), b.state, slots.input(I1))).toBe(true);
-    g.ops.retry(slots.input(I1));
+    g.ops.retry(slots.input(I1), attemptOf(g, slots.input(I1)));
     expect(g.posts).toHaveLength(2);
-  });
-
-  test("a superseded not-done Stop frees its slot: the banner's Stop for the new launch is enabled", () => {
-    const sim = running();
-    const h = harness(sim);
-    h.ops.stop(T, L1);
-    h.reply();
-    expect(h.state().slots[slots.launch(T)]?.phase).toBe("not_done");
-    // A exits on its own; B starts and stalls, in the same socket session.
-    sim.server.launchExited(T, "exit", true);
-    sim.server.launchReserved(T, L2);
-    sim.server.status(T, "process", "running");
-    sim.server.status(T, "attention", [{ kind: "startup_stall" }]);
-    sim.quiesce();
-    h.sync();
-    expect(h.state().slots[slots.launch(T)]?.phase).toBe("released");
-    render(<AttentionBanner state={sim.state} cmds={h.state()} ops={h.ops} />);
-    const stop = screen.getByRole("region", { name: "Attention" }).querySelector('[data-cause="startup_stall"] button');
-    expect(stop?.textContent).toBe("Stop");
-    expect((stop as HTMLButtonElement).disabled).toBe(false);
-  });
-
-  test("an ambiguous outcome keeps its hold when the target changes", () => {
-    const sim = running();
-    const h = harness(sim);
-    h.ops.stop(T, L1);
-    const last = h.posts.at(-1);
-    if (last?.type === "post") h.runner.dispatch({ type: "reply", attempt: last.attempt, reply: { kind: "unknown", status: null, code: null } });
-    sim.server.launchExited(T, "exit", true);
-    sim.server.launchReserved(T, L2);
-    sim.quiesce();
-    h.sync();
-    expect(h.state().slots[slots.launch(T)]?.phase).toBe("check_thread");
-  });
-
-  test("a held slot takes no second gesture from the page", () => {
-    const sim = running();
-    const h = harness(sim);
-    h.ops.stop(T, L1);
-    h.ops.stop(T, L1);
-    h.ops.ready(T, L1);
-    h.ops.ready(T, L1);
-    expect(h.posts.map((p) => (p.type === "post" ? p.name : ""))).toEqual(["stop", "ready"]);
   });
 });

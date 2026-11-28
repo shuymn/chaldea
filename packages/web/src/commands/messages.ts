@@ -47,12 +47,8 @@ const REJECT: Record<RejectReason, string> = {
 export const rejectText = (r: RejectReason) => REJECT[r];
 
 /** The hint for an exited launch whose death is not confirmed (mvp:216). */
-export function hintText(thread: string, launch: string | null): string {
-  const review = `Review with "chaldea stop ${thread} --assume-dead"`;
-  // `--launch` names only a current launch whose death is unconfirmed.
-  return launch === null
-    ? `Resume is blocked. ${review}.`
-    : `Resume waits until the previous launch is confirmed dead. ${review}, then confirm with "--launch ${launch}".`;
+export function hintText(thread: string, launch: string): string {
+  return `Resume waits until the previous launch is confirmed dead. Review with "chaldea stop ${thread} --assume-dead", then confirm with "--launch ${launch}".`;
 }
 
 export const INVALID_TEXT = {

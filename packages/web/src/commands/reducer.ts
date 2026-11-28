@@ -3,11 +3,13 @@
 // the event stream: a command settles only on its own reply (D7), and the page shows input
 // state from the stream.
 //
-// Each slot holds one logical command, reserved synchronously when its gesture is taken,
-// so a second gesture finds it busy. Nothing retries automatically: an ambiguous reply
-// shows "check the thread" with Forget only; a not-done reply offers Retry, after its
-// `retry_after`, only while the attempt's socket session is current. A reply that arrives
-// after its context changed updates only its own command's shown result.
+// A slot is held while its command is in flight or its outcome is unknown, reserved
+// synchronously at the gesture, so a second gesture finds it busy and is refused with a
+// notice. Nothing retries automatically: an ambiguous reply shows "check the thread" with
+// Forget only. A not-done command did nothing, so it frees its slot at once; its Retry,
+// after `retry_after` and only while the attempt's socket session is current, reserves
+// the slot again through the same busy check. A reply that arrives after its context
+// changed updates only its own command's shown result.
 
 import type { CommandName, Reply } from "./client";
 import { commandText, INVALID_TEXT, refusedText } from "./messages";
@@ -17,7 +19,7 @@ export type Phase =
   | "inflight"
   /** The outcome is unknown: the owner checks the thread; only Forget is offered. */
   | "check_thread"
-  /** Not done: Retry (after `retryAt`) while in session, and Forget. */
+  /** Not done: the slot is free; Retry (after `retryAt`) while in session, and Forget. */
   | "not_done"
   /** Done: the reply is the result. */
   | "settled"
@@ -27,7 +29,14 @@ export type Phase =
   | "forgotten";
 
 /** Phases that hold their slot. */
-export const BUSY: ReadonlySet<Phase> = new Set(["inflight", "check_thread", "not_done"]);
+export const BUSY: ReadonlySet<Phase> = new Set(["inflight", "check_thread"]);
+
+/** Why a busy slot refuses a gesture, with the way out. */
+function busyReason(c: Command): string {
+  return c.phase === "check_thread"
+    ? "check the thread first, or Forget the earlier one"
+    : "the previous one is still pending";
+}
 
 /** The UTF-8 limit of a prompt (`core::input::MAX_PROMPT_BYTES`, mvp:186). */
 export const MAX_PROMPT_BYTES = 256 * 1024;
@@ -136,12 +145,10 @@ export type CmdAction = At &
     | { readonly type: "edit"; readonly thread: string; readonly text: string }
     /** A gesture starting a command; a `send` takes its text from the thread's draft. */
     | ({ readonly type: "gesture" } & Gesture)
-    | { readonly type: "retry"; readonly slot: string; readonly allowed: boolean; readonly why?: string }
+    | { readonly type: "retry"; readonly slot: string; readonly attempt: number; readonly allowed: boolean; readonly why?: string }
     | { readonly type: "forget"; readonly slot: string }
     | { readonly type: "reply"; readonly attempt: number; readonly reply: Reply }
     | { readonly type: "tick" }
-    /** Not-done commands whose target was superseded: released. */
-    | { readonly type: "release"; readonly slots: readonly string[] }
   );
 
 export type CmdEffect =
@@ -207,8 +214,9 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
     }
     case "gesture": {
       // A refused gesture sends nothing and keeps the draft, but says why (a notice).
-      const why = busy(s, a.slot)
-        ? "the previous one is still pending"
+      const held = s.slots[a.slot];
+      const why = held !== undefined && busy(s, a.slot)
+        ? busyReason(held)
         : s.ctx.session === null
           ? "the page is not live"
           : !a.allowed
@@ -260,6 +268,11 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
     case "retry": {
       const c = s.slots[a.slot];
       if (!c) break;
+      // The slot is reserved again at the click: a newer command in it refuses the Retry.
+      if (c.attempt !== a.attempt) {
+        notify(prefixed(c.label, refusedText(c.name, busy(s, a.slot) ? busyReason(c) : "a newer one replaced it")));
+        break;
+      }
       if (!a.allowed || !retryable(s, a.slot) || !inSession(s.ctx, c)) {
         notify(prefixed(c.label, refusedText(c.name, a.why ?? "it is not available now")));
         break;
@@ -323,15 +336,6 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
       // The outcome as shown now, frozen with its target.
       const settled = s.slots[c.slot];
       if (settled) notify(prefixed(c.label, commandText(settled)));
-      break;
-    }
-    case "release": {
-      // Not-done commands whose target was superseded (controls.ts `superseded`): no Retry can
-      // ever go, so the slot is free. Other phases keep their hold.
-      for (const slot of a.slots) {
-        const c = s.slots[slot];
-        if (c?.phase === "not_done") put({ ...c, phase: "released", retryAt: null, stale: true });
-      }
       break;
     }
   }

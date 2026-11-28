@@ -23,7 +23,7 @@ export function CommandLine(props: { state: State; cmds: CmdState; slot: string;
         </span>
       )}
       {canRetry(cmds, props.state, slot) && (
-        <button type="button" className="control" onClick={() => ops.retry(slot)}>
+        <button type="button" className="control" onClick={() => ops.retry(slot, c.attempt)}>
           Retry
         </button>
       )}

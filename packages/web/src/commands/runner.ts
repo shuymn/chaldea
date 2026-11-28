@@ -7,7 +7,7 @@ import type { Fetch } from "../http";
 import type { Runner } from "../sync/runner";
 import type { State } from "../sync/state";
 import { type CommandName, postCommand } from "./client";
-import { context, refusal, sameContext, supersededSlots, threadLabel } from "./controls";
+import { context, refusal, sameContext, threadLabel } from "./controls";
 import { type CmdAction, type CmdEffect, type CmdState, initialCmdState, reduceCommands } from "./reducer";
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
@@ -45,12 +45,8 @@ export class CommandRunner {
 
   /** The sync side changed: pass its session context on when it differs. */
   private follow(): void {
-    const s = this.sync.getState();
-    const ctx = context(s);
+    const ctx = context(this.sync.getState());
     if (!sameContext(ctx, this.state.ctx)) this.dispatch({ type: "context", ctx });
-    // A not-done command whose target was superseded can never be retried: free its slot.
-    const gone = supersededSlots(this.state, s);
-    if (gone.length > 0) this.dispatch({ type: "release", slots: gone });
   }
 
   /**
@@ -82,11 +78,11 @@ export class CommandRunner {
     });
   }
 
-  retry(slot: string, allowed: (s: State) => boolean): void {
+  retry(slot: string, attempt: number, allowed: (s: State) => boolean): void {
     this.follow();
     const s = this.sync.getState();
     const c = this.state.slots[slot];
-    this.dispatch({ type: "retry", slot, allowed: allowed(s), why: refusal(s, c?.name ?? "send", c?.thread ?? null) });
+    this.dispatch({ type: "retry", slot, attempt, allowed: allowed(s), why: refusal(s, c?.name ?? "send", c?.thread ?? null) });
   }
 
   dispatch(input: CmdInput): void {

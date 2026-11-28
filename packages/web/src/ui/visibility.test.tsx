@@ -13,6 +13,7 @@ import { type CmdAction, type CmdState, type Gesture, initialCmdState, reduceCom
 import { threadId } from "../sync/model/server";
 import { seeded } from "../sync/ops";
 import type { Sim } from "../sync/sim";
+import type { HostCopy, State } from "../sync/state";
 import { AttentionBanner } from "./AttentionBanner";
 import type { Ops } from "./ops";
 import { StatusBar } from "./StatusBar";
@@ -90,14 +91,51 @@ describe("command visibility", () => {
     s = reply(s, slots.ready(T1), { kind: "settled", status: 409, code: "launch_changed" });
     act(() => view.rerender(<StatusBar state={sim.state} cmds={s} />));
     const first = shown();
-    // Ready again: in flight, no reply yet. The thread is then closed (its host row changes).
+    // Ready again: in flight, no reply yet. Then the host copy names the thread differently.
     s = gesture(sim, s, { slot: slots.ready(T1), name: "ready", thread: T1 });
-    sim.server.close(T1);
-    sim.quiesce();
-    act(() => view.rerender(<StatusBar state={sim.state} cmds={s} />));
+    const host = sim.state.streams.host!.copy as HostCopy;
+    const row = host.threads[T1]!;
+    const relabelled: State = {
+      ...sim.state,
+      streams: {
+        ...sim.state.streams,
+        host: {
+          ...sim.state.streams.host!,
+          copy: { ...host, threads: { ...host.threads, [T1]: { ...row, info: { ...row.info, cwd: "/work/renamed" } } } },
+        },
+      },
+    };
+    expect(threadLabel(relabelled, T1)).not.toBe(threadLabel(sim.state, T1));
+    act(() => view.rerender(<StatusBar state={relabelled} cmds={s} />));
     expect(s.slots[slots.ready(T1)]?.phase).toBe("inflight");
     expect(shown()).toBe(first);
+    expect(shown()).toContain("/work/p1");
     expect(announced()).toBe(first);
+  });
+
+  test("a pending Back online is announced after a command notice that took priority", () => {
+    vi.useFakeTimers();
+    const sim = live();
+    let s = step(initialCmdState(), { type: "context", ctx: context(sim.state) });
+    const view = render(<StatusBar state={sim.state} cmds={s} />);
+    // Offline, then back: "Back online" is pending (debounced) when a refusal arrives.
+    sim.restart();
+    sim.up = false;
+    for (let k = 0; k < 3; k++) {
+      sim.advance(31_000);
+      while (sim.serveTicket());
+      for (const id of [...sim.flights.keys()]) sim.serve(id);
+      while (sim.deliver());
+    }
+    act(() => view.rerender(<StatusBar state={sim.state} cmds={s} />));
+    expect(screen.getByRole("alert")).toBeTruthy();
+    sim.quiesce();
+    act(() => view.rerender(<StatusBar state={sim.state} cmds={s} />));
+    s = gesture(sim, s, { slot: slots.send(T2), name: "send", thread: T2 });
+    act(() => view.rerender(<StatusBar state={sim.state} cmds={s} />));
+    expect(announced()).toBe("claude /work/p2 [0193abcd]: Write a message first.");
+    act(() => vi.advanceTimersByTime(2000));
+    expect(announced()).toBe("Back online.");
   });
 
   test("an identical refusal twice is announced twice", () => {

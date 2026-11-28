@@ -24,6 +24,7 @@ const TITLE: Record<Entry["kind"], string> = {
 function ThreadEntries(props: { state: State; cmds: CmdState; thread: string; entries: Entry[]; ops: Ops }) {
   const { state, cmds, thread, entries, ops } = props;
   const { ask, dialogs } = useLaunchConfirm(state, thread, ops);
+  const hint = hintLaunch(state, thread);
   const host = state.streams[HOST]?.copy;
   const info = host?.kind === "host" ? host.threads[thread]?.info : undefined;
   return (
@@ -64,8 +65,9 @@ function ThreadEntries(props: { state: State; cmds: CmdState; thread: string; en
                 Stop
               </button>
             )}
-            {e.kind === "resume_blocked" && (
-              <span className="hint break-words text-sm">{hintText(thread, hintLaunch(state, thread))}</span>
+            {e.kind === "resume_blocked" && hint !== null && (
+              // Only for a current launch whose death is unconfirmed.
+              <span className="hint break-words text-sm">{hintText(thread, hint)}</span>
             )}
           </li>
         ))}

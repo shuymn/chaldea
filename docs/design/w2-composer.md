@@ -12,7 +12,7 @@ mvp §4 row W2 (mvp:438, :480, :616, :631): PR 19, M1; extends `docs/design/w1-p
 
 ### 2.1 Composer
 
-A `<form>` per selected thread: visible `<label>`, `<textarea>`, submit button, helper buttons `type="button"`; submit calls `preventDefault()` first (CSP `form-action 'none'`, w1-pwa:14). Drafts live in memory per thread (`forms` §1–2).
+A `<form>` per selected thread: visible `<label>`, `<textarea>`, submit button, `type="button"` helpers; submit calls `preventDefault()` (CSP `form-action 'none'`, w1-pwa:14). Drafts live in memory per thread (`forms` §1–2).
 
 **Enter** keydown, in order:
 
@@ -20,7 +20,7 @@ A `<form>` per selected thread: visible `<label>`, `<textarea>`, submit button, 
 2. Shift+Enter → native newline.
 3. Ctrl/Cmd+Enter, or plain Enter when `(pointer: fine)` matches → `preventDefault`, then submit unless `repeat`. Plain Enter otherwise → newline.
 
-Sizing: `field-sizing: content`, `width: 100%`, `font-size: max(1rem, 1em)`, 48 px coarse targets (`forms` §5).
+Sizing: `field-sizing: content`, `font-size: max(1rem, 1em)`, 48 px coarse targets (`forms` §5).
 
 **Submit** sends the value unchanged (mvp:184); empty text or UTF-8 over 256 KiB (mvp:186) sends nothing, with an `aria-invalid` described error. On `queued` the draft clears only if its revision is still the submitted one.
 
@@ -34,13 +34,13 @@ Sizing: `field-sizing: content`, `width: 100%`, `font-size: max(1rem, 1em)`, 48 
 | Mark ready | `ready { thread_id, expected_launch_id }` | open, `running` |
 | It arrived / Dismiss | `input_resolve { input_id, delivered }` | input `unconfirmed` |
 | Cancel | `input_cancel { input_id }` | input `queued` |
-| New thread | `spawn { agent, cwd, prompt?, task? }` (empty optionals omitted) | always |
+| New thread | `spawn { agent, cwd, prompt?, task? }` (empties omitted) | always |
 | Stop | `stop { thread_id, expected_launch_id }` | open, launch not exited |
 | Resume | `resume { thread_id, expected_launch_id }` | open, exited, death confirmed |
 
 Unconfirmed death shows *the hint* instead of Resume: review with `chaldea stop <thread> --assume-dead`, confirm with `--launch <id>` (mvp:216; a refused resume raises `resume_blocked`, supervisor.md:122). Ready and Stop confirm in a `showModal()` dialog (`accessibility` §12) pinning the launch; a launch change closes it. Ready's dialog states the assertion: the pinned CLI's normal composer is open and empty, no popup or search; queued prompts may proceed.
 
-**Dispatch** needs `live`; send, ready, and input commands also need a *current* copy (W1's `syncedCheck` conditions, per stream, with equal non-null socket and copy epochs); Stop and Resume use the latest valid copy and the pinned launch. Each slot (the spawn form; a thread's send; its stop or resume; its ready; an input's resolve or cancel) holds one logical command, reserved synchronously before dispatch, Retry included. `command_id` is `crypto.randomUUID()`, frozen with the body bytes and credential generation. **Nothing retries automatically.**
+**Dispatch** needs `live`; send, ready, and input commands also need a *current* copy (W1's `syncedCheck` per stream; equal non-null socket and copy epochs); Stop and Resume use the latest valid copy and the pinned launch. Each slot (spawn; per thread: send, stop or resume, ready; per input) holds one in-flight or unknown command, reserved synchronously before dispatch; a not-done command frees its slot, and its Retry reserves it again (refused if a newer one holds it). `command_id` is `crypto.randomUUID()`, frozen with the body bytes and credential generation. **Nothing retries automatically.**
 
 | Reply (http-surface:563-610) | Means | Controls |
 |---|---|---|
@@ -51,7 +51,7 @@ Unconfirmed death shows *the hint* instead of Resume: review with `chaldea stop 
 | 408; 503 `busy`, `shutting_down`, `disk_full`, `store_failed` | not done | Retry, Forget |
 | 401 | not done; W1's compare-and-delete with the frozen generation | — |
 
-Ambiguous outcomes are never retried: the browser cannot prove a retry reaches the receipts that saw the attempt (http-surface:616). Retry, after `retry_after`, exists only for not-done attempts within their socket session (same epoch and generation, no reopen or `hello` since); later, they release. Only a 2xx or settled reply settles; a reply after its context changed updates only its command's result, never drafts, selection, or newer slots. An unresolved command shows its state (a Send, its frozen text) beside the thread's; nothing infers which command took effect. Forgetting an unknown command keeps the draft, warning that resending is a new input. W1's status region announces.
+Ambiguous outcomes are never retried: the browser cannot prove a retry reaches the receipts that saw the attempt (http-surface:616). Retry, after `retry_after`, exists only for not-done attempts within their socket session (no reopen, `hello`, epoch or generation change since). Only a 2xx or settled reply settles; a late reply (its context changed) updates only its own result, never drafts, selection, or newer slots. An unresolved command shows its state (a Send, its frozen text); nothing infers which command took effect. Forgetting an unknown command keeps the draft and warns that resending is new. W1's status region announces outcomes and refusals.
 
 ### 2.3 Thread Copy Additions
 
