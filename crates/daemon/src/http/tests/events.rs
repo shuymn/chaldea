@@ -452,7 +452,7 @@ async fn forced_snapshot(srv: &TestServer, owner: &str, stream: StreamId) -> (Ep
 /// the `raw_unknown` events replayed after `as_of_seq`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_raw_unknown_count() {
-    let srv = start().await;
+    let srv = TestServer::start(Mounts::mvp()).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     srv.append(vec![registered(thread(1), true)]).await;
     let thread = StreamId::Thread(thread(1));
