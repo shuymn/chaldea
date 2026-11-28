@@ -6,4 +6,8 @@ import type { WorktreeChanged } from "./WorktreeChanged";
 /**
  * The thread list, worktrees, and host- and workspace-scoped surfaces.
  */
-export type HostSnapshot = { threads: Array<ThreadInfo>, worktrees: Array<WorktreeChanged>, surfaces: Array<SurfaceUpdate>, };
+export type HostSnapshot = { threads: Array<ThreadInfo>, worktrees: Array<WorktreeChanged>, surfaces: Array<SurfaceUpdate>,
+/**
+ * The stream's `raw_unknown` events at or below `as_of_seq`.
+ */
+raw_unknown_count: number, };

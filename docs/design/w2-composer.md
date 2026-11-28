@@ -20,7 +20,7 @@ A `<form>` per selected thread: visible `<label>`, `<textarea>`, submit button, 
 2. Shift+Enter → native newline.
 3. Ctrl/Cmd+Enter, or plain Enter when `(pointer: fine)` matches → `preventDefault`, then submit unless `repeat`. Plain Enter otherwise → newline.
 
-Sizing: `field-sizing: content`, `width: 100%` (`form-fields-automatically-fit-contents`), `font-size: max(1rem, 1em)`, 48 px coarse targets (`forms` §5).
+Sizing: `field-sizing: content`, `width: 100%`, `font-size: max(1rem, 1em)`, 48 px coarse targets (`forms` §5).
 
 **Submit** sends the value unchanged (mvp:184); empty text or UTF-8 over 256 KiB (mvp:186) sends nothing, with an `aria-invalid` described error. On `queued` the draft clears only if its revision is still the submitted one.
 
@@ -59,7 +59,7 @@ From the thread's own stream (F1):
 
 - `launch`: id, `exited` (`exit_reason` set), `death_confirmed`; from `ThreadSnapshot.launch` (sync.rs:220) and that id's launch events.
 - `inputs`: state, `reason`, `by`, `created_by`, preview. Snapshots give non-terminal inputs without reason or `by` (omitted until a transition); up to 20 terminal transitions observed by this copy.
-- `rawUnknown`: the snapshot's `raw_unknown_count` plus accepted forward envelopes of `kind` `raw_unknown` after its base, as the SQL counts (replays from 0). Host likewise.
+- `rawUnknown`: the snapshot's `raw_unknown_count` plus accepted forward envelopes of `kind` `raw_unknown` after its base (replays from 0). Host likewise.
 
 ### 2.4 Inputs, Banner, Counts
 
@@ -67,7 +67,7 @@ From the thread's own stream (F1):
 |---|---|---|
 | `queued` | waiting for readiness | Cancel |
 | `sending`, `sent` | in flight | — |
-| `unconfirmed` | may have reached the CLI; never resent | It arrived, Dismiss |
+| `unconfirmed` | may have reached the CLI | It arrived, Dismiss |
 | terminal | reason, `by` | — |
 
 No resend (mvp:185); replies never roll back streamed state.
@@ -84,7 +84,7 @@ No resend (mvp:185); replies never roll back streamed state.
 | D2 | Plain Enter submits on a fine primary pointer (a preference, not keyboard detection). | Everywhere (soft keyboards compose words). | reversible |
 | D3 | A composing Enter is left to the IME. | `preventDefault` first (disturbs confirmation). | reversible |
 | D4 | Commands and drafts get their own pure reducer. | One reducer. | reversible |
-| D5 | Snapshots carry `raw_unknown_count`, counted in their read transaction (`events_kind` index, schema.rs:92); no `schema_version` bump; daemon and PWA ship as one binary. | Client-side counting (snapshots hide earlier events). | reversible |
+| D5 | Snapshots carry `raw_unknown_count`, counted in their read transaction (event-store §2.7); no `schema_version` bump; daemon, CLI, and PWA ship as one binary. A newer CLI or tab fails visibly on an older daemon's snapshots (inspect: unreadable snapshot; tab: schema error), losing and writing nothing, until the restart or reload an upgrade needs. | Client-side counting (snapshots hide earlier events). | reversible |
 | D6 | `assume_dead`, `close`, approvals stay out. | In the PWA (host evidence, mvp:216; T2). | reversible |
 | D7 | Input state is the stream's. | Optimistic state. | — |
 
@@ -115,7 +115,6 @@ No resend (mvp:185); replies never roll back streamed state.
 ## 5. Risks
 
 - **Double send**: slots and frozen ids; Forget then Send, or reload, is a deliberate input.
-- **Accepted: the PWA never retries an ambiguous outcome**; the owner checks the thread and re-issues deliberately, as `unconfirmed` is never auto-resent (AGENTS:19).
 - **Lost Japanese text**: drafts survive failures and late replies, not reloads (accepted, mvp:220).
 - **IME gaps**: CI synthesizes compositions; real IMEs are W2-1; Android is Phase 2.
 - **Token scope**: the owner token permits keys and attach (mvp:257); the page uses neither.

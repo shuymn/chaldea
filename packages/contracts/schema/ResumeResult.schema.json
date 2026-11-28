@@ -1,0 +1,49 @@
+{
+  "$defs": {
+    "InputId": {
+      "description": "One prompt sent through `chaldea send`, the PWA, or `surface_action` (§2.3).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "LaunchId": {
+      "description": "A launch: one process lifetime of a thread.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "LaunchOutcome": {
+      "description": "Whether a spawn or resume started its process.",
+      "enum": [
+        "started",
+        "spawn_failed"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The success body of `resume`.",
+  "properties": {
+    "input_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/InputId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "launch_id": {
+      "$ref": "#/$defs/LaunchId"
+    },
+    "outcome": {
+      "$ref": "#/$defs/LaunchOutcome"
+    }
+  },
+  "required": [
+    "launch_id",
+    "input_id",
+    "outcome"
+  ],
+  "title": "ResumeResult",
+  "type": "object"
+}

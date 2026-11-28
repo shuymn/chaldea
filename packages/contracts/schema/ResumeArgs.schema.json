@@ -1,0 +1,38 @@
+{
+  "$defs": {
+    "LaunchId": {
+      "description": "A launch: one process lifetime of a thread.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "ThreadId": {
+      "description": "A thread: one agent conversation across all its launches.",
+      "format": "uuid",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The arguments of `resume`.",
+  "properties": {
+    "expected_launch_id": {
+      "$ref": "#/$defs/LaunchId",
+      "description": "The launch the client read as current; another current launch is `launch_changed`."
+    },
+    "prompt": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "thread_id": {
+      "$ref": "#/$defs/ThreadId"
+    }
+  },
+  "required": [
+    "thread_id",
+    "expected_launch_id"
+  ],
+  "title": "ResumeArgs",
+  "type": "object"
+}

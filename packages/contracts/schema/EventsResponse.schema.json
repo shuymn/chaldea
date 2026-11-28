@@ -527,6 +527,13 @@
     "HostSnapshot": {
       "description": "The thread list, worktrees, and host- and workspace-scoped surfaces.",
       "properties": {
+        "raw_unknown_count": {
+          "description": "The stream's `raw_unknown` events at or below `as_of_seq`.",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
         "surfaces": {
           "items": {
             "$ref": "#/$defs/SurfaceUpdate"
@@ -549,7 +556,8 @@
       "required": [
         "threads",
         "worktrees",
-        "surfaces"
+        "surfaces",
+        "raw_unknown_count"
       ],
       "type": "object"
     },
@@ -1082,6 +1090,13 @@
           },
           "type": "array"
         },
+        "raw_unknown_count": {
+          "description": "The stream's `raw_unknown` events at or below `as_of_seq`.",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
         "recent_events": {
           "description": "The last `SNAPSHOT_RECENT_EVENTS` events of the stream.",
           "items": {
@@ -1136,7 +1151,8 @@
         "inputs",
         "open_approvals",
         "surfaces",
-        "recent_events"
+        "recent_events",
+        "raw_unknown_count"
       ],
       "type": "object"
     },
