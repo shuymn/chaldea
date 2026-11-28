@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chaldea_core::command::{StopOutcome, StopResult};
-use chaldea_core::ids::LaunchId;
+use chaldea_core::ids::{LaunchId, ThreadId};
+use chaldea_core::state::{ProcessState, TaskState, TurnState};
+use chaldea_core::sync::{LaunchInfo, ThreadSummary};
 use chaldea_daemon::lifecycle::{DiscoveryRecord, Evidence, RecordState, names};
 use chaldea_pty_runtime::host;
 use serde_json::{Value, json};
@@ -61,6 +63,18 @@ fn main() {
         Case {
             name: "explicit_pin_reads_nothing",
             run: explicit_pin_reads_nothing,
+        },
+        Case {
+            name: "unpinned_reads_the_launch",
+            run: unpinned_reads_the_launch,
+        },
+        Case {
+            name: "close_stop_matching_pin",
+            run: close_stop_matching,
+        },
+        Case {
+            name: "assume_dead_preview_reads_only",
+            run: preview_reads_only,
         },
     ]);
 }
@@ -309,27 +323,87 @@ fn close_stop() {
     m.end();
 }
 
+/// `close --stop` pinned to the live current launch stops it and closes the thread.
+fn close_stop_matching() {
+    let m = Moved::start();
+    let (code, v, err) = m.agent(&["close", &m.t, "--stop", "--launch", &m.new]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(v["stop"]["launch_id"], m.new.as_str(), "{v}");
+    assert_eq!(v["stop"]["outcome"], "stopped", "{v}");
+    assert_eq!(v["stop"]["death_confirmed"], true, "{v}");
+    let (status, body) = request_complete(
+        m.port,
+        "GET",
+        &format!("/api/threads/{}", m.t),
+        &m.token,
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    let s: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(s["closed"], true, "{s}");
+    assert_eq!(s["process_state"], "exited", "{s}");
+    m.end();
+}
+
+/// `stop --assume-dead` alone through dispatch, on a launch stopped with its death proven: the
+/// complete preview names the launch, its reason, and that no report was needed, exits 0,
+/// and changes no stream.
+fn preview_reads_only() {
+    let m = Moved::start();
+    let (code, _, err) = m.agent(&["stop", &m.t]);
+    assert_eq!(code, 0, "{err}");
+    let before = m.events();
+    let (code, out, err) = run_to_exit(&mut cmd(
+        &m.labels,
+        &m.d.path,
+        &["stop", &m.t, "--assume-dead"],
+        &[],
+    ));
+    assert_eq!(code, 0, "{out}{err}");
+    for line in [
+        format!("launch: {}", m.new),
+        "exit reason: stopped".to_owned(),
+        "The launch's end was proven when it exited, so no check report was needed.".to_owned(),
+    ] {
+        assert!(out.lines().any(|l| l == line), "{line:?} in:\n{out}");
+    }
+    assert!(
+        !out.contains("--launch"),
+        "a proven end offers no confirmation: {out}"
+    );
+    assert_eq!(m.events(), before, "the preview changes nothing");
+    m.end();
+}
+
 // ---- request bodies ----
 
 /// One request a [`Stub`] read: its method, path, and body.
 type Seen = (String, String, Value);
 
 /// A daemon stand-in on `127.0.0.1`: this test holds `dir`'s lock and its record names this
-/// process as the serving daemon on the stub's port. It answers `POST /api/commands/<name>`
-/// with the reply given for `<name>`, every other request 404, and records each one.
+/// process as the serving daemon on the stub's port. It answers `GET <path>` with the reply
+/// given for a name that is a path (`/…`), `POST /api/commands/<name>` with the one given for
+/// any other `<name>`, every other request 404, and records each one.
 struct Stub {
     seen: Arc<Mutex<Vec<Seen>>>,
     _lock: std::fs::File,
 }
 
 impl Stub {
-    fn start(dir: &Path, replies: &[(&str, Value)]) -> Stub {
+    fn start(dir: &Path, replies: &[(String, Value)]) -> Stub {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let replies: Vec<(String, Vec<u8>)> = replies
             .iter()
-            .map(|(n, v)| (format!("/api/commands/{n}"), serde_json::to_vec(v).unwrap()))
+            .map(|(n, v)| {
+                let key = if n.starts_with('/') {
+                    format!("GET {n}")
+                } else {
+                    format!("POST /api/commands/{n}")
+                };
+                (key, serde_json::to_vec(v).unwrap())
+            })
             .collect();
         let s = seen.clone();
         std::thread::spawn(move || {
@@ -338,7 +412,8 @@ impl Stub {
                 let Some((method, path, body)) = read_request(&mut c) else {
                     continue;
                 };
-                let reply = replies.iter().find(|(p, _)| method == "POST" && *p == path);
+                let key = format!("{method} {path}");
+                let reply = replies.iter().find(|(k, _)| *k == key);
                 let (status, out) = match reply {
                     Some((_, r)) => ("200 OK", r.clone()),
                     None => ("404 Not Found", br#"{"code":"not_found"}"#.to_vec()),
@@ -436,7 +511,7 @@ fn stop_bodies() {
     let d = state();
     let t = "00000000-0000-4000-8000-000000000007";
     let x = LaunchId::from_u128(0x1);
-    let stub = Stub::start(&d.path, &[("stop", stopped(x))]);
+    let stub = Stub::start(&d.path, &[("stop".into(), stopped(x))]);
     let x_s = x.to_string();
     let run = |args: &[&str]| {
         let (code, _, err) = run_to_exit(&mut cmd(&labels, &d.path, args, &[]));
@@ -483,77 +558,121 @@ fn stopped(x: LaunchId) -> Value {
     .unwrap()
 }
 
+/// The replies for every pinned command, launch `x` in their results.
+fn command_replies(t: &str, x: LaunchId) -> Vec<(String, Value)> {
+    vec![
+        ("ready".into(), json!({ "launch_id": x })),
+        (
+            "key".into(),
+            json!({ "outcome": "written", "bytes_written": 1 }),
+        ),
+        (
+            "resume".into(),
+            json!({ "launch_id": LaunchId::from_u128(0x2), "input_id": null, "outcome": "started" }),
+        ),
+        ("close".into(), json!({ "thread_id": t, "stop": null })),
+        ("stop".into(), stopped(x)),
+    ]
+}
+
+/// Each pinnable command's arguments (`--launch` and its value go last, `key`'s keys after),
+/// its command name, and the field that carries the pin.
+const PINNED: [(&[&str], &str, &str); 5] = [
+    (&["ready"], "ready", "expected_launch_id"),
+    (&["key"], "key", "launch_id"),
+    (&["resume"], "resume", "expected_launch_id"),
+    (&["close"], "close", "expected_launch_id"),
+    (&["close", "--stop"], "close", "expected_launch_id"),
+];
+
+/// `cmd <t> <rest> [--launch <pin>]`, with `key`'s key after.
+fn command_line<'a>(t: &'a str, cmd: &[&'a str], pin: Option<&'a str>) -> Vec<&'a str> {
+    let mut args = vec![cmd[0], t];
+    args.extend(&cmd[1..]);
+    if let Some(p) = pin {
+        args.extend(["--launch", p]);
+    }
+    if cmd[0] == "key" {
+        args.push("enter");
+    }
+    args
+}
+
 /// An explicit `--launch` is the pin itself: each command sends its one POST, naming `X`,
-/// with no summary read before it; without the flag, `ready`, `key`, `resume`, and `close`
-/// read the summary first (here refused, so nothing is posted).
+/// with no summary read before it, and `close --stop` keeps `stop: true`.
 fn explicit_pin_reads_nothing() {
     let labels = Labels::new();
     let d = state();
     let t = "00000000-0000-4000-8000-000000000007";
     let x = LaunchId::from_u128(0x1);
-    let stub = Stub::start(
-        &d.path,
-        &[
-            ("ready", json!({ "launch_id": x })),
-            ("key", json!({ "outcome": "written", "bytes_written": 1 })),
-            (
-                "resume",
-                json!({ "launch_id": LaunchId::from_u128(0x2), "input_id": null, "outcome": "started" }),
-            ),
-            ("close", json!({ "thread_id": t, "stop": null })),
-            ("stop", stopped(x)),
-        ],
-    );
+    let stub = Stub::start(&d.path, &command_replies(t, x));
     let x_s = x.to_string();
-    let pin = |cmd_name: &str, field: &str, args: &[&str]| {
-        let (code, _, err) = run_to_exit(&mut cmd(&labels, &d.path, args, &[]));
+    let mut all = PINNED.to_vec();
+    all.push((&["stop"], "stop", "expected_launch_id"));
+    for (cmd_args, name, field) in all {
+        let args = command_line(t, cmd_args, Some(&x_s));
+        let (code, _, err) = run_to_exit(&mut cmd(&labels, &d.path, &args, &[]));
         assert_eq!(code, 0, "{args:?}: {err}");
         let seen = stub.take();
         assert_eq!(seen.len(), 1, "{args:?}: one request, no read: {seen:?}");
         let (m, p, b) = &seen[0];
         assert_eq!(
             (m.as_str(), p.as_str()),
-            ("POST", &*format!("/api/commands/{cmd_name}"))
+            ("POST", &*format!("/api/commands/{name}"))
         );
         assert_eq!(b["args"][field], json!(x), "{args:?}: {b}");
+        if name == "close" {
+            let stop = cmd_args.contains(&"--stop");
+            assert_eq!(b["args"]["stop"], json!(stop), "{args:?}: {b}");
+        }
+    }
+}
+
+/// Without `--launch`, `ready`, `key`, `resume`, and `close` read the summary first and pin
+/// its current launch `Y`.
+fn unpinned_reads_the_launch() {
+    let labels = Labels::new();
+    let d = state();
+    let t = "00000000-0000-4000-8000-000000000007";
+    let y = LaunchId::from_u128(0x3);
+    let summary = ThreadSummary {
+        thread_id: ThreadId(uuid::Uuid::parse_str(t).unwrap()),
+        closed: false,
+        process_state: ProcessState::Running,
+        turn_state: TurnState::Idle,
+        task_state: TaskState::None,
+        attention_count: 0,
+        launch: Some(LaunchInfo {
+            launch_id: y,
+            pid: None,
+            manual: false,
+            exit_reason: None,
+            death_confirmed: false,
+        }),
     };
-    pin(
-        "ready",
-        "expected_launch_id",
-        &["ready", t, "--launch", &x_s],
-    );
-    pin("key", "launch_id", &["key", t, "--launch", &x_s, "enter"]);
-    pin(
-        "resume",
-        "expected_launch_id",
-        &["resume", t, "--launch", &x_s],
-    );
-    pin(
-        "close",
-        "expected_launch_id",
-        &["close", t, "--launch", &x_s],
-    );
-    pin(
-        "close",
-        "expected_launch_id",
-        &["close", t, "--stop", "--launch", &x_s],
-    );
-    pin("stop", "expected_launch_id", &["stop", t, "--launch", &x_s]);
-    for args in [
-        &["ready", t][..],
-        &["key", t, "enter"],
-        &["resume", t],
-        &["close", t],
-    ] {
-        let (code, _, err) = run_to_exit(&mut cmd(&labels, &d.path, args, &[]));
-        assert_eq!(code, 1, "{args:?}: {err}");
+    let summary_path = format!("/api/threads/{t}");
+    let mut replies = command_replies(t, y);
+    replies.push((
+        summary_path.clone(),
+        serde_json::to_value(&summary).unwrap(),
+    ));
+    let stub = Stub::start(&d.path, &replies);
+    for (cmd_args, name, field) in PINNED {
+        let args = command_line(t, cmd_args, None);
+        let (code, _, err) = run_to_exit(&mut cmd(&labels, &d.path, &args, &[]));
+        assert_eq!(code, 0, "{args:?}: {err}");
         let seen = stub.take();
-        assert_eq!(seen.len(), 1, "{args:?}: {seen:?}");
         assert_eq!(
-            seen[0].0, "GET",
-            "{args:?}: the summary read, then nothing posted"
+            seen.len(),
+            2,
+            "{args:?}: the read, then the command: {seen:?}"
         );
-        assert_eq!(seen[0].1, format!("/api/threads/{t}"));
+        assert_eq!((seen[0].0.as_str(), &*seen[0].1), ("GET", &*summary_path));
+        assert_eq!(
+            (seen[1].0.as_str(), &*seen[1].1),
+            ("POST", &*format!("/api/commands/{name}"))
+        );
+        assert_eq!(seen[1].2["args"][field], json!(y), "{args:?}");
     }
 }
 
