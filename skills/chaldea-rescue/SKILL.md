@@ -18,20 +18,23 @@ The `chaldea` CLI acts with the owner token: every command acts on a live agent 
 
 ## Change state (only when the human asked for that command)
 
-Run a command only when the human asked for that action on that thread, and only in its pinned form: `--launch <inspected>` names the launch you inspected, so the daemon acts on that launch or on nothing. Take `<inspected>` and any input id from your latest `inspect`.
+Run a command only when the human asked for that action on that thread, and only in its pinned form: `--launch <inspected>` names the launch you inspected, so the daemon acts on that launch or on nothing.
+
+- `<inspected>` is frozen: take it, and any input id, from the inspection the human's request refers to, and keep it for that request. If a later `inspect` shows a different launch, hand back; the request was about the launch the human saw, not its replacement.
+- Pass `<text>` and `<path>` as one argument each (quote them).
 
 | Command | Pinned form | Confirm |
 |---|---|---|
 | ready | `chaldea ready <thread> --launch <inspected>` | `inspect` shows the readiness on that launch |
 | stop | `chaldea stop <thread> --launch <inspected>` | its exit code; `inspect` shows the launch stopping or exited |
-| resume | `chaldea resume <thread> --launch <inspected>` (the inspected launch has exited) | the printed new launch; `inspect` shows it starting |
+| resume | `chaldea resume <thread> --launch <inspected>` (the inspected launch has exited) | the printed `launch_id` and `outcome: "started"`; `inspect` shows that launch as the current one (its `launch_started` event, or its state, already past `starting`) |
 | close | `chaldea close <thread> --launch <inspected>` | `inspect` shows `closed` |
 | key | `chaldea key <thread> --launch <inspected> <keys>`; for a card the human named, `chaldea key <thread> --launch <inspected> --approval <approval> <keys>` | the printed `outcome` |
-| input resolve, input cancel | `chaldea input resolve <input> --outcome <outcome>`, `chaldea input cancel <input>` | `inspect` shows that input's new state |
+| input resolve, input cancel | `chaldea input resolve <input> --outcome <outcome>`, `chaldea input cancel <input>` | the printed `input_id` and `state`; later, that input's `input_state_changed` events (a terminal input leaves `snapshot.inputs`) |
 | send | `chaldea send <thread> <text>`, only when the human authorized whichever launch is current when the daemon admits it (it assigns the input to the current starting or running launch, then gates it) | `inspect` shows the queued input |
 | spawn | `chaldea spawn --agent <agent> --cwd <path>` | the printed new thread |
 
-- "the thread's current launch changed" (exit 1) means the launch you inspected is gone and nothing was done: hand back.
+- "the thread's current launch changed" (exit 1) means the launch you inspected is gone and nothing was done: hand back. A thread closed since your inspection answers `thread_closed` instead, with nothing done: hand back too.
 - An unknown outcome (a timeout, `pending`, `incomplete`, a lost reply) is final for you: hand back rather than repeat the command.
 - `send` cannot be pinned: hand back every request to send to a specific launch.
 - `input resolve` needs evidence for that input and that launch (its `user_message`, or the human's confirmation). An empty composer does not prove a prompt was absent, and matching text in history does not prove which submission arrived.

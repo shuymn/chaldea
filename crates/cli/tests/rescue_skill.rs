@@ -115,3 +115,20 @@ fn rescue_skill_names_no_api_access() {
         "a JSON example needs its schema check"
     );
 }
+
+/// Guards T2-4 (c): the agent pins the launch of the inspection the human's request refers to,
+/// and hands back when a later `inspect` shows another launch, so a refreshed inspection never
+/// retargets an authorized action to a replacement launch.
+#[test]
+fn rescue_skill_freezes_the_launch() {
+    for line in [
+        "`<inspected>` is frozen: take it, and any input id, from the inspection the human's request refers to",
+        "If a later `inspect` shows a different launch, hand back",
+    ] {
+        assert!(SKILL.contains(line), "the skill lost: {line}");
+    }
+    assert!(
+        !SKILL.contains("latest `inspect`"),
+        "the pin comes from the request's inspection"
+    );
+}
