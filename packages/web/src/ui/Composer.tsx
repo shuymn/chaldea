@@ -6,16 +6,12 @@
 import { useId, useRef } from "react";
 
 import { canSend, lockReason, slots } from "../commands/controls";
+import { INVALID_TEXT } from "../commands/messages";
 import { busy, type CmdState, draftOf } from "../commands/reducer";
 import type { State } from "../sync/state";
 import { CommandLine } from "./CommandLine";
 import { decide } from "./keys";
 import type { Ops } from "./ops";
-
-const INVALID = {
-  empty: "Write a message first.",
-  too_large: "The message is over 256 KiB of UTF-8; shorten it to send.",
-} as const;
 
 const finePointer = () => typeof matchMedia === "function" && matchMedia("(pointer: fine)").matches;
 
@@ -41,7 +37,8 @@ export function Composer(props: { state: State; cmds: CmdState; thread: string; 
       aria-label="Composer"
       onSubmit={(e) => {
         e.preventDefault();
-        ops.send(thread);
+        // Single flight from the keyboard too: Ctrl+Enter submits without the (disabled) button.
+        if (!busy(cmds, slot)) ops.send(thread);
       }}
     >
       <label id={`${id}-label`} htmlFor={`${id}-text`} className="font-semibold">
@@ -90,7 +87,7 @@ export function Composer(props: { state: State; cmds: CmdState; thread: string; 
       </p>
       {invalid !== undefined && (
         <p id={`${id}-error`} className="text-sm font-semibold">
-          {INVALID[invalid]}
+          {INVALID_TEXT[invalid]}
         </p>
       )}
       <div className="flex flex-wrap items-center gap-2">
@@ -98,7 +95,7 @@ export function Composer(props: { state: State; cmds: CmdState; thread: string; 
           Send
         </button>
       </div>
-      <CommandLine cmds={cmds} slot={slot} ops={ops} showText />
+      <CommandLine state={state} cmds={cmds} slot={slot} ops={ops} showText />
     </form>
   );
 }

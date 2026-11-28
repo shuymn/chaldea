@@ -1,20 +1,22 @@
 // The page's command operations, bound to the runners (App.tsx builds them). Every one
-// reads its gate from the sync state at the gesture; the reducer reserves the slot.
+// reads its gate from the sync state at the gesture, and none acts while its slot is held
+// (the reducer reserves the slot and refuses a busy one too).
 
 import type { SpawnArgs } from "@chaldea/contracts/generated/SpawnArgs";
 
+import type { CommandName } from "../commands/client";
 import {
   canCancel,
   canResolve,
   canSend,
   canSpawn,
-  lockReason,
   readyLaunch,
   resumeLaunch,
   slots,
   stopLaunch,
+  targetGate,
 } from "../commands/controls";
-import type { Command } from "../commands/reducer";
+import { busy } from "../commands/reducer";
 import type { CommandRunner } from "../commands/runner";
 import type { State } from "../sync/state";
 
@@ -31,76 +33,55 @@ export interface Ops {
   forget(slot: string): void;
 }
 
-/** The gate a command's Retry needs: the same as its first dispatch. */
-function gateOf(c: Command): (s: State) => boolean {
-  const t = c.thread ?? "";
-  switch (c.name) {
-    case "send":
-      return (s) => canSend(s, t);
-    case "ready":
-      return (s) => readyLaunch(s, t) !== null;
-    case "stop":
-      return (s) => stopLaunch(s, t) !== null;
-    case "resume":
-      return (s) => resumeLaunch(s, t) !== null;
-    case "input_resolve":
-    case "input_cancel":
-      return (s) => lockReason(s, t) === null;
-    case "spawn":
-      return canSpawn;
-  }
-}
-
 export function bindOps(commands: CommandRunner): Ops {
+  const gesture = (
+    slot: string,
+    name: CommandName,
+    thread: string | null,
+    args: Record<string, unknown>,
+    allowed: (s: State) => boolean,
+  ) => {
+    if (busy(commands.getState(), slot)) return;
+    commands.gesture({ slot, name, thread, args, allowed });
+  };
   return {
     edit: (thread, text) => commands.dispatch({ type: "edit", thread, text }),
-    send: (thread) =>
-      commands.gesture({ slot: slots.send(thread), name: "send", thread, args: {}, allowed: (s) => canSend(s, thread) }),
+    send: (thread) => gesture(slots.send(thread), "send", thread, {}, (s) => canSend(s, thread)),
     ready: (thread, launch) =>
-      commands.gesture({
-        slot: slots.ready(thread),
-        name: "ready",
+      gesture(
+        slots.ready(thread),
+        "ready",
         thread,
-        args: { thread_id: thread, expected_launch_id: launch },
-        allowed: (s) => readyLaunch(s, thread) === launch,
-      }),
+        { thread_id: thread, expected_launch_id: launch },
+        (s) => readyLaunch(s, thread) === launch,
+      ),
     stop: (thread, launch) =>
-      commands.gesture({
-        slot: slots.launch(thread),
-        name: "stop",
+      gesture(
+        slots.launch(thread),
+        "stop",
         thread,
-        args: { thread_id: thread, expected_launch_id: launch },
-        allowed: (s) => stopLaunch(s, thread) === launch,
-      }),
+        { thread_id: thread, expected_launch_id: launch },
+        (s) => stopLaunch(s, thread) === launch,
+      ),
     resume: (thread, launch) =>
-      commands.gesture({
-        slot: slots.launch(thread),
-        name: "resume",
+      gesture(
+        slots.launch(thread),
+        "resume",
         thread,
-        args: { thread_id: thread, expected_launch_id: launch },
-        allowed: (s) => resumeLaunch(s, thread) === launch,
-      }),
+        { thread_id: thread, expected_launch_id: launch },
+        (s) => resumeLaunch(s, thread) === launch,
+      ),
     resolve: (thread, input, delivered) =>
-      commands.gesture({
-        slot: slots.input(input),
-        name: "input_resolve",
-        thread,
-        args: { input_id: input, delivered },
-        allowed: (s) => canResolve(s, thread, input),
-      }),
+      gesture(slots.input(input), "input_resolve", thread, { input_id: input, delivered }, (s) =>
+        canResolve(s, thread, input),
+      ),
     cancel: (thread, input) =>
-      commands.gesture({
-        slot: slots.input(input),
-        name: "input_cancel",
-        thread,
-        args: { input_id: input },
-        allowed: (s) => canCancel(s, thread, input),
-      }),
-    spawn: (args) =>
-      commands.gesture({ slot: slots.spawn, name: "spawn", thread: null, args: { ...args }, allowed: canSpawn }),
+      gesture(slots.input(input), "input_cancel", thread, { input_id: input }, (s) => canCancel(s, thread, input)),
+    spawn: (args) => gesture(slots.spawn, "spawn", null, { ...args }, canSpawn),
     retry: (slot) => {
       const c = commands.getState().slots[slot];
-      if (c) commands.retry(slot, gateOf(c));
+      // The same target gate the Retry control shows (controls.ts `canRetry`).
+      if (c) commands.retry(slot, targetGate(c));
     },
     forget: (slot) => commands.dispatch({ type: "forget", slot }),
   };

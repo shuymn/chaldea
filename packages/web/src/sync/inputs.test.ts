@@ -7,7 +7,7 @@ import { describe, expect, test } from "vitest";
 import { threadId } from "./model/server";
 import { seeded } from "./ops";
 import type { Sim } from "./sim";
-import { TERMINAL_INPUTS, threadCopy } from "./state";
+import { threadCopy } from "./state";
 
 const T = threadId(1);
 const id = (n: number) => `0193dddd-0000-7000-8000-${n.toString(16).padStart(12, "0")}`;
@@ -56,15 +56,15 @@ describe("inputs.project", () => {
 
   test("the done list keeps the newest 20", () => {
     const sim = watching();
-    for (let n = 1; n <= TERMINAL_INPUTS + 3; n++) {
+    for (let n = 1; n <= 23; n++) {
       sim.server.inputCreated(T, id(n), `p${n}`);
       sim.server.inputState(T, id(n), "rejected", { kind: "rejected", reject: "lossy_text" });
       sim.quiesce();
     }
     const c = threadCopy(sim.state, T);
-    expect(c?.done).toHaveLength(TERMINAL_INPUTS);
+    expect(c?.done).toHaveLength(20);
     expect(c?.done[0]?.id).toBe(id(4));
-    expect(c?.done.at(-1)?.id).toBe(id(TERMINAL_INPUTS + 3));
+    expect(c?.done.at(-1)?.id).toBe(id(23));
     expect(c?.done.at(-1)?.reason).toEqual({ kind: "rejected", reject: "lossy_text" });
   });
 

@@ -65,6 +65,13 @@ export interface Draft {
 
 export type Invalid = "empty" | "too_large";
 
+export interface Notice {
+  readonly seq: number;
+  readonly kind: "result" | "invalid";
+  readonly slot: string;
+  readonly thread: string | null;
+}
+
 /** What the sync side says about the page's context, for session checks. */
 export interface Context {
   /** `<socket id>|<socket epoch>|<copy epoch>|<generation>`; null without a `hello`. */
@@ -82,10 +89,24 @@ export interface CmdState {
   readonly ctx: Context;
   readonly nextAttempt: number;
   readonly wakeAt: number | null;
+  /**
+   * The latest outcome to announce and show in the status bar, whatever is selected: a
+   * command reply (by slot), or a refused send (by thread). `seq` grows with each.
+   */
+  readonly notice: Notice | null;
 }
 
 export function initialCmdState(now = 0): CmdState {
-  return { now, drafts: {}, slots: {}, invalid: {}, ctx: { session: null, gone: {} }, nextAttempt: 1, wakeAt: null };
+  return {
+    now,
+    drafts: {},
+    slots: {},
+    invalid: {},
+    ctx: { session: null, gone: {} },
+    nextAttempt: 1,
+    wakeAt: null,
+    notice: null,
+  };
 }
 
 type At = { readonly now: number };
@@ -182,6 +203,7 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
         // The value is sent unchanged (mvp:184).
         if (d.text.length === 0 || utf8.encode(d.text).length > MAX_PROMPT_BYTES) {
           s = { ...s, invalid: { ...s.invalid, [a.thread]: d.text.length === 0 ? "empty" : "too_large" } };
+          s = { ...s, notice: { seq: (s.notice?.seq ?? 0) + 1, kind: "invalid", slot: a.slot, thread: a.thread } };
           break;
         }
         text = d.text;
@@ -235,6 +257,7 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
       if (!c) break;
       const fresh = !c.stale && inSession(s.ctx, c);
       const r = a.reply;
+      s = { ...s, notice: { seq: (s.notice?.seq ?? 0) + 1, kind: "result", slot: c.slot, thread: c.thread } };
       switch (r.kind) {
         case "ok":
         case "unreadable":

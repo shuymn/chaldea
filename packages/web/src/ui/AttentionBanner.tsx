@@ -4,7 +4,7 @@
 
 import { hintLaunch, readyLaunch, slots, stopLaunch } from "../commands/controls";
 import { hintText } from "../commands/messages";
-import type { CmdState } from "../commands/reducer";
+import { busy, type CmdState } from "../commands/reducer";
 import { HOST, type State } from "../sync/state";
 import { attentionEntries, type Entry } from "./attention";
 import { CommandLine } from "./CommandLine";
@@ -41,14 +41,14 @@ function ThreadEntries(props: { state: State; cmds: CmdState; thread: string; en
             {e.input !== null && (
               <>
                 <InputActions state={state} cmds={cmds} thread={thread} input={e.input} ops={ops} />
-                <CommandLine cmds={cmds} slot={slots.input(e.input.id)} ops={ops} />
+                <CommandLine state={state} cmds={cmds} slot={slots.input(e.input.id)} ops={ops} />
               </>
             )}
             {e.kind === "input_gate_timeout" && (
               <button
                 type="button"
                 className="control"
-                disabled={readyLaunch(state, thread) === null}
+                disabled={readyLaunch(state, thread) === null || busy(cmds, slots.ready(thread))}
                 onClick={() => ask("ready")}
               >
                 Mark ready
@@ -58,7 +58,7 @@ function ThreadEntries(props: { state: State; cmds: CmdState; thread: string; en
               <button
                 type="button"
                 className="control"
-                disabled={stopLaunch(state, thread) === null}
+                disabled={stopLaunch(state, thread) === null || busy(cmds, slots.launch(thread))}
                 onClick={() => ask("stop")}
               >
                 Stop

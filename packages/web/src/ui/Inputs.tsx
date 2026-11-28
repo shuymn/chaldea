@@ -91,7 +91,7 @@ export function Inputs(props: { state: State; cmds: CmdState; thread: string; op
               <div className="flex flex-wrap items-center gap-2">
                 <InputActions state={state} cmds={cmds} thread={thread} input={i} ops={ops} />
               </div>
-              <CommandLine cmds={cmds} slot={slots.input(i.id)} ops={ops} />
+              <CommandLine state={state} cmds={cmds} slot={slots.input(i.id)} ops={ops} />
             </li>
           );
         })}

@@ -75,7 +75,7 @@ export function SpawnForm(props: { state: State; cmds: CmdState; ops: Ops }) {
           </button>
         </div>
       </form>
-      <CommandLine cmds={cmds} slot={slots.spawn} ops={ops} />
+      <CommandLine state={state} cmds={cmds} slot={slots.spawn} ops={ops} />
     </section>
   );
 }

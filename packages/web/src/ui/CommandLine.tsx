@@ -3,11 +3,13 @@
 
 import { useEffect, useId, useRef } from "react";
 
-import { busy, type CmdState, retryable } from "../commands/reducer";
+import { canRetry } from "../commands/controls";
+import { busy, type CmdState } from "../commands/reducer";
 import { commandText } from "../commands/messages";
+import type { State } from "../sync/state";
 import type { Ops } from "./ops";
 
-export function CommandLine(props: { cmds: CmdState; slot: string; ops: Ops; showText?: boolean }) {
+export function CommandLine(props: { state: State; cmds: CmdState; slot: string; ops: Ops; showText?: boolean }) {
   const { cmds, slot, ops } = props;
   const c = cmds.slots[slot];
   if (!c) return null;
@@ -20,7 +22,7 @@ export function CommandLine(props: { cmds: CmdState; slot: string; ops: Ops; sho
           {c.text.length > 200 ? `${c.text.slice(0, 200)}…` : c.text}
         </span>
       )}
-      {retryable(cmds, slot) && (
+      {canRetry(cmds, props.state, slot) && (
         <button type="button" className="control" onClick={() => ops.retry(slot)}>
           Retry
         </button>

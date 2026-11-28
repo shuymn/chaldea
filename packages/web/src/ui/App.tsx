@@ -35,7 +35,7 @@ export function App(props: { runner: Runner; commands: CommandRunner }) {
       </a>
       <header className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-neutral-300 px-3 py-2 dark:border-neutral-700">
         <h1 className="text-xl font-bold">Chaldea</h1>
-        <StatusBar state={state} />
+        <StatusBar state={state} cmds={cmds} />
         {host?.copy?.kind === "host" && (
           <span className="text-sm" data-raw-unknown="host">
             host raw_unknown count: {host.copy.rawUnknown}

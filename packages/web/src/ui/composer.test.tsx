@@ -101,6 +101,49 @@ describe("composer", () => {
     expect(send).toHaveBeenCalledTimes(1);
   });
 
+  test("isComposing alone, through the component, holds the Enter without preventing it", () => {
+    const { box, send } = setup();
+    expect(key(box, { isComposing: true })).toBe(true);
+    expect(key(box, { isComposing: true, ctrlKey: true })).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  test("Ctrl+Enter while the send slot is held calls no send", () => {
+    const sim = seeded();
+    sim.server.status(T1, "process", "running");
+    sim.dispatch({ type: "select", thread: T1 });
+    sim.quiesce();
+    const held = {
+      attempt: 1,
+      slot: `send:${T1}`,
+      name: "send",
+      commandId: "c",
+      body: "{}",
+      generation: "g",
+      session: "s",
+      thread: T1,
+      text: "x",
+      revision: 1,
+      phase: "inflight",
+      reply: null,
+      retryAt: null,
+      stale: false,
+      posts: 1,
+    } as const;
+    const cmds: CmdState = {
+      ...initialCmdState(0),
+      drafts: { [T1]: { text: "next", revision: 2 } },
+      slots: { [held.slot]: held },
+    };
+    const send = vi.fn();
+    vi.stubGlobal("matchMedia", (q: string) => ({ matches: q === "(pointer: fine)" }));
+    render(<Composer state={sim.state} cmds={cmds} thread={T1} ops={{ edit: vi.fn(), send } as unknown as Ops} />);
+    const box = screen.getByLabelText("Message");
+    expect(key(box, { ctrlKey: true })).toBe(false);
+    expect(key(box, {})).toBe(false);
+    expect(send).not.toHaveBeenCalled();
+  });
+
   test("blur resets the flag and the timestamp", () => {
     const { box, send } = setup();
     fireEvent.compositionStart(box);

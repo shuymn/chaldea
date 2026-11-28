@@ -7,7 +7,7 @@ import { useEffect, useState } from "react";
 
 import { hintLaunch, readyLaunch, resumeLaunch, slots, stopLaunch } from "../commands/controls";
 import { hintText } from "../commands/messages";
-import type { CmdState } from "../commands/reducer";
+import { busy, type CmdState } from "../commands/reducer";
 import { type State, threadCopy } from "../sync/state";
 import { CommandLine, ConfirmDialog } from "./CommandLine";
 import type { Ops } from "./ops";
@@ -71,17 +71,17 @@ export function ThreadActions(props: { state: State; cmds: CmdState; thread: str
   return (
     <section aria-label="Thread actions" className="flex flex-col gap-2 px-3 pb-2">
       <div className="flex flex-wrap items-center gap-2">
-        <button type="button" className="control" disabled={ready === null} onClick={() => ask("ready")}>
+        <button type="button" className="control" disabled={ready === null || busy(cmds, slots.ready(thread))} onClick={() => ask("ready")}>
           Mark ready
         </button>
-        <button type="button" className="control" disabled={stop === null} onClick={() => ask("stop")}>
+        <button type="button" className="control" disabled={stop === null || busy(cmds, slots.launch(thread))} onClick={() => ask("stop")}>
           Stop
         </button>
         {hint === null && (
           <button
             type="button"
             className="control"
-            disabled={resume === null}
+            disabled={resume === null || busy(cmds, slots.launch(thread))}
             onClick={() => resume !== null && ops.resume(thread, resume)}
           >
             Resume
@@ -90,26 +90,9 @@ export function ThreadActions(props: { state: State; cmds: CmdState; thread: str
         {copy !== null && <span className="text-sm">raw_unknown count: {copy.rawUnknown}</span>}
       </div>
       {hint !== null && <p className="hint break-words text-sm">{hintText(thread, hint)}</p>}
-      <CommandLine cmds={cmds} slot={slots.ready(thread)} ops={ops} />
-      <CommandLine cmds={cmds} slot={slots.launch(thread)} ops={ops} />
-      <LaunchHint cmds={cmds} thread={thread} />
+      <CommandLine state={state} cmds={cmds} slot={slots.ready(thread)} ops={ops} />
+      <CommandLine state={state} cmds={cmds} slot={slots.launch(thread)} ops={ops} />
       {dialogs}
     </section>
   );
-}
-
-/** A stop that answered `death_confirmed: false`, or a resume refused as `death_unconfirmed`: the hint. */
-function LaunchHint(props: { cmds: CmdState; thread: string }) {
-  const c = props.cmds.slots[slots.launch(props.thread)];
-  const r = c?.reply;
-  if (!c || !r) return null;
-  const launch =
-    r.kind === "ok" && "launch_id" in r.result
-      ? r.result.launch_id
-      : ((JSON.parse(c.body) as { args: { expected_launch_id?: string } }).args.expected_launch_id ?? "<id>");
-  const unconfirmed =
-    (r.kind === "ok" && "death_confirmed" in r.result && !r.result.death_confirmed) ||
-    (r.kind === "settled" && r.code === "death_unconfirmed");
-  if (!unconfirmed) return null;
-  return <p className="hint break-words text-sm">{hintText(props.thread, launch)}</p>;
 }
