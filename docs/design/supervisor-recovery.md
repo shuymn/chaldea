@@ -164,7 +164,7 @@ Every reason applies: `daemon_restart`, `unknown_after_crash`, an unconfirmed `s
 
 **One confirmation per launch.** The intent runs in the writer's job, which re-reads `L`; the writer runs one job at a time, so of two assertions for `L` the second reads it confirmed and is answered `asserted` with nothing written. The key backs this: a second `launch_death_confirmed` for `L` from another command differs in `command_id` and is `KeyConflict`. A probe never writes one (§2.1 rule 1). After the assertion, `resume` and `close` pass their death check (sup §2.3 step 3, "Close"); a resume of an unbound launch then still answers `no_session` (`ops.rs:374-385`). Whether worktree removal treats the launch as in use is the check of the deferred `worktree remove` (mvp §2.6), which reads `death_confirmed`.
 
-**CLI.** `chaldea stop <thread> --assume-dead [--launch <id>]`; `--launch` requires `--assume-dead`. With `--launch`, it sends `StopArgs { thread_id, expected_launch_id: id, assume_dead: true }`; refusals print as 10a1's do. Without `--launch` it sends nothing (the preview).
+**CLI.** `chaldea stop <thread> --assume-dead [--launch <id>]`. With `--launch`, it sends `StopArgs { thread_id, expected_launch_id: id, assume_dead: true }`; refusals print as 10a1's do. Without `--launch` it sends nothing (the preview). `--launch` without `--assume-dead` pins a plain stop to that launch, `StopArgs { thread_id, expected_launch_id: id }` (`docs/design/t2-terminal.md` §2.7).
 
 **Preview**, under one 30 s cutoff for every request (`cli::client`'s deadline rules):
 
