@@ -24,8 +24,8 @@ Run a command only when the human asked for that action on that thread, and only
 - After the command, confirm it with what it printed (a resume's new `launch_id`). Any further action on a new launch needs the human's fresh request.
 - Pass each value as one literal argument, with no shell expansion: `<text>` after `--`, and `<path>` as an absolute path in `--cwd=<path>`. Quote with single quotes: in a POSIX shell `'…'` with an embedded `'` written as `'\''`; in PowerShell `'…'` with an embedded `'` written as `''`.
   - When you can start a process with an argument array, pass the values that way, with no shell.
-  - On a PowerShell command line the rule holds only on PowerShell 7.3+ with `$PSNativeCommandArgumentPassing` set to `Standard` or `Windows`: Windows PowerShell 5.1 and `Legacy` mode can drop embedded `"`, and PowerShell also treats curly quotes (`‘` `’`) as delimiters.
-  - If a value contains `"` or a curly quote and you cannot pass it exactly, hand back.
+  - On a PowerShell command line the rule holds only on PowerShell 7.3+ with `$PSNativeCommandArgumentPassing` set to `Standard` or `Windows`: Windows PowerShell 5.1 and `Legacy` mode can drop embedded `"`, and PowerShell also treats typographic quotes (`‘` `’`) as delimiters.
+  - If a value contains `"` or a typographic quote and you cannot pass it exactly, hand back.
 
 | Command | Pinned form | Confirm |
 |---|---|---|
