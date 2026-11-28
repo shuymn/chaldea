@@ -15,10 +15,11 @@ fn value(placeholder: &str) -> Option<&'static str> {
         "input" => "00000000-0000-4000-8000-000000000003",
         "approval" => "00000000-0000-4000-8000-000000000004",
         "keys" => "down enter",
-        "text" => "hello",
+        // Words and a leading dash: one argument only after `--` and inside quotes.
+        "text" => "--help me",
         "outcome" => "delivered",
         "agent" => "claude",
-        "path" => "/work/repo",
+        "path" => "/work/my repo",
         _ => return None,
     })
 }
@@ -48,7 +49,8 @@ fn examples(md: &str) -> Vec<String> {
     out
 }
 
-/// `example` with each `<name>` replaced by its value, as argv.
+/// `example` with each `<name>` replaced by its value, split as a shell splits it: at white
+/// space outside double quotes, which are removed.
 fn argv(example: &str) -> Vec<OsString> {
     let mut s = String::new();
     let mut rest = example;
@@ -64,7 +66,27 @@ fn argv(example: &str) -> Vec<OsString> {
         rest = &rest[i + end + 1..];
     }
     s.push_str(rest);
-    s.split_whitespace().map(OsString::from).collect()
+    let (mut out, mut word, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
+    for c in s.chars() {
+        match c {
+            '"' => (quoted, any) = (!quoted, true),
+            c if c.is_whitespace() && !quoted => {
+                if any {
+                    out.push(OsString::from(std::mem::take(&mut word)));
+                    any = false;
+                }
+            }
+            c => {
+                word.push(c);
+                any = true;
+            }
+        }
+    }
+    assert!(!quoted, "an open quote in `{example}`");
+    if any {
+        out.push(OsString::from(word));
+    }
+    out
 }
 
 #[test]
@@ -76,6 +98,21 @@ fn rescue_skill_commands() {
             panic!("`{e}` does not parse:\n{m}");
         }
     }
+    // `send`'s text and `spawn`'s path each reach the command whole.
+    let parsed = |cmd: &str| {
+        let e = examples
+            .iter()
+            .find(|e| e.split_whitespace().nth(1) == Some(cmd))
+            .unwrap_or_else(|| panic!("no `chaldea {cmd}` example"));
+        chaldea_cli::check_args(&argv(e)).unwrap()
+    };
+    let send = parsed("send");
+    assert!(
+        send.starts_with("Send {") && send.contains(r#"text: "--help me""#),
+        "{send}"
+    );
+    let spawn = parsed("spawn");
+    assert!(spawn.contains(r#"cwd: Some("/work/my repo")"#), "{spawn}");
     // Every command that takes a pin is shown with it.
     for cmd in ["ready", "stop", "resume", "close", "key"] {
         let of: Vec<&String> = examples
@@ -87,6 +124,18 @@ fn rescue_skill_commands() {
             assert!(e.contains("--launch <inspected>"), "`{e}` is not pinned");
         }
     }
+}
+
+/// `--` makes a prompt that looks like a flag the prompt: without it, `--help` is clap's help.
+#[test]
+fn send_text_after_double_dash() {
+    let t = value("thread").unwrap();
+    let sent = chaldea_cli::check_args(&argv(&format!("chaldea send {t} -- --help"))).unwrap();
+    assert!(
+        sent.starts_with("Send {") && sent.contains(r#"text: "--help""#),
+        "{sent}"
+    );
+    assert!(chaldea_cli::check_args(&argv(&format!("chaldea send {t} --help"))).is_err());
 }
 
 /// The check above, failing: an example of a flag the CLI does not have.
@@ -117,13 +166,15 @@ fn rescue_skill_names_no_api_access() {
 }
 
 /// Guards T2-4 (c): the agent pins the launch of the inspection the human's request refers to,
-/// and hands back when a later `inspect` shows another launch, so a refreshed inspection never
-/// retargets an authorized action to a replacement launch.
+/// and hands back when an `inspect` before the command shows another launch, so a refreshed
+/// inspection never retargets an authorized action to a replacement launch; after the command,
+/// what it printed confirms it, and a new launch needs a fresh request.
 #[test]
 fn rescue_skill_freezes_the_launch() {
     for line in [
         "`<inspected>` is frozen: take it, and any input id, from the inspection the human's request refers to",
-        "If a later `inspect` shows a different launch, hand back",
+        "If an `inspect` you run before the command shows a different launch, hand back",
+        "Any further action on a new launch needs the human's fresh request",
     ] {
         assert!(SKILL.contains(line), "the skill lost: {line}");
     }

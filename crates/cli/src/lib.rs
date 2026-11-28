@@ -155,15 +155,18 @@ fn parse(args: &[OsString]) -> Result<Cli, clap::Error> {
     Cli::try_parse_from(args)
 }
 
-/// Whether `args` (the program name first) parse as a `chaldea` command line, with clap's
-/// message when they do not; runs nothing (the documented examples' check).
+/// The command `args` (the program name first) parse as, in its `Debug` form, or clap's
+/// message (help included) when they do not parse as a command; runs nothing (the documented
+/// examples' check).
 ///
 /// # Errors
 ///
 /// Clap's rendered message.
 #[doc(hidden)]
-pub fn check_args(args: &[OsString]) -> Result<(), String> {
-    parse(args).map(drop).map_err(|e| e.render().to_string())
+pub fn check_args(args: &[OsString]) -> Result<String, String> {
+    parse(args)
+        .map(|cli| format!("{:?}", cli.command))
+        .map_err(|e| e.render().to_string())
 }
 
 /// Prints a `clap::Error` through `diag` (stdout for `--help` and `--version`) and returns its
