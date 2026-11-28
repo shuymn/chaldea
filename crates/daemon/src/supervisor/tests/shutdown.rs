@@ -186,9 +186,14 @@ async fn release_rule() {
             ParticipantEnd::Clean,
         ),
     ] {
+        // Short bounds end the held cases soon; the control keeps the normal ones, so a
+        // slow host cannot leave its token counted.
+        let held = want == ParticipantEnd::LeftRunning;
         let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
-            c.kill_budget = Duration::from_millis(300);
-            c.close_bounds.join = Duration::from_millis(300);
+            if held {
+                c.kill_budget = Duration::from_millis(300);
+                c.close_bounds.join = Duration::from_millis(300);
+            }
         })
         .await;
         rig.clock.resume();

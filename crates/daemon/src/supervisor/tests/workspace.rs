@@ -309,7 +309,10 @@ async fn admission_at_spawn() {
     let rig = Rig::new().await;
     rig.clock.resume();
     let held = rig.pauses.arm(Pause::GitAfterAdmit);
-    let deadline = rig.sup.now() + Duration::from_millis(200);
+    // The probe takes the shared spawn lock within this budget, and only real time passes
+    // it (its check reads `Instant::now()`): long enough for a slow host to reach the gate,
+    // short enough to wait out.
+    let deadline = rig.sup.now() + Duration::from_secs(2);
     let real = rig.sup.real(deadline);
     let (sup, cwd) = (rig.sup.clone(), dir.path().to_path_buf());
     let probe = std::thread::spawn(move || common_dir(&sup, &cwd, deadline));
