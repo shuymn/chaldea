@@ -173,6 +173,7 @@ pub enum LaunchOutcome {
 
 /// The success body of `spawn`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+#[schemars(extend("required" = ["thread_id", "launch_id", "input_id", "outcome"]))]
 pub struct SpawnResult {
     pub thread_id: ThreadId,
     pub launch_id: LaunchId,
@@ -183,6 +184,7 @@ pub struct SpawnResult {
 
 /// The success body of `resume`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
+#[schemars(extend("required" = ["launch_id", "input_id", "outcome"]))]
 pub struct ResumeResult {
     pub launch_id: LaunchId,
     pub input_id: Option<InputId>,

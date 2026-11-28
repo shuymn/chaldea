@@ -47,6 +47,7 @@
         "turn_ref": "turn-3"
       }
     ],
+    "raw_unknown_count": 3,
     "recent_events": [
       {
         "command_id": "01930000-0000-7000-8000-000000000040",

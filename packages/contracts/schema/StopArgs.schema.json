@@ -1,0 +1,42 @@
+{
+  "$defs": {
+    "LaunchId": {
+      "description": "A launch: one process lifetime of a thread.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "ThreadId": {
+      "description": "A thread: one agent conversation across all its launches.",
+      "format": "uuid",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The arguments of `stop`.",
+  "properties": {
+    "assume_dead": {
+      "description": "The owner's assertion that the exited launch `expected_launch_id` has ended\n(`docs/design/supervisor-recovery.md` §2.5): an owner token only, with\n`expected_launch_id`. Omitted when false, so a plain stop keeps its canonical form.",
+      "type": "boolean"
+    },
+    "expected_launch_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LaunchId"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "When given, the current launch must be this one (`launch_changed` otherwise)."
+    },
+    "thread_id": {
+      "$ref": "#/$defs/ThreadId"
+    }
+  },
+  "required": [
+    "thread_id"
+  ],
+  "title": "StopArgs",
+  "type": "object"
+}

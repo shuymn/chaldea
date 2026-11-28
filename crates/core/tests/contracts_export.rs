@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 use chaldea_core::attach::{AttachClientMessage, AttachServerMessage};
 use chaldea_core::command::{
     CloseResult, InputCancelArgs, InputCommandResult, InputResolveArgs, KeyArgs, KeyResult,
-    ReadyArgs, ReadyResult, SendArgs, SendResult, StopResult,
+    ReadyArgs, ReadyResult, ResumeArgs, ResumeResult, SendArgs, SendResult, SpawnArgs, SpawnResult,
+    StopArgs, StopResult,
 };
 use chaldea_core::event::{EventEnvelope, GenericEvent, TypedEvent};
 use chaldea_core::http::{
@@ -133,6 +134,11 @@ fn generate(out: &Path) -> (PathBuf, PathBuf) {
     export_ts::<PairResponse>(&cfg);
     export_ts::<ThreadsResponse>(&cfg);
     export_ts::<WorktreesResponse>(&cfg);
+    export_ts::<SpawnArgs>(&cfg);
+    export_ts::<SpawnResult>(&cfg);
+    export_ts::<ResumeArgs>(&cfg);
+    export_ts::<ResumeResult>(&cfg);
+    export_ts::<StopArgs>(&cfg);
     export_ts::<StopResult>(&cfg);
     export_ts::<CloseResult>(&cfg);
     export_ts::<SendArgs>(&cfg);
@@ -173,6 +179,11 @@ fn generate(out: &Path) -> (PathBuf, PathBuf) {
     export_schema::<PairResponse>(&schema);
     export_schema::<ThreadsResponse>(&schema);
     export_schema::<WorktreesResponse>(&schema);
+    export_schema::<SpawnArgs>(&schema);
+    export_schema::<SpawnResult>(&schema);
+    export_schema::<ResumeArgs>(&schema);
+    export_schema::<ResumeResult>(&schema);
+    export_schema::<StopArgs>(&schema);
     export_schema::<StopResult>(&schema);
     export_schema::<CloseResult>(&schema);
     export_schema::<SendArgs>(&schema);
@@ -283,9 +294,9 @@ fn committed_contracts_equal_generated_output() {
     );
 }
 
-/// `StopResult`'s `exit_code` and `signal` and `CloseResult`'s `stop` are always present on
-/// the wire, as `null` when unknown or when no stop ran: each schema lists them in
-/// `required`.
+/// `StopResult`'s `exit_code` and `signal`, `CloseResult`'s `stop`, and the `input_id` of
+/// `SpawnResult` and `ResumeResult` are always present on the wire, as `null` when unknown,
+/// when no stop ran, or without a prompt: each schema lists them in `required`.
 #[test]
 fn nullable_result_fields_are_required() {
     let required = |schema: Value| -> Vec<String> {
@@ -318,6 +329,20 @@ fn nullable_result_fields_are_required() {
     for f in ["input_id", "state", "reject_reason"] {
         assert!(send.iter().any(|r| r == f), "SendResult: {f} not required");
     }
+    let spawn = required(serde_json::to_value(schemars::schema_for!(SpawnResult)).unwrap());
+    for f in ["thread_id", "launch_id", "input_id", "outcome"] {
+        assert!(
+            spawn.iter().any(|r| r == f),
+            "SpawnResult: {f} not required"
+        );
+    }
+    let resume = required(serde_json::to_value(schemars::schema_for!(ResumeResult)).unwrap());
+    for f in ["launch_id", "input_id", "outcome"] {
+        assert!(
+            resume.iter().any(|r| r == f),
+            "ResumeResult: {f} not required"
+        );
+    }
     let key = required(serde_json::to_value(schemars::schema_for!(KeyResult)).unwrap());
     for f in ["outcome", "bytes_written"] {
         assert!(key.iter().any(|r| r == f), "KeyResult: {f} not required");
@@ -328,7 +353,6 @@ fn nullable_result_fields_are_required() {
 /// `ErrorBody` only from a non-2xx status, and a success body must not look like one.
 #[test]
 fn success_schemas_have_no_code() {
-    use chaldea_core::command::{ResumeResult, SpawnResult};
     for (name, schema) in [
         ("SpawnResult", schemars::schema_for!(SpawnResult)),
         ("ResumeResult", schemars::schema_for!(ResumeResult)),
