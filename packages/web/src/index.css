@@ -66,3 +66,33 @@ body {
 .skip-link:focus {
   inset-block-start: 0.5rem;
 }
+
+/* Form fields (forms §5): they fit their content and never zoom iOS. */
+.field,
+.composer-text {
+  width: 100%;
+  font: inherit;
+  font-size: max(1rem, 1em);
+  padding: 0.5rem;
+  border: 1px solid currentColor;
+  border-radius: 0.25rem;
+  background: Canvas;
+  color: CanvasText;
+}
+.composer-text {
+  field-sizing: content;
+  min-block-size: 3lh;
+  max-block-size: 50vh;
+}
+/* 48 px coarse targets on the composer and its controls only. */
+@media (pointer: coarse) {
+  .composer :where(textarea, button) {
+    min-block-size: 48px;
+  }
+  .composer button {
+    min-inline-size: 48px;
+  }
+}
+dialog.confirm::backdrop {
+  background: rgb(0 0 0 / 0.4);
+}

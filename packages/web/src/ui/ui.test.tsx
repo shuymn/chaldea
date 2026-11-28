@@ -8,6 +8,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import type { CredentialStore } from "../auth/credential";
 import { threadId } from "../sync/model/server";
 import { seeded } from "../sync/ops";
+import { CommandRunner } from "../commands/runner";
 import { Runner } from "../sync/runner";
 import { threadStream } from "../sync/state";
 import { App } from "./App";
@@ -47,7 +48,8 @@ describe("ui", () => {
       now: () => 0,
       socketUrl: (p) => p,
     });
-    render(<App runner={runner} />);
+    const commands = new CommandRunner(runner, { fetch: () => new Promise<Response>(() => {}), now: () => 0, uuid: () => "u" });
+    render(<App runner={runner} commands={commands} />);
     await act(() => runner.start());
     expect(screen.getByText(/Browser storage is unavailable/)).toBeTruthy();
     fail = false;
@@ -57,6 +59,7 @@ describe("ui", () => {
     });
     expect(screen.queryByText(/Browser storage is unavailable/)).toBeNull();
     expect(screen.getByText(/This link is spent or expired/)).toBeTruthy();
+    commands.stop();
     runner.stop();
   });
 

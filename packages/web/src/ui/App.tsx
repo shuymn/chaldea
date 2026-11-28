@@ -1,16 +1,26 @@
-// The page: header with the status, the thread list, and the timeline. Read-only in W1:
-// no composer, commands, or terminal.
+// The page: header with the status, the attention banner, the thread list with the
+// new-thread form, and the selected thread's actions, inputs, composer, and timeline
+// (docs/design/w1-pwa.md, docs/design/w2-composer.md). No terminal view.
 
-import { useCallback, useSyncExternalStore } from "react";
+import { useCallback, useMemo, useSyncExternalStore } from "react";
 
+import type { CommandRunner } from "../commands/runner";
 import type { Runner } from "../sync/runner";
+import { AttentionBanner } from "./AttentionBanner";
+import { Composer } from "./Composer";
+import { Inputs } from "./Inputs";
+import { bindOps } from "./ops";
+import { SpawnForm } from "./SpawnForm";
 import { StatusBar } from "./StatusBar";
+import { ThreadActions } from "./ThreadActions";
 import { ThreadList } from "./ThreadList";
 import { Timeline } from "./Timeline";
 
-export function App(props: { runner: Runner }) {
-  const { runner } = props;
+export function App(props: { runner: Runner; commands: CommandRunner }) {
+  const { runner, commands } = props;
   const state = useSyncExternalStore(runner.subscribe, runner.getState);
+  const cmds = useSyncExternalStore(commands.subscribe, commands.getState);
+  const ops = useMemo(() => bindOps(commands), [commands]);
   const select = useCallback((thread: string) => runner.dispatch({ type: "select", thread }), [runner]);
   const retry = useCallback(() => runner.dispatch({ type: "retry" }), [runner]);
   const visible = useCallback(
@@ -26,6 +36,11 @@ export function App(props: { runner: Runner }) {
       <header className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-neutral-300 px-3 py-2 dark:border-neutral-700">
         <h1 className="text-xl font-bold">Chaldea</h1>
         <StatusBar state={state} />
+        {host?.copy?.kind === "host" && (
+          <span className="text-sm" data-raw-unknown="host">
+            host raw unknown events: {host.copy.rawUnknown}
+          </span>
+        )}
       </header>
       {state.storageFailed && state.generation === undefined ? (
         <main id="main" className="p-3">
@@ -46,26 +61,40 @@ export function App(props: { runner: Runner }) {
           </p>
         </main>
       ) : (
-        <div className="layout">
-          {host?.error && (
-            <p className="px-3 py-2">
-              {host.error.message}{" "}
-              <button type="button" className="control" onClick={retry}>
-                Retry
-              </button>
-            </p>
-          )}
-          <ThreadList state={state} onSelect={select} onVisible={visible} onRetry={retry} />
-          <main id="main" tabIndex={-1} className="min-w-0">
-            <Timeline
-              state={state}
-              onOlder={() => runner.dispatch({ type: "older" })}
-              onNewer={() => runner.dispatch({ type: "newer" })}
-              onLatest={() => runner.dispatch({ type: "latest" })}
-              onRetry={retry}
-            />
-          </main>
-        </div>
+        <>
+          <AttentionBanner state={state} cmds={cmds} ops={ops} />
+          <div className="layout">
+            {host?.error && (
+              <p className="px-3 py-2">
+                {host.error.message}{" "}
+                <button type="button" className="control" onClick={retry}>
+                  Retry
+                </button>
+              </p>
+            )}
+            <div className="min-w-0">
+              <ThreadList state={state} onSelect={select} onVisible={visible} onRetry={retry} />
+              <SpawnForm state={state} cmds={cmds} ops={ops} />
+            </div>
+            <main id="main" tabIndex={-1} className="min-w-0">
+              {state.selected !== null && (
+                // Keyed by thread: a switch resets the composer's IME flag and timestamp.
+                <div key={state.selected} className="pt-2">
+                  <ThreadActions state={state} cmds={cmds} thread={state.selected} ops={ops} />
+                  <Inputs state={state} cmds={cmds} thread={state.selected} ops={ops} />
+                  <Composer state={state} cmds={cmds} thread={state.selected} ops={ops} />
+                </div>
+              )}
+              <Timeline
+                state={state}
+                onOlder={() => runner.dispatch({ type: "older" })}
+                onNewer={() => runner.dispatch({ type: "newer" })}
+                onLatest={() => runner.dispatch({ type: "latest" })}
+                onRetry={retry}
+              />
+            </main>
+          </div>
+        </>
       )}
     </div>
   );

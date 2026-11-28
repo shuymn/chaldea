@@ -8,6 +8,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.resetModules();
   vi.doUnmock("./sync/runner");
+  vi.doUnmock("./commands/runner");
   vi.doUnmock("react-dom/client");
   vi.doUnmock("./auth/credential");
   document.body.replaceChildren();
@@ -19,7 +20,7 @@ function transition(type: "pagehide" | "pageshow", persisted: boolean): Event {
   return e;
 }
 
-test("pagehide stops the client and closes the store, persisted or not; a persisted pageshow reloads", async () => {
+test("pagehide stops the commands and the client and closes the store, persisted or not; a persisted pageshow reloads", async () => {
   const root = document.createElement("div");
   root.id = "root";
   document.body.append(root);
@@ -29,6 +30,8 @@ test("pagehide stops the client and closes the store, persisted or not; a persis
   const reload = vi.fn();
   vi.stubGlobal("location", { reload, hash: "", pathname: "/", search: "", href: "http://127.0.0.1:1/" });
   vi.doMock("./sync/runner", () => ({ browserRunner: () => runner }));
+  const commands = { stop: vi.fn(() => order.push("commands")) };
+  vi.doMock("./commands/runner", () => ({ browserCommands: () => commands }));
   vi.doMock("./auth/credential", () => ({
     CredentialStore: class {
       close = close;
@@ -48,8 +51,9 @@ test("pagehide stops the client and closes the store, persisted or not; a persis
 
   window.dispatchEvent(transition("pagehide", true));
   expect(runner.stop).toHaveBeenCalledTimes(1);
-  // The store's connection is closed after the runner stopped.
-  expect(order).toEqual(["stop", "close"]);
+  // Command requests end first, then the runner; the store closes after it stopped.
+  expect(order).toEqual(["commands", "stop", "close"]);
+  expect(commands.stop).toHaveBeenCalledTimes(1);
   expect(root.textContent).toBe("");
   window.dispatchEvent(transition("pageshow", true));
   expect(reload).toHaveBeenCalledTimes(1);
