@@ -287,6 +287,8 @@ export class ModelServer {
         },
       };
     }
+    // The stream's `raw_unknown` events at or below `head`, as the daemon counts them.
+    const rawUnknownCount = log.filter((e) => e.kind === "raw_unknown").length;
     if (q.stream === "host") {
       return {
         status: 200,
@@ -299,6 +301,7 @@ export class ModelServer {
             threads: [...this.db.threads.values()].map((t) => this.info(t)),
             worktrees: [],
             surfaces: [],
+            raw_unknown_count: rawUnknownCount,
           },
           as_of_seq: head,
           reason: d.reason,
@@ -331,6 +334,7 @@ export class ModelServer {
           surfaces: [],
           vt_snapshot: null,
           recent_events: log.slice(Math.max(0, head - this.cfg.recent)),
+          raw_unknown_count: rawUnknownCount,
         },
         as_of_seq: head,
         reason: d.reason,

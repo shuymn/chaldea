@@ -4,6 +4,7 @@
   "mode": "snapshot",
   "reason": "too_many_events",
   "snapshot": {
+    "raw_unknown_count": 2,
     "stream": "host",
     "surfaces": [
       {

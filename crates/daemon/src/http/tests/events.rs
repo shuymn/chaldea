@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use chaldea_core::auth::TokenKind;
 use chaldea_core::event::TypedEvent;
-use chaldea_core::ids::{Actor, Agent, Open, StreamId, ThreadId, WorkspaceId};
+use chaldea_core::ids::{Actor, Agent, Epoch, Open, StreamId, ThreadId, WorkspaceId};
 use chaldea_core::payload::{
     ApprovalRequested, Content, HumanWriteOrigin, InputEncoding, ReadinessEvidence, SurfaceUpdate,
     ThreadRole, VtCursor, VtModes, VtSnapshotTaken, WorktreeChanged, WorktreeState,
@@ -25,11 +25,13 @@ use super::support::{Model, Op, event, raw_unknown, soon};
 use crate::http::Mounts;
 use crate::store::NewEvent;
 
-/// The events of a committed job, kept per stream in order.
+/// The events of a committed job, kept per stream in order, with each stream's
+/// `raw_unknown` count.
 #[derive(Default)]
 struct Log {
     keys: BTreeMap<StreamId, Vec<String>>,
     events: Vec<TypedEvent>,
+    raw_unknowns: BTreeMap<StreamId, u64>,
 }
 
 impl Log {
@@ -40,6 +42,9 @@ impl Log {
                 .or_default()
                 .push(e.idempotency_key.0.clone());
             self.events.push(e.event.clone());
+            if matches!(e.event, TypedEvent::RawUnknown(_)) {
+                *self.raw_unknowns.entry(e.stream_id).or_default() += 1;
+            }
         }
     }
 }
@@ -173,6 +178,11 @@ fn expected_thread(m: &Model, log: &Log, t: ThreadId) -> (ThreadSnapshot, Vec<St
         ),
         vt_snapshot: if attention_or_card { latest_vt } else { None },
         recent_events: Vec::new(),
+        raw_unknown_count: log
+            .raw_unknowns
+            .get(&StreamId::Thread(t))
+            .copied()
+            .unwrap_or(0),
     };
     (snapshot, recent)
 }
@@ -190,6 +200,7 @@ fn expected_host(m: &Model, log: &Log) -> HostSnapshot {
         surfaces: surfaces(log, |s| {
             !matches!(s.scope, chaldea_core::payload::SurfaceScope::Thread { .. })
         }),
+        raw_unknown_count: log.raw_unknowns.get(&StreamId::Host).copied().unwrap_or(0),
     }
 }
 
@@ -354,6 +365,7 @@ async fn snapshot_equals_model_at_cut() {
                     surfaces,
                     vt_snapshot,
                     recent_events,
+                    raw_unknown_count,
                 } = *s;
                 let (want, recent) = expected_thread(&m, &log, t);
                 assert_eq!(thread, want.thread);
@@ -371,6 +383,7 @@ async fn snapshot_equals_model_at_cut() {
                     .map(|e| e.idempotency_key.0.clone())
                     .collect();
                 assert_eq!(got, recent);
+                assert_eq!(raw_unknown_count, want.raw_unknown_count);
             }
             StreamSnapshot::Host(s) => {
                 assert_eq!(as_of_seq, host_head, "as_of_seq is the head at the cut");
@@ -378,11 +391,13 @@ async fn snapshot_equals_model_at_cut() {
                     threads,
                     worktrees,
                     surfaces,
+                    raw_unknown_count,
                 } = s;
                 let want = expected_host(&m, &log);
                 assert_eq!(threads, want.threads);
                 assert_eq!(worktrees, want.worktrees);
                 assert_eq!(surfaces, want.surfaces);
+                assert_eq!(raw_unknown_count, want.raw_unknown_count);
             }
         }
         // Both queued jobs committed after the read; the later state is the next cut's.
@@ -391,6 +406,9 @@ async fn snapshot_equals_model_at_cut() {
         keep(StreamId::Thread(t), format!("after:{stream}:vt"));
         keep(StreamId::Host, format!("after:{stream}:h"));
         log.events.push(TypedEvent::VtSnapshotTaken(vt(9)));
+        for s in [StreamId::Thread(t), StreamId::Host] {
+            *log.raw_unknowns.entry(s).or_default() += 1;
+        }
     }
     srv.stop().await;
 }
@@ -422,5 +440,88 @@ async fn page_and_head_from_one_snapshot() {
         panic!("a page")
     };
     assert_eq!((events.len(), head_seq, has_more), (0, 0, false));
+    srv.stop().await;
+}
+
+/// A forced snapshot (`epoch` mismatch) of `stream`: its epoch, `as_of_seq`, and
+/// `raw_unknown_count`.
+async fn forced_snapshot(srv: &TestServer, owner: &str, stream: StreamId) -> (Epoch, u64, u64) {
+    let req = srv
+        .req(
+            "GET",
+            &format!("/api/events?stream_id={stream}&epoch=elsewhere"),
+        )
+        .bearer(owner);
+    let EventsResponse::Snapshot {
+        epoch,
+        snapshot,
+        as_of_seq,
+        ..
+    } = decode(&srv.send(&req).await)
+    else {
+        panic!("a snapshot")
+    };
+    let count = match snapshot {
+        StreamSnapshot::Thread(s) => s.raw_unknown_count,
+        StreamSnapshot::Host(s) => s.raw_unknown_count,
+    };
+    (epoch, as_of_seq, count)
+}
+
+/// A snapshot's `raw_unknown_count` is the stream's `raw_unknown` events at or below
+/// `as_of_seq`, on a thread and on the host; a later snapshot's count equals that base plus
+/// the `raw_unknown` events replayed after `as_of_seq`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_raw_unknown_count() {
+    let srv = start().await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let mut m = Model::default();
+    let mut log = Log::default();
+    let t = m.register(true);
+    commit(&srv, &mut m, &mut log).await;
+    let thread = StreamId::Thread(t);
+    // Another kind between the `raw_unknown` events, so the count is not the head.
+    let mut before = vec![
+        raw_unknown(thread, "t:1", Content::text("a")),
+        event(thread, "vt:1", TypedEvent::VtSnapshotTaken(vt(1))),
+        raw_unknown(thread, "t:2", Content::text("b")),
+    ];
+    before.extend(
+        (1..=3).map(|n| raw_unknown(StreamId::Host, &format!("h:{n}"), Content::text("h"))),
+    );
+    log.record(&before);
+    srv.append(before).await;
+    for (stream, want) in [(thread, 2), (StreamId::Host, 3)] {
+        let (epoch, as_of_seq, count) = forced_snapshot(&srv, &owner, stream).await;
+        assert_eq!(
+            count, want,
+            "{stream}: the raw_unknown events at or below as_of_seq"
+        );
+        assert_eq!(count, log.raw_unknowns[&stream]);
+        assert!(as_of_seq > count, "{stream}: other kinds are not counted");
+        srv.append(vec![raw_unknown(
+            stream,
+            &format!("later:{stream}"),
+            Content::text("later"),
+        )])
+        .await;
+        let req = srv
+            .req(
+                "GET",
+                &format!("/api/events?stream_id={stream}&after_seq={as_of_seq}&epoch={epoch}"),
+            )
+            .bearer(&owner);
+        let EventsResponse::Replay { events, .. } = decode(&srv.send(&req).await) else {
+            panic!("a page")
+        };
+        let replayed = events
+            .iter()
+            .filter(|e| e.kind.as_str() == "raw_unknown")
+            .count() as u64;
+        assert_eq!(replayed, 1);
+        let (_, next_seq, fresh) = forced_snapshot(&srv, &owner, stream).await;
+        assert!(next_seq > as_of_seq);
+        assert_eq!(fresh, count + replayed, "{stream}: base plus replayed");
+    }
     srv.stop().await;
 }

@@ -109,6 +109,7 @@ fn snapshot_with_cwd(cwd: &str) -> String {
             "payload": {},
         }))
         .unwrap()],
+        raw_unknown_count: 0,
     };
     serde_json::to_string(&EventsResponse::Snapshot {
         stream_id: StreamId::Thread(T),

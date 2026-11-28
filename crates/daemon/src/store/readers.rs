@@ -513,6 +513,17 @@ impl<'a> ReadTx<'a> {
         to_u64(h)
     }
 
+    /// The stream's `raw_unknown` events, counted on the `events_kind` index. In the same
+    /// read as `stream_head`, it covers exactly the events at or below the head.
+    fn raw_unknown_count(&self, s: StreamId) -> Result<u64, StoreError> {
+        let n: i64 = sql(self.conn.query_row(
+            "SELECT count(*) FROM events WHERE stream_id = ?1 AND kind = 'raw_unknown'",
+            [s.to_string()],
+            |r| r.get(0),
+        ))?;
+        to_u64(n)
+    }
+
     /// The thread's snapshot and its `as_of_seq`, from one snapshot of the database.
     ///
     /// # Errors
@@ -609,6 +620,7 @@ impl<'a> ReadTx<'a> {
                 surfaces,
                 vt_snapshot,
                 recent_events,
+                raw_unknown_count: self.raw_unknown_count(stream)?,
             };
             Ok(Some((snapshot, self.stream_head(stream)?)))
         })
@@ -689,6 +701,7 @@ impl<'a> ReadTx<'a> {
                     threads,
                     worktrees,
                     surfaces,
+                    raw_unknown_count: self.raw_unknown_count(StreamId::Host)?,
                 },
                 self.stream_head(StreamId::Host)?,
             ))

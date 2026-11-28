@@ -25,4 +25,8 @@ vt_snapshot: VtSnapshotTaken | null,
 /**
  * The last `SNAPSHOT_RECENT_EVENTS` events of the stream.
  */
-recent_events: Array<EventEnvelope>, };
+recent_events: Array<EventEnvelope>,
+/**
+ * The stream's `raw_unknown` events at or below `as_of_seq`.
+ */
+raw_unknown_count: number, };

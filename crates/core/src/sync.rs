@@ -231,6 +231,12 @@ pub struct ThreadSnapshot {
     pub vt_snapshot: Option<VtSnapshotTaken>,
     /// The last `SNAPSHOT_RECENT_EVENTS` events of the stream.
     pub recent_events: Vec<EventEnvelope>,
+    /// The stream's `raw_unknown` events at or below `as_of_seq`.
+    #[serde(
+        serialize_with = "crate::wire::ser_safe_u64",
+        deserialize_with = "crate::wire::safe_u64"
+    )]
+    pub raw_unknown_count: u64,
 }
 
 /// The thread list, worktrees, and host- and workspace-scoped surfaces.
@@ -239,6 +245,12 @@ pub struct HostSnapshot {
     pub threads: Vec<ThreadInfo>,
     pub worktrees: Vec<WorktreeChanged>,
     pub surfaces: Vec<SurfaceUpdate>,
+    /// The stream's `raw_unknown` events at or below `as_of_seq`.
+    #[serde(
+        serialize_with = "crate::wire::ser_safe_u64",
+        deserialize_with = "crate::wire::safe_u64"
+    )]
+    pub raw_unknown_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, TS, JsonSchema)]
