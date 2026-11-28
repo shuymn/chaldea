@@ -8,6 +8,7 @@
 // `Stop`: after one prompt the turn stays running and the gate closed (the closed-gate fixture).
 
 import { mkdtempSync } from "node:fs";
+import { createServer } from "node:http";
 import { join } from "node:path";
 
 import type { Page, Route, WebSocketRoute } from "@playwright/test";
@@ -323,9 +324,11 @@ test("stop_dialog_pins", async ({ daemon, page }) => {
   expect(stops).toEqual([]);
 });
 
-test("death_unconfirmed_hint", async ({ daemon, page }) => {
+test("death_unconfirmed_replies", async ({ daemon, page }) => {
   // No CI trigger exists for an exited launch with death unconfirmed on a real daemon: the
-  // replies that report one are fulfilled here.
+  // replies that report one are fulfilled here. Each shows on its own line; the hint itself
+  // follows the current launch, which the stream shows confirmed dead, so it is not shown
+  // (commands.map covers the hint from a copy with death unconfirmed).
   test.setTimeout(120_000);
   const thread = await openGate(daemon);
   await page.route("**/api/commands/stop", async (route) => {
@@ -340,11 +343,157 @@ test("death_unconfirmed_hint", async ({ daemon, page }) => {
   await actions(page).getByRole("button", { name: "Stop" }).click();
   await page.getByRole("dialog", { name: "Stop this launch?" }).getByRole("button", { name: "Stop" }).click();
   await expect(commandLine(page, `launch:${thread}`)).toContainText("death not confirmed", { timeout: 45_000 });
-  await expect(actions(page).locator(".hint")).toContainText(`chaldea stop ${thread} --assume-dead`);
-  await expect(actions(page).locator(".hint")).toContainText("--launch ");
-  await actions(page).getByRole("button", { name: "Resume" }).click();
+  await daemon.waitEvents(thread, (es) => es.some((e) => e.kind === "launch_exited" && e.payload.death_confirmed === true));
+  const resume = actions(page).getByRole("button", { name: "Resume" });
+  await expect(resume).toBeEnabled({ timeout: 20_000 });
+  await expect(actions(page).locator(".hint")).toHaveCount(0);
+  await resume.click();
   await expect(commandLine(page, `launch:${thread}`)).toContainText("not confirmed dead");
-  await expect(actions(page).locator(".hint")).toContainText("--assume-dead");
+  await expect(actions(page).locator(".hint")).toHaveCount(0);
+});
+
+/**
+ * A server that answers every request with `status` and its headers, sends the start of a
+ * body promising more, then resets the connection: a reply whose body fails after the headers.
+ */
+async function cuttingServer(status: number, origin: string): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = createServer((req, res) => {
+    req.resume();
+    res.writeHead(status, {
+      "content-type": "application/json",
+      "content-length": "4096",
+      "access-control-allow-origin": origin,
+      "cache-control": "no-store",
+    });
+    res.write('{"code":"in_pro');
+    setTimeout(() => res.socket?.destroy(), 100);
+  });
+  await new Promise<void>((ok) => server.listen(0, "127.0.0.1", ok));
+  const a = server.address();
+  const port = typeof a === "object" && a ? a.port : 0;
+  return {
+    url: `http://127.0.0.1:${port}/cut`,
+    close: () =>
+      new Promise<void>((ok) => {
+        server.closeAllConnections();
+        server.close(() => ok());
+      }),
+  };
+}
+
+test("reply_body_cut", async ({ daemon, page }) => {
+  // The headers arrive and the body fails: the outcome is unknown, whatever the status.
+  const thread = await openGate(daemon);
+  const cut409 = await cuttingServer(409, daemon.origin);
+  const cut408 = await cuttingServer(408, daemon.origin);
+  try {
+    await page.route("**/api/commands/spawn", (route) => route.continue({ url: cut409.url }));
+    await page.route("**/api/commands/send", (route) => route.continue({ url: cut408.url }));
+    await openThread(page, daemon, thread);
+    const spawns = commandPosts(page, "spawn");
+    const sends = commandPosts(page, "send");
+    await page.getByLabel("Working directory (absolute path)").fill(mkdtempSync(join(daemon.root, "cwd-")));
+    await page.getByRole("button", { name: "Start thread" }).click();
+    await expect(commandLine(page, "spawn")).toHaveAttribute("data-phase", "check_thread", { timeout: 20_000 });
+    await expect(page.getByRole("button", { name: "Start thread" })).toBeDisabled();
+    await composer(page).fill("cut reply");
+    await sendButton(page).click();
+    const line = commandLine(page, `send:${thread}`);
+    await expect(line).toHaveAttribute("data-phase", "check_thread", { timeout: 20_000 });
+    await page.waitForTimeout(1500);
+    await expect(line.getByRole("button", { name: "Retry" })).toHaveCount(0);
+    await expect(sendButton(page)).toBeDisabled();
+    expect([spawns.length, sends.length]).toEqual([1, 1]);
+  } finally {
+    await cut409.close();
+    await cut408.close();
+  }
+});
+
+test("single_flight_held", async ({ daemon, page }) => {
+  // The first POST is held before it is forwarded, with no reopen: the keyboard, the button,
+  // and the launch controls send nothing more while the slot is held.
+  test.setTimeout(120_000);
+  const thread = await openGate(daemon);
+  const sendHold = await hold(page, "/api/commands/send");
+  const stopHold = await hold(page, "/api/commands/stop");
+  await openThread(page, daemon, thread);
+  const sends = commandPosts(page, "send");
+  const stops = commandPosts(page, "stop");
+  await composer(page).fill("once only");
+  await composer(page).press("Control+Enter");
+  const first = await sendHold.next();
+  await composer(page).press("Control+Enter");
+  await composer(page).press("Enter");
+  await sendButton(page).dispatchEvent("click");
+  await page.waitForTimeout(500);
+  expect(sends).toHaveLength(1);
+  await first.continue();
+  await expect(commandLine(page, `send:${thread}`)).toHaveAttribute("data-phase", "settled");
+  expect(sends).toHaveLength(1);
+  expect(await daemon.inputs(thread)).toHaveLength(1);
+
+  await actions(page).getByRole("button", { name: "Stop" }).click();
+  await page.getByRole("dialog", { name: "Stop this launch?" }).getByRole("button", { name: "Stop" }).click();
+  const stop = await stopHold.next();
+  await expect(actions(page).getByRole("button", { name: "Stop" })).toBeDisabled();
+  await actions(page).getByRole("button", { name: "Stop" }).dispatchEvent("click");
+  await page.waitForTimeout(300);
+  await expect(page.getByRole("dialog", { name: "Stop this launch?" })).toBeHidden();
+  expect(stops).toHaveLength(1);
+  await stop.continue();
+  await expect(commandLine(page, `launch:${thread}`)).toContainText("stopped", { timeout: 45_000 });
+  expect(stops).toHaveLength(1);
+});
+
+test("late_result_after_404", async ({ daemon, page }) => {
+  // A Send held, its thread 404s (selection and composer go), then `queued` arrives: the
+  // result is shown in the status bar and announced.
+  const thread = await openGate(daemon);
+  const tap = await socketTap(page);
+  const held = await hold(page, "/api/commands/send");
+  let gone = false;
+  await page.route(
+    (u) => u.pathname === "/api/events" && u.searchParams.get("stream_id") === `thread:${thread}`,
+    async (route) => {
+      if (gone) await route.fulfill({ status: 404, contentType: "application/json", body: '{"code":"not_found"}' });
+      else await route.continue();
+    },
+  );
+  await openThread(page, daemon, thread);
+  await composer(page).fill("late result");
+  await sendButton(page).click();
+  const route = await held.next();
+  const res = await route.fetch();
+  gone = true;
+  tap.drop();
+  await expect(composer(page)).toHaveCount(0, { timeout: 20_000 });
+  await route.fulfill({ response: res });
+  const last = page.locator("[data-last-command]");
+  await expect(last).toContainText("Send: queued.");
+  await expect(last).toContainText("claude ");
+  await expect(page.getByRole("status")).toHaveText(await last.innerText());
+});
+
+test("dialog_keyboard", async ({ daemon, page, browserName }) => {
+  // WebKit moves focus to buttons with Alt+Tab (the macOS default).
+  const tab = browserName === "webkit" ? "Alt+Tab" : "Tab";
+  const thread = await openGate(daemon);
+  await openThread(page, daemon, thread);
+  const trigger = actions(page).getByRole("button", { name: "Stop" });
+  await expect(trigger).toBeEnabled();
+  await page.locator(`li[data-thread="${thread}"] button`).first().focus();
+  for (let i = 0; i < 40 && !(await trigger.evaluate((el) => el === document.activeElement)); i++) {
+    await page.keyboard.press(tab);
+  }
+  await expect(trigger).toBeFocused();
+  await page.keyboard.press("Enter");
+  const dialog = page.getByRole("dialog", { name: "Stop this launch?" });
+  await expect(dialog).toBeVisible();
+  expect(await dialog.evaluate((d) => d.contains(document.activeElement))).toBe(true);
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(trigger).toBeFocused();
 });
 
 test("command_401", async ({ daemon, context }) => {

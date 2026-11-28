@@ -290,12 +290,18 @@ test("ime_sequences", async ({ daemon, page, browserName, browser }) => {
     expect(JSON.parse(posts[n - 1]!).args.text).toBe("日本語");
   }
   for (const how of ["inside", "webkit229", "window"] as const) {
-    const text = `変換 ${how}`;
+    // A decomposed が (U+304B U+3099): kept as typed, never normalized to NFC.
+    const text = `変換 ${how} が`;
     expect(await syntheticComposition(page, text, how), `${how}: the composing Enter was prevented`).toBe(true);
     await expect(composer(page)).toHaveValue(text);
     await freshEnter(++n);
     expect(JSON.parse(posts[n - 1]!).args.text).toBe(text);
   }
+  const stored = (await daemon.waitInputs(thread, (is) => is.length === n)).map((i) => i.text);
+  for (const how of ["inside", "webkit229", "window"] as const) {
+    expect(stored).toContain(`変換 ${how} が`);
+  }
+  expect(stored.some((t) => t.includes("が"))).toBe(false);
 
   if (browserName !== "chromium") return;
   // A coarse primary pointer: plain Enter is a newline; Ctrl+Enter sends.

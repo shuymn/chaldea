@@ -71,11 +71,51 @@ test("request_policy", async ({ daemon, page }) => {
   await page.locator(`li[data-thread="${thread}"] button`).first().click();
   await expect(page.locator("main ol").getByText("policy check").first()).toBeVisible();
   await expect(statusOf(page)).toHaveText("live");
-  // A real command (W2-12).
-  await page.getByLabel("Message", { exact: true }).fill("a policy send");
-  await page.getByRole("form", { name: "Composer" }).getByRole("button", { name: "Send", exact: true }).click();
-  await expect(page.locator(`[data-slot="send:${thread}"]`)).toHaveAttribute("data-phase", "settled");
-  await expect.poll(() => sent.some((r) => new URL(r.url).pathname === "/api/commands/send")).toBe(true);
+  // Every command the page has, through its own controls (W2-12).
+  test.setTimeout(150_000);
+  const line = (slot: string) => page.locator(`[data-slot="${slot}"]`).first();
+  const actions = page.getByRole("region", { name: "Thread actions" });
+  const sendText = async (text: string) => {
+    await page.getByLabel("Message", { exact: true }).fill(text);
+    await page.getByRole("form", { name: "Composer" }).getByRole("button", { name: "Send", exact: true }).click();
+    await expect(line(`send:${thread}`)).toHaveAttribute("data-phase", "settled");
+  };
+  const row = (id: string) => page.locator(`section[aria-labelledby="inputs-heading"] li[data-input="${id}"]`);
+  await daemon.waitInputs(thread, (is) => is[0]?.state === "acked");
+  // send, then input_cancel on the queued input (the gate is closed after the first turn).
+  await sendText("a policy send");
+  const [, queued] = await daemon.waitInputs(thread, (is) => is[1]?.state === "queued");
+  await row(queued!.input_id).getByRole("button", { name: "Cancel" }).click();
+  await daemon.waitInputs(thread, (is) => is[1]?.state === "cancelled");
+  // ready, stop, resume.
+  await actions.getByRole("button", { name: "Mark ready" }).click();
+  await page.getByRole("dialog", { name: "Mark the CLI ready?" }).getByRole("button", { name: "Mark ready" }).click();
+  await expect(line(`ready:${thread}`)).toHaveAttribute("data-phase", "settled");
+  await actions.getByRole("button", { name: "Stop" }).click();
+  await page.getByRole("dialog", { name: "Stop this launch?" }).getByRole("button", { name: "Stop" }).click();
+  await expect(line(`launch:${thread}`)).toContainText("stopped", { timeout: 45_000 });
+  await expect(actions.getByRole("button", { name: "Resume" })).toBeEnabled({ timeout: 20_000 });
+  await actions.getByRole("button", { name: "Resume" }).click();
+  await expect(line(`launch:${thread}`)).toContainText("Resume: outcome: started", { timeout: 45_000 });
+  await daemon.waitEvents(thread, (es) => {
+    const second = es.filter((e) => e.kind === "launch_started")[1]?.launch_id;
+    return second != null && es.some((e) => e.kind === "readiness_observed" && e.launch_id === second);
+  });
+  // input_resolve on an unconfirmed input (two lines, `sent`, then a stop).
+  await sendText("line one\nline two");
+  const sentOne = await daemon.waitInputs(thread, (is) => is[2]?.state === "sent", 25_000);
+  await daemon.chaldea(["stop", thread]);
+  await daemon.waitInputs(thread, (is) => is[2]?.state === "unconfirmed");
+  await row(sentOne[2]!.input_id).getByRole("button", { name: "Dismiss" }).click();
+  await daemon.waitInputs(thread, (is) => is[2]?.state === "dismissed");
+  // spawn from the form.
+  await page.getByLabel("Working directory (absolute path)").fill(join(daemon.root));
+  await page.getByRole("button", { name: "Start thread" }).click();
+  await expect(line("spawn")).toHaveAttribute("data-phase", "settled", { timeout: 45_000 });
+  const commandPaths = new Set(sent.map((r) => new URL(r.url).pathname).filter((p) => p.startsWith("/api/commands/")));
+  expect([...commandPaths].sort()).toEqual(
+    ["input_cancel", "input_resolve", "ready", "resume", "send", "spawn", "stop"].map((c) => `/api/commands/${c}`),
+  );
 
   // Every mutation is one the page is allowed; nothing reads the screen, attaches, or writes keys.
   const MUTATIONS = new Set([
