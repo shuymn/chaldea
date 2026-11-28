@@ -92,6 +92,11 @@ const VERB: Record<Command["name"], string> = {
   resume: "Resume",
 };
 
+/** A gesture that sent nothing, and why. */
+export function refusedText(name: Command["name"], why: string): string {
+  return `${VERB[name]}: not sent — ${why}.`;
+}
+
 /** One line for a command: its state, then its result. */
 export function commandText(c: Command): string {
   const verb = VERB[c.name];

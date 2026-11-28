@@ -8,7 +8,7 @@
 import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { context, slots, threadLabel } from "../commands/controls";
+import { canSend, context, refusal, slots, threadLabel } from "../commands/controls";
 import { type CmdAction, type CmdState, type Gesture, initialCmdState, reduceCommands } from "../commands/reducer";
 import { threadId } from "../sync/model/server";
 import { seeded } from "../sync/ops";
@@ -133,6 +133,65 @@ describe("command visibility", () => {
     act(() => view.rerender(<StatusBar state={sim.state} cmds={s} />));
     act(() => vi.advanceTimersByTime(2000));
     expect(announced()).toBe("claude /work/p2 [0193abcd]: Write a message first.");
+  });
+
+  test("a gesture refused for a stale copy is shown and announced, posts nothing, keeps the draft", () => {
+    const sim = live();
+    sim.server.status(T2, "process", "running");
+    sim.quiesce();
+    let s = step(initialCmdState(), { type: "context", ctx: context(sim.state) });
+    s = step(s, { type: "edit", thread: T2, text: "kept" });
+    const view = render(<StatusBar state={sim.state} cmds={s} />);
+    expect(canSend(sim.state, T2)).toBe(true);
+    // Between render and click the copy falls behind: an announced head it has not read.
+    sim.server.message(T2, 3);
+    sim.refresh();
+    for (const id of [...sim.conns.keys()]) while (sim.socketStep(id));
+    while (sim.deliverFrame());
+    expect(canSend(sim.state, T2)).toBe(false);
+    const [next, effects] = reduceCommands(s, {
+      type: "gesture",
+      slot: slots.send(T2),
+      name: "send",
+      thread: T2,
+      label: threadLabel(sim.state, T2),
+      args: {},
+      allowed: canSend(sim.state, T2),
+      why: refusal(sim.state, "send", T2),
+      commandId: "c1",
+      generation: "gen-1",
+      now: 0,
+    });
+    s = next;
+    expect(effects.filter((e) => e.type === "post")).toEqual([]);
+    expect(s.drafts[T2]?.text).toBe("kept");
+    act(() => view.rerender(<StatusBar state={sim.state} cmds={s} />));
+    const want = "claude /work/p2 [0193abcd]: Send: not sent — waiting for the thread to catch up.";
+    expect(shown()).toBe(want);
+    expect(announced()).toBe(want);
+  });
+
+  test("a gesture on a held slot is shown and announced and posts nothing", () => {
+    const sim = live();
+    let s = step(initialCmdState(), { type: "context", ctx: context(sim.state) });
+    s = gesture(sim, s, { slot: slots.launch(T2), name: "stop", thread: T2 });
+    const view = render(<StatusBar state={sim.state} cmds={s} />);
+    const [next, effects] = reduceCommands(s, {
+      type: "gesture",
+      slot: slots.launch(T2),
+      name: "stop",
+      thread: T2,
+      label: threadLabel(sim.state, T2),
+      args: {},
+      allowed: true,
+      commandId: "c2",
+      generation: "gen-1",
+      now: 0,
+    });
+    expect(effects.filter((e) => e.type === "post")).toEqual([]);
+    act(() => view.rerender(<StatusBar state={sim.state} cmds={next} />));
+    expect(shown()).toBe("claude /work/p2 [0193abcd]: Stop: not sent — the previous one is still pending.");
+    expect(announced()).toBe(shown());
   });
 
   test("the banner renders awaiting_approval with no action", () => {

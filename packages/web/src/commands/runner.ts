@@ -7,7 +7,7 @@ import type { Fetch } from "../http";
 import type { Runner } from "../sync/runner";
 import type { State } from "../sync/state";
 import { type CommandName, postCommand } from "./client";
-import { context, sameContext, supersededSlots, threadLabel } from "./controls";
+import { context, refusal, sameContext, supersededSlots, threadLabel } from "./controls";
 import { type CmdAction, type CmdEffect, type CmdState, initialCmdState, reduceCommands } from "./reducer";
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
@@ -76,6 +76,7 @@ export class CommandRunner {
       label: opts.thread === null ? null : threadLabel(s, opts.thread),
       args: opts.args,
       allowed: opts.allowed(s),
+      why: refusal(s, opts.name, opts.thread),
       commandId: this.deps.uuid(),
       generation,
     });
@@ -83,7 +84,9 @@ export class CommandRunner {
 
   retry(slot: string, allowed: (s: State) => boolean): void {
     this.follow();
-    this.dispatch({ type: "retry", slot, allowed: allowed(this.sync.getState()) });
+    const s = this.sync.getState();
+    const c = this.state.slots[slot];
+    this.dispatch({ type: "retry", slot, allowed: allowed(s), why: refusal(s, c?.name ?? "send", c?.thread ?? null) });
   }
 
   dispatch(input: CmdInput): void {

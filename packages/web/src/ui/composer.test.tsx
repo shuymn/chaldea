@@ -108,7 +108,7 @@ describe("composer", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  test("Ctrl+Enter while the send slot is held calls no send", () => {
+  test("Ctrl+Enter while the send slot is held is prevented and passed to the reducer", () => {
     const sim = seeded();
     sim.server.status(T1, "process", "running");
     sim.dispatch({ type: "select", thread: T1 });
@@ -142,7 +142,8 @@ describe("composer", () => {
     const box = screen.getByLabelText("Message");
     expect(key(box, { ctrlKey: true })).toBe(false);
     expect(key(box, {})).toBe(false);
-    expect(send).not.toHaveBeenCalled();
+    // Each reaches the reducer, which refuses the held slot with a notice (visibility.test).
+    expect(send).toHaveBeenCalledTimes(2);
   });
 
   test("blur resets the flag and the timestamp", () => {

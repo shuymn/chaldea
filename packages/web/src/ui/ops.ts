@@ -1,6 +1,6 @@
 // The page's command operations, bound to the runners (App.tsx builds them). Every one
-// reads its gate from the sync state at the gesture, and none acts while its slot is held
-// (the reducer reserves the slot and refuses a busy one too).
+// reads its gate from the sync state at the gesture; the reducer reserves the slot and
+// refuses a busy, locked, or closed one with a notice.
 
 import type { SpawnArgs } from "@chaldea/contracts/generated/SpawnArgs";
 
@@ -16,7 +16,6 @@ import {
   stopLaunch,
   targetGate,
 } from "../commands/controls";
-import { busy } from "../commands/reducer";
 import type { CommandRunner } from "../commands/runner";
 import type { State } from "../sync/state";
 
@@ -41,7 +40,6 @@ export function bindOps(commands: CommandRunner): Ops {
     args: Record<string, unknown>,
     allowed: (s: State) => boolean,
   ) => {
-    if (busy(commands.getState(), slot)) return;
     commands.gesture({ slot, name, thread, args, allowed });
   };
   return {

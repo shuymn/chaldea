@@ -35,6 +35,15 @@ export function lockReason(s: State, thread: string): string | null {
   return null;
 }
 
+/** Why a refused gesture on `thread` sent nothing, for its notice. */
+export function refusal(s: State, name: Command["name"], thread: string | null): string {
+  if (!live(s)) return "the page is not live";
+  // Send, Ready, and the input commands need a current copy; Stop and Resume do not.
+  const needsCurrent = name !== "stop" && name !== "resume" && name !== "spawn";
+  if (needsCurrent && thread !== null && !current(s, threadStream(thread))) return "waiting for the thread to catch up";
+  return "it is not available now";
+}
+
 export function canSend(s: State, thread: string): boolean {
   const c = threadCopy(s, thread);
   return (

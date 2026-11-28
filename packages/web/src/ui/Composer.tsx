@@ -37,8 +37,9 @@ export function Composer(props: { state: State; cmds: CmdState; thread: string; 
       aria-label="Composer"
       onSubmit={(e) => {
         e.preventDefault();
-        // Single flight from the keyboard too: Ctrl+Enter submits without the (disabled) button.
-        if (!busy(cmds, slot)) ops.send(thread);
+        // Ctrl+Enter submits even with the button disabled: a held slot or a lock is refused
+        // in the reducer, which posts nothing and says why (a notice).
+        ops.send(thread);
       }}
     >
       <label id={`${id}-label`} htmlFor={`${id}-text`} className="font-semibold">

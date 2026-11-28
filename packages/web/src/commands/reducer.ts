@@ -10,7 +10,7 @@
 // after its context changed updates only its own command's shown result.
 
 import type { CommandName, Reply } from "./client";
-import { commandText, INVALID_TEXT } from "./messages";
+import { commandText, INVALID_TEXT, refusedText } from "./messages";
 
 export type Phase =
   /** An attempt is in flight. */
@@ -124,6 +124,8 @@ export type Gesture = {
   readonly args: Readonly<Record<string, unknown>>;
   /** From the gate at the gesture: `live`, and the current copy the command needs. */
   readonly allowed: boolean;
+  /** Why the gate refused, for the notice (controls.ts `refusal`). */
+  readonly why?: string;
   readonly commandId: string;
   readonly generation: string;
 };
@@ -134,7 +136,7 @@ export type CmdAction = At &
     | { readonly type: "edit"; readonly thread: string; readonly text: string }
     /** A gesture starting a command; a `send` takes its text from the thread's draft. */
     | ({ readonly type: "gesture" } & Gesture)
-    | { readonly type: "retry"; readonly slot: string; readonly allowed: boolean }
+    | { readonly type: "retry"; readonly slot: string; readonly allowed: boolean; readonly why?: string }
     | { readonly type: "forget"; readonly slot: string }
     | { readonly type: "reply"; readonly attempt: number; readonly reply: Reply }
     | { readonly type: "tick" }
@@ -204,7 +206,18 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
       break;
     }
     case "gesture": {
-      if (!a.allowed || busy(s, a.slot) || s.ctx.session === null) break;
+      // A refused gesture sends nothing and keeps the draft, but says why (a notice).
+      const why = busy(s, a.slot)
+        ? "the previous one is still pending"
+        : s.ctx.session === null
+          ? "the page is not live"
+          : !a.allowed
+            ? (a.why ?? "it is not available now")
+            : null;
+      if (why !== null) {
+        notify(prefixed(a.label, refusedText(a.name, why)));
+        break;
+      }
       let args = a.args;
       let text: string | null = null;
       let revision: number | null = null;
@@ -228,7 +241,7 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
         commandId: a.commandId,
         body: JSON.stringify({ command_id: a.commandId, args }),
         generation: a.generation,
-        session: s.ctx.session,
+        session: s.ctx.session ?? "",
         thread: a.thread,
         label: a.label,
         text,
@@ -246,7 +259,11 @@ export function reduceCommands(prev: CmdState, a: CmdAction): [CmdState, CmdEffe
     }
     case "retry": {
       const c = s.slots[a.slot];
-      if (!a.allowed || !c || !retryable(s, a.slot) || !inSession(s.ctx, c)) break;
+      if (!c) break;
+      if (!a.allowed || !retryable(s, a.slot) || !inSession(s.ctx, c)) {
+        notify(prefixed(c.label, refusedText(c.name, a.why ?? "it is not available now")));
+        break;
+      }
       // The same command: its frozen id, body bytes, and generation.
       const next: Command = { ...c, attempt: s.nextAttempt, phase: "inflight", reply: null, retryAt: null, posts: c.posts + 1 };
       s = { ...s, nextAttempt: s.nextAttempt + 1 };
