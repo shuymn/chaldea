@@ -21,7 +21,7 @@ use chaldea_core::sync::{
 
 use super::shared;
 use super::support::http::{CLIENT_WAIT, Reply, TestServer};
-use super::support::{Model, Op, event, raw_unknown, soon};
+use super::support::{Model, Op, event, raw_unknown, registered, soon, thread};
 use crate::http::Mounts;
 use crate::store::NewEvent;
 
@@ -309,31 +309,25 @@ async fn snapshot_equals_model_at_cut() {
         // handler's read.
         let hold = srv.hold_writer().await;
         let (done_tx, done_rx) = mpsc::channel();
-        queue(
-            &srv,
-            vec![
-                raw_unknown(
-                    StreamId::Thread(t),
-                    &format!("after:{stream}:t"),
-                    Content::text("later"),
-                ),
-                event(
-                    StreamId::Thread(t),
-                    &format!("after:{stream}:vt"),
-                    TypedEvent::VtSnapshotTaken(vt(9)),
-                ),
-            ],
-            &done_tx,
-        );
-        queue(
-            &srv,
-            vec![raw_unknown(
-                StreamId::Host,
-                &format!("after:{stream}:h"),
+        let later_thread = vec![
+            raw_unknown(
+                StreamId::Thread(t),
+                &format!("after:{stream}:t"),
                 Content::text("later"),
-            )],
-            &done_tx,
-        );
+            ),
+            event(
+                StreamId::Thread(t),
+                &format!("after:{stream}:vt"),
+                TypedEvent::VtSnapshotTaken(vt(9)),
+            ),
+        ];
+        let later_host = vec![raw_unknown(
+            StreamId::Host,
+            &format!("after:{stream}:h"),
+            Content::text("later"),
+        )];
+        queue(&srv, later_thread.clone(), &done_tx);
+        queue(&srv, later_host.clone(), &done_tx);
         let req = srv
             .req(
                 "GET",
@@ -401,14 +395,8 @@ async fn snapshot_equals_model_at_cut() {
             }
         }
         // Both queued jobs committed after the read; the later state is the next cut's.
-        let mut keep = |stream: StreamId, k: String| log.keys.entry(stream).or_default().push(k);
-        keep(StreamId::Thread(t), format!("after:{stream}:t"));
-        keep(StreamId::Thread(t), format!("after:{stream}:vt"));
-        keep(StreamId::Host, format!("after:{stream}:h"));
-        log.events.push(TypedEvent::VtSnapshotTaken(vt(9)));
-        for s in [StreamId::Thread(t), StreamId::Host] {
-            *log.raw_unknowns.entry(s).or_default() += 1;
-        }
+        log.record(&later_thread);
+        log.record(&later_host);
     }
     srv.stop().await;
 }
@@ -475,11 +463,8 @@ async fn forced_snapshot(srv: &TestServer, owner: &str, stream: StreamId) -> (Ep
 async fn snapshot_raw_unknown_count() {
     let srv = start().await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
-    let mut m = Model::default();
-    let mut log = Log::default();
-    let t = m.register(true);
-    commit(&srv, &mut m, &mut log).await;
-    let thread = StreamId::Thread(t);
+    srv.append(vec![registered(thread(1), true)]).await;
+    let thread = StreamId::Thread(thread(1));
     // Another kind between the `raw_unknown` events, so the count is not the head.
     let mut before = vec![
         raw_unknown(thread, "t:1", Content::text("a")),
@@ -489,7 +474,6 @@ async fn snapshot_raw_unknown_count() {
     before.extend(
         (1..=3).map(|n| raw_unknown(StreamId::Host, &format!("h:{n}"), Content::text("h"))),
     );
-    log.record(&before);
     srv.append(before).await;
     for (stream, want) in [(thread, 2), (StreamId::Host, 3)] {
         let (epoch, as_of_seq, count) = forced_snapshot(&srv, &owner, stream).await;
@@ -497,7 +481,6 @@ async fn snapshot_raw_unknown_count() {
             count, want,
             "{stream}: the raw_unknown events at or below as_of_seq"
         );
-        assert_eq!(count, log.raw_unknowns[&stream]);
         assert!(as_of_seq > count, "{stream}: other kinds are not counted");
         srv.append(vec![raw_unknown(
             stream,

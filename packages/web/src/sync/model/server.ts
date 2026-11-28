@@ -288,7 +288,7 @@ export class ModelServer {
       };
     }
     // The stream's `raw_unknown` events at or below `head`, as the daemon counts them.
-    const rawUnknownCount = log.filter((e) => e.kind === "raw_unknown").length;
+    const rawUnknownCount = log.reduce((n, e) => n + (e.kind === "raw_unknown" ? 1 : 0), 0);
     if (q.stream === "host") {
       return {
         status: 200,
