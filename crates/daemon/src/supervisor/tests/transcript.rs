@@ -354,13 +354,14 @@ async fn a_poll_starting_after_hold_waits_for_the_final_read() {
     rig.until("a poll ran", || rig.pauses.passed(Pause::TailerPoll))
         .await;
     let poll = rig.pauses.arm(Pause::TailerPoll);
-    std::fs::write(&path, LINE).unwrap();
     let poll = tokio::task::spawn_blocking(move || {
         poll.wait();
         poll
     })
     .await
     .unwrap();
+    // Written once the poll is parked, so no earlier poll can read it.
+    std::fs::write(&path, LINE).unwrap();
     rig.sup.tailers.set(Mode::Hold);
     poll.go();
     rig.until("the poll found Hold", || {
