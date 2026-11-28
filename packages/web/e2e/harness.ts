@@ -44,13 +44,38 @@ export async function untilShown(page: Page, seq: number): Promise<void> {
   });
 }
 
-export const test = base.extend<{ daemon: Daemon }>({
-  daemon: async ({}, use, info) => {
+/** Pairs `page` and selects `thread`; resolves once the page is live. */
+export async function openThread(page: Page, daemon: Daemon, thread: string): Promise<void> {
+  await openLink(page, await daemon.pairUrl());
+  await page.locator(`li[data-thread="${thread}"] button`).first().click();
+  await expect(statusOf(page)).toHaveText("live");
+}
+
+/** The bodies of every `POST /api/commands/<name>` the page sends from now on. */
+export function commandPosts(page: Page, name: string): string[] {
+  const bodies: string[] = [];
+  page.on("request", (r) => {
+    if (r.method() === "POST" && new URL(r.url()).pathname === `/api/commands/${name}`) bodies.push(r.postData() ?? "");
+  });
+  return bodies;
+}
+
+/** The selected thread's composer textarea and its Send button. */
+export const composer = (page: Page) => page.getByLabel("Message", { exact: true });
+export const sendButton = (page: Page) => page.getByRole("form", { name: "Composer" }).getByRole("button", { name: "Send", exact: true });
+
+/** The command line of a slot (`send:<thread>`, `spawn`, …). */
+export const commandLine = (page: Page, slot: string) => page.locator(`[data-slot="${slot}"]`);
+
+export const test = base.extend<{ daemon: Daemon; claude: "echo" | "missing" }>({
+  // What runs as `claude` (e2e/daemon.ts): FakeCli `echo`, or nothing (`test.use({ claude: "missing" })`).
+  claude: ["echo", { option: true }],
+  daemon: async ({ claude }, use, info) => {
     const root = mkdtempSync(join(tmpdir(), "chaldea-e2e-"));
     let d: Daemon | null = null;
     let stopFailure: unknown = null;
     try {
-      d = new Daemon({ root, port: await freePort() });
+      d = new Daemon({ root, port: await freePort(), claude });
       await d.start();
       await use(d);
     } finally {

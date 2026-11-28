@@ -27,7 +27,7 @@ function ThreadEntries(props: { state: State; cmds: CmdState; thread: string; en
   const host = state.streams[HOST]?.copy;
   const info = host?.kind === "host" ? host.threads[thread]?.info : undefined;
   return (
-    <li data-thread={thread} className="py-1">
+    <li data-attention-thread={thread} className="py-1">
       <p className="text-sm">
         <span className="font-semibold">{info?.agent ?? "thread"}</span>{" "}
         <span className="break-all" dir="auto">

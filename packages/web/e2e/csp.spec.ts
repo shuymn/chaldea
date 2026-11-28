@@ -39,6 +39,15 @@ test("csp_clean", async ({ daemon, page }) => {
   await daemon.chaldea(["send", thread, "live over the socket"]);
   await expect(timeline.getByText("live over the socket").first()).toBeVisible();
   await expect(page.getByText("unknown event")).toHaveCount(0);
+  // The composer, a command, and a native dialog under the same CSP (W2-12).
+  await page.getByLabel("Message", { exact: true }).fill("CSP の送信 🎌");
+  await page.getByRole("form", { name: "Composer" }).getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.locator(`[data-slot="send:${thread}"]`)).toHaveAttribute("data-phase", "settled");
+  await page.getByRole("region", { name: "Thread actions" }).getByRole("button", { name: "Stop" }).click();
+  const dialog = page.getByRole("dialog", { name: "Stop this launch?" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toBeHidden();
   expect(await violations(page)).toEqual([]);
 });
 

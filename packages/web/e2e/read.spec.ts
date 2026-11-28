@@ -1,7 +1,9 @@
 // The read path against the daemon: generic rows (W1-8), the restart (W1-3, W1-12), and the
-// 390 × 844 layout (W1-4).
+// 390 × 844 layout (W1-4, and W2-12 for the composer, inputs, banner, and dialogs).
 
 import { join } from "node:path";
+
+import type { Page } from "@playwright/test";
 
 import { expect, openLink, shownSeqs, statusOf, test, untilShown } from "./harness";
 
@@ -160,6 +162,7 @@ function range(from: number, to: number): number[] {
 }
 
 test("layout_390", async ({ daemon, page }) => {
+  test.setTimeout(120_000);
   // Long unbroken text in every field the list and the timeline show, and a closed row.
   const cwd = join(daemon.root, `a-directory-name-without-any-break-${"x".repeat(120)}`);
   const { thread } = await daemon.spawnThread({ cwd, prompt: `unbroken-${"y".repeat(300)}` });
@@ -197,15 +200,53 @@ test("layout_390", async ({ daemon, page }) => {
   // Each of them, and each of their parts, is rendered visible (not `visibility: hidden`,
   // not transparent), lies inside the viewport, and shows its whole content: no box past
   // either edge, no block narrower than what it holds.
-  const clipped = await page.evaluate(() => {
+  expect(await clipped(page, "[data-status], li[data-thread], #timeline-heading, [role='group'], main ol > li")).toEqual([]);
+
+  // W2-12: the composer, the inputs, the attention banner, and both dialogs fit too. An
+  // input goes `unconfirmed` (two lines, `sent`, then a stop), and a resumed launch makes
+  // Stop and Mark ready available.
+  const { thread: busy } = await daemon.spawnThread({ cwd: join(daemon.root, `busy-${"w".repeat(120)}`) });
+  await daemon.waitEvents(busy, (es) => es.some((e) => e.kind === "readiness_observed"));
+  await daemon.chaldea(["send", busy, `first-line-${"v".repeat(200)}\nsecond line`]);
+  await daemon.waitInputs(busy, (is) => is[0]?.state === "sent", 25_000);
+  await daemon.chaldea(["stop", busy]);
+  await daemon.waitInputs(busy, (is) => is[0]?.state === "unconfirmed");
+  const { launch_id: resumed } = (await daemon.chaldea(["resume", busy])) as { launch_id: string };
+  await daemon.waitEvents(busy, (es) => es.some((e) => e.kind === "readiness_observed" && e.launch_id === resumed));
+  await page.locator(`li[data-thread="${busy}"] button`).first().click();
+  await expect(page.getByRole("region", { name: "Attention" })).toBeVisible();
+  await page.getByLabel("Message", { exact: true }).fill(`unbroken-draft-${"u".repeat(300)}`);
+  const actions = page.getByRole("region", { name: "Thread actions" });
+  await expect(actions.getByRole("button", { name: "Mark ready" })).toBeEnabled({ timeout: 20_000 });
+  const parts = "section[aria-label='Attention'], section[aria-label='Thread actions'], section[aria-labelledby='inputs-heading'], form[aria-label='Composer']";
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBe(0);
+  expect(await clipped(page, parts)).toEqual([]);
+  for (const [button, name] of [
+    ["Mark ready", "Mark the CLI ready?"],
+    ["Stop", "Stop this launch?"],
+  ] as const) {
+    await actions.getByRole("button", { name: button }).click();
+    const dialog = page.getByRole("dialog", { name });
+    await expect(dialog).toBeVisible();
+    expect(await clipped(page, "dialog[open]")).toEqual([]);
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(dialog).toBeHidden();
+  }
+});
+
+/**
+ * Every element under `selector` that is not rendered visible (no box, `visibility:
+ * hidden`, transparent), lies outside the viewport, or is narrower than what it holds.
+ */
+function clipped(page: Page, selector: string): Promise<string[]> {
+  return page.evaluate((selector) => {
     // Both spellings of the options: the current ones and the older ones WebKit may read.
     const visible = { visibilityProperty: true, opacityProperty: true, checkVisibilityCSS: true, checkOpacity: true };
-    const roots = [
-      ...document.querySelectorAll("[data-status], li[data-thread], #timeline-heading, [role='group'], main ol > li"),
-    ];
     const bad: string[] = [];
-    for (const root of roots) {
+    for (const root of document.querySelectorAll(selector)) {
       for (const el of [root, ...root.querySelectorAll("*")]) {
+        // Options and closed dialogs have no box of their own.
+        if (el.tagName === "OPTION" || el.closest("dialog:not([open])")) continue;
         const r = el.getBoundingClientRect();
         const what = `${el.tagName.toLowerCase()} "${(el.textContent ?? "").slice(0, 30)}"`;
         if (r.width === 0 || r.height === 0) bad.push(`${what}: no box`);
@@ -217,6 +258,5 @@ test("layout_390", async ({ daemon, page }) => {
       }
     }
     return bad;
-  });
-  expect(clipped).toEqual([]);
-});
+  }, selector);
+}

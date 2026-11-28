@@ -87,7 +87,7 @@ export function ThreadActions(props: { state: State; cmds: CmdState; thread: str
             Resume
           </button>
         )}
-        {copy !== null && <span className="text-sm">raw unknown events: {copy.rawUnknown}</span>}
+        {copy !== null && <span className="text-sm">raw_unknown count: {copy.rawUnknown}</span>}
       </div>
       {hint !== null && <p className="hint break-words text-sm">{hintText(thread, hint)}</p>}
       <CommandLine cmds={cmds} slot={slots.ready(thread)} ops={ops} />

@@ -1,0 +1,468 @@
+// The commands against the daemon (docs/design/w2-composer.md §2.2, §2.4, §4): W2-5
+// `send_outcome_unknown`, `send_not_done_retry`, `double_submit`, `retry_session`; W2-7 and
+// W2-8 `unconfirmed_resolve`, `gate_timeout_cancel`; W2-10 `ready_opens_gate`,
+// `spawn_stop_resume`, `spawn_failed`, `stop_dialog_pins`, `command_401`, and the
+// unconfirmed-death hint.
+//
+// FakeCli `echo` emits `SessionStart`, then one `UserPromptSubmit` per input line, and never
+// `Stop`: after one prompt the turn stays running and the gate closed (the closed-gate fixture).
+
+import { mkdtempSync } from "node:fs";
+import { join } from "node:path";
+
+import type { Page, Route, WebSocketRoute } from "@playwright/test";
+
+import {
+  commandLine,
+  commandPosts,
+  composer,
+  type Daemon,
+  expect,
+  openLink,
+  openThread,
+  sendButton,
+  statusOf,
+  test,
+} from "./harness";
+
+const SPENT = "This link is spent or expired";
+
+async function openGate(daemon: Daemon): Promise<string> {
+  const { thread } = await daemon.spawnThread();
+  await daemon.waitEvents(thread, (es) => es.some((e) => e.kind === "readiness_observed"));
+  return thread;
+}
+
+/** The closed-gate fixture: a first prompt acked, the turn running, the gate closed. */
+async function closedGate(daemon: Daemon): Promise<string> {
+  const { thread } = await daemon.spawnThread({ prompt: "first turn" });
+  await daemon.waitInputs(thread, (is) => is[0]?.state === "acked");
+  return thread;
+}
+
+const actions = (page: Page) => page.getByRole("region", { name: "Thread actions" });
+const banner = (page: Page) => page.getByRole("region", { name: "Attention" });
+const inputRow = (page: Page, id: string) => page.locator(`section[aria-labelledby="inputs-heading"] li[data-input="${id}"]`);
+
+/** Sends `text` from the composer and waits for the reply. */
+async function send(page: Page, thread: string, text: string): Promise<void> {
+  await composer(page).fill(text);
+  await sendButton(page).click();
+  await expect(commandLine(page, `send:${thread}`)).toHaveAttribute("data-phase", "settled");
+}
+
+/** Holds every request to `path` until the test answers it. */
+async function hold(page: Page, path: string): Promise<{ next: () => Promise<Route> }> {
+  const waiting: ((r: Route) => void)[] = [];
+  const queued: Route[] = [];
+  await page.route(`**${path}`, (route) => {
+    const w = waiting.shift();
+    if (w) w(route);
+    else queued.push(route);
+  });
+  return {
+    next: () => {
+      const q = queued.shift();
+      return q ? Promise.resolve(q) : new Promise<Route>((ok) => waiting.push(ok));
+    },
+  };
+}
+
+test("ready_opens_gate", async ({ daemon, page }) => {
+  test.setTimeout(120_000);
+  const thread = await closedGate(daemon);
+  await openThread(page, daemon, thread);
+  await send(page, thread, "second turn");
+  const [, second] = await daemon.waitInputs(thread, (is) => is[1]?.state === "queued");
+  await expect(inputRow(page, second!.input_id)).toHaveAttribute("data-state", "queued");
+  const readies = commandPosts(page, "ready");
+
+  await actions(page).getByRole("button", { name: "Mark ready" }).click();
+  const dialog = page.getByRole("dialog", { name: "Mark the CLI ready?" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("normal composer, open and empty, with no popup");
+  await expect(dialog).toContainText("Queued prompts may then be written");
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toBeHidden();
+  await page.waitForTimeout(300);
+  expect(readies).toEqual([]);
+
+  await actions(page).getByRole("button", { name: "Mark ready" }).click();
+  await dialog.getByRole("button", { name: "Mark ready" }).click();
+  await expect(commandLine(page, `ready:${thread}`)).toHaveAttribute("data-phase", "settled");
+  expect(readies).toHaveLength(1);
+  const es = await daemon.waitEvents(thread, (xs) =>
+    xs.some((e) => e.kind === "readiness_observed" && e.payload.evidence === "owner_asserted"),
+  );
+  expect(es.some((e) => e.kind === "readiness_observed" && e.payload.by === "human")).toBe(true);
+  await daemon.waitInputs(thread, (is) => is[1]?.state === "acked");
+  await expect(inputRow(page, second!.input_id)).toHaveAttribute("data-state", "acked");
+});
+
+test("gate_timeout_cancel", async ({ daemon, page }, info) => {
+  test.skip(!["chromium-desktop", "webkit-390"].includes(info.project.name), "60 s gate timeout: two projects only");
+  test.setTimeout(150_000);
+  const thread = await closedGate(daemon);
+  await openThread(page, daemon, thread);
+  await send(page, thread, "waits for readiness");
+  const [, second] = await daemon.waitInputs(thread, (is) => is[1]?.state === "queued");
+  const entry = banner(page).locator(`[data-cause="input_gate_timeout"]`);
+  await expect(entry).toBeVisible({ timeout: 90_000 });
+  await expect(entry.getByRole("button", { name: "Mark ready" })).toBeVisible();
+  await entry.getByRole("button", { name: "Cancel" }).click();
+  await daemon.waitInputs(thread, (is) => is[1]?.state === "cancelled");
+  await expect(banner(page)).toHaveCount(0);
+  await expect(inputRow(page, second!.input_id)).toHaveAttribute("data-state", "cancelled");
+  await expect(inputRow(page, second!.input_id).getByRole("button")).toHaveCount(0);
+});
+
+/** An input that went `unconfirmed`: two lines (whose per-line hooks match no input), `sent`, then a CLI stop. */
+async function unconfirmed(daemon: Daemon, page: Page, thread: string): Promise<string> {
+  await send(page, thread, "line one\nline two");
+  const [i] = await daemon.waitInputs(thread, (is) => is[0]?.state === "sent", 25_000);
+  await daemon.chaldea(["stop", thread]);
+  await daemon.waitInputs(thread, (is) => is[0]?.state === "unconfirmed");
+  return i!.input_id;
+}
+
+test("unconfirmed_resolve", async ({ daemon, page }) => {
+  test.setTimeout(120_000);
+  const thread = await openGate(daemon);
+  await openThread(page, daemon, thread);
+  const id = await unconfirmed(daemon, page, thread);
+  const entry = banner(page).locator(`[data-cause="input_unconfirmed"]`);
+  await expect(entry).toBeVisible();
+  await expect(entry.getByRole("button")).toHaveText(["It arrived", "Dismiss"]);
+  await expect(inputRow(page, id)).toHaveAttribute("data-state", "unconfirmed");
+  await expect(inputRow(page, id).getByRole("button", { name: "Cancel" })).toHaveCount(0);
+  await entry.getByRole("button", { name: "Dismiss" }).click();
+  await daemon.waitInputs(thread, (is) => is[0]?.state === "dismissed");
+  await expect(banner(page)).toHaveCount(0);
+  await expect(inputRow(page, id)).toHaveAttribute("data-state", "dismissed");
+  await expect(inputRow(page, id)).toContainText("by human");
+});
+
+test("send_outcome_unknown", async ({ daemon, page }) => {
+  const thread = await openGate(daemon);
+  await page.route("**/api/commands/send", async (route) => {
+    // Committed, its reply lost.
+    await route.fetch();
+    await route.abort();
+  });
+  await openThread(page, daemon, thread);
+  const posts = commandPosts(page, "send");
+  await composer(page).fill("did it arrive?");
+  await sendButton(page).click();
+  const line = commandLine(page, `send:${thread}`);
+  await expect(line).toHaveAttribute("data-phase", "check_thread");
+  await expect(line).toContainText("Check the thread");
+  await expect(line.getByRole("button", { name: "Retry" })).toHaveCount(0);
+  await expect(sendButton(page)).toBeDisabled();
+  await page.waitForTimeout(1500);
+  await expect(line.getByRole("button", { name: "Retry" })).toHaveCount(0);
+  expect(posts).toHaveLength(1);
+  expect(await daemon.waitInputs(thread, (is) => is.length === 1)).toHaveLength(1);
+  await line.getByRole("button", { name: "Forget" }).click();
+  await expect(line).toContainText("Sending again is a new command");
+  await expect(composer(page)).toHaveValue("did it arrive?");
+  await expect(sendButton(page)).toBeEnabled();
+});
+
+test("send_not_done_retry", async ({ daemon, page }) => {
+  const thread = await openGate(daemon);
+  let first = true;
+  await page.route("**/api/commands/send", async (route) => {
+    if (first) {
+      first = false;
+      await route.fulfill({ status: 503, contentType: "application/json", body: '{"code":"busy","retry_after":1}' });
+    } else {
+      await route.continue();
+    }
+  });
+  await openThread(page, daemon, thread);
+  const posts = commandPosts(page, "send");
+  await composer(page).fill("retried 再送");
+  await sendButton(page).click();
+  const line = commandLine(page, `send:${thread}`);
+  await expect(line).toHaveAttribute("data-phase", "not_done");
+  await expect(line).toContainText("the daemon is busy");
+  const retry = line.getByRole("button", { name: "Retry" });
+  await expect(retry).toBeVisible({ timeout: 5_000 });
+  await retry.click();
+  await expect(line).toHaveAttribute("data-phase", "settled");
+  expect(posts).toHaveLength(2);
+  expect(posts[1] === posts[0], "the Retry's body differs from the first attempt's").toBe(true);
+  expect(JSON.parse(posts[1]!).command_id).toBe(JSON.parse(posts[0]!).command_id);
+  await page.waitForTimeout(500);
+  expect(await daemon.inputs(thread)).toHaveLength(1);
+});
+
+test("double_submit", async ({ daemon, page }) => {
+  test.setTimeout(150_000);
+  const thread = await openGate(daemon);
+  await openThread(page, daemon, thread);
+  const sends = commandPosts(page, "send");
+  const spawns = commandPosts(page, "spawn");
+
+  await composer(page).fill("once");
+  await sendButton(page).dblclick();
+  await expect(commandLine(page, `send:${thread}`)).toHaveAttribute("data-phase", "settled");
+  expect(sends).toHaveLength(1);
+  expect(await daemon.inputs(thread)).toHaveLength(1);
+
+  const cwd = mkdtempSync(join(daemon.root, "cwd-form-"));
+  await page.getByLabel("Working directory (absolute path)").fill(cwd);
+  await page.getByRole("button", { name: "Start thread" }).dblclick();
+  await expect(commandLine(page, "spawn")).toHaveAttribute("data-phase", "settled", { timeout: 45_000 });
+  expect(spawns).toHaveLength(1);
+  const host = await daemon.stream("host");
+  expect(host.filter((e) => e.kind === "thread_registered" && e.payload.cwd === cwd)).toHaveLength(1);
+
+  // Retry, double-clicked: one more POST.
+  await page.locator(`li[data-thread="${thread}"] button`).first().click();
+  let first = true;
+  await page.route("**/api/commands/send", async (route) => {
+    if (first) {
+      first = false;
+      await route.fulfill({ status: 503, contentType: "application/json", body: '{"code":"busy","retry_after":1}' });
+    } else {
+      await route.continue();
+    }
+  });
+  await composer(page).fill("retry once");
+  await sendButton(page).click();
+  const retry = commandLine(page, `send:${thread}`).getByRole("button", { name: "Retry" });
+  await expect(retry).toBeVisible({ timeout: 5_000 });
+  await retry.dblclick();
+  await expect(commandLine(page, `send:${thread}`)).toHaveAttribute("data-phase", "settled");
+  expect(sends).toHaveLength(3);
+  expect(await daemon.inputs(thread)).toHaveLength(2);
+  await page.unroute("**/api/commands/send");
+
+  // An unconfirmed input: It arrived held, then Dismiss sends nothing.
+  const fresh = await openGate(daemon);
+  await page.locator(`li[data-thread="${fresh}"] button`).first().click();
+  await expect(statusOf(page)).toHaveText("live");
+  const id = await unconfirmed(daemon, page, fresh);
+  const resolves = commandPosts(page, "input_resolve");
+  const held = await hold(page, "/api/commands/input_resolve");
+  const row = inputRow(page, id);
+  await row.getByRole("button", { name: "It arrived" }).click();
+  const route = await held.next();
+  await expect(row.getByRole("button", { name: "Dismiss" })).toBeDisabled();
+  await row.getByRole("button", { name: "Dismiss" }).dispatchEvent("click");
+  await banner(page).locator(`[data-cause="input_unconfirmed"]`).getByRole("button", { name: "Dismiss" }).dispatchEvent("click");
+  await page.waitForTimeout(300);
+  expect(resolves).toHaveLength(1);
+  await route.continue();
+  await daemon.waitInputs(fresh, (is) => is[0]?.state === "acked");
+  await expect(row).toHaveAttribute("data-state", "acked");
+  expect(resolves).toHaveLength(1);
+});
+
+test("spawn_stop_resume", async ({ daemon, page }) => {
+  test.setTimeout(150_000);
+  await openLink(page, await daemon.pairUrl());
+  await expect(statusOf(page)).toHaveText("live");
+  const cwd = mkdtempSync(join(daemon.root, "cwd-form-"));
+  await page.getByLabel("Working directory (absolute path)").fill(cwd);
+  await page.getByLabel("Task (optional)").fill("from the form");
+  await page.getByRole("button", { name: "Start thread" }).click();
+  await expect(commandLine(page, "spawn")).toContainText("outcome: started", { timeout: 45_000 });
+  const reg = (await daemon.stream("host")).find((e) => e.kind === "thread_registered" && e.payload.cwd === cwd);
+  const thread = reg!.payload.thread_id as string;
+  expect(reg!.payload.task).toBe("from the form");
+  // The selection moved to the new thread.
+  await expect(page.locator(`li[data-thread="${thread}"] button`).first()).toHaveAttribute("aria-current", "true");
+  await daemon.waitEvents(thread, (es) => es.some((e) => e.kind === "readiness_observed"));
+
+  await expect(actions(page).getByRole("button", { name: "Stop" })).toBeEnabled({ timeout: 20_000 });
+  await actions(page).getByRole("button", { name: "Stop" }).click();
+  const dialog = page.getByRole("dialog", { name: "Stop this launch?" });
+  await dialog.getByRole("button", { name: "Stop" }).click();
+  await expect(commandLine(page, `launch:${thread}`)).toContainText("stopped, death confirmed", { timeout: 45_000 });
+  const es = await daemon.waitEvents(thread, (xs) => xs.some((e) => e.kind === "launch_exited"));
+  const exited = es.find((e) => e.kind === "launch_exited")!;
+  expect([exited.payload.reason, exited.payload.death_confirmed]).toEqual(["stopped", true]);
+
+  const resume = actions(page).getByRole("button", { name: "Resume" });
+  await expect(resume).toBeEnabled({ timeout: 20_000 });
+  await resume.click();
+  await expect(commandLine(page, `launch:${thread}`)).toContainText("Resume: outcome: started", { timeout: 45_000 });
+  await expect(commandLine(page, `launch:${thread}`)).toBeVisible();
+  await daemon.waitEvents(thread, (xs) => xs.filter((e) => e.kind === "launch_started").length === 2);
+  // The counts shown are the daemon's (W2-9).
+  await expect(actions(page)).toContainText(`raw_unknown count: ${await daemon.rawUnknown(`thread:${thread}`)}`);
+  await expect(page.locator("[data-raw-unknown=host]")).toHaveText(`host raw_unknown count: ${await daemon.rawUnknown("host")}`);
+});
+
+test.describe("without a claude on PATH", () => {
+  test.use({ claude: "missing" });
+  test("spawn_failed", async ({ daemon, page }) => {
+    await openLink(page, await daemon.pairUrl());
+    await expect(statusOf(page)).toHaveText("live");
+    await page.getByLabel("Working directory (absolute path)").fill(mkdtempSync(join(daemon.root, "cwd-")));
+    await page.getByRole("button", { name: "Start thread" }).click();
+    await expect(commandLine(page, "spawn")).toContainText("outcome: spawn_failed", { timeout: 45_000 });
+  });
+});
+
+test("stop_dialog_pins", async ({ daemon, page }) => {
+  test.setTimeout(120_000);
+  const thread = await openGate(daemon);
+  await openThread(page, daemon, thread);
+  const stops = commandPosts(page, "stop");
+  await actions(page).getByRole("button", { name: "Stop" }).click();
+  const dialog = page.getByRole("dialog", { name: "Stop this launch?" });
+  await expect(dialog).toBeVisible();
+  // Launch A ends and B starts from the CLI: the dialog pinned A, so it closes.
+  await daemon.chaldea(["stop", thread]);
+  await daemon.chaldea(["resume", thread]);
+  await expect(dialog).toBeHidden({ timeout: 20_000 });
+  await page.waitForTimeout(500);
+  expect(stops).toEqual([]);
+});
+
+test("death_unconfirmed_hint", async ({ daemon, page }) => {
+  // No CI trigger exists for an exited launch with death unconfirmed on a real daemon: the
+  // replies that report one are fulfilled here.
+  test.setTimeout(120_000);
+  const thread = await openGate(daemon);
+  await page.route("**/api/commands/stop", async (route) => {
+    const res = await route.fetch();
+    const body = (await res.json()) as Record<string, unknown>;
+    await route.fulfill({ response: res, json: { ...body, death_confirmed: false, confirmed_within_deadline: false } });
+  });
+  await page.route("**/api/commands/resume", (route) =>
+    route.fulfill({ status: 409, contentType: "application/json", body: '{"code":"death_unconfirmed"}' }),
+  );
+  await openThread(page, daemon, thread);
+  await actions(page).getByRole("button", { name: "Stop" }).click();
+  await page.getByRole("dialog", { name: "Stop this launch?" }).getByRole("button", { name: "Stop" }).click();
+  await expect(commandLine(page, `launch:${thread}`)).toContainText("death not confirmed", { timeout: 45_000 });
+  await expect(actions(page).locator(".hint")).toContainText(`chaldea stop ${thread} --assume-dead`);
+  await expect(actions(page).locator(".hint")).toContainText("--launch ");
+  await actions(page).getByRole("button", { name: "Resume" }).click();
+  await expect(commandLine(page, `launch:${thread}`)).toContainText("not confirmed dead");
+  await expect(actions(page).locator(".hint")).toContainText("--assume-dead");
+});
+
+test("command_401", async ({ daemon, context }) => {
+  test.setTimeout(120_000);
+  const thread = await openGate(daemon);
+
+  // (b) An old generation's 401 arrives after a re-pair in another tab: the replacement survives.
+  const a = await context.newPage();
+  const auth: string[] = [];
+  a.on("request", (r) => {
+    const h = r.headers().authorization;
+    if (h) auth.push(h);
+  });
+  await openThread(a, daemon, thread);
+  const tokenA = auth.at(-1)!;
+  const held = await hold(a, "/api/commands/send");
+  await composer(a).fill("held with the old pairing");
+  await sendButton(a).click();
+  const route = await held.next();
+  const b = await context.newPage();
+  await openLink(b, await daemon.pairUrl());
+  await expect(statusOf(b)).toHaveText("live");
+  await expect.poll(() => auth.at(-1) !== tokenA, { message: "tab A never adopted the new pairing", timeout: 15_000 }).toBe(true);
+  const tokenB = auth.at(-1)!;
+  await route.fulfill({ status: 401, contentType: "application/json", body: '{"code":"unauthorized"}' });
+  await expect(commandLine(a, `send:${thread}`)).toContainText("the pairing was refused");
+  await a.waitForTimeout(1_000);
+  await expect(a.getByText(SPENT)).toHaveCount(0);
+  await expect(statusOf(a)).toHaveText("live");
+  await expect(composer(a)).toHaveValue("held with the old pairing");
+  await expect(sendButton(a)).toBeEnabled();
+  await a.reload();
+  await expect(statusOf(a)).toHaveText("live");
+  expect(auth.at(-1) === tokenB, "the replacement credential did not survive").toBe(true);
+  await a.unroute("**/api/commands/send");
+
+  // (a) A 401 for the current generation clears it, and the page asks for a fresh link.
+  await a.route("**/api/commands/send", (r) =>
+    r.fulfill({ status: 401, contentType: "application/json", body: '{"code":"unauthorized"}' }),
+  );
+  await a.locator(`li[data-thread="${thread}"] button`).first().click();
+  await composer(a).fill("refused");
+  await sendButton(a).click();
+  await expect(a.getByText(SPENT)).toBeVisible({ timeout: 15_000 });
+  await expect(b.getByText(SPENT)).toBeVisible({ timeout: 15_000 });
+});
+
+/** The page's events socket passed through; `drop()` closes it so the page opens a new one. */
+async function socketTap(page: Page): Promise<{ drop: () => void; opened: () => number }> {
+  let current: WebSocketRoute | null = null;
+  let n = 0;
+  await page.routeWebSocket(/\/api\/ws(\?|$)/, (ws) => {
+    const server = ws.connectToServer();
+    current = ws;
+    n += 1;
+    ws.onMessage((m) => server.send(m));
+    server.onMessage((m) => ws.send(m));
+  });
+  return {
+    drop: () => {
+      void current?.close();
+      current = null;
+    },
+    opened: () => n,
+  };
+}
+
+test("retry_session", async ({ daemon, page }) => {
+  test.setTimeout(150_000);
+  const thread = await openGate(daemon);
+  const tap = await socketTap(page);
+  const held = await hold(page, "/api/commands/send");
+  await openThread(page, daemon, thread);
+  const posts = commandPosts(page, "send");
+  const line = commandLine(page, `send:${thread}`);
+  const reopen = async () => {
+    const before = tap.opened();
+    tap.drop();
+    await expect.poll(() => tap.opened(), { timeout: 20_000 }).toBeGreaterThan(before);
+    await expect(statusOf(page)).toHaveText("live", { timeout: 20_000 });
+  };
+
+  // (a) Not done (408), then a reopen: Retry goes, the slot is released.
+  await composer(page).fill("a: not done");
+  await sendButton(page).click();
+  await (await held.next()).fulfill({ status: 408, contentType: "application/json", body: '{"code":"request_timeout"}' });
+  await expect(line.getByRole("button", { name: "Retry" })).toBeVisible();
+  await reopen();
+  await expect(line.getByRole("button", { name: "Retry" })).toHaveCount(0);
+  await expect(line).toHaveAttribute("data-phase", "released");
+  await expect(sendButton(page)).toBeEnabled();
+  expect(posts).toHaveLength(1);
+
+  // (b) In flight across a reopen, then the reply is lost: check the thread, no Retry.
+  await composer(page).fill("b: lost");
+  await sendButton(page).click();
+  const b = await held.next();
+  await reopen();
+  await b.abort();
+  await expect(line).toHaveAttribute("data-phase", "check_thread");
+  await expect(line.getByRole("button", { name: "Retry" })).toHaveCount(0);
+  expect(posts).toHaveLength(2);
+  await line.getByRole("button", { name: "Forget" }).click();
+
+  // (c) A `queued` reply held across a reopen: a newer Send waits for the slot (single
+  // flight); the late reply shows its result and does not clear the untouched draft.
+  await composer(page).fill("c: late queued");
+  await sendButton(page).click();
+  const c = await held.next();
+  const res = await c.fetch();
+  await reopen();
+  await expect(sendButton(page)).toBeDisabled();
+  await composer(page).press("Control+Enter");
+  await page.waitForTimeout(300);
+  expect(posts).toHaveLength(3);
+  await c.fulfill({ response: res });
+  await expect(line).toHaveAttribute("data-phase", "settled");
+  await expect(line).toContainText("queued");
+  await expect(composer(page)).toHaveValue("c: late queued");
+  await expect(sendButton(page)).toBeEnabled();
+});

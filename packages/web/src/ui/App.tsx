@@ -38,7 +38,7 @@ export function App(props: { runner: Runner; commands: CommandRunner }) {
         <StatusBar state={state} />
         {host?.copy?.kind === "host" && (
           <span className="text-sm" data-raw-unknown="host">
-            host raw unknown events: {host.copy.rawUnknown}
+            host raw_unknown count: {host.copy.rawUnknown}
           </span>
         )}
       </header>

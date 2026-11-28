@@ -61,11 +61,36 @@ test("request_policy", async ({ daemon, page }) => {
   page.on("requestfailed", (r) => record(r, true, Promise.resolve(r.headers())));
   const sockets: string[] = [];
   page.on("websocket", (ws) => sockets.push(ws.url()));
+  /** The purpose of every ticket POST. */
+  const tickets: unknown[] = [];
+  page.on("request", (r) => {
+    if (new URL(r.url()).pathname === "/api/ws-ticket") tickets.push((r.postDataJSON() as { purpose?: unknown }).purpose);
+  });
 
   await openLink(page, await daemon.pairUrl());
   await page.locator(`li[data-thread="${thread}"] button`).first().click();
   await expect(page.locator("main ol").getByText("policy check").first()).toBeVisible();
   await expect(statusOf(page)).toHaveText("live");
+  // A real command (W2-12).
+  await page.getByLabel("Message", { exact: true }).fill("a policy send");
+  await page.getByRole("form", { name: "Composer" }).getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.locator(`[data-slot="send:${thread}"]`)).toHaveAttribute("data-phase", "settled");
+  await expect.poll(() => sent.some((r) => new URL(r.url).pathname === "/api/commands/send")).toBe(true);
+
+  // Every mutation is one the page is allowed; nothing reads the screen, attaches, or writes keys.
+  const MUTATIONS = new Set([
+    "/api/pair",
+    "/api/ws-ticket",
+    ...["send", "ready", "input_resolve", "input_cancel", "spawn", "stop", "resume"].map((c) => `/api/commands/${c}`),
+  ]);
+  for (const r of sent) {
+    const path = new URL(r.url).pathname;
+    expect(path.endsWith("/screen") || path.startsWith("/api/attach") || path === "/api/commands/key", path).toBe(false);
+    if (r.method !== "GET") expect(MUTATIONS.has(path), `${r.method} ${path}`).toBe(true);
+    if (r.method === "GET" && path.startsWith("/api/")) expect(path, `GET ${path}`).toBe("/api/events");
+  }
+  expect(tickets.length).toBeGreaterThan(0);
+  expect(tickets.every((t) => t === "events"), "a ticket of another purpose").toBe(true);
 
   const tokens = new Set<string>();
   let posts = 0;
