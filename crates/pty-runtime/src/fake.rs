@@ -412,10 +412,12 @@ struct FakeControl(Arc<Proc>);
 
 impl PtyControl for FakeControl {
     fn resize(&self, size: PtySize) -> io::Result<()> {
-        assert!(
-            !self.0.panic_resize.swap(false, Ordering::AcqRel),
-            "injected resize panic"
-        );
+        if self.0.panic_resize.swap(false, Ordering::AcqRel) {
+            // Unwinds without the panic hook: std's default one prints a backtrace under a
+            // process-wide lock, and a caller's answer waits for the unwind, so it would wait
+            // for as long as the hook takes.
+            std::panic::resume_unwind(Box::new("injected resize panic"));
+        }
         {
             let p = &self.0;
             let mut h = lock(&p.resize_hold);
@@ -774,7 +776,7 @@ impl FakeChild {
         self.proc.fail_resize.store(true, Ordering::Release);
     }
 
-    /// The next backend `resize` panics at its entry.
+    /// The next backend `resize` panics at its entry, unwinding without the panic hook.
     pub fn panic_on_next_resize(&self) {
         self.proc.panic_resize.store(true, Ordering::Release);
     }
@@ -1841,6 +1843,33 @@ mod tests {
         let r = child.kill_tree(&[], soon(), Instant::now() + Duration::from_millis(20));
         assert_eq!((r.tree_dead, r.attempt), (false, KillAttempt::Signalled));
         assert_eq!(signals(&c), 1);
+    }
+
+    /// The injected resize panic unwinds without running the panic hook, so a caller that
+    /// answers after the unwind never waits for the hook; the next resize succeeds.
+    #[test]
+    fn resize_panic_skips_the_hook() {
+        use std::cell::Cell;
+        thread_local! {
+            static HOOK_RAN: Cell<bool> = const { Cell::new(false) };
+        }
+        static WRAP: std::sync::Once = std::sync::Once::new();
+        WRAP.call_once(|| {
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                HOOK_RAN.with(|r| r.set(true));
+                prev(info);
+            }));
+        });
+        let (_child, c, parts) = spawn(FakeScript::default());
+        c.panic_on_next_resize();
+        let size = PtySize::new(90, 20).unwrap();
+        let unwound =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parts.control.resize(size)))
+                .is_err();
+        assert!(unwound);
+        assert!(!HOOK_RAN.with(Cell::get));
+        parts.control.resize(size).unwrap();
     }
 
     #[test]
