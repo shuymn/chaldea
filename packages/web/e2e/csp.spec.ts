@@ -4,7 +4,7 @@
 
 import type { Page } from "@playwright/test";
 
-import { caughtUpWith, expect, openLink, selectThread, statusOf, test } from "./harness";
+import { caughtUpWith, expect, inputsOf, openLink, selectThread, statusOf, test } from "./harness";
 
 declare global {
   interface Window {
@@ -26,6 +26,7 @@ async function recordViolations(page: Page): Promise<void> {
 const violations = (page: Page) => page.evaluate(() => window.__violations ?? null);
 
 test("csp_clean", async ({ daemon, page }) => {
+  test.setTimeout(120_000);
   await recordViolations(page);
   const { thread } = await daemon.spawnThread({ prompt: "CSP の確認 🎌" });
   await openLink(page, await daemon.pairUrl());
@@ -39,15 +40,18 @@ test("csp_clean", async ({ daemon, page }) => {
   await daemon.chaldea(["send", thread, "live over the socket"]);
   await expect(timeline.getByText("live over the socket").first()).toBeVisible();
   await expect(page.getByText("unknown event")).toHaveCount(0);
-  // The spawn prompt's writes end with the running turn (the echo CLI never ends it, so the
-  // CLI's input stays queued); then the page holds them and the composer is ready.
+  // The spawn prompt's writes end with its last state, `acked`, or `unconfirmed` past the
+  // 30 s ack window when its hook came before the write completed; the echo CLI never ends
+  // the turn, so the CLI's input stays queued. Then the page holds them and the composer is ready.
   await caughtUpWith(
     page,
     daemon,
     thread,
-    (xs) =>
-      xs.filter((e) => e.kind === "input_created").length === 2 &&
-      xs.some((e) => e.kind === "status_changed" && e.payload.field === "turn_state" && e.payload.to === "running"),
+    (xs) => {
+      const [spawned, sent] = inputsOf(xs);
+      return ["acked", "unconfirmed"].includes(spawned?.state ?? "") && sent?.state === "queued";
+    },
+    45_000,
   );
   // The composer, a command, and a native dialog under the same CSP (W2-12).
   await page.getByLabel("Message", { exact: true }).fill("CSP の送信 🎌");

@@ -6,7 +6,18 @@ import { join } from "node:path";
 
 import type { BrowserContext, Page, Request, Route } from "@playwright/test";
 
-import { caughtUpWith, type Daemon, expect, hasFragment, openLink, selectThread, statusOf, test } from "./harness";
+import {
+  caughtUpWith,
+  type Daemon,
+  expect,
+  hasFragment,
+  inputsOf,
+  linesHooked,
+  openLink,
+  selectThread,
+  statusOf,
+  test,
+} from "./harness";
 
 const SPENT = "This link is spent or expired";
 
@@ -108,11 +119,10 @@ test("request_policy", async ({ daemon, page }) => {
   });
   // input_resolve on an unconfirmed input (two lines, `sent`, then a stop).
   await sendText("line one\nline two");
-  const sentOne = await daemon.waitInputs(thread, (is) => is[2]?.state === "sent", 25_000);
+  const sentOne = inputsOf(await daemon.waitEvents(thread, linesHooked(2), 25_000))[2]!;
   await daemon.chaldea(["stop", thread]);
-  await daemon.waitInputs(thread, (is) => is[2]?.state === "unconfirmed");
-  await caughtUpWith(page, daemon, thread);
-  await row(sentOne[2]!.input_id).getByRole("button", { name: "Dismiss" }).click();
+  await caughtUpWith(page, daemon, thread, (es) => inputsOf(es)[2]?.state === "unconfirmed");
+  await row(sentOne.id).getByRole("button", { name: "Dismiss" }).click();
   await daemon.waitInputs(thread, (is) => is[2]?.state === "dismissed");
   // spawn from the form.
   await page.getByLabel("Working directory (absolute path)").fill(join(daemon.root));
