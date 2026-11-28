@@ -82,7 +82,7 @@ export class CommandRunner {
     this.follow();
     const s = this.sync.getState();
     const c = this.state.slots[slot];
-    this.dispatch({ type: "retry", slot, attempt, name, allowed: allowed(s), why: refusal(s, name, c?.thread ?? null) });
+    this.dispatch({ type: "retry", slot, attempt, name, allowed: allowed(s), why: refusal(s, name, c?.thread ?? null, true) });
   }
 
   dispatch(input: CmdInput): void {

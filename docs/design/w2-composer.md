@@ -40,7 +40,7 @@ Sizing: `field-sizing: content`, `font-size: max(1rem, 1em)`, 48 px coarse targe
 
 Unconfirmed death shows *the hint* instead of Resume: review with `chaldea stop <thread> --assume-dead`, confirm with `--launch <id>` (mvp:216; a refused resume raises `resume_blocked`, supervisor.md:122). Ready and Stop confirm in a `showModal()` dialog (`accessibility` §12) pinning the launch; a launch change closes it. Ready's dialog states the assertion: the pinned CLI's normal composer is open and empty, no popup or search; queued prompts may proceed.
 
-**Dispatch** needs `live`; send, ready, and input commands also need a *current* copy (W1's `syncedCheck` per stream; equal non-null socket and copy epochs); Stop and Resume use the latest valid copy and the pinned launch. Each slot (spawn; per thread: send, stop or resume, ready; per input) holds one in-flight or unknown command, reserved synchronously before dispatch; a not-done command frees its slot; its Retry needs the displayed attempt and an eligible frozen target, and reserves the slot again. `command_id` is `crypto.randomUUID()`, frozen with the body bytes and credential generation. **Nothing retries automatically.**
+**Dispatch** needs `live`; send, ready, and input commands also need a *current* copy (W1's `syncedCheck` per stream; equal non-null socket and copy epochs); Stop and Resume use the latest valid copy and the pinned launch. Each slot (spawn; per thread: send, stop or resume, ready; per input) holds one in-flight or unknown command, reserved synchronously before dispatch; a not-done command frees its slot; its Retry needs the displayed attempt, an eligible frozen target, and a current copy (Stop and Resume too), and reserves the slot again. `command_id` is `crypto.randomUUID()`, frozen with the body bytes and credential generation. **Nothing retries automatically.**
 
 | Reply (http-surface:563-610) | Means | Controls |
 |---|---|---|
@@ -51,7 +51,7 @@ Unconfirmed death shows *the hint* instead of Resume: review with `chaldea stop 
 | 408; 503 `busy`, `shutting_down`, `disk_full`, `store_failed` | not done | Retry, Forget |
 | 401 | not done; W1's compare-and-delete with the frozen generation | — |
 
-Ambiguous outcomes are never retried: the browser cannot prove a retry reaches the receipts that saw the attempt (http-surface:616). Retry, after `retry_after`, exists only for not-done attempts within their socket session (no reopen, `hello`, epoch or generation change since). Only a 2xx or settled reply settles; a late reply (its context changed) updates only its own result, never drafts, selection, or newer slots. An unresolved command shows its state (a Send, its frozen text); nothing infers which command took effect. Forgetting an unknown command keeps the draft and warns that resending is new. W1's status region announces outcomes and refusals.
+Ambiguous outcomes are never retried: a retry may miss the receipts that saw the attempt (http-surface:616). Retry, after `retry_after`, exists only for not-done attempts within their socket session (no reopen, `hello`, epoch or generation change since). Only a 2xx or settled reply settles; a late reply (its context changed) updates only its own result, never drafts, selection, or newer slots. An unresolved command shows its state (a Send, its frozen text); nothing infers which command took effect. Forgetting an unknown command keeps the draft and warns that resending is new. W1's status region announces outcomes and refusals.
 
 ### 2.3 Thread Copy Additions
 
@@ -114,8 +114,8 @@ No resend (mvp:185); replies never change streamed state.
 
 ## 5. Risks
 
-- **Double send**: slots and frozen ids; Forget then Send, or reload, is a deliberate input.
+- **Double send**: slots and frozen ids; Forget then Send, or reload, is deliberate.
 - **Lost Japanese text**: drafts survive failures and late replies, not reloads (mvp:220).
 - **IME gaps**: CI synthesizes compositions; real IMEs are W2-1; Android, Phase 2.
-- **Token scope**: the owner token permits keys and attach (mvp:257); the page uses neither.
+- **Token scope**: the owner token permits keys and attach (mvp:257), unused here.
 - **Ready misuse**: the prompt is attributed or `unconfirmed`, not resent (mvp:172).

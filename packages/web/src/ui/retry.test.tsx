@@ -6,7 +6,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test } from "vitest";
 
-import { canRetry, context, slots, threadLabel } from "../commands/controls";
+import { canRetry, context, refusal, slots, threadLabel } from "../commands/controls";
 import {
   type CmdAction,
   type CmdEffect,
@@ -56,7 +56,7 @@ function harness(sim: Sim) {
         generation: "gen-1",
       }),
     retry: (slot: string, attempt: number, name: never, allowed: (x: typeof sim.state) => boolean) =>
-      run({ type: "retry", slot, attempt, name, allowed: allowed(sim.state) }),
+      run({ type: "retry", slot, attempt, name, allowed: allowed(sim.state), why: refusal(sim.state, name, s.slots[slot]?.thread ?? null, true) }),
   } as unknown as CommandRunner;
   /** Answers the latest POST with 503 `busy`. */
   const busy = () => {
@@ -195,6 +195,31 @@ describe("slots and Retry", () => {
     render(<CommandLine state={sim.state} cmds={h.state()} slot={slots.send(T)} ops={h.ops} showText />);
     expect(h.state().slots[slots.send(T)]?.phase).toBe("not_done");
     expect(document.querySelector("[data-frozen-text]")?.textContent).toBe("Retry sends: earlier prompt");
+  });
+
+  test("a Stop or Resume Retry refused during catch-up says it waits for the thread", () => {
+    for (const kind of ["stop", "resume"] as const) {
+      const sim = running();
+      if (kind === "resume") {
+        sim.server.status(T, "process", "exited");
+        sim.server.launchExited(T, "stopped", true);
+        sim.quiesce();
+      }
+      const h = harness(sim);
+      if (kind === "stop") h.ops.stop(T, L1);
+      else h.ops.resume(T, L1);
+      h.busy();
+      // The copy falls behind an announced head: not current, same target.
+      sim.server.message(T, 3);
+      sim.refresh();
+      for (const id of [...sim.conns.keys()]) while (sim.socketStep(id));
+      while (sim.deliverFrame());
+      h.ops.retry(slots.launch(T), attemptOf(h, slots.launch(T)), kind);
+      expect(h.posts, kind).toHaveLength(1);
+      expect(h.state().notice?.text, kind).toMatch(
+        new RegExp(`Retry ${kind === "stop" ? "Stop" : "Resume"}: not sent — waiting for the thread to catch up\\.$`),
+      );
+    }
   });
 
   test("Retry with the slot taken by a newer command is refused with a notice", () => {
