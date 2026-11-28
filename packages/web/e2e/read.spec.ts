@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import type { Page } from "@playwright/test";
 
-import { expect, openLink, shownSeqs, statusOf, test, untilShown } from "./harness";
+import { caughtUpWith, exitUnconfirmed, expect, linesHooked, openLink, selectThread, shownSeqs, statusOf, test, untilShown } from "./harness";
 
 test("generic_rows", async ({ daemon, page }) => {
   const { thread } = await daemon.spawnThread({ prompt: "typed neighbour" });
@@ -208,12 +208,14 @@ test("layout_390", async ({ daemon, page }) => {
   const { thread: busy } = await daemon.spawnThread({ cwd: join(daemon.root, `busy-${"w".repeat(120)}`) });
   await daemon.waitEvents(busy, (es) => es.some((e) => e.kind === "readiness_observed"));
   await daemon.chaldea(["send", busy, `first-line-${"v".repeat(200)}\nsecond line`]);
-  await daemon.waitInputs(busy, (is) => is[0]?.state === "sent", 25_000);
+  await daemon.waitEvents(busy, linesHooked(0), 25_000);
   await daemon.chaldea(["stop", busy]);
-  await daemon.waitInputs(busy, (is) => is[0]?.state === "unconfirmed");
+  await daemon.waitEvents(busy, exitUnconfirmed(0));
   const { launch_id: resumed } = (await daemon.chaldea(["resume", busy])) as { launch_id: string };
-  await daemon.waitEvents(busy, (es) => es.some((e) => e.kind === "readiness_observed" && e.launch_id === resumed));
-  await page.locator(`li[data-thread="${busy}"] button`).first().click();
+  await selectThread(page, busy);
+  await caughtUpWith(page, daemon, busy, (es) =>
+    es.some((e) => e.kind === "readiness_observed" && e.launch_id === resumed),
+  );
   await expect(page.getByRole("region", { name: "Attention" })).toBeVisible();
   await page.getByLabel("Message", { exact: true }).fill(`unbroken-draft-${"u".repeat(300)}`);
   const actions = page.getByRole("region", { name: "Thread actions" });
