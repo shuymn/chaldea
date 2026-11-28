@@ -13,6 +13,7 @@ use serde_json::json;
 use super::{Rig, json};
 use crate::lifecycle::ParticipantEnd;
 use crate::store::tests::support;
+use crate::store::tests::support::waits::bounded;
 use crate::supervisor::Pause;
 use crate::supervisor::components::shutdown;
 use crate::transcript::{BATCH_LINES, DROPPED_OFF_BLOCKING, FINAL_TRIES, Mode, read_probe};
@@ -251,7 +252,9 @@ fn polls(rig: &Rig) -> u32 {
 
 /// A budget too short for a wait and another try: the failing final read (a missing file)
 /// ends after its first try instead of waiting past the participant's end (three tries 100 ms
-/// apart would need about 200 ms).
+/// apart would need about 200 ms). The budget is on the stopped test clock, so however slowly
+/// the host runs it does not pass; a wait for a retry would never end on that clock, and the
+/// bound fails the test instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_final_retry_is_not_waited_past_the_budget() {
     let rig = rig().await;
@@ -268,8 +271,15 @@ async fn a_final_retry_is_not_waited_past_the_budget() {
         .await;
     rig.until("a poll ran", || polls(&rig) > 0).await;
     let before = polls(&rig);
+    // The tracker's last check reads real time against `end`: a minute's skew keeps that
+    // check from deciding the 180 ms budget.
+    rig.clock.skew(Duration::from_secs(60));
+    rig.clock.stop();
     let end = rig.sup.now() + Duration::from_millis(180);
-    assert_eq!(shutdown(rig.sup.clone(), end).await, ParticipantEnd::Clean);
+    let ended = bounded(Duration::from_secs(10), shutdown(rig.sup.clone(), end))
+        .await
+        .expect("the participant ends without a retry's wait");
+    assert_eq!(ended, ParticipantEnd::Clean);
     assert!(rig.sup.tailers.launches().is_empty());
     assert_eq!(polls(&rig) - before, 1);
     rig.srv.stop().await;
