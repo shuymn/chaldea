@@ -1173,7 +1173,12 @@ async fn events_limit_unchanged() {
     let live = rig.claude().await;
     let before = live.child.input().len();
     let mut ws = rig.srv.ws(&rig.owner).await;
-    ws.text(&"x".repeat(64 * 1024 + 1)).await;
+    // A valid `subscribe`, refused only for its size.
+    let host = chaldea_core::ids::StreamId::Host.to_string();
+    let mut over = json!({ "type": "subscribe", "stream_ids": [host] }).to_string();
+    over.push_str(&" ".repeat(64 * 1024 + 1 - over.len()));
+    // The server may close while the client is still sending; the outcome is read below.
+    let _ = ws.ws.send(WsMessage::Text(over.into())).await;
     let (code, frames) = ws.until_closed().await;
     assert!(matches!(code, Some(1009) | None), "{code:?}");
     assert!(frames.is_empty(), "{frames:?}");
