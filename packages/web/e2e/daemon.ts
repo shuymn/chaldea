@@ -36,6 +36,7 @@ export function freePort(): Promise<number> {
 }
 
 interface Envelope {
+  readonly stream_id: string;
   readonly seq: number;
   readonly kind: string;
   readonly launch_id: string | null;
@@ -183,8 +184,8 @@ export class Daemon {
   }
 
   /** The thread's events through the owner token (the test's own view of the daemon). */
-  events(thread: string): Promise<Envelope[]> {
-    return this.stream(`thread:${thread}`);
+  events(thread: string, end?: number): Promise<Envelope[]> {
+    return this.stream(`thread:${thread}`, end);
   }
 
   /**
@@ -245,31 +246,36 @@ export class Daemon {
     return new TextDecoder("utf-8", { fatal: true }).decode(await r.arrayBuffer());
   }
 
-  /** Every event of `stream` (`host` or `thread:<id>`) through the owner token. */
-  async stream(stream: string): Promise<Envelope[]> {
+  /** Every event of `stream` (`host` or `thread:<id>`) through the owner token, by `end`. */
+  async stream(stream: string, end = Date.now() + 20_000): Promise<Envelope[]> {
     const token = this.token();
     const out: Envelope[] = [];
     let after = 0;
     for (;;) {
+      const left = end - Date.now();
+      if (left <= 0) throw new Error(`GET /api/events: ${stream} not read in time (${out.length} events)`);
       const q = new URLSearchParams({ stream_id: stream, after_seq: String(after), limit: "1000" });
       const r = await fetch(`${this.origin}/api/events?${q}`, {
         headers: { Authorization: `Bearer ${token}` },
-        signal: AbortSignal.timeout(10_000),
+        signal: AbortSignal.timeout(Math.min(10_000, left)),
       });
       if (!r.ok) throw new Error(`GET /api/events: ${r.status}`);
-      const body = (await r.json()) as { mode: string; events?: Envelope[]; has_more?: boolean };
+      const body = (await r.json()) as { mode: string; stream_id?: string; events?: Envelope[]; has_more?: boolean };
       if (body.mode !== "replay" || !body.events) throw new Error(`GET /api/events: mode ${body.mode}`);
+      if (body.stream_id !== stream || body.events.some((e) => e.stream_id !== stream)) {
+        throw new Error(`GET /api/events: a replay of another stream than ${stream}`);
+      }
       out.push(...body.events);
       if (!body.has_more || body.events.length === 0) return out;
       after = body.events[body.events.length - 1]!.seq;
     }
   }
 
-  /** Polls the thread until `pred` holds over its events; returns them. */
-  async waitEvents(thread: string, pred: (es: Envelope[]) => boolean): Promise<Envelope[]> {
-    const end = Date.now() + 20_000;
+  /** Polls the thread until `pred` holds over its events, within `ms`; returns them. */
+  async waitEvents(thread: string, pred: (es: Envelope[]) => boolean, ms = 20_000): Promise<Envelope[]> {
+    const end = Date.now() + ms;
     for (;;) {
-      const es = await this.events(thread);
+      const es = await this.events(thread, end);
       if (pred(es)) return es;
       if (Date.now() > end) throw new Error(`events of the thread never matched (${es.length} events)`);
       await sleep(100);

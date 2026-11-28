@@ -14,12 +14,16 @@ import { join } from "node:path";
 import type { Page, Route } from "@playwright/test";
 
 import {
+  caughtUpWith,
   commandLine,
   commandPosts,
   composer,
   countSubmits,
   type Daemon,
+  exitUnconfirmed,
   expect,
+  inputsOf,
+  linesHooked,
   openGate,
   openLink,
   openThread,
@@ -119,10 +123,10 @@ test("gate_timeout_cancel", async ({ daemon, page }, info) => {
 /** An input that went `unconfirmed`: two lines (whose per-line hooks match no input), `sent`, then a CLI stop. */
 async function unconfirmed(daemon: Daemon, page: Page, thread: string): Promise<string> {
   await send(page, thread, "line one\nline two");
-  const [i] = await daemon.waitInputs(thread, (is) => is[0]?.state === "sent", 25_000);
+  const [i] = inputsOf(await daemon.waitEvents(thread, linesHooked(0), 25_000));
   await daemon.chaldea(["stop", thread]);
-  await daemon.waitInputs(thread, (is) => is[0]?.state === "unconfirmed");
-  return i!.input_id;
+  await caughtUpWith(page, daemon, thread, exitUnconfirmed(0));
+  return i!.id;
 }
 
 test("unconfirmed_resolve", async ({ daemon, page }) => {

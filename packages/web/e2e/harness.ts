@@ -61,30 +61,99 @@ export async function selectThread(page: Page, thread: string): Promise<void> {
 const READY_HINT = "Enter sends on a desktop pointer";
 
 /**
- * `thread` is the selected row, and its mounted composer shows the ready hint (the page is
- * live with a current copy of the thread, no lock hint), read in one check: the state a send,
- * ready, or input command needs at the gesture. A gesture made earlier is refused with a
- * notice, and typing into a just-mounted composer can be lost to WebKit's fill.
+ * `thread` is the selected row, its timeline's last row is at least `#<seq>`, and its mounted
+ * composer shows the ready hint (the page is live with a current copy of the thread, no lock
+ * hint), read in one check: the state a send, ready, or input command needs at the gesture.
+ * A gesture made earlier is refused with a notice, and typing into a just-mounted composer
+ * can be lost to WebKit's fill.
  */
-export async function caughtUp(page: Page, thread: string): Promise<void> {
+export async function caughtUp(page: Page, thread: string, seq = 0): Promise<void> {
   await expect
     .poll(
       () =>
         page.evaluate(
-          ({ thread, hint }) => {
+          ({ thread, seq, hint }) => {
             const row = document.querySelector(`li[data-thread="${thread}"] button`);
+            const seqs = document.querySelectorAll("main ol > li p:first-child > span:first-child");
+            const last = Number(seqs[seqs.length - 1]?.textContent?.replace(/^#/, "") ?? 0);
             const box = document.querySelector('form[aria-label="Composer"] textarea');
             // The textarea's own hint: the first element its `aria-describedby` names.
             const hintId = box?.getAttribute("aria-describedby")?.split(" ")[0] ?? "";
             const shown = hintId === "" ? "" : (document.getElementById(hintId)?.textContent ?? "");
-            return row?.getAttribute("aria-current") === "true" && shown.startsWith(hint);
+            return row?.getAttribute("aria-current") === "true" && last >= seq && shown.startsWith(hint);
           },
-          { thread, hint: READY_HINT },
+          { thread, seq, hint: READY_HINT },
         ),
-      { message: "the thread's composer never became ready" },
+      { timeout: 20_000, message: `the thread's composer never became ready through #${seq}` },
     )
     .toBe(true);
 }
+
+/**
+ * `caughtUp` after a change made outside the page (a CLI command, a daemon wait), through the
+ * daemon's last event of the thread: the ready hint alone can show while an announce of those
+ * events is still on its way, and one that lands between Playwright's check and the click
+ * disables the control under it. `settled`, when given, is the change's last write, waited
+ * for first; the guarantee is through the head sampled then.
+ */
+export async function caughtUpWith(
+  page: Page,
+  daemon: Daemon,
+  thread: string,
+  settled?: Parameters<Daemon["waitEvents"]>[1],
+  ms?: number,
+): Promise<void> {
+  const es = settled ? await daemon.waitEvents(thread, settled, ms) : await daemon.events(thread);
+  const head = es.at(-1)?.seq;
+  if (head === undefined) throw new Error("the thread has no events to catch up through");
+  await caughtUp(page, thread, head);
+}
+
+/** The thread's inputs from its events, in creation order: id, launch, seq created, latest state and reason. */
+export function inputsOf(es: Awaited<ReturnType<Daemon["events"]>>) {
+  type Input = { id: string; launch: string | null; seq: number; state: string; reason: string | null };
+  const out = new Map<string, Input>();
+  for (const e of es) {
+    const id = e.payload.input_id as string;
+    if (e.kind === "input_created") {
+      out.set(id, { id, launch: e.launch_id, seq: e.seq, state: e.payload.initial_state as string, reason: null });
+    } else if (e.kind === "input_state_changed" && out.has(id)) {
+      const reason = (e.payload.reason as { kind?: string } | undefined)?.kind ?? null;
+      out.set(id, { ...out.get(id)!, state: e.payload.to as string, reason });
+    }
+  }
+  return [...out.values()];
+}
+
+/**
+ * The thread's `n`th input is a two-line prompt that is `sent`, and FakeCli's two per-line
+ * prompt hooks of its launch (matching no input) are in: a stop now leaves neither in flight.
+ * Hook delivery is best effort, so a lost hook fails these fixtures with "never matched"
+ * rather than letting them pass.
+ */
+export const linesHooked =
+  (n: number) =>
+  (es: Awaited<ReturnType<Daemon["events"]>>): boolean => {
+    const i = inputsOf(es)[n];
+    const hooks = es.filter(
+      (e) => e.kind === "user_message" && e.payload.input_id === null && e.launch_id === i?.launch && e.seq > i.seq,
+    );
+    return i?.state === "sent" && hooks.length >= 2;
+  };
+
+/**
+ * The thread's `n`th input went `unconfirmed` by its launch's exit (not the ack window), and
+ * that launch exited because it was stopped (not on its own).
+ */
+export const exitUnconfirmed =
+  (n: number) =>
+  (es: Awaited<ReturnType<Daemon["events"]>>): boolean => {
+    const i = inputsOf(es)[n];
+    const stopped = es.some(
+      (e) => e.kind === "launch_exited" && e.payload.launch_id === i?.launch && e.payload.reason === "stopped",
+    );
+    return i?.state === "unconfirmed" && i.reason === "launch_exited" && stopped;
+  };
 
 /** Waits until the timeline's last row is at least `#<seq>`. */
 export async function shownAtLeast(page: Page, seq: number): Promise<void> {

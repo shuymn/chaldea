@@ -4,7 +4,7 @@
 
 import type { Page } from "@playwright/test";
 
-import { expect, openLink, statusOf, test } from "./harness";
+import { caughtUpWith, expect, inputsOf, openLink, selectThread, statusOf, test } from "./harness";
 
 declare global {
   interface Window {
@@ -26,19 +26,41 @@ async function recordViolations(page: Page): Promise<void> {
 const violations = (page: Page) => page.evaluate(() => window.__violations ?? null);
 
 test("csp_clean", async ({ daemon, page }) => {
+  // The spawn prompt's 35 s wait, then the catch-up and the command waits.
+  test.setTimeout(90_000);
   await recordViolations(page);
-  const { thread } = await daemon.spawnThread({ prompt: "CSP の確認 🎌" });
+  const prompt = "CSP の確認 🎌";
+  const { thread } = await daemon.spawnThread({ prompt });
   await openLink(page, await daemon.pairUrl());
-  await page.locator(`li[data-thread="${thread}"] button`).first().click();
+  await selectThread(page, thread);
   // Typed rows: the page decoded the events with the validators under this CSP.
   const timeline = page.locator("main ol");
   await expect(timeline.getByText("thread registered").or(timeline.getByText("launch reserved")).first()).toBeVisible();
-  await expect(timeline.getByText("CSP の確認 🎌").first()).toBeVisible();
+  await expect(timeline.getByText(prompt).first()).toBeVisible();
   await expect(statusOf(page)).toHaveText("live");
+  // Settled: once the prompt's hook has committed no later ack can come, and once the input is
+  // acked or unconfirmed (past the 30 s ack window) no `sent` or `unconfirmed` is pending.
+  await daemon.waitEvents(
+    thread,
+    (xs) => {
+      const spawned = inputsOf(xs)[0];
+      const hooked = xs.some(
+        (e) =>
+          e.kind === "user_message" &&
+          e.launch_id === spawned?.launch &&
+          (e.payload.prompt as { inline?: string } | undefined)?.inline === prompt,
+      );
+      return hooked && (spawned?.state === "acked" || spawned?.state === "unconfirmed");
+    },
+    35_000,
+  );
   // A live event over the socket.
   await daemon.chaldea(["send", thread, "live over the socket"]);
   await expect(timeline.getByText("live over the socket").first()).toBeVisible();
   await expect(page.getByText("unknown event")).toHaveCount(0);
+  // The echo CLI never ends the turn, so the CLI's input stays queued: then the page holds
+  // every write and the composer is ready.
+  await caughtUpWith(page, daemon, thread, (xs) => inputsOf(xs)[1]?.state === "queued");
   // The composer, a command, and a native dialog under the same CSP (W2-12).
   await page.getByLabel("Message", { exact: true }).fill("CSP の送信 🎌");
   await page.getByRole("form", { name: "Composer" }).getByRole("button", { name: "Send", exact: true }).click();
