@@ -163,6 +163,13 @@ class Step {
         return this.latest();
       case "retry":
         return this.retry();
+      case "commandUnauthorized":
+        // The current generation takes the read path's compare-and-delete. An older one's
+        // compare-and-delete leaves the newer credential alone, and its reread, bound to the
+        // older generation, adopts nothing.
+        if (a.generation === this.s.generation) this.unauthorized(a.generation);
+        else this.effects.push({ type: "clearCredential", generation: a.generation });
+        return;
     }
   }
 

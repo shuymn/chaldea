@@ -151,6 +151,11 @@ export class Runner {
     for (const l of this.listeners) l();
   }
 
+  /** The token of `generation` while it is the credential in use, else null. */
+  token(generation: string): string | null {
+    return this.tokenFor(generation);
+  }
+
   private tokenFor(generation: string): string | null {
     return this.cred?.generation === generation ? this.cred.token : null;
   }

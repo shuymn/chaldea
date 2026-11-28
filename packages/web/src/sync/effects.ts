@@ -48,6 +48,8 @@ export type Action = At &
     | { readonly type: "latest" }
     /** The user asked to retry what failed. */
     | { readonly type: "retry" }
+    /** A command attempt made with this generation got 401 (docs/design/w2-composer.md §2.2). */
+    | { readonly type: "commandUnauthorized"; readonly generation: string }
   );
 
 export type Effect =

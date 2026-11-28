@@ -28,7 +28,7 @@ export function eventsPath(req: Request): string {
   return `/api/events?${q.toString()}`;
 }
 
-function headers(token: string | null, json: boolean): Headers {
+export function headers(token: string | null, json: boolean): Headers {
   const h = new Headers();
   if (token !== null) h.set("Authorization", `Bearer ${token}`);
   if (json) h.set("Content-Type", "application/json");
@@ -36,7 +36,7 @@ function headers(token: string | null, json: boolean): Headers {
 }
 
 /** Reads the body as text, refusing more than `max` bytes before parsing. */
-async function readLimited(res: Response, max: number): Promise<string | null> {
+export async function readLimited(res: Response, max: number): Promise<string | null> {
   const declared = res.headers.get("Content-Length");
   if (declared !== null && Number(declared) > max) {
     await res.body?.cancel();
