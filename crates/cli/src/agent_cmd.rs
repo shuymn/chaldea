@@ -55,7 +55,7 @@ const UNCONFIRMED_RESTART: &str = "The previous process of this thread could not
 const UNCONFIRMED_STOPPED: &str =
     "The previous process of this thread could not be confirmed to have ended when it stopped.";
 /// The tail of the `death_unconfirmed` lines; `<thread>` is the thread's id.
-const UNCONFIRMED_TAIL: &str = "To review what was checked, run `chaldea stop <thread> --assume-dead`; once you have made sure its processes ended, confirm with `--launch <id>`. Its history is kept, and new threads can be started.";
+const UNCONFIRMED_TAIL: &str = "To review what was checked, run `chaldea stop <thread> --assume-dead`; once you have made sure its processes ended, confirm with `chaldea stop <thread> --assume-dead --launch <id>`. Its history is kept, and new threads can be started.";
 /// The line of a stop whose death was confirmed after its 5 s, counted from the attempt the
 /// daemon accepted.
 const CONFIRMED_LATE: &str = "The process ended, but its end was not confirmed within 5 s of the stop request the daemon accepted.";

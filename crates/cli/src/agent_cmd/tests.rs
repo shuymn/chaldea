@@ -512,7 +512,7 @@ const RESTART: &str = "The previous process of this thread could not be confirme
 const STOPPED: &str =
     "The previous process of this thread could not be confirmed to have ended when it stopped.";
 /// The tail, with `T` for the thread.
-const TAIL: &str = "To review what was checked, run `chaldea stop 00000000-0000-0000-0000-000000000007 --assume-dead`; once you have made sure its processes ended, confirm with `--launch <id>`. Its history is kept, and new threads can be started.";
+const TAIL: &str = "To review what was checked, run `chaldea stop 00000000-0000-0000-0000-000000000007 --assume-dead`; once you have made sure its processes ended, confirm with `chaldea stop 00000000-0000-0000-0000-000000000007 --assume-dead --launch <id>`. Its history is kept, and new threads can be started.";
 
 /// PR10a1-CL-37: `death_unconfirmed` prints the reason's line only when the read after the
 /// refusal shows the pinned launch exited unconfirmed; otherwise, and for `stop`, the general
@@ -797,7 +797,7 @@ fn unconfirmed_text() {
     assert_eq!(
         err.lines().last().unwrap(),
         format!(
-            "chaldea: To review what was checked, run `chaldea stop {T} --assume-dead`; once you have made sure its processes ended, confirm with `--launch <id>`. Its history is kept, and new threads can be started."
+            "chaldea: To review what was checked, run `chaldea stop {T} --assume-dead`; once you have made sure its processes ended, confirm with `chaldea stop {T} --assume-dead --launch <id>`. Its history is kept, and new threads can be started."
         )
     );
 }
