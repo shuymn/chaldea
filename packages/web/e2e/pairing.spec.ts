@@ -63,7 +63,10 @@ test("request_policy", async ({ daemon, page }) => {
   page.on("websocket", (ws) => sockets.push(ws.url()));
   /** The purpose of every ticket POST. */
   const tickets: unknown[] = [];
+  /** Every request as it starts, so one still pending when the test ends is checked too. */
+  const started: { method: string; url: string }[] = [];
   page.on("request", (r) => {
+    started.push({ method: r.method(), url: r.url() });
     if (new URL(r.url()).pathname === "/api/ws-ticket") tickets.push((r.postDataJSON() as { purpose?: unknown }).purpose);
   });
 
@@ -123,8 +126,12 @@ test("request_policy", async ({ daemon, page }) => {
     "/api/ws-ticket",
     ...["send", "ready", "input_resolve", "input_cancel", "spawn", "stop", "resume"].map((c) => `/api/commands/${c}`),
   ]);
-  for (const r of sent) {
-    const path = new URL(r.url).pathname;
+  // Checked on every request as it started, finished or not.
+  expect(started.length).toBeGreaterThanOrEqual(sent.length);
+  for (const r of started) {
+    const u = new URL(r.url);
+    expect(u.origin, `a request left the page's origin (${u.pathname})`).toBe(daemon.origin);
+    const path = u.pathname;
     expect(path.endsWith("/screen") || path.startsWith("/api/attach") || path === "/api/commands/key", path).toBe(false);
     if (r.method !== "GET") expect(MUTATIONS.has(path), `${r.method} ${path}`).toBe(true);
     if (r.method === "GET" && path.startsWith("/api/")) expect(path, `GET ${path}`).toBe("/api/events");

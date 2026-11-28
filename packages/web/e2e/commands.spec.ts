@@ -210,6 +210,9 @@ test("double_submit", async ({ daemon, page }) => {
   await expect(commandLine(page, `send:${thread}`)).toHaveAttribute("data-phase", "settled");
   expect(sends).toHaveLength(1);
   expect(await daemon.inputs(thread)).toHaveLength(1);
+  // The thread's stream settles (the input acked) before the Retry part needs a current copy.
+  const [once] = await daemon.waitInputs(thread, (is) => is[0]?.state === "acked");
+  await expect(inputRow(page, once!.input_id)).toHaveAttribute("data-state", "acked");
 
   const cwd = mkdtempSync(join(daemon.root, "cwd-form-"));
   await page.getByLabel("Working directory (absolute path)").fill(cwd);
@@ -231,7 +234,10 @@ test("double_submit", async ({ daemon, page }) => {
     }
   });
   await composer(page).fill("retry once");
+  await expect(sendButton(page)).toBeEnabled();
+  await expect(page.getByText("Commands wait until")).toHaveCount(0);
   await sendButton(page).click();
+  await expect(commandLine(page, `send:${thread}`)).toHaveAttribute("data-phase", "not_done");
   const retry = commandLine(page, `send:${thread}`).getByRole("button", { name: "Retry" });
   await expect(retry).toBeVisible({ timeout: 5_000 });
   await retry.dblclick();
