@@ -87,7 +87,7 @@ impl Script {
         Arc::new(move |ids, _deadline| {
             s.calls.lock().unwrap().push(ids.to_vec());
             if s.panic.swap(false, Ordering::SeqCst) {
-                panic!("an injected kill_recorded panic");
+                chaldea_pty_runtime::fake::inject_panic("an injected kill_recorded panic");
             }
             if s.parking.load(Ordering::SeqCst) {
                 s.park.enter();

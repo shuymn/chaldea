@@ -415,7 +415,7 @@ mod tests {
         };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _spawned = fake.spawn(&spec, super::DrainSink::test(|_| {})).unwrap();
-            panic!("a fault while the spawn is unconsumed");
+            crate::fake::inject_panic("injected fault while the spawn is unconsumed");
         }));
         assert!(r.is_err());
         let child = fake.take_child().unwrap();

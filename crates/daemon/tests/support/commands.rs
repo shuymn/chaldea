@@ -438,7 +438,9 @@ impl CommandEffect for SlowEffect {
             let http_status = match run.tag.as_str() {
                 "effect_408" => 408,
                 "effect_42" => 42,
-                "effect_panic" => panic!("test_slow_effect panics in its effect"),
+                "effect_panic" => chaldea_pty_runtime::fake::inject_panic(
+                    "injected panic in test_slow_effect's effect",
+                ),
                 _ => 200,
             };
             EffectOutcome::Done(CommandResult {
@@ -519,11 +521,9 @@ impl CommandHandler for Refuse {
                     tx.append(vec![e])?;
                     Ok(Intent::Pending(EffectRun::new(())))
                 }
-                // Unwinds without the panic hook, which would delay the job's reply by as
-                // long as it takes (std's default hook prints a backtrace under a lock).
-                How::Panic => {
-                    std::panic::resume_unwind(Box::new("test_refuse panics in its intent"))
-                }
+                How::Panic => chaldea_pty_runtime::fake::inject_panic(
+                    "injected panic in test_refuse's intent",
+                ),
             }),
         })
     }

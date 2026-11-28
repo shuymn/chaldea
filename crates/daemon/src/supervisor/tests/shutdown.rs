@@ -186,9 +186,18 @@ async fn release_rule() {
             ParticipantEnd::Clean,
         ),
     ] {
+        // A short bound only where the case waits it out on purpose: the kill budget for
+        // the ignored kill, the join for the held waiter and the ignored kill's live child.
+        // Every other step keeps the normal bounds, so a slow host does not change the case.
+        let short_kill = name == "tree_dead false";
+        let short_join = matches!(name, "pty-wait abandoned" | "tree_dead false");
         let rig = Rig::with(chaldea_core::adapter::HostOs::Macos, |c| {
-            c.kill_budget = Duration::from_millis(300);
-            c.close_bounds.join = Duration::from_millis(300);
+            if short_kill {
+                c.kill_budget = Duration::from_millis(300);
+            }
+            if short_join {
+                c.close_bounds.join = Duration::from_millis(300);
+            }
         })
         .await;
         rig.clock.resume();
@@ -197,6 +206,7 @@ async fn release_rule() {
         let r = rig.cmd("stop", &json!({ "thread_id": t })).await;
         assert_eq!(r.status, 200, "{name}");
         assert_eq!(rig.launch(l).death_confirmed, confirmed, "{name}");
+        // The panic case does not prove that the kill reached its injected panic.
         assert_eq!(graceful(&rig).await, want, "{name}");
         rig.srv.stop().await;
     }

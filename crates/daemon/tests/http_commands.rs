@@ -16,7 +16,8 @@ use chaldea_daemon::http::Mounts;
 use chaldea_daemon::store::TokenSelector;
 use support::commands::{completed_body, slow_body};
 use support::http::{
-    Reply, TestServer, eventually, host_events_of, reached, reached_sync, settled, spawn_send,
+    DEADLINE, Reply, TestServer, eventually, host_events_of, reached, reached_sync, settled,
+    spawn_send,
 };
 use support::waits;
 use support::{event, registered_under, reserved, soon, started};
@@ -224,7 +225,7 @@ async fn in_progress_while_effect_runs() {
 /// completes and a retry replays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn effect_holds_receipt_in_progress() {
-    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let (srv, probe) = TestServer::with_commands(|c| c.short_deadline = DEADLINE).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let req = srv.command("test_slow_effect", &owner, cid(1), r#"{"tag":"slow"}"#);
     let (effect_reached, release) = probe.hold_effect();
@@ -569,7 +570,7 @@ async fn revoked_during_effect() {
 /// replays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_successful_intent() {
-    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let (srv, probe) = TestServer::with_commands(|c| c.short_deadline = DEADLINE).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let req = srv.command("test_slow_effect", &owner, cid(1), r#"{"tag":"late"}"#);
     let (intent_reached, release) = probe.hold_intent();
@@ -597,7 +598,7 @@ async fn late_successful_intent() {
 /// `outcome_unknown`, never 408; the intent job then expires, leaving no receipt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn writer_held_is_outcome_unknown() {
-    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let (srv, probe) = TestServer::with_commands(|c| c.short_deadline = DEADLINE).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let writer = srv.hold_writer().await;
     let r = srv

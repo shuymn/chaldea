@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use chaldea_core::adapter::ReadinessMode;
+use chaldea_core::adapter::{HostOs, ReadinessMode};
 use chaldea_core::ids::{Agent, InputId};
 use chaldea_core::input::InputState;
 use chaldea_core::state::TurnState;
@@ -199,8 +199,19 @@ async fn settle_later_hooks() {
     assert_eq!(count(&rig, &live, "stop_settled"), 0);
     rig.stop().await;
 
-    // A later hook held before its job: the fence is unfinished, then its mark ends it.
-    let (rig, live) = settle_rig().await;
+    // A later hook held before its job: the fence is unfinished, then its mark ends it. The
+    // short budget (2 s) passes within the `SETTLE` the clock moves.
+    let (rig, live) = settle_on(
+        SRig::on_http(
+            HostOs::Macos,
+            |_| {},
+            |h| {
+                h.short_deadline = crate::store::tests::support::http::DEADLINE;
+            },
+        )
+        .await,
+    )
+    .await;
     turn(&rig, &live, "p").await;
     let (got, release) = rig.ingest.points.arm_job(rig.next_ordinal(&live));
     let h = rig.hook_of(&live, "Notification", &json!({}));
@@ -651,7 +662,13 @@ impl crate::supervisor::send::HookDecoder for HoldStop {
 async fn stop_after_outcome_unknown() {
     let hold = Arc::new(HoldStop(std::sync::Mutex::new(None)));
     let h2 = hold.clone();
-    let rig = SRig::with(move |c| c.decoders = crate::supervisor::send::Decoders::all(h2)).await;
+    // The short budget (2 s): the clock moves past its reply cutoff below.
+    let rig = SRig::on_http(
+        HostOs::Macos,
+        move |c| c.decoders = crate::supervisor::send::Decoders::all(h2),
+        |h| h.short_deadline = crate::store::tests::support::http::DEADLINE,
+    )
+    .await;
     let live = rig.bound(Agent::Codex).await;
     rig.clock.stop();
     rig.hook(&live, "UserPromptSubmit", &json!({ "prompt": "p" }))

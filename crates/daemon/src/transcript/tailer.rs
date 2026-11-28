@@ -62,6 +62,9 @@ pub(crate) struct Tailers {
     /// Polls that ran (tests).
     #[cfg(test)]
     pub(crate) polls: std::sync::atomic::AtomicU32,
+    /// Polls whose blocking task found `Hold` and read nothing (tests).
+    #[cfg(test)]
+    pub(crate) skipped: std::sync::atomic::AtomicU32,
     /// Store reads that borrowed a reader (tests).
     #[cfg(test)]
     pub(crate) reads: std::sync::atomic::AtomicU32,
@@ -83,6 +86,8 @@ impl Default for Tailers {
             read_faults: Mutex::default(),
             #[cfg(test)]
             polls: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            skipped: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             reads: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
@@ -433,6 +438,11 @@ async fn run(sup: Arc<Supervisor>, thread: ThreadId, launch: LaunchId) {
         let Some((t, step)) = blocking(&sup, move || {
             // A poll that would start once admission is closed waits for the final read.
             if *at_start.borrow() == Mode::Hold {
+                #[cfg(test)]
+                be.sup
+                    .tailers
+                    .skipped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return (t, None);
             }
             #[cfg(test)]

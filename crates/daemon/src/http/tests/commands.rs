@@ -671,17 +671,16 @@ async fn last_admitted_attempt_is_awaited() {
 }
 
 /// A command's own budget (`test_long_deadline`: 30 s) governs its request, not the server's
-/// short deadline (2 s), measured from the connection's first head byte: the first byte is
+/// short deadline (set to [`DEADLINE`], 2 s), measured from the connection's first head byte: the first byte is
 /// read, the server's clock moves 20 s on, and the rest of the head and all but the last
 /// body byte follow. The body completed then runs the command; with the clock moved 31 s
 /// on first, it is 408 with nothing submitted and no receipt (measured from the head's
 /// end, it would have run).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn command_budget_is_its_own() {
-    let (srv, _probe) = TestServer::with_commands(|_| {}).await;
+    let (srv, _probe) = TestServer::with_commands(|c| c.short_deadline = DEADLINE).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let s = shared(&srv);
-    assert_eq!(s.cfg.short_deadline, Duration::from_secs(2));
     for (n, skew, want) in [
         (1, 20, (200, None)),
         (2, 31, (408, code("request_timeout"))),
@@ -725,7 +724,7 @@ async fn command_budget_is_its_own() {
 /// and no receipt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incomplete_command_body_is_408() {
-    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let (srv, probe) = TestServer::with_commands(|c| c.short_deadline = DEADLINE).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let s = shared(&srv);
     let bytes = srv
@@ -786,7 +785,7 @@ async fn completion_failure_is_fatal() {
 /// runner still reports `CommitUnknown`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_commit_unknown_reaches_the_sink() {
-    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let (srv, probe) = TestServer::with_commands(|c| c.short_deadline = DEADLINE).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let (intent_reached, intent_release) = probe.hold_intent();
     *srv.store.store().faults().commit.lock().unwrap() = Some(CommitFault::IoErrAfterCommit);
@@ -935,7 +934,7 @@ fn mvp_plus_refuses_a_repeated_name() {
 /// gets 409 `in_progress` at its reply time with the receipt still `in_progress`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stored_result_follows_its_completion() {
-    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let (srv, probe) = TestServer::with_commands(|c| c.short_deadline = DEADLINE).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let s = shared(&srv);
     let req = srv.command("test_slow_effect", &owner, cid(1), r#"{"tag":"c"}"#);
@@ -1226,30 +1225,28 @@ async fn revoking_commit_unknown_is_fatal() {
 /// How an effect ends decides the reply and the report: `Unrecorded` answers 503
 /// `outcome_unknown` at once with no completion attempt and reports `ReceiptUncompleted`;
 /// after the request's reply time it reports once the effect ends; `ShuttingDown` answers
-/// the same with no report. The receipt stays `in_progress` in each.
+/// the same with no report. The receipt stays `in_progress` in each. The cases answered at
+/// once run on a stopped clock, so their reply time never passes; the case after the reply
+/// time runs on its own server with the short budget ([`DEADLINE`]).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn effect_outcomes() {
-    let (srv, probe) = TestServer::with_commands(|_| {}).await;
-    let owner = srv.token(TokenKind::Owner, None, None).await;
-    let s = shared(&srv);
-    let cmd = |n, outcome: &str| {
+    let cmd = |srv: &TestServer, owner: &str, n, outcome: &str| {
         srv.command(
             "test_effect_outcome",
-            &owner,
+            owner,
             cid(n),
             &format!(r#"{{"outcome":"{outcome}"}}"#),
         )
     };
 
     // Unrecorded while the request waits.
+    let (srv, probe) = TestServer::with_commands(|_| {}).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
+    let s = shared(&srv);
+    srv.clock.stop();
     let before = s.faults.submits();
-    let started = std::time::Instant::now();
-    let r = srv.send(&cmd(1, "unrecorded")).await;
+    let r = srv.send(&cmd(&srv, &owner, 1, "unrecorded")).await;
     assert_eq!(r.outcome(), (503, code("outcome_unknown")));
-    assert!(
-        started.elapsed() < DEADLINE,
-        "answered before the reply time"
-    );
     assert_eq!(
         s.faults.submits(),
         before + 1,
@@ -1264,9 +1261,24 @@ async fn effect_outcomes() {
         ReceiptStatus::InProgress
     );
 
+    // ShuttingDown.
+    let before = s.faults.submits();
+    let r = srv.send(&cmd(&srv, &owner, 3, "shutting_down")).await;
+    assert_eq!(r.outcome(), (503, code("outcome_unknown")));
+    assert_eq!(s.faults.submits(), before + 1);
+    assert!(srv.sink.0.lock().unwrap().is_empty());
+    assert_eq!(
+        srv.receipt(cid(3)).unwrap().status,
+        ReceiptStatus::InProgress
+    );
+    assert_eq!(probe.effects(), 2);
+    srv.stop().await;
+
     // Unrecorded after the request's reply time.
+    let (srv, probe) = TestServer::with_commands(|c| c.short_deadline = DEADLINE).await;
+    let owner = srv.token(TokenKind::Owner, None, None).await;
     let (effect_reached, release) = probe.hold_effect();
-    let first = spawn_send(&srv, &cmd(2, "unrecorded"));
+    let first = spawn_send(&srv, &cmd(&srv, &owner, 2, "unrecorded"));
     reached(effect_reached).await;
     assert_eq!(joined(first).await.outcome(), (409, code("in_progress")));
     assert!(srv.sink.0.lock().unwrap().is_empty());
@@ -1284,18 +1296,7 @@ async fn effect_outcomes() {
         srv.receipt(cid(2)).unwrap().status,
         ReceiptStatus::InProgress
     );
-
-    // ShuttingDown.
-    let before = s.faults.submits();
-    let r = srv.send(&cmd(3, "shutting_down")).await;
-    assert_eq!(r.outcome(), (503, code("outcome_unknown")));
-    assert_eq!(s.faults.submits(), before + 1);
-    assert!(srv.sink.0.lock().unwrap().is_empty());
-    assert_eq!(
-        srv.receipt(cid(3)).unwrap().status,
-        ReceiptStatus::InProgress
-    );
-    assert_eq!(probe.effects(), 3);
+    assert_eq!(probe.effects(), 1);
     srv.stop().await;
 }
 
@@ -1318,13 +1319,10 @@ async fn revocation_nudge_from_the_server() {
 
 /// The launch commands' codes (supervisor §2.2) are handler replies at one status each: a
 /// result with the code at that status is stored and answered as it is; at any other status
-/// it is 500 `internal`. The requests are sent one after another under a 60 s budget: a
-/// request that outlasts the test server's 2 s one is 503 `outcome_unknown` by design, and
-/// this test is about the codes, not the deadline.
+/// it is 500 `internal`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn launch_codes_at_their_statuses() {
-    let (srv, _probe) =
-        TestServer::with_commands(|c| c.short_deadline = Duration::from_secs(60)).await;
+    let (srv, _probe) = TestServer::with_commands(|_| {}).await;
     let owner = srv.token(TokenKind::Owner, None, None).await;
     let codes = [
         ("thread_closed", 409),
@@ -1367,7 +1365,7 @@ async fn launch_codes_at_their_statuses() {
 }
 
 /// Through the HTTP path: `dispatch` hands the intent the request's `RequestStart` (its first
-/// head byte), not a later reading. The server's clock moves 1 s, within the 2 s budget,
+/// head byte), not a later reading. The server's clock moves 1 s, within the budget,
 /// while the guard's token read is held, after the request was received.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn dispatch_copies_request_start() {

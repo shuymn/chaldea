@@ -105,7 +105,7 @@ impl crate::supervisor::exit::ExitStep for PanicAfterCommit {
 
     fn after_commit(&self, _exit: &crate::supervisor::exit::ExitFacts) {
         if let Some(tx) = self.0.lock().unwrap().take() {
-            std::panic::panic_any(super::Unwound(tx));
+            chaldea_pty_runtime::fake::inject_panic(super::Unwound(tx));
         }
     }
 }

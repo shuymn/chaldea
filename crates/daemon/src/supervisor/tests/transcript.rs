@@ -13,6 +13,7 @@ use serde_json::json;
 use super::{Rig, json};
 use crate::lifecycle::ParticipantEnd;
 use crate::store::tests::support;
+use crate::store::tests::support::waits::bounded;
 use crate::supervisor::Pause;
 use crate::supervisor::components::shutdown;
 use crate::transcript::{BATCH_LINES, DROPPED_OFF_BLOCKING, FINAL_TRIES, Mode, read_probe};
@@ -251,10 +252,18 @@ fn polls(rig: &Rig) -> u32 {
 
 /// A budget too short for a wait and another try: the failing final read (a missing file)
 /// ends after its first try instead of waiting past the participant's end (three tries 100 ms
-/// apart would need about 200 ms).
+/// apart would need about 200 ms). The clock is stopped from the start, so the first poll is
+/// the only ordinary one and no budget passes however slowly the host runs; a wait for a
+/// retry would never end on that clock, and the bound fails the test instead. The PTY closes
+/// before the participant starts, by a stop under its own budget with the tailer held as at
+/// shutdown, so the 180 ms are the final read's alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_final_retry_is_not_waited_past_the_budget() {
     let rig = rig().await;
+    // The tracker's last check reads real time against `end`: a minute's skew keeps that
+    // check from deciding the 180 ms budget.
+    rig.clock.skew(Duration::from_secs(60));
+    rig.clock.stop();
     let (t, l) = spawn_claude(&rig).await;
     let files = tempfile::tempdir().unwrap();
     let path = files.path().join("missing.jsonl");
@@ -267,9 +276,19 @@ async fn a_final_retry_is_not_waited_past_the_budget() {
         )])
         .await;
     rig.until("a poll ran", || polls(&rig) > 0).await;
+    // Held, the tailer starts no poll; the one counted above had already started.
+    rig.sup.tailers.set(Mode::Hold);
+    let r = rig.cmd("stop", &json!({ "thread_id": t })).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    rig.until("the exit is stored", || rig.launch(l).exit_reason.is_some())
+        .await;
+    assert_eq!(rig.sup.tracker.count(), 0, "the close released everything");
     let before = polls(&rig);
     let end = rig.sup.now() + Duration::from_millis(180);
-    assert_eq!(shutdown(rig.sup.clone(), end).await, ParticipantEnd::Clean);
+    let ended = bounded(Duration::from_secs(10), shutdown(rig.sup.clone(), end))
+        .await
+        .expect("the participant ends without a retry's wait");
+    assert_eq!(ended, ParticipantEnd::Clean);
     assert!(rig.sup.tailers.launches().is_empty());
     assert_eq!(polls(&rig) - before, 1);
     rig.srv.stop().await;
@@ -335,18 +354,20 @@ async fn a_poll_starting_after_hold_waits_for_the_final_read() {
     rig.until("a poll ran", || rig.pauses.passed(Pause::TailerPoll))
         .await;
     let poll = rig.pauses.arm(Pause::TailerPoll);
-    std::fs::write(&path, LINE).unwrap();
     let poll = tokio::task::spawn_blocking(move || {
         poll.wait();
         poll
     })
     .await
     .unwrap();
+    // Written once the poll is parked, so no earlier poll can read it.
+    std::fs::write(&path, LINE).unwrap();
     rig.sup.tailers.set(Mode::Hold);
     poll.go();
-    tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(300)))
-        .await
-        .unwrap();
+    rig.until("the poll found Hold", || {
+        rig.sup.tailers.skipped.load(Ordering::Relaxed) == 1
+    })
+    .await;
     assert!(texts(&rig, t).is_empty());
     let end = rig.sup.now() + Duration::from_secs(5);
     assert_eq!(shutdown(rig.sup.clone(), end).await, ParticipantEnd::Clean);

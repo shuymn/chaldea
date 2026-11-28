@@ -1720,7 +1720,9 @@ fn panicking_close_kill_closes_the_job() {
     let child = take_child(&pty).unwrap();
     let id = child.identity().clone();
     let watch = open_verified(id.pid, &id.start_time);
-    *child.in_kill.lock().unwrap() = Some(Box::new(|| panic!("injected terminate_job panic")));
+    *child.in_kill.lock().unwrap() = Some(Box::new(|| {
+        crate::fake::inject_panic("injected terminate_job panic")
+    }));
     drop(child);
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         session.close(&[], crate::CloseBounds::default())
