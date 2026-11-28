@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use chaldea_core::command::{StopOutcome, StopResult};
 use chaldea_core::ids::{LaunchId, ThreadId};
+use chaldea_core::payload::ExitReason;
 use chaldea_core::state::{ProcessState, TaskState, TurnState};
 use chaldea_core::sync::{LaunchInfo, ThreadSummary};
 use chaldea_daemon::lifecycle::{DiscoveryRecord, Evidence, RecordState, names};
@@ -75,6 +76,10 @@ fn main() {
         Case {
             name: "assume_dead_preview_reads_only",
             run: preview_reads_only,
+        },
+        Case {
+            name: "assume_dead_preview_posts_nothing",
+            run: preview_posts_nothing,
         },
     ]);
 }
@@ -674,6 +679,87 @@ fn unpinned_reads_the_launch() {
         );
         assert_eq!(seen[1].2["args"][field], json!(y), "{args:?}");
     }
+}
+
+/// The complete preview through dispatch against the stub: a launch stopped with its death
+/// proven, whose one `launch_exited` is the stream's only event. It prints the proven end,
+/// exits 0, and sends only reads (the summary, the page, the summary again), no POST.
+fn preview_posts_nothing() {
+    let labels = Labels::new();
+    let d = state();
+    let t = "00000000-0000-4000-8000-000000000007";
+    let x = LaunchId::from_u128(0x1);
+    let summary = ThreadSummary {
+        thread_id: ThreadId(uuid::Uuid::parse_str(t).unwrap()),
+        closed: false,
+        process_state: ProcessState::Exited,
+        turn_state: TurnState::Idle,
+        task_state: TaskState::None,
+        attention_count: 0,
+        launch: Some(LaunchInfo {
+            launch_id: x,
+            pid: None,
+            manual: false,
+            exit_reason: Some(ExitReason::Stopped),
+            death_confirmed: true,
+        }),
+    };
+    let at = "2026-11-26T00:00:00.001Z";
+    let exited = json!({
+        "stream_id": format!("thread:{t}"),
+        "seq": 1,
+        "event_id": uuid::Uuid::from_u128(1),
+        "schema_version": 1,
+        "idempotency_key": "k:1",
+        "kind": "launch_exited",
+        "thread_id": t,
+        "launch_id": x,
+        "command_id": null,
+        "source": { "kind": "daemon", "agent": null, "cli_version": null, "transcript": null },
+        "occurred_at": at,
+        "recorded_at": at,
+        "payload": { "launch_id": x, "code": null, "signal": null,
+                     "reason": "stopped", "death_confirmed": true },
+    });
+    let page = json!({
+        "mode": "replay",
+        "stream_id": format!("thread:{t}"),
+        "epoch": "e1",
+        "events": [exited],
+        "head_seq": 1,
+        "has_more": false,
+        "has_more_before": false,
+    });
+    let mut replies = command_replies(t, x);
+    replies.push((
+        format!("/api/threads/{t}"),
+        serde_json::to_value(&summary).unwrap(),
+    ));
+    replies.push((
+        format!("/api/events?stream_id=thread:{t}&before_seq=9007199254740991&limit=16"),
+        page,
+    ));
+    let stub = Stub::start(&d.path, &replies);
+    let (code, out, err) = run_to_exit(&mut cmd(
+        &labels,
+        &d.path,
+        &["stop", t, "--assume-dead"],
+        &[],
+    ));
+    assert_eq!(code, 0, "{out}{err}");
+    for line in [
+        format!("launch: {x}"),
+        "exit reason: stopped".to_owned(),
+        "The launch's end was proven when it exited, so no check report was needed.".to_owned(),
+    ] {
+        assert!(out.lines().any(|l| l == line), "{line:?} in:\n{out}");
+    }
+    let seen = stub.take();
+    assert!(
+        seen.iter().any(|(_, p, _)| p.starts_with("/api/events?")),
+        "{seen:?}"
+    );
+    assert!(seen.iter().all(|(m, _, _)| m == "GET"), "no POST: {seen:?}");
 }
 
 // ---- helpers ----

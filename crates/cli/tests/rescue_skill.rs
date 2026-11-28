@@ -15,11 +15,12 @@ fn value(placeholder: &str) -> Option<&'static str> {
         "input" => "00000000-0000-4000-8000-000000000003",
         "approval" => "00000000-0000-4000-8000-000000000004",
         "keys" => "down enter",
-        // Words and a leading dash: one argument only after `--` and inside quotes.
-        "text" => "--help me",
+        // Words, a leading dash, a `$`, and a single quote: one literal argument only after
+        // `--` and inside single quotes, with the quote escaped.
+        "text" => "--help $HOME it's",
         "outcome" => "delivered",
         "agent" => "claude",
-        "path" => "/work/my repo",
+        "path" => "/work/$x it's",
         _ => return None,
     })
 }
@@ -49,8 +50,9 @@ fn examples(md: &str) -> Vec<String> {
     out
 }
 
-/// `example` with each `<name>` replaced by its value, split as a shell splits it: at white
-/// space outside double quotes, which are removed.
+/// `example` with each `<name>` replaced by its value, each `'` in it written `'\''` as the
+/// skill tells the agent, split as a POSIX shell splits it: at white space outside single
+/// quotes, whose text is literal, with a backslash outside them taking the next character.
 fn argv(example: &str) -> Vec<OsString> {
     let mut s = String::new();
     let mut rest = example;
@@ -62,15 +64,21 @@ fn argv(example: &str) -> Vec<OsString> {
         let name = &rest[i + 1..i + end];
         let v =
             value(name).unwrap_or_else(|| panic!("unknown placeholder <{name}> in `{example}`"));
-        s.push_str(v);
+        s.push_str(&v.replace('\'', "'\\''"));
         rest = &rest[i + end + 1..];
     }
     s.push_str(rest);
     let (mut out, mut word, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
-    for c in s.chars() {
+    let mut cs = s.chars();
+    while let Some(c) = cs.next() {
         match c {
-            '"' => (quoted, any) = (!quoted, true),
-            c if c.is_whitespace() && !quoted => {
+            '\'' => (quoted, any) = (!quoted, true),
+            c if quoted => word.push(c),
+            '\\' => {
+                word.extend(cs.next());
+                any = true;
+            }
+            c if c.is_whitespace() => {
                 if any {
                     out.push(OsString::from(std::mem::take(&mut word)));
                     any = false;
@@ -98,7 +106,7 @@ fn rescue_skill_commands() {
             panic!("`{e}` does not parse:\n{m}");
         }
     }
-    // `send`'s text and `spawn`'s path each reach the command whole.
+    // `send`'s text and `spawn`'s path each reach the command whole and literal.
     let parsed = |cmd: &str| {
         let e = examples
             .iter()
@@ -108,11 +116,11 @@ fn rescue_skill_commands() {
     };
     let send = parsed("send");
     assert!(
-        send.starts_with("Send {") && send.contains(r#"text: "--help me""#),
+        send.starts_with("Send {") && send.contains(r#"text: "--help $HOME it's""#),
         "{send}"
     );
     let spawn = parsed("spawn");
-    assert!(spawn.contains(r#"cwd: Some("/work/my repo")"#), "{spawn}");
+    assert!(spawn.contains(r#"cwd: Some("/work/$x it's")"#), "{spawn}");
     // Every command that takes a pin is shown with it.
     for cmd in ["ready", "stop", "resume", "close", "key"] {
         let of: Vec<&String> = examples
