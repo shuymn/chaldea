@@ -12,7 +12,7 @@ mvp §4 row W2 (mvp:438, :480, :616, :631): PR 19, M1; extends `docs/design/w1-p
 
 ### 2.1 Composer
 
-A `<form>` per selected thread: visible `<label>`, `<textarea>`, submit button, helper buttons `type="button"`; submit calls `preventDefault()` first (CSP `form-action 'none'`, w1-pwa:14). Drafts live in memory per thread (`forms` §1–2).
+A `<form>` per selected thread: visible `<label>`, `<textarea>`, submit button, `type="button"` helpers; submit calls `preventDefault()` (CSP `form-action 'none'`, w1-pwa:14). Drafts live in memory per thread (`forms` §1–2).
 
 **Enter** keydown, in order:
 
@@ -20,7 +20,7 @@ A `<form>` per selected thread: visible `<label>`, `<textarea>`, submit button, 
 2. Shift+Enter → native newline.
 3. Ctrl/Cmd+Enter, or plain Enter when `(pointer: fine)` matches → `preventDefault`, then submit unless `repeat`. Plain Enter otherwise → newline.
 
-Sizing: `field-sizing: content`, `width: 100%`, `font-size: max(1rem, 1em)`, 48 px coarse targets (`forms` §5).
+Sizing: `field-sizing: content`, `font-size: max(1rem, 1em)`, 48 px coarse targets (`forms` §5).
 
 **Submit** sends the value unchanged (mvp:184); empty text or UTF-8 over 256 KiB (mvp:186) sends nothing, with an `aria-invalid` described error. On `queued` the draft clears only if its revision is still the submitted one.
 
@@ -34,24 +34,24 @@ Sizing: `field-sizing: content`, `width: 100%`, `font-size: max(1rem, 1em)`, 48 
 | Mark ready | `ready { thread_id, expected_launch_id }` | open, `running` |
 | It arrived / Dismiss | `input_resolve { input_id, delivered }` | input `unconfirmed` |
 | Cancel | `input_cancel { input_id }` | input `queued` |
-| New thread | `spawn { agent, cwd, prompt?, task? }` (empty optionals omitted) | always |
+| New thread | `spawn { agent, cwd, prompt?, task? }` (empty omitted) | always |
 | Stop | `stop { thread_id, expected_launch_id }` | open, launch not exited |
 | Resume | `resume { thread_id, expected_launch_id }` | open, exited, death confirmed |
 
 Unconfirmed death shows *the hint* instead of Resume: review with `chaldea stop <thread> --assume-dead`, confirm with `--launch <id>` (mvp:216; a refused resume raises `resume_blocked`, supervisor.md:122). Ready and Stop confirm in a `showModal()` dialog (`accessibility` §12) pinning the launch; a launch change closes it. Ready's dialog states the assertion: the pinned CLI's normal composer is open and empty, no popup or search; queued prompts may proceed.
 
-**Dispatch** needs `live`; send, ready, and input commands also need a *current* copy (W1's `syncedCheck` conditions, per stream, with equal non-null socket and copy epochs); Stop and Resume use the latest valid copy and the pinned launch. Each slot (the spawn form; a thread's send; its stop or resume; its ready; an input's resolve or cancel) holds one logical command, reserved synchronously before dispatch, Retry included. `command_id` is `crypto.randomUUID()`, frozen with the body bytes and credential generation. **Nothing retries automatically.**
+**Dispatch** needs `live`; send, ready, and input commands also need a *current* copy (W1's `syncedCheck` per stream; equal non-null socket and copy epochs); Stop and Resume use the latest valid copy and the pinned launch. Each slot (spawn; per thread: send, stop or resume, ready; per input) holds one in-flight or unknown command, reserved synchronously before dispatch; a not-done command frees its slot; its Retry needs the displayed attempt, an eligible frozen target, and a current copy (Stop and Resume too), and reserves the slot again. `command_id` is `crypto.randomUUID()`, frozen with the body bytes and credential generation. **Nothing retries automatically.**
 
 | Reply (http-surface:563-610) | Means | Controls |
 |---|---|---|
-| 2xx, valid | the result: `rejected` with reason; `spawn_failed`; `death_confirmed: false` with the hint | — |
+| 2xx, valid | the result: `rejected` with reason; `spawn_failed`; `death_confirmed: false` | — |
 | 2xx, invalid | done, unreadable | — |
 | other handler code; guard and parser 4xx; 501; 409 `conflict`, `unknown_after_crash` (own texts) | settled | — |
-| 409 `in_progress`; 503 `outcome_unknown`, unparsed 503; 500; transport; timeout | unknown | "check the thread", Forget |
+| 409 `in_progress`, undecodable 409; 503 `outcome_unknown`, unparsed 503; 500; transport; timeout; body-read failure | unknown | "check the thread", Forget |
 | 408; 503 `busy`, `shutting_down`, `disk_full`, `store_failed` | not done | Retry, Forget |
 | 401 | not done; W1's compare-and-delete with the frozen generation | — |
 
-Ambiguous outcomes are never retried: the browser cannot prove a retry reaches the receipts that saw the attempt (http-surface:616). Retry, after `retry_after`, exists only for not-done attempts within their socket session (same epoch and generation, no reopen or `hello` since); later, they release. Only a 2xx or settled reply settles; a reply after its context changed updates only its command's result, never drafts, selection, or newer slots. An unresolved command shows its state (a Send, its frozen text) beside the thread's; nothing infers which command took effect. Forgetting an unknown command keeps the draft, warning that resending is a new input. W1's status region announces.
+Ambiguous outcomes are never retried: a retry may miss the receipts that saw the attempt (http-surface:616). Retry, after `retry_after`, exists only for not-done attempts within their socket session (no reopen, `hello`, epoch or generation change since). Only a 2xx or settled reply settles; a late reply (its context changed) updates only its own result, never drafts, selection, or newer slots. An unresolved command shows its state (a Send, its frozen text); nothing infers which command took effect. Forgetting an unknown command keeps the draft and warns that resending is new. W1's status region announces outcomes and refusals.
 
 ### 2.3 Thread Copy Additions
 
@@ -70,18 +70,18 @@ From the thread's own stream (F1):
 | `unconfirmed` | may have reached the CLI | It arrived, Dismiss |
 | terminal | reason, `by` | — |
 
-No resend (mvp:185); replies never roll back streamed state.
+No resend (mvp:185); replies never change streamed state.
 
-**Banner**: a `<section aria-label="Attention">` (not a live region) of followed threads whose *valid* copy has causes (mvp:141-147) or `awaiting_approval` turn state, never host "last known" values. Actions match the current input id and state: `input_unconfirmed` → resolve; `input_gate_timeout` → Cancel, Mark ready; `session_start_timeout`, `startup_stall` → Stop; `resume_blocked` → the hint; `awaiting_approval` → none (T2). Entries follow `status_changed`, snapshots, and unfollowing.
+**Banner**: a `<section aria-label="Attention">` (not a live region) of followed threads whose *valid* copy has causes (mvp:141-147) or `awaiting_approval` turn state, never host "last known" values. Actions match the current input id and state: `input_unconfirmed` → resolve; `input_gate_timeout` → Cancel, Mark ready; `session_start_timeout`, `startup_stall` → Stop; `resume_blocked` → the hint; `awaiting_approval` → none (T2). Entries follow `status_changed`, snapshots, unfollowing.
 
-**Counts**: per thread and host.
+**Counts**: thread and host.
 
 ## 3. Decisions
 
 | # | Decision | Rejected | |
 |---|---|---|---|
 | D1 | Retry only not-done attempts, with frozen id and body. | Retrying ambiguous outcomes (needs daemon-checked receipts). | reversible |
-| D2 | Plain Enter submits on a fine primary pointer (a preference, not keyboard detection). | Everywhere (soft keyboards compose words). | reversible |
+| D2 | Plain Enter submits on a fine primary pointer (not keyboard detection). | Everywhere (soft keyboards compose words). | reversible |
 | D3 | A composing Enter is left to the IME. | `preventDefault` first (disturbs confirmation). | reversible |
 | D4 | Commands and drafts get their own pure reducer. | One reducer. | reversible |
 | D5 | Snapshots carry `raw_unknown_count`, counted in their read transaction (event-store §2.7); no `schema_version` bump; daemon, CLI, and PWA ship as one binary. A newer CLI or tab fails visibly on an older daemon's snapshots (inspect: unreadable snapshot; tab: schema error), losing and writing nothing, until the restart or reload an upgrade needs. | Client-side counting (snapshots hide earlier events). | reversible |
@@ -90,7 +90,7 @@ No resend (mvp:185); replies never roll back streamed state.
 
 ## 4. Acceptance Criteria
 
-**Purpose layer** (M1 owner, macOS, Claude Code; record browser versions).
+**Purpose layer** (M1 owner, macOS, Claude Code; browser versions recorded).
 
 | ID | Criterion (EARS) |
 |---|---|
@@ -114,8 +114,8 @@ No resend (mvp:185); replies never roll back streamed state.
 
 ## 5. Risks
 
-- **Double send**: slots and frozen ids; Forget then Send, or reload, is a deliberate input.
-- **Lost Japanese text**: drafts survive failures and late replies, not reloads (accepted, mvp:220).
-- **IME gaps**: CI synthesizes compositions; real IMEs are W2-1; Android is Phase 2.
-- **Token scope**: the owner token permits keys and attach (mvp:257); the page uses neither.
+- **Double send**: slots and frozen ids; Forget then Send, or reload, is deliberate.
+- **Lost Japanese text**: drafts survive failures and late replies, not reloads (mvp:220).
+- **IME gaps**: CI synthesizes compositions; real IMEs are W2-1; Android, Phase 2.
+- **Token scope**: the owner token permits keys and attach (mvp:257), unused here.
 - **Ready misuse**: the prompt is attributed or `unconfirmed`, not resent (mvp:172).

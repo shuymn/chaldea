@@ -10,7 +10,7 @@ import { HISTORY_FAILED, problems } from "./check";
 import { MODEL_CONFIG, Sim, TEST_CONFIG } from "./sim";
 import { status } from "./state";
 import { threadId } from "./model/server";
-import { type Op, opArb, run, seeded, start, startArb } from "./ops";
+import { type Op, opArb, run, seeded, start, startArb, w2OpArb } from "./ops";
 
 const NUM_RUNS = 1000;
 
@@ -36,6 +36,18 @@ describe("sync.converges", () => {
   test("random schedules, half from the seeded race, converge after quiesce", () => {
     fc.assert(
       fc.property(startArb, fc.array(opArb(), { maxLength: 80, size: "max" }), (from, ops: Op[]) => {
+        const sim = start(from);
+        for (const op of ops) run(sim, op);
+        settle(sim);
+      }),
+      { numRuns: NUM_RUNS },
+    );
+  });
+
+  test("with raw_unknown, launch, and input writes, raw_unknown_count, launches, and inputs converge too", () => {
+    // check.ts compares each copy's `raw_unknown` count with the server's, both streams.
+    fc.assert(
+      fc.property(startArb, fc.array(w2OpArb(), { maxLength: 80, size: "max" }), (from, ops: Op[]) => {
         const sim = start(from);
         for (const op of ops) run(sim, op);
         settle(sim);

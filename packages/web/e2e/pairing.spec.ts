@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 import type { BrowserContext, Page, Request, Route } from "@playwright/test";
 
-import { type Daemon, expect, hasFragment, openLink, statusOf, test } from "./harness";
+import { type Daemon, expect, hasFragment, openLink, selectThread, statusOf, test } from "./harness";
 
 const SPENT = "This link is spent or expired";
 
@@ -61,11 +61,86 @@ test("request_policy", async ({ daemon, page }) => {
   page.on("requestfailed", (r) => record(r, true, Promise.resolve(r.headers())));
   const sockets: string[] = [];
   page.on("websocket", (ws) => sockets.push(ws.url()));
+  /** The purpose of every ticket POST. */
+  const tickets: unknown[] = [];
+  /** Every request as it starts, so one still pending when the test ends is checked too. */
+  const started: { method: string; url: string }[] = [];
+  page.on("request", (r) => {
+    started.push({ method: r.method(), url: r.url() });
+    if (new URL(r.url()).pathname === "/api/ws-ticket") tickets.push((r.postDataJSON() as { purpose?: unknown }).purpose);
+  });
 
   await openLink(page, await daemon.pairUrl());
-  await page.locator(`li[data-thread="${thread}"] button`).first().click();
+  await selectThread(page, thread);
   await expect(page.locator("main ol").getByText("policy check").first()).toBeVisible();
   await expect(statusOf(page)).toHaveText("live");
+  // Every command the page has, through its own controls (W2-12).
+  test.setTimeout(150_000);
+  const line = (slot: string) => page.locator(`[data-slot="${slot}"]`).first();
+  const actions = page.getByRole("region", { name: "Thread actions" });
+  const sendText = async (text: string) => {
+    await page.getByLabel("Message", { exact: true }).fill(text);
+    await page.getByRole("form", { name: "Composer" }).getByRole("button", { name: "Send", exact: true }).click();
+    await expect(line(`send:${thread}`)).toHaveAttribute("data-phase", "settled");
+  };
+  const row = (id: string) => page.locator(`section[aria-labelledby="inputs-heading"] li[data-input="${id}"]`);
+  await daemon.waitInputs(thread, (is) => is[0]?.state === "acked");
+  // send, then input_cancel on the queued input (the gate is closed after the first turn).
+  await sendText("a policy send");
+  const [, queued] = await daemon.waitInputs(thread, (is) => is[1]?.state === "queued");
+  await row(queued!.input_id).getByRole("button", { name: "Cancel" }).click();
+  await daemon.waitInputs(thread, (is) => is[1]?.state === "cancelled");
+  // ready, stop, resume.
+  await actions.getByRole("button", { name: "Mark ready" }).click();
+  await page.getByRole("dialog", { name: "Mark the CLI ready?" }).getByRole("button", { name: "Mark ready" }).click();
+  await expect(line(`ready:${thread}`)).toHaveAttribute("data-phase", "settled");
+  await actions.getByRole("button", { name: "Stop" }).click();
+  await page.getByRole("dialog", { name: "Stop this launch?" }).getByRole("button", { name: "Stop" }).click();
+  await expect(line(`launch:${thread}`)).toContainText("stopped", { timeout: 45_000 });
+  await expect(actions.getByRole("button", { name: "Resume" })).toBeEnabled({ timeout: 20_000 });
+  await actions.getByRole("button", { name: "Resume" }).click();
+  await expect(line(`launch:${thread}`)).toContainText("Resume: outcome: started", { timeout: 45_000 });
+  await daemon.waitEvents(thread, (es) => {
+    const second = es.filter((e) => e.kind === "launch_started")[1]?.launch_id;
+    return second != null && es.some((e) => e.kind === "readiness_observed" && e.launch_id === second);
+  });
+  // input_resolve on an unconfirmed input (two lines, `sent`, then a stop).
+  await sendText("line one\nline two");
+  const sentOne = await daemon.waitInputs(thread, (is) => is[2]?.state === "sent", 25_000);
+  await daemon.chaldea(["stop", thread]);
+  await daemon.waitInputs(thread, (is) => is[2]?.state === "unconfirmed");
+  await row(sentOne[2]!.input_id).getByRole("button", { name: "Dismiss" }).click();
+  await daemon.waitInputs(thread, (is) => is[2]?.state === "dismissed");
+  // spawn from the form.
+  await page.getByLabel("Working directory (absolute path)").fill(join(daemon.root));
+  await page.getByRole("button", { name: "Start thread" }).click();
+  await expect(line("spawn")).toHaveAttribute("data-phase", "settled", { timeout: 45_000 });
+  // `sent` takes a request when Playwright reports it finished, which can come after the page
+  // showed its reply: wait for the last one rather than read the list once.
+  const commandPaths = () =>
+    [...new Set(sent.map((r) => new URL(r.url).pathname).filter((p) => p.startsWith("/api/commands/")))].sort();
+  await expect
+    .poll(commandPaths)
+    .toEqual(["input_cancel", "input_resolve", "ready", "resume", "send", "spawn", "stop"].map((c) => `/api/commands/${c}`));
+
+  // Every mutation is one the page is allowed; nothing reads the screen, attaches, or writes keys.
+  const MUTATIONS = new Set([
+    "/api/pair",
+    "/api/ws-ticket",
+    ...["send", "ready", "input_resolve", "input_cancel", "spawn", "stop", "resume"].map((c) => `/api/commands/${c}`),
+  ]);
+  // Checked on every request as it started, finished or not.
+  expect(started.length).toBeGreaterThanOrEqual(sent.length);
+  for (const r of started) {
+    const u = new URL(r.url);
+    expect(u.origin, `a request left the page's origin (${u.pathname})`).toBe(daemon.origin);
+    const path = u.pathname;
+    expect(path.endsWith("/screen") || path.startsWith("/api/attach") || path === "/api/commands/key", path).toBe(false);
+    if (r.method !== "GET") expect(MUTATIONS.has(path), `${r.method} ${path}`).toBe(true);
+    if (r.method === "GET" && path.startsWith("/api/")) expect(path, `GET ${path}`).toBe("/api/events");
+  }
+  expect(tickets.length).toBeGreaterThan(0);
+  expect(tickets.every((t) => t === "events"), "a ticket of another purpose").toBe(true);
 
   const tokens = new Set<string>();
   let posts = 0;

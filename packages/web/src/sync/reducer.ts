@@ -3,6 +3,7 @@
 // formal-specs §7.1 and mvp §2.4 "Replay", "Backward history", and "Live notifications".
 
 import { decode } from "@chaldea/contracts";
+import type { Content } from "@chaldea/contracts/generated/Content";
 import type { EventEnvelope } from "@chaldea/contracts/generated/EventEnvelope";
 import type { EventsResponse } from "@chaldea/contracts/generated/EventsResponse";
 
@@ -14,6 +15,7 @@ import {
   HOST,
   type HostCopy,
   type HostRow,
+  type InputView,
   listRows,
   newStream,
   type Pending,
@@ -21,6 +23,8 @@ import {
   type State,
   type Stream,
   type StreamError,
+  TERMINAL_INPUTS,
+  TERMINAL_STATES,
   type ThreadCopy,
   threadOf,
   threadStream,
@@ -159,6 +163,13 @@ class Step {
         return this.latest();
       case "retry":
         return this.retry();
+      case "commandUnauthorized":
+        // The current generation takes the read path's compare-and-delete. An older one's
+        // compare-and-delete leaves the newer credential alone, and its reread, bound to the
+        // older generation, adopts nothing.
+        if (a.generation === this.s.generation) this.unauthorized(a.generation);
+        else this.effects.push({ type: "clearCredential", generation: a.generation });
+        return;
     }
   }
 
@@ -880,14 +891,30 @@ class Step {
 // ---- projections ------------------------------------------------------------------------
 
 function emptyCopy(key: string): Copy {
-  if (key === HOST) return { kind: "host", cursor: 0, threads: {} };
+  if (key === HOST) return { kind: "host", cursor: 0, threads: {}, rawUnknown: 0 };
   // ThreadState::registered: the axes before the thread stream states any.
-  return { kind: "thread", cursor: 0, process: "exited", turn: "unknown", task: null, attention: [] };
+  return {
+    kind: "thread",
+    cursor: 0,
+    process: "exited",
+    turn: "unknown",
+    task: null,
+    attention: [],
+    launch: null,
+    inputs: [],
+    done: [],
+    rawUnknown: 0,
+  };
 }
 
-/** Applies one event of the copy's own stream; kinds that change no projection advance the cursor only. */
+/**
+ * Applies one event of the copy's own stream; kinds that change no projection advance the
+ * cursor only. Every accepted envelope of kind `raw_unknown` counts, typed or not, as the
+ * daemon's `raw_unknown_count` does.
+ */
 function applyEvent(copy: Copy, e: EventEnvelope): Copy {
   const d = decode(e);
+  const raw = e.kind === "raw_unknown" ? 1 : 0;
   if (copy.kind === "host") {
     let threads = copy.threads;
     if (d.outcome === "typed") {
@@ -916,27 +943,75 @@ function applyEvent(copy: Copy, e: EventEnvelope): Copy {
         if (cur) threads = { ...threads, [ev.payload.thread_id]: { ...cur, info: { ...cur.info, closed: true } } };
       }
     }
-    return { kind: "host", cursor: e.seq, threads } satisfies HostCopy;
+    return { kind: "host", cursor: e.seq, threads, rawUnknown: copy.rawUnknown + raw } satisfies HostCopy;
   }
-  let next: ThreadCopy = { ...copy, cursor: e.seq };
-  if (d.outcome === "typed" && d.event.kind === "status_changed") {
-    const p = d.event.payload;
-    switch (p.field) {
-      case "process_state":
-        next = { ...next, process: p.to };
-        break;
-      case "turn_state":
-        next = { ...next, turn: p.to };
-        break;
-      case "task_state":
-        next = { ...next, task: p.to };
-        break;
-      case "attention":
-        next = { ...next, attention: p.to };
-        break;
+  const next: ThreadCopy = { ...copy, cursor: e.seq, rawUnknown: copy.rawUnknown + raw };
+  if (d.outcome !== "typed") return next;
+  const ev = d.event;
+  switch (ev.kind) {
+    case "status_changed": {
+      const p = ev.payload;
+      switch (p.field) {
+        case "process_state":
+          return { ...next, process: p.to };
+        case "turn_state":
+          return { ...next, turn: p.to };
+        case "task_state":
+          return { ...next, task: p.to };
+        case "attention":
+          return { ...next, attention: p.to };
+      }
     }
+    case "launch_reserved":
+      // The reserved launch becomes the thread's current one (store/project.rs).
+      return {
+        ...next,
+        launch: { id: ev.payload.launch_id, exited: false, exitReason: null, deathConfirmed: false },
+      };
+    case "launch_exited": {
+      const l = next.launch;
+      if (l?.id !== ev.payload.launch_id) return next;
+      const { reason, death_confirmed } = ev.payload;
+      return { ...next, launch: { ...l, exited: true, exitReason: reason, deathConfirmed: death_confirmed } };
+    }
+    case "launch_death_confirmed": {
+      const l = next.launch;
+      if (l?.id !== ev.payload.launch_id) return next;
+      return { ...next, launch: { ...l, deathConfirmed: true } };
+    }
+    case "input_created": {
+      const p = ev.payload;
+      const input: InputView = {
+        id: p.input_id,
+        state: p.initial_state,
+        reason: null,
+        by: null,
+        createdBy: p.created_by,
+        preview: contentPreview(p.text),
+      };
+      return { ...next, inputs: [...next.inputs.filter((i) => i.id !== p.input_id), input] };
+    }
+    case "input_state_changed": {
+      const p = ev.payload;
+      const cur = next.inputs.find((i) => i.id === p.input_id);
+      if (!cur) return next;
+      const moved: InputView = { ...cur, state: p.to, reason: p.reason, by: p.by };
+      if (!TERMINAL_STATES.has(p.to)) {
+        return { ...next, inputs: next.inputs.map((i) => (i.id === p.input_id ? moved : i)) };
+      }
+      return {
+        ...next,
+        inputs: next.inputs.filter((i) => i.id !== p.input_id),
+        done: [...next.done, moved].slice(-TERMINAL_INPUTS),
+      };
+    }
+    default:
+      return next;
   }
-  return next;
+}
+
+function contentPreview(c: Content): string {
+  return "inline" in c ? c.inline : c.preview;
 }
 
 function snapshotCopy(body: Extract<EventsResponse, { mode: "snapshot" }>): Copy {
@@ -944,9 +1019,10 @@ function snapshotCopy(body: Extract<EventsResponse, { mode: "snapshot" }>): Copy
   if (snap.stream === "host") {
     const threads: Record<string, HostRow> = {};
     for (const info of snap.threads) threads[info.thread_id] = { info, fromSnapshot: true };
-    return { kind: "host", cursor: body.as_of_seq, threads };
+    return { kind: "host", cursor: body.as_of_seq, threads, rawUnknown: snap.raw_unknown_count };
   }
   const t = snap.thread;
+  const l = snap.launch;
   return {
     kind: "thread",
     cursor: body.as_of_seq,
@@ -954,6 +1030,21 @@ function snapshotCopy(body: Extract<EventsResponse, { mode: "snapshot" }>): Copy
     turn: t.turn_state,
     task: t.task_state,
     attention: t.attention,
+    launch:
+      l === null
+        ? null
+        : { id: l.launch_id, exited: l.exit_reason !== null, exitReason: l.exit_reason, deathConfirmed: l.death_confirmed },
+    // Inputs not yet terminal, without the reason or actor of their last transition.
+    inputs: snap.inputs.map((i) => ({
+      id: i.input_id,
+      state: i.state,
+      reason: null,
+      by: null,
+      createdBy: i.created_by,
+      preview: contentPreview(i.text),
+    })),
+    done: [],
+    rawUnknown: snap.raw_unknown_count,
   };
 }
 

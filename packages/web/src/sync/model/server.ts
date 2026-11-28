@@ -7,6 +7,10 @@
 import type { AttentionCause } from "@chaldea/contracts/generated/AttentionCause";
 import type { EventEnvelope } from "@chaldea/contracts/generated/EventEnvelope";
 import type { EventsResponse } from "@chaldea/contracts/generated/EventsResponse";
+import type { InputInfo } from "@chaldea/contracts/generated/InputInfo";
+import type { InputReason } from "@chaldea/contracts/generated/InputReason";
+import type { InputState } from "@chaldea/contracts/generated/InputState";
+import type { LaunchInfo } from "@chaldea/contracts/generated/LaunchInfo";
 import type { ProcessState } from "@chaldea/contracts/generated/ProcessState";
 import type { StreamHeadEntry } from "@chaldea/contracts/generated/StreamHeadEntry";
 import type { TaskState } from "@chaldea/contracts/generated/TaskState";
@@ -35,7 +39,12 @@ interface ThreadRec {
   readonly cwd: string;
   closed: boolean;
   axes: Axes;
+  launch: LaunchInfo | null;
+  /** Inputs not yet terminal, in creation order. */
+  inputs: InputInfo[];
 }
+
+const TERMINAL: readonly InputState[] = ["acked", "rejected", "cancelled", "dismissed"];
 
 interface Db {
   readonly epoch: string;
@@ -128,6 +137,8 @@ export class ModelServer {
       cwd: `/work/p${n % 3}`,
       closed: false,
       axes: { process: "exited", turn: "unknown", task: task ? "active" : "none", attention: [] },
+      launch: null,
+      inputs: [],
     };
     this.db.threads.set(id, rec);
     this.db.logs.set(`thread:${id}`, []);
@@ -178,6 +189,103 @@ export class ModelServer {
   }
 
   /**
+   * A `raw_unknown` event on `host` or a thread's stream: with a valid payload (typed), or
+   * one the reader cannot decode (generic). The daemon counts both.
+   */
+  rawUnknown(stream: string, typed: boolean): void {
+    if (!this.db.logs.has(stream)) return;
+    const payload = typed
+      ? {
+          source: "hook",
+          reason: "unparseable",
+          agent: "claude",
+          cli_version: null,
+          content_type: "application/json",
+          raw: { inline: "{", encoding: "utf8" },
+        }
+      : { source: 42 };
+    this.append(stream, "raw_unknown", payload, stream === "host" ? null : stream.slice("thread:".length));
+  }
+
+  /** `launch_reserved`: `launch` becomes the thread's current launch. */
+  launchReserved(id: string, launch: string): void {
+    const t = this.db.threads.get(id);
+    if (!t) return;
+    t.launch = { launch_id: launch, pid: null, manual: false, exit_reason: null, death_confirmed: false };
+    this.append(
+      `thread:${id}`,
+      "launch_reserved",
+      { launch_id: launch, expected_previous: null, agent: t.agent, argv_digest: "00", manual: false, worktree_id: null },
+      id,
+    );
+  }
+
+  launchExited(id: string, reason: "exit" | "stopped" | "daemon_restart", deathConfirmed: boolean): void {
+    const t = this.db.threads.get(id);
+    const l = t?.launch;
+    if (!t || !l || l.exit_reason !== null) return;
+    t.launch = { ...l, exit_reason: reason, death_confirmed: deathConfirmed };
+    this.append(
+      `thread:${id}`,
+      "launch_exited",
+      { launch_id: l.launch_id, code: null, signal: null, reason, death_confirmed: deathConfirmed },
+      id,
+    );
+  }
+
+  deathConfirmed(id: string): void {
+    const t = this.db.threads.get(id);
+    const l = t?.launch;
+    if (!t || !l || l.death_confirmed) return;
+    t.launch = { ...l, death_confirmed: true };
+    this.append(`thread:${id}`, "launch_death_confirmed", { launch_id: l.launch_id, method: "session_scan" }, id);
+  }
+
+  inputCreated(id: string, input: string, text: string): void {
+    const t = this.db.threads.get(id);
+    if (!t || t.inputs.some((i) => i.input_id === input)) return;
+    const info: InputInfo = {
+      input_id: input,
+      launch_id: t.launch?.launch_id ?? null,
+      state: "queued",
+      text: { inline: text, encoding: "utf8" },
+      encoding: "bracketed_paste",
+      created_by: "human",
+      sent_after_seq: null,
+    };
+    t.inputs.push(info);
+    this.append(
+      `thread:${id}`,
+      "input_created",
+      {
+        input_id: input,
+        launch_id: info.launch_id,
+        initial_state: "queued",
+        text: info.text,
+        encoding: info.encoding,
+        origin: "pwa",
+        created_by: "human",
+      },
+      id,
+    );
+  }
+
+  inputState(id: string, input: string, to: InputState, reason: InputReason, by: string | null = null): void {
+    const t = this.db.threads.get(id);
+    const cur = t?.inputs.find((i) => i.input_id === input);
+    if (!t || !cur) return;
+    const from = cur.state;
+    if (TERMINAL.includes(to)) t.inputs = t.inputs.filter((i) => i.input_id !== input);
+    else cur.state = to;
+    this.append(
+      `thread:${id}`,
+      "input_state_changed",
+      { input_id: input, from, to, reason, sent_after_seq: null, by },
+      id,
+    );
+  }
+
+  /**
    * A new database: the next epoch with empty streams. Threads in `keep` are registered
    * again in it; `tokens` false is a database without the paired token.
    */
@@ -190,6 +298,11 @@ export class ModelServer {
 
   head(stream: string): number {
     return this.db.logs.get(stream)?.length ?? 0;
+  }
+
+  /** The stream's `raw_unknown` events at or below its head, as the daemon counts them. */
+  rawUnknownCount(stream: string): number {
+    return this.log(stream).reduce((n, e) => n + (e.kind === "raw_unknown" ? 1 : 0), 0);
   }
 
   exists(stream: string): boolean {
@@ -287,8 +400,7 @@ export class ModelServer {
         },
       };
     }
-    // The stream's `raw_unknown` events at or below `head`, as the daemon counts them.
-    const rawUnknownCount = log.reduce((n, e) => n + (e.kind === "raw_unknown" ? 1 : 0), 0);
+    const rawUnknownCount = this.rawUnknownCount(q.stream);
     if (q.stream === "host") {
       return {
         status: 200,
@@ -319,7 +431,7 @@ export class ModelServer {
         snapshot: {
           stream: "thread",
           thread: this.info(t),
-          launch: null,
+          launch: t.launch === null ? null : { ...t.launch },
           session: null,
           gate: {
             readiness_seq: null,
@@ -328,7 +440,7 @@ export class ModelServer {
             last_human_write_seq: null,
             last_turn_start_seq: null,
           },
-          inputs: [],
+          inputs: t.inputs.map((i) => ({ ...i })),
           open_approvals: [],
           worktree: null,
           surfaces: [],

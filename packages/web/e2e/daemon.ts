@@ -42,6 +42,14 @@ interface Envelope {
   readonly payload: Record<string, unknown>;
 }
 
+interface InputRecord {
+  readonly input_id: string;
+  readonly state: string;
+  readonly text: string;
+  readonly origin: string;
+  readonly reason: string | null;
+}
+
 const sleep = (ms: number) => new Promise((ok) => setTimeout(ok, ms));
 
 export class Daemon {
@@ -56,7 +64,14 @@ export class Daemon {
   private proc: Proc | null = null;
   private stderr = "";
 
-  constructor(opts: { root: string; port: number; program?: readonly string[]; waits?: Waits }) {
+  constructor(opts: {
+    root: string;
+    port: number;
+    program?: readonly string[];
+    waits?: Waits;
+    /** `echo` (the default): FakeCli as `claude`; `missing`: no `claude` on `PATH`, so a spawn fails. */
+    claude?: "echo" | "missing";
+  }) {
     this.port = opts.port;
     this.root = opts.root;
     this.program = opts.program ?? [CHALDEA];
@@ -64,6 +79,7 @@ export class Daemon {
     this.state = join(this.root, "state");
     this.bin = join(this.root, "bin");
     mkdirSync(this.bin);
+    if (opts.claude === "missing") return;
     // FakeCli `echo` as `claude`: it emits Claude's hooks through the real emitter, and its
     // launch arguments (`--settings`, `--session-id`, `--resume`) follow `--`.
     const wrapper = join(this.bin, "claude");
@@ -162,13 +178,80 @@ export class Daemon {
     return { thread: v.thread_id };
   }
 
+  private token(): string {
+    return readFileSync(join(this.state, "owner.token"), "utf8").trim();
+  }
+
   /** The thread's events through the owner token (the test's own view of the daemon). */
-  async events(thread: string): Promise<Envelope[]> {
-    const token = readFileSync(join(this.state, "owner.token"), "utf8").trim();
+  events(thread: string): Promise<Envelope[]> {
+    return this.stream(`thread:${thread}`);
+  }
+
+  /**
+   * The thread's inputs from its durable events: each `input_created` in order, its text
+   * (a blob read through `/api/blobs`), and its latest state and reason.
+   */
+  async inputs(thread: string): Promise<InputRecord[]> {
+    const out = new Map<string, InputRecord>();
+    for (const e of await this.events(thread)) {
+      const p = e.payload as {
+        input_id: string;
+        initial_state: string;
+        text: { inline?: string; blob?: { sha256: string } };
+        origin: string;
+        to: string;
+        reason?: { kind: string };
+      };
+      if (e.kind === "input_created") {
+        out.set(p.input_id, {
+          input_id: p.input_id,
+          state: p.initial_state,
+          text: await this.content(`thread:${thread}`, p.text),
+          origin: p.origin,
+          reason: null,
+        });
+      } else if (e.kind === "input_state_changed") {
+        const i = out.get(p.input_id);
+        if (i) out.set(p.input_id, { ...i, state: p.to, reason: p.reason?.kind ?? null });
+      }
+    }
+    return [...out.values()];
+  }
+
+  /** Polls the thread's inputs until `pred` holds; returns them. */
+  async waitInputs(thread: string, pred: (is: InputRecord[]) => boolean, ms = 20_000): Promise<InputRecord[]> {
+    const end = Date.now() + ms;
+    for (;;) {
+      const is = await this.inputs(thread);
+      if (pred(is)) return is;
+      if (Date.now() > end) throw new Error(`inputs never matched: ${JSON.stringify(is.map((i) => i.state))}`);
+      await sleep(100);
+    }
+  }
+
+  /** The stream's `raw_unknown` events (`host` or `thread:<id>`), as the daemon's count. */
+  async rawUnknown(stream: string): Promise<number> {
+    return (await this.stream(stream)).filter((e) => e.kind === "raw_unknown").length;
+  }
+
+  private async content(stream: string, c: { inline?: string; blob?: { sha256: string } }): Promise<string> {
+    if (typeof c.inline === "string") return c.inline;
+    const q = new URLSearchParams({ stream_id: stream });
+    const r = await fetch(`${this.origin}/api/blobs/${c.blob?.sha256}?${q}`, {
+      headers: { Authorization: `Bearer ${this.token()}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!r.ok) throw new Error(`GET /api/blobs: ${r.status}`);
+    return new TextDecoder("utf-8", { fatal: true }).decode(await r.arrayBuffer());
+  }
+
+  /** Every event of `stream` (`host` or `thread:<id>`) through the owner token. */
+  async stream(stream: string): Promise<Envelope[]> {
+    const token = this.token();
     const out: Envelope[] = [];
     let after = 0;
     for (;;) {
-      const q = new URLSearchParams({ stream_id: `thread:${thread}`, after_seq: String(after), limit: "1000" });
+      const q = new URLSearchParams({ stream_id: stream, after_seq: String(after), limit: "1000" });
       const r = await fetch(`${this.origin}/api/events?${q}`, {
         headers: { Authorization: `Bearer ${token}` },
         signal: AbortSignal.timeout(10_000),
