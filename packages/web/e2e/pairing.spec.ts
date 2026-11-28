@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 import type { BrowserContext, Page, Request, Route } from "@playwright/test";
 
-import { type Daemon, expect, hasFragment, openLink, selectThread, statusOf, test } from "./harness";
+import { caughtUpWith, type Daemon, expect, hasFragment, openLink, selectThread, statusOf, test } from "./harness";
 
 const SPENT = "This link is spent or expired";
 
@@ -85,11 +85,13 @@ test("request_policy", async ({ daemon, page }) => {
   };
   const row = (id: string) => page.locator(`section[aria-labelledby="inputs-heading"] li[data-input="${id}"]`);
   await daemon.waitInputs(thread, (is) => is[0]?.state === "acked");
+  await caughtUpWith(page, daemon, thread);
   // send, then input_cancel on the queued input (the gate is closed after the first turn).
   await sendText("a policy send");
   const [, queued] = await daemon.waitInputs(thread, (is) => is[1]?.state === "queued");
   await row(queued!.input_id).getByRole("button", { name: "Cancel" }).click();
   await daemon.waitInputs(thread, (is) => is[1]?.state === "cancelled");
+  await caughtUpWith(page, daemon, thread);
   // ready, stop, resume.
   await actions.getByRole("button", { name: "Mark ready" }).click();
   await page.getByRole("dialog", { name: "Mark the CLI ready?" }).getByRole("button", { name: "Mark ready" }).click();
@@ -100,7 +102,7 @@ test("request_policy", async ({ daemon, page }) => {
   await expect(actions.getByRole("button", { name: "Resume" })).toBeEnabled({ timeout: 20_000 });
   await actions.getByRole("button", { name: "Resume" }).click();
   await expect(line(`launch:${thread}`)).toContainText("Resume: outcome: started", { timeout: 45_000 });
-  await daemon.waitEvents(thread, (es) => {
+  await caughtUpWith(page, daemon, thread, (es) => {
     const second = es.filter((e) => e.kind === "launch_started")[1]?.launch_id;
     return second != null && es.some((e) => e.kind === "readiness_observed" && e.launch_id === second);
   });
@@ -109,6 +111,7 @@ test("request_policy", async ({ daemon, page }) => {
   const sentOne = await daemon.waitInputs(thread, (is) => is[2]?.state === "sent", 25_000);
   await daemon.chaldea(["stop", thread]);
   await daemon.waitInputs(thread, (is) => is[2]?.state === "unconfirmed");
+  await caughtUpWith(page, daemon, thread);
   await row(sentOne[2]!.input_id).getByRole("button", { name: "Dismiss" }).click();
   await daemon.waitInputs(thread, (is) => is[2]?.state === "dismissed");
   // spawn from the form.

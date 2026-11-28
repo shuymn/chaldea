@@ -4,7 +4,7 @@
 
 import type { Page } from "@playwright/test";
 
-import { expect, openLink, statusOf, test } from "./harness";
+import { caughtUpWith, expect, openLink, selectThread, statusOf, test } from "./harness";
 
 declare global {
   interface Window {
@@ -29,7 +29,7 @@ test("csp_clean", async ({ daemon, page }) => {
   await recordViolations(page);
   const { thread } = await daemon.spawnThread({ prompt: "CSP の確認 🎌" });
   await openLink(page, await daemon.pairUrl());
-  await page.locator(`li[data-thread="${thread}"] button`).first().click();
+  await selectThread(page, thread);
   // Typed rows: the page decoded the events with the validators under this CSP.
   const timeline = page.locator("main ol");
   await expect(timeline.getByText("thread registered").or(timeline.getByText("launch reserved")).first()).toBeVisible();
@@ -39,6 +39,16 @@ test("csp_clean", async ({ daemon, page }) => {
   await daemon.chaldea(["send", thread, "live over the socket"]);
   await expect(timeline.getByText("live over the socket").first()).toBeVisible();
   await expect(page.getByText("unknown event")).toHaveCount(0);
+  // The spawn prompt's writes end with the running turn (the echo CLI never ends it, so the
+  // CLI's input stays queued); then the page holds them and the composer is ready.
+  await caughtUpWith(
+    page,
+    daemon,
+    thread,
+    (xs) =>
+      xs.filter((e) => e.kind === "input_created").length === 2 &&
+      xs.some((e) => e.kind === "status_changed" && e.payload.field === "turn_state" && e.payload.to === "running"),
+  );
   // The composer, a command, and a native dialog under the same CSP (W2-12).
   await page.getByLabel("Message", { exact: true }).fill("CSP の送信 🎌");
   await page.getByRole("form", { name: "Composer" }).getByRole("button", { name: "Send", exact: true }).click();

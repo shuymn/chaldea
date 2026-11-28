@@ -86,6 +86,24 @@ export async function caughtUp(page: Page, thread: string): Promise<void> {
     .toBe(true);
 }
 
+/**
+ * `caughtUp` after a change made outside the page (a CLI command, a daemon wait): first the
+ * page shows the thread's events through the daemon's last one, written by then. The ready
+ * hint alone can show while an announce of those events is still on its way, and one that
+ * lands between Playwright's check and the click disables the control under it. `done`, when
+ * given, is the change's last write, waited for first.
+ */
+export async function caughtUpWith(
+  page: Page,
+  daemon: Daemon,
+  thread: string,
+  done?: Parameters<Daemon["waitEvents"]>[1],
+): Promise<void> {
+  const es = done ? await daemon.waitEvents(thread, done) : await daemon.events(thread);
+  await shownAtLeast(page, es.at(-1)!.seq);
+  await caughtUp(page, thread);
+}
+
 /** Waits until the timeline's last row is at least `#<seq>`. */
 export async function shownAtLeast(page: Page, seq: number): Promise<void> {
   await expect

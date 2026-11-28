@@ -14,6 +14,7 @@ import { join } from "node:path";
 import type { Page, Route } from "@playwright/test";
 
 import {
+  caughtUpWith,
   commandLine,
   commandPosts,
   composer,
@@ -122,6 +123,7 @@ async function unconfirmed(daemon: Daemon, page: Page, thread: string): Promise<
   const [i] = await daemon.waitInputs(thread, (is) => is[0]?.state === "sent", 25_000);
   await daemon.chaldea(["stop", thread]);
   await daemon.waitInputs(thread, (is) => is[0]?.state === "unconfirmed");
+  await caughtUpWith(page, daemon, thread);
   return i!.input_id;
 }
 
